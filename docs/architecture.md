@@ -557,7 +557,7 @@ It is run with the debug pin (C11). The HTTP cells run right after M2, and the W
    - Record `context_management`.
 4. **Repeat** the whole matrix on a second day.
 5. **Decision rule.** A family is **portable** only if every valid cell passes and its negative control fails. Any explicit rejection or silent drop marks that family **not portable**.
-6. **Reactive safety net.** E2r (C4) is proposed for both outcomes, because server behaviour can change. Whether to adopt it is the user's decision.
+6. **Reactive safety net.** E2r (C4) is proposed for both outcomes, because server behaviour can change. The user decides on it after V2.
 7. **Data handling.** Body captures for V2 contain conversation content and are therefore made only with the separate Phase 0 tool. That tool writes only under `.sandbox\` and deletes its output after the decision is recorded.
 
 ### 16.2 Fault injection (`qb-testkit` fake upstreams)
