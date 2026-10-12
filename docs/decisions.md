@@ -132,13 +132,13 @@ The user delegated this decision to independent reviewers. Three models answered
 6. **Caution:** the 88 % post-switch Codex cache figure may reflect shared prefixes rather than true cross-account sharing. Codex rules are not relaxed before a clean test.
 
 <a id="d12"></a>
-## D12. WebSocket permessage-deflate per leg — Proposed (design owner, 2026-10-13, after the design pre-check)
+## D12. WebSocket permessage-deflate per leg — Accepted (user, 2026-10-13)
 
 Codex offers permessage-deflate on every socket (`responses_websocket.rs:538-541`).
 
 **Loopback leg (Codex ↔ quota-baton): declined.** Compression saves nothing on loopback, and it would cost CPU and per-socket zlib state.
 
-**Upstream leg (quota-baton ↔ chatgpt.com): used.** Full-input messages are uncompressed: p95 33 MB, raw p99 51 MB. Text compresses 4–18×. A full resend happens after every idle close, every 60-minute server close and every failover.
+**Upstream leg (quota-baton ↔ chatgpt.com): used.** quota-baton is not a client imitating Codex. It sits inside the address layer that Codex is pointed at, so this upstream connection is quota-baton's own, and compressing it is purely a bandwidth and latency choice. Whether chatgpt.com negotiates deflate is confirmed in V4. Full-input messages are uncompressed: p95 33 MB, raw p99 51 MB. Text compresses 4–18×. A full resend happens after every idle close, every 60-minute server close and every failover.
 
 **Library and memory.**
 - This needs a deflate-capable WebSocket client, such as the openai-oss-forks tungstenite that Codex itself uses.

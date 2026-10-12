@@ -334,7 +334,7 @@ Relay design:
 - **Per-hop handshake.**
   - `Sec-WebSocket-*`, `Connection` and `Upgrade` belong to each leg; they are never copied (C3). Each leg negotiates its own extensions.
   - Codex offers permessage-deflate (`responses_websocket.rs:538-541`).
-  - Per [D12](decisions.md#d12) (proposed):
+  - Per [D12](decisions.md#d12) (accepted):
     - **Loopback leg:** deflate is declined.
     - **Upstream leg:** deflate is used. This needs a deflate-capable client, such as the tungstenite fork Codex itself uses. Full-input resends compress 4–18×, and every idle close or failover triggers one.
 - **Pin.** One client socket maps to exactly one upstream socket, pinned to one account for its life.
