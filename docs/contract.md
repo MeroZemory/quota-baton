@@ -191,32 +191,63 @@ Rules for answering a WebSocket upgrade:
 
 ## C7. Selection policy
 
-Input: the family, the request's session key with its optional parent key (C8), the model if known, and the set of accounts already tried.
+These rules come from the P2 blind panel (`.sandbox/reviews/switch-policy-blind-panel.md`, [D11](decisions.md#d11)).
 
-1. If the session key is bound to account A, and A is eligible and not yet tried, use A.
-2. Else, if the parent key is bound to account P, P is eligible, and P has not been tried, bind the session to P and use it.
-3. Else, let `E` be the eligible accounts that have not been tried.
-   - Let `S` be the accounts in `E` whose every known usage window is below `soft_threshold_pct` (default 90).
-   - Let `pool` be `S` if it is non-empty, otherwise `E`.
-4. Order `pool` by these keys, in sequence:
-   1. `priority`, ascending (user setting, default 0)
-   2. the soonest `reset_at` of the 7-day window, with unknown values sorting last
-   3. the 5-hour `used_pct`, ascending
+**Input:** the family, the request's session key with its optional parent key (C8), the model if known, and the accounts already tried.
+
+**Placement is serialized** per family, so a burst of new sessions sees each earlier decision.
+
+**Projected usage.** For each window it is the last observed `used_pct`, plus an in-flight allowance for each request in flight on that account (`inflight_allowance_pct`). Usage that is unknown, or older than 15 min while the account has traffic, sorts last and is never read as 0 %.
+
+**The gate** (new-session placement):
+- every 5-hour window is projected below `gate_5h_pct` (default 90)
+- every weekly window is projected below `gate_weekly_pct` (default 90), or below `gate_weekly_near_reset_pct` (default 98) when its weekly reset is within `near_reset_secs` (default 18 000)
+- the account is not drained
+- the account is not known to be unable to serve the requested model (learned from earlier 400/403 errors for that model)
+
+**Steps:**
+1. If the session key is bound to account A, and A is eligible (C5) and not yet tried, use A. Two exceptions:
+   - **Reset hold:** A is in `cooling(quota)` and its limiting window resets within `reset_hold_secs` (default 60). Hold the request until the reset instead of moving it; the cache is still warm.
+   - **Cold point:** see below.
+2. Else, if the parent key is bound to account P, P is eligible and P has not been tried, bind the session to P and use it.
+3. Else, let `E` be the eligible accounts that have not been tried, and let `G` be the accounts in `E` that pass the gate.
+4. If `G` is non-empty, order it by:
+   1. the soonest weekly `reset_at`. Resets within 3 h of each other count as tied.
+   2. among tied accounts, the soonest 5-hour `reset_at`, with unstarted windows last
+   3. the lower projected usage on the binding window
    4. account id
-5. Take the first account in that order and bind the session (and the parent, if it was unbound) to it.
-6. If `E` is empty, apply C6 row 14 or row 15.
+
+   Take the first account.
+5. If `G` is empty but `E` is not, take the account in `E` with the most headroom on its binding window. This is the 2B fallback.
+6. Bind the session, and the parent if it was unbound, to the chosen account.
+7. If `E` is empty, apply C6 row 14 or row 15.
+
+**"Unusable" stays narrow.** It means:
+- a window at its limit, where on credit-capable accounts with `allow_credits=false` a projected 99 % counts as the limit, because headers lag
+- auth still failing after one refresh (C5)
+- the user pausing or disabling the account
+
+Overload, 5xx, short rate limits and network errors retry in place (C6).
 
 Further rules:
-- **Thresholds never move a session.** Usage thresholds MUST NOT move a bound session. A session moves only when its account fails the eligibility test in C5, or at a cold point (below).
-- **`last_used` updates.** Every HTTP request and every relayed WebSocket `response.create` updates the binding's `last_used`. `last_used` is set to the end of the response.
+- **Thresholds never move a session.** Gates and usage MUST NOT move a bound session. A session moves only when its account fails the eligibility test in C5, or at a cold point.
+- **`last_used`.** Every HTTP request and every relayed WebSocket `response.create` updates the binding's `last_used`, set to the end of the response. Idle time is measured over the whole session identity group, sub-agents included.
 - **Pinned sockets keep their binding.** A binding referenced by an open pinned WebSocket is never expired or evicted.
-- **Cold-point rebalance.** A binding idle (`now - last_used`) for at least `rebalance_idle_secs` (default 3600) is dropped. The session's next request is then selected as new (steps 3–5).
-  - At that age the provider prompt cache is already cold. The Claude 1-hour TTL is the longest that Claude Code uses, and Codex's in-memory retention is shorter. So a move back to the preferred account costs no extra cache miss.
+- **Cold point** (staged 1B). A binding is cold when it has been idle (`now - last_used`) for at least `rebalance_idle_secs`, default 3600. That is never below the longest prompt-cache TTL in use for the provider. At a cold point, the cache is cold on every account, so a move costs no extra cache miss.
+  - **While [D10](decisions.md#d10) is not resolved "portable"**, including the "not portable" outcome, a cold session is re-placed (steps 3–6) **only if its current account fails the gate**. A forced move would then probably come soon anyway, and doing it at a cold boundary is cheaper than doing it mid-session. Otherwise the binding stays, for up to `session_binding_max_secs` (default 7 days).
+  - **After "portable"**, a cold session is re-placed as if new. If the result is its current account, nothing changes.
   - `[websocket] idle_close_secs` MUST be smaller than `rebalance_idle_secs`.
-  - This rule applies **only if [D10](decisions.md#d10) resolves to "portable"**. Otherwise bindings last `session_binding_max_secs` (default 7 days), and a session never moves except when forced.
-- **Persistence.** Bindings and hand-off foreign-id sets are persisted write-behind, at most 60 s late, to `state/bindings.json`. They are flushed on drain and on exit. LRU capacity is 20 000. They are exported and imported on takeover (C11).
-- **Unbound requests** (no key, C8) stay on the family's **last-used account** until it becomes ineligible. Selection then runs once and the result becomes the new last-used account. They never move per request.
+- **Moves.**
+  - They happen only at request boundaries, atomically for the whole session group.
+  - A running stream is never moved.
+  - Every move is logged to the ledger with: reason, account from and to, request bytes, and the cache-hit result of the next turn when the usage fields show it.
+- **Persistence.** Bindings and hand-off foreign-id sets are persisted write-behind, at most 60 s late, to `state/bindings.json`, and flushed on drain and on exit. LRU capacity is 20 000. They are exported and imported on takeover (C11).
+- **Unbound requests** (no key, C8) stay on the family's **last-used account** until it becomes ineligible. Selection then runs once, and the result becomes the new last-used account.
 - **WebSocket selection** runs once per connection, on the upgrade (C6 row 13). The connection keeps that account until it closes.
+- **Drain vs pause.**
+  - Drain stops new placements on the account, and existing sessions stay.
+  - Pause (C5 `user_state`) moves existing sessions away at their next request.
+  - Neither is required for normal use.
 
 ## C8. Session keys and the allowed body peek
 
@@ -315,7 +346,7 @@ Base: `http://127.0.0.1:<admin_port>/admin/v1`. Every route requires `Authorizat
 | `GET /accounts/login/{login_id}` | `{status: pending\|completed\|failed\|expired, account_id?, error?}` |
 | `POST /accounts/login/{login_id}/cancel` | Cancels the login |
 | `POST /accounts/{id}/{pause\|resume\|disable\|enable}` | Changes `user_state` |
-| `PATCH /accounts/{id}` `{label?, priority?, allow_credits?}` | Edits account settings |
+| `PATCH /accounts/{id}` `{label?, drain?, allow_credits?}` | Edits account settings |
 | `DELETE /accounts/{id}` | Removes the account file. This does not revoke the account upstream. |
 | `POST /accounts/{id}/refresh-usage` | Polls usage now, subject to the minimum interval |
 | `POST /lifecycle/drain` | Takeover handover, in this order:<br>1. stop refresh-ahead and 401-triggered refresh (a 401 during drain is relayed without refresh or health change)<br>2. stop writing account and state files<br>3. flush bindings<br>4. close the data listener<br>5. **release the credential lease**<br>6. return `{bindings:[...], lease_released:true}`<br>In-flight streams continue until done or `drain_timeout_secs`. |
@@ -343,9 +374,14 @@ data_port = 10200            # 10100 after cutover
 admin_port = 10201
 
 [routing]
-soft_threshold_pct = 90
-rebalance_idle_secs = 3600          # cold-point rebalance (only when D10 = portable)
-session_binding_max_secs = 604800   # binding lifetime when D10 = not portable
+gate_5h_pct = 90
+gate_weekly_pct = 90
+gate_weekly_near_reset_pct = 98     # applies within near_reset_secs of the weekly reset
+near_reset_secs = 18000
+inflight_allowance_pct = 1          # per in-flight request, added to projected usage; tuned from the ledger
+reset_hold_secs = 60
+rebalance_idle_secs = 3600          # cold point; >= the longest prompt-cache TTL in use
+session_binding_max_secs = 604800
 
 [guard]
 retain_max_per_request_mib = 64   # larger bodies are forwarded without retention (no failover)
@@ -359,8 +395,8 @@ max_message_size_mib = 192        # both legs; max_frame_size is set to the same
 [quota]
 poll_min_interval_secs = 300
 
-[accounts.<id>]              # per-account overrides
-priority = 0
+[accounts.<id>]              # per-account settings (also set from the tray)
+drain = false
 allow_credits = false
 ```
 

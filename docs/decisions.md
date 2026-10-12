@@ -59,7 +59,7 @@ Reasons:
 - shared refresh-token families get revoked
 
 <a id="d6"></a>
-## D6. Implementation language: Rust — Proposed (design owner, 2026-10-13)
+## D6. Implementation language: Rust — Accepted (user, 2026-10-13)
 
 The core and the tray are both Rust. The reasons:
 - the memory target
@@ -70,7 +70,7 @@ The core and the tray are both Rust. The reasons:
 Hot patching is handled by architecture rather than language. Config and accounts reload live, the tray is a separate process, and the core upgrades by takeover-and-drain. Python and TypeScript were considered and not preferred.
 
 <a id="d7"></a>
-## D7. Two processes: core and tray — Proposed (design owner, 2026-10-13)
+## D7. Two processes: core and tray — Accepted (user, 2026-10-13)
 
 The UI can crash, restart or be rebuilt without cutting live Claude Code or Codex streams.
 
@@ -112,17 +112,24 @@ Rejected alternative: keeping full transcripts in the proxy, as earlier proxies 
 E2r, the reactive strip-and-retry rule, is **proposed** as a safety net for both branches. It recovers sessions whose binding memory was lost, and it covers changes in server behaviour. It needs the user's approval, as every C4 exception does.
 
 <a id="d11"></a>
-## D11. Account-switching policy: switch only when forced or free — Proposed (design owner, 2026-10-13; the user leans the same way)
+## D11. Account-switching policy — Accepted (decided by a P2 blind panel at the user's request, 2026-10-13)
 
-Goal: minimize tokens spent re-reading context after cache misses, keep perishable quota from expiring unused, and need no user attention.
+The user delegated this decision to independent reviewers. Three models answered a neutral sheet blind: Opus 5.5 max, Fable 5.1 xhigh and Codex gpt-6.1-sol. The sheet, the answers and the union of conditions are in `.sandbox/reviews/switch-policy-blind-panel.md`. The normative rules are in contract C7.
 
-1. **Live sessions stay put.** They move only when their account becomes unusable: a limit, an auth failure, or the user pausing or disabling it.
-2. **New sessions** go to the account whose weekly quota resets soonest, among accounts below 90 % on every window ("use it before it resets").
-3. **Free rebalance.** A session idle for at least 1 hour already has a cold cache, so its next request is placed like a new session. This gradually returns traffic to the preferred account at no extra cost. It is enabled only if D10 resolves to portable.
-4. **Rejected: restore immediately** when the preferred account recovers. Each move costs one cold turn, about 25–40× a warm turn's input on Claude Opus 5.5. The benefit is small, because new sessions already go to the preferred account.
-5. **Rejected: proactively moving warm sessions** to use expiring weekly quota. The gain is marginal and only matters when total usage nears total capacity, and the logic is not lightweight.
+**Goal:** minimize tokens re-read after cache misses, keep perishable quota from expiring unused, and need no user attention.
 
-Zero configuration is required. The optional knobs are per-account `priority`, `allow_credits`, and the thresholds in config.
+1. **New sessions: soonest weekly reset first (unanimous).**
+   - The choice is limited to accounts that pass a gate on projected usage (in-flight requests included): 5-hour below 90 %, weekly below 90 %, or below 98 % within about 5 h of its reset.
+   - If none passes, the account with the most headroom is used.
+2. **Live sessions: move only when forced or free ("staged 1B"; Opus and Fable chose 1B, Codex 1A).**
+   - **Forced:** the account becomes unusable (a limit, auth still failing after a refresh, or a user pause). A limit that resets within 60 s holds the request instead.
+   - **Free:** after at least 1 h idle, when the cache is cold on every account.
+     - Until V2 shows that conversation items are portable, a cold session moves only if its current account fails the gate. This keeps Codex's objection: idle does not prove that reasoning continuity survives a move.
+     - After V2, it is re-placed like a new session.
+3. **Rejected:** restoring immediately when a preferred account recovers (unanimous), and moving warm sessions early to use expiring weekly quota (unanimous). New-session placement serves that goal without a cache cost.
+4. **No priority list.** The only manual placement setting is per-account **drain** (no new sessions; existing sessions stay). `allow_credits` stays off by default.
+5. **Tuning from data:** the ledger records moves, the weekly quota left unused at each reset, and forced moves per gate crossing.
+6. **Caution:** the 88 % post-switch Codex cache figure may reflect shared prefixes rather than true cross-account sharing. Codex rules are not relaxed before a clean test.
 
 <a id="d12"></a>
 ## D12. WebSocket permessage-deflate per leg — Proposed (design owner, 2026-10-13, after the design pre-check)
