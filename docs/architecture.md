@@ -255,14 +255,21 @@ The later API-key providers implement the same trait without OAuth.
 1. If the bound account is eligible for this request, use it.
 2. Otherwise, if the parent's account is eligible, use it and bind.
 3. Otherwise choose among eligible accounts:
-   - prefer accounts below the soft threshold on every known window (default 90 %)
-   - order by user priority, then soonest weekly reset ("use it before it resets"; the same ordering as the orchestrator's ADR-0040), then lowest 5-hour usage
-   - bind the session to the chosen account
+   - Placement is serialized. It applies the gate to projected usage: the last observed usage plus an allowance for each request in flight.
+     - 5-hour usage must stay below 90 %.
+     - Weekly usage must stay below 90 %, or below 98 % within about 5 h of that account's weekly reset.
+   - Among accounts that pass, the **soonest weekly reset** comes first ("use it before it resets"; the same ordering as the orchestrator's ADR-0040). Resets within 3 h of each other count as tied and are broken by the soonest 5-hour reset.
+   - If none passes, take the account with the most headroom.
+   - Bind the session to the chosen account.
 4. If no account is eligible, return the all-exhausted response (C6).
 
-The soft threshold never moves a bound session. A bound session moves only in two cases:
-- **Forced:** its account enters `cooling`, `needs_relogin`, `paused` or `disabled`.
-- **Free:** at a cold point, i.e. after one hour idle, when the provider cache is already cold. On its next request the session is placed like a new one, which naturally returns it to the preferred account. This applies only if V2 shows that conversation items are portable across accounts ([D11](decisions.md#d11)).
+No user-maintained priority order exists. The only manual placement setting is **drain**, which takes no new sessions while existing ones stay.
+
+The gate never moves a bound session. A bound session moves only in two cases:
+- **Forced:** its account enters `cooling`, `needs_relogin`, `paused` or `disabled`. A quota limit that resets within 60 s holds the request instead of moving it.
+- **Free:** at a cold point, i.e. after one hour idle, when the provider cache is already cold.
+  - Until V2 shows that conversation items are portable, a cold session moves only if its current account fails the gate.
+  - After that, it is placed like a new session ([D11](decisions.md#d11)).
 
 Why not switch a session back as soon as the preferred account recovers? Each switch makes one turn re-read the whole context without cache.
 - Claude caches are isolated per workspace, so a switch is always a full miss.
@@ -271,8 +278,8 @@ Why not switch a session back as soon as the preferred account recovers? Each sw
 
 Switching only when forced or free is therefore the token-optimal policy. Routing new sessions to the quota that expires soonest captures most of the benefit of restoring.
 
-Tuning items, revisited with shadow-run data rather than designed up front:
-- A headroom check that is aware of the time left until reset.
+Tuning items, revisited with shadow-run data rather than designed up front. The ledger logs every move, the weekly % left unused at each reset, and the forced moves per gate crossing (C7).
+- A 5-hour gate projected from the burn rate, and headroom measured in absolute tokens (learned from Δ% per token), as the panel suggested.
 - The herd of cold turns when a busy account exhausts.
 - Whether Claude Code on a custom base URL uses only the 5-minute TTL. If so, the cold point could be shorter than 1 h. Keeping 1 h is conservative and only delays a free rebalance.
 
@@ -385,7 +392,7 @@ Relay design:
     - a state chip: in use, ready, limit until HH:MM, needs re-login, paused, disabled
     - 5-hour and weekly usage bars with reset times
     - row actions: log in / re-login, pause / resume, disable / enable
-    - row menu toggles: "prefer this account" (sets `priority`) and, for Codex, "allow paid credits" (`allow_credits`)
+    - row menu toggles: "take no new conversations" (`drain`) and, for Codex, "allow paid credits" (`allow_credits`)
     - These two toggles cover every per-account setting, so the user never edits files for normal use.
   - Footer:
     - add account
@@ -415,7 +422,7 @@ Details are in contract C11.
 
 | Path | Content |
 |---|---|
-| `config.toml` | Small user settings: ports, thresholds, per-account priorities, `allow_credits` (C12) |
+| `config.toml` | Small user settings: ports, gates, and the per-account `drain` / `allow_credits` (C12) |
 | `accounts\*.json` | Account metadata plus the DPAPI token blob, one file per account |
 | `accounts\.lock` | Credential lease (§6) |
 | `state\quota.json` | Last usage snapshots, so the tray is not blank after a restart |
@@ -600,7 +607,7 @@ Each milestone is independently verifiable and sized for an implementer working 
 | M4a | State machine and failover: C5 and C6 for HTTP and WebSocket; passive quota from headers and events | The fault-injection rows for C5/C6 |
 | M4b | Selection and bindings: C7 and C8, persistence write-behind, all-exhausted and no-usable responses | Testkit selection cases |
 | M4c | Hand-off, only as approved by the user: the reactive strip-and-retry rule (E2r, proposed for both outcomes), and the full E2/E3 rewrites only if V2 found the family not portable | Testkit with captured shapes |
-| M5 | Usage polling (cooling accounts hourly, pre-row-14/15 polls), soft threshold, credits hold, early reset | Testkit; a live comparison with the CLIs' own status |
+| M5 | Usage polling (cooling accounts hourly, pre-row-14/15 polls), placement gate with in-flight allowance and near-reset weekly gate, reset hold, credits hold, early reset, move and unused-quota logging | Testkit; a live comparison with the CLIs' own status |
 | M6a | Tray: read-only flyout | Manual UI check; tray memory |
 | M6b | Tray: account actions, row-menu toggles, login and re-login | Manual UI check |
 | M7a | Takeover: credential-lease handover, drain, and socket handover if the M3 spike requires it | Testkit takeover cases |
