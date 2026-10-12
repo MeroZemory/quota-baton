@@ -109,7 +109,7 @@ A session changes account only when its account becomes ineligible (contract C7)
 
 Rejected alternative: keeping full transcripts in the proxy, as earlier proxies do. It does not fix account-bound blobs, and it is the measured cause of their memory use (R6, R7).
 
-E2r, the reactive strip-and-retry rule, is **proposed** as a safety net for both branches. It recovers sessions whose binding memory was lost, and it covers changes in server behaviour. It needs the user's approval, as every C4 exception does.
+E2r, the reactive strip-and-retry rule, is **proposed** as a safety net for both branches. **The user will decide on it after V2** (2026-10-13). It recovers sessions whose binding memory was lost, and it covers changes in server behaviour. It needs the user's approval, as every C4 exception does.
 
 <a id="d11"></a>
 ## D11. Account-switching policy — Accepted (decided by a P2 blind panel at the user's request, 2026-10-13)
