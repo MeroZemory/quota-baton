@@ -391,6 +391,7 @@ memory_hard_limit_mib = 1024
 [websocket]
 idle_close_secs = 1800            # MUST be < routing.rebalance_idle_secs
 max_message_size_mib = 192        # both legs; max_frame_size is set to the same value (Codex sends single-frame messages)
+upstream_deflate = false          # D12: decided by the M3 A/B measurement; the loopback leg never negotiates deflate
 
 [quota]
 poll_min_interval_secs = 300

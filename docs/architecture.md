@@ -334,9 +334,9 @@ Relay design:
 - **Per-hop handshake.**
   - `Sec-WebSocket-*`, `Connection` and `Upgrade` belong to each leg; they are never copied (C3). Each leg negotiates its own extensions.
   - Codex offers permessage-deflate (`responses_websocket.rs:538-541`).
-  - Per [D12](decisions.md#d12) (accepted):
-    - **Loopback leg:** deflate is declined.
-    - **Upstream leg:** deflate is used. This needs a deflate-capable client, such as the tungstenite fork Codex itself uses. Full-input resends compress 4–18×, and every idle close or failover triggers one.
+  - Per [D12](decisions.md#d12):
+    - **Loopback leg:** deflate is always declined.
+    - **Upstream leg:** a switch, `upstream_deflate`, default **off**. It is decided by an A/B measurement in M3. The expected gain is modest, because large inputs are mostly screenshots (about 1.5×). Enabling it needs a deflate-capable client, such as the tungstenite fork Codex itself uses.
 - **Pin.** One client socket maps to exactly one upstream socket, pinned to one account for its life.
 - **No WebSocket-over-HTTP emulation mode exists**, so there is no setting to forget. The previous proxy's default emulation mode is what made it keep a transcript per socket (R6 §5). A WebSocket client is always served by a WebSocket upstream, and an HTTP client by HTTP.
 - **Relay messages in both directions with unchanged payloads.**
@@ -499,7 +499,7 @@ Rust, with one workspace and two binaries ([D6](decisions.md#d6), pending confir
 | Runtime | tokio, multi-threaded |
 | Data-plane and admin servers | axum / hyper |
 | Upstream HTTP client | reqwest with rustls, streaming bodies, no automatic decompression; standard configuration (no fingerprint shaping) |
-| WebSocket | tokio-tungstenite, with a permessage-deflate-capable tungstenite for the upstream leg, e.g. the openai-oss-forks fork that Codex uses ([D12](decisions.md#d12)) |
+| WebSocket | tokio-tungstenite. If D12 enables upstream deflate after the M3 measurement: a permessage-deflate-capable tungstenite, e.g. the openai-oss-forks fork that Codex uses |
 | Windows APIs | the `windows` crate: DPAPI, Shell_NotifyIcon, Win32 windows, Direct2D/DirectWrite |
 | Config | serde + toml |
 | Logs | tracing with a redaction layer |
@@ -603,7 +603,7 @@ Each milestone is independently verifiable and sized for an implementer working 
 | M1 | Account store (DPAPI with entropy, atomic writes, generation, credential lease); OAuth login for both providers through the CLI (callback on 127.0.0.1 and ::1); single-flight refresh with the failed-token guard, typed errors and `refresh_uncertain` | Unit tests; one real login per provider by the user (V6). The user chooses the accounts (O10). |
 | M2 | Single-account HTTP pass-through for every C1 HTTP route; commit hold; in-flight budget and retention cap; ledger with `originator` / UA; debug pin (C11); `shape-capture` build; body-invariance tests | Testkit; then **gate G1** |
 | **G1** | **Phase 0 gate:** V1, V3 (both home types), V5, V6, V7, and the HTTP cells of V2 | Outcomes recorded. D10 decided for HTTP. Any D3 conflict escalated to the user before M3. |
-| M3 | Codex WebSocket relay: dial-first upgrade, per-hop handshake, deflate per D12, message budget and backpressure, commit point, idle close; spike of the Windows port rebind | Testkit; V4; WebSocket cells of V2 |
+| M3 | Codex WebSocket relay: dial-first upgrade, per-hop handshake, the `upstream_deflate` switch (default off), message budget and backpressure, commit point, idle close; spike of the Windows port rebind | Testkit; V4; WebSocket cells of V2; the D12 deflate A/B measurement |
 | M4a | State machine and failover: C5 and C6 for HTTP and WebSocket; passive quota from headers and events | The fault-injection rows for C5/C6 |
 | M4b | Selection and bindings: C7 and C8, persistence write-behind, all-exhausted and no-usable responses | Testkit selection cases |
 | M4c | Hand-off, only as approved by the user: the reactive strip-and-retry rule (E2r, proposed for both outcomes), and the full E2/E3 rewrites only if V2 found the family not portable | Testkit with captured shapes |

@@ -132,17 +132,26 @@ The user delegated this decision to independent reviewers. Three models answered
 6. **Caution:** the 88 % post-switch Codex cache figure may reflect shared prefixes rather than true cross-account sharing. Codex rules are not relaxed before a clean test.
 
 <a id="d12"></a>
-## D12. WebSocket permessage-deflate per leg — Accepted (user, 2026-10-13)
+## D12. WebSocket permessage-deflate — Accepted (user, 2026-10-13): off by default; decide after an M3 A/B measurement
 
-Codex offers permessage-deflate on every socket (`responses_websocket.rs:538-541`).
+**Loopback leg (Codex ↔ quota-baton): always declined.** Compression saves nothing on loopback.
 
-**Loopback leg (Codex ↔ quota-baton): declined.** Compression saves nothing on loopback, and it would cost CPU and per-socket zlib state.
+**Upstream leg (quota-baton ↔ chatgpt.com): a switch, `upstream_deflate`, default off.**
+- quota-baton is not a client imitating Codex. It sits inside the address layer that Codex is pointed at, so this upstream connection is its own. Compressing it is purely a bandwidth and latency choice.
+- Deflate is negotiated per connection. If the server declines, the connection simply runs uncompressed, so support can be checked safely (V4).
 
-**Upstream leg (quota-baton ↔ chatgpt.com): used.** quota-baton is not a client imitating Codex. It sits inside the address layer that Codex is pointed at, so this upstream connection is quota-baton's own, and compressing it is purely a bandwidth and latency choice. Whether chatgpt.com negotiates deflate is confirmed in V4. Full-input messages are uncompressed: p95 33 MB, raw p99 51 MB. Text compresses 4–18×. A full resend happens after every idle close, every 60-minute server close and every failover.
+**Expected gain (R7).** Large Codex inputs are large mostly because of screenshots, which are already compressed.
 
-**Library and memory.**
-- This needs a deflate-capable WebSocket client, such as the openai-oss-forks tungstenite that Codex itself uses.
-- The compressor is configured to keep as little idle state as the library allows. The A1 soak measures the per-pair memory.
+| Input | Size, raw → zstd | Saved upload at 20 Mbps | at 100 Mbps |
+|---|---|---|---|
+| p95 | 33 MB → about 22 MB (1.5×) | about 4 s | about 1 s |
+| Text-only | 3–4 MB → about 1 MB | about 1 s | under 0.3 s |
 
-**Alternative:** no deflate upstream. This is simpler and uses less memory per pair, but every full resend goes up uncompressed.
+**Costs:** zlib state per connection, CPU, and a deflate-capable WebSocket library.
 
+**Decision procedure (M3).** An A/B test with genuine Codex through quota-baton:
+- Use a synthetic large test conversation of tens of MB, never the user's real conversations.
+- A test switch makes the proxy open a new upstream connection every turn, so every turn sends the full input.
+- Alternate deflate on and off on each connection, about 10 times each, on a less important account.
+- Measure upload time, time to the first response event (which includes server-side decompression), proxy CPU and memory, and the negotiated extension.
+- Enable it only if the time saved on the user's own line is clear and A1 still holds.
