@@ -2,12 +2,13 @@ mod credentials;
 mod headers;
 mod hold;
 mod ledger;
+mod upload;
 
 use std::{sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
-    body::{Body, to_bytes},
+    body::Body,
     extract::{Request, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
@@ -95,6 +96,13 @@ pub fn router(state: Arc<RelayState>) -> Router {
     Router::new().fallback(relay).with_state(state)
 }
 
+fn retry_body(bytes: Bytes) -> reqwest::Body {
+    reqwest::Body::wrap_stream(futures_util::stream::once(std::future::ready(Ok::<
+        _,
+        std::io::Error,
+    >(bytes))))
+}
+
 fn route(method: &Method, path: &str, headers: &HeaderMap) -> Option<(Provider, String)> {
     match (method, path) {
         (&Method::POST, "/v1/messages" | "/v1/messages/count_tokens") => {
@@ -171,10 +179,8 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
             "지원하지 않는 경로입니다.",
         );
     };
-    // M2 임시 형태: admission 전 전체 raw body가 예산을 일시적으로 넘을 수 있다.
-    // 예산은 retained 저장소의 admission 검사이며 hard heap cap은 별도 메모리 guard가 담당한다.
-    let raw = match to_bytes(body, usize::MAX).await {
-        Ok(bytes) => bytes,
+    let upload = match upload::read(body, state.retain_cap, completion.input_bytes.clone()).await {
+        Ok(upload) => upload,
         Err(_) => {
             return failure(
                 &mut completion,
@@ -185,12 +191,22 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
             );
         }
     };
-    completion.record.bytes_in = u64::try_from(raw.len()).unwrap_or(u64::MAX);
-    let mut retained = RetainedBody::admit(&raw, state.retain_cap, &state.budget);
+    let mut retained = if upload.overflow.is_none() {
+        RetainedBody::admit(&upload.prefix, state.retain_cap, &state.budget)
+    } else {
+        None
+    };
     completion.record.retained_copy = retained.is_some();
-    let session = session::classify(provider, path, &parts.headers, &raw);
+    let session = session::classify(provider, path, &parts.headers, &upload.prefix);
     completion.session(&session);
-    state.observability.capture(&parts.headers, &raw);
+    #[cfg(all(feature = "shape-capture", debug_assertions))]
+    {
+        let observability = state.observability.clone();
+        let headers = parts.headers.clone();
+        let prefix = upload.prefix.clone();
+        // 선택적 키 관찰은 런타임 스레드에서 큰 JSON을 파싱하지 않는다.
+        let _ = tokio::task::spawn_blocking(move || observability.capture(&headers, &prefix)).await;
+    }
     let account = match state.select(provider, session.key.as_deref()).await {
         Ok(Some(account)) => account,
         Ok(None) => {
@@ -241,7 +257,7 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
         url.push('?');
         url.push_str(query);
     }
-    let mut body_to_send = raw;
+    let mut body_to_send = upload.into_body();
     let mut retry_used = false;
     let mut auth_checked = false;
     let (status, response_headers, held) = loop {
@@ -259,26 +275,18 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
                 }
             };
         completion.record.attempts += 1;
-        // wrap_stream은 raw Bytes 저장소를 공유하며 인코딩이나 직렬화를 하지 않는다.
-        let request_body =
-            reqwest::Body::wrap_stream(futures_util::stream::once(std::future::ready(Ok::<
-                _,
-                std::io::Error,
-            >(
-                body_to_send,
-            ))));
         let send = state
             .client
             .request(parts.method.clone(), &url)
             .headers(upstream_headers)
-            .body(request_body)
+            .body(body_to_send)
             .send();
         let response = match tokio::time::timeout(Duration::from_secs(300), send).await {
             Ok(Ok(response)) => response,
             _ => {
                 if !retry_used && let Some(copy) = &retained {
                     retry_used = true;
-                    body_to_send = copy.bytes();
+                    body_to_send = retry_body(copy.bytes());
                     tokio::time::sleep(Duration::from_millis(250)).await;
                     continue;
                 }
@@ -312,7 +320,7 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
                     retry_used = true;
                     account = updated;
                     tokens = new_tokens;
-                    body_to_send = retained.as_ref().expect("retained retry").bytes();
+                    body_to_send = retry_body(retained.as_ref().expect("retained retry").bytes());
                     continue;
                 }
                 // 보관본이 없으면 reload 결과와 무관하게 401을 그대로 relay한다.
@@ -333,7 +341,7 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
             && let Some(copy) = &retained
         {
             retry_used = true;
-            body_to_send = copy.bytes();
+            body_to_send = retry_body(copy.bytes());
             tokio::time::sleep(Duration::from_millis(250)).await;
             continue;
         }
