@@ -98,6 +98,8 @@ Later, Anthropic-compatible API-key providers will be used from Claude Code: Dee
 
 pi agent and other non-genuine clients are out of scope.
 
+Orca-managed Codex homes are not wired at cutover; the user does not use Orca (2026-10-13). quota-baton has no Orca-specific code, so a Codex CLI in any home that is pointed at it still works.
+
 <a id="d9"></a>
 ## D9. Hands-off live configuration; cutover is the user's decision — Accepted (user, 2026-10-13)
 
