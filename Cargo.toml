@@ -1,0 +1,35 @@
+[workspace]
+members = ["crates/qb-core", "crates/qb-proto", "crates/qb-testkit", "crates/qb-tray", "crates/quota-baton"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "=1.0.100"
+axum = "=0.8.6"
+base64 = "=0.22.1"
+chrono = { version = "=0.4.42", features = ["serde"] }
+clap = { version = "=4.5.51", features = ["derive"] }
+fs2 = "=0.4.3"
+rand = "=0.9.2"
+reqwest = { version = "=0.12.24", default-features = false, features = ["json"] }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.145"
+sha2 = "=0.10.9"
+subtle = "=2.6.1"
+tempfile = "=3.23.0"
+thiserror = "=2.0.17"
+tokio = { version = "=1.48.0", features = ["full"] }
+toml = "=0.9.8"
+tracing = "=0.1.41"
+tracing-appender = "=0.2.3"
+tracing-subscriber = { version = "=0.3.20", features = ["env-filter", "json"] }
+windows = { version = "=0.62.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Memory", "Win32_System_Threading"] }
+zeroize = { version = "=1.8.2", features = ["derive"] }
+qb-core = { path = "crates/qb-core" }
+qb-proto = { path = "crates/qb-proto" }
+qb-testkit = { path = "crates/qb-testkit" }
