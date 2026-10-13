@@ -683,6 +683,24 @@ impl AccountRuntime {
         }).collect())
     }
 
+    /// Build account views with the live affinity statistics held by the
+    /// bindings store.  AccountRuntime does not own that store, so callers
+    /// that expose the complete AccountView pass it explicitly.
+    pub async fn views_with_bindings(
+        &self,
+        bindings: &crate::bindings::BindingTable,
+    ) -> Result<Vec<Value>, ()> {
+        let mut views = self.views().await?;
+        for view in &mut views {
+            if let Some(id) = view["id"].as_str() {
+                let (count, last_used) = bindings.account_stats(id);
+                view["bound_sessions"] = json!(count);
+                view["last_used_at"] = json!(last_used);
+            }
+        }
+        Ok(views)
+    }
+
     pub async fn observe_headers(&self, id: &str, provider: Provider, headers: &HeaderMap) {
         self.observe_headers_for_model(id, provider, headers, None)
             .await;
