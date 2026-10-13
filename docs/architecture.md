@@ -232,11 +232,13 @@ The later API-key providers implement the same trait without OAuth.
   3. Persist the new tokens, then clear the flag.
   4. Only then use the new tokens.
 - **Persist failure.** Keep the new tokens in memory, keep retrying the write, and never reload an older generation. The account goes to `cooling(store_error)` and the tray shows a critical warning.
+- **Write-ahead save failure** (the `refresh_uncertain=true` write fails, M1b review SF2): do **not** send the refresh. Keep serving with the current access token while it is valid, and show the attention badge. Requests are never failed because of this. The account goes to `cooling(store_error)` only when the current token can no longer serve.
+- **A 401 while a rotated token is pending persistence** carries a token that is no longer current. It changes nothing (SF4).
 - **Errors are typed by the JSON error code.**
   - **Terminal:** `refresh_token_invalidated`, `refresh_token_reused`, `refresh_token_expired`, `refresh_token_revoked`, `invalid_grant`, or any 401 from the token endpoint. The account becomes `needs_relogin` at once, with no retry.
   - **Uncertain:** a transport failure after the request was sent, or a crash while `refresh_uncertain` is set. The refresh token may already be consumed.
     - Keep serving with the current access token.
-    - Retry at the next refresh-ahead point, not sooner, so that a possibly replayed token is used as late as possible.
+    - **Retry only when the current access token can no longer serve** (M1b review MF1/SF1). That means it is within 10 min of expiry, or a 401 arrives for the current token. There is no fixed-interval retry, and no immediate retry after a restart, even when the original refresh-ahead point has already passed. The possibly consumed refresh token is thereby used as late as possible.
     - A terminal code on that retry means `needs_relogin`.
   - **5xx or 429:** back off and retry while the access token stays valid and is not rejected.
   - **Unknown 4xx:** back off like 5xx. After 3 in a row, the tray shows an attention badge. These never trigger an automatic `needs_relogin`.
