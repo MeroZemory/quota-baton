@@ -16,7 +16,7 @@ use crate::{
 };
 
 #[derive(Clone)]
-pub(super) struct TokenGates {
+pub(crate) struct TokenGates {
     gates: Arc<Mutex<BTreeMap<String, Arc<Mutex<ReloadClock>>>>>,
     client: reqwest::Client,
     runtime: Arc<AccountRuntime>,

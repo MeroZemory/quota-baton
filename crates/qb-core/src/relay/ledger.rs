@@ -23,6 +23,7 @@ pub(in crate::relay) struct Completion {
     pub failed_access: Option<zeroize::Zeroizing<String>>,
     pub binding: Option<crate::bindings::BindingLease>,
     pub reset_hold_used: bool,
+    pub usage_prepolled: bool,
     pub reset_hold_timed_out: bool,
     observability: Arc<Observability>,
     inflight: Option<Arc<AtomicU64>>,
@@ -40,6 +41,7 @@ impl Completion {
         Self {
             start: Instant::now(),
             reset_hold_used: false,
+            usage_prepolled: false,
             reset_hold_timed_out: false,
             input_bytes: Arc::new(AtomicU64::new(0)),
             runtime: None,

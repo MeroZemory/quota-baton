@@ -282,6 +282,24 @@ fn help_is_available() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("serve"));
 }
 
+#[test]
+fn refresh_usage_is_exposed_and_requires_a_running_core() {
+    let home = fixture();
+    let help = command(home.path())
+        .args(["accounts", "--help"])
+        .bounded_output()
+        .unwrap();
+    assert!(help.status.success());
+    assert!(String::from_utf8_lossy(&help.stdout).contains("refresh-usage"));
+    let result = command(home.path())
+        .args(["accounts", "refresh-usage", "cx-synthetic"])
+        .bounded_output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("코어를 먼저 실행"));
+    assert!(!home.path().join("accounts").exists());
+}
+
 #[cfg(not(feature = "phase0"))]
 #[test]
 fn default_cli_has_no_phase0_or_body_capture() {

@@ -72,8 +72,20 @@ async fn pair_with_tracking(
     let budget = InflightBudget::new(limit);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_address = listener.local_addr().unwrap();
-    let relay = tracking.then(|| {
-        let store = Arc::new(crate::accounts::AccountStore::acquire(home.path()).unwrap());
+    let relay = if tracking {
+        let store = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                match crate::accounts::AccountStore::acquire(home.path()) {
+                    Ok(store) => break Arc::new(store),
+                    Err(crate::accounts::StoreError::LeaseBusy) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await
+                    }
+                    Err(error) => panic!("synthetic credential lease: {error}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
         let mut config = crate::config::Config::default();
         config.upstream.codex_base = format!("http://{upstream_address}");
         config.upstream.anthropic_base = format!("http://{upstream_address}");
@@ -86,8 +98,10 @@ async fn pair_with_tracking(
                 "key":"codex:overlap", "account":"fake-account", "last_used":chrono::Utc::now()
             }]}))
             .unwrap();
-        relay
-    });
+        Some(relay)
+    } else {
+        None
+    };
     let accept = tokio::spawn(async move {
         let (socket, _) = listener.accept().await.unwrap();
         accept_async_with_config(socket, Some(config()))

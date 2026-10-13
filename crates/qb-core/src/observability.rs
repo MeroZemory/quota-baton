@@ -208,6 +208,7 @@ struct Credits {
 
 enum Command {
     Quota(String, Box<Snapshot>),
+    PollQuota(String, Box<Snapshot>),
     Ledger(serde_json::Value),
     #[cfg(all(feature = "shape-capture", debug_assertions))]
     Capture(serde_json::Value),
@@ -293,6 +294,33 @@ impl Observability {
             self.remember(account_id, &snapshot);
             self.enqueue(Command::Quota(account_id.into(), Box::new(snapshot)));
         }
+    }
+
+    pub(crate) fn observe_poll(
+        &self,
+        id: &str,
+        value: serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        let next: Snapshot = serde_json::from_value(value).ok()?;
+        self.remember(id, &next);
+        let merged = self.quota_snapshot(id)?;
+        let persisted: Snapshot = serde_json::from_value(merged.clone()).ok()?;
+        self.enqueue(Command::PollQuota(id.into(), Box::new(persisted)));
+        Some(merged)
+    }
+
+    pub(crate) fn capture_poll(&self, provider: Provider, body: &[u8]) {
+        #[cfg(all(feature = "shape-capture", debug_assertions))]
+        if let Some(capture) = &self.capture {
+            let headers = HeaderMap::new();
+            if let Some(mut value) = capture.shape(&headers, b"{}") {
+                value["shape"]["poll"] = crate::quota::poll_shape(provider, body);
+                value["shape"]["provider"] = serde_json::json!(provider);
+                self.enqueue(Command::Capture(value));
+            }
+        }
+        #[cfg(not(all(feature = "shape-capture", debug_assertions)))]
+        let _ = (provider, body);
     }
 
     pub fn observe_codex_event(&self, account_id: &str, event: &serde_json::Value) {
@@ -806,6 +834,13 @@ impl Writer {
     }
     fn event(&mut self, command: Command) {
         let result = match command {
+            Command::PollQuota(id, next) => {
+                // observe_poll already merged this snapshot and cleared stale
+                // limit signals; a second merge must not resurrect them.
+                self.state.accounts.insert(id, *next);
+                self.quota_dirty = true;
+                Ok(())
+            }
             Command::Quota(id, mut next) => {
                 if let Some(mut old) = self.state.accounts.remove(&id) {
                     let early_reset = next.windows.iter().any(|w| {

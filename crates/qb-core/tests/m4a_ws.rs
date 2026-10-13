@@ -297,6 +297,44 @@ async fn c7_upgrade_near_reset_retries_bound_account_once_without_moving() {
 }
 
 #[tokio::test]
+async fn rn2_upgrade_reset_sleep_releases_pending_auth_probe() {
+    let h = Harness::new(2).await;
+    let (mut first, original) = h.connect().await;
+    first.close(None).await.unwrap();
+    h.store
+        .update_metadata(&original, |a| a.auth_probe_pending = true)
+        .unwrap();
+    h.fake.state.push_handshake(
+        StatusCode::TOO_MANY_REQUESTS,
+        r#"{"error":{"type":"usage_limit_reached","resets_in_seconds":2}}"#,
+        HeaderMap::new(),
+    );
+    let monitor = async {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if h.fake.state.requests().len() >= 2 && !h.state.accounts.probing(&original) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            h.store.load(&original).unwrap().health,
+            Health::Cooling {
+                reason: HealthReason::Quota,
+                ..
+            }
+        ));
+    };
+    let ((mut retry, next), ()) = tokio::join!(h.connect(), monitor);
+    assert_eq!(next, original);
+    assert!(!h.store.load(&original).unwrap().auth_probe_pending);
+    retry.close(None).await.unwrap();
+}
+
+#[tokio::test]
 async fn c7_upgrade_move_then_reset_retry_preserves_first_turn_marker() {
     let h = Harness::new(2).await;
     let (mut first, original) = h.connect().await;

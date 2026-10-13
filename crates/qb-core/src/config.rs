@@ -19,6 +19,8 @@ pub struct Config {
 pub struct UpstreamConfig {
     pub anthropic_base: String,
     pub codex_base: String,
+    pub claude_usage_base: String,
+    pub codex_usage_base: String,
 }
 
 impl Default for UpstreamConfig {
@@ -26,6 +28,8 @@ impl Default for UpstreamConfig {
         Self {
             anthropic_base: "https://api.anthropic.com".into(),
             codex_base: "https://chatgpt.com/backend-api/codex".into(),
+            claude_usage_base: "https://api.anthropic.com".into(),
+            codex_usage_base: "https://chatgpt.com".into(),
         }
     }
 }
@@ -35,6 +39,8 @@ impl UpstreamConfig {
         for (value, expected) in [
             (&self.anthropic_base, "https://api.anthropic.com"),
             (&self.codex_base, "https://chatgpt.com/backend-api/codex"),
+            (&self.claude_usage_base, "https://api.anthropic.com"),
+            (&self.codex_usage_base, "https://chatgpt.com"),
         ] {
             if value == expected {
                 continue;
@@ -46,6 +52,7 @@ impl UpstreamConfig {
                 if url.scheme() == "http"
                     && url.host_str() == Some("127.0.0.1")
                     && url.port().is_some()
+                    && !matches!(url.port(), Some(10100 | 10101))
                     && url.username().is_empty()
                     && url.password().is_none()
                     && url.query().is_none()
@@ -187,6 +194,16 @@ impl Default for QuotaConfig {
     }
 }
 
+impl QuotaConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            (1..=3600).contains(&self.poll_min_interval_secs),
+            "quota.poll_min_interval_secs must be between 1 and 3600 to permit hourly cooling polls"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AccountConfig {
@@ -213,6 +230,7 @@ impl Config {
         config.upstream.validate()?;
         config.websocket.validate()?;
         config.routing.validate()?;
+        config.quota.validate()?;
         anyhow::ensure!(
             config.websocket.idle_close_secs < config.routing.rebalance_idle_secs,
             "websocket.idle_close_secs must be less than routing.rebalance_idle_secs"
@@ -288,6 +306,33 @@ mod upstream_tests {
         ] {
             config.anthropic_base = value.into();
             assert!(config.validate().is_err());
+        }
+    }
+    #[test]
+    fn usage_bases_and_interval_preserve_polling_safety() {
+        let mut config = UpstreamConfig::default();
+        for value in [
+            "https://evil.invalid",
+            "http://127.0.0.1:10100",
+            "http://127.0.0.1:10101",
+            "http://localhost:32123",
+            "http://127.0.0.1:32123/path",
+        ] {
+            config.codex_usage_base = value.into();
+            assert!(config.validate().is_err());
+        }
+        config.codex_usage_base = "http://127.0.0.1:32123".into();
+        config.claude_usage_base = "http://127.0.0.1:32124".into();
+        assert!(config.validate().is_ok());
+        assert!(QuotaConfig::default().validate().is_ok());
+        for secs in [0, 3601, u64::MAX] {
+            assert!(
+                QuotaConfig {
+                    poll_min_interval_secs: secs
+                }
+                .validate()
+                .is_err()
+            );
         }
     }
 }

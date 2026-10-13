@@ -151,8 +151,7 @@ async fn upgrade_inner(
                 Some(response) => response,
                 None => {
                     state
-                        .accounts
-                        .unavailable(Provider::Codex, true, None)
+                        .unavailable(completion, Provider::Codex, true, None)
                         .await
                 }
             };
@@ -167,8 +166,7 @@ async fn upgrade_inner(
                     Some(response) => response,
                     None => {
                         state
-                            .accounts
-                            .unavailable(Provider::Codex, true, None)
+                            .unavailable(completion, Provider::Codex, true, None)
                             .await
                     }
                 };
@@ -187,7 +185,7 @@ async fn upgrade_inner(
         if !state.accounts.eligible(&account.id, None).await {
             continue;
         }
-        let probe = match state.accounts.begin_probe(&account) {
+        let mut probe = match state.accounts.begin_probe(&account) {
             Ok(probe) => probe,
             Err(_) => continue,
         };
@@ -388,6 +386,7 @@ async fn upgrade_inner(
                 forbidden += 1;
             }
             if decision.kind == super::outcome::Kind::Quota {
+                drop(probe.take());
                 match state
                     .retry_after_reset(&session, completion, &account.id, None)
                     .await
@@ -408,6 +407,10 @@ async fn upgrade_inner(
                             }
                             Err(()) => return network_failure(),
                         }
+                        probe = match state.accounts.begin_probe(&account) {
+                            Ok(probe) => probe,
+                            Err(_) => continue 'accounts,
+                        };
                         continue;
                     }
                     Ok(false) => {}
