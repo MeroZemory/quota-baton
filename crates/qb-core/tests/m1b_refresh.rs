@@ -971,6 +971,9 @@ async fn runtime_uncertain_after_ahead_waits_for_expiry_margin() {
             .is_none()
     );
     assert_eq!(fake.state.requests().len(), 1);
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(120)).await;
+    tokio::time::resume();
     set_long_lifetime(&f, 599, true);
     fake.state.push(success());
     assert!(
@@ -1312,5 +1315,71 @@ async fn not_sent_retry_does_not_clear_uncertainty_from_earlier_attempt() {
             .count(),
         1
     );
+    gates.shutdown_refreshes().await.unwrap();
+}
+
+#[tokio::test]
+async fn uncertain_near_expiry_spaces_proactive_attempts_but_current401_overrides() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new(false, 60, Provider::Codex);
+    set_long_lifetime(&f, 599, true);
+    let fake = ScriptedUpstream::start().await.unwrap();
+    let gates = f
+        .gates()
+        .with_token_endpoint(Provider::Codex, fake.url.clone());
+    for _ in 0..5 {
+        fake.state
+            .push(ScriptedResponse::json(StatusCode::OK, "truncated-json"));
+    }
+    gates
+        .refresh_ahead(f.store.clone(), f.obs.clone(), f.account.id.clone())
+        .await
+        .unwrap();
+    assert_eq!(fake.state.requests().len(), 1);
+    for _ in 0..3 {
+        gates
+            .refresh_ahead(f.store.clone(), f.obs.clone(), f.account.id.clone())
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        fake.state.requests().len(),
+        1,
+        "proactive replay within two minutes"
+    );
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(119)).await;
+    tokio::time::resume();
+    gates
+        .refresh_ahead(f.store.clone(), f.obs.clone(), f.account.id.clone())
+        .await
+        .unwrap();
+    assert_eq!(fake.state.requests().len(), 1);
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(2)).await;
+    tokio::time::resume();
+    gates
+        .refresh_ahead(f.store.clone(), f.obs.clone(), f.account.id.clone())
+        .await
+        .unwrap();
+    assert_eq!(fake.state.requests().len(), 2);
+    let (a, t) = gates
+        .before_request(f.store.clone(), f.obs.clone(), f.account.id.clone())
+        .await
+        .unwrap();
+    gates
+        .after_401(f.store.clone(), f.obs.clone(), a, &t)
+        .await
+        .unwrap();
+    assert_eq!(
+        fake.state.requests().len(),
+        3,
+        "new current-token 401 bypasses uncertain spacing"
+    );
+    gates
+        .refresh_ahead(f.store.clone(), f.obs.clone(), f.account.id.clone())
+        .await
+        .unwrap();
+    assert_eq!(fake.state.requests().len(), 3);
     gates.shutdown_refreshes().await.unwrap();
 }

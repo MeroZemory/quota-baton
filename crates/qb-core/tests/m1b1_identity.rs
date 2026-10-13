@@ -280,10 +280,13 @@ fn unresolved_or_ambiguous_legacy_identity_is_refused_even_with_replace() {
             login::save(store, &account, &tokens, true),
             Err(LoginStoreError::IdentityConflict)
         ));
-        assert!(matches!(
-            import::run(store, cpa, &[], false),
-            Err(StoreError::IdentityCollision)
-        ));
+        assert!(
+            import::run(store, cpa, &[], false)
+                .unwrap()
+                .iter()
+                .any(|row| row.action == import::ImportAction::Skipped
+                    && row.reason == Some(import::SkipReason::InvalidData))
+        );
         assert_eq!(store.list().unwrap().len(), 1);
     });
 }
@@ -340,10 +343,13 @@ fn missing_user_claim_on_reimport_cannot_duplicate_known_family() {
     isolated(|store, cpa, _| {
         let old = imported(store, cpa, Some("synthetic-user-a"), 1);
         write(cpa, "account.json", &fixture(None, EMAIL, 2));
-        assert!(matches!(
-            import::run(store, cpa, &[], false),
-            Err(StoreError::IdentityCollision)
-        ));
+        assert!(
+            import::run(store, cpa, &[], false)
+                .unwrap()
+                .iter()
+                .any(|row| row.action == import::ImportAction::Skipped
+                    && row.reason == Some(import::SkipReason::InvalidData))
+        );
         assert_eq!(store.list().unwrap().len(), 1);
         assert!(
             store
@@ -377,7 +383,13 @@ fn journal_recovery_finishes_legacy_replacement_after_email_change() {
     store.save(&account, &tokens, None).unwrap();
     fs::write(
         home.join("accounts/.login-migration"),
-        serde_json::to_vec(&json!({"old": old.id, "new": account.id})).unwrap(),
+        serde_json::to_vec(&json!({"old": old.id, "new": account.id, "proof": {
+            "old_identity": old.identity,
+            "resolved_identity": Identity::Codex {
+                account_id: match &old.identity { Identity::Codex { account_id, .. } => account_id.clone(), _ => unreachable!() },
+                user_id: Some("synthetic-user-a".into()), email: EMAIL.into()
+            }
+        }})).unwrap(),
     )
     .unwrap();
     drop(store);

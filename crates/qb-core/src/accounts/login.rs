@@ -179,7 +179,7 @@ pub fn save(
     next.generation = same_file.map_or(0, |old| old.generation);
     let migration = old.filter(|old| old.id != next.id);
     if let Some(old) = migration {
-        store.begin_login_migration(&old.id, &next.id)?;
+        store.begin_login_migration(&old.id, &next.id, &next.identity)?;
     }
     let updated = match store.save_unlocked(&next, tokens, same_file.map(|old| old.generation)) {
         Ok(updated) => updated,
