@@ -210,7 +210,14 @@ These rules come from the P2 blind panel (`.sandbox/reviews/switch-policy-blind-
 
 **Placement is serialized** per family, so a burst of new sessions sees each earlier decision.
 
-**Projected usage.** For each window it is the last observed `used_pct`, plus an in-flight allowance for each request in flight on that account (`inflight_allowance_pct`). Usage that is unknown, or older than 15 min while the account has traffic, sorts last and is never read as 0 %.
+**Projected usage.** For each window it is the last observed `used_pct`, plus an in-flight allowance for each request in flight on that account (`inflight_allowance_pct`). Rules from the M4b review:
+- **Gating windows.** Only the account windows count for the gate and for ordering: `5h` and `7d` (Codex primary/secondary as named by C9). Sub-buckets such as `7d_oi` and other names never gate the account and never set the weekly ordering. They act only through model-scoped cooling (C5) (S1).
+- **Past reset.** A window whose `reset_at` has passed counts as 0 % used and unstarted until a new observation arrives (F2).
+- **Unknown or stale.** A window is stale when its observation is older than 15 min **and** the account has carried traffic newer than that observation.
+  - Unknown or stale usage **sorts last** in ordering but **does not fail the gate**: it is not known to be over (F1).
+  - Traffic records older than the latest observation do not count.
+  - Restored bindings do not count as traffic.
+- **Projection.** The in-flight projection is used only for placement. It never creates a cooling, for example the credits hold (S5). Coolings come only from observed values (C5).
 
 **The gate** (new-session placement):
 - every 5-hour window is projected below `gate_5h_pct` (default 90)
@@ -221,6 +228,9 @@ These rules come from the P2 blind panel (`.sandbox/reviews/switch-policy-blind-
 **Steps:**
 1. If the session key is bound to account A, and A is eligible (C5) and not yet tried, use A. Two exceptions:
    - **Reset hold:** A is in `cooling(quota)` and its limiting window resets within `reset_hold_secs` (default 60). Hold the request until the reset instead of moving it; the cache is still warm.
+     - **During a request (F3).** The hold also applies when A answers *this* request with a pre-commit usage limit whose reset is within `reset_hold_secs`. The request then waits until the reset and retries A once from the retained copy, instead of failing over. This applies to HTTP, and to a WebSocket **upgrade**. An error on an already-open socket keeps the row 13a behaviour.
+     - **Bound (S2).** The hold never exceeds `reset_hold_secs`, which stays well below both clients' timeouts (Claude Code 600 s; Codex stream idle 300 s). If the reset has not taken effect when the hold ends, normal failover applies at once. No separate client-timeout estimate is used.
+     - **Scope (S3).** The hold is per request. A request whose hold ended does not stop the next request of that session from holding.
    - **Cold point:** see below.
 2. Else, if the parent key is bound to account P, P is eligible and P has not been tried, bind the session to P and use it.
 3. Else, let `E` be the eligible accounts that have not been tried, and let `G` be the accounts in `E` that pass the gate.
@@ -258,6 +268,7 @@ Further rules:
 - **Persistence.** Bindings are persisted write-behind, at most 60 s late, to `state/bindings.json`, and flushed on drain and on exit. LRU capacity is 20 000. They are exported and imported on takeover (C11).
 - **Unbound requests** (no key, C8) stay on the family's **last-used account** until it becomes ineligible. Selection then runs once, and the result becomes the new last-used account.
 - **WebSocket selection** runs once per connection, on the upgrade (C6 row 13). The connection keeps that account until it closes.
+- **Drained account at a cold point (S7).** A drained account fails the gate, so a cold session on it is re-placed. The move is free, because the cache is already cold. A warm session stays until it goes cold.
 - **Drain vs pause.**
   - Drain stops new placements on the account, and existing sessions stay.
   - Pause (C5 `user_state`) moves existing sessions away at their next request.
