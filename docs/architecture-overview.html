@@ -667,10 +667,10 @@ html { scroll-behavior: smooth; }
       <line class="edge-acc" x1="650" y1="54" x2="702" y2="54" marker-end="url(#f6b)"/>
       <rect class="box-note" x="704" y="24" width="244" height="128" rx="5"/>
       <text x="718" y="48" class="t-b t-acc">1시간 넘게 쉰 세션</text>
-      <text x="718" y="70">캐시가 이미 식어 옮겨도 손해 없음</text>
+      <text x="718" y="70">지금 계정이 게이트를 넘었으면</text>
       <text x="718" y="90">→ 새 세션처럼 다시 배치</text>
-      <text x="718" y="116" class="t-m">V2 통과 전에는 지금 계정이</text>
-      <text x="718" y="134" class="t-m">게이트를 넘었을 때만</text>
+      <text x="718" y="116" class="t-m">캐시는 이미 식었지만 이전 속생각은</text>
+      <text x="718" y="134" class="t-m">잃으므로 필요할 때만 옮김</text>
     </svg>
     </div>
     <figcaption>게이트는 진행 중인 요청만큼의 여유를 더해 계산합니다. 주간 리셋이 5시간 안으로 남은 계정은 98%까지 받습니다. 곧 사라질 할당량이기 때문입니다. 리셋 시각이 3시간 안으로 비슷한 계정끼리는 5시간 창이 먼저 리셋되는 쪽을 고릅니다. 고른 계정에 세션을 묶고, 진행 중인 대화는 임계치만으로 옮기지 않습니다.</figcaption>
@@ -704,22 +704,23 @@ html { scroll-behavior: smooth; }
   </div>
   <div class="prose">
     <p>대화 데이터는 거의 전부 평문이라 어느 계정이든 읽을 수 있습니다. 예외는 모델이 답하기 전에 한 생각입니다. 서버는 이 생각을 자기만 열 수 있는 봉인된 데이터(Codex의 <span class="mono">encrypted_content</span>, Claude의 서명된 thinking)로 돌려주고, CLI는 그것을 매 턴 다시 보냅니다.</p>
-    <p>다른 계정이 이 봉인을 열 수 있는지는 아직 모릅니다. 증거도 엇갈립니다. 0단계 실험 V2로 확인하고, 그 결과로 처리 방식(D10)을 정합니다.</p>
+    <p>Codex와 Claude Code는 이 봉인 데이터를 매 턴 그대로 다시 보내고, 직접 빼는 일이 없습니다. quota-baton도 똑같이 그대로 전달합니다(D10).</p>
   </div>
   <div class="split">
     <div>
-      <h3>다른 계정이 열 수 있으면</h3>
+      <h3>V2 실험 결과 (2026-10-13, HTTP)</h3>
       <ul>
-        <li>그대로 전달합니다. 옮길 때 드는 비용은 캐시 한 번뿐입니다.</li>
-        <li>1시간 넘게 쉰 세션의 재배치(D11)를 완전히 켭니다.</li>
+        <li>계정 A의 봉인 데이터를 계정 B로 보내면 200입니다. 서버가 오류 없이 무시합니다. 입력 토큰 수가 데이터를 뺀 경우와 같았고, 도구 호출 도중의 턴에서도 같았습니다.</li>
+        <li>자기 계정에서 1바이트를 변조하면 400입니다. 서버는 자기가 만든 것은 검증하고, 남이 만든 것은 버립니다.</li>
+        <li>계정을 넘긴 대화는 계속 이어집니다. 잃는 것은 이전 턴의 속생각과, 넘긴 직후 한 턴의 캐시뿐입니다.</li>
       </ul>
     </div>
     <div>
-      <h3>열 수 없으면</h3>
+      <h3>그래서</h3>
       <ul>
-        <li>옮긴 세션에서 이전 계정의 추론 조각만 뺍니다(E2·E3). 대화는 이어지고, 이전 턴의 속생각만 잊습니다.</li>
-        <li>Codex의 압축 요약은 빼면 앞 대화가 사라지므로 절대 빼지 않습니다. 원래 계정으로 돌려보내거나 트레이로 알립니다.</li>
-        <li>거절됐을 때 한 번 빼고 다시 보내는 안전장치(E2r)는 V2 결과를 보고 사용자가 정합니다.</li>
+        <li>조각을 빼거나 고치는 기능(E1–E3)과 거절 시 재전송 안전장치(E2r)는 만들지 않습니다.</li>
+        <li>남은 위험은 Codex 압축 요약입니다. 이전 프록시 로그에 다른 계정에서 거절된 듯한 기록이 3건 있습니다. 빼면 앞 대화가 사라지므로 빼는 방법은 없습니다. 대신 세션을 원래 계정에 오래 묶어 두어 피합니다.</li>
+        <li>요청 기록에 서버 오류 코드를 남겨, 서버 동작이 바뀌면 드러나게 합니다.</li>
       </ul>
     </div>
   </div>
@@ -769,7 +770,7 @@ html { scroll-behavior: smooth; }
       <thead><tr><th>ID</th><th>확인할 것</th><th>결과에 따른 결정</th></tr></thead>
       <tbody>
         <tr><td class="k">V1</td><td>Claude Code 요청을 인증 헤더만 바꿔 보내도 통과하는가. 세션 헤더, 메타데이터, 서명을 보내는가</td><td>통과하면 진행. 신원 수정이 필요하면 실제 계정 값만 허용하고, 클라이언트 서명을 다시 계산해야 하면 위장 금지에 걸리므로 사용자 결정</td></tr>
-        <tr><td class="k">V2</td><td>계정 A에서 만든 봉인 데이터를 계정 B가 받는가. 대조군(원래 계정, 데이터 제거, 1바이트 변조), 실험 대상 데이터 존재 확인, 이틀 반복</td><td>D10 결정. 한 번이라도 거절하거나 조용히 버리면 "열 수 없음"</td></tr>
+        <tr><td class="k">V2</td><td>계정 A에서 만든 봉인 데이터를 계정 B가 받는가. 대조군(원래 계정, 데이터 제거, 1바이트 변조)과 데이터 존재 확인 포함</td><td><strong>완료(HTTP)</strong>: 조용히 무시됨 → D10 그대로 전달. WebSocket과 다른 날 반복은 확인용</td></tr>
         <tr><td class="k">V3</td><td>Codex 요청이 그대로 통과하는가 (기본 홈과 Orca 홈 둘 다)</td><td>한쪽이 실패하면 헤더 예외(H3)와 그 홈 설정 변경 중 사용자 선택</td></tr>
         <tr><td class="k">V4</td><td>WebSocket 재연결 동작, 연결 단계의 429·400이 재시도 없이 끝나는지, 압축 협상</td><td>실패하면 M4 전에 WebSocket 설계 수정</td></tr>
         <tr><td class="k">V5</td><td>사용량 조회 API의 모양과 필요한 헤더</td><td>Claude 조회 API가 없으면 리셋 시각까지 대기 후 다음 요청으로 확인</td></tr>
@@ -850,11 +851,11 @@ html { scroll-behavior: smooth; }
         <tr><td class="k">D7</td><td>코어와 트레이를 별도 프로그램으로</td><td><span class="chip ok">확정</span></td></tr>
         <tr><td class="k">D8</td><td>Claude·Codex 먼저, 나중에 DeepSeek·Z.ai·MiMo (Claude Code에서 API 키로)</td><td><span class="chip ok">확정</span></td></tr>
         <tr><td class="k">D9</td><td>실사용 설정은 승인 없이 안 건드림. 컷오버는 사용자 결정</td><td><span class="chip ok">확정</span></td></tr>
-        <tr><td class="k">D10</td><td>계정을 넘길 때 봉인 데이터 처리</td><td><span class="chip wait">V2 후</span></td></tr>
+        <tr><td class="k">D10</td><td>계정을 넘길 때 봉인 데이터: Codex·Claude처럼 그대로 전달</td><td><span class="chip ok">확정</span></td></tr>
         <tr><td class="k">D11</td><td>전환 정책: 새 대화는 리셋 이른 계정, 진행 중 대화는 강제되거나 식었을 때만</td><td><span class="chip ok">확정</span></td></tr>
         <tr><td class="k">D12</td><td>OpenAI 구간 압축: 기본 끔</td><td><span class="chip acc">M3 실측 후</span></td></tr>
         <tr><td class="k">D13</td><td>0단계 계정: 주력 계정부터 하나씩</td><td><span class="chip ok">확정</span></td></tr>
-        <tr><td class="k">E2r</td><td>거절 시 봉인 데이터만 빼고 한 번 다시 보내는 안전장치</td><td><span class="chip wait">V2 후</span></td></tr>
+        <tr><td class="k">E2r</td><td>거절 시 봉인 데이터만 빼고 다시 보내는 안전장치: 거절 사례가 없어 만들지 않음</td><td><span class="chip ok">철회</span></td></tr>
       </tbody>
     </table>
   </div>

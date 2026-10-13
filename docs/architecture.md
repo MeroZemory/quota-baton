@@ -92,7 +92,7 @@ What a design needs follows from those numbers:
   - The first request after a switch is cache-cold.
   - **Not portable, but harmless:** a moved session keeps working and loses only earlier hidden reasoning. Remote-compaction blobs were not tested; R8 I-16 suggests they are rejected.
   - The WebSocket cells and the second-day repeat are still pending.
-- This is the decisive Phase 0 test (V2, §16.1). Its outcome selects the hand-off policy ([D10](decisions.md#d10)).
+- **Decision ([D10](decisions.md#d10)): relay as the genuine clients do.** Both CLIs replay these items verbatim and never strip them. The servers verify the items they minted and ignore the ones they did not. quota-baton therefore changes nothing, and has no hand-off rewrite.
 
 ## 3. Principles
 
@@ -275,7 +275,7 @@ The later API-key providers implement the same trait without OAuth.
 - Every HTTP request and every relayed WebSocket `response.create` updates `last_used`.
 - A binding that an open pinned socket references is never expired or evicted.
 - Lifetime follows the cold-point rule in contract C7. The idle time is measured from the end of the last response.
-- Persisted write-behind (at most 60 s late) to `state\bindings.json`, together with any hand-off foreign-id sets (C4). Flushed on drain and exit, and exported to the successor on takeover.
+- Persisted write-behind (at most 60 s late) to `state\bindings.json`, . Flushed on drain and exit, and exported to the successor on takeover.
 - A WebSocket connection is additionally pinned to one account for its whole life.
 - **Unbound requests** (no key derivable, C8) stay on their family's last-used account until it becomes ineligible. They never move per request.
 
@@ -464,7 +464,7 @@ Details are in contract C11.
 | `accounts\*.json` | Account metadata plus the DPAPI token blob, one file per account |
 | `accounts\.lock` | Credential lease (§6) |
 | `state\quota.json` | Last usage snapshots, so the tray is not blank after a restart |
-| `state\bindings.json` | Session bindings and hand-off foreign-id sets. Written behind, at most 60 s late (§7). |
+| `state\bindings.json` | Session bindings. Written behind, at most 60 s late (§7). |
 | `ledger\YYYY-MM-DD.jsonl` | Per-request metadata, no content (§13) |
 | `logs\` | Rolling logs with redaction |
 | `admin.token`, `client.key` | Local secrets, user-ACL'd |
@@ -481,17 +481,15 @@ Details are in contract C11.
   - It identifies who sends what during the shadow run (O11).
   - It also records one event per token refresh attempt and per linked reload: account, trigger, outcome code, and new expiry. No token values. Three Codex token families died within a week for unknown reasons (R8 I-06), and these events make the next one diagnosable.
   - Retention: 30 days or 500 MB, whichever comes first.
-- **Shared in-flight budget**, `inflight_budget_mib`, default 384. It covers three things:
+- **Shared in-flight budget**, `inflight_budget_mib`, default 384. It covers two things:
   - retained HTTP bodies
   - in-flight WebSocket messages
-  - transient hand-off decode buffers
 
   The budget is an admission and backpressure check, not a hard heap cap; the memory guard below is the hard backstop.
 
   Retained copies are capped at 64 MiB per request. When the budget is exhausted:
   - HTTP is forwarded without retention, so it has no failover.
   - WebSocket reading pauses, which applies backpressure.
-  - Hand-off rewrites wait.
 - **Memory guard.**
   - Private bytes are sampled every 10 s.
   - Above the hard limit (default 1 GiB), until memory recovers:
@@ -579,7 +577,7 @@ Phase 0 runs against the real upstreams on a **shadow port (10200)**:
 | Id | Question | Outcome → decision |
 |---|---|---|
 | V1 | **Claude pass-through.** Does Claude Code's request, unchanged apart from the C3 credential headers, succeed on an account token? Record whether Claude Code sends the following to a custom base URL: `X-Claude-Code-Session-Id`, `-Agent-Id`, `-Parent-Agent-Id` (main, subagent and count_tokens requests), `metadata.user_id`, `diagnostics`, a billing `cch` value, and `Accept-Encoding`. | **Pass:** the Claude half proceeds. **Upstream rejects the identity or signature:** if the fix would require writing the serving account's real `account_uuid` and no client signature covers the body, it becomes candidate E4. If it would require computing a client signature, it is **infeasible under D3** and escalated to the user. **Header absent:** the C8 fallbacks apply. |
-| V2 | **Account portability, the decisive test.** Procedure below. | Decides [D10](decisions.md#d10) per provider family |
+| V2 | **Account portability.** Procedure below. | Done for HTTP on 2026-10-13: foreign items are silently ignored, so [D10](decisions.md#d10) is pass-through. The WebSocket cells and a second-day repeat are confirmation only. |
 | V3 | **Codex pass-through, default home** (`~/.codex`: built-in OpenAI provider, API-key auth; the user does not use Orca homes, 2026-10-13). Does the request, unchanged apart from C3, succeed? Is a routing hint needed? | **Pass:** proceed. **Fail:** the user chooses between candidate header exception H3 and rewiring the home to a passing shape at cutover. |
 | V4 | **Codex WebSocket relay.** Check on the wire what R6 found in source: a close during a response leads to a reconnect and a full resend, and an idle close leads to a silent reconnect. Also check that a 429 `usage_limit_reached` or a 400 on the upgrade is terminal, and the deflate negotiation on each leg. | **Pass:** proceed. **Fail:** redesign §9 before M4. |
 | V5 | **Usage endpoints** (`wham/usage`, Claude OAuth usage): exact shape, required headers, an honest `User-Agent`. | The parsed snapshot matches the CLI's own `/status`. If there is no Claude endpoint, use the fallback in §8. |
@@ -614,7 +612,7 @@ It is run with the debug pin (C11). The HTTP cells run right after M2, and the W
    - Record `context_management`.
 4. **Repeat** the whole matrix on a second day.
 5. **Decision rule.** A family is **portable** only if every valid cell passes and its negative control fails. Any explicit rejection or silent drop marks that family **not portable**.
-6. **Reactive safety net.** E2r (C4) is proposed for both outcomes, because server behaviour can change. The user decides on it after V2.
+6. **Watching for change.** The ledger records upstream error codes (C6 row 12b), so a future server change that starts rejecting foreign items becomes visible.
 7. **Data handling.** Body captures for V2 contain conversation content and are therefore made only with the separate Phase 0 tool. That tool writes only under `.sandbox\` and deletes its output after the decision is recorded.
 
 ### 16.2 Fault injection (`qb-testkit` fake upstreams)
@@ -663,7 +661,6 @@ Each milestone is independently verifiable and sized for an implementer working 
 | M3 | Codex WebSocket relay: dial-first upgrade, per-hop handshake, the `upstream_deflate` switch (default off), message budget and backpressure, commit point, idle close; spike of the Windows port rebind | Testkit; V4; WebSocket cells of V2; the D12 deflate A/B measurement |
 | M4a | State machine and failover: C5 and C6 for HTTP and WebSocket; passive quota from headers and events | The fault-injection rows for C5/C6 |
 | M4b | Selection and bindings: C7 and C8, persistence write-behind, all-exhausted and no-usable responses | Testkit selection cases |
-| M4c | Hand-off, only as approved by the user: the reactive strip-and-retry rule (E2r, proposed for both outcomes), and the full E2/E3 rewrites only if V2 found the family not portable | Testkit with captured shapes |
 | M5 | Usage polling (cooling accounts hourly, pre-row-14/15 polls), placement gate with in-flight allowance and near-reset weekly gate, reset hold, credits hold, early reset, move and unused-quota logging | Testkit; a live comparison with the CLIs' own status |
 | M6a | Tray: read-only flyout | Manual UI check; tray memory |
 | M6b | Tray: account actions, row-menu toggles, login and re-login | Manual UI check |
@@ -675,7 +672,7 @@ Each milestone is independently verifiable and sized for an implementer working 
 
 ## 18. Open questions
 
-- **O1–O7** correspond to Phase 0 items V1–V7. O2 (V2, account portability) decides [D10](decisions.md#d10) and is answered at gate G1 (HTTP) and in M3 (WebSocket).
+- **O1–O7** correspond to Phase 0 items V1–V7. O2 (V2, account portability) was answered on 2026-10-13: pass-through ([D10](decisions.md#d10)). The M3 WebSocket cells are confirmation only.
 - **O8.** Resolved. Codex posts `{base}/images/generations` and `{base}/images/edits` (`codex-api/src/endpoint/images.rs:62-83`), so the upstream is `https://chatgpt.com/backend-api/codex/images/{generations,edits}`. V7 confirms acceptance.
 - **O9.** The Codex model catalog. Either pass `/v1/models?client_version=` through to `backend-api/codex/models` with a healthy account, or serve a cached file that quota-baton refreshes. Pick in M2 from the real client's behaviour.
 - **O10.** Do quota-baton's own OAuth logins coexist with the CPA logins of the same accounts during the shadow period? Separate logins should be separate token families. The user picks the accounts. Watch for revocations.
