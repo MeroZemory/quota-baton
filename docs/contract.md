@@ -112,6 +112,7 @@ Each account has two independent fields:
 - `permission` (403 with a known model)
 - `payment` (402)
 - `store_error` (credential persist failure)
+- `link_stale` (a linked import whose CPA file has no newer token by expiry; D5)
 
 **An account is eligible for a request when all of these hold:**
 - `user_state == active`
@@ -343,6 +344,7 @@ Base: `http://127.0.0.1:<admin_port>/admin/v1`. Every route requires `Authorizat
 | `GET /state` | `{accounts:[AccountView], inflight:{requests, bytes}, memory:{private_bytes}, bindings:{count}, data_port, version}` |
 | `GET /events` | SSE stream of `account_changed`, `quota_updated`, `core_warning` and `login_progress` |
 | `POST /accounts/login` `{provider}` | Returns `{login_id, auth_url}`. The core runs the callback listener. |
+| `POST /accounts/import` `{source:"cpa", mode:"linked"\|"adopted", activate:[...]}` | Imports from CPA's auth directory (D5). Returns per-identity metadata, never tokens. `adopted` is refused while CPA can still refresh the account. |
 | `GET /accounts/login/{login_id}` | `{status: pending\|completed\|failed\|expired, account_id?, error?}` |
 | `POST /accounts/login/{login_id}/cancel` | Cancels the login |
 | `POST /accounts/{id}/{pause\|resume\|disable\|enable}` | Changes `user_state` |
@@ -403,9 +405,14 @@ allow_credits = false
 
 ### `accounts/<id>.json`
 
+`source` is `{"kind": "oauth"}`, or `{"kind": "cpa", "mode": "linked" | "adopted", "dir": "<CPA auth dir>", "match": {"account_uuid" | "account_id": "...", "email": "..."}}`. A linked account MUST NOT call any token endpoint. Its token comes only from re-reading the matched CPA file (architecture §6).
+
+DPAPI is called with the application entropy, the ASCII bytes `quota-baton/v1/account-secret`, and with `CRYPTPROTECT_UI_FORBIDDEN`.
+
 ```json
 { "schema": 1, "id": "cx-1a2b3c", "provider": "codex",
   "label": "...", "email": "...", "plan": "plus",
+  "source": { "kind": "cpa", "mode": "linked", "dir": "...", "match": { "account_id": "...", "email": "..." } },
   "identity": { "...provider ids per C10..." },
   "user_state": "active",
   "health": { "kind": "ready" },

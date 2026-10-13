@@ -52,11 +52,26 @@ Required the orchestrator changes are separate work in the the orchestrator repo
 The latter also resolves the Claude adapter env leak at `packages/claude-code-adapter/src/index.ts:147`. quota-baton exposes no orchestrator-specific API.
 
 <a id="d5"></a>
-## D5. Accounts only through quota-baton's own OAuth — Accepted (user, 2026-10-13)
+## D5. Where accounts come from — Accepted (user, 2026-10-13; revised the same day at the user's request)
 
+Accounts enter quota-baton in two ways: through its own OAuth login, or through **import from CPA's auth files**.
 
-Reasons:
-- shared refresh-token families get revoked
+An import runs in one of two modes, so that a single-use refresh token never has two refreshers:
+- **Linked.**
+  - CPA stays the refresh owner, and quota-baton never calls a token endpoint for the account.
+  - It re-reads CPA's file for that account to follow each rotation.
+  - This needs no change to CPA and is usable during the shadow run.
+- **Adopted.**
+  - quota-baton becomes the sole refresh owner.
+  - This is allowed only after CPA can no longer refresh the account: CPA has stopped for good, or the user has removed the file from CPA's auth directory.
+  - It is a cutover step (M8).
+
+Evidence behind the rule (2026-10-13):
+- CPA refreshes **disabled** accounts as well. Its disabled Claude files were refreshed at 09:14. Disabling an account in CPA therefore does not hand over ownership.
+- Rotated refresh tokens are single-use. Reusing one can revoke the whole token family (R1 §2, R2 §2), as in the 10-10 incident.
+
+**Never imported:**
+- `~/.codex`, `~/.claude`, Orca and the orchestrator homes. Their CLIs refresh the tokens themselves.
 
 <a id="d6"></a>
 ## D6. Implementation language: Rust — Accepted (user, 2026-10-13)

@@ -234,6 +234,20 @@ The later API-key providers implement the same trait without OAuth.
   - **Unknown 4xx:** back off like 5xx. After 3 in a row, the tray shows an attention badge. These never trigger an automatic `needs_relogin`.
 - **A 401 after a successful refresh** is not proof of death. The account goes to `cooling(auth)` for 15 min, doubling up to 4 h, and a probe request runs when the cooldown expires. Only the terminal conditions above, and revocation 401s (C6 row 4), demand a browser re-login.
 
+**Import from CPA** ([D5](decisions.md#d5)).
+- `quota-baton accounts import cpa` reads `~/.cli-proxy-api/auths/*.json`. It maps the fields as follows:
+  - Claude: `access_token`, `refresh_token`, `expired`, `email`, `account_uuid`, `organization_uuid`
+  - Codex: the same tokens plus `id_token`, `account_id` and `plan_type`
+- It writes one quota-baton account per identity: DPAPI-encrypted, `user_state=disabled` unless listed in `--activate`.
+- It prints metadata only, never token values.
+- **Linked mode** (default).
+  - The account never refreshes. Before the access token is within 10 min of expiry, and once on any 401, the core re-reads the CPA file with the same identity.
+  - It matches by `account_uuid`/`account_id` + email, not by filename, because CPA renames files on re-login.
+  - CPA writes files non-atomically, so a partial or unparsable read is retried up to 3 times, 200 ms apart.
+  - If the file holds no newer token by expiry, the account goes to `cooling(link_stale)`. The tray then shows "CPA is not refreshing this account".
+- **Adopt** (`--adopt`, M8 only).
+  - The command refuses unless CPA can no longer refresh the account: the CPA process is not running, or the account's file is gone from CPA's directory.
+  - From then on the account is owned like an OAuth login.
 
 ## 7. Selection and session affinity
 
@@ -609,7 +623,7 @@ Each milestone is independently verifiable and sized for an implementer working 
 | M | Content | Verification |
 |---|---|---|
 | M0 | Workspace and crates; config; redacting logs; data listener with client key, Host and Origin checks; admin health; `qb-testkit` skeleton | cargo test, curl |
-| M1 | Account store (DPAPI with entropy, atomic writes, generation, credential lease); OAuth login for both providers through the CLI (callback on 127.0.0.1 and ::1); single-flight refresh with the failed-token guard, typed errors and `refresh_uncertain` | Unit tests; one real login per provider by the user (V6). The user chooses the accounts (O10). |
+| M1 | **M1a:** account store (DPAPI with entropy, atomic writes, generation, credential lease) and **CPA import in linked mode** (D5). **M1b:** OAuth login for both providers through the CLI (callback on 127.0.0.1 and ::1); single-flight refresh with the failed-token guard, typed errors and `refresh_uncertain` | Unit tests; one real login per provider by the user (V6). The user chooses the accounts (O10). |
 | M2 | Single-account HTTP pass-through for every C1 HTTP route; commit hold; in-flight budget and retention cap; ledger with `originator` / UA; debug pin (C11); `shape-capture` build; body-invariance tests | Testkit; then **gate G1** |
 | **G1** | **Phase 0 gate:** V1, V3 (both home types), V5, V6, V7, and the HTTP cells of V2 | Outcomes recorded. D10 decided for HTTP. Any D3 conflict escalated to the user before M3. |
 | M3 | Codex WebSocket relay: dial-first upgrade, per-hop handshake, the `upstream_deflate` switch (default off), message budget and backpressure, commit point, idle close; spike of the Windows port rebind | Testkit; V4; WebSocket cells of V2; the D12 deflate A/B measurement |
