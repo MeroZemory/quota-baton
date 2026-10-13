@@ -155,3 +155,15 @@ The user delegated this decision to independent reviewers. Three models answered
 - Alternate deflate on and off on each connection, about 10 times each, on a less important account.
 - Measure upload time, time to the first response event (which includes server-side decompression), proxy CPU and memory, and the negotiated extension.
 - Enable it only if the time saved on the user's own line is clear and A1 still holds.
+
+<a id="d13"></a>
+## D13. Phase 0 test accounts — Accepted (user, 2026-10-13)
+
+Log in to quota-baton **one account at a time**, starting with the main accounts the user already uses:
+- **Codex:** `acct-alpha@mail.test`, then `hello.sample-acct@mail.test`. Both are plus plans, and both can spend paid credits.
+- **Claude:** `acct-alpha@mail.test`. `hello.sample-acct@mail.test` is added when a second account is needed, for example for the V2 pair.
+
+Before the next login, check that the same account still works in CPA. This guards against an unknown effect of a second login (O10).
+
+Before M5's credit hold exists, the Phase 0 credit guard applies (architecture §16.1): no tests at 80 % or more of any window, and stop at 95 %.
+

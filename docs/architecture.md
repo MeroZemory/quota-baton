@@ -518,7 +518,13 @@ Crates:
 
 Phase 0 runs against the real upstreams on a **shadow port (10200)**:
 - One interactive session is pointed at quota-baton through its environment only. Global client config is not touched.
-- It uses accounts the user logs into through quota-baton. **The user decides** which accounts and when, because the effect of a new login on CPA's live token families is unknown (O10).
+- It uses accounts the user logs into through quota-baton, following [D13](decisions.md#d13).
+  - Log in **one account at a time**, starting with the main accounts already in use: Claude `acct-alpha`, Codex `acct-alpha`, then Codex `hello.sample-acct`. Claude `hello.sample-acct` is added only when a pair is needed.
+  - After each login, confirm that the same account still works in CPA before adding the next one (O10).
+- **Credit guard.** The Codex plus accounts can keep serving by spending paid credits, and the credit hold only arrives in M5. Until then:
+  - Before each test run, check the account's usage (V5 poll, or the CLI's `/status`).
+  - Do not run tests on an account at or above 80 % of any window.
+  - Stop if usage reaches 95 %.
 - Wire shapes are recorded with the `shape-capture` build (§13).
 - The decision rule for each test is written down before it runs.
 
@@ -538,7 +544,10 @@ It is run with the debug pin (C11). The HTTP cells run right after M2, and the W
 
 1. **Matrix.**
    - Run each Codex cell over HTTP, and repeat a subset over WebSocket.
-   - Pair account types in both directions: plus↔plus and plus↔free for Codex (the user's current Codex plans), and the available Claude pairs.
+   - Pairs, run in both directions:
+     - Codex: `acct-alpha` ↔ `hello.sample-acct` (plus ↔ plus).
+     - Claude: `acct-alpha` ↔ `hello.sample-acct`.
+     - A plus ↔ free cell is added only if the user later adds a free account.
    - Use one model that every plan in the pair can run, with the same effort and headers, so that "model not supported" cannot cause a false negative.
    - Switch both at a turn boundary and in the middle of a tool loop.
 2. **Codex cells.**
