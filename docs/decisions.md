@@ -196,7 +196,7 @@ Before M5's credit hold exists, the Phase 0 credit guard applies (architecture �
 - **Capacity.** Upstream request-rate limits started at 60–72 requests per minute.
 - **Fail-fast proxy.** The previous proxy answered 429 within 73 ms during a 0–4 s cooldown.
 - **Re-binding cascade.** Sessions moved to the other account and re-sent 150–350k uncached tokens each, which pushed that account over its limit too.
-- **Retry burn.** Codex spent its 5 retries within seconds and left `/goal` stalled with no automatic resume.
+- **Retry burn.** Codex stopped and left `/goal` stalled with no automatic resume. Codex 0.162.1 retries a rate 429 only when the response carries retry advice. The previous proxy's synthesized errors carried a ~4 s advice, so the 5 retries went within seconds. Without advice, the same error ends the turn at once.
 
 **Decision. Each layer owns one thing.**
 
@@ -207,8 +207,12 @@ Before M5's credit hold exists, the Phase 0 credit guard applies (architecture �
 | Orchestrator (an agent orchestrator, or `/goal` supervision) | How many sessions run per account, and when a stopped session resumes: back off with jitter, resume in the same session (a fork loses the cache), never resume everything at once | Choosing accounts (D4) |
 
 **Assignment of the 429 report's proposals:**
-- **A (soft-pin on rate limits)** and **F (`retry-after`):** quota-baton, in C6.3.
+- **A (soft-pin on rate limits)** and **F (`retry-after`):** quota-baton, in C6.3. A rate limit never moves a session and never causes failover, whatever its `Retry-After`.
 - **B (admission control):** quota-baton, in its simple form, which is per-account pacing in C6.3. Token buckets on uncached input are not adopted, because the upstream limits are not published and a guessed bucket would either throttle needlessly or not protect at all.
 - **C (active-session cap with rotation)** and **D (stall watcher with same-session resume):** the orchestrator.
 - **E (account health signals):** quota-baton already covers this with the tray badge, the ledger of every health and user-state change, and its own usage polling (C9). The 401s from the quota-watch script belong to the old setup.
+
+**Limit of absorption.** Under a sustained limit, a Codex HTTP turn survives about 5–6 minutes (C6.3 "Ceiling"). The orchestrator's caps and resume rules must take this into account.
+
+**Review.** Fable independent review, `.sandbox/reviews/D14-rate-hold-review.md`. All five must-fix and six should-fix items were adopted into C6.3 on the same day.
 
