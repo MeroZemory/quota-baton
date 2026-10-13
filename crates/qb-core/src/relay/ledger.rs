@@ -19,7 +19,9 @@ pub(in crate::relay) struct Completion {
     pub record: RequestRecord,
     pub start: Instant,
     pub input_bytes: Arc<AtomicU64>,
+    pub runtime: Option<Arc<crate::account_runtime::AccountRuntime>>,
     observability: Arc<Observability>,
+    inflight: Option<Arc<AtomicU64>>,
 }
 
 impl Completion {
@@ -33,7 +35,9 @@ impl Completion {
         Self {
             start: Instant::now(),
             input_bytes: Arc::new(AtomicU64::new(0)),
+            runtime: None,
             observability,
+            inflight: None,
             record: RequestRecord {
                 ts: chrono::Utc::now().to_rfc3339(),
                 req: format!("{:032x}", rand::random::<u128>()),
@@ -58,6 +62,7 @@ impl Completion {
                 outcome: "client_drop".into(),
                 retained_copy: false,
                 upstream_error_code: None,
+                attempt_details: Vec::new(),
             },
         }
     }
@@ -77,6 +82,26 @@ impl Completion {
         u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
+    pub fn track(&mut self, counter: Arc<AtomicU64>) {
+        counter.fetch_add(1, Ordering::Relaxed);
+        self.inflight = Some(counter);
+    }
+
+    pub fn attempt(&mut self, account: &str) {
+        self.record.attempts += 1;
+        self.record
+            .attempt_details
+            .push(crate::observability::AttemptRecord {
+                account: account.into(),
+                failover_reason: None,
+            });
+    }
+    pub fn failover(&mut self, reason: &str) {
+        if let Some(attempt) = self.record.attempt_details.last_mut() {
+            attempt.failover_reason = Some(reason.into());
+        }
+    }
+
     pub fn outcome(&mut self, status: u16, outcome: &str) {
         self.record.status = status;
         self.record.outcome = outcome.into();
@@ -90,6 +115,9 @@ impl Completion {
 
 impl Drop for Completion {
     fn drop(&mut self) {
+        if let Some(counter) = self.inflight.take() {
+            counter.fetch_sub(1, Ordering::Relaxed);
+        }
         self.record.dur_ms = self.elapsed_ms();
         self.record.bytes_in = self.input_bytes.load(Ordering::Relaxed);
         self.observability.record_request(self.record.clone());

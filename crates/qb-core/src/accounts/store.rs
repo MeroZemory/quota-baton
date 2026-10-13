@@ -1,11 +1,11 @@
-use super::{Account, Tokens, crypto, lease::Lease};
+use super::{Account, Health, Tokens, crypto, lease::Lease};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, OpenOptions},
     io::Write,
     os::windows::{ffi::OsStrExt, io::AsRawHandle},
     path::{Path, PathBuf},
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
 };
 use windows::{
     Win32::{
@@ -56,13 +56,62 @@ struct Record {
 pub struct AccountStore {
     dir: PathBuf,
     gate: Mutex<()>,
+    observer: Mutex<Option<AccountObserver>>,
     _lease: Lease,
 }
 
+pub type AccountObserver = Arc<dyn Fn(&Account, &Health) + Send + Sync>;
+
 impl AccountStore {
+    pub fn home(&self) -> &Path {
+        self.dir.parent().expect("account store has a home")
+    }
+
+    fn write_settings_unlocked(
+        &self,
+        id: &str,
+        drain: Option<bool>,
+        allow_credits: Option<bool>,
+    ) -> Result<(), StoreError> {
+        self.path(id)?;
+        let path = self.home().join("config.toml");
+        let mut value: toml_edit::DocumentMut = match fs::read_to_string(&path) {
+            Ok(text) => text.parse().map_err(|_| StoreError::InvalidData)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml_edit::DocumentMut::new(),
+            Err(_) => return Err(StoreError::Io),
+        };
+        let accounts = value
+            .entry("accounts")
+            .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
+            .as_table_like_mut()
+            .ok_or(StoreError::InvalidData)?;
+        let settings = accounts
+            .entry(id)
+            .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
+            .as_table_like_mut()
+            .ok_or(StoreError::InvalidData)?;
+        for (key, flag) in [("drain", drain), ("allow_credits", allow_credits)] {
+            if let Some(flag) = flag {
+                let decor = settings
+                    .get(key)
+                    .and_then(toml_edit::Item::as_value)
+                    .map(|v| v.decor().clone())
+                    .unwrap_or_default();
+                let mut replacement = toml_edit::Value::from(flag);
+                *replacement.decor_mut() = decor;
+                settings.insert(key, toml_edit::Item::Value(replacement));
+            }
+        }
+        let bytes = value.to_string();
+        self.atomic_write(&path, bytes.as_bytes())
+    }
     // 조회와 미리보기는 실행 중인 코어의 lease를 빼앗지 않는다.
     pub fn list_metadata(home: &Path) -> Result<Vec<Account>, StoreError> {
-        Self::read_metadata_dir(&home.join("accounts"))
+        let mut accounts = Self::read_metadata_dir(&home.join("accounts"))?;
+        for account in &mut accounts {
+            account.health.expire(chrono::Utc::now());
+        }
+        Ok(accounts)
     }
     pub fn acquire(home: &Path) -> Result<Self, StoreError> {
         let dir = home.join("accounts");
@@ -71,8 +120,29 @@ impl AccountStore {
         Ok(Self {
             dir,
             gate: Mutex::new(()),
+            observer: Mutex::new(None),
             _lease: lease,
         })
+    }
+
+    /// Called after each successful account write, under the transaction gate.
+    /// Observers must not query the store, perform I/O, or panic.
+    pub fn set_observer(&self, observer: AccountObserver) {
+        *self
+            .observer
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(observer);
+    }
+
+    fn notify(&self, account: &Account, previous: &Health) {
+        let observer = self
+            .observer
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        if let Some(observer) = observer {
+            observer(account, previous);
+        }
     }
 
     pub(crate) fn transaction(&self) -> Result<MutexGuard<'_, ()>, StoreError> {
@@ -85,7 +155,10 @@ impl AccountStore {
     }
 
     pub(crate) fn list_unlocked(&self) -> Result<Vec<Account>, StoreError> {
-        Self::read_metadata_dir(&self.dir)
+        Self::read_metadata_dir(&self.dir)?
+            .into_iter()
+            .map(|account| self.load_unlocked(&account.id))
+            .collect()
     }
 
     fn read_metadata_dir(dir: &Path) -> Result<Vec<Account>, StoreError> {
@@ -114,7 +187,77 @@ impl AccountStore {
 
     pub fn load(&self, id: &str) -> Result<Account, StoreError> {
         let _guard = self.transaction()?;
-        Ok(self.read(id)?.account)
+        self.load_unlocked(id)
+    }
+
+    fn load_unlocked(&self, id: &str) -> Result<Account, StoreError> {
+        let mut record = self.read(id)?;
+        if record.account.health.expire(chrono::Utc::now()) {
+            let generation = record.account.generation;
+            self.write_metadata_record(record, generation)
+        } else {
+            Ok(record.account)
+        }
+    }
+
+    /// Mutates current metadata while holding the credential lease and transaction.
+    /// No token decryption is performed. Async callers must use spawn_blocking.
+    pub fn update_metadata(
+        &self,
+        id: &str,
+        update: impl FnOnce(&mut Account),
+    ) -> Result<Account, StoreError> {
+        let _guard = self.transaction()?;
+        self.update_metadata_unlocked(id, update)
+    }
+
+    pub fn update_settings(
+        &self,
+        id: &str,
+        drain: Option<bool>,
+        allow_credits: Option<bool>,
+        update: impl FnOnce(&mut Account),
+    ) -> Result<Account, StoreError> {
+        let _guard = self.transaction()?;
+        self.read(id)?;
+        if drain.is_some() || allow_credits.is_some() {
+            self.write_settings_unlocked(id, drain, allow_credits)?;
+        }
+        self.update_metadata_unlocked(id, update)
+    }
+
+    fn update_metadata_unlocked(
+        &self,
+        id: &str,
+        update: impl FnOnce(&mut Account),
+    ) -> Result<Account, StoreError> {
+        let mut record = self.read(id)?;
+        let current = record.account.clone();
+        update(&mut record.account);
+        Self::validate(&record.account)?;
+        if record.account.id != current.id
+            || record.account.identity != current.identity
+            || record.account.source != current.source
+            || record.account.token_meta != current.token_meta
+            || record.account.generation != current.generation
+        {
+            return Err(StoreError::InvalidData);
+        }
+        self.write_metadata_record(record, current.generation)
+    }
+
+    fn write_metadata_record(
+        &self,
+        mut record: Record,
+        generation: u64,
+    ) -> Result<Account, StoreError> {
+        let previous = self.read(&record.account.id)?.account;
+        Self::check_generation(Some(generation), Some(previous.generation))?;
+        record.account.generation = generation.checked_add(1).ok_or(StoreError::InvalidData)?;
+        let bytes = serde_json::to_vec_pretty(&record).map_err(|_| StoreError::InvalidData)?;
+        self.atomic_write(&self.path(&record.account.id)?, &bytes)?;
+        self.notify(&record.account, &previous.health);
+        Ok(record.account)
     }
 
     pub fn tokens(&self, account: &Account) -> Result<Tokens, StoreError> {
@@ -169,6 +312,12 @@ impl AccountStore {
             return Err(StoreError::InvalidData);
         }
         let mut updated = account.clone();
+        if old
+            .as_ref()
+            .is_some_and(|old| account.token_meta.newer_than(&old.account.token_meta))
+        {
+            updated.apply_health_signal(super::HealthSignal::NewerLinkedToken, chrono::Utc::now());
+        }
         updated.generation = expected
             .unwrap_or(0)
             .checked_add(1)
@@ -179,6 +328,12 @@ impl AccountStore {
         };
         let bytes = serde_json::to_vec_pretty(&record).map_err(|_| StoreError::InvalidData)?;
         self.atomic_write(&self.path(&account.id)?, &bytes)?;
+        self.notify(
+            &updated,
+            old.as_ref()
+                .map(|old| &old.account.health)
+                .unwrap_or(&Health::Ready),
+        );
         Ok(updated)
     }
 
@@ -194,6 +349,8 @@ impl AccountStore {
         if account.schema != 1
             || account.id != account.identity.id()
             || account.provider != account.identity.provider()
+            || matches!(&account.health, super::Health::Cooling { scope, .. }
+                if scope != "account" && scope.strip_prefix("model:").is_none_or(|model| model.is_empty()))
         {
             return Err(StoreError::InvalidData);
         }
@@ -228,13 +385,8 @@ impl AccountStore {
                 StoreError::Io
             }
         })?;
-        let mut record: Record =
-            serde_json::from_slice(&bytes).map_err(|_| StoreError::InvalidData)?;
+        let record: Record = serde_json::from_slice(&bytes).map_err(|_| StoreError::InvalidData)?;
         Self::validate(&record.account)?;
-        if matches!(&record.account.health, super::Health::Cooling { until, .. } if *until <= chrono::Utc::now())
-        {
-            record.account.health = super::Health::Ready;
-        }
         Ok(record)
     }
 

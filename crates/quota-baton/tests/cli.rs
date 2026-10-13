@@ -314,8 +314,9 @@ async fn serve_and_status_use_isolated_home() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let health: qb_proto::HealthResponse = serde_json::from_slice(&output.stdout).unwrap();
-    assert!(health.ok);
+    let status = String::from_utf8(output.stdout).unwrap();
+    assert!(status.contains("코어: 실행 중"));
+    assert!(status.contains("5시간 사용률"));
     let key = std::fs::read_to_string(home.path().join("client.key")).unwrap();
     assert_eq!(
         client
@@ -451,6 +452,122 @@ async fn offline_online_import_and_admin_refusal() {
     assert!(listing.contains("준비됨"));
     assert!(!listing.contains('{'));
     assert!(!listing.contains("fake-access-"));
+    let id = qb_core::accounts::AccountStore::list_metadata(&home).unwrap()[0]
+        .id
+        .clone();
+    let mut events = client
+        .get(format!("{base}/events"))
+        .bearer_auth(token.trim())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(events.status(), 200);
+    assert!(
+        events.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/event-stream")
+    );
+    for (action, expected) in [
+        ("pause", "paused"),
+        ("resume", "active"),
+        ("disable", "disabled"),
+        ("enable", "active"),
+    ] {
+        let mut cmd = command(&home);
+        cmd.args(["accounts", action, &id]);
+        let output = tokio::task::spawn_blocking(move || cmd.output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let state: serde_json::Value = client
+            .get(format!("{base}/state"))
+            .bearer_auth(token.trim())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(state["accounts"][0]["user_state"], expected);
+        assert_eq!(state["bindings"]["count"], 0);
+        assert_eq!(state["data_port"], data_port);
+        assert!(state["inflight"]["requests"].is_number());
+        assert!(state["memory"]["private_bytes"].is_number());
+        for forbidden in [
+            "secret_dpapi_b64",
+            "fake-access-",
+            "fake-refresh-",
+            "fake-id-",
+        ] {
+            assert!(!state.to_string().contains(forbidden));
+        }
+    }
+    let chunk = tokio::time::timeout(Duration::from_secs(2), events.chunk())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&chunk).contains("event: account_changed"));
+    let patch = client
+        .patch(format!("{base}/accounts/{id}"))
+        .bearer_auth(token.trim())
+        .json(&serde_json::json!({"label":"합성 계정", "drain":true, "allow_credits":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(patch.status(), 200);
+    let patch: serde_json::Value = patch.json().await.unwrap();
+    assert_eq!(patch["label"], "합성 계정");
+    assert_eq!(patch["drain"], true);
+    assert_eq!(patch["allow_credits"], true);
+    assert!(patch.get("source").is_none());
+    let bad = client
+        .patch(format!("{base}/accounts/{id}"))
+        .bearer_auth(token.trim())
+        .json(&serde_json::json!({"user_state":"disabled"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+    let unauthenticated = client.get(format!("{base}/state")).send().await.unwrap();
+    assert_eq!(unauthenticated.status(), 401);
+    let invalid_label = client
+        .patch(format!("{base}/accounts/{id}"))
+        .bearer_auth(token.trim())
+        .json(&serde_json::json!({"label":"invalid\nlabel"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid_label.status(), 400);
+    let missing = client
+        .post(format!("{base}/accounts/cx-missing/pause"))
+        .bearer_auth(token.trim())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404);
+    std::fs::write(home.join("admin.token"), "synthetic-wrong-admin-token").unwrap();
+    for args in [vec!["status"], vec!["accounts", "disable", &id]] {
+        let mut cmd = command(&home);
+        cmd.args(args);
+        let output = tokio::task::spawn_blocking(move || cmd.output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!output.status.success());
+    }
+    assert_eq!(
+        qb_core::accounts::AccountStore::list_metadata(&home).unwrap()[0].user_state,
+        qb_core::accounts::UserState::Active
+    );
+    std::fs::write(home.join("admin.token"), &token).unwrap();
+    drop(events);
     let accounts = qb_core::accounts::AccountStore::list_metadata(&home).unwrap();
     assert_eq!(accounts.len(), 1);
     assert_eq!(
@@ -469,4 +586,247 @@ async fn offline_online_import_and_admin_refusal() {
         store.tokens(&accounts[0]).unwrap().access_token,
         "fake-access-3"
     );
+}
+
+#[test]
+fn offline_status_and_actions_use_synthetic_metadata_and_quota() {
+    let _serial = SERVE_SERIAL.blocking_lock();
+    let home = fixture();
+    let cpa = home.path().join("cpa");
+    std::fs::create_dir(&cpa).unwrap();
+    std::fs::write(
+        cpa.join("synthetic.json"),
+        serde_json::to_vec(&cpa_fixture(1)).unwrap(),
+    )
+    .unwrap();
+    let admin = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!(
+            "[server]\nadmin_port={}\n",
+            admin.local_addr().unwrap().port()
+        ),
+    )
+    .unwrap();
+    drop(admin);
+    run_import(home.path(), &cpa, &[]);
+    let id = qb_core::accounts::AccountStore::list_metadata(home.path()).unwrap()[0]
+        .id
+        .clone();
+    let health: qb_core::accounts::Health = serde_json::from_value(serde_json::json!({
+        "kind":"cooling", "reason":"quota", "until":"2030-01-01T05:00:00Z", "scope":"account"
+    }))
+    .unwrap();
+    {
+        let store = qb_core::accounts::AccountStore::acquire(home.path()).unwrap();
+        store
+            .update_metadata(&id, |account| {
+                account.health = health.clone();
+                account.label = "합성 계정".into();
+            })
+            .unwrap();
+    }
+    std::fs::create_dir_all(home.path().join("state")).unwrap();
+    std::fs::write(
+        home.path().join("state/quota.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema":1, "accounts":{id.clone():{"windows":[
+                {"name":"5h", "used_pct":37.5, "reset_at":"2030-01-01T05:00:00Z"},
+                {"name":"7d", "used_pct":91.0, "reset_at":"2030-01-07T00:00:00Z"}
+            ]}}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    for (action, expected) in [
+        ("pause", qb_core::accounts::UserState::Paused),
+        ("resume", qb_core::accounts::UserState::Active),
+        ("disable", qb_core::accounts::UserState::Disabled),
+        ("enable", qb_core::accounts::UserState::Active),
+    ] {
+        let output = command(home.path())
+            .args(["accounts", action, &id])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let account = qb_core::accounts::AccountStore::list_metadata(home.path())
+            .unwrap()
+            .remove(0);
+        assert_eq!(account.user_state, expected);
+        assert_eq!(account.health, health);
+    }
+    let output = command(home.path()).arg("status").output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status = String::from_utf8(output.stdout).unwrap();
+    for expected in [
+        "중지됨",
+        "대기 중",
+        "할당량 소진",
+        "합성 계정",
+        "37.5%",
+        "91.0%",
+        "2030-01-01T05:00:00Z",
+        "2030-01-07T00:00:00Z",
+    ] {
+        assert!(status.contains(expected), "missing {expected}: {status}");
+    }
+    for forbidden in [
+        "fake-access-",
+        "fake-refresh-",
+        "fake-id-",
+        "secret_dpapi_b64",
+    ] {
+        assert!(!status.contains(forbidden));
+    }
+    let store = qb_core::accounts::AccountStore::acquire(home.path()).unwrap();
+    let account_path = home.path().join("accounts").join(format!("{id}.json"));
+    let before = std::fs::read(&account_path).unwrap();
+    let output = command(home.path()).arg("status").output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read(&account_path).unwrap(), before);
+    let output = command(home.path())
+        .args(["accounts", "disable", &id])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        store.list().unwrap()[0].user_state,
+        qb_core::accounts::UserState::Active
+    );
+}
+
+#[test]
+fn responding_unhealthy_admin_never_falls_back_to_disk() {
+    use std::io::{Read, Write};
+    for (status, body) in [
+        ("401 Unauthorized", "{}"),
+        ("503 Service Unavailable", "{}"),
+        (
+            "200 OK",
+            r#"{"ok":false,"version":"synthetic","pid":0,"started_at":"2030-01-01T00:00:00Z"}"#,
+        ),
+    ] {
+        for args in [vec!["status"], vec!["accounts", "pause", "cx-synthetic"]] {
+            let home = fixture();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            std::fs::write(
+                home.path().join("config.toml"),
+                format!(
+                    "[server]\nadmin_port={}\n",
+                    listener.local_addr().unwrap().port()
+                ),
+            )
+            .unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = [0; 4096];
+                let amount = stream.read(&mut request).unwrap();
+                assert!(amount > 0, "CLI closed before sending a request");
+                write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            });
+            let output = command(home.path()).args(args).output().unwrap();
+            server.join().unwrap();
+            assert!(!output.status.success());
+            assert!(
+                !home.path().join("accounts").exists(),
+                "responding admin caused disk fallback"
+            );
+        }
+    }
+}
+
+#[test]
+fn offline_status_does_not_create_a_store() {
+    let home = fixture();
+    let admin = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!(
+            "[server]\nadmin_port={}\n",
+            admin.local_addr().unwrap().port()
+        ),
+    )
+    .unwrap();
+    drop(admin);
+    let output = command(home.path()).arg("status").output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8(output.stdout).unwrap().contains("중지됨"));
+    assert!(!home.path().join("accounts").exists());
+    assert!(!home.path().join("state").exists());
+}
+
+#[test]
+fn online_status_unknown_health_is_utf8_safe_and_omits_secret_fields() {
+    use std::io::{Read, Write};
+    let home = fixture();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!(
+            "[server]\nadmin_port={}\n",
+            listener.local_addr().unwrap().port()
+        ),
+    )
+    .unwrap();
+    std::fs::write(home.path().join("admin.token"), "synthetic-admin-secret").unwrap();
+    let state = serde_json::json!({"accounts":[{
+        "id":"cx-synthetic", "provider":"codex", "label":"합성 🧪\t계정\n\u{1b}",
+        "user_state":"active", "health":{"kind":"future_health", "reason":{"access_token":"synthetic-reason-secret"}},
+        "windows":[], "access_token":"synthetic-access-secret", "secret_dpapi_b64":"synthetic-dpapi-secret"
+    }]});
+    let server = std::thread::spawn(move || {
+        for body in [
+            serde_json::json!({"ok":true,"version":"synthetic","pid":0,"started_at":"2030-01-01T00:00:00Z"}).to_string(),
+            state.to_string(),
+        ] {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut request = [0;4096];
+            let amount = stream.read(&mut request).unwrap();
+            assert!(amount > 0, "CLI closed before sending a request");
+            assert!(String::from_utf8_lossy(&request[..amount]).contains("Bearer synthetic-admin-secret"));
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        }
+    });
+    let output = command(home.path()).arg("status").output().unwrap();
+    server.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status = String::from_utf8(output.stdout).unwrap();
+    assert!(status.contains("알 수 없음"));
+    assert!(status.contains("합성 🧪 계정"));
+    assert!(!status.contains('\u{1b}'));
+    assert_eq!(status.lines().count(), 3);
+    for secret in [
+        "synthetic-admin-secret",
+        "synthetic-access-secret",
+        "synthetic-dpapi-secret",
+        "synthetic-reason-secret",
+    ] {
+        assert!(!status.contains(secret));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
+    }
+    assert!(!home.path().join("accounts").exists());
 }
