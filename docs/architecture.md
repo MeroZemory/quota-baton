@@ -674,7 +674,7 @@ Each milestone is independently verifiable and sized for an implementer working 
 
 - **O1–O7** correspond to Phase 0 items V1–V7. O2 (V2, account portability) was answered on 2026-10-13: pass-through ([D10](decisions.md#d10)). The M3 WebSocket cells are confirmation only.
 - **O8.** Resolved. Codex posts `{base}/images/generations` and `{base}/images/edits` (`codex-api/src/endpoint/images.rs:62-83`), so the upstream is `https://chatgpt.com/backend-api/codex/images/{generations,edits}`. V7 confirms acceptance.
-- **O9.** The Codex model catalog. Either pass `/v1/models?client_version=` through to `backend-api/codex/models` with a healthy account, or serve a cached file that quota-baton refreshes. Pick in M2 from the real client's behaviour.
+- **O9.** Resolved (2026-10-13, V7). `GET /v1/models?client_version=` passes through to `backend-api/codex/models` and returns the full `{"models":[...]}` catalog that Codex expects (10 models live). The Claude `/v1/models` also passes through (13 models).
 - **O10.** Do quota-baton's own OAuth logins coexist with the CPA logins of the same accounts during the shadow period? Separate logins should be separate token families. The user picks the accounts. Watch for revocations.
 - **O11.** Who sends the 99.6k HTTP `POST /v1/responses` requests seen at the previous proxy?
   - Codex is WebSocket-first (R6), and the default-home `codex-tui.log` has no "falling back to HTTP" warning. So sticky fallback is not shown to be the cause.
