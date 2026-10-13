@@ -512,6 +512,7 @@ async fn login(
     replace_linked: bool,
     no_browser: bool,
 ) -> anyhow::Result<()> {
+    let mut offline_obs = None;
     let (backend, id, auth_url) = if let Some((client, base, token)) =
         running_admin(home, config).await?
     {
@@ -562,14 +563,16 @@ async fn login(
             .timeout(Duration::from_secs(30))
             .user_agent(concat!("quota-baton/", env!("CARGO_PKG_VERSION")))
             .build()?;
-        let service = qb_core::oauth::LoginService::new(store, client, obs);
+        let service = qb_core::oauth::LoginService::new(store, client, obs.clone());
         let start = match service.start(provider, replace_linked).await {
             Ok(start) => start,
             Err(error) => {
                 println_utf8!("{}", login_failure(Some(&error.to_string())));
+                finish_offline_login(service, obs).await?;
                 anyhow::bail!("로그인을 시작하지 못했습니다.");
             }
         };
+        offline_obs = Some(obs);
         (LoginBackend::Local(service), start.login_id, start.auth_url)
     };
 
@@ -662,7 +665,20 @@ async fn login(
     if result.is_err() {
         let _ = backend.cancel(&id).await;
     }
+    if let (LoginBackend::Local(service), Some(obs)) = (backend, offline_obs) {
+        finish_offline_login(service, obs).await?;
+    }
     result
+}
+
+async fn finish_offline_login(
+    service: qb_core::oauth::LoginService,
+    obs: std::sync::Arc<qb_core::observability::Observability>,
+) -> anyhow::Result<()> {
+    service.cancel_all().await;
+    let flushed = tokio::task::spawn_blocking(move || obs.flush()).await?;
+    drop(service);
+    flushed
 }
 
 fn login_failure(error: Option<&str>) -> &'static str {
@@ -679,9 +695,44 @@ fn login_failure(error: Option<&str>) -> &'static str {
         Some(error) if error == (LoginError::CallbackPortBusy { port: 54545 }).to_string() => {
             "Claude 로그인 콜백 포트 54545가 사용 중입니다. 다른 로그인 프로그램을 종료한 뒤 다시 시도해 주세요."
         }
+        Some(error) if error == qb_core::accounts::login::IDENTITY_CONFLICT_REASON => {
+            qb_core::accounts::login::IDENTITY_CONFLICT_REASON
+        }
+        Some(error) if error == LoginError::StateMismatch.to_string() => {
+            "로그인 상태가 일치하지 않습니다. 로그인을 다시 시작해 주세요."
+        }
+        Some(error) if error == LoginError::StoreFailed.to_string() => {
+            "계정 정보를 저장하지 못했습니다. 저장 공간과 접근 권한을 확인해 주세요."
+        }
+        Some(error) if error == LoginError::NotFound.to_string() => {
+            "로그인 요청을 찾을 수 없습니다. 로그인을 다시 시작해 주세요."
+        }
+        Some(error) if error == LoginError::InvalidCallback.to_string() => {
+            "로그인 콜백이 올바르지 않습니다. 로그인을 다시 시작해 주세요."
+        }
+        Some(error) if error == LoginError::ExchangeFailed.to_string() => {
+            "인증 서버와 통신하지 못했습니다. 로그인을 다시 시도해 주세요."
+        }
+        Some(error) if error == LoginError::InvalidIdentity.to_string() => {
+            "인증 서버의 계정 정보를 확인하지 못했습니다."
+        }
+        Some(error) if error == LoginError::InvalidTestEndpoint.to_string() => {
+            "테스트 주소는 관리 포트를 제외한 숫자 루프백 주소여야 합니다."
+        }
+        Some(error)
+            if [1455, 54545]
+                .iter()
+                .any(|&port| error == (LoginError::CallbackBindFailed { port }).to_string()) =>
+        {
+            "로그인 콜백에 연결할 수 없습니다. 루프백 네트워크와 접근 권한을 확인해 주세요."
+        }
         _ => "로그인에 실패했습니다. 로그인 요청과 계정 연결 상태를 확인한 뒤 다시 시도해 주세요.",
     }
 }
+
+#[cfg(test)]
+#[path = "accounts_cli_m1b_fixes_tests.rs"]
+mod m1b_fixes_tests;
 
 #[cfg(windows)]
 fn open_browser(url: &str) -> std::io::Result<()> {

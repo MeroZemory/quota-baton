@@ -2,6 +2,7 @@ use super::{
     Account, AccountStore, Health, Identity, ImportMode, Provider, Source, SourceMatch, StoreError,
     TokenMeta, Tokens, UserState,
 };
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -68,6 +69,27 @@ pub(crate) enum ReadError {
     UnknownType,
 }
 
+// Identity claims only: this does not authenticate or verify the JWT signature.
+pub(crate) fn codex_user_id(tokens: &Tokens, account_id: &str) -> Option<String> {
+    let mut parts = tokens.id_token.as_deref()?.split('.');
+    parts.next()?;
+    let payload = parts.next()?;
+    parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let payload = Zeroizing::new(URL_SAFE_NO_PAD.decode(payload).ok()?);
+    let claims: serde_json::Value = serde_json::from_slice(&payload).ok()?;
+    let auth = &claims["https://api.openai.com/auth"];
+    if auth["chatgpt_account_id"].as_str()? != account_id {
+        return None;
+    }
+    auth["chatgpt_user_id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+}
+
 pub(crate) fn paths(dir: &Path) -> Result<Vec<PathBuf>, StoreError> {
     let mut paths = Vec::new();
     for entry in fs::read_dir(dir).map_err(|_| StoreError::Io)? {
@@ -127,9 +149,9 @@ pub(crate) fn read(path: &Path, dir: &Path) -> Result<Candidate, ReadError> {
                 .ok_or(ReadError::InvalidData)?;
             (
                 Identity::Codex {
+                    user_id: codex_user_id(&file.tokens, &id),
                     account_id: id,
                     email: file.email.clone(),
-                    user_id: None,
                 },
                 file.email.clone(),
                 file.plan_type,
@@ -233,6 +255,59 @@ fn execute(
                 continue;
             }
         };
+        // Keep a resolved legacy record's key until login's journaled migration.
+        // Re-import must not expose the same family under a second id.
+        let mut legacy = Vec::new();
+        for old in accounts.values() {
+            if let (
+                Identity::Codex {
+                    account_id: a,
+                    user_id: Some(_),
+                    ..
+                },
+                Identity::Codex {
+                    account_id: b,
+                    user_id: None,
+                    ..
+                },
+            ) = (&old.identity, &account.identity)
+                && a == b
+            {
+                // Losing the claim must not recreate a known family by email.
+                return Err(StoreError::IdentityCollision);
+            }
+            if let (
+                Identity::Codex {
+                    account_id: a,
+                    user_id: None,
+                    ..
+                },
+                Identity::Codex {
+                    account_id: b,
+                    user_id: Some(_),
+                    ..
+                },
+            ) = (&old.identity, &account.identity)
+                && a == b
+            {
+                let identity = super::linked::resolve_identity(old)
+                    .map_err(|_| StoreError::IdentityCollision)?;
+                if matches!(identity, Identity::Codex { user_id: None, .. }) {
+                    return Err(StoreError::IdentityCollision);
+                }
+                if identity.canonical_key() == account.identity.canonical_key() {
+                    legacy.push(old);
+                }
+            }
+        }
+        if legacy.len() > 1 || (!legacy.is_empty() && accounts.contains_key(&account.id)) {
+            return Err(StoreError::IdentityCollision);
+        }
+        if let Some(old) = legacy.first() {
+            account.id = old.id.clone();
+            account.identity = old.identity.clone();
+            account.source = old.source.clone();
+        }
         let old = accounts.get(&account.id);
         if old.is_some_and(|old| old.identity.canonical_key() != account.identity.canonical_key()) {
             return Err(StoreError::IdentityCollision);

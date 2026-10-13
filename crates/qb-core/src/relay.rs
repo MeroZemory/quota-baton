@@ -78,6 +78,7 @@ impl RelayState {
             self.client.clone(),
             self.observability.clone(),
         )
+        .with_runtime(self.accounts.clone())
     }
     pub fn start_refresh_scheduler(&self) -> tokio::task::JoinHandle<()> {
         self.tokens

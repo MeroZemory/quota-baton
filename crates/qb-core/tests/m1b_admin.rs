@@ -436,7 +436,7 @@ async fn authenticated_login_completes_for_both_providers_and_releases_callbacks
 }
 
 #[tokio::test]
-async fn authenticated_cancel_mismatch_and_expiry_are_terminal_and_secret_free() {
+async fn authenticated_cancel_and_mismatch_wait_until_expiry_are_secret_free() {
     let h = Harness::new(0).await;
     let cancelled = h.start(Provider::Codex).await;
     assert_eq!(
@@ -448,12 +448,19 @@ async fn authenticated_cancel_mismatch_and_expiry_are_terminal_and_secret_free()
         LoginState::Cancelled
     );
     h.closed(&cancelled).await;
-    let failed = h.start(Provider::Claude).await;
-    h.callback(&failed, true).await;
-    let status = h.terminal(&failed.login_id).await;
-    assert_eq!(status.status, LoginState::Failed);
-    assert!(status.error.is_some());
-    h.closed(&failed).await;
+    let mismatch = h.start(Provider::Claude).await;
+    h.callback(&mismatch, true).await;
+    let status = h.status(&mismatch.login_id).await;
+    assert_eq!(status.status, LoginState::Pending);
+    assert!(status.error.is_none());
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(600)).await;
+    tokio::time::resume();
+    assert_eq!(
+        h.terminal(&mismatch.login_id).await.status,
+        LoginState::Expired
+    );
+    h.closed(&mismatch).await;
     let expired = h.start(Provider::Codex).await;
     // Advance only after the HTTP start response: no paused-clock network races.
     tokio::time::pause();
