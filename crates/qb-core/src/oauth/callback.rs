@@ -11,6 +11,8 @@ use tokio::{
 };
 use zeroize::Zeroizing;
 
+const MAX_CALLBACK_READS: usize = 16;
+
 pub(super) struct Listeners {
     v4: TcpListener,
     v6: Option<TcpListener>,
@@ -80,6 +82,9 @@ fn spawn_callback_read(
         return;
     };
     if !peer.ip().is_loopback() {
+        return;
+    }
+    if reads.len() >= MAX_CALLBACK_READS {
         return;
     }
     let path = path.to_owned();

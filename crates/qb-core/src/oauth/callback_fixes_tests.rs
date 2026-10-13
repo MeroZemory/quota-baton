@@ -106,6 +106,11 @@ async fn preconnect_socket_does_not_delay_a_valid_callback() {
     assert_eq!(code.as_str(), "synthetic-code");
 }
 
+#[test]
+fn callback_read_cap_is_fixed() {
+    assert_eq!(MAX_CALLBACK_READS, 16);
+}
+
 #[tokio::test]
 async fn only_matching_state_provider_error_ends_login() {
     let listeners = ipv4_only().await;

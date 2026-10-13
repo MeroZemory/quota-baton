@@ -141,6 +141,16 @@ pub struct TrayRead {
     pub snapshot: TraySnapshot,
 }
 
+/// Convert the admin snapshot into the model consumed by both the live
+/// Direct2D flyout and the WIC review renderer.
+pub fn layout_rows(
+    read: &TrayRead,
+    now: std::time::SystemTime,
+) -> anyhow::Result<Vec<qb_tray::Row>> {
+    let json = serde_json::to_string(&read.snapshot)?;
+    Ok(qb_tray::parse_state_at(&json, now)?)
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TraySnapshot {
     #[serde(default)]
