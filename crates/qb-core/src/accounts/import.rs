@@ -129,6 +129,7 @@ pub(crate) fn read(path: &Path, dir: &Path) -> Result<Candidate, ReadError> {
                 Identity::Codex {
                     account_id: id,
                     email: file.email.clone(),
+                    user_id: None,
                 },
                 file.email.clone(),
                 file.plan_type,

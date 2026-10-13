@@ -385,6 +385,7 @@ pub(crate) mod tests {
 
     pub(crate) fn fixture() -> Account {
         let identity = super::super::Identity::Codex {
+            user_id: None,
             account_id: "synthetic-hardening".into(),
             email: "hardening@example.invalid".into(),
         };

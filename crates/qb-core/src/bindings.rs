@@ -1478,6 +1478,7 @@ mod tests {
         let mut c = candidate(id, used, 30, 2);
         c.account.provider = Provider::Codex;
         c.account.identity = Identity::Codex {
+            user_id: None,
             account_id: id.into(),
             email: "synthetic@example.invalid".into(),
         };

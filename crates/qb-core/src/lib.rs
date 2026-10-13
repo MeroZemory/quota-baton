@@ -7,6 +7,7 @@ pub mod capture;
 pub mod config;
 pub mod debug_pin;
 pub mod guard;
+pub mod oauth;
 pub mod observability;
 #[cfg(all(feature = "phase0", debug_assertions))]
 pub mod phase0;

@@ -47,6 +47,7 @@ pub struct AccountRuntime {
     volatile: Mutex<BTreeMap<String, Health>>,
     inflight: Mutex<BTreeMap<String, usize>>,
     poller: Mutex<Option<Weak<crate::quota::UsagePoller>>>,
+    refresh_attention: Mutex<BTreeSet<String>>,
 }
 
 pub struct InflightGuard {
@@ -87,6 +88,7 @@ impl Drop for Probe {
 impl AccountRuntime {
     pub fn new(store: Arc<AccountStore>, obs: Arc<Observability>, _allowance: f64) -> Arc<Self> {
         let (events, _) = broadcast::channel(256);
+        obs.set_events(events.clone());
         let writer = obs.clone();
         let changes = events.clone();
         store.set_observer(Arc::new(move |account,previous| {
@@ -102,11 +104,29 @@ impl AccountRuntime {
             volatile: Mutex::new(BTreeMap::new()),
             inflight: Mutex::new(BTreeMap::new()),
             poller: Mutex::new(None),
+            refresh_attention: Mutex::new(BTreeSet::new()),
         })
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Value> {
         self.events.subscribe()
+    }
+
+    pub fn set_refresh_attention(&self, id: &str, attention: bool) {
+        let mut flags = self
+            .refresh_attention
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let changed = if attention {
+            flags.insert(id.into())
+        } else {
+            flags.remove(id)
+        };
+        if changed {
+            let _ = self.events.send(
+                json!({"event":"account_changed","data":{"id":id,"refresh_attention":attention}}),
+            );
+        }
     }
 
     pub(crate) fn set_poller(&self, poller: &Arc<crate::quota::UsagePoller>) {
@@ -328,7 +348,7 @@ impl AccountRuntime {
             let health=self.volatile.lock().ok().and_then(|v|v.get(&a.id).cloned()).unwrap_or(a.health);
             let pending = self.probing(&a.id) || ((a.auth_probe_pending || a.auth_failures > 0) && health == Health::Ready);
             let health = if pending { json!({"kind":"cooling","reason":"auth","until":Utc::now(),"scope":"account","probe_pending":true}) } else { json!(health) };
-            json!({"id":a.id,"provider":a.provider,"label":a.label,"email":a.email,"plan":quota["plan"].as_str().map(str::to_owned).or(a.plan),"user_state":a.user_state,"health":health,"probe_pending":pending,"windows":quota["windows"].as_array().cloned().unwrap_or_default(),"credits":quota["credits"],"last_used_at":null,"bound_sessions":0,"token_expires_at":a.token_meta.expires_at,"drain":a.drain,"allow_credits":a.allow_credits})
+            json!({"id":a.id,"provider":a.provider,"label":a.label,"email":a.email,"plan":quota["plan"].as_str().map(str::to_owned).or(a.plan),"user_state":a.user_state,"health":health,"probe_pending":pending,"windows":quota["windows"].as_array().cloned().unwrap_or_default(),"credits":quota["credits"],"last_used_at":null,"bound_sessions":0,"token_expires_at":a.token_meta.expires_at,"drain":a.drain,"allow_credits":a.allow_credits,"refresh_attention":self.refresh_attention.lock().map(|f|f.contains(&a.id)).unwrap_or(false)})
         }).collect())
     }
 

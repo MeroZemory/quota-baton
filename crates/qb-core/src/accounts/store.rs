@@ -121,12 +121,14 @@ impl AccountStore {
         let dir = home.join("accounts");
         fs::create_dir_all(&dir).map_err(|_| StoreError::Io)?;
         let lease = Lease::acquire(&dir)?;
-        Ok(Self {
+        let store = Self {
             dir,
             gate: Mutex::new(()),
             observer: Mutex::new(None),
             _lease: lease,
-        })
+        };
+        store.recover_login_migration()?;
+        Ok(store)
     }
 
     /// Called after each successful account write, under the transaction gate.
@@ -394,6 +396,70 @@ impl AccountStore {
             return Err(StoreError::InvalidData);
         }
         Ok(self.dir.join(format!("{id}.json")))
+    }
+
+    pub(crate) fn remove_login_record_unlocked(&self, id: &str) -> Result<(), StoreError> {
+        fs::remove_file(self.path(id)?).map_err(|_| StoreError::Io)
+    }
+
+    pub(crate) fn begin_login_migration(&self, old: &str, new: &str) -> Result<(), StoreError> {
+        self.check_login_migration_clear()?;
+        self.path(old)?;
+        self.path(new)?;
+        self.atomic_write(
+            &self.dir.join(".login-migration"),
+            serde_json::json!({"old":old,"new":new})
+                .to_string()
+                .as_bytes(),
+        )
+    }
+    pub(crate) fn check_login_migration_clear(&self) -> Result<(), StoreError> {
+        match fs::symlink_metadata(self.dir.join(".login-migration")) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(_) => Err(StoreError::InvalidData),
+            Err(_) => Err(StoreError::Io),
+        }
+    }
+    pub(crate) fn finish_login_migration(&self) -> Result<(), StoreError> {
+        fs::remove_file(self.dir.join(".login-migration")).map_err(|_| StoreError::Io)
+    }
+    fn recover_login_migration(&self) -> Result<(), StoreError> {
+        let bytes = match fs::read(self.dir.join(".login-migration")) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err(StoreError::Io),
+        };
+        #[derive(Deserialize)]
+        struct Migration {
+            old: String,
+            new: String,
+        }
+        let migration: Migration =
+            serde_json::from_slice(&bytes).map_err(|_| StoreError::InvalidData)?;
+        if migration.old == migration.new {
+            return Err(StoreError::InvalidData);
+        }
+        self.path(&migration.old)?;
+        self.path(&migration.new)?;
+        match self.read(&migration.new) {
+            Ok(new) if matches!(new.account.source, super::Source::Oauth) => {
+                // A metadata-valid replacement must also contain usable credentials
+                // before recovery removes the only old token record.
+                let _tokens = crypto::decrypt(&new.secret_dpapi_b64)?;
+                match self.read(&migration.old) {
+                    Ok(old)
+                        if super::login::matches(&old.account.identity, &new.account.identity) =>
+                    {
+                        self.remove_login_record_unlocked(&migration.old)?;
+                    }
+                    Err(StoreError::NotFound) => {}
+                    _ => return Err(StoreError::IdentityCollision),
+                }
+            }
+            Err(StoreError::NotFound) => {}
+            _ => return Err(StoreError::InvalidData),
+        }
+        self.finish_login_migration()
     }
 
     fn read(&self, id: &str) -> Result<Record, StoreError> {
