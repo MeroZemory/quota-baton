@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+mod accounts_cli;
 
 #[derive(Parser)]
 #[command(version, about = "로컬 계정 프록시")]
@@ -13,6 +14,11 @@ enum Command {
     Serve,
     #[command(about = "상태를 확인합니다")]
     Status,
+    #[command(about = "계정을 관리합니다")]
+    Accounts {
+        #[command(subcommand)]
+        command: accounts_cli::AccountsCommand,
+    },
 }
 
 #[tokio::main]
@@ -30,8 +36,14 @@ async fn run() -> anyhow::Result<()> {
         Command::Serve => {
             let _logs = qb_core::logging::init(&home)?;
             let config = qb_core::config::Config::load(&home)?;
+            let store = std::sync::Arc::new(qb_core::accounts::AccountStore::acquire(&home)?);
             let secrets = qb_core::local_secrets::load_or_create(&home)?;
-            let _servers = qb_core::http::spawn(&config, secrets).await?;
+            let _servers = qb_core::http::spawn_with_admin(
+                &config,
+                secrets,
+                qb_core::admin::account_routes(store),
+            )
+            .await?;
             println!("프록시를 시작했습니다.");
             tokio::signal::ctrl_c().await?;
         }
@@ -52,6 +64,10 @@ async fn run() -> anyhow::Result<()> {
                 .json()
                 .await?;
             println!("{}", serde_json::to_string_pretty(&health)?);
+        }
+        Command::Accounts { command } => {
+            let config = qb_core::config::Config::load(&home)?;
+            accounts_cli::run(command, &home, &config).await?;
         }
     }
     Ok(())
