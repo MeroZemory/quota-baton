@@ -263,6 +263,105 @@ async fn c6_row_13_upgrade_quota_health_before_second_account() {
 }
 
 #[tokio::test]
+async fn c7_upgrade_near_reset_retries_bound_account_once_without_moving() {
+    let h = Harness::new(2).await;
+    let (mut first, original) = h.connect().await;
+    first.close(None).await.unwrap();
+    h.fake.state.push_handshake(
+        StatusCode::TOO_MANY_REQUESTS,
+        r#"{"error":{"type":"usage_limit_reached","resets_in_seconds":2}}"#,
+        HeaderMap::new(),
+    );
+    let start = std::time::Instant::now();
+    let (mut retry, account) = h.connect().await;
+    assert_eq!(account, original);
+    assert!(start.elapsed() >= Duration::from_millis(1800));
+    assert!(start.elapsed() < Duration::from_secs(5));
+    let requests = h.fake.state.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[1].headers["authorization"],
+        requests[2].headers["authorization"]
+    );
+    let upgrade = h
+        .ledger()
+        .into_iter()
+        .find(|row| row["outcome"] == "ws_upgrade" && row["attempts"] == 2)
+        .unwrap();
+    assert_eq!(
+        upgrade["attempt_details"][0]["failover_reason"],
+        "reset_hold_retry"
+    );
+    assert_eq!(h.store.load(&original).unwrap().health, Health::Ready);
+    retry.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn c7_upgrade_move_then_reset_retry_preserves_first_turn_marker() {
+    let h = Harness::new(2).await;
+    let (mut first, original) = h.connect().await;
+    first.close(None).await.unwrap();
+    h.state
+        .accounts
+        .change(&original, Some(UserState::Paused), None, None, None)
+        .await
+        .unwrap();
+    h.fake.state.push_handshake(
+        StatusCode::TOO_MANY_REQUESTS,
+        r#"{"error":{"type":"usage_limit_reached","resets_in_seconds":2}}"#,
+        HeaderMap::new(),
+    );
+    let (mut client, next) = h.connect().await;
+    assert_ne!(next, original);
+    for _ in 0..2 {
+        h.fake
+            .state
+            .push_reply([Message::Text(r#"{"type":"response.completed"}"#.into())]);
+        create(&mut client, "fixture-model").await;
+        assert!(matches!(receive(&mut client).await, Message::Text(_)));
+    }
+    client.close(None).await.unwrap();
+    let turns: Vec<_> = h
+        .ledger()
+        .into_iter()
+        .filter(|r| r["outcome"] == "ok")
+        .collect();
+    assert_eq!(turns.len(), 2);
+    assert_eq!(turns[0]["after_move"], true);
+    assert_ne!(turns[1]["after_move"], true);
+}
+
+#[tokio::test]
+async fn c7_upgrade_second_near_reset_limit_fails_over_without_another_hold() {
+    let h = Harness::new(2).await;
+    let (mut first, original) = h.connect().await;
+    first.close(None).await.unwrap();
+    for _ in 0..2 {
+        h.fake.state.push_handshake(
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"type":"usage_limit_reached","resets_in_seconds":2}}"#,
+            HeaderMap::new(),
+        );
+    }
+    let start = std::time::Instant::now();
+    let (mut retry, account) = h.connect().await;
+    assert_ne!(account, original);
+    assert!(start.elapsed() >= Duration::from_millis(1800));
+    assert!(start.elapsed() < Duration::from_millis(3800));
+    let requests = h.fake.state.requests();
+    assert_eq!(requests.len(), 4);
+    assert_eq!(
+        requests[1].headers["authorization"],
+        requests[2].headers["authorization"]
+    );
+    assert_ne!(
+        requests[2].headers["authorization"],
+        requests[3].headers["authorization"]
+    );
+    retry.close(None).await.unwrap();
+}
+
+#[tokio::test]
 async fn c6_row_13a_metadata_does_not_commit_health_then_1012_reconnect() {
     let h = Harness::new(2).await;
     h.fake.state.push_reply([

@@ -67,3 +67,7 @@ required-features = ["testkit"]
 [[test]]
 name = "m4a_credentials"
 required-features = ["testkit"]
+
+[[test]]
+name = "m4b"
+required-features = ["testkit"]

@@ -43,7 +43,6 @@ pub struct AccountRuntime {
     obs: Arc<Observability>,
     events: broadcast::Sender<Value>,
     limits: Mutex<BTreeMap<String, LimitResponse>>,
-    allowance: f64,
     probes: Mutex<BTreeSet<String>>,
     volatile: Mutex<BTreeMap<String, Health>>,
     inflight: Mutex<BTreeMap<String, usize>>,
@@ -85,7 +84,7 @@ impl Drop for Probe {
 }
 
 impl AccountRuntime {
-    pub fn new(store: Arc<AccountStore>, obs: Arc<Observability>, allowance: f64) -> Arc<Self> {
+    pub fn new(store: Arc<AccountStore>, obs: Arc<Observability>, _allowance: f64) -> Arc<Self> {
         let (events, _) = broadcast::channel(256);
         let writer = obs.clone();
         let changes = events.clone();
@@ -98,7 +97,6 @@ impl AccountRuntime {
             obs,
             events,
             limits: Mutex::new(BTreeMap::new()),
-            allowance,
             probes: Mutex::new(BTreeSet::new()),
             volatile: Mutex::new(BTreeMap::new()),
             inflight: Mutex::new(BTreeMap::new()),
@@ -250,11 +248,8 @@ impl AccountRuntime {
                     !w.is_empty()
                         && w.iter()
                             .all(|w| w["used_pct"].as_f64().is_some_and(|p| p < 100.0))
-                        && w.iter().any(|w| {
-                            w["used_pct"].as_f64().is_some_and(|p| {
-                                p + self.allowance * self.inflight_count(&id) as f64 >= 99.0
-                            })
-                        })
+                        && w.iter()
+                            .any(|w| w["used_pct"].as_f64().is_some_and(|p| p >= 99.0))
                 }) && q["signals"]["limit_reached"] != true
                     && q["signals"]["unified_status"] != "rejected"
             });
@@ -382,7 +377,6 @@ impl AccountRuntime {
         let store = self.store.clone();
         let account_id = id.to_owned();
         let model = model.map(str::to_owned);
-        let projected_allowance = self.allowance * self.inflight_count(id) as f64;
         let observation = snapshot.clone();
         let account = tokio::task::spawn_blocking(move || {
             store
@@ -391,7 +385,7 @@ impl AccountRuntime {
                         crate::accounts::HealthSignal::UsageSnapshot {
                             snapshot: observation,
                             model,
-                            projected_allowance,
+                            projected_allowance: 0.0,
                         },
                         Utc::now(),
                     );

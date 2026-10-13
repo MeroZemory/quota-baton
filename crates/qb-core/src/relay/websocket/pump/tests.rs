@@ -23,6 +23,7 @@ struct Pair {
     obs: Arc<Observability>,
     home: tempfile::TempDir,
     server: tokio::task::JoinHandle<()>,
+    relay: Option<Arc<crate::relay::RelayState>>,
 }
 
 impl Drop for Pair {
@@ -54,6 +55,16 @@ async fn pair_with_read_timeout(
     limit: usize,
     read_timeout: Duration,
 ) -> Pair {
+    pair_with_tracking(idle_close, close_after_response, limit, read_timeout, false).await
+}
+
+async fn pair_with_tracking(
+    idle_close: Duration,
+    close_after_response: bool,
+    limit: usize,
+    read_timeout: Duration,
+    tracking: bool,
+) -> Pair {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/pump-tests");
     std::fs::create_dir_all(&root).unwrap();
     let home = tempfile::tempdir_in(root).unwrap();
@@ -61,6 +72,22 @@ async fn pair_with_read_timeout(
     let budget = InflightBudget::new(limit);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_address = listener.local_addr().unwrap();
+    let relay = tracking.then(|| {
+        let store = Arc::new(crate::accounts::AccountStore::acquire(home.path()).unwrap());
+        let mut config = crate::config::Config::default();
+        config.upstream.codex_base = format!("http://{upstream_address}");
+        config.upstream.anthropic_base = format!("http://{upstream_address}");
+        let relay = Arc::new(
+            crate::relay::RelayState::new(store, &config, obs.clone(), Arc::default()).unwrap(),
+        );
+        relay
+            .bindings
+            .import(serde_json::json!({"schema":1,"bindings":[{
+                "key":"codex:overlap", "account":"fake-account", "last_used":chrono::Utc::now()
+            }]}))
+            .unwrap();
+        relay
+    });
     let accept = tokio::spawn(async move {
         let (socket, _) = listener.accept().await.unwrap();
         accept_async_with_config(socket, Some(config()))
@@ -87,12 +114,14 @@ async fn pair_with_read_timeout(
     let upstream = Arc::new(Mutex::new(Some(upstream)));
     let handler_obs = obs.clone();
     let handler_budget = budget.clone();
+    let handler_relay = relay.clone();
     let router = Router::new().route(
         "/",
         get(move |mut request: Request| {
             let upstream = upstream.clone();
             let obs = handler_obs.clone();
             let budget = handler_budget.clone();
+            let relay = handler_relay.clone();
             async move {
                 let upstream = upstream.lock().await.take().unwrap();
                 let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(
@@ -111,12 +140,15 @@ async fn pair_with_read_timeout(
                         upstream,
                         Context {
                             runtime: None,
-                            relay: None,
+                            session: Session {
+                                key: relay.as_ref().map(|_| "codex:overlap".into()),
+                                ..Session::default()
+                            },
+                            relay,
                             credentials: None,
                             budget,
                             observability: obs,
                             account: "fake-account".into(),
-                            session: Session::default(),
                             headers: HeaderMap::new(),
                             idle_close,
                             close_after_response,
@@ -152,6 +184,7 @@ async fn pair_with_read_timeout(
         obs,
         home,
         server,
+        relay,
     }
 }
 
@@ -259,6 +292,7 @@ async fn duplex_pong_for_role(role: Role) {
         budget.reserve_message(size),
         Delivered {
             bytes: size,
+            request: None,
             terminal: None,
             completed: false,
         },
@@ -293,6 +327,120 @@ async fn duplex_pong_for_role(role: Role) {
     .await
     .unwrap();
     assert_eq!(budget.used(), 0);
+}
+
+#[tokio::test]
+async fn overlapping_creates_keep_reservations_and_match_out_of_order_terminals() {
+    let mut pair = pair_with_tracking(
+        Duration::from_secs(60),
+        false,
+        4 * PARSE_LIMIT,
+        UPSTREAM_READ_TIMEOUT,
+        true,
+    )
+    .await;
+    let relay = pair.relay.as_ref().unwrap().clone();
+    let before = relay.bindings.export().unwrap()["bindings"][0]["last_used"].clone();
+    let creates = [
+        r#"{ "type":"response.create", "model":"first", "input":"first-private" }"#,
+        r#"{ "type":"response.create", "model":"second", "input":"second-private" }"#,
+    ];
+    for (index, create) in creates.iter().enumerate() {
+        pair.client
+            .send(Message::Text((*create).into()))
+            .await
+            .unwrap();
+        assert_eq!(next(&mut pair.peer).await, Message::Text((*create).into()));
+        assert_eq!(
+            relay.inflight_requests.load(Ordering::Relaxed),
+            (index + 1) as u64
+        );
+        assert_eq!(relay.bindings.pending_count("fake-account"), index + 1);
+        assert!(!records(&pair).iter().any(|row| row.get("req").is_some()));
+        assert_eq!(
+            relay.bindings.export().unwrap()["bindings"][0]["last_used"],
+            before
+        );
+    }
+    let mut created_bytes = Vec::new();
+    for id in ["r-first", "r-second"] {
+        let raw = format!(r#"{{ "type":"response.created", "response":{{"id":"{id}"}} }}"#);
+        created_bytes.push(raw.len());
+        pair.peer
+            .send(Message::Text(raw.clone().into()))
+            .await
+            .unwrap();
+        assert_eq!(next(&mut pair.client).await, Message::Text(raw.into()));
+    }
+    // The second turn finishes first; its ID lives at the event's top level.
+    let second = r#"{ "type":"response.completed", "response_id":"r-second", "usage":{"input_tokens":200,"input_tokens_details":{"cached_tokens":22},"private":"never-ledger"} }"#;
+    pair.peer.send(Message::Text(second.into())).await.unwrap();
+    assert_eq!(next(&mut pair.client).await, Message::Text(second.into()));
+    let rows = requests(&pair, 1).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["model"], "second");
+    assert_eq!(rows[0]["bytes_in"], creates[1].len());
+    assert_eq!(rows[0]["bytes_out"], created_bytes[1] + second.len());
+    assert_eq!(rows[0]["cache_usage"]["cached_tokens"], 22);
+    assert_eq!(relay.inflight_requests.load(Ordering::Relaxed), 1);
+    assert_eq!(relay.bindings.pending_count("fake-account"), 1);
+    // The first turn is still active, and its terminal uses response.id.
+    let first = r#"{ "type":"response.completed", "response":{"id":"r-first","usage":{"input_tokens":100,"input_tokens_details":{"cached_tokens":11}}} }"#;
+    pair.peer.send(Message::Text(first.into())).await.unwrap();
+    assert_eq!(next(&mut pair.client).await, Message::Text(first.into()));
+    let rows = requests(&pair, 2).await;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1]["model"], "first");
+    assert_eq!(rows[1]["bytes_in"], creates[0].len());
+    assert_eq!(rows[1]["bytes_out"], created_bytes[0] + first.len());
+    assert_eq!(rows[1]["cache_usage"]["cached_tokens"], 11);
+    assert!(rows.iter().all(|row| row["outcome"] == "ok"));
+    assert!(!rows.iter().any(|row| row.to_string().contains("private")));
+    // Request logging happens just before the completion fields release guards.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while relay.inflight_requests.load(Ordering::Relaxed) != 0
+            || relay.bindings.pending_count("fake-account") != 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(relay.bindings.export().unwrap()["bindings"][0]["last_used"] != before);
+}
+
+#[tokio::test]
+async fn no_id_error_finishes_pending_create_and_unknown_id_keeps_active_turn() {
+    let mut pair = pair(Duration::from_secs(60), false, 4 * PARSE_LIMIT).await;
+    for model in ["first", "second"] {
+        let raw = format!(r#"{{"type":"response.create","model":"{model}"}}"#);
+        pair.client
+            .send(Message::Text(raw.clone().into()))
+            .await
+            .unwrap();
+        assert_eq!(next(&mut pair.peer).await, Message::Text(raw.into()));
+    }
+    for raw in [
+        r#"{"type":"response.created","response":{"id":"r-first"}}"#,
+        r#"{"type":"response.completed","response_id":"unknown"}"#,
+    ] {
+        pair.peer.send(Message::Text(raw.into())).await.unwrap();
+        assert_eq!(next(&mut pair.client).await, Message::Text(raw.into()));
+    }
+    assert!(!records(&pair).iter().any(|row| row.get("req").is_some()));
+    let error = r#"{"type":"error","status":400,"error":{"code":"invalid_request_error"}}"#;
+    pair.peer.send(Message::Text(error.into())).await.unwrap();
+    assert_eq!(next(&mut pair.client).await, Message::Text(error.into()));
+    let rows = requests(&pair, 1).await;
+    assert_eq!(rows[0]["model"], "second");
+    assert_eq!(rows[0]["outcome"], "upstream_error");
+    let done = r#"{"type":"response.done","usage":{"input_tokens_details":{"cached_tokens":17}}}"#;
+    pair.peer.send(Message::Text(done.into())).await.unwrap();
+    assert_eq!(next(&mut pair.client).await, Message::Text(done.into()));
+    let rows = requests(&pair, 2).await;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1]["model"], "first");
+    assert_eq!(rows[1]["cache_usage"]["cached_tokens"], 17);
 }
 
 #[tokio::test]

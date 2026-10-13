@@ -545,6 +545,12 @@ async fn c5_passive_header_exhaustion_credits_and_early_reset() {
         .accounts
         .observe_headers(id, Provider::Codex, &headers)
         .await;
+    assert_eq!(h.store.load(id).unwrap().health, Health::Ready);
+    headers.insert("x-codex-primary-used-percent", "99".parse().unwrap());
+    h.state
+        .accounts
+        .observe_headers(id, Provider::Codex, &headers)
+        .await;
     assert!(matches!(
         h.store.load(id).unwrap().health,
         Health::Cooling {
@@ -783,13 +789,9 @@ async fn c6_row_14_model_scoped_cooling_respects_request_model() {
 
 #[tokio::test]
 async fn c6_row_2_until_uses_exhausted_window_not_unrelated_weekly_reset() {
-    let h = Harness::new(Provider::Codex, 2, 384, 1024).await;
     for (primary, secondary, seconds) in [(100, 40, 3600), (40, 100, 432000)] {
-        for id in h.ids() {
-            h.store
-                .update_metadata(&id, |a| a.health = Health::Ready)
-                .unwrap();
-        }
+        // Each limiting-window scenario starts without the other's quota snapshot.
+        let h = Harness::new(Provider::Codex, 2, 384, 1024).await;
         let now = Utc::now();
         let mut r = ScriptedResponse::json(StatusCode::TOO_MANY_REQUESTS, "{}");
         for (slot, used, reset, minutes) in [
@@ -935,7 +937,16 @@ async fn c6_row_5_transient_and_throttled_refresh_cools_auth_five_minutes_and_fa
         }
         h.fake.state.push(ok());
         let before = Utc::now();
-        let response = h.send(Provider::Codex, "{}").await;
+        // C7 keeps unbound traffic on its last account; each round deliberately
+        // starts a new binding to exercise the first account's refresh throttle.
+        let response = reqwest::Client::new()
+            .post(format!("http://{}/v1/responses", h.servers.data_addr))
+            .bearer_auth("synthetic-client")
+            .header("session-id", format!("refresh-round-{round}"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
         assert_eq!(response.status(), 200);
         assert_ne!(response.headers()["x-quota-baton-account"], id);
         let account = h.store.load(&id).unwrap();
