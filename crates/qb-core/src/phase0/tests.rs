@@ -667,3 +667,64 @@ async fn summary_sse_usage_only_and_stream_failure_is_sanitized() {
         "replay response read failed"
     );
 }
+
+#[tokio::test]
+async fn summary_preserves_ordinary_words_and_redacts_token_substrings() {
+    let forbidden = vec![
+        "ces".to_owned(),
+        "thin".to_owned(),
+        "sk-synthetic-token".to_owned(),
+    ];
+    let response = Response::new(Body::from(serde_json::to_vec(&json!({"error":{
+        "message":"access thinking account's (sk-synthetic-token) prefixsk-synthetic-tokensuffix ces thin"
+    }})).unwrap()));
+    let summary = summarize(response, "account", &forbidden).await.unwrap();
+    let message = summary["error"]["message"].as_str().unwrap();
+    assert!(message.starts_with("access thinking account's"));
+    assert!(!message.contains("sk-synthetic-token"));
+    assert!(message.ends_with("ces thin"));
+}
+
+#[tokio::test]
+async fn summary_preserves_captured_standalone_words_and_bounds_error_message() {
+    let forbidden = [
+        "a",
+        "the",
+        "ok",
+        "access",
+        "thinking",
+        "ordinary prompt sentence",
+        "synthetic-access",
+        "synthetic-prompt",
+        "encrypted-synthetic-secret",
+        "c3ludGhldGljLWJhc2U2NC1zZWNyZXQ=",
+        "opaqueID123456789012345678",
+    ]
+    .map(str::to_owned);
+    let message = "a the ok access thinking ordinary prompt sentence synthetic-access synthetic-prompt encrypted-synthetic-secret c3ludGhldGljLWJhc2U2NC1zZWNyZXQ= opaqueID123456789012345678";
+    let response = Response::new(Body::from(
+        serde_json::to_vec(&json!({
+            "error":{"code":"ok","message":message}, "content":"never-serialize-full-body"
+        }))
+        .unwrap(),
+    ));
+    let summary = summarize(response, "account", &forbidden).await.unwrap();
+    assert_eq!(summary["error"]["code"], "ok");
+    assert_eq!(
+        summary["error"]["message"],
+        "a the ok access thinking ordinary prompt sentence [redacted] [redacted] [redacted] [redacted] [redacted]"
+    );
+    assert!(!summary.to_string().contains("never-serialize-full-body"));
+    let response = Response::new(Body::from(
+        serde_json::to_vec(&json!({"error":{"message":"가".repeat(250)}})).unwrap(),
+    ));
+    let summary = summarize(response, "account", &forbidden).await.unwrap();
+    assert_eq!(
+        summary["error"]["message"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .count(),
+        200
+    );
+}

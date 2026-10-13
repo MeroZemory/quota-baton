@@ -65,10 +65,38 @@ omits `Accept`; genuine clients supply that header themselves.
 Observability uses a bounded non-blocking queue and batches disk synchronization
 once per second. Queue overflow drops events and reports counts once per minute.
 Corrupt quota caches are moved aside and ledger pruning failures are warnings.
-Successful streams are recorded at upstream EOF independently of the client's
-last body poll. A bounded observer recognizes Claude and Codex terminal SSE events,
-including compressed streams; early disconnects remain `client_drop`.
+Successful streams are recorded when their terminal event is delivered, even if
+the client closes before upstream EOF. Failed terminal events record an error.
+A bounded observer recognizes Claude and Codex terminal SSE events, including
+compressed streams; disconnects before a terminal event remain `client_drop`.
 Logs default to `info` for file and stderr. `QB_LOG` overrides `RUST_LOG` when set.
+
+Codex WebSocket upgrades dial upstream before answering the client. Each socket
+pair stays on its selected account, shares the HTTP linked-token gates and uses
+the existing TLS client. Handshake headers are generated independently per hop.
+The loopback leg declines compression. `[websocket] upstream_deflate=true` fails
+startup because tungstenite 0.28.0 has no deflate support; adopting a deflate fork
+and the live D12 A/B test remain design decisions.
+
+Both legs allow 192 MiB messages and frames by default. Text/binary payloads and
+control messages pass through verbatim; large outgoing messages are fragmented
+into 64 KiB frames so pongs can run between writes. The shared in-flight budget
+pauses client reads and counts complete messages until writes finish. A small
+local patch to crates.io tungstenite releases large socket buffers after use;
+its source, licenses and regression are in `vendor/tungstenite`.
+
+Only upstream text messages of at most 1 MiB are inspected, for response tracking,
+quota and error identifiers. No transcript or previous-response state is retained.
+The ledger includes response and connection records plus bounded
+`upstream_error_code` identifiers on HTTP and WebSocket responses. Socket pairs
+close normally after `idle_close_secs` (default 1800); upstream reads time out
+after 600 seconds, reset by upstream pings. Debug `phase0` builds add
+`serve --phase0-close-after-response` to close normally after each completion.
+
+For a synthetic manual check, run `cargo run -p qb-testkit --example ws_fakes`;
+its `--client ws://127.0.0.1:<port>/v1/responses` mode prints only a sanitized
+transcript. Use the matching synthetic fixture key specified in the example,
+an isolated `QB_HOME`, ephemeral ports and a `testkit` build for the local base.
 
 Phase 0 account pins use the authenticated admin API:
 `POST /admin/v1/debug/pin` with `{account_id, session_key?}` and
