@@ -255,11 +255,33 @@ impl SideDecoder {
     }
 }
 
-#[cfg(test)]
 fn decoded_prefix(raw: &[u8], encoding: SideEncoding) -> Option<Vec<u8>> {
     let mut decoder = SideDecoder::new(encoding).ok()?;
     let _ = decoder.feed(raw);
     Some(decoder.decoded().to_vec())
+}
+
+pub(super) fn error_code(headers: &HeaderMap, raw: &[u8]) -> Option<String> {
+    let decoded = decoded_side(headers, raw)?;
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&decoded) {
+        return crate::observability::safe_error_code(&value);
+    }
+    for line in decoded.split(|b| *b == b'\n') {
+        if let Some(data) = line.strip_prefix(b"data:")
+            && let Ok(value) = serde_json::from_slice::<serde_json::Value>(data.trim_ascii())
+            && let Some(code) = crate::observability::safe_error_code(&value)
+        {
+            return Some(code);
+        }
+    }
+    None
+}
+
+pub(super) fn decoded_side(headers: &HeaderMap, raw: &[u8]) -> Option<Vec<u8>> {
+    Some(match side_encoding(headers)? {
+        Some(encoding) => decoded_prefix(&raw[..raw.len().min(HOLD_LIMIT)], encoding)?,
+        None => raw[..raw.len().min(HOLD_LIMIT)].to_vec(),
+    })
 }
 
 #[derive(Default)]
@@ -348,6 +370,44 @@ fn classify_event(event: &[u8]) -> Option<CommitDecision> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn error_code_is_bounded_decoded_and_never_message_text() {
+        use axum::http::HeaderMap;
+        let raw=br#"{"error":{"code":"invalid_encrypted_content","type":"invalid_request_error","message":"synthetic secret body"}}"#;
+        let mut headers = HeaderMap::new();
+        assert_eq!(
+            super::error_code(&headers, raw).as_deref(),
+            Some("invalid_encrypted_content")
+        );
+        for (name, kind) in [
+            ("gzip", super::SideEncoding::Gzip),
+            ("deflate", super::SideEncoding::Deflate),
+            ("br", super::SideEncoding::Brotli),
+            ("zstd", super::SideEncoding::Zstd),
+        ] {
+            headers.insert("content-encoding", name.parse().unwrap());
+            assert_eq!(
+                super::error_code(&headers, &compress(raw, kind)).as_deref(),
+                Some("invalid_encrypted_content")
+            );
+        }
+        headers.clear();
+        assert_eq!(
+            super::error_code(
+                &headers,
+                br#"{"error":{"type":"authentication_error","message":"never logged"}}"#
+            )
+            .as_deref(),
+            Some("authentication_error")
+        );
+        assert!(
+            super::error_code(
+                &headers,
+                br#"{"error":{"code":"Bearer sk-secret","message":"never logged"}}"#
+            )
+            .is_none()
+        );
+    }
     use super::*;
 
     fn compress(event: &[u8], encoding: SideEncoding) -> Vec<u8> {

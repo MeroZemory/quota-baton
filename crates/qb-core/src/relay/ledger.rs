@@ -15,7 +15,7 @@ use crate::{
     session::Session,
 };
 
-pub(super) struct Completion {
+pub(in crate::relay) struct Completion {
     pub record: RequestRecord,
     pub start: Instant,
     pub input_bytes: Arc<AtomicU64>,
@@ -57,6 +57,7 @@ impl Completion {
                 attempts: 0,
                 outcome: "client_drop".into(),
                 retained_copy: false,
+                upstream_error_code: None,
             },
         }
     }

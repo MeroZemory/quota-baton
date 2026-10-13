@@ -13,7 +13,7 @@ impl SummaryObserver {
     pub fn new(forbidden: &[String]) -> Self {
         let mut forbidden: Vec<_> = forbidden
             .iter()
-            .filter(|text| !text.is_empty())
+            .filter(|text| known_token_shape(text))
             .cloned()
             .collect();
         forbidden.sort_by_key(|text| std::cmp::Reverse(text.len()));
@@ -24,6 +24,7 @@ impl SummaryObserver {
     fn redact(&self, text: &str, limit: usize) -> String {
         let mut result = text.to_owned();
         for secret in &self.forbidden {
+            // 알려진 토큰 값은 다른 문자열 안에 포함되어도 가린다.
             result = result.replace(secret, "[redacted]");
         }
         // 알려진 값 외에도 토큰 모양의 단어는 출력하지 않는다.
@@ -166,12 +167,39 @@ impl SummaryObserver {
     }
 }
 
+// 캡처의 일반 단어와 문장은 제외하고 연속된 자격 증명·불투명 식별자만 보관한다.
+fn known_token_shape(text: &str) -> bool {
+    !text.is_empty()
+        && text.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'+' | b'/' | b'=')
+        })
+        && (token_pattern(text)
+            || (text.len() >= 8 && text.contains(['-', '_']))
+            || (text.len() >= 24
+                && text.bytes().any(|byte| {
+                    byte.is_ascii_digit()
+                        || byte.is_ascii_uppercase()
+                        || matches!(byte, b'+' | b'/' | b'=')
+                }))
+            || text.len() >= 32)
+}
+
 fn token_pattern(text: &str) -> bool {
-    text.contains("sk-")
-        || text.contains("eyJ")
-        || text
-            .split_whitespace()
-            .any(|word| word.eq_ignore_ascii_case("bearer"))
+    ["sk-", "eyJ"].iter().any(|prefix| {
+        text.match_indices(prefix).any(|(offset, prefix)| {
+            !text[..offset]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_alphabetic)
+                && text[offset + prefix.len()..]
+                    .chars()
+                    .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+                    .count()
+                    >= 8
+        })
+    }) || text
+        .split_whitespace()
+        .any(|word| word.eq_ignore_ascii_case("bearer"))
 }
 
 // 줄 경계를 넘는 UTF-8과 CRLF를 보존하면서 이벤트 본문은 관찰 후 버린다.
