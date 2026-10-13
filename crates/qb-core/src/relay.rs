@@ -301,7 +301,9 @@ impl RelayState {
                     .is_ok_and(|tokens| !tokens.access_token.is_empty())
                 && {
                     let pacing = self.accounts.pacing_snapshot(&account.id);
-                    pacing.rate_backoff_until.is_none() && pacing.waiting == 0
+                    pacing.rate_step == 0
+                        && pacing.rate_backoff_until.is_none()
+                        && pacing.waiting == 0
                 }
         });
         let runtime = self.accounts.clone();
@@ -316,7 +318,9 @@ impl RelayState {
                         && !runtime.blocked_in_memory(&a.id)
                         && (bound.as_deref() == Some(a.id.as_str()) || !has_non_pacing || {
                             let pacing = runtime.pacing_snapshot(&a.id);
-                            pacing.rate_backoff_until.is_none() && pacing.waiting == 0
+                            pacing.rate_step == 0
+                                && pacing.rate_backoff_until.is_none()
+                                && pacing.waiting == 0
                         })
                         && store.tokens(a).is_ok_and(|t| !t.access_token.is_empty())
                 })

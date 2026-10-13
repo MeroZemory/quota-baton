@@ -251,6 +251,9 @@ impl AccountRuntime {
     }
 
     fn decay_pacing(state: &mut PacingState, now: Instant) {
+        if state.backoff_until.is_some_and(|until| until <= now) {
+            state.backoff_until = None;
+        }
         if let Some(last) = state.last_429 {
             let quiet = now.saturating_duration_since(last);
             let drops = (quiet.as_secs() / 60) as u32;
@@ -330,13 +333,18 @@ impl AccountRuntime {
             let mut states = self.pacing.lock().unwrap_or_else(|e| e.into_inner());
             let state = Self::pacing_state(&mut states, id);
             let now = Instant::now();
-            let open = state.backoff_until.is_none_or(|until| now >= until)
-                && state.last_release.is_none_or(|last| {
-                    now.saturating_duration_since(last) >= state.release_interval
-                })
-                && state.waiting.is_empty();
+            Self::decay_pacing(state, now);
+            let pacing = state.step > 0 || state.backoff_until.is_some();
+            let open = state.waiting.is_empty()
+                && (!pacing
+                    || (state.backoff_until.is_none_or(|until| now >= until)
+                        && state.last_release.is_none_or(|last| {
+                            now.saturating_duration_since(last) >= state.release_interval
+                        })));
             if open {
-                state.last_release = Some(now);
+                if pacing {
+                    state.last_release = Some(now);
+                }
                 true
             } else {
                 state.waiting.push_back(waiter.clone());
@@ -372,6 +380,7 @@ impl AccountRuntime {
                 let mut states = self.pacing.lock().unwrap_or_else(|e| e.into_inner());
                 let state = Self::pacing_state(&mut states, &id);
                 let now = Instant::now();
+                Self::decay_pacing(state, now);
                 while state
                     .waiting
                     .front()
@@ -385,15 +394,22 @@ impl AccountRuntime {
                 };
                 let deadline = waiter.queued_at
                     + StdDuration::from_secs(self.rate_hold_secs.load(Ordering::Relaxed));
-                let gate = state.backoff_until.unwrap_or(now).max(
-                    state
-                        .last_release
-                        .map_or(now, |last| last + state.release_interval),
-                );
+                let pacing = state.step > 0 || state.backoff_until.is_some();
+                let gate = if pacing {
+                    state.backoff_until.unwrap_or(now).max(
+                        state
+                            .last_release
+                            .map_or(now, |last| last + state.release_interval),
+                    )
+                } else {
+                    now
+                };
                 if now >= gate || now >= deadline {
                     let forced = now >= deadline;
                     state.waiting.pop_front();
-                    state.last_release = Some(now);
+                    if pacing {
+                        state.last_release = Some(now);
+                    }
                     (Some(waiter), state.wake.clone(), forced)
                 } else {
                     (None, state.wake.clone(), false)
@@ -408,23 +424,30 @@ impl AccountRuntime {
                 let states = self.pacing.lock().unwrap_or_else(|e| e.into_inner());
                 let state = states.get(&id).expect("pacing state exists");
                 let now = Instant::now();
-                let next = state
-                    .backoff_until
-                    .unwrap_or(now)
-                    .max(
-                        state
-                            .last_release
-                            .map_or(now, |last| last + state.release_interval),
-                    )
-                    .min(state.waiting.front().map_or(
-                        now + StdDuration::from_secs(self.rate_hold_secs.load(Ordering::Relaxed)),
-                        |w| {
-                            w.queued_at
-                                + StdDuration::from_secs(
-                                    self.rate_hold_secs.load(Ordering::Relaxed),
-                                )
-                        },
-                    ));
+                let pacing = state.step > 0 || state.backoff_until.is_some_and(|until| until > now);
+                let next = if pacing {
+                    state
+                        .backoff_until
+                        .unwrap_or(now)
+                        .max(
+                            state
+                                .last_release
+                                .map_or(now, |last| last + state.release_interval),
+                        )
+                        .min(state.waiting.front().map_or(
+                            now + StdDuration::from_secs(
+                                self.rate_hold_secs.load(Ordering::Relaxed),
+                            ),
+                            |w| {
+                                w.queued_at
+                                    + StdDuration::from_secs(
+                                        self.rate_hold_secs.load(Ordering::Relaxed),
+                                    )
+                            },
+                        ))
+                } else {
+                    now
+                };
                 next.saturating_duration_since(now)
             };
             tokio::select! {
