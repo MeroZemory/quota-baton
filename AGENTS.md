@@ -12,6 +12,10 @@ The documentation map is in `docs/README.md`. The normative behaviour is in `doc
 - **Run a review build in the implementer's worktree only while the implementer is idle.** Use the default target, run `cargo test` / `cargo clippy` sequentially, and do not keep a second copy.
 - Never move build output to D: or E:.
 - If a cleanup is blocked, report the exact path and size instead of working around it.
+- **Retention of run artifacts.** Verification copies, test binaries, temporary homes, and capture or serve logs under `.sandbox/` are deleted once their milestone is merged. Before deleting, record the result in the milestone report.
+  - Keep only what a report or review cites: `.sandbox/reports/<M>.md` with its cited evidence files, `.sandbox/reviews`, `.sandbox/briefs` and `.sandbox/research`.
+  - Never copy test executables or debug symbols (`*.exe`, `*.pdb`) into `.sandbox`. Cite their test names instead.
+  - Body captures that contain conversation content are deleted as soon as their result is recorded.
 
 ## Working rules for the implementer main (supervisor common rules, 2026-10-13)
 
