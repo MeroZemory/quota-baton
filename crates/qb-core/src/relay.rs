@@ -4,6 +4,7 @@ mod hold;
 mod ledger;
 mod response;
 mod upload;
+mod websocket;
 
 use std::{sync::Arc, time::Duration};
 
@@ -39,6 +40,9 @@ pub struct RelayState {
     observability: Arc<Observability>,
     pins: Arc<DebugPins>,
     tokens: TokenGates,
+    websocket: crate::config::WebsocketConfig,
+    #[cfg(all(feature = "phase0", debug_assertions))]
+    close_after_response: bool,
     #[cfg(all(feature = "phase0", debug_assertions))]
     body_capture: Option<Arc<crate::phase0::BodyCapture>>,
 }
@@ -51,6 +55,7 @@ impl RelayState {
         pins: Arc<DebugPins>,
     ) -> anyhow::Result<Self> {
         config.upstream.validate()?;
+        config.websocket.validate()?;
         let client = upstream_client()?;
         Ok(Self {
             store,
@@ -62,6 +67,9 @@ impl RelayState {
             observability,
             pins,
             tokens: TokenGates::default(),
+            websocket: config.websocket.clone(),
+            #[cfg(all(feature = "phase0", debug_assertions))]
+            close_after_response: false,
             #[cfg(all(feature = "phase0", debug_assertions))]
             body_capture: None,
         })
@@ -70,6 +78,12 @@ impl RelayState {
     #[cfg(all(feature = "phase0", debug_assertions))]
     pub fn with_body_capture(mut self, capture: Arc<crate::phase0::BodyCapture>) -> Self {
         self.body_capture = Some(capture);
+        self
+    }
+
+    #[cfg(all(feature = "phase0", debug_assertions))]
+    pub fn with_close_after_response(mut self, enabled: bool) -> Self {
+        self.close_after_response = enabled;
         self
     }
 
@@ -272,6 +286,15 @@ fn failure(
 }
 
 async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Response {
+    if request.method() == Method::GET
+        && request.uri().path() == "/v1/responses"
+        && request
+            .headers()
+            .get("upgrade")
+            .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"))
+    {
+        return websocket::upgrade(state, request).await;
+    }
     let (parts, body) = request.into_parts();
     let path = parts.uri.path();
     let family = if path == "/v1/messages" || path.starts_with("/v1/messages/") {
@@ -518,6 +541,9 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
     };
     // M4는 이 명시적 pre-commit 결정 지점에서 retained body로 failover를 연결한다.
     let decision = held.decision;
+    if !status.is_success() || decision == CommitDecision::FirstError {
+        completion.record.upstream_error_code = hold::error_code(&response_headers, &held.prefix);
+    }
     drop(retained.take());
     completion.record.status = status.as_u16();
     completion.record.ttfb_ms = completion.elapsed_ms();

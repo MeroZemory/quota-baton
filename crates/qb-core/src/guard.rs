@@ -9,6 +9,7 @@ use bytes::Bytes;
 pub struct InflightBudget {
     limit: usize,
     used: AtomicUsize,
+    changed: tokio::sync::Notify,
 }
 
 impl InflightBudget {
@@ -16,11 +17,33 @@ impl InflightBudget {
         Arc::new(Self {
             limit,
             used: AtomicUsize::new(0),
+            changed: tokio::sync::Notify::new(),
         })
     }
 
     pub fn used(&self) -> usize {
         self.used.load(Ordering::Acquire)
+    }
+
+    // 메모리에 이미 들어온 메시지는 초과분도 기록하며 쓰기가 끝나면 돌려준다.
+    pub fn reserve_message(self: &Arc<Self>, bytes: usize) -> Reservation {
+        self.used.fetch_add(bytes, Ordering::AcqRel);
+        Reservation {
+            budget: self.clone(),
+            bytes,
+        }
+    }
+
+    pub async fn wait_available(&self) {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.used() < self.limit {
+                return;
+            }
+            notified.await;
+        }
     }
 
     pub fn try_reserve(self: &Arc<Self>, bytes: usize) -> Option<Reservation> {
@@ -44,6 +67,7 @@ pub struct Reservation {
 impl Drop for Reservation {
     fn drop(&mut self) {
         self.budget.used.fetch_sub(self.bytes, Ordering::AcqRel);
+        self.budget.changed.notify_waiters();
     }
 }
 

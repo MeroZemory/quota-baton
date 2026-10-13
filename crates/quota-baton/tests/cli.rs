@@ -40,6 +40,7 @@ fn default_cli_has_no_phase0_or_body_capture() {
     for args in [
         vec!["phase0", "replay"],
         vec!["serve", "--capture-bodies-dir", ".sandbox"],
+        vec!["serve", "--phase0-close-after-response"],
     ] {
         let output = command(home.path()).args(args).output().unwrap();
         assert!(!output.status.success());

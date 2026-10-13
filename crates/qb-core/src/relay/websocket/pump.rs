@@ -1,0 +1,401 @@
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    sync::{Arc, atomic::Ordering},
+    time::Duration,
+};
+
+use axum::http::{HeaderMap, Method};
+use futures_util::{Sink, SinkExt, StreamExt, future::BoxFuture, stream::SplitSink};
+use serde_json::Value;
+use tokio::time::Instant;
+use tokio_tungstenite::tungstenite::{
+    Message,
+    protocol::{
+        CloseFrame,
+        frame::{
+            Frame,
+            coding::{Data, OpCode},
+        },
+    },
+};
+
+use super::{ClientSocket, UpstreamSocket};
+use crate::{
+    accounts::Provider::Codex,
+    guard::{InflightBudget, Reservation},
+    observability::{Observability, safe_error_code, safe_identifier},
+    relay::ledger::Completion,
+    session::Session,
+};
+
+const PARSE_LIMIT: usize = 1024 * 1024;
+const TYPE_LIMIT: usize = 100;
+const UPSTREAM_READ_TIMEOUT: Duration = Duration::from_secs(600);
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+
+pub(super) struct Context {
+    pub budget: Arc<InflightBudget>,
+    pub observability: Arc<Observability>,
+    pub account: String,
+    pub session: Session,
+    pub headers: HeaderMap,
+    pub idle_close: Duration,
+    pub close_after_response: bool,
+    pub capture_ticket: Option<PathBuf>,
+    pub connection: String,
+}
+
+pub(in crate::relay) struct CurrentCompletion {
+    completion: Completion,
+    committed: bool,
+    first_message: bool,
+}
+
+impl CurrentCompletion {
+    fn new(context: &Context) -> Self {
+        let mut completion = Completion::new(
+            context.observability.clone(),
+            &Method::GET,
+            "/v1/responses",
+            Codex,
+            &context.headers,
+        );
+        completion.session(&context.session);
+        completion.record.transport = "ws".into();
+        completion.record.account = Some(context.account.clone());
+        completion.record.status = 101;
+        completion.record.upstream_status = Some(101);
+        completion.record.attempts = 1;
+        Self {
+            completion,
+            committed: false,
+            first_message: true,
+        }
+    }
+
+    fn upstream(&mut self, event: Option<&Value>) -> Option<&'static str> {
+        if self.first_message {
+            self.completion.record.ttfb_ms = self.completion.elapsed_ms();
+            self.first_message = false;
+        }
+        let kind = event
+            .and_then(|value| value.get("type"))
+            .and_then(Value::as_str);
+        let error = matches!(kind, Some("error" | "response.failed"));
+        if error {
+            self.completion.record.upstream_error_code = event.and_then(safe_error_code);
+            if let Some(status) = event
+                .and_then(|event| event.get("status"))
+                .and_then(Value::as_u64)
+                .filter(|status| (100..=599).contains(status))
+            {
+                self.completion.record.status = status as u16;
+                self.completion.record.upstream_status = Some(status as u16);
+            }
+            // M4에서 이 지점의 pre-commit 오류를 계정 전환과 1012 종료로 바꾼다.
+            if !self.committed { /* M3는 원본 오류를 그대로 전달한다. */ }
+        } else {
+            self.committed = true;
+        }
+        match kind {
+            Some("response.completed" | "response.done") => Some("ok"),
+            Some("error" | "response.failed") => Some("upstream_error"),
+            _ => None,
+        }
+    }
+}
+
+fn parsed(text: &str) -> Option<Value> {
+    (text.len() <= PARSE_LIMIT)
+        .then(|| serde_json::from_str(text).ok())
+        .flatten()
+}
+
+fn response_create(text: &str) -> bool {
+    if text.len() <= PARSE_LIMIT {
+        return parsed(text).is_some_and(|value| value["type"] == "response.create");
+    }
+    // 큰 입력은 Codex의 선두 type 필드만 검사하고 입력 본문을 파싱하지 않는다.
+    let prefix = &text.as_bytes()[..text.len().min(256)];
+    let mut remaining = prefix;
+    for token in [b"{".as_slice(), b"\"type\"", b":", b"\"response.create\""] {
+        remaining = remaining.trim_ascii_start();
+        let Some(rest) = remaining.strip_prefix(token) else {
+            return false;
+        };
+        remaining = rest;
+    }
+    matches!(remaining.trim_ascii_start().first(), Some(b',' | b'}'))
+}
+
+fn count_type(counts: &mut BTreeMap<String, u64>, event: &Value) {
+    let Some(kind) = event
+        .get("type")
+        .and_then(Value::as_str)
+        .and_then(safe_identifier)
+    else {
+        return;
+    };
+    if let Some(count) = counts.get_mut(&kind) {
+        *count = count.saturating_add(1);
+    } else if counts.len() < TYPE_LIMIT {
+        counts.insert(kind, 1);
+    }
+}
+
+struct Delivered {
+    bytes: usize,
+    terminal: Option<&'static str>,
+    completed: bool,
+}
+
+type Write<S> = BoxFuture<'static, (S, bool, Delivered)>;
+
+fn write<S>(
+    mut sink: S,
+    message: Message,
+    reservation: Reservation,
+    delivered: Delivered,
+) -> Write<S>
+where
+    S: Sink<Message> + Send + Unpin + 'static,
+    S::Error: Send,
+{
+    Box::pin(async move {
+        let fragment = message.len() > PARSE_LIMIT
+            && matches!(&message, Message::Text(_) | Message::Binary(_));
+        let success = if fragment {
+            let kind = if matches!(&message, Message::Text(_)) {
+                Data::Text
+            } else {
+                Data::Binary
+            };
+            let bytes = message.into_data();
+            let mut success = true;
+            for start in (0..bytes.len()).step_by(64 * 1024) {
+                let end = (start + 64 * 1024).min(bytes.len());
+                let opcode = OpCode::Data(if start == 0 { kind } else { Data::Continue });
+                if sink
+                    .send(Message::Frame(Frame::message(
+                        bytes.slice(start..end),
+                        opcode,
+                        end == bytes.len(),
+                    )))
+                    .await
+                    .is_err()
+                {
+                    success = false;
+                    break;
+                }
+                // 각 프레임 사이에 읽기와 자동 pong이 실행될 기회를 준다.
+                tokio::task::yield_now().await;
+            }
+            success
+        } else {
+            sink.send(message).await.is_ok()
+        };
+        // flush가 끝나기 전에는 예산을 반환하지 않는다.
+        drop(reservation);
+        (sink, success, delivered)
+    })
+}
+
+fn flush<S, M>(mut sink: S) -> Write<S>
+where
+    S: Sink<M> + Send + Unpin + 'static,
+    S::Error: Send,
+{
+    Box::pin(async move {
+        let success = sink.flush().await.is_ok();
+        (
+            sink,
+            success,
+            Delivered {
+                bytes: 0,
+                terminal: None,
+                completed: false,
+            },
+        )
+    })
+}
+
+pub(super) async fn run(client: ClientSocket, upstream: UpstreamSocket, context: Context) {
+    run_with_read_timeout(client, upstream, context, UPSTREAM_READ_TIMEOUT).await;
+}
+
+async fn run_with_read_timeout(
+    client: ClientSocket,
+    upstream: UpstreamSocket,
+    context: Context,
+    upstream_read_timeout: Duration,
+) {
+    let (client_sink, mut client_read) = client.split();
+    let (upstream_sink, mut upstream_read) = upstream.split();
+    let mut client_sink = Some(client_sink);
+    let mut upstream_sink = Some(upstream_sink);
+    let mut to_client: Option<Write<SplitSink<ClientSocket, Message>>> = None;
+    let mut to_upstream: Option<Write<SplitSink<UpstreamSocket, Message>>> = None;
+    let mut current: Option<CurrentCompletion> = None;
+    let mut client_admitted = false;
+    let mut terminal_pending = false;
+    let mut counts = BTreeMap::new();
+    let mut last_activity = Instant::now();
+    let mut upstream_activity = last_activity;
+    let mut ending: Option<(Option<CloseFrame>, &'static str)> = None;
+    let mut end_deadline = last_activity;
+    context.observability.record_ws_connection(
+        &context.connection,
+        &context.account,
+        "ws_open",
+        None,
+        "open",
+    );
+
+    loop {
+        if ending.is_some() && to_client.is_none() && to_upstream.is_none() {
+            break;
+        }
+        // 각 방향은 메시지 하나만 보유한다. split 잠금은 poll 사이에 해제되어
+        // 큰 쓰기가 진행되는 동안 같은 소켓의 읽기와 자동 pong을 poll할 수 있다.
+        tokio::select! {
+            result = async { to_client.as_mut().unwrap().await }, if to_client.is_some() => {
+                let (sink, success, delivered) = result;
+                client_sink = Some(sink);
+                to_client = None;
+                if success {
+                    last_activity = Instant::now();
+                    if let Some(active) = current.as_mut() {
+                        active.completion.record.bytes_out = active.completion.record.bytes_out.saturating_add(delivered.bytes as u64);
+                    }
+                    if let Some(outcome) = delivered.terminal {
+                        terminal_pending = false;
+                        if let Some(active) = current.take() { active.completion.finish(outcome); }
+                        if context.close_after_response && delivered.completed && ending.is_none() {
+                            ending = Some((Some(CloseFrame { code: 1000.into(), reason: "".into() }), "response_complete"));
+                            end_deadline = Instant::now() + CLOSE_TIMEOUT;
+                        }
+                    }
+                } else if ending.is_none() {
+                    ending = Some((None, "client_write_error"));
+                    end_deadline = Instant::now() + CLOSE_TIMEOUT;
+                }
+            }
+            result = async { to_upstream.as_mut().unwrap().await }, if to_upstream.is_some() => {
+                let (sink, success, _) = result;
+                upstream_sink = Some(sink);
+                to_upstream = None;
+                if success { last_activity = Instant::now(); }
+                if !success && ending.is_none() {
+                    if let Some(active) = current.as_mut() { active.completion.record.outcome = "upstream_error".into(); }
+                    ending = Some((None, "upstream_write_error"));
+                    end_deadline = Instant::now() + CLOSE_TIMEOUT;
+                }
+            }
+            _ = context.budget.wait_available(), if !client_admitted && to_upstream.is_none() && ending.is_none() => {
+                client_admitted = true;
+            }
+            message = client_read.next(), if client_admitted && to_upstream.is_none() && ending.is_none() && !terminal_pending => {
+                client_admitted = false;
+                last_activity = Instant::now();
+                match message {
+                    Some(Ok(message)) => {
+                        if let Message::Text(text) = &message && response_create(text.as_str()) {
+                            current = Some(CurrentCompletion::new(&context));
+                        }
+                        let bytes = message.len();
+                        // 라이브러리가 예약한 로컬 pong을 반대쪽 전달 완료와 독립적으로 flush한다.
+                        if matches!(&message, Message::Ping(_)) && to_client.is_none() {
+                            to_client = Some(flush(client_sink.take().unwrap()));
+                        }
+                        if let Some(active) = current.as_mut() { active.completion.input_bytes.fetch_add(bytes as u64, Ordering::Relaxed); }
+                        if let Message::Close(frame) = &message {
+                            ending = Some((frame.clone(), "client_close"));
+                            end_deadline = Instant::now() + CLOSE_TIMEOUT;
+                        }
+                        to_upstream = Some(write(upstream_sink.take().unwrap(), message, context.budget.reserve_message(bytes), Delivered { bytes, terminal: None, completed: false }));
+                    }
+                    _ => { ending = Some((None, "client_eof")); end_deadline = Instant::now() + CLOSE_TIMEOUT; }
+                }
+            }
+            message = upstream_read.next(), if to_client.is_none() && ending.is_none() => {
+                last_activity = Instant::now();
+                upstream_activity = last_activity;
+                match message {
+                    Some(Ok(message)) => {
+                        let bytes = message.len();
+                        if matches!(&message, Message::Ping(_)) && to_upstream.is_none() {
+                            to_upstream = Some(flush(upstream_sink.take().unwrap()));
+                        }
+                        let event = if let Message::Text(text) = &message { parsed(text.as_str()) } else { None };
+                        if let Some(event) = event.as_ref() {
+                            context.observability.observe_codex_event(&context.account, event);
+                            count_type(&mut counts, event);
+                        }
+                        let terminal = current.as_mut().and_then(|active| active.upstream(event.as_ref()));
+                        terminal_pending = terminal.is_some();
+                        let completed = event.as_ref().is_some_and(|event| event["type"] == "response.completed");
+                        if let Message::Close(frame) = &message {
+                            ending = Some((frame.clone(), "upstream_close"));
+                            end_deadline = Instant::now() + CLOSE_TIMEOUT;
+                        }
+                        to_client = Some(write(client_sink.take().unwrap(), message, context.budget.reserve_message(bytes), Delivered { bytes, terminal, completed }));
+                    }
+                    _ => {
+                        if let Some(active) = current.as_mut() { active.completion.record.outcome = "upstream_error".into(); }
+                        ending = Some((None, "upstream_eof")); end_deadline = Instant::now() + CLOSE_TIMEOUT;
+                    }
+                }
+            }
+            _ = tokio::time::sleep_until(last_activity + context.idle_close), if ending.is_none() && to_client.is_none() && to_upstream.is_none() => {
+                ending = Some((Some(CloseFrame { code: 1000.into(), reason: "".into() }), "idle_close"));
+                end_deadline = Instant::now() + CLOSE_TIMEOUT;
+            }
+            _ = tokio::time::sleep_until(upstream_activity + upstream_read_timeout), if ending.is_none() => {
+                if let Some(active) = current.as_mut() { active.completion.record.outcome = "upstream_error".into(); }
+                ending = Some((Some(CloseFrame { code: 1001.into(), reason: "".into() }), "upstream_read_timeout"));
+                end_deadline = Instant::now() + CLOSE_TIMEOUT;
+            }
+            _ = tokio::time::sleep_until(end_deadline), if ending.is_some() => { break; }
+        }
+    }
+    let (frame, reason) = ending.unwrap_or((None, "closed"));
+    let code = frame.as_ref().map(|frame| frame.code.into());
+    // 종료 handshake도 느린 상대 때문에 무기한 소켓을 붙잡지 않는다.
+    let close_client = async {
+        if let Some(mut sink) = client_sink {
+            if reason == "client_close" {
+                let _ = sink.flush().await;
+            } else {
+                let _ = sink.send(Message::Close(frame.clone())).await;
+            }
+        }
+    };
+    let close_upstream = async {
+        if let Some(mut sink) = upstream_sink {
+            if reason == "upstream_close" {
+                let _ = sink.flush().await;
+            } else {
+                let _ = sink.send(Message::Close(frame.clone())).await;
+            }
+        }
+    };
+    let _ = tokio::time::timeout(CLOSE_TIMEOUT, async {
+        tokio::join!(close_client, close_upstream);
+    })
+    .await;
+    drop(current);
+    context
+        .observability
+        .capture_ws_types(context.capture_ticket.as_deref(), &counts);
+    context.observability.record_ws_connection(
+        &context.connection,
+        &context.account,
+        "ws_close",
+        code,
+        reason,
+    );
+}
+
+#[cfg(test)]
+mod tests;
