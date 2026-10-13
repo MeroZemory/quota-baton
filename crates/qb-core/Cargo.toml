@@ -25,6 +25,9 @@ sha2.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-tungstenite.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 toml.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
@@ -46,4 +49,8 @@ phase0 = []
 
 [[test]]
 name = "m2"
+required-features = ["testkit"]
+
+[[test]]
+name = "m3"
 required-features = ["testkit"]
