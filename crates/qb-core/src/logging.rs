@@ -8,6 +8,7 @@ use std::{
 use tracing::field::{Field, Visit};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{
+    Layer,
     field::RecordFields,
     fmt::{
         FormattedFields,
@@ -99,13 +100,25 @@ pub fn init(home: &Path) -> anyhow::Result<WorkerGuard> {
     let file = tracing_subscriber::fmt::layer()
         .with_ansi(false)
         .fmt_fields(RedactingFields)
-        .with_writer(writer);
+        .with_writer(writer)
+        .with_filter(log_filter());
     let stderr = tracing_subscriber::fmt::layer()
         .with_ansi(false)
         .fmt_fields(RedactingFields)
-        .with_writer(io::stderr);
+        .with_writer(io::stderr)
+        .with_filter(log_filter());
     install(file, stderr)?;
     Ok(guard)
+}
+
+fn log_filter() -> tracing_subscriber::EnvFilter {
+    let directive = std::env::var("QB_LOG")
+        .ok()
+        .or_else(|| std::env::var("RUST_LOG").ok())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "info".into());
+    tracing_subscriber::EnvFilter::try_new(directive)
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
 }
 
 fn install<F, E>(file: F, stderr: E) -> anyhow::Result<()>
