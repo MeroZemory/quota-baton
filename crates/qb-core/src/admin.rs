@@ -150,15 +150,13 @@ pub fn runtime_routes(relay: Arc<crate::relay::RelayState>, data_port: u16) -> R
 
 async fn runtime_state(State(state): State<RuntimeAdmin>) -> Response {
     state.relay.quota.mark_tray_open();
-    match state.relay.accounts.views().await {
-        Ok(mut accounts) => {
-            for account in &mut accounts {
-                if let Some(id) = account["id"].as_str().map(str::to_owned) {
-                    let (count, last_used) = state.relay.bindings.account_stats(&id);
-                    account["bound_sessions"] = serde_json::json!(count);
-                    account["last_used_at"] = serde_json::json!(last_used);
-                }
-            }
+    match state
+        .relay
+        .accounts
+        .views_with_bindings(&state.relay.bindings)
+        .await
+    {
+        Ok(accounts) => {
             Json(serde_json::json!({
             "accounts": accounts,
             "inflight": {
@@ -248,14 +246,14 @@ async fn account_action(
 async fn refresh_usage(state: RuntimeAdmin, id: String) -> Response {
     use crate::quota::PollError;
     match state.relay.quota.poll(&id).await {
-        Ok(_) => match state.relay.accounts.views().await {
+        Ok(_) => match state
+            .relay
+            .accounts
+            .views_with_bindings(&state.relay.bindings)
+            .await
+        {
             Ok(views) => match views.into_iter().find(|view| view["id"] == id) {
-                Some(mut view) => {
-                    let (count, last) = state.relay.bindings.account_stats(&id);
-                    view["bound_sessions"] = serde_json::json!(count);
-                    view["last_used_at"] = serde_json::json!(last);
-                    Json(view).into_response()
-                }
+                Some(view) => Json(view).into_response(),
                 None => error(StatusCode::NOT_FOUND, "Account not found"),
             },
             Err(()) => error(StatusCode::INTERNAL_SERVER_ERROR, "Account state unavailable"),

@@ -6,7 +6,11 @@ use std::{
 };
 
 use axum::http::{HeaderMap, Method};
-use futures_util::{Sink, SinkExt, StreamExt, future::BoxFuture, stream::SplitSink};
+use futures_util::{
+    Sink, SinkExt, StreamExt,
+    future::BoxFuture,
+    stream::{SplitSink, SplitStream},
+};
 use serde_json::Value;
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::{
@@ -43,6 +47,7 @@ pub(super) struct Context {
     pub account: String,
     pub session: Session,
     pub headers: HeaderMap,
+    pub upstream_url: String,
     pub idle_close: Duration,
     pub close_after_response: bool,
     pub capture_ticket: Option<PathBuf>,
@@ -55,6 +60,8 @@ pub(in crate::relay) struct CurrentCompletion {
     first_message: bool,
     model: Option<String>,
     response_id: Option<String>,
+    last_create: Option<Message>,
+    rate_retries: u32,
 }
 
 impl CurrentCompletion {
@@ -91,6 +98,8 @@ impl CurrentCompletion {
             first_message: true,
             model: None,
             response_id: None,
+            last_create: None,
+            rate_retries: 0,
         }
     }
 
@@ -366,11 +375,40 @@ fn count_type(counts: &mut BTreeMap<String, u64>, event: &Value) {
     }
 }
 
+fn ws_rate_advice(event: &Value) -> bool {
+    event
+        .get("headers")
+        .or_else(|| event.get("error").and_then(|error| error.get("headers")))
+        .and_then(Value::as_object)
+        .is_some_and(|headers| {
+            headers
+                .keys()
+                .any(|key| key.eq_ignore_ascii_case("retry-after"))
+        })
+}
+
+fn has_previous_response_id(message: &Message) -> bool {
+    let Message::Text(text) = message else {
+        return false;
+    };
+    if text.len() <= PARSE_LIMIT {
+        return parsed(text)
+            .and_then(|value| value.get("previous_response_id").cloned())
+            .is_some_and(|value| !value.is_null());
+    }
+    text[..text.len().min(PARSE_LIMIT)].contains("\"previous_response_id\"")
+}
+
 struct Delivered {
     bytes: usize,
     request: Option<u64>,
     terminal: Option<&'static str>,
     completed: bool,
+}
+
+struct PendingRateResend {
+    request: u64,
+    message: Message,
 }
 
 type Write<S> = BoxFuture<'static, (S, bool, Delivered)>;
@@ -444,6 +482,33 @@ where
     })
 }
 
+async fn redial_rate(
+    context: &Context,
+    pending: PendingRateResend,
+    upstream_read: &mut SplitStream<UpstreamSocket>,
+    budget: Arc<InflightBudget>,
+) -> Result<Write<SplitSink<UpstreamSocket, Message>>, ()> {
+    if let Some(runtime) = &context.runtime {
+        let _admission = runtime.admit(&context.account).await;
+    }
+    let socket = super::redial_same_account(context).await?;
+    let (sink, read) = socket.split();
+    *upstream_read = read;
+    let bytes = pending.message.len();
+    let reservation = budget.reserve_message(bytes);
+    Ok(write(
+        sink,
+        pending.message,
+        reservation,
+        Delivered {
+            bytes,
+            request: Some(pending.request),
+            terminal: None,
+            completed: false,
+        },
+    ))
+}
+
 pub(super) async fn run(client: ClientSocket, upstream: UpstreamSocket, context: Context) {
     run_with_read_timeout(client, upstream, context, UPSTREAM_READ_TIMEOUT).await;
 }
@@ -460,6 +525,7 @@ async fn run_with_read_timeout(
     let mut upstream_sink = Some(upstream_sink);
     let mut to_client: Option<Write<SplitSink<ClientSocket, Message>>> = None;
     let mut to_upstream: Option<Write<SplitSink<UpstreamSocket, Message>>> = None;
+    let mut pending_rate_redial: Option<PendingRateResend> = None;
     let mut current = BTreeMap::<u64, CurrentCompletion>::new();
     let mut next_request = 0;
     let mut model: Option<String> = None;
@@ -536,7 +602,20 @@ async fn run_with_read_timeout(
                 upstream_sink = Some(sink);
                 to_upstream = None;
                 if success { last_activity = Instant::now(); }
-                if !success && ending.is_none() {
+                if success {
+                    pending_rate_redial = None;
+                } else if ending.is_none()
+                    && let Some(pending) = pending_rate_redial.take()
+                    && !has_previous_response_id(&pending.message)
+                {
+                    match redial_rate(&context, pending, &mut upstream_read, context.budget.clone()).await {
+                        Ok(write) => to_upstream = Some(write),
+                        Err(()) => {
+                            ending = Some((None, "upstream_write_error"));
+                            end_deadline = Instant::now() + CLOSE_TIMEOUT;
+                        }
+                    }
+                } else if !success && ending.is_none() {
                     for active in current.values_mut() { active.completion.record.outcome = "upstream_error".into(); }
                     ending = Some((None, "upstream_write_error"));
                     end_deadline = Instant::now() + CLOSE_TIMEOUT;
@@ -563,6 +642,9 @@ async fn run_with_read_timeout(
                             active.completion.record.model = model.clone();
                             request = Some(next_request);
                             current.insert(next_request, active);
+                            if let Some(active) = current.get_mut(&next_request) {
+                                active.last_create = Some(message.clone());
+                            }
                             next_request += 1;
                         }
                         let bytes = message.len();
@@ -591,6 +673,7 @@ async fn run_with_read_timeout(
                         }
                         let event = if let Message::Text(text) = &message { parsed(text.as_str()) } else { None };
                         let request = response_completion(&mut current, event.as_ref());
+                        let mut suppress_rate_event = false;
                         if let Some(event) = event.as_ref() {
                             if let Some(runtime) = &context.runtime {
                                 let active_model = request.and_then(|id| current.get(&id)).and_then(|active| active.model.as_deref());
@@ -611,12 +694,13 @@ async fn run_with_read_timeout(
                                 };
                                 // Row 13a excludes row 3 rate limits and requires a current request.
                                 if current.len() == 1 && request.and_then(|id| current.get(&id)).is_some_and(|active| !active.committed)
-                                    && let Some(decision) = decision
-                                    && decision.failover() && decision.kind != crate::relay::outcome::Kind::Rate
+                                    && decision.as_ref().is_some_and(|decision| decision.failover() && decision.kind != crate::relay::outcome::Kind::Rate)
                                     && reconnect_available(&context).await.unwrap_or(false) {
                                     if let Some(mut active) = request.and_then(|id| current.remove(&id)) {
                                         active.upstream(Some(event));
-                                        active.completion.failover(decision.reason());
+                                        active
+                                            .completion
+                                            .failover(decision.as_ref().expect("decision").reason());
                                         active.completion.finish("failover");
                                     }
                                     ending = Some((Some(CloseFrame { code: 1012.into(), reason: "".into() }), "precommit_failover"));
@@ -624,8 +708,83 @@ async fn run_with_read_timeout(
                                     // C6 row 13a suppresses this pre-commit error.
                                     continue;
                                 }
+                                if current.len() == 1
+                                    && request.and_then(|id| current.get(&id)).is_some_and(|active| !active.committed)
+                                    && decision.as_ref().is_some_and(|decision| decision.kind == crate::relay::outcome::Kind::Rate)
+                                    && !ws_rate_advice(event)
+                                {
+                                    let resend = request
+                                        .and_then(|id| current.get_mut(&id))
+                                        .and_then(|active| {
+                                            if active.rate_retries >= 3 {
+                                                active.completion.relayed_rate_429();
+                                                active.completion.record.outcome = "rate_hold_relayed_429".into();
+                                                None
+                                            } else {
+                                                active.rate_retries += 1;
+                                                active.completion.rate_retry();
+                                                active.last_create.clone()
+                                            }
+                                        });
+                                    if let Some(message) = resend
+                                        && let Some(sink) = upstream_sink.take()
+                                    {
+                                        pending_rate_redial = Some(PendingRateResend {
+                                            request: request.expect("active rate request"),
+                                            message: message.clone(),
+                                        });
+                                        let runtime = context.runtime.clone();
+                                        let account = context.account.clone();
+                                        let budget = context.budget.clone();
+                                        let bytes = message.len();
+                                        let reservation = budget.reserve_message(bytes);
+                                        to_upstream = Some(Box::pin(async move {
+                                            tokio::time::sleep(Duration::from_secs(1)).await;
+                                            if let Some(runtime) = runtime {
+                                                let _ = runtime.admit(&account).await;
+                                            }
+                                            write(
+                                                sink,
+                                                message,
+                                                reservation,
+                                                Delivered { bytes, request, terminal: None, completed: false },
+                                            )
+                                            .await
+                                        }));
+                                        suppress_rate_event = true;
+                                    } else {
+                                        ending = Some((Some(CloseFrame { code: 1012.into(), reason: "".into() }), "rate_hold"));
+                                        end_deadline = Instant::now() + CLOSE_TIMEOUT;
+                                        suppress_rate_event = true;
+                                    }
+                                }
                             }
-                            count_type(&mut counts, event);
+                            if !suppress_rate_event {
+                                count_type(&mut counts, event);
+                            }
+                        }
+                        if suppress_rate_event {
+                            continue;
+                        }
+                        if let Message::Close(frame) = &message
+                            && let Some(pending) = pending_rate_redial.take()
+                        {
+                            to_upstream = None;
+                            if !has_previous_response_id(&pending.message)
+                                && let Ok(write) = redial_rate(
+                                    &context,
+                                    pending,
+                                    &mut upstream_read,
+                                    context.budget.clone(),
+                                )
+                                .await
+                            {
+                                to_upstream = Some(write);
+                                continue;
+                            }
+                            ending = Some((frame.clone(), "upstream_close"));
+                            end_deadline = Instant::now() + CLOSE_TIMEOUT;
+                            continue;
                         }
                         let terminal = request.and_then(|id| current.get_mut(&id)).and_then(|active| active.upstream(event.as_ref()));
                         terminal_pending = terminal.is_some();
@@ -637,6 +796,22 @@ async fn run_with_read_timeout(
                         to_client = Some(write(client_sink.take().unwrap(), message, context.budget.reserve_message(bytes), Delivered { bytes, request, terminal, completed }));
                     }
                     _ => {
+                        if let Some(pending) = pending_rate_redial.take()
+                            && !has_previous_response_id(&pending.message)
+                        {
+                            to_upstream = None;
+                            if let Ok(write) = redial_rate(
+                                &context,
+                                pending,
+                                &mut upstream_read,
+                                context.budget.clone(),
+                            )
+                            .await
+                            {
+                                to_upstream = Some(write);
+                                continue;
+                            }
+                        }
                         for active in current.values_mut() { active.completion.record.outcome = "upstream_error".into(); }
                         ending = Some((None, "upstream_eof")); end_deadline = Instant::now() + CLOSE_TIMEOUT;
                     }

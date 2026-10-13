@@ -78,6 +78,12 @@ pub struct RequestRecord {
     pub bytes_in: u64,
     pub bytes_out: u64,
     pub attempts: u32,
+    #[serde(default)]
+    pub rate_wait_ms: u64,
+    #[serde(default)]
+    pub rate_retries: u32,
+    #[serde(default)]
+    pub relayed_rate_429s: u32,
     pub outcome: String,
     #[serde(default)]
     pub retained_copy: bool,
@@ -1156,6 +1162,9 @@ mod tests {
             bytes_in: 3,
             bytes_out: 4,
             attempts: 1,
+            rate_wait_ms: 0,
+            rate_retries: 0,
+            relayed_rate_429s: 0,
             outcome: "ok".into(),
             retained_copy: true,
             upstream_error_code: None,

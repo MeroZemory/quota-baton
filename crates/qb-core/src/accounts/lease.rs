@@ -1,17 +1,15 @@
 use super::StoreError;
 use fs2::FileExt;
+use sha2::{Digest, Sha256};
 use std::{
     fs::OpenOptions,
-    path::Path,
+    path::{Path, PathBuf},
     sync::mpsc,
     thread::{self, JoinHandle},
 };
-use windows::{
-    Win32::{
-        Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT},
-        System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject},
-    },
-    core::w,
+use windows::Win32::{
+    Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT},
+    System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject},
 };
 
 pub(super) struct Lease {
@@ -32,12 +30,14 @@ impl Lease {
         FileExt::try_lock_exclusive(&lock).map_err(|_| StoreError::LeaseBusy)?;
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (release, release_rx) = mpsc::channel();
+        let mutex_name = mutex_name(dir);
         // Windows mutex는 획득한 스레드에서만 해제할 수 있다.
         let thread = thread::Builder::new()
             .name("credential-lease".into())
             .spawn(move || {
-                let result =
-                    unsafe { CreateMutexW(None, false, w!("Local\\quota-baton-credentials")) };
+                let result = unsafe {
+                    CreateMutexW(None, false, windows::core::PCWSTR(mutex_name.as_ptr()))
+                };
                 let handle = match result {
                     Ok(handle) => handle,
                     Err(_) => {
@@ -81,6 +81,24 @@ impl Lease {
             }
         }
     }
+}
+
+fn mutex_name(accounts_dir: &Path) -> Vec<u16> {
+    let home = accounts_dir
+        .parent()
+        .unwrap_or(accounts_dir)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(accounts_dir));
+    let normalized = home.to_string_lossy().to_lowercase();
+    let digest = Sha256::digest(normalized.as_bytes());
+    let suffix: String = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("Local\\quota-baton-credentials-{suffix}")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 impl Drop for Lease {
