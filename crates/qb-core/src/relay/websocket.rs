@@ -192,7 +192,15 @@ async fn upgrade_inner(
         // Row 5 and row 11 have independent same-account retry budgets.
         let mut network_retry = false;
         let mut token_retry = false;
+        let mut rate_retries = 0_u32;
+        let upgrade_started = std::time::Instant::now();
         loop {
+            let _admission = tokio::time::timeout(
+                Duration::from_secs(state.ws_upgrade_hold_secs),
+                state.accounts.admit(&account.id),
+            )
+            .await
+            .ok();
             let mut forwarded =
                 match headers::upstream(&parts.headers, &account, &tokens.access_token) {
                     Ok(headers) => headers,
@@ -303,6 +311,30 @@ async fn upgrade_inner(
             {
                 decision.kind = super::outcome::Kind::Auth;
                 decision.signal = None;
+            }
+            if decision.kind == super::outcome::Kind::Rate {
+                let retry_after = error
+                    .headers
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .map(|s| Duration::from_secs(s.min(60)));
+                state.accounts.observe_429(&account.id, retry_after);
+                if rate_retries < state.rate_hold_max_retries
+                    && upgrade_started.elapsed() < Duration::from_secs(state.ws_upgrade_hold_secs)
+                {
+                    rate_retries += 1;
+                    completion.rate_retry();
+                    continue;
+                }
+                completion.relayed_rate_429();
+                let mut response = error.into_response();
+                if !response.headers().contains_key("retry-after") {
+                    response
+                        .headers_mut()
+                        .insert("retry-after", HeaderValue::from_static("1"));
+                }
+                return response;
             }
             let failover = decision.failover();
             let reason = decision.reason();

@@ -24,7 +24,7 @@ pub(super) struct Decision {
 }
 impl Decision {
     pub fn failover(&self) -> bool {
-        self.kind != Kind::Relay
+        !matches!(self.kind, Kind::Relay | Kind::Rate)
     }
     pub fn reason(&self) -> &'static str {
         match self.kind {
@@ -107,12 +107,25 @@ pub(super) fn classify(
         && (event["type"] == "error"
             || event["type"] == "response.failed"
             || root.get("error").is_some());
+    // A bounded handshake body can end before its closing braces. Preserve an
+    // explicit Codex quota marker found in that prefix; treating it as a
+    // generic rate limit would incorrectly retry a cached limit response.
+    let truncated_codex_quota = provider == Provider::Codex
+        && (decoded
+            .windows(b"\"type\":\"usage_limit_reached\"".len())
+            .any(|window| window == b"\"type\":\"usage_limit_reached\"")
+            || decoded
+                .windows(b"\"type\": \"usage_limit_reached\"".len())
+                .any(|window| window == b"\"type\": \"usage_limit_reached\"")
+            || decoded
+                .windows(b"\"code\":\"usage_limit_reached\"".len())
+                .any(|window| window == b"\"code\":\"usage_limit_reached\""));
     if kind == "usage_limit_reached"
         || code == "usage_limit_reached"
+        || truncated_codex_quota
         || (has("x-codex-limit-reached", "true")
             && (effective == StatusCode::TOO_MANY_REQUESTS || error_event))
-        || (effective == StatusCode::TOO_MANY_REQUESTS
-            && (provider == Provider::Codex || claude_limit))
+        || (effective == StatusCode::TOO_MANY_REQUESTS && claude_limit)
     {
         decision.kind = Kind::Quota;
         let mut scope = "account".to_owned();
@@ -206,17 +219,14 @@ pub(super) fn classify(
                 now + Duration::seconds(header_seconds(headers, "retry-after").unwrap_or(300)),
             );
         decision.signal = cooling(HealthReason::Quota, until, scope);
-    } else if effective == StatusCode::TOO_MANY_REQUESTS
-        && header_seconds(headers, "retry-after").is_some_and(|s| s > 10)
+    } else if !matches!(
+        code,
+        "websocket_connection_limit_reached" | "previous_response_not_found"
+    ) && (effective == StatusCode::TOO_MANY_REQUESTS
+        || matches!(code, "rate_limit_exceeded" | "slow_down")
+        || kind == "rate_limit_error")
     {
         decision.kind = Kind::Rate;
-        decision.signal = cooling(
-            HealthReason::Rate,
-            now + Duration::seconds(header_seconds(headers, "retry-after").unwrap()),
-            model
-                .map(|m| format!("model:{m}"))
-                .unwrap_or("account".into()),
-        );
     } else if effective == StatusCode::UNAUTHORIZED
         || (effective.is_success() && kind == "authentication_error")
     {
@@ -324,4 +334,28 @@ pub(super) fn error_value(raw: &[u8]) -> Value {
         }
     }
     Value::Null
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_usage_limit_is_not_rate_for_complete_64k_body() {
+        let mut body =
+            serde_json::json!({"error":{"type":"usage_limit_reached","padding":""}}).to_string();
+        body = serde_json::json!({
+            "error": {"type": "usage_limit_reached", "padding": "x".repeat(65536 - body.len())}
+        })
+        .to_string();
+        assert_eq!(body.len(), 65536);
+        let decision = classify(
+            Provider::Codex,
+            StatusCode::TOO_MANY_REQUESTS,
+            &HeaderMap::new(),
+            body.as_bytes(),
+            None,
+        );
+        assert_eq!(decision.kind, Kind::Quota);
+    }
 }

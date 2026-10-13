@@ -222,28 +222,24 @@ async fn c6_row_2_usage_limit_fails_over_and_cools_before_selection() {
     assert!(change < finish);
 }
 #[tokio::test]
-async fn c6_row_3_only_long_rate_limit_fails_over() {
+async fn c6_row_3_rate_limit_retries_in_place_without_failover() {
     let h = Harness::new(Provider::Claude, 2, 384, 1024).await;
-    for (seconds, expected) in [(10, 429), (11, 200)] {
-        let mut r = ScriptedResponse::json(
-            StatusCode::TOO_MANY_REQUESTS,
-            "{\"error\":{\"type\":\"rate_limit_error\"}}",
-        );
-        r.headers
-            .insert("retry-after", seconds.to_string().parse().unwrap());
-        h.fake.state.push(r);
-        if expected == 200 {
-            h.fake.state.push(ok());
-        }
-        assert_eq!(h.send(Provider::Claude, "{}").await.status(), expected);
-    }
-    assert!(matches!(
-        h.store.load(&h.ids()[0]).unwrap().health,
-        Health::Cooling {
-            reason: HealthReason::Rate,
-            ..
-        }
-    ));
+    let mut r = ScriptedResponse::json(
+        StatusCode::TOO_MANY_REQUESTS,
+        "{\"error\":{\"type\":\"rate_limit_error\"}}",
+    );
+    r.headers.insert("retry-after", "1".parse().unwrap());
+    h.fake.state.push(r);
+    h.fake.state.push(ok());
+    let response = h.send(Provider::Claude, "{}").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(h.fake.state.requests().len(), 2);
+    let row = h
+        .ledger()
+        .into_iter()
+        .find(|row| row["rate_retries"] == 1)
+        .expect("in-place retry is ledgered");
+    assert_eq!(row["outcome"], "rate_hold_ok");
 }
 #[tokio::test]
 async fn c6_row_4_linked_revocation_cools_link_stale_and_fails_over() {

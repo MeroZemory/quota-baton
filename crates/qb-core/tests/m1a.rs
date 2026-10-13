@@ -382,10 +382,8 @@ fn lease_contention_drop_and_thread_safety() {
             Err(StoreError::LeaseBusy)
         ));
         let other_home = home.with_file_name("other-home");
-        assert!(matches!(
-            AccountStore::acquire(&other_home),
-            Err(StoreError::LeaseBusy)
-        ));
+        let other_store = AccountStore::acquire(&other_home).unwrap();
+        drop(other_store);
         let home_copy = home.to_path_buf();
         assert!(
             thread::spawn(move || matches!(

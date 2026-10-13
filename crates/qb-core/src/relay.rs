@@ -52,6 +52,9 @@ pub struct RelayState {
     pub quota: Arc<crate::quota::UsagePoller>,
     pub bindings: Arc<crate::bindings::BindingTable>,
     reset_hold_secs: u64,
+    rate_hold_secs: u64,
+    rate_hold_max_retries: u32,
+    ws_upgrade_hold_secs: u64,
     pub inflight_requests: Arc<AtomicU64>,
     store: Arc<AccountStore>,
     client: reqwest::Client,
@@ -137,6 +140,7 @@ impl RelayState {
             observability.clone(),
             config.routing.inflight_allowance_pct,
         );
+        accounts.set_rate_hold_secs(config.routing.rate_hold_secs);
         let tokens = TokenGates::new(client.clone(), accounts.clone());
         let quota = crate::quota::UsagePoller::new(
             store.clone(),
@@ -155,6 +159,9 @@ impl RelayState {
             quota,
             bindings,
             reset_hold_secs: config.routing.reset_hold_secs,
+            rate_hold_secs: config.routing.rate_hold_secs,
+            rate_hold_max_retries: config.routing.rate_hold_max_retries,
+            ws_upgrade_hold_secs: config.routing.ws_upgrade_hold_secs,
             inflight_requests: Arc::new(AtomicU64::new(0)),
             store,
             client,
@@ -246,7 +253,7 @@ impl RelayState {
         &self,
         provider: Provider,
         key: Option<&str>,
-        _model: Option<&str>,
+        model: Option<&str>,
         tried: &BTreeSet<String>,
     ) -> Result<Vec<crate::bindings::Candidate>, ()> {
         let store = self.store.clone();
@@ -285,6 +292,18 @@ impl RelayState {
                 *account = updated;
             }
         }
+        let bound = self.bindings.current(key);
+        let has_non_pacing = accounts.iter().any(|account| {
+            account.provider == provider
+                && account.eligible(model)
+                && store
+                    .tokens(account)
+                    .is_ok_and(|tokens| !tokens.access_token.is_empty())
+                && {
+                    let pacing = self.accounts.pacing_snapshot(&account.id);
+                    pacing.rate_backoff_until.is_none() && pacing.waiting == 0
+                }
+        });
         let runtime = self.accounts.clone();
         let obs = self.observability.clone();
         tokio::task::spawn_blocking(move || {
@@ -295,6 +314,10 @@ impl RelayState {
                         && !tried.contains(&a.id)
                         && !runtime.probing(&a.id)
                         && !runtime.blocked_in_memory(&a.id)
+                        && (bound.as_deref() == Some(a.id.as_str()) || !has_non_pacing || {
+                            let pacing = runtime.pacing_snapshot(&a.id);
+                            pacing.rate_backoff_until.is_none() && pacing.waiting == 0
+                        })
                         && store.tokens(a).is_ok_and(|t| !t.access_token.is_empty())
                 })
                 .map(|account| {
@@ -838,6 +861,10 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
     let mut body_to_send = upload.into_body();
     let mut network_retry = false;
     let mut token_retry = false;
+    let mut rate_retries = 0_u32;
+    let rate_hold_started = Instant::now();
+    let mut rate_relay_retry_after = None;
+    let mut rate_relayed = false;
     let mut permission_denials = 0;
     let mut probe = state.claim_probe(&mut account).await;
     let (status, response_headers, held) = loop {
@@ -886,6 +913,9 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
             continue;
         }
         completion.record.account = Some(account.id.clone());
+        let admission_started = Instant::now();
+        let _admission = state.accounts.admit(&account.id).await;
+        completion.rate_wait(admission_started.elapsed().as_millis() as u64);
         let upstream_headers =
             match headers::upstream(&parts.headers, &account, &tokens.access_token) {
                 Ok(headers) => headers,
@@ -1088,6 +1118,44 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
                     }
                 }
             }
+        } else if decision.kind == outcome::Kind::Rate {
+            let retry_after = response_headers
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(|s| Duration::from_secs(s.min(60)));
+            let pacing = state.accounts.observe_429(&account.id, retry_after);
+            if retry_after.is_none() {
+                rate_relay_retry_after = pacing.rate_backoff_until.map(|until| {
+                    until
+                        .saturating_duration_since(Instant::now())
+                        .as_secs()
+                        .clamp(1, 60)
+                });
+            }
+            if let Some(copy) = retained.as_ref()
+                && rate_retries < state.rate_hold_max_retries
+                && rate_hold_started.elapsed() < Duration::from_secs(state.rate_hold_secs)
+            {
+                rate_retries += 1;
+                completion.rate_retry();
+                let delay = response_headers
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(1)
+                    .clamp(1, 60);
+                let remaining = Duration::from_secs(state.rate_hold_secs)
+                    .saturating_sub(rate_hold_started.elapsed());
+                let wait = Duration::from_secs(delay).min(remaining);
+                completion.rate_wait(wait.as_millis() as u64);
+                body_to_send = retry_body(copy.bytes());
+                tokio::time::sleep(wait).await;
+                continue;
+            }
+            rate_relayed = true;
+            completion.relayed_rate_429();
+            completion.outcome(status.as_u16(), "rate_hold_relayed_429");
         } else if let Some(signal) = decision.signal.take()
             && state
                 .accounts
@@ -1269,12 +1337,27 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
     completion.record.ttfb_ms = completion.elapsed_ms();
     let success_outcome = if decision == CommitDecision::FirstError {
         "first_event_error"
+    } else if rate_retries > 0 && status.is_success() {
+        "rate_hold_ok"
     } else if status.is_success() {
         "ok"
     } else {
         "upstream_status_error"
     };
     let mut output_headers = headers::filtered(&response_headers, false);
+    if rate_relayed && !output_headers.contains_key("retry-after") {
+        let seconds = response_headers
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .or(rate_relay_retry_after)
+            .unwrap_or(1)
+            .clamp(1, 60);
+        output_headers.insert(
+            "retry-after",
+            HeaderValue::from_str(&seconds.to_string()).expect("bounded retry-after"),
+        );
+    }
     if let Ok(value) = HeaderValue::from_str(&account.id) {
         output_headers.insert("x-quota-baton-account", value);
     }
