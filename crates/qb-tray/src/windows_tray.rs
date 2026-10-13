@@ -3,12 +3,13 @@ use std::os::windows::process::CommandExt;
 use std::{
     ffi::c_void,
     mem::size_of,
+    path::PathBuf,
     process::Command,
     sync::{
         Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use windows::{
     Win32::{
@@ -49,9 +50,10 @@ use windows::{
 
 const TRAY_MESSAGE: u32 = WM_APP + 1;
 const WINDOW_CLASS: PCWSTR = w!("QuotaBatonTrayFlyout");
-static MODEL: OnceLock<Mutex<(Vec<qb_tray::Row>, String)>> = OnceLock::new();
+static MODEL: OnceLock<Mutex<(Vec<qb_tray::Row>, String, bool)>> = OnceLock::new();
 static SUPERVISOR: OnceLock<Mutex<Supervisor>> = OnceLock::new();
 static SUPERVISE_ENABLED: AtomicBool = AtomicBool::new(true);
+static FIXTURE_MODE: AtomicBool = AtomicBool::new(false);
 
 struct Supervisor {
     last_start: Option<Instant>,
@@ -67,8 +69,15 @@ fn supervisor() -> &'static Mutex<Supervisor> {
     })
 }
 
-fn model() -> &'static Mutex<(Vec<qb_tray::Row>, String)> {
-    MODEL.get_or_init(|| Mutex::new((Vec::new(), "v0.1.0".to_owned())))
+fn model() -> &'static Mutex<(Vec<qb_tray::Row>, String, bool)> {
+    MODEL.get_or_init(|| Mutex::new((Vec::new(), "v0.1.0".to_owned(), false)))
+}
+
+fn flyout_height() -> i32 {
+    let rows = &model().lock().unwrap_or_else(|e| e.into_inner()).0;
+    qb_tray::native_render::content_height(rows, false)
+        .ceil()
+        .clamp(120.0, 700.0) as i32
 }
 
 fn update_status(supervise: bool) {
@@ -79,7 +88,8 @@ fn update_status(supervise: bool) {
             .block_on(client.read())
             .map_err(|e| anyhow::anyhow!(e))?;
         let rows = super::client::layout_rows(&read, std::time::SystemTime::now())?;
-        *model().lock().unwrap_or_else(|e| e.into_inner()) = (rows, read.snapshot.version.clone());
+        *model().lock().unwrap_or_else(|e| e.into_inner()) =
+            (rows, read.snapshot.version.clone(), true);
         Ok(super::client::render_flyout(&read))
     })();
     let text = match result {
@@ -112,12 +122,14 @@ fn update_status(supervise: bool) {
         }
     };
     if text == "코어에 연결할 수 없습니다" {
-        model().lock().unwrap_or_else(|e| e.into_inner()).0.clear();
+        let mut model = model().lock().unwrap_or_else(|e| e.into_inner());
+        model.0.clear();
+        model.2 = false;
     }
 }
 
 fn paint_window(hwnd: HWND) -> Result<()> {
-    let (rows, version) = model().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let (rows, version, core_ok) = model().lock().unwrap_or_else(|e| e.into_inner()).clone();
     unsafe {
         let factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
         let props = D2D1_RENDER_TARGET_PROPERTIES {
@@ -130,7 +142,7 @@ fn paint_window(hwnd: HWND) -> Result<()> {
             hwnd,
             pixelSize: D2D_SIZE_U {
                 width: 360,
-                height: 700,
+                height: flyout_height() as u32,
             },
             presentOptions: D2D1_PRESENT_OPTIONS_NONE,
         };
@@ -140,8 +152,9 @@ fn paint_window(hwnd: HWND) -> Result<()> {
             &rows,
             false,
             &version,
-            std::time::SystemTime::now(),
+            SystemTime::now(),
             false,
+            core_ok,
         )?;
     }
     Ok(())
@@ -160,7 +173,9 @@ unsafe extern "system" fn window_proc(
                 let _ = ShowWindow(hwnd, SW_HIDE);
                 return LRESULT(0);
             }
-            update_status(SUPERVISE_ENABLED.load(Ordering::Relaxed));
+            if !FIXTURE_MODE.load(Ordering::Relaxed) {
+                update_status(SUPERVISE_ENABLED.load(Ordering::Relaxed));
+            }
             let mut point = POINT::default();
             let _ = GetCursorPos(&mut point);
             let _ = SetWindowPos(
@@ -169,7 +184,7 @@ unsafe extern "system" fn window_proc(
                 point.x - 360,
                 point.y - 700,
                 360,
-                700,
+                flyout_height(),
                 Default::default(),
             );
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
@@ -221,9 +236,23 @@ unsafe extern "system" fn window_proc(
     }
 }
 
-pub fn run(supervise: bool, open_flyout: bool) -> Result<()> {
+pub fn run(
+    supervise: bool,
+    open_flyout: bool,
+    fixture: Option<PathBuf>,
+    now: SystemTime,
+) -> Result<()> {
     SUPERVISE_ENABLED.store(supervise, Ordering::Relaxed);
-    update_status(supervise);
+    if let Some(fixture) = fixture {
+        let json = std::fs::read_to_string(fixture)?;
+        let state: qb_tray::State = serde_json::from_str(&json)?;
+        let rows = qb_tray::parse_state_at(&json, now)?;
+        *model().lock().unwrap_or_else(|e| e.into_inner()) = (rows, state.version, true);
+        FIXTURE_MODE.store(true, Ordering::Relaxed);
+    } else {
+        FIXTURE_MODE.store(false, Ordering::Relaxed);
+        update_status(supervise);
+    }
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let instance: HINSTANCE = GetModuleHandleW(None)?.into();
@@ -245,7 +274,7 @@ pub fn run(supervise: bool, open_flyout: bool) -> Result<()> {
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             360,
-            700,
+            flyout_height(),
             None,
             Some(HMENU::default()),
             Some(instance),
