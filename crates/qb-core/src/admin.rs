@@ -16,6 +16,74 @@ pub fn account_routes(store: Arc<AccountStore>) -> Router {
         .with_state(store)
 }
 
+#[derive(serde::Deserialize)]
+pub struct LoginRequest {
+    pub provider: crate::accounts::Provider,
+    #[serde(default)]
+    pub replace_linked: bool,
+}
+
+pub fn login_routes(service: crate::oauth::LoginService) -> Router {
+    Router::new()
+        .route("/admin/v1/accounts/login", post(start_login))
+        .route(
+            "/admin/v1/accounts/login/{login_id}",
+            axum::routing::get(login_status),
+        )
+        .route(
+            "/admin/v1/accounts/login/{login_id}/cancel",
+            post(cancel_login),
+        )
+        .with_state(service)
+}
+async fn start_login(
+    State(service): State<crate::oauth::LoginService>,
+    request: Result<Json<LoginRequest>, JsonRejection>,
+) -> Response {
+    let Ok(Json(request)) = request else {
+        return error(StatusCode::BAD_REQUEST, "로그인 요청이 올바르지 않습니다.");
+    };
+    match service
+        .start(request.provider, request.replace_linked)
+        .await
+    {
+        Ok(start) => Json(start).into_response(),
+        Err(error) => login_error(error),
+    }
+}
+async fn login_status(
+    State(service): State<crate::oauth::LoginService>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    match service.status(&id).await {
+        Ok(status) => Json(status).into_response(),
+        Err(error) => login_error(error),
+    }
+}
+async fn cancel_login(
+    State(service): State<crate::oauth::LoginService>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    match service.cancel(&id).await {
+        Ok(()) => match service.status(&id).await {
+            Ok(status) => Json(status).into_response(),
+            Err(error) => login_error(error),
+        },
+        Err(error) => login_error(error),
+    }
+}
+fn login_error(error_value: crate::oauth::LoginError) -> Response {
+    use crate::oauth::LoginError;
+    let status = match error_value {
+        LoginError::NotFound => StatusCode::NOT_FOUND,
+        LoginError::CallbackPortBusy { .. }
+        | LoginError::LinkedConflict
+        | LoginError::IdentityConflict => StatusCode::CONFLICT,
+        _ => StatusCode::BAD_REQUEST,
+    };
+    error(status, &error_value.to_string())
+}
+
 async fn import_cpa(
     State(store): State<Arc<AccountStore>>,
     request: Result<Json<CpaImportRequest>, JsonRejection>,
@@ -135,8 +203,10 @@ fn account_events(
         loop {
             match receiver.recv().await {
                 Ok(value) => {
-                    let Some(name @ ("account_changed" | "quota_updated")) =
-                        value["event"].as_str()
+                    let Some(
+                        name @ ("account_changed" | "quota_updated" | "login_progress"
+                        | "core_warning"),
+                    ) = value["event"].as_str()
                     else {
                         continue;
                     };

@@ -512,9 +512,10 @@ async fn expiry_reload_is_throttled_stale_events_limited_and_401_bypasses_thrott
         1
     );
     assert_eq!(
-        rows.iter().filter(|r| r["outcome"] == "link_stale").count(),
+        rows.iter().filter(|r| r["outcome"] == "unchanged").count(),
         1
     );
+    assert!(!rows.iter().any(|r| r["outcome"] == "link_stale"));
     source["last_refresh"] = json!("2031-01-02T00:00:00Z");
     source["access_token"] = json!("fake-access-claude-2");
     source["expired"] = json!("2030-01-02T00:00:00Z");

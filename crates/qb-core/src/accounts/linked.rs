@@ -1,5 +1,5 @@
 use super::{
-    Account, AccountStore, ImportMode, Source, SourceMatch, StoreError, Tokens,
+    Account, AccountStore, Identity, ImportMode, Source, SourceMatch, StoreError, Tokens,
     import::{self, Candidate, ReadError},
 };
 use std::{thread, time::Duration};
@@ -20,7 +20,15 @@ pub enum LinkError {
     Store(#[from] StoreError),
 }
 
+pub(crate) fn resolve_identity(account: &Account) -> Result<Identity, LinkError> {
+    Ok(find_candidate(account, false)?.account.identity)
+}
+
 fn candidate(account: &Account) -> Result<Candidate, LinkError> {
+    find_candidate(account, true)
+}
+
+fn find_candidate(account: &Account, require_newer: bool) -> Result<Candidate, LinkError> {
     let dir = match &account.source {
         Source::Cpa {
             mode: ImportMode::Linked,
@@ -42,8 +50,17 @@ fn candidate(account: &Account) -> Result<Candidate, LinkError> {
             match import::read(&path, dir) {
                 Ok(candidate)
                     if candidate.account.identity.canonical_key()
-                        == account.identity.canonical_key() =>
+                        == account.identity.canonical_key()
+                        || (matches!(account.identity, Identity::Codex { user_id: None, .. })
+                            && SourceMatch::from(&candidate.account.identity)
+                                == SourceMatch::from(&account.identity)) =>
                 {
+                    if best.as_ref().is_some_and(|old| {
+                        old.account.identity.canonical_key()
+                            != candidate.account.identity.canonical_key()
+                    }) {
+                        return Err(LinkError::InvalidData);
+                    }
                     if best.as_ref().is_none_or(|old| {
                         candidate
                             .account
@@ -58,7 +75,7 @@ fn candidate(account: &Account) -> Result<Candidate, LinkError> {
             }
         }
         if let Some(candidate) = best {
-            if candidate.account.token_meta.newer_than(&account.token_meta) {
+            if !require_newer || candidate.account.token_meta.newer_than(&account.token_meta) {
                 return Ok(candidate);
             }
             if !invalid || attempt == 3 {
