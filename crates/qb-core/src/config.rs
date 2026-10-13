@@ -6,11 +6,59 @@ use serde::{Deserialize, Serialize};
 #[serde(default)]
 pub struct Config {
     pub server: ServerConfig,
+    pub upstream: UpstreamConfig,
     pub routing: RoutingConfig,
     pub guard: GuardConfig,
     pub websocket: WebsocketConfig,
     pub quota: QuotaConfig,
     pub accounts: BTreeMap<String, AccountConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct UpstreamConfig {
+    pub anthropic_base: String,
+    pub codex_base: String,
+}
+
+impl Default for UpstreamConfig {
+    fn default() -> Self {
+        Self {
+            anthropic_base: "https://api.anthropic.com".into(),
+            codex_base: "https://chatgpt.com/backend-api/codex".into(),
+        }
+    }
+}
+
+impl UpstreamConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for (value, expected) in [
+            (&self.anthropic_base, "https://api.anthropic.com"),
+            (&self.codex_base, "https://chatgpt.com/backend-api/codex"),
+        ] {
+            if value == expected {
+                continue;
+            }
+            #[cfg(any(test, all(feature = "testkit", debug_assertions)))]
+            {
+                let url = reqwest::Url::parse(value)
+                    .map_err(|_| anyhow::anyhow!("invalid upstream base"))?;
+                if url.scheme() == "http"
+                    && url.host_str() == Some("127.0.0.1")
+                    && url.port().is_some()
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.query().is_none()
+                    && url.fragment().is_none()
+                    && url.path() == "/"
+                {
+                    continue;
+                }
+            }
+            anyhow::bail!("upstream base is not allowed in this build");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -125,6 +173,7 @@ impl Config {
             .clone()
             .try_into()
             .map_err(|_| anyhow::anyhow!("invalid config.toml types"))?;
+        config.upstream.validate()?;
         anyhow::ensure!(
             config.websocket.idle_close_secs < config.routing.rebalance_idle_secs,
             "websocket.idle_close_secs must be less than routing.rebalance_idle_secs"
@@ -158,6 +207,33 @@ fn warn_unknown(value: &toml::Value, known: &toml::Value, prefix: &str) {
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod upstream_tests {
+    use super::*;
+    #[test]
+    fn bases_are_exact_and_test_http_is_loopback_only() {
+        assert!(UpstreamConfig::default().validate().is_ok());
+        let mut config = UpstreamConfig {
+            anthropic_base: "http://127.0.0.1:32123".into(),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+        for value in [
+            "https://api.anthropic.com/other",
+            "https://evil.invalid",
+            "http://localhost:32123",
+            "http://0.0.0.0:32123",
+            "http://127.0.0.1:32123/path",
+            "http://user:pass@127.0.0.1:32123",
+            "http://127.0.0.1:32123?q=x",
+            "http://127.0.0.1:32123#fragment",
+        ] {
+            config.anthropic_base = value.into();
+            assert!(config.validate().is_err());
         }
     }
 }

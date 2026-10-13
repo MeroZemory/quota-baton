@@ -46,6 +46,21 @@ pub async fn spawn_with_admin(
     secrets: LocalSecrets,
     extra_admin: Router,
 ) -> anyhow::Result<RunningServers> {
+    spawn_with_routes(
+        config,
+        secrets,
+        Router::new().fallback(not_found),
+        extra_admin,
+    )
+    .await
+}
+
+pub async fn spawn_with_routes(
+    config: &Config,
+    secrets: LocalSecrets,
+    data_routes: Router,
+    extra_admin: Router,
+) -> anyhow::Result<RunningServers> {
     anyhow::ensure!(
         !secrets.client_key.is_empty() && !secrets.admin_token.is_empty(),
         "local secrets must not be empty"
@@ -60,17 +75,15 @@ pub async fn spawn_with_admin(
     let admin_addr = admin.local_addr()?;
     let client_key: Arc<str> = secrets.client_key.into();
     let admin_token: Arc<str> = secrets.admin_token.into();
-    let data_app = Router::new()
-        .fallback(not_found)
-        .layer(middleware::from_fn_with_state(
-            Safety {
-                port: data_addr.port(),
-                key: client_key.clone(),
-                other_key: admin_token.clone(),
-                admin: false,
-            },
-            safety,
-        ));
+    let data_app = data_routes.layer(middleware::from_fn_with_state(
+        Safety {
+            port: data_addr.port(),
+            key: client_key.clone(),
+            other_key: admin_token.clone(),
+            admin: false,
+        },
+        safety,
+    ));
     let started_at = chrono::Utc::now().to_rfc3339();
     let admin_app = Router::new()
         .route(

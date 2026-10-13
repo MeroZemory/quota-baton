@@ -6,6 +6,12 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+bytes.workspace = true
+futures-util.workspace = true
+async-stream.workspace = true
+reqwest.workspace = true
+zstd.workspace = true
+flate2.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 base64.workspace = true
@@ -29,3 +35,9 @@ qb-proto.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 reqwest.workspace = true
+qb-testkit.workspace = true
+
+[features]
+default = []
+testkit = []
+shape-capture = []
