@@ -71,7 +71,7 @@ These rules apply to the data port and the admin port alike.
 
    A candidate header exception joins this table only through the same register process as C4:
    - **H2.** For Claude, add `extended-cache-ttl-2025-04-11` when the body uses 1-hour cache markers. Pending **[V1]**.
-   - **H3.** For Codex, add a routing-hint header. Pending **[V3]**.
+   - **H3.** Withdrawn (2026-10-13). V3 passed without a routing hint.
 
 ### Response to client
 
@@ -89,15 +89,12 @@ These rules apply to the data port and the admin port alike.
 
 | Id | Status | Rule | Gate |
 |---|---|---|---|
-| E1 | Candidate | Claude: when the session's account has changed since the message that `diagnostics.previous_message_id` points to, set that field to `null`. | Adopt only if **[V1]** shows that Claude Code sends the field and **[V2]** shows that the upstream rejects a field from another account. If **[V1]** shows a client signature covering the body, E1 is rejected and the issue goes back to design. |
-| E2 | Candidate | Codex hand-off rewrite. Applies to requests of a session whose account changed. At the first request after the change, record the ids of the input **reasoning** items carrying `encrypted_content` as **foreign**. On that request and every later one, drop the foreign items from `input`. Compaction items are never dropped; the same rule as in E2r applies. This requires decoding the body only for such sessions. The original `Content-Encoding` is re-applied. | Adopt only if **[V2]** shows that ChatGPT accounts reject another account's encrypted items. When adopted, the cutover tool also offers plaintext compaction (`remote_compaction = "unsupported"` on the client provider), because a foreign compaction blob cannot be recovered by stripping. |
-| E3 | Candidate | Claude hand-off rewrite. For a session whose account changed, drop `thinking` / `redacted_thinking` blocks minted before the change from earlier assistant turns. The current tool-use turn is exempt; if that turn is foreign, the request fails over to the original account when eligible, or else is returned as is. | Adopt only if **[V2]** shows that thinking signatures are rejected across accounts. |
+| E1 | Withdrawn (2026-10-13) | Null a foreign `diagnostics.previous_message_id` | V1: genuine Claude Code does not send `diagnostics`. |
+| E2 | Withdrawn (2026-10-13) | Strip foreign Codex reasoning items | V2: another account ignores them silently, with no error. Genuine Codex replays them verbatim, too. |
+| E3 | Withdrawn (2026-10-13) | Strip foreign Claude thinking blocks | V2: ignored silently, even inside a tool-use turn. Stripping is itself a history edit, which preserved-thinking models may reject. |
+| E2r | Withdrawn (2026-10-13) | Strip and retry after a foreign-content rejection | No rejection for foreign reasoning or thinking exists (V2). Compaction could not be stripped anyway, and binding stickiness already keeps a session on its minting account. |
 
-| E2r | Proposed. **The user decides after V2** (2026-10-13). | Reactive safety net. A request rejected **before commit** with a signal of foreign content triggers three steps:<br>• Signals: Codex `invalid_encrypted_content`, `thinking_signature_invalid` or "Request blocked"; Claude "Invalid `signature` in `thinking` block".<br>• Step 1: strip from the retained body. For Codex, every `encrypted_content`-bearing **reasoning** item. For Claude, the `thinking` / `redacted_thinking` blocks outside the current tool-use turn.<br>• **Compaction items, and any other encrypted content that is not a reasoning item (e.g. encrypted message parts), are never stripped**, because stripping could silently discard history. If the rejected body carries a foreign compaction item, the request goes back to the account that minted it, when that account is known and eligible. The session binding is then moved back to that account. Otherwise the 400 is relayed and the tray shows an actionable notice: resume the session after the original account resets, or start a new one.<br>• Step 2: retry once on the **same** account.<br>• Step 3: record the session's foreign-id set, so later requests are stripped the same way (E2/E3 semantics).<br>On WebSocket the frame is not relayed. The socket closes with 1012, and the strip applies to the reconnect's full input. | Needed in both D10 branches. It recovers sessions whose binding memory was lost (LRU, crash, fork) and covers changes in server behaviour. Lossy: earlier reasoning continuity is lost. A body without a retained copy (C6 row 17) is returned as is. |
-
-Hand-off rewrites keep bounded state. Per session that is the switch point and the foreign item ids, a few KiB, persisted write-behind in `state/bindings.json`. They never retain conversation content.
-
-Decoding a body for a hand-off rewrite uses transient memory, counted against the in-flight budget. The original `Content-Encoding` is re-applied.
+The register is empty. Encrypted and signed conversation items are relayed exactly as the client sent them, which is what the genuine clients themselves do ([D10](decisions.md#d10)).
 
 ## C5. Account state
 
@@ -168,7 +165,7 @@ Each account has two independent fields:
 | 11 | Connect, TLS or DNS failure, header timeout, or the upstream closes before any byte | One retry on the same account after 250 ms, then give up | 502 in native shape (C6.2) | None |
 | 12 | Error after commit (SSE `error` or `response.failed` event, connection drop) | **Never retried** | Relayed as is, then the stream ends | Signals inside the event apply (e.g. `usage_limit_reached` leads to `cooling(quota)`) |
 | 12a | An error **event** before commit, e.g. a first SSE event that is `error` or `response.failed` | Treated like the matching status row (2–7, 10) | As that row | As that row |
-| 12b | Pre-commit 400 signalling foreign content | Only if E2r (C4) is adopted: strip and retry once on the same account. Otherwise as row 9. | That retry's response, or the 400 as is | None (if E2r is adopted, the session's foreign-id set is recorded) |
+| 12b | Pre-commit 400 with an encrypted-content error code: Codex `invalid_encrypted_content` or `thinking_signature_invalid`, Claude "Invalid `signature` in `thinking` block" | No failover, as row 9 | Upstream response as is | None. The ledger records the error code (C12), so a change in server behaviour shows up. |
 | 13 | WebSocket upgrade | Dial upstream first. Classify the handshake response with rows 2–7 and 11, and fail over before answering the client. | 101 with an open upstream; otherwise row 14, 15, or 502 for a pure network failure | As in those rows |
 | 13a | WebSocket: before commit, an `error` from rows 2 or 4–7 answers a `response.create` | Do **not** relay the frame. Record the health change, then close the client socket with 1012. Codex reconnects with full input, and row 13 selects another account. | No error; the turn continues on another account | As in rows 2–7 |
 | 13b | WebSocket: an error frame after commit, or any other error | — | Frame relayed as is | As in rows 2–12 |
@@ -238,14 +235,15 @@ Further rules:
 - **`last_used`.** Every HTTP request and every relayed WebSocket `response.create` updates the binding's `last_used`, set to the end of the response. Idle time is measured over the whole session identity group, sub-agents included.
 - **Pinned sockets keep their binding.** A binding referenced by an open pinned WebSocket is never expired or evicted.
 - **Cold point** (staged 1B). A binding is cold when it has been idle (`now - last_used`) for at least `rebalance_idle_secs`, default 3600. That is never below the longest prompt-cache TTL in use for the provider. At a cold point, the cache is cold on every account, so a move costs no extra cache miss.
-  - **While [D10](decisions.md#d10) is not resolved "portable"**, including the "not portable" outcome, a cold session is re-placed (steps 3–6) **only if its current account fails the gate**. A forced move would then probably come soon anyway, and doing it at a cold boundary is cheaper than doing it mid-session. Otherwise the binding stays, for up to `session_binding_max_secs` (default 7 days).
-  - **After "portable"**, a cold session is re-placed as if new. If the result is its current account, nothing changes.
+  - A cold session is re-placed (steps 3–6) **only if its current account fails the gate**. A forced move would then probably come soon anyway, and doing it at a cold boundary is cheaper than doing it mid-session.
+  - Otherwise the binding stays, for up to `session_binding_max_secs` (default 7 days).
+  - Why not re-place every cold session? V2 showed that a move keeps the conversation working but drops its earlier hidden reasoning (D10). A move that is not needed is therefore not free.
   - `[websocket] idle_close_secs` MUST be smaller than `rebalance_idle_secs`.
 - **Moves.**
   - They happen only at request boundaries, atomically for the whole session group.
   - A running stream is never moved.
   - Every move is logged to the ledger with: reason, account from and to, request bytes, and the cache-hit result of the next turn when the usage fields show it.
-- **Persistence.** Bindings and hand-off foreign-id sets are persisted write-behind, at most 60 s late, to `state/bindings.json`, and flushed on drain and on exit. LRU capacity is 20 000. They are exported and imported on takeover (C11).
+- **Persistence.** Bindings are persisted write-behind, at most 60 s late, to `state/bindings.json`, and flushed on drain and on exit. LRU capacity is 20 000. They are exported and imported on takeover (C11).
 - **Unbound requests** (no key, C8) stay on the family's **last-used account** until it becomes ineligible. Selection then runs once, and the result becomes the new last-used account.
 - **WebSocket selection** runs once per connection, on the upgrade (C6 row 13). The connection keeps that account until it closes.
 - **Drain vs pause.**
@@ -292,9 +290,7 @@ Further rules:
 
 Both apply only to identity-encoded bodies, allocate no DOM, and never feed into rewriting.
 
-**Codex bodies** are never decoded on the normal path. The two exceptions:
-- the hand-off rewrites in C4 (E2, E2r)
-- the `shape-capture` build (architecture §13)
+**Codex bodies** are never decoded on the normal path. The exceptions are debug-only: the `shape-capture` and `phase0` builds (architecture §13).
 
 ## C9. Usage signals
 
@@ -391,7 +387,7 @@ session_binding_max_secs = 604800
 
 [guard]
 retain_max_per_request_mib = 64   # larger bodies are forwarded without retention (no failover)
-inflight_budget_mib = 384         # shared: retained HTTP bodies + in-flight WS messages + hand-off decode buffers
+inflight_budget_mib = 384         # shared: retained HTTP bodies + in-flight WS messages
 memory_hard_limit_mib = 1024
 
 [tray]
@@ -437,11 +433,9 @@ The DPAPI blob decrypts to `{access_token, refresh_token, id_token?}`. Files are
 
 ### `state/bindings.json`
 
-`{ "schema": 1, "bindings": [{ "key": "<session key>", "account": "<id>", "last_used": "...", "foreign": [{ "minted_by": "<account id or null>", "ids": ["<item id>", ...] }] }] }`
+`{ "schema": 1, "bindings": [{ "key": "<session key>", "account": "<id>", "last_used": "..." }] }`
 
-`minted_by` is the account the session was bound to before the switch, when it is known. The compaction route-back in E2r uses it. When it is `null`, route-back is impossible, so the 400 is relayed with a tray notice.
-
-It is written behind, at most 60 s late, and flushed on drain and exit. It holds no conversation content. Foreign `ids` are opaque item ids or signature hashes, never content.
+It is written behind, at most 60 s late, and flushed on drain and exit. It holds no conversation content.
 
 ### Ledger line
 
@@ -450,7 +444,7 @@ It is written behind, at most 60 s late, and flushed on drain and exit. It holds
  "account":"cx-1a2b3c","session":"<sha256/12>","model":null,
  "originator":"codex_cli_rs","ua":"codex_cli_rs/0.162.1",
  "status":200,"upstream_status":200,"ttfb_ms":412,"dur_ms":38120,
- "bytes_in":812345,"bytes_out":91234,"attempts":1,"outcome":"ok"}
+ "bytes_in":812345,"bytes_out":91234,"attempts":1,"outcome":"ok","upstream_error_code":null}
 ```
 
 ## C13. Acceptance

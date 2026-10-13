@@ -114,19 +114,23 @@ The server binds only to 127.0.0.1, and the repo and docs contain no secrets. Th
 The herdr shim requires `openai_base_url` to remain a top-section key in `~/.codex/config.toml`.
 
 <a id="d10"></a>
-## D10. Mid-session hand-off policy — Proposed (decided per provider family by Phase 0 test V2, then user approval)
+## D10. Mid-session hand-off: relay as the genuine clients do — Accepted (user direction "the way Codex and Claude do it", 2026-10-13)
 
-A session changes account only when its account becomes ineligible (contract C7). Which branch applies depends on whether the encrypted conversation items that clients replay are accepted by another account. For Codex these are encrypted reasoning and remote-compaction blobs; for Claude, thinking signatures. That is unknown, and the evidence conflicts (architecture §2.2).
+Codex and Claude Code replay their encrypted or signed conversation items verbatim on every turn and never strip them: Codex reasoning and compaction blobs, Claude thinking signatures. quota-baton does the same. It never strips, rewrites or reorders them, and it has no hand-off rewrite.
 
-- **Portable:** pure pass-through. The only cost of a switch is one cold prompt cache.
-- **Not portable:**
-  - apply hand-off rewrites E2 (Codex) and E3 (Claude) from contract C4
-  - the cutover tool offers plaintext Codex compaction
-  - a switched session loses earlier reasoning continuity, but keeps working
+**Evidence: V2 HTTP cells, 2026-10-13.**
+- Items minted by account A and sent to account B: 200. They are silently ignored, because the input-token count equals the stripped body. This holds inside a tool-use turn as well.
+- Tampered items on the minting account: 400. The server validates what it minted and ignores what it did not.
+- A moved session keeps working. It loses only its earlier hidden reasoning, and the first turn after the move is cache-cold.
 
-Rejected alternative: keeping full transcripts in the proxy, as earlier proxies do. It does not fix account-bound blobs, and it is the measured cause of their memory use (R6, R7).
+**Withdrawn:** C4 exceptions E1, E2, E3 and E2r, and header exception H3.
 
-E2r, the reactive strip-and-retry rule, is **proposed** as a safety net for both branches. **The user will decide on it after V2** (2026-10-13). It recovers sessions whose binding memory was lost, and it covers changes in server behaviour. It needs the user's approval, as every C4 exception does.
+**Residual risk.**
+- Codex remote-compaction blobs may be rejected on another account. The previous proxy logs show 3 such 400s after it lost a session binding, with the minting account unconfirmed (R8 I-16).
+- Stripping cannot help there, because the blob is the earlier history. Persistent, sticky bindings (C7) keep a session on its minting account instead.
+- The ledger records upstream error codes, so the failure is visible if it happens.
+
+Rejected alternative: keeping full transcripts in the proxy, as earlier proxies do. It is the measured cause of their memory use (R6, R7).
 
 <a id="d11"></a>
 ## D11. Account-switching policy — Accepted (decided by a P2 blind panel at the user's request, 2026-10-13)
@@ -140,9 +144,7 @@ The user delegated this decision to independent reviewers. Three models answered
    - If none passes, the account with the most headroom is used.
 2. **Live sessions: move only when forced or free ("staged 1B"; Opus and Fable chose 1B, Codex 1A).**
    - **Forced:** the account becomes unusable (a limit, auth still failing after a refresh, or a user pause). A limit that resets within 60 s holds the request instead.
-   - **Free:** after at least 1 h idle, when the cache is cold on every account.
-     - Until V2 shows that conversation items are portable, a cold session moves only if its current account fails the gate. This keeps Codex's objection: idle does not prove that reasoning continuity survives a move.
-     - After V2, it is re-placed like a new session.
+   - **Free:** after at least 1 h idle, when the cache is cold on every account, but only if the current account fails the gate. V2 confirmed Codex's objection: a move keeps the conversation working but drops its earlier hidden reasoning, so a move that is not needed is avoided.
 3. **Rejected:** restoring immediately when a preferred account recovers (unanimous), and moving warm sessions early to use expiring weekly quota (unanimous). New-session placement serves that goal without a cache cost.
 4. **No priority list.** The only manual placement setting is per-account **drain** (no new sessions; existing sessions stay). `allow_credits` stays off by default.
 5. **Tuning from data:** the ledger records moves, the weekly quota left unused at each reset, and forced moves per gate crossing.
