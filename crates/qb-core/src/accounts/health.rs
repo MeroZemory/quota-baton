@@ -222,7 +222,7 @@ impl Account {
         &mut self,
         snapshot: &serde_json::Value,
         model: Option<&str>,
-        allowance: f64,
+        _allowance: f64,
         now: DateTime<Utc>,
     ) {
         use serde_json::Value;
@@ -268,7 +268,8 @@ impl Account {
         let qualifies = |w: &Value| {
             w["used_pct"]
                 .as_f64()
-                .is_some_and(|p| p >= 100.0 || (credits && p + allowance >= 99.0))
+                // C7 projections guide placement; only observed usage cools.
+                .is_some_and(|p| p >= 100.0 || (credits && p >= 99.0))
                 || w["status"] == "rejected"
                 || ((global || serving) && active_matches(w))
         };
@@ -381,6 +382,26 @@ pub(crate) mod tests {
             generation: 0,
             token_meta: super::super::TokenMeta::default(),
         }
+    }
+
+    #[test]
+    fn placement_projection_never_creates_credit_cooling() {
+        let now = Utc::now();
+        let mut account = fixture();
+        let snapshot = serde_json::json!({"windows":[{
+            "name":"5h", "used_pct":98.0, "reset_at":now + Duration::hours(1),
+            "observed_at":now
+        }]});
+        account.apply_health_signal(
+            HealthSignal::UsageSnapshot {
+                snapshot,
+                model: None,
+                projected_allowance: 50.0,
+            },
+            now,
+        );
+        assert_eq!(account.health, Health::Ready);
+        assert_eq!(account.quota_cooling, None);
     }
 
     #[test]

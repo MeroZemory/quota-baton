@@ -38,7 +38,7 @@ use ledger::Completion;
 pub struct RelayState {
     pub accounts: Arc<crate::account_runtime::AccountRuntime>,
     pub bindings: Arc<crate::bindings::BindingTable>,
-    placement: [tokio::sync::Mutex<()>; 2],
+    reset_hold_secs: u64,
     pub inflight_requests: Arc<AtomicU64>,
     store: Arc<AccountStore>,
     client: reqwest::Client,
@@ -100,7 +100,7 @@ impl RelayState {
         Ok(Self {
             accounts,
             bindings,
-            placement: [tokio::sync::Mutex::new(()), tokio::sync::Mutex::new(())],
+            reset_hold_secs: config.routing.reset_hold_secs,
             inflight_requests: Arc::new(AtomicU64::new(0)),
             store,
             client,
@@ -191,7 +191,7 @@ impl RelayState {
         &self,
         provider: Provider,
         key: Option<&str>,
-        model: Option<&str>,
+        _model: Option<&str>,
         tried: &BTreeSet<String>,
     ) -> Result<Vec<crate::bindings::Candidate>, ()> {
         let store = self.store.clone();
@@ -232,8 +232,6 @@ impl RelayState {
         }
         let runtime = self.accounts.clone();
         let obs = self.observability.clone();
-        let bindings = self.bindings.clone();
-        let model = model.map(str::to_owned);
         tokio::task::spawn_blocking(move || {
             accounts
                 .into_iter()
@@ -245,9 +243,6 @@ impl RelayState {
                         && store.tokens(a).is_ok_and(|t| !t.access_token.is_empty())
                 })
                 .map(|account| {
-                    let account = runtime
-                        .projected_quota(&account.id, &bindings, model.as_deref())
-                        .map_err(|_| ())?;
                     Ok(crate::bindings::Candidate {
                         quota: obs.quota_snapshot(&account.id),
                         // Every production attempt reserves the live table;
@@ -299,10 +294,8 @@ impl RelayState {
     ) -> Result<Option<Account>, ()> {
         // A failed pre-commit attempt is finished before reserving its successor.
         completion.end_attempt();
-        let family = usize::from(provider == Provider::Codex);
-        let mut excluded = tried.clone();
+        let excluded = tried.clone();
         loop {
-            let placement = self.placement[family].lock().await;
             let candidates = self
                 .candidates(provider, session.key.as_deref(), model, &excluded)
                 .await?;
@@ -310,7 +303,7 @@ impl RelayState {
             let bytes = completion
                 .input_bytes
                 .load(std::sync::atomic::Ordering::Relaxed);
-            let choice = self.bindings.choose(
+            let choice = self.bindings.choose_with_hold(
                 provider,
                 session.key.as_deref(),
                 session.parent.as_deref(),
@@ -318,8 +311,9 @@ impl RelayState {
                 &candidates,
                 pinned.as_deref(),
                 bytes,
+                !completion.reset_hold_used,
+                completion.reset_hold_timed_out,
             );
-            drop(placement);
             match choice {
                 crate::bindings::Decision::Selected {
                     account,
@@ -327,14 +321,17 @@ impl RelayState {
                     moves,
                 } => {
                     for event in moves {
-                        self.observability.record_move(
+                        self.observability.record_group_move(
                             &event.key,
                             event.from.as_deref(),
                             &event.to,
                             &event.reason,
                             event.bytes,
+                            event.keys,
+                            event.debug_pin,
                         );
                     }
+                    completion.record.after_move |= lease.after_move;
                     completion.binding = Some(lease);
                     return Ok(candidates
                         .into_iter()
@@ -344,22 +341,76 @@ impl RelayState {
                 crate::bindings::Decision::None => return Ok(None),
                 crate::bindings::Decision::Hold { until } => {
                     let wait = (until - chrono::Utc::now()).to_std().unwrap_or_default();
-                    let remaining = completion
-                        .hold_deadline
-                        .saturating_duration_since(Instant::now());
-                    if wait <= remaining {
-                        tokio::time::sleep(wait).await;
-                    } else {
-                        tokio::time::sleep(remaining).await;
-                        if let Some(id) = self.bindings.current(session.key.as_deref()) {
-                            excluded.insert(id);
-                        }
-                        self.bindings
-                            .mark_reset_hold_timeout(session.key.as_deref());
-                    }
+                    completion.reset_hold_used = true;
+                    tokio::time::sleep(wait.min(Duration::from_secs(self.reset_hold_secs))).await;
+                    // This flag is request-local; a later turn may hold again.
+                    completion.reset_hold_timed_out = true;
                 }
             }
         }
+    }
+
+    /// C7 permits one same-account retry after a near reset, before commit.
+    /// The request owns the budget; no session-wide hold flag survives it.
+    async fn retry_after_reset(
+        &self,
+        session: &session::Session,
+        completion: &mut Completion,
+        id: &str,
+        model: Option<&str>,
+    ) -> Result<bool, ()> {
+        if completion.reset_hold_used
+            || self.bindings.current(session.key.as_deref()).as_deref() != Some(id)
+        {
+            return Ok(false);
+        }
+        let store = self.store.clone();
+        let account_id = id.to_owned();
+        let account = tokio::task::spawn_blocking(move || store.load(&account_id))
+            .await
+            .map_err(|_| ())?
+            .map_err(|_| ())?;
+        let now = chrono::Utc::now();
+        let reset = match &account.health {
+            Health::Cooling {
+                reason: HealthReason::Quota,
+                until,
+                scope,
+            } if account.user_state == UserState::Active
+                && (scope == "account"
+                    || scope
+                        .strip_prefix("model:")
+                        .is_some_and(|m| model == Some(m))) =>
+            {
+                account
+                    .quota_cooling
+                    .as_ref()
+                    .map_or(*until, |q| q.reset_at)
+            }
+            _ => return Ok(false),
+        };
+        let Ok(wait) = (reset - now).to_std() else {
+            return Ok(false);
+        };
+        if wait > Duration::from_secs(self.reset_hold_secs) {
+            return Ok(false);
+        }
+        completion.end_attempt();
+        completion.reset_hold_used = true;
+        completion.failover("reset_hold_retry");
+        tokio::time::sleep(wait).await;
+        let store = self.store.clone();
+        let account_id = id.to_owned();
+        let account = tokio::task::spawn_blocking(move || store.load(&account_id))
+            .await
+            .map_err(|_| ())?
+            .map_err(|_| ())?;
+        if !account.eligible(model) {
+            completion.reset_hold_timed_out = true;
+            return Ok(false);
+        }
+        completion.binding = Some(self.bindings.begin_request(session.key.as_deref(), id));
+        Ok(true)
     }
 }
 
@@ -996,6 +1047,58 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
         if !decision.failover() || retained.is_none() || permission_denials >= 2 {
             break (status, response_headers, held);
         }
+        if decision.kind == outcome::Kind::Quota {
+            match state
+                .retry_after_reset(
+                    &session,
+                    &mut completion,
+                    &account.id,
+                    request_model.as_deref(),
+                )
+                .await
+            {
+                Ok(true) => {
+                    drop(probe.take());
+                    match state
+                        .tokens
+                        .before_request(
+                            state.store.clone(),
+                            state.observability.clone(),
+                            account.id.clone(),
+                        )
+                        .await
+                    {
+                        Ok((updated, refreshed)) => {
+                            account = updated;
+                            tokens = refreshed;
+                        }
+                        Err(()) => {
+                            return failure(
+                                &mut completion,
+                                StatusCode::BAD_GATEWAY,
+                                provider,
+                                "store_error",
+                                "Could not read account tokens",
+                            );
+                        }
+                    }
+                    probe = state.claim_probe(&mut account).await;
+                    body_to_send =
+                        retry_body(retained.as_ref().expect("retained reset retry").bytes());
+                    continue;
+                }
+                Ok(false) => {}
+                Err(()) => {
+                    return failure(
+                        &mut completion,
+                        StatusCode::BAD_GATEWAY,
+                        provider,
+                        "store_error",
+                        "Could not check account reset",
+                    );
+                }
+            }
+        }
         if tried.len() >= 4 {
             if state
                 .select(
@@ -1154,5 +1257,125 @@ mod tests {
         for path in ["/v1/memories/trace_summarize", "/unknown", "/v1/responses/"] {
             assert!(route(&Method::POST, path, &headers).is_none());
         }
+    }
+    #[tokio::test]
+    async fn selection_reload_wait_does_not_block_another_placement_in_the_family() {
+        use crate::{
+            config::Config,
+            debug_pin::DebugPins,
+            relay::{RelayState, ledger::Completion},
+            session::Session,
+        };
+        let sandbox = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.sandbox/hardening-fixtures");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        let root = tempfile::tempdir_in(sandbox).unwrap();
+        let cpa = root.path().join("cpa");
+        std::fs::create_dir_all(&cpa).unwrap();
+        std::fs::write(cpa.join("synthetic.json"), serde_json::to_vec(&serde_json::json!({
+            "type":"codex", "email":"placement@example.invalid", "account_id":"synthetic-placement",
+            "access_token":"synthetic-placement-access", "refresh_token":"synthetic-placement-refresh",
+            "expired":"2099-01-01T00:00:00Z", "last_refresh":"2026-10-13T00:00:01Z"
+        })).unwrap()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let store = loop {
+            match AccountStore::acquire(&root.path().join("home")) {
+                Ok(store) => break Arc::new(store),
+                Err(crate::accounts::StoreError::LeaseBusy) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(10)).await
+                }
+                Err(error) => panic!("synthetic fixture lease: {error}"),
+            }
+        };
+        crate::accounts::import::run(
+            &store,
+            &cpa,
+            &["codex:placement@example.invalid".into()],
+            false,
+        )
+        .unwrap();
+        let id = store.list().unwrap()[0].id.clone();
+        let obs = Arc::new(Observability::new(store.home(), None).unwrap());
+        let mut config = Config::default();
+        config.upstream.codex_base = "http://127.0.0.1:9".into();
+        config.upstream.anthropic_base = "http://127.0.0.1:9".into();
+        let state = Arc::new(
+            RelayState::new(
+                store.clone(),
+                &config,
+                obs.clone(),
+                Arc::new(DebugPins::default()),
+            )
+            .unwrap(),
+        );
+        store
+            .update_metadata(&id, |account| {
+                account.health = Health::Cooling {
+                    reason: HealthReason::LinkStale,
+                    until: chrono::Utc::now() + chrono::Duration::hours(1),
+                    scope: "account".into(),
+                }
+            })
+            .unwrap();
+        let guard = state.tokens.block_selection_for_test(&id).await;
+        let waiting_state = state.clone();
+        let waiting_obs = obs.clone();
+        let first = tokio::spawn(async move {
+            let mut completion = Completion::new(
+                waiting_obs,
+                &axum::http::Method::POST,
+                "/v1/responses",
+                Provider::Codex,
+                &axum::http::HeaderMap::new(),
+            );
+            let session = Session {
+                key: Some("codex:waiting".into()),
+                parent: None,
+                model: None,
+            };
+            waiting_state
+                .select_request(
+                    Provider::Codex,
+                    &session,
+                    &mut completion,
+                    None,
+                    &std::collections::BTreeSet::new(),
+                )
+                .await
+        });
+        // The first selection is suspended at its credential gate. Restore the
+        // account so an independent selection can bypass that reload.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(!first.is_finished());
+        store
+            .update_metadata(&id, |account| account.health = Health::Ready)
+            .unwrap();
+        let mut completion = Completion::new(
+            obs,
+            &axum::http::Method::POST,
+            "/v1/responses",
+            Provider::Codex,
+            &axum::http::HeaderMap::new(),
+        );
+        let session = Session {
+            key: Some("codex:independent".into()),
+            parent: None,
+            model: None,
+        };
+        let second = tokio::time::timeout(
+            Duration::from_secs(2),
+            state.select_request(
+                Provider::Codex,
+                &session,
+                &mut completion,
+                None,
+                &std::collections::BTreeSet::new(),
+            ),
+        )
+        .await;
+        first.abort();
+        let _ = first.await;
+        drop(guard);
+        assert_eq!(second.unwrap().unwrap().unwrap().id, id);
     }
 }

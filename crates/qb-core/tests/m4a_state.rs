@@ -861,7 +861,7 @@ mod runtime_regressions {
     }
 
     #[tokio::test]
-    async fn n5_inflight_allowance_counts_each_request_on_that_account() {
+    async fn n5_inflight_counts_each_request_but_only_observed_usage_cools() {
         let f = Fixture::new(&[Provider::Codex, Provider::Codex], 0.5);
         let now = Utc::now();
         let reset = now + Duration::hours(1);
@@ -876,6 +876,11 @@ mod runtime_regressions {
         assert_eq!(f.runtime.inflight_count(&f.ids[0]), 2);
         let a = f
             .snapshot(vec![window("5h", 98.0, reset, now)], json!({}), None)
+            .await;
+        assert_eq!(a.health, Health::Ready);
+        assert_eq!(a.quota_cooling, None);
+        let a = f
+            .snapshot(vec![window("5h", 99.0, reset, now)], json!({}), None)
             .await;
         assert_cooling(&a, HealthReason::Quota, reset, "account");
         drop(second);

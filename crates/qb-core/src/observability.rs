@@ -87,6 +87,8 @@ pub struct RequestRecord {
     pub attempt_details: Vec<AttemptRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_usage: Option<CacheUsage>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub after_move: bool,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -420,6 +422,20 @@ impl Observability {
     }
 
     pub fn record_move(&self, key: &str, from: Option<&str>, to: &str, reason: &str, bytes: u64) {
+        self.record_group_move(key, from, to, reason, bytes, 1, false);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_group_move(
+        &self,
+        key: &str,
+        from: Option<&str>,
+        to: &str,
+        reason: &str,
+        bytes: u64,
+        keys: usize,
+        debug_pin: bool,
+    ) {
         use sha2::{Digest, Sha256};
         if !matches!(
             reason,
@@ -432,7 +448,7 @@ impl Observability {
         self.enqueue(Command::Ledger(serde_json::json!({
             "ts": Utc::now().to_rfc3339(), "event": "binding_move",
             "session": session, "from": from, "to": to, "reason": reason,
-            "bytes_in": bytes
+            "bytes_in": bytes, "keys": keys, "debug_pin": debug_pin
         })));
     }
 
@@ -1070,6 +1086,7 @@ mod tests {
             upstream_error_code: None,
             attempt_details: Vec::new(),
             cache_usage: None,
+            after_move: false,
         }
     }
 

@@ -22,7 +22,8 @@ pub(in crate::relay) struct Completion {
     pub runtime: Option<Arc<crate::account_runtime::AccountRuntime>>,
     pub failed_access: Option<zeroize::Zeroizing<String>>,
     pub binding: Option<crate::bindings::BindingLease>,
-    pub hold_deadline: Instant,
+    pub reset_hold_used: bool,
+    pub reset_hold_timed_out: bool,
     observability: Arc<Observability>,
     inflight: Option<Arc<AtomicU64>>,
     account_inflight: Option<(String, crate::account_runtime::InflightGuard)>,
@@ -38,16 +39,8 @@ impl Completion {
     ) -> Self {
         Self {
             start: Instant::now(),
-            hold_deadline: Instant::now()
-                + std::time::Duration::from_secs_f64(
-                    headers
-                        .get("x-stainless-timeout")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|v| v.parse::<f64>().ok())
-                        .filter(|v| v.is_finite() && *v >= 0.0)
-                        .unwrap_or(300.0)
-                        .min(300.0),
-                ),
+            reset_hold_used: false,
+            reset_hold_timed_out: false,
             input_bytes: Arc::new(AtomicU64::new(0)),
             runtime: None,
             failed_access: None,
@@ -81,6 +74,7 @@ impl Completion {
                 upstream_error_code: None,
                 attempt_details: Vec::new(),
                 cache_usage: None,
+                after_move: false,
             },
         }
     }
