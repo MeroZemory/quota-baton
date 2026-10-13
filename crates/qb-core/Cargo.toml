@@ -42,6 +42,7 @@ qb-testkit.workspace = true
 default = []
 testkit = []
 shape-capture = []
+phase0 = []
 
 [[test]]
 name = "m2"
