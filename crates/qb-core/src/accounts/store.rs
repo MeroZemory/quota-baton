@@ -57,7 +57,7 @@ pub struct AccountStore {
     dir: PathBuf,
     gate: Mutex<()>,
     observer: Mutex<Option<AccountObserver>>,
-    _lease: Lease,
+    lease: Mutex<Option<Lease>>,
 }
 
 pub type AccountObserver = Arc<dyn Fn(&Account, &Health) + Send + Sync>;
@@ -125,10 +125,22 @@ impl AccountStore {
             dir,
             gate: Mutex::new(()),
             observer: Mutex::new(None),
-            _lease: lease,
+            lease: Mutex::new(Some(lease)),
         };
         store.recover_login_migration()?;
         Ok(store)
+    }
+
+    /// Release the home lease while read-only runtime objects are still
+    /// alive.  Takeover uses this after all writers and refresh tasks stop;
+    /// ordinary shutdown still releases it through Drop.
+    pub fn release_lease(&self) {
+        let lease = self
+            .lease
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        drop(lease);
     }
 
     /// Called after each successful account write, under the transaction gate.
