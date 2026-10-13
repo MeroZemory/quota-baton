@@ -1,4 +1,10 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
+};
 
 use axum::http::{HeaderMap, Method};
 use sha2::{Digest, Sha256};
@@ -12,6 +18,7 @@ use crate::{
 pub(super) struct Completion {
     pub record: RequestRecord,
     pub start: Instant,
+    pub input_bytes: Arc<AtomicU64>,
     observability: Arc<Observability>,
 }
 
@@ -25,6 +32,7 @@ impl Completion {
     ) -> Self {
         Self {
             start: Instant::now(),
+            input_bytes: Arc::new(AtomicU64::new(0)),
             observability,
             record: RequestRecord {
                 ts: chrono::Utc::now().to_rfc3339(),
@@ -77,6 +85,7 @@ impl Completion {
 impl Drop for Completion {
     fn drop(&mut self) {
         self.record.dur_ms = self.elapsed_ms();
+        self.record.bytes_in = self.input_bytes.load(Ordering::Relaxed);
         self.observability.record_request(self.record.clone());
     }
 }
