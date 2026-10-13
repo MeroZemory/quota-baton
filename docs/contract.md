@@ -127,7 +127,9 @@ Each account has two independent fields:
 | From | Event | To |
 |---|---|---|
 | any health | Terminal refresh error: `refresh_token_invalidated`, `refresh_token_reused`, `refresh_token_expired`, `refresh_token_revoked`, `invalid_grant`, or any 401 from the token endpoint | `needs_relogin` |
-| any health | Upstream 401 carrying a revocation or invalidation signal (C6 row 4) | `needs_relogin` |
+| any health | Upstream 401 carrying a revocation or invalidation signal (C6 row 4), on an **owned** account | `needs_relogin` |
+| any health | **Linked account, any 401** (rows 4 and 5, data plane or usage poll; V5 2026-10-13) | Re-read the CPA file first. A newer token means retry with it, and no health change. No newer token means `cooling(link_stale)`. A linked account **never** enters `needs_relogin`, because only CPA can re-login it. Anthropic revokes the old access token as soon as CPA refreshes, so this case is normal. |
+| `needs_relogin` or `cooling(link_stale)` (linked) | A CPA re-import or linked reload finds a newer token for the same identity | `ready` |
 | `ready` | Upstream 401 with the **current** token, a refresh succeeds, then a 401 again with the **new** token | `cooling(auth, until=now+15m, account)`, doubling on each repeat up to 4 h. A probe request runs when it expires. |
 | — | Upstream 401 with a token that is **no longer current** (another request already refreshed) | **no change**. The request retries once with the current token. |
 | `needs_relogin` | Re-login completes for the same identity | `ready` |
@@ -325,11 +327,12 @@ Every source normalizes into the account snapshot `windows[]` (`name`, `used_pct
 | Codex response headers | `x-codex-{primary,secondary}-{used-percent,window-minutes,reset-after-seconds,reset-at}`; the window is named from its minutes (300 is `5h`, 10080 is `7d`, any other value is `<n>m`); `x-codex-plan-type`, `x-codex-limit-reached`, `x-codex-active-limit`, `x-codex-credits-{has-credits,unlimited,balance}` |
 | Codex WebSocket event `codex.rate_limits` | `rate_limits.{primary,secondary}.{used_percent,window_minutes,reset_after_seconds\|reset_at}`, `limit_reached`, `credits`, `plan_type` |
 | Codex poll | `GET https://chatgpt.com/backend-api/wham/usage` with `Authorization`, `ChatGPT-Account-Id` (this casing, as Codex's backend client sends it, `backend-client/src/client.rs:277-278`), `Accept: application/json` and `User-Agent: quota-baton/<ver>`. Response: `rate_limit.{limit_reached, primary_window{used_percent,reset_at}, secondary_window{...}}`, `plan_type`, `credits` **[V5]** |
-| Claude poll | `GET https://api.anthropic.com/api/oauth/usage` with `Authorization` and `anthropic-beta: oauth-2025-04-20`. Expected: `five_hour{utilization,resets_at}`, `seven_day{...}` **[V5]**, unverified |
+| Claude poll | `GET https://api.anthropic.com/api/oauth/usage` with `Authorization`, `anthropic-beta: oauth-2025-04-20`, `Accept: application/json` and an honest `User-Agent`. **Verified live (V5, 2026-10-13):** 200, shape `five_hour{utilization, resets_at, …}`, `seven_day{…}`, and nullable sub-buckets (`seven_day_opus`, `seven_day_sonnet`, `seven_day_oauth_apps`, plus others with opaque names). `utilization` is a **percent 0..100** here, so do not guess the scale; only the response *headers* use fractions 0..1. `seven_day_opus` and `seven_day_sonnet` are model-scoped sub-buckets. Other names are ignored. |
 
 Polling rules (architecture §8):
 - A `cooling(quota)` account is polled at least hourly.
-- A poll answered with 401 is handled exactly like a data-plane 401 (C6 row 5). The quota watcher ignored 2,704 such 401s and stayed blind for days (R8 I-07).
+- A poll answered with 401 is handled exactly like a data-plane 401 (C6 rows 4 and 5, including the linked-account rule in C5).
+- **Linked accounts at startup and before each poll:** if the CPA file shows a newer `last_refresh` than the stored token, reload it first. The quota watcher ignored 2,704 such 401s and stayed blind for days (R8 I-07).
 - Every candidate is polled immediately before C6 row 14 or row 15 is answered.
 - The minimum interval per account is 5 minutes.
 - Polls never run for `needs_relogin` or `disabled` accounts.
