@@ -34,9 +34,6 @@ pub(super) struct HeldResponse {
 fn stream_error() -> io::Error {
     io::Error::other("업스트림 응답 스트림이 중단되었습니다.")
 }
-pub(super) fn sanitized_stream_error(_: reqwest::Error) -> io::Error {
-    stream_error()
-}
 
 pub(super) async fn hold(
     status: StatusCode,
