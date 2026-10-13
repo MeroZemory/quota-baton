@@ -85,6 +85,28 @@ async fn bad_states_and_duplicate_parameters_do_not_end_ipv4_only_login() {
 }
 
 #[tokio::test]
+async fn preconnect_socket_does_not_delay_a_valid_callback() {
+    let listeners = ipv4_only().await;
+    let port = listeners.port();
+    let preconnect = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+        .await
+        .unwrap();
+    let login = tokio::spawn(listeners.callback("/callback", "synthetic-state"));
+    assert!(
+        request(port, "/callback?code=synthetic-code&state=synthetic-state")
+            .await
+            .starts_with("HTTP/1.1 200")
+    );
+    drop(preconnect);
+    let code = tokio::time::timeout(Duration::from_secs(2), login)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(code.as_str(), "synthetic-code");
+}
+
+#[tokio::test]
 async fn only_matching_state_provider_error_ends_login() {
     let listeners = ipv4_only().await;
     let port = listeners.port();

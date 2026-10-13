@@ -7,6 +7,7 @@ use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    task::JoinSet,
 };
 use zeroize::Zeroizing;
 
@@ -40,54 +41,61 @@ impl Listeners {
         path: &str,
         expected_state: &str,
     ) -> Result<Zeroizing<String>, LoginError> {
+        let mut reads = JoinSet::new();
         loop {
-            let accepted = tokio::select! {
-                value = self.v4.accept() => value,
+            tokio::select! {
+                value = self.v4.accept() => {
+                    spawn_callback_read(&mut reads, value, path, expected_state);
+                }
                 value = async {
                     match &self.v6 {
                         Some(listener) => listener.accept().await,
                         None => std::future::pending().await,
                     }
-                } => value,
-            }
-            .map_err(|_| LoginError::InvalidCallback)?;
-            let (mut stream, peer) = accepted;
-            if !peer.ip().is_loopback() {
-                continue;
-            }
-            let parsed = tokio::time::timeout(
-                Duration::from_secs(5),
-                read_callback(&mut stream, path, expected_state),
-            )
-            .await;
-            let result = match parsed {
-                Ok(result) => result,
-                Err(_) => {
-                    continue;
+                } => {
+                    spawn_callback_read(&mut reads, value, path, expected_state);
                 }
-            };
-            let response = match &result {
-                Ok(Some(_)) => {
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n로그인 요청을 받았습니다. 이 창을 닫아도 됩니다."
+                result = reads.join_next(), if !reads.is_empty() => {
+                    if let Some(Ok(result)) = result {
+                        match result {
+                            Ok(Some(code)) => return Ok(code),
+                            Ok(None) => {},
+                            Err(LoginError::ExchangeFailed) => return Err(LoginError::ExchangeFailed),
+                            Err(_) => {},
+                        }
+                    }
                 }
-                _ => {
-                    "HTTP/1.1 400 Bad Request\r\nCache-Control: no-store\r\nConnection: close\r\n\r\nInvalid login callback."
-                }
-            };
-            let _ = tokio::time::timeout(
-                Duration::from_secs(1),
-                stream.write_all(response.as_bytes()),
-            )
-            .await;
-            match result {
-                Ok(Some(code)) => return Ok(code),
-                Ok(None) => continue,
-                // Untrusted local requests must not cancel a pending login.
-                Err(LoginError::ExchangeFailed) => return Err(LoginError::ExchangeFailed),
-                Err(_) => continue,
             }
         }
     }
+}
+
+fn spawn_callback_read(
+    reads: &mut JoinSet<Result<Option<Zeroizing<String>>, LoginError>>,
+    accepted: Result<(TcpStream, std::net::SocketAddr), std::io::Error>,
+    path: &str,
+    expected_state: &str,
+) {
+    let Ok((mut stream, peer)) = accepted else {
+        return;
+    };
+    if !peer.ip().is_loopback() {
+        return;
+    }
+    let path = path.to_owned();
+    let expected_state = expected_state.to_owned();
+    reads.spawn(async move {
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_callback(&mut stream, &path, &expected_state),
+        ).await.unwrap_or(Err(LoginError::InvalidCallback));
+        let response = match &result {
+            Ok(Some(_)) => "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n로그인 요청을 받았습니다. 이 창을 닫아도 됩니다.",
+            _ => "HTTP/1.1 400 Bad Request\r\nCache-Control: no-store\r\nConnection: close\r\n\r\nInvalid login callback.",
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(1), stream.write_all(response.as_bytes())).await;
+        result
+    });
 }
 
 async fn read_callback(
