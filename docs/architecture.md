@@ -679,4 +679,16 @@ Each milestone is independently verifiable and sized for an implementer working 
 - **O11.** Who sends the 99.6k HTTP `POST /v1/responses` requests seen at the previous proxy?
   - Codex is WebSocket-first (R6), and the default-home `codex-tui.log` has no "falling back to HTTP" warning. So sticky fallback is not shown to be the cause.
   - The M2 ledger records `originator` and the `User-Agent` product token so the shadow run can identify the senders.
+- **O13. Per-account model entitlements: catalog and routing.** Owner decision, not yet decided (raised 2026-10-13).
+  - **Problem.** Plans and accounts differ in which models they can serve. On 2026-10-13, Codex `gpt-daybreak-blue-latest` was listed for acct-alpha but not in the catalog fetched through hello.sample-acct (V7: 10 models, no daybreak). CPA hides such models entirely, because it serves a public catalog, and rejects them with `model_not_found`.
+  - **Today's design.**
+    - `/v1/models` passes through with **one** account, so the visible catalog depends on which account answered.
+    - Selection does not look at entitlements in advance. A wrong account answers with a "model not supported" 400, and C6 row 6a then fails over and cools only that model on that account. This is reactive, and the first request on the wrong account pays one extra round trip.
+    - Codex HTTP bodies are not decoded, so the model is unknown on HTTP. The WebSocket path reads it from `response.create`.
+  - **Options** (they can be combined):
+    1. Show the union of the catalogs of all active accounts. Fetch per account on start and refresh periodically.
+    2. Model-aware routing: skip accounts whose catalog lacks the requested model, falling back in placement order. This needs the model name, either from a bounded head peek of identity-encoded Codex bodies or from the WebSocket message.
+    3. A manual allow or hide list per model in the tray.
+    4. Rely on row 6a cooling only (the current design).
+  - The choice affects C1 (`/v1/models`), C7 (eligibility gets a model filter) and C8 (peek scope). It does not change D2: the request body still never changes.
 - **O12.** `POST /v1/memories/trace_summarize` is used by Codex's `memories` feature, which is off by default (`core/src/client.rs:179`, `features/src/lib.rs:1231-1235`). It returns 404 (unsupported) until the user asks for it.

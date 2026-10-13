@@ -115,7 +115,12 @@ Each account has two independent fields:
 
 **An account is eligible for a request when all of these hold:**
 - `user_state == active`
-- `health == ready`, or `cooling` that is scoped to a model other than the request's model, where that model is known
+- `health == ready`, or a `cooling` scoped to a model **other than** the request's model
+  - **Unknown model** (M4a review S4): a model-scoped cooling does **not** exclude the account.
+    - This covers Codex HTTP, any WebSocket upgrade, and messages over 1 MiB.
+    - If the account then rejects the model again, row 6 or row 6a fails over as usual.
+  - Only account-scoped states exclude an account whose model is unknown.
+- not in the **reconnect exclusion** of the request's session key (C6 row 13a)
 - a credential is present
 - the account is not in the request's tried set
 
@@ -127,14 +132,16 @@ Each account has two independent fields:
 | — | Upstream 401 with a token that is **no longer current** (another request already refreshed) | **no change**. The request retries once with the current token. |
 | `needs_relogin` | Re-login completes for the same identity | `ready` |
 | `ready` | Usage limit rejection (C6 row 2) | `cooling(quota, until=reset_at, scope)` |
-| `ready` | Usage snapshot shows a window ≥ 100 % or `limit_reached`, or a Codex account is serving from credits and `allow_credits=false` | `cooling(quota, until=reset_at, account)` |
+| `ready` | Usage snapshot shows an **account window** (`5h`, `7d`, Codex primary or secondary) at 100 % or more, or `limit_reached`, or a Codex account is serving from credits and `allow_credits=false` | `cooling(quota, until=<reset_at of the limiting window>, account)`. The limiting window is the one at or over its limit (for credits: projected ≥ 99 %, or the one named by `x-codex-active-limit`). Never use the latest reset across all windows (M4a review M1, M2). If several windows are at their limit, use the **latest** of *those* resets. If no window qualifies, use the soonest known reset. |
+| `ready` | A **sub-bucket** window (e.g. Claude `7d_oi`) at 100 % or more | `cooling(quota, until=<its reset>, model:<the request's model>)`. With the model unknown, no change. Sub-buckets never cool the whole account (M4a review S5; matches row 2). |
 | `ready` | Rate limit with `Retry-After` > 10 s (C6 row 3) | `cooling(rate, until=now+retry_after, model or account)` |
 | `ready` | 403 when the request's model is known (C6 row 6) | `cooling(permission, until=now+1h, model:<model>)` |
 | — | 403 when the model is unknown (always the case for Codex) | **no account-wide change**. Handled per request (C6 row 6). |
 | `ready` | 402 | `cooling(payment, until=now+6h, account)` |
 | `ready` | Persisting rotated tokens fails | `cooling(store_error, until=now+5m, account)`, while the write keeps retrying. The tray shows a critical warning. |
 | `cooling` | `until` passes | `ready` (`auth`: after a successful probe) |
-| `cooling(quota)` | A poll shows a different `reset_at` and every window < 100 % (early reset). Cooling accounts are polled at least hourly (C9). | `ready` |
+| `cooling(quota)` | **Early reset** (M4a review S3). A **fresh** observation, newer than the cooling's start, of the window that caused the cooling shows `used_pct` < 100 **and** a `reset_at` that differs by more than 300 s from the one recorded when the cooling started. Cooling accounts are polled at least hourly (C9). | `ready` |
+| `cooling` (any) | A new cooling event arrives | The **later** `until` wins, and an account-scoped cooling is never replaced by a model-scoped one (M4a review S2) |
 | — | 404, 400, 409, 413, 422, 5xx, 529, 507, network errors, anything during a takeover drain | **no change** |
 
 `user_state` transitions come from admin actions: pause, resume, disable, enable. A `disabled` account is neither selected nor polled.
@@ -155,7 +162,7 @@ Each account has two independent fields:
 | 2 | Usage limit: Claude 429 with unified `5h` or `7d` status `rejected` (sub-bucket only, e.g. `7d_oi`, means model scope); Codex 429 or error type `usage_limit_reached`, or `x-codex-limit-reached: true` | Failover | Next account's response; if none is eligible, row 14 | `cooling(quota, until=reset)` |
 | 3 | Other 429 (rate limit without a window rejection) | Failover only if `Retry-After` > 10 s | Upstream response as is, or the next account's | Row 3 of C5 if > 10 s; otherwise none |
 | 4 | 401 whose body signals revocation: Codex "invalidated oauth token" text or code `token_revoked`, or an Anthropic `authentication_error` saying the token was revoked | Failover | Next account's response; if none, row 15 | `needs_relogin` |
-| 5 | Other 401, from the data plane **or a usage poll** (R8 I-07) | If the failed token is not current, retry once with the current token.<br>If it is current:<br>• **owned** account: a single-flight refresh, then one retry<br>• **linked** account: a single re-read of the CPA file, then one retry if the file holds a newer token<br>A terminal refresh error, a 401 with the new token, or (linked) no newer token triggers failover. | Next account's response; if none, row 14 or row 15 | Per C5: `needs_relogin` on a terminal refresh error. `cooling(auth)` on a 401 with a new token. Linked with no newer token: `cooling(link_stale)` |
+| 5 | Other 401, from the data plane **or a usage poll** (R8 I-07) | If the failed token is not current, retry once with the current token.<br>If it is current:<br>• **owned** account: a single-flight refresh, then one retry<br>• **linked** account: a single re-read of the CPA file, then one retry if the file holds a newer token<br>A terminal refresh error, a 401 with the new token, (linked) no newer token, **or a refresh that is transient, skipped or throttled** triggers failover (M4a review M4). In the last case the account gets `cooling(auth, 5 min)` so it is not reselected at once. | Next account's response; if none, row 14 or row 15 | Per C5: `needs_relogin` on a terminal refresh error. `cooling(auth)` on a 401 with a new token. Linked with no newer token: `cooling(link_stale)` |
 | 6 | 403 | Failover. If a **second** account also returns 403 for the same request, stop and relay that response. | Next account's response, or the second 403 as is | Known model: `cooling(permission, model)`. Unknown model: none. **Account-level denial** (e.g. Claude "OAuth ... not allowed for this organization"): `cooling(permission, account, 6h)` plus a tray notice (R8 I-18). |
 | 6a | 400 "model is not supported when using Codex with a ChatGPT account" (plan cannot serve the model; R8 I-17) | Failover, as for row 6 | Next account's response, or the 400 as is if none | `cooling(permission, model:<model>, 6h)`. The model name comes from the error text, because Codex bodies are not decoded. The C7 gate then skips the account for that model. |
 | 7 | 402 | Failover | Next account's response; if none, upstream response as is | `cooling(payment)` |
@@ -167,11 +174,16 @@ Each account has two independent fields:
 | 12a | An error **event** before commit, e.g. a first SSE event that is `error` or `response.failed` | Treated like the matching status row (2–7, 10) | As that row | As that row |
 | 12b | Pre-commit 400 with an encrypted-content error code: Codex `invalid_encrypted_content` or `thinking_signature_invalid`, Claude "Invalid `signature` in `thinking` block" | No failover, as row 9 | Upstream response as is | None. The ledger records the error code (C12), so a change in server behaviour shows up. |
 | 13 | WebSocket upgrade | Dial upstream first. Classify the handshake response with rows 2–7 and 11, and fail over before answering the client. | 101 with an open upstream; otherwise row 14, 15, or 502 for a pure network failure | As in those rows |
-| 13a | WebSocket: before commit, an `error` from rows 2 or 4–7 answers a `response.create` | Do **not** relay the frame. Record the health change, then close the client socket with 1012. Codex reconnects with full input, and row 13 selects another account. | No error; the turn continues on another account | As in rows 2–7 |
+| 13a | WebSocket: before commit, an `error` from rows 2 or 4–7 answers a `response.create` | First apply the matching row's health logic. For a 401 that is the row 5 token handling, including `cooling(auth)` (M4a review M3).
+Close with 1012 **only if** a different eligible account exists for the reconnect. In that case:
+1. Add the pinned account to the session key's **reconnect exclusion** (TTL 120 s, in memory), so that the reconnect cannot reselect it.
+2. Do **not** relay the frame.
+3. Close the client socket with 1012.
+Otherwise relay the error frame as is, which ends the turn without burning Codex's retries. Codex reconnects with full input, and row 13 selects another account. | No error; the turn continues on another account | As in rows 2–7 |
 | 13b | WebSocket: an error frame after commit, or any other error | — | Frame relayed as is | As in rows 2–12 |
 | 13c | WebSocket: the pinned account becomes ineligible while the socket is idle | — | Client socket closed (1000); Codex reconnects silently on its next request | — |
-| 14 | No eligible account, and every candidate is in `cooling(quota, rate or auth)`. A poll of every candidate runs first (C9). | — | **HTTP:** 429. Replay the cached genuine limit response of the account whose reset comes soonest (status, body and limit headers, at most 64 KiB, with the original `Content-Encoding` kept), with `retry-after` set to the remaining seconds. Without a cache, use the synthesized shape (C6.2). **WebSocket upgrade:** native 429 with a `usage_limit_reached` body, which is terminal for Codex. | — |
-| 15 | No usable account at all (`needs_relogin`, `paused`, `disabled`, or none configured) | — | **400** in native shape, type `invalid_request_error`, message "quota-baton: no usable <provider> account — open the tray". It is terminal in both clients, so there are no retry storms and no sticky HTTP fallback. The user has to act anyway. | — |
+| 14 | No eligible account, and **at least one** active account is in `cooling(quota, rate or auth)` or has an auth probe running (M4a review S6). A poll of every candidate runs first (C9). | — | **HTTP:** 429. Replay the cached genuine limit response of the account whose reset comes soonest (status, body and limit headers, at most 64 KiB, with the original `Content-Encoding` kept), with `retry-after` set to the remaining seconds. Without a cache, use the synthesized shape (C6.2). **WebSocket upgrade:** native 429 with a `usage_limit_reached` body, which is terminal for Codex. | — |
+| 15 | No usable account at all, and no active account is in a cooling that will expire. The accounts are `needs_relogin`, `paused`, `disabled`, or none are configured. | — | **400** in native shape, type `invalid_request_error`, message "quota-baton: no usable <provider> account — open the tray". It is terminal in both clients, so there are no retry storms and no sticky HTTP fallback. The user has to act anyway. | — |
 | 16 | Memory guard tripped | — | 503 with `Retry-After: 5` | — |
 | 17 | In-flight budget exhausted, or the body exceeds the per-request cap | The request is forwarded **without** a retained copy, so it has no failover | Upstream response as is | — |
 
