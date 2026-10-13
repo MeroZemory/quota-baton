@@ -175,6 +175,9 @@ The user delegated this decision to independent reviewers. Three models answered
 - Measure upload time, time to the first response event (which includes server-side decompression), proxy CPU and memory, and the negotiated extension.
 - Enable it only if the time saved on the user's own line is clear and A1 still holds.
 
+
+**Outcome (M3, 2026-10-13):** tokio-tungstenite 0.28 has no permessage-deflate, so enabling it would need a git fork. The switch stays off, and `true` refuses to start. Expected gain is modest (about 1.5x at p95, mostly screenshots). Revisit only if slow full-input uploads become a measured problem.
+
 <a id="d13"></a>
 ## D13. Phase 0 test accounts — Accepted (user, 2026-10-13)
 
