@@ -686,6 +686,64 @@ fn offline_status_and_actions_use_synthetic_metadata_and_quota() {
     ] {
         assert!(!status.contains(forbidden));
     }
+    // Offline snapshots use the same expiry display as the live admin response.
+    std::fs::write(
+        home.path().join("state/quota.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema":1, "accounts":{id.clone():{"windows":[
+                {"name":"5h", "used_pct":100.0, "reset_at":"2000-01-01T05:00:00Z"},
+                {"name":"7d", "used_pct":99.0, "reset_at":"2000-01-07T00:00:00Z"}
+            ]}}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let output = command(home.path()).arg("status").output().unwrap();
+    assert!(output.status.success());
+    let status = String::from_utf8(output.stdout).unwrap();
+    let columns: Vec<_> = status.lines().nth(2).unwrap().split('\t').collect();
+    assert_eq!(columns[5], "리셋됨");
+    assert_eq!(columns[7], "리셋됨");
+    assert!(!status.contains("100.0%"));
+    assert!(!status.contains("99.0%"));
+    for (health, pending, failures, expected) in [
+        (
+            serde_json::json!({"kind":"cooling", "reason":"auth", "until":"2000-01-01T00:00:00Z", "scope":"account"}),
+            false,
+            1,
+            "인증 확인 대기",
+        ),
+        (
+            serde_json::json!({"kind":"ready"}),
+            false,
+            1,
+            "인증 확인 대기",
+        ),
+        (
+            serde_json::json!({"kind":"ready"}),
+            true,
+            0,
+            "인증 확인 대기",
+        ),
+        (serde_json::json!({"kind":"ready"}), false, 0, "준비됨"),
+    ] {
+        let health: qb_core::accounts::Health = serde_json::from_value(health).unwrap();
+        {
+            let store = qb_core::accounts::AccountStore::acquire(home.path()).unwrap();
+            store
+                .update_metadata(&id, |account| {
+                    account.health = health.clone();
+                    account.auth_probe_pending = pending;
+                    account.auth_failures = failures;
+                })
+                .unwrap();
+        }
+        let output = command(home.path()).arg("status").output().unwrap();
+        assert!(output.status.success());
+        let status = String::from_utf8(output.stdout).unwrap();
+        let columns: Vec<_> = status.lines().nth(2).unwrap().split('\t').collect();
+        assert_eq!(columns[4], expected);
+    }
     let store = qb_core::accounts::AccountStore::acquire(home.path()).unwrap();
     let account_path = home.path().join("accounts").join(format!("{id}.json"));
     let before = std::fs::read(&account_path).unwrap();
@@ -827,6 +885,80 @@ fn online_status_unknown_health_is_utf8_safe_and_omits_secret_fields() {
     ] {
         assert!(!status.contains(secret));
         assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
+    }
+    assert!(!home.path().join("accounts").exists());
+}
+
+#[test]
+fn online_status_piped_and_file_stdout_are_utf8_with_expired_windows_and_probe_pending() {
+    use std::io::{Read, Write};
+    let home = fixture();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!(
+            "[server]\nadmin_port={}\n",
+            listener.local_addr().unwrap().port()
+        ),
+    )
+    .unwrap();
+    std::fs::write(home.path().join("admin.token"), "synthetic-admin-token").unwrap();
+    let state = serde_json::json!({"accounts":[
+        {"id":"cx-expired-five", "provider":"codex", "label":"합성 🧪", "user_state":"active",
+         "health":{"kind":"ready"}, "probe_pending":true, "windows":[
+            {"name":"5h", "used_pct":100.0, "reset_at":"2000-01-01T09:00:00.123+09:00"},
+            {"name":"7d", "used_pct":37.5, "reset_at":"2099-01-07T00:00:00Z"}
+         ]},
+        {"id":"cx-expired-seven", "provider":"codex", "label":"합성 계정", "user_state":"active",
+         "health":{"kind":"ready"}, "probe_pending":false, "windows":[
+            {"name":"5h", "used_pct":91.0, "reset_at":"2099-01-01T05:00:00Z"},
+            {"name":"7d", "used_pct":99.0, "reset_at":"2000-01-07T00:00:00Z"}
+         ]},
+        {"id":"cx-missing-reset", "provider":"codex", "user_state":"active",
+         "health":{"kind":"ready"}, "windows":[{"name":"5h", "used_pct":12.0}]},
+        {"id":"cx-invalid-reset", "provider":"codex", "user_state":"active",
+         "health":{"kind":"cooling", "reason":"auth", "until":"2099-01-01T00:00:00Z"},
+         "windows":[{"name":"7d", "used_pct":25.0, "reset_at":"invalid"}]}
+    ]});
+    let server = std::thread::spawn(move || {
+        // Both process launches query health, then state; no real core or upstream.
+        for _ in 0..2 {
+            for body in [
+                serde_json::json!({"ok":true,"version":"synthetic","pid":0,"started_at":"2030-01-01T00:00:00Z"}).to_string(),
+                state.to_string(),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut request = [0; 4096];
+                assert!(stream.read(&mut request).unwrap() > 0);
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        }
+    });
+    let expected = concat!(
+        "코어: 실행 중\n",
+        "계정 ID\t제공자\t라벨\t사용 상태\t계정 상태\t5시간 사용률\t5시간 초기화\t7일 사용률\t7일 초기화\t상태 이유\t대기 종료\n",
+        "cx-expired-five\tcodex\t합성 🧪\t활성\t인증 확인 대기\t리셋됨\t2000-01-01T09:00:00.123+09:00\t37.5%\t2099-01-07T00:00:00Z\t-\t-\n",
+        "cx-expired-seven\tcodex\t합성 계정\t활성\t준비됨\t91.0%\t2099-01-01T05:00:00Z\t리셋됨\t2000-01-07T00:00:00Z\t-\t-\n",
+        "cx-missing-reset\tcodex\t-\t활성\t준비됨\t12.0%\t-\t-\t-\t-\t-\n",
+        "cx-invalid-reset\tcodex\t-\t활성\t대기 중\t-\t-\t25.0%\tinvalid\t인증 오류\t2099-01-01T00:00:00Z\n",
+    );
+    let piped = command(home.path()).arg("status").output().unwrap();
+    let output_path = home.path().join("status.stdout");
+    let redirected = command(home.path())
+        .arg("status")
+        .stdout(Stdio::from(std::fs::File::create(&output_path).unwrap()))
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(piped.status.success(), "{:?}", piped.stderr);
+    assert!(redirected.status.success(), "{:?}", redirected.stderr);
+    assert!(redirected.stdout.is_empty());
+    let file_bytes = std::fs::read(output_path).unwrap();
+    for bytes in [&piped.stdout, &file_bytes] {
+        assert_eq!(std::str::from_utf8(bytes).unwrap(), expected);
+        assert_eq!(bytes.as_slice(), expected.as_bytes());
+        assert!(!bytes.starts_with(&[0xef, 0xbb, 0xbf]));
     }
     assert!(!home.path().join("accounts").exists());
 }

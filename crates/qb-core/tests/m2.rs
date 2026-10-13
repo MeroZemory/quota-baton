@@ -544,7 +544,7 @@ async fn expiry_reload_is_throttled_stale_events_limited_and_401_bypasses_thrott
     h.claude
         .state
         .push(ScriptedResponse::json(StatusCode::UNAUTHORIZED, "{}"));
-    assert_eq!(h.send("/v1/messages", "{}").await.status(), 400);
+    assert_eq!(h.send("/v1/messages", "{}").await.status(), 429);
     let rows = h.ledger();
     assert_eq!(
         rows.iter().filter(|r| r["outcome"] == "link_stale").count(),
@@ -619,13 +619,13 @@ async fn linked_reload_before_expiry_and_401_once_then_link_stale() {
         "{\"error\":\"synthetic unauthorized\"}",
     ));
     let response = h.send("/v1/responses", "{}").await;
-    assert_eq!(response.status(), 400);
+    assert_eq!(response.status(), 429);
     assert!(
         response
             .text()
             .await
             .unwrap()
-            .contains("no usable codex account")
+            .contains("usage_limit_reached")
     );
     assert_eq!(h.codex.state.requests().len(), 3);
     assert!(h.store.list().unwrap().iter().any(|account| matches!(
@@ -845,7 +845,10 @@ async fn no_account_and_debug_pin_routes() {
     let error: Value = response.json().await.unwrap();
     assert_eq!(error["type"], "error");
     assert_eq!(error["error"]["type"], "invalid_request_error");
-    assert!(error["error"]["message"].as_str().unwrap().contains("계정"));
+    assert_eq!(
+        error["error"]["message"],
+        "quota-baton: no usable claude account — open the tray"
+    );
     assert!(
         error["error"]["message"]
             .as_str()

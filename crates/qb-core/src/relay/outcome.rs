@@ -103,9 +103,14 @@ pub(super) fn classify(
             "rejected",
         )
     }) || has("anthropic-ratelimit-unified-status", "rejected");
+    let error_event = status.is_success()
+        && (event["type"] == "error"
+            || event["type"] == "response.failed"
+            || root.get("error").is_some());
     if kind == "usage_limit_reached"
         || code == "usage_limit_reached"
-        || has("x-codex-limit-reached", "true")
+        || (has("x-codex-limit-reached", "true")
+            && (effective == StatusCode::TOO_MANY_REQUESTS || error_event))
         || (effective == StatusCode::TOO_MANY_REQUESTS
             && (provider == Provider::Codex || claude_limit))
     {
@@ -148,20 +153,58 @@ pub(super) fn classify(
             {
                 resets.push(now + Duration::seconds(s.min(31_536_000)));
             }
-            for slot in ["primary", "secondary"] {
-                if let Some(t) = header_timestamp(headers, &format!("x-codex-{slot}-reset-at")) {
-                    resets.push(t);
+            // A body reset identifies the limit directly. Otherwise inspect only
+            // exhausted/active windows, never an unrelated weekly reset.
+            if resets.is_empty() {
+                let mut known = Vec::new();
+                let active = headers
+                    .get("x-codex-active-limit")
+                    .and_then(|v| v.to_str().ok());
+                for slot in ["primary", "secondary"] {
+                    let reset = header_timestamp(headers, &format!("x-codex-{slot}-reset-at"))
+                        .or_else(|| {
+                            header_seconds(headers, &format!("x-codex-{slot}-reset-after-seconds"))
+                                .map(|s| now + Duration::seconds(s))
+                        })
+                        .filter(|reset| *reset > now);
+                    if let Some(reset) = reset {
+                        known.push(reset);
+                        let used = headers
+                            .get(format!("x-codex-{slot}-used-percent"))
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|v| v.parse::<f64>().ok());
+                        let minutes = headers
+                            .get(format!("x-codex-{slot}-window-minutes"))
+                            .and_then(|v| v.to_str().ok());
+                        let active_matches = active == Some(slot)
+                            || (active == Some("5h") && minutes == Some("300"))
+                            || (active == Some("7d") && minutes == Some("10080"));
+                        if used.is_some_and(|n| n >= 100.0) || active_matches {
+                            resets.push(reset);
+                        }
+                    }
                 }
-                if let Some(s) =
-                    header_seconds(headers, &format!("x-codex-{slot}-reset-after-seconds"))
-                {
-                    resets.push(now + Duration::seconds(s));
+                if resets.is_empty() {
+                    resets.extend(known.into_iter().min());
                 }
             }
         }
-        let until = resets.into_iter().max().unwrap_or(
-            now + Duration::seconds(header_seconds(headers, "retry-after").unwrap_or(300)),
-        );
+        if provider == Provider::Claude
+            && scope == "account"
+            && !has("anthropic-ratelimit-unified-5h-status", "rejected")
+            && !has("anthropic-ratelimit-unified-7d-status", "rejected")
+            && has("anthropic-ratelimit-unified-7d_oi-status", "rejected")
+            && model.is_none()
+        {
+            return decision;
+        }
+        let until = resets
+            .into_iter()
+            .filter(|reset| *reset > now)
+            .max()
+            .unwrap_or(
+                now + Duration::seconds(header_seconds(headers, "retry-after").unwrap_or(300)),
+            );
         decision.signal = cooling(HealthReason::Quota, until, scope);
     } else if effective == StatusCode::TOO_MANY_REQUESTS
         && header_seconds(headers, "retry-after").is_some_and(|s| s > 10)
@@ -240,14 +283,24 @@ pub(super) fn classify(
 }
 
 pub(super) fn header_seconds(h: &HeaderMap, name: &str) -> Option<i64> {
-    h.get(name)?
-        .to_str()
-        .ok()?
-        .parse::<f64>()
-        .ok()
-        .filter(|n| n.is_finite() && *n >= 0.0)
-        .map(|n| n.ceil().min(31_536_000.0) as i64)
+    let value = h.get(name)?.to_str().ok()?;
+    if let Ok(number) = value.parse::<f64>() {
+        return number
+            .is_finite()
+            .then_some(number)
+            .filter(|n| *n >= 0.0)
+            .map(|n| n.ceil().min(31_536_000.0) as i64);
+    }
+    if name == "retry-after" {
+        return DateTime::parse_from_rfc2822(value).ok().map(|date| {
+            (date.with_timezone(&Utc) - Utc::now())
+                .num_seconds()
+                .clamp(0, 31_536_000)
+        });
+    }
+    None
 }
+
 fn header_timestamp(h: &HeaderMap, name: &str) -> Option<DateTime<Utc>> {
     DateTime::from_timestamp(h.get(name)?.to_str().ok()?.parse().ok()?, 0)
 }

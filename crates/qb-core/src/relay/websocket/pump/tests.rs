@@ -763,3 +763,36 @@ fn c6_row_13a_only_response_events_commit_the_current_request() {
     current.upstream(Some(&serde_json::json!({"type":"response.created"})));
     assert!(current.committed);
 }
+
+#[test]
+fn health_broadcast_filters_unrelated_accounts_before_idle_eligibility_load() {
+    for kind in ["account_changed", "quota_updated"] {
+        assert!(!event_affects_account(
+            &serde_json::json!({"event":kind,"data":{"id":"other-account"}}),
+            "pinned-account"
+        ));
+        assert!(event_affects_account(
+            &serde_json::json!({"event":kind,"data":{"id":"pinned-account"}}),
+            "pinned-account"
+        ));
+    }
+    assert!(!event_affects_account(
+        &serde_json::json!({"event":"account_changed","data":{}}),
+        "pinned-account"
+    ));
+}
+
+#[test]
+fn auth_retry_marker_expires_before_natural_access_token_expiry() {
+    let now = std::time::Instant::now();
+    let marker = crate::relay::websocket::RetriedToken {
+        relay: std::sync::Weak::new(),
+        account: "synthetic-account".into(),
+        digest: [7; 32],
+        expires_at: now + crate::relay::websocket::RETRY_MARKER_TTL,
+    };
+    assert!(marker.matches(&[7; 32], now + Duration::from_secs(119)));
+    assert!(!marker.matches(&[7; 32], now + Duration::from_secs(120)));
+    assert!(!marker.matches(&[7; 32], now + Duration::from_secs(3600)));
+    assert!(!marker.matches(&[8; 32], now));
+}

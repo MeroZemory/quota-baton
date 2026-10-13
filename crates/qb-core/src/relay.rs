@@ -8,9 +8,9 @@ mod upload;
 mod websocket;
 
 use std::{
-    collections::BTreeSet,
-    sync::{Arc, atomic::AtomicU64},
-    time::Duration,
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Mutex, atomic::AtomicU64},
+    time::{Duration, Instant},
 };
 
 #[cfg(all(feature = "phase0", debug_assertions))]
@@ -24,7 +24,7 @@ use axum::{
 use bytes::Bytes;
 
 use crate::{
-    accounts::{Account, AccountStore, Health, HealthReason, Provider, UserState, linked},
+    accounts::{Account, AccountStore, Health, HealthReason, Provider, UserState},
     config::Config,
     debug_pin::DebugPins,
     guard::{InflightBudget, RetainedBody, mib_bytes},
@@ -49,6 +49,7 @@ pub struct RelayState {
     pins: Arc<DebugPins>,
     tokens: TokenGates,
     websocket: crate::config::WebsocketConfig,
+    reconnect_exclusions: Mutex<BTreeMap<(String, String), Instant>>,
     #[cfg(all(feature = "phase0", debug_assertions))]
     close_after_response: bool,
     #[cfg(all(feature = "phase0", debug_assertions))]
@@ -104,6 +105,7 @@ impl RelayState {
             pins,
             tokens,
             websocket: config.websocket.clone(),
+            reconnect_exclusions: Mutex::new(BTreeMap::new()),
             #[cfg(all(feature = "phase0", debug_assertions))]
             close_after_response: false,
             #[cfg(all(feature = "phase0", debug_assertions))]
@@ -129,6 +131,49 @@ impl RelayState {
         self
     }
 
+    async fn claim_probe(&self, account: &mut Account) -> Option<crate::account_runtime::Probe> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match self.accounts.begin_probe(account) {
+                Ok(probe) => return probe,
+                Err(_) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    let store = self.store.clone();
+                    let id = account.id.clone();
+                    match tokio::task::spawn_blocking(move || store.load(&id)).await {
+                        Ok(Ok(updated)) => *account = updated,
+                        _ => {
+                            account.user_state = UserState::Paused;
+                            return None;
+                        }
+                    }
+                    if !account.eligible(None) {
+                        return None;
+                    }
+                }
+                Err(_) => {
+                    account.user_state = UserState::Paused;
+                    return None;
+                }
+            }
+        }
+    }
+
+    pub(super) fn exclude_reconnect(&self, key: Option<&str>, account: &str) {
+        if let Some(key) = key
+            && let Ok(mut exclusions) = self.reconnect_exclusions.lock()
+        {
+            exclusions.retain(|_, expiry| *expiry > Instant::now());
+            if exclusions.len() >= 4096 {
+                exclusions.pop_first();
+            }
+            exclusions.insert(
+                (key.to_owned(), account.to_owned()),
+                Instant::now() + Duration::from_secs(120),
+            );
+        }
+    }
+
     async fn select(
         &self,
         provider: Provider,
@@ -139,32 +184,43 @@ impl RelayState {
         let pinned = self.pins.get(provider, key);
         let store = self.store.clone();
         let model = model.map(str::to_owned);
-        let tried = tried.clone();
+        let mut tried = tried.clone();
+        if let Some(key) = key
+            && let Ok(mut exclusions) = self.reconnect_exclusions.lock()
+        {
+            exclusions.retain(|_, expiry| *expiry > Instant::now());
+            tried.extend(
+                exclusions
+                    .keys()
+                    .filter(|(session, _)| session == key)
+                    .map(|(_, id)| id.clone()),
+            );
+        }
         let runtime = self.accounts.clone();
-        let obs = self.observability.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut accounts = store.list().map_err(|_| ())?;
-            for account in &mut accounts {
-                if account.provider == provider
-                    && account.user_state == UserState::Active
-                    && matches!(
-                        account.health,
-                        Health::Cooling {
-                            reason: HealthReason::LinkStale,
-                            ..
-                        }
-                    )
-                    && let Ok(updated) = linked::reload_and_store(&store, account)
-                {
-                    obs.record_reload(
-                        &updated.id,
-                        "selection",
-                        "updated",
-                        updated.token_meta.expires_at,
-                    );
-                    *account = updated;
-                }
+        let read_store = store.clone();
+        let mut accounts = tokio::task::spawn_blocking(move || read_store.list())
+            .await
+            .map_err(|_| ())?
+            .map_err(|_| ())?;
+        for account in &mut accounts {
+            if account.provider == provider
+                && account.user_state == UserState::Active
+                && matches!(
+                    account.health,
+                    Health::Cooling {
+                        reason: HealthReason::LinkStale,
+                        ..
+                    }
+                )
+                && let Ok(updated) = self
+                    .tokens
+                    .selection_reload(store.clone(), self.observability.clone(), account.clone())
+                    .await
+            {
+                *account = updated;
             }
+        }
+        tokio::task::spawn_blocking(move || {
             let usable = |a: &Account| {
                 a.provider == provider
                     && a.eligible(model.as_deref())
@@ -532,21 +588,10 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
         url.push_str(query);
     }
     let mut body_to_send = upload.into_body();
-    let mut retry_used = false;
+    let mut network_retry = false;
     let mut token_retry = false;
     let mut permission_denials = 0;
-    let mut probe = match state.accounts.begin_probe(&account) {
-        Ok(probe) => probe,
-        Err(_) => {
-            return failure(
-                &mut completion,
-                StatusCode::BAD_GATEWAY,
-                provider,
-                "auth_probe_pending",
-                "Account authentication probe is already running",
-            );
-        }
-    };
+    let mut probe = state.claim_probe(&mut account).await;
     let (status, response_headers, held) = loop {
         if !account.eligible(request_model.as_deref()) {
             let next = state
@@ -587,19 +632,8 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
                     );
                 }
             }
-            probe = match state.accounts.begin_probe(&account) {
-                Ok(probe) => probe,
-                Err(_) => {
-                    return failure(
-                        &mut completion,
-                        StatusCode::BAD_GATEWAY,
-                        provider,
-                        "auth_probe_pending",
-                        "Account authentication probe is already running",
-                    );
-                }
-            };
-            retry_used = false;
+            probe = state.claim_probe(&mut account).await;
+            network_retry = false;
             token_retry = false;
             continue;
         }
@@ -627,8 +661,8 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
         let response = match tokio::time::timeout(Duration::from_secs(300), send).await {
             Ok(Ok(response)) => response,
             _ => {
-                if !retry_used && let Some(copy) = &retained {
-                    retry_used = true;
+                if !network_retry && let Some(copy) = &retained {
+                    network_retry = true;
                     completion.failover("network_retry");
                     body_to_send = retry_body(copy.bytes());
                     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -646,10 +680,17 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
         let status = response.status();
         completion.record.upstream_status = Some(status.as_u16());
         let response_headers = response.headers().clone();
-        state
-            .accounts
-            .observe_headers(&account.id, provider, &response_headers)
-            .await;
+        if status.is_success() || status == StatusCode::TOO_MANY_REQUESTS {
+            state
+                .accounts
+                .observe_headers_for_model(
+                    &account.id,
+                    provider,
+                    &response_headers,
+                    request_model.as_deref(),
+                )
+                .await;
+        }
         #[cfg(all(feature = "shape-capture", debug_assertions))]
         state
             .observability
@@ -662,8 +703,8 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
         )
         .await;
         if held.decision == CommitDecision::StreamError && held.prefix.is_empty() {
-            if !retry_used && let Some(copy) = &retained {
-                retry_used = true;
+            if !network_retry && let Some(copy) = &retained {
+                network_retry = true;
                 completion.failover("network_retry");
                 body_to_send = retry_body(copy.bytes());
                 tokio::time::sleep(Duration::from_millis(250)).await;
@@ -704,6 +745,28 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
         if let Some(model) = decision.model.take() {
             request_model = Some(model);
         }
+        if decision.kind == outcome::Kind::Revoked {
+            match state
+                .tokens
+                .revoke_if_current(state.store.clone(), &account, &tokens)
+                .await
+            {
+                Ok(updated) if !matches!(updated.health, Health::NeedsRelogin { .. }) => {
+                    decision.kind = outcome::Kind::Auth;
+                }
+                Ok(_) => {}
+                Err(()) => {
+                    return failure(
+                        &mut completion,
+                        StatusCode::BAD_GATEWAY,
+                        provider,
+                        "store_error",
+                        "Could not persist account health",
+                    );
+                }
+            }
+            decision.signal = None;
+        }
         if decision.kind == outcome::Kind::Auth {
             if token_retry {
                 if state
@@ -737,8 +800,7 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
                     .await
                 {
                     Ok(Some((updated, refreshed))) => {
-                        if !retry_used && let Some(copy) = &retained {
-                            retry_used = true;
+                        if !token_retry && let Some(copy) = &retained {
                             token_retry = true;
                             completion.failover("token_retry");
                             account = updated;
@@ -747,15 +809,22 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
                             continue;
                         }
                     }
-                    Ok(None)
+                    Ok(None) => {
                         if state
-                            .accounts
-                            .eligible(&account.id, request_model.as_deref())
-                            .await =>
-                    {
-                        break (status, response_headers, held);
+                            .tokens
+                            .cool_unavailable_auth(state.store.clone(), &account, &tokens)
+                            .await
+                            .is_err()
+                        {
+                            return failure(
+                                &mut completion,
+                                StatusCode::BAD_GATEWAY,
+                                provider,
+                                "store_error",
+                                "Could not persist account health",
+                            );
+                        }
                     }
-                    Ok(None) => {}
                     Err(()) => {
                         return failure(
                             &mut completion,
@@ -853,19 +922,8 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
                         );
                     }
                 }
-                probe = match state.accounts.begin_probe(&account) {
-                    Ok(probe) => probe,
-                    Err(_) => {
-                        return failure(
-                            &mut completion,
-                            StatusCode::BAD_GATEWAY,
-                            provider,
-                            "auth_probe_pending",
-                            "Account authentication probe is already running",
-                        );
-                    }
-                };
-                retry_used = false;
+                probe = state.claim_probe(&mut account).await;
+                network_retry = false;
                 token_retry = false;
                 body_to_send = retry_body(retained.as_ref().expect("retained failover").bytes());
             }
@@ -916,6 +974,7 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
     if let Ok(value) = HeaderValue::from_str(&account.id) {
         output_headers.insert("x-quota-baton-account", value);
     }
+    completion.failed_access = Some(zeroize::Zeroizing::new(tokens.access_token.clone()));
     let body = response::body(completion, held, status, &response_headers, success_outcome);
     let mut response = Response::new(body);
     *response.status_mut() = status;

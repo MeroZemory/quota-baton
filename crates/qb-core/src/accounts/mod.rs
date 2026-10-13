@@ -6,7 +6,7 @@ pub mod linked;
 mod store;
 
 use chrono::{DateTime, Utc};
-pub use health::{HealthScope, HealthSignal, UsageWindow};
+pub use health::HealthSignal;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
@@ -172,6 +172,14 @@ pub enum Health {
     },
 }
 
+/// Persisted evidence required to release quota cooling before its deadline.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuotaCooling {
+    pub window: String,
+    pub reset_at: DateTime<Utc>,
+    pub started_at: DateTime<Utc>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenMeta {
     pub expires_at: Option<DateTime<Utc>>,
@@ -210,6 +218,10 @@ pub struct Account {
     pub health: Health,
     #[serde(default)]
     pub auth_failures: u32,
+    #[serde(default)]
+    pub auth_probe_pending: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_cooling: Option<QuotaCooling>,
     #[serde(default)]
     pub drain: bool,
     #[serde(default)]
