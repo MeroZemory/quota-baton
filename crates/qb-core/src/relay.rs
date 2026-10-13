@@ -2,11 +2,16 @@ mod credentials;
 mod headers;
 mod hold;
 mod ledger;
+mod outcome;
 mod response;
 mod upload;
 mod websocket;
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Mutex, atomic::AtomicU64},
+    time::{Duration, Instant},
+};
 
 #[cfg(all(feature = "phase0", debug_assertions))]
 use axum::body::Body;
@@ -19,7 +24,7 @@ use axum::{
 use bytes::Bytes;
 
 use crate::{
-    accounts::{Account, AccountStore, Provider, UserState},
+    accounts::{Account, AccountStore, Health, HealthReason, Provider, UserState},
     config::Config,
     debug_pin::DebugPins,
     guard::{InflightBudget, RetainedBody, mib_bytes},
@@ -31,16 +36,20 @@ pub use hold::CommitDecision;
 use ledger::Completion;
 
 pub struct RelayState {
+    pub accounts: Arc<crate::account_runtime::AccountRuntime>,
+    pub inflight_requests: Arc<AtomicU64>,
     store: Arc<AccountStore>,
     client: reqwest::Client,
     anthropic_base: String,
     codex_base: String,
     pub budget: Arc<InflightBudget>,
     retain_cap: usize,
+    memory_limit: usize,
     observability: Arc<Observability>,
     pins: Arc<DebugPins>,
     tokens: TokenGates,
     websocket: crate::config::WebsocketConfig,
+    reconnect_exclusions: Mutex<BTreeMap<(String, String), Instant>>,
     #[cfg(all(feature = "phase0", debug_assertions))]
     close_after_response: bool,
     #[cfg(all(feature = "phase0", debug_assertions))]
@@ -48,6 +57,25 @@ pub struct RelayState {
 }
 
 impl RelayState {
+    fn memory_rejection(&self, provider: Provider) -> Option<Response> {
+        if crate::guard::private_bytes() <= self.memory_limit as u64 {
+            return None;
+        }
+        let mut response = native_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            provider,
+            if provider == Provider::Claude {
+                "api_error"
+            } else {
+                "server_error"
+            },
+            "quota-baton: memory guard tripped",
+        );
+        response
+            .headers_mut()
+            .insert("retry-after", HeaderValue::from_static("5"));
+        Some(response)
+    }
     pub fn new(
         store: Arc<AccountStore>,
         config: &Config,
@@ -57,17 +85,27 @@ impl RelayState {
         config.upstream.validate()?;
         config.websocket.validate()?;
         let client = upstream_client()?;
+        let accounts = crate::account_runtime::AccountRuntime::new(
+            store.clone(),
+            observability.clone(),
+            config.routing.inflight_allowance_pct,
+        );
+        let tokens = TokenGates::new(client.clone(), accounts.clone());
         Ok(Self {
+            accounts,
+            inflight_requests: Arc::new(AtomicU64::new(0)),
             store,
             client,
             anthropic_base: config.upstream.anthropic_base.trim_end_matches('/').into(),
             codex_base: config.upstream.codex_base.trim_end_matches('/').into(),
             budget: InflightBudget::new(mib_bytes(config.guard.inflight_budget_mib)),
             retain_cap: mib_bytes(config.guard.retain_max_per_request_mib),
+            memory_limit: mib_bytes(config.guard.memory_hard_limit_mib),
             observability,
             pins,
-            tokens: TokenGates::default(),
+            tokens,
             websocket: config.websocket.clone(),
+            reconnect_exclusions: Mutex::new(BTreeMap::new()),
             #[cfg(all(feature = "phase0", debug_assertions))]
             close_after_response: false,
             #[cfg(all(feature = "phase0", debug_assertions))]
@@ -87,19 +125,113 @@ impl RelayState {
         self
     }
 
-    async fn select(&self, provider: Provider, key: Option<&str>) -> Result<Option<Account>, ()> {
+    #[cfg(all(feature = "testkit", debug_assertions))]
+    pub fn with_token_endpoint(mut self, provider: Provider, url: String) -> Self {
+        self.tokens = self.tokens.with_token_endpoint(provider, url);
+        self
+    }
+
+    async fn claim_probe(&self, account: &mut Account) -> Option<crate::account_runtime::Probe> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match self.accounts.begin_probe(account) {
+                Ok(probe) => return probe,
+                Err(_) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    let store = self.store.clone();
+                    let id = account.id.clone();
+                    match tokio::task::spawn_blocking(move || store.load(&id)).await {
+                        Ok(Ok(updated)) => *account = updated,
+                        _ => {
+                            account.user_state = UserState::Paused;
+                            return None;
+                        }
+                    }
+                    if !account.eligible(None) {
+                        return None;
+                    }
+                }
+                Err(_) => {
+                    account.user_state = UserState::Paused;
+                    return None;
+                }
+            }
+        }
+    }
+
+    pub(super) fn exclude_reconnect(&self, key: Option<&str>, account: &str) {
+        if let Some(key) = key
+            && let Ok(mut exclusions) = self.reconnect_exclusions.lock()
+        {
+            exclusions.retain(|_, expiry| *expiry > Instant::now());
+            if exclusions.len() >= 4096 {
+                exclusions.pop_first();
+            }
+            exclusions.insert(
+                (key.to_owned(), account.to_owned()),
+                Instant::now() + Duration::from_secs(120),
+            );
+        }
+    }
+
+    async fn select(
+        &self,
+        provider: Provider,
+        key: Option<&str>,
+        model: Option<&str>,
+        tried: &BTreeSet<String>,
+    ) -> Result<Option<Account>, ()> {
         let pinned = self.pins.get(provider, key);
         let store = self.store.clone();
+        let model = model.map(str::to_owned);
+        let mut tried = tried.clone();
+        if let Some(key) = key
+            && let Ok(mut exclusions) = self.reconnect_exclusions.lock()
+        {
+            exclusions.retain(|_, expiry| *expiry > Instant::now());
+            tried.extend(
+                exclusions
+                    .keys()
+                    .filter(|(session, _)| session == key)
+                    .map(|(_, id)| id.clone()),
+            );
+        }
+        let runtime = self.accounts.clone();
+        let read_store = store.clone();
+        let mut accounts = tokio::task::spawn_blocking(move || read_store.list())
+            .await
+            .map_err(|_| ())?
+            .map_err(|_| ())?;
+        for account in &mut accounts {
+            if account.provider == provider
+                && account.user_state == UserState::Active
+                && matches!(
+                    account.health,
+                    Health::Cooling {
+                        reason: HealthReason::LinkStale,
+                        ..
+                    }
+                )
+                && let Ok(updated) = self
+                    .tokens
+                    .selection_reload(store.clone(), self.observability.clone(), account.clone())
+                    .await
+            {
+                *account = updated;
+            }
+        }
         tokio::task::spawn_blocking(move || {
-            let accounts = store.list().map_err(|_| ())?;
-            Ok(match pinned {
-                Some(id) => accounts
-                    .into_iter()
-                    .find(|account| account.provider == provider && account.id == id),
-                None => accounts.into_iter().find(|account| {
-                    account.provider == provider && account.user_state == UserState::Active
-                }),
-            })
+            let usable = |a: &Account| {
+                a.provider == provider
+                    && a.eligible(model.as_deref())
+                    && !tried.contains(&a.id)
+                    && !runtime.probing(&a.id)
+                    && !runtime.blocked_in_memory(&a.id)
+                    && store.tokens(a).is_ok_and(|t| !t.access_token.is_empty())
+            };
+            Ok(pinned
+                .and_then(|id| accounts.iter().find(|a| a.id == id && usable(a)).cloned())
+                .or_else(|| accounts.into_iter().find(usable)))
         })
         .await
         .map_err(|_| ())?
@@ -311,6 +443,8 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
         provider,
         &parts.headers,
     );
+    completion.track(state.inflight_requests.clone());
+    completion.runtime = Some(state.accounts.clone());
     let Some((_, upstream_path)) = routed else {
         return failure(
             &mut completion,
@@ -320,6 +454,10 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
             "Unsupported route",
         );
     };
+    if let Some(response) = state.memory_rejection(provider) {
+        completion.outcome(response.status().as_u16(), "memory_guard");
+        return response;
+    }
     let upload = match upload::read(body, state.retain_cap, completion.input_bytes.clone()).await {
         Ok(upload) => upload,
         Err(_) => {
@@ -340,6 +478,8 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
     completion.record.retained_copy = retained.is_some();
     let session = session::classify(provider, path, &parts.headers, &upload.prefix);
     completion.session(&session);
+    let mut tried = BTreeSet::new();
+    let mut request_model = session.model.clone();
     #[cfg(all(feature = "shape-capture", debug_assertions))]
     let shape_ticket = {
         let observability = state.observability.clone();
@@ -364,23 +504,33 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
         .await
         .unwrap_or(Err(()))
     } else {
-        state.select(provider, session.key.as_deref()).await
+        state
+            .select(
+                provider,
+                session.key.as_deref(),
+                request_model.as_deref(),
+                &tried,
+            )
+            .await
     };
     #[cfg(not(all(feature = "phase0", debug_assertions)))]
-    let selection = state.select(provider, session.key.as_deref()).await;
+    let selection = state
+        .select(
+            provider,
+            session.key.as_deref(),
+            request_model.as_deref(),
+            &tried,
+        )
+        .await;
     let account = match selection {
         Ok(Some(account)) => account,
         Ok(None) => {
-            return failure(
-                &mut completion,
-                StatusCode::BAD_REQUEST,
-                provider,
-                "no_account",
-                &format!(
-                    "quota-baton: no usable {} account - open the quota-baton tray (사용 가능한 계정이 없습니다. 트레이를 여세요)",
-                    provider.as_str()
-                ),
-            );
+            let response = state
+                .accounts
+                .unavailable(provider, false, request_model.as_deref())
+                .await;
+            completion.outcome(response.status().as_u16(), "no_account");
+            return response;
         }
         Err(()) => {
             return failure(
@@ -393,6 +543,7 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
         }
     };
     completion.record.account = Some(account.id.clone());
+    tried.insert(account.id.clone());
     #[cfg(all(feature = "phase0", debug_assertions))]
     if upload.overflow.is_none()
         && parts.extensions.get::<ForcedAccount>().is_none()
@@ -437,9 +588,56 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
         url.push_str(query);
     }
     let mut body_to_send = upload.into_body();
-    let mut retry_used = false;
-    let mut auth_checked = false;
+    let mut network_retry = false;
+    let mut token_retry = false;
+    let mut permission_denials = 0;
+    let mut probe = state.claim_probe(&mut account).await;
     let (status, response_headers, held) = loop {
+        if !account.eligible(request_model.as_deref()) {
+            let next = state
+                .select(
+                    provider,
+                    session.key.as_deref(),
+                    request_model.as_deref(),
+                    &tried,
+                )
+                .await;
+            if tried.len() >= 4 || !matches!(next, Ok(Some(_))) {
+                let response = state
+                    .accounts
+                    .unavailable(provider, false, request_model.as_deref())
+                    .await;
+                completion.outcome(response.status().as_u16(), "accounts_exhausted");
+                return response;
+            }
+            let next = next.unwrap().unwrap();
+            drop(probe.take());
+            tried.insert(next.id.clone());
+            match state
+                .tokens
+                .before_request(state.store.clone(), state.observability.clone(), next.id)
+                .await
+            {
+                Ok((updated, refreshed)) => {
+                    account = updated;
+                    tokens = refreshed;
+                }
+                Err(()) => {
+                    return failure(
+                        &mut completion,
+                        StatusCode::BAD_GATEWAY,
+                        provider,
+                        "store_error",
+                        "Could not read account tokens",
+                    );
+                }
+            }
+            probe = state.claim_probe(&mut account).await;
+            network_retry = false;
+            token_retry = false;
+            continue;
+        }
+        completion.record.account = Some(account.id.clone());
         let upstream_headers =
             match headers::upstream(&parts.headers, &account, &tokens.access_token) {
                 Ok(headers) => headers,
@@ -453,7 +651,7 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
                     );
                 }
             };
-        completion.record.attempts += 1;
+        completion.attempt(&account.id);
         let send = state
             .client
             .request(parts.method.clone(), &url)
@@ -463,8 +661,9 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
         let response = match tokio::time::timeout(Duration::from_secs(300), send).await {
             Ok(Ok(response)) => response,
             _ => {
-                if !retry_used && let Some(copy) = &retained {
-                    retry_used = true;
+                if !network_retry && let Some(copy) = &retained {
+                    network_retry = true;
+                    completion.failover("network_retry");
                     body_to_send = retry_body(copy.bytes());
                     tokio::time::sleep(Duration::from_millis(250)).await;
                     continue;
@@ -480,37 +679,22 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
         };
         let status = response.status();
         completion.record.upstream_status = Some(status.as_u16());
-        state
-            .observability
-            .observe_headers(&account.id, provider, response.headers());
+        let response_headers = response.headers().clone();
+        if status.is_success() || status == StatusCode::TOO_MANY_REQUESTS {
+            state
+                .accounts
+                .observe_headers_for_model(
+                    &account.id,
+                    provider,
+                    &response_headers,
+                    request_model.as_deref(),
+                )
+                .await;
+        }
         #[cfg(all(feature = "shape-capture", debug_assertions))]
         state
             .observability
-            .capture_response(shape_ticket.as_deref(), response.headers());
-        if status == StatusCode::UNAUTHORIZED && !auth_checked {
-            auth_checked = true;
-            let refreshed = state
-                .tokens
-                .after_401(
-                    state.store.clone(),
-                    state.observability.clone(),
-                    account.clone(),
-                    &tokens,
-                )
-                .await;
-            match refreshed {
-                Ok(Some((updated, new_tokens))) if !retry_used && retained.is_some() => {
-                    retry_used = true;
-                    account = updated;
-                    tokens = new_tokens;
-                    body_to_send = retry_body(retained.as_ref().expect("retained retry").bytes());
-                    continue;
-                }
-                // 보관본이 없으면 reload 결과와 무관하게 401을 그대로 relay한다.
-                _ => {}
-            }
-        }
-        let response_headers = response.headers().clone();
+            .capture_response(shape_ticket.as_deref(), &response_headers);
         let held = hold::hold(
             status,
             &response_headers,
@@ -518,17 +702,14 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
             Duration::from_secs(10),
         )
         .await;
-        if held.decision == CommitDecision::StreamError
-            && held.prefix.is_empty()
-            && !retry_used
-            && let Some(copy) = &retained
-        {
-            retry_used = true;
-            body_to_send = retry_body(copy.bytes());
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            continue;
-        }
         if held.decision == CommitDecision::StreamError && held.prefix.is_empty() {
+            if !network_retry && let Some(copy) = &retained {
+                network_retry = true;
+                completion.failover("network_retry");
+                body_to_send = retry_body(copy.bytes());
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            }
             return failure(
                 &mut completion,
                 StatusCode::BAD_GATEWAY,
@@ -537,9 +718,244 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
                 "Could not read upstream response",
             );
         }
-        break (status, response_headers, held);
+        let before_commit = !status.is_success() || held.decision == CommitDecision::FirstError;
+        if !before_commit {
+            if probe.is_some()
+                && status.is_success()
+                && state.accounts.probe_success(&account.id).await.is_err()
+            {
+                return failure(
+                    &mut completion,
+                    StatusCode::BAD_GATEWAY,
+                    provider,
+                    "store_error",
+                    "Could not persist account probe result",
+                );
+            }
+            break (status, response_headers, held);
+        }
+        let mut decision = outcome::classify(
+            provider,
+            status,
+            &response_headers,
+            &held.prefix,
+            request_model.as_deref(),
+        );
+        completion.record.upstream_error_code = hold::error_code(&response_headers, &held.prefix);
+        if let Some(model) = decision.model.take() {
+            request_model = Some(model);
+        }
+        if decision.kind == outcome::Kind::Revoked {
+            match state
+                .tokens
+                .revoke_if_current(state.store.clone(), &account, &tokens)
+                .await
+            {
+                Ok(updated) if !matches!(updated.health, Health::NeedsRelogin { .. }) => {
+                    decision.kind = outcome::Kind::Auth;
+                }
+                Ok(_) => {}
+                Err(()) => {
+                    return failure(
+                        &mut completion,
+                        StatusCode::BAD_GATEWAY,
+                        provider,
+                        "store_error",
+                        "Could not persist account health",
+                    );
+                }
+            }
+            decision.signal = None;
+        }
+        if decision.kind == outcome::Kind::Auth {
+            if token_retry {
+                if state
+                    .tokens
+                    .auth_failed(
+                        state.store.clone(),
+                        state.observability.clone(),
+                        account.clone(),
+                        &tokens,
+                    )
+                    .await
+                    .is_err()
+                {
+                    return failure(
+                        &mut completion,
+                        StatusCode::BAD_GATEWAY,
+                        provider,
+                        "store_error",
+                        "Could not persist account health",
+                    );
+                }
+            } else {
+                match state
+                    .tokens
+                    .after_401(
+                        state.store.clone(),
+                        state.observability.clone(),
+                        account.clone(),
+                        &tokens,
+                    )
+                    .await
+                {
+                    Ok(Some((updated, refreshed))) => {
+                        if !token_retry && let Some(copy) = &retained {
+                            token_retry = true;
+                            completion.failover("token_retry");
+                            account = updated;
+                            tokens = refreshed;
+                            body_to_send = retry_body(copy.bytes());
+                            continue;
+                        }
+                    }
+                    Ok(None) => {
+                        if state
+                            .tokens
+                            .cool_unavailable_auth(state.store.clone(), &account, &tokens)
+                            .await
+                            .is_err()
+                        {
+                            return failure(
+                                &mut completion,
+                                StatusCode::BAD_GATEWAY,
+                                provider,
+                                "store_error",
+                                "Could not persist account health",
+                            );
+                        }
+                    }
+                    Err(()) => {
+                        return failure(
+                            &mut completion,
+                            StatusCode::BAD_GATEWAY,
+                            provider,
+                            "store_error",
+                            "Could not update account credentials",
+                        );
+                    }
+                }
+            }
+        } else if let Some(signal) = decision.signal.take()
+            && state
+                .accounts
+                .transition(&account.id, signal)
+                .await
+                .is_err()
+        {
+            return failure(
+                &mut completion,
+                StatusCode::BAD_GATEWAY,
+                provider,
+                "store_error",
+                "Could not persist account health",
+            );
+        }
+        if matches!(decision.kind, outcome::Kind::Quota | outcome::Kind::Rate) && held.complete {
+            state
+                .accounts
+                .cache_limit(&account.id, status, &response_headers, &held.prefix);
+        }
+        if decision.kind == outcome::Kind::Permission {
+            permission_denials += 1;
+        }
+        // M4b는 select만 교체한다. 보관본 없는 요청과 commit 이후에는 재전송하지 않는다.
+        if !decision.failover() || retained.is_none() || permission_denials >= 2 {
+            break (status, response_headers, held);
+        }
+        if tried.len() >= 4 {
+            if state
+                .select(
+                    provider,
+                    session.key.as_deref(),
+                    request_model.as_deref(),
+                    &tried,
+                )
+                .await
+                .is_ok_and(|next| next.is_none())
+                && matches!(
+                    decision.kind,
+                    outcome::Kind::Quota
+                        | outcome::Kind::Rate
+                        | outcome::Kind::Auth
+                        | outcome::Kind::Revoked
+                )
+            {
+                let response = state
+                    .accounts
+                    .unavailable(provider, false, request_model.as_deref())
+                    .await;
+                completion.outcome(response.status().as_u16(), "accounts_exhausted");
+                return response;
+            }
+            break (status, response_headers, held);
+        }
+        completion.failover(decision.reason());
+        let next = state
+            .select(
+                provider,
+                session.key.as_deref(),
+                request_model.as_deref(),
+                &tried,
+            )
+            .await;
+        match next {
+            Ok(Some(next)) => {
+                drop(probe.take());
+                tried.insert(next.id.clone());
+                let snapshot = state
+                    .tokens
+                    .before_request(state.store.clone(), state.observability.clone(), next.id)
+                    .await;
+                match snapshot {
+                    Ok((updated, refreshed)) => {
+                        account = updated;
+                        tokens = refreshed;
+                    }
+                    Err(()) => {
+                        return failure(
+                            &mut completion,
+                            StatusCode::BAD_GATEWAY,
+                            provider,
+                            "store_error",
+                            "Could not read account tokens",
+                        );
+                    }
+                }
+                probe = state.claim_probe(&mut account).await;
+                network_retry = false;
+                token_retry = false;
+                body_to_send = retry_body(retained.as_ref().expect("retained failover").bytes());
+            }
+            Ok(None)
+                if matches!(
+                    decision.kind,
+                    outcome::Kind::Payment
+                        | outcome::Kind::ModelPermission
+                        | outcome::Kind::Permission
+                ) =>
+            {
+                break (status, response_headers, held);
+            }
+            Ok(None) => {
+                let response = state
+                    .accounts
+                    .unavailable(provider, false, request_model.as_deref())
+                    .await;
+                completion.outcome(response.status().as_u16(), "accounts_exhausted");
+                return response;
+            }
+            Err(()) => {
+                return failure(
+                    &mut completion,
+                    StatusCode::BAD_GATEWAY,
+                    provider,
+                    "store_error",
+                    "Could not select an account",
+                );
+            }
+        }
     };
-    // M4는 이 명시적 pre-commit 결정 지점에서 retained body로 failover를 연결한다.
     let decision = held.decision;
     if !status.is_success() || decision == CommitDecision::FirstError {
         completion.record.upstream_error_code = hold::error_code(&response_headers, &held.prefix);
@@ -558,6 +974,7 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
     if let Ok(value) = HeaderValue::from_str(&account.id) {
         output_headers.insert("x-quota-baton-account", value);
     }
+    completion.failed_access = Some(zeroize::Zeroizing::new(tokens.access_token.clone()));
     let body = response::body(completion, held, status, &response_headers, success_outcome);
     let mut response = Response::new(body);
     *response.status_mut() = status;

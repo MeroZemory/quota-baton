@@ -103,7 +103,29 @@ Phase 0 account pins use the authenticated admin API:
 `DELETE /admin/v1/debug/pin`. The account determines the provider family;
 `session_key` uses the internal prefixed form (`codex:<id>` or `claude:<id>`).
 Session pins override that family's global pin; pins clear on
-restart. These controls deliberately override active-account selection for tests.
+restart. Pins prefer an eligible account; they never bypass paused/disabled state,
+health or credential gates.
+
+M4a persists account health and user state under the credential lease. HTTP retries
+use the retained, unchanged body only before commit. A request tries at most four
+accounts, with one token retry and one independent network retry per account. Selection currently
+prefers the provider pin, then eligible account IDs in order; M4b supplies bindings
+and the full selection policy. A matching pre-commit WebSocket error is suppressed
+after its health transition is saved, followed by close 1012. An idle connection
+whose account becomes ineligible closes with 1000. Post-commit errors stay verbatim.
+
+Passive headers and Codex rate-limit events update quota health, including the
+credits hold and early reset. Exhausted HTTP accounts replay a bounded cached limit
+response with its original encoding; WebSocket upgrades return native terminal 429.
+The admin API adds `/state`, `/events`, account pause/resume/disable/enable and
+settings PATCH. `quota-baton status` renders a Korean account table; account actions
+use the running core, or acquire the lease directly while it is stopped. Settings
+PATCH preserves TOML comments and other fields and persists account metadata.
+
+`cargo run -p qb-testkit --example m4a_fakes` starts local synthetic HTTP and
+WebSocket fault servers. Its `--client ws://127.0.0.1:<port>/v1/responses` mode checks
+1012, reconnect on another account and normal completion, without printing bodies
+or credentials. Use an isolated synthetic `QB_HOME` and a debug `testkit` core.
 
 Shape capture needs an explicit debug feature build and an existing directory whose
 canonical path contains a `.sandbox` component:
@@ -142,7 +164,7 @@ Replay requires a running core and its admin token. The authenticated debug rout
 `strip_encrypted` (`none`, `reasoning`, `all`; default `none`) and
 `tamper_encrypted` (default `false`). It calls the same relay, credential gates and
 linked-reload path as product traffic, without changing account pins.
-`--strip reasoning` uses product hand-off semantics; `--strip all` is a diagnostic
+`--strip reasoning` preserves the narrower legacy diagnostic mode; `--strip all` is a diagnostic
 control removing every encrypted Codex input item or every Claude thinking block.
 `--tamper-encrypted` changes the first encrypted value or signature across types.
 The CLI prints presence counts before sending and one summary line afterward:
@@ -155,7 +177,7 @@ The synthetic HTTP harness can be started with
 run with `cargo test --workspace`; isolated core integration runs need
 `cargo test -p qb-core --features testkit`.
 
-OAuth login/refresh, WebSocket relay, failover, live polling, and tray UI remain later
+OAuth login, active polling, full selection/bindings and tray UI remain later
 milestones. Live upstream validation remains gated by the design-session G1 checks.
 
 Implementation milestones and pending protocol gates are recorded in

@@ -8,10 +8,102 @@ use tokio_tungstenite::{
         protocol::{Role, WebSocketConfig},
     },
 };
+// Remember the retry token across sockets without retaining credential bytes or
+// keeping a RelayState alive. Each live relay has at most one entry per account.
+const RETRY_MARKER_TTL: Duration = Duration::from_secs(120);
+struct RetriedToken {
+    relay: std::sync::Weak<RelayState>,
+    account: String,
+    digest: [u8; 32],
+    expires_at: std::time::Instant,
+}
+impl RetriedToken {
+    fn matches(&self, digest: &[u8; 32], now: std::time::Instant) -> bool {
+        self.expires_at > now && self.digest == *digest
+    }
+}
+static RETRIED_TOKENS: std::sync::Mutex<Vec<RetriedToken>> = std::sync::Mutex::new(Vec::new());
+
+fn token_retried(relay: &Arc<RelayState>, account: &str, token: &str, mark: bool) -> bool {
+    use sha2::{Digest, Sha256};
+    let digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+    let mut entries = RETRIED_TOKENS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let now = std::time::Instant::now();
+    entries.retain(|entry| entry.relay.strong_count() > 0 && entry.expires_at > now);
+    let owner = Arc::downgrade(relay);
+    if let Some(entry) = entries
+        .iter_mut()
+        .find(|entry| entry.relay.ptr_eq(&owner) && entry.account == account)
+    {
+        let matched = entry.matches(&digest, now);
+        if mark {
+            entry.digest = digest;
+            entry.expires_at = now + RETRY_MARKER_TTL;
+        }
+        return matched;
+    }
+    if mark {
+        entries.push(RetriedToken {
+            relay: owner,
+            account: account.into(),
+            digest,
+            expires_at: now + RETRY_MARKER_TTL,
+        });
+    }
+    false
+}
+
+fn clear_retried_token(relay: &Arc<RelayState>, account: &str, token: &str) {
+    use sha2::{Digest, Sha256};
+    let digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+    let owner = Arc::downgrade(relay);
+    let now = std::time::Instant::now();
+    RETRIED_TOKENS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .retain(|entry| {
+            entry.relay.strong_count() > 0
+                && entry.expires_at > now
+                && !(entry.relay.ptr_eq(&owner)
+                    && entry.account == account
+                    && entry.digest == digest)
+        });
+}
+
 pub(super) type UpstreamSocket = WebSocketStream<reqwest::Upgraded>;
 pub(super) type ClientSocket = WebSocketStream<hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>>;
 
-pub(super) async fn upgrade(state: Arc<RelayState>, mut request: Request) -> Response {
+pub(super) async fn upgrade(state: Arc<RelayState>, request: Request) -> Response {
+    let mut completion = Completion::new(
+        state.observability.clone(),
+        &Method::GET,
+        "/v1/responses",
+        Provider::Codex,
+        request.headers(),
+    );
+    completion.record.transport = "ws".into();
+    completion.track(state.inflight_requests.clone());
+    completion.runtime = Some(state.accounts.clone());
+    let response = upgrade_inner(state, request, &mut completion).await;
+    completion.record.status = response.status().as_u16();
+    completion.finish(if response.status() == StatusCode::SWITCHING_PROTOCOLS {
+        "ws_upgrade"
+    } else {
+        "ws_upgrade_error"
+    });
+    response
+}
+
+async fn upgrade_inner(
+    state: Arc<RelayState>,
+    mut request: Request,
+    completion: &mut Completion,
+) -> Response {
+    if let Some(response) = state.memory_rejection(Provider::Codex) {
+        return response;
+    }
     use base64::{Engine, engine::general_purpose::STANDARD};
     let key = request
         .headers()
@@ -37,40 +129,7 @@ pub(super) async fn upgrade(state: Arc<RelayState>, mut request: Request) -> Res
     let client_upgrade = hyper::upgrade::on(&mut request);
     let (parts, _) = request.into_parts();
     let session = session::classify(Provider::Codex, "/v1/responses", &parts.headers, &[]);
-    let account = match state.select(Provider::Codex, session.key.as_deref()).await {
-        Ok(Some(account)) => account,
-        Ok(None) => {
-            return native_error(
-                StatusCode::BAD_REQUEST,
-                Provider::Codex,
-                "invalid_request_error",
-                "quota-baton: no usable codex account - open the quota-baton tray (사용 가능한 계정이 없습니다. 트레이를 여세요)",
-            );
-        }
-        Err(_) => {
-            return native_error(
-                StatusCode::BAD_GATEWAY,
-                Provider::Codex,
-                "server_error",
-                "Could not read account store",
-            );
-        }
-    };
-    let (mut account, mut tokens) = match state
-        .tokens
-        .before_request(state.store.clone(), state.observability.clone(), account.id)
-        .await
-    {
-        Ok(value) => value,
-        Err(_) => {
-            return native_error(
-                StatusCode::BAD_GATEWAY,
-                Provider::Codex,
-                "server_error",
-                "Could not read account tokens",
-            );
-        }
-    };
+    completion.session(&session);
     let ticket = state.observability.capture_request(&parts.headers, &[]);
     let query = parts
         .uri
@@ -83,58 +142,186 @@ pub(super) async fn upgrade(state: Arc<RelayState>, mut request: Request) -> Res
         .max_message_size(Some(limit))
         .max_frame_size(Some(limit))
         .write_buffer_size(0);
-    let mut reloaded = false;
-    let mut network_retried = false;
-    let (upstream, upstream_headers) = loop {
-        let mut forwarded = match headers::upstream(&parts.headers, &account, &tokens.access_token)
+    let mut tried = std::collections::BTreeSet::new();
+    let mut forbidden = 0;
+    let mut last_error = None;
+    let (upstream, upstream_headers, account, tokens) = 'accounts: loop {
+        if tried.len() == 4 {
+            return match last_error {
+                Some(response) => response,
+                None => {
+                    state
+                        .accounts
+                        .unavailable(Provider::Codex, true, None)
+                        .await
+                }
+            };
+        }
+        let account = match state
+            .select(Provider::Codex, session.key.as_deref(), None, &tried)
+            .await
         {
-            Ok(headers) => headers,
+            Ok(Some(account)) => account,
+            Ok(None) => {
+                return match last_error {
+                    Some(response) => response,
+                    None => {
+                        state
+                            .accounts
+                            .unavailable(Provider::Codex, true, None)
+                            .await
+                    }
+                };
+            }
             Err(_) => return network_failure(),
         };
-        // 각 leg의 키와 확장 협상은 독립적이다. HTTP 클라이언트의 TLS 설정은 공유한다.
-        let key = generate_key();
-        forwarded.insert("connection", HeaderValue::from_static("Upgrade"));
-        forwarded.insert("upgrade", HeaderValue::from_static("websocket"));
-        forwarded.insert("sec-websocket-version", HeaderValue::from_static("13"));
-        forwarded.insert(
-            "sec-websocket-key",
-            HeaderValue::from_str(&key).expect("generated key"),
-        );
-        let result = tokio::time::timeout(
-            Duration::from_secs(300),
-            state.client.get(&url).headers(forwarded).send(),
-        )
-        .await;
-        match result {
-            Ok(Ok(response)) => {
-                state.observability.observe_headers(
-                    &account.id,
-                    Provider::Codex,
-                    response.headers(),
+        tried.insert(account.id.clone());
+        let (mut account, mut tokens) = match state
+            .tokens
+            .before_request(state.store.clone(), state.observability.clone(), account.id)
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(_) => return network_failure(),
+        };
+        if !state.accounts.eligible(&account.id, None).await {
+            continue;
+        }
+        let probe = match state.accounts.begin_probe(&account) {
+            Ok(probe) => probe,
+            Err(_) => continue,
+        };
+        // Row 5 and row 11 have independent same-account retry budgets.
+        let mut network_retry = false;
+        let mut token_retry = false;
+        loop {
+            let mut forwarded =
+                match headers::upstream(&parts.headers, &account, &tokens.access_token) {
+                    Ok(headers) => headers,
+                    Err(_) => return network_failure(),
+                };
+            let key = generate_key();
+            forwarded.insert("connection", HeaderValue::from_static("Upgrade"));
+            forwarded.insert("upgrade", HeaderValue::from_static("websocket"));
+            forwarded.insert("sec-websocket-version", HeaderValue::from_static("13"));
+            forwarded.insert(
+                "sec-websocket-key",
+                HeaderValue::from_str(&key).expect("generated key"),
+            );
+            completion.record.account = Some(account.id.clone());
+            completion.attempt(&account.id);
+            let result = tokio::time::timeout(
+                Duration::from_secs(300),
+                state.client.get(&url).headers(forwarded).send(),
+            )
+            .await;
+            let response = match result {
+                Ok(Ok(response)) => response,
+                _ if !network_retry => {
+                    completion.failover("network_retry");
+                    network_retry = true;
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+                _ => return network_failure(),
+            };
+            completion.record.upstream_status = Some(response.status().as_u16());
+            if response.status() == StatusCode::SWITCHING_PROTOCOLS
+                || response.status().is_success()
+                || response.status() == StatusCode::TOO_MANY_REQUESTS
+            {
+                state
+                    .accounts
+                    .observe_headers(&account.id, Provider::Codex, response.headers())
+                    .await;
+            }
+            if response.status() == StatusCode::SWITCHING_PROTOCOLS {
+                let headers = response.headers().clone();
+                if headers
+                    .get("sec-websocket-accept")
+                    .is_none_or(|v| v.as_bytes() != derive_accept_key(key.as_bytes()).as_bytes())
+                    || !header_token(&headers, "upgrade", "websocket")
+                    || !header_token(&headers, "connection", "upgrade")
+                    || headers.contains_key("sec-websocket-extensions")
+                    || headers.contains_key("sec-websocket-protocol")
+                {
+                    return network_failure();
+                }
+                let stream = match response.upgrade().await {
+                    Ok(stream) => stream,
+                    Err(_) => return network_failure(),
+                };
+                if probe.is_some() && state.accounts.probe_success(&account.id).await.is_err() {
+                    return network_failure();
+                }
+                drop(probe);
+                break 'accounts (
+                    WebSocketStream::from_raw_socket(stream, Role::Client, Some(config)).await,
+                    headers,
+                    account,
+                    tokens,
                 );
-                if response.status() == StatusCode::SWITCHING_PROTOCOLS {
-                    let headers = response.headers().clone();
-                    if headers.get("sec-websocket-accept").is_none_or(|v| {
-                        v.as_bytes() != derive_accept_key(key.as_bytes()).as_bytes()
-                    }) || !header_token(&headers, "upgrade", "websocket")
-                        || !header_token(&headers, "connection", "upgrade")
-                        || headers.contains_key("sec-websocket-extensions")
-                        || headers.contains_key("sec-websocket-protocol")
+            }
+            let error = match read_error(response).await {
+                Ok(error) => error,
+                Err(_) if !network_retry => {
+                    completion.failover("network_retry");
+                    network_retry = true;
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+                Err(_) => return network_failure(),
+            };
+            let current_token = if error.status == StatusCode::UNAUTHORIZED {
+                match state
+                    .tokens
+                    .is_current(state.store.clone(), &account, &tokens)
+                    .await
+                {
+                    Ok(current) => current,
+                    Err(()) => return network_failure(),
+                }
+            } else {
+                true
+            };
+            let mut decision = super::outcome::classify(
+                Provider::Codex,
+                error.status,
+                &error.headers,
+                &error.raw,
+                None,
+            );
+            if !current_token
+                && matches!(
+                    decision.kind,
+                    super::outcome::Kind::Auth | super::outcome::Kind::Revoked
+                )
+            {
+                decision.kind = super::outcome::Kind::Auth;
+                decision.signal = None;
+            }
+            let failover = decision.failover();
+            let reason = decision.reason();
+            if decision.kind == super::outcome::Kind::Auth {
+                if current_token
+                    && (token_retry
+                        || token_retried(&state, &account.id, &tokens.access_token, false))
+                {
+                    if state
+                        .tokens
+                        .auth_failed(
+                            state.store.clone(),
+                            state.observability.clone(),
+                            account.clone(),
+                            &tokens,
+                        )
+                        .await
+                        .is_err()
                     {
                         return network_failure();
                     }
-                    let stream = match response.upgrade().await {
-                        Ok(stream) => stream,
-                        Err(_) => return network_failure(),
-                    };
-                    break (
-                        WebSocketStream::from_raw_socket(stream, Role::Client, Some(config)).await,
-                        headers,
-                    );
-                }
-                if response.status() == StatusCode::UNAUTHORIZED && !reloaded {
-                    reloaded = true;
-                    if let Ok(Some((updated, refreshed))) = state
+                } else {
+                    match state
                         .tokens
                         .after_401(
                             state.store.clone(),
@@ -144,18 +331,72 @@ pub(super) async fn upgrade(state: Arc<RelayState>, mut request: Request) -> Res
                         )
                         .await
                     {
-                        account = updated;
-                        tokens = refreshed;
-                        continue;
+                        Ok(Some((updated, refreshed))) if !token_retry => {
+                            completion.failover("token_retry");
+                            token_retry = true;
+                            token_retried(&state, &updated.id, &refreshed.access_token, true);
+                            account = updated;
+                            tokens = refreshed;
+                            continue;
+                        }
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
+                            if state
+                                .tokens
+                                .cool_unavailable_auth(state.store.clone(), &account, &tokens)
+                                .await
+                                .is_err()
+                            {
+                                return network_failure();
+                            }
+                        }
+                        Err(()) => return network_failure(),
                     }
                 }
-                return handshake_error(response).await;
+            } else if decision.kind == super::outcome::Kind::Revoked {
+                if state
+                    .tokens
+                    .revoke_if_current(state.store.clone(), &account, &tokens)
+                    .await
+                    .is_err()
+                {
+                    return network_failure();
+                }
+            } else if let Some(signal) = decision.signal
+                && state
+                    .accounts
+                    .transition(&account.id, signal)
+                    .await
+                    .is_err()
+            {
+                return network_failure();
             }
-            _ if !network_retried => {
-                network_retried = true;
-                tokio::time::sleep(Duration::from_millis(250)).await;
+            if failover {
+                completion.failover(reason);
             }
-            _ => return network_failure(),
+            if error.complete
+                && matches!(
+                    decision.kind,
+                    super::outcome::Kind::Quota | super::outcome::Kind::Rate
+                )
+            {
+                state
+                    .accounts
+                    .cache_limit(&account.id, error.status, &error.headers, &error.raw);
+            }
+            if error.status == StatusCode::FORBIDDEN {
+                forbidden += 1;
+            }
+            let preserve_last = matches!(
+                decision.kind,
+                super::outcome::Kind::Payment | super::outcome::Kind::ModelPermission
+            );
+            let response = error.into_response();
+            if !failover || forbidden == 2 {
+                return response;
+            }
+            last_error = preserve_last.then_some(response);
+            continue 'accounts;
         }
     };
     state
@@ -173,6 +414,12 @@ pub(super) async fn upgrade(state: Arc<RelayState>, mut request: Request) -> Res
         }
     };
     let context = pump::Context {
+        runtime: Some(state.accounts.clone()),
+        relay: Some(state.clone()),
+        credentials: Some((
+            account.clone(),
+            zeroize::Zeroizing::new(tokens.access_token.clone()),
+        )),
         budget: state.budget.clone(),
         observability: state.observability.clone(),
         account: account.id.clone(),
@@ -235,69 +482,71 @@ fn header_token(headers: &HeaderMap, name: &str, token: &str) -> bool {
         .any(|v| v.trim().eq_ignore_ascii_case(token))
 }
 
-async fn handshake_error(response: reqwest::Response) -> Response {
-    let status = response.status();
-    let response_headers = response.headers().clone();
-    // 한도 분류용 앞부분만 보관한다. 뒤쪽은 원본 스트림으로 이어서 전달한다.
-    let mut stream = response.bytes_stream();
+struct HandshakeError {
+    status: StatusCode,
+    headers: HeaderMap,
+    raw: Vec<u8>,
+    remainder: Option<Bytes>,
+    stream:
+        std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
+    complete: bool,
+}
+
+async fn read_error(response: reqwest::Response) -> Result<HandshakeError, ()> {
     use futures_util::StreamExt;
-    let mut raw = Vec::new();
-    let mut remainder = None;
-    while raw.len() < 65536 {
-        match tokio::time::timeout(Duration::from_secs(10), stream.next()).await {
+    let mut error = HandshakeError {
+        status: response.status(),
+        headers: response.headers().clone(),
+        raw: Vec::new(),
+        remainder: None,
+        stream: Box::pin(response.bytes_stream()),
+        complete: false,
+    };
+    // Read beyond the bound to distinguish an exact 64 KiB complete body.
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), error.stream.next()).await {
             Ok(Some(Ok(chunk))) => {
-                let take = chunk.len().min(65536 - raw.len());
-                raw.extend_from_slice(&chunk[..take]);
+                let take = chunk.len().min(65536 - error.raw.len());
+                error.raw.extend_from_slice(&chunk[..take]);
                 if take < chunk.len() {
-                    remainder = Some(chunk.slice(take..));
+                    error.remainder = Some(chunk.slice(take..));
                     break;
                 }
             }
-            Ok(None) => break,
-            _ => return network_failure(),
-        }
-    }
-    let parsed = hold::decoded_side(&response_headers, &raw)
-        .and_then(|decoded| serde_json::from_slice::<serde_json::Value>(&decoded).ok());
-    let usage_limit = parsed
-        .as_ref()
-        .and_then(|v| v.get("error"))
-        .is_some_and(|v| {
-            ["type", "code"].iter().any(|field| {
-                v.get(field).and_then(serde_json::Value::as_str) == Some("usage_limit_reached")
-            })
-        });
-    if status == StatusCode::TOO_MANY_REQUESTS || usage_limit {
-        let mut error = serde_json::json!({"error":{"type":"usage_limit_reached","message":"Upstream usage limit reached"}});
-        for field in ["resets_at", "resets_in_seconds"] {
-            if let Some(value) = parsed
-                .as_ref()
-                .and_then(|v| v.get("error"))
-                .and_then(|v| v.get(field))
-                .filter(|v| v.is_number())
-            {
-                error["error"][field] = value.clone();
+            Ok(None) => {
+                error.complete = true;
+                break;
             }
+            _ => return Err(()),
         }
-        let mut result = (StatusCode::TOO_MANY_REQUESTS, Json(error)).into_response();
-        for (name, value) in &headers::filtered(&response_headers, false) {
-            if name != "content-length" && name != "content-encoding" && name != "content-type" {
-                result.headers_mut().append(name.clone(), value.clone());
+    }
+    Ok(error)
+}
+
+impl HandshakeError {
+    fn into_response(self) -> Response {
+        use futures_util::StreamExt;
+        if self.status == StatusCode::UPGRADE_REQUIRED {
+            return network_failure();
+        }
+        let Self {
+            status,
+            headers: response_headers,
+            raw,
+            remainder,
+            mut stream,
+            ..
+        } = self;
+        let output = async_stream::stream! {
+            if !raw.is_empty() { yield Ok::<Bytes, std::io::Error>(raw.into()); }
+            if let Some(chunk) = remainder { yield Ok(chunk); }
+            while let Some(chunk) = stream.next().await {
+                yield chunk.map_err(|_| std::io::Error::other("Upstream handshake body interrupted"));
             }
-        }
-        return result;
+        };
+        let mut response = Response::new(axum::body::Body::from_stream(output));
+        *response.status_mut() = status;
+        *response.headers_mut() = headers::filtered(&response_headers, false);
+        response
     }
-    // 계약상 426은 로컬 답변으로 내보내지 않는다.
-    if status == StatusCode::UPGRADE_REQUIRED {
-        return network_failure();
-    }
-    let output = async_stream::stream! {
-        if !raw.is_empty() { yield Ok::<Bytes,std::io::Error>(raw.into()); }
-        if let Some(chunk) = remainder { yield Ok(chunk); }
-        while let Some(chunk) = stream.next().await { yield chunk.map_err(|_|std::io::Error::other("Upstream handshake body interrupted")); }
-    };
-    let mut result = Response::new(axum::body::Body::from_stream(output));
-    *result.status_mut() = status;
-    *result.headers_mut() = headers::filtered(&response_headers, false);
-    result
 }
