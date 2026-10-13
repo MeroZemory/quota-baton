@@ -3,6 +3,7 @@
 // Compile the bounded internal credential layer against the production modules.
 pub use qb_core::{account_runtime, accounts, observability};
 #[path = "../src/relay/credentials.rs"]
+#[allow(dead_code)] // This isolated harness exercises a subset of the shared production gate.
 mod credentials;
 
 use accounts::{
@@ -598,8 +599,15 @@ async fn c5_owned_transient_refresh_errors_keep_health_and_writeahead() {
         let gates = f
             .gates()
             .with_token_endpoint(Provider::Claude, upstream.url.clone());
-        let account = f.store.load(&f.account.id).unwrap();
+        // Each status is an independent attempt, not a simulated crash with
+        // the previous attempt's uncertain write-ahead marker.
+        let mut account = f.store.load(&f.account.id).unwrap();
         let tokens = f.store.tokens(&account).unwrap();
+        account.token_meta.refresh_uncertain = false;
+        let account = f
+            .store
+            .save(&account, &tokens, Some(account.generation))
+            .unwrap();
         upstream.state.push(ScriptedResponse::json(
             status,
             r#"{"error":"unknown_error"}"#,

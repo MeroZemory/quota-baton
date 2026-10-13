@@ -38,6 +38,7 @@ zeroize.workspace = true
 qb-proto.workspace = true
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
 reqwest.workspace = true
 qb-testkit.workspace = true

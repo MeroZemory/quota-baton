@@ -217,6 +217,7 @@ enum Command {
 }
 
 pub struct Observability {
+    events: std::sync::Mutex<Option<tokio::sync::broadcast::Sender<serde_json::Value>>>,
     snapshots: std::sync::Mutex<BTreeMap<String, serde_json::Value>>,
     tx: mpsc::SyncSender<Command>,
     worker: Option<thread::JoinHandle<()>>,
@@ -226,6 +227,44 @@ pub struct Observability {
 }
 
 impl Observability {
+    pub(crate) fn set_events(&self, sender: tokio::sync::broadcast::Sender<serde_json::Value>) {
+        *self.events.lock().unwrap_or_else(|e| e.into_inner()) = Some(sender);
+    }
+    fn progress(&self, event: serde_json::Value) {
+        if let Some(sender) = self
+            .events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            let _ = sender.send(event);
+        }
+    }
+    pub fn record_login(
+        &self,
+        provider: Provider,
+        login_id: &str,
+        status: &str,
+        account_id: Option<&str>,
+    ) {
+        self.enqueue(Command::Ledger(serde_json::json!({"ts":Utc::now().to_rfc3339(),"event":"login","provider":provider,"login_id":login_id,"outcome":status,"account":account_id})));
+        self.progress(serde_json::json!({"event":"login_progress","data":{"login_id":login_id,"status":status,"account_id":account_id}}));
+    }
+    pub fn record_refresh(
+        &self,
+        account: &str,
+        trigger: &str,
+        outcome: &str,
+        expires_at: Option<DateTime<Utc>>,
+    ) {
+        self.enqueue(Command::Ledger(serde_json::json!({"ts":Utc::now().to_rfc3339(),"event":"token_refresh","account":account,"trigger":trigger,"outcome":outcome,"expires_at":expires_at})));
+    }
+    pub fn core_warning(&self, account: &str, code: &str) {
+        self.enqueue(Command::Ledger(serde_json::json!({"ts":Utc::now().to_rfc3339(),"event":"core_warning","account":account,"code":code})));
+        self.progress(
+            serde_json::json!({"event":"core_warning","data":{"account":account,"code":code}}),
+        );
+    }
     pub fn new(home: &Path, capture: Option<CaptureOptions>) -> anyhow::Result<Self> {
         #[cfg(not(all(feature = "shape-capture", debug_assertions)))]
         anyhow::ensure!(
@@ -280,6 +319,7 @@ impl Observability {
             .name("qb-observability".into())
             .spawn(move || run(home, state, rx, worker_dropped))?;
         Ok(Self {
+            events: std::sync::Mutex::new(None),
             snapshots: std::sync::Mutex::new(snapshots),
             tx,
             worker: Some(worker),
@@ -1381,6 +1421,7 @@ mod tests {
         // 작성자가 멈춘 큐로 느린 디스크를 결정적으로 재현한다.
         let (tx, rx) = mpsc::sync_channel(2);
         let obs = Observability {
+            events: std::sync::Mutex::new(None),
             snapshots: std::sync::Mutex::new(BTreeMap::new()),
             tx,
             worker: None,
@@ -1512,6 +1553,7 @@ mod tests {
             let _ = done_tx.send(drained);
         });
         let obs = Observability {
+            events: std::sync::Mutex::new(None),
             snapshots: std::sync::Mutex::new(BTreeMap::new()),
             tx,
             worker: Some(worker),
