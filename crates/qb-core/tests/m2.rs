@@ -31,6 +31,8 @@ struct Harness {
     codex: ScriptedUpstream,
     servers: RunningServers,
     client: reqwest::Client,
+    #[cfg(feature = "phase0")]
+    captures: PathBuf,
 }
 
 fn fixture(provider: &str, version: u8, expiry: Option<String>) -> Value {
@@ -86,8 +88,19 @@ impl Harness {
         config.upstream.codex_base = codex.url.clone();
         let obs = Arc::new(Observability::new(&home, None).unwrap());
         let pins = Arc::new(DebugPins::default());
-        let state =
-            Arc::new(RelayState::new(store.clone(), &config, obs.clone(), pins.clone()).unwrap());
+        let state = RelayState::new(store.clone(), &config, obs.clone(), pins.clone()).unwrap();
+        #[cfg(feature = "phase0")]
+        let captures = root.path().join("body-captures");
+        #[cfg(feature = "phase0")]
+        fs::create_dir(&captures).unwrap();
+        #[cfg(feature = "phase0")]
+        let state = state.with_body_capture(Arc::new(
+            qb_core::phase0::BodyCapture::new(captures.clone(), 20).unwrap(),
+        ));
+        let state = Arc::new(state);
+        let admin = qb_core::debug_pin::routes(store.clone(), pins.clone());
+        #[cfg(feature = "phase0")]
+        let admin = admin.merge(relay::phase0_routes(state.clone()));
         let servers = http::spawn_with_routes(
             &config,
             LocalSecrets {
@@ -95,7 +108,7 @@ impl Harness {
                 admin_token: "fake-local-admin".into(),
             },
             relay::router(state),
-            qb_core::debug_pin::routes(store.clone(), pins.clone()),
+            admin,
         )
         .await
         .unwrap();
@@ -115,6 +128,8 @@ impl Harness {
             codex,
             servers,
             client,
+            #[cfg(feature = "phase0")]
+            captures,
         }
     }
     fn url(&self, path: &str) -> String {
@@ -246,7 +261,10 @@ async fn every_route_preserves_path_query_and_c3_headers() {
         assert_eq!(request.body.as_ref(), b"{ \"input\": [] }");
     }
     for path in ["/v1/memories/trace_summarize", "/unknown"] {
-        assert_eq!(h.send(path, "{}").await.status(), 404);
+        let response = h.send(path, "{}").await;
+        assert_eq!(response.status(), 404);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["message"], "Unsupported route");
     }
     assert_eq!(h.claude.state.requests().len(), 3);
     assert_eq!(h.codex.state.requests().len(), 6);
@@ -655,6 +673,154 @@ async fn global_codex_pin_leaves_claude_active_account_usable() {
 }
 
 #[tokio::test]
+async fn local_machine_errors_are_english_without_secrets() {
+    let _serial = SERIAL.lock().await;
+    let mut h = Harness::new(64, 384).await;
+    for (name, value, expected, message) in [
+        (
+            "authorization",
+            "Bearer fake-wrong",
+            401,
+            "Invalid local credential",
+        ),
+        ("host", "evil.invalid", 421, "Invalid Host"),
+        ("origin", "null", 403, "Origin is forbidden"),
+    ] {
+        let response = h
+            .client
+            .post(h.url("/v1/messages"))
+            .header(name, value)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["message"], message);
+        assert!(!body.to_string().contains("fake-wrong"));
+    }
+    h.claude.state.push(ScriptedResponse::json(
+        StatusCode::BAD_GATEWAY,
+        r#"{"error":{"type":"api_error","message":"Synthetic upstream failure"}}"#,
+    ));
+    let response = h.send("/v1/messages", "{}").await;
+    assert_eq!(response.status(), 502);
+    assert!(
+        response
+            .text()
+            .await
+            .unwrap()
+            .contains("Synthetic upstream failure")
+    );
+    let old = std::mem::replace(&mut h.codex, ScriptedUpstream::start().await.unwrap());
+    drop(old);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let response = h.send("/v1/responses", "{}").await;
+    assert_eq!(response.status(), 502);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["message"], "Could not connect to upstream");
+    assert!(!body.to_string().contains("fake-access"));
+}
+
+#[cfg(feature = "phase0")]
+#[tokio::test]
+async fn phase0_authenticated_replay_uses_forced_account_and_linked_401_path() {
+    let _serial = SERIAL.lock().await;
+    let h = Harness::new(64, 384).await;
+    let body = r#"{"input":[{"type":"reasoning","encrypted_content":"synthetic-encrypted"},{"type":"message","content":[{"type":"input_text","text":"synthetic conversation"}]}]}"#;
+    h.send("/v1/responses", body).await.bytes().await.unwrap();
+    let capture = fs::read_dir(&h.captures)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let mut second = fixture("codex", 1, None);
+    second["email"] = json!("second@example.invalid");
+    second["account_id"] = json!("synthetic-second");
+    fs::write(
+        h.cpa.join("second.json"),
+        serde_json::to_vec(&second).unwrap(),
+    )
+    .unwrap();
+    import::run(&h.store, &h.cpa, &[], false).unwrap();
+    let account = h
+        .store
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|a| {
+            a.identity
+                .canonical_key()
+                .contains("second@example.invalid")
+        })
+        .unwrap();
+    second["last_refresh"] = json!("2026-01-02T00:00:00Z");
+    second["access_token"] = json!("fake-access-second-2");
+    fs::write(
+        h.cpa.join("second.json"),
+        serde_json::to_vec(&second).unwrap(),
+    )
+    .unwrap();
+    let request = json!({"capture_path":capture,"account_id":account.id,"strip_encrypted":"none","tamper_encrypted":false});
+    assert_eq!(
+        h.client
+            .post(h.admin("/phase0/replay"))
+            .json(&request)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    h.codex
+        .state
+        .push(ScriptedResponse::json(StatusCode::UNAUTHORIZED, "{}"));
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert("content-type", "text/event-stream".parse().unwrap());
+    h.codex.state.push(ScriptedResponse {status:StatusCode::OK,headers,chunks:vec![(Duration::ZERO,Bytes::from_static(b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":42,\"input_tokens_details\":{\"cached_tokens\":12}},\"output\":[{\"text\":\"synthetic conversation\"}]}}\n\n"))]});
+    let response = h
+        .client
+        .post(h.admin("/phase0/replay"))
+        .bearer_auth("fake-local-admin")
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let summary: Value = response.json().await.unwrap();
+    assert_eq!(summary["status"], 200);
+    assert_eq!(summary["account"], account.id);
+    assert_eq!(summary["strip_encrypted"], "none");
+    let text = summary.to_string();
+    assert!(text.contains("42"));
+    assert!(text.contains("12"));
+    assert!(!text.contains("synthetic conversation"));
+    assert!(!text.contains("synthetic-encrypted"));
+    assert!(!text.contains("fake-access"));
+    let sent = h.codex.state.requests();
+    assert_eq!(sent.len(), 3);
+    assert_eq!(sent[1].headers["chatgpt-account-id"], "synthetic-second");
+    assert_eq!(
+        sent[2].headers["authorization"],
+        "Bearer fake-access-second-2"
+    );
+    assert_eq!(&sent[2].body[..], body.as_bytes());
+    assert_eq!(fs::read_dir(&h.captures).unwrap().count(), 1);
+    let invalid = json!({"capture_path":Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),"account_id":account.id});
+    assert_eq!(
+        h.client
+            .post(h.admin("/phase0/replay"))
+            .bearer_auth("fake-local-admin")
+            .json(&invalid)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+}
+
+#[tokio::test]
 async fn no_account_and_debug_pin_routes() {
     let _serial = SERIAL.lock().await;
     let h = Harness::new(64, 384).await;
@@ -671,6 +837,12 @@ async fn no_account_and_debug_pin_routes() {
     assert_eq!(error["type"], "error");
     assert_eq!(error["error"]["type"], "invalid_request_error");
     assert!(error["error"]["message"].as_str().unwrap().contains("계정"));
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no usable claude account")
+    );
     let account = h
         .store
         .list()

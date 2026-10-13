@@ -2,19 +2,20 @@ mod credentials;
 mod headers;
 mod hold;
 mod ledger;
+mod response;
 mod upload;
 
 use std::{sync::Arc, time::Duration};
 
+#[cfg(all(feature = "phase0", debug_assertions))]
+use axum::body::Body;
 use axum::{
     Json, Router,
-    body::Body,
     extract::{Request, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
-use futures_util::StreamExt;
 
 use crate::{
     accounts::{Account, AccountStore, Provider, UserState},
@@ -38,6 +39,8 @@ pub struct RelayState {
     observability: Arc<Observability>,
     pins: Arc<DebugPins>,
     tokens: TokenGates,
+    #[cfg(all(feature = "phase0", debug_assertions))]
+    body_capture: Option<Arc<crate::phase0::BodyCapture>>,
 }
 
 impl RelayState {
@@ -48,18 +51,7 @@ impl RelayState {
         pins: Arc<DebugPins>,
     ) -> anyhow::Result<Self> {
         config.upstream.validate()?;
-        let client = reqwest::Client::builder()
-            .use_rustls_tls()
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .no_gzip()
-            .no_brotli()
-            .no_deflate()
-            .no_zstd()
-            .connect_timeout(Duration::from_secs(10))
-            .read_timeout(Duration::from_secs(600))
-            .build()
-            .map_err(|_| anyhow::anyhow!("릴레이 HTTP 클라이언트를 만들 수 없습니다."))?;
+        let client = upstream_client()?;
         Ok(Self {
             store,
             client,
@@ -70,7 +62,15 @@ impl RelayState {
             observability,
             pins,
             tokens: TokenGates::default(),
+            #[cfg(all(feature = "phase0", debug_assertions))]
+            body_capture: None,
         })
+    }
+
+    #[cfg(all(feature = "phase0", debug_assertions))]
+    pub fn with_body_capture(mut self, capture: Arc<crate::phase0::BodyCapture>) -> Self {
+        self.body_capture = Some(capture);
+        self
     }
 
     async fn select(&self, provider: Provider, key: Option<&str>) -> Result<Option<Account>, ()> {
@@ -92,8 +92,126 @@ impl RelayState {
     }
 }
 
+fn upstream_client() -> anyhow::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .use_rustls_tls()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .no_zstd()
+        .connect_timeout(Duration::from_secs(10))
+        .read_timeout(Duration::from_secs(600))
+        .build()
+        .map_err(|_| anyhow::anyhow!("Could not create upstream HTTP client"))
+}
+
 pub fn router(state: Arc<RelayState>) -> Router {
     Router::new().fallback(relay).with_state(state)
+}
+
+#[cfg(all(feature = "phase0", debug_assertions))]
+#[derive(Clone)]
+struct ForcedAccount(String);
+
+#[cfg(all(feature = "phase0", debug_assertions))]
+#[derive(serde::Deserialize)]
+pub struct ReplayRequest {
+    pub capture_path: std::path::PathBuf,
+    pub account_id: String,
+    #[serde(default)]
+    pub strip_encrypted: crate::phase0::StripMode,
+    #[serde(default)]
+    pub tamper_encrypted: bool,
+}
+
+#[cfg(all(feature = "phase0", debug_assertions))]
+pub fn phase0_routes(state: Arc<RelayState>) -> Router {
+    Router::new()
+        .route(
+            "/admin/v1/phase0/replay",
+            axum::routing::post(replay_capture),
+        )
+        .with_state(state)
+}
+
+#[cfg(all(feature = "phase0", debug_assertions))]
+async fn replay_capture(
+    State(state): State<Arc<RelayState>>,
+    payload: Result<Json<ReplayRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let result = async {
+        let Json(payload) =
+            payload.map_err(|_| anyhow::anyhow!("Invalid phase0 replay request"))?;
+        let store = state.store.clone();
+        let id = payload.account_id.clone();
+        let (account, tokens) = tokio::task::spawn_blocking(move || {
+            let account = store.load(&id)?;
+            let tokens = store.tokens(&account)?;
+            Ok::<_, crate::accounts::StoreError>((account, tokens))
+        })
+        .await??;
+        let prepared = tokio::task::spawn_blocking(move || {
+            crate::phase0::prepare(
+                &payload.capture_path,
+                account.provider,
+                payload.strip_encrypted,
+                payload.tamper_encrypted,
+            )
+        })
+        .await??;
+        // 내보내는 것은 암호화 항목의 개수뿐이며 본문과 원래 헤더는 로그에 넣지 않는다.
+        tracing::info!(presence = %prepared.presence, "Phase 0 replay presence");
+        let diagnostics = prepared.diagnostics;
+        let mut forbidden = prepared.forbidden;
+        forbidden.push(tokens.access_token.clone());
+        forbidden.push(tokens.refresh_token.clone());
+        if let Some(token) = &tokens.id_token {
+            forbidden.push(token.clone());
+        }
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri(prepared.route)
+            .body(Body::from(prepared.body))?;
+        *request.headers_mut() = prepared.headers;
+        request
+            .extensions_mut()
+            .insert(ForcedAccount(account.id.clone()));
+        // 제품의 선택 이후 경로를 그대로 실행한다. pin 변경이나 별도 토큰 읽기 경로를 만들지 않는다.
+        let response = relay(State(state.clone()), request).await;
+        let store = state.store.clone();
+        let id = account.id.clone();
+        if let Ok(Ok(tokens)) = tokio::task::spawn_blocking(move || {
+            let current = store.load(&id)?;
+            store.tokens(&current)
+        })
+        .await
+        {
+            forbidden.push(tokens.access_token.clone());
+            forbidden.push(tokens.refresh_token.clone());
+            if let Some(token) = &tokens.id_token {
+                forbidden.push(token.clone());
+            }
+        }
+        let mut summary = crate::phase0::summarize(response, &account.id, &forbidden).await?;
+        if let Some(fields) = diagnostics.as_object() {
+            for (key, value) in fields {
+                summary[key] = value.clone();
+            }
+        }
+        Ok::<_, anyhow::Error>(summary)
+    }
+    .await;
+    match result {
+        Ok(summary) => Json(summary).into_response(),
+        Err(_) => native_error(
+            StatusCode::BAD_REQUEST,
+            Provider::Codex,
+            "invalid_request_error",
+            "Phase 0 replay failed; check capture path and account",
+        ),
+    }
 }
 
 fn retry_body(bytes: Bytes) -> reqwest::Body {
@@ -176,7 +294,7 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
             StatusCode::NOT_FOUND,
             provider,
             "unsupported",
-            "지원하지 않는 경로입니다.",
+            "Unsupported route",
         );
     };
     let upload = match upload::read(body, state.retain_cap, completion.input_bytes.clone()).await {
@@ -187,7 +305,7 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
                 StatusCode::BAD_REQUEST,
                 provider,
                 "body_error",
-                "요청 본문을 읽을 수 없습니다.",
+                "Could not read request body",
             );
         }
     };
@@ -200,14 +318,34 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
     let session = session::classify(provider, path, &parts.headers, &upload.prefix);
     completion.session(&session);
     #[cfg(all(feature = "shape-capture", debug_assertions))]
-    {
+    let shape_ticket = {
         let observability = state.observability.clone();
         let headers = parts.headers.clone();
         let prefix = upload.prefix.clone();
         // 선택적 키 관찰은 런타임 스레드에서 큰 JSON을 파싱하지 않는다.
-        let _ = tokio::task::spawn_blocking(move || observability.capture(&headers, &prefix)).await;
-    }
-    let account = match state.select(provider, session.key.as_deref()).await {
+        tokio::task::spawn_blocking(move || observability.capture_request(&headers, &prefix))
+            .await
+            .ok()
+            .flatten()
+    };
+    #[cfg(all(feature = "phase0", debug_assertions))]
+    let selection = if let Some(ForcedAccount(id)) = parts.extensions.get::<ForcedAccount>() {
+        let store = state.store.clone();
+        let id = id.clone();
+        tokio::task::spawn_blocking(move || {
+            store
+                .load(&id)
+                .map(|account| (account.provider == provider).then_some(account))
+                .map_err(|_| ())
+        })
+        .await
+        .unwrap_or(Err(()))
+    } else {
+        state.select(provider, session.key.as_deref()).await
+    };
+    #[cfg(not(all(feature = "phase0", debug_assertions)))]
+    let selection = state.select(provider, session.key.as_deref()).await;
+    let account = match selection {
         Ok(Some(account)) => account,
         Ok(None) => {
             return failure(
@@ -216,7 +354,7 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
                 provider,
                 "no_account",
                 &format!(
-                    "quota-baton: 사용 가능한 {} 계정이 없습니다. 트레이를 열어 주세요.",
+                    "quota-baton: no usable {} account - open the quota-baton tray (사용 가능한 계정이 없습니다. 트레이를 여세요)",
                     provider.as_str()
                 ),
             );
@@ -227,11 +365,29 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
                 StatusCode::BAD_GATEWAY,
                 provider,
                 "store_error",
-                "계정 저장소를 읽을 수 없습니다.",
+                "Could not read account store",
             );
         }
     };
     completion.record.account = Some(account.id.clone());
+    #[cfg(all(feature = "phase0", debug_assertions))]
+    if upload.overflow.is_none()
+        && parts.extensions.get::<ForcedAccount>().is_none()
+        && let Some(capture) = &state.body_capture
+    {
+        let capture = capture.clone();
+        let route = path.to_owned();
+        let headers = parts.headers.clone();
+        let account = account.id.clone();
+        let raw = upload.prefix.clone();
+        if !matches!(
+            tokio::task::spawn_blocking(move || capture.record(&route, &headers, &account, &raw))
+                .await,
+            Ok(Ok(_))
+        ) {
+            tracing::warn!("Phase 0 body capture failed");
+        }
+    }
     let (mut account, mut tokens) = match state
         .tokens
         .before_request(state.store.clone(), state.observability.clone(), account.id)
@@ -244,7 +400,7 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
                 StatusCode::BAD_GATEWAY,
                 provider,
                 "store_error",
-                "계정 토큰을 읽을 수 없습니다.",
+                "Could not read account tokens",
             );
         }
     };
@@ -270,7 +426,7 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
                         StatusCode::BAD_GATEWAY,
                         provider,
                         "credential_header_error",
-                        "업스트림 인증 헤더를 만들 수 없습니다.",
+                        "Could not create upstream credential headers",
                     );
                 }
             };
@@ -295,7 +451,7 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
                     StatusCode::BAD_GATEWAY,
                     provider,
                     "upstream_error",
-                    "업스트림에 연결할 수 없습니다.",
+                    "Could not connect to upstream",
                 );
             }
         };
@@ -304,6 +460,10 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
         state
             .observability
             .observe_headers(&account.id, provider, response.headers());
+        #[cfg(all(feature = "shape-capture", debug_assertions))]
+        state
+            .observability
+            .capture_response(shape_ticket.as_deref(), response.headers());
         if status == StatusCode::UNAUTHORIZED && !auth_checked {
             auth_checked = true;
             let refreshed = state
@@ -351,7 +511,7 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
                 StatusCode::BAD_GATEWAY,
                 provider,
                 "upstream_error",
-                "업스트림 응답을 읽을 수 없습니다.",
+                "Could not read upstream response",
             );
         }
         break (status, response_headers, held);
@@ -372,36 +532,8 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
     if let Ok(value) = HeaderValue::from_str(&account.id) {
         output_headers.insert("x-quota-baton-account", value);
     }
-    let stream = async_stream::stream! {
-        // generator가 한 번도 poll되지 않아도 captured completion의 Drop이 기록한다.
-        let mut completion = completion;
-        let mut held = held;
-        if !held.prefix.is_empty() {
-            completion.record.bytes_out += held.prefix.len() as u64;
-            yield Ok::<Bytes, std::io::Error>(held.prefix);
-        }
-        if let Some(remainder) = held.remainder {
-            completion.record.bytes_out += remainder.len() as u64;
-            yield Ok(remainder);
-        }
-        if let Some(error) = held.terminal {
-            completion.record.outcome = "upstream_stream_error".into();
-            yield Err(error);
-        } else {
-            while let Some(chunk) = held.stream.next().await {
-                match chunk {
-                    Ok(chunk) => { completion.record.bytes_out += chunk.len() as u64; yield Ok(chunk); }
-                    Err(error) => {
-                        completion.record.outcome = "upstream_stream_error".into();
-                        yield Err(hold::sanitized_stream_error(error));
-                        return;
-                    }
-                }
-            }
-            completion.record.outcome = success_outcome.into();
-        }
-    };
-    let mut response = Response::new(Body::from_stream(stream));
+    let body = response::body(completion, held, status, &response_headers, success_outcome);
+    let mut response = Response::new(body);
     *response.status_mut() = status;
     *response.headers_mut() = output_headers;
     response

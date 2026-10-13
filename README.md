@@ -65,6 +65,10 @@ omits `Accept`; genuine clients supply that header themselves.
 Observability uses a bounded non-blocking queue and batches disk synchronization
 once per second. Queue overflow drops events and reports counts once per minute.
 Corrupt quota caches are moved aside and ledger pruning failures are warnings.
+Successful streams are recorded at upstream EOF independently of the client's
+last body poll. A bounded observer recognizes Claude and Codex terminal SSE events,
+including compressed streams; early disconnects remain `client_drop`.
+Logs default to `info` for file and stderr. `QB_LOG` overrides `RUST_LOG` when set.
 
 Phase 0 account pins use the authenticated admin API:
 `POST /admin/v1/debug/pin` with `{account_id, session_key?}` and
@@ -86,6 +90,37 @@ names, approved header values, and JSON key names. The release build refuses the
 `shape-capture` feature. Capture files are independent of `QB_HOME`.
 Key scanning is bounded to 64 MiB of decoded input, depth 3, and 4096 keys;
 capture records explicitly mark unavailable or truncated key observations.
+For a captured request, a separate response record includes limit header names
+and values (`anthropic-ratelimit-*`, `x-codex-*`, `retry-after`, `x-request-id`).
+
+The `phase0` debug feature adds body capture and replay for synthetic portability
+checks. These captures contain conversation content; use synthetic conversations
+and delete the files after verification. A release build enabling `phase0` fails.
+
+```powershell
+cargo build -p quota-baton --features phase0
+target/debug/quota-baton.exe serve --capture-bodies-dir .sandbox/body-captures --capture-bodies-limit 20
+target/debug/quota-baton.exe phase0 replay --capture .sandbox/body-captures/body-example.json --account cx-example --strip reasoning
+```
+
+The capture directory must already exist inside a canonical `.sandbox` path.
+Only complete `/v1/messages` and `/v1/responses` bodies within the upload cap are
+captured. Authorization, API key, cookie and host headers are excluded. Captures
+store raw base64 bytes and decoded JSON for zstd. Bodies and decoded input are
+bounded to 64 MiB; capture files are bounded to 192 MiB including base64 overhead.
+
+Replay requires a running core and its admin token. The authenticated debug route
+`POST /admin/v1/phase0/replay` accepts `capture_path`, `account_id`,
+`strip_encrypted` (`none`, `reasoning`, `all`; default `none`) and
+`tamper_encrypted` (default `false`). It calls the same relay, credential gates and
+linked-reload path as product traffic, without changing account pins.
+`--strip reasoning` uses product hand-off semantics; `--strip all` is a diagnostic
+control removing every encrypted Codex input item or every Claude thinking block.
+`--tamper-encrypted` changes the first encrypted value or signature across types.
+The CLI prints presence counts before sending and one summary line afterward:
+status, error fields, usage, serving account, applied mode, removal counts and
+tampered type. It prints no body or credentials. Unchanged replay preserves raw
+bytes; transformations retain the original supported content encoding.
 
 The synthetic HTTP harness can be started with
 `cargo run -p qb-testkit --example http_fakes`. Full fake-upstream integration tests
