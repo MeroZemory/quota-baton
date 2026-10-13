@@ -23,3 +23,4 @@ qb-testkit.workspace = true
 default = []
 testkit = ["qb-core/testkit"]
 shape-capture = ["qb-core/shape-capture"]
+phase0 = ["qb-core/phase0"]

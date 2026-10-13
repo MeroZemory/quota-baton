@@ -33,6 +33,143 @@ fn help_is_available() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("serve"));
 }
 
+#[cfg(not(feature = "phase0"))]
+#[test]
+fn default_cli_has_no_phase0_or_body_capture() {
+    let home = fixture();
+    for args in [
+        vec!["phase0", "replay"],
+        vec!["serve", "--capture-bodies-dir", ".sandbox"],
+    ] {
+        let output = command(home.path()).args(args).output().unwrap();
+        assert!(!output.status.success());
+    }
+    assert!(!home.path().join("accounts").exists());
+}
+
+#[cfg(feature = "phase0")]
+#[tokio::test]
+async fn phase0_cli_capture_and_replay_print_counts_and_summary_only() {
+    let _serial = SERVE_SERIAL.lock().await;
+    let root = fixture();
+    let home = root.path().join("home");
+    let cpa = root.path().join("cpa");
+    let captures = root.path().join("captures");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&cpa).unwrap();
+    std::fs::create_dir_all(&captures).unwrap();
+    std::fs::write(
+        cpa.join("codex.json"),
+        serde_json::to_vec(&cpa_fixture(1)).unwrap(),
+    )
+    .unwrap();
+    let fake = qb_testkit::ScriptedUpstream::start().await.unwrap();
+    let data = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let admin = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let data_port = data.local_addr().unwrap().port();
+    let admin_port = admin.local_addr().unwrap().port();
+    std::fs::write(home.join("config.toml"), format!("[server]\ndata_port={data_port}\nadmin_port={admin_port}\n[upstream]\ncodex_base='{}'\n", fake.url)).unwrap();
+    drop((data, admin));
+    let output = command(&home)
+        .args(["accounts", "import", "cpa", "--dir"])
+        .arg(&cpa)
+        .args(["--activate", "codex:synthetic@example.invalid"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let account = qb_core::accounts::AccountStore::list_metadata(&home)
+        .unwrap()
+        .remove(0);
+    let stderr_path = home.join("serve.stderr");
+    let _core = Core(
+        command(&home)
+            .args(["serve", "--capture-bodies-dir"])
+            .arg(&captures)
+            .args(["--capture-bodies-limit", "1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(std::fs::File::create(&stderr_path).unwrap()))
+            .spawn()
+            .unwrap(),
+    );
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let mut ready = false;
+    for _ in 0..100 {
+        if client
+            .get(format!("http://127.0.0.1:{admin_port}/admin/v1/health"))
+            .send()
+            .await
+            .is_ok()
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(ready);
+    assert!(
+        std::fs::read_to_string(stderr_path)
+            .unwrap()
+            .contains("대화 내용")
+    );
+    let key = std::fs::read_to_string(home.join("client.key")).unwrap();
+    let body = r#"{"input":[{"type":"reasoning","encrypted_content":"synthetic-encrypted"},{"type":"message","content":[{"type":"input_text","text":"synthetic conversation"}]}]}"#;
+    client
+        .post(format!("http://127.0.0.1:{data_port}/v1/responses"))
+        .bearer_auth(key.trim())
+        .body(body)
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let capture = std::fs::read_dir(&captures)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let mut replay = command(&home);
+    replay
+        .current_dir(&captures)
+        .args(["phase0", "replay", "--capture"])
+        .arg(capture.file_name().unwrap())
+        .args(["--account", &account.id, "--strip", "reasoning"]);
+    let output = tokio::task::spawn_blocking(move || replay.output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0]["encrypted_content"]["reasoning"], 1);
+    assert_eq!(lines[1]["strip_encrypted"], "reasoning");
+    assert_eq!(lines[1]["status"], 200);
+    assert_eq!(lines[1]["account"], account.id);
+    for forbidden in [
+        "synthetic conversation",
+        "synthetic-encrypted",
+        "fake-access",
+        "fake-refresh",
+        key.trim(),
+    ] {
+        assert!(!text.contains(forbidden));
+    }
+    let sent = fake.state.requests();
+    assert_eq!(sent.len(), 2);
+    let stripped: serde_json::Value = serde_json::from_slice(&sent[1].body).unwrap();
+    assert_eq!(stripped["input"].as_array().unwrap().len(), 1);
+    assert_eq!(std::fs::read_dir(captures).unwrap().count(), 1);
+}
+
 #[tokio::test]
 async fn startup_recovers_corrupt_quota_and_listens() {
     let _serial = SERVE_SERIAL.lock().await;

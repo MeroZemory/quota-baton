@@ -80,6 +80,11 @@ impl Completion {
         self.record.status = status;
         self.record.outcome = outcome.into();
     }
+
+    // 채널을 닫기 전에 원장을 확정하여 body EOF 뒤의 flush와 경합하지 않는다.
+    pub fn finish(mut self, outcome: &str) {
+        self.record.outcome = outcome.into();
+    }
 }
 
 impl Drop for Completion {

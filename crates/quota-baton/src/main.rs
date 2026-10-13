@@ -23,6 +23,12 @@ enum Command {
             help = "기록할 요청 수를 지정합니다"
         )]
         capture_limit: usize,
+        #[cfg(feature = "phase0")]
+        #[arg(long, help = "기존 .sandbox 폴더에 합성 대화 본문을 기록합니다")]
+        capture_bodies_dir: Option<std::path::PathBuf>,
+        #[cfg(feature = "phase0")]
+        #[arg(long, default_value_t = 20, requires = "capture_bodies_dir")]
+        capture_bodies_limit: usize,
     },
     #[command(about = "상태를 확인합니다")]
     Status,
@@ -30,6 +36,27 @@ enum Command {
     Accounts {
         #[command(subcommand)]
         command: accounts_cli::AccountsCommand,
+    },
+    #[cfg(feature = "phase0")]
+    #[command(about = "디버그 캡처를 재생합니다")]
+    Phase0 {
+        #[command(subcommand)]
+        command: Phase0Command,
+    },
+}
+
+#[cfg(feature = "phase0")]
+#[derive(Subcommand)]
+enum Phase0Command {
+    Replay {
+        #[arg(long)]
+        capture: std::path::PathBuf,
+        #[arg(long)]
+        account: String,
+        #[arg(long, default_value = "none", value_parser = ["none", "reasoning", "all"])]
+        strip: String,
+        #[arg(long)]
+        tamper_encrypted: bool,
     },
 }
 
@@ -81,6 +108,10 @@ async fn run() -> anyhow::Result<()> {
             capture_dir,
             #[cfg(feature = "shape-capture")]
             capture_limit,
+            #[cfg(feature = "phase0")]
+            capture_bodies_dir,
+            #[cfg(feature = "phase0")]
+            capture_bodies_limit,
         } => {
             let _logs = qb_core::logging::init(&home)?;
             let config = qb_core::config::Config::load(&home)?;
@@ -97,19 +128,33 @@ async fn run() -> anyhow::Result<()> {
             let observability =
                 std::sync::Arc::new(qb_core::observability::Observability::new(&home, capture)?);
             let pins = std::sync::Arc::new(qb_core::debug_pin::DebugPins::default());
-            let relay = std::sync::Arc::new(qb_core::relay::RelayState::new(
+            let relay = qb_core::relay::RelayState::new(
                 store.clone(),
                 &config,
                 observability.clone(),
                 pins.clone(),
-            )?);
+            )?;
+            #[cfg(feature = "phase0")]
+            let relay = if let Some(dir) = capture_bodies_dir {
+                let capture = qb_core::phase0::BodyCapture::new(dir, capture_bodies_limit)?;
+                eprintln!(
+                    "경고: 본문 캡처에는 대화 내용이 포함됩니다. 합성 대화만 사용하고 검증 후 파일을 삭제하세요."
+                );
+                relay.with_body_capture(std::sync::Arc::new(capture))
+            } else {
+                relay
+            };
+            let relay = std::sync::Arc::new(relay);
+            let admin_routes = qb_core::admin::account_routes(store.clone())
+                .merge(qb_core::debug_pin::routes(store, pins));
+            #[cfg(feature = "phase0")]
+            let admin_routes = admin_routes.merge(qb_core::relay::phase0_routes(relay.clone()));
             let secrets = qb_core::local_secrets::load_or_create(&home)?;
             let servers = qb_core::http::spawn_with_routes(
                 &config,
                 secrets,
                 qb_core::relay::router(relay),
-                qb_core::admin::account_routes(store.clone())
-                    .merge(qb_core::debug_pin::routes(store, pins)),
+                admin_routes,
             )
             .await?;
             println!("프록시를 시작했습니다.");
@@ -139,6 +184,55 @@ async fn run() -> anyhow::Result<()> {
         Command::Accounts { command } => {
             let config = qb_core::config::Config::load(&home)?;
             accounts_cli::run(command, &home, &config).await?;
+        }
+        #[cfg(feature = "phase0")]
+        Command::Phase0 {
+            command:
+                Phase0Command::Replay {
+                    capture,
+                    account,
+                    strip,
+                    tamper_encrypted,
+                },
+        } => {
+            let config = qb_core::config::Config::load(&home)?;
+            let capture = capture
+                .canonicalize()
+                .map_err(|_| anyhow::anyhow!("Capture path must exist"))?;
+            let provider = if account.starts_with("cl-") {
+                qb_core::accounts::Provider::Claude
+            } else if account.starts_with("cx-") {
+                qb_core::accounts::Provider::Codex
+            } else {
+                anyhow::bail!("Invalid phase0 account");
+            };
+            let capture_path = capture.clone();
+            let strip_encrypted: qb_core::phase0::StripMode =
+                serde_json::from_value(serde_json::json!(strip))?;
+            let prepared = tokio::task::spawn_blocking(move || {
+                qb_core::phase0::prepare(&capture_path, provider, strip_encrypted, tamper_encrypted)
+            })
+            .await??;
+            // 네트워크 전송 전에 출력하는 것은 개수뿐이다.
+            println!("{}", serde_json::to_string(&prepared.presence)?);
+            drop(prepared);
+            let token = std::fs::read_to_string(home.join("admin.token"))?;
+            let summary: serde_json::Value = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_secs(150))
+                .build()?
+                .post(format!(
+                    "http://127.0.0.1:{}/admin/v1/phase0/replay",
+                    config.server.admin_port
+                ))
+                .bearer_auth(token.trim())
+                .json(&serde_json::json!({"capture_path":capture,"account_id":account,"strip_encrypted":strip_encrypted,"tamper_encrypted":tamper_encrypted}))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            println!("{}", serde_json::to_string(&summary)?);
         }
     }
     Ok(())

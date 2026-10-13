@@ -19,6 +19,24 @@ mod enabled {
     const MAX_BODY: usize = 64 * 1024 * 1024;
     const MAX_KEYS: usize = 4096;
 
+    pub(crate) fn response_shape(headers: &HeaderMap) -> Value {
+        let mut values = BTreeMap::new();
+        for name in headers.keys().filter(|name| {
+            name.as_str().starts_with("anthropic-ratelimit-")
+                || name.as_str().starts_with("x-codex-")
+                || matches!(name.as_str(), "retry-after" | "x-request-id")
+        }) {
+            let entries: Vec<_> = headers
+                .get_all(name)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .filter(|value| value.len() <= 4096)
+                .collect();
+            values.insert(name.as_str(), entries);
+        }
+        json!({"response_header_names": values.keys().collect::<Vec<_>>(), "response_header_values": values})
+    }
+
     pub struct Capture {
         destination: PathBuf,
         remaining: AtomicUsize,
@@ -405,4 +423,4 @@ mod enabled {
 }
 
 #[cfg(all(feature = "shape-capture", debug_assertions))]
-pub(crate) use enabled::Capture;
+pub(crate) use enabled::{Capture, response_shape};
