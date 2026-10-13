@@ -166,7 +166,10 @@ async fn refresh_ahead_boundary_before_request_and_adopted_singleflight_401() {
             gates.before_request(f.store.clone(), f.obs.clone(), f.account.id.clone()),
             gates.after_401(f.store.clone(), f.obs.clone(), account, &old)
         );
-        assert_eq!(first.unwrap().1.access_token, "synthetic-access-new");
+        assert!(
+            ["synthetic-access-old", "synthetic-access-new"]
+                .contains(&first.unwrap().1.access_token.as_str())
+        );
         assert_eq!(
             second.unwrap().unwrap().1.access_token,
             "synthetic-access-new"
@@ -185,15 +188,17 @@ async fn refresh_ahead_boundary_before_request_and_adopted_singleflight_401() {
         let log = serde_json::to_string(&events).unwrap();
         assert!(!log.contains("synthetic-access"));
         assert!(!log.contains("synthetic-refresh"));
+        gates.shutdown_refreshes().await.unwrap();
     }
 }
 
 #[tokio::test]
-async fn crash_uncertain_keeps_access_and_defers_even_current_token_401_until_ahead() {
+async fn crash_uncertain_after_ahead_waits_for_expiry_margin_or_current401() {
     let _serial = SERIAL.lock().await;
     let f = Fixture::new(false, 60, Provider::Codex);
     let fake = ScriptedUpstream::start().await.unwrap();
-    let account = set_lifetime(&f, 250, true);
+    // 12 minutes left of a 2-hour token: after ahead, before expiry-minus10.
+    let account = set_long_lifetime(&f, 720, true);
     let old = f.store.tokens(&account).unwrap();
     let gates = f
         .gates()
@@ -209,14 +214,41 @@ async fn crash_uncertain_keeps_access_and_defers_even_current_token_401_until_ah
     );
     assert!(
         gates
-            .after_401(f.store.clone(), f.obs.clone(), account, &old)
+            .refresh_ahead(f.store.clone(), f.obs.clone(), account.id.clone())
             .await
             .unwrap()
             .is_none()
     );
     assert!(fake.state.requests().is_empty());
-    // Simulate restart at the next refresh point; the on-disk flag survives.
-    set_lifetime(&f, 100, true);
+    // A new gate models a restart after the old ahead boundary. No replay.
+    let restarted = f
+        .gates()
+        .with_token_endpoint(Provider::Codex, fake.url.clone());
+    assert!(
+        restarted
+            .refresh_ahead(f.store.clone(), f.obs.clone(), account.id.clone())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(fake.state.requests().is_empty());
+    fake.state.push(success());
+    assert!(
+        restarted
+            .after_401(f.store.clone(), f.obs.clone(), account, &old)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(fake.state.requests().len(), 1);
+    gates.shutdown_refreshes().await.unwrap();
+    restarted.shutdown_refreshes().await.unwrap();
+    drop(gates);
+    drop(restarted);
+    drop(f);
+    // A separate account/gate proves the expiry margin trigger without a 401.
+    let f = Fixture::new(false, 60, Provider::Codex);
+    set_long_lifetime(&f, 599, true);
     let restarted = f
         .gates()
         .with_token_endpoint(Provider::Codex, fake.url.clone());
@@ -228,14 +260,7 @@ async fn crash_uncertain_keeps_access_and_defers_even_current_token_401_until_ah
             .unwrap()
             .is_some()
     );
-    assert_eq!(fake.state.requests().len(), 1);
-    assert!(
-        !f.store
-            .load(&f.account.id)
-            .unwrap()
-            .token_meta
-            .refresh_uncertain
-    );
+    assert_eq!(fake.state.requests().len(), 2);
 }
 
 #[tokio::test]
@@ -269,6 +294,13 @@ async fn transient_refresh_backoff_is_shared_with_401_and_recovers() {
         );
         assert_eq!(fake.state.requests().len(), 1);
         assert_eq!(f.store.load(&account.id).unwrap().health, Health::Ready);
+        assert!(
+            !f.store
+                .load(&account.id)
+                .unwrap()
+                .token_meta
+                .refresh_uncertain
+        );
         fake.state.push(success());
         tokio::time::sleep(Duration::from_millis(2100)).await;
         assert!(
@@ -457,7 +489,7 @@ async fn test_build_refuses_default_production_endpoint_without_network() {
     assert!(
         ledger(&f)
             .iter()
-            .any(|e| e["event"] == "token_refresh" && e["outcome"] == "http_503")
+            .any(|e| e["event"] == "token_refresh" && e["outcome"] == "transport_connect")
     );
 }
 
@@ -527,14 +559,6 @@ async fn terminal_refresh_ahead_and_uncertain_reply_have_distinct_outcomes() {
             .unwrap()
             .is_none()
     );
-    assert!(
-        gates
-            .after_401(f.store.clone(), f.obs.clone(), account, &old)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert_eq!(fake.state.requests().len(), 1);
     let current = f.store.load(&f.account.id).unwrap();
     assert_eq!(current.health, Health::Ready);
     assert!(current.token_meta.refresh_uncertain);
@@ -658,8 +682,38 @@ async fn writeahead_persist_failure_never_consumes_refresh_token() {
     let result = gates
         .refresh_ahead(f.store.clone(), f.obs.clone(), f.account.id.clone())
         .await;
+    let request = tokio::time::timeout(
+        Duration::from_millis(300),
+        gates.before_request(f.store.clone(), f.obs.clone(), f.account.id.clone()),
+    )
+    .await;
+    gates.shutdown_refreshes().await.unwrap();
     fs::set_permissions(&path, permissions).unwrap();
-    assert!(result.is_err());
+    assert_eq!(
+        request.unwrap().unwrap().1.access_token,
+        "synthetic-access-old"
+    );
+    assert!(result.unwrap().is_none());
+    assert_eq!(
+        f.runtime.views().await.unwrap()[0]["refresh_attention"],
+        true
+    );
+    assert_eq!(f.store.load(&f.account.id).unwrap().health, Health::Ready);
+    assert_eq!(
+        gates
+            .before_request(f.store.clone(), f.obs.clone(), f.account.id.clone())
+            .await
+            .unwrap()
+            .1
+            .access_token,
+        "synthetic-access-old"
+    );
+    gates.shutdown_refreshes().await.unwrap();
+    assert!(
+        ledger(&f)
+            .iter()
+            .any(|e| e["outcome"] == "store_error_writeahead")
+    );
     assert!(fake.state.requests().is_empty());
     assert!(
         !f.store
@@ -866,6 +920,397 @@ async fn known_transient_error_breaks_unknown_4xx_streak() {
         !ledger(&f)
             .iter()
             .any(|e| e["event"] == "core_warning" && e["code"] == "refresh_unknown_4xx")
+    );
+    gates.shutdown_refreshes().await.unwrap();
+}
+
+fn set_long_lifetime(f: &Fixture, remaining: i64, uncertain: bool) -> Account {
+    set_lifetime(f, remaining, uncertain);
+    let path = f
+        ._root
+        .path()
+        .join("accounts")
+        .join(format!("{}.json", f.account.id));
+    let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    record["token_meta"]["last_refresh_at"] =
+        json!(Utc::now() + ChronoDuration::seconds(remaining - 7200));
+    fs::write(path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+    f.store.load(&f.account.id).unwrap()
+}
+
+#[tokio::test]
+async fn runtime_uncertain_after_ahead_waits_for_expiry_margin() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new(false, 60, Provider::Codex);
+    set_long_lifetime(&f, 720, false);
+    let fake = ScriptedUpstream::start().await.unwrap();
+    let gates = f
+        .gates()
+        .with_token_endpoint(Provider::Codex, fake.url.clone());
+    fake.state
+        .push(ScriptedResponse::json(StatusCode::OK, "truncated-json"));
+    assert!(
+        gates
+            .refresh_ahead(f.store.clone(), f.obs.clone(), f.account.id.clone())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        f.store
+            .load(&f.account.id)
+            .unwrap()
+            .token_meta
+            .refresh_uncertain
+    );
+    assert!(
+        gates
+            .refresh_ahead(f.store.clone(), f.obs.clone(), f.account.id.clone())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(fake.state.requests().len(), 1);
+    set_long_lifetime(&f, 599, true);
+    fake.state.push(success());
+    assert!(
+        gates
+            .refresh_ahead(f.store.clone(), f.obs.clone(), f.account.id.clone())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(fake.state.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn request_serves_current_access_during_slow_ahead_refresh() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new(false, 60, Provider::Codex);
+    set_lifetime(&f, 100, false);
+    let fake = ScriptedUpstream::start().await.unwrap();
+    let mut response = success();
+    response.chunks[0].0 = Duration::from_millis(500);
+    fake.state.push(response);
+    let gates = f
+        .gates()
+        .with_token_endpoint(Provider::Codex, fake.url.clone());
+    let first = tokio::time::timeout(
+        Duration::from_millis(300),
+        gates.before_request(f.store.clone(), f.obs.clone(), f.account.id.clone()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(first.1.access_token, "synthetic-access-old");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while fake.state.requests().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let second = tokio::time::timeout(
+        Duration::from_millis(100),
+        gates.before_request(f.store.clone(), f.obs.clone(), f.account.id.clone()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(second.1.access_token, "synthetic-access-old");
+    gates.shutdown_refreshes().await.unwrap();
+    assert_eq!(fake.state.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn old401_during_pending_rotation_never_changes_auth_health() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new(false, 60, Provider::Codex);
+    let account = set_lifetime(&f, 100, false);
+    let old = f.store.tokens(&account).unwrap();
+    let fake = ScriptedUpstream::start().await.unwrap();
+    let mut response = success();
+    response.chunks[0].0 = Duration::from_millis(200);
+    fake.state.push(response);
+    let gates = f
+        .gates()
+        .with_token_endpoint(Provider::Codex, fake.url.clone());
+    let caller = {
+        let gates = gates.clone();
+        let store = f.store.clone();
+        let obs = f.obs.clone();
+        let id = account.id.clone();
+        tokio::spawn(async move { gates.refresh_ahead(store, obs, id).await })
+    };
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while fake.state.requests().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let path = f
+        ._root
+        .path()
+        .join("accounts")
+        .join(format!("{}.json", account.id));
+    let permissions = fs::metadata(&path).unwrap().permissions();
+    let mut readonly = permissions.clone();
+    readonly.set_readonly(true);
+    fs::set_permissions(&path, readonly).unwrap();
+    caller.await.unwrap().unwrap();
+    // Restore so an erroneous health write would succeed; the retry has a 1s delay.
+    fs::set_permissions(&path, permissions).unwrap();
+    assert!(
+        !gates
+            .is_current(f.store.clone(), &account, &old)
+            .await
+            .unwrap()
+    );
+    assert!(
+        gates
+            .after_401(f.store.clone(), f.obs.clone(), account.clone(), &old)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    gates
+        .revoke_if_current(f.store.clone(), &account, &old)
+        .await
+        .unwrap();
+    gates
+        .auth_failed(f.store.clone(), f.obs.clone(), account.clone(), &old)
+        .await
+        .unwrap();
+    gates
+        .cool_unavailable_auth(f.store.clone(), &account, &old)
+        .await
+        .unwrap();
+    assert!(!matches!(
+        f.store.load(&account.id).unwrap().health,
+        Health::NeedsRelogin { .. }
+    ));
+    gates.shutdown_refreshes().await.unwrap();
+    let current = f.store.load(&account.id).unwrap();
+    assert_eq!(current.health, Health::Ready);
+    assert_eq!(
+        f.store.tokens(&current).unwrap().access_token,
+        "synthetic-access-new"
+    );
+}
+
+#[tokio::test]
+async fn deleted_pending_rotation_is_superseded_and_shutdown_finishes() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new(false, 60, Provider::Codex);
+    set_lifetime(&f, 100, false);
+    let fake = ScriptedUpstream::start().await.unwrap();
+    let mut response = success();
+    response.chunks[0].0 = Duration::from_millis(200);
+    fake.state.push(response);
+    let gates = f
+        .gates()
+        .with_token_endpoint(Provider::Codex, fake.url.clone());
+    let caller = {
+        let gates = gates.clone();
+        let store = f.store.clone();
+        let obs = f.obs.clone();
+        let id = f.account.id.clone();
+        tokio::spawn(async move { gates.refresh_ahead(store, obs, id).await })
+    };
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while fake.state.requests().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let path = f
+        ._root
+        .path()
+        .join("accounts")
+        .join(format!("{}.json", f.account.id));
+    let permissions = fs::metadata(&path).unwrap().permissions();
+    let mut readonly = permissions.clone();
+    readonly.set_readonly(true);
+    fs::set_permissions(&path, readonly).unwrap();
+    caller.await.unwrap().unwrap();
+    fs::set_permissions(&path, permissions).unwrap();
+    fs::remove_file(&path).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), gates.shutdown_refreshes())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(ledger(&f).iter().any(|e| e["outcome"] == "superseded"));
+    assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn error_type_terminal_clears_uncertainty() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new(false, 60, Provider::Claude);
+    set_lifetime(&f, 100, false);
+    let fake = ScriptedUpstream::start().await.unwrap();
+    fake.state.push(ScriptedResponse::json(
+        StatusCode::BAD_REQUEST,
+        r#"{"error":{"type":"invalid_grant"}}"#,
+    ));
+    let gates = f
+        .gates()
+        .with_token_endpoint(Provider::Claude, fake.url.clone());
+    gates
+        .refresh_ahead(f.store.clone(), f.obs.clone(), f.account.id.clone())
+        .await
+        .unwrap();
+    let current = f.store.load(&f.account.id).unwrap();
+    assert!(!current.token_meta.refresh_uncertain);
+    assert!(matches!(current.health,Health::NeedsRelogin {reason,..} if reason=="invalid_grant"));
+}
+
+#[tokio::test]
+async fn notdue_scheduler_preflight_does_not_decrypt_tokens() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new(false, 60, Provider::Codex);
+    set_lifetime(&f, 250, false);
+    let path = f
+        ._root
+        .path()
+        .join("accounts")
+        .join(format!("{}.json", f.account.id));
+    let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    record["secret_dpapi_b64"] = json!("synthetic-invalid-ciphertext");
+    fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    assert!(
+        f.store
+            .tokens(&f.store.load(&f.account.id).unwrap())
+            .is_err()
+    );
+    let gates = f.gates();
+    assert!(
+        gates
+            .refresh_ahead(f.store.clone(), f.obs.clone(), f.account.id.clone())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    gates.shutdown_refreshes().await.unwrap();
+}
+
+#[tokio::test]
+async fn writeahead_failure_cools_only_when_access_cannot_serve() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new(false, 60, Provider::Codex);
+    set_lifetime(&f, -1, false);
+    let fake = ScriptedUpstream::start().await.unwrap();
+    let gates = f
+        .gates()
+        .with_token_endpoint(Provider::Codex, fake.url.clone());
+    let path = f
+        ._root
+        .path()
+        .join("accounts")
+        .join(format!("{}.json", f.account.id));
+    let permissions = fs::metadata(&path).unwrap().permissions();
+    let mut readonly = permissions.clone();
+    readonly.set_readonly(true);
+    fs::set_permissions(&path, readonly).unwrap();
+    let result = gates
+        .refresh_ahead(f.store.clone(), f.obs.clone(), f.account.id.clone())
+        .await;
+    fs::set_permissions(&path, permissions).unwrap();
+    assert!(result.unwrap().is_none());
+    assert!(fake.state.requests().is_empty());
+    assert_eq!(
+        f.runtime.views().await.unwrap()[0]["health"]["reason"],
+        "store_error"
+    );
+    fake.state.push(success());
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    assert!(
+        gates
+            .refresh_ahead(f.store.clone(), f.obs.clone(), f.account.id.clone())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(!f.runtime.blocked_in_memory(&f.account.id));
+    assert_eq!(
+        f.runtime.views().await.unwrap()[0]["health"]["kind"],
+        "ready"
+    );
+    assert_eq!(
+        f.runtime.views().await.unwrap()[0]["refresh_attention"],
+        false
+    );
+    gates.shutdown_refreshes().await.unwrap();
+}
+
+#[tokio::test]
+async fn connect_failure_clears_uncertainty_and_uses_regular_backoff() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new(false, 60, Provider::Codex);
+    set_long_lifetime(&f, 720, false);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let gates = f
+        .gates()
+        .with_token_endpoint(Provider::Codex, format!("http://{address}/token"));
+    gates
+        .refresh_ahead(f.store.clone(), f.obs.clone(), f.account.id.clone())
+        .await
+        .unwrap();
+    assert!(
+        !f.store
+            .load(&f.account.id)
+            .unwrap()
+            .token_meta
+            .refresh_uncertain
+    );
+    assert!(
+        ledger(&f)
+            .iter()
+            .any(|e| e["outcome"] == "transport_connect")
+    );
+    gates.shutdown_refreshes().await.unwrap();
+}
+
+#[tokio::test]
+async fn not_sent_retry_does_not_clear_uncertainty_from_earlier_attempt() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new(false, 60, Provider::Codex);
+    let account = set_long_lifetime(&f, 720, true);
+    let old = f.store.tokens(&account).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let gates = f
+        .gates()
+        .with_token_endpoint(Provider::Codex, format!("http://{address}/token"));
+    gates
+        .after_401(f.store.clone(), f.obs.clone(), account, &old)
+        .await
+        .unwrap();
+    assert!(
+        f.store
+            .load(&f.account.id)
+            .unwrap()
+            .token_meta
+            .refresh_uncertain
+    );
+    assert!(
+        gates
+            .refresh_ahead(f.store.clone(), f.obs.clone(), f.account.id.clone())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        ledger(&f)
+            .iter()
+            .filter(|e| e["event"] == "token_refresh")
+            .count(),
+        1
     );
     gates.shutdown_refreshes().await.unwrap();
 }

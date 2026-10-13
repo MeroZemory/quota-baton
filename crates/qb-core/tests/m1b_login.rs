@@ -176,6 +176,9 @@ async fn callback(start: &LoginStart, mismatch: bool, ipv6: bool) {
     socket.write_all(request.as_bytes()).await.unwrap();
     let mut response = Vec::new();
     socket.read_to_end(&mut response).await.unwrap();
+    if mismatch {
+        assert!(response.starts_with(b"HTTP/1.1 400 Bad Request"));
+    }
     assert!(!String::from_utf8_lossy(&response).contains("synthetic-code"));
 }
 async fn terminal(service: &LoginService, id: &str) -> LoginStatus {
@@ -276,15 +279,20 @@ async fn both_providers_exchange_identity_persistence_and_pkce() {
 }
 
 #[tokio::test]
-async fn mismatch_and_exchange_failure_are_redacted_and_release_listeners() {
+async fn mismatch_keeps_waiting_and_exchange_failure_is_redacted_and_releases_listeners() {
     let h = Harness::new().await;
     let start = h.service.start(Provider::Claude, false).await.unwrap();
     callback(&start, true, false).await;
-    let status = terminal(&h.service, &start.login_id).await;
-    assert_eq!(status.status, LoginState::Failed);
-    assert!(status.error.as_deref() == Some(LoginError::StateMismatch.to_string().as_str()));
+    let status = h.service.status(&start.login_id).await.unwrap();
+    assert_eq!(status.status, LoginState::Pending);
+    assert!(status.error.is_none());
     assert!(h.fake.state.requests().is_empty());
+    h.replies(Provider::Claude);
+    callback(&start, false, false).await;
+    let status = terminal(&h.service, &start.login_id).await;
+    assert_eq!(status.status, LoginState::Completed);
     closed(&start).await;
+    h.assert_no_secrets(&status);
     h.fake.state.push(ScriptedResponse::json(
         StatusCode::BAD_REQUEST,
         r#"{"error":"synthetic-code synthetic-login-access"}"#,
@@ -322,6 +330,69 @@ async fn cancel_and_ten_minute_expiry_release_both_listeners() {
     );
     closed(&start).await;
     tokio::time::resume();
+}
+
+#[tokio::test]
+async fn live_relogin_clears_refresh_attention_and_memory_store_error_only_after_success() {
+    use qb_core::{account_runtime::AccountRuntime, accounts::HealthReason};
+
+    let mut h = Harness::new().await;
+    let first = h.login(Provider::Codex, false, false).await;
+    assert_eq!(first.status, LoginState::Completed);
+    let id = first.account_id.unwrap();
+    let saved = h
+        .store
+        .update_metadata(&id, |account| {
+            account.label = "synthetic-saved-label".into();
+        })
+        .unwrap();
+    let runtime = AccountRuntime::new(h.store.clone(), h.obs.clone(), 1.0);
+    h.service = h.service.clone().with_runtime(runtime.clone());
+    runtime.set_refresh_attention(&id, true);
+    let mut volatile = saved.clone();
+    volatile.health = Health::Cooling {
+        reason: HealthReason::StoreError,
+        until: chrono::Utc::now() + chrono::Duration::minutes(10),
+        scope: "account".into(),
+    };
+    runtime.emit_account(&volatile);
+    assert!(runtime.blocked_in_memory(&id));
+    let before = runtime.views().await.unwrap();
+    let before = before.iter().find(|view| view["id"] == id).unwrap();
+    assert_eq!(before["refresh_attention"], true);
+    assert_eq!(before["health"]["reason"], "store_error");
+
+    // A failed exchange must leave the live warning and memory guard intact.
+    h.fake.state.push(ScriptedResponse::json(
+        StatusCode::BAD_REQUEST,
+        r#"{"error":"synthetic-denied"}"#,
+    ));
+    let start = h.service.start(Provider::Codex, false).await.unwrap();
+    callback(&start, false, false).await;
+    let failed = terminal(&h.service, &start.login_id).await;
+    assert_eq!(failed.status, LoginState::Failed);
+    assert!(runtime.blocked_in_memory(&id));
+    let failed_view = runtime.views().await.unwrap();
+    assert_eq!(
+        failed_view.iter().find(|view| view["id"] == id).unwrap()["refresh_attention"],
+        true
+    );
+    closed(&start).await;
+
+    let completed = h.login(Provider::Codex, false, false).await;
+    assert_eq!(completed.status, LoginState::Completed);
+    assert_eq!(completed.account_id.as_deref(), Some(id.as_str()));
+    assert!(!runtime.blocked_in_memory(&id));
+    let after = h.store.load(&id).unwrap();
+    assert!(after.generation > saved.generation);
+    assert_eq!(after.health, Health::Ready);
+    assert_eq!(after.label, "synthetic-saved-label");
+    let views = runtime.views().await.unwrap();
+    let view = views.iter().find(|view| view["id"] == id).unwrap();
+    assert_eq!(view["refresh_attention"], false);
+    assert_eq!(view["health"]["kind"], "ready");
+    assert_eq!(view["label"], "synthetic-saved-label");
+    h.assert_no_secrets(&completed);
 }
 
 #[tokio::test]

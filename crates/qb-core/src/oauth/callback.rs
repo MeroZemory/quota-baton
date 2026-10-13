@@ -12,21 +12,23 @@ use zeroize::Zeroizing;
 
 pub(super) struct Listeners {
     v4: TcpListener,
-    v6: TcpListener,
+    v6: Option<TcpListener>,
     port: u16,
 }
 impl Listeners {
     pub async fn bind(port: u16) -> Result<Self, LoginError> {
         let v4 = TcpListener::bind((Ipv4Addr::LOCALHOST, port))
             .await
-            .map_err(|_| LoginError::CallbackPortBusy { port })?;
+            .map_err(|error| bind_error(&error, port))?;
         let port = v4
             .local_addr()
-            .map_err(|_| LoginError::CallbackPortBusy { port })?
+            .map_err(|_| LoginError::CallbackBindFailed { port })?
             .port();
-        let v6 = TcpListener::bind((Ipv6Addr::LOCALHOST, port))
-            .await
-            .map_err(|_| LoginError::CallbackPortBusy { port })?;
+        let v6 = match TcpListener::bind((Ipv6Addr::LOCALHOST, port)).await {
+            Ok(listener) => Some(listener),
+            Err(error) if ipv6_unavailable(&error) => None,
+            Err(error) => return Err(bind_error(&error, port)),
+        };
         Ok(Self { v4, v6, port })
     }
     pub fn port(&self) -> u16 {
@@ -41,7 +43,12 @@ impl Listeners {
         loop {
             let accepted = tokio::select! {
                 value = self.v4.accept() => value,
-                value = self.v6.accept() => value,
+                value = async {
+                    match &self.v6 {
+                        Some(listener) => listener.accept().await,
+                        None => std::future::pending().await,
+                    }
+                } => value,
             }
             .map_err(|_| LoginError::InvalidCallback)?;
             let (mut stream, peer) = accepted;
@@ -75,7 +82,9 @@ impl Listeners {
             match result {
                 Ok(Some(code)) => return Ok(code),
                 Ok(None) => continue,
-                Err(error) => return Err(error),
+                // Untrusted local requests must not cancel a pending login.
+                Err(LoginError::ExchangeFailed) => return Err(LoginError::ExchangeFailed),
+                Err(_) => continue,
             }
         }
     }
@@ -86,11 +95,11 @@ async fn read_callback(
     path: &str,
     expected_state: &str,
 ) -> Result<Option<Zeroizing<String>>, LoginError> {
-    let mut request = Zeroizing::new(Vec::new());
+    let mut request = Zeroizing::new(Vec::with_capacity(8192));
     loop {
-        let mut chunk = [0u8; 1024];
+        let mut chunk = Zeroizing::new([0u8; 1024]);
         let size = stream
-            .read(&mut chunk)
+            .read(&mut chunk[..])
             .await
             .map_err(|_| LoginError::InvalidCallback)?;
         if size == 0 || request.len() + size > 8192 {
@@ -114,18 +123,30 @@ async fn read_callback(
     if !target.starts_with('/') || target.starts_with("//") {
         return Err(LoginError::InvalidCallback);
     }
-    let url = reqwest::Url::parse(&format!("http://127.0.0.1{target}"))
-        .map_err(|_| LoginError::InvalidCallback)?;
-    if url.path() != path {
+    parse_target(target, path, expected_state)
+}
+
+fn parse_target(
+    target: &str,
+    path: &str,
+    expected_state: &str,
+) -> Result<Option<Zeroizing<String>>, LoginError> {
+    // Parse borrowed request bytes directly: Url would keep an unwiped copy
+    // of the entire callback, including the authorization code.
+    let (request_path, query) = target.split_once('?').unwrap_or((target, ""));
+    if request_path != path {
         return Ok(None);
     }
     let mut state = None;
     let mut code = None;
     let mut provider_error = false;
-    for (key, value) in url.query_pairs() {
-        match key.as_ref() {
-            "state" if state.is_none() => state = Some(Zeroizing::new(value.into_owned())),
-            "code" if code.is_none() => code = Some(Zeroizing::new(value.into_owned())),
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = decode_component(key)?;
+        let value = decode_component(value)?;
+        match key.as_str() {
+            "state" if state.is_none() => state = Some(value),
+            "code" if code.is_none() => code = Some(value),
             "state" | "code" => return Err(LoginError::InvalidCallback),
             "error" => provider_error = true,
             _ => {}
@@ -143,3 +164,51 @@ async fn read_callback(
         .ok_or(LoginError::InvalidCallback)?;
     Ok(Some(code))
 }
+
+fn decode_component(encoded: &str) -> Result<Zeroizing<String>, LoginError> {
+    let mut decoded = Zeroizing::new(Vec::with_capacity(encoded.len()));
+    let mut bytes = encoded.bytes();
+    while let Some(byte) = bytes.next() {
+        decoded.push(match byte {
+            b'+' => b' ',
+            b'%' => {
+                let hi = bytes.next().and_then(|b| (b as char).to_digit(16));
+                let lo = bytes.next().and_then(|b| (b as char).to_digit(16));
+                match (hi, lo) {
+                    (Some(hi), Some(lo)) => (hi * 16 + lo) as u8,
+                    _ => return Err(LoginError::InvalidCallback),
+                }
+            }
+            byte => byte,
+        });
+    }
+    let text = std::str::from_utf8(&decoded).map_err(|_| LoginError::InvalidCallback)?;
+    Ok(Zeroizing::new(text.to_owned()))
+}
+
+fn bind_error(error: &std::io::Error, port: u16) -> LoginError {
+    if error.kind() == std::io::ErrorKind::AddrInUse {
+        LoginError::CallbackPortBusy { port }
+    } else {
+        LoginError::CallbackBindFailed { port }
+    }
+}
+
+fn ipv6_unavailable(error: &std::io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::Unsupported
+    ) {
+        return true;
+    }
+    // Windows WSAEAFNOSUPPORT may map to Uncategorized.
+    #[cfg(windows)]
+    if error.raw_os_error() == Some(10047) {
+        return true;
+    }
+    false
+}
+
+#[cfg(test)]
+#[path = "callback_fixes_tests.rs"]
+mod fixes_tests;

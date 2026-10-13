@@ -3,6 +3,7 @@ mod callback;
 mod exchange;
 mod parameters;
 
+use crate::account_runtime::AccountRuntime;
 use crate::accounts::{AccountStore, Provider};
 use crate::observability::Observability;
 use parameters::Parameters;
@@ -57,13 +58,17 @@ pub enum LoginError {
         "로그인 콜백 포트 {port}를 사용할 수 없습니다. 다른 로그인 프로그램을 종료한 뒤 다시 시도해 주세요."
     )]
     CallbackPortBusy { port: u16 },
+    #[error(
+        "로그인 콜백 포트 {port}에 연결할 수 없습니다. 루프백 네트워크와 접근 권한을 확인해 주세요."
+    )]
+    CallbackBindFailed { port: u16 },
     #[error("로그인 요청을 찾을 수 없습니다.")]
     NotFound,
     #[error(
         "CPA에 연결된 계정입니다. 별도 토큰 충돌을 막기 위해 로그인을 거절했습니다. 연결을 바꾸려면 replace_linked를 명시해 주세요."
     )]
     LinkedConflict,
-    #[error("기존 계정 정보와 로그인한 계정의 식별 정보가 일치하지 않습니다.")]
+    #[error("{}", crate::accounts::login::IDENTITY_CONFLICT_REASON)]
     IdentityConflict,
     #[error("로그인 상태가 일치하지 않습니다. 로그인을 다시 시작해 주세요.")]
     StateMismatch,
@@ -82,6 +87,20 @@ pub enum LoginError {
 struct Session {
     status: watch::Sender<LoginStatus>,
     cancel: watch::Sender<bool>,
+    finished_at: Mutex<Option<tokio::time::Instant>>,
+}
+
+const TERMINAL_RETENTION: Duration = Duration::from_secs(600);
+
+fn prune_sessions(sessions: &mut HashMap<String, Arc<Session>>) {
+    let now = tokio::time::Instant::now();
+    sessions.retain(|_, session| {
+        session
+            .finished_at
+            .lock()
+            .unwrap()
+            .is_none_or(|finished| now.duration_since(finished) < TERMINAL_RETENTION)
+    });
 }
 
 /// Dropping the last service handle cancels all pending logins.
@@ -93,6 +112,7 @@ struct Inner {
     store: Arc<AccountStore>,
     client: reqwest::Client,
     obs: Arc<Observability>,
+    runtime: Mutex<Option<Arc<AccountRuntime>>>,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     #[cfg(all(feature = "testkit", debug_assertions))]
     test: Option<LoginTestConfig>,
@@ -112,6 +132,7 @@ impl LoginService {
                 store,
                 client,
                 obs,
+                runtime: Mutex::new(None),
                 sessions: Mutex::new(HashMap::new()),
                 #[cfg(all(feature = "testkit", debug_assertions))]
                 test: None,
@@ -119,11 +140,19 @@ impl LoginService {
         }
     }
 
+    /// Attach the live account state to clear refresh warnings after a saved login.
+    /// The hook is optional for standalone/offline login services.
+    pub fn with_runtime(self, runtime: Arc<AccountRuntime>) -> Self {
+        *self.inner.runtime.lock().unwrap() = Some(runtime);
+        self
+    }
+
     pub async fn start(
         &self,
         provider: Provider,
         replace_linked: bool,
     ) -> Result<LoginStart, LoginError> {
+        prune_sessions(&mut self.inner.sessions.lock().unwrap());
         let mut params = Parameters::new(provider);
         #[cfg(all(feature = "testkit", debug_assertions))]
         if let Some(test) = &self.inner.test {
@@ -150,7 +179,11 @@ impl LoginService {
         };
         let (status, _) = watch::channel(pending);
         let (cancel, mut cancelled) = watch::channel(false);
-        let session = Arc::new(Session { status, cancel });
+        let session = Arc::new(Session {
+            status,
+            cancel,
+            finished_at: Mutex::new(None),
+        });
         self.inner
             .sessions
             .lock()
@@ -159,6 +192,7 @@ impl LoginService {
         let store = self.inner.store.clone();
         let client = self.inner.client.clone();
         let obs = self.inner.obs.clone();
+        let runtime = self.inner.runtime.lock().unwrap().clone();
         let task_id = login_id.clone();
         let expires = tokio::time::Instant::now() + Duration::from_secs(600);
         obs.record_login(provider, &login_id, "started", None);
@@ -188,6 +222,10 @@ impl LoginService {
                                 }
                                 _ => LoginError::StoreFailed,
                             })?;
+                    if let Some(runtime) = &runtime {
+                        runtime.set_refresh_attention(&saved.account.id, false);
+                        runtime.clear_memory_health(&saved.account);
+                    }
                     if saved.replaced_linked {
                         obs.record_login(
                             provider,
@@ -215,6 +253,7 @@ impl LoginService {
                 outcome.status.as_str(),
                 outcome.account_id.as_deref(),
             );
+            *session.finished_at.lock().unwrap() = Some(tokio::time::Instant::now());
             session.status.send_replace(outcome);
         });
         Ok(LoginStart { login_id, auth_url })
@@ -265,15 +304,15 @@ impl LoginService {
     }
 
     fn session(&self, id: &str) -> Result<Arc<Session>, LoginError> {
-        self.inner
-            .sessions
-            .lock()
-            .unwrap()
-            .get(id)
-            .cloned()
-            .ok_or(LoginError::NotFound)
+        let mut sessions = self.inner.sessions.lock().unwrap();
+        prune_sessions(&mut sessions);
+        sessions.get(id).cloned().ok_or(LoginError::NotFound)
     }
 }
+
+#[cfg(test)]
+#[path = "oauth/session_fixes_tests.rs"]
+mod session_fixes_tests;
 
 #[cfg(all(feature = "testkit", debug_assertions))]
 #[derive(Clone)]

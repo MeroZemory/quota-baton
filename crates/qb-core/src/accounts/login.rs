@@ -3,13 +3,16 @@ use super::{
     Account, AccountStore, Health, HealthReason, Identity, ImportMode, Source, StoreError, Tokens,
 };
 
+// Shared with the OAuth/CLI error mapping; fixed text contains no source data.
+pub const IDENTITY_CONFLICT_REASON: &str = "계정의 사용자를 확인할 수 없거나 같은 사용자 계정이 중복되어 있습니다. CPA id_token의 사용자 정보와 연결 설정을 확인해 주세요.";
+
 #[derive(Debug, thiserror::Error)]
 pub enum LoginStoreError {
     #[error(
         "CPA 연결 계정이 이미 있습니다. 서로 다른 토큰 계열을 만들지 않으려면 연결 교체를 명시해 주세요."
     )]
     LinkedConflict,
-    #[error("로그인 계정의 식별 정보가 충돌합니다.")]
+    #[error("{}", IDENTITY_CONFLICT_REASON)]
     IdentityConflict,
     #[error("로그인 계정을 저장하지 못했습니다.")]
     Store,
@@ -53,7 +56,7 @@ fn ambiguous_legacy(existing: &Identity, incoming: &Identity) -> bool {
         ) => a == b,
         _ => false,
     };
-    same_id && !matches(existing, incoming)
+    same_id && (matches!(existing, Identity::Codex { .. }) || !matches(existing, incoming))
 }
 
 pub(crate) fn matches(existing: &Identity, incoming: &Identity) -> bool {
@@ -61,8 +64,9 @@ pub(crate) fn matches(existing: &Identity, incoming: &Identity) -> bool {
         return true;
     }
     match (existing, incoming) {
-        // Older imported metadata did not carry the C10 user id. Match that
-        // record conservatively; new OAuth identities always include the user.
+        // Preserve same-email compatibility for existing migration journals.
+        // Changed-email legacy CPA recovery must resolve the current CPA user;
+        // save refuses unresolved Codex records before this fallback is used.
         (
             Identity::Codex {
                 account_id: a,
@@ -99,9 +103,29 @@ pub fn save(
 ) -> Result<SavedLogin, LoginStoreError> {
     let _guard = store.transaction()?;
     store.check_login_migration_clear()?;
-    let existing = store.list_unlocked()?;
-    // Legacy records lack a provider identity dimension. A changed email cannot
-    // prove a different identity, so never create a second token family beside it.
+    let mut existing = store.list_unlocked()?;
+    for old in &mut existing {
+        if let (
+            Identity::Codex {
+                account_id: a,
+                user_id: None,
+                ..
+            },
+            Identity::Codex { account_id: b, .. },
+        ) = (&old.identity, &account.identity)
+            && a == b
+            && let Ok(
+                identity @ Identity::Codex {
+                    user_id: Some(_), ..
+                },
+            ) = super::linked::resolve_identity(old)
+        {
+            // Resolve metadata only; never install possibly older CPA tokens.
+            old.identity = identity;
+        }
+    }
+    // Unresolved Codex users are ambiguous even with the same email. Never
+    // create or replace a family based on workspace/email alone.
     if existing
         .iter()
         .any(|old| ambiguous_legacy(&old.identity, &account.identity))

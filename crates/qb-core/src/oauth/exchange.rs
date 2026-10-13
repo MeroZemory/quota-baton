@@ -2,7 +2,7 @@ use super::{LoginError, parameters::Parameters};
 use crate::accounts::{Account, Health, Identity, Provider, Source, TokenMeta, Tokens, UserState};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 #[derive(Deserialize)]
@@ -19,25 +19,13 @@ pub(super) async fn exchange(
     verifier: &str,
     state: &str,
 ) -> Result<(Account, Tokens), LoginError> {
-    let redirect = params.redirect();
-    let fields = [
-        ("grant_type", "authorization_code"),
-        ("client_id", params.client_id),
-        ("code", code),
-        ("redirect_uri", redirect.as_str()),
-        ("code_verifier", verifier),
-    ];
+    let (content_type, payload) = exchange_body(params, code, verifier, state)?;
     let request = client
         .post(&params.token)
         .header(reqwest::header::USER_AGENT, user_agent())
-        .header(reqwest::header::ACCEPT, "application/json");
-    let request = match params.provider {
-        Provider::Claude => request.json(&serde_json::json!({
-            "grant_type": "authorization_code", "client_id": params.client_id,
-            "code": code, "redirect_uri": redirect, "code_verifier": verifier, "state": state,
-        })),
-        Provider::Codex => request.form(&fields),
-    };
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header(reqwest::header::CONTENT_TYPE, content_type)
+        .body(payload);
     let bytes = body(
         request
             .send()
@@ -145,6 +133,95 @@ pub(super) async fn exchange(
     };
     Ok((account, reply.tokens))
 }
+
+// Bytes retains this owner until the last HTTP-body clone is dropped, at which
+// point the serialized code and verifier are wiped as well.
+struct SecretBody(Zeroizing<Vec<u8>>);
+impl AsRef<[u8]> for SecretBody {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+fn exchange_body(
+    params: &Parameters,
+    code: &str,
+    verifier: &str,
+    state: &str,
+) -> Result<(&'static str, bytes::Bytes), LoginError> {
+    let redirect = params.redirect();
+    let fields = [
+        ("grant_type", "authorization_code"),
+        ("client_id", params.client_id),
+        ("code", code),
+        ("redirect_uri", redirect.as_str()),
+        ("code_verifier", verifier),
+    ];
+    // Reserve an upper bound to avoid reallocating secret-bearing buffers.
+    let capacity = fields
+        .iter()
+        .map(|(key, value)| key.len() + value.len())
+        .sum::<usize>()
+        + state.len()
+        + 256;
+    let mut payload = Zeroizing::new(Vec::with_capacity(capacity * 6));
+    let content_type = match params.provider {
+        Provider::Claude => {
+            #[derive(Serialize)]
+            struct Request<'a> {
+                grant_type: &'a str,
+                client_id: &'a str,
+                code: &'a str,
+                redirect_uri: &'a str,
+                code_verifier: &'a str,
+                state: &'a str,
+            }
+            serde_json::to_writer(
+                &mut *payload,
+                &Request {
+                    grant_type: "authorization_code",
+                    client_id: params.client_id,
+                    code,
+                    redirect_uri: &redirect,
+                    code_verifier: verifier,
+                    state,
+                },
+            )
+            .map_err(|_| LoginError::ExchangeFailed)?;
+            "application/json"
+        }
+        Provider::Codex => {
+            for (index, (key, value)) in fields.iter().enumerate() {
+                if index != 0 {
+                    payload.push(b'&');
+                }
+                payload.extend_from_slice(key.as_bytes());
+                payload.push(b'=');
+                for byte in value.bytes() {
+                    match byte {
+                        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                            payload.push(byte)
+                        }
+                        byte => {
+                            const HEX: &[u8] = b"0123456789ABCDEF";
+                            payload.extend_from_slice(&[
+                                b'%',
+                                HEX[(byte >> 4) as usize],
+                                HEX[(byte & 15) as usize],
+                            ]);
+                        }
+                    }
+                }
+            }
+            "application/x-www-form-urlencoded"
+        }
+    };
+    Ok((content_type, bytes::Bytes::from_owner(SecretBody(payload))))
+}
+
+#[cfg(test)]
+#[path = "exchange_fixes_tests.rs"]
+mod fixes_tests;
 
 fn required(value: &serde_json::Value, name: &str) -> Result<String, LoginError> {
     value[name]

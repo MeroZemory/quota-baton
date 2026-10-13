@@ -621,7 +621,7 @@ async fn c5_owned_transient_refresh_errors_keep_health_and_writeahead() {
         );
         let current = f.store.load(&account.id).unwrap();
         assert_eq!(current.health, Health::Ready);
-        assert!(current.token_meta.refresh_uncertain);
+        assert!(!current.token_meta.refresh_uncertain);
         assert_eq!(
             f.store.tokens(&current).unwrap().access_token,
             tokens.access_token

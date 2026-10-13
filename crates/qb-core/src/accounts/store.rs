@@ -448,7 +448,25 @@ impl AccountStore {
                 let _tokens = crypto::decrypt(&new.secret_dpapi_b64)?;
                 match self.read(&migration.old) {
                     Ok(old)
-                        if super::login::matches(&old.account.identity, &new.account.identity) =>
+                        if super::login::matches(&old.account.identity, &new.account.identity)
+                            || (matches!(
+                                old.account.identity,
+                                super::Identity::Codex { user_id: None, .. }
+                            ) && super::linked::resolve_identity(&old.account).is_ok_and(
+                                |identity| {
+                                    // Workspace alone never authorizes deleting a legacy
+                                    // record after an email change. The current linked CPA
+                                    // source must prove the same canonical workspace/user.
+                                    matches!(
+                                        identity,
+                                        super::Identity::Codex {
+                                            user_id: Some(_),
+                                            ..
+                                        }
+                                    ) && identity.canonical_key()
+                                        == new.account.identity.canonical_key()
+                                },
+                            )) =>
                     {
                         self.remove_login_record_unlocked(&migration.old)?;
                     }
