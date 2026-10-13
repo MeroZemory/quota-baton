@@ -16,7 +16,7 @@ use crate::{
 };
 
 #[derive(Clone)]
-pub(super) struct TokenGates {
+pub(crate) struct TokenGates {
     gates: Arc<Mutex<BTreeMap<String, Arc<Mutex<ReloadClock>>>>>,
     client: reqwest::Client,
     runtime: Arc<AccountRuntime>,
@@ -134,7 +134,29 @@ impl TokenGates {
     ) -> Result<Account, ()> {
         let expected = account.clone();
         let failed = zeroize::Zeroizing::new(tokens.access_token.clone());
+        let gate = self.gate(&account.id).await;
+        let guard = gate.lock_owned().await;
         tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            let (current, current_tokens) = snapshot(&store, &expected.id)?;
+            if is_linked(&current) {
+                // Defensive fallback for callers classifying a linked 401 as revoked.
+                return match linked::reload_and_store(&store, &current) {
+                    Ok(updated) => Ok(updated),
+                    Err(linked::LinkError::Store(StoreError::GenerationConflict { .. })) => {
+                        snapshot(&store, &current.id).map(|(account, _)| account)
+                    }
+                    Err(_) if current_tokens.access_token != *failed => Ok(current),
+                    Err(_) => transition(
+                        &store,
+                        &current,
+                        &failed,
+                        HealthSignal::LinkStale {
+                            retry_at: chrono::Utc::now() + chrono::Duration::minutes(5),
+                        },
+                    ),
+                };
+            }
             transition(
                 &store,
                 &expected,
@@ -159,7 +181,7 @@ impl TokenGates {
         tokio::task::spawn_blocking(move || {
             store
                 .update_metadata_for_token(&id, &failed, |account| {
-                    if account.eligible(None) {
+                    if account.eligible(None) && !is_linked(account) {
                         account.apply_health_signal(
                             HealthSignal::Cooling {
                                 reason: HealthReason::Auth,
@@ -192,6 +214,29 @@ impl TokenGates {
             .clone()
     }
 
+    /// Startup and pre-poll reloads are serialized but never admission-throttled.
+    pub(crate) async fn reload_linked(
+        &self,
+        store: Arc<AccountStore>,
+        obs: Arc<Observability>,
+        id: String,
+        trigger: &str,
+    ) -> Result<Account, ()> {
+        let gate = self.gate(&id).await;
+        let guard = gate.lock_owned().await;
+        let trigger = trigger.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let mut clock = guard;
+            let (current, _) = snapshot(&store, &id)?;
+            if !is_linked(&current) {
+                return Ok(current);
+            }
+            reload(&store, &obs, current, &trigger, &mut clock)
+        })
+        .await
+        .map_err(|_| ())?
+    }
+
     pub async fn before_request(
         &self,
         store: Arc<AccountStore>,
@@ -208,9 +253,10 @@ impl TokenGates {
             }
             let (mut account, _) = snapshot(&store, &id)?;
             if is_linked(&account)
-                && account.token_meta.expires_at.is_some_and(|expiry| {
-                    expiry <= chrono::Utc::now() + chrono::Duration::minutes(10)
-                })
+                && (clock.before_expiry.is_none()
+                    || account.token_meta.expires_at.is_some_and(|expiry| {
+                        expiry <= chrono::Utc::now() + chrono::Duration::minutes(10)
+                    }))
                 && clock.before_expiry()
             {
                 account = reload(&store, &observability, account, "before_expiry", &mut clock)?;
@@ -242,7 +288,7 @@ impl TokenGates {
     pub async fn auth_failed(
         &self,
         store: Arc<AccountStore>,
-        _obs: Arc<Observability>,
+        obs: Arc<Observability>,
         account: Account,
         failed: &Tokens,
     ) -> Result<(), ()> {
@@ -250,9 +296,19 @@ impl TokenGates {
         let guard = gate.lock_owned().await;
         let failed = zeroize::Zeroizing::new(failed.access_token.clone());
         tokio::task::spawn_blocking(move || {
-            let _guard = guard;
+            let mut clock = guard;
             for _ in 0..3 {
                 let (current, tokens) = snapshot(&store, &account.id)?;
+                if is_linked(&current) {
+                    // Retry budget is exhausted: persist CPA rotation, never send again.
+                    let trigger = if tokens.access_token != *failed {
+                        "stale_token_401"
+                    } else {
+                        "upstream_401"
+                    };
+                    reload(&store, &obs, current, trigger, &mut clock)?;
+                    return Ok(());
+                }
                 if tokens.access_token != *failed {
                     return Ok(());
                 }
@@ -294,21 +350,26 @@ impl TokenGates {
         let (current, tokens) = tokio::task::spawn_blocking(move || snapshot(&read_store, &id))
             .await
             .map_err(|_| ())??;
-        if tokens.access_token != *failed {
-            return Ok(Some((current, tokens)));
-        }
-        if matches!(current.health, Health::NeedsRelogin { .. }) {
-            return Ok(None);
-        }
         if is_linked(&current) {
+            let trigger = if tokens.access_token != *failed {
+                "stale_token_401"
+            } else {
+                "upstream_401"
+            };
             return tokio::task::spawn_blocking(move || {
                 let mut clock = clock;
-                let updated = reload(&store, &obs, current, "upstream_401", &mut clock)?;
+                let updated = reload(&store, &obs, current, trigger, &mut clock)?;
                 let (updated, tokens) = snapshot(&store, &updated.id)?;
                 Ok((tokens.access_token != *failed).then_some((updated, tokens)))
             })
             .await
             .map_err(|_| ())?;
+        }
+        if tokens.access_token != *failed {
+            return Ok(Some((current, tokens)));
+        }
+        if matches!(current.health, Health::NeedsRelogin { .. }) {
+            return Ok(None);
         }
         if clock
             .refresh_failure
@@ -592,7 +653,7 @@ fn transition(
     Ok(updated)
 }
 
-fn is_linked(account: &Account) -> bool {
+pub(crate) fn is_linked(account: &Account) -> bool {
     matches!(
         account.source,
         Source::Cpa {
@@ -647,11 +708,13 @@ fn reload(
                 obs.record_reload(&account.id, trigger, outcome, account.token_meta.expires_at);
             }
             // reload 실패에도 실패한 원문이나 파일 경로는 로그에 넣지 않는다.
-            if trigger == "upstream_401"
-                || account
-                    .token_meta
-                    .expires_at
-                    .is_some_and(|expiry| expiry <= chrono::Utc::now())
+            if matches!(account.health, Health::NeedsRelogin { .. })
+                || (trigger != "stale_token_401"
+                    && (trigger == "upstream_401"
+                        || account
+                            .token_meta
+                            .expires_at
+                            .is_some_and(|expiry| expiry <= chrono::Utc::now())))
             {
                 transition(
                     store,

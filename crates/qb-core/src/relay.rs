@@ -1,4 +1,4 @@
-mod credentials;
+pub(crate) mod credentials;
 mod headers;
 mod hold;
 mod ledger;
@@ -35,8 +35,21 @@ use credentials::TokenGates;
 pub use hold::CommitDecision;
 use ledger::Completion;
 
+pub(crate) fn poll_revoked(provider: Provider, body: &[u8]) -> bool {
+    outcome::classify(
+        provider,
+        StatusCode::UNAUTHORIZED,
+        &HeaderMap::new(),
+        body,
+        None,
+    )
+    .kind
+        == outcome::Kind::Revoked
+}
+
 pub struct RelayState {
     pub accounts: Arc<crate::account_runtime::AccountRuntime>,
+    pub quota: Arc<crate::quota::UsagePoller>,
     pub bindings: Arc<crate::bindings::BindingTable>,
     reset_hold_secs: u64,
     pub inflight_requests: Arc<AtomicU64>,
@@ -59,6 +72,21 @@ pub struct RelayState {
 }
 
 impl RelayState {
+    async fn unavailable(
+        &self,
+        completion: &mut Completion,
+        provider: Provider,
+        websocket: bool,
+        model: Option<&str>,
+    ) -> Response {
+        if !completion.usage_prepolled {
+            completion.usage_prepolled = true;
+            self.quota.before_unavailable(provider).await;
+        }
+        self.accounts
+            .unavailable_known(provider, websocket, model)
+            .await
+    }
     fn memory_rejection(&self, provider: Provider) -> Option<Response> {
         if crate::guard::private_bytes() <= self.memory_limit as u64 {
             return None;
@@ -87,6 +115,7 @@ impl RelayState {
         config.upstream.validate()?;
         config.websocket.validate()?;
         config.routing.validate()?;
+        config.quota.validate()?;
         let client = upstream_client()?;
         let accounts = crate::account_runtime::AccountRuntime::new(
             store.clone(),
@@ -94,11 +123,21 @@ impl RelayState {
             config.routing.inflight_allowance_pct,
         );
         let tokens = TokenGates::new(client.clone(), accounts.clone());
+        let quota = crate::quota::UsagePoller::new(
+            store.clone(),
+            accounts.clone(),
+            observability.clone(),
+            client.clone(),
+            tokens.clone(),
+            config,
+        );
+        accounts.set_poller(&quota);
         // The lease is held and account expiry/reconciliation precedes affinity restore.
         store.list()?;
         let bindings = crate::bindings::BindingTable::new(store.home(), config.routing.clone())?;
         Ok(Self {
             accounts,
+            quota,
             bindings,
             reset_hold_secs: config.routing.reset_hold_secs,
             inflight_requests: Arc::new(AtomicU64::new(0)),
@@ -136,6 +175,7 @@ impl RelayState {
     #[cfg(all(feature = "testkit", debug_assertions))]
     pub fn with_token_endpoint(mut self, provider: Provider, url: String) -> Self {
         self.tokens = self.tokens.with_token_endpoint(provider, url);
+        self.quota.set_tokens(self.tokens.clone());
         self
     }
 
@@ -295,6 +335,7 @@ impl RelayState {
         // A failed pre-commit attempt is finished before reserving its successor.
         completion.end_attempt();
         let excluded = tried.clone();
+        let mut held_account = None;
         loop {
             let candidates = self
                 .candidates(provider, session.key.as_deref(), model, &excluded)
@@ -320,6 +361,11 @@ impl RelayState {
                     lease,
                     moves,
                 } => {
+                    if completion.reset_hold_timed_out
+                        && held_account.as_deref() == Some(account.as_str())
+                    {
+                        completion.reset_hold_timed_out = false;
+                    }
                     for event in moves {
                         self.observability.record_group_move(
                             &event.key,
@@ -338,8 +384,13 @@ impl RelayState {
                         .find(|c| c.account.id == account)
                         .map(|c| c.account));
                 }
+                crate::bindings::Decision::None if !completion.usage_prepolled => {
+                    completion.usage_prepolled = true;
+                    self.quota.before_unavailable(provider).await;
+                }
                 crate::bindings::Decision::None => return Ok(None),
                 crate::bindings::Decision::Hold { until } => {
+                    held_account = self.bindings.current(session.key.as_deref());
                     let wait = (until - chrono::Utc::now()).to_std().unwrap_or_default();
                     completion.reset_hold_used = true;
                     tokio::time::sleep(wait.min(Duration::from_secs(self.reset_hold_secs))).await;
@@ -704,8 +755,7 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
         Ok(Some(account)) => account,
         Ok(None) => {
             let response = state
-                .accounts
-                .unavailable(provider, false, request_model.as_deref())
+                .unavailable(&mut completion, provider, false, request_model.as_deref())
                 .await;
             completion.outcome(response.status().as_u16(), "no_account");
             return response;
@@ -788,8 +838,7 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
                 .await;
             if tried.len() >= 4 || !matches!(next, Ok(Some(_))) {
                 let response = state
-                    .accounts
-                    .unavailable(provider, false, request_model.as_deref())
+                    .unavailable(&mut completion, provider, false, request_model.as_deref())
                     .await;
                 completion.outcome(response.status().as_u16(), "accounts_exhausted");
                 return response;
@@ -929,6 +978,10 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
         if let Some(model) = decision.model.take() {
             request_model = Some(model);
         }
+        if decision.kind == outcome::Kind::Revoked && credentials::is_linked(&account) {
+            decision.kind = outcome::Kind::Auth;
+            decision.signal = None;
+        }
         if decision.kind == outcome::Kind::Revoked {
             match state
                 .tokens
@@ -1048,6 +1101,7 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
             break (status, response_headers, held);
         }
         if decision.kind == outcome::Kind::Quota {
+            drop(probe.take());
             match state
                 .retry_after_reset(
                     &session,
@@ -1118,8 +1172,7 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
                 )
             {
                 let response = state
-                    .accounts
-                    .unavailable(provider, false, request_model.as_deref())
+                    .unavailable(&mut completion, provider, false, request_model.as_deref())
                     .await;
                 completion.outcome(response.status().as_u16(), "accounts_exhausted");
                 return response;
@@ -1176,8 +1229,7 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
             }
             Ok(None) => {
                 let response = state
-                    .accounts
-                    .unavailable(provider, false, request_model.as_deref())
+                    .unavailable(&mut completion, provider, false, request_model.as_deref())
                     .await;
                 completion.outcome(response.status().as_u16(), "accounts_exhausted");
                 return response;

@@ -71,3 +71,7 @@ required-features = ["testkit"]
 [[test]]
 name = "m4b"
 required-features = ["testkit"]
+
+[[test]]
+name = "m5"
+required-features = ["testkit"]

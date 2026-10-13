@@ -831,6 +831,44 @@ async fn quota_reset_hold_ignores_client_timeout_and_moves_immediately_after_bou
 }
 
 #[tokio::test]
+async fn rn1_successful_reset_hold_then_payment_failover_is_forced() {
+    let h = Harness::with_hold(Provider::Codex, 3).await;
+    let headers = [("session-id", "hold-then-payment")];
+    let first = h.turn("/v1/responses", &headers, RAW).await;
+    h.store
+        .update_metadata(&first, |a| {
+            a.health = Health::Cooling {
+                reason: HealthReason::Quota,
+                until: Utc::now() + ChronoDuration::seconds(2),
+                scope: "account".into(),
+            };
+        })
+        .unwrap();
+    h.fake.state.push(ScriptedResponse::json(
+        StatusCode::PAYMENT_REQUIRED,
+        r#"{"error":{"type":"payment_required"}}"#,
+    ));
+    let next = h.turn("/v1/responses", &headers, RAW).await;
+    assert_ne!(next, first);
+    h.obs.flush().unwrap();
+    let records: Vec<Value> = fs::read_dir(h.home.join("ledger"))
+        .unwrap()
+        .flat_map(|entry| {
+            fs::read_to_string(entry.unwrap().path())
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let moved = records
+        .iter()
+        .find(|row| row["event"] == "binding_move" && row["from"] == first)
+        .unwrap();
+    assert_eq!(moved["reason"], "forced");
+}
+
+#[tokio::test]
 async fn forced_move_keeps_body_verbatim_and_request_ledger_session_hashed() {
     let h = Harness::new(Provider::Codex).await;
     let headers = [("session-id", "ledger-session")];

@@ -297,6 +297,44 @@ async fn c7_upgrade_near_reset_retries_bound_account_once_without_moving() {
 }
 
 #[tokio::test]
+async fn rn2_upgrade_reset_sleep_releases_pending_auth_probe() {
+    let h = Harness::new(2).await;
+    let (mut first, original) = h.connect().await;
+    first.close(None).await.unwrap();
+    h.store
+        .update_metadata(&original, |a| a.auth_probe_pending = true)
+        .unwrap();
+    h.fake.state.push_handshake(
+        StatusCode::TOO_MANY_REQUESTS,
+        r#"{"error":{"type":"usage_limit_reached","resets_in_seconds":2}}"#,
+        HeaderMap::new(),
+    );
+    let monitor = async {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if h.fake.state.requests().len() >= 2 && !h.state.accounts.probing(&original) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            h.store.load(&original).unwrap().health,
+            Health::Cooling {
+                reason: HealthReason::Quota,
+                ..
+            }
+        ));
+    };
+    let ((mut retry, next), ()) = tokio::join!(h.connect(), monitor);
+    assert_eq!(next, original);
+    assert!(!h.store.load(&original).unwrap().auth_probe_pending);
+    retry.close(None).await.unwrap();
+}
+
+#[tokio::test]
 async fn c7_upgrade_move_then_reset_retry_preserves_first_turn_marker() {
     let h = Harness::new(2).await;
     let (mut first, original) = h.connect().await;
@@ -597,7 +635,7 @@ async fn c6_row_13a_model_permission_records_scope_before_close() {
 }
 
 #[tokio::test]
-async fn c6_row_13a_revocation_closes_and_marks_relogin() {
+async fn c6_row_13a_linked_revocation_closes_and_cools_link_stale_without_replay() {
     let h = Harness::new(2).await;
     h.fake.state.push_reply([Message::Text(r#"{"type":"error","status":401,"error":{"code":"token_revoked","message":"synthetic revoked token"}}"#.into())]);
     let (mut client, account) = h.connect().await;
@@ -605,10 +643,162 @@ async fn c6_row_13a_revocation_closes_and_marks_relogin() {
     assert_close(receive(&mut client).await, 1012);
     assert!(matches!(
         h.store.load(&account).unwrap().health,
-        Health::NeedsRelogin { .. }
+        Health::Cooling {
+            reason: HealthReason::LinkStale,
+            ..
+        }
     ));
     let (mut reconnect, next) = h.connect().await;
     assert_ne!(account, next);
+    assert_eq!(h.fake.state.requests().len(), 2);
+    assert_eq!(
+        h.fake
+            .state
+            .messages()
+            .iter()
+            .filter(|m| matches!(m, Message::Text(_)))
+            .count(),
+        1
+    );
+    assert!(h.token_fake.state.requests().is_empty());
+    reconnect.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn c6_row_13a_owned_revocation_closes_and_marks_relogin() {
+    let h = Harness::new_with_owned(2, true).await;
+    h.fake.state.push_reply([Message::Text(
+        r#"{"type":"error","status":401,"error":{"code":"token_revoked"}}"#.into(),
+    )]);
+    let (mut client, account) = h.connect().await;
+    create(&mut client, "fixture-model").await;
+    assert_close(receive(&mut client).await, 1012);
+    assert!(matches!(
+        h.store.load(&account).unwrap().health,
+        Health::NeedsRelogin { .. }
+    ));
+    assert!(h.token_fake.state.requests().is_empty());
+    let (mut reconnect, next) = h.connect().await;
+    assert_ne!(account, next);
+    reconnect.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn m5_1_linked_revoked_handshake_reloads_cpa_or_cools_link_stale() {
+    for newer in [false, true] {
+        let h = Harness::new(2).await;
+        let id = &h.ids[0];
+        let account = h.store.load(id).unwrap();
+        let old_token = h.store.tokens(&account).unwrap().access_token.clone();
+        h.fake.state.push_handshake_delayed(
+            StatusCode::UNAUTHORIZED,
+            r#"{"error":{"code":"token_revoked"}}"#,
+            HeaderMap::new(),
+            Duration::from_millis(500),
+        );
+        let request = h.request();
+        let connecting = tokio::spawn(async move { connect_async(request).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while h.fake.state.requests().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // Rotate after the initial handshake, so before_request cannot load it first.
+        if newer {
+            rotate_linked_cpa(&h, id, "synthetic-cpa-handshake-rotated");
+        }
+        let (mut client, response) = connecting.await.unwrap().unwrap();
+        let next = response.headers()["x-quota-baton-account"]
+            .to_str()
+            .unwrap();
+        let requests = h.fake.state.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].headers["authorization"],
+            format!("Bearer {old_token}")
+        );
+        let updated = h.store.load(id).unwrap();
+        if newer {
+            assert_eq!(next, id.as_str());
+            assert_eq!(
+                requests[1].headers["authorization"],
+                "Bearer synthetic-cpa-handshake-rotated"
+            );
+            assert_eq!(updated.health, Health::Ready);
+            assert_eq!(
+                h.store.tokens(&updated).unwrap().access_token,
+                "synthetic-cpa-handshake-rotated"
+            );
+        } else {
+            assert_eq!(next, h.ids[1]);
+            assert!(matches!(
+                updated.health,
+                Health::Cooling {
+                    reason: HealthReason::LinkStale,
+                    ..
+                }
+            ));
+        }
+        assert_eq!(updated.auth_failures, 0);
+        assert!(h.token_fake.state.requests().is_empty());
+        assert!(h.fake.state.messages().is_empty());
+        client.close(None).await.unwrap();
+    }
+}
+
+fn rotate_linked_cpa(h: &Harness, id: &str, access_token: &str) {
+    let account = h.store.load(id).unwrap();
+    let qb_core::accounts::Source::Cpa { dir, .. } = account.source else {
+        panic!("expected linked fixture")
+    };
+    let path = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            let fixture: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+            fixture["email"] == account.email
+        })
+        .unwrap();
+    let mut fixture: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    fixture["access_token"] = access_token.into();
+    fixture["last_refresh"] = "2026-10-13T00:00:02Z".into();
+    fs::write(path, serde_json::to_vec(&fixture).unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn m5_1_linked_revoked_open_frame_reloads_newer_cpa_without_replay() {
+    let h = Harness::new(2).await;
+    let (mut client, id) = h.connect().await;
+    // The old token has already completed its handshake before CPA is rotated.
+    rotate_linked_cpa(&h, &id, "synthetic-cpa-frame-rotated");
+    h.fake.state.push_reply([Message::Text(
+        r#"{"type":"error","status":401,"error":{"code":"token_revoked"}}"#.into(),
+    )]);
+    create(&mut client, "fixture-model").await;
+    assert_close(receive(&mut client).await, 1012);
+    let updated = h.store.load(&id).unwrap();
+    assert_eq!(updated.health, Health::Ready);
+    assert_eq!(updated.auth_failures, 0);
+    assert_eq!(
+        h.store.tokens(&updated).unwrap().access_token,
+        "synthetic-cpa-frame-rotated"
+    );
+    assert_eq!(h.fake.state.requests().len(), 1);
+    let (mut reconnect, next) = h.connect().await;
+    assert_ne!(next, id);
+    assert_eq!(h.fake.state.requests().len(), 2);
+    assert_eq!(
+        h.fake
+            .state
+            .messages()
+            .iter()
+            .filter(|m| matches!(m, Message::Text(_)))
+            .count(),
+        1
+    );
+    assert!(h.token_fake.state.requests().is_empty());
     reconnect.close(None).await.unwrap();
 }
 

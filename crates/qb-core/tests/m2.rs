@@ -591,19 +591,31 @@ async fn linked_reload_before_expiry_and_401_once_then_link_stale() {
         h.claude.state.requests()[0].headers["authorization"],
         "Bearer fake-access-claude-2"
     );
-    fs::write(
-        h.cpa.join("codex.json"),
-        serde_json::to_vec(&fixture("codex", 2, None)).unwrap(),
-    )
-    .unwrap();
-    h.codex.state.push(ScriptedResponse::json(
+    let mut unauthorized = ScriptedResponse::json(
         StatusCode::UNAUTHORIZED,
         "{\"error\":\"synthetic unauthorized\"}",
-    ));
+    );
+    unauthorized.chunks[0].0 = Duration::from_millis(500);
+    h.codex.state.push(unauthorized);
     h.codex
         .state
         .push(ScriptedResponse::json(StatusCode::OK, "{\"ok\":true}"));
-    assert_eq!(h.send("/v1/responses", "{}").await.status(), 200);
+    let (response, _) = tokio::join!(h.send("/v1/responses", "{}"), async {
+        // Let first-use reload see the old CPA token before rotating it in flight.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while h.codex.state.requests().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        fs::write(
+            h.cpa.join("codex.json"),
+            serde_json::to_vec(&fixture("codex", 2, None)).unwrap(),
+        )
+        .unwrap();
+    });
+    assert_eq!(response.status(), 200);
     let requests = h.codex.state.requests();
     assert_eq!(requests.len(), 2);
     assert_eq!(
@@ -763,13 +775,6 @@ async fn phase0_authenticated_replay_uses_forced_account_and_linked_401_path() {
                 .contains("second@example.invalid")
         })
         .unwrap();
-    second["last_refresh"] = json!("2026-01-02T00:00:00Z");
-    second["access_token"] = json!("fake-access-second-2");
-    fs::write(
-        h.cpa.join("second.json"),
-        serde_json::to_vec(&second).unwrap(),
-    )
-    .unwrap();
     let request = json!({"capture_path":capture,"account_id":account.id,"strip_encrypted":"none","tamper_encrypted":false});
     assert_eq!(
         h.client
@@ -781,20 +786,40 @@ async fn phase0_authenticated_replay_uses_forced_account_and_linked_401_path() {
             .status(),
         401
     );
-    h.codex
-        .state
-        .push(ScriptedResponse::json(StatusCode::UNAUTHORIZED, "{}"));
+    let mut unauthorized = ScriptedResponse::json(StatusCode::UNAUTHORIZED, "{}");
+    unauthorized.chunks[0].0 = Duration::from_millis(500);
+    h.codex.state.push(unauthorized);
     let mut headers = axum::http::HeaderMap::new();
     headers.insert("content-type", "text/event-stream".parse().unwrap());
     h.codex.state.push(ScriptedResponse {status:StatusCode::OK,headers,chunks:vec![(Duration::ZERO,Bytes::from_static(b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":42,\"input_tokens_details\":{\"cached_tokens\":12}},\"output\":[{\"text\":\"synthetic conversation\"}]}}\n\n"))]});
-    let response = h
-        .client
-        .post(h.admin("/phase0/replay"))
-        .bearer_auth("fake-local-admin")
-        .json(&request)
-        .send()
-        .await
-        .unwrap();
+    let (response, _) = tokio::join!(
+        async {
+            h.client
+                .post(h.admin("/phase0/replay"))
+                .bearer_auth("fake-local-admin")
+                .json(&request)
+                .send()
+                .await
+                .unwrap()
+        },
+        async {
+            // The capture request is already recorded; wait for the forced replay attempt.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while h.codex.state.requests().len() < 2 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            second["last_refresh"] = json!("2026-01-02T00:00:00Z");
+            second["access_token"] = json!("fake-access-second-2");
+            fs::write(
+                h.cpa.join("second.json"),
+                serde_json::to_vec(&second).unwrap(),
+            )
+            .unwrap();
+        }
+    );
     assert_eq!(response.status(), 200);
     let summary: Value = response.json().await.unwrap();
     assert_eq!(summary["status"], 200);
@@ -809,6 +834,11 @@ async fn phase0_authenticated_replay_uses_forced_account_and_linked_401_path() {
     let sent = h.codex.state.requests();
     assert_eq!(sent.len(), 3);
     assert_eq!(sent[1].headers["chatgpt-account-id"], "synthetic-second");
+    assert_eq!(
+        sent[1].headers["authorization"],
+        "Bearer fake-access-codex-1"
+    );
+    assert_eq!(sent[2].headers["chatgpt-account-id"], "synthetic-second");
     assert_eq!(
         sent[2].headers["authorization"],
         "Bearer fake-access-second-2"

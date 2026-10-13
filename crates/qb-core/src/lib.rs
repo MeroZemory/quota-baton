@@ -10,6 +10,7 @@ pub mod guard;
 pub mod observability;
 #[cfg(all(feature = "phase0", debug_assertions))]
 pub mod phase0;
+pub mod quota;
 pub mod relay;
 pub mod session;
 

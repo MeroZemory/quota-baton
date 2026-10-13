@@ -260,12 +260,11 @@ fn c5_reimport_preserves_metadata_and_only_newer_tokens_clear_needs_relogin() {
     let id = account().id;
     let terminal = store
         .update_metadata(&id, |a| {
-            a.apply_health_signal(
-                HealthSignal::TerminalRefresh {
-                    reason: "invalid_grant".into(),
-                },
-                now(),
-            );
+            // Legacy persisted state from before linked revocations were distinguished.
+            a.health = Health::NeedsRelogin {
+                reason: "token_revoked".into(),
+                since: now(),
+            };
             a.user_state = UserState::Paused;
             a.auth_failures = 3;
             a.drain = true;
