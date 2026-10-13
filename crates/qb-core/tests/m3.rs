@@ -267,7 +267,7 @@ async fn handshake_failure_rows_never_return_426_and_keep_raw_bodies() {
     for (status, body, expected) in [
         (
             429,
-            r#"{"error":{"type":"rate_limit_error","resets_at":2000000000,"resets_in_seconds":60}}"#,
+            r#"{"error":{"type":"usage_limit_reached","resets_at":2000000000,"resets_in_seconds":60}}"#,
             429,
         ),
         (
