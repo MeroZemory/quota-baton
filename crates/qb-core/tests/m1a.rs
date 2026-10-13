@@ -325,7 +325,7 @@ fn generation_cooling_and_atomic_write() {
             store.save(&initial, &tokens, Some(initial.generation)),
             Err(StoreError::GenerationConflict {
                 expected: Some(1),
-                actual: Some(2)
+                actual: Some(3)
             })
         ));
         assert!(matches!(
@@ -349,7 +349,7 @@ fn generation_cooling_and_atomic_write() {
         }));
         drop(store);
         let reopened = AccountStore::acquire(home).unwrap();
-        assert_eq!(reopened.load(&initial.id).unwrap().generation, 2);
+        assert_eq!(reopened.load(&initial.id).unwrap().generation, 3);
         assert!(
             reopened
                 .tokens(&reopened.load(&initial.id).unwrap())

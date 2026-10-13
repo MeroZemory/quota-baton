@@ -110,6 +110,9 @@ async fn pair_with_read_timeout(
                         client,
                         upstream,
                         Context {
+                            runtime: None,
+                            relay: None,
+                            credentials: None,
                             budget,
                             observability: obs,
                             account: "fake-account".into(),
@@ -727,4 +730,36 @@ async fn close_code_and_reason_are_mirrored_both_ways() {
             assert_eq!(next(&mut pair.peer).await, close);
         }
     }
+}
+
+#[test]
+fn c6_row_13a_only_response_events_commit_the_current_request() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/pump-tests");
+    std::fs::create_dir_all(&root).unwrap();
+    let home = tempfile::tempdir_in(root).unwrap();
+    let context = Context {
+        runtime: None,
+        relay: None,
+        credentials: None,
+        budget: InflightBudget::new(PARSE_LIMIT),
+        observability: Arc::new(Observability::new(home.path(), None).unwrap()),
+        account: "fixture".into(),
+        session: Session::default(),
+        headers: HeaderMap::new(),
+        idle_close: Duration::from_secs(60),
+        close_after_response: false,
+        capture_ticket: None,
+        connection: "fixture".into(),
+    };
+    let mut current = CurrentCompletion::new(&context);
+    for event in [
+        None,
+        Some(serde_json::json!({"type":"metadata"})),
+        Some(serde_json::json!({"type":"codex.rate_limits"})),
+    ] {
+        current.upstream(event.as_ref());
+        assert!(!current.committed);
+    }
+    current.upstream(Some(&serde_json::json!({"type":"response.created"})));
+    assert!(current.committed);
 }

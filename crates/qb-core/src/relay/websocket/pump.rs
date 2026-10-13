@@ -35,6 +35,9 @@ const UPSTREAM_READ_TIMEOUT: Duration = Duration::from_secs(600);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(super) struct Context {
+    pub runtime: Option<Arc<crate::account_runtime::AccountRuntime>>,
+    pub relay: Option<Arc<crate::relay::RelayState>>,
+    pub credentials: Option<(crate::accounts::Account, zeroize::Zeroizing<String>)>,
     pub budget: Arc<InflightBudget>,
     pub observability: Arc<Observability>,
     pub account: String,
@@ -50,6 +53,7 @@ pub(in crate::relay) struct CurrentCompletion {
     completion: Completion,
     committed: bool,
     first_message: bool,
+    model: Option<String>,
 }
 
 impl CurrentCompletion {
@@ -62,15 +66,19 @@ impl CurrentCompletion {
             &context.headers,
         );
         completion.session(&context.session);
+        if let Some(relay) = &context.relay {
+            completion.track(relay.inflight_requests.clone());
+        }
         completion.record.transport = "ws".into();
         completion.record.account = Some(context.account.clone());
         completion.record.status = 101;
         completion.record.upstream_status = Some(101);
-        completion.record.attempts = 1;
+        completion.attempt(&context.account);
         Self {
             completion,
             committed: false,
             first_message: true,
+            model: None,
         }
     }
 
@@ -93,9 +101,7 @@ impl CurrentCompletion {
                 self.completion.record.status = status as u16;
                 self.completion.record.upstream_status = Some(status as u16);
             }
-            // M4에서 이 지점의 pre-commit 오류를 계정 전환과 1012 종료로 바꾼다.
-            if !self.committed { /* M3는 원본 오류를 그대로 전달한다. */ }
-        } else {
+        } else if kind.is_some_and(|kind| kind.starts_with("response.")) {
             self.committed = true;
         }
         match kind {
@@ -104,6 +110,78 @@ impl CurrentCompletion {
             _ => None,
         }
     }
+}
+
+// Error-frame auth reload uses the credential that opened the pinned socket.
+// It never replays a response.create into a different upstream connection.
+async fn apply_error(
+    context: &Context,
+    event: &Value,
+    model: Option<&str>,
+) -> Result<crate::relay::outcome::Decision, ()> {
+    use crate::relay::outcome::{self, Kind};
+    // The shared HTTP classifier decodes at most 64 KiB. Reduce an already
+    // parsed WS error to its decision fields so unrelated large metadata cannot
+    // hide a signal. The original message is still relayed unchanged.
+    let root = event.get("response").unwrap_or(event);
+    let error = root.get("error").unwrap_or(root);
+    let mut bounded_error = serde_json::Map::new();
+    for field in ["type", "code"] {
+        if let Some(value) = error
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|value| value.len() <= 256)
+        {
+            bounded_error.insert(field.into(), Value::String(value.into()));
+        }
+    }
+    if let Some(message) = error.get("message").and_then(Value::as_str) {
+        bounded_error.insert(
+            "message".into(),
+            Value::String(message.chars().take(8192).collect()),
+        );
+    }
+    for field in ["resets_at", "resets_in_seconds"] {
+        if let Some(value) = error.get(field).filter(|value| value.is_number()) {
+            bounded_error.insert(field.into(), value.clone());
+        }
+    }
+    let raw = serde_json::to_vec(
+        &serde_json::json!({"status":event.get("status"),"error":bounded_error}),
+    )
+    .unwrap_or_default();
+    let mut decision = outcome::classify(
+        Codex,
+        axum::http::StatusCode::OK,
+        &HeaderMap::new(),
+        &raw,
+        model,
+    );
+    if decision.kind == Kind::Auth {
+        if let (Some(relay), Some((account, access_token))) = (&context.relay, &context.credentials)
+        {
+            let failed = crate::accounts::Tokens {
+                access_token: access_token.to_string(),
+                refresh_token: String::new(),
+                id_token: None,
+            };
+            // This socket has never sent a request with the refreshed token.
+            // Reload/refresh can mark linked staleness or terminal failure; an
+            // uncertain refresh does not establish cooling(auth).
+            relay
+                .tokens
+                .after_401(
+                    relay.store.clone(),
+                    context.observability.clone(),
+                    account.clone(),
+                    &failed,
+                )
+                .await?;
+        }
+    } else if let (Some(runtime), Some(signal)) = (&context.runtime, decision.signal.take()) {
+        runtime.transition(&context.account, signal).await?;
+    }
+    Ok(decision)
 }
 
 fn parsed(text: &str) -> Option<Value> {
@@ -237,6 +315,8 @@ async fn run_with_read_timeout(
     let mut to_client: Option<Write<SplitSink<ClientSocket, Message>>> = None;
     let mut to_upstream: Option<Write<SplitSink<UpstreamSocket, Message>>> = None;
     let mut current: Option<CurrentCompletion> = None;
+    let mut model: Option<String> = None;
+    let mut health_events = context.runtime.as_ref().map(|runtime| runtime.subscribe());
     let mut client_admitted = false;
     let mut terminal_pending = false;
     let mut counts = BTreeMap::new();
@@ -251,6 +331,19 @@ async fn run_with_read_timeout(
         None,
         "open",
     );
+
+    if let Some(runtime) = &context.runtime
+        && !runtime.eligible(&context.account, None).await
+    {
+        ending = Some((
+            Some(CloseFrame {
+                code: 1000.into(),
+                reason: "".into(),
+            }),
+            "account_ineligible",
+        ));
+        end_deadline = Instant::now() + CLOSE_TIMEOUT;
+    }
 
     loop {
         if ending.is_some() && to_client.is_none() && to_upstream.is_none() {
@@ -271,6 +364,11 @@ async fn run_with_read_timeout(
                     if let Some(outcome) = delivered.terminal {
                         terminal_pending = false;
                         if let Some(active) = current.take() { active.completion.finish(outcome); }
+                        if ending.is_none() && let Some(runtime) = &context.runtime
+                            && !runtime.eligible(&context.account, model.as_deref()).await {
+                            ending = Some((Some(CloseFrame { code: 1000.into(), reason: "".into() }), "account_ineligible"));
+                            end_deadline = Instant::now() + CLOSE_TIMEOUT;
+                        }
                         if context.close_after_response && delivered.completed && ending.is_none() {
                             ending = Some((Some(CloseFrame { code: 1000.into(), reason: "".into() }), "response_complete"));
                             end_deadline = Instant::now() + CLOSE_TIMEOUT;
@@ -301,7 +399,16 @@ async fn run_with_read_timeout(
                 match message {
                     Some(Ok(message)) => {
                         if let Message::Text(text) = &message && response_create(text.as_str()) {
-                            current = Some(CurrentCompletion::new(&context));
+                            model = parsed(text.as_str()).and_then(|value| value.get("model").and_then(Value::as_str).map(str::to_owned));
+                            if let Some(runtime) = &context.runtime && !runtime.eligible(&context.account, model.as_deref()).await {
+                                ending = Some((Some(CloseFrame { code: 1000.into(), reason: "".into() }), "account_ineligible"));
+                                end_deadline = Instant::now() + CLOSE_TIMEOUT;
+                                continue;
+                            }
+                            let mut active = CurrentCompletion::new(&context);
+                            active.model = model.clone();
+                            active.completion.record.model = model.clone();
+                            current = Some(active);
                         }
                         let bytes = message.len();
                         // 라이브러리가 예약한 로컬 pong을 반대쪽 전달 완료와 독립적으로 flush한다.
@@ -329,7 +436,34 @@ async fn run_with_read_timeout(
                         }
                         let event = if let Message::Text(text) = &message { parsed(text.as_str()) } else { None };
                         if let Some(event) = event.as_ref() {
-                            context.observability.observe_codex_event(&context.account, event);
+                            if let Some(runtime) = &context.runtime {
+                                runtime.observe_codex_event(&context.account, event).await;
+                            } else {
+                                context.observability.observe_codex_event(&context.account, event);
+                            }
+                            if matches!(event.get("type").and_then(Value::as_str), Some("error" | "response.failed")) {
+                                let active_model = current.as_ref().and_then(|active| active.model.as_deref());
+                                let decision = match apply_error(&context, event, active_model).await {
+                                    Ok(decision) => decision,
+                                    Err(()) => {
+                                        ending = Some((Some(CloseFrame { code: 1011.into(), reason: "".into() }), "health_store_error"));
+                                        end_deadline = Instant::now() + CLOSE_TIMEOUT;
+                                        continue;
+                                    }
+                                };
+                                // Row 13a excludes row 3 rate limits and requires a current request.
+                                if current.as_ref().is_some_and(|active| !active.committed)
+                                    && decision.failover() && decision.kind != crate::relay::outcome::Kind::Rate {
+                                    if let Some(mut active) = current.take() {
+                                        active.upstream(Some(event));
+                                        active.completion.failover(decision.reason());
+                                        active.completion.finish("failover");
+                                    }
+                                    ending = Some((Some(CloseFrame { code: 1012.into(), reason: "".into() }), "precommit_failover"));
+                                    end_deadline = Instant::now() + CLOSE_TIMEOUT;
+                                    continue;
+                                }
+                            }
                             count_type(&mut counts, event);
                         }
                         let terminal = current.as_mut().and_then(|active| active.upstream(event.as_ref()));
@@ -345,6 +479,16 @@ async fn run_with_read_timeout(
                         if let Some(active) = current.as_mut() { active.completion.record.outcome = "upstream_error".into(); }
                         ending = Some((None, "upstream_eof")); end_deadline = Instant::now() + CLOSE_TIMEOUT;
                     }
+                }
+            }
+            event = async { health_events.as_mut().unwrap().recv().await }, if health_events.is_some() && ending.is_none() => {
+                if matches!(event, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
+                    health_events = None;
+                }
+                if current.is_none() && !terminal_pending && let Some(runtime) = &context.runtime
+                    && !runtime.eligible(&context.account, model.as_deref()).await {
+                    ending = Some((Some(CloseFrame { code: 1000.into(), reason: "".into() }), "account_ineligible"));
+                    end_deadline = Instant::now() + CLOSE_TIMEOUT;
                 }
             }
             _ = tokio::time::sleep_until(last_activity + context.idle_close), if ending.is_none() && to_client.is_none() && to_upstream.is_none() => {

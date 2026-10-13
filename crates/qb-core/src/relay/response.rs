@@ -55,6 +55,15 @@ pub(in crate::relay) fn body(
     let (tx, rx) = mpsc::channel(1);
     let response_headers = response_headers.clone();
     tokio::spawn(async move {
+        let runtime = completion.runtime.clone();
+        let account = completion.record.account.clone();
+        let provider = if completion.record.family == "claude" {
+            crate::accounts::Provider::Claude
+        } else {
+            crate::accounts::Provider::Codex
+        };
+        let model = completion.record.model.clone();
+        let mut observed_error = 0;
         let mut completion = Some(completion);
         let HeldResponse {
             prefix,
@@ -111,6 +120,27 @@ pub(in crate::relay) fn body(
                 }
             };
             observer.feed(&chunk);
+            if let Some(sink) = observer.decoder.as_ref().map(Decoder::sink)
+                && sink.error_sequence != observed_error
+            {
+                observed_error = sink.error_sequence;
+                if let (Some(runtime), Some(account), Some(event)) =
+                    (&runtime, &account, &sink.error_event)
+                {
+                    let decision = crate::relay::outcome::classify(
+                        provider,
+                        StatusCode::OK,
+                        &HeaderMap::new(),
+                        event,
+                        model.as_deref(),
+                    );
+                    if let Some(signal) = decision.signal
+                        && runtime.transition(account, signal).await.is_err()
+                    {
+                        tracing::error!("Could not persist upstream health signal");
+                    }
+                }
+            }
             let len = chunk.len() as u64;
             if let Some(record) = completion.as_mut()
                 && let Some(code) = observer
@@ -232,6 +262,8 @@ struct EventSink {
     terminal: bool,
     failed: bool,
     error_code: Option<String>,
+    error_event: Option<Vec<u8>>,
+    error_sequence: u64,
 }
 
 impl EventSink {
@@ -264,6 +296,10 @@ impl EventSink {
                     && let Some(code) = crate::observability::safe_error_code(&event)
                 {
                     self.error_code = Some(code);
+                }
+                if event.get("error").is_some() || event["type"] == "response.failed" {
+                    self.error_event = Some(data);
+                    self.error_sequence = self.error_sequence.saturating_add(1);
                 }
             }
         }
@@ -402,6 +438,8 @@ impl Decoder {
                     terminal: false,
                     failed: false,
                     error_code: None,
+                    error_event: None,
+                    error_sequence: 0,
                 };
                 &EMPTY
             }
@@ -463,6 +501,7 @@ mod tests {
                     stream,
                     terminal: None,
                     decision: CommitDecision::NormalData,
+                    complete: false,
                 },
                 status,
                 headers,
@@ -947,6 +986,7 @@ mod tests {
             stream: Box::pin(futures_util::stream::pending()),
             terminal: Some(io::Error::other("private held upstream error")),
             decision: CommitDecision::StreamError,
+            complete: false,
         };
         let completion = Completion::new(
             fixture.obs.clone(),

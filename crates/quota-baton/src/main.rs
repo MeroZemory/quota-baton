@@ -124,8 +124,13 @@ async fn run() -> anyhow::Result<()> {
         } => {
             let _logs = qb_core::logging::init(&home)?;
             let config = qb_core::config::Config::load(&home)?;
-            let store = std::sync::Arc::new(qb_core::accounts::AccountStore::acquire(&home)?);
-            store.list()?;
+            let account_home = home.clone();
+            let store = std::sync::Arc::new(
+                tokio::task::spawn_blocking(move || {
+                    qb_core::accounts::AccountStore::acquire(&account_home)
+                })
+                .await??,
+            );
             qb_core::set_process_priority()?;
             #[cfg(feature = "shape-capture")]
             let capture = capture_dir.map(|dir| qb_core::observability::CaptureOptions {
@@ -156,7 +161,16 @@ async fn run() -> anyhow::Result<()> {
             #[cfg(feature = "phase0")]
             let relay = relay.with_close_after_response(phase0_close_after_response);
             let relay = std::sync::Arc::new(relay);
+            relay
+                .accounts
+                .initialize_settings(config.accounts.clone())
+                .await
+                .map_err(|_| anyhow::anyhow!("계정 설정을 저장하지 못했습니다."))?;
             let admin_routes = qb_core::admin::account_routes(store.clone())
+                .merge(qb_core::admin::runtime_routes(
+                    relay.clone(),
+                    config.server.data_port,
+                ))
                 .merge(qb_core::debug_pin::routes(store, pins));
             #[cfg(feature = "phase0")]
             let admin_routes = admin_routes.merge(qb_core::relay::phase0_routes(relay.clone()));
@@ -176,21 +190,7 @@ async fn run() -> anyhow::Result<()> {
         }
         Command::Status => {
             let config = qb_core::config::Config::load(&home)?;
-            let token = std::fs::read_to_string(home.join("admin.token"))?;
-            let health: qb_proto::HealthResponse = reqwest::Client::builder()
-                .no_proxy()
-                .build()?
-                .get(format!(
-                    "http://127.0.0.1:{}/admin/v1/health",
-                    config.server.admin_port
-                ))
-                .bearer_auth(token.trim())
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
-            println!("{}", serde_json::to_string_pretty(&health)?);
+            accounts_cli::status(&home, &config).await?;
         }
         Command::Accounts { command } => {
             let config = qb_core::config::Config::load(&home)?;

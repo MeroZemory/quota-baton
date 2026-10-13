@@ -112,6 +112,9 @@ mod tests {
             source: Source::Oauth,
             user_state: UserState::Active,
             health: Health::Ready,
+            auth_failures: 0,
+            drain: false,
+            allow_credits: false,
             generation: 1,
             token_meta: TokenMeta::default(),
         }
