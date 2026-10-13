@@ -246,7 +246,7 @@ async fn c6_row_3_only_long_rate_limit_fails_over() {
     ));
 }
 #[tokio::test]
-async fn c6_row_4_revocation_is_terminal_and_fails_over() {
+async fn c6_row_4_linked_revocation_cools_link_stale_and_fails_over() {
     let h = Harness::new(Provider::Codex, 2, 384, 1024).await;
     h.fake.state.push(ScriptedResponse::json(
         StatusCode::UNAUTHORIZED,
@@ -256,8 +256,90 @@ async fn c6_row_4_revocation_is_terminal_and_fails_over() {
     assert_eq!(h.send(Provider::Codex, "{}").await.status(), 200);
     assert!(matches!(
         h.store.load(&h.ids()[0]).unwrap().health,
+        Health::Cooling {
+            reason: HealthReason::LinkStale,
+            ..
+        }
+    ));
+}
+#[tokio::test]
+async fn c6_row_4_owned_revocation_is_terminal_and_fails_over() {
+    let h = Harness::new(Provider::Codex, 2, 384, 1024).await;
+    let id = h.ids().remove(0);
+    let mut account = h.store.load(&id).unwrap();
+    let tokens = h.store.tokens(&account).unwrap();
+    account.source = qb_core::accounts::Source::Oauth;
+    h.store
+        .save(&account, &tokens, Some(account.generation))
+        .unwrap();
+    h.fake.state.push(ScriptedResponse::json(
+        StatusCode::UNAUTHORIZED,
+        r#"{"error":{"code":"token_revoked"}}"#,
+    ));
+    h.fake.state.push(ok());
+    let response = h.send(Provider::Codex, "{}").await;
+    assert_eq!(response.status(), 200);
+    assert_ne!(response.headers()["x-quota-baton-account"], id);
+    assert!(matches!(
+        h.store.load(&id).unwrap().health,
         Health::NeedsRelogin { .. }
     ));
+    assert_eq!(h.fake.state.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn m5_1_linked_revoked_401_reloads_newer_cpa_and_retries_same_account() {
+    let h = Harness::new(Provider::Codex, 1, 384, 1024).await;
+    let id = h.ids().remove(0);
+    let account = h.store.load(&id).unwrap();
+    let old_token = h.store.tokens(&account).unwrap().access_token.clone();
+    let qb_core::accounts::Source::Cpa { dir, .. } = account.source else {
+        panic!("expected linked fixture")
+    };
+    let mut revoked = ScriptedResponse::json(
+        StatusCode::UNAUTHORIZED,
+        r#"{"error":{"code":"token_revoked"}}"#,
+    );
+    revoked.chunks[0].0 = Duration::from_millis(500);
+    h.fake.state.push(revoked);
+    h.fake.state.push(ok());
+    let raw = r#"{"input":"conversation-marker","encrypted_content":"verbatim"}"#;
+    let (response, _) = tokio::join!(h.send(Provider::Codex, raw), async {
+        // First-use reload must see the old CPA token; rotate only once it is in flight.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while h.fake.state.requests().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let path = dir.join("0.json");
+        let mut fixture: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        fixture["access_token"] = "synthetic-cpa-rotated".into();
+        fixture["last_refresh"] = "2026-10-13T00:00:02Z".into();
+        fs::write(path, serde_json::to_vec(&fixture).unwrap()).unwrap();
+    });
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["x-quota-baton-account"], id);
+    response.bytes().await.unwrap();
+    let requests = h.fake.state.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0].headers["authorization"],
+        format!("Bearer {old_token}")
+    );
+    assert_eq!(
+        requests[1].headers["authorization"],
+        "Bearer synthetic-cpa-rotated"
+    );
+    assert!(requests.iter().all(|request| request.body == raw));
+    let updated = h.store.load(&id).unwrap();
+    assert_eq!(updated.health, Health::Ready);
+    assert_eq!(updated.auth_failures, 0);
+    assert_eq!(
+        h.store.tokens(&updated).unwrap().access_token,
+        "synthetic-cpa-rotated"
+    );
 }
 #[tokio::test]
 async fn c6_row_5_linked_401_without_newer_token_fails_over() {

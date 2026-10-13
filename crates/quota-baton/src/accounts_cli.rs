@@ -6,6 +6,21 @@ use std::{
     time::Duration,
 };
 
+#[derive(Debug)]
+pub enum UsageCliError {
+    CoreRequired,
+    TooSoon,
+}
+impl std::fmt::Display for UsageCliError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::CoreRequired => "사용량을 갱신하려면 코어를 먼저 실행해 주세요.",
+            Self::TooSoon => "사용량 조회 간격이 지나지 않았습니다. 잠시 후 다시 시도해 주세요.",
+        })
+    }
+}
+impl std::error::Error for UsageCliError {}
+
 #[derive(Subcommand)]
 pub enum AccountsCommand {
     #[command(about = "계정 목록을 확인합니다")]
@@ -18,6 +33,8 @@ pub enum AccountsCommand {
     Disable { id: String },
     #[command(about = "계정을 활성화합니다")]
     Enable { id: String },
+    #[command(about = "계정 사용량을 갱신합니다")]
+    RefreshUsage { id: String },
     #[command(about = "CPA 계정을 가져옵니다")]
     Import {
         #[command(subcommand)]
@@ -44,6 +61,7 @@ pub struct CpaArgs {
 
 pub async fn run(command: AccountsCommand, home: &Path, config: &Config) -> anyhow::Result<()> {
     match command {
+        AccountsCommand::RefreshUsage { id } => refresh_usage(home, config, &id).await?,
         AccountsCommand::Pause { id } => action(home, config, &id, "pause").await?,
         AccountsCommand::Resume { id } => action(home, config, &id, "resume").await?,
         AccountsCommand::Disable { id } => action(home, config, &id, "disable").await?,
@@ -272,6 +290,28 @@ async fn action(home: &Path, config: &Config, id: &str, action: &str) -> anyhow:
         cell(&serde_json::json!(id)),
         translated(&serde_json::to_value(state)?)
     );
+    Ok(())
+}
+
+async fn refresh_usage(home: &Path, config: &Config, id: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        qb_core::observability::safe_identifier(id).is_some(),
+        "계정 ID를 확인해 주세요."
+    );
+    let (client, base, token) = running_admin(home, config)
+        .await?
+        .ok_or(UsageCliError::CoreRequired)?;
+    let response = client
+        .post(format!("{base}/accounts/{id}/refresh-usage"))
+        .timeout(Duration::from_secs(35))
+        .bearer_auth(token.trim())
+        .send()
+        .await?;
+    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(UsageCliError::TooSoon.into());
+    }
+    response.error_for_status()?;
+    println_utf8!("계정 {}의 사용량을 갱신했습니다.", id);
     Ok(())
 }
 

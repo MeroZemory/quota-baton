@@ -233,6 +233,15 @@ async fn apply_error(
         &raw,
         model,
     );
+    if decision.kind == Kind::Revoked
+        && context
+            .credentials
+            .as_ref()
+            .is_some_and(|(account, _)| crate::relay::credentials::is_linked(account))
+    {
+        decision.kind = Kind::Auth;
+        decision.signal = None;
+    }
     if !current_token && matches!(decision.kind, Kind::Auth | Kind::Revoked) {
         decision.kind = Kind::Auth;
         decision.signal = None;

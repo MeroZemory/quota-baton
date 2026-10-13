@@ -46,6 +46,7 @@ pub struct AccountRuntime {
     probes: Mutex<BTreeSet<String>>,
     volatile: Mutex<BTreeMap<String, Health>>,
     inflight: Mutex<BTreeMap<String, usize>>,
+    poller: Mutex<Option<Weak<crate::quota::UsagePoller>>>,
 }
 
 pub struct InflightGuard {
@@ -100,11 +101,16 @@ impl AccountRuntime {
             probes: Mutex::new(BTreeSet::new()),
             volatile: Mutex::new(BTreeMap::new()),
             inflight: Mutex::new(BTreeMap::new()),
+            poller: Mutex::new(None),
         })
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Value> {
         self.events.subscribe()
+    }
+
+    pub(crate) fn set_poller(&self, poller: &Arc<crate::quota::UsagePoller>) {
+        *self.poller.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(poller));
     }
 
     pub fn track_inflight(self: &Arc<Self>, id: &str) -> InflightGuard {
@@ -432,7 +438,24 @@ impl AccountRuntime {
         websocket: bool,
         model: Option<&str>,
     ) -> Response {
-        // M5는 여기서 후보별 최소 간격을 지키는 사용량 poll을 실행한다.
+        let poller = self
+            .poller
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(Weak::upgrade);
+        if let Some(poller) = poller {
+            poller.before_unavailable(provider).await;
+        }
+        self.unavailable_known(provider, websocket, model).await
+    }
+
+    pub(crate) async fn unavailable_known(
+        &self,
+        provider: Provider,
+        websocket: bool,
+        model: Option<&str>,
+    ) -> Response {
         let store = self.store.clone();
         let accounts = tokio::task::spawn_blocking(move || store.list())
             .await
