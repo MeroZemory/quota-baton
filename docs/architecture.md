@@ -85,6 +85,7 @@ What a design needs follows from those numbers:
 - If another ChatGPT account rejects them, every later turn of a session that changed account fails.
 - The evidence is contradictory.
 - For Claude, thinking-block signatures carry the same question. The previous proxy never stripped them across accounts and saw almost no 400s, which is weak evidence that they are portable.
+- **New evidence (R8 I-16):** three Codex compaction blobs were rejected with `thinking_signature_invalid` after the previous proxy lost a session's binding and served it from another account. Compaction at least appears to be account-bound.
 - This is the decisive Phase 0 test (V2, §16.1). Its outcome selects the hand-off policy ([D10](decisions.md#d10)).
 
 ## 3. Principles
@@ -106,8 +107,9 @@ What a design needs follows from those numbers:
   - Usage thresholds steer only new sessions.
   - A forced move happens only when the bound account becomes ineligible.
 - **P6 Single owner of credentials.**
-  - Accounts come only from quota-baton's own OAuth flow.
-  - There is one writer per account.
+  - Accounts come from quota-baton's own OAuth flow, or from CPA in linked or adopted mode (D5).
+  - Exactly one refresher exists per token family: quota-baton for owned and adopted accounts, CPA for linked ones.
+  - There is one writer per account file.
   - Rotated tokens are persisted atomically before use.
 - **P7 Small surface.** Two upstream families now, plus one later class: Anthropic-compatible API-key providers. No translation.
 - **P8 Local only.**
@@ -420,7 +422,17 @@ Relay design:
     - open logs
     - quit, which offers "tray only" or "tray and proxy"
 - **Updates.** The flyout subscribes to the admin event stream while open and refreshes on a slow timer otherwise.
-- **Toasts** appear only for actionable events: an account needs re-login, or all accounts of a provider are exhausted.
+- **Toasts** appear only for actionable events:
+  - an account needs re-login
+  - an account hits its limit
+  - all accounts of a provider are exhausted
+  - **a burst**: one client (`originator`/UA) opens more than `burst_new_sessions` (default 30) new sessions within 10 minutes. This is the signature of a runaway loop draining the pool (R8 I-40).
+  - a linked account goes stale
+  - the core restarted unexpectedly
+- **Supervision.**
+  - The tray polls the core's health every 10 s.
+  - If the core is unreachable for 30 s and its process is gone, the tray restarts it with backoff (5 s doubling to 5 min) and shows a toast. The previous proxy died silently three times with no supervisor (R8 I-03).
+  - The tray never kills a live core.
 - **Autostart.** The tray starts at logon through `HKCU\...\Run`, but only after cutover approval.
 
 ## 11. Admin API
@@ -460,8 +472,9 @@ Details are in contract C11.
   - Rotation is daily, keeping 7 days and at most 50 MB.
 - **Ledger** (from M2).
   - One JSON line per request with: time, request id, family, route, account id, session hash, model (when known without decoding), `originator` and `User-Agent` product token, status, upstream status, time to first byte, duration, bytes in and out, attempts, outcome.
-  - Kept 30 days.
   - It identifies who sends what during the shadow run (O11).
+  - It also records one event per token refresh attempt and per linked reload: account, trigger, outcome code, and new expiry. No token values. Three Codex token families died within a week for unknown reasons (R8 I-06), and these events make the next one diagnosable.
+  - Retention: 30 days or 500 MB, whichever comes first.
 - **Shared in-flight budget**, `inflight_budget_mib`, default 384. It covers three things:
   - retained HTTP bodies
   - in-flight WebSocket messages
@@ -489,6 +502,13 @@ Details are in contract C11.
 
 ## 14. Lifecycle and upgrades
 
+- **Startup order.**
+  1. Acquire the lease.
+  2. Load accounts and state.
+  3. Then bind the listeners.
+
+  A request never reaches a half-initialised core; the previous proxy returned startup 400s (R8 I-04).
+- **Priority.** The core runs at `ABOVE_NORMAL_PRIORITY_CLASS`, so that a saturated machine does not starve relaying or health checks.
 - **Config** reloads on file change. Account changes apply immediately through the admin API.
 - **Takeover.**
   1. `quota-baton serve --takeover` asks the running core, over the admin API, to drain.
@@ -542,7 +562,7 @@ Phase 0 runs against the real upstreams on a **shadow port (10200)**:
   - Log in **one account at a time**, starting with the main accounts already in use: Claude `acct-alpha`, Codex `acct-alpha`, then Codex `hello.sample-acct`. Claude `hello.sample-acct` is added only when a pair is needed.
   - After each login, confirm that the same account still works in CPA before adding the next one (O10).
 - **Credit guard.** The Codex plus accounts can keep serving by spending paid credits, and the credit hold only arrives in M5. Until then:
-  - Before each test run, check the account's usage (V5 poll, or the CLI's `/status`).
+  - Before each test run, check the account's usage with quota-baton's own usage poll (V5, which therefore runs first in G1). The CLI's `/status` shows nothing in API-key mode (R8 I-37).
   - Do not run tests on an account at or above 80 % of any window.
   - Stop if usage reaches 95 %.
 - Wire shapes are recorded with the `shape-capture` build (§13).
@@ -616,7 +636,7 @@ Each row of contract C5 and C6 has a test. In particular:
 
 | Id | Criterion |
 |---|---|
-| A1 | **Memory**, as core private bytes. The harness is a seeded load generator that samples request sizes from the R7 distributions (HTTP bodies and WebSocket full-input messages: p95 33 MB, p99 51 MB raw) and records time to first byte and upload rate.<br>• Idle: ≤ 40 MiB.<br>• 300 idle WebSocket pairs: ≤ 128 MiB.<br>• 2 h soak (32 concurrent HTTP streams, 50 active WebSocket pairs, plus reconnect-driven full-input resends): peak ≤ 512 MiB. The in-flight budget is 384 MiB.<br>• Back to ≤ 128 MiB within 5 min of idle.<br>• 24 h soak: no upward trend.<br>• Tray: ≤ 30 MiB.<br>These are initial targets, set at M7c. The allocator and buffer sizes may be tuned to meet them; the targets themselves are not relaxed silently. |
+| A1 | **Memory**, as core private bytes. The harness is a seeded load generator that samples request sizes from the R7 distributions (HTTP bodies and WebSocket full-input messages: p95 33 MB, p99 51 MB raw) and records time to first byte and upload rate.<br>• Idle: ≤ 40 MiB.<br>• 300 idle WebSocket pairs: ≤ 128 MiB.<br>• 2 h soak (32 concurrent HTTP streams, 50 active WebSocket pairs, plus reconnect-driven full-input resends): peak ≤ 512 MiB. The in-flight budget is 384 MiB.<br>• Back to ≤ 128 MiB within 5 min of idle.<br>• 24 h soak: no upward trend.<br>• Tray: ≤ 30 MiB.<br>• **CPU:** idle ≤ 1 % of one core on average; during the soak ≤ 25 % of one core on average. The previous proxy averages about 0.7 of a core (R8 I-54).<br>These are initial targets, set at M7c. The allocator and buffer sizes may be tuned to meet them; the targets themselves are not relaxed silently. |
 | A2 | Added time to first byte ≤ 5 ms p50 locally, excluding refresh and the commit hold. Measured from M7b (tee); the M2 interim shape is exempt. |
 | A3 | Every fault-injection test in §16.2 passes. |
 | A4 | Forwarded HTTP bodies and WebSocket message payloads are identical to what was received, except for registered exceptions. |
@@ -642,14 +662,14 @@ Each milestone is independently verifiable and sized for an implementer working 
 | M7a | Takeover: credential-lease handover, drain, and socket handover if the M3 spike requires it | Testkit takeover cases |
 | M7b | Tee plus compressed body retention, and the memory guard | A2; budget tests |
 | M7c | Soak | A1 |
-| M8 | Cutover tool: journaled `wire` / `unwire` with a dry-run diff. Checklist: the Claude settings env; the Codex default home (keep `openai_base_url` in the top section for the herdr shim); Orca homes are **not** wired (the user does not use Orca), but herdr's `session-homes.json` may still resume old sessions in Orca homes, which keep pointing at CPA until those sessions are retired; `model_catalog_json` without the 14 `anthropic/*` entries (D2); autostart; and what happens to other clients on 10100, such as pi | Dry run reviewed by the user. **Running it is the user's decision** ([D9](decisions.md#d9)). |
+| M8 | Cutover tool: journaled `wire` / `unwire` with a dry-run diff. Checklist: the Claude settings env; the Codex default home (keep `openai_base_url` in the top section for the herdr shim); Orca homes are **not** wired (the user does not use Orca), but herdr's `session-homes.json` may still resume old sessions in Orca homes, which keep pointing at the previous proxy until those sessions are retired; `model_catalog_json` without the 14 `anthropic/*` entries (D2), never pointed at a frozen file (R8 I-19); autostart; what happens to other clients on 10100, such as pi and omp; stop the previous proxy's scheduled tasks (`cliproxyapi-proxy`, `cliproxyapi-quota-watch`); offer to archive or delete plaintext credential copies in the previous proxy backups (R8 I-33). Wiring rules (R8 I-34–I-36): wired homes send the client key, never their own ChatGPT token; never change the provider id of existing Codex threads; write config files atomically and retry on a locked file | Dry run reviewed by the user. **Running it is the user's decision** ([D9](decisions.md#d9)). |
 | Later | Anthropic-compatible API-key providers (DeepSeek, Z.ai, MiMo); token accounting in the ledger | — |
 
 ## 18. Open questions
 
 - **O1–O7** correspond to Phase 0 items V1–V7. O2 (V2, account portability) decides [D10](decisions.md#d10) and is answered at gate G1 (HTTP) and in M3 (WebSocket).
 - **O8.** Resolved. Codex posts `{base}/images/generations` and `{base}/images/edits` (`codex-api/src/endpoint/images.rs:62-83`), so the upstream is `https://chatgpt.com/backend-api/codex/images/{generations,edits}`. V7 confirms acceptance.
-- **O9.** The Codex model catalog. Either pass `/v1/models?client_version=` through to `backend-api/codex/models` with a healthy account, or serve a cached file through `model_catalog_json`. Pick in M2 from the real client's behaviour.
+- **O9.** The Codex model catalog. Either pass `/v1/models?client_version=` through to `backend-api/codex/models` with a healthy account, or serve a cached file that quota-baton refreshes. Pick in M2 from the real client's behaviour.
 - **O10.** Do quota-baton's own OAuth logins coexist with the CPA logins of the same accounts during the shadow period? Separate logins should be separate token families. The user picks the accounts. Watch for revocations.
 - **O11.** Who sends the 99.6k HTTP `POST /v1/responses` requests seen at the previous proxy?
   - Codex is WebSocket-first (R6), and the default-home `codex-tui.log` has no "falling back to HTTP" warning. So sticky fallback is not shown to be the cause.

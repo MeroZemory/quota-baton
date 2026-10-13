@@ -282,7 +282,7 @@ html { scroll-behavior: smooth; }
       <ul>
         <li>프로토콜 번역 (예: Codex에서 Claude 모델 쓰기)</li>
         <li>클라이언트 위장: TLS 지문, 헤더, 기기 정보 바꾸기</li>
-        <li>다른 도구(CPA, Orca, <span class="mono">~/.codex</span> 등)의 토큰 가져오기</li>
+        <li>Orca, <span class="mono">~/.codex</span> 등의 토큰 가져오기 (CPA는 연결 모드로만 가져옴)</li>
         <li>원격 접속, 다중 사용자, 자동 업데이트</li>
         <li>오케스트레이터 전용 API (오케스트레이터는 프로바이더만 고르고, 계정 전환은 quota-baton이 맡음)</li>
       </ul>
@@ -379,7 +379,7 @@ html { scroll-behavior: smooth; }
     <div><span class="pid">P3</span><b>코어는 안정, 나머지는 자유</b><p>트레이, 설정, 계정 변경이 진행 중인 대화를 끊지 않습니다. 업그레이드는 넘겨받기 방식으로 합니다.</p></div>
     <div><span class="pid">P4</span><b>정직한 계정 상태</b><p>서버가 보낸 명시적 오류 코드로만 상태를 바꿉니다. 토큰 만료 시각만으로는 판단하지 않습니다.</p></div>
     <div><span class="pid">P5</span><b>사용량과 캐시 인식</b><p>진행 중 대화는 강제될 때와 캐시가 이미 식었을 때만 옮깁니다.</p></div>
-    <div><span class="pid">P6</span><b>토큰 주인은 하나</b><p>자체 OAuth 로그인만 씁니다. 갱신은 한 프로세스만 하고, 새 토큰은 저장한 다음에 씁니다.</p></div>
+    <div><span class="pid">P6</span><b>토큰 주인은 하나</b><p>자체 OAuth 로그인 계정과 CPA에서 가져온 계정만 씁니다. 가져온 계정은 CPA가 계속 갱신하고 quota-baton은 따라 읽기만 합니다. 갱신하는 쪽은 언제나 하나뿐이고, 새 토큰은 저장한 다음에 씁니다.</p></div>
     <div><span class="pid">P7</span><b>작은 범위</b><p>프로바이더 둘과 나중에 API 키형 셋만 다룹니다. 번역은 하지 않습니다.</p></div>
     <div><span class="pid">P8</span><b>로컬 전용</b><p>127.0.0.1에만 열고, 클라이언트 키와 Host·Origin을 검사합니다. 관리 포트는 따로 둡니다.</p></div>
   </div>
@@ -407,7 +407,8 @@ html { scroll-behavior: smooth; }
         <li>5시간·주간 사용량 막대와 리셋 시각</li>
         <li>로그인·재로그인, 일시정지·재개, 비활성화, "새 대화 받지 않기", "유료 크레딧 허용"</li>
         <li>계정 추가, 설정 폴더, 로그, 종료</li>
-        <li>알림은 재로그인이 필요할 때와 모든 계정이 소진됐을 때만</li>
+        <li>알림은 재로그인 필요, 계정 한도 도달, 전 계정 소진, 한 클라이언트가 새 대화를 폭주시킬 때, 코어가 예기치 않게 다시 시작됐을 때만</li>
+        <li>코어가 죽으면 트레이가 다시 띄웁니다(5초부터 최대 5분 간격)</li>
       </ul>
     </div>
   </div>
@@ -597,7 +598,8 @@ html { scroll-behavior: smooth; }
     <div>
       <h3>로그인과 저장</h3>
       <ul>
-        <li>quota-baton 자체 OAuth 로그인(PKCE)만 씁니다. 콜백은 127.0.0.1과 ::1에서만 받습니다.</li>
+        <li>계정은 자체 OAuth 로그인(PKCE)으로 추가하거나 CPA에서 가져옵니다. 로그인 콜백은 127.0.0.1과 ::1에서만 받고, 끝나면 바로 닫습니다.</li>
+        <li>CPA에서 가져온 계정은 연결 모드입니다. CPA가 갱신하고 quota-baton은 그 파일을 다시 읽어 따라갑니다. 갱신을 넘겨받는 인수 모드는 컷오버 때만 씁니다.</li>
         <li>Codex 로그인은 1455 포트를 씁니다. <span class="mono">codex login</span>이 그 포트를 쓰고 있으면 안내만 하고 멈춥니다.</li>
         <li>토큰은 DPAPI로 암호화하고, 임시 파일에 쓴 뒤 교체하는 방식으로 저장합니다. 저장할 때마다 세대 번호가 올라갑니다.</li>
         <li>토큰을 쥘 수 있는 프로세스는 하나뿐입니다. 독점 잠금을 쥔 코어만 갱신하고 저장합니다.</li>
@@ -844,7 +846,6 @@ html { scroll-behavior: smooth; }
         <tr><td class="k">D2</td><td>그대로 전달, 프로토콜 번역 없음</td><td><span class="chip ok">확정</span></td></tr>
         <tr><td class="k">D3</td><td>클라이언트 위장 없음 (TLS 지문, 헤더, 기기 정보)</td><td><span class="chip ok">확정</span></td></tr>
         <tr><td class="k">D4</td><td>오케스트레이터는 프록시를 모르고 프로바이더만 고름. The orchestrator 쪽 수정은 별도 작업</td><td><span class="chip ok">확정</span></td></tr>
-        <tr><td class="k">D5</td><td>계정은 quota-baton 자체 OAuth로만 추가</td><td><span class="chip ok">확정</span></td></tr>
         <tr><td class="k">D6</td><td>Rust로 구현</td><td><span class="chip ok">확정</span></td></tr>
         <tr><td class="k">D7</td><td>코어와 트레이를 별도 프로그램으로</td><td><span class="chip ok">확정</span></td></tr>
         <tr><td class="k">D8</td><td>Claude·Codex 먼저, 나중에 DeepSeek·Z.ai·MiMo (Claude Code에서 API 키로)</td><td><span class="chip ok">확정</span></td></tr>
