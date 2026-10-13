@@ -8,6 +8,13 @@ pub struct HealthResponse {
     pub started_at: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DebugPinRequest {
+    #[serde(default)]
+    pub session_key: Option<String>,
+    pub account_id: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ImportMode {
