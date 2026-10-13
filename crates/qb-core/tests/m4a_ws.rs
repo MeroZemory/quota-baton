@@ -335,6 +335,145 @@ async fn rn2_upgrade_reset_sleep_releases_pending_auth_probe() {
 }
 
 #[tokio::test]
+async fn c6_3_ws_upgrade_hold_capped_below_15s() {
+    let h = Harness::new(1).await;
+    for _ in 0..5 {
+        h.fake.state.push_handshake(
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"code":"rate_limit_exceeded"}}"#,
+            HeaderMap::new(),
+        );
+    }
+    let result = tokio::time::timeout(Duration::from_secs(15), h.error()).await;
+    assert!(
+        result.is_ok(),
+        "upgrade rate hold exceeded Codex connect bound"
+    );
+    assert_eq!(result.unwrap().0, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn c6_3_ws_precommit_rate_frame_resent_on_open_socket() {
+    let h = Harness::new(1).await;
+    let rate = r#"{"type":"error","status":429,"error":{"code":"rate_limit_exceeded"}}"#;
+    h.fake.state.push_reply([Message::Text(rate.into())]);
+    h.fake
+        .state
+        .push_reply([Message::Text(r#"{"type":"response.completed"}"#.into())]);
+    let (mut client, account) = h.connect().await;
+    create(&mut client, "fixture-model").await;
+    assert_eq!(
+        receive(&mut client).await,
+        Message::Text(r#"{"type":"response.completed"}"#.into())
+    );
+    let text_messages = h
+        .fake
+        .state
+        .messages()
+        .into_iter()
+        .filter(|message| matches!(message, Message::Text(_)))
+        .count();
+    assert_eq!(text_messages, 2);
+    assert_eq!(h.store.load(&account).unwrap().health, Health::Ready);
+    client.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn c6_3_ws_precommit_rate_redial_same_account_without_previous_response_id() {
+    let h = Harness::new(1).await;
+    let rate = r#"{"type":"error","status":429,"error":{"code":"rate_limit_exceeded"}}"#;
+    h.fake.state.push_reply([
+        Message::Text(rate.into()),
+        Message::Close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
+            code: 1012.into(),
+            reason: "synthetic close".into(),
+        })),
+    ]);
+    h.fake
+        .state
+        .push_reply([Message::Text(r#"{"type":"response.completed"}"#.into())]);
+    let (mut client, account) = h.connect().await;
+    create(&mut client, "fixture-model").await;
+    assert_eq!(
+        receive(&mut client).await,
+        Message::Text(r#"{"type":"response.completed"}"#.into())
+    );
+    let events = h.fake.state.events();
+    assert!(
+        events
+            .iter()
+            .filter(|event| matches!(event, qb_testkit::websocket::ConnectionEvent::Opened(_)))
+            .count()
+            >= 2
+    );
+    let messages = h.fake.state.messages();
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| matches!(message, Message::Text(_)))
+            .count(),
+        2
+    );
+    assert_eq!(h.store.load(&account).unwrap().health, Health::Ready);
+    client.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn c6_3_ws_rate_frame_with_advice_relayed_immediately() {
+    let h = Harness::new(1).await;
+    let rate = r#"{"type":"error","status":429,"error":{"code":"rate_limit_exceeded"},"headers":{"retry-after":"5"}}"#;
+    h.fake.state.push_reply([Message::Text(rate.into())]);
+    let (mut client, _) = h.connect().await;
+    create(&mut client, "fixture-model").await;
+    assert_eq!(receive(&mut client).await, Message::Text(rate.into()));
+    client.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn c6_3_ws_rate_frame_without_advice_closes_1012_same_account() {
+    let h = Harness::new(2).await;
+    let rate = r#"{"type":"error","status":429,"error":{"code":"rate_limit_exceeded"}}"#;
+    h.fake.state.push_reply(
+        (0..4)
+            .map(|_| Message::Text(rate.into()))
+            .collect::<Vec<_>>(),
+    );
+    let (mut client, account) = h.connect().await;
+    create(&mut client, "fixture-model").await;
+    assert_close(receive(&mut client).await, 1012);
+    let (mut reconnect, same_account) = h.connect().await;
+    assert_eq!(same_account, account);
+    assert_eq!(same_account, h.ids[0]);
+    let requests = h.fake.state.requests();
+    let first_authorization = requests[0].headers["authorization"].clone();
+    assert!(
+        requests
+            .iter()
+            .all(|request| { request.headers["authorization"] == first_authorization })
+    );
+    assert_eq!(requests.len(), 2, "only A should receive both upgrades");
+    reconnect.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn c6_3_ws_connection_limit_frame_not_held() {
+    let h = Harness::new(1).await;
+    for code in [
+        "websocket_connection_limit_reached",
+        "previous_response_not_found",
+    ] {
+        let error = json!({"type":"error","status":429,"error":{"code":code}}).to_string();
+        h.fake
+            .state
+            .push_reply([Message::Text(error.clone().into())]);
+        let (mut client, _) = h.connect().await;
+        create(&mut client, "fixture-model").await;
+        assert_eq!(receive(&mut client).await, Message::Text(error.into()));
+        client.close(None).await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn c7_upgrade_move_then_reset_retry_preserves_first_turn_marker() {
     let h = Harness::new(2).await;
     let (mut first, original) = h.connect().await;

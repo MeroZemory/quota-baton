@@ -216,6 +216,7 @@ async fn serve_socket(stream: tokio::net::TcpStream, state: WebSocketState) {
                     .into(),
                 headers: request.headers().clone(),
                 body: Bytes::new(),
+                received_at: std::time::Instant::now(),
             });
             if let Some(failure) = inner.handshakes.pop_front() {
                 *callback_delay.lock().unwrap() = failure.body_delay;
