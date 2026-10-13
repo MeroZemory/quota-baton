@@ -1,5 +1,5 @@
 use std::{
-    io::{self, Read},
+    io::{self, Write},
     pin::Pin,
     time::Duration,
 };
@@ -20,6 +20,7 @@ pub enum CommitDecision {
     HoldTimeout,
     End,
     StreamError,
+    Undecodable,
 }
 
 pub(super) struct HeldResponse {
@@ -56,25 +57,19 @@ pub(super) async fn hold(
                 .trim()
                 .eq_ignore_ascii_case("text/event-stream")
         });
-    let identity = headers
-        .get("content-encoding")
-        .is_none_or(|v| v.as_bytes().eq_ignore_ascii_case(b"identity"));
-    let encoding = headers.get("content-encoding").and_then(|value| {
-        let value = value.as_bytes().trim_ascii();
-        if value.eq_ignore_ascii_case(b"zstd") {
-            Some(SideEncoding::Zstd)
-        } else if value.eq_ignore_ascii_case(b"gzip") {
-            Some(SideEncoding::Gzip)
-        } else if value.eq_ignore_ascii_case(b"deflate") {
-            Some(SideEncoding::Deflate)
-        } else {
-            None
-        }
-    });
+    let encoding = side_encoding(headers);
+    let mut decoder = if sse && status.is_success() {
+        encoding.and_then(|encoding| encoding.map(SideDecoder::new).transpose().ok().flatten())
+    } else {
+        None
+    };
     let deadline = tokio::time::Instant::now() + timeout;
     let mut scanner = EventScanner::default();
     let decision = if !status.is_success() {
         CommitDecision::Status
+    } else if sse && (encoding.is_none() || (encoding != Some(None) && decoder.is_none())) {
+        // 지원하지 않는 인코딩은 첫 바이트를 기다리지 않고 원본 스트림을 넘긴다.
+        CommitDecision::Undecodable
     } else {
         loop {
             match tokio::time::timeout_at(deadline, stream.next()).await {
@@ -96,18 +91,19 @@ pub(super) async fn hold(
                     if !sse {
                         break CommitDecision::NormalData;
                     }
-                    if identity && let Some(decision) = scanner.scan(&prefix) {
-                        break decision;
-                    }
-                    if let Some(encoding) = encoding
-                        && let Some(decoded) = decoded_prefix(&prefix, encoding)
-                    {
-                        if let Some(decision) = EventScanner::default().scan(&decoded) {
+                    if let Some(decoder) = decoder.as_mut() {
+                        let result = decoder.feed(&chunk[..take]);
+                        if let Some(decision) = scanner.scan(decoder.decoded()) {
                             break decision;
                         }
-                        if decoded.len() == HOLD_LIMIT {
+                        if decoder.decoded().len() == HOLD_LIMIT {
                             break CommitDecision::HoldLimit;
                         }
+                        if result.is_err() {
+                            break CommitDecision::Undecodable;
+                        }
+                    } else if let Some(decision) = scanner.scan(&prefix) {
+                        break decision;
                     }
                     if prefix.len() == HOLD_LIMIT {
                         break CommitDecision::HoldLimit;
@@ -125,46 +121,148 @@ pub(super) async fn hold(
     }
 }
 
-// 불완전한 frame에서도 읽힌 부분만 검사한다. raw/decoded 출력은 각각 64 KiB 이하이다.
-// decoder window는 8 MiB로 제한하여 작은 압축 입력의 거대한 window 요구를 거부한다.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum SideEncoding {
     Zstd,
     Gzip,
     Deflate,
+    Brotli,
 }
 
-fn decoded_prefix(raw: &[u8], encoding: SideEncoding) -> Option<Vec<u8>> {
-    match encoding {
-        SideEncoding::Zstd => {
-            let mut decoder = zstd::stream::read::Decoder::new(raw).ok()?;
-            decoder.window_log_max(23).ok()?;
-            Some(read_bounded(decoder))
+// 중복 헤더와 쉼표로 쌓인 인코딩도 지원 불가로 처리한다.
+fn side_encoding(headers: &HeaderMap) -> Option<Option<SideEncoding>> {
+    let mut values = headers.get_all("content-encoding").iter();
+    let Some(value) = values.next() else {
+        return Some(None);
+    };
+    if values.next().is_some() {
+        return None;
+    }
+    let value = value.as_bytes().trim_ascii();
+    if value.eq_ignore_ascii_case(b"identity") {
+        Some(None)
+    } else if value.eq_ignore_ascii_case(b"zstd") {
+        Some(Some(SideEncoding::Zstd))
+    } else if value.eq_ignore_ascii_case(b"gzip") {
+        Some(Some(SideEncoding::Gzip))
+    } else if value.eq_ignore_ascii_case(b"deflate") {
+        Some(Some(SideEncoding::Deflate))
+    } else if value.eq_ignore_ascii_case(b"br") {
+        Some(Some(SideEncoding::Brotli))
+    } else {
+        None
+    }
+}
+
+#[derive(Default)]
+struct BoundedDecoded(Vec<u8>);
+
+impl Write for BoundedDecoded {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let take = bytes.len().min(HOLD_LIMIT - self.0.len());
+        if take == 0 && !bytes.is_empty() {
+            return Err(io::Error::other("압축 해제 검사 한도에 도달했습니다."));
         }
-        SideEncoding::Gzip => Some(read_bounded(flate2::read::MultiGzDecoder::new(raw))),
-        SideEncoding::Deflate => {
-            let decoded = read_bounded(flate2::read::ZlibDecoder::new(raw));
-            // HTTP deflate의 zlib wrapper가 없는 서버도 side scan만 허용한다.
-            Some(if decoded.is_empty() {
-                read_bounded(flate2::read::DeflateDecoder::new(raw))
+        self.0.extend_from_slice(&bytes[..take]);
+        Ok(take)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+// 디코더 상태를 유지하며 새 압축 조각만 입력한다. 출력은 64 KiB에서 중단한다.
+// zstd window는 8 MiB, brotli는 표준 window(최대 16 MiB)로 제한된다.
+enum SideDecoder {
+    Zstd(zstd::stream::write::Decoder<'static, BoundedDecoded>),
+    Gzip(flate2::write::MultiGzDecoder<BoundedDecoded>),
+    DeflateHeader(Vec<u8>),
+    Zlib(flate2::write::ZlibDecoder<BoundedDecoded>),
+    RawDeflate(flate2::write::DeflateDecoder<BoundedDecoded>),
+    Brotli {
+        decoder: Box<brotli::DecompressorWriter<BoundedDecoded>>,
+        header_checked: bool,
+    },
+}
+
+impl SideDecoder {
+    fn new(encoding: SideEncoding) -> io::Result<Self> {
+        let output = BoundedDecoded::default();
+        Ok(match encoding {
+            SideEncoding::Zstd => {
+                let mut decoder = zstd::stream::write::Decoder::new(output)?;
+                decoder.window_log_max(23)?;
+                Self::Zstd(decoder)
+            }
+            SideEncoding::Gzip => Self::Gzip(flate2::write::MultiGzDecoder::new(output)),
+            SideEncoding::Deflate => Self::DeflateHeader(Vec::with_capacity(2)),
+            SideEncoding::Brotli => Self::Brotli {
+                decoder: Box::new(brotli::DecompressorWriter::new(output, 4096)),
+                header_checked: false,
+            },
+        })
+    }
+
+    fn feed(&mut self, mut bytes: &[u8]) -> io::Result<()> {
+        if let Self::Brotli { header_checked, .. } = self
+            && !*header_checked
+            && let Some(first) = bytes.first()
+        {
+            // 라이브러리는 large-window 확장도 허용하므로 할당 전에 거부한다.
+            if first & 0x7f == 0x11 {
+                return Err(io::Error::other("brotli 확장 window는 검사하지 않습니다."));
+            }
+            *header_checked = true;
+        }
+        if let Self::DeflateHeader(header) = self {
+            let take = bytes.len().min(2 - header.len());
+            header.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+            if header.len() < 2 {
+                return Ok(());
+            }
+            let initial = [header[0], header[1]];
+            // HTTP deflate의 zlib wrapper 유무를 두 바이트로 판별한다.
+            let zlib = initial[0] & 15 == 8
+                && initial[0] >> 4 <= 7
+                && u16::from_be_bytes(initial) % 31 == 0;
+            *self = if zlib {
+                Self::Zlib(flate2::write::ZlibDecoder::new(BoundedDecoded::default()))
             } else {
-                decoded
-            })
+                Self::RawDeflate(flate2::write::DeflateDecoder::new(BoundedDecoded::default()))
+            };
+            self.feed(&initial)?;
+        }
+        let writer: &mut dyn Write = match self {
+            Self::Zstd(decoder) => decoder,
+            Self::Gzip(decoder) => decoder,
+            Self::Zlib(decoder) => decoder,
+            Self::RawDeflate(decoder) => decoder,
+            Self::Brotli { decoder, .. } => decoder.as_mut(),
+            Self::DeflateHeader(_) => unreachable!(),
+        };
+        writer.write_all(bytes)?;
+        writer.flush()
+    }
+
+    fn decoded(&self) -> &[u8] {
+        match self {
+            Self::Zstd(decoder) => &decoder.get_ref().0,
+            Self::Gzip(decoder) => &decoder.get_ref().0,
+            Self::Zlib(decoder) => &decoder.get_ref().0,
+            Self::RawDeflate(decoder) => &decoder.get_ref().0,
+            Self::Brotli { decoder, .. } => &decoder.get_ref().0,
+            Self::DeflateHeader(_) => &[],
         }
     }
 }
 
-fn read_bounded(mut decoder: impl Read) -> Vec<u8> {
-    let mut decoded = Vec::with_capacity(HOLD_LIMIT);
-    let mut scratch = [0u8; 4096];
-    while decoded.len() < HOLD_LIMIT {
-        let take = scratch.len().min(HOLD_LIMIT - decoded.len());
-        match decoder.read(&mut scratch[..take]) {
-            Ok(0) | Err(_) => break,
-            Ok(count) => decoded.extend_from_slice(&scratch[..count]),
-        }
-    }
-    decoded
+#[cfg(test)]
+fn decoded_prefix(raw: &[u8], encoding: SideEncoding) -> Option<Vec<u8>> {
+    let mut decoder = SideDecoder::new(encoding).ok()?;
+    let _ = decoder.feed(raw);
+    Some(decoder.decoded().to_vec())
 }
 
 #[derive(Default)]
@@ -254,6 +352,237 @@ fn classify_event(event: &[u8]) -> Option<CommitDecision> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn compress(event: &[u8], encoding: SideEncoding) -> Vec<u8> {
+        match encoding {
+            SideEncoding::Gzip => {
+                let mut encoder =
+                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+                encoder.write_all(event).unwrap();
+                encoder.finish().unwrap()
+            }
+            SideEncoding::Deflate => {
+                let mut encoder =
+                    flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+                encoder.write_all(event).unwrap();
+                encoder.finish().unwrap()
+            }
+            SideEncoding::Zstd => zstd::stream::encode_all(event, 1).unwrap(),
+            SideEncoding::Brotli => {
+                let mut output = Vec::new();
+                {
+                    let mut encoder = brotli::CompressorWriter::new(&mut output, 4096, 3, 22);
+                    encoder.write_all(event).unwrap();
+                }
+                output
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn brotli_first_event_commits_without_waiting_and_preserves_raw() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "text/event-stream".parse().unwrap());
+        headers.insert("content-encoding", "br".parse().unwrap());
+        for (event, expected) in [
+            (
+                b"data: {\"type\":\"response.created\"}\n\n".as_slice(),
+                CommitDecision::NormalData,
+            ),
+            (
+                b"event: error\ndata: {\"type\":\"error\"}\n\n".as_slice(),
+                CommitDecision::FirstError,
+            ),
+        ] {
+            // flush만 한 열린 압축 스트림도 첫 이벤트를 바로 분류해야 한다.
+            let mut encoder = brotli::CompressorWriter::new(Vec::new(), 4096, 3, 22);
+            encoder.write_all(event).unwrap();
+            encoder.flush().unwrap();
+            let raw = Bytes::copy_from_slice(encoder.get_ref());
+            let stream = futures_util::stream::iter([Ok(raw.clone())])
+                .chain(futures_util::stream::pending());
+            let held = tokio::time::timeout(
+                Duration::from_millis(250),
+                hold(
+                    StatusCode::OK,
+                    &headers,
+                    Box::pin(stream),
+                    Duration::from_secs(10),
+                ),
+            )
+            .await
+            .expect("첫 이벤트에서 커밋해야 한다");
+            assert_eq!(held.decision, expected);
+            assert_eq!(held.prefix, raw);
+        }
+    }
+
+    #[tokio::test]
+    async fn brotli_tiny_fragments_normal_and_first_error_preserve_raw() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "text/event-stream".parse().unwrap());
+        headers.insert("content-encoding", "br".parse().unwrap());
+        for (event, expected) in [
+            (
+                b": ping\n\ndata: {}\n\n".as_slice(),
+                CommitDecision::NormalData,
+            ),
+            (
+                b": ping\n\nevent: error\ndata: {\"type\":\"error\"}\n\n".as_slice(),
+                CommitDecision::FirstError,
+            ),
+        ] {
+            let raw = compress(event, SideEncoding::Brotli);
+            let chunks: Vec<_> = raw
+                .iter()
+                .map(|byte| Ok(Bytes::copy_from_slice(&[*byte])))
+                .collect();
+            let stream = futures_util::stream::iter(chunks).chain(futures_util::stream::pending());
+            let mut held = tokio::time::timeout(
+                Duration::from_millis(250),
+                hold(
+                    StatusCode::OK,
+                    &headers,
+                    Box::pin(stream),
+                    Duration::from_secs(10),
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(held.decision, expected);
+            let mut relayed = held.prefix.to_vec();
+            while relayed.len() < raw.len() {
+                relayed.extend_from_slice(&held.stream.next().await.unwrap().unwrap());
+            }
+            assert_eq!(relayed, raw);
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_and_stacked_encodings_commit_before_polling_delayed_stream() {
+        for values in [
+            vec!["snappy"],
+            vec!["gzip, br"],
+            vec!["identity, gzip"],
+            vec!["gzip", "br"],
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("content-type", "text/event-stream".parse().unwrap());
+            for value in values {
+                headers.append("content-encoding", value.parse().unwrap());
+            }
+            let raw = Bytes::from_static(b"compressed synthetic bytes");
+            let expected = raw.clone();
+            let stream = async_stream::stream! {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                yield Ok(raw);
+            };
+            // poll 자체가 호출되지 않는지 별도 스트림으로도 확인한다.
+            let never_poll = futures_util::stream::poll_fn(
+                |_| -> std::task::Poll<Option<Result<Bytes, reqwest::Error>>> {
+                    panic!("지원하지 않는 인코딩은 스트림을 읽으면 안 된다")
+                },
+            );
+            let held = hold(
+                StatusCode::OK,
+                &headers,
+                Box::pin(never_poll),
+                Duration::from_secs(10),
+            )
+            .await;
+            assert_eq!(held.decision, CommitDecision::Undecodable);
+            assert!(held.prefix.is_empty());
+            let mut held = tokio::time::timeout(
+                Duration::from_millis(100),
+                hold(
+                    StatusCode::OK,
+                    &headers,
+                    Box::pin(stream),
+                    Duration::from_secs(10),
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(held.decision, CommitDecision::Undecodable);
+            assert!(held.prefix.is_empty());
+            assert!(held.remainder.is_none());
+            assert_eq!(held.stream.next().await.unwrap().unwrap(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_compression_and_brotli_large_window_commit_without_waiting() {
+        for (encoding, bytes) in [
+            ("gzip", vec![0; 32]),
+            ("deflate", vec![0xff; 32]),
+            ("zstd", vec![0; 32]),
+            // large-window 식별자는 첫 바이트에서 검사하여 큰 window 할당을 막는다.
+            ("br", vec![0x11, 30]),
+            ("br", vec![0x91, 30]),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("content-type", "text/event-stream".parse().unwrap());
+            headers.insert("content-encoding", encoding.parse().unwrap());
+            let raw = Bytes::from(bytes);
+            let stream = futures_util::stream::iter([Ok(raw.clone())])
+                .chain(futures_util::stream::pending());
+            let held = tokio::time::timeout(
+                Duration::from_millis(250),
+                hold(
+                    StatusCode::OK,
+                    &headers,
+                    Box::pin(stream),
+                    Duration::from_secs(10),
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(held.decision, CommitDecision::Undecodable, "{encoding}");
+            assert_eq!(held.prefix, raw);
+        }
+    }
+
+    #[test]
+    fn compressed_fragments_decode_and_scan_incrementally_with_bounded_output() {
+        // 잘 압축되지 않는 긴 주석을 한 바이트씩 입력해 전체 prefix 재해제를 회귀 검사한다.
+        let mut event = b": ".to_vec();
+        let mut state = 7u32;
+        for _ in 0..32_000 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            event.push(b'!' + (state % 90) as u8);
+        }
+        event.extend_from_slice(b"\n\ndata: {}\n\n");
+        for encoding in [
+            SideEncoding::Gzip,
+            SideEncoding::Deflate,
+            SideEncoding::Brotli,
+            SideEncoding::Zstd,
+        ] {
+            let raw = compress(&event, encoding);
+            let mut decoder = SideDecoder::new(encoding).unwrap();
+            let mut scanner = EventScanner::default();
+            let mut decision = None;
+            let started = std::time::Instant::now();
+            for byte in &raw {
+                decoder.feed(std::slice::from_ref(byte)).unwrap();
+                decision = decision.or_else(|| scanner.scan(decoder.decoded()));
+                assert!(decoder.decoded().len() <= HOLD_LIMIT);
+            }
+            assert_eq!(decoder.decoded(), event);
+            assert_eq!(decision, Some(CommitDecision::NormalData));
+            assert_eq!(scanner.scanned, event.len());
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "조각마다 전체 prefix를 재해제하면 안 된다"
+            );
+            let bomb = compress(&vec![b'x'; HOLD_LIMIT * 2], encoding);
+            let mut decoder = SideDecoder::new(encoding).unwrap();
+            let _ = decoder.feed(&bomb);
+            assert_eq!(decoder.decoded().len(), HOLD_LIMIT);
+        }
+    }
 
     #[tokio::test]
     async fn hold_first_error_normal_and_raw_cap() {
