@@ -5,8 +5,11 @@
 //! JSON shape is the read-only `/admin/v1/state` shape, so fixture and UI tests can
 //! exercise it without starting the core.
 
+use chrono::{DateTime, FixedOffset, Local};
 use serde::Deserialize;
 use std::time::{Duration, SystemTime};
+
+pub mod actions;
 
 #[cfg(windows)]
 pub mod native_render;
@@ -43,6 +46,14 @@ pub struct Account {
     pub refresh_attention: bool,
     #[serde(default)]
     pub drain: bool,
+    #[serde(default)]
+    pub allow_credits: bool,
+    #[serde(default)]
+    pub bound_sessions: u64,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub pacing: Pacing,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -63,8 +74,16 @@ pub struct Window {
     pub status: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
+pub struct Pacing {
+    pub backoff_secs: Option<u64>,
+    #[serde(default)]
+    pub rate_step: u8,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
+    pub id: String,
     pub provider: String,
     pub name: String,
     pub email: Option<String>,
@@ -75,6 +94,11 @@ pub struct Row {
     pub five_hour: Usage,
     pub seven_day: Usage,
     pub attention: bool,
+    pub source: String,
+    pub allow_credits: bool,
+    pub drain: bool,
+    pub bound_sessions: u64,
+    pub pacing_until: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -114,6 +138,7 @@ pub struct Colors {
     pub warning: Rgb,
     pub critical: Rgb,
     pub track: Rgb,
+    pub divider: Rgb,
 }
 
 pub fn parse_state(json: &str) -> serde_json::Result<Vec<Row>> {
@@ -136,11 +161,16 @@ pub fn row(account: &Account, now: SystemTime) -> Row {
         .or_else(|| account.label.clone())
         .unwrap_or_else(|| "이름 없는 계정".into());
     let health_chip = health_chip(account, now);
-    let health_tone = if account.probe_pending || account.drain || account.refresh_attention {
-        Tone::Warning
-    } else {
-        health_tone(account)
-    };
+    let pacing = account
+        .pacing
+        .backoff_secs
+        .is_some_and(|seconds| seconds > 0);
+    let health_tone =
+        if account.probe_pending || account.drain || account.refresh_attention || pacing {
+            Tone::Warning
+        } else {
+            health_tone(account)
+        };
     let five_window = account
         .windows
         .iter()
@@ -152,11 +182,16 @@ pub fn row(account: &Account, now: SystemTime) -> Row {
             .and_then(|_| account.windows.iter().find(|w| w.name != "5h"))
     });
     Row {
+        id: account.id.clone(),
         provider: provider_name(&account.provider).into(),
         name,
         email,
         plan: account.plan.clone(),
-        user_chip: user_chip(&account.user_state),
+        user_chip: if account.user_state == "active" && account.bound_sessions > 0 {
+            "사용 중".into()
+        } else {
+            user_chip(&account.user_state)
+        },
         health_chip,
         health_tone,
         five_hour: usage(five_window, now),
@@ -164,8 +199,17 @@ pub fn row(account: &Account, now: SystemTime) -> Row {
         attention: account.refresh_attention
             || account.probe_pending
             || account.drain
+            || pacing
             || health_tone == Tone::Warning
             || health_tone == Tone::Critical,
+        source: account.source.clone(),
+        allow_credits: account.allow_credits,
+        drain: account.drain,
+        bound_sessions: account.bound_sessions,
+        pacing_until: account
+            .pacing
+            .backoff_secs
+            .map(|seconds| seconds.to_string()),
     }
 }
 
@@ -191,6 +235,9 @@ pub fn health_chip(account: &Account, now: SystemTime) -> String {
     }
     if account.drain {
         return "전환 대기".into();
+    }
+    if let Some(seconds) = account.pacing.backoff_secs.filter(|seconds| *seconds > 0) {
+        return format!("속도 조절 중 · {seconds}초");
     }
     match account.health.kind.as_str() {
         "ready" => "준비됨".into(),
@@ -286,16 +333,19 @@ pub fn format_reset(value: &str, now: SystemTime) -> String {
         return "리셋됨".into();
     }
     let remaining = at.duration_since(now).unwrap_or_default();
-    if remaining > Duration::from_secs(24 * 3600) {
-        let month = value.get(5..7).unwrap_or("??");
-        let day = value.get(8..10).unwrap_or("??");
-        let hour = value.get(11..13).unwrap_or("??");
-        let minute = value.get(14..16).unwrap_or("??");
-        return format!("{month}/{day} {hour}:{minute} 초기화");
+    let local = value
+        .parse::<DateTime<FixedOffset>>()
+        .ok()
+        .map(|timestamp| timestamp.with_timezone(&Local));
+    if remaining > Duration::from_secs(24 * 3600)
+        && let Some(local) = local
+    {
+        return format!("{} 초기화", local.format("%m/%d %H:%M"));
     }
-    let hour = value.get(11..13).unwrap_or("??");
-    let minute = value.get(14..16).unwrap_or("??");
-    format!("{hour}:{minute} 초기화")
+    local.map_or_else(
+        || value.into(),
+        |local| format!("{} 초기화", local.format("%H:%M")),
+    )
 }
 
 fn window_label(name: &str) -> String {
@@ -370,6 +420,7 @@ pub fn colors(dark: bool) -> Colors {
             warning: Rgb(235, 174, 58),
             critical: Rgb(235, 83, 83),
             track: Rgb(75, 75, 80),
+            divider: Rgb(46, 46, 46),
         }
     } else {
         Colors {
@@ -382,6 +433,7 @@ pub fn colors(dark: bool) -> Colors {
             warning: Rgb(174, 108, 0),
             critical: Rgb(190, 45, 45),
             track: Rgb(224, 228, 234),
+            divider: Rgb(236, 236, 236),
         }
     }
 }
@@ -463,9 +515,15 @@ mod tests {
     #[test]
     fn reset_and_date_are_stable() {
         let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let expected_reset = "2027-01-01T00:00:00Z"
+            .parse::<chrono::DateTime<chrono::FixedOffset>>()
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%m/%d %H:%M")
+            .to_string();
         assert_eq!(
             format_reset("2027-01-01T00:00:00Z", now),
-            "01/01 00:00 초기화"
+            format!("{expected_reset} 초기화")
         );
         assert_eq!(format_reset("2020-01-01T00:00:00Z", now), "리셋됨");
     }

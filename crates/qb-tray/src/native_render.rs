@@ -31,10 +31,19 @@ use windows::{
 const WIDTH: f32 = 360.0;
 const PADDING: f32 = 12.0;
 const SECTION_GAP: f32 = 14.0;
-const ROW_HEIGHT: f32 = 104.0;
+
+fn row_height(row: &Row) -> f32 {
+    if row.user_chip == "비활성" {
+        40.0
+    } else if row.health_tone != Tone::Good {
+        104.0
+    } else {
+        78.0
+    }
+}
 
 pub fn content_height(rows: &[Row], expand_disabled: bool) -> f32 {
-    let mut height = 56.0;
+    let mut height = 48.0;
     for provider in ["Claude", "Codex"] {
         let active = rows
             .iter()
@@ -47,17 +56,26 @@ pub fn content_height(rows: &[Row], expand_disabled: bool) -> f32 {
         if active + disabled == 0 {
             continue;
         }
-        height += SECTION_GAP + active as f32 * ROW_HEIGHT;
+        height += SECTION_GAP
+            + rows
+                .iter()
+                .filter(|row| row.provider == provider && row.user_chip != "비활성")
+                .map(row_height)
+                .sum::<f32>();
         if expand_disabled {
             if disabled > 0 {
                 height += 28.0;
             }
-            height += disabled as f32 * ROW_HEIGHT;
+            height += rows
+                .iter()
+                .filter(|row| row.provider == provider && row.user_chip == "비활성")
+                .map(row_height)
+                .sum::<f32>();
         } else if disabled > 0 {
             height += 28.0;
         }
     }
-    height + 30.0
+    height + 40.0
 }
 
 #[derive(Clone, Copy)]
@@ -235,6 +253,29 @@ pub fn paint(
     expand_disabled: bool,
     core_ok: bool,
 ) -> Result<()> {
+    paint_with_state(
+        target,
+        rows,
+        dark,
+        version,
+        now,
+        expand_disabled,
+        core_ok,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn paint_with_state(
+    target: &ID2D1RenderTarget,
+    rows: &[Row],
+    dark: bool,
+    version: &str,
+    now: SystemTime,
+    expand_disabled: bool,
+    core_ok: bool,
+    state: Option<&str>,
+) -> Result<()> {
     let colors = colors(dark);
     let dwrite: IDWriteFactory = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) }?;
     let title = text_format(&dwrite, 14.0, true)?;
@@ -259,10 +300,15 @@ pub fn paint(
         20.0,
         brush_color(colors.text),
     )?;
+    let status = if core_ok {
+        format!("코어 실행 중 · {version}")
+    } else {
+        "코어에 연결할 수 없음".to_owned()
+    };
     draw_text(
         target,
         &small,
-        &format!("코어 실행 중 · {version}"),
+        &status,
         PADDING,
         30.0,
         250.0,
@@ -281,7 +327,7 @@ pub fn paint(
             &brush,
         );
     }
-    let mut y = 56.0;
+    let mut y = 48.0;
     for provider in ["claude", "codex"] {
         let active = rows
             .iter()
@@ -309,7 +355,7 @@ pub fn paint(
             draw_text(
                 target,
                 &small,
-                &format!("비활성 계정 {}개 ⌃", disabled.len()),
+                &format!("비활성 계정 {}개 ⌄", disabled.len()),
                 PADDING,
                 y,
                 220.0,
@@ -324,7 +370,12 @@ pub fn paint(
             Vec::new()
         }) {
             draw_row(target, &body, &small, row, y, colors, dark, now)?;
-            y += ROW_HEIGHT;
+            y += row_height(row);
+            fill(
+                target,
+                rect(PADDING, y - 1.0, WIDTH - PADDING, y),
+                brush_color(colors.divider),
+            )?;
         }
         if !expand_disabled && !disabled.is_empty() {
             draw_text(
@@ -333,7 +384,7 @@ pub fn paint(
                 &format!(
                     "비활성 계정 {}개 {}",
                     disabled.len(),
-                    if expand_disabled { "⌃" } else { "›" }
+                    if expand_disabled { "⌄" } else { "›" }
                 ),
                 PADDING,
                 y,
@@ -354,6 +405,101 @@ pub fn paint(
         20.0,
         brush_color(colors.muted),
     )?;
+    draw_text(
+        target,
+        &small,
+        "계정 추가    설정    로그    종료",
+        112.0,
+        y + 10.0,
+        236.0,
+        20.0,
+        brush_color(colors.muted),
+    )?;
+    if let Some(state) = state.filter(|value| *value != "list") {
+        let (heading, lines): (&str, Vec<String>) = if state.starts_with("menu:") {
+            let id = state
+                .strip_prefix("menu:")
+                .and_then(|value| value.split(':').next())
+                .unwrap_or_default();
+            let menu_row = rows
+                .iter()
+                .find(|row| row.id == id)
+                .or_else(|| rows.first());
+            let labels = menu_row
+                .map(|row| {
+                    super::actions::menu_items(row)
+                        .into_iter()
+                        .map(|item| item.label(row).to_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            ("계정 메뉴", labels)
+        } else if state.starts_with("confirm-delete:") {
+            (
+                "계정 삭제",
+                vec![
+                    "계정을 quota-baton에서 삭제할까요?".to_owned(),
+                    "[삭제]    [취소]".to_owned(),
+                ],
+            )
+        } else if state == "login:claude" || state == "login:codex" {
+            let provider = if state.ends_with("claude") {
+                "Claude"
+            } else {
+                "Codex"
+            };
+            (
+                "로그인",
+                vec![
+                    provider.to_owned(),
+                    "브라우저에서 로그인을 마치면 자동으로 완료됩니다.".to_owned(),
+                    "주소 복사   취소".to_owned(),
+                    "남은 시간 9:41".to_owned(),
+                ],
+            )
+        } else if state == "quit" {
+            (
+                "종료",
+                vec![
+                    "트레이만 종료".to_owned(),
+                    "트레이와 프록시 종료".to_owned(),
+                    "취소".to_owned(),
+                ],
+            )
+        } else {
+            ("계정 메뉴", vec!["알 수 없는 상태".to_owned()])
+        };
+        let top = 68.0;
+        let bottom = (top + 34.0 + lines.len() as f32 * 27.0 + 14.0)
+            .min(content_height(rows, expand_disabled) - 8.0);
+        fill(
+            target,
+            rect(28.0, top, WIDTH - 12.0, bottom),
+            brush_color(colors.surface),
+        )?;
+        draw_text(
+            target,
+            &section,
+            heading,
+            42.0,
+            top + 10.0,
+            260.0,
+            20.0,
+            brush_color(colors.text),
+        )?;
+        for (index, line) in lines.iter().enumerate() {
+            draw_text(
+                target,
+                &small,
+                line,
+                42.0,
+                top + 38.0 + index as f32 * 27.0,
+                286.0,
+                20.0,
+                brush_color(colors.text),
+            )?;
+        }
+    }
     unsafe {
         target.EndDraw(None, None)?;
     }
@@ -431,6 +577,9 @@ fn draw_row(
         17.0,
         fg,
     )?;
+    if row.user_chip == "비활성" {
+        return Ok(());
+    }
     if !row.five_hour.label.is_empty() {
         draw_meter(target, small, row, PADDING, y + 37.0, 160.0, true, colors)?;
     }
@@ -444,6 +593,8 @@ fn draw_row(
             "다시 로그인해야 합니다".to_owned()
         } else if let Some(until) = row.health_chip.strip_prefix("한도 · ") {
             format!("한도 대기 · {until}까지")
+        } else if let Some(seconds) = row.health_chip.strip_prefix("속도 조절 중 · ") {
+            format!("요청 속도 조절 중 · {seconds}")
         } else {
             row.health_chip.clone()
         };
@@ -463,13 +614,11 @@ fn draw_row(
 }
 
 fn now_time(now: SystemTime) -> String {
-    let value = now
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    format!("{:02}:{:02}", (value / 3600) % 24, (value / 60) % 60)
+    let local = chrono::DateTime::<chrono::Local>::from(chrono::DateTime::<chrono::Utc>::from(now));
+    local.format("%H:%M").to_string()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn render_png(
     rows: &[Row],
     scale: f32,
@@ -478,6 +627,7 @@ pub fn render_png(
     now: SystemTime,
     expand_disabled: bool,
     output: &Path,
+    state: &str,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         [1.0, 1.5, 2.0].contains(&scale),
@@ -508,7 +658,16 @@ pub fn render_png(
         let factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
         let target = factory.CreateWicBitmapRenderTarget(&bitmap, &props)?;
         target.SetDpi(96.0 * scale, 96.0 * scale);
-        paint(&target, rows, dark, version, now, expand_disabled, true)?;
+        paint_with_state(
+            &target,
+            rows,
+            dark,
+            version,
+            now,
+            expand_disabled,
+            true,
+            Some(state),
+        )?;
         let stream = wic.CreateStream()?;
         let wide: Vec<u16> = output
             .as_os_str()
