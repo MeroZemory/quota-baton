@@ -621,12 +621,16 @@ impl BindingTable {
         let entries: Vec<_> = candidates
             .iter()
             .filter(|c| c.account.provider == provider)
+            .map(|c| {
+                let eligible =
+                    effective_account(c, d, &self.config, model, now).eligible_at(model, now);
+                (c, eligible)
+            })
             .collect();
-        let eligible = |c: &Candidate| {
-            effective_account(c, d, &self.config, model, now).eligible_at(model, now)
-        };
         if let Some(id) = pinned
-            && entries.iter().any(|c| c.account.id == id && eligible(c))
+            && entries
+                .iter()
+                .any(|(c, eligible)| c.account.id == id && *eligible)
         {
             return (PreviewDecision::Selected { account: id.into() }, "forced");
         }
@@ -634,7 +638,7 @@ impl BindingTable {
         let mut reason = "new";
         if let Some(b) = bound {
             reason = "forced";
-            if let Some(c) = entries.iter().find(|c| c.account.id == b.account) {
+            if let Some((c, eligible)) = entries.iter().find(|(c, _)| c.account.id == b.account) {
                 if hold_allowed
                     && c.account.user_state == UserState::Active
                     && let Health::Cooling {
@@ -661,7 +665,7 @@ impl BindingTable {
                         return (PreviewDecision::Hold { until: reset }, reason);
                     }
                 }
-                if eligible(c) {
+                if *eligible {
                     let g = group(&b.key);
                     let last = d.groups.get(g).map_or(b.last_used, |entry| entry.last_used);
                     let cold =
@@ -680,7 +684,7 @@ impl BindingTable {
         } else if let Some(p) = parent.and_then(|p| self.retained_binding(d, p, now)) {
             if entries
                 .iter()
-                .any(|c| c.account.id == p.account && eligible(c))
+                .any(|(c, eligible)| c.account.id == p.account && *eligible)
             {
                 return (
                     PreviewDecision::Selected {
@@ -691,7 +695,9 @@ impl BindingTable {
             }
         } else if key.is_none()
             && let Some(id) = d.sticky.get(provider.as_str())
-            && entries.iter().any(|c| &c.account.id == id && eligible(c))
+            && entries
+                .iter()
+                .any(|(c, eligible)| &c.account.id == id && *eligible)
         {
             return (
                 PreviewDecision::Selected {
@@ -702,8 +708,8 @@ impl BindingTable {
         }
         let eligible: Vec<_> = entries
             .into_iter()
-            .filter(|c| !c.account.drain && eligible(c))
-            .map(|c| (c, metrics(c, d, &self.config, now)))
+            .filter(|(c, eligible)| !c.account.drain && *eligible)
+            .map(|(c, _)| (c, metrics(c, d, &self.config, now)))
             .collect();
         let mut gated: Vec<_> = eligible.iter().filter(|(_, m)| m.gate).collect();
         // Anchor the first reset cohort; pairwise approximate comparisons are

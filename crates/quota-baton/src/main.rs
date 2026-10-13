@@ -100,6 +100,9 @@ async fn main() {
 }
 
 fn friendly_error(error: &anyhow::Error) -> String {
+    if let Some(error) = error.downcast_ref::<accounts_cli::UsageCliError>() {
+        return error.to_string();
+    }
     use qb_core::accounts::StoreError;
     if let Some(error) = error.downcast_ref::<StoreError>() {
         return match error {
@@ -210,7 +213,10 @@ async fn run() -> anyhow::Result<()> {
             )
             .await?;
             println_utf8!("프록시를 시작했습니다.");
+            let polling = relay.quota.start();
             tokio::signal::ctrl_c().await?;
+            polling.abort();
+            let _ = polling.await;
             drop(servers);
             // 종료 시 디스크 flush와 작성자 정리도 런타임 스레드를 막지 않는다.
             tokio::task::spawn_blocking(move || {

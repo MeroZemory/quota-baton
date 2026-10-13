@@ -81,6 +81,7 @@ pub fn runtime_routes(relay: Arc<crate::relay::RelayState>, data_port: u16) -> R
 }
 
 async fn runtime_state(State(state): State<RuntimeAdmin>) -> Response {
+    state.relay.quota.mark_tray_open();
     match state.relay.accounts.views().await {
         Ok(mut accounts) => {
             for account in &mut accounts {
@@ -110,8 +111,17 @@ async fn runtime_state(State(state): State<RuntimeAdmin>) -> Response {
 }
 
 async fn runtime_events(State(state): State<RuntimeAdmin>) -> Response {
+    state.relay.quota.mark_tray_open();
     use axum::response::sse::{KeepAlive, Sse};
-    Sse::new(account_events(state.relay.accounts.subscribe()))
+    let guard = state.relay.quota.open_events();
+    let stream = account_events(state.relay.accounts.subscribe());
+    let stream = async_stream::stream! {
+        let _guard = guard;
+        futures_util::pin_mut!(stream);
+        use futures_util::StreamExt;
+        while let Some(event) = stream.next().await { yield event; }
+    };
+    Sse::new(stream)
         .keep_alive(KeepAlive::default())
         .into_response()
 }
@@ -156,12 +166,39 @@ async fn account_action(
 ) -> Response {
     use crate::accounts::UserState;
     let user_state = match action.as_str() {
+        "refresh-usage" => return refresh_usage(state, id).await,
         "pause" => UserState::Paused,
         "resume" | "enable" => UserState::Active,
         "disable" => UserState::Disabled,
         _ => return error(StatusCode::NOT_FOUND, "Unknown account action"),
     };
     change_account(state, id, Some(user_state), AccountPatch::default()).await
+}
+
+async fn refresh_usage(state: RuntimeAdmin, id: String) -> Response {
+    use crate::quota::PollError;
+    match state.relay.quota.poll(&id).await {
+        Ok(_) => match state.relay.accounts.views().await {
+            Ok(views) => match views.into_iter().find(|view| view["id"] == id) {
+                Some(mut view) => {
+                    let (count, last) = state.relay.bindings.account_stats(&id);
+                    view["bound_sessions"] = serde_json::json!(count);
+                    view["last_used_at"] = serde_json::json!(last);
+                    Json(view).into_response()
+                }
+                None => error(StatusCode::NOT_FOUND, "Account not found"),
+            },
+            Err(()) => error(StatusCode::INTERNAL_SERVER_ERROR, "Account state unavailable"),
+        },
+        Err(PollError::TooSoon { retry_after }) => {
+            let mut response = (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({"error":{"code":"poll_too_soon","message":"Usage poll interval has not elapsed","retry_after":retry_after}}))).into_response();
+            if let Ok(value) = axum::http::HeaderValue::from_str(&retry_after.to_string()) { response.headers_mut().insert("retry-after", value); }
+            response
+        }
+        Err(PollError::NotFound) => error(StatusCode::NOT_FOUND, "Account not found"),
+        Err(PollError::Excluded) => (StatusCode::CONFLICT, Json(serde_json::json!({"error":{"code":"poll_excluded","message":"Account cannot be polled"}}))).into_response(),
+        Err(PollError::Unavailable) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error":{"code":"poll_unavailable","message":"Usage poll unavailable"}}))).into_response(),
+    }
 }
 
 async fn account_patch(
