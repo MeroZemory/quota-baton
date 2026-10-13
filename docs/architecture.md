@@ -531,7 +531,7 @@ Details are in contract C11.
   4. The old core finishes its in-flight HTTP streams. WebSocket connections are closed with 1001 after their current response.
   5. The old core exits when idle, or after the drain timeout (default 30 min).
 - **Gapless handover.**
-  - Whether Windows lets the new core bind the port within milliseconds, while the old core still holds accepted sockets, is **spiked in M3**.
+  - Spiked in M3 (2026-10-13): the new core binds the port in under 1 ms while the old core still holds accepted sockets, with or without `SO_EXCLUSIVEADDRUSE`. Socket duplication is not needed.
   - If it does not, hand the listening socket over with `WSADuplicateSocketW` instead.
   - A WebSocket gap longer than about 6 s moves active Codex sessions to HTTP permanently (§9).
 - **Configuration** stays deliberately small. Behaviour fixes go into code, with tests, never into config knobs.
