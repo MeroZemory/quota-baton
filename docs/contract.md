@@ -246,7 +246,7 @@ These rules come from the P2 blind panel (`.sandbox/reviews/switch-policy-blind-
 7. If `E` is empty, apply C6 row 14 or row 15.
 
 **"Unusable" stays narrow.** It means:
-- a window at its limit, where on credit-capable accounts with `allow_credits=false` a projected 99 % counts as the limit, because headers lag
+- a window at its limit, as **observed** (C5). On credit-capable accounts with `allow_credits=false`, an *observed* 99 % counts as the limit. A *projected* 99 % only affects the gate and ordering for new placements; the account stays eligible, including for the 2B fallback. A projection never makes an account unusable and never produces a synthesized 429 or 400.
 - auth still failing after one refresh (C5)
 - the user pausing or disabling the account
 
