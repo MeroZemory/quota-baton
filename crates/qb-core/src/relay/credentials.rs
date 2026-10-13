@@ -159,7 +159,7 @@ impl TokenGates {
         tokio::task::spawn_blocking(move || {
             store
                 .update_metadata_for_token(&id, &failed, |account| {
-                    if account.health == Health::Ready {
+                    if account.eligible(None) {
                         account.apply_health_signal(
                             HealthSignal::Cooling {
                                 reason: HealthReason::Auth,
@@ -699,5 +699,105 @@ mod tests {
             now + Duration::from_secs(600),
             Duration::from_secs(600)
         ));
+    }
+
+    #[tokio::test]
+    async fn r4_unavailable_auth_cools_model_eligible_account_and_guards_token() {
+        use crate::accounts::{Identity, TokenMeta, UserState};
+        let sandbox = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.sandbox/hardening-fixtures");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        let root = tempfile::tempdir_in(sandbox).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let store = loop {
+            match AccountStore::acquire(root.path()) {
+                Ok(store) => break Arc::new(store),
+                Err(StoreError::LeaseBusy) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("synthetic fixture lease: {error}"),
+            }
+        };
+        let now = chrono::Utc::now();
+        let identity = Identity::Codex {
+            account_id: "synthetic-auth-hardening".into(),
+            email: "auth@example.invalid".into(),
+        };
+        let account = Account {
+            schema: 1,
+            id: identity.id(),
+            provider: Provider::Codex,
+            label: "fixture".into(),
+            email: "auth@example.invalid".into(),
+            plan: None,
+            identity,
+            source: Source::Oauth,
+            user_state: UserState::Active,
+            health: Health::Cooling {
+                reason: HealthReason::Permission,
+                until: now + chrono::Duration::hours(1),
+                scope: "model:X".into(),
+            },
+            auth_failures: 0,
+            auth_probe_pending: false,
+            quota_cooling: None,
+            drain: false,
+            allow_credits: false,
+            generation: 0,
+            token_meta: TokenMeta::default(),
+        };
+        let tokens = Tokens {
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            id_token: None,
+        };
+        let account = store.save(&account, &tokens, None).unwrap();
+        let obs = Arc::new(Observability::new(root.path(), None).unwrap());
+        let runtime = AccountRuntime::new(store.clone(), obs, 1.0);
+        let gates = TokenGates::new(reqwest::Client::new(), runtime);
+        assert!(account.eligible(None));
+        let stale = Tokens {
+            access_token: "synthetic-stale".into(),
+            refresh_token: "synthetic-refresh".into(),
+            id_token: None,
+        };
+        gates
+            .cool_unavailable_auth(store.clone(), &account, &stale)
+            .await
+            .unwrap();
+        assert_eq!(store.load(&account.id).unwrap().health, account.health);
+        gates
+            .cool_unavailable_auth(store.clone(), &account, &tokens)
+            .await
+            .unwrap();
+        let cooled = store.load(&account.id).unwrap();
+        assert!(!cooled.eligible(None));
+        assert!(!cooled.eligible(Some("Y")));
+        assert!(
+            matches!(cooled.health, Health::Cooling { scope, until, .. } if scope == "account" && until >= now + chrono::Duration::hours(1))
+        );
+        assert_eq!(cooled.auth_failures, 0);
+
+        // A shorter model cooldown becomes the normal five-minute auth cooldown;
+        // a longer one above retains its existing deadline through the reducer.
+        let account = store
+            .update_metadata(&account.id, |account| {
+                account.health = Health::Cooling {
+                    reason: HealthReason::Permission,
+                    until: chrono::Utc::now() + chrono::Duration::minutes(1),
+                    scope: "model:X".into(),
+                };
+            })
+            .unwrap();
+        gates
+            .cool_unavailable_auth(store.clone(), &account, &tokens)
+            .await
+            .unwrap();
+        let cooled = store.load(&account.id).unwrap();
+        assert!(
+            matches!(cooled.health, Health::Cooling { reason: HealthReason::Auth, scope, .. } if scope == "account")
+        );
+        assert!(cooled.auth_probe_pending);
+        assert_eq!(cooled.auth_failures, 0);
     }
 }

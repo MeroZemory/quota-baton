@@ -103,6 +103,29 @@ impl Default for RoutingConfig {
     }
 }
 
+impl RoutingConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            [
+                self.gate_5h_pct,
+                self.gate_weekly_pct,
+                self.gate_weekly_near_reset_pct,
+                self.inflight_allowance_pct
+            ]
+            .into_iter()
+            .all(|value| value.is_finite() && (0.0..=100.0).contains(&value)),
+            "routing percentages must be finite and between 0 and 100"
+        );
+        anyhow::ensure!(
+            self.gate_weekly_near_reset_pct >= self.gate_weekly_pct
+                && self.rebalance_idle_secs > 0
+                && self.session_binding_max_secs > 0,
+            "invalid routing thresholds or binding lifetime"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct GuardConfig {
@@ -189,6 +212,7 @@ impl Config {
             .map_err(|_| anyhow::anyhow!("invalid config.toml types"))?;
         config.upstream.validate()?;
         config.websocket.validate()?;
+        config.routing.validate()?;
         anyhow::ensure!(
             config.websocket.idle_close_secs < config.routing.rebalance_idle_secs,
             "websocket.idle_close_secs must be less than routing.rebalance_idle_secs"

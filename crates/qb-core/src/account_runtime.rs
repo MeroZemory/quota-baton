@@ -128,6 +128,73 @@ impl AccountRuntime {
             .unwrap_or(0)
     }
 
+    /// Placement reservations precede the first upstream attempt. Apply the C5
+    /// limit reducer under the store transaction so the 2B fallback cannot spend
+    /// credits before an upstream response reports the additional in-flight work.
+    pub(crate) fn projected_quota(
+        &self,
+        id: &str,
+        bindings: &crate::bindings::BindingTable,
+        model: Option<&str>,
+    ) -> Result<Account, crate::accounts::StoreError> {
+        self.store.update_metadata(id, |account| {
+            if !account.eligible(model) {
+                return;
+            }
+            let now = Utc::now();
+            let Some(mut snapshot) = self.obs.quota_snapshot(id) else {
+                return;
+            };
+            let count = bindings.pending_count(id);
+            let traffic = bindings.has_traffic(id);
+            let Some(windows) = snapshot["windows"].as_array_mut() else {
+                return;
+            };
+            if traffic {
+                windows.retain(|window| {
+                    window["observed_at"]
+                        .as_str()
+                        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                        .is_some_and(|observed| {
+                            (now - observed.with_timezone(&Utc)).num_seconds() <= 900
+                        })
+                });
+            }
+            if windows.is_empty() {
+                return;
+            }
+            // This is a projection, not a fresh observation of rejection flags.
+            snapshot["signals"] = Value::Null;
+            let mut projected = account.clone();
+            projected.health = Health::Ready;
+            projected.quota_cooling = None;
+            projected.apply_health_signal(
+                crate::accounts::HealthSignal::UsageSnapshot {
+                    snapshot,
+                    model: model.map(str::to_owned),
+                    projected_allowance: self.allowance * count as f64,
+                },
+                now,
+            );
+            if let Health::Cooling {
+                reason: HealthReason::Quota,
+                until,
+                scope,
+            } = projected.health
+            {
+                account.apply_health_signal(
+                    crate::accounts::HealthSignal::Cooling {
+                        reason: HealthReason::Quota,
+                        until,
+                        scope,
+                    },
+                    now,
+                );
+                account.quota_cooling = projected.quota_cooling;
+            }
+        })
+    }
+
     pub fn probing(&self, id: &str) -> bool {
         self.probes.lock().map(|p| p.contains(id)).unwrap_or(true)
     }

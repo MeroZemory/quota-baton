@@ -54,6 +54,7 @@ pub(in crate::relay) struct CurrentCompletion {
     committed: bool,
     first_message: bool,
     model: Option<String>,
+    response_id: Option<String>,
 }
 
 impl CurrentCompletion {
@@ -69,6 +70,11 @@ impl CurrentCompletion {
         completion.runtime = context.runtime.clone();
         if let Some(relay) = &context.relay {
             completion.track(relay.inflight_requests.clone());
+            completion.binding = Some(
+                relay
+                    .bindings
+                    .begin_request(context.session.key.as_deref(), &context.account),
+            );
         }
         completion.record.transport = "ws".into();
         completion.record.account = Some(context.account.clone());
@@ -80,10 +86,14 @@ impl CurrentCompletion {
             committed: false,
             first_message: true,
             model: None,
+            response_id: None,
         }
     }
 
     fn upstream(&mut self, event: Option<&Value>) -> Option<&'static str> {
+        if let Some(usage) = event.and_then(crate::observability::cache_usage) {
+            self.completion.record.cache_usage = Some(usage);
+        }
         if self.first_message {
             self.completion.record.ttfb_ms = self.completion.elapsed_ms();
             self.first_message = false;
@@ -111,6 +121,43 @@ impl CurrentCompletion {
             _ => None,
         }
     }
+}
+
+// Only completion metadata is queued; the pump still holds one wire message
+// per direction. Local IDs keep delivery bookkeeping stable across new creates.
+fn response_completion(
+    current: &mut BTreeMap<u64, CurrentCompletion>,
+    event: Option<&Value>,
+) -> Option<u64> {
+    let kind = event.and_then(|event| event["type"].as_str());
+    let response_id = event.and_then(|event| {
+        event["response_id"]
+            .as_str()
+            .or_else(|| event["response"]["id"].as_str())
+    });
+    if let Some(response_id) = response_id {
+        if let Some((&id, _)) = current
+            .iter()
+            .find(|(_, active)| active.response_id.as_deref() == Some(response_id))
+        {
+            return Some(id);
+        }
+        if kind == Some("response.created") {
+            let (&id, active) = current
+                .iter_mut()
+                .find(|(_, active)| active.response_id.is_none())?;
+            active.response_id = Some(response_id.into());
+            return Some(id);
+        }
+        // An explicit unknown ID must not complete some other turn.
+        return None;
+    }
+    if matches!(kind, Some("response.created" | "error" | "response.failed"))
+        && let Some((&id, _)) = current.iter().find(|(_, active)| !active.committed)
+    {
+        return Some(id);
+    }
+    current.keys().next().copied()
 }
 
 // Error-frame auth reload uses the credential that opened the pinned socket.
@@ -308,6 +355,7 @@ fn count_type(counts: &mut BTreeMap<String, u64>, event: &Value) {
 
 struct Delivered {
     bytes: usize,
+    request: Option<u64>,
     terminal: Option<&'static str>,
     completed: bool,
 }
@@ -375,6 +423,7 @@ where
             success,
             Delivered {
                 bytes: 0,
+                request: None,
                 terminal: None,
                 completed: false,
             },
@@ -398,7 +447,8 @@ async fn run_with_read_timeout(
     let mut upstream_sink = Some(upstream_sink);
     let mut to_client: Option<Write<SplitSink<ClientSocket, Message>>> = None;
     let mut to_upstream: Option<Write<SplitSink<UpstreamSocket, Message>>> = None;
-    let mut current: Option<CurrentCompletion> = None;
+    let mut current = BTreeMap::<u64, CurrentCompletion>::new();
+    let mut next_request = 0;
     let mut model: Option<String> = None;
     let mut health_events = context.runtime.as_ref().map(|runtime| runtime.subscribe());
     let mut client_admitted = false;
@@ -442,23 +492,23 @@ async fn run_with_read_timeout(
                 to_client = None;
                 if success {
                     last_activity = Instant::now();
-                    if let Some(active) = current.as_mut() {
+                    if let Some(active) = delivered.request.and_then(|id| current.get_mut(&id)) {
                         active.completion.record.bytes_out = active.completion.record.bytes_out.saturating_add(delivered.bytes as u64);
                     }
                     if let Some(outcome) = delivered.terminal {
                         terminal_pending = false;
-                        if let Some(active) = current.take() {
+                        if let Some(active) = delivered.request.and_then(|id| current.remove(&id)) {
                             if outcome == "ok" && let (Some(relay), Some((account, token))) = (&context.relay, &context.credentials) {
                                 super::clear_retried_token(relay, &account.id, token);
                             }
                             active.completion.finish(outcome);
                         }
-                        if ending.is_none() && let Some(runtime) = &context.runtime
+                        if current.is_empty() && ending.is_none() && let Some(runtime) = &context.runtime
                             && !runtime.eligible(&context.account, model.as_deref()).await {
                             ending = Some((Some(CloseFrame { code: 1000.into(), reason: "".into() }), "account_ineligible"));
                             end_deadline = Instant::now() + CLOSE_TIMEOUT;
                         }
-                        if context.close_after_response && delivered.completed && ending.is_none() {
+                        if current.is_empty() && context.close_after_response && delivered.completed && ending.is_none() {
                             ending = Some((Some(CloseFrame { code: 1000.into(), reason: "".into() }), "response_complete"));
                             end_deadline = Instant::now() + CLOSE_TIMEOUT;
                         }
@@ -474,7 +524,7 @@ async fn run_with_read_timeout(
                 to_upstream = None;
                 if success { last_activity = Instant::now(); }
                 if !success && ending.is_none() {
-                    if let Some(active) = current.as_mut() { active.completion.record.outcome = "upstream_error".into(); }
+                    for active in current.values_mut() { active.completion.record.outcome = "upstream_error".into(); }
                     ending = Some((None, "upstream_write_error"));
                     end_deadline = Instant::now() + CLOSE_TIMEOUT;
                 }
@@ -487,6 +537,7 @@ async fn run_with_read_timeout(
                 last_activity = Instant::now();
                 match message {
                     Some(Ok(message)) => {
+                        let mut request = current.keys().next().copied();
                         if let Message::Text(text) = &message && response_create(text.as_str()) {
                             model = parsed(text.as_str()).and_then(|value| value.get("model").and_then(Value::as_str).map(str::to_owned));
                             if let Some(runtime) = &context.runtime && !runtime.eligible(&context.account, model.as_deref()).await {
@@ -497,19 +548,21 @@ async fn run_with_read_timeout(
                             let mut active = CurrentCompletion::new(&context);
                             active.model = model.clone();
                             active.completion.record.model = model.clone();
-                            current = Some(active);
+                            request = Some(next_request);
+                            current.insert(next_request, active);
+                            next_request += 1;
                         }
                         let bytes = message.len();
                         // 라이브러리가 예약한 로컬 pong을 반대쪽 전달 완료와 독립적으로 flush한다.
                         if matches!(&message, Message::Ping(_)) && to_client.is_none() {
                             to_client = Some(flush(client_sink.take().unwrap()));
                         }
-                        if let Some(active) = current.as_mut() { active.completion.input_bytes.fetch_add(bytes as u64, Ordering::Relaxed); }
+                        if let Some(active) = request.and_then(|id| current.get_mut(&id)) { active.completion.input_bytes.fetch_add(bytes as u64, Ordering::Relaxed); }
                         if let Message::Close(frame) = &message {
                             ending = Some((frame.clone(), "client_close"));
                             end_deadline = Instant::now() + CLOSE_TIMEOUT;
                         }
-                        to_upstream = Some(write(upstream_sink.take().unwrap(), message, context.budget.reserve_message(bytes), Delivered { bytes, terminal: None, completed: false }));
+                        to_upstream = Some(write(upstream_sink.take().unwrap(), message, context.budget.reserve_message(bytes), Delivered { bytes, request, terminal: None, completed: false }));
                     }
                     _ => { ending = Some((None, "client_eof")); end_deadline = Instant::now() + CLOSE_TIMEOUT; }
                 }
@@ -524,50 +577,54 @@ async fn run_with_read_timeout(
                             to_upstream = Some(flush(upstream_sink.take().unwrap()));
                         }
                         let event = if let Message::Text(text) = &message { parsed(text.as_str()) } else { None };
+                        let request = response_completion(&mut current, event.as_ref());
                         if let Some(event) = event.as_ref() {
                             if let Some(runtime) = &context.runtime {
-                                let active_model = current.as_ref().and_then(|active| active.model.as_deref());
+                                let active_model = request.and_then(|id| current.get(&id)).and_then(|active| active.model.as_deref());
                                 runtime.observe_codex_event_for_model(&context.account, event, active_model).await;
                             } else {
                                 context.observability.observe_codex_event(&context.account, event);
                             }
                             if matches!(event.get("type").and_then(Value::as_str), Some("error" | "response.failed")) {
-                                let active_model = current.as_ref().and_then(|active| active.model.as_deref());
+                                let active_model = request.and_then(|id| current.get(&id)).and_then(|active| active.model.as_deref());
                                 let decision = match apply_error(&context, event, active_model).await {
-                                    Ok(decision) => decision,
+                                    Ok(decision) => Some(decision),
                                     Err(()) => {
                                         ending = Some((Some(CloseFrame { code: 1011.into(), reason: "".into() }), "health_store_error"));
                                         end_deadline = Instant::now() + CLOSE_TIMEOUT;
-                                        continue;
+                                        // Forward the original error even when health persistence fails.
+                                        None
                                     }
                                 };
                                 // Row 13a excludes row 3 rate limits and requires a current request.
-                                if current.as_ref().is_some_and(|active| !active.committed)
+                                if current.len() == 1 && request.and_then(|id| current.get(&id)).is_some_and(|active| !active.committed)
+                                    && let Some(decision) = decision
                                     && decision.failover() && decision.kind != crate::relay::outcome::Kind::Rate
                                     && reconnect_available(&context).await.unwrap_or(false) {
-                                    if let Some(mut active) = current.take() {
+                                    if let Some(mut active) = request.and_then(|id| current.remove(&id)) {
                                         active.upstream(Some(event));
                                         active.completion.failover(decision.reason());
                                         active.completion.finish("failover");
                                     }
                                     ending = Some((Some(CloseFrame { code: 1012.into(), reason: "".into() }), "precommit_failover"));
                                     end_deadline = Instant::now() + CLOSE_TIMEOUT;
+                                    // C6 row 13a suppresses this pre-commit error.
                                     continue;
                                 }
                             }
                             count_type(&mut counts, event);
                         }
-                        let terminal = current.as_mut().and_then(|active| active.upstream(event.as_ref()));
+                        let terminal = request.and_then(|id| current.get_mut(&id)).and_then(|active| active.upstream(event.as_ref()));
                         terminal_pending = terminal.is_some();
                         let completed = event.as_ref().is_some_and(|event| event["type"] == "response.completed");
                         if let Message::Close(frame) = &message {
                             ending = Some((frame.clone(), "upstream_close"));
                             end_deadline = Instant::now() + CLOSE_TIMEOUT;
                         }
-                        to_client = Some(write(client_sink.take().unwrap(), message, context.budget.reserve_message(bytes), Delivered { bytes, terminal, completed }));
+                        to_client = Some(write(client_sink.take().unwrap(), message, context.budget.reserve_message(bytes), Delivered { bytes, request, terminal, completed }));
                     }
                     _ => {
-                        if let Some(active) = current.as_mut() { active.completion.record.outcome = "upstream_error".into(); }
+                        for active in current.values_mut() { active.completion.record.outcome = "upstream_error".into(); }
                         ending = Some((None, "upstream_eof")); end_deadline = Instant::now() + CLOSE_TIMEOUT;
                     }
                 }
@@ -581,7 +638,7 @@ async fn run_with_read_timeout(
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => true,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => false,
                 };
-                if relevant && current.is_none() && !terminal_pending && let Some(runtime) = &context.runtime
+                if relevant && current.is_empty() && !terminal_pending && let Some(runtime) = &context.runtime
                     && !runtime.eligible(&context.account, model.as_deref()).await {
                     ending = Some((Some(CloseFrame { code: 1000.into(), reason: "".into() }), "account_ineligible"));
                     end_deadline = Instant::now() + CLOSE_TIMEOUT;
@@ -592,7 +649,7 @@ async fn run_with_read_timeout(
                 end_deadline = Instant::now() + CLOSE_TIMEOUT;
             }
             _ = tokio::time::sleep_until(upstream_activity + upstream_read_timeout), if ending.is_none() => {
-                if let Some(active) = current.as_mut() { active.completion.record.outcome = "upstream_error".into(); }
+                for active in current.values_mut() { active.completion.record.outcome = "upstream_error".into(); }
                 ending = Some((Some(CloseFrame { code: 1001.into(), reason: "".into() }), "upstream_read_timeout"));
                 end_deadline = Instant::now() + CLOSE_TIMEOUT;
             }

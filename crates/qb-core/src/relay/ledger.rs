@@ -21,6 +21,8 @@ pub(in crate::relay) struct Completion {
     pub input_bytes: Arc<AtomicU64>,
     pub runtime: Option<Arc<crate::account_runtime::AccountRuntime>>,
     pub failed_access: Option<zeroize::Zeroizing<String>>,
+    pub binding: Option<crate::bindings::BindingLease>,
+    pub hold_deadline: Instant,
     observability: Arc<Observability>,
     inflight: Option<Arc<AtomicU64>>,
     account_inflight: Option<(String, crate::account_runtime::InflightGuard)>,
@@ -36,9 +38,20 @@ impl Completion {
     ) -> Self {
         Self {
             start: Instant::now(),
+            hold_deadline: Instant::now()
+                + std::time::Duration::from_secs_f64(
+                    headers
+                        .get("x-stainless-timeout")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .filter(|v| v.is_finite() && *v >= 0.0)
+                        .unwrap_or(300.0)
+                        .min(300.0),
+                ),
             input_bytes: Arc::new(AtomicU64::new(0)),
             runtime: None,
             failed_access: None,
+            binding: None,
             observability,
             inflight: None,
             account_inflight: None,
@@ -67,6 +80,7 @@ impl Completion {
                 retained_copy: false,
                 upstream_error_code: None,
                 attempt_details: Vec::new(),
+                cache_usage: None,
             },
         }
     }
@@ -110,6 +124,11 @@ impl Completion {
                 account: account.into(),
                 failover_reason: None,
             });
+    }
+
+    pub fn end_attempt(&mut self) {
+        self.account_inflight = None;
+        self.binding = None;
     }
     pub fn failover(&mut self, reason: &str) {
         if let Some(attempt) = self.record.attempt_details.last_mut() {

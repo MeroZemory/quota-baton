@@ -44,13 +44,23 @@ pub fn classify(provider: Provider, path: &str, headers: &HeaderMap, body: &[u8]
             }
         }
         Provider::Claude => {
-            let identity = header(headers, "content-encoding")
-                .is_none_or(|value| value.eq_ignore_ascii_case("identity"));
+            let identity = !headers.contains_key("content-encoding")
+                || header(headers, "content-encoding")
+                    .is_some_and(|value| value.eq_ignore_ascii_case("identity"));
             let peek = path == "/v1/messages" && identity;
-            let sid = header(headers, "x-claude-code-session-id")
-                .map(str::to_owned)
-                .or_else(|| peek.then(|| tail_session(body)).flatten());
             let model = peek.then(|| head_model(body)).flatten();
+            // C8's body fallback is a root key, independent of agent headers.
+            if !headers.contains_key("x-claude-code-session-id") {
+                return Session {
+                    key: peek
+                        .then(|| tail_session(body))
+                        .flatten()
+                        .map(|sid| format!("claude:{sid}")),
+                    parent: None,
+                    model,
+                };
+            }
+            let sid = header(headers, "x-claude-code-session-id").map(str::to_owned);
             let Some(sid) = sid else {
                 return Session {
                     model,
@@ -131,7 +141,7 @@ fn tail_session(body: &[u8]) -> Option<String> {
         // 이후가 최상위 객체의 끝인지 확인해 중첩 metadata와 문자열 내부를 배제한다.
         loop {
             rest = whitespace(rest);
-            if rest == b"}" {
+            if rest.starts_with(b"}") {
                 break;
             }
             let Some(next) = rest.strip_prefix(b",") else {
@@ -148,7 +158,12 @@ fn tail_session(body: &[u8]) -> Option<String> {
             };
             rest = next;
         }
-        if whitespace(rest) != b"}" {
+        // JSON permits whitespace after the final closing brace, but no other
+        // bytes (including another enclosing brace or a concatenated value).
+        if !whitespace(rest)
+            .strip_prefix(b"}")
+            .is_some_and(|suffix| whitespace(suffix).is_empty())
+        {
             continue;
         }
         let user = metadata.user_id?;
@@ -257,6 +272,162 @@ mod tests {
                 br#"{"session_id":"body"}"#
             ),
             Session::default()
+        );
+    }
+
+    #[test]
+    fn c8_claude_fallback_root_and_absent_header() {
+        let body = br#"{"metadata":{"user_id":"fixture_session_body"}}"#;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-claude-code-agent-id", "child".parse().unwrap());
+        headers.insert("x-claude-code-parent-agent-id", "parent".parse().unwrap());
+        let session = classify(Provider::Claude, "/v1/messages", &headers, body);
+        assert_eq!(session.key.as_deref(), Some("claude:body"));
+        assert_eq!(session.parent, None);
+        headers.insert("x-claude-code-session-id", "header".parse().unwrap());
+        assert_eq!(
+            classify(Provider::Claude, "/v1/messages", &headers, body)
+                .key
+                .as_deref(),
+            Some("claude:header:agent:child")
+        );
+        headers.insert("x-claude-code-session-id", "".parse().unwrap());
+        assert_eq!(
+            classify(Provider::Claude, "/v1/messages", &headers, body).key,
+            None
+        );
+        headers.append("x-claude-code-session-id", "duplicate".parse().unwrap());
+        assert_eq!(
+            classify(Provider::Claude, "/v1/messages", &headers, body).key,
+            None
+        );
+    }
+
+    #[test]
+    fn c8_claude_tail_boundary_and_identity_encoding() {
+        let suffix = br#""metadata":{"user_id":"fixture_session_boundary"},"max_tokens":4}"#;
+        let mut body = br#"{"messages":[{"content":""#.to_vec();
+        body.extend(std::iter::repeat_n(b'x', SCAN_LIMIT * 2));
+        body.extend_from_slice(b"\"}],");
+        body.extend_from_slice(suffix);
+        body.extend(std::iter::repeat_n(b' ', SCAN_LIMIT - suffix.len()));
+        let mut headers = HeaderMap::new();
+        assert_eq!(
+            classify(Provider::Claude, "/v1/messages", &headers, &body)
+                .key
+                .as_deref(),
+            Some("claude:boundary")
+        );
+        body.push(b' '); // The metadata key now crosses the 64 KiB boundary.
+        assert_eq!(
+            classify(Provider::Claude, "/v1/messages", &headers, &body).key,
+            None
+        );
+        let body = br#"{"model":"fixture","metadata":{"user_id":"fixture_session_encoded"}}"#;
+        for encoding in ["gzip", "br", "zstd", "identity, gzip", ""] {
+            headers.insert("content-encoding", encoding.parse().unwrap());
+            assert_eq!(
+                classify(Provider::Claude, "/v1/messages", &headers, body),
+                Session::default()
+            );
+        }
+        headers.insert("content-encoding", "IDENTITY".parse().unwrap());
+        assert_eq!(
+            classify(Provider::Claude, "/v1/messages", &headers, body)
+                .key
+                .as_deref(),
+            Some("claude:encoded")
+        );
+        headers.append("content-encoding", "gzip".parse().unwrap());
+        assert_eq!(
+            classify(Provider::Claude, "/v1/messages", &headers, body),
+            Session::default()
+        );
+        assert_eq!(
+            tail_session(br#"{"messages":[{"metadata":{"user_id":"fixture_session_nested"}}]}"#),
+            None
+        );
+        assert_eq!(
+            tail_session(br#"{"metadata":{"user_id":"not-a-session"}}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn c8_codex_alpha_search_metadata_and_header_precedence() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-codex-turn-metadata",
+            r#"{"session_id":"search","ignored":{"items":[1,2,3]}}"#
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            classify(
+                Provider::Codex,
+                "/v1/alpha/search",
+                &headers,
+                b"invalid body"
+            )
+            .key
+            .as_deref(),
+            Some("codex:search")
+        );
+        for name in ["session_id", "Session-Id"] {
+            headers.insert(name, "root".parse().unwrap());
+            assert_eq!(
+                classify(
+                    Provider::Codex,
+                    "/v1/alpha/search",
+                    &headers,
+                    b"invalid body"
+                )
+                .key
+                .as_deref(),
+                Some("codex:root")
+            );
+            headers.remove(name);
+        }
+        for raw in ["invalid", r#"{"session_id":null}"#, r#"{"session_id":""}"#] {
+            headers.insert("x-codex-turn-metadata", raw.parse().unwrap());
+            assert_eq!(
+                classify(
+                    Provider::Codex,
+                    "/v1/alpha/search",
+                    &headers,
+                    br#"{"session_id":"body"}"#
+                ),
+                Session::default()
+            );
+        }
+        headers.insert(
+            "x-codex-turn-metadata",
+            format!("{{\"session_id\":\"{}\"}}", "x".repeat(SCAN_LIMIT))
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            classify(Provider::Codex, "/v1/alpha/search", &headers, b""),
+            Session::default()
+        );
+    }
+
+    #[test]
+    fn c8_claude_tail_accepts_trailing_whitespace_only() {
+        let body = br#"{"metadata":{"user_id":"fixture_session_whitespace"},"max_tokens":4}"#;
+        for suffix in [b"".as_slice(), b" ", b"\t\r\n "] {
+            let mut padded = body.to_vec();
+            padded.extend_from_slice(suffix);
+            assert_eq!(tail_session(&padded).as_deref(), Some("whitespace"));
+        }
+        for suffix in [b"}".as_slice(), b" {}", b" null", b" trailing"] {
+            let mut invalid = body.to_vec();
+            invalid.extend_from_slice(suffix);
+            assert_eq!(tail_session(&invalid), None);
+        }
+        assert_eq!(
+            tail_session(br#"{"nested":{"metadata":{"user_id":"fixture_session_nested"}}} "#),
+            None
         );
     }
 }
