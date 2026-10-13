@@ -4,6 +4,10 @@ The documentation map is in `docs/README.md`. The normative behaviour is in `doc
 
 ## Build hygiene (C: has little free space; D: and E: are full)
 
+- **One implementation worktree, ever:** `C:/_projects/SampleUser/quota-baton-impl`.
+  - To start a new milestone, switch the branch inside it (`git switch -c impl/<m> dev`).
+  - Do not create per-milestone worktrees such as `quota-baton-m6a`. Each new worktree grows its own multi-GiB `target/`.
+- **Review check copies** (design session) are temporary. The script `.sandbox/scripts/check-copy.sh` runs the check and then removes the copy together with its `target/`. Never leave one behind.
 - **One target per worktree.** Use the worktree's default `target/` only.
   - Do not create extra `CARGO_TARGET_DIR`s per feature set, per reviewer or per test run. Examples to avoid: `.sandbox/target-*`, `.sandbox/targets/*`.
   - Build the feature variants one after another in the same target.
