@@ -30,7 +30,8 @@ Implement quota-baton exactly as specified, milestone by milestone, until M8 is 
 | Milestone | Status |
 |---|---|
 | M0, M1a, M2, M3, M4a, M4b, M5, M1b | merged |
-| M6a | tray, read-only flyout; review fixes M6a.1 in progress |
+| M6a | tray, read-only flyout; review fixes M6a.2 in progress |
+| M4c | rate hold and per-account pacing (D14, contract C6.3); brief `M4c.md` |
 | M6b | tray actions, row-menu toggles, login/relogin |
 | M7a | takeover: lease handover and drain |
 | M7b | tee with compressed body retention, memory guard |
