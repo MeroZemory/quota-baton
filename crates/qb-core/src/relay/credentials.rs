@@ -177,6 +177,12 @@ impl TokenGates {
         .map_err(|_| ())?
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)] // Also compiled by the external credential-layer test harness.
+    pub(super) async fn block_selection_for_test(&self, id: &str) -> impl Send {
+        self.gate(id).await.lock_owned().await
+    }
+
     async fn gate(&self, id: &str) -> Arc<Mutex<ReloadClock>> {
         self.gates
             .lock()

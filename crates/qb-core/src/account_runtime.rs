@@ -43,7 +43,6 @@ pub struct AccountRuntime {
     obs: Arc<Observability>,
     events: broadcast::Sender<Value>,
     limits: Mutex<BTreeMap<String, LimitResponse>>,
-    allowance: f64,
     probes: Mutex<BTreeSet<String>>,
     volatile: Mutex<BTreeMap<String, Health>>,
     inflight: Mutex<BTreeMap<String, usize>>,
@@ -85,7 +84,7 @@ impl Drop for Probe {
 }
 
 impl AccountRuntime {
-    pub fn new(store: Arc<AccountStore>, obs: Arc<Observability>, allowance: f64) -> Arc<Self> {
+    pub fn new(store: Arc<AccountStore>, obs: Arc<Observability>, _allowance: f64) -> Arc<Self> {
         let (events, _) = broadcast::channel(256);
         let writer = obs.clone();
         let changes = events.clone();
@@ -98,7 +97,6 @@ impl AccountRuntime {
             obs,
             events,
             limits: Mutex::new(BTreeMap::new()),
-            allowance,
             probes: Mutex::new(BTreeSet::new()),
             volatile: Mutex::new(BTreeMap::new()),
             inflight: Mutex::new(BTreeMap::new()),
@@ -126,73 +124,6 @@ impl AccountRuntime {
             .ok()
             .and_then(|counts| counts.get(id).copied())
             .unwrap_or(0)
-    }
-
-    /// Placement reservations precede the first upstream attempt. Apply the C5
-    /// limit reducer under the store transaction so the 2B fallback cannot spend
-    /// credits before an upstream response reports the additional in-flight work.
-    pub(crate) fn projected_quota(
-        &self,
-        id: &str,
-        bindings: &crate::bindings::BindingTable,
-        model: Option<&str>,
-    ) -> Result<Account, crate::accounts::StoreError> {
-        self.store.update_metadata(id, |account| {
-            if !account.eligible(model) {
-                return;
-            }
-            let now = Utc::now();
-            let Some(mut snapshot) = self.obs.quota_snapshot(id) else {
-                return;
-            };
-            let count = bindings.pending_count(id);
-            let traffic = bindings.has_traffic(id);
-            let Some(windows) = snapshot["windows"].as_array_mut() else {
-                return;
-            };
-            if traffic {
-                windows.retain(|window| {
-                    window["observed_at"]
-                        .as_str()
-                        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-                        .is_some_and(|observed| {
-                            (now - observed.with_timezone(&Utc)).num_seconds() <= 900
-                        })
-                });
-            }
-            if windows.is_empty() {
-                return;
-            }
-            // This is a projection, not a fresh observation of rejection flags.
-            snapshot["signals"] = Value::Null;
-            let mut projected = account.clone();
-            projected.health = Health::Ready;
-            projected.quota_cooling = None;
-            projected.apply_health_signal(
-                crate::accounts::HealthSignal::UsageSnapshot {
-                    snapshot,
-                    model: model.map(str::to_owned),
-                    projected_allowance: self.allowance * count as f64,
-                },
-                now,
-            );
-            if let Health::Cooling {
-                reason: HealthReason::Quota,
-                until,
-                scope,
-            } = projected.health
-            {
-                account.apply_health_signal(
-                    crate::accounts::HealthSignal::Cooling {
-                        reason: HealthReason::Quota,
-                        until,
-                        scope,
-                    },
-                    now,
-                );
-                account.quota_cooling = projected.quota_cooling;
-            }
-        })
     }
 
     pub fn probing(&self, id: &str) -> bool {
@@ -317,11 +248,8 @@ impl AccountRuntime {
                     !w.is_empty()
                         && w.iter()
                             .all(|w| w["used_pct"].as_f64().is_some_and(|p| p < 100.0))
-                        && w.iter().any(|w| {
-                            w["used_pct"].as_f64().is_some_and(|p| {
-                                p + self.allowance * self.inflight_count(&id) as f64 >= 99.0
-                            })
-                        })
+                        && w.iter()
+                            .any(|w| w["used_pct"].as_f64().is_some_and(|p| p >= 99.0))
                 }) && q["signals"]["limit_reached"] != true
                     && q["signals"]["unified_status"] != "rejected"
             });
@@ -449,7 +377,6 @@ impl AccountRuntime {
         let store = self.store.clone();
         let account_id = id.to_owned();
         let model = model.map(str::to_owned);
-        let projected_allowance = self.allowance * self.inflight_count(id) as f64;
         let observation = snapshot.clone();
         let account = tokio::task::spawn_blocking(move || {
             store
@@ -458,7 +385,7 @@ impl AccountRuntime {
                         crate::accounts::HealthSignal::UsageSnapshot {
                             snapshot: observation,
                             model,
-                            projected_allowance,
+                            projected_allowance: 0.0,
                         },
                         Utc::now(),
                     );

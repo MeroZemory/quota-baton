@@ -2,7 +2,7 @@
 use axum::http::{HeaderMap, StatusCode};
 use chrono::{Duration as ChronoDuration, Utc};
 use qb_core::{
-    accounts::{AccountStore, Health, HealthReason, Provider, import},
+    accounts::{AccountStore, Health, HealthReason, Provider, QuotaCooling, import},
     config::Config,
     debug_pin::DebugPins,
     http::{self, RunningServers},
@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -38,6 +38,10 @@ struct Harness {
 
 impl Harness {
     async fn new(provider: Provider) -> Self {
+        Self::with_hold(provider, 60).await
+    }
+
+    async fn with_hold(provider: Provider, reset_hold_secs: u64) -> Self {
         // Waiting behind other bounded cases is separate from the HTTP deadline.
         let serial = tokio::time::timeout(Duration::from_secs(120), SERIAL.lock())
             .await
@@ -84,6 +88,7 @@ impl Harness {
             .unwrap()
             .unwrap();
         let mut config = Config::default();
+        config.routing.reset_hold_secs = reset_hold_secs;
         config.server.data_port = 0;
         config.server.admin_port = 0;
         config.upstream.anthropic_base = fake.url.clone();
@@ -141,6 +146,10 @@ impl Harness {
     }
 
     async fn restart(self) -> Self {
+        self.restart_with_fixture(|_| {}).await
+    }
+
+    async fn restart_with_fixture(self, edit: impl FnOnce(&Path)) -> Self {
         self.state.bindings.flush().unwrap();
         self.obs.flush().unwrap();
         let Self {
@@ -168,6 +177,8 @@ impl Harness {
         drop(state);
         drop(store);
         drop(obs);
+        // Edit synthetic persisted state only after every writer has stopped.
+        edit(&home);
         let store = tokio::time::timeout(DEADLINE, async {
             loop {
                 match AccountStore::acquire(&home) {
@@ -396,6 +407,125 @@ fn usage(provider: Provider, percent: u32) -> HeaderMap {
     headers
 }
 
+fn near_reset_limit() -> ScriptedResponse {
+    ScriptedResponse::json(
+        StatusCode::TOO_MANY_REQUESTS,
+        r#"{"error":{"type":"usage_limit_reached","resets_in_seconds":2,"message":"synthetic quota"}}"#,
+    )
+}
+
+#[tokio::test]
+async fn precommit_quota_reset_hold_retries_same_account_once_with_exact_body() {
+    let h = Harness::with_hold(Provider::Codex, 3).await;
+    let headers = [("session-id", "in-request-hold")];
+    let first = h.turn("/v1/responses", &headers, RAW).await;
+    h.fake.state.push(near_reset_limit());
+    h.fake
+        .state
+        .push(ScriptedResponse::json(StatusCode::OK, "{\"held\":true}"));
+    let start = Instant::now();
+    let (status, account, body) = h.send("/v1/responses", &headers, RAW).await;
+    let elapsed = start.elapsed();
+    assert_eq!(status, 200);
+    assert_eq!(account, first);
+    assert_eq!(body, b"{\"held\":true}");
+    assert!(elapsed >= Duration::from_millis(1500), "{elapsed:?}");
+    assert!(elapsed < Duration::from_millis(3500), "{elapsed:?}");
+    let attempts = h.fake.state.requests();
+    assert_eq!(attempts.len(), 3);
+    for attempt in &attempts {
+        assert_eq!(
+            attempt.headers["authorization"],
+            attempts[0].headers["authorization"]
+        );
+        assert_eq!(attempt.body.as_ref(), RAW.as_bytes());
+    }
+    assert!(
+        !h.ledger()
+            .iter()
+            .any(|row| row["event"] == "binding_move" && !row["from"].is_null())
+    );
+}
+
+#[tokio::test]
+async fn second_precommit_429_fails_over_immediately_without_another_hold() {
+    let h = Harness::with_hold(Provider::Codex, 3).await;
+    let headers = [("session-id", "hold-once")];
+    let first = h.turn("/v1/responses", &headers, RAW).await;
+    let other = h.ids().into_iter().find(|id| id != &first).unwrap();
+    h.fake.state.push(near_reset_limit());
+    h.fake.state.push(near_reset_limit());
+    h.fake.state.push(ScriptedResponse::json(
+        StatusCode::OK,
+        "{\"failover\":true}",
+    ));
+    let start = Instant::now();
+    let (status, account, body) = h.send("/v1/responses", &headers, RAW).await;
+    let elapsed = start.elapsed();
+    assert_eq!(status, 200);
+    assert_eq!(account, other);
+    assert_eq!(body, b"{\"failover\":true}");
+    assert!(elapsed >= Duration::from_millis(1500), "{elapsed:?}");
+    assert!(elapsed < Duration::from_millis(3500), "{elapsed:?}");
+    let attempts = h.fake.state.requests();
+    assert_eq!(attempts.len(), 4);
+    assert_eq!(
+        attempts[1].headers["authorization"],
+        attempts[0].headers["authorization"]
+    );
+    assert_eq!(
+        attempts[2].headers["authorization"],
+        attempts[0].headers["authorization"]
+    );
+    assert_ne!(
+        attempts[3].headers["authorization"],
+        attempts[0].headers["authorization"]
+    );
+    assert!(
+        attempts
+            .iter()
+            .all(|attempt| attempt.body.as_ref() == RAW.as_bytes())
+    );
+    h.counts(&[(&first, 0), (&other, 1)]).await;
+}
+
+#[tokio::test]
+async fn next_request_can_hold_again_after_failed_hold_without_a_move() {
+    let h = Harness::with_hold(Provider::Codex, 3).await;
+    let headers = [("session-id", "hold-per-request")];
+    let first = h.turn("/v1/responses", &headers, RAW).await;
+    let other = h.ids().into_iter().find(|id| id != &first).unwrap();
+    h.pause(&other).await;
+    for _ in 0..2 {
+        h.store
+            .update_metadata(&first, |account| {
+                account.health = Health::Cooling {
+                    reason: HealthReason::Quota,
+                    until: Utc::now() + ChronoDuration::seconds(30),
+                    scope: "account".into(),
+                };
+                account.quota_cooling = Some(QuotaCooling {
+                    window: "7d".into(),
+                    reset_at: Utc::now() + ChronoDuration::seconds(2),
+                    started_at: Utc::now(),
+                });
+            })
+            .unwrap();
+        let start = Instant::now();
+        let (status, _, body) = h.send("/v1/responses", &headers, RAW).await;
+        let elapsed = start.elapsed();
+        assert_eq!(status, 429);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["error"]["type"],
+            "usage_limit_reached"
+        );
+        assert!(elapsed >= Duration::from_millis(1500), "{elapsed:?}");
+        assert!(elapsed < Duration::from_millis(3500), "{elapsed:?}");
+        assert_eq!(h.fake.state.requests().len(), 1);
+        h.counts(&[(&first, 1), (&other, 0)]).await;
+    }
+}
+
 #[tokio::test]
 async fn sticky_http_above_gate_keeps_binding_but_new_session_uses_other_account() {
     let h = Harness::new(Provider::Codex).await;
@@ -420,19 +550,18 @@ async fn sticky_http_above_gate_keeps_binding_but_new_session_uses_other_account
 }
 
 #[tokio::test]
-async fn codex_binding_reservation_projects_credit_limit_and_persists_quota_before_dial() {
+async fn projected_credit_limit_only_spreads_placement_and_never_cools_warm_binding() {
     let h = Harness::new(Provider::Codex).await;
     let headers = [("session-id", "projected-credit-limit")];
     let first = h.turn("/v1/responses", &headers, RAW).await;
     let other = h.ids().into_iter().find(|id| id != &first).unwrap();
-    h.pause(&other).await;
     h.counts(&[(&first, 1), (&other, 0)]).await;
     assert!(!h.store.load(&first).unwrap().allow_credits);
     assert_eq!(h.state.accounts.inflight_count(&first), 0);
     assert_eq!(h.state.bindings.pending_count(&first), 0);
 
     let reset = Utc::now() + ChronoDuration::hours(1);
-    let mut observed = usage(Provider::Codex, 98);
+    let mut observed = usage(Provider::Codex, 89);
     for name in ["x-codex-primary-reset-at", "x-codex-secondary-reset-at"] {
         observed.insert(name, reset.timestamp().to_string().parse().unwrap());
     }
@@ -441,33 +570,45 @@ async fn codex_binding_reservation_projects_credit_limit_and_persists_quota_befo
         .observe_headers(&first, Provider::Codex, &observed)
         .await;
     assert_eq!(h.store.load(&first).unwrap().health, Health::Ready);
+    h.state
+        .accounts
+        .observe_headers(&other, Provider::Codex, &usage(Provider::Codex, 95))
+        .await;
+    assert_eq!(
+        h.turn(
+            "/v1/responses",
+            &[("session-id", "projection-control")],
+            RAW
+        )
+        .await,
+        first,
+        "without pending work the known-passing account wins placement"
+    );
 
-    // Reserve placement without starting an upstream attempt: only the binding
-    // table can supply the extra 1% that reaches the no-credits quota limit.
-    let reservation = h.state.bindings.begin_request(None, &first);
-    assert_eq!(h.state.bindings.pending_count(&first), 1);
+    // Reservations alone supply the extra 10% that reaches the no-credits limit.
+    let reservations: Vec<_> = (0..10)
+        .map(|_| h.state.bindings.begin_request(None, &first))
+        .collect();
+    assert_eq!(h.state.bindings.pending_count(&first), 10);
     assert_eq!(h.state.accounts.inflight_count(&first), 0);
     let upstream_calls = h.fake.state.requests().len();
-    assert_eq!(upstream_calls, 1);
-    let (status, _, body) = h.send("/v1/responses", &headers, RAW).await;
-    assert_eq!(status, 429);
-    let error: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(error["error"]["type"], "usage_limit_reached");
-    assert_eq!(h.fake.state.requests().len(), upstream_calls);
+    assert_eq!(upstream_calls, 2);
+    assert_eq!(h.turn("/v1/responses", &headers, RAW).await, first);
+    assert_eq!(
+        h.turn("/v1/responses", &[("session-id", "projection-new")], RAW)
+            .await,
+        other
+    );
+    assert_eq!(h.fake.state.requests().len(), upstream_calls + 2);
     assert_eq!(h.state.accounts.inflight_count(&first), 0);
-    assert_eq!(h.state.bindings.pending_count(&first), 1);
-    assert!(matches!(h.store.load(&first).unwrap().health,
-        Health::Cooling { reason: HealthReason::Quota, until, scope }
-            if scope == "account" && until.timestamp() == reset.timestamp()));
-    drop(reservation);
+    assert_eq!(h.state.bindings.pending_count(&first), 10);
+    assert_eq!(h.store.load(&first).unwrap().health, Health::Ready);
+    assert!(h.store.load(&first).unwrap().quota_cooling.is_none());
+    drop(reservations);
     assert_eq!(h.state.bindings.pending_count(&first), 0);
-    assert!(matches!(
-        h.store.load(&first).unwrap().health,
-        Health::Cooling {
-            reason: HealthReason::Quota,
-            ..
-        }
-    ));
+    assert_eq!(h.store.load(&first).unwrap().health, Health::Ready);
+    assert!(h.store.load(&first).unwrap().quota_cooling.is_none());
+    h.counts(&[(&first, 2), (&other, 1)]).await;
 }
 
 #[tokio::test]
@@ -532,6 +673,26 @@ async fn claude_parent_inheritance_and_forced_move_keep_entire_group_together() 
     h.counts(&[(&first, 0), (&other, 3)]).await;
     assert_eq!(h.turn("/v1/messages", &root, "{}").await, other);
     assert_eq!(h.turn("/v1/messages", &child, "{}").await, other);
+    let rows = h.ledger();
+    let moves: Vec<_> = rows
+        .iter()
+        .filter(|row| row["event"] == "binding_move" && row["from"] == first)
+        .collect();
+    assert_eq!(moves.len(), 1, "one event per moved identity group");
+    assert_eq!(moves[0]["keys"], 3);
+    assert!(
+        moves
+            .iter()
+            .all(|row| row["to"] == other && row["reason"] == "forced")
+    );
+    assert_eq!(
+        moves
+            .iter()
+            .map(|row| row["bytes_in"].as_u64().unwrap_or(0))
+            .sum::<u64>(),
+        2,
+        "the triggering {{}} request is charged once for the entire three-key group"
+    );
 }
 
 #[tokio::test]
@@ -624,8 +785,8 @@ async fn quota_reset_hold_waits_two_seconds_and_keeps_http_binding() {
 }
 
 #[tokio::test]
-async fn quota_reset_hold_respects_client_timeout_and_moves_to_ready_account() {
-    let h = Harness::new(Provider::Codex).await;
+async fn quota_reset_hold_ignores_client_timeout_and_moves_immediately_after_bounded_hold() {
+    let h = Harness::with_hold(Provider::Codex, 3).await;
     let first = h
         .turn("/v1/responses", &[("session-id", "hold-timeout")], RAW)
         .await;
@@ -634,22 +795,38 @@ async fn quota_reset_hold_respects_client_timeout_and_moves_to_ready_account() {
         .update_metadata(&first, |account| {
             account.health = Health::Cooling {
                 reason: HealthReason::Quota,
-                until: Utc::now() + ChronoDuration::seconds(2),
+                until: Utc::now() + ChronoDuration::seconds(30),
                 scope: "account".into(),
-            }
+            };
+            account.quota_cooling = Some(QuotaCooling {
+                window: "7d".into(),
+                reset_at: Utc::now() + ChronoDuration::seconds(2),
+                started_at: Utc::now(),
+            });
         })
         .unwrap();
     let start = Instant::now();
     assert_eq!(
         h.turn(
             "/v1/responses",
-            &[("session-id", "hold-timeout"), ("x-stainless-timeout", "1")],
+            &[
+                ("session-id", "hold-timeout"),
+                ("x-stainless-timeout", "0.1")
+            ],
             RAW
         )
         .await,
         other
     );
-    assert!(start.elapsed() < Duration::from_millis(1500));
+    let elapsed = start.elapsed();
+    assert!(elapsed >= Duration::from_millis(1500), "{elapsed:?}");
+    // Two-second reset plus local HTTP overhead; no second hold or 30s cooling wait.
+    assert!(elapsed < Duration::from_millis(3500), "{elapsed:?}");
+    assert!(matches!(
+        h.store.load(&first).unwrap().health,
+        Health::Cooling { .. }
+    ));
+    assert_eq!(h.fake.state.requests().len(), 2);
     h.counts(&[(&first, 0), (&other, 1)]).await;
 }
 
@@ -685,6 +862,18 @@ async fn forced_move_keeps_body_verbatim_and_request_ledger_session_hashed() {
         .filter(|row| row["transport"] == "http")
         .collect();
     assert_eq!(requests.len(), 3);
+    assert_ne!(
+        requests[0]["after_move"], true,
+        "initial placement is not a move"
+    );
+    assert_eq!(
+        requests[1]["after_move"], true,
+        "the first turn on the moved binding is marked"
+    );
+    assert_ne!(
+        requests[2]["after_move"], true,
+        "the marker is consumed by one turn"
+    );
     for row in &requests {
         assert_eq!(row["session"], hash);
         assert_eq!(row["bytes_in"], RAW.len() as u64);
@@ -738,6 +927,23 @@ async fn claude_forced_move_records_only_numeric_cache_usage_and_preserves_respo
     assert_ne!(first, second);
     assert_eq!(body, usage_body.as_bytes());
     let rows = h.ledger();
+    let placements: Vec<_> = rows
+        .iter()
+        .filter(|row| row["event"] == "binding_move" && row["reason"] == "new")
+        .collect();
+    assert_eq!(
+        placements.len(),
+        1,
+        "Claude emits the same new-binding event as Codex"
+    );
+    assert_eq!(placements[0]["from"], Value::Null);
+    assert_eq!(placements[0]["to"], first);
+    assert_eq!(placements[0]["bytes_in"], RAW.len() as u64);
+    let hash: String = Sha256::digest(b"claude:ledger-session")[..6]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(placements[0]["session"], hash);
     let cached: Vec<_> = rows
         .iter()
         .filter(|row| row.get("cache_usage").is_some_and(|usage| !usage.is_null()))
@@ -786,4 +992,96 @@ async fn explicit_bindings_flush_and_restart_preserve_drained_http_session() {
         other
     );
     h.counts(&[(&first, 1), (&other, 1)]).await;
+}
+
+// Simulate an hour-idle restart with synthetic persisted metadata. No wall-clock
+// hour, live account, or mutable production binding is needed for the cold point.
+fn cold_fixture(home: &Path, expired: bool) {
+    let path = home.join("state/bindings.json");
+    let mut bindings: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    for binding in bindings["bindings"].as_array_mut().unwrap() {
+        binding["last_used"] = json!((Utc::now() - ChronoDuration::hours(2)).to_rfc3339());
+    }
+    fs::write(path, serde_json::to_vec(&bindings).unwrap()).unwrap();
+    let path = home.join("state/quota.json");
+    let mut quota: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    for account in quota["accounts"].as_object_mut().unwrap().values_mut() {
+        for window in account["windows"].as_array_mut().unwrap() {
+            window["observed_at"] = json!(
+                (Utc::now()
+                    - if expired {
+                        ChronoDuration::minutes(2)
+                    } else {
+                        ChronoDuration::hours(2)
+                    })
+                .to_rfc3339()
+            );
+            window["used_pct"] = json!(if expired { 95.0 } else { 10.0 });
+            window["reset_at"] = json!(
+                (Utc::now()
+                    + if expired {
+                        ChronoDuration::minutes(-1)
+                    } else {
+                        ChronoDuration::hours(24)
+                    })
+                .to_rfc3339()
+            );
+        }
+    }
+    fs::write(path, serde_json::to_vec(&quota).unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn cold_restored_binding_with_old_observations_never_moves_or_ping_pongs() {
+    let h = Harness::new(Provider::Codex).await;
+    let mut ids = h.ids();
+    ids.sort();
+    // Bind to the higher id so the old all-stale fallback cannot accidentally
+    // select the already-bound account and hide the regression.
+    h.state
+        .accounts
+        .observe_headers(&ids[0], Provider::Codex, &usage(Provider::Codex, 95))
+        .await;
+    let headers = [("session-id", "cold-old-observation")];
+    let first = h.turn("/v1/responses", &headers, RAW).await;
+    assert_eq!(first, ids[1]);
+    let h = h
+        .restart_with_fixture(|home| cold_fixture(home, false))
+        .await;
+    assert_eq!(h.turn("/v1/responses", &headers, RAW).await, first);
+    let h = h
+        .restart_with_fixture(|home| cold_fixture(home, false))
+        .await;
+    assert_eq!(h.turn("/v1/responses", &headers, RAW).await, first);
+    h.counts(&[(&first, 1), (&ids[0], 0)]).await;
+    assert!(
+        !h.ledger()
+            .iter()
+            .any(|row| row["event"] == "binding_move" && !row["from"].is_null())
+    );
+}
+
+#[tokio::test]
+async fn cold_binding_with_expired_windows_treats_old_usage_as_zero_and_stays() {
+    let h = Harness::new(Provider::Codex).await;
+    let mut ids = h.ids();
+    ids.sort();
+    h.state
+        .accounts
+        .observe_headers(&ids[0], Provider::Codex, &usage(Provider::Codex, 95))
+        .await;
+    let headers = [("session-id", "cold-expired-window")];
+    let first = h.turn("/v1/responses", &headers, RAW).await;
+    assert_eq!(first, ids[1]);
+    let h = h
+        .restart_with_fixture(|home| cold_fixture(home, true))
+        .await;
+    assert_eq!(h.turn("/v1/responses", &headers, RAW).await, first);
+    assert_eq!(h.store.load(&first).unwrap().health, Health::Ready);
+    h.counts(&[(&first, 1), (&ids[0], 0)]).await;
+    assert!(
+        !h.ledger()
+            .iter()
+            .any(|row| row["event"] == "binding_move" && !row["from"].is_null())
+    );
 }

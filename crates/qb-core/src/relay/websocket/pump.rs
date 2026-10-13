@@ -77,6 +77,10 @@ impl CurrentCompletion {
             );
         }
         completion.record.transport = "ws".into();
+        completion.record.after_move = completion
+            .binding
+            .as_ref()
+            .is_some_and(|lease| lease.after_move);
         completion.record.account = Some(context.account.clone());
         completion.record.status = 101;
         completion.record.upstream_status = Some(101);

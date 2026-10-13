@@ -545,6 +545,12 @@ async fn c5_passive_header_exhaustion_credits_and_early_reset() {
         .accounts
         .observe_headers(id, Provider::Codex, &headers)
         .await;
+    assert_eq!(h.store.load(id).unwrap().health, Health::Ready);
+    headers.insert("x-codex-primary-used-percent", "99".parse().unwrap());
+    h.state
+        .accounts
+        .observe_headers(id, Provider::Codex, &headers)
+        .await;
     assert!(matches!(
         h.store.load(id).unwrap().health,
         Health::Cooling {

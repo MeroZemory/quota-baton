@@ -387,6 +387,33 @@ async fn upgrade_inner(
             if error.status == StatusCode::FORBIDDEN {
                 forbidden += 1;
             }
+            if decision.kind == super::outcome::Kind::Quota {
+                match state
+                    .retry_after_reset(&session, completion, &account.id, None)
+                    .await
+                {
+                    Ok(true) => {
+                        match state
+                            .tokens
+                            .before_request(
+                                state.store.clone(),
+                                state.observability.clone(),
+                                account.id.clone(),
+                            )
+                            .await
+                        {
+                            Ok((updated, refreshed)) => {
+                                account = updated;
+                                tokens = refreshed;
+                            }
+                            Err(()) => return network_failure(),
+                        }
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(()) => return network_failure(),
+                }
+            }
             let preserve_last = matches!(
                 decision.kind,
                 super::outcome::Kind::Payment | super::outcome::Kind::ModelPermission
@@ -415,8 +442,13 @@ async fn upgrade_inner(
     };
     let socket_pin = state.bindings.pin(session.key.as_deref());
     if let Some(lease) = &mut completion.binding {
+        // A reset retry replaces the attempt lease, but the handshake still
+        // owes its accumulated move marker to the first response.create.
+        lease.after_move |= completion.record.after_move;
         lease.defer_after_move();
     }
+    // The handshake defers the marker to the first response.create ledger row.
+    completion.record.after_move = false;
     let context = pump::Context {
         runtime: Some(state.accounts.clone()),
         relay: Some(state.clone()),

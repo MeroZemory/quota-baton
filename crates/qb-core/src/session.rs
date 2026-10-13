@@ -4,6 +4,7 @@ use serde::Deserialize;
 use crate::accounts::Provider;
 
 const SCAN_LIMIT: usize = 64 * 1024;
+const TAIL_METADATA_ATTEMPTS: usize = 16;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Session {
@@ -118,6 +119,43 @@ fn head_model(body: &[u8]) -> Option<String> {
     }
 }
 
+// Walk backwards from the outer closing brace, even when the tail starts in a
+// string or nested value. Only top-level, unescaped keys spend a parse attempt.
+fn tail_metadata_candidates(tail: &[u8]) -> impl Iterator<Item = usize> + '_ {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    tail.iter()
+        .enumerate()
+        .rev()
+        .filter_map(move |(offset, &byte)| {
+            if byte == b'"' {
+                let escaped = tail[..offset]
+                    .iter()
+                    .rev()
+                    .take_while(|&&byte| byte == b'\\')
+                    .count()
+                    % 2
+                    != 0;
+                if !escaped {
+                    in_string = !in_string;
+                    if !in_string && depth == 1 && tail[offset..].starts_with(b"\"metadata\"") {
+                        return Some(offset);
+                    }
+                }
+            } else if !in_string {
+                match byte {
+                    b'}' | b']' => depth += 1,
+                    b'{' | b'[' => depth = depth.saturating_sub(1),
+                    _ => {}
+                }
+            }
+            None
+        })
+        // Each parser can inspect the remaining tail. A fixed attempt budget
+        // keeps total work linear in SCAN_LIMIT, including malformed inputs.
+        .take(TAIL_METADATA_ATTEMPTS)
+}
+
 fn tail_session(body: &[u8]) -> Option<String> {
     #[derive(Deserialize)]
     struct Metadata {
@@ -128,11 +166,9 @@ fn tail_session(body: &[u8]) -> Option<String> {
         session_id: Option<String>,
     }
     let tail = &body[body.len().saturating_sub(SCAN_LIMIT)..];
-    for (offset, window) in tail.windows(b"\"metadata\"".len()).enumerate().rev() {
-        if window != b"\"metadata\"" {
-            continue;
-        }
-        let Some(rest) = whitespace(&tail[offset + window.len()..]).strip_prefix(b":") else {
+    for offset in tail_metadata_candidates(tail) {
+        let Some(rest) = whitespace(&tail[offset + b"\"metadata\"".len()..]).strip_prefix(b":")
+        else {
             continue;
         };
         let Some((metadata, mut rest)) = value::<Metadata>(whitespace(rest)) else {
@@ -181,6 +217,43 @@ fn tail_session(body: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn n5_tail_metadata_attempts_are_bounded() {
+        // Every candidate has valid metadata and a valid suffix, but no session.
+        // Without the cap, each candidate reparses all the fields after it.
+        let mut body = b"{".to_vec();
+        for _ in 0..1700 {
+            body.extend_from_slice(b"\"metadata\":{\"user_id\":\"invalid\"},");
+        }
+        body.extend_from_slice(b"\"padding\":\"");
+        body.extend(std::iter::repeat_n(b'x', 8 * 1024));
+        body.extend_from_slice(b"\",\"max_tokens\":4}");
+        assert!(body.len() < SCAN_LIMIT);
+        assert_eq!(
+            tail_metadata_candidates(&body).count(),
+            TAIL_METADATA_ATTEMPTS
+        );
+        assert_eq!(tail_session(&body), None);
+    }
+
+    #[test]
+    fn n5_thousands_of_nested_metadata_preserve_near_tail_fallback() {
+        for user_id in [r#"fixture_session_tail"#, r#"{\"session_id\":\"tail\"}"#] {
+            let mut body =
+                format!("{{\"metadata\":{{\"user_id\":\"{user_id}\"}},\"items\":[").into_bytes();
+            for _ in 0..2000 {
+                body.extend_from_slice(b"{\"metadata\":{}},");
+            }
+            body.extend_from_slice(br#"{"text":"\"metadata\":{},\\"}],"max_tokens":4} "#);
+            assert!(body.len() < SCAN_LIMIT);
+            assert_eq!(tail_metadata_candidates(&body).count(), 1);
+            let original = body.clone();
+            let session = classify(Provider::Claude, "/v1/messages", &HeaderMap::new(), &body);
+            assert_eq!(session.key.as_deref(), Some("claude:tail"));
+            assert_eq!(body, original);
+        }
+    }
 
     #[test]
     fn claude_root_agent_parent_and_bounded_peek() {
