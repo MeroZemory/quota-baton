@@ -407,7 +407,7 @@ async fn commit_hold_waits_for_normal_data_and_relays_first_error() {
     let expected = [first.as_ref(), normal.as_ref(), last.as_ref()].concat();
     assert_eq!(response.bytes().await.unwrap().as_ref(), expected);
     let error = Bytes::from_static(
-        b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\"}}\n\n",
+        b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\"}}\n\n",
     );
     h.claude
         .state
