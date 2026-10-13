@@ -19,6 +19,10 @@ struct Args {
     now: Option<String>,
     #[arg(long, requires = "render_png")]
     expand_disabled: bool,
+    /// Review state to paint: list, menu:<id>, confirm-delete:<id>, login:claude,
+    /// login:codex, or quit.
+    #[arg(long, default_value = "list", requires = "render_png")]
+    state: String,
     #[arg(long, requires_all = ["fixture", "no_supervise"])]
     open_flyout: bool,
     /// Do not start or restart a missing core.
@@ -58,6 +62,7 @@ fn main() -> anyhow::Result<()> {
             now,
             args.expand_disabled,
             &output,
+            &args.state,
         )
         .map_err(anyhow::Error::msg)?;
         return Ok(());
