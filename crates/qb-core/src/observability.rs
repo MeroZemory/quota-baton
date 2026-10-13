@@ -3,15 +3,22 @@ use axum::http::HeaderMap;
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
-    sync::mpsc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     thread,
+    time::{Duration as StdDuration, Instant},
 };
 
 const LEDGER_MAX_BYTES: u64 = 500_000_000;
+const SYNC_INTERVAL: StdDuration = StdDuration::from_secs(1);
+const WARN_INTERVAL: StdDuration = StdDuration::from_secs(60);
 
 #[derive(Clone, Debug)]
 pub struct CaptureOptions {
@@ -132,6 +139,7 @@ enum Command {
 pub struct Observability {
     tx: mpsc::SyncSender<Command>,
     worker: Option<thread::JoinHandle<()>>,
+    dropped: Arc<AtomicU64>,
     #[cfg(all(feature = "shape-capture", debug_assertions))]
     capture: Option<crate::capture::Capture>,
 }
@@ -147,32 +155,48 @@ impl Observability {
         let capture = capture.map(crate::capture::Capture::new).transpose()?;
         fs::create_dir_all(home.join("state"))?;
         fs::create_dir_all(home.join("ledger"))?;
-        retain(
-            &home.join("ledger"),
-            Utc::now().date_naive(),
-            LEDGER_MAX_BYTES,
-        )
-        .map_err(|_| anyhow::anyhow!("ledger retention failed"))?;
-        // 리스너를 열기 전에 기존 스냅샷을 검증하고 읽는다.
-        let state = match fs::read(home.join("state/quota.json")) {
-            Ok(bytes) => serde_json::from_slice::<QuotaState>(&bytes)
-                .map_err(|_| anyhow::anyhow!("invalid quota state"))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => QuotaState {
-                schema: 1,
-                ..Default::default()
-            },
-            Err(_) => anyhow::bail!("quota state read failed"),
+        prune(&home.join("ledger"));
+        // 손상된 캐시는 격리하고 빈 상태로 시작한다. 원문 오류는 로그에 남기지 않는다.
+        let path = home.join("state/quota.json");
+        let empty = || QuotaState {
+            schema: 1,
+            ..Default::default()
         };
-        anyhow::ensure!(state.schema == 1, "unsupported quota state schema");
-        // 디스크가 느릴 때 큐를 제한하고 대기하여 원장 항목을 버리지 않는다.
+        let state = match fs::read(&path) {
+            Ok(bytes) => match serde_json::from_slice::<QuotaState>(&bytes) {
+                Ok(state) if state.schema == 1 => state,
+                _ => {
+                    let backup = path.with_file_name(format!(
+                        "quota.json.corrupt-{}-{:08x}",
+                        Utc::now().timestamp_millis(),
+                        rand::random::<u32>()
+                    ));
+                    if fs::rename(&path, backup).is_err() {
+                        tracing::warn!("Corrupt quota state could not be renamed; starting empty");
+                    } else {
+                        tracing::warn!("Corrupt quota state renamed; starting empty");
+                    }
+                    empty()
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => empty(),
+            Err(_) => {
+                tracing::warn!("Quota state could not be read; starting empty");
+                empty()
+            }
+        };
+        // 요청 경로에서는 큐가 가득 차도 디스크나 작성자를 기다리지 않는다.
         let (tx, rx) = mpsc::sync_channel(256);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let worker_dropped = dropped.clone();
         let home = home.to_owned();
         let worker = thread::Builder::new()
             .name("qb-observability".into())
-            .spawn(move || run(home, state, rx))?;
+            .spawn(move || run(home, state, rx, worker_dropped))?;
         Ok(Self {
             tx,
             worker: Some(worker),
+            dropped,
             #[cfg(all(feature = "shape-capture", debug_assertions))]
             capture,
         })
@@ -180,9 +204,7 @@ impl Observability {
 
     pub fn observe_headers(&self, account_id: &str, provider: Provider, headers: &HeaderMap) {
         if let Some(snapshot) = snapshot(provider, headers, Utc::now()) {
-            let _ = self
-                .tx
-                .send(Command::Quota(account_id.into(), Box::new(snapshot)));
+            self.enqueue(Command::Quota(account_id.into(), Box::new(snapshot)));
         }
     }
 
@@ -199,7 +221,7 @@ impl Observability {
             .filter(|v| v.len() == 12 && v.bytes().all(|c| c.is_ascii_hexdigit()));
         record.ua = record.ua.as_deref().and_then(product);
         if let Ok(value) = serde_json::to_value(record) {
-            let _ = self.tx.send(Command::Ledger(value));
+            self.enqueue(Command::Ledger(value));
         }
     }
 
@@ -210,7 +232,7 @@ impl Observability {
         outcome: &str,
         expires_at: Option<DateTime<Utc>>,
     ) {
-        let _ = self.tx.send(Command::Ledger(serde_json::json!({"ts": Utc::now().to_rfc3339(), "event": "linked_reload", "account": account_id, "trigger": trigger, "outcome": outcome, "expires_at": expires_at})));
+        self.enqueue(Command::Ledger(serde_json::json!({"ts": Utc::now().to_rfc3339(), "event": "linked_reload", "account": account_id, "trigger": trigger, "outcome": outcome, "expires_at": expires_at})));
     }
 
     pub fn capture(&self, headers: &HeaderMap, body: &[u8]) {
@@ -218,10 +240,16 @@ impl Observability {
         if let Some(capture) = &self.capture
             && let Some(value) = capture.shape(headers, body)
         {
-            let _ = self.tx.send(Command::Capture(value));
+            self.enqueue(Command::Capture(value));
         }
         #[cfg(not(all(feature = "shape-capture", debug_assertions)))]
         let _ = (headers, body);
+    }
+
+    fn enqueue(&self, command: Command) {
+        if self.tx.try_send(command).is_err() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub fn flush(&self) -> anyhow::Result<()> {
@@ -236,9 +264,28 @@ impl Observability {
 }
 impl Drop for Observability {
     fn drop(&mut self) {
-        let _ = self.tx.send(Command::Stop);
-        if let Some(worker) = self.worker.take() {
+        let Some(worker) = self.worker.take() else {
+            return;
+        };
+        let tx = self.tx.clone();
+        let cleanup = move || {
+            let _ = tx.send(Command::Stop);
             let _ = worker.join();
+        };
+        // 마지막 Arc가 요청 처리 중 해제되어도 런타임 스레드는 종료 배출을 기다리지 않는다.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            if thread::Builder::new()
+                .name("qb-observability-stop".into())
+                .spawn(cleanup)
+                .is_err()
+            {
+                // 송신자가 모두 해제되면 작성자는 남은 큐를 배출하고 종료한다.
+                tracing::warn!(
+                    "Observability cleanup thread unavailable; writer will drain on disconnect"
+                );
+            }
+        } else {
+            cleanup();
         }
     }
 }
@@ -382,12 +429,62 @@ fn snapshot(provider: Provider, h: &HeaderMap, now: DateTime<Utc>) -> Option<Sna
     })
 }
 
-fn run(home: PathBuf, mut state: QuotaState, rx: mpsc::Receiver<Command>) {
-    let mut error = None;
-    for command in rx {
+// 누락 수는 작성자가 집계하며 최대 분당 한 번만 경고한다.
+struct DropWarnings {
+    last: Instant,
+}
+impl DropWarnings {
+    fn report(&mut self, dropped: &AtomicU64, now: Instant) -> u64 {
+        if now.duration_since(self.last) < WARN_INTERVAL {
+            return 0;
+        }
+        let count = dropped.swap(0, Ordering::Relaxed);
+        if count != 0 {
+            tracing::warn!(dropped = count, "Observability queue dropped events");
+            self.last = now;
+        }
+        count
+    }
+}
+
+struct Writer {
+    home: PathBuf,
+    state: QuotaState,
+    quota_dirty: bool,
+    dirty_files: BTreeSet<PathBuf>,
+    last_sync: Instant,
+    last_prune: Instant,
+    error: bool,
+    #[cfg(test)]
+    sync_batches: usize,
+}
+impl Writer {
+    fn new(home: PathBuf, state: QuotaState) -> Self {
+        let now = Instant::now();
+        Self {
+            home,
+            state,
+            quota_dirty: false,
+            dirty_files: BTreeSet::new(),
+            last_sync: now,
+            last_prune: now,
+            error: false,
+            #[cfg(test)]
+            sync_batches: 0,
+        }
+    }
+    fn append(&mut self, path: PathBuf, value: &serde_json::Value) -> std::io::Result<()> {
+        let mut bytes = serde_json::to_vec(value)?;
+        bytes.push(b'\n');
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        // 부분 쓰기가 실패해도 해당 파일은 다음 배치에서 동기화한다.
+        self.dirty_files.insert(path);
+        file.write_all(&bytes)
+    }
+    fn event(&mut self, command: Command) {
         let result = match command {
             Command::Quota(id, mut next) => {
-                if let Some(old) = state.accounts.remove(&id) {
+                if let Some(old) = self.state.accounts.remove(&id) {
                     for mut window in old.windows {
                         if let Some(new) = next.windows.iter_mut().find(|w| w.name == window.name) {
                             new.used_pct = new.used_pct.or(window.used_pct);
@@ -406,50 +503,111 @@ fn run(home: PathBuf, mut state: QuotaState, rx: mpsc::Receiver<Command>) {
                     next.credits = next.credits.or(old.credits);
                     next.signals.merge(old.signals);
                 }
-                state.accounts.insert(id, *next);
-                serde_json::to_vec(&state)
-                    .map_err(std::io::Error::other)
-                    .and_then(|bytes| atomic_write(&home.join("state/quota.json"), &bytes))
+                self.state.accounts.insert(id, *next);
+                self.quota_dirty = true;
+                Ok(())
             }
-            Command::Ledger(value) => append(
-                &home
+            Command::Ledger(value) => self.append(
+                self.home
                     .join("ledger")
                     .join(format!("{}.jsonl", Utc::now().format("%Y-%m-%d"))),
                 &value,
-            )
-            .and_then(|_| {
-                retain(
-                    &home.join("ledger"),
-                    Utc::now().date_naive(),
-                    LEDGER_MAX_BYTES,
-                )
-            }),
+            ),
             #[cfg(all(feature = "shape-capture", debug_assertions))]
-            Command::Capture(value) => {
-                let path = value["destination"].as_str().map(PathBuf::from);
-                match path {
-                    Some(path) => append(&path, &value["shape"]),
-                    None => Ok(()),
-                }
-            }
-            Command::Flush(reply) => {
-                let _ = reply.send(error.clone().map_or(Ok(()), Err));
-                continue;
-            }
-            Command::Stop => break,
+            Command::Capture(value) => match value["destination"].as_str().map(PathBuf::from) {
+                Some(path) => self.append(path, &value["shape"]),
+                None => Ok(()),
+            },
+            Command::Flush(_) | Command::Stop => unreachable!(),
         };
         if result.is_err() {
-            error = Some("observability persistence failed".to_owned());
+            tracing::warn!("Observability write failed; later events will retry");
+            self.error = true;
+        }
+    }
+    fn persist(&mut self, now: Instant) {
+        if now.duration_since(self.last_prune) >= WARN_INTERVAL {
+            prune(&self.home.join("ledger"));
+            self.last_prune = now;
+        }
+        if now.duration_since(self.last_sync) < SYNC_INTERVAL {
+            return;
+        }
+        self.last_sync = now;
+        if !self.quota_dirty && self.dirty_files.is_empty() {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.sync_batches += 1;
+        }
+        if self.quota_dirty {
+            let result = serde_json::to_vec(&self.state)
+                .map_err(std::io::Error::other)
+                .and_then(|bytes| atomic_write(&self.home.join("state/quota.json"), &bytes));
+            if result.is_ok() {
+                self.quota_dirty = false;
+            } else {
+                tracing::warn!("Quota state write failed; next batch will retry");
+            }
+        }
+        self.dirty_files.retain(|path| {
+            let result = OpenOptions::new()
+                .write(true)
+                .open(path)
+                .and_then(|file| file.sync_data());
+            if result.is_err() {
+                tracing::warn!("Observability sync failed; next batch will retry");
+                true
+            } else {
+                false
+            }
+        });
+        // 실제 동기화가 오래 걸려도 완료 시점부터 다음 배치까지 간격을 지킨다.
+        self.last_sync = now.max(Instant::now());
+    }
+    fn flush(&mut self) -> Result<(), String> {
+        // 명시적 flush도 이전 배치로부터 1초를 지키고, 수락한 이벤트의 저장을 완료한다.
+        if self.quota_dirty || !self.dirty_files.is_empty() {
+            thread::sleep(SYNC_INTERVAL.saturating_sub(self.last_sync.elapsed()));
+            self.persist(Instant::now());
+        }
+        if std::mem::take(&mut self.error) || self.quota_dirty || !self.dirty_files.is_empty() {
+            Err("observability persistence failed".into())
+        } else {
+            Ok(())
         }
     }
 }
-fn append(path: &Path, value: &serde_json::Value) -> std::io::Result<()> {
-    let mut bytes = serde_json::to_vec(value)?;
-    bytes.push(b'\n');
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    file.write_all(&bytes)?;
-    file.sync_data()
+fn run(home: PathBuf, state: QuotaState, rx: mpsc::Receiver<Command>, dropped: Arc<AtomicU64>) {
+    let mut writer = Writer::new(home, state);
+    let mut warnings = DropWarnings {
+        last: Instant::now() - WARN_INTERVAL,
+    };
+    loop {
+        match rx.recv_timeout(SYNC_INTERVAL.saturating_sub(writer.last_sync.elapsed())) {
+            Ok(Command::Flush(reply)) => {
+                let _ = reply.send(writer.flush());
+            }
+            Ok(Command::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if writer.flush().is_err() {
+                    tracing::warn!("Observability shutdown flush failed");
+                }
+                break;
+            }
+            Ok(command) => writer.event(command),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        writer.persist(Instant::now());
+        warnings.report(&dropped, Instant::now());
+    }
 }
+fn prune(dir: &Path) {
+    if retain(dir, Utc::now().date_naive(), LEDGER_MAX_BYTES).is_err() {
+        tracing::warn!("Ledger retention failed; next prune will retry");
+    }
+}
+
 fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let temporary = path.with_extension(format!("{:032x}.tmp", rand::random::<u128>()));
     let result = (|| {
@@ -464,9 +622,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         {
             use std::os::windows::ffi::OsStrExt;
             use windows::{
-                Win32::Storage::FileSystem::{
-                    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-                },
+                Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MoveFileExW},
                 core::PCWSTR,
             };
             let src: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
@@ -475,7 +631,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
                 MoveFileExW(
                     PCWSTR(src.as_ptr()),
                     PCWSTR(dst.as_ptr()),
-                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                    MOVEFILE_REPLACE_EXISTING,
                 )
             }
             .map_err(std::io::Error::other)
@@ -765,34 +921,261 @@ mod tests {
         assert!(!text.contains("health"));
     }
 
+    #[derive(Clone, Default)]
+    struct TestLog(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl Write for TestLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    fn warnings(f: impl FnOnce()) -> String {
+        let log = TestLog::default();
+        let sink = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || sink.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = log.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+    fn quota_command(percent: &str) -> Command {
+        let mut h = HeaderMap::new();
+        h.insert("x-codex-primary-used-percent", percent.parse().unwrap());
+        Command::Quota(
+            "cx-synthetic".into(),
+            Box::new(snapshot(Provider::Codex, &h, Utc::now()).unwrap()),
+        )
+    }
+    fn writer(dir: &Path) -> Writer {
+        fs::create_dir_all(dir.join("state")).unwrap();
+        fs::create_dir_all(dir.join("ledger")).unwrap();
+        Writer::new(
+            dir.to_owned(),
+            QuotaState {
+                schema: 1,
+                ..Default::default()
+            },
+        )
+    }
+
     #[test]
-    fn bounded_queue_keeps_every_request_and_flush_reports_safe_errors() {
+    fn bounded_queue_drops_without_waiting_and_warns_once_per_minute() {
+        // 작성자가 멈춘 큐로 느린 디스크를 결정적으로 재현한다.
+        let (tx, rx) = mpsc::sync_channel(2);
+        let obs = Observability {
+            tx,
+            worker: None,
+            dropped: Arc::new(AtomicU64::new(0)),
+            #[cfg(all(feature = "shape-capture", debug_assertions))]
+            capture: None,
+        };
+        let start = Instant::now();
+        obs.record_request(record());
+        obs.record_request(record());
+        for _ in 0..600 {
+            obs.record_request(record());
+        }
+        obs.record_reload("cx-synthetic", "expiry", "unchanged", None);
+        let mut h = HeaderMap::new();
+        h.insert("x-codex-limit-reached", "true".parse().unwrap());
+        obs.observe_headers("cx-synthetic", Provider::Codex, &h);
+        assert!(start.elapsed() < StdDuration::from_secs(1));
+        assert_eq!(obs.dropped.load(Ordering::Relaxed), 602);
+        let mut reporter = DropWarnings {
+            last: start - WARN_INTERVAL,
+        };
+        let log = warnings(|| {
+            assert_eq!(reporter.report(&obs.dropped, start), 602);
+            obs.record_request(record());
+            assert_eq!(
+                reporter.report(
+                    &obs.dropped,
+                    start + WARN_INTERVAL - StdDuration::from_nanos(1)
+                ),
+                0
+            );
+            assert_eq!(obs.dropped.load(Ordering::Relaxed), 1);
+            assert_eq!(reporter.report(&obs.dropped, start + WARN_INTERVAL), 1);
+        });
+        assert_eq!(log.matches("Observability queue dropped events").count(), 2);
+        assert!(log.contains("dropped=602"));
+        assert!(log.contains("dropped=1"));
+        assert_eq!(rx.try_iter().count(), 2);
+        drop(rx);
+    }
+
+    #[test]
+    fn ledger_and_quota_sync_in_one_second_batches() {
+        let dir = directory();
+        let mut writer = writer(dir.path());
+        let start = writer.last_sync;
+        for i in 0..100 {
+            writer.event(Command::Ledger(json!({"req": i})));
+            writer.event(quota_command("10"));
+            writer.persist(start + StdDuration::from_millis(i));
+        }
+        assert_eq!(writer.sync_batches, 0);
+        assert!(!dir.path().join("state/quota.json").exists());
+        writer.persist(start + SYNC_INTERVAL);
+        assert_eq!(writer.sync_batches, 1);
+        assert!(!writer.quota_dirty);
+        assert!(writer.dirty_files.is_empty());
+        writer.event(quota_command("20"));
+        writer.event(Command::Ledger(json!({"req": 100})));
+        writer.persist(start + SYNC_INTERVAL + StdDuration::from_millis(999));
+        assert_eq!(writer.sync_batches, 1);
+        let state: Value =
+            serde_json::from_slice(&fs::read(dir.path().join("state/quota.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            state["accounts"]["cx-synthetic"]["windows"][0]["used_pct"],
+            10.0
+        );
+        writer.persist(start + SYNC_INTERVAL * 2);
+        assert_eq!(writer.sync_batches, 2);
+        let state: Value =
+            serde_json::from_slice(&fs::read(dir.path().join("state/quota.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            state["accounts"]["cx-synthetic"]["windows"][0]["used_pct"],
+            20.0
+        );
+        let ledger = dir
+            .path()
+            .join("ledger")
+            .join(format!("{}.jsonl", Utc::now().format("%Y-%m-%d")));
+        assert_eq!(fs::read_to_string(&ledger).unwrap().lines().count(), 101);
+    }
+
+    #[test]
+    fn flush_drains_accepted_events_and_respects_sync_interval() {
         let dir = directory();
         let obs = Observability::new(dir.path(), None).unwrap();
-        for i in 0..600 {
-            let mut record = record();
-            record.req = format!("request-{i}");
-            obs.record_request(record);
+        for _ in 0..100 {
+            obs.record_request(record());
         }
+        obs.observe_headers("cx-synthetic", Provider::Codex, &{
+            let mut h = HeaderMap::new();
+            h.insert("x-codex-limit-reached", "true".parse().unwrap());
+            h
+        });
+        assert_eq!(obs.dropped.load(Ordering::Relaxed), 0);
         obs.flush().unwrap();
-        let path = fs::read_dir(dir.path().join("ledger"))
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
-        let text = fs::read_to_string(path).unwrap();
-        assert_eq!(text.lines().count(), 600);
-        let ids: std::collections::BTreeSet<_> = text
-            .lines()
-            .map(|line| {
-                serde_json::from_str::<Value>(line).unwrap()["req"]
-                    .as_str()
-                    .unwrap()
-                    .to_owned()
-            })
-            .collect();
-        assert_eq!(ids.len(), 600);
+        let ledger = dir
+            .path()
+            .join("ledger")
+            .join(format!("{}.jsonl", Utc::now().format("%Y-%m-%d")));
+        assert_eq!(fs::read_to_string(&ledger).unwrap().lines().count(), 100);
+        assert!(dir.path().join("state/quota.json").exists());
+        obs.record_request(record());
+        let start = Instant::now();
+        obs.flush().unwrap();
+        assert!(start.elapsed() >= StdDuration::from_millis(900));
+        assert_eq!(fs::read_to_string(&ledger).unwrap().lines().count(), 101);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_drop_never_waits_for_full_queue_and_still_stops_writer() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let worker = thread::spawn(move || {
+            // 회귀 시에도 테스트가 영원히 정지하지 않도록 대기 시간을 제한한다.
+            let _ = resume_rx.recv_timeout(StdDuration::from_secs(2));
+            let mut drained = 0;
+            for command in rx {
+                match command {
+                    Command::Stop => break,
+                    Command::Ledger(_) => drained += 1,
+                    _ => panic!("unexpected command"),
+                }
+            }
+            let _ = done_tx.send(drained);
+        });
+        let obs = Observability {
+            tx,
+            worker: Some(worker),
+            dropped: Arc::new(AtomicU64::new(0)),
+            #[cfg(all(feature = "shape-capture", debug_assertions))]
+            capture: None,
+        };
+        obs.record_request(record());
+        let start = Instant::now();
+        drop(obs);
+        assert!(start.elapsed() < StdDuration::from_millis(250));
+        tokio::time::sleep(StdDuration::from_millis(10)).await;
+        resume_tx.send(()).unwrap();
+        assert_eq!(
+            tokio::time::timeout(StdDuration::from_secs(3), done_rx)
+                .await
+                .unwrap()
+                .unwrap(),
+            1
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn transient_sync_and_quota_errors_retry_in_next_batch_without_sticky_failure() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = directory();
+        let mut writer = writer(dir.path());
+        let start = writer.last_sync;
+        writer.event(Command::Ledger(json!({"req": "synthetic"})));
+        writer.event(quota_command("42"));
+        let ledger = writer.dirty_files.iter().next().unwrap().clone();
+        let lock = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&ledger)
+            .unwrap();
+        fs::create_dir(dir.path().join("state/quota.json")).unwrap();
+        let log = warnings(|| writer.persist(start + SYNC_INTERVAL));
+        assert!(log.contains("Quota state write failed; next batch will retry"));
+        assert!(log.contains("Observability sync failed; next batch will retry"));
+        assert!(writer.quota_dirty);
+        assert!(writer.dirty_files.contains(&ledger));
+        drop(lock);
+        fs::remove_dir(dir.path().join("state/quota.json")).unwrap();
+        writer.persist(start + SYNC_INTERVAL * 2);
+        assert!(!writer.quota_dirty);
+        assert!(writer.dirty_files.is_empty());
+        writer.flush().unwrap();
+        let state: Value =
+            serde_json::from_slice(&fs::read(dir.path().join("state/quota.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            state["accounts"]["cx-synthetic"]["windows"][0]["used_pct"],
+            42.0
+        );
+        assert_eq!(fs::read_to_string(ledger).unwrap().lines().count(), 1);
+    }
+
+    #[test]
+    fn transient_ledger_and_quota_errors_recover_after_flush() {
+        let dir = directory();
+        let obs = Observability::new(dir.path(), None).unwrap();
+        let ledger = dir
+            .path()
+            .join("ledger")
+            .join(format!("{}.jsonl", Utc::now().format("%Y-%m-%d")));
+        fs::create_dir(&ledger).unwrap();
+        obs.record_request(record());
+        assert_eq!(
+            obs.flush().unwrap_err().to_string(),
+            "observability persistence failed"
+        );
+        fs::remove_dir(&ledger).unwrap();
+        obs.record_request(record());
+        obs.flush().unwrap();
+        assert_eq!(fs::read_to_string(&ledger).unwrap().lines().count(), 1);
         fs::create_dir(dir.path().join("state/quota.json")).unwrap();
         let mut h = HeaderMap::new();
         h.insert("x-codex-limit-reached", "true".parse().unwrap());
@@ -801,24 +1184,87 @@ mod tests {
             obs.flush().unwrap_err().to_string(),
             "observability persistence failed"
         );
+        fs::remove_dir(dir.path().join("state/quota.json")).unwrap();
+        // 새 quota 이벤트가 없어도 이전의 최신 상태를 다시 저장한다.
+        obs.flush().unwrap();
+        let value: Value =
+            serde_json::from_slice(&fs::read(dir.path().join("state/quota.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            value["accounts"]["cx-synthetic"]["signals"]["limit_reached"],
+            true
+        );
+        obs.flush().unwrap();
     }
 
     #[test]
-    fn invalid_state_refuses_start_and_errors_are_sanitized() {
+    fn corrupt_and_unsupported_quota_are_renamed_warned_and_start_empty() {
+        for contents in ["fake-access-marker", r#"{"schema":2,"accounts":{}}"#] {
+            let dir = directory();
+            fs::create_dir(dir.path().join("state")).unwrap();
+            fs::write(dir.path().join("state/quota.json"), contents).unwrap();
+            let log = warnings(|| {
+                let obs = Observability::new(dir.path(), None).unwrap();
+                assert!(!dir.path().join("state/quota.json").exists());
+                let files: Vec<_> = fs::read_dir(dir.path().join("state"))
+                    .unwrap()
+                    .map(|e| e.unwrap().path())
+                    .collect();
+                assert_eq!(files.len(), 1);
+                assert!(
+                    files[0]
+                        .file_name()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .starts_with("quota.json.corrupt-")
+                );
+                assert_eq!(fs::read_to_string(&files[0]).unwrap(), contents);
+                let mut h = HeaderMap::new();
+                h.insert("x-codex-limit-reached", "true".parse().unwrap());
+                obs.observe_headers("cx-new", Provider::Codex, &h);
+                obs.flush().unwrap();
+                let value: Value =
+                    serde_json::from_slice(&fs::read(dir.path().join("state/quota.json")).unwrap())
+                        .unwrap();
+                assert_eq!(value["schema"], 1);
+                assert_eq!(value["accounts"].as_object().unwrap().len(), 1);
+            });
+            assert!(log.contains("Corrupt quota state renamed; starting empty"));
+            assert!(!log.contains("fake-access-marker"));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn locked_expired_ledger_warns_starts_and_retries_next_prune() {
+        use std::os::windows::fs::OpenOptionsExt;
         let dir = directory();
-        fs::create_dir(dir.path().join("state")).unwrap();
-        fs::write(dir.path().join("state/quota.json"), "fake-access-marker").unwrap();
-        let error = Observability::new(dir.path(), None)
-            .err()
-            .unwrap()
-            .to_string();
-        assert_eq!(error, "invalid quota state");
-        fs::write(
-            dir.path().join("state/quota.json"),
-            serde_json::to_vec(&json!({"schema": 2, "accounts": {}})).unwrap(),
-        )
-        .unwrap();
-        assert!(Observability::new(dir.path(), None).is_err());
+        fs::create_dir(dir.path().join("ledger")).unwrap();
+        let expired = dir.path().join("ledger/2000-01-01.jsonl");
+        fs::write(&expired, "synthetic").unwrap();
+        let lock = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&expired)
+            .unwrap();
+        let log = warnings(|| {
+            let obs = Observability::new(dir.path(), None).unwrap();
+            obs.record_request(record());
+            obs.flush().unwrap();
+        });
+        assert!(log.contains("Ledger retention failed; next prune will retry"));
+        assert!(expired.exists());
+        let mut writer = writer(dir.path());
+        let start = writer.last_prune;
+        let log = warnings(|| writer.persist(start + WARN_INTERVAL));
+        assert!(log.contains("Ledger retention failed"));
+        drop(lock);
+        writer.persist(start + WARN_INTERVAL + StdDuration::from_secs(59));
+        assert!(expired.exists());
+        writer.persist(start + WARN_INTERVAL * 2);
+        assert!(!expired.exists());
+        assert!(!writer.error);
     }
 
     #[test]

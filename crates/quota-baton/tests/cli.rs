@@ -33,9 +33,9 @@ fn help_is_available() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("serve"));
 }
 
-#[test]
-fn startup_refuses_invalid_state_before_listening() {
-    let _serial = SERVE_SERIAL.blocking_lock();
+#[tokio::test]
+async fn startup_recovers_corrupt_quota_and_listens() {
+    let _serial = SERVE_SERIAL.lock().await;
     let home = fixture();
     std::fs::create_dir_all(home.path().join("state")).unwrap();
     std::fs::write(
@@ -43,9 +43,71 @@ fn startup_refuses_invalid_state_before_listening() {
         "invalid synthetic state",
     )
     .unwrap();
-    let output = command(home.path()).arg("serve").output().unwrap();
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("quota"));
+    let data = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let admin = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let data_port = data.local_addr().unwrap().port();
+    let admin_port = admin.local_addr().unwrap().port();
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!("[server]\ndata_port = {data_port}\nadmin_port = {admin_port}\n"),
+    )
+    .unwrap();
+    drop((data, admin));
+    // 경고 출력도 프로젝트 안의 가짜 홈에서만 보관한다.
+    let stderr_path = home.path().join("serve.stderr");
+    let stderr = std::fs::File::create(&stderr_path).unwrap();
+    let mut core = Core(
+        command(home.path())
+            .arg("serve")
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr))
+            .spawn()
+            .unwrap(),
+    );
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(1))
+        .build()
+        .unwrap();
+    let mut ready = false;
+    for _ in 0..100 {
+        let token = std::fs::read_to_string(home.path().join("admin.token")).unwrap_or_default();
+        if client
+            .get(format!("http://127.0.0.1:{admin_port}/admin/v1/health"))
+            .bearer_auth(token.trim())
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success())
+        {
+            ready = true;
+            break;
+        }
+        if let Some(status) = core.0.try_wait().unwrap() {
+            panic!("serve exited: {status}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(ready, "core did not start");
+    assert!(core.0.try_wait().unwrap().is_none());
+    let backups: Vec<_> = std::fs::read_dir(home.path().join("state"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("quota.json.corrupt-")
+        })
+        .collect();
+    assert_eq!(backups.len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(&backups[0]).unwrap(),
+        "invalid synthetic state"
+    );
+    assert!(!home.path().join("state/quota.json").exists());
+    let stderr = std::fs::read_to_string(stderr_path).unwrap();
+    assert!(stderr.contains("Corrupt quota state renamed; starting empty"));
+    assert!(!stderr.contains("invalid synthetic state"));
 }
 
 #[cfg(not(feature = "shape-capture"))]

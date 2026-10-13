@@ -115,7 +115,8 @@ async fn run() -> anyhow::Result<()> {
             println!("프록시를 시작했습니다.");
             tokio::signal::ctrl_c().await?;
             drop(servers);
-            observability.flush()?;
+            // 종료 시 디스크 flush와 작성자 정리도 런타임 스레드를 막지 않는다.
+            tokio::task::spawn_blocking(move || observability.flush()).await??;
         }
         Command::Status => {
             let config = qb_core::config::Config::load(&home)?;
