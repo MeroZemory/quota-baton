@@ -1335,7 +1335,9 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
     drop(retained.take());
     completion.record.status = status.as_u16();
     completion.record.ttfb_ms = completion.elapsed_ms();
-    let success_outcome = if decision == CommitDecision::FirstError {
+    let success_outcome = if rate_relayed {
+        "rate_hold_relayed_429"
+    } else if decision == CommitDecision::FirstError {
         "first_event_error"
     } else if rate_retries > 0 && status.is_success() {
         "rate_hold_ok"

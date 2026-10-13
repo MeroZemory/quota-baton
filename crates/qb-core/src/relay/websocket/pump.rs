@@ -6,7 +6,11 @@ use std::{
 };
 
 use axum::http::{HeaderMap, Method};
-use futures_util::{Sink, SinkExt, StreamExt, future::BoxFuture, stream::SplitSink};
+use futures_util::{
+    Sink, SinkExt, StreamExt,
+    future::BoxFuture,
+    stream::{SplitSink, SplitStream},
+};
 use serde_json::Value;
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::{
@@ -43,6 +47,7 @@ pub(super) struct Context {
     pub account: String,
     pub session: Session,
     pub headers: HeaderMap,
+    pub upstream_url: String,
     pub idle_close: Duration,
     pub close_after_response: bool,
     pub capture_ticket: Option<PathBuf>,
@@ -382,11 +387,28 @@ fn ws_rate_advice(event: &Value) -> bool {
         })
 }
 
+fn has_previous_response_id(message: &Message) -> bool {
+    let Message::Text(text) = message else {
+        return false;
+    };
+    if text.len() <= PARSE_LIMIT {
+        return parsed(text)
+            .and_then(|value| value.get("previous_response_id").cloned())
+            .is_some_and(|value| !value.is_null());
+    }
+    text[..text.len().min(PARSE_LIMIT)].contains("\"previous_response_id\"")
+}
+
 struct Delivered {
     bytes: usize,
     request: Option<u64>,
     terminal: Option<&'static str>,
     completed: bool,
+}
+
+struct PendingRateResend {
+    request: u64,
+    message: Message,
 }
 
 type Write<S> = BoxFuture<'static, (S, bool, Delivered)>;
@@ -460,6 +482,33 @@ where
     })
 }
 
+async fn redial_rate(
+    context: &Context,
+    pending: PendingRateResend,
+    upstream_read: &mut SplitStream<UpstreamSocket>,
+    budget: Arc<InflightBudget>,
+) -> Result<Write<SplitSink<UpstreamSocket, Message>>, ()> {
+    if let Some(runtime) = &context.runtime {
+        let _admission = runtime.admit(&context.account).await;
+    }
+    let socket = super::redial_same_account(context).await?;
+    let (sink, read) = socket.split();
+    *upstream_read = read;
+    let bytes = pending.message.len();
+    let reservation = budget.reserve_message(bytes);
+    Ok(write(
+        sink,
+        pending.message,
+        reservation,
+        Delivered {
+            bytes,
+            request: Some(pending.request),
+            terminal: None,
+            completed: false,
+        },
+    ))
+}
+
 pub(super) async fn run(client: ClientSocket, upstream: UpstreamSocket, context: Context) {
     run_with_read_timeout(client, upstream, context, UPSTREAM_READ_TIMEOUT).await;
 }
@@ -476,6 +525,7 @@ async fn run_with_read_timeout(
     let mut upstream_sink = Some(upstream_sink);
     let mut to_client: Option<Write<SplitSink<ClientSocket, Message>>> = None;
     let mut to_upstream: Option<Write<SplitSink<UpstreamSocket, Message>>> = None;
+    let mut pending_rate_redial: Option<PendingRateResend> = None;
     let mut current = BTreeMap::<u64, CurrentCompletion>::new();
     let mut next_request = 0;
     let mut model: Option<String> = None;
@@ -552,7 +602,20 @@ async fn run_with_read_timeout(
                 upstream_sink = Some(sink);
                 to_upstream = None;
                 if success { last_activity = Instant::now(); }
-                if !success && ending.is_none() {
+                if success {
+                    pending_rate_redial = None;
+                } else if ending.is_none()
+                    && let Some(pending) = pending_rate_redial.take()
+                    && !has_previous_response_id(&pending.message)
+                {
+                    match redial_rate(&context, pending, &mut upstream_read, context.budget.clone()).await {
+                        Ok(write) => to_upstream = Some(write),
+                        Err(()) => {
+                            ending = Some((None, "upstream_write_error"));
+                            end_deadline = Instant::now() + CLOSE_TIMEOUT;
+                        }
+                    }
+                } else if !success && ending.is_none() {
                     for active in current.values_mut() { active.completion.record.outcome = "upstream_error".into(); }
                     ending = Some((None, "upstream_write_error"));
                     end_deadline = Instant::now() + CLOSE_TIMEOUT;
@@ -666,6 +729,10 @@ async fn run_with_read_timeout(
                                     if let Some(message) = resend
                                         && let Some(sink) = upstream_sink.take()
                                     {
+                                        pending_rate_redial = Some(PendingRateResend {
+                                            request: request.expect("active rate request"),
+                                            message: message.clone(),
+                                        });
                                         let runtime = context.runtime.clone();
                                         let account = context.account.clone();
                                         let budget = context.budget.clone();
@@ -699,6 +766,26 @@ async fn run_with_read_timeout(
                         if suppress_rate_event {
                             continue;
                         }
+                        if let Message::Close(frame) = &message
+                            && let Some(pending) = pending_rate_redial.take()
+                        {
+                            to_upstream = None;
+                            if !has_previous_response_id(&pending.message)
+                                && let Ok(write) = redial_rate(
+                                    &context,
+                                    pending,
+                                    &mut upstream_read,
+                                    context.budget.clone(),
+                                )
+                                .await
+                            {
+                                to_upstream = Some(write);
+                                continue;
+                            }
+                            ending = Some((frame.clone(), "upstream_close"));
+                            end_deadline = Instant::now() + CLOSE_TIMEOUT;
+                            continue;
+                        }
                         let terminal = request.and_then(|id| current.get_mut(&id)).and_then(|active| active.upstream(event.as_ref()));
                         terminal_pending = terminal.is_some();
                         let completed = event.as_ref().is_some_and(|event| event["type"] == "response.completed");
@@ -709,6 +796,22 @@ async fn run_with_read_timeout(
                         to_client = Some(write(client_sink.take().unwrap(), message, context.budget.reserve_message(bytes), Delivered { bytes, request, terminal, completed }));
                     }
                     _ => {
+                        if let Some(pending) = pending_rate_redial.take()
+                            && !has_previous_response_id(&pending.message)
+                        {
+                            to_upstream = None;
+                            if let Ok(write) = redial_rate(
+                                &context,
+                                pending,
+                                &mut upstream_read,
+                                context.budget.clone(),
+                            )
+                            .await
+                            {
+                                to_upstream = Some(write);
+                                continue;
+                            }
+                        }
                         for active in current.values_mut() { active.completion.record.outcome = "upstream_error".into(); }
                         ending = Some((None, "upstream_eof")); end_deadline = Instant::now() + CLOSE_TIMEOUT;
                     }

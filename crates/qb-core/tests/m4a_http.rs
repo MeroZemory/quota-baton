@@ -12,7 +12,12 @@ use qb_core::{
 };
 use qb_testkit::{ScriptedResponse, ScriptedUpstream};
 use serde_json::{Value, json};
-use std::{fs, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    fs,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 struct Harness {
@@ -132,6 +137,24 @@ impl Harness {
             .await
             .unwrap()
     }
+    async fn send_with_session(&self, provider: Provider, session: &str) -> reqwest::Response {
+        reqwest::Client::new()
+            .post(format!(
+                "http://{}{}",
+                self.servers.data_addr,
+                if provider == Provider::Codex {
+                    "/v1/responses"
+                } else {
+                    "/v1/messages"
+                }
+            ))
+            .bearer_auth("synthetic-client")
+            .header("x-claude-code-session-id", session)
+            .body("{}")
+            .send()
+            .await
+            .unwrap()
+    }
     fn ids(&self) -> Vec<String> {
         self.store
             .list()
@@ -240,6 +263,209 @@ async fn c6_row_3_rate_limit_retries_in_place_without_failover() {
         .find(|row| row["rate_retries"] == 1)
         .expect("in-place retry is ledgered");
     assert_eq!(row["outcome"], "rate_hold_ok");
+}
+
+#[tokio::test]
+async fn c6_3_http_rate_429_retries_in_place_same_account() {
+    let h = Harness::new(Provider::Claude, 2, 384, 1024).await;
+    let mut limited = ScriptedResponse::json(
+        StatusCode::TOO_MANY_REQUESTS,
+        "{\"error\":{\"type\":\"rate_limit_error\"}}",
+    );
+    limited.headers.insert("retry-after", "1".parse().unwrap());
+    h.fake.state.push(limited);
+    h.fake.state.push(ok());
+    let response = h.send(Provider::Claude, "{}").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(h.fake.state.requests().len(), 2);
+    let row = h
+        .ledger()
+        .into_iter()
+        .find(|row| row["rate_retries"] == 1)
+        .unwrap();
+    assert_eq!(row["outcome"], "rate_hold_ok");
+}
+
+#[tokio::test]
+async fn c6_3_http_rate_429_budget_exhausted_relays_with_retry_after() {
+    let h = Harness::new(Provider::Claude, 2, 384, 1024).await;
+    for _ in 0..4 {
+        let mut limited = ScriptedResponse::json(
+            StatusCode::TOO_MANY_REQUESTS,
+            "{\"error\":{\"type\":\"rate_limit_error\"}}",
+        );
+        limited.headers.insert("retry-after", "1".parse().unwrap());
+        h.fake.state.push(limited);
+    }
+    let response = h.send(Provider::Claude, "{}").await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry_after = response.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert!((1..=60).contains(&retry_after));
+    assert_eq!(h.fake.state.requests().len(), 4);
+    assert!(
+        h.ledger()
+            .iter()
+            .any(|row| row["outcome"] == "rate_hold_relayed_429")
+    );
+}
+
+#[tokio::test]
+async fn c6_3_http_rate_429_no_failover_even_with_long_retry_after() {
+    let h = Harness::new(Provider::Claude, 2, 0, 1024).await;
+    for value in [61_u64, 3600] {
+        let mut limited = ScriptedResponse::json(
+            StatusCode::TOO_MANY_REQUESTS,
+            "{\"error\":{\"type\":\"rate_limit_error\"}}",
+        );
+        limited
+            .headers
+            .insert("retry-after", value.to_string().parse().unwrap());
+        h.fake.state.push(limited);
+        let response = h.send(Provider::Claude, "{}").await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+    assert_eq!(h.fake.state.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn c6_3_pacing_step_grows_under_concurrent_success() {
+    let h = Harness::new(Provider::Claude, 1, 384, 1024).await;
+    let id = h.ids()[0].clone();
+    let start = Instant::now();
+    h.state
+        .accounts
+        .observe_429_at(&id, start, start, None, 1.0);
+    assert_eq!(h.state.accounts.pacing_snapshot(&id).rate_step, 1);
+    h.fake.state.push(ok());
+    assert_eq!(
+        h.send(Provider::Claude, "{}").await.status(),
+        StatusCode::OK
+    );
+    let second = start + Duration::from_secs(3);
+    h.state
+        .accounts
+        .observe_429_at(&id, second, second, None, 1.0);
+    assert_eq!(h.state.accounts.pacing_snapshot(&id).rate_step, 2);
+}
+
+#[tokio::test]
+async fn c6_3_release_interval_adapts_after_429_window() {
+    let h = Harness::new(Provider::Claude, 1, 384, 1024).await;
+    let id = h.ids()[0].clone();
+    let start = Instant::now();
+    h.state
+        .accounts
+        .observe_429_at(&id, start, start, None, 1.0);
+    let first = h.state.accounts.pacing_snapshot(&id).rate_release_interval;
+    let second = start + Duration::from_secs(3);
+    h.state
+        .accounts
+        .observe_429_at(&id, second, second, None, 1.0);
+    let doubled = h.state.accounts.pacing_snapshot(&id).rate_release_interval;
+    assert_eq!(doubled, first * 2);
+    let mut now = second;
+    for _ in 0..8 {
+        now += Duration::from_secs(3);
+        h.state.accounts.observe_429_at(&id, now, now, None, 1.0);
+    }
+    assert!(h.state.accounts.pacing_snapshot(&id).rate_release_interval <= Duration::from_secs(5));
+    let quiet = now + Duration::from_secs(61);
+    let snapshot = h.state.accounts.pacing_snapshot_at(&id, quiet);
+    assert!(snapshot.rate_release_interval >= Duration::from_millis(250));
+}
+
+#[tokio::test]
+async fn c6_3_admission_wait_exhausted_sends_once() {
+    let h = Harness::new(Provider::Claude, 1, 0, 1024).await;
+    let id = h.ids()[0].clone();
+    h.state.accounts.set_rate_hold_secs(1);
+    h.state
+        .accounts
+        .observe_429(&id, Some(Duration::from_secs(60)));
+    h.fake.state.push(ok());
+    let response = h.send(Provider::Claude, "{}").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(h.fake.state.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn c6_3_placement_skips_pacing_account_but_binding_stays() {
+    let h = Harness::new(Provider::Claude, 2, 0, 1024).await;
+    let id = h.ids()[0].clone();
+    h.state
+        .accounts
+        .observe_429(&id, Some(Duration::from_secs(60)));
+    assert!(
+        h.state
+            .accounts
+            .pacing_snapshot(&id)
+            .rate_backoff_until
+            .is_some()
+    );
+    let h2 = h.state.accounts.pacing_snapshot(&h.ids()[1]);
+    assert!(h2.rate_backoff_until.is_none());
+}
+
+#[tokio::test]
+async fn c6_3_retained_copy_budget_exhausted_falls_back_to_relay() {
+    let h = Harness::new(Provider::Claude, 1, 0, 1024).await;
+    let mut limited = ScriptedResponse::json(
+        StatusCode::TOO_MANY_REQUESTS,
+        "{\"error\":{\"type\":\"rate_limit_error\"}}",
+    );
+    limited.headers.insert("retry-after", "1".parse().unwrap());
+    h.fake.state.push(limited);
+    let response = h.send(Provider::Claude, "{}").await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(h.fake.state.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn c6_3_storm_simulation() {
+    let h = Harness::new(Provider::Claude, 2, 384, 1024).await;
+    // The first window's limiter emits one 429. The following synthetic
+    // window is clear; all 16 turns use the same warm session binding.
+    let mut limited = ScriptedResponse::json(
+        StatusCode::TOO_MANY_REQUESTS,
+        "{\"error\":{\"type\":\"rate_limit_error\"}}",
+    );
+    limited.headers.insert("retry-after", "1".parse().unwrap());
+    h.fake.state.push(limited);
+    for _ in 0..16 {
+        h.fake.state.push(ok());
+    }
+    let responses = futures_util::future::join_all(
+        (0..16).map(|_| h.send_with_session(Provider::Claude, "storm-session")),
+    )
+    .await;
+    assert!(
+        responses
+            .iter()
+            .all(|response| response.status() == StatusCode::OK)
+    );
+    let accounts: std::collections::BTreeSet<_> = responses
+        .iter()
+        .map(|response| {
+            response.headers()["x-quota-baton-account"]
+                .to_str()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(
+        accounts.len(),
+        1,
+        "rate limiting must not rebind warm sessions"
+    );
+    assert_eq!(
+        h.fake.state.requests().len(),
+        17,
+        "one 429 is absorbed by one retry"
+    );
+    assert!(h.ledger().iter().all(|row| row["status"] != 429));
 }
 #[tokio::test]
 async fn c6_row_4_linked_revocation_cools_link_stale_and_fails_over() {

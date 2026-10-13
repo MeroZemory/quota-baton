@@ -341,6 +341,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn c6_3_classification() {
+        for code in ["rate_limit_exceeded", "slow_down"] {
+            let body = serde_json::json!({"error":{"code":code}}).to_string();
+            assert_eq!(
+                classify(
+                    Provider::Codex,
+                    StatusCode::BAD_REQUEST,
+                    &HeaderMap::new(),
+                    body.as_bytes(),
+                    None
+                )
+                .kind,
+                Kind::Rate
+            );
+        }
+        let claude = br#"{"error":{"type":"rate_limit_error"}}"#;
+        assert_eq!(
+            classify(
+                Provider::Claude,
+                StatusCode::TOO_MANY_REQUESTS,
+                &HeaderMap::new(),
+                claude,
+                None
+            )
+            .kind,
+            Kind::Rate
+        );
+        let mut quota_headers = HeaderMap::new();
+        quota_headers.insert("x-codex-limit-reached", "true".parse().unwrap());
+        let quota = br#"{"error":{"type":"rate_limit_error"}}"#;
+        assert_eq!(
+            classify(
+                Provider::Codex,
+                StatusCode::TOO_MANY_REQUESTS,
+                &quota_headers,
+                quota,
+                None
+            )
+            .kind,
+            Kind::Quota
+        );
+    }
+
+    #[test]
     fn codex_usage_limit_is_not_rate_for_complete_64k_body() {
         let mut body =
             serde_json::json!({"error":{"type":"usage_limit_reached","padding":""}}).to_string();
