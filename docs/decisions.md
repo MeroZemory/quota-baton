@@ -189,3 +189,26 @@ Before the next login, check that the same account still works in CPA. This guar
 
 Before M5's credit hold exists, the Phase 0 credit guard applies (architecture §16.1): no tests at 80 % or more of any window, and stop at 95 %.
 
+<a id="d14"></a>
+## D14. Rate limits and role separation — Accepted (user direction "separate each side's role exactly", 2026-10-14)
+
+**Background.** On the night of 2026-10-14, about 16 Codex mains and their sub-agents shared two ChatGPT Plus accounts through the previous proxy. Many sessions stopped with "exceeded retry limit, last status: 429" and stayed stopped for hours. The root cause is in `<audit>/codex-429-recovery-2026-10-14/원인보고서.md`:
+- **Capacity.** Upstream request-rate limits started at 60–72 requests per minute.
+- **Fail-fast proxy.** The previous proxy answered 429 within 73 ms during a 0–4 s cooldown.
+- **Re-binding cascade.** Sessions moved to the other account and re-sent 150–350k uncached tokens each, which pushed that account over its limit too.
+- **Retry burn.** Codex spent its 5 retries within seconds and left `/goal` stalled with no automatic resume.
+
+**Decision. Each layer owns one thing.**
+
+| Layer | Owns | Never does |
+|---|---|---|
+| quota-baton (proxy) | Account problems: failover for quota, auth and permission; absorbing short rate limits on the same account (rate hold and pacing, contract C6.3); precise native errors with `retry-after` | Moving warm sessions because of a rate limit; deciding how many sessions run |
+| Client (Codex CLI, Claude Code) | Its own in-turn retries, unchanged | — |
+| Orchestrator (an agent orchestrator, or `/goal` supervision) | How many sessions run per account, and when a stopped session resumes: back off with jitter, resume in the same session (a fork loses the cache), never resume everything at once | Choosing accounts (D4) |
+
+**Assignment of the 429 report's proposals:**
+- **A (soft-pin on rate limits)** and **F (`retry-after`):** quota-baton, in C6.3.
+- **B (admission control):** quota-baton, in its simple form, which is per-account pacing in C6.3. Token buckets on uncached input are not adopted, because the upstream limits are not published and a guessed bucket would either throttle needlessly or not protect at all.
+- **C (active-session cap with rotation)** and **D (stall watcher with same-session resume):** the orchestrator.
+- **E (account health signals):** quota-baton already covers this with the tray badge, the ledger of every health and user-state change, and its own usage polling (C9). The 401s from the quota-watch script belong to the old setup.
+
