@@ -69,6 +69,17 @@ impl Account {
             }
     }
 
+    /// Expire before reading health for a transition, retaining auth probe history.
+    pub(crate) fn expire_health(&mut self, now: DateTime<Utc>) -> bool {
+        let expired_auth = matches!(self.health, Health::Cooling { reason: HealthReason::Auth, until, .. } if until <= now);
+        if !self.health.expire(now) {
+            return false;
+        }
+        self.auth_probe_pending |= expired_auth;
+        self.quota_cooling = None;
+        true
+    }
+
     /// Returns whether health or persisted auth backoff changed. User state is
     /// independent and is never modified by an upstream signal.
     pub fn apply_health_signal(&mut self, signal: HealthSignal, now: DateTime<Utc>) -> bool {
@@ -78,6 +89,7 @@ impl Account {
             self.auth_probe_pending,
             self.quota_cooling.clone(),
         );
+        self.expire_health(now);
         match signal {
             HealthSignal::TerminalRefresh { reason } | HealthSignal::Revoked { reason } => {
                 self.health = Health::NeedsRelogin { reason, since: now };
@@ -157,7 +169,9 @@ impl Account {
             )
     }
 
-    /// Duration and scope merge independently; neither dimension may weaken.
+    /// Duration and account scope merge independently; account scope never narrows.
+    /// The record holds one model scope: a later deadline replaces another model's
+    /// scope (C5 permits this); equal or shorter deadlines retain the old model.
     fn cool(&mut self, reason: HealthReason, until: DateTime<Utc>, scope: String) -> bool {
         if matches!(self.health, Health::NeedsRelogin { .. }) {
             return false;
@@ -208,7 +222,7 @@ impl Account {
         &mut self,
         snapshot: &serde_json::Value,
         model: Option<&str>,
-        allowance: f64,
+        _allowance: f64,
         now: DateTime<Utc>,
     ) {
         use serde_json::Value;
@@ -254,7 +268,8 @@ impl Account {
         let qualifies = |w: &Value| {
             w["used_pct"]
                 .as_f64()
-                .is_some_and(|p| p >= 100.0 || (credits && p + allowance >= 99.0))
+                // C7 projections guide placement; only observed usage cools.
+                .is_some_and(|p| p >= 100.0 || (credits && p >= 99.0))
                 || w["status"] == "rejected"
                 || ((global || serving) && active_matches(w))
         };
@@ -337,4 +352,148 @@ fn timestamp(value: &serde_json::Value) -> Option<DateTime<Utc>> {
         .as_str()
         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
         .map(|t| t.with_timezone(&Utc))
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    pub(crate) fn fixture() -> Account {
+        let identity = super::super::Identity::Codex {
+            account_id: "synthetic-hardening".into(),
+            email: "hardening@example.invalid".into(),
+        };
+        Account {
+            schema: 1,
+            id: identity.id(),
+            provider: Provider::Codex,
+            label: "fixture".into(),
+            email: "hardening@example.invalid".into(),
+            plan: None,
+            identity,
+            source: super::super::Source::Oauth,
+            user_state: UserState::Active,
+            health: Health::Ready,
+            auth_failures: 0,
+            auth_probe_pending: false,
+            quota_cooling: None,
+            drain: false,
+            allow_credits: false,
+            generation: 0,
+            token_meta: super::super::TokenMeta::default(),
+        }
+    }
+
+    #[test]
+    fn placement_projection_never_creates_credit_cooling() {
+        let now = Utc::now();
+        let mut account = fixture();
+        let snapshot = serde_json::json!({"windows":[{
+            "name":"5h", "used_pct":98.0, "reset_at":now + Duration::hours(1),
+            "observed_at":now
+        }]});
+        account.apply_health_signal(
+            HealthSignal::UsageSnapshot {
+                snapshot,
+                model: None,
+                projected_allowance: 50.0,
+            },
+            now,
+        );
+        assert_eq!(account.health, Health::Ready);
+        assert_eq!(account.quota_cooling, None);
+    }
+
+    #[test]
+    fn r1_expired_account_cooling_does_not_widen_model_transition() {
+        let now = Utc::now();
+        for reason in [HealthReason::Rate, HealthReason::Auth, HealthReason::Quota] {
+            let mut account = fixture();
+            account.health = Health::Cooling {
+                reason,
+                until: now,
+                scope: "account".into(),
+            };
+            account.quota_cooling = Some(QuotaCooling {
+                window: "5h".into(),
+                reset_at: now,
+                started_at: now - Duration::hours(1),
+            });
+            account.auth_failures = 2;
+            assert!(account.apply_health_signal(
+                HealthSignal::Cooling {
+                    reason: HealthReason::Permission,
+                    until: now + Duration::hours(1),
+                    scope: "model:X".into()
+                },
+                now
+            ));
+            assert!(matches!(account.health, Health::Cooling { scope, .. } if scope == "model:X"));
+            assert_eq!(account.quota_cooling, None);
+            assert_eq!(account.auth_failures, 2);
+            assert_eq!(account.auth_probe_pending, reason == HealthReason::Auth);
+        }
+    }
+
+    #[test]
+    fn r1_expiry_applies_to_no_change_and_auth_transitions() {
+        let now = Utc::now();
+        let mut account = fixture();
+        account.health = Health::Cooling {
+            reason: HealthReason::Auth,
+            until: now,
+            scope: "account".into(),
+        };
+        account.auth_failures = 2;
+        assert!(account.apply_health_signal(HealthSignal::NoChange, now));
+        assert_eq!(account.health, Health::Ready);
+        assert!(account.auth_probe_pending);
+        account.apply_health_signal(HealthSignal::AuthAfterRefresh, now);
+        assert_eq!(account.auth_failures, 3);
+        assert_eq!(
+            account.health,
+            Health::Cooling {
+                reason: HealthReason::Auth,
+                until: now + Duration::minutes(60),
+                scope: "account".into()
+            }
+        );
+    }
+
+    #[test]
+    fn r2_single_model_scope_replacement_uses_later_deadline() {
+        let now = Utc::now();
+        let mut account = fixture();
+        for (model, minutes) in [("X", 60), ("Y", 30), ("Y", 60), ("Y", 120)] {
+            account.apply_health_signal(
+                HealthSignal::Cooling {
+                    reason: HealthReason::Permission,
+                    until: now + Duration::minutes(minutes),
+                    scope: format!("model:{model}"),
+                },
+                now,
+            );
+            let expected = if minutes == 120 { "Y" } else { "X" };
+            assert!(!account.eligible_at(Some(expected), now));
+            assert!(account.eligible_at(Some(if expected == "X" { "Y" } else { "X" }), now));
+        }
+        account.apply_health_signal(
+            HealthSignal::Cooling {
+                reason: HealthReason::Quota,
+                until: now + Duration::minutes(10),
+                scope: "account".into(),
+            },
+            now,
+        );
+        account.apply_health_signal(
+            HealthSignal::Cooling {
+                reason: HealthReason::Permission,
+                until: now + Duration::minutes(180),
+                scope: "model:Z".into(),
+            },
+            now,
+        );
+        assert!(!account.eligible_at(None, now));
+        assert!(matches!(account.health, Health::Cooling { scope, .. } if scope == "account"));
+    }
 }

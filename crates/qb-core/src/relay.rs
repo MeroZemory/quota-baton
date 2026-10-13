@@ -37,6 +37,8 @@ use ledger::Completion;
 
 pub struct RelayState {
     pub accounts: Arc<crate::account_runtime::AccountRuntime>,
+    pub bindings: Arc<crate::bindings::BindingTable>,
+    reset_hold_secs: u64,
     pub inflight_requests: Arc<AtomicU64>,
     store: Arc<AccountStore>,
     client: reqwest::Client,
@@ -84,6 +86,7 @@ impl RelayState {
     ) -> anyhow::Result<Self> {
         config.upstream.validate()?;
         config.websocket.validate()?;
+        config.routing.validate()?;
         let client = upstream_client()?;
         let accounts = crate::account_runtime::AccountRuntime::new(
             store.clone(),
@@ -91,8 +94,13 @@ impl RelayState {
             config.routing.inflight_allowance_pct,
         );
         let tokens = TokenGates::new(client.clone(), accounts.clone());
+        // The lease is held and account expiry/reconciliation precedes affinity restore.
+        store.list()?;
+        let bindings = crate::bindings::BindingTable::new(store.home(), config.routing.clone())?;
         Ok(Self {
             accounts,
+            bindings,
+            reset_hold_secs: config.routing.reset_hold_secs,
             inflight_requests: Arc::new(AtomicU64::new(0)),
             store,
             client,
@@ -133,11 +141,16 @@ impl RelayState {
 
     async fn claim_probe(&self, account: &mut Account) -> Option<crate::account_runtime::Probe> {
         let deadline = Instant::now() + Duration::from_secs(30);
+        let mut delay = Duration::from_millis(10);
         loop {
             match self.accounts.begin_probe(account) {
                 Ok(probe) => return probe,
                 Err(_) if Instant::now() < deadline => {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    tokio::time::sleep(
+                        delay.min(deadline.saturating_duration_since(Instant::now())),
+                    )
+                    .await;
+                    delay = (delay * 2).min(Duration::from_millis(500));
                     let store = self.store.clone();
                     let id = account.id.clone();
                     match tokio::task::spawn_blocking(move || store.load(&id)).await {
@@ -174,16 +187,14 @@ impl RelayState {
         }
     }
 
-    async fn select(
+    async fn candidates(
         &self,
         provider: Provider,
         key: Option<&str>,
-        model: Option<&str>,
+        _model: Option<&str>,
         tried: &BTreeSet<String>,
-    ) -> Result<Option<Account>, ()> {
-        let pinned = self.pins.get(provider, key);
+    ) -> Result<Vec<crate::bindings::Candidate>, ()> {
         let store = self.store.clone();
-        let model = model.map(str::to_owned);
         let mut tried = tried.clone();
         if let Some(key) = key
             && let Ok(mut exclusions) = self.reconnect_exclusions.lock()
@@ -196,7 +207,6 @@ impl RelayState {
                     .map(|(_, id)| id.clone()),
             );
         }
-        let runtime = self.accounts.clone();
         let read_store = store.clone();
         let mut accounts = tokio::task::spawn_blocking(move || read_store.list())
             .await
@@ -220,21 +230,187 @@ impl RelayState {
                 *account = updated;
             }
         }
+        let runtime = self.accounts.clone();
+        let obs = self.observability.clone();
         tokio::task::spawn_blocking(move || {
-            let usable = |a: &Account| {
-                a.provider == provider
-                    && a.eligible(model.as_deref())
-                    && !tried.contains(&a.id)
-                    && !runtime.probing(&a.id)
-                    && !runtime.blocked_in_memory(&a.id)
-                    && store.tokens(a).is_ok_and(|t| !t.access_token.is_empty())
-            };
-            Ok(pinned
-                .and_then(|id| accounts.iter().find(|a| a.id == id && usable(a)).cloned())
-                .or_else(|| accounts.into_iter().find(usable)))
+            accounts
+                .into_iter()
+                .filter(|a| {
+                    a.provider == provider
+                        && !tried.contains(&a.id)
+                        && !runtime.probing(&a.id)
+                        && !runtime.blocked_in_memory(&a.id)
+                        && store.tokens(a).is_ok_and(|t| !t.access_token.is_empty())
+                })
+                .map(|account| {
+                    Ok(crate::bindings::Candidate {
+                        quota: obs.quota_snapshot(&account.id),
+                        // Every production attempt reserves the live table;
+                        // a runtime count sampled before completion can be stale.
+                        inflight: 0,
+                        account,
+                    })
+                })
+                .collect::<Result<Vec<_>, ()>>()
         })
         .await
         .map_err(|_| ())?
+    }
+
+    // Availability checks must never mutate affinity or reserve an attempt.
+    async fn select(
+        &self,
+        provider: Provider,
+        key: Option<&str>,
+        model: Option<&str>,
+        tried: &BTreeSet<String>,
+    ) -> Result<Option<Account>, ()> {
+        let candidates = self.candidates(provider, key, model, tried).await?;
+        let pinned = self.pins.get(provider, key);
+        match self.bindings.preview(
+            provider,
+            key,
+            None,
+            model,
+            &candidates,
+            pinned.as_deref(),
+            0,
+        ) {
+            crate::bindings::PreviewDecision::Selected { account } => Ok(candidates
+                .into_iter()
+                .find(|c| c.account.id == account)
+                .map(|c| c.account)),
+            _ => Ok(None),
+        }
+    }
+
+    async fn select_request(
+        &self,
+        provider: Provider,
+        session: &session::Session,
+        completion: &mut Completion,
+        model: Option<&str>,
+        tried: &BTreeSet<String>,
+    ) -> Result<Option<Account>, ()> {
+        // A failed pre-commit attempt is finished before reserving its successor.
+        completion.end_attempt();
+        let excluded = tried.clone();
+        loop {
+            let candidates = self
+                .candidates(provider, session.key.as_deref(), model, &excluded)
+                .await?;
+            let pinned = self.pins.get(provider, session.key.as_deref());
+            let bytes = completion
+                .input_bytes
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let choice = self.bindings.choose_with_hold(
+                provider,
+                session.key.as_deref(),
+                session.parent.as_deref(),
+                model,
+                &candidates,
+                pinned.as_deref(),
+                bytes,
+                !completion.reset_hold_used,
+                completion.reset_hold_timed_out,
+            );
+            match choice {
+                crate::bindings::Decision::Selected {
+                    account,
+                    lease,
+                    moves,
+                } => {
+                    for event in moves {
+                        self.observability.record_group_move(
+                            &event.key,
+                            event.from.as_deref(),
+                            &event.to,
+                            &event.reason,
+                            event.bytes,
+                            event.keys,
+                            event.debug_pin,
+                        );
+                    }
+                    completion.record.after_move |= lease.after_move;
+                    completion.binding = Some(lease);
+                    return Ok(candidates
+                        .into_iter()
+                        .find(|c| c.account.id == account)
+                        .map(|c| c.account));
+                }
+                crate::bindings::Decision::None => return Ok(None),
+                crate::bindings::Decision::Hold { until } => {
+                    let wait = (until - chrono::Utc::now()).to_std().unwrap_or_default();
+                    completion.reset_hold_used = true;
+                    tokio::time::sleep(wait.min(Duration::from_secs(self.reset_hold_secs))).await;
+                    // This flag is request-local; a later turn may hold again.
+                    completion.reset_hold_timed_out = true;
+                }
+            }
+        }
+    }
+
+    /// C7 permits one same-account retry after a near reset, before commit.
+    /// The request owns the budget; no session-wide hold flag survives it.
+    async fn retry_after_reset(
+        &self,
+        session: &session::Session,
+        completion: &mut Completion,
+        id: &str,
+        model: Option<&str>,
+    ) -> Result<bool, ()> {
+        if completion.reset_hold_used
+            || self.bindings.current(session.key.as_deref()).as_deref() != Some(id)
+        {
+            return Ok(false);
+        }
+        let store = self.store.clone();
+        let account_id = id.to_owned();
+        let account = tokio::task::spawn_blocking(move || store.load(&account_id))
+            .await
+            .map_err(|_| ())?
+            .map_err(|_| ())?;
+        let now = chrono::Utc::now();
+        let reset = match &account.health {
+            Health::Cooling {
+                reason: HealthReason::Quota,
+                until,
+                scope,
+            } if account.user_state == UserState::Active
+                && (scope == "account"
+                    || scope
+                        .strip_prefix("model:")
+                        .is_some_and(|m| model == Some(m))) =>
+            {
+                account
+                    .quota_cooling
+                    .as_ref()
+                    .map_or(*until, |q| q.reset_at)
+            }
+            _ => return Ok(false),
+        };
+        let Ok(wait) = (reset - now).to_std() else {
+            return Ok(false);
+        };
+        if wait > Duration::from_secs(self.reset_hold_secs) {
+            return Ok(false);
+        }
+        completion.end_attempt();
+        completion.reset_hold_used = true;
+        completion.failover("reset_hold_retry");
+        tokio::time::sleep(wait).await;
+        let store = self.store.clone();
+        let account_id = id.to_owned();
+        let account = tokio::task::spawn_blocking(move || store.load(&account_id))
+            .await
+            .map_err(|_| ())?
+            .map_err(|_| ())?;
+        if !account.eligible(model) {
+            completion.reset_hold_timed_out = true;
+            return Ok(false);
+        }
+        completion.binding = Some(self.bindings.begin_request(session.key.as_deref(), id));
+        Ok(true)
     }
 }
 
@@ -505,9 +681,10 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
         .unwrap_or(Err(()))
     } else {
         state
-            .select(
+            .select_request(
                 provider,
-                session.key.as_deref(),
+                &session,
+                &mut completion,
                 request_model.as_deref(),
                 &tried,
             )
@@ -515,9 +692,10 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
     };
     #[cfg(not(all(feature = "phase0", debug_assertions)))]
     let selection = state
-        .select(
+        .select_request(
             provider,
-            session.key.as_deref(),
+            &session,
+            &mut completion,
             request_model.as_deref(),
             &tried,
         )
@@ -543,6 +721,11 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
         }
     };
     completion.record.account = Some(account.id.clone());
+    // Phase-0 forced replay bypasses affinity, but still participates in the
+    // authoritative placement reservation count.
+    if completion.binding.is_none() {
+        completion.binding = Some(state.bindings.begin_request(None, &account.id));
+    }
     tried.insert(account.id.clone());
     #[cfg(all(feature = "phase0", debug_assertions))]
     if upload.overflow.is_none()
@@ -595,9 +778,10 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
     let (status, response_headers, held) = loop {
         if !account.eligible(request_model.as_deref()) {
             let next = state
-                .select(
+                .select_request(
                     provider,
-                    session.key.as_deref(),
+                    &session,
+                    &mut completion,
                     request_model.as_deref(),
                     &tried,
                 )
@@ -863,6 +1047,58 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
         if !decision.failover() || retained.is_none() || permission_denials >= 2 {
             break (status, response_headers, held);
         }
+        if decision.kind == outcome::Kind::Quota {
+            match state
+                .retry_after_reset(
+                    &session,
+                    &mut completion,
+                    &account.id,
+                    request_model.as_deref(),
+                )
+                .await
+            {
+                Ok(true) => {
+                    drop(probe.take());
+                    match state
+                        .tokens
+                        .before_request(
+                            state.store.clone(),
+                            state.observability.clone(),
+                            account.id.clone(),
+                        )
+                        .await
+                    {
+                        Ok((updated, refreshed)) => {
+                            account = updated;
+                            tokens = refreshed;
+                        }
+                        Err(()) => {
+                            return failure(
+                                &mut completion,
+                                StatusCode::BAD_GATEWAY,
+                                provider,
+                                "store_error",
+                                "Could not read account tokens",
+                            );
+                        }
+                    }
+                    probe = state.claim_probe(&mut account).await;
+                    body_to_send =
+                        retry_body(retained.as_ref().expect("retained reset retry").bytes());
+                    continue;
+                }
+                Ok(false) => {}
+                Err(()) => {
+                    return failure(
+                        &mut completion,
+                        StatusCode::BAD_GATEWAY,
+                        provider,
+                        "store_error",
+                        "Could not check account reset",
+                    );
+                }
+            }
+        }
         if tried.len() >= 4 {
             if state
                 .select(
@@ -892,9 +1128,10 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
         }
         completion.failover(decision.reason());
         let next = state
-            .select(
+            .select_request(
                 provider,
-                session.key.as_deref(),
+                &session,
+                &mut completion,
                 request_model.as_deref(),
                 &tried,
             )
@@ -1020,5 +1257,125 @@ mod tests {
         for path in ["/v1/memories/trace_summarize", "/unknown", "/v1/responses/"] {
             assert!(route(&Method::POST, path, &headers).is_none());
         }
+    }
+    #[tokio::test]
+    async fn selection_reload_wait_does_not_block_another_placement_in_the_family() {
+        use crate::{
+            config::Config,
+            debug_pin::DebugPins,
+            relay::{RelayState, ledger::Completion},
+            session::Session,
+        };
+        let sandbox = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.sandbox/hardening-fixtures");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        let root = tempfile::tempdir_in(sandbox).unwrap();
+        let cpa = root.path().join("cpa");
+        std::fs::create_dir_all(&cpa).unwrap();
+        std::fs::write(cpa.join("synthetic.json"), serde_json::to_vec(&serde_json::json!({
+            "type":"codex", "email":"placement@example.invalid", "account_id":"synthetic-placement",
+            "access_token":"synthetic-placement-access", "refresh_token":"synthetic-placement-refresh",
+            "expired":"2099-01-01T00:00:00Z", "last_refresh":"2026-10-13T00:00:01Z"
+        })).unwrap()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let store = loop {
+            match AccountStore::acquire(&root.path().join("home")) {
+                Ok(store) => break Arc::new(store),
+                Err(crate::accounts::StoreError::LeaseBusy) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(10)).await
+                }
+                Err(error) => panic!("synthetic fixture lease: {error}"),
+            }
+        };
+        crate::accounts::import::run(
+            &store,
+            &cpa,
+            &["codex:placement@example.invalid".into()],
+            false,
+        )
+        .unwrap();
+        let id = store.list().unwrap()[0].id.clone();
+        let obs = Arc::new(Observability::new(store.home(), None).unwrap());
+        let mut config = Config::default();
+        config.upstream.codex_base = "http://127.0.0.1:9".into();
+        config.upstream.anthropic_base = "http://127.0.0.1:9".into();
+        let state = Arc::new(
+            RelayState::new(
+                store.clone(),
+                &config,
+                obs.clone(),
+                Arc::new(DebugPins::default()),
+            )
+            .unwrap(),
+        );
+        store
+            .update_metadata(&id, |account| {
+                account.health = Health::Cooling {
+                    reason: HealthReason::LinkStale,
+                    until: chrono::Utc::now() + chrono::Duration::hours(1),
+                    scope: "account".into(),
+                }
+            })
+            .unwrap();
+        let guard = state.tokens.block_selection_for_test(&id).await;
+        let waiting_state = state.clone();
+        let waiting_obs = obs.clone();
+        let first = tokio::spawn(async move {
+            let mut completion = Completion::new(
+                waiting_obs,
+                &axum::http::Method::POST,
+                "/v1/responses",
+                Provider::Codex,
+                &axum::http::HeaderMap::new(),
+            );
+            let session = Session {
+                key: Some("codex:waiting".into()),
+                parent: None,
+                model: None,
+            };
+            waiting_state
+                .select_request(
+                    Provider::Codex,
+                    &session,
+                    &mut completion,
+                    None,
+                    &std::collections::BTreeSet::new(),
+                )
+                .await
+        });
+        // The first selection is suspended at its credential gate. Restore the
+        // account so an independent selection can bypass that reload.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(!first.is_finished());
+        store
+            .update_metadata(&id, |account| account.health = Health::Ready)
+            .unwrap();
+        let mut completion = Completion::new(
+            obs,
+            &axum::http::Method::POST,
+            "/v1/responses",
+            Provider::Codex,
+            &axum::http::HeaderMap::new(),
+        );
+        let session = Session {
+            key: Some("codex:independent".into()),
+            parent: None,
+            model: None,
+        };
+        let second = tokio::time::timeout(
+            Duration::from_secs(2),
+            state.select_request(
+                Provider::Codex,
+                &session,
+                &mut completion,
+                None,
+                &std::collections::BTreeSet::new(),
+            ),
+        )
+        .await;
+        first.abort();
+        let _ = first.await;
+        drop(guard);
+        assert_eq!(second.unwrap().unwrap().unwrap().id, id);
     }
 }

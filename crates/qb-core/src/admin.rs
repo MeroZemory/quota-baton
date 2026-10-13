@@ -82,18 +82,30 @@ pub fn runtime_routes(relay: Arc<crate::relay::RelayState>, data_port: u16) -> R
 
 async fn runtime_state(State(state): State<RuntimeAdmin>) -> Response {
     match state.relay.accounts.views().await {
-        Ok(accounts) => Json(serde_json::json!({
+        Ok(mut accounts) => {
+            for account in &mut accounts {
+                if let Some(id) = account["id"].as_str().map(str::to_owned) {
+                    let (count, last_used) = state.relay.bindings.account_stats(&id);
+                    account["bound_sessions"] = serde_json::json!(count);
+                    account["last_used_at"] = serde_json::json!(last_used);
+                }
+            }
+            Json(serde_json::json!({
             "accounts": accounts,
             "inflight": {
                 "requests": state.relay.inflight_requests.load(std::sync::atomic::Ordering::Relaxed),
                 "bytes": state.relay.budget.used()
             },
             "memory": {"private_bytes": crate::guard::private_bytes()},
-            "bindings": {"count": 0},
+            "bindings": {"count": state.relay.bindings.count()},
             "data_port": state.data_port,
             "version": env!("CARGO_PKG_VERSION")
-        })).into_response(),
-        Err(()) => error(StatusCode::INTERNAL_SERVER_ERROR, "Account state unavailable"),
+        })).into_response()
+        }
+        Err(()) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Account state unavailable",
+        ),
     }
 }
 
@@ -200,12 +212,23 @@ async fn change_account(
         )
         .await
     {
-        Ok(account) => Json(serde_json::json!({
+        Ok(account) => {
+            if patch.drain == Some(true) {
+                let bindings = state.relay.bindings.clone();
+                if !matches!(
+                    tokio::task::spawn_blocking(move || bindings.flush()).await,
+                    Ok(Ok(()))
+                ) {
+                    return error(StatusCode::INTERNAL_SERVER_ERROR, "Binding flush failed");
+                }
+            }
+            Json(serde_json::json!({
             "id": account.id, "provider": account.provider, "label": account.label,
             "email": account.email, "plan": account.plan, "user_state": account.user_state,
             "health": account.health, "drain": account.drain, "allow_credits": account.allow_credits
         }))
-        .into_response(),
+        .into_response()
+        }
         Err(()) => error(StatusCode::INTERNAL_SERVER_ERROR, "Account update failed"),
     }
 }

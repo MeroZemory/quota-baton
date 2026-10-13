@@ -85,6 +85,34 @@ pub struct RequestRecord {
     pub upstream_error_code: Option<String>,
     #[serde(default)]
     pub attempt_details: Vec<AttemptRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_usage: Option<CacheUsage>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub after_move: bool,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct CacheUsage {
+    pub input_tokens: Option<u64>,
+    pub cached_tokens: Option<u64>,
+    pub cache_creation_input_tokens: Option<u64>,
+}
+
+/// Only numerical usage fields cross the response observer into the ledger.
+pub fn cache_usage(event: &serde_json::Value) -> Option<CacheUsage> {
+    let usage = event
+        .get("usage")
+        .or_else(|| event.get("response")?.get("usage"))
+        .or_else(|| event.get("message")?.get("usage"))?;
+    let result = CacheUsage {
+        input_tokens: usage["input_tokens"].as_u64(),
+        cached_tokens: usage["cache_read_input_tokens"]
+            .as_u64()
+            .or_else(|| usage["input_tokens_details"]["cached_tokens"].as_u64()),
+        cache_creation_input_tokens: usage["cache_creation_input_tokens"].as_u64(),
+    };
+    (result.cached_tokens.is_some() || result.cache_creation_input_tokens.is_some())
+        .then_some(result)
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -391,6 +419,37 @@ impl Observability {
         if let Ok(value) = serde_json::to_value(record) {
             self.enqueue(Command::Ledger(value));
         }
+    }
+
+    pub fn record_move(&self, key: &str, from: Option<&str>, to: &str, reason: &str, bytes: u64) {
+        self.record_group_move(key, from, to, reason, bytes, 1, false);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_group_move(
+        &self,
+        key: &str,
+        from: Option<&str>,
+        to: &str,
+        reason: &str,
+        bytes: u64,
+        keys: usize,
+        debug_pin: bool,
+    ) {
+        use sha2::{Digest, Sha256};
+        if !matches!(
+            reason,
+            "forced" | "cold_rebalance" | "reset_hold_timeout" | "new"
+        ) {
+            return;
+        }
+        let digest = Sha256::digest(key.as_bytes());
+        let session: String = digest[..6].iter().map(|b| format!("{b:02x}")).collect();
+        self.enqueue(Command::Ledger(serde_json::json!({
+            "ts": Utc::now().to_rfc3339(), "event": "binding_move",
+            "session": session, "from": from, "to": to, "reason": reason,
+            "bytes_in": bytes, "keys": keys, "debug_pin": debug_pin
+        })));
     }
 
     fn remember(&self, id: &str, next: &Snapshot) {
@@ -975,6 +1034,28 @@ mod tests {
     use super::*;
     use serde_json::{Value, json};
 
+    #[test]
+    fn binding_moves_hash_identity_and_cache_usage_only_keeps_numbers() {
+        let dir = directory();
+        let obs = Observability::new(dir.path(), None).unwrap();
+        obs.record_move("claude:private-session", Some("old"), "new", "forced", 123);
+        let usage = cache_usage(&json!({"response":{"usage":{"input_tokens":100,
+            "input_tokens_details":{"cached_tokens":80},"private":"conversation-secret"}}}))
+        .unwrap();
+        assert_eq!(usage.cached_tokens, Some(80));
+        let mut request = record();
+        request.cache_usage = Some(usage);
+        obs.record_request(request);
+        obs.flush().unwrap();
+        let text = fs::read_dir(dir.path().join("ledger"))
+            .unwrap()
+            .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect::<String>();
+        assert!(!text.contains("private-session"));
+        assert!(!text.contains("conversation-secret"));
+        assert!(text.contains("binding_move") && text.contains("cached_tokens"));
+    }
+
     fn directory() -> tempfile::TempDir {
         let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/observability-tests");
         fs::create_dir_all(&base).unwrap();
@@ -1004,6 +1085,8 @@ mod tests {
             retained_copy: true,
             upstream_error_code: None,
             attempt_details: Vec::new(),
+            cache_usage: None,
+            after_move: false,
         }
     }
 

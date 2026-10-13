@@ -1,19 +1,256 @@
 use std::{
+    io::{self, Read},
     path::Path,
-    process::{Child, Command, Stdio},
+    process::{Child, Command, ExitStatus, Output, Stdio},
+    sync::{
+        Arc, Mutex, Once,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     time::Duration,
 };
 
-struct Core(Child);
+const CHILD_TIMEOUT: Duration = Duration::from_secs(30);
+struct Core {
+    child: Arc<Mutex<Child>>,
+    timed_out: Arc<AtomicBool>,
+    stop: mpsc::Sender<()>,
+    watchdog: Option<std::thread::JoinHandle<()>>,
+}
 static SERVE_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-impl Drop for Core {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+impl Core {
+    fn spawn(command: &mut Command) -> io::Result<Self> {
+        let child = Arc::new(Mutex::new(command.spawn()?));
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let (stop, stopped) = mpsc::channel();
+        let watched = Arc::clone(&child);
+        let expired = Arc::clone(&timed_out);
+        let watchdog = std::thread::spawn(move || {
+            if matches!(
+                stopped.recv_timeout(CHILD_TIMEOUT),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ) {
+                let mut child = watched.lock().unwrap();
+                if !matches!(child.try_wait(), Ok(Some(_))) {
+                    expired.store(true, Ordering::SeqCst);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        });
+        Ok(Self {
+            child,
+            timed_out,
+            stop,
+            watchdog: Some(watchdog),
+        })
+    }
+
+    fn try_wait(&self) -> io::Result<Option<ExitStatus>> {
+        if self.timed_out.load(Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "CLI child exceeded 30s",
+            ));
+        }
+        self.child.lock().unwrap().try_wait()
+    }
+
+    fn wait(&self) -> io::Result<ExitStatus> {
+        loop {
+            if let Some(status) = self.try_wait()? {
+                // The watchdog may have killed the child while try_wait took its lock.
+                if self.timed_out.load(Ordering::SeqCst) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "CLI child exceeded 30s",
+                    ));
+                }
+                return Ok(status);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 
+impl Drop for Core {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        {
+            let mut child = self.child.lock().unwrap();
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(watchdog) = self.watchdog.take() {
+            let _ = watchdog.join();
+        }
+    }
+}
+
+trait BoundedOutput {
+    fn bounded_output(&mut self) -> io::Result<Output>;
+    fn bounded_output_redirected(&mut self) -> io::Result<Output>;
+}
+
+impl BoundedOutput for Command {
+    fn bounded_output(&mut self) -> io::Result<Output> {
+        capture_output(self, false)
+    }
+
+    fn bounded_output_redirected(&mut self) -> io::Result<Output> {
+        capture_output(self, true)
+    }
+}
+
+fn capture_output(command: &mut Command, redirected: bool) -> io::Result<Output> {
+    if !redirected {
+        command.stdout(Stdio::piped());
+    }
+    command.stdin(Stdio::null()).stderr(Stdio::piped());
+    let core = Core::spawn(command)?;
+    let (stdout, stderr) = {
+        let mut child = core.child.lock().unwrap();
+        (
+            read_output(child.stdout.take()),
+            read_output(child.stderr.take()),
+        )
+    };
+    let status = core.wait()?;
+    Ok(Output {
+        status,
+        stdout: stdout
+            .recv_timeout(Duration::from_secs(1))
+            .map_err(io::Error::other)??,
+        stderr: stderr
+            .recv_timeout(Duration::from_secs(1))
+            .map_err(io::Error::other)??,
+    })
+}
+
+fn read_output(reader: Option<impl Read + Send + 'static>) -> mpsc::Receiver<io::Result<Vec<u8>>> {
+    let (send, receive) = mpsc::channel();
+    // Drain both pipes concurrently, preserving the CLI's piped-stdout coverage.
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = match reader {
+            Some(mut reader) => reader.read_to_end(&mut bytes).map(|_| bytes),
+            None => Ok(bytes),
+        };
+        let _ = send.send(result);
+    });
+    receive
+}
+
+// One deadline covers all accepts and stream I/O in each mock server thread,
+// so joining it remains bounded even when the CLI skips an expected request.
+const MOCK_SERVER_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn mock_io_timeout(deadline: std::time::Instant) -> io::Result<Duration> {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "mock admin deadline exceeded",
+        ));
+    }
+    Ok(remaining.min(Duration::from_secs(5)))
+}
+
+fn mock_response(
+    listener: &std::net::TcpListener,
+    deadline: std::time::Instant,
+    route: &str,
+    status: &str,
+    body: &str,
+    bearer: Option<&str>,
+) -> io::Result<()> {
+    use std::io::Write;
+    listener.set_nonblocking(true)?;
+    let mut stream = loop {
+        mock_io_timeout(deadline)?;
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(mock_io_timeout(deadline)?.min(Duration::from_millis(10)));
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    };
+    stream.set_nonblocking(false)?;
+    let mut request = Vec::new();
+    while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+        if request.len() >= 16 * 1024 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "mock request headers too large",
+            ));
+        }
+        stream.set_read_timeout(Some(mock_io_timeout(deadline)?))?;
+        let mut chunk = [0; 1024];
+        let amount = stream.read(&mut chunk)?;
+        if amount == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "CLI closed before sending request headers",
+            ));
+        }
+        request.extend_from_slice(&chunk[..amount]);
+    }
+    let request = String::from_utf8_lossy(&request);
+    assert_eq!(
+        request.lines().next(),
+        Some(format!("GET {route} HTTP/1.1").as_str()),
+        "unexpected mock admin route"
+    );
+    if let Some(bearer) = bearer {
+        assert!(
+            request.lines().any(|line| line
+                .split_once(':')
+                .is_some_and(|(name, value)| name.eq_ignore_ascii_case("authorization")
+                    && value.trim() == format!("Bearer {bearer}"))),
+            "missing mock admin authorization"
+        );
+    }
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let mut rest = response.as_bytes();
+    while !rest.is_empty() {
+        stream.set_write_timeout(Some(mock_io_timeout(deadline)?))?;
+        let amount = stream.write(rest)?;
+        if amount == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "mock response write stalled",
+            ));
+        }
+        rest = &rest[amount..];
+    }
+    Ok(())
+}
+
 fn command(home: &Path) -> Command {
+    static FEATURES_CHECKED: Once = Once::new();
+    FEATURES_CHECKED.call_once(|| {
+        let mut help = Command::new(env!("CARGO_BIN_EXE_quota-baton"));
+        help.env("QB_HOME", home).args(["serve", "--help"]);
+        let output = help.bounded_output().unwrap();
+        assert!(output.status.success(), "binary feature probe failed");
+        let text = String::from_utf8(output.stdout).unwrap();
+        for (switch, enabled) in [
+            ("--capture-dir", cfg!(feature = "shape-capture")),
+            ("--capture-bodies-dir", cfg!(feature = "phase0")),
+            ("--phase0-close-after-response", cfg!(feature = "phase0")),
+        ] {
+            assert_eq!(
+                text.contains(switch),
+                enabled,
+                "CLI binary feature mismatch: {switch}"
+            );
+        }
+    });
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_quota-baton"));
     cmd.env("QB_HOME", home);
     cmd
@@ -22,13 +259,25 @@ fn command(home: &Path) -> Command {
 fn fixture() -> tempfile::TempDir {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/tests");
     std::fs::create_dir_all(&root).unwrap();
-    tempfile::tempdir_in(root).unwrap()
+    let home = tempfile::tempdir_in(root).unwrap();
+    let data = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let admin = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!(
+            "[server]\ndata_port={}\nadmin_port={}\n",
+            data.local_addr().unwrap().port(),
+            admin.local_addr().unwrap().port(),
+        ),
+    )
+    .unwrap();
+    home
 }
 
 #[test]
 fn help_is_available() {
     let home = fixture();
-    let output = command(home.path()).arg("--help").output().unwrap();
+    let output = command(home.path()).arg("--help").bounded_output().unwrap();
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("serve"));
 }
@@ -42,7 +291,7 @@ fn default_cli_has_no_phase0_or_body_capture() {
         vec!["serve", "--capture-bodies-dir", ".sandbox"],
         vec!["serve", "--phase0-close-after-response"],
     ] {
-        let output = command(home.path()).args(args).output().unwrap();
+        let output = command(home.path()).args(args).bounded_output().unwrap();
         assert!(!output.status.success());
     }
     assert!(!home.path().join("accounts").exists());
@@ -75,24 +324,28 @@ async fn phase0_cli_capture_and_replay_print_counts_and_summary_only() {
         .args(["accounts", "import", "cpa", "--dir"])
         .arg(&cpa)
         .args(["--activate", "codex:synthetic@example.invalid"])
-        .output()
+        .bounded_output()
         .unwrap();
     assert!(output.status.success());
     let account = qb_core::accounts::AccountStore::list_metadata(&home)
         .unwrap()
         .remove(0);
     let stderr_path = home.join("serve.stderr");
-    let _core = Core(
+    let _core = Core::spawn(
         command(&home)
             .args(["serve", "--capture-bodies-dir"])
             .arg(&captures)
             .args(["--capture-bodies-limit", "1"])
             .stdout(Stdio::null())
             .stderr(Stdio::from(std::fs::File::create(&stderr_path).unwrap()))
-            .spawn()
-            .unwrap(),
-    );
-    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            .stdin(Stdio::null()),
+    )
+    .unwrap();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
     let mut ready = false;
     for _ in 0..100 {
         if client
@@ -136,7 +389,7 @@ async fn phase0_cli_capture_and_replay_print_counts_and_summary_only() {
         .args(["phase0", "replay", "--capture"])
         .arg(capture.file_name().unwrap())
         .args(["--account", &account.id, "--strip", "reasoning"]);
-    let output = tokio::task::spawn_blocking(move || replay.output())
+    let output = tokio::task::spawn_blocking(move || replay.bounded_output())
         .await
         .unwrap()
         .unwrap();
@@ -194,14 +447,14 @@ async fn startup_recovers_corrupt_quota_and_listens() {
     // 경고 출력도 프로젝트 안의 가짜 홈에서만 보관한다.
     let stderr_path = home.path().join("serve.stderr");
     let stderr = std::fs::File::create(&stderr_path).unwrap();
-    let mut core = Core(
+    let core = Core::spawn(
         command(home.path())
             .arg("serve")
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr))
-            .spawn()
-            .unwrap(),
-    );
+            .stdin(Stdio::null()),
+    )
+    .unwrap();
     let client = reqwest::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(1))
@@ -220,13 +473,13 @@ async fn startup_recovers_corrupt_quota_and_listens() {
             ready = true;
             break;
         }
-        if let Some(status) = core.0.try_wait().unwrap() {
+        if let Some(status) = core.try_wait().unwrap() {
             panic!("serve exited: {status}");
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(ready, "core did not start");
-    assert!(core.0.try_wait().unwrap().is_none());
+    assert!(core.try_wait().unwrap().is_none());
     let backups: Vec<_> = std::fs::read_dir(home.path().join("state"))
         .unwrap()
         .map(|e| e.unwrap().path())
@@ -255,7 +508,7 @@ fn default_cli_has_no_capture_switch() {
     let output = command(home.path())
         .args(["serve", "--capture-dir"])
         .arg(home.path())
-        .output()
+        .bounded_output()
         .unwrap();
     assert!(!output.status.success());
     assert!(!home.path().join("accounts").exists());
@@ -269,7 +522,7 @@ fn capture_cli_requires_existing_sandbox_directory() {
     let output = command(home.path())
         .args(["serve", "--capture-dir"])
         .arg(home.path().join("missing"))
-        .output()
+        .bounded_output()
         .unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("capture"));
@@ -289,15 +542,19 @@ async fn serve_and_status_use_isolated_home() {
     )
     .unwrap();
     drop((data, admin));
-    let _core = Core(
+    let _core = Core::spawn(
         command(home.path())
             .arg("serve")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
-    let client = reqwest::Client::new();
+            .stdin(Stdio::null()),
+    )
+    .unwrap();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
     let url = format!("http://127.0.0.1:{admin_port}/admin/v1/health");
     let mut ready = false;
     for _ in 0..100 {
@@ -308,7 +565,7 @@ async fn serve_and_status_use_isolated_home() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(ready, "core did not start");
-    let output = command(home.path()).arg("status").output().unwrap();
+    let output = command(home.path()).arg("status").bounded_output().unwrap();
     assert!(
         output.status.success(),
         "{}",
@@ -339,7 +596,7 @@ fn run_import(home: &Path, dir: &Path, extra: &[&str]) -> String {
         .args(["accounts", "import", "cpa", "--dir"])
         .arg(dir)
         .args(extra)
-        .output()
+        .bounded_output()
         .unwrap();
     assert!(
         output.status.success(),
@@ -382,20 +639,20 @@ async fn offline_online_import_and_admin_refusal() {
     let refused = command(&home)
         .args(["accounts", "import", "cpa", "--adopt", "--dir"])
         .arg(root.path().join("does-not-exist"))
-        .output()
+        .bounded_output()
         .unwrap();
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("M8"));
     assert!(!home.join("accounts").exists());
     assert!(run_import(&home, &cpa, &[]).contains("비활성"));
-    let core = Core(
+    let core = Core::spawn(
         command(&home)
             .arg("serve")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
+            .stdin(Stdio::null()),
+    )
+    .unwrap();
     let client = reqwest::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(5))
@@ -411,7 +668,7 @@ async fn offline_online_import_and_admin_refusal() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(ready);
-    let duplicate = command(&home).arg("serve").output().unwrap();
+    let duplicate = command(&home).arg("serve").bounded_output().unwrap();
     assert!(!duplicate.status.success());
     assert!(String::from_utf8_lossy(&duplicate.stderr).contains("계정 저장소"));
     let token = std::fs::read_to_string(home.join("admin.token")).unwrap();
@@ -444,7 +701,10 @@ async fn offline_online_import_and_admin_refusal() {
     .unwrap();
     let updated = run_import(&home, &cpa, &[]);
     assert!(updated.contains("갱신"));
-    let output = command(&home).args(["accounts", "list"]).output().unwrap();
+    let output = command(&home)
+        .args(["accounts", "list"])
+        .bounded_output()
+        .unwrap();
     assert!(output.status.success());
     let listing = String::from_utf8(output.stdout).unwrap();
     assert!(listing.contains("활성"));
@@ -476,7 +736,7 @@ async fn offline_online_import_and_admin_refusal() {
     ] {
         let mut cmd = command(&home);
         cmd.args(["accounts", action, &id]);
-        let output = tokio::task::spawn_blocking(move || cmd.output())
+        let output = tokio::task::spawn_blocking(move || cmd.bounded_output())
             .await
             .unwrap()
             .unwrap();
@@ -556,7 +816,7 @@ async fn offline_online_import_and_admin_refusal() {
     for args in [vec!["status"], vec!["accounts", "disable", &id]] {
         let mut cmd = command(&home);
         cmd.args(args);
-        let output = tokio::task::spawn_blocking(move || cmd.output())
+        let output = tokio::task::spawn_blocking(move || cmd.bounded_output())
             .await
             .unwrap()
             .unwrap();
@@ -646,7 +906,7 @@ fn offline_status_and_actions_use_synthetic_metadata_and_quota() {
     ] {
         let output = command(home.path())
             .args(["accounts", action, &id])
-            .output()
+            .bounded_output()
             .unwrap();
         assert!(
             output.status.success(),
@@ -659,7 +919,7 @@ fn offline_status_and_actions_use_synthetic_metadata_and_quota() {
         assert_eq!(account.user_state, expected);
         assert_eq!(account.health, health);
     }
-    let output = command(home.path()).arg("status").output().unwrap();
+    let output = command(home.path()).arg("status").bounded_output().unwrap();
     assert!(
         output.status.success(),
         "{}",
@@ -698,7 +958,7 @@ fn offline_status_and_actions_use_synthetic_metadata_and_quota() {
         .unwrap(),
     )
     .unwrap();
-    let output = command(home.path()).arg("status").output().unwrap();
+    let output = command(home.path()).arg("status").bounded_output().unwrap();
     assert!(output.status.success());
     let status = String::from_utf8(output.stdout).unwrap();
     let columns: Vec<_> = status.lines().nth(2).unwrap().split('\t').collect();
@@ -738,7 +998,7 @@ fn offline_status_and_actions_use_synthetic_metadata_and_quota() {
                 })
                 .unwrap();
         }
-        let output = command(home.path()).arg("status").output().unwrap();
+        let output = command(home.path()).arg("status").bounded_output().unwrap();
         assert!(output.status.success());
         let status = String::from_utf8(output.stdout).unwrap();
         let columns: Vec<_> = status.lines().nth(2).unwrap().split('\t').collect();
@@ -747,7 +1007,7 @@ fn offline_status_and_actions_use_synthetic_metadata_and_quota() {
     let store = qb_core::accounts::AccountStore::acquire(home.path()).unwrap();
     let account_path = home.path().join("accounts").join(format!("{id}.json"));
     let before = std::fs::read(&account_path).unwrap();
-    let output = command(home.path()).arg("status").output().unwrap();
+    let output = command(home.path()).arg("status").bounded_output().unwrap();
     assert!(
         output.status.success(),
         "{}",
@@ -756,7 +1016,7 @@ fn offline_status_and_actions_use_synthetic_metadata_and_quota() {
     assert_eq!(std::fs::read(&account_path).unwrap(), before);
     let output = command(home.path())
         .args(["accounts", "disable", &id])
-        .output()
+        .bounded_output()
         .unwrap();
     assert!(!output.status.success());
     assert_eq!(
@@ -767,7 +1027,6 @@ fn offline_status_and_actions_use_synthetic_metadata_and_quota() {
 
 #[test]
 fn responding_unhealthy_admin_never_falls_back_to_disk() {
-    use std::io::{Read, Write};
     for (status, body) in [
         ("401 Unauthorized", "{}"),
         ("503 Service Unavailable", "{}"),
@@ -788,16 +1047,10 @@ fn responding_unhealthy_admin_never_falls_back_to_disk() {
             )
             .unwrap();
             let server = std::thread::spawn(move || {
-                let (mut stream, _) = listener.accept().unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
-                let mut request = [0; 4096];
-                let amount = stream.read(&mut request).unwrap();
-                assert!(amount > 0, "CLI closed before sending a request");
-                write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                let deadline = std::time::Instant::now() + MOCK_SERVER_TIMEOUT;
+                mock_response(&listener, deadline, "/admin/v1/health", status, body, None).unwrap();
             });
-            let output = command(home.path()).args(args).output().unwrap();
+            let output = command(home.path()).args(args).bounded_output().unwrap();
             server.join().unwrap();
             assert!(!output.status.success());
             assert!(
@@ -821,7 +1074,7 @@ fn offline_status_does_not_create_a_store() {
     )
     .unwrap();
     drop(admin);
-    let output = command(home.path()).arg("status").output().unwrap();
+    let output = command(home.path()).arg("status").bounded_output().unwrap();
     assert!(
         output.status.success(),
         "{}",
@@ -834,7 +1087,6 @@ fn offline_status_does_not_create_a_store() {
 
 #[test]
 fn online_status_unknown_health_is_utf8_safe_and_omits_secret_fields() {
-    use std::io::{Read, Write};
     let home = fixture();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     std::fs::write(
@@ -852,20 +1104,15 @@ fn online_status_unknown_health_is_utf8_safe_and_omits_secret_fields() {
         "windows":[], "access_token":"synthetic-access-secret", "secret_dpapi_b64":"synthetic-dpapi-secret"
     }]});
     let server = std::thread::spawn(move || {
-        for body in [
-            serde_json::json!({"ok":true,"version":"synthetic","pid":0,"started_at":"2030-01-01T00:00:00Z"}).to_string(),
-            state.to_string(),
+        let deadline = std::time::Instant::now() + MOCK_SERVER_TIMEOUT;
+        for (route, body) in [
+            ("/admin/v1/health", serde_json::json!({"ok":true,"version":"synthetic","pid":0,"started_at":"2030-01-01T00:00:00Z"}).to_string()),
+            ("/admin/v1/state", state.to_string()),
         ] {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            let mut request = [0;4096];
-            let amount = stream.read(&mut request).unwrap();
-            assert!(amount > 0, "CLI closed before sending a request");
-            assert!(String::from_utf8_lossy(&request[..amount]).contains("Bearer synthetic-admin-secret"));
-            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            mock_response(&listener, deadline, route, "200 OK", &body, Some("synthetic-admin-secret")).unwrap();
         }
     });
-    let output = command(home.path()).arg("status").output().unwrap();
+    let output = command(home.path()).arg("status").bounded_output().unwrap();
     server.join().unwrap();
     assert!(
         output.status.success(),
@@ -891,7 +1138,6 @@ fn online_status_unknown_health_is_utf8_safe_and_omits_secret_fields() {
 
 #[test]
 fn online_status_piped_and_file_stdout_are_utf8_with_expired_windows_and_probe_pending() {
-    use std::io::{Read, Write};
     let home = fixture();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     std::fs::write(
@@ -921,17 +1167,14 @@ fn online_status_piped_and_file_stdout_are_utf8_with_expired_windows_and_probe_p
          "windows":[{"name":"7d", "used_pct":25.0, "reset_at":"invalid"}]}
     ]});
     let server = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + MOCK_SERVER_TIMEOUT;
         // Both process launches query health, then state; no real core or upstream.
         for _ in 0..2 {
-            for body in [
-                serde_json::json!({"ok":true,"version":"synthetic","pid":0,"started_at":"2030-01-01T00:00:00Z"}).to_string(),
-                state.to_string(),
+            for (route, body) in [
+                ("/admin/v1/health", serde_json::json!({"ok":true,"version":"synthetic","pid":0,"started_at":"2030-01-01T00:00:00Z"}).to_string()),
+                ("/admin/v1/state", state.to_string()),
             ] {
-                let (mut stream, _) = listener.accept().unwrap();
-                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-                let mut request = [0; 4096];
-                assert!(stream.read(&mut request).unwrap() > 0);
-                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                mock_response(&listener, deadline, route, "200 OK", &body, Some("synthetic-admin-token")).unwrap();
             }
         }
     });
@@ -943,12 +1186,12 @@ fn online_status_piped_and_file_stdout_are_utf8_with_expired_windows_and_probe_p
         "cx-missing-reset\tcodex\t-\t활성\t준비됨\t12.0%\t-\t-\t-\t-\t-\n",
         "cx-invalid-reset\tcodex\t-\t활성\t대기 중\t-\t-\t25.0%\tinvalid\t인증 오류\t2099-01-01T00:00:00Z\n",
     );
-    let piped = command(home.path()).arg("status").output().unwrap();
+    let piped = command(home.path()).arg("status").bounded_output().unwrap();
     let output_path = home.path().join("status.stdout");
     let redirected = command(home.path())
         .arg("status")
         .stdout(Stdio::from(std::fs::File::create(&output_path).unwrap()))
-        .output()
+        .bounded_output_redirected()
         .unwrap();
     server.join().unwrap();
     assert!(piped.status.success(), "{:?}", piped.stderr);
