@@ -210,7 +210,11 @@ The later API-key providers implement the same trait without OAuth.
 - DPAPI is called with `CRYPTPROTECT_UI_FORBIDDEN` and an application entropy value. This protects tokens at rest from other users, but not from malware running as the same user.
 
 **Credential lease, the single owner across processes.**
-- A core must hold an exclusive lease before it loads accounts. The lease is a named mutex `Local\quota-baton-credentials` plus a locked `accounts\.lock`.
+- A core must hold an exclusive lease before it loads accounts.
+  - The lease is a named mutex plus a locked `accounts\.lock`.
+  - The mutex is **per data home**: `Local\quota-baton-credentials-<h>`, where `<h>` is the first 16 hex digits of the SHA-256 of the lowercased canonical home path.
+  - The lease protects one home's account files. Two homes never share owned tokens, and linked accounts only re-read CPA files.
+  - A single global name made isolated test homes and the real core block each other: `LeaseBusy` failures whenever tests ran concurrently (M6a merge check, 2026-10-14).
 - Only the lease holder may refresh tokens or write account and state files. A second `serve` without the lease refuses to start.
 - On takeover the old core hands the lease over during drain (§14). That way the two cores never refresh the same single-use token.
 
