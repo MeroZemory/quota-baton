@@ -431,7 +431,7 @@ async fn c6_3_ws_rate_frame_with_advice_relayed_immediately() {
 
 #[tokio::test]
 async fn c6_3_ws_rate_frame_without_advice_closes_1012_same_account() {
-    let h = Harness::new(1).await;
+    let h = Harness::new(2).await;
     let rate = r#"{"type":"error","status":429,"error":{"code":"rate_limit_exceeded"}}"#;
     h.fake.state.push_reply(
         (0..4)
@@ -443,6 +443,15 @@ async fn c6_3_ws_rate_frame_without_advice_closes_1012_same_account() {
     assert_close(receive(&mut client).await, 1012);
     let (mut reconnect, same_account) = h.connect().await;
     assert_eq!(same_account, account);
+    assert_eq!(same_account, h.ids[0]);
+    let requests = h.fake.state.requests();
+    let first_authorization = requests[0].headers["authorization"].clone();
+    assert!(
+        requests
+            .iter()
+            .all(|request| { request.headers["authorization"] == first_authorization })
+    );
+    assert_eq!(requests.len(), 2, "only A should receive both upgrades");
     reconnect.close(None).await.unwrap();
 }
 

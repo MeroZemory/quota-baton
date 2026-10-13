@@ -1127,10 +1127,8 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
             let pacing = state.accounts.observe_429(&account.id, retry_after);
             if retry_after.is_none() {
                 rate_relay_retry_after = pacing.rate_backoff_until.map(|until| {
-                    until
-                        .saturating_duration_since(Instant::now())
-                        .as_secs()
-                        .clamp(1, 60)
+                    let remaining = until.saturating_duration_since(Instant::now());
+                    (remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0)).clamp(1, 60)
                 });
             }
             if let Some(copy) = retained.as_ref()
