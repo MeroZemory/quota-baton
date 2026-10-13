@@ -73,7 +73,7 @@ impl RelayState {
     }
 
     async fn select(&self, provider: Provider, key: Option<&str>) -> Result<Option<Account>, ()> {
-        let pinned = self.pins.get(key);
+        let pinned = self.pins.get(provider, key);
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || {
             let accounts = store.list().map_err(|_| ())?;
