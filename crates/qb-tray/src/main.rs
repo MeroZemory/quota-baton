@@ -1,5 +1,5 @@
 mod client;
-use qb_tray::{parse_state, render_png};
+use qb_tray::{parse_state_at, render_png};
 
 use clap::Parser;
 
@@ -15,6 +15,12 @@ struct Args {
     scale: f32,
     #[arg(long, requires = "render_png")]
     fixture: Option<std::path::PathBuf>,
+    #[arg(long, requires = "render_png")]
+    now: Option<String>,
+    #[arg(long, requires = "render_png")]
+    expand_disabled: bool,
+    #[arg(long, requires_all = ["fixture", "no_supervise"])]
+    open_flyout: bool,
     /// Do not start or restart a missing core.
     #[arg(long)]
     no_supervise: bool,
@@ -31,13 +37,33 @@ fn main() -> anyhow::Result<()> {
             .fixture
             .ok_or_else(|| anyhow::anyhow!("--fixture is required with --render-png"))?;
         let json = std::fs::read_to_string(fixture)?;
-        let rows = parse_state(&json)?;
-        let png =
-            render_png(&rows, args.scale, args.theme == "dark").map_err(anyhow::Error::msg)?;
-        std::fs::write(output, png)?;
+        let state: qb_tray::State = serde_json::from_str(&json)?;
+        let now = args
+            .now
+            .as_deref()
+            .and_then(|value| {
+                let meta = qb_core::accounts::TokenMeta {
+                    expires_at: serde_json::from_value(serde_json::Value::String(value.into()))
+                        .ok(),
+                    ..Default::default()
+                };
+                meta.expires_at.map(std::time::SystemTime::from)
+            })
+            .unwrap_or_else(std::time::SystemTime::now);
+        let rows = parse_state_at(&json, now)?;
+        render_png(
+            &rows,
+            args.scale,
+            args.theme == "dark",
+            &state.version,
+            now,
+            args.expand_disabled,
+            &output,
+        )
+        .map_err(anyhow::Error::msg)?;
         return Ok(());
     }
-    windows_tray::run(!args.no_supervise)
+    windows_tray::run(!args.no_supervise, args.open_flyout)
 }
 
 #[cfg(not(windows))]

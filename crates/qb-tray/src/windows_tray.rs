@@ -12,13 +12,19 @@ use std::{
 };
 use windows::{
     Win32::{
-        Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM},
+        Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
         Graphics::{
+            Direct2D::{
+                Common::D2D_SIZE_U, D2D1_FACTORY_TYPE_SINGLE_THREADED,
+                D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE,
+                D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1CreateFactory,
+                ID2D1Factory,
+            },
             Dwm::{
                 DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
                 DwmSetWindowAttribute,
             },
-            Gdi::{BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT, TextOutW},
+            Gdi::InvalidateRect,
         },
         System::LibraryLoader::GetModuleHandleW,
         UI::{
@@ -31,8 +37,8 @@ use windows::{
                 CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW,
                 DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, HMENU, IDC_ARROW,
                 IDI_APPLICATION, IsWindowVisible, LoadCursorW, LoadIconW, MSG, PostQuitMessage,
-                RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOSIZE, SetForegroundWindow,
-                SetTimer, SetWindowPos, ShowWindow, TranslateMessage, WM_APP, WM_DESTROY,
+                RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SetForegroundWindow, SetTimer,
+                SetWindowPos, ShowWindow, TranslateMessage, WM_APP, WM_DESTROY, WM_DPICHANGED,
                 WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONUP, WM_PAINT, WM_RBUTTONUP, WM_SETTINGCHANGE,
                 WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
             },
@@ -43,7 +49,7 @@ use windows::{
 
 const TRAY_MESSAGE: u32 = WM_APP + 1;
 const WINDOW_CLASS: PCWSTR = w!("QuotaBatonTrayFlyout");
-static STATUS: OnceLock<Mutex<Vec<u16>>> = OnceLock::new();
+static MODEL: OnceLock<Mutex<(Vec<qb_tray::Row>, String)>> = OnceLock::new();
 static SUPERVISOR: OnceLock<Mutex<Supervisor>> = OnceLock::new();
 static SUPERVISE_ENABLED: AtomicBool = AtomicBool::new(true);
 
@@ -61,15 +67,8 @@ fn supervisor() -> &'static Mutex<Supervisor> {
     })
 }
 
-fn status_text() -> &'static Mutex<Vec<u16>> {
-    STATUS.get_or_init(|| {
-        Mutex::new(
-            "코어 상태를 확인하는 중..."
-                .encode_utf16()
-                .chain([0])
-                .collect(),
-        )
-    })
+fn model() -> &'static Mutex<(Vec<qb_tray::Row>, String)> {
+    MODEL.get_or_init(|| Mutex::new((Vec::new(), "v0.1.0".to_owned())))
 }
 
 fn update_status(supervise: bool) {
@@ -79,6 +78,8 @@ fn update_status(supervise: bool) {
         let read = runtime
             .block_on(client.read())
             .map_err(|e| anyhow::anyhow!(e))?;
+        let rows = super::client::layout_rows(&read, std::time::SystemTime::now())?;
+        *model().lock().unwrap_or_else(|e| e.into_inner()) = (rows, read.snapshot.version.clone());
         Ok(super::client::render_flyout(&read))
     })();
     let text = match result {
@@ -110,16 +111,40 @@ fn update_status(supervise: bool) {
             "코어에 연결할 수 없습니다".to_owned()
         }
     };
-    let mut value = Vec::new();
-    for line in text.lines() {
-        value.extend(line.encode_utf16());
-        value.push(0);
+    if text == "코어에 연결할 수 없습니다" {
+        model().lock().unwrap_or_else(|e| e.into_inner()).0.clear();
     }
-    value.truncate(2048);
-    if value.last() != Some(&0) {
-        value.push(0);
+}
+
+fn paint_window(hwnd: HWND) -> Result<()> {
+    let (rows, version) = model().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    unsafe {
+        let factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
+        let props = D2D1_RENDER_TARGET_PROPERTIES {
+            r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+            dpiX: 96.0,
+            dpiY: 96.0,
+            ..Default::default()
+        };
+        let hwnd_props = D2D1_HWND_RENDER_TARGET_PROPERTIES {
+            hwnd,
+            pixelSize: D2D_SIZE_U {
+                width: 360,
+                height: 700,
+            },
+            presentOptions: D2D1_PRESENT_OPTIONS_NONE,
+        };
+        let target = factory.CreateHwndRenderTarget(&props, &hwnd_props)?;
+        qb_tray::native_render::paint(
+            &target,
+            &rows,
+            false,
+            &version,
+            std::time::SystemTime::now(),
+            false,
+        )?;
     }
-    *status_text().lock().unwrap_or_else(|e| e.into_inner()) = value;
+    Ok(())
 }
 
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -142,10 +167,10 @@ unsafe extern "system" fn window_proc(
                 hwnd,
                 None,
                 point.x - 360,
-                point.y - 430,
+                point.y - 700,
                 360,
-                430,
-                SWP_NOSIZE,
+                700,
+                Default::default(),
             );
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             let _ = SetForegroundWindow(hwnd);
@@ -163,24 +188,29 @@ unsafe extern "system" fn window_proc(
             let _ = InvalidateRect(Some(hwnd), None, true);
             LRESULT(0)
         }
+        WM_DPICHANGED => {
+            if lparam.0 != 0 {
+                let suggested = &*(lparam.0 as *const RECT);
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    suggested.left,
+                    suggested.top,
+                    suggested.right - suggested.left,
+                    suggested.bottom - suggested.top,
+                    Default::default(),
+                );
+            }
+            let _ = InvalidateRect(Some(hwnd), None, true);
+            LRESULT(0)
+        }
         WM_TIMER => {
             update_status(SUPERVISE_ENABLED.load(Ordering::Relaxed));
             let _ = InvalidateRect(Some(hwnd), None, true);
             LRESULT(0)
         }
         WM_PAINT => {
-            let mut paint = PAINTSTRUCT::default();
-            let dc = BeginPaint(hwnd, &mut paint);
-            let text = status_text()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
-            for (row, line) in text.split(|value| *value == 0).enumerate() {
-                if !line.is_empty() {
-                    let _ = TextOutW(dc, 20, 20 + row as i32 * 24, line);
-                }
-            }
-            let _ = EndPaint(hwnd, &paint);
+            let _ = paint_window(hwnd);
             LRESULT(0)
         }
         WM_DESTROY => {
@@ -191,7 +221,7 @@ unsafe extern "system" fn window_proc(
     }
 }
 
-pub fn run(supervise: bool) -> Result<()> {
+pub fn run(supervise: bool, open_flyout: bool) -> Result<()> {
     SUPERVISE_ENABLED.store(supervise, Ordering::Relaxed);
     update_status(supervise);
     unsafe {
@@ -215,7 +245,7 @@ pub fn run(supervise: bool) -> Result<()> {
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             360,
-            430,
+            700,
             None,
             Some(HMENU::default()),
             Some(instance),
@@ -249,6 +279,10 @@ pub fn run(supervise: bool) -> Result<()> {
         icon.szTip[..tip.len()].copy_from_slice(&tip);
         if !Shell_NotifyIconW(NIM_ADD, &icon).as_bool() {
             anyhow::bail!("트레이 아이콘을 만들 수 없습니다");
+        }
+        if open_flyout {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            let _ = SetForegroundWindow(hwnd);
         }
         let mut message = MSG::default();
         while GetMessageW(&mut message, None, 0, 0).as_bool() {

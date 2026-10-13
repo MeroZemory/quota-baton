@@ -1,11 +1,12 @@
 {
-  "version": "synthetic-m6a.1",
+  "version": "v0.1.0",
   "accounts": [
-    {"id":"cl-ready","provider":"claude","label":"Claude 합성","email":"a@example.com","plan":"plus","user_state":"active","health":{"kind":"ready"},"windows":[{"name":"5h","used_pct":45.0,"reset_at":"2099-10-19T16:50:00Z"},{"name":"7d","used_pct":76.0,"reset_at":"2099-10-19T21:00:00Z"}]},
-    {"id":"cl-relogin","provider":"claude","label":"Claude 재로그인","email":"b@example.com","plan":"pro","user_state":"active","health":{"kind":"needs_relogin","reason":"auth"},"windows":[{"name":"5h","used_pct":null,"reset_at":null},{"name":"7d","used_pct":12.0,"reset_at":"2099-10-20T00:00:00Z"}]},
-    {"id":"cx-ready","provider":"codex","label":"Codex 합성","email":"c@example.com","plan":"free","user_state":"active","health":{"kind":"ready"},"windows":[{"name":"5h","used_pct":42.5,"reset_at":"2099-10-19T17:00:00Z"},{"name":"7d","used_pct":92.0,"reset_at":"2099-10-20T00:00:00Z"}]},
-    {"id":"cx-cooling","provider":"codex","label":"Codex 한도 대기","email":"d@example.com","plan":"plus","user_state":"active","health":{"kind":"cooling","reason":"quota","until":"2099-10-19T16:50:00Z","scope":"account"},"windows":[{"name":"5h","used_pct":99.0,"reset_at":"2099-10-19T16:50:00Z"},{"name":"7d","used_pct":80.0,"reset_at":"2099-10-20T00:00:00Z"}]},
-    {"id":"cl-disabled","provider":"claude","label":"Claude 비활성","email":"e@example.com","plan":"free","user_state":"disabled","health":{"kind":"ready"},"windows":[]},
-    {"id":"cx-disabled","provider":"codex","label":"Codex 비활성","email":"f@example.com","plan":"free","user_state":"disabled","health":{"kind":"ready"},"windows":[]}
+    {"id":"cl-ready","provider":"claude","label":null,"email":"a@example.com","plan":"plus","user_state":"active","health":{"kind":"ready"},"windows":[{"name":"5h","used_pct":45.0,"reset_at":"2026-10-19T16:50:00+09:00"},{"name":"7d","used_pct":76.0,"reset_at":"2026-10-21T21:00:00+09:00"}]},
+    {"id":"cl-relogin","provider":"claude","label":null,"email":"b@example.com","plan":"pro","user_state":"active","health":{"kind":"needs_relogin","reason":"auth"},"windows":[{"name":"5h","used_pct":null,"reset_at":null},{"name":"7d","used_pct":12.0,"reset_at":"2026-10-21T21:00:00+09:00"}]},
+    {"id":"cl-disabled","provider":"claude","label":null,"email":"e@example.com","plan":"free","user_state":"disabled","health":{"kind":"ready"},"windows":[]},
+    {"id":"cx-ready","provider":"codex","label":null,"email":"c@example.com","plan":"free","user_state":"active","health":{"kind":"ready"},"windows":[{"name":"5h","used_pct":42.5,"reset_at":"2026-10-19T17:00:00+09:00"},{"name":"7d","used_pct":92.0,"reset_at":"2026-10-21T21:00:00+09:00"}]},
+    {"id":"cx-cooling","provider":"codex","label":null,"email":"d@example.com","plan":"plus","user_state":"active","health":{"kind":"cooling","reason":"quota","until":"2026-10-19T16:50:00+09:00","scope":"account"},"windows":[{"name":"5h","used_pct":99.0,"reset_at":"2026-10-19T16:50:00+09:00"},{"name":"7d","used_pct":80.0,"reset_at":"2026-10-21T21:00:00+09:00"}]},
+    {"id":"cx-30d","provider":"codex","label":null,"email":"g@example.com","plan":"free","user_state":"active","health":{"kind":"ready"},"windows":[{"name":"43200m","used_pct":0.0,"reset_at":"2026-11-12T00:00:00+09:00"}]},
+    {"id":"cx-disabled","provider":"codex","label":null,"email":"f@example.com","plan":"free","user_state":"disabled","health":{"kind":"ready"},"windows":[]}
   ]
 }
