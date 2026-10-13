@@ -86,6 +86,12 @@ What a design needs follows from those numbers:
 - The evidence is contradictory.
 - For Claude, thinking-block signatures carry the same question. The previous proxy never stripped them across accounts and saw almost no 400s, which is weak evidence that they are portable.
 - **New evidence (R8 I-16):** three Codex compaction blobs were rejected with `thinking_signature_invalid` after the previous proxy lost a session's binding and served it from another account. Compaction at least appears to be account-bound.
+- **V2 result, HTTP cells, day 1 (2026-10-13; `.sandbox/g1/G1-log.md`).**
+  - Codex encrypted reasoning items and Claude signed thinking blocks from account A are **silently ignored** by account B: 200, and the input-token count equals the stripped body. This holds inside a tool-use turn as well.
+  - The negative controls (tampered blob or signature on the minting account) are rejected with 400, so validation exists.
+  - The first request after a switch is cache-cold.
+  - **Not portable, but harmless:** a moved session keeps working and loses only earlier hidden reasoning. Remote-compaction blobs were not tested; R8 I-16 suggests they are rejected.
+  - The WebSocket cells and the second-day repeat are still pending.
 - This is the decisive Phase 0 test (V2, §16.1). Its outcome selects the hand-off policy ([D10](decisions.md#d10)).
 
 ## 3. Principles
