@@ -151,6 +151,11 @@ pub(crate) fn read(path: &Path, dir: &Path) -> Result<Candidate, ReadError> {
         identity,
         user_state: UserState::Disabled,
         health: Health::Ready,
+        auth_failures: 0,
+        auth_probe_pending: false,
+        quota_cooling: None,
+        drain: false,
+        allow_credits: false,
         generation: 0,
         token_meta: TokenMeta {
             expires_at: file.expired,
@@ -247,6 +252,16 @@ fn execute(
         if let Some(old) = old {
             account.generation = old.generation;
             account.user_state = old.user_state;
+            account.label = old.label.clone();
+            account.health = old.health.clone();
+            account.auth_failures = old.auth_failures;
+            account.auth_probe_pending = old.auth_probe_pending;
+            account.quota_cooling = old.quota_cooling.clone();
+            account.drain = old.drain;
+            account.allow_credits = old.allow_credits;
+            if account.token_meta.newer_than(&old.token_meta) {
+                account.apply_health_signal(super::HealthSignal::NewerLinkedToken, Utc::now());
+            }
             if account
                 .token_meta
                 .compare(&old.token_meta)

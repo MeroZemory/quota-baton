@@ -38,10 +38,11 @@ tempfile = "=3.23.0"
 thiserror = "=2.0.17"
 tokio = { version = "=1.48.0", features = ["full"] }
 toml = "=0.9.8"
+toml_edit = "=0.23.10"
 tracing = "=0.1.41"
 tracing-appender = "=0.2.3"
 tracing-subscriber = { version = "=0.3.20", features = ["env-filter", "json"] }
-windows = { version = "=0.62.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Memory", "Win32_System_Threading", "Win32_System_Console"] }
+windows = { version = "=0.62.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_System_Console"] }
 zeroize = { version = "=1.8.2", features = ["derive"] }
 qb-core = { path = "crates/qb-core" }
 qb-proto = { path = "crates/qb-proto" }

@@ -544,7 +544,7 @@ async fn expiry_reload_is_throttled_stale_events_limited_and_401_bypasses_thrott
     h.claude
         .state
         .push(ScriptedResponse::json(StatusCode::UNAUTHORIZED, "{}"));
-    assert_eq!(h.send("/v1/messages", "{}").await.status(), 401);
+    assert_eq!(h.send("/v1/messages", "{}").await.status(), 429);
     let rows = h.ledger();
     assert_eq!(
         rows.iter().filter(|r| r["outcome"] == "link_stale").count(),
@@ -556,7 +556,7 @@ async fn expiry_reload_is_throttled_stale_events_limited_and_401_bypasses_thrott
 }
 
 #[tokio::test]
-async fn linked_reload_before_expiry_and_401_once_without_health_changes() {
+async fn linked_reload_before_expiry_and_401_once_then_link_stale() {
     let _serial = SERIAL.lock().await;
     let h = Harness::new(64, 384).await;
     let old = h
@@ -619,19 +619,22 @@ async fn linked_reload_before_expiry_and_401_once_without_health_changes() {
         "{\"error\":\"synthetic unauthorized\"}",
     ));
     let response = h.send("/v1/responses", "{}").await;
-    assert_eq!(response.status(), 401);
-    assert_eq!(
-        response.text().await.unwrap(),
-        "{\"error\":\"synthetic unauthorized\"}"
+    assert_eq!(response.status(), 429);
+    assert!(
+        response
+            .text()
+            .await
+            .unwrap()
+            .contains("usage_limit_reached")
     );
     assert_eq!(h.codex.state.requests().len(), 3);
-    assert!(
-        h.store
-            .list()
-            .unwrap()
-            .iter()
-            .all(|account| account.health == qb_core::accounts::Health::Ready)
-    );
+    assert!(h.store.list().unwrap().iter().any(|account| matches!(
+        account.health,
+        qb_core::accounts::Health::Cooling {
+            reason: qb_core::accounts::HealthReason::LinkStale,
+            ..
+        }
+    )));
     let rows = h.ledger();
     assert!(
         rows.iter()
@@ -742,7 +745,13 @@ async fn phase0_authenticated_replay_uses_forced_account_and_linked_401_path() {
         serde_json::to_vec(&second).unwrap(),
     )
     .unwrap();
-    import::run(&h.store, &h.cpa, &[], false).unwrap();
+    import::run(
+        &h.store,
+        &h.cpa,
+        &["codex:second@example.invalid".into()],
+        false,
+    )
+    .unwrap();
     let account = h
         .store
         .list()
@@ -836,7 +845,10 @@ async fn no_account_and_debug_pin_routes() {
     let error: Value = response.json().await.unwrap();
     assert_eq!(error["type"], "error");
     assert_eq!(error["error"]["type"], "invalid_request_error");
-    assert!(error["error"]["message"].as_str().unwrap().contains("계정"));
+    assert_eq!(
+        error["error"]["message"],
+        "quota-baton: no usable claude account — open the tray"
+    );
     assert!(
         error["error"]["message"]
             .as_str()
@@ -881,7 +893,7 @@ async fn no_account_and_debug_pin_routes() {
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), 200);
+    assert_eq!(response.status(), 400);
     response.bytes().await.unwrap();
     assert_eq!(h.send("/v1/responses", "{}").await.status(), 400);
     assert_eq!(

@@ -1,3 +1,4 @@
+pub mod account_runtime;
 pub mod accounts;
 pub mod admin;
 #[cfg(feature = "shape-capture")]

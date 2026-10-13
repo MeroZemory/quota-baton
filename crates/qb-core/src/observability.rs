@@ -83,6 +83,14 @@ pub struct RequestRecord {
     pub retained_copy: bool,
     #[serde(default)]
     pub upstream_error_code: Option<String>,
+    #[serde(default)]
+    pub attempt_details: Vec<AttemptRecord>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct AttemptRecord {
+    pub account: String,
+    pub failover_reason: Option<String>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -91,6 +99,17 @@ struct QuotaState {
     schema: u32,
     #[serde(default)]
     accounts: BTreeMap<String, Snapshot>,
+}
+fn reset_moved(new: &serde_json::Value, old: &serde_json::Value) -> bool {
+    new.as_str()
+        .zip(old.as_str())
+        .and_then(|(new, old)| {
+            Some((
+                DateTime::parse_from_rfc3339(new).ok()?,
+                DateTime::parse_from_rfc3339(old).ok()?,
+            ))
+        })
+        .is_some_and(|(new, old)| (new - old).num_seconds().abs() > 300)
 }
 fn schema() -> u32 {
     1
@@ -101,6 +120,8 @@ struct Window {
     name: String,
     used_pct: Option<f64>,
     reset_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    observed_at: Option<DateTime<Utc>>,
     status: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
@@ -122,6 +143,8 @@ struct Signals {
     retry_after_seconds: Option<f64>,
     limit_reached: Option<bool>,
     active_limit: Option<String>,
+    #[serde(default)]
+    serving_from_credits: Option<bool>,
 }
 impl Signals {
     fn is_empty(&self) -> bool {
@@ -132,6 +155,7 @@ impl Signals {
             && self.retry_after_seconds.is_none()
             && self.limit_reached.is_none()
             && self.active_limit.is_none()
+            && self.serving_from_credits.is_none()
     }
     fn merge(&mut self, old: Self) {
         self.unified_status = self.unified_status.take().or(old.unified_status);
@@ -144,6 +168,7 @@ impl Signals {
         self.retry_after_seconds = self.retry_after_seconds.or(old.retry_after_seconds);
         self.limit_reached = self.limit_reached.or(old.limit_reached);
         self.active_limit = self.active_limit.take().or(old.active_limit);
+        self.serving_from_credits = self.serving_from_credits.or(old.serving_from_credits);
     }
 }
 #[derive(Serialize, Deserialize)]
@@ -163,6 +188,7 @@ enum Command {
 }
 
 pub struct Observability {
+    snapshots: std::sync::Mutex<BTreeMap<String, serde_json::Value>>,
     tx: mpsc::SyncSender<Command>,
     worker: Option<thread::JoinHandle<()>>,
     dropped: Arc<AtomicU64>,
@@ -216,10 +242,16 @@ impl Observability {
         let dropped = Arc::new(AtomicU64::new(0));
         let worker_dropped = dropped.clone();
         let home = home.to_owned();
+        let snapshots = state
+            .accounts
+            .iter()
+            .filter_map(|(id, s)| serde_json::to_value(s).ok().map(|v| (id.clone(), v)))
+            .collect();
         let worker = thread::Builder::new()
             .name("qb-observability".into())
             .spawn(move || run(home, state, rx, worker_dropped))?;
         Ok(Self {
+            snapshots: std::sync::Mutex::new(snapshots),
             tx,
             worker: Some(worker),
             dropped,
@@ -230,6 +262,7 @@ impl Observability {
 
     pub fn observe_headers(&self, account_id: &str, provider: Provider, headers: &HeaderMap) {
         if let Some(snapshot) = snapshot(provider, headers, Utc::now()) {
+            self.remember(account_id, &snapshot);
             self.enqueue(Command::Quota(account_id.into(), Box::new(snapshot)));
         }
     }
@@ -271,6 +304,13 @@ impl Observability {
                 add(format!("x-codex-{}", key.replace('_', "-")), value);
             }
         }
+        if let Some(value) = event
+            .get("serving_from_credits")
+            .or_else(|| limits.get("serving_from_credits"))
+            .or_else(|| event.get("credits").and_then(|c| c.get("used")))
+        {
+            add("x-codex-credits-serving".into(), value);
+        }
         if let Some(credits) = event.get("credits").or_else(|| limits.get("credits")) {
             for key in ["has_credits", "unlimited", "balance"] {
                 if let Some(value) = credits.get(key) {
@@ -280,6 +320,7 @@ impl Observability {
         }
         if let Some(mut snapshot) = snapshot(Provider::Codex, &headers, Utc::now()) {
             snapshot.source = "codex.rate_limits".into();
+            self.remember(account_id, &snapshot);
             self.enqueue(Command::Quota(account_id.into(), Box::new(snapshot)));
         }
     }
@@ -345,9 +386,84 @@ impl Observability {
             .session
             .filter(|v| v.len() == 12 && v.bytes().all(|c| c.is_ascii_hexdigit()));
         record.ua = record.ua.as_deref().and_then(product);
+        record.model = record.model.as_deref().and_then(safe_identifier);
+        record.originator = record.originator.as_deref().and_then(safe_identifier);
         if let Ok(value) = serde_json::to_value(record) {
             self.enqueue(Command::Ledger(value));
         }
+    }
+
+    fn remember(&self, id: &str, next: &Snapshot) {
+        if let Ok(mut snapshots) = self.snapshots.lock()
+            && let Ok(mut value) = serde_json::to_value(next)
+        {
+            // 부분 헤더 응답은 기존 창 정보를 지우지 않는다.
+            if let Some(old) = snapshots.get(id) {
+                if let (Some(new), Some(previous)) =
+                    (value["windows"].as_array_mut(), old["windows"].as_array())
+                {
+                    for window in previous {
+                        if let Some(updated) = new.iter_mut().find(|w| w["name"] == window["name"])
+                        {
+                            let reset_changed = !updated["reset_at"].is_null()
+                                && !window["reset_at"].is_null()
+                                && reset_moved(&updated["reset_at"], &window["reset_at"]);
+                            for key in ["used_pct", "reset_at", "observed_at", "status"] {
+                                if updated[key].is_null() && !(key == "status" && reset_changed) {
+                                    updated[key] = window[key].clone();
+                                }
+                            }
+                        } else {
+                            new.push(window.clone());
+                        }
+                    }
+                }
+                let fresh_reset = value["windows"].as_array().is_some_and(|windows| {
+                    windows.iter().any(|window| {
+                        window["used_pct"].as_f64().is_some_and(|used| used < 100.0)
+                            && old["windows"].as_array().is_some_and(|old| {
+                                old.iter().any(|prior| {
+                                    prior["name"] == window["name"]
+                                        && reset_moved(&window["reset_at"], &prior["reset_at"])
+                                })
+                            })
+                    })
+                });
+                if let (Ok(mut next_signals), Ok(mut prior_signals)) = (
+                    serde_json::from_value::<Signals>(value["signals"].clone()),
+                    serde_json::from_value::<Signals>(old["signals"].clone()),
+                ) {
+                    if fresh_reset {
+                        prior_signals.unified_status = None;
+                        prior_signals.limit_reached = None;
+                        prior_signals.serving_from_credits = None;
+                        prior_signals.active_limit = None;
+                    }
+                    next_signals.merge(prior_signals);
+                    value["signals"] = serde_json::to_value(next_signals).unwrap_or_default();
+                }
+                for key in ["plan", "credits"] {
+                    if value[key].is_null() {
+                        value[key] = old[key].clone();
+                    }
+                }
+            }
+            snapshots.insert(id.into(), value);
+        }
+    }
+
+    pub fn quota_snapshot(&self, id: &str) -> Option<serde_json::Value> {
+        self.snapshots.lock().ok()?.get(id).cloned()
+    }
+
+    pub fn record_health(
+        &self,
+        id: &str,
+        from: &crate::accounts::Health,
+        to: &crate::accounts::Health,
+    ) {
+        let value = serde_json::to_value(to).unwrap_or_default();
+        self.enqueue(Command::Ledger(serde_json::json!({"ts":Utc::now().to_rfc3339(),"event":"health_changed","account":id,"from":from,"to":to,"reason":value["reason"],"until":value["until"]})));
     }
 
     pub fn record_reload(
@@ -493,7 +609,7 @@ fn snapshot(provider: Provider, h: &HeaderMap, now: DateTime<Utc>) -> Option<Sna
             for name in ["5h", "7d", "7d_oi"] {
                 let prefix = format!("anthropic-ratelimit-unified-{name}");
                 let used_pct = number(h, &format!("{prefix}-utilization"))
-                    .filter(|v| (0.0..=1.0).contains(v))
+                    .filter(|v| *v >= 0.0)
                     .map(|v| v * 100.0);
                 let reset_at = timestamp(h, &format!("{prefix}-reset"));
                 let status = status(h, &format!("{prefix}-status"));
@@ -502,6 +618,7 @@ fn snapshot(provider: Provider, h: &HeaderMap, now: DateTime<Utc>) -> Option<Sna
                         name: name.into(),
                         used_pct,
                         reset_at,
+                        observed_at: used_pct.map(|_| now),
                         status,
                     });
                 }
@@ -510,12 +627,14 @@ fn snapshot(provider: Provider, h: &HeaderMap, now: DateTime<Utc>) -> Option<Sna
         Provider::Codex => {
             signals.limit_reached = header(h, "x-codex-limit-reached").and_then(|v| v.parse().ok());
             signals.active_limit = header(h, "x-codex-active-limit")
-                .filter(|v| matches!(*v, "primary" | "secondary" | "5h" | "7d"))
+                .filter(|v| matches!(*v, "primary" | "secondary" | "5h" | "7d" | "credits"))
                 .map(str::to_owned);
+            signals.serving_from_credits = header(h, "x-codex-credits-serving")
+                .and_then(|v| v.parse().ok())
+                .or_else(|| (header(h, "x-codex-active-limit") == Some("credits")).then_some(true));
             for slot in ["primary", "secondary"] {
                 let prefix = format!("x-codex-{slot}");
-                let used_pct = number(h, &format!("{prefix}-used-percent"))
-                    .filter(|v| (0.0..=100.0).contains(v));
+                let used_pct = number(h, &format!("{prefix}-used-percent")).filter(|v| *v >= 0.0);
                 let minutes = header(h, &format!("{prefix}-window-minutes"))
                     .and_then(|v| v.parse::<u32>().ok());
                 let name = match minutes {
@@ -532,11 +651,12 @@ fn snapshot(provider: Provider, h: &HeaderMap, now: DateTime<Utc>) -> Option<Sna
                         .and_then(|d| now.checked_add_signed(d))
                 });
                 let status = status(h, "x-codex-limit-reached");
-                if used_pct.is_some() {
+                if used_pct.is_some() || reset_at.is_some_and(|reset| reset > now) {
                     windows.push(Window {
                         name,
                         used_pct,
                         reset_at,
+                        observed_at: used_pct.map(|_| now),
                         status,
                     });
                 }
@@ -628,12 +748,39 @@ impl Writer {
     fn event(&mut self, command: Command) {
         let result = match command {
             Command::Quota(id, mut next) => {
-                if let Some(old) = self.state.accounts.remove(&id) {
+                if let Some(mut old) = self.state.accounts.remove(&id) {
+                    let early_reset = next.windows.iter().any(|w| {
+                        old.windows.iter().any(|old| {
+                            old.name == w.name
+                                && w.reset_at.is_some()
+                                && old.reset_at.is_some()
+                                && w.reset_at
+                                    .zip(old.reset_at)
+                                    .is_some_and(|(new, old)| (new - old).num_seconds().abs() > 300)
+                        })
+                    }) && next
+                        .windows
+                        .iter()
+                        .all(|w| w.used_pct.is_some_and(|p| p < 100.0));
+                    if early_reset {
+                        old.signals.unified_status = None;
+                        old.signals.limit_reached = None;
+                        old.signals.serving_from_credits = None;
+                        old.signals.active_limit = None;
+                    }
                     for mut window in old.windows {
                         if let Some(new) = next.windows.iter_mut().find(|w| w.name == window.name) {
+                            let reset_changed = new.reset_at.is_some()
+                                && window.reset_at.is_some()
+                                && new.reset_at.zip(window.reset_at).is_some_and(|(new, old)| {
+                                    (new - old).num_seconds().abs() > 300
+                                });
                             new.used_pct = new.used_pct.or(window.used_pct);
                             new.reset_at = new.reset_at.or(window.reset_at);
-                            new.status = new.status.take().or(window.status.take());
+                            new.observed_at = new.observed_at.or(window.observed_at);
+                            if !reset_changed {
+                                new.status = new.status.take().or(window.status.take());
+                            }
                         } else {
                             next.windows.push(window);
                         }
@@ -856,6 +1003,7 @@ mod tests {
             outcome: "ok".into(),
             retained_copy: true,
             upstream_error_code: None,
+            attempt_details: Vec::new(),
         }
     }
 
@@ -1115,6 +1263,7 @@ mod tests {
         // 작성자가 멈춘 큐로 느린 디스크를 결정적으로 재현한다.
         let (tx, rx) = mpsc::sync_channel(2);
         let obs = Observability {
+            snapshots: std::sync::Mutex::new(BTreeMap::new()),
             tx,
             worker: None,
             dropped: Arc::new(AtomicU64::new(0)),
@@ -1245,6 +1394,7 @@ mod tests {
             let _ = done_tx.send(drained);
         });
         let obs = Observability {
+            snapshots: std::sync::Mutex::new(BTreeMap::new()),
             tx,
             worker: Some(worker),
             dropped: Arc::new(AtomicU64::new(0)),
@@ -1413,7 +1563,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_realistic_windows_require_usage_and_never_invent_resets() {
+    fn codex_realistic_windows_keep_known_future_resets_without_inventing_usage() {
         let now: DateTime<Utc> = "2026-10-13T00:00:00Z".parse().unwrap();
         let mut h = HeaderMap::new();
         h.insert("x-codex-primary-used-percent", "12".parse().unwrap());
@@ -1449,6 +1599,16 @@ mod tests {
         assert_eq!(absent.windows[0].reset_at, None);
         h.remove("x-codex-primary-used-percent");
         h.remove("x-codex-secondary-used-percent");
+        let reset_only = snapshot(Provider::Codex, &h, now).unwrap();
+        assert_eq!(reset_only.windows.len(), 1);
+        assert_eq!(reset_only.windows[0].name, "7d");
+        assert_eq!(reset_only.windows[0].used_pct, None);
+        assert_eq!(reset_only.windows[0].observed_at, None);
+        assert_eq!(
+            reset_only.windows[0].reset_at,
+            DateTime::from_timestamp(2000000000, 0)
+        );
+        h.remove("x-codex-secondary-reset-at");
         assert!(snapshot(Provider::Codex, &h, now).is_none());
     }
 

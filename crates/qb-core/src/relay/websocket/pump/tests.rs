@@ -110,6 +110,9 @@ async fn pair_with_read_timeout(
                         client,
                         upstream,
                         Context {
+                            runtime: None,
+                            relay: None,
+                            credentials: None,
                             budget,
                             observability: obs,
                             account: "fake-account".into(),
@@ -727,4 +730,69 @@ async fn close_code_and_reason_are_mirrored_both_ways() {
             assert_eq!(next(&mut pair.peer).await, close);
         }
     }
+}
+
+#[test]
+fn c6_row_13a_only_response_events_commit_the_current_request() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/pump-tests");
+    std::fs::create_dir_all(&root).unwrap();
+    let home = tempfile::tempdir_in(root).unwrap();
+    let context = Context {
+        runtime: None,
+        relay: None,
+        credentials: None,
+        budget: InflightBudget::new(PARSE_LIMIT),
+        observability: Arc::new(Observability::new(home.path(), None).unwrap()),
+        account: "fixture".into(),
+        session: Session::default(),
+        headers: HeaderMap::new(),
+        idle_close: Duration::from_secs(60),
+        close_after_response: false,
+        capture_ticket: None,
+        connection: "fixture".into(),
+    };
+    let mut current = CurrentCompletion::new(&context);
+    for event in [
+        None,
+        Some(serde_json::json!({"type":"metadata"})),
+        Some(serde_json::json!({"type":"codex.rate_limits"})),
+    ] {
+        current.upstream(event.as_ref());
+        assert!(!current.committed);
+    }
+    current.upstream(Some(&serde_json::json!({"type":"response.created"})));
+    assert!(current.committed);
+}
+
+#[test]
+fn health_broadcast_filters_unrelated_accounts_before_idle_eligibility_load() {
+    for kind in ["account_changed", "quota_updated"] {
+        assert!(!event_affects_account(
+            &serde_json::json!({"event":kind,"data":{"id":"other-account"}}),
+            "pinned-account"
+        ));
+        assert!(event_affects_account(
+            &serde_json::json!({"event":kind,"data":{"id":"pinned-account"}}),
+            "pinned-account"
+        ));
+    }
+    assert!(!event_affects_account(
+        &serde_json::json!({"event":"account_changed","data":{}}),
+        "pinned-account"
+    ));
+}
+
+#[test]
+fn auth_retry_marker_expires_before_natural_access_token_expiry() {
+    let now = std::time::Instant::now();
+    let marker = crate::relay::websocket::RetriedToken {
+        relay: std::sync::Weak::new(),
+        account: "synthetic-account".into(),
+        digest: [7; 32],
+        expires_at: now + crate::relay::websocket::RETRY_MARKER_TTL,
+    };
+    assert!(marker.matches(&[7; 32], now + Duration::from_secs(119)));
+    assert!(!marker.matches(&[7; 32], now + Duration::from_secs(120)));
+    assert!(!marker.matches(&[7; 32], now + Duration::from_secs(3600)));
+    assert!(!marker.matches(&[8; 32], now));
 }

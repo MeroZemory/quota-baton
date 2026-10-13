@@ -29,6 +29,7 @@ pub(super) struct HeldResponse {
     pub stream: RawStream,
     pub terminal: Option<io::Error>,
     pub decision: CommitDecision,
+    pub complete: bool,
 }
 
 fn stream_error() -> io::Error {
@@ -44,6 +45,7 @@ pub(super) async fn hold(
     let mut prefix = Vec::with_capacity(HOLD_LIMIT);
     let mut remainder = None;
     let mut terminal = None;
+    let mut complete = false;
     let sse = headers
         .get("content-type")
         .and_then(|v| v.to_str().ok())
@@ -63,6 +65,31 @@ pub(super) async fn hold(
     let deadline = tokio::time::Instant::now() + timeout;
     let mut scanner = EventScanner::default();
     let decision = if !status.is_success() {
+        // 오류 분류와 진짜 한도 응답 캐시는 제한된 원본 복사만 사용한다.
+        loop {
+            match tokio::time::timeout_at(deadline, stream.next()).await {
+                Ok(None) => {
+                    complete = true;
+                    break;
+                }
+                Ok(Some(Ok(chunk))) => {
+                    let take = chunk.len().min(HOLD_LIMIT - prefix.len());
+                    prefix.extend_from_slice(&chunk[..take]);
+                    if take < chunk.len() {
+                        remainder = Some(chunk.slice(take..));
+                        break;
+                    }
+                    if prefix.len() == HOLD_LIMIT {
+                        break;
+                    }
+                }
+                Ok(Some(Err(_))) => {
+                    terminal = Some(stream_error());
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
         CommitDecision::Status
     } else if sse && (encoding.is_none() || (encoding != Some(None) && decoder.is_none())) {
         // 지원하지 않는 인코딩은 첫 바이트를 기다리지 않고 원본 스트림을 넘긴다.
@@ -71,7 +98,10 @@ pub(super) async fn hold(
         loop {
             match tokio::time::timeout_at(deadline, stream.next()).await {
                 Err(_) => break CommitDecision::HoldTimeout,
-                Ok(None) => break CommitDecision::End,
+                Ok(None) => {
+                    complete = true;
+                    break CommitDecision::End;
+                }
                 Ok(Some(Err(_))) => {
                     terminal = Some(stream_error());
                     break CommitDecision::StreamError;
@@ -115,6 +145,7 @@ pub(super) async fn hold(
         stream,
         terminal,
         decision,
+        complete,
     }
 }
 
