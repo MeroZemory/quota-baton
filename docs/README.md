@@ -5,6 +5,7 @@
 | [decisions.md](decisions.md) | Records each decision and who made it | Before you change scope or direction |
 | [architecture.md](architecture.md) | Explains how the system is built and why, including the verification plan and the milestones | When you first start on the project |
 | [contract.md](contract.md) | Normative externally observable behaviour: routes, headers, body invariance, state machine, error mapping, selection, and file formats | Before implementing or testing any behaviour |
+| [architecture-overview.html](architecture-overview.html) | Korean visual overview of the three documents above, for the owner. It is non-normative: where it differs, the documents above win. | To grasp the design quickly; open it in a browser |
 
 Rules:
 - A normative statement lives in exactly one place. Behaviour belongs in `contract.md`; design rationale belongs in `architecture.md`.
