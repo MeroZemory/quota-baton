@@ -196,10 +196,7 @@ impl AccountStore {
 
     fn load_unlocked(&self, id: &str) -> Result<Account, StoreError> {
         let mut record = self.read(id)?;
-        let expired_auth = matches!(record.account.health, Health::Cooling {reason: super::HealthReason::Auth,until,..} if until <= chrono::Utc::now());
-        if record.account.health.expire(chrono::Utc::now()) {
-            record.account.auth_probe_pending |= expired_auth;
-            record.account.quota_cooling = None;
+        if record.account.expire_health(chrono::Utc::now()) {
             let generation = record.account.generation;
             self.write_metadata_record(record, generation)
         } else {
@@ -227,6 +224,8 @@ impl AccountStore {
         update: impl FnOnce(&mut Account),
     ) -> Result<Account, StoreError> {
         let _guard = self.transaction()?;
+        // Expire even when a stale token suppresses the requested transition.
+        self.load_unlocked(id)?;
         let record = self.read(id)?;
         let tokens = crypto::decrypt(&record.secret_dpapi_b64)?;
         if tokens.access_token != failed {
@@ -257,6 +256,7 @@ impl AccountStore {
     ) -> Result<Account, StoreError> {
         let mut record = self.read(id)?;
         let current = record.account.clone();
+        record.account.expire_health(chrono::Utc::now());
         update(&mut record.account);
         Self::validate(&record.account)?;
         if record.account.id != current.id
@@ -452,5 +452,90 @@ impl AccountStore {
             let _ = fs::remove_file(&path);
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{HealthReason, HealthSignal};
+    use super::*;
+    use chrono::{Duration, Utc};
+
+    #[test]
+    fn r1_metadata_and_token_guarded_transitions_expire_before_read() {
+        let sandbox =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/hardening-fixtures");
+        fs::create_dir_all(&sandbox).unwrap();
+        let root = tempfile::tempdir_in(sandbox).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let store = loop {
+            match AccountStore::acquire(root.path()) {
+                Ok(store) => break store,
+                Err(StoreError::LeaseBusy) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("synthetic fixture lease: {error}"),
+            }
+        };
+        let tokens = Tokens {
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            id_token: None,
+        };
+        let now = Utc::now();
+        for guarded in [false, true] {
+            let mut account = super::super::health::tests::fixture();
+            account.health = Health::Cooling {
+                reason: HealthReason::Auth,
+                until: now - Duration::seconds(1),
+                scope: "account".into(),
+            };
+            account.auth_failures = 2;
+            let expected = store.read(&account.id).ok().map(|r| r.account.generation);
+            account.generation = expected.unwrap_or(0);
+            let saved = store.save(&account, &tokens, expected).unwrap();
+            let update = |account: &mut Account| {
+                assert_eq!(account.health, Health::Ready);
+                assert!(account.auth_probe_pending);
+                account.apply_health_signal(
+                    HealthSignal::Cooling {
+                        reason: HealthReason::Permission,
+                        until: now + Duration::hours(1),
+                        scope: "model:X".into(),
+                    },
+                    now,
+                );
+            };
+            let updated = if guarded {
+                store
+                    .update_metadata_for_token(&saved.id, &tokens.access_token, update)
+                    .unwrap()
+            } else {
+                store.update_metadata(&saved.id, update).unwrap()
+            };
+            assert!(matches!(&updated.health, Health::Cooling { scope, .. } if scope == "model:X"));
+            assert_eq!(updated.auth_failures, 2);
+            assert_eq!(store.read(&saved.id).unwrap().account, updated);
+        }
+        let mut account = store
+            .read(&super::super::health::tests::fixture().id)
+            .unwrap()
+            .account;
+        account.health = Health::Cooling {
+            reason: HealthReason::Auth,
+            until: now - Duration::seconds(1),
+            scope: "account".into(),
+        };
+        let saved = store
+            .save(&account, &tokens, Some(account.generation))
+            .unwrap();
+        let updated = store
+            .update_metadata_for_token(&saved.id, "synthetic-stale-token", |_| {
+                panic!("stale token must suppress callback")
+            })
+            .unwrap();
+        assert_eq!(updated.health, Health::Ready);
+        assert!(updated.auth_probe_pending);
+        assert_eq!(store.read(&saved.id).unwrap().account, updated);
     }
 }

@@ -37,6 +37,8 @@ use ledger::Completion;
 
 pub struct RelayState {
     pub accounts: Arc<crate::account_runtime::AccountRuntime>,
+    pub bindings: Arc<crate::bindings::BindingTable>,
+    placement: [tokio::sync::Mutex<()>; 2],
     pub inflight_requests: Arc<AtomicU64>,
     store: Arc<AccountStore>,
     client: reqwest::Client,
@@ -84,6 +86,7 @@ impl RelayState {
     ) -> anyhow::Result<Self> {
         config.upstream.validate()?;
         config.websocket.validate()?;
+        config.routing.validate()?;
         let client = upstream_client()?;
         let accounts = crate::account_runtime::AccountRuntime::new(
             store.clone(),
@@ -91,8 +94,13 @@ impl RelayState {
             config.routing.inflight_allowance_pct,
         );
         let tokens = TokenGates::new(client.clone(), accounts.clone());
+        // The lease is held and account expiry/reconciliation precedes affinity restore.
+        store.list()?;
+        let bindings = crate::bindings::BindingTable::new(store.home(), config.routing.clone())?;
         Ok(Self {
             accounts,
+            bindings,
+            placement: [tokio::sync::Mutex::new(()), tokio::sync::Mutex::new(())],
             inflight_requests: Arc::new(AtomicU64::new(0)),
             store,
             client,
@@ -133,11 +141,16 @@ impl RelayState {
 
     async fn claim_probe(&self, account: &mut Account) -> Option<crate::account_runtime::Probe> {
         let deadline = Instant::now() + Duration::from_secs(30);
+        let mut delay = Duration::from_millis(10);
         loop {
             match self.accounts.begin_probe(account) {
                 Ok(probe) => return probe,
                 Err(_) if Instant::now() < deadline => {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    tokio::time::sleep(
+                        delay.min(deadline.saturating_duration_since(Instant::now())),
+                    )
+                    .await;
+                    delay = (delay * 2).min(Duration::from_millis(500));
                     let store = self.store.clone();
                     let id = account.id.clone();
                     match tokio::task::spawn_blocking(move || store.load(&id)).await {
@@ -174,16 +187,14 @@ impl RelayState {
         }
     }
 
-    async fn select(
+    async fn candidates(
         &self,
         provider: Provider,
         key: Option<&str>,
         model: Option<&str>,
         tried: &BTreeSet<String>,
-    ) -> Result<Option<Account>, ()> {
-        let pinned = self.pins.get(provider, key);
+    ) -> Result<Vec<crate::bindings::Candidate>, ()> {
         let store = self.store.clone();
-        let model = model.map(str::to_owned);
         let mut tried = tried.clone();
         if let Some(key) = key
             && let Ok(mut exclusions) = self.reconnect_exclusions.lock()
@@ -196,7 +207,6 @@ impl RelayState {
                     .map(|(_, id)| id.clone()),
             );
         }
-        let runtime = self.accounts.clone();
         let read_store = store.clone();
         let mut accounts = tokio::task::spawn_blocking(move || read_store.list())
             .await
@@ -220,21 +230,136 @@ impl RelayState {
                 *account = updated;
             }
         }
+        let runtime = self.accounts.clone();
+        let obs = self.observability.clone();
+        let bindings = self.bindings.clone();
+        let model = model.map(str::to_owned);
         tokio::task::spawn_blocking(move || {
-            let usable = |a: &Account| {
-                a.provider == provider
-                    && a.eligible(model.as_deref())
-                    && !tried.contains(&a.id)
-                    && !runtime.probing(&a.id)
-                    && !runtime.blocked_in_memory(&a.id)
-                    && store.tokens(a).is_ok_and(|t| !t.access_token.is_empty())
-            };
-            Ok(pinned
-                .and_then(|id| accounts.iter().find(|a| a.id == id && usable(a)).cloned())
-                .or_else(|| accounts.into_iter().find(usable)))
+            accounts
+                .into_iter()
+                .filter(|a| {
+                    a.provider == provider
+                        && !tried.contains(&a.id)
+                        && !runtime.probing(&a.id)
+                        && !runtime.blocked_in_memory(&a.id)
+                        && store.tokens(a).is_ok_and(|t| !t.access_token.is_empty())
+                })
+                .map(|account| {
+                    let account = runtime
+                        .projected_quota(&account.id, &bindings, model.as_deref())
+                        .map_err(|_| ())?;
+                    Ok(crate::bindings::Candidate {
+                        quota: obs.quota_snapshot(&account.id),
+                        // Every production attempt reserves the live table;
+                        // a runtime count sampled before completion can be stale.
+                        inflight: 0,
+                        account,
+                    })
+                })
+                .collect::<Result<Vec<_>, ()>>()
         })
         .await
         .map_err(|_| ())?
+    }
+
+    // Availability checks must never mutate affinity or reserve an attempt.
+    async fn select(
+        &self,
+        provider: Provider,
+        key: Option<&str>,
+        model: Option<&str>,
+        tried: &BTreeSet<String>,
+    ) -> Result<Option<Account>, ()> {
+        let candidates = self.candidates(provider, key, model, tried).await?;
+        let pinned = self.pins.get(provider, key);
+        match self.bindings.preview(
+            provider,
+            key,
+            None,
+            model,
+            &candidates,
+            pinned.as_deref(),
+            0,
+        ) {
+            crate::bindings::PreviewDecision::Selected { account } => Ok(candidates
+                .into_iter()
+                .find(|c| c.account.id == account)
+                .map(|c| c.account)),
+            _ => Ok(None),
+        }
+    }
+
+    async fn select_request(
+        &self,
+        provider: Provider,
+        session: &session::Session,
+        completion: &mut Completion,
+        model: Option<&str>,
+        tried: &BTreeSet<String>,
+    ) -> Result<Option<Account>, ()> {
+        // A failed pre-commit attempt is finished before reserving its successor.
+        completion.end_attempt();
+        let family = usize::from(provider == Provider::Codex);
+        let mut excluded = tried.clone();
+        loop {
+            let placement = self.placement[family].lock().await;
+            let candidates = self
+                .candidates(provider, session.key.as_deref(), model, &excluded)
+                .await?;
+            let pinned = self.pins.get(provider, session.key.as_deref());
+            let bytes = completion
+                .input_bytes
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let choice = self.bindings.choose(
+                provider,
+                session.key.as_deref(),
+                session.parent.as_deref(),
+                model,
+                &candidates,
+                pinned.as_deref(),
+                bytes,
+            );
+            drop(placement);
+            match choice {
+                crate::bindings::Decision::Selected {
+                    account,
+                    lease,
+                    moves,
+                } => {
+                    for event in moves {
+                        self.observability.record_move(
+                            &event.key,
+                            event.from.as_deref(),
+                            &event.to,
+                            &event.reason,
+                            event.bytes,
+                        );
+                    }
+                    completion.binding = Some(lease);
+                    return Ok(candidates
+                        .into_iter()
+                        .find(|c| c.account.id == account)
+                        .map(|c| c.account));
+                }
+                crate::bindings::Decision::None => return Ok(None),
+                crate::bindings::Decision::Hold { until } => {
+                    let wait = (until - chrono::Utc::now()).to_std().unwrap_or_default();
+                    let remaining = completion
+                        .hold_deadline
+                        .saturating_duration_since(Instant::now());
+                    if wait <= remaining {
+                        tokio::time::sleep(wait).await;
+                    } else {
+                        tokio::time::sleep(remaining).await;
+                        if let Some(id) = self.bindings.current(session.key.as_deref()) {
+                            excluded.insert(id);
+                        }
+                        self.bindings
+                            .mark_reset_hold_timeout(session.key.as_deref());
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -505,9 +630,10 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
         .unwrap_or(Err(()))
     } else {
         state
-            .select(
+            .select_request(
                 provider,
-                session.key.as_deref(),
+                &session,
+                &mut completion,
                 request_model.as_deref(),
                 &tried,
             )
@@ -515,9 +641,10 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
     };
     #[cfg(not(all(feature = "phase0", debug_assertions)))]
     let selection = state
-        .select(
+        .select_request(
             provider,
-            session.key.as_deref(),
+            &session,
+            &mut completion,
             request_model.as_deref(),
             &tried,
         )
@@ -543,6 +670,11 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
         }
     };
     completion.record.account = Some(account.id.clone());
+    // Phase-0 forced replay bypasses affinity, but still participates in the
+    // authoritative placement reservation count.
+    if completion.binding.is_none() {
+        completion.binding = Some(state.bindings.begin_request(None, &account.id));
+    }
     tried.insert(account.id.clone());
     #[cfg(all(feature = "phase0", debug_assertions))]
     if upload.overflow.is_none()
@@ -595,9 +727,10 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
     let (status, response_headers, held) = loop {
         if !account.eligible(request_model.as_deref()) {
             let next = state
-                .select(
+                .select_request(
                     provider,
-                    session.key.as_deref(),
+                    &session,
+                    &mut completion,
                     request_model.as_deref(),
                     &tried,
                 )
@@ -892,9 +1025,10 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
         }
         completion.failover(decision.reason());
         let next = state
-            .select(
+            .select_request(
                 provider,
-                session.key.as_deref(),
+                &session,
+                &mut completion,
                 request_model.as_deref(),
                 &tried,
             )

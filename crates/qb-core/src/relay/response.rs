@@ -49,12 +49,22 @@ pub(in crate::relay) fn body(
 ) -> Body {
     completion.record.status = status.as_u16();
     let success_outcome = success_outcome.to_owned();
+    if let Some(decoded) = crate::relay::hold::decoded_side(response_headers, &held.prefix)
+        && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&decoded)
+    {
+        completion.record.cache_usage = crate::observability::cache_usage(&value);
+    }
     let mut observer = Observer::new(response_headers);
     observer.error_body = (!status.is_success()).then(Vec::new);
     // 한 조각만 대기시키고 종료 청크가 소비될 때까지 completion을 함께 보관한다.
     let (tx, rx) = mpsc::channel(1);
     let response_headers = response_headers.clone();
     tokio::spawn(async move {
+        let mut json_body = response_headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .filter(|v| v.to_ascii_lowercase().contains("json"))
+            .map(|_| Vec::new());
         let runtime = completion.runtime.clone();
         let account = completion.record.account.clone();
         let provider = if completion.record.family == "claude" {
@@ -90,8 +100,9 @@ pub(in crate::relay) fn body(
                     _ = tx.closed() => {
                         // 비 SSE 응답은 즉시 준비된 EOF까지 확인한다.
                         if matches!(stream.next().now_or_never(), Some(None))
-                            && let Some(completion) = completion.take()
+                            && let Some(mut completion) = completion.take()
                         {
+                            json_cache_usage(&mut completion, &response_headers, json_body.as_deref());
                             completion.finish(&success_outcome);
                         }
                         return;
@@ -100,7 +111,8 @@ pub(in crate::relay) fn body(
                 }
             };
             let Some(chunk) = next else {
-                if let Some(completion) = completion.take() {
+                if let Some(mut completion) = completion.take() {
+                    json_cache_usage(&mut completion, &response_headers, json_body.as_deref());
                     completion.finish(&success_outcome);
                 }
                 return;
@@ -121,6 +133,21 @@ pub(in crate::relay) fn body(
                 }
             };
             observer.feed(&chunk);
+            if let Some(body) = &mut json_body {
+                if chunk.len() <= HOLD_LIMIT.saturating_sub(body.len()) {
+                    body.extend_from_slice(&chunk);
+                } else {
+                    json_body = None;
+                }
+            }
+            if let Some(record) = completion.as_mut()
+                && let Some(usage) = observer
+                    .decoder
+                    .as_ref()
+                    .and_then(|decoder| decoder.sink().cache_usage.clone())
+            {
+                record.record.cache_usage = Some(usage);
+            }
             if let Some(sink) = observer.decoder.as_ref().map(Decoder::sink)
                 && sink.error_sequence != observed_error
             {
@@ -209,6 +236,16 @@ pub(in crate::relay) fn body(
     Body::from_stream(Receiver(rx))
 }
 
+fn json_cache_usage(completion: &mut Completion, headers: &HeaderMap, body: Option<&[u8]>) {
+    if let Some(raw) = body
+        && let Some(decoded) = crate::relay::hold::decoded_side(headers, raw)
+        && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&decoded)
+        && let Some(usage) = crate::observability::cache_usage(&value)
+    {
+        completion.record.cache_usage = Some(usage);
+    }
+}
+
 fn stream_error() -> io::Error {
     io::Error::other("Upstream response stream interrupted")
 }
@@ -285,6 +322,7 @@ struct EventSink {
     error_code: Option<String>,
     error_event: Option<Vec<u8>>,
     error_sequence: u64,
+    cache_usage: Option<crate::observability::CacheUsage>,
 }
 
 impl EventSink {
@@ -307,6 +345,9 @@ impl EventSink {
                 }
             }
             if let Ok(event) = serde_json::from_slice::<serde_json::Value>(&data) {
+                if let Some(usage) = crate::observability::cache_usage(&event) {
+                    self.cache_usage = Some(usage);
+                }
                 if let Some(kind) = event.get("type").and_then(serde_json::Value::as_str) {
                     self.terminal |= terminal_kind(kind.as_bytes());
                     self.failed |= kind == "response.failed";
@@ -461,6 +502,7 @@ impl Decoder {
                     error_code: None,
                     error_event: None,
                     error_sequence: 0,
+                    cache_usage: None,
                 };
                 &EMPTY
             }
@@ -913,6 +955,32 @@ mod tests {
             drop(stream);
             assert_eq!(received, raw, "{encoding}");
             assert_eq!(fixture.outcome().await, "ok", "{encoding}");
+        }
+    }
+
+    #[tokio::test]
+    async fn split_and_compressed_json_cache_usage_is_numeric_and_wire_verbatim() {
+        let payload = br#"{"usage":{"input_tokens":100,"input_tokens_details":{"cached_tokens":80}},"private":"conversation-secret"}"#;
+        for encoding in ["identity", "gzip", "zstd"] {
+            let raw = compress(payload, encoding);
+            let fixture = Fixture::new();
+            let mut headers = HeaderMap::new();
+            headers.insert("content-type", "application/json".parse().unwrap());
+            headers.insert("content-encoding", encoding.parse().unwrap());
+            let chunks: Vec<_> = raw
+                .chunks(7)
+                .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+                .collect();
+            let received = axum::body::to_bytes(
+                fixture.body(Box::pin(futures_util::stream::iter(chunks)), &headers, "ok"),
+                usize::MAX,
+            )
+            .await
+            .unwrap();
+            assert_eq!(received.as_ref(), raw, "{encoding}");
+            let row = fixture.row().unwrap();
+            assert_eq!(row["cache_usage"]["cached_tokens"], 80);
+            assert!(!row.to_string().contains("conversation-secret"));
         }
     }
 

@@ -205,7 +205,7 @@ async fn run() -> anyhow::Result<()> {
             let servers = qb_core::http::spawn_with_routes(
                 &config,
                 secrets,
-                qb_core::relay::router(relay),
+                qb_core::relay::router(relay.clone()),
                 admin_routes,
             )
             .await?;
@@ -213,7 +213,11 @@ async fn run() -> anyhow::Result<()> {
             tokio::signal::ctrl_c().await?;
             drop(servers);
             // 종료 시 디스크 flush와 작성자 정리도 런타임 스레드를 막지 않는다.
-            tokio::task::spawn_blocking(move || observability.flush()).await??;
+            tokio::task::spawn_blocking(move || {
+                relay.bindings.flush()?;
+                observability.flush()
+            })
+            .await??;
         }
         Command::Status => {
             let config = qb_core::config::Config::load(&home)?;

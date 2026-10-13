@@ -158,7 +158,7 @@ async fn upgrade_inner(
             };
         }
         let account = match state
-            .select(Provider::Codex, session.key.as_deref(), None, &tried)
+            .select_request(Provider::Codex, &session, completion, None, &tried)
             .await
         {
             Ok(Some(account)) => account,
@@ -413,6 +413,10 @@ async fn upgrade_inner(
             false
         }
     };
+    let socket_pin = state.bindings.pin(session.key.as_deref());
+    if let Some(lease) = &mut completion.binding {
+        lease.defer_after_move();
+    }
     let context = pump::Context {
         runtime: Some(state.accounts.clone()),
         relay: Some(state.clone()),
@@ -431,6 +435,7 @@ async fn upgrade_inner(
         connection: format!("{:032x}", rand::random::<u128>()),
     };
     tokio::spawn(async move {
+        let _socket_pin = socket_pin;
         if let Ok(client) = client_upgrade.await {
             let client = WebSocketStream::from_raw_socket(
                 hyper_util::rt::TokioIo::new(client),
