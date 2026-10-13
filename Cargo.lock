@@ -1166,6 +1166,8 @@ name = "qb-tray"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clap",
+ "flate2",
  "qb-core",
  "reqwest",
  "serde",

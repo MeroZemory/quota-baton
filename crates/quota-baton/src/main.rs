@@ -94,12 +94,20 @@ enum Phase0Command {
 async fn main() {
     qb_core::set_console_utf8();
     if let Err(error) = run().await {
-        eprintln!("실패했습니다: {}", friendly_error(&error));
+        let message = friendly_error(&error);
+        if message == "로그인 시간이 만료되었습니다. 다시 시작해 주세요." {
+            eprintln!("{message}");
+        } else {
+            eprintln!("실패했습니다: {message}");
+        }
         std::process::exit(1);
     }
 }
 
 fn friendly_error(error: &anyhow::Error) -> String {
+    if error.to_string().contains("로그인 시간이 만료되었습니다") {
+        return "로그인 시간이 만료되었습니다. 다시 시작해 주세요.".into();
+    }
     if let Some(error) = error.downcast_ref::<accounts_cli::UsageCliError>() {
         return error.to_string();
     }

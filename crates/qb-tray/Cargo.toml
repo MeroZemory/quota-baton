@@ -9,8 +9,13 @@ license.workspace = true
 name = "quota-baton-tray"
 path = "src/main.rs"
 
+[lib]
+path = "src/layout.rs"
+
 [dependencies]
 anyhow.workspace = true
+flate2.workspace = true
+clap.workspace = true
 qb-core.workspace = true
 reqwest.workspace = true
 serde.workspace = true

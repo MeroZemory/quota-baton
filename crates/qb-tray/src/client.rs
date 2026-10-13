@@ -236,6 +236,9 @@ pub fn render_status_line(read: &TrayRead) -> String {
     }
 }
 
+/// Render a deterministic review image from an admin state fixture. The native
+/// flyout consumes the same rows; this compact encoder keeps the aid usable in
+/// CI without a desktop compositor.
 pub fn render_flyout(read: &TrayRead) -> String {
     let mut lines = vec![render_status_line(read)];
     for provider in ["claude", "codex"] {
