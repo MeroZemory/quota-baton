@@ -14,7 +14,7 @@ Implement quota-baton exactly as specified, milestone by milestone, until M8 is 
 
 1. **Pick the current milestone.** It is the first entry in the list below that is not yet merged into `dev`. Its brief is `C:/_projects/SampleUser/quota-baton/.sandbox/briefs/<M>.md`. A fix brief (`<M>.<n>-fixes.md`) for the current milestone takes priority over everything else. The newest file by time wins.
 2. **If no brief exists yet** for the next milestone, implement it directly from `docs/architecture.md` §17 and the referenced contract sections. Do not wait.
-3. **Branching.** Work in the worktree `C:/_projects/SampleUser/quota-baton-impl`. Create the branch `impl/<m>` from `dev`, run `git merge dev` before each milestone and after each fix brief, and make atomic English commits. Never push. Never merge into `dev` yourself; the design session merges after review.
+3. **Branching.** Work only in the worktree `C:/_projects/SampleUser/quota-baton-impl`. Never create another worktree: switch branches inside this one (AGENTS.md build hygiene). Create the branch `impl/<m>` from `dev`, run `git merge dev` before each milestone and after each fix brief, and make atomic English commits. Never push. Never merge into `dev` yourself; the design session merges after review.
 4. **Verification.** Run every check before reporting: `cargo fmt --check`, strict clippy for the default features and for all features, workspace tests for the default and full feature sets, and the standalone `qb-core` tests. Run them one after another in the default target with `CARGO_INCREMENTAL=0`.
 5. **Report once per milestone, at the gate.** Write `C:/_projects/SampleUser/quota-baton/.sandbox/reports/<M>.md`. Then send the report:
 
