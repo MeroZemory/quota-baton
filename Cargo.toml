@@ -42,7 +42,7 @@ toml_edit = "=0.23.10"
 tracing = "=0.1.41"
 tracing-appender = "=0.2.3"
 tracing-subscriber = { version = "=0.3.20", features = ["env-filter", "json"] }
-windows = { version = "=0.62.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_System_Console"] }
+windows = { version = "=0.62.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_System_Console", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_UI_Input_KeyboardAndMouse"] }
 zeroize = { version = "=1.8.2", features = ["derive"] }
 qb-core = { path = "crates/qb-core" }
 qb-proto = { path = "crates/qb-proto" }

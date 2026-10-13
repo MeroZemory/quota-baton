@@ -1,3 +1,14 @@
+mod client;
+
+#[cfg(windows)]
+mod windows_tray;
+
+#[cfg(windows)]
+fn main() -> anyhow::Result<()> {
+    windows_tray::run()
+}
+
+#[cfg(not(windows))]
 fn main() {
-    println!("not implemented");
+    eprintln!("quota-baton-tray requires Windows");
 }
