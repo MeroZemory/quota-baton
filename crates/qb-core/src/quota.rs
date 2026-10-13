@@ -564,6 +564,7 @@ mod tests {
             for n in 0..count {
                 let mut a = crate::accounts::health::tests::fixture();
                 a.identity = Identity::Codex {
+                    user_id: None,
                     account_id: format!("synthetic-usage-{n}"),
                     email: format!("usage-{n}@example.invalid"),
                 };

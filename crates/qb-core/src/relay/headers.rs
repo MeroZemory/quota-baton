@@ -97,6 +97,7 @@ mod tests {
                 email: "fixture@example.invalid".into(),
             },
             Provider::Codex => Identity::Codex {
+                user_id: None,
                 account_id: "fixture-account".into(),
                 email: "fixture@example.invalid".into(),
             },

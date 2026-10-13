@@ -72,6 +72,21 @@ pub struct RelayState {
 }
 
 impl RelayState {
+    pub fn login_service(&self) -> crate::oauth::LoginService {
+        crate::oauth::LoginService::new(
+            self.store.clone(),
+            self.client.clone(),
+            self.observability.clone(),
+        )
+        .with_runtime(self.accounts.clone())
+    }
+    pub fn start_refresh_scheduler(&self) -> tokio::task::JoinHandle<()> {
+        self.tokens
+            .start_refresh_scheduler(self.store.clone(), self.observability.clone())
+    }
+    pub async fn shutdown_refreshes(&self) -> Result<(), ()> {
+        self.tokens.shutdown_refreshes().await
+    }
     async fn unavailable(
         &self,
         completion: &mut Completion,

@@ -3,6 +3,7 @@ pub mod health;
 pub mod import;
 mod lease;
 pub mod linked;
+pub mod login;
 mod store;
 
 use chrono::{DateTime, Utc};
@@ -40,6 +41,8 @@ pub enum Identity {
     Codex {
         account_id: String,
         email: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_id: Option<String>,
     },
 }
 
@@ -60,7 +63,15 @@ impl Identity {
                 ..
             } => serde_json::to_string(&("claude", account_uuid, email))
                 .expect("string serialization"),
-            Self::Codex { account_id, email } => {
+            Self::Codex {
+                account_id,
+                user_id: Some(user_id),
+                ..
+            } => serde_json::to_string(&("codex", account_id, "user", user_id))
+                .expect("string serialization"),
+            Self::Codex {
+                account_id, email, ..
+            } => {
                 serde_json::to_string(&("codex", account_id, email)).expect("string serialization")
             }
         }
@@ -111,7 +122,9 @@ impl From<&Identity> for SourceMatch {
                 organization_uuid: organization_uuid.clone(),
                 email: email.clone(),
             },
-            Identity::Codex { account_id, email } => Self::Codex {
+            Identity::Codex {
+                account_id, email, ..
+            } => Self::Codex {
                 account_id: account_id.clone(),
                 email: email.clone(),
             },

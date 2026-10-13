@@ -500,6 +500,7 @@ fn canonical_identity_and_collision_guard() {
         let (a, b) = (0..100_000)
             .find_map(|n| {
                 let identity = Identity::Codex {
+                    user_id: None,
                     account_id: format!("synthetic-collision-{n}"),
                     email: "collision@example.invalid".into(),
                 };

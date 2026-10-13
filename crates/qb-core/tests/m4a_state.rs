@@ -12,6 +12,7 @@ fn now() -> chrono::DateTime<Utc> {
 
 fn account() -> Account {
     let identity = qb_core::accounts::Identity::Codex {
+        user_id: None,
         account_id: "synthetic-state".into(),
         email: "fixture@example.invalid".into(),
     };
@@ -328,7 +329,7 @@ mod runtime_regressions {
             fs::create_dir(home.path().join("accounts")).unwrap();
             let ids = providers.iter().enumerate().map(|(index, provider)| {
             let identity = match provider {
-                Provider::Codex => Identity::Codex { account_id: format!("synthetic-{index}"), email: "fixture@example.invalid".into() },
+                Provider::Codex => Identity::Codex { user_id: None, account_id: format!("synthetic-{index}"), email: "fixture@example.invalid".into() },
                 Provider::Claude => Identity::Claude { account_uuid: format!("synthetic-{index}"), organization_uuid: None, email: "fixture@example.invalid".into() },
             };
             let id = identity.id();

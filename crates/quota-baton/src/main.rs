@@ -201,7 +201,9 @@ async fn run() -> anyhow::Result<()> {
                 .startup_reload()
                 .await
                 .map_err(|_| anyhow::anyhow!("연결된 계정의 토큰을 다시 읽지 못했습니다."))?;
+            let login = relay.login_service();
             let admin_routes = qb_core::admin::account_routes(store.clone())
+                .merge(qb_core::admin::login_routes(login.clone()))
                 .merge(qb_core::admin::runtime_routes(
                     relay.clone(),
                     config.server.data_port,
@@ -219,10 +221,19 @@ async fn run() -> anyhow::Result<()> {
             .await?;
             println_utf8!("프록시를 시작했습니다.");
             let polling = relay.quota.start();
+            let refreshing = relay.start_refresh_scheduler();
             tokio::signal::ctrl_c().await?;
             polling.abort();
+            refreshing.abort();
             let _ = polling.await;
+            let _ = refreshing.await;
             drop(servers);
+            login.cancel_all().await;
+            // The lease must outlive detached token consumption and durable writes.
+            while relay.shutdown_refreshes().await.is_err() {
+                println_utf8!("종료 중 토큰 저장 작업이 끝나기를 기다립니다.");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
             // 종료 시 디스크 flush와 작성자 정리도 런타임 스레드를 막지 않는다.
             tokio::task::spawn_blocking(move || {
                 relay.bindings.flush()?;

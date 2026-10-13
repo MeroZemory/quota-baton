@@ -121,12 +121,14 @@ impl AccountStore {
         let dir = home.join("accounts");
         fs::create_dir_all(&dir).map_err(|_| StoreError::Io)?;
         let lease = Lease::acquire(&dir)?;
-        Ok(Self {
+        let store = Self {
             dir,
             gate: Mutex::new(()),
             observer: Mutex::new(None),
             _lease: lease,
-        })
+        };
+        store.recover_login_migration()?;
+        Ok(store)
     }
 
     /// Called after each successful account write, under the transaction gate.
@@ -394,6 +396,134 @@ impl AccountStore {
             return Err(StoreError::InvalidData);
         }
         Ok(self.dir.join(format!("{id}.json")))
+    }
+
+    pub(crate) fn remove_login_record_unlocked(&self, id: &str) -> Result<(), StoreError> {
+        fs::remove_file(self.path(id)?).map_err(|_| StoreError::Io)
+    }
+
+    pub(crate) fn begin_login_migration(
+        &self,
+        old: &str,
+        new: &str,
+        resolved_identity: &super::Identity,
+    ) -> Result<(), StoreError> {
+        self.check_login_migration_clear()?;
+        self.path(old)?;
+        self.path(new)?;
+        let old_identity = self.read(old)?.account.identity;
+        self.atomic_write(
+            &self.dir.join(".login-migration"),
+            serde_json::json!({"old":old,"new":new,"proof":{
+                "old_identity":old_identity,"resolved_identity":resolved_identity
+            }})
+            .to_string()
+            .as_bytes(),
+        )
+    }
+    pub(crate) fn check_login_migration_clear(&self) -> Result<(), StoreError> {
+        match fs::symlink_metadata(self.dir.join(".login-migration")) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(_) => Err(StoreError::InvalidData),
+            Err(_) => Err(StoreError::Io),
+        }
+    }
+    pub(crate) fn finish_login_migration(&self) -> Result<(), StoreError> {
+        fs::remove_file(self.dir.join(".login-migration")).map_err(|_| StoreError::Io)
+    }
+    fn recover_login_migration(&self) -> Result<(), StoreError> {
+        let bytes = match fs::read(self.dir.join(".login-migration")) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err(StoreError::Io),
+        };
+        #[derive(Deserialize)]
+        struct Proof {
+            old_identity: super::Identity,
+            resolved_identity: super::Identity,
+        }
+        #[derive(Deserialize)]
+        struct Migration {
+            old: String,
+            new: String,
+            #[serde(default)]
+            proof: Option<Proof>,
+        }
+        let migration: Migration =
+            serde_json::from_slice(&bytes).map_err(|_| StoreError::InvalidData)?;
+        if migration.old == migration.new {
+            return Err(StoreError::InvalidData);
+        }
+        self.path(&migration.old)?;
+        self.path(&migration.new)?;
+        match self.read(&migration.new) {
+            Ok(new) if matches!(new.account.source, super::Source::Oauth) => {
+                // A metadata-valid replacement must also contain usable credentials
+                // before recovery removes the only old token record.
+                let _tokens = crypto::decrypt(&new.secret_dpapi_b64)?;
+                match self.read(&migration.old) {
+                    Ok(mut old) => {
+                        // The transaction authorized this replacement before journaling.
+                        // Recovery uses immutable identity evidence, never live CPA state.
+                        let authorized = if let Some(proof) = &migration.proof {
+                            proof.old_identity == old.account.identity
+                                && (super::login::matches(
+                                    &proof.old_identity,
+                                    &proof.resolved_identity,
+                                ) || matches!(
+                                    (&proof.old_identity, &proof.resolved_identity),
+                                    (super::Identity::Codex { account_id: a, user_id: None, .. },
+                                     super::Identity::Codex { account_id: b, user_id: Some(_), .. }) if a == b
+                                ))
+                                && super::login::matches(
+                                    &proof.resolved_identity,
+                                    &new.account.identity,
+                                )
+                        } else {
+                            super::login::matches(&old.account.identity, &new.account.identity)
+                        };
+                        if authorized {
+                            self.remove_login_record_unlocked(&migration.old)?;
+                        } else if migration.proof.is_none()
+                            && matches!(
+                                old.account.source,
+                                super::Source::Cpa {
+                                    mode: super::ImportMode::Linked,
+                                    ..
+                                }
+                            )
+                            && matches!(
+                                (&old.account.identity, &new.account.identity),
+                                (super::Identity::Codex { account_id: a, user_id: None, .. },
+                                 super::Identity::Codex { account_id: b, user_id: Some(_), .. }) if a == b
+                            )
+                        {
+                            // Old journals lack the proof needed to delete either family.
+                            // Preserve both and stop placing requests on the legacy record.
+                            old.account.user_state = super::UserState::Disabled;
+                            let generation = old.account.generation;
+                            self.write_metadata_record(old, generation)?;
+                            tracing::warn!(
+                                code = "login_migration_legacy_retained",
+                                "사용자 근거가 없는 이전 로그인 복구 기록: 두 계정을 보존하고 기존 연결 계정을 비활성화했습니다."
+                            );
+                        } else {
+                            return Err(StoreError::IdentityCollision);
+                        }
+                    }
+                    Err(StoreError::NotFound) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(StoreError::NotFound) => {}
+            _ => return Err(StoreError::InvalidData),
+        }
+        self.finish_login_migration()?;
+        tracing::warn!(
+            code = "login_migration_recovered",
+            "중단된 로그인 변경을 저장된 복구 기록으로 복구했습니다."
+        );
+        Ok(())
     }
 
     fn read(&self, id: &str) -> Result<Record, StoreError> {

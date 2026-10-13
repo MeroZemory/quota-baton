@@ -1,4 +1,4 @@
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use qb_core::{accounts::AccountStore, config::Config};
 use qb_proto::{CpaImportRequest, ImportMode};
 use std::{
@@ -23,6 +23,15 @@ impl std::error::Error for UsageCliError {}
 
 #[derive(Subcommand)]
 pub enum AccountsCommand {
+    #[command(about = "브라우저로 계정에 로그인합니다")]
+    Login {
+        #[arg(value_enum)]
+        provider: LoginProvider,
+        #[arg(long, help = "CPA 연결을 해제하고 직접 로그인 계정으로 전환합니다")]
+        replace_linked: bool,
+        #[arg(long, help = "브라우저를 열지 않고 로그인 주소만 표시합니다")]
+        no_browser: bool,
+    },
     #[command(about = "계정 목록을 확인합니다")]
     List,
     #[command(about = "계정 사용을 일시 중지합니다")]
@@ -40,6 +49,21 @@ pub enum AccountsCommand {
         #[command(subcommand)]
         source: ImportSource,
     },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum LoginProvider {
+    Claude,
+    Codex,
+}
+
+impl From<LoginProvider> for qb_core::accounts::Provider {
+    fn from(provider: LoginProvider) -> Self {
+        match provider {
+            LoginProvider::Claude => Self::Claude,
+            LoginProvider::Codex => Self::Codex,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -61,6 +85,13 @@ pub struct CpaArgs {
 
 pub async fn run(command: AccountsCommand, home: &Path, config: &Config) -> anyhow::Result<()> {
     match command {
+        AccountsCommand::Login {
+            provider,
+            replace_linked,
+            no_browser,
+        } => {
+            login(home, config, provider.into(), replace_linked, no_browser).await?;
+        }
         AccountsCommand::RefreshUsage { id } => refresh_usage(home, config, &id).await?,
         AccountsCommand::Pause { id } => action(home, config, &id, "pause").await?,
         AccountsCommand::Resume { id } => action(home, config, &id, "resume").await?,
@@ -108,6 +139,7 @@ pub async fn run(command: AccountsCommand, home: &Path, config: &Config) -> anyh
             };
             let client = reqwest::Client::builder()
                 .no_proxy()
+                .user_agent(concat!("quota-baton/", env!("CARGO_PKG_VERSION")))
                 .timeout(Duration::from_secs(5))
                 .build()?;
             let base = format!("http://127.0.0.1:{}/admin/v1", config.server.admin_port);
@@ -198,6 +230,7 @@ fn translated(value: &serde_json::Value) -> String {
         Some("skipped") => "건너뜀".into(),
         Some("unknown_type") => "지원하지 않는 계정 유형".into(),
         Some("invalid_data") => "잘못된 계정 데이터".into(),
+        Some("owned_account") => "이미 소유한 계정".into(),
         _ => cell(value),
     }
 }
@@ -236,6 +269,8 @@ async fn running_admin(
 ) -> anyhow::Result<Option<(reqwest::Client, String, String)>> {
     let client = reqwest::Client::builder()
         .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!("quota-baton/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(5))
         .build()?;
     let base = format!("http://127.0.0.1:{}/admin/v1", config.server.admin_port);
@@ -419,4 +454,342 @@ fn percentage(window: &serde_json::Value, now: std::time::SystemTime) -> String 
         .as_f64()
         .map(|value| format!("{value:.1}%"))
         .unwrap_or_else(|| "-".into())
+}
+
+enum LoginBackend {
+    Admin {
+        client: reqwest::Client,
+        base: String,
+        token: String,
+    },
+    Local(qb_core::oauth::LoginService),
+}
+
+impl LoginBackend {
+    async fn status(&self, id: &str) -> anyhow::Result<serde_json::Value> {
+        match self {
+            Self::Admin {
+                client,
+                base,
+                token,
+            } => Ok(client
+                .get(format!("{base}/accounts/login/{id}"))
+                .bearer_auth(token.trim())
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?),
+            Self::Local(service) => Ok(serde_json::to_value(service.status(id).await?)?),
+        }
+    }
+
+    async fn cancel(&self, id: &str) -> anyhow::Result<()> {
+        match self {
+            Self::Admin {
+                client,
+                base,
+                token,
+            } => {
+                client
+                    .post(format!("{base}/accounts/login/{id}/cancel"))
+                    .bearer_auth(token.trim())
+                    .send()
+                    .await?
+                    .error_for_status()?;
+            }
+            Self::Local(service) => {
+                service.cancel(id).await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+async fn login(
+    home: &Path,
+    config: &Config,
+    provider: qb_core::accounts::Provider,
+    replace_linked: bool,
+    no_browser: bool,
+) -> anyhow::Result<()> {
+    let mut offline_obs = None;
+    let (backend, id, auth_url) = if let Some((client, base, token)) =
+        running_admin(home, config).await?
+    {
+        let response = client
+            .post(format!("{base}/accounts/login"))
+            .bearer_auth(token.trim())
+            .json(&serde_json::json!({ "provider": provider, "replace_linked": replace_linked }))
+            .send()
+            .await?;
+        if let Err(error) = response.error_for_status_ref() {
+            let payload: serde_json::Value = response.json().await.unwrap_or_default();
+            println_utf8!("{}", login_failure(payload["error"]["message"].as_str()));
+            return Err(error.into());
+        }
+        let start: serde_json::Value = response.json().await?;
+        let id = start["login_id"]
+            .as_str()
+            .filter(|id| {
+                !id.is_empty()
+                    && id.len() <= 100
+                    && id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+            })
+            .ok_or_else(|| anyhow::anyhow!("로그인 응답을 확인해 주세요."))?
+            .to_owned();
+        let url = start["auth_url"].as_str().unwrap_or_default().to_owned();
+        (
+            LoginBackend::Admin {
+                client,
+                base,
+                token,
+            },
+            id,
+            url,
+        )
+    } else {
+        let home = home.to_owned();
+        let (store, obs) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let store = std::sync::Arc::new(AccountStore::acquire(&home)?);
+            let obs = std::sync::Arc::new(qb_core::observability::Observability::new(&home, None)?);
+            Ok((store, obs))
+        })
+        .await??;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(30))
+            .user_agent(concat!("quota-baton/", env!("CARGO_PKG_VERSION")))
+            .build()?;
+        let service = qb_core::oauth::LoginService::new(store, client, obs.clone());
+        let start = match service.start(provider, replace_linked).await {
+            Ok(start) => start,
+            Err(error) => {
+                println_utf8!("{}", login_failure(Some(&error.to_string())));
+                finish_offline_login(service, obs).await?;
+                anyhow::bail!("로그인을 시작하지 못했습니다.");
+            }
+        };
+        offline_obs = Some(obs);
+        (LoginBackend::Local(service), start.login_id, start.auth_url)
+    };
+
+    // Only provider authorization URLs may be printed or opened. Never expose a
+    // callback URL, arbitrary admin text, userinfo, or provider error payload.
+    let result = async {
+        let url = reqwest::Url::parse(&auth_url)?;
+        let host = match provider {
+            qb_core::accounts::Provider::Claude => "claude.ai",
+            qb_core::accounts::Provider::Codex => "auth.openai.com",
+        };
+        anyhow::ensure!(
+            url.scheme() == "https"
+                && url.host_str() == Some(host)
+                && url.path() == "/oauth/authorize"
+                && url.port().is_none()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.fragment().is_none()
+                && !url.query_pairs().any(|(key, value)| (key == "code"
+                    && !(provider == qb_core::accounts::Provider::Claude && value == "true"))
+                    || matches!(
+                        key.as_ref(),
+                        "code_verifier"
+                            | "client_secret"
+                            | "access_token"
+                            | "refresh_token"
+                            | "id_token"
+                            | "error"
+                            | "error_description"
+                    )),
+            "로그인 주소를 확인해 주세요."
+        );
+        println_utf8!("로그인 주소: {}", url.as_str());
+        if !no_browser && open_browser(url.as_str()).is_err() {
+            println_utf8!("브라우저를 열지 못했습니다. 위 주소를 직접 열어 주세요.");
+        }
+        println_utf8!("로그인 대기 중입니다. 취소하려면 Ctrl+C를 누르세요.");
+        let interrupt = tokio::signal::ctrl_c();
+        tokio::pin!(interrupt);
+        let deadline = tokio::time::sleep(Duration::from_secs(605));
+        tokio::pin!(deadline);
+        loop {
+            let status = tokio::select! {
+                signal = &mut interrupt => {
+                    signal?;
+                    backend.cancel(&id).await?;
+                    println_utf8!("로그인을 취소했습니다.");
+                    return Ok(());
+                }
+                _ = &mut deadline => {
+                    println_utf8!("로그인 시간이 만료되었습니다. 다시 시작해 주세요.");
+                    anyhow::bail!("로그인 시간이 만료되었습니다.");
+                }
+                status = backend.status(&id) => status?,
+            };
+            match status["status"].as_str() {
+                Some("pending") => {}
+                Some("completed") => {
+                    println_utf8!("로그인을 완료했습니다.");
+                    return Ok(());
+                }
+                Some("cancelled") => {
+                    println_utf8!("로그인을 취소했습니다.");
+                    return Ok(());
+                }
+                Some("expired") => {
+                    println_utf8!("로그인 시간이 만료되었습니다. 다시 시작해 주세요.");
+                    anyhow::bail!("로그인 시간이 만료되었습니다.");
+                }
+                Some("failed") => {
+                    // Never print the returned error/code or any account fields.
+                    println_utf8!("{}", login_failure(status["error"].as_str()));
+                    anyhow::bail!("로그인에 실패했습니다.");
+                }
+                _ => anyhow::bail!("로그인 상태를 확인해 주세요."),
+            }
+            tokio::select! {
+                signal = &mut interrupt => {
+                    signal?;
+                    backend.cancel(&id).await?;
+                    println_utf8!("로그인을 취소했습니다.");
+                    return Ok(());
+                }
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            }
+        }
+    }
+    .await;
+    if result.is_err() {
+        let _ = backend.cancel(&id).await;
+    }
+    if let (LoginBackend::Local(service), Some(obs)) = (backend, offline_obs) {
+        finish_offline_login(service, obs).await?;
+    }
+    result
+}
+
+async fn finish_offline_login(
+    service: qb_core::oauth::LoginService,
+    obs: std::sync::Arc<qb_core::observability::Observability>,
+) -> anyhow::Result<()> {
+    service.cancel_all().await;
+    let flushed = tokio::task::spawn_blocking(move || obs.flush()).await?;
+    drop(service);
+    flushed
+}
+
+fn login_failure(error: Option<&str>) -> &'static str {
+    use qb_core::oauth::LoginError;
+    match error {
+        Some(error)
+            if error == "linked_conflict" || error == LoginError::LinkedConflict.to_string() =>
+        {
+            "CPA에 연결된 계정입니다. 독립된 토큰 충돌을 막기 위해 로그인을 거부했습니다. 연결을 해제하고 전환하려면 --replace-linked로 다시 시도해 주세요."
+        }
+        Some(error) if error == (LoginError::CallbackPortBusy { port: 1455 }).to_string() => {
+            "Codex 로그인 콜백 포트 1455가 사용 중입니다. 다른 로그인 프로그램을 종료한 뒤 다시 시도해 주세요."
+        }
+        Some(error) if error == (LoginError::CallbackPortBusy { port: 54545 }).to_string() => {
+            "Claude 로그인 콜백 포트 54545가 사용 중입니다. 다른 로그인 프로그램을 종료한 뒤 다시 시도해 주세요."
+        }
+        Some(error) if error == qb_core::accounts::login::IDENTITY_CONFLICT_REASON => {
+            qb_core::accounts::login::IDENTITY_CONFLICT_REASON
+        }
+        Some(error) if error == LoginError::StateMismatch.to_string() => {
+            "로그인 상태가 일치하지 않습니다. 로그인을 다시 시작해 주세요."
+        }
+        Some(error) if error == LoginError::StoreFailed.to_string() => {
+            "계정 정보를 저장하지 못했습니다. 저장 공간과 접근 권한을 확인해 주세요."
+        }
+        Some(error) if error == LoginError::NotFound.to_string() => {
+            "로그인 요청을 찾을 수 없습니다. 로그인을 다시 시작해 주세요."
+        }
+        Some(error) if error == LoginError::InvalidCallback.to_string() => {
+            "로그인 콜백이 올바르지 않습니다. 로그인을 다시 시작해 주세요."
+        }
+        Some(error) if error == LoginError::ExchangeFailed.to_string() => {
+            "인증 서버와 통신하지 못했습니다. 로그인을 다시 시도해 주세요."
+        }
+        Some(error) if error == LoginError::InvalidIdentity.to_string() => {
+            "인증 서버의 계정 정보를 확인하지 못했습니다."
+        }
+        Some(error) if error == LoginError::InvalidTestEndpoint.to_string() => {
+            "테스트 주소는 관리 포트를 제외한 숫자 루프백 주소여야 합니다."
+        }
+        Some(error)
+            if [1455, 54545]
+                .iter()
+                .any(|&port| error == (LoginError::CallbackBindFailed { port }).to_string()) =>
+        {
+            "로그인 콜백에 연결할 수 없습니다. 루프백 네트워크와 접근 권한을 확인해 주세요."
+        }
+        _ => "로그인에 실패했습니다. 로그인 요청과 계정 연결 상태를 확인한 뒤 다시 시도해 주세요.",
+    }
+}
+
+#[cfg(test)]
+#[path = "accounts_cli_m1b_fixes_tests.rs"]
+mod m1b_fixes_tests;
+
+#[cfg(test)]
+#[test]
+fn import_owned_account_reason_has_korean_label() {
+    assert_eq!(
+        translated(&serde_json::json!("owned_account")),
+        "이미 소유한 계정"
+    );
+}
+
+#[cfg(windows)]
+fn open_browser(url: &str) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn ShellExecuteW(
+            window: *mut std::ffi::c_void,
+            operation: *const u16,
+            file: *const u16,
+            parameters: *const u16,
+            directory: *const u16,
+            show: i32,
+        ) -> *mut std::ffi::c_void;
+    }
+    let operation: Vec<u16> = "open\0".encode_utf16().collect();
+    let file: Vec<u16> = std::ffi::OsStr::new(url)
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    // ShellExecute receives the validated URL as data, without a command shell.
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+        )
+    };
+    if result as isize <= 32 {
+        return Err(std::io::Error::other("브라우저를 열지 못했습니다."));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn open_browser(url: &str) -> std::io::Result<()> {
+    let program = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let status = std::process::Command::new(program).arg(url).status()?;
+    if !status.success() {
+        return Err(std::io::Error::other("브라우저를 열지 못했습니다."));
+    }
+    Ok(())
 }

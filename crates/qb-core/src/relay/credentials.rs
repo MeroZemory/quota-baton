@@ -1,16 +1,16 @@
 use std::{
     collections::BTreeMap,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},
 };
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 use crate::{
     account_runtime::AccountRuntime,
     accounts::{
         Account, AccountStore, Health, HealthReason, HealthSignal, ImportMode, Provider, Source,
-        StoreError, Tokens, linked,
+        StoreError, Tokens, UserState, linked,
     },
     observability::Observability,
 };
@@ -18,10 +18,70 @@ use crate::{
 #[derive(Clone)]
 pub(crate) struct TokenGates {
     gates: Arc<Mutex<BTreeMap<String, Arc<Mutex<ReloadClock>>>>>,
+    lifecycle: Arc<RefreshLifecycle>,
     client: reqwest::Client,
     runtime: Arc<AccountRuntime>,
+    ahead_access: Arc<StdMutex<BTreeMap<String, (Account, Tokens)>>>,
+    ahead_changed: Arc<Notify>,
     claude_endpoint: String,
     codex_endpoint: String,
+}
+
+#[derive(Default)]
+struct RefreshLifecycle {
+    state: StdMutex<RefreshActivityState>,
+    changed: Notify,
+}
+
+#[derive(Default)]
+struct RefreshActivityState {
+    stopped: bool,
+    active: usize,
+}
+
+struct RefreshActivity(Arc<RefreshLifecycle>);
+
+impl Drop for RefreshActivity {
+    fn drop(&mut self) {
+        self.0.state.lock().expect("refresh lifecycle").active -= 1;
+        self.0.changed.notify_waiters();
+    }
+}
+
+impl RefreshLifecycle {
+    fn admit(self: &Arc<Self>) -> Option<RefreshActivity> {
+        let mut state = self.state.lock().expect("refresh lifecycle");
+        if state.stopped {
+            return None;
+        }
+        state.active += 1;
+        Some(RefreshActivity(self.clone()))
+    }
+
+    // A persistence retry inherits an already admitted refresh, including during shutdown.
+    fn track_write(self: &Arc<Self>) -> RefreshActivity {
+        self.state.lock().expect("refresh lifecycle").active += 1;
+        RefreshActivity(self.clone())
+    }
+
+    fn stopped(&self) -> bool {
+        self.state.lock().expect("refresh lifecycle").stopped
+    }
+
+    async fn wait(&self, idle: bool) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let state = self.state.lock().expect("refresh lifecycle");
+                if (idle && state.active == 0) || (!idle && state.stopped) {
+                    return;
+                }
+            }
+            changed.await;
+        }
+    }
 }
 
 #[derive(Default)]
@@ -30,6 +90,9 @@ struct ReloadClock {
     stale_event: Option<Instant>,
     pending: Option<Rotation>,
     refresh_failure: Option<(zeroize::Zeroizing<String>, Instant)>,
+    uncertain_retry: Option<(zeroize::Zeroizing<String>, tokio::time::Instant)>,
+    backoff_failures: u32,
+    unknown_failures: u32,
 }
 
 struct Rotation {
@@ -66,8 +129,11 @@ impl TokenGates {
     pub fn new(client: reqwest::Client, runtime: Arc<AccountRuntime>) -> Self {
         Self {
             gates: Arc::default(),
+            lifecycle: Arc::default(),
             client,
             runtime,
+            ahead_access: Arc::default(),
+            ahead_changed: Arc::default(),
             claude_endpoint: "https://platform.claude.com/v1/oauth/token".into(),
             codex_endpoint: "https://auth.openai.com/oauth/token".into(),
         }
@@ -97,9 +163,14 @@ impl TokenGates {
         account: &Account,
         tokens: &Tokens,
     ) -> Result<bool, ()> {
+        let guard = self.gate(&account.id).await.lock_owned().await;
+        if let Some(pending) = &guard.pending {
+            return Ok(pending.tokens.access_token == tokens.access_token);
+        }
         let id = account.id.clone();
         let failed = zeroize::Zeroizing::new(tokens.access_token.clone());
         tokio::task::spawn_blocking(move || {
+            let _guard = guard;
             snapshot(&store, &id).map(|(_, current)| current.access_token == *failed)
         })
         .await
@@ -137,6 +208,11 @@ impl TokenGates {
         let gate = self.gate(&account.id).await;
         let guard = gate.lock_owned().await;
         tokio::task::spawn_blocking(move || {
+            if let Some(pending) = &guard.pending
+                && pending.tokens.access_token != *failed
+            {
+                return Ok(pending.account.clone());
+            }
             let _guard = guard;
             let (current, current_tokens) = snapshot(&store, &expected.id)?;
             if is_linked(&current) {
@@ -176,9 +252,18 @@ impl TokenGates {
         account: &Account,
         tokens: &Tokens,
     ) -> Result<(), ()> {
+        let guard = self.gate(&account.id).await.lock_owned().await;
+        if guard
+            .pending
+            .as_ref()
+            .is_some_and(|p| p.tokens.access_token != tokens.access_token)
+        {
+            return Ok(());
+        }
         let id = account.id.clone();
         let failed = zeroize::Zeroizing::new(tokens.access_token.clone());
         tokio::task::spawn_blocking(move || {
+            let _guard = guard;
             store
                 .update_metadata_for_token(&id, &failed, |account| {
                     if account.eligible(None) && !is_linked(account) {
@@ -237,6 +322,96 @@ impl TokenGates {
         .map_err(|_| ())?
     }
 
+    /// Returns a durable rotation when due; cancellation never aborts token consumption.
+    pub async fn refresh_ahead(
+        &self,
+        store: Arc<AccountStore>,
+        obs: Arc<Observability>,
+        id: String,
+    ) -> Result<Option<(Account, Tokens)>, ()> {
+        let Some(activity) = self.lifecycle.admit() else {
+            return Ok(None);
+        };
+        let this = self.clone();
+        tokio::spawn(async move {
+            let _activity = activity;
+            this.refresh_or_reload(store, obs, id, None, "refresh_ahead")
+                .await
+        })
+        .await
+        .map_err(|_| ())?
+    }
+
+    /// Stops new refreshes and waits for detached token consumption and writes.
+    /// On timeout or an unsaved rotation the caller must retain the lease and retry.
+    pub async fn shutdown_refreshes(&self) -> Result<(), ()> {
+        self.lifecycle
+            .state
+            .lock()
+            .expect("refresh lifecycle")
+            .stopped = true;
+        self.lifecycle.changed.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(30), self.lifecycle.wait(true))
+            .await
+            .map_err(|_| ())?;
+        let gates: Vec<_> = self.gates.lock().await.values().cloned().collect();
+        let mut failed = false;
+        for gate in gates {
+            let mut clock = gate.lock().await;
+            if let Some(rotation) = &clock.pending {
+                match persist_async(self.runtime.store.clone(), rotation).await {
+                    Ok(Some((account, _))) => {
+                        self.runtime.clear_memory_health(&account);
+                        clock.pending = None;
+                    }
+                    Ok(None) => {
+                        tracing::info!(account = %rotation.account.id, "Deleted account rotation superseded");
+                        clock.pending = None;
+                    }
+                    Err(()) => failed = true,
+                }
+            }
+        }
+        if failed { Err(()) } else { Ok(()) }
+    }
+
+    /// Shutdown wakes this scheduler; aborting it also remains safe.
+    pub fn start_refresh_scheduler(
+        &self,
+        store: Arc<AccountStore>,
+        obs: Arc<Observability>,
+    ) -> tokio::task::JoinHandle<()> {
+        let this = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(15));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {},
+                    _ = this.lifecycle.wait(false) => break,
+                }
+                if this.lifecycle.stopped() {
+                    break;
+                }
+                let read_store = store.clone();
+                if let Ok(Ok(accounts)) =
+                    tokio::task::spawn_blocking(move || read_store.list()).await
+                {
+                    for account in accounts {
+                        if !is_linked(&account)
+                            && account.user_state == UserState::Active
+                            && !account.drain
+                        {
+                            let _ = this
+                                .refresh_ahead(store.clone(), obs.clone(), account.id)
+                                .await;
+                        }
+                    }
+                }
+            }
+        })
+    }
+
     pub async fn before_request(
         &self,
         store: Arc<AccountStore>,
@@ -244,14 +419,39 @@ impl TokenGates {
         id: String,
     ) -> Result<(Account, Tokens), ()> {
         let gate = self.gate(&id).await;
-        // blocking 작업이 요청 취소 후에도 계속되므로 lock 소유권을 작업 안으로 옮긴다.
-        let guard = gate.lock_owned().await;
-        tokio::task::spawn_blocking(move || {
+        let guard = loop {
+            let changed = self.ahead_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if let Ok(guard) = gate.clone().try_lock_owned() {
+                break guard;
+            }
+            {
+                let serving = self.ahead_access.lock().expect("ahead access");
+                if let Some((account, tokens)) = serving.get(&id)
+                    && access_valid(account, chrono::Utc::now())
+                {
+                    return Ok((account.clone(), copy_tokens(tokens)));
+                }
+            }
+            // Wake when valid access is published, or when the gate is released.
+            tokio::select! {
+                guard = gate.clone().lock_owned() => break guard,
+                _ = &mut changed => {},
+            }
+        };
+        let read_store = store.clone();
+        let read_obs = observability.clone();
+        let read_id = id.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let store = read_store;
+            let observability = read_obs;
+            let id = read_id;
             let mut clock = guard;
             if clock.pending.is_some() {
                 return Err(());
             }
-            let (mut account, _) = snapshot(&store, &id)?;
+            let (mut account, tokens) = snapshot(&store, &id)?;
             if is_linked(&account)
                 && (clock.before_expiry.is_none()
                     || account.token_meta.expires_at.is_some_and(|expiry| {
@@ -261,10 +461,21 @@ impl TokenGates {
             {
                 account = reload(&store, &observability, account, "before_expiry", &mut clock)?;
             }
-            snapshot(&store, &account.id)
+            if is_linked(&account) {
+                snapshot(&store, &account.id)
+            } else {
+                Ok((account, tokens))
+            }
         })
         .await
-        .map_err(|_| ())?
+        .map_err(|_| ())??;
+        if !is_linked(&result.0) && ahead_due(&result.0, chrono::Utc::now()) {
+            let this = self.clone();
+            tokio::spawn(async move {
+                let _ = this.refresh_ahead(store, observability, id).await;
+            });
+        }
+        Ok(result)
     }
 
     pub async fn after_401(
@@ -274,12 +485,22 @@ impl TokenGates {
         account: Account,
         failed: &Tokens,
     ) -> Result<Option<(Account, Tokens)>, ()> {
+        let Some(activity) = self.lifecycle.admit() else {
+            return Ok(None);
+        };
         let failed = zeroize::Zeroizing::new(failed.access_token.clone());
         let this = self.clone();
         // Dropping the requesting future does not abort the single-use refresh.
         tokio::spawn(async move {
-            this.refresh_or_reload(store, observability, account.id, failed)
-                .await
+            let _activity = activity;
+            this.refresh_or_reload(
+                store,
+                observability,
+                account.id,
+                Some(failed),
+                "upstream_401",
+            )
+            .await
         })
         .await
         .map_err(|_| ())?
@@ -297,6 +518,13 @@ impl TokenGates {
         let failed = zeroize::Zeroizing::new(failed.access_token.clone());
         tokio::task::spawn_blocking(move || {
             let mut clock = guard;
+            if clock
+                .pending
+                .as_ref()
+                .is_some_and(|p| p.tokens.access_token != *failed)
+            {
+                return Ok(());
+            }
             for _ in 0..3 {
                 let (current, tokens) = snapshot(&store, &account.id)?;
                 if is_linked(&current) {
@@ -339,18 +567,38 @@ impl TokenGates {
         store: Arc<AccountStore>,
         obs: Arc<Observability>,
         id: String,
-        failed: zeroize::Zeroizing<String>,
+        failed: Option<zeroize::Zeroizing<String>>,
+        trigger: &str,
     ) -> Result<Option<(Account, Tokens)>, ()> {
         let gate = self.gate(&id).await;
         let mut clock = gate.clone().lock_owned().await;
-        if clock.pending.is_some() {
+        if self.lifecycle.stopped() || clock.pending.is_some() {
             return Ok(None);
+        }
+        if failed.is_none() {
+            let read_store = store.clone();
+            let read_id = id.clone();
+            let metadata = tokio::task::spawn_blocking(move || read_store.load(&read_id))
+                .await
+                .map_err(|_| ())?
+                .map_err(|_| ())?;
+            if is_linked(&metadata)
+                || metadata.drain
+                || metadata.user_state != UserState::Active
+                || matches!(metadata.health, Health::NeedsRelogin { .. })
+                || !ahead_due(&metadata, chrono::Utc::now())
+            {
+                return Ok(None);
+            }
         }
         let read_store = store.clone();
         let (current, tokens) = tokio::task::spawn_blocking(move || snapshot(&read_store, &id))
             .await
             .map_err(|_| ())??;
         if is_linked(&current) {
+            let Some(failed) = failed else {
+                return Ok(None);
+            };
             let trigger = if tokens.access_token != *failed {
                 "stale_token_401"
             } else {
@@ -365,10 +613,18 @@ impl TokenGates {
             .await
             .map_err(|_| ())?;
         }
+        assert!(!is_linked(&current), "linked accounts cannot refresh");
+        let ahead = failed.is_none();
+        let failed = failed.unwrap_or_else(|| zeroize::Zeroizing::new(tokens.access_token.clone()));
         if tokens.access_token != *failed {
             return Ok(Some((current, tokens)));
         }
-        if matches!(current.health, Health::NeedsRelogin { .. }) {
+        let due = ahead_due(&current, chrono::Utc::now());
+        // Per-account drain keeps warm sessions and paused accounts still poll.
+        // Only proactive refresh is restricted by placement settings (C5/C6/C9).
+        if (ahead && (current.drain || current.user_state != UserState::Active || !due))
+            || matches!(current.health, Health::NeedsRelogin { .. })
+        {
             return Ok(None);
         }
         if clock
@@ -378,7 +634,32 @@ impl TokenGates {
         {
             return Ok(None);
         }
+        if ahead
+            && current.token_meta.refresh_uncertain
+            && clock
+                .uncertain_retry
+                .as_ref()
+                .is_some_and(|(token, retry_at)| {
+                    **token == *failed && tokio::time::Instant::now() < *retry_at
+                })
+        {
+            return Ok(None);
+        }
+        let serving = if ahead && access_valid(&current, chrono::Utc::now()) {
+            self.ahead_access
+                .lock()
+                .expect("ahead access")
+                .insert(current.id.clone(), (current.clone(), copy_tokens(&tokens)));
+            self.ahead_changed.notify_waiters();
+            Some(AheadAccess {
+                entries: self.ahead_access.clone(),
+                id: current.id.clone(),
+            })
+        } else {
+            None
+        };
         // Write-ahead must finish before consuming the refresh token.
+        let prior_uncertain = current.token_meta.refresh_uncertain;
         let write_store = store.clone();
         let mut uncertain = current.clone();
         uncertain.token_meta.refresh_uncertain = true;
@@ -391,47 +672,108 @@ impl TokenGates {
         {
             Ok(current) => current,
             Err(StoreError::GenerationConflict { .. }) => return Ok(None),
-            Err(_) => return Err(()),
+            Err(_) => {
+                clock.unknown_failures = 0;
+                self.runtime.set_refresh_attention(&current.id, true);
+                obs.record_refresh(
+                    &current.id,
+                    trigger,
+                    "store_error_writeahead",
+                    current.token_meta.expires_at,
+                );
+                obs.core_warning(&current.id, "refresh_store_error_writeahead");
+                if !ahead || !access_valid(&current, chrono::Utc::now()) {
+                    let mut cooled = current.clone();
+                    cooled.apply_health_signal(HealthSignal::StoreFailure, chrono::Utc::now());
+                    obs.record_health(&current.id, &current.health, &cooled.health);
+                    self.runtime.emit_account(&cooled);
+                }
+                clock.refresh_failure = Some((failed, Instant::now() + Duration::from_secs(2)));
+                return Ok(None);
+            }
         };
+        if self.lifecycle.stopped() {
+            restore_uncertainty(store.clone(), &current, &tokens, prior_uncertain).await;
+            return Ok(None);
+        }
+        // Space proactive uncertain retries from the send boundary. A new
+        // current-token 401 bypasses this interval, but sets the next one too.
+        clock.uncertain_retry = Some((
+            zeroize::Zeroizing::new(failed.to_string()),
+            tokio::time::Instant::now() + Duration::from_secs(120),
+        ));
         let reply = tokio::time::timeout(
             Duration::from_secs(30),
             self.request_refresh(&current, &tokens),
         )
         .await;
-        let reply = match reply {
+        drop(serving);
+        let mut reply = match reply {
             Ok(Ok(reply)) => reply,
-            Ok(Err(Some(reason))) => {
-                tokio::task::spawn_blocking(move || {
-                    transition(
-                        &store,
+            failure => {
+                let error = match failure {
+                    Ok(Err(error)) => error,
+                    Err(_) => RefreshError::Uncertain,
+                    Ok(Ok(_)) => unreachable!(),
+                };
+                obs.record_refresh(&current.id, trigger, &error.outcome(), None);
+                if !matches!(error, RefreshError::Uncertain) {
+                    clock.uncertain_retry = None;
+                    // A request never sent cannot settle uncertainty from an earlier attempt.
+                    restore_uncertainty(
+                        store.clone(),
                         &current,
-                        &failed,
-                        HealthSignal::TerminalRefresh { reason },
+                        &tokens,
+                        prior_uncertain && matches!(error, RefreshError::NotSent),
                     )
-                })
-                .await
-                .map_err(|_| ())??;
-                return Ok(None);
-            }
-            // Uncertain and transient errors keep the access token and health.
-            _ => {
-                // A possibly consumed single-use token is never immediately retried
-                // by a concurrent waiter. Retry no earlier than refresh-ahead.
-                let retry_secs = current
-                    .token_meta
-                    .expires_at
-                    .zip(current.token_meta.last_refresh_at)
-                    .map(|(expires, refreshed)| {
-                        (expires - (expires - refreshed) / 5 - chrono::Utc::now()).num_seconds()
+                    .await;
+                }
+                if let RefreshError::Terminal(reason) = error {
+                    clock.unknown_failures = 0;
+                    self.runtime.set_refresh_attention(&current.id, false);
+                    tokio::task::spawn_blocking(move || {
+                        transition(
+                            &store,
+                            &current,
+                            &failed,
+                            HealthSignal::TerminalRefresh { reason },
+                        )
                     })
-                    .unwrap_or(60)
-                    .clamp(60, 86400) as u64;
-                clock.refresh_failure =
-                    Some((failed, Instant::now() + Duration::from_secs(retry_secs)));
+                    .await
+                    .map_err(|_| ())??;
+                    return Ok(None);
+                }
+                if matches!(error, RefreshError::Unknown4xx(_)) {
+                    clock.unknown_failures = clock.unknown_failures.saturating_add(1);
+                    self.runtime
+                        .set_refresh_attention(&current.id, clock.unknown_failures >= 3);
+                    if clock.unknown_failures == 3 {
+                        obs.core_warning(&current.id, "refresh_unknown_4xx");
+                    }
+                } else {
+                    clock.unknown_failures = 0;
+                    self.runtime.set_refresh_attention(&current.id, false);
+                }
+                clock.backoff_failures = clock.backoff_failures.saturating_add(1);
+                // Expiry/current401 gates uncertainty; the separate interval
+                // only spaces proactive attempts after entering that window.
+                clock.refresh_failure = if matches!(error, RefreshError::Uncertain) {
+                    None
+                } else {
+                    Some((
+                        failed,
+                        Instant::now()
+                            + Duration::from_secs((1u64 << clock.backoff_failures.min(8)).min(300)),
+                    ))
+                };
                 return Ok(None);
             }
         };
         clock.refresh_failure = None;
+        clock.uncertain_retry = None;
+        clock.backoff_failures = 0;
+        clock.unknown_failures = 0;
+        self.runtime.set_refresh_attention(&current.id, false);
         let mut rotated = current.clone();
         let refreshed_at = chrono::Utc::now();
         rotated.token_meta.last_refresh_at = Some(refreshed_at);
@@ -446,18 +788,32 @@ impl TokenGates {
         let rotation = Rotation {
             account: rotated,
             tokens: Tokens {
-                access_token: reply.access_token,
+                access_token: std::mem::take(&mut reply.access_token),
                 refresh_token: reply
                     .refresh_token
+                    .take()
                     .unwrap_or_else(|| tokens.refresh_token.clone()),
-                id_token: reply.id_token.or_else(|| tokens.id_token.clone()),
+                id_token: reply.id_token.take().or_else(|| tokens.id_token.clone()),
             },
             failed_token: failed,
             store_error_in_memory: false,
         };
         let result = persist_async(store.clone(), &rotation).await;
         match result {
-            Ok((updated, tokens)) => Ok(Some((updated, tokens))),
+            Ok(Some((updated, tokens))) => {
+                self.runtime.clear_memory_health(&updated);
+                obs.record_refresh(
+                    &current.id,
+                    trigger,
+                    "success",
+                    updated.token_meta.expires_at,
+                );
+                Ok(Some((updated, tokens)))
+            }
+            Ok(None) => {
+                obs.record_refresh(&current.id, trigger, "superseded", None);
+                Ok(None)
+            }
             Err(_) => {
                 let mut rotation = rotation;
                 rotation
@@ -480,10 +836,19 @@ impl TokenGates {
                     obs.record_health(&current.id, &current.health, &rotation.account.health);
                     self.runtime.emit_account(&rotation.account);
                 }
+                obs.record_refresh(
+                    &current.id,
+                    trigger,
+                    "store_error",
+                    rotation.account.token_meta.expires_at,
+                );
+                obs.core_warning(&current.id, "refresh_store_error");
                 tracing::error!(account = %current.id, "Rotated credential persistence failed; retrying account write");
                 clock.pending = Some(rotation);
                 let this = self.clone();
+                let activity = self.lifecycle.track_write();
                 tokio::spawn(async move {
+                    let _activity = activity;
                     this.retry_rotation(store, obs, gate).await;
                 });
                 Ok(None)
@@ -499,17 +864,34 @@ impl TokenGates {
     ) {
         let mut seconds = 1;
         loop {
-            tokio::time::sleep(Duration::from_secs(seconds)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(seconds)) => {},
+                _ = self.lifecycle.wait(false) => {},
+            }
             let mut clock = gate.lock().await;
             let Some(rotation) = &clock.pending else {
                 return;
             };
-            if let Ok((account, _)) = persist_async(store.clone(), rotation).await {
-                if rotation.store_error_in_memory && rotation.account.health != account.health {
-                    obs.record_health(&account.id, &rotation.account.health, &account.health);
+            match persist_async(store.clone(), rotation).await {
+                Ok(Some((account, _))) => {
+                    if rotation.store_error_in_memory && rotation.account.health != account.health {
+                        obs.record_health(&account.id, &rotation.account.health, &account.health);
+                    }
+                    self.runtime.clear_memory_health(&account);
+                    clock.pending = None;
+                    return;
                 }
-                self.runtime.clear_memory_health(&account);
-                clock.pending = None;
+                Ok(None) => {
+                    obs.record_refresh(&rotation.account.id, "persist_retry", "superseded", None);
+                    clock.pending = None;
+                    return;
+                }
+                Err(()) => {}
+            }
+            if self.lifecycle.stopped() {
+                // The durable old record remains refresh_uncertain. Never retry
+                // indefinitely or discard the pending rotation while still running.
+                obs.core_warning(&rotation.account.id, "refresh_shutdown_store_error");
                 return;
             }
             seconds = (seconds * 2).min(60);
@@ -520,7 +902,8 @@ impl TokenGates {
         &self,
         account: &Account,
         tokens: &Tokens,
-    ) -> Result<RefreshReply, Option<String>> {
+    ) -> Result<RefreshReply, RefreshError> {
+        assert!(!is_linked(account), "linked accounts cannot refresh");
         let (url, client_id, scope) = match account.provider {
             Provider::Claude => (
                 &self.claude_endpoint,
@@ -533,6 +916,24 @@ impl TokenGates {
                 "openid profile email",
             ),
         };
+        #[cfg(any(test, all(feature = "testkit", debug_assertions)))]
+        {
+            let safe = reqwest::Url::parse(url).is_ok_and(|url| {
+                url.scheme() == "http"
+                    && url.host_str().is_some_and(|host| {
+                        host.trim_matches(['[', ']'])
+                            .parse::<std::net::IpAddr>()
+                            .is_ok_and(|ip| ip.is_loopback())
+                    })
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.fragment().is_none()
+                    && !matches!(url.port_or_known_default(), Some(10100 | 10101))
+            });
+            if !safe {
+                return Err(RefreshError::NotSent);
+            }
+        }
         let body = [
             ("grant_type", "refresh_token"),
             ("refresh_token", tokens.refresh_token.as_str()),
@@ -543,52 +944,155 @@ impl TokenGates {
             "user-agent",
             concat!("quota-baton/", env!("CARGO_PKG_VERSION")),
         );
-        let request = match account.provider { Provider::Claude => request.json(&serde_json::json!({"grant_type":"refresh_token","refresh_token":tokens.refresh_token,"client_id":client_id,"scope":scope})), Provider::Codex => request.form(&body) };
-        let mut response = request.send().await.map_err(|_| None)?;
+        let request = match account.provider {
+            Provider::Claude => request.json(&std::collections::BTreeMap::from(body)),
+            Provider::Codex => request.form(&body),
+        };
+        let mut response = request.send().await.map_err(|error| {
+            if error.is_connect() {
+                RefreshError::NotSent
+            } else {
+                RefreshError::Uncertain
+            }
+        })?;
         let status = response.status();
         if status.as_u16() == 401 {
-            return Err(Some("token_endpoint_401".into()));
+            return Err(RefreshError::Terminal("token_endpoint_401".into()));
         }
         if status.is_server_error() || status.as_u16() == 429 {
-            return Err(None);
+            return Err(RefreshError::Backoff(status.as_u16()));
         }
         let mut bytes = zeroize::Zeroizing::new(Vec::new());
-        while let Some(chunk) = response.chunk().await.map_err(|_| None)? {
+        while let Some(chunk) = response.chunk().await.map_err(|_| {
+            if status.is_client_error() {
+                RefreshError::Unknown4xx(status.as_u16())
+            } else {
+                RefreshError::Uncertain
+            }
+        })? {
             if bytes.len().saturating_add(chunk.len()) > 65536 {
-                return Err(None);
+                return Err(if status.is_client_error() {
+                    RefreshError::Unknown4xx(status.as_u16())
+                } else {
+                    RefreshError::Uncertain
+                });
             }
             bytes.extend_from_slice(&chunk);
         }
         if !status.is_success() {
-            let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| None)?;
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
             let code = value["error"]
                 .as_str()
                 .or_else(|| value["error"]["code"].as_str())
+                .or_else(|| value["error"]["type"].as_str())
                 .or_else(|| value["code"].as_str());
-            return Err(code
-                .filter(|code| {
-                    matches!(
-                        *code,
-                        "refresh_token_invalidated"
-                            | "refresh_token_reused"
-                            | "refresh_token_expired"
-                            | "refresh_token_revoked"
-                            | "invalid_grant"
-                    )
-                })
-                .map(str::to_owned));
+            return Err(match code {
+                Some(
+                    code @ ("refresh_token_invalidated"
+                    | "refresh_token_reused"
+                    | "refresh_token_expired"
+                    | "refresh_token_revoked"
+                    | "invalid_grant"),
+                ) => RefreshError::Terminal(code.to_owned()),
+                _ if status.is_client_error() => RefreshError::Unknown4xx(status.as_u16()),
+                _ => RefreshError::Backoff(status.as_u16()),
+            });
         }
-        let reply: RefreshReply = serde_json::from_slice(&bytes).map_err(|_| None)?;
+        let reply: RefreshReply =
+            serde_json::from_slice(&bytes).map_err(|_| RefreshError::Uncertain)?;
         if reply.access_token.is_empty()
-            || reply.refresh_token.as_ref().is_some_and(String::is_empty)
+            || reply
+                .refresh_token
+                .as_ref()
+                .is_some_and(|value| value.is_empty())
         {
-            return Err(None);
+            return Err(RefreshError::Uncertain);
         }
         Ok(reply)
     }
 }
 
-#[derive(serde::Deserialize)]
+enum RefreshError {
+    Terminal(String),
+    Uncertain,
+    NotSent,
+    Backoff(u16),
+    Unknown4xx(u16),
+}
+
+impl RefreshError {
+    fn outcome(&self) -> String {
+        match self {
+            Self::Terminal(code) => code.clone(),
+            Self::Uncertain => "transport_uncertain".into(),
+            Self::NotSent => "transport_connect".into(),
+            Self::Backoff(status) | Self::Unknown4xx(status) => format!("http_{status}"),
+        }
+    }
+}
+
+// Stable jitter delays the 20% boundary by at most 2% of lifetime.
+fn refresh_point(account: &Account) -> Option<chrono::DateTime<chrono::Utc>> {
+    let expires = account.token_meta.expires_at?;
+    let refreshed = account.token_meta.last_refresh_at?;
+    let lifetime = (expires - refreshed).num_seconds().max(0);
+    let jitter = account.id.bytes().fold(0u64, |hash, byte| {
+        hash.wrapping_mul(31).wrapping_add(u64::from(byte))
+    }) % 201;
+    Some(
+        expires - chrono::Duration::seconds(lifetime / 5)
+            + chrono::Duration::seconds(lifetime * jitter as i64 / 10000),
+    )
+}
+
+fn refresh_due(account: &Account, now: chrono::DateTime<chrono::Utc>) -> bool {
+    refresh_point(account)
+        .or(account.token_meta.expires_at)
+        .is_some_and(|point| now >= point)
+}
+
+fn access_valid(account: &Account, now: chrono::DateTime<chrono::Utc>) -> bool {
+    account
+        .token_meta
+        .expires_at
+        .is_none_or(|expiry| now < expiry)
+}
+fn ahead_due(account: &Account, now: chrono::DateTime<chrono::Utc>) -> bool {
+    if account.token_meta.refresh_uncertain {
+        account
+            .token_meta
+            .expires_at
+            .is_some_and(|expiry| now >= expiry - chrono::Duration::minutes(10))
+    } else {
+        refresh_due(account, now)
+    }
+}
+struct AheadAccess {
+    entries: Arc<StdMutex<BTreeMap<String, (Account, Tokens)>>>,
+    id: String,
+}
+impl Drop for AheadAccess {
+    fn drop(&mut self) {
+        self.entries.lock().expect("ahead access").remove(&self.id);
+    }
+}
+async fn restore_uncertainty(
+    store: Arc<AccountStore>,
+    account: &Account,
+    tokens: &Tokens,
+    uncertain: bool,
+) {
+    let account = account.clone();
+    let tokens = copy_tokens(tokens);
+    let _ = tokio::task::spawn_blocking(move || {
+        let mut cleared = account;
+        cleared.token_meta.refresh_uncertain = uncertain;
+        store.save(&cleared, &tokens, Some(cleared.generation))
+    })
+    .await;
+}
+
+#[derive(serde::Deserialize, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 struct RefreshReply {
     access_token: String,
     refresh_token: Option<String>,
@@ -607,15 +1111,25 @@ fn copy_tokens(tokens: &Tokens) -> Tokens {
 async fn persist_async(
     store: Arc<AccountStore>,
     rotation: &Rotation,
-) -> Result<(Account, Tokens), ()> {
+) -> Result<Option<(Account, Tokens)>, ()> {
     let account = rotation.account.clone();
     let tokens = copy_tokens(&rotation.tokens);
     let failed = zeroize::Zeroizing::new(rotation.failed_token.to_string());
     tokio::task::spawn_blocking(move || {
         for _ in 0..3 {
-            let (mut current, stored_tokens) = snapshot(&store, &account.id)?;
+            let mut current = match store.load(&account.id) {
+                Ok(current) => current,
+                Err(StoreError::NotFound) => return Ok(None),
+                Err(_) => return Err(()),
+            };
+            let stored_tokens = match store.tokens(&current) {
+                Ok(tokens) => tokens,
+                Err(StoreError::GenerationConflict { .. }) => continue,
+                Err(StoreError::NotFound) => return Ok(None),
+                Err(_) => return Err(()),
+            };
             if stored_tokens.access_token != *failed {
-                return Ok((current, stored_tokens));
+                return Ok(Some((current, stored_tokens)));
             }
             current.token_meta = account.token_meta.clone();
             if matches!(
@@ -628,7 +1142,7 @@ async fn persist_async(
                 current.health = Health::Ready;
             }
             match store.save(&current, &tokens, Some(current.generation)) {
-                Ok(updated) => return Ok((updated, tokens)),
+                Ok(updated) => return Ok(Some((updated, tokens))),
                 Err(StoreError::GenerationConflict { .. }) => continue,
                 Err(_) => return Err(()),
             }
@@ -696,7 +1210,14 @@ fn reload(
             Ok(updated)
         }
         Err(error) => {
+            let expired = account
+                .token_meta
+                .expires_at
+                .is_some_and(|expiry| expiry <= chrono::Utc::now());
+            let rejected_401 = trigger == "upstream_401";
             let outcome = match error {
+                linked::LinkError::Stale if !expired && !rejected_401 => "unchanged",
+                linked::LinkError::Missing if !expired && !rejected_401 => "link_missing",
                 linked::LinkError::Stale | linked::LinkError::Missing => "link_stale",
                 linked::LinkError::InvalidData => "link_invalid",
                 linked::LinkError::Store(StoreError::GenerationConflict { .. }) => {
@@ -790,6 +1311,7 @@ mod tests {
         let now = chrono::Utc::now();
         let identity = Identity::Codex {
             account_id: "synthetic-auth-hardening".into(),
+            user_id: None,
             email: "auth@example.invalid".into(),
         };
         let account = Account {

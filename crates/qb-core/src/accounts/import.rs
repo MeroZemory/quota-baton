@@ -2,6 +2,7 @@ use super::{
     Account, AccountStore, Health, Identity, ImportMode, Provider, Source, SourceMatch, StoreError,
     TokenMeta, Tokens, UserState,
 };
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -25,6 +26,7 @@ pub enum SkipReason {
     UnknownType,
     InvalidData,
     OlderToken,
+    OwnedAccount,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -66,6 +68,27 @@ pub(crate) enum ReadError {
     Io,
     InvalidData,
     UnknownType,
+}
+
+// Identity claims only: this does not authenticate or verify the JWT signature.
+pub(crate) fn codex_user_id(tokens: &Tokens, account_id: &str) -> Option<String> {
+    let mut parts = tokens.id_token.as_deref()?.split('.');
+    parts.next()?;
+    let payload = parts.next()?;
+    parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let payload = Zeroizing::new(URL_SAFE_NO_PAD.decode(payload).ok()?);
+    let claims: serde_json::Value = serde_json::from_slice(&payload).ok()?;
+    let auth = &claims["https://api.openai.com/auth"];
+    if auth["chatgpt_account_id"].as_str()? != account_id {
+        return None;
+    }
+    auth["chatgpt_user_id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
 }
 
 pub(crate) fn paths(dir: &Path) -> Result<Vec<PathBuf>, StoreError> {
@@ -127,6 +150,7 @@ pub(crate) fn read(path: &Path, dir: &Path) -> Result<Candidate, ReadError> {
                 .ok_or(ReadError::InvalidData)?;
             (
                 Identity::Codex {
+                    user_id: codex_user_id(&file.tokens, &id),
                     account_id: id,
                     email: file.email.clone(),
                 },
@@ -207,7 +231,7 @@ fn execute(
         .map(|account| (account.id.clone(), account))
         .collect();
     let mut rows = Vec::new();
-    for path in paths(&dir)? {
+    'files: for path in paths(&dir)? {
         let Candidate {
             mut account,
             tokens,
@@ -232,9 +256,97 @@ fn execute(
                 continue;
             }
         };
+        // Keep a resolved legacy record's key until login's journaled migration.
+        // Re-import must not expose the same family under a second id.
+        let mut legacy = Vec::new();
+        for old in accounts.values() {
+            if let (
+                Identity::Codex {
+                    account_id: a,
+                    user_id: Some(_),
+                    ..
+                },
+                Identity::Codex {
+                    account_id: b,
+                    user_id: None,
+                    ..
+                },
+            ) = (&old.identity, &account.identity)
+                && a == b
+            {
+                // Losing the claim must not recreate a known family by email.
+                rows.push(row(
+                    &account,
+                    ImportAction::Skipped,
+                    Some(SkipReason::InvalidData),
+                ));
+                continue 'files;
+            }
+            if let (
+                Identity::Codex {
+                    account_id: a,
+                    user_id: None,
+                    ..
+                },
+                Identity::Codex {
+                    account_id: b,
+                    user_id: Some(_),
+                    ..
+                },
+            ) = (&old.identity, &account.identity)
+                && a == b
+            {
+                // An owned legacy record cannot be resolved through CPA. Never
+                // recreate its possible token family under a resolved key.
+                if owned(old) {
+                    legacy.push(old);
+                    continue;
+                }
+                let identity = match super::linked::resolve_identity(old) {
+                    Ok(identity) => identity,
+                    Err(_) => {
+                        rows.push(row(
+                            &account,
+                            ImportAction::Skipped,
+                            Some(SkipReason::InvalidData),
+                        ));
+                        continue 'files;
+                    }
+                };
+                if matches!(identity, Identity::Codex { user_id: None, .. }) {
+                    rows.push(row(
+                        &account,
+                        ImportAction::Skipped,
+                        Some(SkipReason::InvalidData),
+                    ));
+                    continue 'files;
+                }
+                if identity.canonical_key() == account.identity.canonical_key() {
+                    legacy.push(old);
+                }
+            }
+        }
+        if legacy.len() > 1 || (!legacy.is_empty() && accounts.contains_key(&account.id)) {
+            rows.push(row(
+                &account,
+                ImportAction::Skipped,
+                Some(SkipReason::InvalidData),
+            ));
+            continue 'files;
+        }
+        if let Some(old) = legacy.first() {
+            account.id = old.id.clone();
+            account.identity = old.identity.clone();
+            account.source = old.source.clone();
+        }
         let old = accounts.get(&account.id);
         if old.is_some_and(|old| old.identity.canonical_key() != account.identity.canonical_key()) {
-            return Err(StoreError::IdentityCollision);
+            rows.push(row(
+                &account,
+                ImportAction::Skipped,
+                Some(SkipReason::InvalidData),
+            ));
+            continue 'files;
         }
         let activated = activate
             .iter()
@@ -249,7 +361,21 @@ fn execute(
         let mut stored_timestamp = None;
         let mut file_timestamp = None;
         let mut write_activation = false;
-        if let Some(old) = old {
+        if let Some(old) = old.filter(|old| owned(old)) {
+            account = old.clone();
+            action = ImportAction::Skipped;
+            reason = Some(SkipReason::OwnedAccount);
+            if activated && old.user_state != UserState::Active {
+                write_activation = true;
+                if !dry_run {
+                    preserved_tokens = Some(
+                        store
+                            .ok_or(StoreError::Synchronization)?
+                            .tokens_unlocked(old)?,
+                    );
+                }
+            }
+        } else if let Some(old) = old {
             account.generation = old.generation;
             account.user_state = old.user_state;
             account.label = old.label.clone();
@@ -314,6 +440,17 @@ fn execute(
         accounts.insert(account.id.clone(), account);
     }
     Ok(rows)
+}
+
+fn owned(account: &Account) -> bool {
+    matches!(
+        account.source,
+        Source::Oauth
+            | Source::Cpa {
+                mode: ImportMode::Adopted,
+                ..
+            }
+    )
 }
 
 fn row(account: &Account, action: ImportAction, reason: Option<SkipReason>) -> ImportRow {
