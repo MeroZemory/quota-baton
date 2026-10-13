@@ -47,19 +47,30 @@ The upstream defaults are `https://api.anthropic.com` and
 `https://chatgpt.com/backend-api/codex`. The normal build accepts only those exact
 bases; the explicit `testkit` feature in debug builds also accepts
 `http://127.0.0.1:<port>` for fake upstreams. Redirects and automatic decompression are disabled. Request and response
-bytes pass through unchanged. The M2 interim upload path buffers the whole body;
-only bodies within the retention cap and shared budget can be retried after a
-linked-token reload. There is no account failover yet.
+bytes pass through unchanged. Uploads buffer at most the per-request retention cap;
+larger uploads stream the buffered prefix followed by the remaining client body.
+Only complete bodies within the cap and shared budget can be retried after a
+linked-token reload. Expiry reloads run at most once per account per minute;
+401-triggered reloads bypass that throttle. There is no account failover yet.
 
 The core acquires its credential lease and loads accounts and passive quota state
 before opening listeners. It runs at above-normal process priority. Passive quota
 headers persist under `state/quota.json`; request metadata and linked-reload events
 persist under `ledger/`. No bodies or credentials are logged. Request retention is
 released at the bounded commit decision (first data/error, 64 KiB, or 10 seconds).
+SSE classification uses an incremental side decoder for gzip, deflate, Brotli and
+zstd. Unknown or stacked encodings commit immediately; relayed bytes stay raw.
+The accepted C3 limitation remains: reqwest inserts `Accept: */*` when a client
+omits `Accept`; genuine clients supply that header themselves.
+Observability uses a bounded non-blocking queue and batches disk synchronization
+once per second. Queue overflow drops events and reports counts once per minute.
+Corrupt quota caches are moved aside and ledger pruning failures are warnings.
 
 Phase 0 account pins use the authenticated admin API:
 `POST /admin/v1/debug/pin` with `{account_id, session_key?}` and
-`DELETE /admin/v1/debug/pin`. Session pins override the global pin; pins clear on
+`DELETE /admin/v1/debug/pin`. The account determines the provider family;
+`session_key` uses the internal prefixed form (`codex:<id>` or `claude:<id>`).
+Session pins override that family's global pin; pins clear on
 restart. These controls deliberately override active-account selection for tests.
 
 Shape capture needs an explicit debug feature build and an existing directory whose
