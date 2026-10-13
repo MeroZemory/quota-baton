@@ -1,0 +1,31 @@
+[package]
+name = "qb-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+base64.workspace = true
+chrono.workspace = true
+fs2.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
+windows.workspace = true
+zeroize.workspace = true
+qb-proto.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+reqwest.workspace = true
