@@ -8,3 +8,18 @@ license.workspace = true
 [[bin]]
 name = "quota-baton-tray"
 path = "src/main.rs"
+
+[lib]
+path = "src/layout.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+qb-core.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+windows.workspace = true
+windows-numerics.workspace = true

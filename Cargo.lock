@@ -1164,6 +1164,18 @@ dependencies = [
 [[package]]
 name = "qb-tray"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "qb-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+ "tokio",
+ "windows",
+ "windows-numerics",
+]
 
 [[package]]
 name = "quinn"
