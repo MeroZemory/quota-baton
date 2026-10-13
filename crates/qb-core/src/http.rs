@@ -12,7 +12,7 @@ use axum::{
     routing::get,
 };
 use subtle::ConstantTimeEq;
-use tokio::{net::TcpListener, task::JoinHandle};
+use tokio::{net::TcpListener, sync::Notify, task::JoinHandle};
 
 use crate::{config::Config, local_secrets::LocalSecrets};
 
@@ -21,6 +21,12 @@ pub struct RunningServers {
     pub admin_addr: SocketAddr,
     pub data_task: JoinHandle<std::io::Result<()>>,
     pub admin_task: JoinHandle<std::io::Result<()>>,
+    shutdown: Arc<Notify>,
+}
+impl RunningServers {
+    pub fn shutdown(&self) {
+        self.shutdown.notify_waiters();
+    }
 }
 impl Drop for RunningServers {
     fn drop(&mut self) {
@@ -69,10 +75,11 @@ pub async fn spawn_with_routes(
         secrets.client_key != secrets.admin_token,
         "local secrets must be distinct"
     );
-    let data = TcpListener::bind((Ipv4Addr::LOCALHOST, config.server.data_port)).await?;
-    let admin = TcpListener::bind((Ipv4Addr::LOCALHOST, config.server.admin_port)).await?;
+    let data = bind_listener(config.server.data_port).await?;
+    let admin = bind_listener(config.server.admin_port).await?;
     let data_addr = data.local_addr()?;
     let admin_addr = admin.local_addr()?;
+    let shutdown = Arc::new(Notify::new());
     let client_key: Arc<str> = secrets.client_key.into();
     let admin_token: Arc<str> = secrets.admin_token.into();
     let data_app = data_routes.layer(middleware::from_fn_with_state(
@@ -108,18 +115,22 @@ pub async fn spawn_with_routes(
             },
             safety,
         ));
+    let data_shutdown = shutdown.clone();
     let data_task = tokio::spawn(async move {
         axum::serve(
             data,
             data_app.into_make_service_with_connect_info::<SocketAddr>(),
         )
+        .with_graceful_shutdown(async move { data_shutdown.notified().await })
         .await
     });
+    let admin_shutdown = shutdown.clone();
     let admin_task = tokio::spawn(async move {
         axum::serve(
             admin,
             admin_app.into_make_service_with_connect_info::<SocketAddr>(),
         )
+        .with_graceful_shutdown(async move { admin_shutdown.notified().await })
         .await
     });
     Ok(RunningServers {
@@ -127,7 +138,24 @@ pub async fn spawn_with_routes(
         admin_addr,
         data_task,
         admin_task,
+        shutdown,
     })
+}
+
+async fn bind_listener(port: u16) -> anyhow::Result<TcpListener> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await {
+            Ok(listener) => return Ok(listener),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AddrInUse
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 async fn safety(

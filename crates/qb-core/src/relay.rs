@@ -9,7 +9,10 @@ mod websocket;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Mutex, atomic::AtomicU64},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -22,6 +25,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
+use tokio::sync::Notify;
 
 use crate::{
     accounts::{Account, AccountStore, Health, HealthReason, Provider, UserState},
@@ -68,6 +72,9 @@ pub struct RelayState {
     tokens: TokenGates,
     websocket: crate::config::WebsocketConfig,
     reconnect_exclusions: Mutex<BTreeMap<(String, String), Instant>>,
+    draining: AtomicBool,
+    drain_notify: Notify,
+    lease_notify: Notify,
     #[cfg(all(feature = "phase0", debug_assertions))]
     close_after_response: bool,
     #[cfg(all(feature = "phase0", debug_assertions))]
@@ -89,6 +96,59 @@ impl RelayState {
     }
     pub async fn shutdown_refreshes(&self) -> Result<(), ()> {
         self.tokens.shutdown_refreshes().await
+    }
+
+    /// Begin a takeover drain exactly once.  Admission is closed before any
+    /// refresh or binding work begins, so a successor cannot observe a writer
+    /// still consuming the old credential lease.
+    pub async fn begin_drain(&self) -> Result<serde_json::Value, ()> {
+        if self
+            .draining
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(self.bindings.export().unwrap_or_else(|_| {
+                serde_json::json!({
+                    "schema": 2,
+                    "bindings": []
+                })
+            }));
+        }
+        if self.tokens.shutdown_refreshes().await.is_err() {
+            self.draining.store(false, Ordering::Release);
+            return Err(());
+        }
+        let bindings = self.bindings.clone();
+        let exported = tokio::task::spawn_blocking(move || {
+            bindings.flush()?;
+            bindings.export()
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .ok_or(())?;
+        self.drain_notify.notify_waiters();
+        Ok(exported)
+    }
+
+    pub fn release_lease_after_drain(&self) {
+        self.store.release_lease();
+        self.lease_notify.notify_waiters();
+    }
+
+    pub async fn wait_for_lease_release(&self) {
+        self.lease_notify.notified().await;
+    }
+
+    pub async fn wait_for_drain(&self) {
+        if self.draining.load(Ordering::Acquire) {
+            return;
+        }
+        self.drain_notify.notified().await;
+    }
+
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::Acquire)
     }
     async fn unavailable(
         &self,
@@ -175,6 +235,9 @@ impl RelayState {
             tokens,
             websocket: config.websocket.clone(),
             reconnect_exclusions: Mutex::new(BTreeMap::new()),
+            draining: AtomicBool::new(false),
+            drain_notify: Notify::new(),
+            lease_notify: Notify::new(),
             #[cfg(all(feature = "phase0", debug_assertions))]
             close_after_response: false,
             #[cfg(all(feature = "phase0", debug_assertions))]
@@ -687,6 +750,18 @@ fn failure(
 }
 
 async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Response {
+    if state.is_draining() {
+        let mut response = native_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            Provider::Claude,
+            "server_error",
+            "quota-baton is handing over",
+        );
+        response
+            .headers_mut()
+            .insert("retry-after", HeaderValue::from_static("1"));
+        return response;
+    }
     if request.method() == Method::GET
         && request.uri().path() == "/v1/responses"
         && request

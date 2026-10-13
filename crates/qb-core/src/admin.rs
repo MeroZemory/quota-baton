@@ -145,7 +145,55 @@ pub fn runtime_routes(relay: Arc<crate::relay::RelayState>, data_port: u16) -> R
             "/admin/v1/accounts/{id}",
             axum::routing::patch(account_patch),
         )
+        .route("/admin/v1/lifecycle/drain", post(lifecycle_drain))
+        .route("/admin/v1/lifecycle/shutdown", post(lifecycle_shutdown))
         .with_state(RuntimeAdmin { relay, data_port })
+}
+
+#[derive(Default, serde::Deserialize)]
+struct DrainRequest {
+    #[serde(default = "default_drain_timeout")]
+    drain_timeout_secs: u64,
+}
+
+fn default_drain_timeout() -> u64 {
+    30 * 60
+}
+
+async fn lifecycle_drain(
+    State(state): State<RuntimeAdmin>,
+    request: Result<Json<DrainRequest>, JsonRejection>,
+) -> Response {
+    let timeout = request.ok().map(|Json(value)| value.drain_timeout_secs);
+    let _timeout = timeout
+        .unwrap_or_else(default_drain_timeout)
+        .clamp(1, 30 * 60);
+    match state.relay.begin_drain().await {
+        Ok(bindings) => match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            state.relay.wait_for_lease_release(),
+        )
+        .await
+        {
+            Ok(()) => Json(serde_json::json!({
+                "bindings": bindings.get("bindings").cloned().unwrap_or_else(|| serde_json::json!([])),
+                "lease_released": true
+            }))
+            .into_response(),
+            Err(_) => error(StatusCode::SERVICE_UNAVAILABLE, "Lease handover timed out"),
+        },
+        Err(()) => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Drain is still in progress",
+        ),
+    }
+}
+
+async fn lifecycle_shutdown(
+    State(state): State<RuntimeAdmin>,
+    request: Result<Json<DrainRequest>, JsonRejection>,
+) -> Response {
+    lifecycle_drain(State(state), request).await
 }
 
 async fn runtime_state(State(state): State<RuntimeAdmin>) -> Response {
@@ -232,6 +280,9 @@ async fn account_action(
     State(state): State<RuntimeAdmin>,
     axum::extract::Path((id, action)): axum::extract::Path<(String, String)>,
 ) -> Response {
+    if state.relay.is_draining() {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "Core is draining");
+    }
     use crate::accounts::UserState;
     let user_state = match action.as_str() {
         "refresh-usage" => return refresh_usage(state, id).await,
@@ -274,6 +325,9 @@ async fn account_patch(
     axum::extract::Path(id): axum::extract::Path<String>,
     request: Result<Json<AccountPatch>, JsonRejection>,
 ) -> Response {
+    if state.relay.is_draining() {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "Core is draining");
+    }
     match request {
         Ok(Json(patch)) => change_account(state, id, None, patch).await,
         Err(_) => error(StatusCode::BAD_REQUEST, "Invalid account settings"),

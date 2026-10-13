@@ -59,6 +59,8 @@ enum Command {
         #[cfg(feature = "phase0")]
         #[arg(long, help = "응답 완료 후 소켓을 닫아 합성 이식성 검사를 진행합니다")]
         phase0_close_after_response: bool,
+        #[arg(long, help = "실행 중인 코어를 drain한 뒤 계정 lease를 넘겨받습니다")]
+        takeover: bool,
     },
     #[command(about = "상태를 확인합니다")]
     Status,
@@ -144,6 +146,29 @@ fn friendly_error(error: &anyhow::Error) -> String {
     "요청을 처리하지 못했습니다. 데이터 폴더와 설정을 확인해 주세요.".into()
 }
 
+async fn request_takeover(
+    home: &std::path::Path,
+    config: &qb_core::config::Config,
+) -> anyhow::Result<serde_json::Value> {
+    let secrets = qb_core::local_secrets::load_or_create(home)?;
+    let port = config.server.admin_port;
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let response = client
+        .post(format!("http://127.0.0.1:{port}/admin/v1/lifecycle/drain"))
+        .header(reqwest::header::HOST, format!("127.0.0.1:{port}"))
+        .header(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {}", secrets.admin_token),
+        )
+        .json(&serde_json::json!({"drain_timeout_secs": 30}))
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        anyhow::bail!("running core refused takeover ({})", response.status());
+    }
+    Ok(response.json().await?)
+}
+
 async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let home = qb_core::home()?;
@@ -159,16 +184,31 @@ async fn run() -> anyhow::Result<()> {
             capture_bodies_limit,
             #[cfg(feature = "phase0")]
             phase0_close_after_response,
+            takeover,
         } => {
             let _logs = qb_core::logging::init(&home)?;
             let config = qb_core::config::Config::load(&home)?;
-            let account_home = home.clone();
-            let store = std::sync::Arc::new(
-                tokio::task::spawn_blocking(move || {
+            let mut imported_bindings = None;
+            let started = std::time::Instant::now();
+            let store = loop {
+                let account_home = home.clone();
+                match tokio::task::spawn_blocking(move || {
                     qb_core::accounts::AccountStore::acquire(&account_home)
                 })
-                .await??,
-            );
+                .await?
+                {
+                    Ok(store) => break std::sync::Arc::new(store),
+                    Err(qb_core::accounts::StoreError::LeaseBusy)
+                        if takeover && started.elapsed() < std::time::Duration::from_secs(2) =>
+                    {
+                        if imported_bindings.is_none() {
+                            imported_bindings = Some(request_takeover(&home, &config).await?);
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            };
             qb_core::set_process_priority()?;
             #[cfg(feature = "shape-capture")]
             let capture = capture_dir.map(|dir| qb_core::observability::CaptureOptions {
@@ -199,6 +239,19 @@ async fn run() -> anyhow::Result<()> {
             #[cfg(feature = "phase0")]
             let relay = relay.with_close_after_response(phase0_close_after_response);
             let relay = std::sync::Arc::new(relay);
+            if let Some(bindings) = imported_bindings {
+                let value = serde_json::json!({
+                    "schema": 2,
+                    "bindings": bindings
+                        .get("bindings")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!([])),
+                });
+                relay
+                    .bindings
+                    .import(value)
+                    .map_err(|_| anyhow::anyhow!("인계된 세션 바인딩을 읽지 못했습니다."))?;
+            }
             relay
                 .accounts
                 .initialize_settings(config.accounts.clone())
@@ -220,7 +273,7 @@ async fn run() -> anyhow::Result<()> {
             #[cfg(feature = "phase0")]
             let admin_routes = admin_routes.merge(qb_core::relay::phase0_routes(relay.clone()));
             let secrets = qb_core::local_secrets::load_or_create(&home)?;
-            let servers = qb_core::http::spawn_with_routes(
+            let mut servers = qb_core::http::spawn_with_routes(
                 &config,
                 secrets,
                 qb_core::relay::router(relay.clone()),
@@ -230,11 +283,21 @@ async fn run() -> anyhow::Result<()> {
             println_utf8!("프록시를 시작했습니다.");
             let polling = relay.quota.start();
             let refreshing = relay.start_refresh_scheduler();
-            tokio::signal::ctrl_c().await?;
+            tokio::select! {
+                result = tokio::signal::ctrl_c() => { result?; }
+                _ = relay.wait_for_drain() => {}
+            }
             polling.abort();
             refreshing.abort();
             let _ = polling.await;
             let _ = refreshing.await;
+            if relay.is_draining() {
+                relay.release_lease_after_drain();
+            }
+            servers.shutdown();
+            let drain_deadline = std::time::Duration::from_secs(30 * 60);
+            let _ = tokio::time::timeout(drain_deadline, &mut servers.data_task).await;
+            let _ = tokio::time::timeout(drain_deadline, &mut servers.admin_task).await;
             drop(servers);
             login.cancel_all().await;
             // The lease must outlive detached token consumption and durable writes.
