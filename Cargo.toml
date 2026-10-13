@@ -1,6 +1,10 @@
 [workspace]
 members = ["crates/qb-core", "crates/qb-proto", "crates/qb-testkit", "crates/qb-tray", "crates/quota-baton"]
 resolver = "2"
+exclude = ["vendor/tungstenite"]
+
+[patch.crates-io]
+tungstenite = { path = "vendor/tungstenite" }
 
 [workspace.package]
 version = "0.1.0"
@@ -10,7 +14,10 @@ license = "MIT"
 
 [workspace.dependencies]
 anyhow = "=1.0.100"
-axum = "=0.8.6"
+axum = { version = "=0.8.6", features = ["ws"] }
+tokio-tungstenite = { version = "=0.28.0", features = ["rustls-tls-webpki-roots"] }
+hyper = { version = "=1.12.0", features = ["server", "http1"] }
+hyper-util = { version = "=0.1.21", features = ["tokio"] }
 base64 = "=0.22.1"
 chrono = { version = "=0.4.42", features = ["serde"] }
 clap = { version = "=4.5.51", features = ["derive"] }
@@ -34,7 +41,7 @@ toml = "=0.9.8"
 tracing = "=0.1.41"
 tracing-appender = "=0.2.3"
 tracing-subscriber = { version = "=0.3.20", features = ["env-filter", "json"] }
-windows = { version = "=0.62.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Memory", "Win32_System_Threading"] }
+windows = { version = "=0.62.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Memory", "Win32_System_Threading", "Win32_System_Console"] }
 zeroize = { version = "=1.8.2", features = ["derive"] }
 qb-core = { path = "crates/qb-core" }
 qb-proto = { path = "crates/qb-proto" }
