@@ -230,6 +230,7 @@ fn translated(value: &serde_json::Value) -> String {
         Some("skipped") => "건너뜀".into(),
         Some("unknown_type") => "지원하지 않는 계정 유형".into(),
         Some("invalid_data") => "잘못된 계정 데이터".into(),
+        Some("owned_account") => "이미 소유한 계정".into(),
         _ => cell(value),
     }
 }
@@ -733,6 +734,15 @@ fn login_failure(error: Option<&str>) -> &'static str {
 #[cfg(test)]
 #[path = "accounts_cli_m1b_fixes_tests.rs"]
 mod m1b_fixes_tests;
+
+#[cfg(test)]
+#[test]
+fn import_owned_account_reason_has_korean_label() {
+    assert_eq!(
+        translated(&serde_json::json!("owned_account")),
+        "이미 소유한 계정"
+    );
+}
 
 #[cfg(windows)]
 fn open_browser(url: &str) -> std::io::Result<()> {

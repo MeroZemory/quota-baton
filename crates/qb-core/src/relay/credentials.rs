@@ -90,6 +90,7 @@ struct ReloadClock {
     stale_event: Option<Instant>,
     pending: Option<Rotation>,
     refresh_failure: Option<(zeroize::Zeroizing<String>, Instant)>,
+    uncertain_retry: Option<(zeroize::Zeroizing<String>, tokio::time::Instant)>,
     backoff_failures: u32,
     unknown_failures: u32,
 }
@@ -633,6 +634,17 @@ impl TokenGates {
         {
             return Ok(None);
         }
+        if ahead
+            && current.token_meta.refresh_uncertain
+            && clock
+                .uncertain_retry
+                .as_ref()
+                .is_some_and(|(token, retry_at)| {
+                    **token == *failed && tokio::time::Instant::now() < *retry_at
+                })
+        {
+            return Ok(None);
+        }
         let serving = if ahead && access_valid(&current, chrono::Utc::now()) {
             self.ahead_access
                 .lock()
@@ -684,6 +696,12 @@ impl TokenGates {
             restore_uncertainty(store.clone(), &current, &tokens, prior_uncertain).await;
             return Ok(None);
         }
+        // Space proactive uncertain retries from the send boundary. A new
+        // current-token 401 bypasses this interval, but sets the next one too.
+        clock.uncertain_retry = Some((
+            zeroize::Zeroizing::new(failed.to_string()),
+            tokio::time::Instant::now() + Duration::from_secs(120),
+        ));
         let reply = tokio::time::timeout(
             Duration::from_secs(30),
             self.request_refresh(&current, &tokens),
@@ -700,6 +718,7 @@ impl TokenGates {
                 };
                 obs.record_refresh(&current.id, trigger, &error.outcome(), None);
                 if !matches!(error, RefreshError::Uncertain) {
+                    clock.uncertain_retry = None;
                     // A request never sent cannot settle uncertainty from an earlier attempt.
                     restore_uncertainty(
                         store.clone(),
@@ -736,7 +755,8 @@ impl TokenGates {
                     self.runtime.set_refresh_attention(&current.id, false);
                 }
                 clock.backoff_failures = clock.backoff_failures.saturating_add(1);
-                // Uncertainty is gated by expiry/current401, never a replay timer.
+                // Expiry/current401 gates uncertainty; the separate interval
+                // only spaces proactive attempts after entering that window.
                 clock.refresh_failure = if matches!(error, RefreshError::Uncertain) {
                     None
                 } else {
@@ -750,6 +770,7 @@ impl TokenGates {
             }
         };
         clock.refresh_failure = None;
+        clock.uncertain_retry = None;
         clock.backoff_failures = 0;
         clock.unknown_failures = 0;
         self.runtime.set_refresh_attention(&current.id, false);

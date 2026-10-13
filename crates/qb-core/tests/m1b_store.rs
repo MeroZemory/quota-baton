@@ -294,7 +294,7 @@ fn unresolved_migration_cannot_be_overwritten_by_another_login() {
 }
 
 #[test]
-fn changed_email_cpa_recovery_requires_resolved_canonical_user() {
+fn old_changed_email_journal_retains_linked_records_without_live_cpa_reads() {
     let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     for case in 0..4 {
         let (home, store) = fixture();
@@ -332,14 +332,29 @@ fn changed_email_cpa_recovery_requires_resolved_canonical_user() {
         let marker = home.path().join("accounts/.login-migration");
         fs::write(&marker, json!({"old": old.id, "new": new.id}).to_string()).unwrap();
         drop(store);
-        assert!(
-            matches!(
+        if case == 3 {
+            // An adopted family is unrelated to linked migration recovery.
+            assert!(matches!(
                 AccountStore::acquire(home.path()),
                 Err(qb_core::accounts::StoreError::IdentityCollision)
-            ),
-            "case {case}"
-        );
-        assert!(marker.exists(), "case {case}");
+            ));
+            assert!(marker.exists());
+        } else {
+            let reopened = AccountStore::acquire(home.path()).unwrap();
+            assert_eq!(reopened.list().unwrap().len(), 2);
+            assert_eq!(
+                reopened.load(&old.id).unwrap().user_state,
+                qb_core::accounts::UserState::Disabled
+            );
+            assert_eq!(
+                reopened
+                    .tokens(&reopened.load(&old.id).unwrap())
+                    .unwrap()
+                    .access_token,
+                tokens().access_token
+            );
+            assert!(!marker.exists());
+        }
         for id in [&old.id, &new.id] {
             assert!(
                 home.path()
@@ -349,5 +364,81 @@ fn changed_email_cpa_recovery_requires_resolved_canonical_user() {
                 "case {case}"
             );
         }
+    }
+}
+
+#[test]
+fn authorized_changed_email_journal_survives_missing_or_rewritten_cpa() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    for missing in [true, false] {
+        let (home, store) = fixture();
+        let mut old = account(None, "fixture@example.invalid");
+        let dir = home.path().join("synthetic-cpa");
+        write_cpa(&dir, Some("synthetic-user"));
+        old.source = Source::Cpa {
+            mode: qb_core::accounts::ImportMode::Linked,
+            dir: dir.clone(),
+            r#match: qb_core::accounts::SourceMatch::from(&old.identity),
+        };
+        let old = store.save(&old, &tokens(), None).unwrap();
+        let resolved = account(Some("synthetic-user"), "fixture@example.invalid");
+        let new = account(Some("synthetic-user"), "changed@example.invalid");
+        let new = store.save(&new, &tokens(), None).unwrap();
+        fs::write(
+            home.path().join("accounts/.login-migration"),
+            json!({
+                "old": old.id, "new": new.id,
+                "proof": {"old_identity": old.identity, "resolved_identity": resolved.identity}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        if missing {
+            fs::remove_dir_all(&dir).unwrap();
+        } else {
+            write_cpa(&dir, Some("other-user"));
+        }
+        drop(store);
+        let restarted = AccountStore::acquire(home.path()).unwrap();
+        assert_eq!(restarted.list().unwrap(), vec![new.clone()]);
+        assert_eq!(
+            restarted.tokens(&new).unwrap().access_token,
+            tokens().access_token
+        );
+        assert!(!home.path().join("accounts/.login-migration").exists());
+    }
+}
+
+#[test]
+fn migration_proof_cannot_authorize_an_unrelated_stored_user() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let (home, store) = fixture();
+    let old = account(Some("other-user"), "fixture@example.invalid");
+    let old = store.save(&old, &tokens(), None).unwrap();
+    let resolved = account(Some("synthetic-user"), "fixture@example.invalid");
+    let new = account(Some("synthetic-user"), "changed@example.invalid");
+    store.save(&new, &tokens(), None).unwrap();
+    fs::write(
+        home.path().join("accounts/.login-migration"),
+        json!({
+            "old":old.id,"new":new.id,"proof":{
+                "old_identity":old.identity,"resolved_identity":resolved.identity
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    drop(store);
+    assert!(matches!(
+        AccountStore::acquire(home.path()),
+        Err(qb_core::accounts::StoreError::IdentityCollision)
+    ));
+    for id in [&old.id, &new.id] {
+        assert!(
+            home.path()
+                .join("accounts")
+                .join(format!("{id}.json"))
+                .exists()
+        );
     }
 }
