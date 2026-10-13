@@ -145,7 +145,7 @@ pub fn row(account: &Account, now: SystemTime) -> Row {
         .windows
         .iter()
         .find(|w| w.name == "5h")
-        .or_else(|| account.windows.iter().find(|w| w.name != "7d"));
+        .or_else(|| account.windows.first());
     let weekly_window = account.windows.iter().find(|w| w.name == "7d").or_else(|| {
         five_window
             .filter(|window| window.name == "5h")
@@ -243,10 +243,10 @@ pub fn provider_name(provider: &str) -> &str {
 fn usage(window: Option<&Window>, now: SystemTime) -> Usage {
     let Some(window) = window else {
         return Usage {
-            label: "주간".into(),
+            label: String::new(),
             percent: None,
-            percent_text: "-".into(),
-            reset_text: "-".into(),
+            percent_text: "–".into(),
+            reset_text: "–".into(),
         };
     };
     let expired = window
@@ -266,7 +266,7 @@ fn usage(window: Option<&Window>, now: SystemTime) -> Usage {
                 if expired {
                     "리셋됨".into()
                 } else {
-                    "-".into()
+                    "–".into()
                 }
             },
             |p| format!("{p:.0}%"),
@@ -274,7 +274,7 @@ fn usage(window: Option<&Window>, now: SystemTime) -> Usage {
         reset_text: window
             .reset_at
             .as_deref()
-            .map_or_else(|| "-".into(), |s| format_reset(s, now)),
+            .map_or_else(|| "–".into(), |s| format_reset(s, now)),
     }
 }
 
@@ -338,6 +338,26 @@ pub fn badge(rows: &[Row], core_ok: bool) -> Badge {
     }
 }
 
+pub fn badge_color(rows: &[Row], core_ok: bool, dark: bool) -> Rgb {
+    match badge(rows, core_ok) {
+        Badge::Normal => colors(dark).good,
+        Badge::Attention => {
+            if dark {
+                Rgb(247, 194, 92)
+            } else {
+                colors(false).warning
+            }
+        }
+        Badge::Error => {
+            if dark {
+                Rgb(255, 139, 139)
+            } else {
+                colors(false).critical
+            }
+        }
+    }
+}
+
 pub fn colors(dark: bool) -> Colors {
     if dark {
         Colors {
@@ -362,6 +382,31 @@ pub fn colors(dark: bool) -> Colors {
             warning: Rgb(174, 108, 0),
             critical: Rgb(190, 45, 45),
             track: Rgb(224, 228, 234),
+        }
+    }
+}
+
+pub fn chip_colors(dark: bool, tone: Tone, inactive: bool) -> (Rgb, Rgb) {
+    if dark {
+        return if inactive {
+            (Rgb(70, 70, 76), Rgb(220, 220, 226))
+        } else {
+            match tone {
+                Tone::Good => (Rgb(35, 76, 52), Rgb(132, 225, 160)),
+                Tone::Warning => (Rgb(87, 68, 29), Rgb(247, 194, 92)),
+                Tone::Critical => (Rgb(91, 42, 42), Rgb(255, 139, 139)),
+                Tone::Neutral => (Rgb(70, 70, 76), Rgb(220, 220, 226)),
+            }
+        };
+    }
+    if inactive {
+        (Rgb(238, 240, 242), Rgb(99, 106, 116))
+    } else {
+        match tone {
+            Tone::Good => (Rgb(231, 242, 235), Rgb(30, 145, 73)),
+            Tone::Warning => (Rgb(250, 240, 223), Rgb(174, 108, 0)),
+            Tone::Critical => (Rgb(247, 229, 228), Rgb(190, 45, 45)),
+            Tone::Neutral => (Rgb(238, 240, 242), Rgb(99, 106, 116)),
         }
     }
 }
@@ -434,6 +479,20 @@ mod tests {
     #[test]
     fn colors_differ() {
         assert_ne!(colors(false).background, colors(true).background);
+    }
+
+    #[test]
+    fn dark_chip_tokens_cover_every_style() {
+        for tone in [Tone::Good, Tone::Warning, Tone::Critical, Tone::Neutral] {
+            assert_ne!(
+                chip_colors(true, tone, false),
+                chip_colors(false, tone, false)
+            );
+        }
+        assert_ne!(
+            chip_colors(true, Tone::Neutral, true),
+            chip_colors(false, Tone::Neutral, true)
+        );
     }
 
     #[test]

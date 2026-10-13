@@ -1,4 +1,4 @@
-use super::{Colors, Row, Tone, colors};
+use super::{Colors, Row, Tone, badge_color, chip_colors, colors};
 use std::{path::Path, time::SystemTime};
 use windows::{
     Win32::{
@@ -7,7 +7,7 @@ use windows::{
                 Common::{
                     D2D_RECT_F, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
                 },
-                D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_RENDER_TARGET_PROPERTIES,
+                D2D1_ELLIPSE, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_RENDER_TARGET_PROPERTIES,
                 D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1CreateFactory, ID2D1Factory,
                 ID2D1RenderTarget,
             },
@@ -31,10 +31,10 @@ use windows::{
 const WIDTH: f32 = 360.0;
 const PADDING: f32 = 12.0;
 const SECTION_GAP: f32 = 14.0;
-const ROW_HEIGHT: f32 = 92.0;
+const ROW_HEIGHT: f32 = 104.0;
 
-fn content_height(rows: &[Row], expand_disabled: bool) -> f32 {
-    let mut height = 56.0 + 48.0;
+pub fn content_height(rows: &[Row], expand_disabled: bool) -> f32 {
+    let mut height = 56.0;
     for provider in ["Claude", "Codex"] {
         let active = rows
             .iter()
@@ -49,12 +49,15 @@ fn content_height(rows: &[Row], expand_disabled: bool) -> f32 {
         }
         height += SECTION_GAP + active as f32 * ROW_HEIGHT;
         if expand_disabled {
+            if disabled > 0 {
+                height += 28.0;
+            }
             height += disabled as f32 * ROW_HEIGHT;
         } else if disabled > 0 {
             height += 28.0;
         }
     }
-    height + 40.0
+    height + 30.0
 }
 
 #[derive(Clone, Copy)]
@@ -155,25 +158,9 @@ fn meter_color(row: &Row, pct: Option<f64>, colors: Colors) -> BrushColor {
     brush_color(rgb)
 }
 
-fn health_colors(row: &Row, colors: Colors) -> (BrushColor, BrushColor) {
-    match row.health_tone {
-        Tone::Good => (
-            brush_color(super::Rgb(231, 242, 235)),
-            brush_color(colors.good),
-        ),
-        Tone::Warning => (
-            brush_color(super::Rgb(250, 240, 223)),
-            brush_color(colors.warning),
-        ),
-        Tone::Critical => (
-            brush_color(super::Rgb(247, 229, 228)),
-            brush_color(colors.critical),
-        ),
-        Tone::Neutral => (
-            brush_color(super::Rgb(238, 240, 242)),
-            brush_color(colors.muted),
-        ),
-    }
+fn health_colors(row: &Row, dark: bool) -> (BrushColor, BrushColor) {
+    let (bg, fg) = chip_colors(dark, row.health_tone, row.user_chip == "비활성");
+    (brush_color(bg), brush_color(fg))
 }
 
 fn reset_label(row: &Row, first: bool) -> &str {
@@ -246,6 +233,7 @@ pub fn paint(
     version: &str,
     now: SystemTime,
     expand_disabled: bool,
+    core_ok: bool,
 ) -> Result<()> {
     let colors = colors(dark);
     let dwrite: IDWriteFactory = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) }?;
@@ -281,11 +269,18 @@ pub fn paint(
         17.0,
         brush_color(colors.muted),
     )?;
-    fill(
-        target,
-        rect(340.0, 17.0, 348.0, 25.0),
-        brush_color(colors.good),
-    )?;
+    unsafe {
+        let brush =
+            target.CreateSolidColorBrush(&brush_color(badge_color(rows, core_ok, dark)).0, None)?;
+        target.FillEllipse(
+            &D2D1_ELLIPSE {
+                point: windows_numerics::Vector2 { X: 344.0, Y: 21.0 },
+                radiusX: 4.0,
+                radiusY: 4.0,
+            },
+            &brush,
+        );
+    }
     let mut y = 56.0;
     for provider in ["claude", "codex"] {
         let active = rows
@@ -310,19 +305,36 @@ pub fn paint(
             brush_color(colors.muted),
         )?;
         y += SECTION_GAP;
+        if expand_disabled && !disabled.is_empty() {
+            draw_text(
+                target,
+                &small,
+                &format!("비활성 계정 {}개 ⌃", disabled.len()),
+                PADDING,
+                y,
+                220.0,
+                22.0,
+                brush_color(colors.muted),
+            )?;
+            y += 28.0;
+        }
         for row in active.into_iter().chain(if expand_disabled {
             disabled.clone()
         } else {
             Vec::new()
         }) {
-            draw_row(target, &body, &small, row, y, colors, now)?;
+            draw_row(target, &body, &small, row, y, colors, dark, now)?;
             y += ROW_HEIGHT;
         }
         if !expand_disabled && !disabled.is_empty() {
             draw_text(
                 target,
                 &small,
-                &format!("비활성 계정 {}개 ›", disabled.len()),
+                &format!(
+                    "비활성 계정 {}개 {}",
+                    disabled.len(),
+                    if expand_disabled { "⌃" } else { "›" }
+                ),
                 PADDING,
                 y,
                 220.0,
@@ -348,6 +360,7 @@ pub fn paint(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_row(
     target: &ID2D1RenderTarget,
     body: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
@@ -355,16 +368,17 @@ fn draw_row(
     row: &Row,
     y: f32,
     colors: Colors,
+    dark: bool,
     now: SystemTime,
 ) -> Result<()> {
-    let (bg, fg) = health_colors(row, colors);
+    let (bg, fg) = health_colors(row, dark);
     let name = row.email.as_deref().unwrap_or(&row.name);
     draw_text(
         target,
         body,
         name,
         PADDING,
-        y,
+        y + 10.0,
         150.0,
         20.0,
         brush_color(colors.text),
@@ -374,9 +388,9 @@ fn draw_row(
             target,
             rect(
                 145.0,
-                y + 1.0,
+                y + 11.0,
                 145.0 + plan.len() as f32 * 7.0 + 14.0,
-                y + 20.0,
+                y + 30.0,
             ),
             brush_color(colors.track),
         )?;
@@ -385,7 +399,7 @@ fn draw_row(
             small,
             plan,
             152.0,
-            y + 2.0,
+            y + 12.0,
             50.0,
             16.0,
             brush_color(colors.muted),
@@ -399,7 +413,12 @@ fn draw_row(
     let chip_width = display_chip.chars().count() as f32 * 11.0 + 18.0;
     pill(
         target,
-        rect(WIDTH - PADDING - chip_width, y, WIDTH - PADDING, y + 21.0),
+        rect(
+            WIDTH - PADDING - chip_width,
+            y + 10.0,
+            WIDTH - PADDING,
+            y + 31.0,
+        ),
         bg,
     )?;
     draw_text(
@@ -407,14 +426,18 @@ fn draw_row(
         small,
         display_chip,
         WIDTH - PADDING - chip_width + 9.0,
-        y + 2.0,
+        y + 12.0,
         chip_width - 10.0,
         17.0,
         fg,
     )?;
-    draw_meter(target, small, row, PADDING, y + 27.0, 160.0, true, colors)?;
-    draw_meter(target, small, row, 188.0, y + 27.0, 160.0, false, colors)?;
-    if row.health_tone != Tone::Good || row.user_chip == "비활성" {
+    if !row.five_hour.label.is_empty() {
+        draw_meter(target, small, row, PADDING, y + 37.0, 160.0, true, colors)?;
+    }
+    if !row.seven_day.label.is_empty() {
+        draw_meter(target, small, row, 188.0, y + 37.0, 160.0, false, colors)?;
+    }
+    if row.health_tone != Tone::Good && row.user_chip != "비활성" {
         let reason = if row.user_chip == "비활성" {
             "비활성".to_owned()
         } else if row.health_chip == "재로그인 필요" {
@@ -429,13 +452,13 @@ fn draw_row(
             small,
             &reason,
             PADDING,
-            y + 69.0,
+            y + 86.0,
             330.0,
             18.0,
             brush_color(colors.muted),
         )?;
     }
-    let _ = now;
+    let _ = (now, dark);
     Ok(())
 }
 
@@ -485,7 +508,7 @@ pub fn render_png(
         let factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
         let target = factory.CreateWicBitmapRenderTarget(&bitmap, &props)?;
         target.SetDpi(96.0 * scale, 96.0 * scale);
-        paint(&target, rows, dark, version, now, expand_disabled)?;
+        paint(&target, rows, dark, version, now, expand_disabled, true)?;
         let stream = wic.CreateStream()?;
         let wide: Vec<u16> = output
             .as_os_str()
