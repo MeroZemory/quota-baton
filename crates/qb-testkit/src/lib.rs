@@ -17,6 +17,7 @@ pub struct RecordedRequest {
     pub path_and_query: String,
     pub headers: HeaderMap,
     pub body: Bytes,
+    pub received_at: Instant,
 }
 
 #[derive(Clone)]
@@ -134,6 +135,7 @@ async fn scripted(State(state): State<ScriptedState>, request: Request) -> Respo
         path_and_query: parts.uri.path_and_query().unwrap().as_str().into(),
         headers: parts.headers.clone(),
         body,
+        received_at: Instant::now(),
     });
     let response = state.limiter_response(&parts.headers).unwrap_or_else(|| {
         state

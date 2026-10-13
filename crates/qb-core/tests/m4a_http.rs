@@ -469,6 +469,76 @@ async fn c6_3_admission_wait_exhausted_sends_once() {
 }
 
 #[tokio::test]
+async fn c6_3_no_pacing_no_spacing() {
+    let h = Harness::new(Provider::Claude, 1, 0, 1024).await;
+    let start = h.fake.state.requests().len();
+    let harness = &h;
+    let responses = futures_util::future::join_all((0..32).map(|n| {
+        let session = format!("unpaced-{n}");
+        async move { harness.send_with_session(Provider::Claude, &session).await }
+    }))
+    .await;
+    assert!(
+        responses
+            .iter()
+            .all(|response| response.status().is_success())
+    );
+    let requests = h.fake.state.requests();
+    let arrivals: Vec<_> = requests[start..]
+        .iter()
+        .map(|request| request.received_at)
+        .collect();
+    assert_eq!(arrivals.len(), 32);
+    let span = arrivals
+        .iter()
+        .copied()
+        .max()
+        .unwrap()
+        .saturating_duration_since(arrivals.iter().copied().min().unwrap());
+    assert!(
+        span < Duration::from_millis(200),
+        "unpaced span was {span:?}"
+    );
+}
+
+#[tokio::test]
+async fn c6_3_spacing_stops_after_decay() {
+    let h = Harness::new(Provider::Claude, 1, 0, 1024).await;
+    let id = h.ids()[0].clone();
+    let now = Instant::now();
+    h.state.accounts.observe_429_at(&id, now, now, None, 1.0);
+    let decayed = h
+        .state
+        .accounts
+        .pacing_snapshot_at(&id, now + Duration::from_secs(301));
+    assert_eq!(decayed.rate_step, 0);
+    assert!(decayed.rate_backoff_until.is_none());
+
+    let start = h.fake.state.requests().len();
+    let harness = &h;
+    futures_util::future::join_all((0..32).map(|n| {
+        let session = format!("decayed-{n}");
+        async move { harness.send_with_session(Provider::Claude, &session).await }
+    }))
+    .await;
+    let requests = h.fake.state.requests();
+    let arrivals: Vec<_> = requests[start..]
+        .iter()
+        .map(|request| request.received_at)
+        .collect();
+    let span = arrivals
+        .iter()
+        .copied()
+        .max()
+        .unwrap()
+        .saturating_duration_since(arrivals.iter().copied().min().unwrap());
+    assert!(
+        span < Duration::from_millis(200),
+        "decayed span was {span:?}"
+    );
+}
+
+#[tokio::test]
 async fn c6_3_placement_skips_pacing_account_but_binding_stays() {
     let h = Harness::new(Provider::Claude, 2, 0, 1024).await;
     let ids = h.ids();
@@ -487,11 +557,8 @@ async fn c6_3_placement_skips_pacing_account_but_binding_stays() {
     assert_eq!(placed_elsewhere.headers()["x-quota-baton-account"], ids[1]);
     let decayed_at = Instant::now() + Duration::from_secs(61);
     let decayed = h.state.accounts.pacing_snapshot_at(&id, decayed_at);
-    assert!(
-        decayed
-            .rate_backoff_until
-            .is_some_and(|until| until <= decayed_at)
-    );
+    assert_eq!(decayed.rate_step, 0);
+    assert!(decayed.rate_backoff_until.is_none());
     assert_eq!(decayed.rate_release_interval, Duration::from_millis(250));
     let _ = h.send_with_session(Provider::Claude, "s3").await;
     let still_bound = h.send_with_session(Provider::Claude, "s1").await;
@@ -536,20 +603,6 @@ async fn c6_3_storm_simulation() {
     h.fake
         .state
         .enable_window_limiter(8, Duration::from_secs(1));
-    let client = reqwest::Client::new();
-    futures_util::future::join_all((0..8).map(|_| {
-        let client = client.clone();
-        let url = h.fake.url.clone();
-        async move {
-            client
-                .get(url)
-                .header("authorization", "Bearer synthetic-access-0")
-                .send()
-                .await
-                .unwrap();
-        }
-    }))
-    .await;
     let before = h.fake.state.requests().len();
     let mut round_counts = Vec::new();
     let mut responses_with_bodies = Vec::new();
@@ -573,7 +626,10 @@ async fn c6_3_storm_simulation() {
         round_counts = h.fake.state.limiter_round_429_counts();
     }
     assert_eq!(round_counts.len(), 3);
-    assert!(round_counts[0] > 0, "round one must exercise the limiter");
+    assert!(
+        round_counts[0] >= 2,
+        "round one must exercise several limiter 429s: {round_counts:?}"
+    );
     assert!(
         round_counts[2] < round_counts[0],
         "round counts: {round_counts:?}"
@@ -588,6 +644,10 @@ async fn c6_3_storm_simulation() {
     }
     let requests = h.fake.state.requests();
     let storm_requests = &requests[before..];
+    eprintln!(
+        "synthetic storm upstream requests: {}",
+        storm_requests.len()
+    );
     assert!(
         storm_requests
             .iter()
