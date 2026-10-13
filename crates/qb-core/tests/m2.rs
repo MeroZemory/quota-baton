@@ -517,6 +517,39 @@ async fn linked_reload_before_expiry_and_401_once_without_health_changes() {
 }
 
 #[tokio::test]
+async fn global_codex_pin_leaves_claude_active_account_usable() {
+    let _serial = SERIAL.lock().await;
+    let h = Harness::new(64, 384).await;
+    let accounts = h.store.list().unwrap();
+    let codex = accounts
+        .iter()
+        .find(|a| a.provider == Provider::Codex)
+        .unwrap();
+    let claude = accounts
+        .iter()
+        .find(|a| a.provider == Provider::Claude)
+        .unwrap();
+    assert_eq!(
+        h.client
+            .post(h.admin("/debug/pin"))
+            .bearer_auth("fake-local-admin")
+            .json(&json!({"account_id":codex.id}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let response = h.send("/v1/messages", "{}").await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["x-quota-baton-account"], claude.id);
+    response.bytes().await.unwrap();
+    assert_eq!(h.send("/v1/responses", "{}").await.status(), 200);
+    assert_eq!(h.claude.state.requests().len(), 1);
+    assert_eq!(h.codex.state.requests().len(), 1);
+}
+
+#[tokio::test]
 async fn no_account_and_debug_pin_routes() {
     let _serial = SERIAL.lock().await;
     let h = Harness::new(64, 384).await;
@@ -584,6 +617,10 @@ async fn no_account_and_debug_pin_routes() {
             .status(),
         200
     );
-    assert!(h.pins.get(Some("codex:synthetic-session")).is_none());
+    assert!(
+        h.pins
+            .get(Provider::Codex, Some("codex:synthetic-session"))
+            .is_none()
+    );
     assert!(h.root.path().exists());
 }
