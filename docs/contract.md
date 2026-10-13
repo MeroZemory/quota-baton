@@ -226,7 +226,8 @@ Rate limits are therefore absorbed on the same account. A rate limit **never** m
 - **Release interval.** It starts at 250 ms. It doubles for each backoff window that saw a rate 429, up to 5 s. It shrinks by 25 % after each 60 s with no rate 429, down to 250 ms.
 
 **Admission.** Every request to an account passes its admission gate, whether or not it has a retained copy.
-- The gate is open when `now ≥ rate_backoff_until` and the previous release was at least `rate_release_interval` ago.
+- **An account that is not pacing has no gate.** If `rate_step` = 0 and there is no future `rate_backoff_until`, every request is admitted at once, with no spacing and no limit on concurrency. Pacing exists only after a rate 429.
+- **While the account is pacing** (`rate_step` > 0, or a future `rate_backoff_until`), the gate is open when `now ≥ rate_backoff_until` and the previous release was at least `rate_release_interval` ago. Once `rate_step` has decayed to 0, spacing stops.
 - Waiting requests are released in arrival order, one per interval. One release task per account enforces the spacing.
 - While a request waits, its body is retained or back-pressured.
 - A request whose wait reaches `rate_hold_secs` (default 60) is sent anyway, once. Its response is relayed as is, and C3 adds `retry-after` to a 429. The proxy never synthesizes a rate 429; answering with a synthesized 429 at once was the previous proxy's fail-fast failure.
