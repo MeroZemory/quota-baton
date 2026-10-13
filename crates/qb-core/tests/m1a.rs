@@ -1,9 +1,13 @@
 use chrono::{Duration, Utc};
+use qb_core::account_runtime::AccountRuntime;
 use qb_core::accounts::{
     AccountStore, Health, HealthReason, Identity, Provider, Source, StoreError, UserState,
     import::{self, ImportAction, SkipReason},
     linked::{self, LinkError},
 };
+use qb_core::bindings::BindingTable;
+use qb_core::config::RoutingConfig;
+use qb_core::observability::Observability;
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -382,10 +386,21 @@ fn lease_contention_drop_and_thread_safety() {
             Err(StoreError::LeaseBusy)
         ));
         let other_home = home.with_file_name("other-home");
-        assert!(matches!(
-            AccountStore::acquire(&other_home),
-            Err(StoreError::LeaseBusy)
-        ));
+        let third_home = home.with_file_name("third-home");
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let first_home = other_home.clone();
+        let first_barrier = Arc::clone(&barrier);
+        let first = thread::spawn(move || {
+            let store = AccountStore::acquire(&first_home).unwrap();
+            first_barrier.wait();
+            first_barrier.wait();
+            drop(store);
+        });
+        barrier.wait();
+        let second_store = AccountStore::acquire(&third_home).unwrap();
+        barrier.wait();
+        drop(second_store);
+        first.join().unwrap();
         let home_copy = home.to_path_buf();
         assert!(
             thread::spawn(move || matches!(
@@ -425,6 +440,41 @@ fn lease_contention_drop_and_thread_safety() {
         ));
         drop(lock);
         assert!(AccountStore::acquire(home).is_ok());
+    });
+}
+
+#[test]
+fn account_view_includes_live_binding_stats() {
+    isolated("account_view_includes_live_binding_stats", |home, cpa| {
+        write(cpa, "account.json", &fixture("codex", 1));
+        let store = Arc::new(AccountStore::acquire(home).unwrap());
+        import::run(&store, cpa, &[], false).unwrap();
+        let account = store.list().unwrap().pop().unwrap();
+        let account_id = account.id.clone();
+        let bindings = BindingTable::new(home, RoutingConfig::default()).unwrap();
+        let last_used = Utc::now() - Duration::minutes(2);
+        bindings
+            .import(json!({
+                "schema": 1,
+                "bindings": [
+                    {"key": "codex:one", "account": account_id.clone(), "last_used": last_used},
+                    {"key": "codex:two", "account": account_id.clone(), "last_used": last_used + Duration::minutes(1)},
+                    {"key": "codex:other", "account": "other-account", "last_used": last_used}
+                ]
+            }))
+            .unwrap();
+        let obs = Arc::new(Observability::new(home, None).unwrap());
+        let runtime = AccountRuntime::new(store, obs, 1.0);
+        let views = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(runtime.views_with_bindings(&bindings))
+            .unwrap();
+        let view = views.iter().find(|view| view["id"] == account_id).unwrap();
+        assert_eq!(view["bound_sessions"], 2);
+        assert_eq!(
+            view["last_used_at"],
+            serde_json::to_value(last_used + Duration::minutes(1)).unwrap()
+        );
     });
 }
 

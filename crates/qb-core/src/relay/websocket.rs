@@ -75,6 +75,50 @@ fn clear_retried_token(relay: &Arc<RelayState>, account: &str, token: &str) {
 pub(super) type UpstreamSocket = WebSocketStream<reqwest::Upgraded>;
 pub(super) type ClientSocket = WebSocketStream<hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>>;
 
+async fn redial_same_account(context: &pump::Context) -> Result<UpstreamSocket, ()> {
+    let relay = context.relay.as_ref().ok_or(())?;
+    let (account, token) = context.credentials.as_ref().ok_or(())?;
+    let mut forwarded = headers::upstream(&context.headers, account, token).map_err(|_| ())?;
+    let key = generate_key();
+    forwarded.insert("connection", HeaderValue::from_static("Upgrade"));
+    forwarded.insert("upgrade", HeaderValue::from_static("websocket"));
+    forwarded.insert("sec-websocket-version", HeaderValue::from_static("13"));
+    forwarded.insert(
+        "sec-websocket-key",
+        HeaderValue::from_str(&key).map_err(|_| ())?,
+    );
+    let response = tokio::time::timeout(
+        Duration::from_secs(15),
+        relay
+            .client
+            .get(&context.upstream_url)
+            .headers(forwarded)
+            .send(),
+    )
+    .await
+    .map_err(|_| ())?
+    .map_err(|_| ())?;
+    if response.status() != StatusCode::SWITCHING_PROTOCOLS
+        || response
+            .headers()
+            .get("sec-websocket-accept")
+            .is_none_or(|value| value.as_bytes() != derive_accept_key(key.as_bytes()).as_bytes())
+        || !header_token(response.headers(), "upgrade", "websocket")
+        || !header_token(response.headers(), "connection", "upgrade")
+        || response.headers().contains_key("sec-websocket-extensions")
+        || response.headers().contains_key("sec-websocket-protocol")
+    {
+        return Err(());
+    }
+    let stream = response.upgrade().await.map_err(|_| ())?;
+    let limit = mib_bytes(relay.websocket.max_message_size_mib);
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(limit))
+        .max_frame_size(Some(limit))
+        .write_buffer_size(0);
+    Ok(WebSocketStream::from_raw_socket(stream, Role::Client, Some(config)).await)
+}
+
 pub(super) async fn upgrade(state: Arc<RelayState>, request: Request) -> Response {
     let mut completion = Completion::new(
         state.observability.clone(),
@@ -192,7 +236,15 @@ async fn upgrade_inner(
         // Row 5 and row 11 have independent same-account retry budgets.
         let mut network_retry = false;
         let mut token_retry = false;
+        let mut rate_retries = 0_u32;
+        let upgrade_started = std::time::Instant::now();
         loop {
+            let _admission = tokio::time::timeout(
+                Duration::from_secs(state.ws_upgrade_hold_secs),
+                state.accounts.admit(&account.id),
+            )
+            .await
+            .ok();
             let mut forwarded =
                 match headers::upstream(&parts.headers, &account, &tokens.access_token) {
                     Ok(headers) => headers,
@@ -303,6 +355,30 @@ async fn upgrade_inner(
             {
                 decision.kind = super::outcome::Kind::Auth;
                 decision.signal = None;
+            }
+            if decision.kind == super::outcome::Kind::Rate {
+                let retry_after = error
+                    .headers
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .map(|s| Duration::from_secs(s.min(60)));
+                state.accounts.observe_429(&account.id, retry_after);
+                if rate_retries < state.rate_hold_max_retries
+                    && upgrade_started.elapsed() < Duration::from_secs(state.ws_upgrade_hold_secs)
+                {
+                    rate_retries += 1;
+                    completion.rate_retry();
+                    continue;
+                }
+                completion.relayed_rate_429();
+                let mut response = error.into_response();
+                if !response.headers().contains_key("retry-after") {
+                    response
+                        .headers_mut()
+                        .insert("retry-after", HeaderValue::from_static("1"));
+                }
+                return response;
             }
             let failover = decision.failover();
             let reason = decision.reason();
@@ -470,6 +546,7 @@ async fn upgrade_inner(
         account: account.id.clone(),
         session,
         headers: parts.headers,
+        upstream_url: url,
         idle_close: Duration::from_secs(state.websocket.idle_close_secs),
         close_after_response,
         capture_ticket: ticket,

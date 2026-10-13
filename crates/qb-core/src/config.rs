@@ -92,6 +92,9 @@ pub struct RoutingConfig {
     pub near_reset_secs: u64,
     pub inflight_allowance_pct: f64,
     pub reset_hold_secs: u64,
+    pub rate_hold_secs: u64,
+    pub rate_hold_max_retries: u32,
+    pub ws_upgrade_hold_secs: u64,
     pub rebalance_idle_secs: u64,
     pub session_binding_max_secs: u64,
 }
@@ -104,6 +107,9 @@ impl Default for RoutingConfig {
             near_reset_secs: 18000,
             inflight_allowance_pct: 1.0,
             reset_hold_secs: 60,
+            rate_hold_secs: 60,
+            rate_hold_max_retries: 3,
+            ws_upgrade_hold_secs: 10,
             rebalance_idle_secs: 3600,
             session_binding_max_secs: 604800,
         }
@@ -126,7 +132,10 @@ impl RoutingConfig {
         anyhow::ensure!(
             self.gate_weekly_near_reset_pct >= self.gate_weekly_pct
                 && self.rebalance_idle_secs > 0
-                && self.session_binding_max_secs > 0,
+                && self.session_binding_max_secs > 0
+                && self.rate_hold_secs > 0
+                && self.rate_hold_max_retries > 0
+                && self.ws_upgrade_hold_secs > 0,
             "invalid routing thresholds or binding lifetime"
         );
         Ok(())

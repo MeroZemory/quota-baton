@@ -71,6 +71,9 @@ impl Completion {
                 bytes_in: 0,
                 bytes_out: 0,
                 attempts: 0,
+                rate_wait_ms: 0,
+                rate_retries: 0,
+                relayed_rate_429s: 0,
                 outcome: "client_drop".into(),
                 retained_copy: false,
                 upstream_error_code: None,
@@ -135,6 +138,18 @@ impl Completion {
     pub fn outcome(&mut self, status: u16, outcome: &str) {
         self.record.status = status;
         self.record.outcome = outcome.into();
+    }
+
+    pub fn rate_wait(&mut self, millis: u64) {
+        self.record.rate_wait_ms = self.record.rate_wait_ms.saturating_add(millis);
+    }
+
+    pub fn rate_retry(&mut self) {
+        self.record.rate_retries = self.record.rate_retries.saturating_add(1);
+    }
+
+    pub fn relayed_rate_429(&mut self) {
+        self.record.relayed_rate_429s = self.record.relayed_rate_429s.saturating_add(1);
     }
 
     // 채널을 닫기 전에 원장을 확정하여 body EOF 뒤의 flush와 경합하지 않는다.
