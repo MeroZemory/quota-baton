@@ -433,6 +433,111 @@ async fn budget_overflow_forwards_without_retry_copy() {
 }
 
 #[tokio::test]
+async fn over_cap_chunked_upload_streams_identical_bytes_without_retention() {
+    let _serial = SERIAL.lock().await;
+    let h = Harness::new(1, 384).await;
+    let expected = vec![b'x'; 3 * 1024 * 1024 + 17];
+    let chunks: Vec<_> = expected.chunks(8192).map(Bytes::copy_from_slice).collect();
+    let body = reqwest::Body::wrap_stream(futures_util::stream::iter(
+        chunks.into_iter().map(Ok::<_, std::io::Error>),
+    ));
+    let response = h.send("/v1/responses", body).await;
+    assert_eq!(response.status(), 200);
+    response.bytes().await.unwrap();
+    assert_eq!(h.codex.state.requests()[0].body.as_ref(), expected);
+    let rows = h.ledger();
+    let row = rows
+        .iter()
+        .find(|row| row["route"] == "POST /v1/responses")
+        .unwrap();
+    assert_eq!(row["retained_copy"], false);
+    assert_eq!(row["bytes_in"], expected.len());
+    assert_eq!(row["attempts"], 1);
+}
+
+#[tokio::test]
+async fn expiry_reload_is_throttled_stale_events_limited_and_401_bypasses_throttle() {
+    let _serial = SERIAL.lock().await;
+    let h = Harness::new(64, 384).await;
+    let mut account = h
+        .store
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|a| a.provider == Provider::Claude)
+        .unwrap();
+    let tokens = h.store.tokens(&account).unwrap();
+    account.token_meta.expires_at = Some(chrono::Utc::now() + chrono::Duration::minutes(5));
+    account.token_meta.last_refresh_at = Some("2031-01-01T00:00:00Z".parse().unwrap());
+    let mut source = fixture(
+        "claude",
+        1,
+        Some(account.token_meta.expires_at.unwrap().to_rfc3339()),
+    );
+    source["last_refresh"] = json!("2031-01-01T00:00:00Z");
+    h.store
+        .save(&account, &tokens, Some(account.generation))
+        .unwrap();
+    fs::write(
+        h.cpa.join("claude.json"),
+        serde_json::to_vec(&source).unwrap(),
+    )
+    .unwrap();
+    for _ in 0..3 {
+        h.send("/v1/messages", "{}").await.bytes().await.unwrap();
+    }
+    let rows = h.ledger();
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r["event"] == "linked_reload")
+            .count(),
+        1
+    );
+    assert_eq!(
+        rows.iter().filter(|r| r["outcome"] == "link_stale").count(),
+        1
+    );
+    source["last_refresh"] = json!("2031-01-02T00:00:00Z");
+    source["access_token"] = json!("fake-access-claude-2");
+    source["expired"] = json!("2030-01-02T00:00:00Z");
+    fs::write(
+        h.cpa.join("claude.json"),
+        serde_json::to_vec(&source).unwrap(),
+    )
+    .unwrap();
+    h.claude
+        .state
+        .push(ScriptedResponse::json(StatusCode::UNAUTHORIZED, "{}"));
+    h.claude
+        .state
+        .push(ScriptedResponse::json(StatusCode::OK, "{}"));
+    let response = h.send("/v1/messages", "{}").await;
+    assert_eq!(response.status(), 200);
+    response.bytes().await.unwrap();
+    let requests = h.claude.state.requests();
+    assert_eq!(
+        requests[3].headers["authorization"],
+        "Bearer fake-access-claude-1"
+    );
+    assert_eq!(
+        requests[4].headers["authorization"],
+        "Bearer fake-access-claude-2"
+    );
+    h.claude
+        .state
+        .push(ScriptedResponse::json(StatusCode::UNAUTHORIZED, "{}"));
+    assert_eq!(h.send("/v1/messages", "{}").await.status(), 401);
+    let rows = h.ledger();
+    assert_eq!(
+        rows.iter().filter(|r| r["outcome"] == "link_stale").count(),
+        1
+    );
+    assert!(rows.iter().any(|r| r["event"] == "linked_reload"
+        && r["trigger"] == "upstream_401"
+        && r["outcome"] == "updated"));
+}
+
+#[tokio::test]
 async fn linked_reload_before_expiry_and_401_once_without_health_changes() {
     let _serial = SERIAL.lock().await;
     let h = Harness::new(64, 384).await;
