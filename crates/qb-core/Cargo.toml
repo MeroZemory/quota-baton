@@ -41,3 +41,7 @@ qb-testkit.workspace = true
 default = []
 testkit = []
 shape-capture = []
+
+[[test]]
+name = "m2"
+required-features = ["testkit"]
