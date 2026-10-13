@@ -100,6 +100,17 @@ struct QuotaState {
     #[serde(default)]
     accounts: BTreeMap<String, Snapshot>,
 }
+fn reset_moved(new: &serde_json::Value, old: &serde_json::Value) -> bool {
+    new.as_str()
+        .zip(old.as_str())
+        .and_then(|(new, old)| {
+            Some((
+                DateTime::parse_from_rfc3339(new).ok()?,
+                DateTime::parse_from_rfc3339(old).ok()?,
+            ))
+        })
+        .is_some_and(|(new, old)| (new - old).num_seconds().abs() > 300)
+}
 fn schema() -> u32 {
     1
 }
@@ -109,6 +120,8 @@ struct Window {
     name: String,
     used_pct: Option<f64>,
     reset_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    observed_at: Option<DateTime<Utc>>,
     status: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
@@ -394,8 +407,8 @@ impl Observability {
                         {
                             let reset_changed = !updated["reset_at"].is_null()
                                 && !window["reset_at"].is_null()
-                                && updated["reset_at"] != window["reset_at"];
-                            for key in ["used_pct", "reset_at", "status"] {
+                                && reset_moved(&updated["reset_at"], &window["reset_at"]);
+                            for key in ["used_pct", "reset_at", "observed_at", "status"] {
                                 if updated[key].is_null() && !(key == "status" && reset_changed) {
                                     updated[key] = window[key].clone();
                                 }
@@ -404,6 +417,30 @@ impl Observability {
                             new.push(window.clone());
                         }
                     }
+                }
+                let fresh_reset = value["windows"].as_array().is_some_and(|windows| {
+                    windows.iter().any(|window| {
+                        window["used_pct"].as_f64().is_some_and(|used| used < 100.0)
+                            && old["windows"].as_array().is_some_and(|old| {
+                                old.iter().any(|prior| {
+                                    prior["name"] == window["name"]
+                                        && reset_moved(&window["reset_at"], &prior["reset_at"])
+                                })
+                            })
+                    })
+                });
+                if let (Ok(mut next_signals), Ok(mut prior_signals)) = (
+                    serde_json::from_value::<Signals>(value["signals"].clone()),
+                    serde_json::from_value::<Signals>(old["signals"].clone()),
+                ) {
+                    if fresh_reset {
+                        prior_signals.unified_status = None;
+                        prior_signals.limit_reached = None;
+                        prior_signals.serving_from_credits = None;
+                        prior_signals.active_limit = None;
+                    }
+                    next_signals.merge(prior_signals);
+                    value["signals"] = serde_json::to_value(next_signals).unwrap_or_default();
                 }
                 for key in ["plan", "credits"] {
                     if value[key].is_null() {
@@ -581,6 +618,7 @@ fn snapshot(provider: Provider, h: &HeaderMap, now: DateTime<Utc>) -> Option<Sna
                         name: name.into(),
                         used_pct,
                         reset_at,
+                        observed_at: used_pct.map(|_| now),
                         status,
                     });
                 }
@@ -613,11 +651,12 @@ fn snapshot(provider: Provider, h: &HeaderMap, now: DateTime<Utc>) -> Option<Sna
                         .and_then(|d| now.checked_add_signed(d))
                 });
                 let status = status(h, "x-codex-limit-reached");
-                if used_pct.is_some() {
+                if used_pct.is_some() || reset_at.is_some_and(|reset| reset > now) {
                     windows.push(Window {
                         name,
                         used_pct,
                         reset_at,
+                        observed_at: used_pct.map(|_| now),
                         status,
                     });
                 }
@@ -715,7 +754,9 @@ impl Writer {
                             old.name == w.name
                                 && w.reset_at.is_some()
                                 && old.reset_at.is_some()
-                                && w.reset_at != old.reset_at
+                                && w.reset_at
+                                    .zip(old.reset_at)
+                                    .is_some_and(|(new, old)| (new - old).num_seconds().abs() > 300)
                         })
                     }) && next
                         .windows
@@ -731,9 +772,12 @@ impl Writer {
                         if let Some(new) = next.windows.iter_mut().find(|w| w.name == window.name) {
                             let reset_changed = new.reset_at.is_some()
                                 && window.reset_at.is_some()
-                                && new.reset_at != window.reset_at;
+                                && new.reset_at.zip(window.reset_at).is_some_and(|(new, old)| {
+                                    (new - old).num_seconds().abs() > 300
+                                });
                             new.used_pct = new.used_pct.or(window.used_pct);
                             new.reset_at = new.reset_at.or(window.reset_at);
+                            new.observed_at = new.observed_at.or(window.observed_at);
                             if !reset_changed {
                                 new.status = new.status.take().or(window.status.take());
                             }
@@ -1519,7 +1563,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_realistic_windows_require_usage_and_never_invent_resets() {
+    fn codex_realistic_windows_keep_known_future_resets_without_inventing_usage() {
         let now: DateTime<Utc> = "2026-10-13T00:00:00Z".parse().unwrap();
         let mut h = HeaderMap::new();
         h.insert("x-codex-primary-used-percent", "12".parse().unwrap());
@@ -1555,6 +1599,16 @@ mod tests {
         assert_eq!(absent.windows[0].reset_at, None);
         h.remove("x-codex-primary-used-percent");
         h.remove("x-codex-secondary-used-percent");
+        let reset_only = snapshot(Provider::Codex, &h, now).unwrap();
+        assert_eq!(reset_only.windows.len(), 1);
+        assert_eq!(reset_only.windows[0].name, "7d");
+        assert_eq!(reset_only.windows[0].used_pct, None);
+        assert_eq!(reset_only.windows[0].observed_at, None);
+        assert_eq!(
+            reset_only.windows[0].reset_at,
+            DateTime::from_timestamp(2000000000, 0)
+        );
+        h.remove("x-codex-secondary-reset-at");
         assert!(snapshot(Provider::Codex, &h, now).is_none());
     }
 

@@ -89,7 +89,8 @@ impl Harness {
                 obs.clone(),
                 Arc::new(DebugPins::default()),
             )
-            .unwrap(),
+            .unwrap()
+            .with_token_endpoint(provider, fake.url.clone()),
         );
         let admin = qb_core::admin::runtime_routes(state.clone(), 0);
         let servers = http::spawn_with_routes(
@@ -337,13 +338,13 @@ async fn c6_row_7_payment_fails_over_and_relays_last_when_none() {
     )));
 }
 #[tokio::test]
-async fn c6_row_8_9_10_12b_nonfailover_statuses_preserve_raw_response() {
+async fn c6_row_8_9_10_plain_nonfailover_statuses_preserve_raw_response() {
     let h = Harness::new(Provider::Codex, 2, 384, 1024).await;
     for status in [400, 404, 409, 413, 422, 408, 500, 502, 507, 529] {
         let code = StatusCode::from_u16(status).unwrap();
         h.fake.state.push(ScriptedResponse::json(
             code,
-            r#"{"error":{"code":"invalid_encrypted_content","message":"conversation-marker"}}"#,
+            r#"{"error":{"code":"plain_error","message":"conversation-marker"}}"#,
         ));
         let response = h.send(Provider::Codex, "{}").await;
         assert_eq!(response.status(), code);
@@ -538,6 +539,7 @@ async fn c5_passive_header_exhaustion_credits_and_early_reset() {
         .observe_headers(id, Provider::Codex, &headers)
         .await;
     assert_eq!(h.store.load(id).unwrap().health, Health::Ready);
+    let _inflight = h.state.accounts.track_inflight(id);
     headers.insert("x-codex-primary-used-percent", "98".parse().unwrap());
     h.state
         .accounts
@@ -777,4 +779,247 @@ async fn c6_row_14_model_scoped_cooling_respects_request_model() {
     let other = h.send(Provider::Claude, r#"{"model":"other"}"#).await;
     assert_eq!(other.status(), 200);
     assert_eq!(h.fake.state.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn c6_row_2_until_uses_exhausted_window_not_unrelated_weekly_reset() {
+    let h = Harness::new(Provider::Codex, 2, 384, 1024).await;
+    for (primary, secondary, seconds) in [(100, 40, 3600), (40, 100, 432000)] {
+        for id in h.ids() {
+            h.store
+                .update_metadata(&id, |a| a.health = Health::Ready)
+                .unwrap();
+        }
+        let now = Utc::now();
+        let mut r = ScriptedResponse::json(StatusCode::TOO_MANY_REQUESTS, "{}");
+        for (slot, used, reset, minutes) in [
+            ("primary", primary, 3600, 300),
+            ("secondary", secondary, 432000, 10080),
+        ] {
+            r.headers.insert(
+                format!("x-codex-{slot}-used-percent")
+                    .parse::<axum::http::HeaderName>()
+                    .unwrap(),
+                used.to_string().parse().unwrap(),
+            );
+            r.headers.insert(
+                format!("x-codex-{slot}-reset-at")
+                    .parse::<axum::http::HeaderName>()
+                    .unwrap(),
+                (now.timestamp() + reset).to_string().parse().unwrap(),
+            );
+            r.headers.insert(
+                format!("x-codex-{slot}-window-minutes")
+                    .parse::<axum::http::HeaderName>()
+                    .unwrap(),
+                minutes.to_string().parse().unwrap(),
+            );
+        }
+        h.fake.state.push(r);
+        h.fake.state.push(ok());
+        assert_eq!(h.send(Provider::Codex, "{}").await.status(), 200);
+        let cooled = h
+            .store
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|a| matches!(a.health, Health::Cooling { .. }))
+            .unwrap();
+        assert!(
+            matches!(cooled.health,Health::Cooling{until,..} if (until-now).num_seconds().abs_diff(seconds)<=2)
+        );
+    }
+}
+
+#[tokio::test]
+async fn c6_row_9_10_limit_header_does_not_override_plain_status() {
+    let h = Harness::new(Provider::Codex, 2, 384, 1024).await;
+    for status in [400, 500, 529] {
+        let mut r = ScriptedResponse::json(StatusCode::from_u16(status).unwrap(), "{}");
+        r.headers
+            .insert("x-codex-limit-reached", "true".parse().unwrap());
+        h.fake.state.push(r);
+        assert_eq!(
+            h.send(Provider::Codex, "{}").await.status().as_u16(),
+            status
+        );
+    }
+    assert_eq!(h.fake.state.requests().len(), 3);
+}
+
+#[tokio::test]
+async fn c6_row_3_http_date_retry_after_fails_over() {
+    let h = Harness::new(Provider::Claude, 2, 384, 1024).await;
+    let mut r = ScriptedResponse::json(StatusCode::TOO_MANY_REQUESTS, "{}");
+    r.headers.insert(
+        "retry-after",
+        (Utc::now() + ChronoDuration::seconds(60))
+            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string()
+            .parse()
+            .unwrap(),
+    );
+    h.fake.state.push(r);
+    h.fake.state.push(ok());
+    assert_eq!(h.send(Provider::Claude, "{}").await.status(), 200);
+    assert_eq!(h.fake.state.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn c6_row_12b_both_codex_codes_and_claude_signature_are_verbatim() {
+    let h = Harness::new(Provider::Codex, 2, 384, 1024).await;
+    for code in ["invalid_encrypted_content", "thinking_signature_invalid"] {
+        let raw = json!({"error":{"code":code}}).to_string();
+        h.fake
+            .state
+            .push(ScriptedResponse::json(StatusCode::BAD_REQUEST, raw.clone()));
+        assert_eq!(
+            h.send(Provider::Codex, "{}").await.text().await.unwrap(),
+            raw
+        );
+    }
+    drop(h);
+    let h = Harness::new(Provider::Claude, 2, 384, 1024).await;
+    let raw = r#"{"error":{"type":"invalid_request_error","message":"Invalid `signature` in `thinking` block"}}"#;
+    h.fake
+        .state
+        .push(ScriptedResponse::json(StatusCode::BAD_REQUEST, raw));
+    assert_eq!(
+        h.send(Provider::Claude, "{}").await.text().await.unwrap(),
+        raw
+    );
+    assert_eq!(h.fake.state.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn c5_known_model_http_403_cools_permission_for_one_hour() {
+    let h = Harness::new(Provider::Claude, 2, 384, 1024).await;
+    h.fake
+        .state
+        .push(ScriptedResponse::json(StatusCode::FORBIDDEN, "{}"));
+    h.fake.state.push(ok());
+    let before = Utc::now();
+    assert_eq!(
+        h.send(Provider::Claude, r#"{"model":"blocked"}"#)
+            .await
+            .status(),
+        200
+    );
+    assert!(h.store.list().unwrap().iter().any(|a|matches!(&a.health,Health::Cooling{reason:HealthReason::Permission,until,scope} if scope=="model:blocked" && (*until-before).num_seconds().abs_diff(3600)<=2)));
+}
+
+#[tokio::test]
+async fn c6_row_5_transient_and_throttled_refresh_cools_auth_five_minutes_and_fails_over() {
+    let h = Harness::new(Provider::Codex, 2, 384, 1024).await;
+    let id = h.ids().remove(0);
+    let mut owned = h.store.load(&id).unwrap();
+    let tokens = h.store.tokens(&owned).unwrap();
+    owned.source = qb_core::accounts::Source::Oauth;
+    h.store
+        .save(&owned, &tokens, Some(owned.generation))
+        .unwrap();
+    for round in 0..2 {
+        if round == 1 {
+            h.store
+                .update_metadata(&id, |a| a.health = Health::Ready)
+                .unwrap();
+        }
+        h.fake
+            .state
+            .push(ScriptedResponse::json(StatusCode::UNAUTHORIZED, "{}"));
+        if round == 0 {
+            h.fake.state.push(ScriptedResponse::json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{}",
+            ));
+        }
+        h.fake.state.push(ok());
+        let before = Utc::now();
+        let response = h.send(Provider::Codex, "{}").await;
+        assert_eq!(response.status(), 200);
+        assert_ne!(response.headers()["x-quota-baton-account"], id);
+        let account = h.store.load(&id).unwrap();
+        assert_eq!(account.auth_failures, 0);
+        assert!(
+            matches!(account.health,Health::Cooling{reason:HealthReason::Auth,until,..} if (until-before).num_seconds().abs_diff(300)<=2)
+        );
+    }
+    assert_eq!(h.fake.state.requests().len(), 5);
+}
+
+#[tokio::test]
+async fn c5_auth_probe_race_waits_instead_of_502() {
+    let h = Harness::new(Provider::Codex, 1, 384, 1024).await;
+    let id = h.ids().remove(0);
+    h.store
+        .update_metadata(&id, |a| a.auth_failures = 1)
+        .unwrap();
+    let mut first = ok();
+    first.chunks[0].0 = Duration::from_millis(100);
+    h.fake.state.push(first);
+    h.fake.state.push(ok());
+    let (one, two) = tokio::join!(h.send(Provider::Codex, "{}"), h.send(Provider::Codex, "{}"));
+    assert_ne!(one.status(), 502);
+    assert_ne!(two.status(), 502);
+    assert!(one.status() == 200 || two.status() == 200);
+    assert_eq!(h.store.load(&id).unwrap().auth_failures, 0);
+}
+
+#[tokio::test]
+async fn c5_stale_revocation_401_retries_current_token_without_health_change() {
+    let h = Harness::new(Provider::Codex, 1, 384, 1024).await;
+    let id = h.ids().remove(0);
+    let mut r = ScriptedResponse::json(
+        StatusCode::UNAUTHORIZED,
+        r#"{"error":{"code":"token_revoked"}}"#,
+    );
+    r.chunks[0].0 = Duration::from_millis(150);
+    h.fake.state.push(r);
+    h.fake.state.push(ok());
+    let (response, _) = tokio::join!(h.send(Provider::Codex, "{}"), async {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while h.fake.state.requests().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut account = h.store.load(&id).unwrap();
+        let mut tokens = h.store.tokens(&account).unwrap();
+        tokens.access_token = "synthetic-rotated".into();
+        account.token_meta.last_refresh_at = Some(Utc::now());
+        h.store
+            .save(&account, &tokens, Some(account.generation))
+            .unwrap();
+    });
+    assert_eq!(response.status(), 200);
+    assert_eq!(h.store.load(&id).unwrap().health, Health::Ready);
+    assert_eq!(h.fake.state.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn c5_postcommit_stale_revocation_is_verbatim_without_health_change() {
+    let h = Harness::new(Provider::Codex, 1, 384, 1024).await;
+    let id = h.ids().remove(0);
+    let first = Bytes::from_static(b"data: {\"type\":\"response.created\"}\n\n");
+    let error = Bytes::from_static(
+        b"data: {\"type\":\"error\",\"status\":401,\"error\":{\"code\":\"token_revoked\"}}\n\n",
+    );
+    h.fake.state.push(ScriptedResponse::sse(vec![
+        (Duration::ZERO, first.clone()),
+        (Duration::from_millis(150), error.clone()),
+    ]));
+    let response = h.send(Provider::Codex, "{}").await;
+    let mut account = h.store.load(&id).unwrap();
+    let mut tokens = h.store.tokens(&account).unwrap();
+    tokens.access_token = "synthetic-newer".into();
+    account.token_meta.last_refresh_at = Some(Utc::now());
+    h.store
+        .save(&account, &tokens, Some(account.generation))
+        .unwrap();
+    assert_eq!(
+        response.bytes().await.unwrap(),
+        [first.as_ref(), error.as_ref()].concat()
+    );
+    assert_eq!(h.store.load(&id).unwrap().health, Health::Ready);
 }

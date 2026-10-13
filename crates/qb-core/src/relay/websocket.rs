@@ -8,6 +8,70 @@ use tokio_tungstenite::{
         protocol::{Role, WebSocketConfig},
     },
 };
+// Remember the retry token across sockets without retaining credential bytes or
+// keeping a RelayState alive. Each live relay has at most one entry per account.
+const RETRY_MARKER_TTL: Duration = Duration::from_secs(120);
+struct RetriedToken {
+    relay: std::sync::Weak<RelayState>,
+    account: String,
+    digest: [u8; 32],
+    expires_at: std::time::Instant,
+}
+impl RetriedToken {
+    fn matches(&self, digest: &[u8; 32], now: std::time::Instant) -> bool {
+        self.expires_at > now && self.digest == *digest
+    }
+}
+static RETRIED_TOKENS: std::sync::Mutex<Vec<RetriedToken>> = std::sync::Mutex::new(Vec::new());
+
+fn token_retried(relay: &Arc<RelayState>, account: &str, token: &str, mark: bool) -> bool {
+    use sha2::{Digest, Sha256};
+    let digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+    let mut entries = RETRIED_TOKENS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let now = std::time::Instant::now();
+    entries.retain(|entry| entry.relay.strong_count() > 0 && entry.expires_at > now);
+    let owner = Arc::downgrade(relay);
+    if let Some(entry) = entries
+        .iter_mut()
+        .find(|entry| entry.relay.ptr_eq(&owner) && entry.account == account)
+    {
+        let matched = entry.matches(&digest, now);
+        if mark {
+            entry.digest = digest;
+            entry.expires_at = now + RETRY_MARKER_TTL;
+        }
+        return matched;
+    }
+    if mark {
+        entries.push(RetriedToken {
+            relay: owner,
+            account: account.into(),
+            digest,
+            expires_at: now + RETRY_MARKER_TTL,
+        });
+    }
+    false
+}
+
+fn clear_retried_token(relay: &Arc<RelayState>, account: &str, token: &str) {
+    use sha2::{Digest, Sha256};
+    let digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+    let owner = Arc::downgrade(relay);
+    let now = std::time::Instant::now();
+    RETRIED_TOKENS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .retain(|entry| {
+            entry.relay.strong_count() > 0
+                && entry.expires_at > now
+                && !(entry.relay.ptr_eq(&owner)
+                    && entry.account == account
+                    && entry.digest == digest)
+        });
+}
+
 pub(super) type UpstreamSocket = WebSocketStream<reqwest::Upgraded>;
 pub(super) type ClientSocket = WebSocketStream<hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>>;
 
@@ -21,6 +85,7 @@ pub(super) async fn upgrade(state: Arc<RelayState>, request: Request) -> Respons
     );
     completion.record.transport = "ws".into();
     completion.track(state.inflight_requests.clone());
+    completion.runtime = Some(state.accounts.clone());
     let response = upgrade_inner(state, request, &mut completion).await;
     completion.record.status = response.status().as_u16();
     completion.finish(if response.status() == StatusCode::SWITCHING_PROTOCOLS {
@@ -126,8 +191,8 @@ async fn upgrade_inner(
             Ok(probe) => probe,
             Err(_) => continue,
         };
-        // Auth and network retries share a single extra attempt per account.
-        let mut retry_used = false;
+        // Row 5 and row 11 have independent same-account retry budgets.
+        let mut network_retry = false;
         let mut token_retry = false;
         loop {
             let mut forwarded =
@@ -152,19 +217,24 @@ async fn upgrade_inner(
             .await;
             let response = match result {
                 Ok(Ok(response)) => response,
-                _ if !retry_used => {
+                _ if !network_retry => {
                     completion.failover("network_retry");
-                    retry_used = true;
+                    network_retry = true;
                     tokio::time::sleep(Duration::from_millis(250)).await;
                     continue;
                 }
                 _ => return network_failure(),
             };
             completion.record.upstream_status = Some(response.status().as_u16());
-            state
-                .accounts
-                .observe_headers(&account.id, Provider::Codex, response.headers())
-                .await;
+            if response.status() == StatusCode::SWITCHING_PROTOCOLS
+                || response.status().is_success()
+                || response.status() == StatusCode::TOO_MANY_REQUESTS
+            {
+                state
+                    .accounts
+                    .observe_headers(&account.id, Provider::Codex, response.headers())
+                    .await;
+            }
             if response.status() == StatusCode::SWITCHING_PROTOCOLS {
                 let headers = response.headers().clone();
                 if headers
@@ -194,25 +264,49 @@ async fn upgrade_inner(
             }
             let error = match read_error(response).await {
                 Ok(error) => error,
-                Err(_) if !retry_used => {
+                Err(_) if !network_retry => {
                     completion.failover("network_retry");
-                    retry_used = true;
+                    network_retry = true;
                     tokio::time::sleep(Duration::from_millis(250)).await;
                     continue;
                 }
                 Err(_) => return network_failure(),
             };
-            let decision = super::outcome::classify(
+            let current_token = if error.status == StatusCode::UNAUTHORIZED {
+                match state
+                    .tokens
+                    .is_current(state.store.clone(), &account, &tokens)
+                    .await
+                {
+                    Ok(current) => current,
+                    Err(()) => return network_failure(),
+                }
+            } else {
+                true
+            };
+            let mut decision = super::outcome::classify(
                 Provider::Codex,
                 error.status,
                 &error.headers,
                 &error.raw,
                 None,
             );
+            if !current_token
+                && matches!(
+                    decision.kind,
+                    super::outcome::Kind::Auth | super::outcome::Kind::Revoked
+                )
+            {
+                decision.kind = super::outcome::Kind::Auth;
+                decision.signal = None;
+            }
             let failover = decision.failover();
             let reason = decision.reason();
             if decision.kind == super::outcome::Kind::Auth {
-                if token_retry {
+                if current_token
+                    && (token_retry
+                        || token_retried(&state, &account.id, &tokens.access_token, false))
+                {
                     if state
                         .tokens
                         .auth_failed(
@@ -237,22 +331,36 @@ async fn upgrade_inner(
                         )
                         .await
                     {
-                        Ok(Some((updated, refreshed))) if !retry_used => {
+                        Ok(Some((updated, refreshed))) if !token_retry => {
                             completion.failover("token_retry");
-                            retry_used = true;
                             token_retry = true;
+                            token_retried(&state, &updated.id, &refreshed.access_token, true);
                             account = updated;
                             tokens = refreshed;
                             continue;
                         }
-                        Ok(Some(_)) => return error.into_response(),
-                        Ok(None) if state.accounts.eligible(&account.id, None).await => {
-                            // A transient/uncertain refresh is not a failed new token.
-                            return error.into_response();
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
+                            if state
+                                .tokens
+                                .cool_unavailable_auth(state.store.clone(), &account, &tokens)
+                                .await
+                                .is_err()
+                            {
+                                return network_failure();
+                            }
                         }
-                        Ok(None) => {} // Linked stale or terminal health is already recorded.
                         Err(()) => return network_failure(),
                     }
+                }
+            } else if decision.kind == super::outcome::Kind::Revoked {
+                if state
+                    .tokens
+                    .revoke_if_current(state.store.clone(), &account, &tokens)
+                    .await
+                    .is_err()
+                {
+                    return network_failure();
                 }
             } else if let Some(signal) = decision.signal
                 && state

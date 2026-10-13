@@ -63,6 +63,7 @@ pub(in crate::relay) fn body(
             crate::accounts::Provider::Codex
         };
         let model = completion.record.model.clone();
+        let failed_access = completion.failed_access.clone();
         let mut observed_error = 0;
         let mut completion = Some(completion);
         let HeldResponse {
@@ -134,7 +135,27 @@ pub(in crate::relay) fn body(
                         event,
                         model.as_deref(),
                     );
-                    if let Some(signal) = decision.signal
+                    if decision.kind == crate::relay::outcome::Kind::Revoked
+                        && let Some(failed) = &failed_access
+                    {
+                        let store = runtime.store.clone();
+                        let account = account.clone();
+                        let failed = failed.clone();
+                        let written = tokio::task::spawn_blocking(move || {
+                            store.update_metadata_for_token(&account, &failed, |account| {
+                                account.apply_health_signal(
+                                    crate::accounts::HealthSignal::Revoked {
+                                        reason: "token_revoked".into(),
+                                    },
+                                    chrono::Utc::now(),
+                                );
+                            })
+                        })
+                        .await;
+                        if !matches!(written, Ok(Ok(_))) {
+                            tracing::error!("Could not persist upstream health signal");
+                        }
+                    } else if let Some(signal) = decision.signal
                         && runtime.transition(account, signal).await.is_err()
                     {
                         tracing::error!("Could not persist upstream health signal");

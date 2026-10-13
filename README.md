@@ -108,7 +108,7 @@ health or credential gates.
 
 M4a persists account health and user state under the credential lease. HTTP retries
 use the retained, unchanged body only before commit. A request tries at most four
-accounts, with one extra token or network retry per account. Selection currently
+accounts, with one token retry and one independent network retry per account. Selection currently
 prefers the provider pin, then eligible account IDs in order; M4b supplies bindings
 and the full selection policy. A matching pre-commit WebSocket error is suppressed
 after its health transition is saved, followed by close 1012. An idle connection

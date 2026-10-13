@@ -109,7 +109,11 @@ impl AccountStore {
     pub fn list_metadata(home: &Path) -> Result<Vec<Account>, StoreError> {
         let mut accounts = Self::read_metadata_dir(&home.join("accounts"))?;
         for account in &mut accounts {
-            account.health.expire(chrono::Utc::now());
+            let expired_auth = matches!(account.health, Health::Cooling {reason: super::HealthReason::Auth,until,..} if until <= chrono::Utc::now());
+            if account.health.expire(chrono::Utc::now()) {
+                account.auth_probe_pending |= expired_auth;
+                account.quota_cooling = None;
+            }
         }
         Ok(accounts)
     }
@@ -192,7 +196,10 @@ impl AccountStore {
 
     fn load_unlocked(&self, id: &str) -> Result<Account, StoreError> {
         let mut record = self.read(id)?;
+        let expired_auth = matches!(record.account.health, Health::Cooling {reason: super::HealthReason::Auth,until,..} if until <= chrono::Utc::now());
         if record.account.health.expire(chrono::Utc::now()) {
+            record.account.auth_probe_pending |= expired_auth;
+            record.account.quota_cooling = None;
             let generation = record.account.generation;
             self.write_metadata_record(record, generation)
         } else {
@@ -208,6 +215,23 @@ impl AccountStore {
         update: impl FnOnce(&mut Account),
     ) -> Result<Account, StoreError> {
         let _guard = self.transaction()?;
+        self.update_metadata_unlocked(id, update)
+    }
+
+    /// Compare the failed access token under the metadata transaction. Metadata
+    /// generations may advance while a refresh is in flight without rotating it.
+    pub fn update_metadata_for_token(
+        &self,
+        id: &str,
+        failed: &str,
+        update: impl FnOnce(&mut Account),
+    ) -> Result<Account, StoreError> {
+        let _guard = self.transaction()?;
+        let record = self.read(id)?;
+        let tokens = crypto::decrypt(&record.secret_dpapi_b64)?;
+        if tokens.access_token != failed {
+            return Ok(record.account);
+        }
         self.update_metadata_unlocked(id, update)
     }
 
@@ -242,6 +266,9 @@ impl AccountStore {
             || record.account.generation != current.generation
         {
             return Err(StoreError::InvalidData);
+        }
+        if record.account == current {
+            return Ok(current);
         }
         self.write_metadata_record(record, current.generation)
     }

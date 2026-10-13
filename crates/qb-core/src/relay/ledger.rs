@@ -20,8 +20,10 @@ pub(in crate::relay) struct Completion {
     pub start: Instant,
     pub input_bytes: Arc<AtomicU64>,
     pub runtime: Option<Arc<crate::account_runtime::AccountRuntime>>,
+    pub failed_access: Option<zeroize::Zeroizing<String>>,
     observability: Arc<Observability>,
     inflight: Option<Arc<AtomicU64>>,
+    account_inflight: Option<(String, crate::account_runtime::InflightGuard)>,
 }
 
 impl Completion {
@@ -36,8 +38,10 @@ impl Completion {
             start: Instant::now(),
             input_bytes: Arc::new(AtomicU64::new(0)),
             runtime: None,
+            failed_access: None,
             observability,
             inflight: None,
+            account_inflight: None,
             record: RequestRecord {
                 ts: chrono::Utc::now().to_rfc3339(),
                 req: format!("{:032x}", rand::random::<u128>()),
@@ -88,6 +92,17 @@ impl Completion {
     }
 
     pub fn attempt(&mut self, account: &str) {
+        if self
+            .account_inflight
+            .as_ref()
+            .is_none_or(|(id, _)| id != account)
+        {
+            self.account_inflight = None;
+            self.account_inflight = self
+                .runtime
+                .as_ref()
+                .map(|runtime| (account.to_owned(), runtime.track_inflight(account)));
+        }
         self.record.attempts += 1;
         self.record
             .attempt_details

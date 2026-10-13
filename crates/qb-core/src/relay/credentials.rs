@@ -91,6 +91,92 @@ impl TokenGates {
         self
     }
 
+    pub async fn is_current(
+        &self,
+        store: Arc<AccountStore>,
+        account: &Account,
+        tokens: &Tokens,
+    ) -> Result<bool, ()> {
+        let id = account.id.clone();
+        let failed = zeroize::Zeroizing::new(tokens.access_token.clone());
+        tokio::task::spawn_blocking(move || {
+            snapshot(&store, &id).map(|(_, current)| current.access_token == *failed)
+        })
+        .await
+        .map_err(|_| ())?
+    }
+
+    pub async fn selection_reload(
+        &self,
+        store: Arc<AccountStore>,
+        obs: Arc<Observability>,
+        account: Account,
+    ) -> Result<Account, ()> {
+        let gate = self.gate(&account.id).await;
+        let guard = gate.lock_owned().await;
+        tokio::task::spawn_blocking(move || {
+            let mut clock = guard;
+            let (current, _) = snapshot(&store, &account.id)?;
+            if !clock.before_expiry() {
+                return Ok(current);
+            }
+            reload(&store, &obs, current, "selection", &mut clock)
+        })
+        .await
+        .map_err(|_| ())?
+    }
+
+    pub async fn revoke_if_current(
+        &self,
+        store: Arc<AccountStore>,
+        account: &Account,
+        tokens: &Tokens,
+    ) -> Result<Account, ()> {
+        let expected = account.clone();
+        let failed = zeroize::Zeroizing::new(tokens.access_token.clone());
+        tokio::task::spawn_blocking(move || {
+            transition(
+                &store,
+                &expected,
+                &failed,
+                HealthSignal::Revoked {
+                    reason: "token_revoked".into(),
+                },
+            )
+        })
+        .await
+        .map_err(|_| ())?
+    }
+
+    pub async fn cool_unavailable_auth(
+        &self,
+        store: Arc<AccountStore>,
+        account: &Account,
+        tokens: &Tokens,
+    ) -> Result<(), ()> {
+        let id = account.id.clone();
+        let failed = zeroize::Zeroizing::new(tokens.access_token.clone());
+        tokio::task::spawn_blocking(move || {
+            store
+                .update_metadata_for_token(&id, &failed, |account| {
+                    if account.health == Health::Ready {
+                        account.apply_health_signal(
+                            HealthSignal::Cooling {
+                                reason: HealthReason::Auth,
+                                until: chrono::Utc::now() + chrono::Duration::minutes(5),
+                                scope: "account".into(),
+                            },
+                            chrono::Utc::now(),
+                        );
+                    }
+                })
+                .map(|_| ())
+                .map_err(|_| ())
+        })
+        .await
+        .map_err(|_| ())?
+    }
+
     async fn gate(&self, id: &str) -> Arc<Mutex<ReloadClock>> {
         self.gates
             .lock()
@@ -249,7 +335,12 @@ impl TokenGates {
             Ok(Ok(reply)) => reply,
             Ok(Err(Some(reason))) => {
                 tokio::task::spawn_blocking(move || {
-                    transition(&store, &current, HealthSignal::TerminalRefresh { reason })
+                    transition(
+                        &store,
+                        &current,
+                        &failed,
+                        HealthSignal::TerminalRefresh { reason },
+                    )
                 })
                 .await
                 .map_err(|_| ())??;
@@ -307,8 +398,14 @@ impl TokenGates {
                     .apply_health_signal(HealthSignal::StoreFailure, chrono::Utc::now());
                 let warning_store = store.clone();
                 let expected = current.clone();
+                let rejected = rotation.failed_token.clone();
                 let warning = tokio::task::spawn_blocking(move || {
-                    transition(&warning_store, &expected, HealthSignal::StoreFailure)
+                    transition(
+                        &warning_store,
+                        &expected,
+                        &rejected,
+                        HealthSignal::StoreFailure,
+                    )
                 })
                 .await;
                 rotation.store_error_in_memory = !matches!(warning, Ok(Ok(ref account)) if matches!(account.health, Health::Cooling { reason: HealthReason::StoreError, .. }));
@@ -478,14 +575,12 @@ async fn persist_async(
 fn transition(
     store: &AccountStore,
     expected: &Account,
+    failed: &str,
     signal: HealthSignal,
 ) -> Result<Account, ()> {
     let updated = store
-        .update_metadata(&expected.id, |account| {
-            // Another writer may have rotated between the snapshot and this transaction.
-            if account.generation == expected.generation {
-                account.apply_health_signal(signal, chrono::Utc::now());
-            }
+        .update_metadata_for_token(&expected.id, failed, |account| {
+            account.apply_health_signal(signal, chrono::Utc::now());
         })
         .map_err(|_| ())?;
     Ok(updated)
@@ -521,6 +616,8 @@ fn reload(
     trigger: &str,
     clock: &mut ReloadClock,
 ) -> Result<Account, ()> {
+    let rejected =
+        zeroize::Zeroizing::new(store.tokens(&account).map_err(|_| ())?.access_token.clone());
     match linked::reload_and_store(store, &account) {
         Ok(updated) => {
             obs.record_reload(
@@ -553,6 +650,7 @@ fn reload(
                 transition(
                     store,
                     &account,
+                    &rejected,
                     HealthSignal::LinkStale {
                         retry_at: chrono::Utc::now() + chrono::Duration::minutes(5),
                     },

@@ -50,12 +50,12 @@ pub async fn run(command: AccountsCommand, home: &Path, config: &Config) -> anyh
         AccountsCommand::Enable { id } => action(home, config, &id, "enable").await?,
         AccountsCommand::List => {
             let accounts = AccountStore::list_metadata(home)?;
-            println!(
+            println_utf8!(
                 "계정 ID\t제공자\t이메일\t요금제\t출처\t연결 방식\t사용 상태\t계정 상태\t만료 시각"
             );
             for account in accounts {
                 let value = serde_json::to_value(account)?;
-                println!(
+                println_utf8!(
                     "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                     cell(&value["id"]),
                     cell(&value["provider"]),
@@ -130,12 +130,12 @@ pub async fn run(command: AccountsCommand, home: &Path, config: &Config) -> anyh
                 }
                 Err(error) => return Err(error.into()),
             };
-            println!("계정 ID\t제공자\t이메일\t요금제\t만료 시각\t사용 상태\t결과\t이유");
+            println_utf8!("계정 ID\t제공자\t이메일\t요금제\t만료 시각\t사용 상태\t결과\t이유");
             for row in rows
                 .as_array()
                 .ok_or_else(|| anyhow::anyhow!("Invalid import response"))?
             {
-                println!(
+                println_utf8!(
                     "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                     cell(&row["id"]),
                     cell(&row["provider"]),
@@ -267,7 +267,7 @@ async fn action(home: &Path, config: &Config, id: &str, action: &str) -> anyhow:
         })
         .await??;
     }
-    println!(
+    println_utf8!(
         "계정 {}: {}",
         cell(&serde_json::json!(id)),
         translated(&serde_json::to_value(state)?)
@@ -305,17 +305,21 @@ pub async fn status(home: &Path, config: &Config) -> anyhow::Result<()> {
                 };
                 Ok(AccountStore::list_metadata(&home)?.into_iter().map(|account| {
                 let snapshot = &quota["accounts"][&account.id];
+                let probe_pending = account.auth_probe_pending
+                    || (matches!(account.health, qb_core::accounts::Health::Ready)
+                        && account.auth_failures > 0);
                 serde_json::json!({
                     "id": account.id, "provider": account.provider, "label": account.label,
                     "email": account.email, "plan": account.plan, "user_state": account.user_state,
-                    "health": account.health, "windows": snapshot["windows"]
+                    "health": account.health, "windows": snapshot["windows"],
+                    "probe_pending": probe_pending
                 })
             }).collect())
             })
             .await??;
         (false, accounts)
     };
-    println!(
+    println_utf8!(
         "코어: {}",
         if running {
             "실행 중"
@@ -323,9 +327,10 @@ pub async fn status(home: &Path, config: &Config) -> anyhow::Result<()> {
             "중지됨 (저장된 상태)"
         }
     );
-    println!(
+    println_utf8!(
         "계정 ID\t제공자\t라벨\t사용 상태\t계정 상태\t5시간 사용률\t5시간 초기화\t7일 사용률\t7일 초기화\t상태 이유\t대기 종료"
     );
+    let now = std::time::SystemTime::now();
     for account in accounts {
         let window = |name: &str| {
             account["windows"]
@@ -336,16 +341,20 @@ pub async fn status(home: &Path, config: &Config) -> anyhow::Result<()> {
         };
         let five = window("5h");
         let seven = window("7d");
-        println!(
+        println_utf8!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             cell(&account["id"]),
             cell(&account["provider"]),
             cell(&account["label"]),
             translated(&account["user_state"]),
-            health_label(&account["health"]),
-            percentage(&five["used_pct"]),
+            if account["probe_pending"].as_bool() == Some(true) {
+                "인증 확인 대기".into()
+            } else {
+                health_label(&account["health"])
+            },
+            percentage(&five, now),
             cell(&five["reset_at"]),
-            percentage(&seven["used_pct"]),
+            percentage(&seven, now),
             cell(&seven["reset_at"]),
             translated(&account["health"]["reason"]),
             cell(&account["health"]["until"])
@@ -354,8 +363,19 @@ pub async fn status(home: &Path, config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn percentage(value: &serde_json::Value) -> String {
-    value
+fn percentage(window: &serde_json::Value, now: std::time::SystemTime) -> String {
+    // Reuse the existing chrono-backed timestamp type without a new CLI dependency.
+    let timestamp = qb_core::accounts::TokenMeta {
+        expires_at: serde_json::from_value(window["reset_at"].clone()).ok(),
+        ..Default::default()
+    };
+    if timestamp
+        .expires_at
+        .is_some_and(|reset| std::time::SystemTime::from(reset) <= now)
+    {
+        return "리셋됨".into();
+    }
+    window["used_pct"]
         .as_f64()
         .map(|value| format!("{value:.1}%"))
         .unwrap_or_else(|| "-".into())

@@ -275,7 +275,7 @@ async fn handshake_failure_rows_never_return_426_and_keep_raw_bodies() {
             r#"{"error":{"type":"usage_limit_reached","resets_in_seconds":17}}"#,
             429,
         ),
-        (401, r#"{"error":{"type":"authentication_error"}}"#, 400),
+        (401, r#"{"error":{"type":"authentication_error"}}"#, 429),
         (418, r#"{"synthetic":"raw handshake body"}"#, 418),
         (426, r#"{"error":{"type":"upgrade_required"}}"#, 502),
     ] {
@@ -298,7 +298,7 @@ async fn handshake_failure_rows_never_return_426_and_keep_raw_bodies() {
                     assert_eq!(value["error"]["type"], "usage_limit_reached");
                     assert!(value["error"]["resets_in_seconds"].as_i64().unwrap() > 0);
                 } else if status == 401 {
-                    assert!(String::from_utf8_lossy(raw).contains("no usable codex account"));
+                    assert!(String::from_utf8_lossy(raw).contains("usage_limit_reached"));
                 } else if status != 426 {
                     assert_eq!(raw, body.as_bytes());
                 }
@@ -317,7 +317,7 @@ async fn handshake_failure_rows_never_return_426_and_keep_raw_bodies() {
             assert_eq!(response.status(), 400);
             let text = String::from_utf8_lossy(response.body().as_ref().unwrap());
             assert!(text.contains("no usable codex account"));
-            assert!(text.contains("트레이를 여세요"));
+            assert!(text.contains("— open the tray"));
         }
         _ => panic!("expected no account"),
     }

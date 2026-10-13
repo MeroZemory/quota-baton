@@ -113,6 +113,8 @@ mod tests {
             user_state: UserState::Active,
             health: Health::Ready,
             auth_failures: 0,
+            auth_probe_pending: false,
+            quota_cooling: None,
             drain: false,
             allow_credits: false,
             generation: 1,

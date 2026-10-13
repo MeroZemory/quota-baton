@@ -418,3 +418,131 @@ async fn c5_rotated_persist_failure_retains_memory_and_retries_without_token_rol
     );
     assert_eq!(upstream.state.requests().len(), 1);
 }
+
+#[tokio::test]
+async fn c5_terminal_refresh_survives_metadata_generation_race() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new(false, 60, Provider::Codex);
+    let fake = ScriptedUpstream::start().await.unwrap();
+    let mut reply = ScriptedResponse::json(StatusCode::BAD_REQUEST, r#"{"error":"invalid_grant"}"#);
+    reply.chunks[0].0 = Duration::from_millis(150);
+    fake.state.push(reply);
+    let gates = f
+        .gates()
+        .with_token_endpoint(Provider::Codex, fake.url.clone());
+    let old = f.store.tokens(&f.account).unwrap();
+    let (result, _) = tokio::join!(
+        gates.after_401(f.store.clone(), f.obs.clone(), f.account.clone(), &old),
+        async {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while fake.state.requests().is_empty() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            f.store
+                .update_metadata(&f.account.id, |a| a.label = "concurrent metadata".into())
+                .unwrap();
+        }
+    );
+    assert!(result.unwrap().is_none());
+    let current = f.store.load(&f.account.id).unwrap();
+    assert!(matches!(current.health, Health::NeedsRelogin { .. }));
+    assert_eq!(current.label, "concurrent metadata");
+    assert!(
+        gates
+            .after_401(f.store.clone(), f.obs.clone(), current, &old)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(fake.state.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn c5_stale_revocation_does_not_revoke_rotated_credentials() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new(false, 60, Provider::Codex);
+    let old = f.store.tokens(&f.account).unwrap();
+    let mut rotated = f.store.tokens(&f.account).unwrap();
+    rotated.access_token = "synthetic-rotated".into();
+    f.store
+        .save(&f.account, &rotated, Some(f.account.generation))
+        .unwrap();
+    let gates = f.gates();
+    let current = gates
+        .revoke_if_current(f.store.clone(), &f.account, &old)
+        .await
+        .unwrap();
+    assert_eq!(current.health, Health::Ready);
+    assert!(
+        !gates
+            .is_current(f.store.clone(), &f.account, &old)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn c5_link_stale_selection_reload_uses_shared_sixty_second_throttle() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new(true, -1, Provider::Codex);
+    let gates = f.gates();
+    let current = gates
+        .selection_reload(f.store.clone(), f.obs.clone(), f.account.clone())
+        .await
+        .unwrap();
+    assert!(matches!(
+        current.health,
+        Health::Cooling {
+            reason: HealthReason::LinkStale,
+            ..
+        }
+    ));
+    f.newer_link();
+    let still = gates
+        .selection_reload(f.store.clone(), f.obs.clone(), current.clone())
+        .await
+        .unwrap();
+    let old = f.store.tokens(&still).unwrap();
+    assert_eq!(old.access_token, "synthetic-access-old");
+    assert!(
+        gates
+            .after_401(f.store.clone(), f.obs.clone(), still, &old)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn c5_transient_auth_cooling_is_token_guarded_and_does_not_increment_backoff() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new(false, 60, Provider::Codex);
+    let gates = f.gates();
+    let old = f.store.tokens(&f.account).unwrap();
+    gates
+        .cool_unavailable_auth(f.store.clone(), &f.account, &old)
+        .await
+        .unwrap();
+    let current = f.store.load(&f.account.id).unwrap();
+    assert_eq!(current.auth_failures, 0);
+    assert!(matches!(
+        current.health,
+        Health::Cooling {
+            reason: HealthReason::Auth,
+            ..
+        }
+    ));
+    let mut new = f.store.tokens(&current).unwrap();
+    new.access_token = "synthetic-new-token".into();
+    let mut ready = current.clone();
+    ready.health = Health::Ready;
+    f.store.save(&ready, &new, Some(ready.generation)).unwrap();
+    gates
+        .cool_unavailable_auth(f.store.clone(), &ready, &old)
+        .await
+        .unwrap();
+    assert_eq!(f.store.load(&ready.id).unwrap().health, Health::Ready);
+}

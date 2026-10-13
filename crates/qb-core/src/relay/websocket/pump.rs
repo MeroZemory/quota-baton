@@ -66,6 +66,7 @@ impl CurrentCompletion {
             &context.headers,
         );
         completion.session(&context.session);
+        completion.runtime = context.runtime.clone();
         if let Some(relay) = &context.relay {
             completion.track(relay.inflight_requests.clone());
         }
@@ -147,9 +148,33 @@ async fn apply_error(
         }
     }
     let raw = serde_json::to_vec(
-        &serde_json::json!({"status":event.get("status"),"error":bounded_error}),
+        &serde_json::json!({"type":event.get("type"),"status":event.get("status"),"error":bounded_error}),
     )
     .unwrap_or_default();
+    let failed = context
+        .credentials
+        .as_ref()
+        .map(|(_, token)| crate::accounts::Tokens {
+            access_token: token.to_string(),
+            refresh_token: String::new(),
+            id_token: None,
+        });
+    let current_token = if event.get("status").and_then(Value::as_u64) == Some(401)
+        || error.get("type").and_then(Value::as_str) == Some("authentication_error")
+    {
+        if let (Some(relay), Some((account, _)), Some(failed)) =
+            (&context.relay, &context.credentials, &failed)
+        {
+            relay
+                .tokens
+                .is_current(relay.store.clone(), account, failed)
+                .await?
+        } else {
+            true
+        }
+    } else {
+        true
+    };
     let mut decision = outcome::classify(
         Codex,
         axum::http::StatusCode::OK,
@@ -157,31 +182,90 @@ async fn apply_error(
         &raw,
         model,
     );
+    if !current_token && matches!(decision.kind, Kind::Auth | Kind::Revoked) {
+        decision.kind = Kind::Auth;
+        decision.signal = None;
+    }
     if decision.kind == Kind::Auth {
-        if let (Some(relay), Some((account, access_token))) = (&context.relay, &context.credentials)
+        if let (Some(relay), Some((account, _)), Some(failed)) =
+            (&context.relay, &context.credentials, &failed)
         {
-            let failed = crate::accounts::Tokens {
-                access_token: access_token.to_string(),
-                refresh_token: String::new(),
-                id_token: None,
-            };
-            // This socket has never sent a request with the refreshed token.
-            // Reload/refresh can mark linked staleness or terminal failure; an
-            // uncertain refresh does not establish cooling(auth).
+            if current_token
+                && super::token_retried(relay, &account.id, &failed.access_token, false)
+            {
+                relay
+                    .tokens
+                    .auth_failed(
+                        relay.store.clone(),
+                        context.observability.clone(),
+                        account.clone(),
+                        failed,
+                    )
+                    .await?;
+            } else {
+                match relay
+                    .tokens
+                    .after_401(
+                        relay.store.clone(),
+                        context.observability.clone(),
+                        account.clone(),
+                        failed,
+                    )
+                    .await?
+                {
+                    Some((updated, refreshed)) => {
+                        super::token_retried(relay, &updated.id, &refreshed.access_token, true);
+                    }
+                    None => {
+                        relay
+                            .tokens
+                            .cool_unavailable_auth(relay.store.clone(), account, failed)
+                            .await?;
+                    }
+                }
+            }
+        }
+    } else if decision.kind == Kind::Revoked {
+        if let (Some(relay), Some((account, _)), Some(failed)) =
+            (&context.relay, &context.credentials, &failed)
+        {
             relay
                 .tokens
-                .after_401(
-                    relay.store.clone(),
-                    context.observability.clone(),
-                    account.clone(),
-                    &failed,
-                )
+                .revoke_if_current(relay.store.clone(), account, failed)
                 .await?;
+        } else if let (Some(runtime), Some(signal)) = (&context.runtime, decision.signal.take()) {
+            runtime.transition(&context.account, signal).await?;
         }
     } else if let (Some(runtime), Some(signal)) = (&context.runtime, decision.signal.take()) {
         runtime.transition(&context.account, signal).await?;
     }
     Ok(decision)
+}
+
+async fn reconnect_available(context: &Context) -> Result<bool, ()> {
+    let Some(relay) = &context.relay else {
+        return Ok(false);
+    };
+    let key = context.session.key.as_deref();
+    // Without a stable key, a model-scoped or unchanged account could be
+    // reselected immediately. Relay its frame instead of spending a retry.
+    if key.is_none() && relay.accounts.eligible(&context.account, None).await {
+        return Ok(false);
+    }
+    let tried = std::collections::BTreeSet::from([context.account.clone()]);
+    if relay.select(Codex, key, None, &tried).await?.is_none() {
+        return Ok(false);
+    }
+    relay.exclude_reconnect(key, &context.account);
+    Ok(true)
+}
+
+fn event_affects_account(event: &Value, account: &str) -> bool {
+    event
+        .get("data")
+        .and_then(|data| data.get("id"))
+        .and_then(Value::as_str)
+        == Some(account)
 }
 
 fn parsed(text: &str) -> Option<Value> {
@@ -363,7 +447,12 @@ async fn run_with_read_timeout(
                     }
                     if let Some(outcome) = delivered.terminal {
                         terminal_pending = false;
-                        if let Some(active) = current.take() { active.completion.finish(outcome); }
+                        if let Some(active) = current.take() {
+                            if outcome == "ok" && let (Some(relay), Some((account, token))) = (&context.relay, &context.credentials) {
+                                super::clear_retried_token(relay, &account.id, token);
+                            }
+                            active.completion.finish(outcome);
+                        }
                         if ending.is_none() && let Some(runtime) = &context.runtime
                             && !runtime.eligible(&context.account, model.as_deref()).await {
                             ending = Some((Some(CloseFrame { code: 1000.into(), reason: "".into() }), "account_ineligible"));
@@ -437,7 +526,8 @@ async fn run_with_read_timeout(
                         let event = if let Message::Text(text) = &message { parsed(text.as_str()) } else { None };
                         if let Some(event) = event.as_ref() {
                             if let Some(runtime) = &context.runtime {
-                                runtime.observe_codex_event(&context.account, event).await;
+                                let active_model = current.as_ref().and_then(|active| active.model.as_deref());
+                                runtime.observe_codex_event_for_model(&context.account, event, active_model).await;
                             } else {
                                 context.observability.observe_codex_event(&context.account, event);
                             }
@@ -453,7 +543,8 @@ async fn run_with_read_timeout(
                                 };
                                 // Row 13a excludes row 3 rate limits and requires a current request.
                                 if current.as_ref().is_some_and(|active| !active.committed)
-                                    && decision.failover() && decision.kind != crate::relay::outcome::Kind::Rate {
+                                    && decision.failover() && decision.kind != crate::relay::outcome::Kind::Rate
+                                    && reconnect_available(&context).await.unwrap_or(false) {
                                     if let Some(mut active) = current.take() {
                                         active.upstream(Some(event));
                                         active.completion.failover(decision.reason());
@@ -485,7 +576,12 @@ async fn run_with_read_timeout(
                 if matches!(event, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
                     health_events = None;
                 }
-                if current.is_none() && !terminal_pending && let Some(runtime) = &context.runtime
+                let relevant = match event {
+                    Ok(event) => event_affects_account(&event, &context.account),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => true,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => false,
+                };
+                if relevant && current.is_none() && !terminal_pending && let Some(runtime) = &context.runtime
                     && !runtime.eligible(&context.account, model.as_deref()).await {
                     ending = Some((Some(CloseFrame { code: 1000.into(), reason: "".into() }), "account_ineligible"));
                     end_deadline = Instant::now() + CLOSE_TIMEOUT;

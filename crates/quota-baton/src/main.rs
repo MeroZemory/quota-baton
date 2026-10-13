@@ -1,5 +1,32 @@
 use clap::{Parser, Subcommand};
+
+macro_rules! println_utf8 {
+    ($($arg:tt)*) => {
+        crate::print_stdout(format_args!($($arg)*))?
+    };
+}
+
 mod accounts_cli;
+
+fn print_stdout(args: std::fmt::Arguments<'_>) -> std::io::Result<()> {
+    use std::io::{IsTerminal, Write};
+    let stdout = std::io::stdout();
+    if stdout.is_terminal() {
+        // Keep the existing console path and its UTF-8 console setup.
+        println!("{args}");
+        return Ok(());
+    }
+    let line = format!("{args}\n");
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsHandle;
+        // A pipe/file receives the UTF-8 bytes directly, without console encoding.
+        let mut output = std::fs::File::from(stdout.as_handle().try_clone_to_owned()?);
+        output.write_all(line.as_bytes())
+    }
+    #[cfg(not(windows))]
+    stdout.lock().write_all(line.as_bytes())
+}
 
 #[derive(Parser)]
 #[command(version, about = "로컬 계정 프록시")]
@@ -182,7 +209,7 @@ async fn run() -> anyhow::Result<()> {
                 admin_routes,
             )
             .await?;
-            println!("프록시를 시작했습니다.");
+            println_utf8!("프록시를 시작했습니다.");
             tokio::signal::ctrl_c().await?;
             drop(servers);
             // 종료 시 디스크 flush와 작성자 정리도 런타임 스레드를 막지 않는다.
@@ -225,7 +252,7 @@ async fn run() -> anyhow::Result<()> {
             })
             .await??;
             // 네트워크 전송 전에 출력하는 것은 개수뿐이다.
-            println!("{}", serde_json::to_string(&prepared.presence)?);
+            println_utf8!("{}", serde_json::to_string(&prepared.presence)?);
             drop(prepared);
             let token = std::fs::read_to_string(home.join("admin.token"))?;
             let summary: serde_json::Value = reqwest::Client::builder()
@@ -243,7 +270,7 @@ async fn run() -> anyhow::Result<()> {
                 .error_for_status()?
                 .json()
                 .await?;
-            println!("{}", serde_json::to_string(&summary)?);
+            println_utf8!("{}", serde_json::to_string(&summary)?);
         }
     }
     Ok(())

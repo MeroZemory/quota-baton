@@ -46,6 +46,25 @@ pub struct AccountRuntime {
     allowance: f64,
     probes: Mutex<BTreeSet<String>>,
     volatile: Mutex<BTreeMap<String, Health>>,
+    inflight: Mutex<BTreeMap<String, usize>>,
+}
+
+pub struct InflightGuard {
+    runtime: Weak<AccountRuntime>,
+    id: String,
+}
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.upgrade()
+            && let Ok(mut counts) = runtime.inflight.lock()
+            && let Some(count) = counts.get_mut(&self.id)
+        {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&self.id);
+            }
+        }
+    }
 }
 
 pub struct Probe {
@@ -82,11 +101,31 @@ impl AccountRuntime {
             allowance,
             probes: Mutex::new(BTreeSet::new()),
             volatile: Mutex::new(BTreeMap::new()),
+            inflight: Mutex::new(BTreeMap::new()),
         })
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Value> {
         self.events.subscribe()
+    }
+
+    pub fn track_inflight(self: &Arc<Self>, id: &str) -> InflightGuard {
+        if let Ok(mut counts) = self.inflight.lock() {
+            let count = counts.entry(id.to_owned()).or_default();
+            *count = count.saturating_add(1);
+        }
+        InflightGuard {
+            runtime: Arc::downgrade(self),
+            id: id.to_owned(),
+        }
+    }
+
+    pub fn inflight_count(&self, id: &str) -> usize {
+        self.inflight
+            .lock()
+            .ok()
+            .and_then(|counts| counts.get(id).copied())
+            .unwrap_or(0)
     }
 
     pub fn probing(&self, id: &str) -> bool {
@@ -105,7 +144,9 @@ impl AccountRuntime {
         let _=self.events.send(json!({"event":"account_changed","data":{"id":account.id,"health":account.health,"user_state":account.user_state}}));
     }
     pub fn begin_probe(self: &Arc<Self>, account: &Account) -> Result<Option<Probe>, ProbeBusy> {
-        if account.auth_failures == 0 || account.health != Health::Ready {
+        if (!account.auth_probe_pending && account.auth_failures == 0)
+            || account.health != Health::Ready
+        {
             return Ok(None);
         }
         let mut probes = self.probes.lock().map_err(|_| ProbeBusy)?;
@@ -125,6 +166,7 @@ impl AccountRuntime {
                 .update_metadata(&id, |a| {
                     if a.health == Health::Ready {
                         a.auth_failures = 0;
+                        a.auth_probe_pending = false;
                     }
                 })
                 .map_err(|_| ())
@@ -147,43 +189,22 @@ impl AccountRuntime {
         let account = tokio::task::spawn_blocking(move || {
             let updated = store
                 .update_metadata(&id, |account| {
-                    account.health = match signal {
+                    use crate::accounts::HealthSignal as Signal;
+                    let signal = match signal {
                         HealthSignal::Cooling {
                             reason,
                             until,
                             scope,
-                        } if !matches!(account.health, Health::NeedsRelogin { .. }) => {
-                            Health::Cooling {
-                                reason,
-                                until,
-                                scope,
-                            }
-                        }
-                        HealthSignal::Cooling { .. } => account.health.clone(),
-                        HealthSignal::Revoked(reason) => Health::NeedsRelogin {
+                        } => Signal::Cooling {
                             reason,
-                            since: Utc::now(),
+                            until,
+                            scope,
                         },
-                        HealthSignal::AuthFailure
-                            if !matches!(account.health, Health::NeedsRelogin { .. }) =>
-                        {
-                            let minutes =
-                                (15_i64 * (1_i64 << account.auth_failures.min(4))).min(240);
-                            account.auth_failures = account.auth_failures.saturating_add(1);
-                            Health::Cooling {
-                                reason: HealthReason::Auth,
-                                until: Utc::now() + Duration::minutes(minutes),
-                                scope: "account".into(),
-                            }
-                        }
-                        HealthSignal::AuthFailure => account.health.clone(),
-                        HealthSignal::Ready
-                            if !matches!(account.health, Health::NeedsRelogin { .. }) =>
-                        {
-                            Health::Ready
-                        }
-                        HealthSignal::Ready => account.health.clone(),
+                        HealthSignal::Revoked(reason) => Signal::Revoked { reason },
+                        HealthSignal::AuthFailure => Signal::AuthAfterRefresh,
+                        HealthSignal::Ready => Signal::Ready,
                     };
+                    account.apply_health_signal(signal, Utc::now());
                 })
                 .map_err(|_| ())?;
             Ok::<_, ()>(updated)
@@ -194,7 +215,7 @@ impl AccountRuntime {
     }
 
     pub async fn eligible(&self, id: &str, model: Option<&str>) -> bool {
-        if self.blocked_in_memory(id) {
+        if self.blocked_in_memory(id) || self.probing(id) {
             return false;
         }
         let store = self.store.clone();
@@ -230,9 +251,9 @@ impl AccountRuntime {
                         && w.iter()
                             .all(|w| w["used_pct"].as_f64().is_some_and(|p| p < 100.0))
                         && w.iter().any(|w| {
-                            w["used_pct"]
-                                .as_f64()
-                                .is_some_and(|p| p + self.allowance >= 99.0)
+                            w["used_pct"].as_f64().is_some_and(|p| {
+                                p + self.allowance * self.inflight_count(&id) as f64 >= 99.0
+                            })
                         })
                 }) && q["signals"]["limit_reached"] != true
                     && q["signals"]["unified_status"] != "rejected"
@@ -261,7 +282,7 @@ impl AccountRuntime {
                             }
                         )
                     {
-                        a.health = Health::Ready;
+                        a.apply_health_signal(crate::accounts::HealthSignal::Ready, Utc::now());
                     }
                 })
                 .map_err(|_| ())
@@ -304,103 +325,85 @@ impl AccountRuntime {
         Ok(accounts.into_iter().map(|a| {
             let quota = self.obs.quota_snapshot(&a.id).unwrap_or_default();
             let health=self.volatile.lock().ok().and_then(|v|v.get(&a.id).cloned()).unwrap_or(a.health);
-            json!({"id":a.id,"provider":a.provider,"label":a.label,"email":a.email,"plan":quota["plan"].as_str().map(str::to_owned).or(a.plan),"user_state":a.user_state,"health":health,"windows":quota["windows"].as_array().cloned().unwrap_or_default(),"credits":quota["credits"],"last_used_at":null,"bound_sessions":0,"token_expires_at":a.token_meta.expires_at,"drain":a.drain,"allow_credits":a.allow_credits})
+            let pending = self.probing(&a.id) || ((a.auth_probe_pending || a.auth_failures > 0) && health == Health::Ready);
+            let health = if pending { json!({"kind":"cooling","reason":"auth","until":Utc::now(),"scope":"account","probe_pending":true}) } else { json!(health) };
+            json!({"id":a.id,"provider":a.provider,"label":a.label,"email":a.email,"plan":quota["plan"].as_str().map(str::to_owned).or(a.plan),"user_state":a.user_state,"health":health,"probe_pending":pending,"windows":quota["windows"].as_array().cloned().unwrap_or_default(),"credits":quota["credits"],"last_used_at":null,"bound_sessions":0,"token_expires_at":a.token_meta.expires_at,"drain":a.drain,"allow_credits":a.allow_credits})
         }).collect())
     }
 
     pub async fn observe_headers(&self, id: &str, provider: Provider, headers: &HeaderMap) {
+        self.observe_headers_for_model(id, provider, headers, None)
+            .await;
+    }
+
+    pub async fn observe_headers_for_model(
+        &self,
+        id: &str,
+        provider: Provider,
+        headers: &HeaderMap,
+        model: Option<&str>,
+    ) {
         let previous = self.obs.quota_snapshot(id);
         self.obs.observe_headers(id, provider, headers);
-        if previous != self.obs.quota_snapshot(id) {
-            self.apply_snapshot(id, provider).await;
+        if previous != self.obs.quota_snapshot(id)
+            && let Some(snapshot) = self.obs.quota_snapshot(id)
+        {
+            let _ = self.apply_quota_snapshot(id, snapshot, model).await;
         }
     }
 
     pub async fn observe_codex_event(&self, id: &str, event: &Value) {
+        self.observe_codex_event_for_model(id, event, None).await;
+    }
+
+    pub async fn observe_codex_event_for_model(
+        &self,
+        id: &str,
+        event: &Value,
+        model: Option<&str>,
+    ) {
         if event["type"] != "codex.rate_limits" {
             return;
         }
         self.obs.observe_codex_event(id, event);
-        self.apply_snapshot(id, Provider::Codex).await;
+        if let Some(snapshot) = self.obs.quota_snapshot(id) {
+            let _ = self.apply_quota_snapshot(id, snapshot, model).await;
+        }
     }
 
-    async fn apply_snapshot(&self, id: &str, provider: Provider) {
-        let Some(snapshot) = self.obs.quota_snapshot(id) else {
-            return;
-        };
+    /// Apply an observed snapshot through the same persisted reducer as outcomes
+    /// and credential failures. Per-window timestamps identify fresh evidence.
+    pub async fn apply_quota_snapshot(
+        &self,
+        id: &str,
+        snapshot: Value,
+        model: Option<&str>,
+    ) -> Result<Account, ()> {
         let store = self.store.clone();
         let account_id = id.to_owned();
-        let Ok(Ok(account)) = tokio::task::spawn_blocking(move || store.load(&account_id)).await
-        else {
-            return;
-        };
-        let windows = snapshot["windows"].as_array().cloned().unwrap_or_default();
-        let reset = |w: &Value| {
-            w["reset_at"]
-                .as_str()
-                .and_then(|v| DateTime::parse_from_rfc3339(v).ok())
-                .map(|v| v.with_timezone(&Utc))
-        };
-        let depleted: Vec<_> = windows
-            .iter()
-            .filter(|w| {
-                w["used_pct"].as_f64().is_some_and(|p| p >= 100.0) || w["status"] == "rejected"
-            })
-            .collect();
-        let credits_hold = provider == Provider::Codex
-            && !account.allow_credits
-            && (windows.iter().any(|w| {
-                w["used_pct"]
-                    .as_f64()
-                    .is_some_and(|p| p + self.allowance >= 99.0)
-            }) || snapshot["signals"]["serving_from_credits"] == true);
-        let exhausted = !depleted.is_empty()
-            || snapshot["signals"]["limit_reached"] == true
-            || snapshot["signals"]["unified_status"] == "rejected"
-            || credits_hold;
-        let until = depleted
-            .iter()
-            .filter_map(|w| reset(w))
-            .max()
-            .or_else(|| windows.iter().filter_map(reset).max())
-            .unwrap_or_else(|| Utc::now() + Duration::minutes(5));
-        if exhausted
-            && matches!(
-                account.health,
-                Health::Ready
-                    | Health::Cooling {
-                        reason: HealthReason::Quota,
-                        ..
-                    }
-            )
-        {
-            let _ = self
-                .transition(
-                    id,
-                    HealthSignal::Cooling {
-                        reason: HealthReason::Quota,
-                        until,
-                        scope: "account".into(),
-                    },
-                )
-                .await;
-        } else if let Health::Cooling {
-            reason: HealthReason::Quota,
-            until: old,
-            ..
-        } = account.health
-            && !windows.is_empty()
-            && windows
-                .iter()
-                .all(|w| w["used_pct"].as_f64().is_some_and(|p| p < 100.0))
-            && windows.iter().filter_map(reset).any(|new| new != old)
-            && !exhausted
-        {
-            let _ = self.transition(id, HealthSignal::Ready).await;
-        }
+        let model = model.map(str::to_owned);
+        let projected_allowance = self.allowance * self.inflight_count(id) as f64;
+        let observation = snapshot.clone();
+        let account = tokio::task::spawn_blocking(move || {
+            store
+                .update_metadata(&account_id, |account| {
+                    account.apply_health_signal(
+                        crate::accounts::HealthSignal::UsageSnapshot {
+                            snapshot: observation,
+                            model,
+                            projected_allowance,
+                        },
+                        Utc::now(),
+                    );
+                })
+                .map_err(|_| ())
+        })
+        .await
+        .map_err(|_| ())??;
         let _ = self
             .events
             .send(json!({"event":"quota_updated","data":{"id":id,"snapshot":snapshot}}));
+        Ok(account)
     }
 
     pub fn cache_limit(&self, id: &str, status: StatusCode, headers: &HeaderMap, raw: &[u8]) {
@@ -446,23 +449,40 @@ impl AccountRuntime {
             .iter()
             .filter(|a| a.provider == provider && a.user_state == UserState::Active)
             .collect();
+        let volatile = self.volatile.lock().map(|v| v.clone()).unwrap_or_default();
+        let now = Utc::now();
         let mut cooling = Vec::new();
         for a in &candidates {
-            if let Health::Cooling {
-                reason: HealthReason::Quota | HealthReason::Rate | HealthReason::Auth,
-                until,
-                scope,
-            } = &a.health
-                && (scope == "account" || model.is_none_or(|m| scope == &format!("model:{m}")))
+            for health in std::iter::once(&a.health).chain(volatile.get(&a.id)) {
+                if let Health::Cooling {
+                    reason,
+                    until,
+                    scope,
+                } = health
+                    && *until > now
+                    && (scope == "account" || model.is_some_and(|m| scope == &format!("model:{m}")))
+                {
+                    let replay = matches!(
+                        reason,
+                        HealthReason::Quota | HealthReason::Rate | HealthReason::Auth
+                    );
+                    cooling.push((*a, *until, replay));
+                }
+            }
+            if self.probing(&a.id)
+                || ((a.auth_probe_pending || a.auth_failures > 0) && a.health == Health::Ready)
             {
-                cooling.push((*a, *until));
+                cooling.push((*a, now + Duration::seconds(1), false));
             }
         }
-        if !candidates.is_empty() && cooling.len() == candidates.len() {
-            cooling.sort_by_key(|(_, until)| *until);
-            let (a, until) = cooling[0];
+        if !cooling.is_empty() {
+            // Prefer genuine limit-response resets when available. Other
+            // temporary blockers still produce row 14, using the native shape.
+            cooling.sort_by_key(|(_, until, replay)| (!*replay, *until));
+            let (a, until, replay) = cooling[0];
             let seconds = (until - Utc::now()).num_seconds().max(1);
             let mut result = if !websocket
+                && replay
                 && let Some(cache) = self.limits.lock().ok().and_then(|m| m.get(&a.id).cloned())
             {
                 let mut r = Response::new(Body::from(cache.body));
@@ -483,7 +503,7 @@ impl AccountRuntime {
             );
             result
         } else {
-            let mut error = json!({"error":{"type":"invalid_request_error","message":format!("quota-baton: no usable {} account - open the quota-baton tray (사용 가능한 계정이 없습니다. 트레이를 여세요)",provider.as_str())}});
+            let mut error = json!({"error":{"type":"invalid_request_error","message":format!("quota-baton: no usable {} account — open the tray",provider.as_str())}});
             if provider == Provider::Claude {
                 error["type"] = "error".into();
             }

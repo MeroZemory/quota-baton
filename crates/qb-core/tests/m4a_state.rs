@@ -1,7 +1,7 @@
 use chrono::{Duration, TimeZone, Utc};
 use qb_core::accounts::{
-    Account, AccountStore, Health, HealthReason, HealthScope, HealthSignal, StoreError,
-    UsageWindow, UserState, health::eligible,
+    Account, AccountStore, Health, HealthReason, HealthSignal, StoreError, UserState,
+    health::eligible,
 };
 use serde_json::json;
 use std::{fs, sync::Arc};
@@ -53,14 +53,12 @@ fn assert_cooling(account: &Account, reason: HealthReason, minutes: i64, scope: 
 fn c5_eligibility_model_scope_tried_and_independent_user_state() {
     let mut a = account();
     assert!(!a.drain && !a.allow_credits && a.auth_failures == 0);
-    a.apply_health_signal(
-        HealthSignal::Permission {
-            model: Some("blocked".into()),
-            account_level: false,
-        },
-        now(),
-    );
-    assert!(!a.eligible_at(None, now()));
+    a.health = Health::Cooling {
+        reason: HealthReason::Permission,
+        until: now() + Duration::hours(1),
+        scope: "model:blocked".into(),
+    };
+    assert!(a.eligible_at(None, now()));
     assert!(!a.eligible_at(Some("blocked"), now()));
     assert!(a.eligible_at(Some("other"), now()));
     assert!(!eligible(&a, Some("other"), std::slice::from_ref(&a.id)));
@@ -71,176 +69,6 @@ fn c5_eligibility_model_scope_tried_and_independent_user_state() {
     a.user_state = UserState::Active;
     a.drain = true;
     assert!(a.eligible_at(Some("other"), now()));
-}
-
-#[test]
-fn c5_rows_terminal_refresh_revoked_and_relogin() {
-    for signal in [
-        HealthSignal::TerminalRefresh {
-            reason: "invalid_grant".into(),
-        },
-        HealthSignal::Revoked {
-            reason: "token_revoked".into(),
-        },
-    ] {
-        let mut a = account();
-        a.user_state = UserState::Paused;
-        assert!(a.apply_health_signal(signal, now()));
-        assert!(matches!(a.health, Health::NeedsRelogin { since, .. } if since == now()));
-        a.apply_health_signal(HealthSignal::Payment, now());
-        assert!(matches!(a.health, Health::NeedsRelogin { .. }));
-        a.auth_failures = 4;
-        a.apply_health_signal(HealthSignal::ReloginCompleted, now());
-        assert_eq!(a.health, Health::Ready);
-        assert_eq!(a.auth_failures, 0);
-        assert_eq!(a.user_state, UserState::Paused);
-    }
-}
-
-#[test]
-fn c5_rows_auth_backoff_stale_token_and_expiry_probe() {
-    let mut a = account();
-    for minutes in [15, 30, 60, 120, 240, 240] {
-        a.apply_health_signal(HealthSignal::AuthAfterRefresh, now());
-        assert_cooling(&a, HealthReason::Auth, minutes, "account");
-        let unchanged = a.clone();
-        assert!(!a.apply_health_signal(HealthSignal::StaleToken401, now()));
-        assert_eq!(a, unchanged);
-        assert!(
-            !a.health
-                .expire(now() + Duration::minutes(minutes) - Duration::seconds(1))
-        );
-        assert!(a.health.expire(now() + Duration::minutes(minutes)));
-        assert!(a.eligible_at(None, now() + Duration::minutes(minutes)));
-    }
-    a.auth_failures = u32::MAX;
-    a.apply_health_signal(HealthSignal::AuthAfterRefresh, now());
-    assert_cooling(&a, HealthReason::Auth, 240, "account");
-    assert_eq!(a.auth_failures, u32::MAX);
-}
-
-#[test]
-fn c5_rows_quota_rate_permission_payment_store_error_and_no_change() {
-    let mut a = account();
-    a.apply_health_signal(
-        HealthSignal::Quota {
-            reset_at: now() + Duration::minutes(20),
-            scope: HealthScope::Model("opus".into()),
-        },
-        now(),
-    );
-    assert_cooling(&a, HealthReason::Quota, 20, "model:opus");
-    for signal in [
-        HealthSignal::NoChange,
-        HealthSignal::Permission {
-            model: None,
-            account_level: false,
-        },
-        HealthSignal::Rate {
-            retry_after_secs: 10,
-            scope: HealthScope::Account,
-        },
-    ] {
-        assert!(!a.apply_health_signal(signal, now()));
-    }
-    a.apply_health_signal(
-        HealthSignal::Rate {
-            retry_after_secs: 60,
-            scope: HealthScope::Account,
-        },
-        now(),
-    );
-    assert_cooling(&a, HealthReason::Rate, 1, "account");
-    a.apply_health_signal(
-        HealthSignal::Permission {
-            model: Some("opus".into()),
-            account_level: false,
-        },
-        now(),
-    );
-    assert_cooling(&a, HealthReason::Permission, 60, "model:opus");
-    a.apply_health_signal(
-        HealthSignal::Permission {
-            model: None,
-            account_level: true,
-        },
-        now(),
-    );
-    assert_cooling(&a, HealthReason::Permission, 360, "account");
-    a.apply_health_signal(
-        HealthSignal::ModelUnsupported {
-            model: "gpt-fixture".into(),
-        },
-        now(),
-    );
-    assert_cooling(&a, HealthReason::Permission, 360, "model:gpt-fixture");
-    a.apply_health_signal(HealthSignal::Payment, now());
-    assert_cooling(&a, HealthReason::Payment, 360, "account");
-    a.apply_health_signal(HealthSignal::StoreFailure, now());
-    assert_cooling(&a, HealthReason::StoreError, 5, "account");
-}
-
-fn window(used: f64, projected: f64, minutes: i64) -> UsageWindow {
-    UsageWindow {
-        used_pct: used,
-        projected_pct: projected,
-        reset_at: now() + Duration::minutes(minutes),
-        limit_reached: false,
-    }
-}
-
-#[test]
-fn c5_rows_passive_exhaustion_credits_hold_and_early_reset() {
-    let mut a = account();
-    for (window, credits) in [
-        (window(100.0, 100.0, 20), false),
-        (window(98.0, 99.0, 20), false),
-        (window(1.0, 1.0, 20), true),
-    ] {
-        a.health = Health::Ready;
-        a.apply_health_signal(
-            HealthSignal::UsageSnapshot {
-                windows: vec![window],
-                serving_credits: credits,
-            },
-            now(),
-        );
-        assert_cooling(&a, HealthReason::Quota, 20, "account");
-    }
-    a.apply_health_signal(
-        HealthSignal::UsageSnapshot {
-            windows: vec![window(1.0, 1.0, 20)],
-            serving_credits: false,
-        },
-        now(),
-    );
-    assert_cooling(&a, HealthReason::Quota, 20, "account");
-    a.apply_health_signal(
-        HealthSignal::UsageSnapshot {
-            windows: vec![window(1.0, 1.0, 30)],
-            serving_credits: false,
-        },
-        now(),
-    );
-    assert_eq!(a.health, Health::Ready);
-    a.allow_credits = true;
-    assert!(!a.apply_health_signal(
-        HealthSignal::UsageSnapshot {
-            windows: vec![window(98.0, 99.0, 20)],
-            serving_credits: true
-        },
-        now()
-    ));
-    let mut limited = window(1.0, 1.0, 40);
-    limited.limit_reached = true;
-    a.apply_health_signal(
-        HealthSignal::UsageSnapshot {
-            windows: vec![window(100.0, 100.0, 20), limited],
-            serving_credits: false,
-        },
-        now(),
-    );
-    assert_cooling(&a, HealthReason::Quota, 40, "account");
 }
 
 #[test]
@@ -470,4 +298,750 @@ fn c5_reimport_preserves_metadata_and_only_newer_tokens_clear_needs_relogin() {
         events.lock().unwrap().last(),
         Some((Health::NeedsRelogin { .. }, Health::Ready))
     ));
+}
+
+mod runtime_regressions {
+    //! Synthetic regressions through the runtime that production relay calls.
+    use axum::http::{HeaderMap, StatusCode};
+    use chrono::{DateTime, Duration, Utc};
+    use qb_core::{
+        account_runtime::{AccountRuntime, HealthSignal},
+        accounts::{
+            Account, AccountStore, Health, HealthReason, Identity, Provider, StoreError, UserState,
+        },
+        observability::Observability,
+    };
+    use serde_json::{Value, json};
+    use std::{fs, sync::Arc};
+
+    struct Fixture {
+        runtime: Arc<AccountRuntime>,
+        ids: Vec<String>,
+        // Drop the store/runtime before removing synthetic files.
+        _home: tempfile::TempDir,
+    }
+    impl Fixture {
+        fn new(providers: &[Provider], allowance: f64) -> Self {
+            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../.sandbox/m4a1-runtime");
+            fs::create_dir_all(&root).unwrap();
+            let home = tempfile::tempdir_in(&root).unwrap();
+            fs::create_dir(home.path().join("accounts")).unwrap();
+            let ids = providers.iter().enumerate().map(|(index, provider)| {
+            let identity = match provider {
+                Provider::Codex => Identity::Codex { account_id: format!("synthetic-{index}"), email: "fixture@example.invalid".into() },
+                Provider::Claude => Identity::Claude { account_uuid: format!("synthetic-{index}"), organization_uuid: None, email: "fixture@example.invalid".into() },
+            };
+            let id = identity.id();
+            let record = json!({
+                "schema":1,"id":id,"provider":provider,"label":"synthetic",
+                "email":"fixture@example.invalid","plan":null,"identity":identity,
+                "source":{"kind":"oauth"},"user_state":"active","health":{"kind":"ready"},
+                "generation":1,"token_meta":{"expires_at":null,"last_refresh_at":null,"refresh_uncertain":false},
+                "secret_dpapi_b64":"synthetic-opaque-blob"
+            });
+            fs::write(home.path().join("accounts").join(format!("{id}.json")), serde_json::to_vec(&record).unwrap()).unwrap();
+            id
+        }).collect();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            let store = loop {
+                match AccountStore::acquire(home.path()) {
+                    Ok(store) => break Arc::new(store),
+                    Err(StoreError::LeaseBusy) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(10))
+                    }
+                    Err(error) => panic!("synthetic lease: {error}"),
+                }
+            };
+            let obs = Arc::new(Observability::new(home.path(), None).unwrap());
+            Self {
+                runtime: AccountRuntime::new(store, obs, allowance),
+                ids,
+                _home: home,
+            }
+        }
+        fn load(&self, index: usize) -> Account {
+            self.runtime.store.load(&self.ids[index]).unwrap()
+        }
+        async fn cool(
+            &self,
+            index: usize,
+            reason: HealthReason,
+            until: DateTime<Utc>,
+            scope: &str,
+        ) -> Account {
+            self.runtime
+                .transition(
+                    &self.ids[index],
+                    HealthSignal::Cooling {
+                        reason,
+                        until,
+                        scope: scope.into(),
+                    },
+                )
+                .await
+                .unwrap()
+        }
+        async fn snapshot(
+            &self,
+            windows: Vec<Value>,
+            signals: Value,
+            model: Option<&str>,
+        ) -> Account {
+            self.runtime
+                .apply_quota_snapshot(
+                    &self.ids[0],
+                    json!({"windows":windows,"signals":signals}),
+                    model,
+                )
+                .await
+                .unwrap()
+        }
+    }
+    fn window(name: &str, used: f64, reset: DateTime<Utc>, observed: DateTime<Utc>) -> Value {
+        json!({"name":name,"used_pct":used,"reset_at":reset,"observed_at":observed})
+    }
+    fn assert_cooling(account: &Account, reason: HealthReason, until: DateTime<Utc>, scope: &str) {
+        assert_eq!(
+            account.health,
+            Health::Cooling {
+                reason,
+                until,
+                scope: scope.into()
+            }
+        );
+    }
+    fn codex_headers(primary: f64, secondary: f64, now: DateTime<Utc>) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (slot, used, minutes, reset) in [
+            ("primary", primary, 300, now + Duration::hours(1)),
+            ("secondary", secondary, 10080, now + Duration::days(5)),
+        ] {
+            h.insert(
+                format!("x-codex-{slot}-used-percent")
+                    .parse::<axum::http::HeaderName>()
+                    .unwrap(),
+                used.to_string().parse().unwrap(),
+            );
+            h.insert(
+                format!("x-codex-{slot}-window-minutes")
+                    .parse::<axum::http::HeaderName>()
+                    .unwrap(),
+                minutes.to_string().parse().unwrap(),
+            );
+            h.insert(
+                format!("x-codex-{slot}-reset-at")
+                    .parse::<axum::http::HeaderName>()
+                    .unwrap(),
+                reset.timestamp().to_string().parse().unwrap(),
+            );
+        }
+        h
+    }
+
+    #[tokio::test]
+    async fn m2_two_window_credits_hold_uses_only_triggering_future_reset() {
+        let f = Fixture::new(&[Provider::Codex], 0.0);
+        let now = Utc::now();
+        f.runtime
+            .observe_headers(&f.ids[0], Provider::Codex, &codex_headers(99.0, 40.0, now))
+            .await;
+        assert_cooling(
+            &f.load(0),
+            HealthReason::Quota,
+            DateTime::from_timestamp((now + Duration::hours(1)).timestamp(), 0).unwrap(),
+            "account",
+        );
+        f.runtime
+            .transition(&f.ids[0], HealthSignal::Ready)
+            .await
+            .unwrap();
+        f.runtime
+            .observe_headers(&f.ids[0], Provider::Codex, &codex_headers(40.0, 99.0, now))
+            .await;
+        assert_cooling(
+            &f.load(0),
+            HealthReason::Quota,
+            DateTime::from_timestamp((now + Duration::days(5)).timestamp(), 0).unwrap(),
+            "account",
+        );
+    }
+
+    #[tokio::test]
+    async fn m2_exhausted_windows_latest_trigger_and_no_trigger_soonest() {
+        let f = Fixture::new(&[Provider::Codex], 0.0);
+        let now = Utc::now();
+        let short = now + Duration::hours(1);
+        let long = now + Duration::days(5);
+        for (primary, secondary, signals, expected) in [
+            (100.0, 40.0, json!({}), short),
+            (40.0, 100.0, json!({}), long),
+            (100.0, 100.0, json!({}), long),
+            (40.0, 40.0, json!({"limit_reached":true}), short),
+            (
+                40.0,
+                40.0,
+                json!({"limit_reached":true,"active_limit":"secondary"}),
+                long,
+            ),
+            (
+                40.0,
+                40.0,
+                json!({"serving_from_credits":true,"active_limit":"primary"}),
+                short,
+            ),
+            (40.0, 40.0, json!({"unified_status":"rejected"}), short),
+        ] {
+            f.runtime
+                .transition(&f.ids[0], HealthSignal::Ready)
+                .await
+                .unwrap();
+            let a = f
+                .snapshot(
+                    vec![
+                        window("5h", primary, short, now),
+                        window("7d", secondary, long, now),
+                    ],
+                    signals,
+                    None,
+                )
+                .await;
+            assert_cooling(&a, HealthReason::Quota, expected, "account");
+        }
+    }
+
+    #[tokio::test]
+    async fn m2_stale_merged_windows_do_not_recool_or_write() {
+        let f = Fixture::new(&[Provider::Codex], 0.0);
+        let now = Utc::now();
+        let before = f.load(0);
+        let a = f
+            .snapshot(
+                vec![
+                    window("5h", 100.0, now - Duration::seconds(1), now),
+                    window("7d", 20.0, now + Duration::days(5), now),
+                ],
+                json!({}),
+                None,
+            )
+            .await;
+        assert_eq!(a.health, Health::Ready);
+        assert_eq!(a.generation, before.generation);
+        let a = f
+            .snapshot(
+                vec![window("5h", 100.0, now - Duration::seconds(1), now)],
+                json!({"limit_reached":true}),
+                None,
+            )
+            .await;
+        assert_eq!(a, before);
+    }
+
+    #[tokio::test]
+    async fn s2_concurrent_coolings_keep_later_until_and_account_scope() {
+        let f = Fixture::new(&[Provider::Codex], 0.0);
+        let now = Utc::now();
+        let long = now + Duration::hours(5);
+        let (a, b) = tokio::join!(
+            f.cool(0, HealthReason::Quota, long, "account"),
+            f.cool(
+                0,
+                HealthReason::Rate,
+                now + Duration::seconds(11),
+                "model:x"
+            )
+        );
+        assert!(matches!(a.health, Health::Cooling { .. }));
+        assert!(matches!(b.health, Health::Cooling { .. }));
+        assert_cooling(&f.load(0), HealthReason::Quota, long, "account");
+        let later = long + Duration::hours(1);
+        f.cool(0, HealthReason::Permission, later, "model:x").await;
+        assert_cooling(&f.load(0), HealthReason::Permission, later, "account");
+        f.runtime
+            .transition(&f.ids[0], HealthSignal::Revoked("token_revoked".into()))
+            .await
+            .unwrap();
+        f.cool(
+            0,
+            HealthReason::Quota,
+            later + Duration::hours(1),
+            "account",
+        )
+        .await;
+        assert!(matches!(f.load(0).health, Health::NeedsRelogin { .. }));
+    }
+
+    #[tokio::test]
+    async fn s3_early_reset_requires_fresh_causing_window_and_shift_over_300_seconds() {
+        let f = Fixture::new(&[Provider::Codex], 0.0);
+        let now = Utc::now();
+        let reset = now + Duration::hours(1);
+        let weekly = now + Duration::days(5);
+        let cooled = f
+            .snapshot(
+                vec![
+                    window("5h", 100.0, reset, now),
+                    window("7d", 20.0, weekly, now),
+                ],
+                json!({}),
+                None,
+            )
+            .await;
+        let evidence = cooled.quota_cooling.clone().unwrap();
+        assert_eq!(evidence.window, "5h");
+        assert_eq!(evidence.reset_at, reset);
+        // Evidence survives a disk reload and unrelated metadata changes.
+        assert_eq!(f.load(0).quota_cooling, Some(evidence.clone()));
+        f.runtime
+            .change(&f.ids[0], None, Some("new label".into()), None, None)
+            .await
+            .unwrap();
+        let fresh = evidence.started_at + Duration::seconds(1);
+        for windows in [
+            vec![window(
+                "5h",
+                20.0,
+                reset + Duration::seconds(301),
+                evidence.started_at,
+            )],
+            vec![window("7d", 20.0, weekly + Duration::hours(1), fresh)],
+            vec![window("5h", 20.0, reset + Duration::seconds(1), fresh)],
+            vec![window("5h", 20.0, reset + Duration::seconds(300), fresh)],
+            vec![window("5h", 100.0, reset + Duration::seconds(301), fresh)],
+        ] {
+            let a = f.snapshot(windows, json!({}), None).await;
+            assert!(matches!(a.health, Health::Cooling { .. }));
+        }
+        // The depleted observation above extends cooling and starts new evidence.
+        let current = f.load(0).quota_cooling.unwrap();
+        let a = f
+            .snapshot(
+                vec![window(
+                    "5h",
+                    20.0,
+                    current.reset_at - Duration::seconds(301),
+                    current.started_at + Duration::seconds(1),
+                )],
+                json!({}),
+                None,
+            )
+            .await;
+        assert_eq!(a.health, Health::Ready);
+        assert!(a.quota_cooling.is_none());
+    }
+
+    #[tokio::test]
+    async fn s3_quota_rejection_without_window_evidence_cannot_reset_early() {
+        let f = Fixture::new(&[Provider::Codex], 0.0);
+        let now = Utc::now();
+        f.cool(0, HealthReason::Quota, now + Duration::hours(1), "account")
+            .await;
+        let a = f
+            .snapshot(
+                vec![window(
+                    "5h",
+                    10.0,
+                    now + Duration::hours(2),
+                    now + Duration::seconds(1),
+                )],
+                json!({}),
+                None,
+            )
+            .await;
+        assert!(matches!(a.health, Health::Cooling { .. }));
+        assert!(a.quota_cooling.is_none());
+    }
+
+    #[tokio::test]
+    async fn s4_unknown_model_eligible_but_matching_model_blocked() {
+        let f = Fixture::new(&[Provider::Codex], 0.0);
+        f.cool(
+            0,
+            HealthReason::Permission,
+            Utc::now() + Duration::hours(1),
+            "model:x",
+        )
+        .await;
+        assert!(f.runtime.eligible(&f.ids[0], None).await);
+        assert!(f.runtime.eligible(&f.ids[0], Some("other")).await);
+        assert!(!f.runtime.eligible(&f.ids[0], Some("x")).await);
+        f.runtime
+            .change(&f.ids[0], Some(UserState::Paused), None, None, None)
+            .await
+            .unwrap();
+        assert!(!f.runtime.eligible(&f.ids[0], None).await);
+    }
+
+    #[tokio::test]
+    async fn s5_subbucket_passive_rejection_only_cools_known_request_model() {
+        let f = Fixture::new(&[Provider::Claude], 0.0);
+        let now = Utc::now();
+        let reset = now + Duration::days(5);
+        let mut h = HeaderMap::new();
+        h.insert(
+            "anthropic-ratelimit-unified-7d_oi-utilization",
+            "1".parse().unwrap(),
+        );
+        h.insert(
+            "anthropic-ratelimit-unified-7d_oi-status",
+            "rejected".parse().unwrap(),
+        );
+        h.insert(
+            "anthropic-ratelimit-unified-7d_oi-reset",
+            reset.timestamp().to_string().parse().unwrap(),
+        );
+        h.insert(
+            "anthropic-ratelimit-unified-status",
+            "rejected".parse().unwrap(),
+        );
+        h.insert(
+            "anthropic-ratelimit-unified-representative-claim",
+            "7d_oi".parse().unwrap(),
+        );
+        f.runtime
+            .observe_headers(&f.ids[0], Provider::Claude, &h)
+            .await;
+        assert_eq!(f.load(0).health, Health::Ready);
+        f.runtime
+            .observe_headers_for_model(&f.ids[0], Provider::Claude, &h, Some("opus"))
+            .await;
+        assert_cooling(
+            &f.load(0),
+            HealthReason::Quota,
+            DateTime::from_timestamp(reset.timestamp(), 0).unwrap(),
+            "model:opus",
+        );
+        assert!(f.runtime.eligible(&f.ids[0], Some("sonnet")).await);
+        assert!(f.runtime.eligible(&f.ids[0], None).await);
+    }
+
+    #[tokio::test]
+    async fn s6_mixed_terminal_and_cooling_candidates_use_row14() {
+        let f = Fixture::new(&[Provider::Codex, Provider::Codex, Provider::Codex], 0.0);
+        f.runtime
+            .transition(&f.ids[0], HealthSignal::Revoked("token_revoked".into()))
+            .await
+            .unwrap();
+        f.cool(
+            1,
+            HealthReason::Quota,
+            Utc::now() + Duration::hours(1),
+            "account",
+        )
+        .await;
+        f.cool(
+            2,
+            HealthReason::Permission,
+            Utc::now() + Duration::hours(2),
+            "account",
+        )
+        .await;
+        for ws in [false, true] {
+            let response = f.runtime.unavailable(Provider::Codex, ws, None).await;
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert!(response.headers().contains_key("retry-after"));
+        }
+        f.runtime
+            .change(&f.ids[1], Some(UserState::Paused), None, None, None)
+            .await
+            .unwrap();
+        // Permission cooling is also temporary, so row 15 remains inappropriate.
+        assert_eq!(
+            f.runtime
+                .unavailable(Provider::Codex, false, None)
+                .await
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        f.runtime
+            .change(&f.ids[2], Some(UserState::Disabled), None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            f.runtime
+                .unavailable(Provider::Codex, false, None)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn s6_all_cooling_reasons_and_volatile_store_error_use_native_row14() {
+        let f = Fixture::new(&[Provider::Codex], 0.0);
+        // A stale cached limit must not be replayed for a different reason.
+        f.runtime.cache_limit(
+            &f.ids[0],
+            StatusCode::TOO_MANY_REQUESTS,
+            &HeaderMap::new(),
+            b"old cached quota",
+        );
+        for reason in [
+            HealthReason::LinkStale,
+            HealthReason::Permission,
+            HealthReason::Payment,
+            HealthReason::StoreError,
+        ] {
+            f.runtime
+                .transition(&f.ids[0], HealthSignal::Ready)
+                .await
+                .unwrap();
+            f.cool(0, reason, Utc::now() + Duration::minutes(5), "account")
+                .await;
+            for ws in [false, true] {
+                let response = f.runtime.unavailable(Provider::Codex, ws, None).await;
+                assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+                assert!(response.headers().contains_key("retry-after"));
+                let raw = axum::body::to_bytes(response.into_body(), 65536)
+                    .await
+                    .unwrap();
+                let body: Value = serde_json::from_slice(&raw).unwrap();
+                assert_eq!(body["error"]["type"], "usage_limit_reached");
+            }
+        }
+        f.runtime
+            .transition(&f.ids[0], HealthSignal::Ready)
+            .await
+            .unwrap();
+        let mut warning = f.load(0);
+        warning.health = Health::Cooling {
+            reason: HealthReason::StoreError,
+            until: Utc::now() + Duration::minutes(5),
+            scope: "account".into(),
+        };
+        f.runtime.emit_account(&warning);
+        assert_eq!(f.load(0).health, Health::Ready);
+        for ws in [false, true] {
+            let response = f.runtime.unavailable(Provider::Codex, ws, None).await;
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert!(response.headers().contains_key("retry-after"));
+            let raw = axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&raw).unwrap();
+            assert_eq!(body["error"]["type"], "usage_limit_reached");
+        }
+    }
+
+    #[tokio::test]
+    async fn s6_genuine_limit_cache_wins_over_sooner_nonlimit_cooling() {
+        let f = Fixture::new(&[Provider::Codex, Provider::Codex], 0.0);
+        f.cool(
+            0,
+            HealthReason::LinkStale,
+            Utc::now() + Duration::minutes(1),
+            "account",
+        )
+        .await;
+        let until = Utc::now() + Duration::hours(1);
+        f.cool(1, HealthReason::Quota, until, "account").await;
+        let mut headers = HeaderMap::new();
+        headers.insert("content-encoding", "gzip".parse().unwrap());
+        f.runtime.cache_limit(
+            &f.ids[1],
+            StatusCode::TOO_MANY_REQUESTS,
+            &headers,
+            b"synthetic encoded quota",
+        );
+        let response = f.runtime.unavailable(Provider::Codex, false, None).await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()["content-encoding"], "gzip");
+        assert!(
+            response.headers()["retry-after"]
+                .to_str()
+                .unwrap()
+                .parse::<i64>()
+                .unwrap()
+                > 3000
+        );
+        let raw = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        assert_eq!(&raw[..], b"synthetic encoded quota");
+    }
+
+    #[tokio::test]
+    async fn n5_inflight_allowance_counts_each_request_on_that_account() {
+        let f = Fixture::new(&[Provider::Codex, Provider::Codex], 0.5);
+        let now = Utc::now();
+        let reset = now + Duration::hours(1);
+        let other = f.runtime.track_inflight(&f.ids[1]);
+        let first = f.runtime.track_inflight(&f.ids[0]);
+        assert_eq!(f.runtime.inflight_count(&f.ids[0]), 1);
+        let a = f
+            .snapshot(vec![window("5h", 98.0, reset, now)], json!({}), None)
+            .await;
+        assert_eq!(a.health, Health::Ready);
+        let second = f.runtime.track_inflight(&f.ids[0]);
+        assert_eq!(f.runtime.inflight_count(&f.ids[0]), 2);
+        let a = f
+            .snapshot(vec![window("5h", 98.0, reset, now)], json!({}), None)
+            .await;
+        assert_cooling(&a, HealthReason::Quota, reset, "account");
+        drop(second);
+        drop(first);
+        drop(other);
+        assert_eq!(f.runtime.inflight_count(&f.ids[0]), 0);
+        assert_eq!(f.runtime.inflight_count(&f.ids[1]), 0);
+    }
+
+    #[tokio::test]
+    async fn n6_expired_auth_remains_probe_pending_until_success_and_uses_row14() {
+        let f = Fixture::new(&[Provider::Codex], 0.0);
+        // Transient refresh cooling deliberately does not increment auth_failures.
+        f.cool(
+            0,
+            HealthReason::Auth,
+            Utc::now() - Duration::seconds(1),
+            "account",
+        )
+        .await;
+        let account = f.load(0);
+        assert_eq!(account.health, Health::Ready);
+        assert_eq!(account.auth_failures, 0);
+        assert!(account.auth_probe_pending);
+        let views = f.runtime.views().await.unwrap();
+        assert_eq!(views[0]["health"]["probe_pending"], true);
+        assert_eq!(views[0]["probe_pending"], true);
+        let guard = f.runtime.begin_probe(&account).unwrap().unwrap();
+        assert!(f.runtime.begin_probe(&account).is_err());
+        assert!(!f.runtime.eligible(&account.id, None).await);
+        assert_eq!(
+            f.runtime
+                .unavailable(Provider::Codex, false, None)
+                .await
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        f.runtime.probe_success(&account.id).await.unwrap();
+        drop(guard);
+        assert!(!f.load(0).auth_probe_pending);
+        assert_eq!(
+            f.runtime.views().await.unwrap()[0]["health"]["kind"],
+            "ready"
+        );
+    }
+
+    #[tokio::test]
+    async fn c5_runtime_auth_backoff_saturates_and_terminal_state_is_not_resurrected() {
+        let f = Fixture::new(&[Provider::Codex], 0.0);
+        for (index, minutes) in [15, 30, 60, 120, 240, 240].into_iter().enumerate() {
+            let before = Utc::now();
+            let a = f
+                .runtime
+                .transition(&f.ids[0], HealthSignal::AuthFailure)
+                .await
+                .unwrap();
+            assert_eq!(a.auth_failures, index as u32 + 1);
+            let Health::Cooling {
+                reason: HealthReason::Auth,
+                until,
+                scope,
+            } = a.health
+            else {
+                panic!("expected auth cooling")
+            };
+            assert_eq!(scope, "account");
+            assert!(until >= before + Duration::minutes(minutes));
+            assert!(until <= Utc::now() + Duration::minutes(minutes));
+            f.runtime
+                .transition(&f.ids[0], HealthSignal::Ready)
+                .await
+                .unwrap();
+        }
+        f.runtime
+            .transition(&f.ids[0], HealthSignal::Revoked("token_revoked".into()))
+            .await
+            .unwrap();
+        f.runtime
+            .transition(&f.ids[0], HealthSignal::Ready)
+            .await
+            .unwrap();
+        assert!(matches!(f.load(0).health, Health::NeedsRelogin { .. }));
+    }
+
+    #[tokio::test]
+    async fn c5_runtime_reason_transitions_preserve_independent_user_state() {
+        let f = Fixture::new(&[Provider::Codex], 0.0);
+        f.runtime
+            .change(&f.ids[0], Some(UserState::Paused), None, None, None)
+            .await
+            .unwrap();
+        for reason in [
+            HealthReason::Quota,
+            HealthReason::Rate,
+            HealthReason::Permission,
+            HealthReason::Payment,
+            HealthReason::StoreError,
+            HealthReason::LinkStale,
+        ] {
+            f.runtime
+                .transition(&f.ids[0], HealthSignal::Ready)
+                .await
+                .unwrap();
+            let until = Utc::now() + Duration::hours(1);
+            let a = f.cool(0, reason, until, "account").await;
+            assert_cooling(&a, reason, until, "account");
+            assert_eq!(a.user_state, UserState::Paused);
+        }
+    }
+
+    #[tokio::test]
+    async fn n8_terminal_row15_uses_normative_message() {
+        let f = Fixture::new(&[], 0.0);
+        let response = f.runtime.unavailable(Provider::Codex, false, None).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let raw = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(
+            body["error"]["message"],
+            "quota-baton: no usable codex account — open the tray"
+        );
+    }
+    #[tokio::test]
+    async fn s3_same_limit_timestamp_jitter_preserves_causing_window_evidence() {
+        let f = Fixture::new(&[Provider::Codex], 0.0);
+        let now = Utc::now();
+        let reset = now + Duration::hours(1);
+        let cooled = f
+            .snapshot(vec![window("5h", 100.0, reset, now)], json!({}), None)
+            .await;
+        let evidence = cooled.quota_cooling.clone().unwrap();
+        f.cool(
+            0,
+            HealthReason::Quota,
+            reset + Duration::milliseconds(20),
+            "account",
+        )
+        .await;
+        assert_eq!(f.load(0).quota_cooling, Some(evidence.clone()));
+        let fresh = evidence.started_at + Duration::seconds(1);
+        f.snapshot(
+            vec![window("5h", 20.0, reset + Duration::hours(1), fresh)],
+            json!({}),
+            None,
+        )
+        .await;
+        assert_eq!(f.load(0).health, Health::Ready);
+    }
+    #[tokio::test]
+    async fn m2_reset_only_headers_preserve_known_active_window_reset() {
+        let f = Fixture::new(&[Provider::Codex], 0.0);
+        let reset = Utc::now() + Duration::hours(1);
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-codex-limit-reached", "true".parse().unwrap());
+        headers.insert("x-codex-active-limit", "primary".parse().unwrap());
+        headers.insert(
+            "x-codex-primary-reset-at",
+            reset.timestamp().to_string().parse().unwrap(),
+        );
+        f.runtime
+            .observe_headers(&f.ids[0], Provider::Codex, &headers)
+            .await;
+        assert!(
+            matches!(f.load(0).health,Health::Cooling {until,..} if (until-reset).num_seconds().abs()<=1)
+        );
+    }
 }
