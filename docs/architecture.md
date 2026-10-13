@@ -188,6 +188,7 @@ The later API-key providers implement the same trait without OAuth.
    - Send the body unchanged (C4).
 7. **Commit point.** Commit is the first upstream event that is not an error: the first SSE `data` event, or a non-SSE 2xx body.
    - Response headers and leading events wait in a bounded hold, at most 64 KiB and 10 s. Then they are released together.
+   - This hold is separate from the rate hold (contract C6.3) and the reset hold (C7). Those wait **before** an attempt is sent, not after its headers arrive.
    - Before commit, a failover-eligible outcome (C6) may retry on another account from the retained copy. That includes an error status or an error event that arrives first.
    - After commit, nothing is retried, and errors are relayed in-stream unchanged.
 8. **Stream the response** chunk by chunk.
@@ -585,6 +586,7 @@ Phase 0 runs against the real upstreams on a **shadow port (10200)**:
 | V5 | **Usage endpoints** (`wham/usage`, Claude OAuth usage): exact shape, required headers, an honest `User-Agent`. | The parsed snapshot matches the CLI's own `/status`. If there is no Claude endpoint, use the fallback in §8. |
 | V6 | **OAuth login and refresh** for both providers, with an honest `User-Agent`. | Tokens obtained and the refresh token rotates |
 | V7 | **Pass-through of** `/v1/alpha/search`, `/v1/images/*` and `/v1/models?client_version=`. `/v1/responses/compact` is dormant in Codex 0.162.1, so it stays an untested pass-through. | 200 from the real client |
+| V8 | **Genuine Codex WebSocket rate limit** (D14, contract C6.3). Record which of these occur: a handshake 429, an error frame with or without `headers`, `response.failed` with `rate_limit_exceeded`, or a close. Also record whether the socket stays usable afterwards. Observe it opportunistically, from the ledger and from captures of real traffic, rather than by provoking it. | Confirms which C6.3 WebSocket case applies. Until then, all four cases are implemented. |
 
 **V2 procedure.**
 

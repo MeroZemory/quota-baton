@@ -77,6 +77,7 @@ These rules apply to the data port and the admin port alike.
 
 - Forward the status code and every header except hop-by-hop headers. Keep `Content-Encoding` and do not decode.
 - Add `x-quota-baton-account: <local account id>`. This is a short local id, never an email or an upstream identifier.
+- On an HTTP rate 429 relayed after the rate hold (C6.3), add `retry-after` when it is absent. Use integer seconds, computed after jitter, at least 1 and never above 60; the Claude SDK ignores larger values. This cannot be done for a WebSocket error frame, because frames are payload (C4).
 
 ## C4. Body invariance
 
@@ -106,7 +107,7 @@ Each account has two independent fields:
 
 `reason` is one of:
 - `quota` (usage window exhausted, observed or rejected)
-- `rate` (short rate limit)
+- `rate` (reserved; data-plane rate limits use pacing instead, C6.3)
 - `auth` (a 401 that persists after a successful refresh)
 - `permission` (403 with a known model)
 - `payment` (402)
@@ -136,7 +137,7 @@ Each account has two independent fields:
 | `ready` | Usage limit rejection (C6 row 2) | `cooling(quota, until=reset_at, scope)` |
 | `ready` | Usage snapshot shows an **account window** (`5h`, `7d`, Codex primary or secondary) at 100 % or more, or `limit_reached`, or a Codex account is serving from credits and `allow_credits=false` | `cooling(quota, until=<reset_at of the limiting window>, account)`. The limiting window is the one at or over its limit (for credits: **observed** ≥ 99 %, or the one named by `x-codex-active-limit`; a projection never cools, C7). Never use the latest reset across all windows (M4a review M1, M2). If several windows are at their limit, use the **latest** of *those* resets. If no window qualifies, use the soonest known reset. |
 | `ready` | A **sub-bucket** window (e.g. Claude `7d_oi`) at 100 % or more | `cooling(quota, until=<its reset>, model:<the request's model>)`. With the model unknown, no change. Sub-buckets never cool the whole account (M4a review S5; matches row 2). |
-| `ready` | Rate limit with `Retry-After` > `rate_hold_secs` (C6 row 3, C6.3) | `cooling(rate, until=now+retry_after, model or account)` |
+| — | Request-rate limit (C6 row 3), whatever its `Retry-After` | **no health change**. Per-account pacing only (C6.3). Data-plane 429s no longer produce `cooling(rate)` (D14, review M5). |
 | `ready` | 403 when the request's model is known (C6 row 6) | `cooling(permission, until=now+1h, model:<model>)` |
 | — | 403 when the model is unknown (always the case for Codex) | **no account-wide change**. Handled per request (C6 row 6). |
 | `ready` | 402 | `cooling(payment, until=now+6h, account)` |
@@ -162,7 +163,7 @@ Each account has two independent fields:
 |---|---|---|---|---|
 | 1 | 2xx | — | Relayed stream or body | Quota snapshot updated from headers (C9) |
 | 2 | Usage limit: Claude 429 with unified `5h` or `7d` status `rejected` (sub-bucket only, e.g. `7d_oi`, means model scope); Codex 429 or error type `usage_limit_reached`, or `x-codex-limit-reached: true` | Failover | Next account's response; if none is eligible, row 14 | `cooling(quota, until=reset)` |
-| 3 | Other 429 (rate limit without a window rejection). Live example (Codex, 2026-10-14): body `{"detail":"Rate limit exceeded"}`, no `usage_limit_reached`. This is a short request-rate limit, not quota. | **Rate hold** on the same account (C6.3). Failover only if `Retry-After` > `rate_hold_secs` | The in-place retry's response; after the hold budget, the 429 as is (with `retry-after`), or the next account's for a long `Retry-After` | Row 3 of C5 only if `Retry-After` > `rate_hold_secs`; otherwise none (pacing only, C6.3) |
+| 3 | Request-rate limit: status 429 without a quota signal (row 2); a Codex `error.code` of `rate_limit_exceeded` or `slow_down`; a Claude `error.type` of `rate_limit_error` without a window rejection. Live example (Codex via the previous proxy, 2026-10-14): body `{"detail":"Rate limit exceeded"}`. **Not** row 3: WebSocket frames whose `error.code` is `websocket_connection_limit_reached` or `previous_response_not_found`. They are relayed at once, whatever their `status`, and Codex reconnects by itself. | **Rate hold** on the same account (C6.3). **Never** failover. | The in-place retry's response, or after the hold the 429 as is (C3 adds `retry-after`) | None. Pacing only (C6.3) |
 | 4 | 401 whose body signals revocation: Codex "invalidated oauth token" text or code `token_revoked`, or an Anthropic `authentication_error` saying the token was revoked | Failover | Next account's response; if none, row 15 | `needs_relogin` |
 | 5 | Other 401, from the data plane **or a usage poll** (R8 I-07) | If the failed token is not current, retry once with the current token.<br>If it is current:<br>• **owned** account: a single-flight refresh, then one retry<br>• **linked** account: a single re-read of the CPA file, then one retry if the file holds a newer token<br>A terminal refresh error, a 401 with the new token, (linked) no newer token, **or a refresh that is transient, skipped or throttled** triggers failover (M4a review M4). In the last case the account gets `cooling(auth, 5 min)` so it is not reselected at once. | Next account's response; if none, row 14 or row 15 | Per C5: `needs_relogin` on a terminal refresh error. `cooling(auth)` on a 401 with a new token. Linked with no newer token: `cooling(link_stale)` |
 | 6 | 403 | Failover. If a **second** account also returns 403 for the same request, stop and relay that response. | Next account's response, or the second 403 as is | Known model: `cooling(permission, model)`. Unknown model: none. **Account-level denial** (e.g. Claude "OAuth ... not allowed for this organization"): `cooling(permission, account, 6h)` plus a tray notice (R8 I-18). |
@@ -181,10 +182,10 @@ Close with 1012 **only if** a different eligible account exists for the reconnec
 1. Add the pinned account to the session key's **reconnect exclusion** (TTL 120 s, in memory), so that the reconnect cannot reselect it.
 2. Do **not** relay the frame.
 3. Close the client socket with 1012.
-Otherwise relay the error frame as is, which ends the turn without burning Codex's retries. Codex reconnects with full input, and row 13 selects another account.<br>A **rate** error (row 3) never closes with 1012: it follows C6.3 (the frame is held for the pacing delay, then relayed on the same socket). | No error; the turn continues on another account | As in rows 2–7 |
+Otherwise relay the error frame as is, which ends the turn without burning Codex's retries. Codex reconnects with full input, and row 13 selects another account.<br>A **rate** error (row 3) follows C6.3 instead: never a reconnect exclusion, never a move to another account. | No error; the turn continues on another account | As in rows 2–7 |
 | 13b | WebSocket: an error frame after commit, or any other error | — | Frame relayed as is | As in rows 2–12 |
 | 13c | WebSocket: the pinned account becomes ineligible while the socket is idle | — | Client socket closed (1000); Codex reconnects silently on its next request | — |
-| 14 | No eligible account, and **at least one** active account is in `cooling(quota, rate or auth)` or has an auth probe running (M4a review S6). A poll of every candidate runs first (C9). | — | **HTTP:** 429. Replay the cached genuine limit response of the account whose reset comes soonest (status, body and limit headers, at most 64 KiB, with the original `Content-Encoding` kept), with `retry-after` set to the remaining seconds. Without a cache, use the synthesized shape (C6.2). **WebSocket upgrade:** native 429 with a `usage_limit_reached` body, which is terminal for Codex. | — |
+| 14 | No eligible account, and **at least one** active account is in `cooling(quota or auth)` or has an auth probe running (M4a review S6). A poll of every candidate runs first (C9). | — | **HTTP:** 429. Replay the cached genuine limit response of the account whose reset comes soonest (status, body and limit headers, at most 64 KiB, with the original `Content-Encoding` kept), with `retry-after` set to the remaining seconds. Without a cache, use the synthesized shape (C6.2). **WebSocket upgrade:** native 429 with a `usage_limit_reached` body, which is terminal for Codex. | — |
 | 15 | No usable account at all, and no active account is in a cooling that will expire. The accounts are `needs_relogin`, `paused`, `disabled`, or none are configured. | — | **400** in native shape, type `invalid_request_error`, message "quota-baton: no usable <provider> account — open the tray". It is terminal in both clients, so there are no retry storms and no sticky HTTP fallback. The user has to act anyway. | — |
 | 16 | Memory guard tripped | — | 503 with `Retry-After: 5` | — |
 | 17 | In-flight budget exhausted, or the body exceeds the per-request cap | The request is forwarded **without** a retained copy, so it has no failover | Upstream response as is | — |
@@ -206,20 +207,66 @@ Rules for answering a WebSocket upgrade:
 
 ### C6.3 Rate hold and per-account pacing (D14)
 
-A request-rate 429 (row 3) means the account is being asked too fast, not that it is out of quota. Moving sessions to another account throws away their prompt cache: each moved session re-sends its whole context uncached, and that pushes the other account over its rate limit too. This cascade was observed live on 2026-10-14 under the previous proxy (60 re-bindings at 01:30 KST, 150–350k uncached tokens per moved session). Rate limits are therefore absorbed on the same account.
+A request-rate limit (row 3) means the account is being asked too fast, not that it is out of quota. Moving sessions to another account throws away their prompt cache: each moved session re-sends its whole context uncached, and that pushes the other account over its rate limit too. This cascade was observed live on 2026-10-14 under the previous proxy (60 re-bindings at 01:30 KST, 150–350k uncached tokens per moved session).
 
-- **Pacing state.** Per account, in memory only: `rate_backoff_until` and `rate_step`. It is not a health state. It is not persisted, never changes eligibility and never moves a binding.
-  - A rate 429 sets `rate_step = min(rate_step + 1, 5)`.
-  - It also sets `rate_backoff_until = now + max(retry_after, 2^(rate_step - 1) s)`, with ±20 % jitter. Without a `Retry-After` the delays are 1, 2, 4, 8 and 16 s.
-  - A committed 2xx on the account resets `rate_step` to 0.
-- **Admission.** A request about to be sent to an account whose `rate_backoff_until` lies in the future waits until then. Waiting requests are released in arrival order, 250 ms apart. The wait counts against that request's hold budget.
-- **In-place retry** (HTTP and WebSocket upgrade, with a retained copy). On a pre-commit rate 429, wait for the pacing, then retry the same account from the retained copy. Repeat while the request's total hold time stays within `rate_hold_secs` (default 60). These retries count neither toward the 4-account limit nor toward the token and network budgets.
-- **Budget exhausted, or no retained copy** (row 17). Relay the last 429 as is. If it has no `retry-after`, add one with the remaining pacing seconds (at least 1). There is no failover and no cooling.
-- **Open WebSocket.** This covers a pre-commit error event answering a `response.create`. The proxy cannot replay the turn on the socket. It holds the error frame until `rate_backoff_until`, but for no longer than `rate_hold_secs`, and then relays it. Codex's own retry then resends on the same socket and account, so each of its retries is spaced by the pacing delay instead of being spent within seconds. The socket is never closed with 1012 for a rate error.
-- **Long rate limits.** Only a `Retry-After` greater than `rate_hold_secs` leads to `cooling(rate)` and failover (C5 row), as before.
-- **Placement.** New placements (C7 steps 3–5) skip an account that is pacing whenever another candidate at the same step is not pacing. This only affects placement. Bound sessions never move because of pacing.
-- **Ledger.** Record one `rate_hold` event per request that held: the account, the number of retries, the total wait, and the outcome (`ok` or `relayed_429`).
-- **Capacity is not the proxy's job.** If too many sessions keep one account rate-limited, the remedy is fewer concurrent sessions. That is the orchestrator's job (D14), not a reason to move warm sessions.
+Rate limits are therefore absorbed on the same account. A rate limit **never** moves a session and never causes failover. The design was independently reviewed (`.sandbox/reviews/D14-rate-hold-review.md`; F1–F10 refer to facts from the Codex 0.162.1 source).
+
+**Codex behaviour this relies on (review F2–F7).**
+- Codex retries a rate 429 only when the response carries retry advice: the HTTP `Retry-After` header, or a `headers` map inside a WebSocket error frame.
+- Without advice the turn ends at the first occurrence. The message "exceeded retry limit, last status: 429" is the error's name, not proof that five retries happened.
+- With advice, Codex retries up to 5 times and sleeps until the deadline each time.
+- It drops the WebSocket on any stream error and reconnects with the full input.
+- Its WebSocket connect timeout is 15 s.
+
+**Pacing state.** Each account has `rate_backoff_until`, `rate_step` and `rate_release_interval`, held in memory only.
+- **Not a health state.** It is not persisted, never changes eligibility and never moves a binding.
+- **Owner.** The account runtime owns it, under one lock. The HTTP relay, the upgrade path and the WebSocket pump all update it there.
+- **Backoff window.** A rate 429 starts or extends the window: `rate_backoff_until = max(rate_backoff_until, now + max(retry_after, 2^rate_step s))`, with ±20 % jitter. The window is never shortened.
+- **Step.** A 429 raises `rate_step` (cap 5) only if its request was **sent after** the current window was set. That makes one step per window, not one per 429 in flight. `rate_step` decays by one after each full backoff interval with no rate 429. A committed 2xx does **not** reset it.
+- **Release interval.** It starts at 250 ms. It doubles for each backoff window that saw a rate 429, up to 5 s. It shrinks by 25 % after each 60 s with no rate 429, down to 250 ms.
+
+**Admission.** Every request to an account passes its admission gate, whether or not it has a retained copy.
+- The gate is open when `now ≥ rate_backoff_until` and the previous release was at least `rate_release_interval` ago.
+- Waiting requests are released in arrival order, one per interval. One release task per account enforces the spacing.
+- While a request waits, its body is retained or back-pressured.
+- A request whose wait reaches `rate_hold_secs` (default 60) is sent anyway, once. Its response is relayed as is, and C3 adds `retry-after` to a 429. The proxy never synthesizes a rate 429; answering with a synthesized 429 at once was the previous proxy's fail-fast failure.
+
+**HTTP: retry in place.** This applies to a pre-commit rate 429 when the request has a retained copy.
+- Pass the admission gate again, then retry the same account from the retained copy.
+- Retry at most `rate_hold_max_retries` times (default 3), keeping the total hold within `rate_hold_secs`.
+- These retries count neither toward the 4-account limit nor toward the token and network budgets. The ledger's `attempts` does include them.
+- After the last retry, relay the last 429 as is. Do the same at once when the request has no retained copy (C6 row 17).
+- During a storm, retained copies count against the in-flight budget (architecture §13). When it runs out, later requests have no retained copy, so their 429 is relayed.
+
+**WebSocket upgrade.** No hold on an upgrade lasts longer than `ws_upgrade_hold_secs` (default 10), because Codex's connect timeout is 15 s. This covers both the rate hold and the C7 reset hold. If the pacing ends later than that, answer the upgrade at once as if the hold had expired.
+
+**Open WebSocket, pre-commit rate error.** The proxy keeps the last `response.create` of each socket until commit. Codex sends nothing else on the socket before commit. This copy counts against the in-flight budget, like an HTTP retained copy. Take the first case that applies:
+1. **The upstream socket is still open.** Wait for the pacing delay, then resend the kept message on the same upstream socket. Do not relay the error frame. The pacing delays together stay within `rate_hold_secs`, with at most `rate_hold_max_retries` resends.
+2. **The upstream socket closed, and the message has no `previous_response_id`.** Dial a new upstream socket on the same account, subject to admission, and resend the message there.
+3. **The error frame carries retry advice.** Relay it as is, immediately. Codex retries after the advised delay.
+4. **Otherwise.** Do not relay the frame. Close the client socket with 1012, with **no** reconnect exclusion. Codex treats the close as retryable and reconnects with the full input. The binding is unchanged, so the reconnect goes back to the same account, and admission paces its upgrade (at most `ws_upgrade_hold_secs`). Relaying the frame would end the turn at once (F3).
+
+If the upstream socket closes while a resend is pending, close the client socket with the same code.
+
+Phase 0 item **V8** observes the genuine `wss://chatgpt.com` rate-limit shape. It records which of these occur:
+- a handshake 429
+- an error frame, with or without `headers`
+- `response.failed` with `rate_limit_exceeded`
+- a close
+
+It also records whether the socket stays usable afterwards.
+
+**Placement.** New placements (C7 steps 3–5) skip an account that is pacing whenever another candidate at the same step is not pacing. This affects placement only. Bound sessions never move because of pacing.
+
+**Ceiling.** Absorption is bounded. Under a sustained limit, a Codex HTTP turn survives about (5 + 1) × (`rate_hold_secs` + the advised delay), roughly 5–6 min. After that, Codex's own budget ends the turn. A limit that lasts that long means too many sessions share the account. Reducing them is the orchestrator's job (D14), never a reason to move warm sessions.
+
+**Observability.**
+- `AccountView` (C11) gains `pacing {backoff_until, step, release_interval_ms, waiting}`.
+- The tray shows a pacing account as "속도 조절 중".
+- The ledger records, per request:
+  - `rate_wait_ms` and `rate_retries`
+  - the outcome `rate_hold_ok` or `rate_hold_relayed_429`
+- The ledger also counts relayed 429s per session.
 
 ## C7. Selection policy
 
@@ -248,7 +295,7 @@ These rules come from the P2 blind panel (`.sandbox/reviews/switch-policy-blind-
 1. If the session key is bound to account A, and A is eligible (C5) and not yet tried, use A. Two exceptions:
    - **Reset hold:** A is in `cooling(quota)` and its limiting window resets within `reset_hold_secs` (default 60). Hold the request until the reset instead of moving it; the cache is still warm.
      - **During a request (F3).** The hold also applies when A answers *this* request with a pre-commit usage limit whose reset is within `reset_hold_secs`. The request then waits until the reset and retries A once from the retained copy, instead of failing over. This applies to HTTP, and to a WebSocket **upgrade**. An error on an already-open socket keeps the row 13a behaviour.
-     - **Bound (S2).** The hold never exceeds `reset_hold_secs`, which stays well below both clients' timeouts (Claude Code 600 s; Codex stream idle 300 s). If the reset has not taken effect when the hold ends, normal failover applies at once. No separate client-timeout estimate is used.
+     - **Bound (S2).** The hold never exceeds `reset_hold_secs`, which stays well below both clients' timeouts (Claude Code 600 s; Codex stream idle 300 s). On a WebSocket **upgrade** it never exceeds `ws_upgrade_hold_secs` (10 s), because Codex's connect timeout is 15 s (C6.3). If the reset has not taken effect when the hold ends, normal failover applies at once. No separate client-timeout estimate is used.
      - **Scope (S3).** The hold is per request. A request whose hold ended does not stop the next request of that session from holding.
    - **Cold point:** see below.
 2. Else, if the parent key is bound to account P, P is eligible and P has not been tried, bind the session to P and use it.
@@ -402,6 +449,7 @@ Base: `http://127.0.0.1:<admin_port>/admin/v1`. Every route requires `Authorizat
 - `id`, `provider`, `label`, `email`, `plan`
 - `user_state`, `health` (including `reason`, `until` and `scope`)
 - `windows[]`, `credits`
+- `pacing {backoff_until, step, release_interval_ms, waiting}` (C6.3)
 - `last_used_at`, `bound_sessions`
 - `token_expires_at`
 
@@ -425,7 +473,9 @@ gate_weekly_near_reset_pct = 98     # applies within near_reset_secs of the week
 near_reset_secs = 18000
 inflight_allowance_pct = 1          # per in-flight request, added to projected usage; tuned from the ledger
 reset_hold_secs = 60
-rate_hold_secs = 60                 # C6.3 total in-place hold per request for request-rate 429s
+rate_hold_secs = 60                 # C6.3 total hold per request for request-rate 429s
+rate_hold_max_retries = 3           # C6.3 in-place retries per request
+ws_upgrade_hold_secs = 10           # any hold on a WebSocket upgrade; Codex connect timeout is 15 s
 rebalance_idle_secs = 3600          # cold point; >= the longest prompt-cache TTL in use
 session_binding_max_secs = 604800
 
