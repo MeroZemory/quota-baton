@@ -289,6 +289,12 @@ async fn upgrade_inner(
                 &error.raw,
                 None,
             );
+            if super::credentials::is_linked(&account)
+                && decision.kind == super::outcome::Kind::Revoked
+            {
+                decision.kind = super::outcome::Kind::Auth;
+                decision.signal = None;
+            }
             if !current_token
                 && matches!(
                     decision.kind,

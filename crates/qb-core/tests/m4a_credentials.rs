@@ -139,6 +139,332 @@ async fn c5_linked_stale_401_newer_token_recovery_and_stale_race() {
 }
 
 #[tokio::test]
+async fn m51_linked_first_request_reloads_without_near_expiry() {
+    let _serial = SERIAL.lock().await;
+    for provider in [Provider::Claude, Provider::Codex] {
+        let f = Fixture::new(true, 60, provider);
+        f.newer_link();
+        let (account, tokens) = f
+            .gates()
+            .before_request(f.store.clone(), f.obs.clone(), f.account.id.clone())
+            .await
+            .unwrap();
+        assert_eq!(tokens.access_token, "synthetic-access-new");
+        assert_eq!(account.health, Health::Ready);
+    }
+}
+
+#[tokio::test]
+async fn m51_startup_and_prepoll_reload_are_unthrottled_and_recover_legacy_health() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new(true, 60, Provider::Codex);
+    let gates = f.gates();
+    // Occupy request/selection admission before the startup and poll reloads.
+    gates
+        .before_request(f.store.clone(), f.obs.clone(), f.account.id.clone())
+        .await
+        .unwrap();
+    for health in [
+        Health::NeedsRelogin {
+            reason: "legacy-revoked".into(),
+            since: Utc::now(),
+        },
+        Health::Cooling {
+            reason: HealthReason::LinkStale,
+            until: Utc::now() + ChronoDuration::hours(1),
+            scope: "account".into(),
+        },
+    ] {
+        f.store
+            .update_metadata(&f.account.id, |account| {
+                account.health = health;
+                account.auth_failures = 3;
+                account.auth_probe_pending = true;
+            })
+            .unwrap();
+        f.newer_link();
+        let updated = gates
+            .reload_linked(
+                f.store.clone(),
+                f.obs.clone(),
+                f.account.id.clone(),
+                "prepoll",
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.health, Health::Ready);
+        assert_eq!(updated.auth_failures, 0);
+        assert!(!updated.auth_probe_pending);
+        let persisted = f.store.load(&updated.id).unwrap();
+        assert_eq!(persisted.health, Health::Ready);
+        assert_eq!(
+            persisted.token_meta.last_refresh_at,
+            updated.token_meta.last_refresh_at
+        );
+    }
+}
+
+#[tokio::test]
+async fn m51_linked_401_reloads_before_legacy_needs_relogin_guard() {
+    let _serial = SERIAL.lock().await;
+    for newer in [false, true] {
+        let f = Fixture::new(true, 60, Provider::Claude);
+        let legacy = f
+            .store
+            .update_metadata(&f.account.id, |account| {
+                account.health = Health::NeedsRelogin {
+                    reason: "legacy-revoked".into(),
+                    since: Utc::now(),
+                };
+            })
+            .unwrap();
+        let failed = f.store.tokens(&legacy).unwrap();
+        if newer {
+            f.newer_link();
+        }
+        let retry = f
+            .gates()
+            .after_401(f.store.clone(), f.obs.clone(), legacy, &failed)
+            .await
+            .unwrap();
+        assert_eq!(retry.is_some(), newer);
+        let current = f.store.load(&f.account.id).unwrap();
+        if newer {
+            assert_eq!(current.health, Health::Ready);
+            assert_eq!(retry.unwrap().1.access_token, "synthetic-access-new");
+        } else {
+            assert!(matches!(
+                current.health,
+                Health::Cooling {
+                    reason: HealthReason::LinkStale,
+                    ..
+                }
+            ));
+        }
+    }
+}
+
+#[tokio::test]
+async fn m51_exhausted_linked_retry_rereads_and_persists_without_auth_backoff() {
+    let _serial = SERIAL.lock().await;
+    for newer in [false, true] {
+        let f = Fixture::new(true, 60, Provider::Codex);
+        let gates = f.gates();
+        let failed = f.store.tokens(&f.account).unwrap();
+        if newer {
+            f.newer_link();
+        }
+        // auth_failed has no retry result: it can only persist the reload.
+        gates
+            .auth_failed(f.store.clone(), f.obs.clone(), f.account.clone(), &failed)
+            .await
+            .unwrap();
+        let current = f.store.load(&f.account.id).unwrap();
+        assert_eq!(current.auth_failures, 0);
+        assert!(!current.auth_probe_pending);
+        if newer {
+            assert_eq!(current.health, Health::Ready);
+            assert_eq!(
+                f.store.tokens(&current).unwrap().access_token,
+                "synthetic-access-new"
+            );
+        } else {
+            assert!(matches!(
+                current.health,
+                Health::Cooling {
+                    reason: HealthReason::LinkStale,
+                    ..
+                }
+            ));
+            gates
+                .cool_unavailable_auth(f.store.clone(), &current, &failed)
+                .await
+                .unwrap();
+            assert_eq!(f.store.load(&current.id).unwrap().health, current.health);
+            // Expired link-stale must not become auth cooling either.
+            f.store
+                .update_metadata(&current.id, |account| {
+                    account.health = Health::Cooling {
+                        reason: HealthReason::LinkStale,
+                        until: Utc::now() - ChronoDuration::seconds(1),
+                        scope: "account".into(),
+                    };
+                })
+                .unwrap();
+            gates
+                .cool_unavailable_auth(f.store.clone(), &current, &failed)
+                .await
+                .unwrap();
+            assert!(!matches!(
+                f.store.load(&current.id).unwrap().health,
+                Health::NeedsRelogin { .. }
+                    | Health::Cooling {
+                        reason: HealthReason::Auth,
+                        ..
+                    }
+            ));
+        }
+    }
+}
+
+#[tokio::test]
+async fn m51_linked_stale_failed_token_still_rereads_cpa() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new(true, 60, Provider::Codex);
+    let failed = f.store.tokens(&f.account).unwrap();
+    let mut rotated = f.store.tokens(&f.account).unwrap();
+    rotated.access_token = "synthetic-concurrent-token".into();
+    f.store
+        .save(&f.account, &rotated, Some(f.account.generation))
+        .unwrap();
+    f.newer_link();
+    let (current, tokens) = f
+        .gates()
+        .after_401(f.store.clone(), f.obs.clone(), f.account.clone(), &failed)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(tokens.access_token, "synthetic-access-new");
+    assert_eq!(current.health, Health::Ready);
+}
+
+#[tokio::test]
+async fn m51_startup_stale_link_converts_legacy_needs_relogin() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new(true, 60, Provider::Codex);
+    f.store
+        .update_metadata(&f.account.id, |account| {
+            account.health = Health::NeedsRelogin {
+                reason: "legacy-revoked".into(),
+                since: Utc::now(),
+            };
+        })
+        .unwrap();
+    let current = f
+        .gates()
+        .reload_linked(
+            f.store.clone(),
+            f.obs.clone(),
+            f.account.id.clone(),
+            "startup",
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        current.health,
+        Health::Cooling {
+            reason: HealthReason::LinkStale,
+            ..
+        }
+    ));
+    assert_eq!(
+        f.store.tokens(&current).unwrap().access_token,
+        "synthetic-access-old"
+    );
+    assert_eq!(f.store.load(&current.id).unwrap().health, current.health);
+}
+
+#[tokio::test]
+async fn m51_second_linked_401_cools_current_retry_token() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new(true, 60, Provider::Claude);
+    let gates = f.gates();
+    let old = f.store.tokens(&f.account).unwrap();
+    f.newer_link();
+    let (current, retried) = gates
+        .after_401(f.store.clone(), f.obs.clone(), f.account.clone(), &old)
+        .await
+        .unwrap()
+        .unwrap();
+    gates
+        .auth_failed(f.store.clone(), f.obs.clone(), current, &retried)
+        .await
+        .unwrap();
+    let cooled = f.store.load(&f.account.id).unwrap();
+    assert!(matches!(
+        cooled.health,
+        Health::Cooling {
+            reason: HealthReason::LinkStale,
+            ..
+        }
+    ));
+    assert_eq!(cooled.auth_failures, 0);
+}
+
+#[tokio::test]
+async fn m51_stale_linked_401_never_cools_concurrently_replaced_token() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new(true, 60, Provider::Codex);
+    let gates = f.gates();
+    let old = f.store.tokens(&f.account).unwrap();
+    f.newer_link();
+    let (current, new) = gates
+        .after_401(f.store.clone(), f.obs.clone(), f.account.clone(), &old)
+        .await
+        .unwrap()
+        .unwrap();
+    // Even an expired replacement must not be cooled by a stale-token failure.
+    fs::remove_file(f.cpa.join("fixture.json")).unwrap();
+    let mut expired = current.clone();
+    expired.token_meta.last_refresh_at = Some(Utc::now());
+    expired.token_meta.expires_at = Some(Utc::now() - ChronoDuration::minutes(1));
+    let current = f
+        .store
+        .save(&expired, &new, Some(current.generation))
+        .unwrap();
+    let (after, tokens) = gates
+        .after_401(f.store.clone(), f.obs.clone(), current.clone(), &old)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.health, Health::Ready);
+    assert_eq!(tokens.access_token, new.access_token);
+    gates
+        .auth_failed(f.store.clone(), f.obs.clone(), current.clone(), &old)
+        .await
+        .unwrap();
+    assert_eq!(f.store.load(&current.id).unwrap().health, Health::Ready);
+    let after = gates
+        .revoke_if_current(f.store.clone(), &current, &old)
+        .await
+        .unwrap();
+    assert_eq!(after.health, Health::Ready);
+    assert_eq!(f.store.load(&current.id).unwrap().auth_failures, 0);
+}
+
+#[tokio::test]
+async fn m51_revoked_linked_fallback_rereads_and_never_revokes() {
+    let _serial = SERIAL.lock().await;
+    for newer in [false, true] {
+        let f = Fixture::new(true, 60, Provider::Claude);
+        let failed = f.store.tokens(&f.account).unwrap();
+        if newer {
+            f.newer_link();
+        }
+        let current = f
+            .gates()
+            .revoke_if_current(f.store.clone(), &f.account, &failed)
+            .await
+            .unwrap();
+        if newer {
+            assert_eq!(current.health, Health::Ready);
+            assert_eq!(
+                f.store.tokens(&current).unwrap().access_token,
+                "synthetic-access-new"
+            );
+        } else {
+            assert!(matches!(
+                current.health,
+                Health::Cooling {
+                    reason: HealthReason::LinkStale,
+                    ..
+                }
+            ));
+        }
+    }
+}
+
+#[tokio::test]
 async fn c5_linked_expired_no_newer_token_cools() {
     let _serial = SERIAL.lock().await;
     let f = Fixture::new(true, -1, Provider::Codex);

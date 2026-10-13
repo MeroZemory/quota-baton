@@ -92,7 +92,21 @@ impl Account {
         self.expire_health(now);
         match signal {
             HealthSignal::TerminalRefresh { reason } | HealthSignal::Revoked { reason } => {
-                self.health = Health::NeedsRelogin { reason, since: now };
+                self.health = if matches!(
+                    self.source,
+                    super::Source::Cpa {
+                        mode: super::ImportMode::Linked,
+                        ..
+                    }
+                ) {
+                    Health::Cooling {
+                        reason: HealthReason::LinkStale,
+                        until: now + Duration::minutes(5),
+                        scope: "account".into(),
+                    }
+                } else {
+                    Health::NeedsRelogin { reason, since: now }
+                };
                 self.quota_cooling = None;
                 self.auth_probe_pending = false;
             }
@@ -157,6 +171,17 @@ impl Account {
                 );
             }
             HealthSignal::LinkStale { retry_at } => {
+                if matches!(
+                    self.source,
+                    super::Source::Cpa {
+                        mode: super::ImportMode::Linked,
+                        ..
+                    }
+                ) && matches!(self.health, Health::NeedsRelogin { .. })
+                {
+                    self.health = Health::Ready;
+                    self.auth_probe_pending = false;
+                }
                 self.cool(HealthReason::LinkStale, retry_at, "account".into());
             }
         }
@@ -381,6 +406,47 @@ pub(crate) mod tests {
             allow_credits: false,
             generation: 0,
             token_meta: super::super::TokenMeta::default(),
+        }
+    }
+
+    #[test]
+    fn m51_linked_terminal_signals_cool_and_legacy_link_stale_recovers() {
+        let now = Utc::now();
+        for signal in [
+            HealthSignal::Revoked {
+                reason: "token_revoked".into(),
+            },
+            HealthSignal::TerminalRefresh {
+                reason: "invalid_grant".into(),
+            },
+            HealthSignal::LinkStale {
+                retry_at: now + Duration::minutes(5),
+            },
+        ] {
+            let mut owned = fixture();
+            owned.health = Health::NeedsRelogin {
+                reason: "legacy".into(),
+                since: now,
+            };
+            let mut linked = owned.clone();
+            linked.source = super::super::Source::Cpa {
+                mode: super::super::ImportMode::Linked,
+                dir: std::path::PathBuf::from("synthetic-unused-cpa"),
+                r#match: super::super::SourceMatch::from(&linked.identity),
+            };
+            owned.apply_health_signal(signal.clone(), now);
+            assert!(matches!(owned.health, Health::NeedsRelogin { .. }));
+            linked.apply_health_signal(signal, now);
+            assert_eq!(
+                linked.health,
+                Health::Cooling {
+                    reason: HealthReason::LinkStale,
+                    until: now + Duration::minutes(5),
+                    scope: "account".into(),
+                }
+            );
+            linked.apply_health_signal(HealthSignal::NewerLinkedToken, now);
+            assert_eq!(linked.health, Health::Ready);
         }
     }
 
