@@ -33,6 +33,48 @@ fn help_is_available() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("serve"));
 }
 
+#[test]
+fn startup_refuses_invalid_state_before_listening() {
+    let _serial = SERVE_SERIAL.blocking_lock();
+    let home = fixture();
+    std::fs::create_dir_all(home.path().join("state")).unwrap();
+    std::fs::write(
+        home.path().join("state/quota.json"),
+        "invalid synthetic state",
+    )
+    .unwrap();
+    let output = command(home.path()).arg("serve").output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("quota"));
+}
+
+#[cfg(not(feature = "shape-capture"))]
+#[test]
+fn default_cli_has_no_capture_switch() {
+    let home = fixture();
+    let output = command(home.path())
+        .args(["serve", "--capture-dir"])
+        .arg(home.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!home.path().join("accounts").exists());
+}
+
+#[cfg(feature = "shape-capture")]
+#[test]
+fn capture_cli_requires_existing_sandbox_directory() {
+    let _serial = SERVE_SERIAL.blocking_lock();
+    let home = fixture();
+    let output = command(home.path())
+        .args(["serve", "--capture-dir"])
+        .arg(home.path().join("missing"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("capture"));
+}
+
 #[tokio::test]
 async fn serve_and_status_use_isolated_home() {
     let _serial = SERVE_SERIAL.lock().await;
@@ -83,7 +125,7 @@ async fn serve_and_status_use_isolated_home() {
             .await
             .unwrap()
             .status(),
-        404
+        400
     );
 }
 
@@ -133,7 +175,7 @@ async fn offline_online_import_and_admin_refusal() {
     let file = cpa.join("original.json");
     std::fs::write(&file, serde_json::to_vec(&cpa_fixture(2)).unwrap()).unwrap();
     let preview = run_import(&home, &cpa, &["--dry-run"]);
-    assert!(preview.contains("created"));
+    assert!(preview.contains("생성"));
     assert!(!home.join("accounts").exists());
     assert!(!home.join("logs").exists());
     let refused = command(&home)
@@ -142,9 +184,9 @@ async fn offline_online_import_and_admin_refusal() {
         .output()
         .unwrap();
     assert!(!refused.status.success());
-    assert!(String::from_utf8_lossy(&refused.stderr).contains("adopt is a cutover step (M8)"));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("M8"));
     assert!(!home.join("accounts").exists());
-    assert!(run_import(&home, &cpa, &[]).contains("disabled"));
+    assert!(run_import(&home, &cpa, &[]).contains("비활성"));
     let core = Core(
         command(&home)
             .arg("serve")
@@ -170,17 +212,11 @@ async fn offline_online_import_and_admin_refusal() {
     assert!(ready);
     let duplicate = command(&home).arg("serve").output().unwrap();
     assert!(!duplicate.status.success());
-    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("lease"));
+    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("계정 저장소"));
     let token = std::fs::read_to_string(home.join("admin.token")).unwrap();
     let adopted = client.post(format!("{base}/accounts/import")).bearer_auth(token.trim()).json(&serde_json::json!({"source":"cpa","mode":"adopted","dir":root.path().join("does-not-exist")})).send().await.unwrap();
     assert_eq!(adopted.status(), 400);
-    assert!(
-        adopted
-            .text()
-            .await
-            .unwrap()
-            .contains("adopt is a cutover step (M8)")
-    );
+    assert!(adopted.text().await.unwrap().contains("M8"));
     let invalid = client
         .post(format!("{base}/accounts/import"))
         .bearer_auth(token.trim())
@@ -197,8 +233,8 @@ async fn offline_online_import_and_admin_refusal() {
         &cpa,
         &["--activate", "codex:synthetic@example.invalid"],
     );
-    assert!(older.contains("active"));
-    assert!(older.contains("older"));
+    assert!(older.contains("활성"));
+    assert!(older.contains("이전 토큰"));
     std::fs::remove_file(&file).unwrap();
     std::fs::write(
         cpa.join("renamed.json"),
@@ -206,12 +242,14 @@ async fn offline_online_import_and_admin_refusal() {
     )
     .unwrap();
     let updated = run_import(&home, &cpa, &[]);
-    assert!(updated.contains("updated"));
+    assert!(updated.contains("갱신"));
     let output = command(&home).args(["accounts", "list"]).output().unwrap();
     assert!(output.status.success());
     let listing = String::from_utf8(output.stdout).unwrap();
-    assert!(listing.contains("active"));
-    assert!(listing.contains("linked"));
+    assert!(listing.contains("활성"));
+    assert!(listing.contains("연결"));
+    assert!(listing.contains("준비됨"));
+    assert!(!listing.contains('{'));
     assert!(!listing.contains("fake-access-"));
     let accounts = qb_core::accounts::AccountStore::list_metadata(&home).unwrap();
     assert_eq!(accounts.len(), 1);

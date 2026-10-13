@@ -15,4 +15,11 @@ serde_json.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+qb-core = { workspace = true, features = ["testkit"] }
 tempfile.workspace = true
+qb-testkit.workspace = true
+
+[features]
+default = []
+testkit = ["qb-core/testkit"]
+shape-capture = ["qb-core/shape-capture"]
