@@ -29,6 +29,9 @@ enum Command {
         #[cfg(feature = "phase0")]
         #[arg(long, default_value_t = 20, requires = "capture_bodies_dir")]
         capture_bodies_limit: usize,
+        #[cfg(feature = "phase0")]
+        #[arg(long, help = "응답 완료 후 소켓을 닫아 합성 이식성 검사를 진행합니다")]
+        phase0_close_after_response: bool,
     },
     #[command(about = "상태를 확인합니다")]
     Status,
@@ -62,6 +65,7 @@ enum Phase0Command {
 
 #[tokio::main]
 async fn main() {
+    qb_core::set_console_utf8();
     if let Err(error) = run().await {
         eprintln!("실패했습니다: {}", friendly_error(&error));
         std::process::exit(1);
@@ -84,6 +88,9 @@ fn friendly_error(error: &anyhow::Error) -> String {
         return "코어와 통신하지 못했습니다. 실행 상태와 관리 토큰을 확인해 주세요.".into();
     }
     let detail = error.to_string();
+    if detail.contains("websocket.upstream_deflate") {
+        return "WebSocket upstream_deflate=true는 지원되지 않습니다. deflate 지원 라이브러리를 채택하기 전에는 false로 설정해 주세요.".into();
+    }
     if detail.contains("capture") {
         return "요청 구조를 기록할 폴더를 확인해 주세요. (capture-dir)".into();
     }
@@ -112,6 +119,8 @@ async fn run() -> anyhow::Result<()> {
             capture_bodies_dir,
             #[cfg(feature = "phase0")]
             capture_bodies_limit,
+            #[cfg(feature = "phase0")]
+            phase0_close_after_response,
         } => {
             let _logs = qb_core::logging::init(&home)?;
             let config = qb_core::config::Config::load(&home)?;
@@ -144,6 +153,8 @@ async fn run() -> anyhow::Result<()> {
             } else {
                 relay
             };
+            #[cfg(feature = "phase0")]
+            let relay = relay.with_close_after_response(phase0_close_after_response);
             let relay = std::sync::Arc::new(relay);
             let admin_routes = qb_core::admin::account_routes(store.clone())
                 .merge(qb_core::debug_pin::routes(store, pins));

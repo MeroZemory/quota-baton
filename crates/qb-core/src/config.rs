@@ -137,6 +137,20 @@ impl Default for WebsocketConfig {
     }
 }
 
+impl WebsocketConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.upstream_deflate,
+            "websocket.upstream_deflate=true requires a deflate-capable tungstenite fork; this build supports false only"
+        );
+        anyhow::ensure!(
+            self.idle_close_secs > 0 && self.max_message_size_mib > 0,
+            "websocket limits must be positive"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct QuotaConfig {
@@ -174,6 +188,7 @@ impl Config {
             .try_into()
             .map_err(|_| anyhow::anyhow!("invalid config.toml types"))?;
         config.upstream.validate()?;
+        config.websocket.validate()?;
         anyhow::ensure!(
             config.websocket.idle_close_secs < config.routing.rebalance_idle_secs,
             "websocket.idle_close_secs must be less than routing.rebalance_idle_secs"
@@ -214,6 +229,21 @@ fn warn_unknown(value: &toml::Value, known: &toml::Value, prefix: &str) {
 #[cfg(test)]
 mod upstream_tests {
     use super::*;
+    #[test]
+    fn websocket_deflate_requires_explicit_dependency_support() {
+        let mut config = WebsocketConfig::default();
+        assert!(config.validate().is_ok());
+        assert_eq!(config.max_message_size_mib, 192);
+        assert_eq!(config.idle_close_secs, 1800);
+        config.upstream_deflate = true;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("deflate-capable tungstenite fork")
+        );
+    }
     #[test]
     fn bases_are_exact_and_test_http_is_loopback_only() {
         assert!(UpstreamConfig::default().validate().is_ok());

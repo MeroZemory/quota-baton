@@ -20,6 +20,30 @@ const LEDGER_MAX_BYTES: u64 = 500_000_000;
 const SYNC_INTERVAL: StdDuration = StdDuration::from_secs(1);
 const WARN_INTERVAL: StdDuration = StdDuration::from_secs(60);
 
+pub fn safe_identifier(text: &str) -> Option<String> {
+    if text.is_empty()
+        || text.len() > 100
+        || text.contains("sk-")
+        || text.contains("eyJ")
+        || !text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    {
+        return None;
+    }
+    Some(text.to_owned())
+}
+
+pub fn safe_error_code(event: &serde_json::Value) -> Option<String> {
+    let root = event.get("response").unwrap_or(event);
+    let error = root.get("error").unwrap_or(root);
+    error
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| error.get("type").and_then(serde_json::Value::as_str))
+        .and_then(safe_identifier)
+}
+
 #[derive(Clone, Debug)]
 pub struct CaptureOptions {
     pub dir: PathBuf,
@@ -57,6 +81,8 @@ pub struct RequestRecord {
     pub outcome: String,
     #[serde(default)]
     pub retained_copy: bool,
+    #[serde(default)]
+    pub upstream_error_code: Option<String>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -208,7 +234,106 @@ impl Observability {
         }
     }
 
+    pub fn observe_codex_event(&self, account_id: &str, event: &serde_json::Value) {
+        if event.get("type").and_then(serde_json::Value::as_str) != Some("codex.rate_limits") {
+            return;
+        }
+        let limits = event.get("rate_limits").unwrap_or(event);
+        let mut headers = HeaderMap::new();
+        let mut add = |name: String, value: &serde_json::Value| {
+            let text = value
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| value.to_string());
+            if let (Ok(name), Ok(value)) = (
+                axum::http::HeaderName::from_bytes(name.as_bytes()),
+                axum::http::HeaderValue::from_str(&text),
+            ) {
+                headers.insert(name, value);
+            }
+        };
+        for slot in ["primary", "secondary"] {
+            if let Some(window) = limits.get(slot) {
+                for key in [
+                    "used_percent",
+                    "window_minutes",
+                    "reset_after_seconds",
+                    "reset_at",
+                ] {
+                    if let Some(value) = window.get(key) {
+                        add(format!("x-codex-{slot}-{}", key.replace('_', "-")), value);
+                    }
+                }
+            }
+        }
+        for key in ["limit_reached", "plan_type"] {
+            if let Some(value) = event.get(key).or_else(|| limits.get(key)) {
+                add(format!("x-codex-{}", key.replace('_', "-")), value);
+            }
+        }
+        if let Some(credits) = event.get("credits").or_else(|| limits.get("credits")) {
+            for key in ["has_credits", "unlimited", "balance"] {
+                if let Some(value) = credits.get(key) {
+                    add(format!("x-codex-credits-{}", key.replace('_', "-")), value);
+                }
+            }
+        }
+        if let Some(mut snapshot) = snapshot(Provider::Codex, &headers, Utc::now()) {
+            snapshot.source = "codex.rate_limits".into();
+            self.enqueue(Command::Quota(account_id.into(), Box::new(snapshot)));
+        }
+    }
+
+    pub fn record_ws_connection(
+        &self,
+        connection: &str,
+        account: &str,
+        event: &str,
+        code: Option<u16>,
+        reason: &str,
+    ) {
+        self.enqueue(Command::Ledger(serde_json::json!({"ts":Utc::now().to_rfc3339(),"event":event,"transport":"ws","connection":connection,"account":account,"close_code":code,"reason":reason})));
+    }
+
+    pub fn capture_ws_response(&self, ticket: Option<&Path>, headers: &HeaderMap) {
+        #[cfg(all(feature = "shape-capture", debug_assertions))]
+        if let Some(destination) = ticket {
+            let mut values = BTreeMap::new();
+            for name in headers.keys().filter(|name| {
+                name.as_str().starts_with("x-codex-")
+                    || name.as_str().starts_with("openai-")
+                    || name.as_str() == "x-request-id"
+            }) {
+                let entries: Vec<_> = headers
+                    .get_all(name)
+                    .iter()
+                    .filter_map(|v| v.to_str().ok())
+                    .filter(|v| v.len() <= 4096)
+                    .collect();
+                values.insert(name.as_str(), entries);
+            }
+            self.enqueue(Command::Capture(serde_json::json!({"destination":destination,"shape":{"response_header_names":headers.keys().map(|n|n.as_str()).collect::<Vec<_>>(),"response_header_values":values}})));
+        }
+        #[cfg(not(all(feature = "shape-capture", debug_assertions)))]
+        let _ = (ticket, headers);
+    }
+
+    pub fn capture_ws_types(&self, ticket: Option<&Path>, counts: &BTreeMap<String, u64>) {
+        #[cfg(all(feature = "shape-capture", debug_assertions))]
+        if let Some(destination) = ticket {
+            self.enqueue(Command::Capture(
+                serde_json::json!({"destination":destination,"shape":{"message_types":counts}}),
+            ));
+        }
+        #[cfg(not(all(feature = "shape-capture", debug_assertions)))]
+        let _ = (ticket, counts);
+    }
+
     pub fn record_request(&self, mut record: RequestRecord) {
+        record.upstream_error_code = record
+            .upstream_error_code
+            .as_deref()
+            .and_then(safe_identifier);
         // 쿼리와 원본 세션 식별자는 메타데이터 파일에도 남기지 않는다.
         record.route = record
             .route
@@ -730,6 +855,7 @@ mod tests {
             attempts: 1,
             outcome: "ok".into(),
             retained_copy: true,
+            upstream_error_code: None,
         }
     }
 

@@ -2,7 +2,6 @@ use std::{
     io::{self, Write},
     pin::Pin,
     task::{Context, Poll},
-    time::Duration,
 };
 
 use axum::{
@@ -18,15 +17,26 @@ use crate::relay::{
     ledger::Completion,
 };
 
-const EOF_GRACE: Duration = Duration::from_millis(50);
+struct Chunk {
+    bytes: Result<Bytes, io::Error>,
+    terminal: Option<(Completion, String)>,
+}
 
-struct Receiver(mpsc::Receiver<Result<Bytes, io::Error>>);
+struct Receiver(mpsc::Receiver<Chunk>);
 
 impl Stream for Receiver {
     type Item = Result<Bytes, io::Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.0.poll_recv(cx)
+        self.0.poll_recv(cx).map(|chunk| {
+            chunk.map(|chunk| {
+                // 소비자에게 종료 바이트를 반환할 때만 원장을 확정한다.
+                if let Some((completion, outcome)) = chunk.terminal {
+                    completion.finish(&outcome);
+                }
+                chunk.bytes
+            })
+        })
     }
 }
 
@@ -40,9 +50,12 @@ pub(in crate::relay) fn body(
     completion.record.status = status.as_u16();
     let success_outcome = success_outcome.to_owned();
     let mut observer = Observer::new(response_headers);
-    // 한 조각만 대기시킨다. EOF 확인은 소비자의 다음 body poll과 독립적이다.
+    observer.error_body = (!status.is_success()).then(Vec::new);
+    // 한 조각만 대기시키고 종료 청크가 소비될 때까지 completion을 함께 보관한다.
     let (tx, rx) = mpsc::channel(1);
+    let response_headers = response_headers.clone();
     tokio::spawn(async move {
+        let mut completion = Some(completion);
         let HeldResponse {
             prefix,
             remainder,
@@ -56,76 +69,88 @@ pub(in crate::relay) fn body(
             .chain(remainder);
         let mut pending = initial.map(Ok).collect::<std::collections::VecDeque<_>>();
         let mut terminal = terminal;
-        let mut deadline = None;
         loop {
-            if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
-                return;
-            }
             let next = if let Some(chunk) = pending.pop_front() {
                 Some(chunk)
             } else if let Some(error) = terminal.take() {
                 Some(Err(error))
-            } else if tx.is_closed() && !observer.terminal() {
-                // 즉시 준비된 EOF만 확인한다. 종료 전 client drop은 더 읽지 않는다.
-                match stream.next().now_or_never() {
-                    Some(None) => None,
-                    _ => return,
-                }
             } else {
-                if tx.is_closed() {
-                    deadline.get_or_insert_with(|| tokio::time::Instant::now() + EOF_GRACE);
-                }
-                if let Some(deadline) = deadline {
-                    match tokio::time::timeout_at(deadline, stream.next()).await {
-                        Ok(next) => next.map(|item| item.map_err(|_| stream_error())),
-                        Err(_) => return,
-                    }
-                } else {
-                    tokio::select! {
-                        biased;
-                        _ = tx.closed() => {
-                            if observer.terminal() {
-                                deadline = Some(tokio::time::Instant::now() + EOF_GRACE);
-                                continue;
-                            }
-                            // 마지막 바이트와 EOF가 동시에 준비된 비 SSE 응답도 완료한다.
-                            if matches!(stream.next().now_or_never(), Some(None)) {
-                                completion.finish(&success_outcome);
-                            }
-                            return;
+                tokio::select! {
+                    biased;
+                    _ = tx.closed() => {
+                        // 비 SSE 응답은 즉시 준비된 EOF까지 확인한다.
+                        if matches!(stream.next().now_or_never(), Some(None))
+                            && let Some(completion) = completion.take()
+                        {
+                            completion.finish(&success_outcome);
                         }
-                        next = stream.next() => next.map(|item| item.map_err(|_| stream_error())),
+                        return;
                     }
+                    next = stream.next() => next.map(|item| item.map_err(|_| stream_error())),
                 }
             };
             let Some(chunk) = next else {
-                completion.finish(&success_outcome);
+                if let Some(completion) = completion.take() {
+                    completion.finish(&success_outcome);
+                }
                 return;
             };
             let chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(_) => {
-                    completion.finish("upstream_stream_error");
-                    let _ = tx.send(Err(stream_error())).await;
+                    if let Some(completion) = completion.take() {
+                        completion.finish("upstream_stream_error");
+                    }
+                    let _ = tx
+                        .send(Chunk {
+                            bytes: Err(stream_error()),
+                            terminal: None,
+                        })
+                        .await;
                     return;
                 }
             };
             observer.feed(&chunk);
-            if tx.is_closed() {
-                if !observer.terminal() {
-                    return;
-                }
-                deadline.get_or_insert_with(|| tokio::time::Instant::now() + EOF_GRACE);
-                // 종료 이벤트 뒤의 EOF만 관찰하며 원본 데이터를 별도로 보관하지 않는다.
-                continue;
-            }
             let len = chunk.len() as u64;
-            if tx.send(Ok(chunk)).await.is_err() {
-                if !observer.terminal() {
-                    return;
-                }
-                deadline = Some(tokio::time::Instant::now() + EOF_GRACE);
+            if let Some(record) = completion.as_mut()
+                && let Some(code) = observer
+                    .error_body
+                    .as_ref()
+                    .and_then(|body| crate::relay::hold::error_code(&response_headers, body))
+                    .or_else(|| {
+                        observer
+                            .decoder
+                            .as_ref()
+                            .and_then(|d| d.sink().error_code.clone())
+                    })
+            {
+                record.record.upstream_error_code = Some(code);
+            }
+            let terminal = if observer.terminal() {
+                completion.take().map(|mut completion| {
+                    completion.record.bytes_out += len;
+                    let outcome = if observer.failed() {
+                        "upstream_error".to_owned()
+                    } else {
+                        success_outcome.clone()
+                    };
+                    (completion, outcome)
+                })
             } else {
+                None
+            };
+            if tx
+                .send(Chunk {
+                    bytes: Ok(chunk),
+                    terminal,
+                })
+                .await
+                .is_err()
+            {
+                // 실패한 send나 소비되지 않은 종료 청크는 Drop에서 client_drop으로 기록한다.
+                return;
+            }
+            if let Some(completion) = completion.as_mut() {
                 completion.record.bytes_out += len;
             }
         }
@@ -139,6 +164,7 @@ fn stream_error() -> io::Error {
 
 struct Observer {
     decoder: Option<Decoder>,
+    error_body: Option<Vec<u8>>,
 }
 
 impl Observer {
@@ -163,15 +189,31 @@ impl Observer {
         } else {
             None
         };
-        Self { decoder }
+        Self {
+            decoder,
+            error_body: None,
+        }
     }
 
     fn feed(&mut self, bytes: &[u8]) {
+        if let Some(body) = &mut self.error_body {
+            if bytes.len() <= HOLD_LIMIT.saturating_sub(body.len()) {
+                body.extend_from_slice(bytes);
+            } else {
+                self.error_body = None;
+            }
+        }
         if let Some(decoder) = &mut self.decoder
             && decoder.feed(bytes).is_err()
         {
             self.decoder = None;
         }
+    }
+
+    fn failed(&self) -> bool {
+        self.decoder
+            .as_ref()
+            .is_some_and(|decoder| decoder.sink().failed)
     }
 
     fn terminal(&self) -> bool {
@@ -188,6 +230,8 @@ struct EventSink {
     after_cr: bool,
     oversized: bool,
     terminal: bool,
+    failed: bool,
+    error_code: Option<String>,
 }
 
 impl EventSink {
@@ -196,6 +240,7 @@ impl EventSink {
         for line in self.event.split(|b| matches!(b, b'\r' | b'\n')) {
             if let Some(value) = line.strip_prefix(b"event:") {
                 self.terminal |= terminal_kind(value.trim_ascii());
+                self.failed |= value.trim_ascii() == b"response.failed";
             }
         }
         if !self.oversized {
@@ -208,14 +253,18 @@ impl EventSink {
                     data.extend_from_slice(value.strip_prefix(b" ").unwrap_or(value));
                 }
             }
-            #[derive(serde::Deserialize)]
-            struct Kind {
-                r#type: Option<String>,
-            }
-            if let Ok(kind) = serde_json::from_slice::<Kind>(&data) {
-                self.terminal |= kind
-                    .r#type
-                    .is_some_and(|kind| terminal_kind(kind.as_bytes()));
+            if let Ok(event) = serde_json::from_slice::<serde_json::Value>(&data) {
+                if let Some(kind) = event.get("type").and_then(serde_json::Value::as_str) {
+                    self.terminal |= terminal_kind(kind.as_bytes());
+                    self.failed |= kind == "response.failed";
+                }
+                if (self.failed
+                    || event.get("error").is_some()
+                    || event.get("type").and_then(serde_json::Value::as_str) == Some("error"))
+                    && let Some(code) = crate::observability::safe_error_code(&event)
+                {
+                    self.error_code = Some(code);
+                }
             }
         }
         self.event.clear();
@@ -226,7 +275,7 @@ impl EventSink {
 fn terminal_kind(kind: &[u8]) -> bool {
     matches!(
         kind,
-        b"response.completed" | b"response.done" | b"message_stop"
+        b"response.completed" | b"response.done" | b"response.failed" | b"message_stop"
     )
 }
 
@@ -351,6 +400,8 @@ impl Decoder {
                     after_cr: false,
                     oversized: false,
                     terminal: false,
+                    failed: false,
+                    error_code: None,
                 };
                 &EMPTY
             }
@@ -371,6 +422,7 @@ mod tests {
         Arc,
         atomic::{AtomicBool, Ordering},
     };
+    use std::time::Duration;
 
     struct Fixture {
         dir: tempfile::TempDir,
@@ -387,6 +439,16 @@ mod tests {
         }
 
         fn body(&self, stream: RawStream, headers: &HeaderMap, outcome: &str) -> Body {
+            self.body_with_status(stream, headers, outcome, StatusCode::OK)
+        }
+
+        fn body_with_status(
+            &self,
+            stream: RawStream,
+            headers: &HeaderMap,
+            outcome: &str,
+            status: StatusCode,
+        ) -> Body {
             body(
                 Completion::new(
                     self.obs.clone(),
@@ -402,7 +464,7 @@ mod tests {
                     terminal: None,
                     decision: CommitDecision::NormalData,
                 },
-                StatusCode::OK,
+                status,
                 headers,
                 outcome,
             )
@@ -479,8 +541,148 @@ mod tests {
         }
     }
 
+    #[test]
+    fn failed_event_observes_only_bounded_safe_error_identifier() {
+        for (error, expected) in [
+            (
+                serde_json::json!({"code":"usage_limit_reached","message":"never-record"}),
+                Some("usage_limit_reached"),
+            ),
+            (
+                serde_json::json!({"type":"server_error"}),
+                Some("server_error"),
+            ),
+            (serde_json::json!({"code":"private message"}), None),
+            (serde_json::json!({"code":"sk-synthetic-token"}), None),
+            (serde_json::json!({"code":"x".repeat(101)}), None),
+        ] {
+            let mut observer = Observer::new(&sse("identity"));
+            observer.feed(
+                format!(
+                    "data: {}\n\n",
+                    serde_json::json!({"type":"response.failed","response":{"error":error}})
+                )
+                .as_bytes(),
+            );
+            assert!(observer.terminal() && observer.failed());
+            assert_eq!(
+                observer
+                    .decoder
+                    .as_ref()
+                    .unwrap()
+                    .sink()
+                    .error_code
+                    .as_deref(),
+                expected
+            );
+        }
+    }
+
     #[tokio::test]
-    async fn oversized_named_terminal_event_keeps_bounded_observation_and_eof_grace() {
+    async fn failed_terminal_records_safe_error_code_before_client_close() {
+        let fixture = Fixture::new();
+        let chunk = Bytes::from_static(b"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_error\",\"message\":\"never-record\"}}}\n\n");
+        let upstream =
+            futures_util::stream::iter([Ok(chunk.clone())]).chain(futures_util::stream::pending());
+        let mut stream = fixture
+            .body(Box::pin(upstream), &sse("identity"), "ok")
+            .into_data_stream();
+        assert_eq!(stream.next().await.unwrap().unwrap(), chunk);
+        drop(stream);
+        assert_eq!(fixture.outcome().await, "upstream_error");
+        assert_eq!(
+            fixture.row().unwrap()["upstream_error_code"],
+            "server_error"
+        );
+    }
+
+    #[tokio::test]
+    async fn split_non_success_json_records_error_code_and_preserves_wire_bytes() {
+        let fixture = Fixture::new();
+        let raw = br#"{"error":{"type":"invalid_request_error","message":"never-record"}}"#;
+        let chunks = raw
+            .chunks(3)
+            .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+            .collect::<Vec<_>>();
+        let mut stream = fixture
+            .body_with_status(
+                Box::pin(futures_util::stream::iter(chunks)),
+                &HeaderMap::new(),
+                "upstream_status_error",
+                StatusCode::BAD_REQUEST,
+            )
+            .into_data_stream();
+        let mut received = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            received.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(received, raw);
+        assert_eq!(
+            fixture.row().unwrap()["upstream_error_code"],
+            "invalid_request_error"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_not_sent_to_closed_client_remains_client_drop() {
+        let fixture = Fixture::new();
+        let upstream = futures_util::stream::iter([Ok(Bytes::from_static(
+            b"event: response.done\ndata: {}\n\n",
+        ))]);
+        drop(fixture.body(Box::pin(upstream), &sse("identity"), "ok"));
+        assert_eq!(fixture.outcome().await, "client_drop");
+    }
+
+    #[tokio::test]
+    async fn queued_terminal_in_unpolled_body_drop_records_client_drop() {
+        for kind in [
+            "response.completed",
+            "response.done",
+            "response.failed",
+            "message_stop",
+        ] {
+            let fixture = Fixture::new();
+            let (queued, ready) = tokio::sync::oneshot::channel();
+            let upstream = async_stream::stream! {
+                yield Ok(Bytes::from(format!("data: {{\"type\":\"{kind}\"}}\n\n")));
+                // 다음 upstream poll은 종료 청크가 채널에 들어간 뒤에만 실행된다.
+                queued.send(()).unwrap();
+                std::future::pending::<()>().await;
+            };
+            let body = fixture.body(Box::pin(upstream), &sse("identity"), "ok");
+            tokio::time::timeout(Duration::from_secs(2), ready)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(fixture.row().is_none(), "{kind}");
+            drop(body);
+            assert_eq!(fixture.outcome().await, "client_drop", "{kind}");
+        }
+    }
+
+    #[tokio::test]
+    async fn later_stream_error_does_not_replace_terminal_outcome() {
+        let fixture = Fixture::new();
+        let error = reqwest::Client::new()
+            .get("http://[synthetic-invalid")
+            .build()
+            .unwrap_err();
+        let upstream = futures_util::stream::iter([
+            Ok(Bytes::from_static(
+                b"event: response.completed\ndata: {}\n\n",
+            )),
+            Err(error),
+        ]);
+        let mut stream = fixture
+            .body(Box::pin(upstream), &sse("identity"), "ok")
+            .into_data_stream();
+        stream.next().await.unwrap().unwrap();
+        assert!(stream.next().await.unwrap().is_err());
+        assert_eq!(fixture.outcome().await, "ok");
+    }
+
+    #[tokio::test]
+    async fn oversized_named_terminal_event_finishes_without_eof() {
         let fixture = Fixture::new();
         let mut event = b"event: response.completed\ndata: ".to_vec();
         event.extend(std::iter::repeat_n(b'x', HOLD_LIMIT * 2));
@@ -500,8 +702,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn last_chunk_then_drop_records_normal_eof_without_another_body_poll() {
-        for kind in ["response.completed", "response.done", "message_stop"] {
+    async fn last_terminal_chunk_then_drop_records_completion_without_another_body_poll() {
+        for kind in [
+            "response.completed",
+            "response.done",
+            "message_stop",
+            "response.failed",
+        ] {
             for encoding in ["identity", "gzip", "deflate", "raw-deflate", "br", "zstd"] {
                 let fixture = Fixture::new();
                 let raw = Bytes::from(compress(
@@ -513,13 +720,22 @@ mod tests {
                 } else {
                     encoding
                 });
-                let upstream = futures_util::stream::iter([Ok(raw.clone())]);
+                let upstream = futures_util::stream::iter([Ok(raw.clone())])
+                    .chain(futures_util::stream::pending());
                 let mut stream = fixture
                     .body(Box::pin(upstream), &headers, "ok")
                     .into_data_stream();
                 assert_eq!(stream.next().await.unwrap().unwrap(), raw);
                 drop(stream);
-                assert_eq!(fixture.outcome().await, "ok", "{kind}/{encoding}");
+                assert_eq!(
+                    fixture.outcome().await,
+                    if kind == "response.failed" {
+                        "upstream_error"
+                    } else {
+                        "ok"
+                    },
+                    "{kind}/{encoding}"
+                );
             }
         }
         let fixture = Fixture::new();
@@ -550,7 +766,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drop_before_terminal_and_stalled_terminal_cancel_upstream() {
+    async fn client_close_immediately_after_chunk_cancels_stalled_upstream() {
         for terminal in [false, true] {
             let fixture = Fixture::new();
             let chunk = Bytes::from_static(if terminal {
@@ -570,24 +786,33 @@ mod tests {
                 .into_data_stream();
             assert_eq!(stream.next().await.unwrap().unwrap(), chunk);
             drop(stream);
-            assert_eq!(fixture.outcome().await, "client_drop");
-            assert!(dropped.load(Ordering::SeqCst));
+            assert_eq!(
+                fixture.outcome().await,
+                if terminal { "ok" } else { "client_drop" }
+            );
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !dropped.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
         }
     }
 
     #[tokio::test]
-    async fn terminal_drop_allows_only_short_eof_grace() {
+    async fn terminal_finishes_ledger_while_upstream_stalls_without_eof() {
         let fixture = Fixture::new();
         let upstream = async_stream::stream! {
             yield Ok(Bytes::from_static(b"event: message_stop\ndata: {}\n\n"));
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            std::future::pending::<()>().await;
         };
         let mut stream = fixture
             .body(Box::pin(upstream), &sse("identity"), "ok")
             .into_data_stream();
         stream.next().await.unwrap().unwrap();
-        drop(stream);
         assert_eq!(fixture.outcome().await, "ok");
+        drop(stream);
     }
 
     #[tokio::test]
@@ -682,8 +907,11 @@ mod tests {
             .get("http://[private-upstream-secret")
             .build()
             .unwrap_err();
-        let upstream =
-            futures_util::stream::iter([Ok(Bytes::from_static(b"data: {}\n\n")), Err(error)]);
+        let upstream = futures_util::stream::iter([
+            Ok(Bytes::from_static(b"data: {}\n\n")),
+            Ok(Bytes::from_static(b"data: {\"type\":\"error\",\"error\":{\"code\":\"server_error\",\"message\":\"never-record\"}}\n\n")),
+            Err(error),
+        ]);
         let mut stream = fixture
             .body(Box::pin(upstream), &sse("identity"), "ok")
             .into_data_stream();
@@ -691,11 +919,23 @@ mod tests {
             stream.next().await.unwrap().unwrap(),
             b"data: {}\n\n".as_slice()
         );
+        assert!(
+            stream
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .starts_with(b"data: {\"type\":\"error\"")
+        );
         let error = stream.next().await.unwrap().unwrap_err().to_string();
         assert!(error.contains("Upstream response stream interrupted"));
         assert!(!error.contains("private-upstream-secret"));
         assert!(stream.next().await.is_none());
         assert_eq!(fixture.row().unwrap()["outcome"], "upstream_stream_error");
+        assert_eq!(
+            fixture.row().unwrap()["upstream_error_code"],
+            "server_error"
+        );
     }
 
     #[tokio::test]
