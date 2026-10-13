@@ -239,6 +239,12 @@ The later API-key providers implement the same trait without OAuth.
   - Claude: `access_token`, `refresh_token`, `expired`, `email`, `account_uuid`, `organization_uuid`
   - Codex: the same tokens plus `id_token`, `account_id` and `plan_type`
 - It writes one quota-baton account per identity: DPAPI-encrypted, `user_state=disabled` unless listed in `--activate`.
+- **No token rollback.** A re-import compares the file's `last_refresh` (tie-break `expired`) with the stored token.
+  - Newer → update.
+  - Equal → may update.
+  - Older → skip the token write and report why.
+
+  An explicit `--activate` still applies its `user_state`. No path, linked reload included, ever replaces a token with an older one.
 - It prints metadata only, never token values.
 - **Linked mode** (default).
   - The account never refreshes. Before the access token is within 10 min of expiry, and once on any 401, the core re-reads the CPA file with the same identity.
