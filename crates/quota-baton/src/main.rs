@@ -196,6 +196,11 @@ async fn run() -> anyhow::Result<()> {
                 .initialize_settings(config.accounts.clone())
                 .await
                 .map_err(|_| anyhow::anyhow!("계정 설정을 저장하지 못했습니다."))?;
+            relay
+                .quota
+                .startup_reload()
+                .await
+                .map_err(|_| anyhow::anyhow!("연결된 계정의 토큰을 다시 읽지 못했습니다."))?;
             let admin_routes = qb_core::admin::account_routes(store.clone())
                 .merge(qb_core::admin::runtime_routes(
                     relay.clone(),

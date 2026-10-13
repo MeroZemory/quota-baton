@@ -978,6 +978,10 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
         if let Some(model) = decision.model.take() {
             request_model = Some(model);
         }
+        if decision.kind == outcome::Kind::Revoked && credentials::is_linked(&account) {
+            decision.kind = outcome::Kind::Auth;
+            decision.signal = None;
+        }
         if decision.kind == outcome::Kind::Revoked {
             match state
                 .tokens

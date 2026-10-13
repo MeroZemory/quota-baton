@@ -224,15 +224,24 @@ fn assert_quota(account: &Account, reset: i64) {
 #[tokio::test]
 async fn poll_linked_401_reloads_newer_cpa_and_retries_once() {
     let h = Harness::new(Provider::Codex, false).await;
-    h.newer_link();
-    h.usage.state.push(unauthorized());
+    let mut denied = unauthorized();
+    denied.chunks[0].0 = Duration::from_millis(100);
+    h.usage.state.push(denied);
     h.usage
         .state
         .push(usage(25.0, Utc::now().timestamp() + 3600));
-    assert_eq!(
-        h.state.quota.poll(&h.id).await.unwrap().health,
-        Health::Ready
-    );
+    let poll = h.state.quota.poll(&h.id);
+    let rotate = async {
+        while h.usage.state.requests().is_empty() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        h.newer_link();
+    };
+    let (result, _) =
+        tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(poll, rotate) })
+            .await
+            .unwrap();
+    assert_eq!(result.unwrap().health, Health::Ready);
     let requests = h.usage.state.requests();
     assert_eq!(requests.len(), 2);
     for (request, token) in requests
@@ -275,6 +284,142 @@ async fn poll_linked_401_without_newer_token_cools_link_stale() {
     ));
     assert_eq!(h.usage.state.requests().len(), 1);
     assert!(h.token.state.requests().is_empty());
+}
+
+#[tokio::test]
+async fn claude_live_revocation_scenario_reloads_before_startup_or_poll() {
+    for startup in [true, false] {
+        for legacy_health in [false, true] {
+            let h = Harness::new(Provider::Claude, false).await;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let upstream_revoked = revoked.clone();
+            let upstream_calls = calls.clone();
+            let app = axum::Router::new().fallback(move |headers: HeaderMap| {
+                let revoked = upstream_revoked.clone();
+                let calls = upstream_calls.clone();
+                async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if !revoked.load(std::sync::atomic::Ordering::SeqCst)
+                        || headers
+                            .get("authorization")
+                            .is_some_and(|v| v == "Bearer synthetic-access-new")
+                    {
+                        (
+                            StatusCode::OK,
+                            axum::Json(json!({
+                                "five_hour": {"utilization": 1.0},
+                                "seven_day": {"utilization": 73.0},
+                                "iguana_necktie": {"utilization": 100.0}
+                            })),
+                        )
+                    } else {
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            axum::Json(json!({"error": {"code": "token_revoked"}})),
+                        )
+                    }
+                }
+            });
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let mut config = Config::default();
+            config.upstream.claude_usage_base = format!("http://{addr}");
+            config.quota.poll_min_interval_secs = 1;
+            let state = RelayState::new(
+                h.store.clone(),
+                &config,
+                h.obs.clone(),
+                Arc::new(DebugPins::default()),
+            )
+            .unwrap();
+            if !startup {
+                assert_eq!(state.quota.poll(&h.id).await.unwrap().health, Health::Ready);
+                // The first-use gate is occupied and the token is far from expiry.
+                tokio::time::sleep(Duration::from_millis(1200)).await;
+            }
+            if legacy_health {
+                h.store
+                    .update_metadata(&h.id, |a| {
+                        a.health = Health::NeedsRelogin {
+                            reason: "token_revoked".into(),
+                            since: Utc::now(),
+                        };
+                    })
+                    .unwrap();
+            }
+            h.newer_link();
+            revoked.store(true, std::sync::atomic::Ordering::SeqCst);
+            if startup {
+                state.quota.startup_reload().await.unwrap();
+                assert_eq!(h.account().health, Health::Ready);
+                assert_eq!(
+                    h.store.tokens(&h.account()).unwrap().access_token,
+                    "synthetic-access-new"
+                );
+            }
+            assert_eq!(state.quota.poll(&h.id).await.unwrap().health, Health::Ready);
+            // No stale-token request or reactive retry was necessary.
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                if startup { 1 } else { 2 }
+            );
+            let views = state.accounts.views().await.unwrap();
+            let windows = views[0]["windows"].as_array().unwrap();
+            assert_eq!(windows.len(), 2);
+            assert_eq!(
+                windows.iter().find(|w| w["name"] == "5h").unwrap()["used_pct"],
+                1.0
+            );
+            server.abort();
+        }
+    }
+}
+
+#[tokio::test]
+async fn revoked_linked_poll_rereads_cpa_and_never_requires_relogin() {
+    for newer in [true, false] {
+        let h = Harness::new(Provider::Claude, false).await;
+        let mut denied = ScriptedResponse::json(
+            StatusCode::UNAUTHORIZED,
+            r#"{"error":{"code":"token_revoked"}}"#,
+        );
+        denied.chunks[0].0 = Duration::from_millis(100);
+        h.usage.state.push(denied);
+        h.usage.state.push(ScriptedResponse::json(
+            StatusCode::OK,
+            r#"{"five_hour":{"utilization":35},"seven_day":{"utilization":73}}"#,
+        ));
+        let rotate = async {
+            while h.usage.state.requests().is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            if newer {
+                h.newer_link();
+            }
+        };
+        let (result, _) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(h.state.quota.poll(&h.id), rotate)
+        })
+        .await
+        .unwrap();
+        if newer {
+            assert_eq!(result.unwrap().health, Health::Ready);
+            assert_eq!(h.usage.state.requests().len(), 2);
+        } else {
+            assert_eq!(result.unwrap_err(), PollError::Unavailable);
+            assert!(matches!(
+                h.account().health,
+                Health::Cooling {
+                    reason: HealthReason::LinkStale,
+                    ..
+                }
+            ));
+            assert_eq!(h.usage.state.requests().len(), 1);
+        }
+        assert!(h.token.state.requests().is_empty());
+    }
 }
 
 #[tokio::test]

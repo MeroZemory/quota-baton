@@ -133,6 +133,7 @@ impl UsagePoller {
             semaphore: Semaphore::new(2),
         })
     }
+    #[cfg(all(feature = "testkit", debug_assertions))]
     pub(crate) fn set_tokens(&self, tokens: TokenGates) {
         *self.tokens.lock().unwrap_or_else(|e| e.into_inner()) = tokens;
     }
@@ -188,10 +189,34 @@ impl UsagePoller {
                 _ => PollError::Unavailable,
             })
     }
+    /// Reconcile linked credentials under the core's lease before binding listeners.
+    pub async fn startup_reload(&self) -> Result<(), PollError> {
+        let store = self.store.clone();
+        let accounts = tokio::task::spawn_blocking(move || store.list())
+            .await
+            .map_err(|_| PollError::Unavailable)?
+            .map_err(|_| PollError::Unavailable)?;
+        let gates = self
+            .tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        for account in accounts {
+            if crate::relay::credentials::is_linked(&account) {
+                gates
+                    .reload_linked(self.store.clone(), self.obs.clone(), account.id, "startup")
+                    .await
+                    .map_err(|_| PollError::Unavailable)?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn poll(&self, id: &str) -> Result<Account, PollError> {
         let account = self.load(id).await?;
         if account.user_state == UserState::Disabled
-            || matches!(account.health, Health::NeedsRelogin { .. })
+            || (matches!(account.health, Health::NeedsRelogin { .. })
+                && !crate::relay::credentials::is_linked(&account))
         {
             return Err(PollError::Excluded);
         }
@@ -213,6 +238,17 @@ impl UsagePoller {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        if crate::relay::credentials::is_linked(&account) {
+            gates
+                .reload_linked(
+                    self.store.clone(),
+                    self.obs.clone(),
+                    id.into(),
+                    "before_poll",
+                )
+                .await
+                .map_err(|_| PollError::Unavailable)?;
+        }
         let (mut account, mut tokens) = gates
             .before_request(self.store.clone(), self.obs.clone(), id.into())
             .await
@@ -266,7 +302,8 @@ impl UsagePoller {
                 body.extend_from_slice(&chunk);
             }
             if status == reqwest::StatusCode::UNAUTHORIZED {
-                if crate::relay::poll_revoked(account.provider, &body)
+                if !crate::relay::credentials::is_linked(&account)
+                    && crate::relay::poll_revoked(account.provider, &body)
                     && gates
                         .is_current(self.store.clone(), &account, &tokens)
                         .await

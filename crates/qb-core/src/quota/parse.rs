@@ -10,8 +10,6 @@ const CLAUDE_WINDOWS: &[(&str, &str)] = &[
     ("seven_day", "7d"),
     ("seven_day_opus", "7d_oi"),
     ("seven_day_sonnet", "7d_sonnet"),
-    ("seven_day_oauth_apps", "7d_oauth_apps"),
-    ("seven_day_cowork", "7d_cowork"),
 ];
 
 fn number(value: &Value) -> Option<f64> {
@@ -79,12 +77,7 @@ fn window(name: &str, value: &Value, claude: bool, now: DateTime<Utc>) -> Option
         } else {
             "used_percent"
         }],
-    )
-    .map(|n| {
-        // V5 is unverified: 0..=1 is treated as a fraction, >1 as percent.
-        // Thus exactly 1 is ambiguous and interpreted as 100%, not 1%.
-        if claude && n <= 1.0 { n * 100.0 } else { n }
-    });
+    );
     let reset_at = reset(value, now);
     let state = status(&value["status"]);
     if used.is_none() && reset_at.is_none() && state.is_none() {
@@ -310,19 +303,57 @@ mod tests {
     }
 
     #[test]
-    fn claude_scale_and_model_scoped_buckets() {
-        let result = parse(
-            Provider::Claude,
-            json!({"five_hour": {"utilization": 0.25},
-            "seven_day": {"utilization": 25, "resets_at": "2027-01-15T08:00:00Z"},
-            "seven_day_opus": {"utilization": 1}, "seven_day_sonnet": {"utilization": 100}}),
+    fn claude_oauth_utilization_is_percent_in_all_supported_buckets() {
+        for utilization in [0.0, 0.5, 1.0, 35.0, 73.0] {
+            let body = serde_json::to_vec(&json!({
+                "five_hour": {"utilization": utilization, "resets_at": "2027-01-15T08:00:00Z"},
+                "seven_day": {"utilization": utilization, "resets_at": "2027-01-21T08:00:00Z"},
+                "seven_day_opus": {"utilization": utilization, "resets_at": null},
+                "seven_day_sonnet": {"utilization": utilization, "resets_at": null},
+                "seven_day_oauth_apps": null,
+                "seven_day_cowork": null,
+                "extra_usage": {"is_enabled": false, "monthly_limit": null, "used_credits": 0}
+            }))
+            .unwrap();
+            let result = snapshot(Provider::Claude, &body, now()).unwrap();
+            let windows = result["windows"].as_array().unwrap();
+            assert_eq!(windows.len(), 4);
+            for (window, name) in windows.iter().zip(["5h", "7d", "7d_oi", "7d_sonnet"]) {
+                assert_eq!(window["name"], name);
+                assert_eq!(window["used_pct"], utilization, "{name}");
+                assert_eq!(window["observed_at"], json!(now()));
+            }
+            assert_eq!(windows[0]["reset_at"], "2027-01-15T08:00:00Z");
+            assert_eq!(windows[1]["reset_at"], "2027-01-21T08:00:00Z");
+            assert!(windows[2]["reset_at"].is_null());
+            assert!(windows[3]["reset_at"].is_null());
+            assert_eq!(result["signals"], json!({}));
+        }
+    }
+
+    #[test]
+    fn claude_ignores_other_buckets_even_with_recognized_fields() {
+        let mut value = json!({
+            "seven_day_oauth_apps": {"utilization": 73, "resets_at": "2027-01-15T08:00:00Z"},
+            "seven_day_cowork": {"utilization": 35, "status": "rejected"},
+            "seven_day_opaque_a1b2": {"utilization": 1, "reset_after_seconds": 60},
+            "opaque_c3d4": {"utilization": 0.5, "status": "allowed"},
+            "extra_usage": {"is_enabled": true, "monthly_limit": 100, "used_credits": 73}
+        });
+        let body = serde_json::to_vec(&value).unwrap();
+        assert!(snapshot(Provider::Claude, &body, now()).is_none());
+        assert_eq!(shape(Provider::Claude, &body)["usage"], json!({}));
+
+        value["five_hour"] = json!({"utilization": 0, "resets_at": null});
+        let body = serde_json::to_vec(&value).unwrap();
+        let result = snapshot(Provider::Claude, &body, now()).unwrap();
+        assert_eq!(result["windows"].as_array().unwrap().len(), 1);
+        assert_eq!(result["windows"][0]["name"], "5h");
+        assert_eq!(result["windows"][0]["used_pct"], 0.0);
+        assert_eq!(
+            shape(Provider::Claude, &body)["usage"],
+            json!({"five_hour.utilization": 0.0})
         );
-        assert_eq!(result["windows"][0]["used_pct"], 25.0);
-        assert_eq!(result["windows"][1]["used_pct"], 25.0);
-        assert_eq!(result["windows"][2]["name"], "7d_oi");
-        assert_eq!(result["windows"][2]["used_pct"], 100.0);
-        assert_eq!(result["windows"][3]["name"], "7d_sonnet");
-        assert!(result["signals"]["limit_reached"].is_null());
     }
 
     #[test]
