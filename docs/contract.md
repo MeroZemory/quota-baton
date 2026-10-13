@@ -67,6 +67,8 @@ These rules apply to the data port and the admin port alike.
 
 3. Nothing else may be added, removed or rewritten. In particular, the following are left as the client sent them: User-Agent, originator, version, session or installation identifiers, beta lists (apart from the single append above), header casing, and the TLS or HTTP client configuration.
 
+   **Known limitation (M2 review S4):** the HTTP client library inserts `accept: */*` when a request has no `Accept` header. Genuine Claude Code and Codex always send `Accept`, so this is accepted until evidence shows an effect.
+
    A candidate header exception joins this table only through the same register process as C4:
    - **H2.** For Claude, add `extended-cache-ttl-2025-04-11` when the body uses 1-hour cache markers. Pending **[V1]**.
    - **H3.** For Codex, add a routing-hint header. Pending **[V3]**.
