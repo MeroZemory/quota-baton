@@ -495,7 +495,9 @@ Details are in contract C11.
   - Existing streams are never killed.
 - **Timeouts.** Connect 10 s; response headers 5 min; idle read 10 min.
 - **Shape capture** (Phase 0 only).
-  - Compiled in only with the `shape-capture` cargo feature, never in release builds. Enabled per run, and it expires automatically.
+  - Compiled in only with the `shape-capture` cargo feature **and** `debug_assertions`. A release build with the feature fails to compile.
+  - Enabled per run with `serve --capture-dir <dir> [--capture-limit N]` (default 50 requests, then off).
+  - `<dir>` must already exist and its path must contain a `.sandbox` component. Otherwise `serve` refuses to start. Capture output is never tied to `QB_HOME`.
   - It records header names; header values from an allowlist only (beta lists, versions, `originator`, the UA product token); and body key names to a bounded depth. It never records session, installation, account or turn-metadata values.
   - Output goes under `.sandbox\` and is included in the A5 secret grep.
   - It is a declared exception to "Codex bodies are never decoded".
