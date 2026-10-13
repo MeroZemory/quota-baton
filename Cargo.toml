@@ -48,3 +48,10 @@ zeroize = { version = "=1.8.2", features = ["derive"] }
 qb-core = { path = "crates/qb-core" }
 qb-proto = { path = "crates/qb-proto" }
 qb-testkit = { path = "crates/qb-testkit" }
+
+# Disk hygiene (C: is nearly full): keep line tables for panic locations, drop full debug info.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false

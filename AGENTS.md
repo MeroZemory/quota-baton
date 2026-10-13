@@ -12,6 +12,8 @@ The documentation map is in `docs/README.md`. The normative behaviour is in `doc
   - Do not create extra `CARGO_TARGET_DIR`s per feature set, per reviewer or per test run. Examples to avoid: `.sandbox/target-*`, `.sandbox/targets/*`.
   - Build the feature variants one after another in the same target.
 - **No incremental caches.** `.cargo/config.toml` sets `incremental = false`. Do not override it.
+- **Target cap: 8 GiB.** Check the size of `target/` before each new stage: a fix brief, a milestone, or the next feature set. If it is over 8 GiB, run `cargo clean` first. `incremental = false` does not stop growth: every feature set and every test run adds new hashed test binaries to `target/debug/deps`, and the old ones are never removed.
+- **Debug info.** The workspace `Cargo.toml` sets `[profile.dev] debug = "line-tables-only"` and turns off debug info for dependencies. Do not override it.
 - **Clean up at the end of a milestone.** Run `cargo clean` in the worktree after the milestone report is sent, unless the next milestone starts immediately in the same worktree.
 - **Run a review build in the implementer's worktree only while the implementer is idle.** Use the default target, run `cargo test` / `cargo clippy` sequentially, and do not keep a second copy.
 - Never move build output to D: or E:.
