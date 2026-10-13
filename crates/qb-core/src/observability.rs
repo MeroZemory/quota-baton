@@ -236,14 +236,33 @@ impl Observability {
     }
 
     pub fn capture(&self, headers: &HeaderMap, body: &[u8]) {
+        let _ = self.capture_request(headers, body);
+    }
+
+    pub fn capture_request(&self, headers: &HeaderMap, body: &[u8]) -> Option<PathBuf> {
         #[cfg(all(feature = "shape-capture", debug_assertions))]
         if let Some(capture) = &self.capture
             && let Some(value) = capture.shape(headers, body)
         {
+            let destination = value["destination"].as_str().map(PathBuf::from);
             self.enqueue(Command::Capture(value));
+            return destination;
         }
         #[cfg(not(all(feature = "shape-capture", debug_assertions)))]
         let _ = (headers, body);
+        None
+    }
+
+    pub fn capture_response(&self, ticket: Option<&Path>, headers: &HeaderMap) {
+        #[cfg(all(feature = "shape-capture", debug_assertions))]
+        if let Some(destination) = ticket {
+            self.enqueue(Command::Capture(serde_json::json!({
+                "destination": destination,
+                "shape": crate::capture::response_shape(headers)
+            })));
+        }
+        #[cfg(not(all(feature = "shape-capture", debug_assertions)))]
+        let _ = (ticket, headers);
     }
 
     fn enqueue(&self, command: Command) {
@@ -377,7 +396,7 @@ fn snapshot(provider: Provider, h: &HeaderMap, now: DateTime<Utc>) -> Option<Sna
                 let name = match minutes {
                     Some(300) => "5h".into(),
                     Some(10080) => "7d".into(),
-                    Some(n) if n > 0 => format!("{n}m"),
+                    Some(n) => format!("{n}m"),
                     _ => slot.into(),
                 };
                 let reset_at = timestamp(h, &format!("{prefix}-reset-at")).or_else(|| {
@@ -388,7 +407,7 @@ fn snapshot(provider: Provider, h: &HeaderMap, now: DateTime<Utc>) -> Option<Sna
                         .and_then(|d| now.checked_add_signed(d))
                 });
                 let status = status(h, "x-codex-limit-reached");
-                if used_pct.is_some() || reset_at.is_some() {
+                if used_pct.is_some() {
                     windows.push(Window {
                         name,
                         used_pct,
@@ -1265,6 +1284,94 @@ mod tests {
         writer.persist(start + WARN_INTERVAL * 2);
         assert!(!expired.exists());
         assert!(!writer.error);
+    }
+
+    #[test]
+    fn codex_realistic_windows_require_usage_and_never_invent_resets() {
+        let now: DateTime<Utc> = "2026-10-13T00:00:00Z".parse().unwrap();
+        let mut h = HeaderMap::new();
+        h.insert("x-codex-primary-used-percent", "12".parse().unwrap());
+        h.insert("x-codex-primary-window-minutes", "300".parse().unwrap());
+        h.insert(
+            "x-codex-primary-reset-after-seconds",
+            "120".parse().unwrap(),
+        );
+        h.insert("x-codex-secondary-window-minutes", "10080".parse().unwrap());
+        h.insert(
+            "x-codex-secondary-reset-after-seconds",
+            "0".parse().unwrap(),
+        );
+        let primary = snapshot(Provider::Codex, &h, now).unwrap();
+        assert_eq!(primary.windows.len(), 1);
+        assert_eq!(primary.windows[0].name, "5h");
+        assert_eq!(
+            primary.windows[0].reset_at,
+            Some(now + Duration::seconds(120))
+        );
+        h.insert("x-codex-secondary-used-percent", "7".parse().unwrap());
+        h.insert("x-codex-secondary-reset-at", "2000000000".parse().unwrap());
+        let both = snapshot(Provider::Codex, &h, now).unwrap();
+        assert_eq!(both.windows[1].name, "7d");
+        assert_eq!(
+            both.windows[1].reset_at,
+            DateTime::from_timestamp(2000000000, 0)
+        );
+        h.remove("x-codex-primary-reset-after-seconds");
+        h.insert("x-codex-primary-window-minutes", "60".parse().unwrap());
+        let absent = snapshot(Provider::Codex, &h, now).unwrap();
+        assert_eq!(absent.windows[0].name, "60m");
+        assert_eq!(absent.windows[0].reset_at, None);
+        h.remove("x-codex-primary-used-percent");
+        h.remove("x-codex-secondary-used-percent");
+        assert!(snapshot(Provider::Codex, &h, now).is_none());
+    }
+
+    #[cfg(feature = "shape-capture")]
+    #[test]
+    fn response_shape_capture_allowlists_limits_and_keeps_last_request_response() {
+        let dir = directory();
+        let destination = dir.path().join("capture");
+        fs::create_dir(&destination).unwrap();
+        let obs = Observability::new(
+            dir.path(),
+            Some(CaptureOptions {
+                dir: destination.clone(),
+                limit: 1,
+            }),
+        )
+        .unwrap();
+        let ticket = obs.capture_request(&HeaderMap::new(), b"{}").unwrap();
+        let mut headers = HeaderMap::new();
+        for (name, value) in [
+            ("x-codex-primary-used-percent", "20"),
+            ("anthropic-ratelimit-unified-5h-status", "allowed"),
+            ("retry-after", "60"),
+            ("x-request-id", "synthetic-id"),
+            ("set-cookie", "fake-cookie-secret"),
+            ("authorization", "Bearer fake-access-secret"),
+        ] {
+            headers.insert(name, value.parse().unwrap());
+        }
+        obs.capture_response(Some(&ticket), &headers);
+        assert!(obs.capture_request(&HeaderMap::new(), b"{}").is_none());
+        obs.capture_response(None, &headers);
+        obs.flush().unwrap();
+        let text = fs::read_to_string(ticket).unwrap();
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[1]["response_header_values"]["x-codex-primary-used-percent"],
+            serde_json::json!(["20"])
+        );
+        assert_eq!(
+            lines[1]["response_header_names"].as_array().unwrap().len(),
+            4
+        );
+        assert!(!text.contains("fake-cookie-secret"));
+        assert!(!text.contains("fake-access-secret"));
     }
 
     #[test]

@@ -301,6 +301,9 @@ fn logging_child() {
         return;
     };
     let guard = logging::init(std::path::Path::new(&home)).unwrap();
+    tracing::trace!("trace-level-marker");
+    tracing::debug!("debug-level-marker");
+    tracing::info!("info-level-marker");
     let span = tracing::info_span!(
         "synthetic",
         access_token = "fake-span-secret",
@@ -328,6 +331,8 @@ fn rolling_logs_and_stderr_redact_fields_headers_and_spans() {
         .args(["--exact", "logging_child", "--nocapture"])
         .env("QB_M0_LOG_CHILD", home.path())
         .env("QB_HOME", home.path())
+        .env_remove("QB_LOG")
+        .env_remove("RUST_LOG")
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -341,5 +346,45 @@ fn rolling_logs_and_stderr_redact_fields_headers_and_spans() {
         assert!(text.contains("<redacted>"));
         assert!(text.contains("Unknown configuration key"));
         assert!(!text.contains("fake-"), "synthetic secret leaked into logs");
+    }
+}
+
+#[test]
+fn log_default_info_and_explicit_environment_levels() {
+    for (qb, rust, debug, trace) in [
+        (None, None, false, false),
+        (None, Some("trace"), true, true),
+        (Some("debug"), Some("trace"), true, false),
+    ] {
+        let home = home();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", "logging_child", "--nocapture"])
+            .env("QB_M0_LOG_CHILD", home.path())
+            .env("QB_HOME", home.path())
+            .env_remove("QB_LOG")
+            .env_remove("RUST_LOG");
+        if let Some(value) = qb {
+            command.env("QB_LOG", value);
+        }
+        if let Some(value) = rust {
+            command.env("RUST_LOG", value);
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success());
+        let file = fs::read_dir(home.path().join("logs"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        for text in [
+            String::from_utf8(output.stderr).unwrap(),
+            fs::read_to_string(file).unwrap(),
+        ] {
+            assert!(text.contains("info-level-marker"));
+            assert_eq!(text.contains("debug-level-marker"), debug);
+            assert_eq!(text.contains("trace-level-marker"), trace);
+        }
     }
 }
