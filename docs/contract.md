@@ -153,7 +153,7 @@ Each account has two independent fields:
 **Terms.**
 - **Commit** is the first upstream event that is not an error. For HTTP, response headers and leading events wait in a bounded hold until then (architecture §5 step 7). For WebSocket, see §9.
 - **Failover** means re-running C7 without the accounts already tried, using the retained copy.
-- **Attempt limits.** A request tries at most 4 distinct accounts. Each account gets at most one extra same-account retry, either the token retry of row 5 or the network retry of row 11. Those retries do not count as a new account.
+- **Attempt limits.** A request tries at most 4 distinct accounts. Each account has two independent same-account retry budgets: at most one token retry (row 5) and at most one network retry (row 11). So an account gets at most two extra attempts, and using one budget never consumes the other. These retries do not count as a new account.
 - **Before acting on a decision** (a failover, or a WebSocket close), the health change is recorded first, so the next selection cannot pick the same account again.
 
 | # | Upstream condition | Before commit | Client sees | Health change |
