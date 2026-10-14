@@ -411,7 +411,7 @@ impl RelayState {
         &self,
         provider: Provider,
         key: Option<&str>,
-        model: Option<&str>,
+        _model: Option<&str>,
         tried: &BTreeSet<String>,
     ) -> Result<Vec<crate::bindings::Candidate>, ()> {
         let store = self.store.clone();
@@ -450,22 +450,9 @@ impl RelayState {
                 *account = updated;
             }
         }
-        let bound = self.bindings.current(key);
-        let has_non_pacing = accounts.iter().any(|account| {
-            account.provider == provider
-                && account.eligible(model)
-                && store
-                    .tokens(account)
-                    .is_ok_and(|tokens| !tokens.access_token.is_empty())
-                && {
-                    let pacing = self.accounts.pacing_snapshot(&account.id);
-                    pacing.rate_step == 0
-                        && pacing.rate_backoff_until.is_none()
-                        && pacing.waiting == 0
-                }
-        });
         let runtime = self.accounts.clone();
         let obs = self.observability.clone();
+        let bindings = self.bindings.clone();
         tokio::task::spawn_blocking(move || {
             accounts
                 .into_iter()
@@ -474,15 +461,16 @@ impl RelayState {
                         && !tried.contains(&a.id)
                         && !runtime.probing(&a.id)
                         && !runtime.blocked_in_memory(&a.id)
-                        && (bound.as_deref() == Some(a.id.as_str()) || !has_non_pacing || {
-                            let pacing = runtime.pacing_snapshot(&a.id);
-                            pacing.rate_step == 0
-                                && pacing.rate_backoff_until.is_none()
-                                && pacing.waiting == 0
-                        })
                         && store.tokens(a).is_ok_and(|t| !t.access_token.is_empty())
                 })
                 .map(|account| {
+                    let pacing = runtime.pacing_snapshot(&account.id);
+                    bindings.set_pacing(
+                        &account.id,
+                        pacing.rate_step > 0
+                            || pacing.rate_backoff_until.is_some()
+                            || pacing.waiting > 0,
+                    );
                     Ok(crate::bindings::Candidate {
                         quota: obs.quota_snapshot(&account.id),
                         // Every production attempt reserves the live table;
@@ -495,6 +483,23 @@ impl RelayState {
         })
         .await
         .map_err(|_| ())?
+    }
+
+    async fn note_client_rate(&self, provider: Provider, account: &str, key: Option<&str>) {
+        let Ok(candidates) = self
+            .candidates(provider, None, None, &BTreeSet::new())
+            .await
+        else {
+            return;
+        };
+        let now = chrono::Utc::now();
+        let (active, threshold, groups_hit, marked) =
+            self.bindings
+                .note_client_rate(provider, account, key, &candidates, now);
+        if marked > 0 || (groups_hit >= 3 && self.bindings.overload_report_due(account, now)) {
+            self.observability
+                .record_overload(account, active, threshold, groups_hit, marked);
+        }
     }
 
     // Availability checks must never mutate affinity or reserve an attempt.
@@ -1425,14 +1430,9 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
                 }
             }
             rate_relayed = true;
-            let (active, threshold, groups_hit, marked) = state.bindings.note_client_rate(
-                &account.id,
-                session.key.as_deref(),
-                chrono::Utc::now(),
-            );
             state
-                .observability
-                .record_overload(&account.id, active, threshold, groups_hit, marked);
+                .note_client_rate(provider, &account.id, session.key.as_deref())
+                .await;
             completion.relayed_rate_429();
             completion.outcome(status.as_u16(), "rate_hold_relayed_429");
         } else if let Some(signal) = decision.signal.take()
