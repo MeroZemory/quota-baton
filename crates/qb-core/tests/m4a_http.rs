@@ -664,6 +664,73 @@ async fn c6_3_storm_simulation() {
     }));
     eprintln!("synthetic limiter 429 counts by round: {round_counts:?}");
 }
+
+#[tokio::test]
+async fn c7_1_storm_through_relay_concentrated_then_spread() {
+    let h = Harness::new(Provider::Codex, 2, 384, 1024).await;
+    let ids = h.ids();
+    h.state
+        .accounts
+        .change(&ids[1], Some(UserState::Paused), None, None, None)
+        .await
+        .unwrap();
+    // Fill six distinct groups on A while B is unavailable, then make B an
+    // eligible target for the overload trigger.
+    for n in 0..6 {
+        let response = h
+            .send_with_session(Provider::Codex, &format!("c7-storm-{n}"))
+            .await;
+        assert_eq!(response.headers()["x-quota-baton-account"], ids[0]);
+    }
+    h.state
+        .accounts
+        .change(&ids[1], Some(UserState::Active), None, None, None)
+        .await
+        .unwrap();
+    h.state.accounts.set_rate_hold_secs(1);
+    h.fake
+        .state
+        .enable_window_limiter(0, Duration::from_secs(60));
+    let mut rate_responses = Vec::new();
+    for n in 0..3 {
+        let response = h
+            .send_with_session(Provider::Codex, &format!("c7-storm-{n}"))
+            .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()["x-quota-baton-account"], ids[0]);
+        rate_responses.push(response);
+    }
+    // A marked group moves only at the next request boundary; the 429s above
+    // must all remain on A.
+    let mut moved = None;
+    for n in 0..6 {
+        let response = h
+            .send_with_session(Provider::Codex, &format!("c7-storm-{n}"))
+            .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        if response.headers()["x-quota-baton-account"] == ids[1] {
+            moved = Some(n);
+            break;
+        }
+    }
+    assert!(
+        moved.is_some(),
+        "a marked session must move to the second account"
+    );
+    drop(rate_responses);
+    let ledger = h.ledger();
+    assert!(
+        ledger
+            .iter()
+            .any(|row| row["event"] == "overload_detected"
+                && row["marked"].as_u64().unwrap_or(0) > 0)
+    );
+    assert!(ledger.iter().any(|row| row["event"] == "binding_move"
+        && row["reason"] == "overload"
+        && row["from"] == ids[0]
+        && row["to"] == ids[1]));
+    assert!(h.state.bindings.active_sessions(&ids[0], Utc::now()) <= 6);
+}
 #[tokio::test]
 async fn c6_row_4_linked_revocation_cools_link_stale_and_fails_over() {
     let h = Harness::new(Provider::Codex, 2, 384, 1024).await;

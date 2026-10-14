@@ -414,3 +414,94 @@ fn c7_1_inflight_request_or_streaming_socket_never_victim() {
     assert!(!table.overload_marked(Some("codex:g0"), Utc::now()));
     drop(lease);
 }
+
+#[test]
+fn c7_1_concentrated_marks_cheapest_groups_two_per_window() {
+    let (_root, table) = table();
+    let source = "codex:a";
+    let target = "codex:b";
+    let source_only = candidates(&[source]);
+    let both = candidates(&[source, target]);
+    for (n, bytes) in [10, 90, 20, 80, 30, 70, 40, 60].into_iter().enumerate() {
+        assert_eq!(
+            choose(&table, &format!("codex:g{n}"), &source_only, bytes),
+            source
+        );
+    }
+    table.set_account_threshold(source, Some(5));
+    let _ = table.preview(Provider::Codex, None, None, None, &both, None, 0);
+    assert_eq!(
+        table
+            .note_client_rate(Provider::Codex, source, Some("codex:g0"), &both, Utc::now())
+            .3,
+        0
+    );
+    assert_eq!(
+        table
+            .note_client_rate(Provider::Codex, source, Some("codex:g1"), &both, Utc::now())
+            .3,
+        0
+    );
+    let marked =
+        table.note_client_rate(Provider::Codex, source, Some("codex:g2"), &both, Utc::now());
+    assert_eq!(marked.2, 3);
+    assert_eq!(marked.3, 2);
+    assert!(table.overload_marked(Some("codex:g0"), Utc::now()));
+    assert!(table.overload_marked(Some("codex:g2"), Utc::now()));
+    assert_eq!(
+        table
+            .note_client_rate(Provider::Codex, source, Some("codex:g3"), &both, Utc::now())
+            .3,
+        0
+    );
+}
+
+#[test]
+fn c7_1_in_place_retry_and_reset_hold_are_not_boundaries() {
+    let (_root, table) = table();
+    let source = "codex:a";
+    let target = "codex:b";
+    let only_source = candidates(&[source]);
+    let both = candidates(&[source, target]);
+    for n in 0..6 {
+        choose(&table, &format!("codex:g{n}"), &only_source, 1);
+    }
+    table.set_account_threshold(source, Some(5));
+    let _ = table.preview(Provider::Codex, None, None, None, &both, None, 0);
+    for key in ["codex:g0", "codex:g1", "codex:g2"] {
+        table.note_client_rate(Provider::Codex, source, Some(key), &both, Utc::now());
+    }
+    assert!(table.overload_marked(Some("codex:g0"), Utc::now()));
+    // C6.3 in-place/reset-hold retries reuse the reserved account and do not
+    // ask the binding selector for a new placement.
+    let retry = table.begin_request(Some("codex:g0"), source);
+    assert_eq!(table.current(Some("codex:g0")), Some(source.to_owned()));
+    drop(retry);
+    assert_eq!(table.current(Some("codex:g0")), Some(source.to_owned()));
+    assert_eq!(choose(&table, "codex:g0", &both, 1), target);
+}
+
+#[test]
+fn c7_1_row10_and_row2_outcomes_do_not_count() {
+    let (_root, table) = table();
+    let source = "codex:a";
+    let target = "codex:b";
+    let ids = candidates(&[source, target]);
+    for n in 0..6 {
+        choose(&table, &format!("codex:g{n}"), &candidates(&[source]), 1);
+    }
+    table.set_account_threshold(source, Some(5));
+    // 529, 5xx, model-capacity, and quota 429 are relay classifications that
+    // deliberately never call note_client_rate; absence of a client-rate
+    // trigger leaves every binding unmarked.
+    for _outcome in [529, 500, 429, 429] {
+        assert!(!table.overload_marked(Some("codex:g0"), Utc::now()));
+    }
+    assert_eq!(
+        table
+            .note_client_rate(Provider::Codex, source, Some("codex:g0"), &ids, Utc::now())
+            .2,
+        1
+    );
+    assert!(!table.overload_marked(Some("codex:g0"), Utc::now()));
+}
