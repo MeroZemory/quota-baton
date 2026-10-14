@@ -412,4 +412,108 @@ mod tests {
         assert_eq!(forwarded, input);
         assert_eq!(collect(retained.unwrap().retry_body()).await, input);
     }
+
+    #[tokio::test]
+    async fn m7b_plain_body_over_1mib_retained_compressed_and_zstd_retained_as_is() {
+        let plain = Bytes::from(vec![b'p'; COMPRESS_AFTER + 4096]);
+        let budget = InflightBudget::new(plain.len() * 2);
+        let upload = read(
+            Body::from(plain.clone()),
+            plain.len() * 2,
+            Arc::new(AtomicU64::new(0)),
+            budget.clone(),
+            false,
+        )
+        .await
+        .unwrap();
+        let retained = upload.retained.as_ref().unwrap().complete().await.unwrap();
+        assert_eq!(collect(upload.body).await, plain);
+        assert!(retained.compressed);
+        assert!(retained.bytes.len() < plain.len());
+        assert_eq!(
+            zstd::stream::decode_all(&retained.bytes[..]).unwrap(),
+            plain
+        );
+
+        let encoded = Bytes::from(zstd::stream::encode_all(&plain[..], 1).unwrap());
+        let upload = read(
+            Body::from(encoded.clone()),
+            encoded.len() + 1,
+            Arc::new(AtomicU64::new(0)),
+            InflightBudget::new(encoded.len() + 1),
+            true,
+        )
+        .await
+        .unwrap();
+        let retained = upload.retained.as_ref().unwrap().complete().await.unwrap();
+        assert_eq!(collect(upload.body).await, encoded);
+        assert!(!retained.compressed);
+        assert_eq!(retained.bytes, encoded);
+    }
+
+    #[tokio::test]
+    async fn m7b_over_cap_body_forwarded_without_failover() {
+        let input = Bytes::from(vec![b'x'; COMPRESS_AFTER + 8192]);
+        let upload = read(
+            Body::from(input.clone()),
+            COMPRESS_AFTER,
+            Arc::new(AtomicU64::new(0)),
+            InflightBudget::new(input.len()),
+            false,
+        )
+        .await
+        .unwrap();
+        let handle = upload.retained.as_ref().unwrap().clone();
+        assert_eq!(collect(upload.body).await, input);
+        assert!(handle.complete().await.is_none());
+        assert!(handle.retry_body().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn m7b_budget_exhaustion_mid_body_drops_retention_without_stall() {
+        let input = Bytes::from(vec![b'b'; COMPRESS_AFTER + 8192]);
+        let chunks = input
+            .chunks(4096)
+            .map(|chunk| Ok::<_, std::io::Error>(Bytes::copy_from_slice(chunk)))
+            .collect::<Vec<_>>();
+        let upload = read(
+            Body::from_stream(futures_util::stream::iter(chunks)),
+            input.len(),
+            Arc::new(AtomicU64::new(0)),
+            InflightBudget::new(1024),
+            false,
+        )
+        .await
+        .unwrap();
+        let handle = upload.retained.as_ref().unwrap().clone();
+        assert_eq!(collect(upload.body).await, input);
+        assert!(handle.complete().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn m7b_retry_invariance_plain_and_zstd() {
+        let plain = Bytes::from(vec![b'a'; COMPRESS_AFTER + 1234]);
+        for (input, zstd_input) in [
+            (plain.clone(), false),
+            (
+                Bytes::from(zstd::stream::encode_all(&plain[..], 1).unwrap()),
+                true,
+            ),
+        ] {
+            let upload = read(
+                Body::from(input.clone()),
+                input.len() * 2,
+                Arc::new(AtomicU64::new(0)),
+                InflightBudget::new(input.len() * 2),
+                zstd_input,
+            )
+            .await
+            .unwrap();
+            let handle = upload.retained.as_ref().unwrap().clone();
+            let first = collect(upload.body).await;
+            let retry = collect(handle.retry_body().await.unwrap()).await;
+            assert_eq!(first, input);
+            assert_eq!(retry, input);
+        }
+    }
 }

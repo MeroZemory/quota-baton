@@ -124,6 +124,25 @@ impl RelayState {
         })
     }
 
+    #[cfg(all(feature = "testkit", debug_assertions))]
+    pub fn force_memory_sample_for_test(
+        &self,
+        private_bytes: u64,
+    ) -> crate::guard::MemoryGuardSample {
+        let sample = self.memory_guard.force_sample(private_bytes);
+        match sample.transition {
+            crate::guard::MemoryGuardTransition::On => {
+                self.observability.record_guard("guard_on");
+                self.observability.core_warning("", "memory_guard");
+            }
+            crate::guard::MemoryGuardTransition::Off => {
+                self.observability.record_guard("guard_off");
+            }
+            crate::guard::MemoryGuardTransition::Unchanged => {}
+        }
+        sample
+    }
+
     /// Begin a takeover drain exactly once.  Admission is closed before any
     /// refresh or binding work begins, so a successor cannot observe a writer
     /// still consuming the old credential lease.
@@ -330,7 +349,7 @@ impl RelayState {
         self
     }
 
-    #[cfg(all(feature = "testkit", debug_assertions))]
+    #[cfg(debug_assertions)]
     pub fn with_token_endpoint(mut self, provider: Provider, url: String) -> Self {
         self.tokens = self.tokens.with_token_endpoint(provider, url);
         self.quota.set_tokens(self.tokens.clone());

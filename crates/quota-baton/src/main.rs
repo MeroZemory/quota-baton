@@ -240,7 +240,7 @@ async fn run() -> anyhow::Result<()> {
                 observability.clone(),
                 pins.clone(),
             )?;
-            #[cfg(all(feature = "testkit", debug_assertions))]
+            #[cfg(debug_assertions)]
             let relay = {
                 let mut relay = relay;
                 for (provider, endpoint) in [
@@ -336,10 +336,10 @@ async fn run() -> anyhow::Result<()> {
             // lease to the successor. Existing handlers remain alive under
             // axum's graceful-shutdown drain.
             servers.shutdown();
+            servers.wait_for_listener_close().await;
             if relay.is_draining() {
                 relay.release_lease_after_drain();
             }
-            servers.wait_for_listener_close().await;
             let drain_deadline = relay.drain_timeout();
             let _ = tokio::time::timeout(drain_deadline, async {
                 let _ = tokio::join!(&mut servers.data_task, &mut servers.admin_task);

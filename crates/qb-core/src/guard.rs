@@ -139,6 +139,7 @@ pub struct MemoryGuard {
     hard_limit: u64,
     guarded: std::sync::atomic::AtomicBool,
     last_private: AtomicU64,
+    changed: tokio::sync::Notify,
 }
 
 impl MemoryGuard {
@@ -147,6 +148,7 @@ impl MemoryGuard {
             hard_limit,
             guarded: std::sync::atomic::AtomicBool::new(false),
             last_private: AtomicU64::new(0),
+            changed: tokio::sync::Notify::new(),
         }
     }
     pub fn hard_limit(&self) -> u64 {
@@ -157,6 +159,9 @@ impl MemoryGuard {
     }
     pub fn is_guarded(&self) -> bool {
         self.guarded.load(Ordering::Acquire)
+    }
+    pub async fn changed(&self) {
+        self.changed.notified().await;
     }
     pub fn last_private_bytes(&self) -> u64 {
         self.last_private.load(Ordering::Acquire)
@@ -177,6 +182,9 @@ impl MemoryGuard {
             bytes > self.hard_limit
         };
         self.guarded.store(now, Ordering::Release);
+        if was != now {
+            self.changed.notify_waiters();
+        }
         MemoryGuardSample {
             private_bytes: bytes,
             guarded: now,

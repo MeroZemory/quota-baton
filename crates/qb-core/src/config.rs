@@ -21,9 +21,9 @@ pub struct UpstreamConfig {
     pub codex_base: String,
     pub claude_usage_base: String,
     pub codex_usage_base: String,
-    #[cfg(all(feature = "testkit", debug_assertions))]
+    #[cfg(debug_assertions)]
     pub claude_token_endpoint: Option<String>,
-    #[cfg(all(feature = "testkit", debug_assertions))]
+    #[cfg(debug_assertions)]
     pub codex_token_endpoint: Option<String>,
 }
 
@@ -34,9 +34,9 @@ impl Default for UpstreamConfig {
             codex_base: "https://chatgpt.com/backend-api/codex".into(),
             claude_usage_base: "https://api.anthropic.com".into(),
             codex_usage_base: "https://chatgpt.com".into(),
-            #[cfg(all(feature = "testkit", debug_assertions))]
+            #[cfg(debug_assertions)]
             claude_token_endpoint: None,
-            #[cfg(all(feature = "testkit", debug_assertions))]
+            #[cfg(debug_assertions)]
             codex_token_endpoint: None,
         }
     }
@@ -44,7 +44,7 @@ impl Default for UpstreamConfig {
 
 impl UpstreamConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
-        #[cfg(all(feature = "testkit", debug_assertions))]
+        #[cfg(debug_assertions)]
         for value in [&self.claude_token_endpoint, &self.codex_token_endpoint]
             .into_iter()
             .flatten()
