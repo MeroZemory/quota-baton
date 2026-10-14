@@ -139,7 +139,7 @@ impl TokenGates {
         }
     }
 
-    #[cfg(all(feature = "testkit", debug_assertions))]
+    #[cfg(debug_assertions)]
     pub fn with_token_endpoint(mut self, provider: Provider, url: String) -> Self {
         let parsed = reqwest::Url::parse(&url).expect("synthetic token URL");
         assert!(

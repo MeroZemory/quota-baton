@@ -20,11 +20,27 @@ struct Pair {
     client: Client,
     peer: Peer,
     budget: Arc<InflightBudget>,
+    memory_guard: Arc<crate::guard::MemoryGuard>,
     obs: Arc<Observability>,
     home: tempfile::TempDir,
     server: tokio::task::JoinHandle<()>,
     relay: Option<Arc<crate::relay::RelayState>>,
     drain: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+#[tokio::test]
+async fn m7b_guard_pauses_ws_reads_and_resumes() {
+    let mut pair = pair(Duration::from_secs(60), false, PARSE_LIMIT).await;
+    let create = Message::Text(r#"{"type":"response.create","model":"fixture","input":[]}"#.into());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    pair.memory_guard.force_sample(u64::MAX);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    pair.client.send(create.clone()).await.unwrap();
+    assert!(pair.memory_guard.is_guarded());
+    let held = tokio::time::timeout(Duration::from_millis(100), pair.peer.next()).await;
+    assert!(held.is_err(), "guarded WS read was admitted");
+    pair.memory_guard.force_sample(0);
+    assert_eq!(next(&mut pair.peer).await, create);
 }
 
 impl Drop for Pair {
@@ -71,6 +87,7 @@ async fn pair_with_tracking(
     let home = tempfile::tempdir_in(root).unwrap();
     let obs = Arc::new(Observability::new(home.path(), None).unwrap());
     let budget = InflightBudget::new(limit);
+    let memory_guard = Arc::new(crate::guard::MemoryGuard::new(100));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_address = listener.local_addr().unwrap();
     let relay = if tracking {
@@ -129,6 +146,7 @@ async fn pair_with_tracking(
     let upstream = Arc::new(Mutex::new(Some(upstream)));
     let handler_obs = obs.clone();
     let handler_budget = budget.clone();
+    let handler_memory_guard = memory_guard.clone();
     let handler_relay = relay.clone();
     let (drain, drained) = tokio::sync::oneshot::channel();
     let drained = Arc::new(Mutex::new(Some(drained)));
@@ -172,7 +190,7 @@ async fn pair_with_tracking(
                             })),
                             credentials: None,
                             budget,
-                            memory_guard: Arc::new(crate::guard::MemoryGuard::new(u64::MAX)),
+                            memory_guard: handler_memory_guard.clone(),
                             observability: obs,
                             account: "fake-account".into(),
                             headers: HeaderMap::new(),
@@ -208,6 +226,7 @@ async fn pair_with_tracking(
         client,
         peer,
         budget,
+        memory_guard,
         obs,
         home,
         server,

@@ -655,7 +655,7 @@ async fn run_with_read_timeout(
             _ = context.budget.wait_available(), if !client_admitted && to_upstream.is_none() && ending.is_none() => {
                 client_admitted = true;
             }
-            _ = tokio::time::sleep(Duration::from_millis(100)), if context.memory_guard.is_guarded() && ending.is_none() => {
+            _ = context.memory_guard.changed(), if ending.is_none() => {
                 // Memory protection pauses client reads but leaves existing streams alive.
             }
             message = client_read.next(), if client_admitted && !context.memory_guard.is_guarded() && to_upstream.is_none() && ending.is_none() && !terminal_pending => {
