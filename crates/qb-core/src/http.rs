@@ -163,7 +163,6 @@ pub async fn spawn_with_routes(
             },
             safety,
         ));
-    let data_closed_signal = data_closed.clone();
     let data_task = tokio::spawn(async move {
         axum::serve(
             HandoverListener {
@@ -178,11 +177,9 @@ pub async fn spawn_with_routes(
                     break;
                 }
             }
-            data_closed_signal.send_replace(true);
         })
         .await
     });
-    let admin_closed_signal = admin_closed.clone();
     let admin_task = tokio::spawn(async move {
         axum::serve(
             HandoverListener {
@@ -197,7 +194,6 @@ pub async fn spawn_with_routes(
                     break;
                 }
             }
-            admin_closed_signal.send_replace(true);
         })
         .await
     });
