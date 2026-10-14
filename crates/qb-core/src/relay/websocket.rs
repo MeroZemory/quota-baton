@@ -556,7 +556,16 @@ async fn upgrade_inner(
         capture_ticket: ticket,
         connection: format!("{:032x}", rand::random::<u128>()),
     };
+    struct SocketActivity(Arc<std::sync::atomic::AtomicU64>);
+    impl Drop for SocketActivity {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+    state.inflight_requests.fetch_add(1, Ordering::AcqRel);
+    let activity = SocketActivity(state.inflight_requests.clone());
     tokio::spawn(async move {
+        let _activity = activity;
         let _socket_pin = socket_pin;
         if let Ok(client) = client_upgrade.await {
             let client = WebSocketStream::from_raw_socket(

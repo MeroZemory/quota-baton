@@ -234,6 +234,12 @@ pub struct Observability {
 }
 
 impl Observability {
+    pub fn record_takeover(&self, phase: &str) {
+        self.enqueue(Command::Ledger(serde_json::json!({
+            "ts": Utc::now().to_rfc3339(), "event": "takeover",
+            "phase": phase, "pid": std::process::id()
+        })));
+    }
     pub(crate) fn set_events(&self, sender: tokio::sync::broadcast::Sender<serde_json::Value>) {
         *self.events.lock().unwrap_or_else(|e| e.into_inner()) = Some(sender);
     }

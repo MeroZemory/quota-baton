@@ -128,6 +128,14 @@ fn friendly_error(error: &anyhow::Error) -> String {
         return "코어와 통신하지 못했습니다. 실행 상태와 관리 토큰을 확인해 주세요.".into();
     }
     let detail = error.to_string();
+    if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::AddrInUse)
+    }) {
+        return "포트 인계 대기 시간(2초)이 지났습니다. 포트를 사용하는 프로세스를 확인해 주세요."
+            .into();
+    }
     if detail.contains("websocket.upstream_deflate") {
         return "WebSocket upstream_deflate=true는 지원되지 않습니다. deflate 지원 라이브러리를 채택하기 전에는 false로 설정해 주세요.".into();
     }
@@ -152,7 +160,10 @@ async fn request_takeover(
 ) -> anyhow::Result<serde_json::Value> {
     let secrets = qb_core::local_secrets::load_or_create(home)?;
     let port = config.server.admin_port;
-    let client = reqwest::Client::builder().no_proxy().build()?;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(35))
+        .build()?;
     let response = client
         .post(format!("http://127.0.0.1:{port}/admin/v1/lifecycle/drain"))
         .header(reqwest::header::HOST, format!("127.0.0.1:{port}"))
@@ -160,7 +171,7 @@ async fn request_takeover(
             reqwest::header::AUTHORIZATION,
             format!("Bearer {}", secrets.admin_token),
         )
-        .json(&serde_json::json!({"drain_timeout_secs": 30 * 60}))
+        .json(&serde_json::json!({"drain_timeout_secs": config.server.drain_timeout_secs}))
         .send()
         .await?;
     if !response.status().is_success() {
@@ -219,6 +230,9 @@ async fn run() -> anyhow::Result<()> {
             let capture = None;
             let observability =
                 std::sync::Arc::new(qb_core::observability::Observability::new(&home, capture)?);
+            if takeover {
+                observability.record_takeover("lease_acquired");
+            }
             let pins = std::sync::Arc::new(qb_core::debug_pin::DebugPins::default());
             let relay = qb_core::relay::RelayState::new(
                 store.clone(),
@@ -226,6 +240,25 @@ async fn run() -> anyhow::Result<()> {
                 observability.clone(),
                 pins.clone(),
             )?;
+            #[cfg(all(feature = "testkit", debug_assertions))]
+            let relay = {
+                let mut relay = relay;
+                for (provider, endpoint) in [
+                    (
+                        qb_core::accounts::Provider::Claude,
+                        &config.upstream.claude_token_endpoint,
+                    ),
+                    (
+                        qb_core::accounts::Provider::Codex,
+                        &config.upstream.codex_token_endpoint,
+                    ),
+                ] {
+                    if let Some(endpoint) = endpoint {
+                        relay = relay.with_token_endpoint(provider, endpoint.clone());
+                    }
+                }
+                relay
+            };
             #[cfg(feature = "phase0")]
             let relay = if let Some(dir) = capture_bodies_dir {
                 let capture = qb_core::phase0::BodyCapture::new(dir, capture_bodies_limit)?;
@@ -239,9 +272,10 @@ async fn run() -> anyhow::Result<()> {
             #[cfg(feature = "phase0")]
             let relay = relay.with_close_after_response(phase0_close_after_response);
             let relay = std::sync::Arc::new(relay);
+            relay.set_drain_timeout(config.server.drain_timeout_secs);
             if let Some(bindings) = imported_bindings {
                 let value = serde_json::json!({
-                    "schema": 2,
+                    "schema": 1,
                     "bindings": bindings
                         .get("bindings")
                         .cloned()
@@ -251,6 +285,7 @@ async fn run() -> anyhow::Result<()> {
                     .bindings
                     .import(value)
                     .map_err(|_| anyhow::anyhow!("인계된 세션 바인딩을 읽지 못했습니다."))?;
+                observability.record_takeover("bindings_imported");
             }
             relay
                 .accounts
@@ -280,6 +315,9 @@ async fn run() -> anyhow::Result<()> {
                 admin_routes,
             )
             .await?;
+            if takeover {
+                observability.record_takeover("listening");
+            }
             println_utf8!("프록시를 시작했습니다.");
             let polling = relay.quota.start();
             let refreshing = relay.start_refresh_scheduler();
@@ -302,6 +340,13 @@ async fn run() -> anyhow::Result<()> {
             let drain_deadline = relay.drain_timeout();
             let _ = tokio::time::timeout(drain_deadline, async {
                 let _ = tokio::join!(&mut servers.data_task, &mut servers.admin_task);
+                while relay
+                    .inflight_requests
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    > 0
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
             })
             .await;
             drop(servers);
@@ -313,6 +358,9 @@ async fn run() -> anyhow::Result<()> {
             }
             // 종료 시 디스크 flush와 작성자 정리도 런타임 스레드를 막지 않는다.
             tokio::task::spawn_blocking(move || {
+                if relay.is_draining() {
+                    observability.record_takeover("exited");
+                }
                 relay.bindings.flush()?;
                 observability.flush()
             })
