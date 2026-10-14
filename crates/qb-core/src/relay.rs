@@ -124,7 +124,7 @@ impl RelayState {
         })
     }
 
-    #[cfg(all(feature = "testkit", debug_assertions))]
+    #[cfg(feature = "testkit")]
     pub fn force_memory_sample_for_test(
         &self,
         private_bytes: u64,
