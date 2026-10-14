@@ -15,6 +15,7 @@ pub struct AdminClient {
     admin_token: String,
 }
 
+#[allow(dead_code)]
 impl AdminClient {
     /// Load the port from `QB_HOME/config.toml` and the token from
     /// `QB_HOME/admin.token`, using the same home resolution as the core.
@@ -74,30 +75,201 @@ impl AdminClient {
         Ok(TrayRead { health, snapshot })
     }
 
-    async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, ClientError> {
-        let url = format!("{}{path}", self.base_url);
+    pub async fn patch_account(
+        &self,
+        id: &str,
+        patch: AccountPatch,
+    ) -> Result<TrayAccount, ClientError> {
+        self.send_json(
+            reqwest::Method::PATCH,
+            &format!("/admin/v1/accounts/{id}"),
+            &patch,
+        )
+        .await
+    }
+
+    pub async fn account_action(
+        &self,
+        id: &str,
+        action: AccountAction,
+    ) -> Result<TrayAccount, ClientError> {
+        let path = format!("/admin/v1/accounts/{id}/{}", action.as_str());
+        self.send_json(reqwest::Method::POST, &path, &serde_json::json!({}))
+            .await
+    }
+
+    pub async fn delete_account(&self, id: &str) -> Result<(), ClientError> {
+        self.send_empty(reqwest::Method::DELETE, &format!("/admin/v1/accounts/{id}"))
+            .await
+    }
+
+    pub async fn start_login(&self, provider: &str) -> Result<LoginStart, ClientError> {
+        self.send_json(
+            reqwest::Method::POST,
+            "/admin/v1/accounts/login",
+            &serde_json::json!({"provider": provider}),
+        )
+        .await
+    }
+
+    pub async fn login_status(&self, login_id: &str) -> Result<LoginStatus, ClientError> {
+        self.get(&format!("/admin/v1/accounts/login/{login_id}"))
+            .await
+    }
+
+    pub async fn cancel_login(&self, login_id: &str) -> Result<(), ClientError> {
+        self.send_empty(
+            reqwest::Method::POST,
+            &format!("/admin/v1/accounts/login/{login_id}/cancel"),
+        )
+        .await
+    }
+
+    pub async fn shutdown(&self, drain_timeout_secs: u64) -> Result<(), ClientError> {
+        self.send_empty_json(
+            reqwest::Method::POST,
+            "/admin/v1/lifecycle/shutdown",
+            &serde_json::json!({"drain_timeout_secs": drain_timeout_secs}),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub async fn events(&self) -> Result<reqwest::Response, ClientError> {
+        self.request(reqwest::Method::GET, "/admin/v1/events")
+            .send()
+            .await
+            .map_err(ClientError::Transport)
+    }
+
+    async fn send_json<T: DeserializeOwned>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: &impl Serialize,
+    ) -> Result<T, ClientError> {
+        let response = self.send_empty_json(method, path, body).await?;
+        response.json().await.map_err(ClientError::Decode)
+    }
+
+    async fn send_empty_json(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: &impl Serialize,
+    ) -> Result<reqwest::Response, ClientError> {
         let response = self
-            .http
-            .get(url)
+            .request(method, path)
+            .json(body)
+            .send()
+            .await
+            .map_err(ClientError::Transport)?;
+        Self::check_response(response).await
+    }
+
+    async fn send_empty(&self, method: reqwest::Method, path: &str) -> Result<(), ClientError> {
+        let response = self
+            .request(method, path)
+            .send()
+            .await
+            .map_err(ClientError::Transport)?;
+        Self::check_response(response).await.map(|_| ())
+    }
+
+    async fn check_response(response: reqwest::Response) -> Result<reqwest::Response, ClientError> {
+        if response.status().is_success() {
+            Ok(response)
+        } else {
+            Err(ClientError::Http(response.status()))
+        }
+    }
+
+    fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
+        let url = format!("{}{}", self.base_url, path);
+        self.http
+            .request(method, url)
             .header(header::HOST, self.host())
             .header(header::ORIGIN, format!("{}/", self.base_url))
             .header(
                 header::AUTHORIZATION,
                 format!("Bearer {}", self.admin_token),
             )
+    }
+
+    async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, ClientError> {
+        let response = self
+            .request(reqwest::Method::GET, path)
             .send()
             .await
             .map_err(ClientError::Transport)?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(ClientError::Http(status));
-        }
+        let response = Self::check_response(response).await?;
         response.json().await.map_err(ClientError::Decode)
     }
 
     fn host(&self) -> String {
         self.base_url.trim_start_matches("http://").to_owned()
     }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountAction {
+    Pause,
+    Resume,
+    Disable,
+    Enable,
+    RefreshUsage,
+}
+
+impl AccountAction {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pause => "pause",
+            Self::Resume => "resume",
+            Self::Disable => "disable",
+            Self::Enable => "enable",
+            Self::RefreshUsage => "refresh-usage",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "pause" => Some(Self::Pause),
+            "resume" => Some(Self::Resume),
+            "disable" => Some(Self::Disable),
+            "enable" => Some(Self::Enable),
+            "refresh-usage" => Some(Self::RefreshUsage),
+            _ => None,
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct AccountPatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drain: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_credits: Option<bool>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LoginStart {
+    pub login_id: String,
+    pub auth_url: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LoginStatus {
+    pub status: String,
+    #[serde(default)]
+    pub account_id: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -108,6 +280,17 @@ pub enum ClientError {
     Http(StatusCode),
     #[error("admin API returned invalid JSON: {0}")]
     Decode(#[source] reqwest::Error),
+}
+
+#[allow(dead_code)]
+pub fn short_error(error: &ClientError) -> &'static str {
+    match error {
+        ClientError::Transport(_) => "코어에 연결할 수 없습니다",
+        ClientError::Http(StatusCode::TOO_MANY_REQUESTS) => "잠시 후 다시 시도해 주세요",
+        ClientError::Http(StatusCode::NOT_FOUND) => "계정을 찾을 수 없습니다",
+        ClientError::Http(_) => "요청을 처리하지 못했습니다",
+        ClientError::Decode(_) => "코어 응답을 읽지 못했습니다",
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -189,6 +372,10 @@ pub struct TrayAccount {
     pub allow_credits: bool,
     #[serde(default)]
     pub refresh_attention: bool,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub pacing: qb_tray::Pacing,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
