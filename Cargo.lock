@@ -1240,6 +1240,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "futures-util",
  "qb-core",
  "qb-proto",
  "qb-testkit",
@@ -1247,6 +1248,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-tungstenite",
 ]
 
 [[package]]

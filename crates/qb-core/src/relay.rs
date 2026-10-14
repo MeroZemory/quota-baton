@@ -9,7 +9,10 @@ mod websocket;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Mutex, atomic::AtomicU64},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -22,6 +25,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
+use tokio::sync::Notify;
 
 use crate::{
     accounts::{Account, AccountStore, Health, HealthReason, Provider, UserState},
@@ -68,6 +72,16 @@ pub struct RelayState {
     tokens: TokenGates,
     websocket: crate::config::WebsocketConfig,
     reconnect_exclusions: Mutex<BTreeMap<(String, String), Instant>>,
+    draining: AtomicBool,
+    drain_started: AtomicBool,
+    drain_ready: AtomicBool,
+    lease_released: AtomicBool,
+    drain_gate: tokio::sync::Mutex<()>,
+    drain_timeout_secs: AtomicU64,
+    drain_notify: Notify,
+    drain_start_notify: Notify,
+    lease_notify: Notify,
+    handover_port: u16,
     #[cfg(all(feature = "phase0", debug_assertions))]
     close_after_response: bool,
     #[cfg(all(feature = "phase0", debug_assertions))]
@@ -89,6 +103,92 @@ impl RelayState {
     }
     pub async fn shutdown_refreshes(&self) -> Result<(), ()> {
         self.tokens.shutdown_refreshes().await
+    }
+
+    /// Begin a takeover drain exactly once.  Admission is closed before any
+    /// refresh or binding work begins, so a successor cannot observe a writer
+    /// still consuming the old credential lease.
+    pub async fn begin_drain(&self) -> Result<serde_json::Value, ()> {
+        let _gate = self.drain_gate.lock().await;
+        if !self.draining.swap(true, Ordering::AcqRel) {
+            self.observability.record_takeover("drain_started");
+            self.drain_started.store(true, Ordering::Release);
+            self.drain_start_notify.notify_waiters();
+        }
+        if self.tokens.shutdown_refreshes().await.is_err() {
+            return Err(());
+        }
+        let bindings = self.bindings.clone();
+        let store = self.store.clone();
+        let obs = self.observability.clone();
+        let exported = tokio::task::spawn_blocking(move || {
+            store.stop_writes();
+            obs.freeze_quota()?;
+            bindings.freeze()?;
+            bindings.export()
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .ok_or(())?;
+        self.drain_ready.store(true, Ordering::Release);
+        self.drain_notify.notify_waiters();
+        Ok(exported)
+    }
+
+    pub fn release_lease_after_drain(&self) {
+        self.store.release_lease();
+        self.observability.record_takeover("lease_released");
+        self.lease_released.store(true, Ordering::Release);
+        self.lease_notify.notify_waiters();
+    }
+
+    pub async fn wait_for_lease_release(&self) {
+        loop {
+            let notified = self.lease_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.lease_released.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub async fn wait_for_drain(&self) {
+        loop {
+            let notified = self.drain_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.drain_ready.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub async fn wait_for_drain_start(&self) {
+        if self.drain_started.load(Ordering::Acquire) {
+            return;
+        }
+        let notified = self.drain_start_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !self.drain_started.load(Ordering::Acquire) {
+            notified.await;
+        }
+    }
+
+    pub fn set_drain_timeout(&self, seconds: u64) {
+        self.drain_timeout_secs
+            .store(seconds.clamp(1, 30 * 60), Ordering::Release);
+    }
+    pub fn drain_timeout(&self) -> Duration {
+        Duration::from_secs(self.drain_timeout_secs.load(Ordering::Acquire))
+    }
+
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::Acquire)
     }
     async fn unavailable(
         &self,
@@ -175,6 +275,16 @@ impl RelayState {
             tokens,
             websocket: config.websocket.clone(),
             reconnect_exclusions: Mutex::new(BTreeMap::new()),
+            draining: AtomicBool::new(false),
+            drain_started: AtomicBool::new(false),
+            drain_ready: AtomicBool::new(false),
+            lease_released: AtomicBool::new(false),
+            drain_gate: tokio::sync::Mutex::new(()),
+            drain_timeout_secs: AtomicU64::new(30 * 60),
+            drain_notify: Notify::new(),
+            drain_start_notify: Notify::new(),
+            lease_notify: Notify::new(),
+            handover_port: config.server.data_port,
             #[cfg(all(feature = "phase0", debug_assertions))]
             close_after_response: false,
             #[cfg(all(feature = "phase0", debug_assertions))]
@@ -686,7 +796,93 @@ fn failure(
     native_error(status, provider, kind, message)
 }
 
+/// Requests already accepted on an old keep-alive connection wait for the
+/// successor listener, then use its normal authenticated data route. The old
+/// process performs no account selection or token work for these requests.
+async fn handover_http(state: Arc<RelayState>, request: Request) -> Response {
+    let unavailable = || {
+        native_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            Provider::Codex,
+            "server_error",
+            "quota-baton successor is unavailable",
+        )
+    };
+    if state.handover_port == 0 {
+        return unavailable();
+    }
+    let ready = tokio::time::timeout(Duration::from_secs(5), async {
+        state.wait_for_lease_release().await;
+        loop {
+            match tokio::net::TcpStream::connect((
+                std::net::Ipv4Addr::LOCALHOST,
+                state.handover_port,
+            ))
+            .await
+            {
+                Ok(socket) => {
+                    drop(socket);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+    })
+    .await;
+    if ready.is_err() {
+        return unavailable();
+    }
+    let (parts, body) = request.into_parts();
+    let path = parts.uri.path_and_query().map_or("/", |path| path.as_str());
+    let url = format!("http://127.0.0.1:{}{path}", state.handover_port);
+    let mut headers = parts.headers;
+    for name in [
+        "connection",
+        "transfer-encoding",
+        "keep-alive",
+        "proxy-connection",
+    ] {
+        headers.remove(name);
+    }
+    let result = state
+        .client
+        .request(parts.method, url)
+        .headers(headers)
+        .body(reqwest::Body::wrap_stream(body.into_data_stream()))
+        .send()
+        .await;
+    match result {
+        Ok(response) => {
+            let status = response.status();
+            let mut headers = response.headers().clone();
+            for name in ["connection", "transfer-encoding", "keep-alive"] {
+                headers.remove(name);
+            }
+            let mut relayed = Response::new(axum::body::Body::from_stream(response.bytes_stream()));
+            *relayed.status_mut() = status;
+            *relayed.headers_mut() = headers;
+            relayed
+        }
+        Err(_) => unavailable(),
+    }
+}
+
 async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Response {
+    if state.is_draining() {
+        if request.method() != Method::GET || !request.headers().contains_key("upgrade") {
+            return handover_http(state, request).await;
+        }
+        let mut response = native_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            Provider::Claude,
+            "server_error",
+            "quota-baton is handing over",
+        );
+        response
+            .headers_mut()
+            .insert("retry-after", HeaderValue::from_static("1"));
+        return response;
+    }
     if request.method() == Method::GET
         && request.uri().path() == "/v1/responses"
         && request
@@ -1001,6 +1197,11 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
             );
         }
         let before_commit = !status.is_success() || held.decision == CommitDecision::FirstError;
+        if state.is_draining() {
+            // Once admission closes the old owner only finishes byte relay.
+            // In particular a delayed 401 cannot refresh or change health.
+            break (status, response_headers, held);
+        }
         if !before_commit {
             if probe.is_some()
                 && status.is_success()

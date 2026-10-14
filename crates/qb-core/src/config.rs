@@ -21,6 +21,10 @@ pub struct UpstreamConfig {
     pub codex_base: String,
     pub claude_usage_base: String,
     pub codex_usage_base: String,
+    #[cfg(all(feature = "testkit", debug_assertions))]
+    pub claude_token_endpoint: Option<String>,
+    #[cfg(all(feature = "testkit", debug_assertions))]
+    pub codex_token_endpoint: Option<String>,
 }
 
 impl Default for UpstreamConfig {
@@ -30,12 +34,34 @@ impl Default for UpstreamConfig {
             codex_base: "https://chatgpt.com/backend-api/codex".into(),
             claude_usage_base: "https://api.anthropic.com".into(),
             codex_usage_base: "https://chatgpt.com".into(),
+            #[cfg(all(feature = "testkit", debug_assertions))]
+            claude_token_endpoint: None,
+            #[cfg(all(feature = "testkit", debug_assertions))]
+            codex_token_endpoint: None,
         }
     }
 }
 
 impl UpstreamConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
+        #[cfg(all(feature = "testkit", debug_assertions))]
+        for value in [&self.claude_token_endpoint, &self.codex_token_endpoint]
+            .into_iter()
+            .flatten()
+        {
+            let url = reqwest::Url::parse(value)?;
+            anyhow::ensure!(
+                url.scheme() == "http"
+                    && url.host_str() == Some("127.0.0.1")
+                    && url.port().is_some()
+                    && !matches!(url.port(), Some(10100 | 10101))
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.query().is_none()
+                    && url.fragment().is_none(),
+                "invalid synthetic token endpoint"
+            );
+        }
         for (value, expected) in [
             (&self.anthropic_base, "https://api.anthropic.com"),
             (&self.codex_base, "https://chatgpt.com/backend-api/codex"),
@@ -73,12 +99,14 @@ impl UpstreamConfig {
 pub struct ServerConfig {
     pub data_port: u16,
     pub admin_port: u16,
+    pub drain_timeout_secs: u64,
 }
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             data_port: 10200,
             admin_port: 10201,
+            drain_timeout_secs: 30 * 60,
         }
     }
 }

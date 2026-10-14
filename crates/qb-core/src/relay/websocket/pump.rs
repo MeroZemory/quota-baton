@@ -41,6 +41,8 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 pub(super) struct Context {
     pub runtime: Option<Arc<crate::account_runtime::AccountRuntime>>,
     pub relay: Option<Arc<crate::relay::RelayState>>,
+    pub drain_signal:
+        Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>>>,
     pub credentials: Option<(crate::accounts::Account, zeroize::Zeroizing<String>)>,
     pub budget: Arc<InflightBudget>,
     pub observability: Arc<Observability>,
@@ -516,7 +518,7 @@ pub(super) async fn run(client: ClientSocket, upstream: UpstreamSocket, context:
 async fn run_with_read_timeout(
     client: ClientSocket,
     upstream: UpstreamSocket,
-    context: Context,
+    mut context: Context,
     upstream_read_timeout: Duration,
 ) {
     let (client_sink, mut client_read) = client.split();
@@ -529,6 +531,11 @@ async fn run_with_read_timeout(
     let mut current = BTreeMap::<u64, CurrentCompletion>::new();
     let mut next_request = 0;
     let mut model: Option<String> = None;
+    let mut drain_signal = context.drain_signal.take();
+    let mut draining = context
+        .relay
+        .as_ref()
+        .is_some_and(|relay| relay.is_draining());
     let mut health_events = context.runtime.as_ref().map(|runtime| runtime.subscribe());
     let mut client_admitted = false;
     let mut terminal_pending = false;
@@ -545,7 +552,8 @@ async fn run_with_read_timeout(
         "open",
     );
 
-    if let Some(runtime) = &context.runtime
+    if !draining
+        && let Some(runtime) = &context.runtime
         && !runtime.eligible(&context.account, None).await
     {
         ending = Some((
@@ -559,12 +567,29 @@ async fn run_with_read_timeout(
     }
 
     loop {
+        draining |= context
+            .relay
+            .as_ref()
+            .is_some_and(|relay| relay.is_draining());
+        if draining && current.is_empty() && ending.is_none() {
+            ending = Some((
+                Some(CloseFrame {
+                    code: 1001.into(),
+                    reason: "".into(),
+                }),
+                "takeover_drain",
+            ));
+            end_deadline = Instant::now() + CLOSE_TIMEOUT;
+        }
         if ending.is_some() && to_client.is_none() && to_upstream.is_none() {
             break;
         }
         // 각 방향은 메시지 하나만 보유한다. split 잠금은 poll 사이에 해제되어
         // 큰 쓰기가 진행되는 동안 같은 소켓의 읽기와 자동 pong을 poll할 수 있다.
         tokio::select! {
+            _ = async { drain_signal.as_mut().unwrap().await }, if drain_signal.is_some() && !draining && ending.is_none() => {
+                draining = true;
+            }
             result = async { to_client.as_mut().unwrap().await }, if to_client.is_some() => {
                 let (sink, success, delivered) = result;
                 client_sink = Some(sink);
@@ -581,6 +606,11 @@ async fn run_with_read_timeout(
                                 super::clear_retried_token(relay, &account.id, token);
                             }
                             active.completion.finish(outcome);
+                        }
+                        draining |= context.relay.as_ref().is_some_and(|relay| relay.is_draining());
+                        if draining && current.is_empty() && ending.is_none() {
+                            ending = Some((Some(CloseFrame { code: 1001.into(), reason: "".into() }), "takeover_drain"));
+                            end_deadline = Instant::now() + CLOSE_TIMEOUT;
                         }
                         if current.is_empty() && ending.is_none() && let Some(runtime) = &context.runtime
                             && !runtime.eligible(&context.account, model.as_deref()).await {
@@ -631,6 +661,8 @@ async fn run_with_read_timeout(
                     Some(Ok(message)) => {
                         let mut request = current.keys().next().copied();
                         if let Message::Text(text) = &message && response_create(text.as_str()) {
+                            draining |= context.relay.as_ref().is_some_and(|relay| relay.is_draining());
+                            if draining { continue; }
                             model = parsed(text.as_str()).and_then(|value| value.get("model").and_then(Value::as_str).map(str::to_owned));
                             if let Some(runtime) = &context.runtime && !runtime.eligible(&context.account, model.as_deref()).await {
                                 ending = Some((Some(CloseFrame { code: 1000.into(), reason: "".into() }), "account_ineligible"));
@@ -683,13 +715,20 @@ async fn run_with_read_timeout(
                             }
                             if matches!(event.get("type").and_then(Value::as_str), Some("error" | "response.failed")) {
                                 let active_model = request.and_then(|id| current.get(&id)).and_then(|active| active.model.as_deref());
-                                let decision = match apply_error(&context, event, active_model).await {
-                                    Ok(decision) => Some(decision),
-                                    Err(()) => {
-                                        ending = Some((Some(CloseFrame { code: 1011.into(), reason: "".into() }), "health_store_error"));
-                                        end_deadline = Instant::now() + CLOSE_TIMEOUT;
-                                        // Forward the original error even when health persistence fails.
-                                        None
+                                // During takeover, relay the current turn's error unchanged:
+                                // no auth refresh, health transition, failover, or rate retry.
+                                draining |= context.relay.as_ref().is_some_and(|relay| relay.is_draining());
+                                let decision = if draining {
+                                    None
+                                } else {
+                                    match apply_error(&context, event, active_model).await {
+                                        Ok(decision) => Some(decision),
+                                        Err(()) => {
+                                            ending = Some((Some(CloseFrame { code: 1011.into(), reason: "".into() }), "health_store_error"));
+                                            end_deadline = Instant::now() + CLOSE_TIMEOUT;
+                                            // Forward the original error even when health persistence fails.
+                                            None
+                                        }
                                     }
                                 };
                                 // Row 13a excludes row 3 rate limits and requires a current request.
@@ -817,7 +856,7 @@ async fn run_with_read_timeout(
                     }
                 }
             }
-            event = async { health_events.as_mut().unwrap().recv().await }, if health_events.is_some() && ending.is_none() => {
+            event = async { health_events.as_mut().unwrap().recv().await }, if health_events.is_some() && ending.is_none() && !draining => {
                 if matches!(event, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
                     health_events = None;
                 }
@@ -832,7 +871,7 @@ async fn run_with_read_timeout(
                     end_deadline = Instant::now() + CLOSE_TIMEOUT;
                 }
             }
-            _ = tokio::time::sleep_until(last_activity + context.idle_close), if ending.is_none() && to_client.is_none() && to_upstream.is_none() => {
+            _ = tokio::time::sleep_until(last_activity + context.idle_close), if ending.is_none() && !draining && to_client.is_none() && to_upstream.is_none() => {
                 ending = Some((Some(CloseFrame { code: 1000.into(), reason: "".into() }), "idle_close"));
                 end_deadline = Instant::now() + CLOSE_TIMEOUT;
             }
