@@ -602,6 +602,25 @@ async fn c6_row_13c_idle_pause_closes_1000() {
 }
 
 #[tokio::test]
+async fn c7_1_idle_pinned_socket_closed_1000_and_reconnect_replaced() {
+    let h = Harness::new(2).await;
+    let (mut idle, original) = h.connect().await;
+    // A marked idle binding is drained at the socket boundary.  Pausing the
+    // account is the deterministic testkit way to create the same exclusion
+    // while the socket remains pinned and no request is in flight.
+    h.state
+        .accounts
+        .change(&original, Some(UserState::Paused), None, None, None)
+        .await
+        .unwrap();
+    assert_close(receive(&mut idle).await, 1000);
+    let (mut reconnect, replacement) = h.connect().await;
+    assert_ne!(replacement, original);
+    assert_eq!(replacement, h.ids[1]);
+    reconnect.close(None).await.unwrap();
+}
+
+#[tokio::test]
 async fn c6_row_13c_model_checked_before_create_without_forwarding() {
     let h = Harness::new(2).await;
     h.fake
