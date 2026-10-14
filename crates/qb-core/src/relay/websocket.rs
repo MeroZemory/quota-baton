@@ -537,6 +537,10 @@ async fn upgrade_inner(
     let context = pump::Context {
         runtime: Some(state.accounts.clone()),
         relay: Some(state.clone()),
+        drain_signal: Some(Box::pin({
+            let state = state.clone();
+            async move { state.wait_for_drain_start().await }
+        })),
         credentials: Some((
             account.clone(),
             zeroize::Zeroizing::new(tokens.access_token.clone()),

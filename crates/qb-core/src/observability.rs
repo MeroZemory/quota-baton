@@ -219,6 +219,7 @@ enum Command {
     #[cfg(all(feature = "shape-capture", debug_assertions))]
     Capture(serde_json::Value),
     Flush(mpsc::Sender<Result<(), String>>),
+    FreezeQuota(mpsc::Sender<Result<(), String>>),
     Stop,
 }
 
@@ -654,6 +655,15 @@ impl Observability {
             .map_err(|_| anyhow::anyhow!("observability worker unavailable"))?
             .map_err(anyhow::Error::msg)
     }
+    pub fn freeze_quota(&self) -> anyhow::Result<()> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(Command::FreezeQuota(tx))
+            .map_err(|_| anyhow::anyhow!("observability worker unavailable"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("observability worker unavailable"))?
+            .map_err(anyhow::Error::msg)
+    }
 }
 impl Drop for Observability {
     fn drop(&mut self) {
@@ -848,6 +858,7 @@ struct Writer {
     home: PathBuf,
     state: QuotaState,
     quota_dirty: bool,
+    quota_frozen: bool,
     dirty_files: BTreeSet<PathBuf>,
     last_sync: Instant,
     last_prune: Instant,
@@ -862,6 +873,7 @@ impl Writer {
             home,
             state,
             quota_dirty: false,
+            quota_frozen: false,
             dirty_files: BTreeSet::new(),
             last_sync: now,
             last_prune: now,
@@ -949,7 +961,7 @@ impl Writer {
                 Some(path) => self.append(path, &value["shape"]),
                 None => Ok(()),
             },
-            Command::Flush(_) | Command::Stop => unreachable!(),
+            Command::Flush(_) | Command::FreezeQuota(_) | Command::Stop => unreachable!(),
         };
         if result.is_err() {
             tracing::warn!("Observability write failed; later events will retry");
@@ -957,6 +969,9 @@ impl Writer {
         }
     }
     fn persist(&mut self, now: Instant) {
+        if self.quota_frozen {
+            self.quota_dirty = false;
+        }
         if now.duration_since(self.last_prune) >= WARN_INTERVAL {
             prune(&self.home.join("ledger"));
             self.last_prune = now;
@@ -1019,6 +1034,13 @@ fn run(home: PathBuf, state: QuotaState, rx: mpsc::Receiver<Command>, dropped: A
         match rx.recv_timeout(SYNC_INTERVAL.saturating_sub(writer.last_sync.elapsed())) {
             Ok(Command::Flush(reply)) => {
                 let _ = reply.send(writer.flush());
+            }
+            Ok(Command::FreezeQuota(reply)) => {
+                let result = writer.flush();
+                if result.is_ok() {
+                    writer.quota_frozen = true;
+                }
+                let _ = reply.send(result);
             }
             Ok(Command::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                 if writer.flush().is_err() {

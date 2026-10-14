@@ -165,9 +165,10 @@ async fn lifecycle_drain(
     request: Result<Json<DrainRequest>, JsonRejection>,
 ) -> Response {
     let timeout = request.ok().map(|Json(value)| value.drain_timeout_secs);
-    let _timeout = timeout
+    let timeout = timeout
         .unwrap_or_else(default_drain_timeout)
         .clamp(1, 30 * 60);
+    state.relay.set_drain_timeout(timeout);
     match state.relay.begin_drain().await {
         Ok(bindings) => match tokio::time::timeout(
             std::time::Duration::from_secs(30),
