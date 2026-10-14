@@ -29,8 +29,7 @@ Implement quota-baton exactly as specified, milestone by milestone, until M8 is 
 
 | Milestone | Status |
 |---|---|
-| M0, M1a, M2, M3, M4a, M4b, M5, M1b, M6a, M4c | merged |
-| M6b | tray actions, row-menu toggles, login/relogin; brief `M6b.md` |
+| M0, M1a, M2, M3, M4a, M4b, M5, M1b, M6a, M4c, M6b | merged (M6b visual polish M6b.2 pending) |
 | M7a | takeover: lease handover and drain |
 | M7b | tee with compressed body retention, memory guard |
 | M7c | soak test against acceptance criterion A1 |
