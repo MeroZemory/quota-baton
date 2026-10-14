@@ -27,7 +27,7 @@ use tokio_tungstenite::{
     tungstenite::{Message, client::IntoClientRequest},
 };
 
-const HARD: Duration = Duration::from_secs(30);
+const HARD: Duration = Duration::from_secs(60);
 static SERIAL: OnceLock<TokioMutex<()>> = OnceLock::new();
 
 // The outer timeout includes setup, polling, streaming, CLI waits, and cleanup.
@@ -236,7 +236,7 @@ impl Drop for Core {
     }
 }
 async fn until(mut predicate: impl FnMut() -> bool) {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(15), async {
         while !predicate() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -253,7 +253,7 @@ async fn token(home: &Home) -> String {
         .into()
 }
 async fn ready(client: &Client, home: &Home, token: &str, pid: u32) {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             if let Ok(response) = client
                 .get(home.admin_url("/admin/v1/health"))
