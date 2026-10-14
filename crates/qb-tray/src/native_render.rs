@@ -13,7 +13,8 @@ use windows::{
             },
             DirectWrite::{
                 DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-                DWRITE_FONT_WEIGHT_NORMAL, DWriteCreateFactory, IDWriteFactory,
+                DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_TRAILING, DWriteCreateFactory,
+                IDWriteFactory,
             },
             Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
             Imaging::{
@@ -212,6 +213,213 @@ fn pill(target: &ID2D1RenderTarget, bounds: D2D_RECT_F, color: BrushColor) -> Re
     Ok(())
 }
 
+fn standard_button(target: &ID2D1RenderTarget, bounds: D2D_RECT_F, dark: bool) -> Result<()> {
+    let shape = D2D1_ROUNDED_RECT {
+        rect: bounds,
+        radiusX: 4.0,
+        radiusY: 4.0,
+    };
+    let fill_brush = unsafe {
+        target.CreateSolidColorBrush(
+            &brush_color(if dark {
+                super::Rgb(45, 45, 45)
+            } else {
+                super::Rgb(251, 251, 251)
+            })
+            .0,
+            None,
+        )
+    }?;
+    let border_brush = unsafe {
+        target.CreateSolidColorBrush(
+            &brush_color(if dark {
+                super::Rgb(61, 61, 61)
+            } else {
+                super::Rgb(209, 209, 209)
+            })
+            .0,
+            None,
+        )
+    }?;
+    unsafe {
+        target.FillRoundedRectangle(&shape, &fill_brush);
+        target.DrawRoundedRectangle(&shape, &border_brush, 1.0, None);
+    }
+    Ok(())
+}
+
+fn draw_progress(target: &ID2D1RenderTarget, dark: bool, _now: SystemTime) -> Result<()> {
+    let center = windows_numerics::Vector2 { X: 24.0, Y: 110.0 };
+    let track = unsafe {
+        target.CreateSolidColorBrush(
+            &brush_color(if dark {
+                super::Rgb(58, 58, 58)
+            } else {
+                super::Rgb(230, 232, 235)
+            })
+            .0,
+            None,
+        )
+    }?;
+    let accent = unsafe {
+        target.CreateSolidColorBrush(
+            &brush_color(if dark {
+                super::Rgb(96, 205, 255)
+            } else {
+                super::Rgb(0, 95, 184)
+            })
+            .0,
+            None,
+        )
+    }?;
+    let ellipse = D2D1_ELLIPSE {
+        point: center,
+        radiusX: 7.0,
+        radiusY: 7.0,
+    };
+    unsafe {
+        target.DrawEllipse(&ellipse, &track, 2.0, None);
+        target.DrawEllipse(&ellipse, &accent, 2.0, None);
+    }
+    Ok(())
+}
+
+fn draw_account_menu(
+    target: &ID2D1RenderTarget,
+    factory: &IDWriteFactory,
+    rows: &[Row],
+    dark: bool,
+    state: &str,
+) -> Result<()> {
+    let id = state
+        .strip_prefix("menu:")
+        .and_then(|v| v.split(':').next())
+        .unwrap_or_default();
+    let index = state
+        .rsplit(':')
+        .next()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    let Some(row) = rows.iter().find(|r| r.id == id).or_else(|| rows.first()) else {
+        return Ok(());
+    };
+    let items = super::actions::menu_items(row);
+    let body = text_format(factory, 13.0, false)?;
+    let icons = icon_format(factory, 14.0)?;
+    popup_surface(
+        target,
+        rect(136.0, 126.0, 352.0, 312.0),
+        dark,
+        brush_color(if dark {
+            super::Rgb(44, 44, 44)
+        } else {
+            super::Rgb(252, 252, 252)
+        }),
+    )?;
+    let icon_values = [
+        "\u{e769}", "\u{e733}", "\u{e8d7}", "\u{e72c}", "\u{e74d}", "\u{e73e}",
+    ];
+    let mut y = 135.0;
+    for (n, item) in items.iter().enumerate() {
+        if n == 2 || n == 3 {
+            fill(
+                target,
+                rect(137.0, y, 351.0, y + 1.0),
+                brush_color(if dark {
+                    super::Rgb(71, 71, 71)
+                } else {
+                    super::Rgb(212, 212, 212)
+                }),
+            )?;
+            y += 9.0;
+        }
+        if n == index {
+            pill(
+                target,
+                rect(141.0, y, 347.0, y + 32.0),
+                BrushColor(D2D1_COLOR_F {
+                    r: if dark { 1.0 } else { 0.0 },
+                    g: if dark { 1.0 } else { 0.0 },
+                    b: if dark { 1.0 } else { 0.0 },
+                    a: 0.06,
+                }),
+            )?;
+        }
+        if matches!(
+            item,
+            super::actions::MenuItem::ToggleDrain | super::actions::MenuItem::ToggleCredits
+        ) {
+            let check = D2D1_ROUNDED_RECT {
+                rect: rect(153.0, y + 8.0, 169.0, y + 24.0),
+                radiusX: 3.0,
+                radiusY: 3.0,
+            };
+            let border = unsafe {
+                target.CreateSolidColorBrush(
+                    &brush_color(if dark {
+                        super::Rgb(154, 154, 154)
+                    } else {
+                        super::Rgb(138, 138, 138)
+                    })
+                    .0,
+                    None,
+                )
+            }?;
+            unsafe { target.DrawRoundedRectangle(&check, &border, 1.0, None) };
+            let checked = (matches!(item, super::actions::MenuItem::ToggleDrain) && row.drain)
+                || (matches!(item, super::actions::MenuItem::ToggleCredits) && row.allow_credits);
+            if checked {
+                fill(
+                    target,
+                    check.rect,
+                    brush_color(if dark {
+                        super::Rgb(96, 205, 255)
+                    } else {
+                        super::Rgb(0, 95, 184)
+                    }),
+                )?;
+                draw_text(
+                    target,
+                    &icons,
+                    "\u{e73e}",
+                    155.0,
+                    y + 8.0,
+                    12.0,
+                    16.0,
+                    brush_color(if dark {
+                        super::Rgb(0, 0, 0)
+                    } else {
+                        super::Rgb(255, 255, 255)
+                    }),
+                )?;
+            }
+        } else {
+            draw_text(
+                target,
+                &icons,
+                icon_values.get(n).copied().unwrap_or(""),
+                153.0,
+                y + 8.0,
+                16.0,
+                16.0,
+                brush_color(colors(dark).text),
+            )?;
+        }
+        draw_text(
+            target,
+            &body,
+            item.label(row),
+            177.0,
+            y + 7.0,
+            160.0,
+            18.0,
+            brush_color(colors(dark).text),
+        )?;
+        y += 32.0;
+    }
+    Ok(())
+}
+
 fn popup_surface(
     target: &ID2D1RenderTarget,
     bounds: D2D_RECT_F,
@@ -278,7 +486,9 @@ fn health_colors(row: &Row, dark: bool) -> (BrushColor, BrushColor) {
 #[allow(clippy::too_many_arguments)]
 fn draw_meter_value(
     target: &ID2D1RenderTarget,
-    format: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
+    label_format: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
+    percent_format: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
+    unknown_format: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
     row: &Row,
     usage: &Usage,
     x: f32,
@@ -288,13 +498,31 @@ fn draw_meter_value(
 ) -> Result<()> {
     draw_text(
         target,
-        format,
-        &format!("{} {}", usage.label, usage.percent_text),
+        label_format,
+        &usage.label,
         x,
         y,
         width,
         16.0,
         brush_color(colors.text),
+    )?;
+    draw_text(
+        target,
+        if usage.percent.is_some() {
+            percent_format
+        } else {
+            unknown_format
+        },
+        &usage.percent_text,
+        x + width - 46.0,
+        y,
+        46.0,
+        16.0,
+        if usage.percent.is_some() {
+            brush_color(colors.text)
+        } else {
+            brush_color(colors.muted)
+        },
     )?;
     fill(
         target,
@@ -311,7 +539,7 @@ fn draw_meter_value(
     }
     draw_text(
         target,
-        format,
+        label_format,
         &usage.reset_text,
         x,
         y + 28.0,
@@ -360,6 +588,14 @@ pub fn paint_with_state(
     let body = text_format(&dwrite, 13.0, false)?;
     let small = text_format(&dwrite, 11.0, false)?;
     let section = text_format(&dwrite, 12.0, true)?;
+    let meter_label = text_format(&dwrite, 12.0, false)?;
+    let meter_percent = text_format(&dwrite, 12.0, true)?;
+    let meter_unknown = text_format(&dwrite, 12.0, false)?;
+    let footer = text_format(&dwrite, 12.0, false)?;
+    unsafe {
+        meter_percent.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
+        meter_unknown.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
+    }
     let icons = icon_format(&dwrite, 14.0)?;
     unsafe {
         target.BeginDraw();
@@ -369,6 +605,28 @@ pub fn paint_with_state(
         rect(0.0, 0.0, WIDTH, state_height(&rows, expand_disabled, state)),
         brush_color(colors.surface),
     )?;
+    let frame = D2D1_ROUNDED_RECT {
+        rect: rect(
+            0.5,
+            0.5,
+            WIDTH - 0.5,
+            state_height(&rows, expand_disabled, state) - 0.5,
+        ),
+        radiusX: 8.0,
+        radiusY: 8.0,
+    };
+    let frame_brush = unsafe {
+        target.CreateSolidColorBrush(
+            &brush_color(if dark {
+                super::Rgb(58, 58, 58)
+            } else {
+                super::Rgb(217, 217, 217)
+            })
+            .0,
+            None,
+        )?
+    };
+    unsafe { target.DrawRoundedRectangle(&frame, &frame_brush, 1.0, None) };
     draw_text(
         target,
         &title,
@@ -426,7 +684,7 @@ pub fn paint_with_state(
                 &section,
                 super::provider_name(provider),
                 PADDING,
-                y,
+                y + 16.0,
                 200.0,
                 18.0,
                 brush_color(colors.muted),
@@ -451,7 +709,20 @@ pub fn paint_with_state(
             } else {
                 Vec::new()
             }) {
-                draw_row(target, &body, &small, row, y, colors, dark, now)?;
+                draw_row(
+                    target,
+                    &body,
+                    &small,
+                    row,
+                    y,
+                    colors,
+                    dark,
+                    now,
+                    state,
+                    &meter_label,
+                    &meter_percent,
+                    &meter_unknown,
+                )?;
                 y += row_height(row);
                 fill(
                     target,
@@ -493,13 +764,14 @@ pub fn paint_with_state(
             20.0,
             brush_color(colors.text),
         )?;
+        draw_progress(target, dark, now)?;
         draw_text(
             target,
             &body,
             "브라우저에서 로그인을 마치면 자동으로",
-            16.0,
+            42.0,
             100.0,
-            328.0,
+            302.0,
             20.0,
             brush_color(colors.text),
         )?;
@@ -507,34 +779,43 @@ pub fn paint_with_state(
             target,
             &body,
             "완료됩니다.",
-            16.0,
+            42.0,
             120.0,
-            328.0,
+            302.0,
             20.0,
             brush_color(colors.text),
         )?;
         draw_text(
             target,
-            &small,
+            &text_format(&dwrite, 12.0, false)?,
             "남은 시간 9:41",
             42.0,
-            148.0,
+            144.0,
             180.0,
             16.0,
             brush_color(colors.muted),
         )?;
         for (x, label) in [(16.0, "주소 복사"), (184.0, "취소")] {
-            pill(
-                target,
-                rect(x, 180.0, x + 160.0, 212.0),
-                brush_color(colors.surface),
-            )?;
+            standard_button(target, rect(x, 176.0, x + 160.0, 208.0), dark)?;
+            let label_x = if x == 16.0 { x + 63.0 } else { x + 68.0 };
+            if x == 16.0 {
+                draw_text(
+                    target,
+                    &icons,
+                    "\u{E8C8}",
+                    x + 41.0,
+                    183.0,
+                    14.0,
+                    18.0,
+                    brush_color(colors.text),
+                )?;
+            }
             draw_text(
                 target,
                 &body,
                 label,
-                x + 52.0,
-                187.0,
+                label_x,
+                183.0,
                 80.0,
                 18.0,
                 brush_color(colors.text),
@@ -554,20 +835,25 @@ pub fn paint_with_state(
     )?;
     draw_text(
         target,
-        &small,
+        &footer,
         &format!("갱신 {}", now_time(now)),
         PADDING,
-        y + 10.0,
+        y + 16.0,
         74.0,
-        20.0,
+        16.0,
         brush_color(colors.muted),
     )?;
-    for (x, width, icon, label) in [
+    for (index, (x, width, icon, label)) in [
         (88.0, 81.0, "\u{E710}", "계정 추가"),
         (171.0, 54.0, "\u{E713}", "설정"),
         (227.0, 54.0, "\u{E8A5}", "로그"),
         (283.0, 54.0, "\u{E7E8}", "종료"),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let disabled = login_state && index == 0;
+        let button_color = if disabled { colors.muted } else { colors.text };
         pill(
             target,
             rect(x, y + 8.0, x + width, y + 40.0),
@@ -581,21 +867,25 @@ pub fn paint_with_state(
             y + 15.0,
             14.0,
             16.0,
-            brush_color(colors.text),
+            brush_color(button_color),
         )?;
         draw_text(
             target,
-            &small,
+            &footer,
             label,
             x + 24.0,
             y + 16.0,
             width - 28.0,
             16.0,
-            brush_color(colors.text),
+            brush_color(button_color),
         )?;
+    }
+    if let Some(menu_state) = state.filter(|value| value.starts_with("menu:")) {
+        draw_account_menu(target, &dwrite, &rows, dark, menu_state)?;
     }
     if let Some(state) = state.filter(|value| {
         !matches!(*value, "list" | "expanded" | "pacing" | "truncation")
+            && !value.starts_with("menu:")
             && !value.starts_with("login:")
     }) {
         let (heading, lines): (&str, Vec<String>) = if state.starts_with("menu:") {
@@ -792,6 +1082,10 @@ fn draw_row(
     colors: Colors,
     dark: bool,
     now: SystemTime,
+    state: Option<&str>,
+    meter_label: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
+    meter_percent: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
+    meter_unknown: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
 ) -> Result<()> {
     let (bg, fg) = health_colors(row, dark);
     let name = row.email.as_deref().unwrap_or(&row.name);
@@ -810,6 +1104,21 @@ fn draw_row(
         .unwrap_or(0.0);
     let email_width = (chip_left - 8.0 - plan_width - 6.0 - 16.0).max(40.0);
     let email = trim_text(name, (email_width / 7.0).floor() as usize);
+    let menu_open = state.is_some_and(|value| {
+        value
+            .strip_prefix("menu:")
+            .and_then(|rest| rest.split(':').next())
+            == Some(row.id.as_str())
+    });
+    if menu_open {
+        let hover = BrushColor(D2D1_COLOR_F {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: if dark { 0.04 } else { 0.06 },
+        });
+        pill(target, rect(324.0, y + 10.0, 352.0, y + 34.0), hover)?;
+    }
     draw_text(
         target,
         body,
@@ -829,15 +1138,28 @@ fn draw_row(
         y + 10.0,
         22.0,
         20.0,
-        brush_color(colors.muted),
+        brush_color(if menu_open { colors.text } else { colors.muted }),
     )?;
     if let Some(plan) = row.plan.as_deref().filter(|p| !p.is_empty()) {
         let plan_x = 16.0 + email.chars().count() as f32 * 7.0 + 6.0;
-        pill(
-            target,
-            rect(plan_x, y + 11.0, plan_x + plan_width, y + 29.0),
-            brush_color(colors.track),
-        )?;
+        let plan_rect = rect(plan_x, y + 11.0, plan_x + plan_width, y + 29.0);
+        let plan_border = unsafe {
+            target.CreateSolidColorBrush(
+                &brush_color(if dark {
+                    super::Rgb(74, 74, 74)
+                } else {
+                    super::Rgb(213, 216, 220)
+                })
+                .0,
+                None,
+            )?
+        };
+        let plan_shape = D2D1_ROUNDED_RECT {
+            rect: plan_rect,
+            radiusX: 9.0,
+            radiusY: 9.0,
+        };
+        unsafe { target.DrawRoundedRectangle(&plan_shape, &plan_border, 1.0, None) };
         draw_text(
             target,
             small,
@@ -865,7 +1187,18 @@ fn draw_row(
     }
     for (index, usage) in row.meter_windows.iter().take(2).enumerate() {
         let x = if index == 0 { 16.0 } else { 188.0 };
-        draw_meter_value(target, small, row, usage, x, y + 40.0, 156.0, colors)?;
+        draw_meter_value(
+            target,
+            meter_label,
+            meter_percent,
+            meter_unknown,
+            row,
+            usage,
+            x,
+            y + 40.0,
+            156.0,
+            colors,
+        )?;
     }
     if row.health_tone != Tone::Good && row.user_chip != "비활성" {
         let reason = if row.user_chip == "비활성" {
