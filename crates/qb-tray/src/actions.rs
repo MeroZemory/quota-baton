@@ -196,6 +196,8 @@ mod tests {
                 percent_text: "–".into(),
                 reset_text: "–".into(),
             },
+            meter_windows: Vec::new(),
+            reason_button: true,
             attention: true,
             source: "oauth".into(),
             allow_credits: false,
