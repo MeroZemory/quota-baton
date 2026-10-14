@@ -321,22 +321,25 @@ async fn run() -> anyhow::Result<()> {
             println_utf8!("프록시를 시작했습니다.");
             let polling = relay.quota.start();
             let refreshing = relay.start_refresh_scheduler();
+            let memory_guard = relay.start_memory_guard();
             tokio::select! {
                 result = tokio::signal::ctrl_c() => { result?; }
                 _ = relay.wait_for_drain() => {}
             }
             polling.abort();
             refreshing.abort();
+            memory_guard.abort();
             let _ = polling.await;
             let _ = refreshing.await;
+            let _ = memory_guard.await;
             // Stop accepting new connections before handing the credential
             // lease to the successor. Existing handlers remain alive under
             // axum's graceful-shutdown drain.
             servers.shutdown();
-            servers.wait_for_listener_close().await;
             if relay.is_draining() {
                 relay.release_lease_after_drain();
             }
+            servers.wait_for_listener_close().await;
             let drain_deadline = relay.drain_timeout();
             let _ = tokio::time::timeout(drain_deadline, async {
                 let _ = tokio::join!(&mut servers.data_task, &mut servers.admin_task);

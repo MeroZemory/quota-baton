@@ -278,6 +278,13 @@ impl Observability {
             serde_json::json!({"event":"core_warning","data":{"account":account,"code":code}}),
         );
     }
+    pub fn record_guard(&self, phase: &str) {
+        self.enqueue(Command::Ledger(serde_json::json!({
+            "ts": Utc::now().to_rfc3339(),
+            "event": phase,
+        })));
+        self.progress(serde_json::json!({"event": phase, "data": {}}));
+    }
     pub fn new(home: &Path, capture: Option<CaptureOptions>) -> anyhow::Result<Self> {
         #[cfg(not(all(feature = "shape-capture", debug_assertions)))]
         anyhow::ensure!(

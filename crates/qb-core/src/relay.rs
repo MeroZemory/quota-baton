@@ -31,7 +31,7 @@ use crate::{
     accounts::{Account, AccountStore, Health, HealthReason, Provider, UserState},
     config::Config,
     debug_pin::DebugPins,
-    guard::{InflightBudget, RetainedBody, mib_bytes},
+    guard::{InflightBudget, MemoryGuard, mib_bytes},
     observability::Observability,
     session,
 };
@@ -66,7 +66,7 @@ pub struct RelayState {
     codex_base: String,
     pub budget: Arc<InflightBudget>,
     retain_cap: usize,
-    memory_limit: usize,
+    memory_guard: Arc<MemoryGuard>,
     observability: Arc<Observability>,
     pins: Arc<DebugPins>,
     tokens: TokenGates,
@@ -103,6 +103,25 @@ impl RelayState {
     }
     pub async fn shutdown_refreshes(&self) -> Result<(), ()> {
         self.tokens.shutdown_refreshes().await
+    }
+    pub fn start_memory_guard(&self) -> tokio::task::JoinHandle<()> {
+        let guard = self.memory_guard.clone();
+        let obs = self.observability.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            loop {
+                interval.tick().await;
+                let sample = guard.sample();
+                match sample.transition {
+                    crate::guard::MemoryGuardTransition::On => {
+                        obs.record_guard("guard_on");
+                        obs.core_warning("", "memory_guard");
+                    }
+                    crate::guard::MemoryGuardTransition::Off => obs.record_guard("guard_off"),
+                    crate::guard::MemoryGuardTransition::Unchanged => {}
+                }
+            }
+        })
     }
 
     /// Begin a takeover drain exactly once.  Admission is closed before any
@@ -206,7 +225,12 @@ impl RelayState {
             .await
     }
     fn memory_rejection(&self, provider: Provider) -> Option<Response> {
-        if crate::guard::private_bytes() <= self.memory_limit as u64 {
+        // A zero limit is the deterministic test hook; production sampling is
+        // performed by the 10-second guard task.
+        if self.memory_guard.hard_limit() == 0 {
+            let _ = self.memory_guard.sample();
+        }
+        if !self.memory_guard.is_guarded() {
             return None;
         }
         let mut response = native_error(
@@ -269,7 +293,9 @@ impl RelayState {
             codex_base: config.upstream.codex_base.trim_end_matches('/').into(),
             budget: InflightBudget::new(mib_bytes(config.guard.inflight_budget_mib)),
             retain_cap: mib_bytes(config.guard.retain_max_per_request_mib),
-            memory_limit: mib_bytes(config.guard.memory_hard_limit_mib),
+            memory_guard: Arc::new(MemoryGuard::new(
+                mib_bytes(config.guard.memory_hard_limit_mib) as u64,
+            )),
             observability,
             pins,
             tokens,
@@ -739,13 +765,6 @@ async fn replay_capture(
     }
 }
 
-fn retry_body(bytes: Bytes) -> reqwest::Body {
-    reqwest::Body::wrap_stream(futures_util::stream::once(std::future::ready(Ok::<
-        _,
-        std::io::Error,
-    >(bytes))))
-}
-
 fn route(method: &Method, path: &str, headers: &HeaderMap) -> Option<(Provider, String)> {
     match (method, path) {
         (&Method::POST, "/v1/messages" | "/v1/messages/count_tokens") => {
@@ -923,7 +942,19 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
         completion.outcome(response.status().as_u16(), "memory_guard");
         return response;
     }
-    let upload = match upload::read(body, state.retain_cap, completion.input_bytes.clone()).await {
+    let incoming_zstd = parts
+        .headers
+        .get("content-encoding")
+        .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"zstd"));
+    let upload = match upload::read(
+        body,
+        state.retain_cap,
+        completion.input_bytes.clone(),
+        state.budget.clone(),
+        incoming_zstd,
+    )
+    .await
+    {
         Ok(upload) => upload,
         Err(_) => {
             return failure(
@@ -935,13 +966,17 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
             );
         }
     };
-    let mut retained = if upload.overflow.is_none() {
-        RetainedBody::admit(&upload.prefix, state.retain_cap, &state.budget)
-    } else {
-        None
-    };
+    let mut retained = upload.retained;
     completion.record.retained_copy = retained.is_some();
-    let session = session::classify(provider, path, &parts.headers, &upload.prefix);
+    let mut session_body = upload.prefix.clone();
+    if provider == Provider::Claude
+        && !parts.headers.contains_key("x-claude-code-session-id")
+        && let Some(handle) = retained.as_ref()
+    {
+        let _ = handle.complete().await;
+        session_body = handle.metadata();
+    }
+    let session = session::classify(provider, path, &parts.headers, &session_body);
     completion.session(&session);
     let mut tried = BTreeSet::new();
     let mut request_model = session.model.clone();
@@ -1016,7 +1051,7 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
     }
     tried.insert(account.id.clone());
     #[cfg(all(feature = "phase0", debug_assertions))]
-    if upload.overflow.is_none()
+    if state.retain_cap != 0
         && parts.extensions.get::<ForcedAccount>().is_none()
         && let Some(capture) = &state.body_capture
     {
@@ -1058,7 +1093,7 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
         url.push('?');
         url.push_str(query);
     }
-    let mut body_to_send = upload.into_body();
+    let mut body_to_send = upload.body;
     let mut network_retry = false;
     let mut token_retry = false;
     let mut rate_retries = 0_u32;
@@ -1139,10 +1174,13 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
         let response = match tokio::time::timeout(Duration::from_secs(300), send).await {
             Ok(Ok(response)) => response,
             _ => {
-                if !network_retry && let Some(copy) = &retained {
+                if !network_retry
+                    && let Some(copy) = &retained
+                    && let Some(body) = copy.retry_body().await
+                {
                     network_retry = true;
                     completion.failover("network_retry");
-                    body_to_send = retry_body(copy.bytes());
+                    body_to_send = body;
                     tokio::time::sleep(Duration::from_millis(250)).await;
                     continue;
                 }
@@ -1181,10 +1219,13 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
         )
         .await;
         if held.decision == CommitDecision::StreamError && held.prefix.is_empty() {
-            if !network_retry && let Some(copy) = &retained {
+            if !network_retry
+                && let Some(copy) = &retained
+                && let Some(body) = copy.retry_body().await
+            {
                 network_retry = true;
                 completion.failover("network_retry");
-                body_to_send = retry_body(copy.bytes());
+                body_to_send = body;
                 tokio::time::sleep(Duration::from_millis(250)).await;
                 continue;
             }
@@ -1287,12 +1328,15 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
                     .await
                 {
                     Ok(Some((updated, refreshed))) => {
-                        if !token_retry && let Some(copy) = &retained {
+                        if !token_retry
+                            && let Some(copy) = &retained
+                            && let Some(body) = copy.retry_body().await
+                        {
                             token_retry = true;
                             completion.failover("token_retry");
                             account = updated;
                             tokens = refreshed;
-                            body_to_send = retry_body(copy.bytes());
+                            body_to_send = body;
                             continue;
                         }
                     }
@@ -1352,9 +1396,11 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
                     .saturating_sub(rate_hold_started.elapsed());
                 let wait = Duration::from_secs(delay).min(remaining);
                 completion.rate_wait(wait.as_millis() as u64);
-                body_to_send = retry_body(copy.bytes());
-                tokio::time::sleep(wait).await;
-                continue;
+                if let Some(body) = copy.retry_body().await {
+                    body_to_send = body;
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
             }
             rate_relayed = true;
             completion.relayed_rate_429();
@@ -1384,6 +1430,11 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
         }
         // M4b는 select만 교체한다. 보관본 없는 요청과 commit 이후에는 재전송하지 않는다.
         if !decision.failover() || retained.is_none() || permission_denials >= 2 {
+            break (status, response_headers, held);
+        }
+        if let Some(copy) = retained.as_ref()
+            && copy.complete().await.is_none()
+        {
             break (status, response_headers, held);
         }
         if decision.kind == outcome::Kind::Quota {
@@ -1423,8 +1474,13 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
                         }
                     }
                     probe = state.claim_probe(&mut account).await;
-                    body_to_send =
-                        retry_body(retained.as_ref().expect("retained reset retry").bytes());
+                    body_to_send = retained
+                        .as_ref()
+                        .expect("retained reset retry")
+                        .complete()
+                        .await
+                        .expect("retained body completed")
+                        .retry_body();
                     continue;
                 }
                 Ok(false) => {}
@@ -1501,7 +1557,13 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
                 probe = state.claim_probe(&mut account).await;
                 network_retry = false;
                 token_retry = false;
-                body_to_send = retry_body(retained.as_ref().expect("retained failover").bytes());
+                body_to_send = retained
+                    .as_ref()
+                    .expect("retained failover")
+                    .complete()
+                    .await
+                    .expect("retained body completed")
+                    .retry_body();
             }
             Ok(None)
                 if matches!(
@@ -1535,6 +1597,12 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
     if !status.is_success() || decision == CommitDecision::FirstError {
         completion.record.upstream_error_code = hold::error_code(&response_headers, &held.prefix);
     }
+    if let Some(handle) = retained.as_ref() {
+        let _ = handle.complete().await;
+    }
+    completion.record.retained_copy = retained
+        .as_ref()
+        .is_some_and(|handle| handle.has_retention());
     drop(retained.take());
     completion.record.status = status.as_u16();
     completion.record.ttfb_ms = completion.elapsed_ms();

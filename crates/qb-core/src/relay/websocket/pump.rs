@@ -45,6 +45,7 @@ pub(super) struct Context {
         Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>>>,
     pub credentials: Option<(crate::accounts::Account, zeroize::Zeroizing<String>)>,
     pub budget: Arc<InflightBudget>,
+    pub memory_guard: Arc<crate::guard::MemoryGuard>,
     pub observability: Arc<Observability>,
     pub account: String,
     pub session: Session,
@@ -654,7 +655,10 @@ async fn run_with_read_timeout(
             _ = context.budget.wait_available(), if !client_admitted && to_upstream.is_none() && ending.is_none() => {
                 client_admitted = true;
             }
-            message = client_read.next(), if client_admitted && to_upstream.is_none() && ending.is_none() && !terminal_pending => {
+            _ = tokio::time::sleep(Duration::from_millis(100)), if context.memory_guard.is_guarded() && ending.is_none() => {
+                // Memory protection pauses client reads but leaves existing streams alive.
+            }
+            message = client_read.next(), if client_admitted && !context.memory_guard.is_guarded() && to_upstream.is_none() && ending.is_none() && !terminal_pending => {
                 client_admitted = false;
                 last_activity = Instant::now();
                 match message {

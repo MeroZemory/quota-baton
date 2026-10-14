@@ -1,6 +1,6 @@
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
 use bytes::Bytes;
@@ -121,6 +121,74 @@ pub fn private_bytes() -> u64 {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MemoryGuardTransition {
+    Unchanged,
+    On,
+    Off,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MemoryGuardSample {
+    pub private_bytes: u64,
+    pub guarded: bool,
+    pub transition: MemoryGuardTransition,
+}
+
+pub struct MemoryGuard {
+    hard_limit: u64,
+    guarded: std::sync::atomic::AtomicBool,
+    last_private: AtomicU64,
+}
+
+impl MemoryGuard {
+    pub fn new(hard_limit: u64) -> Self {
+        Self {
+            hard_limit,
+            guarded: std::sync::atomic::AtomicBool::new(false),
+            last_private: AtomicU64::new(0),
+        }
+    }
+    pub fn hard_limit(&self) -> u64 {
+        self.hard_limit
+    }
+    pub fn recovery_limit(&self) -> u64 {
+        self.hard_limit.saturating_mul(9) / 10
+    }
+    pub fn is_guarded(&self) -> bool {
+        self.guarded.load(Ordering::Acquire)
+    }
+    pub fn last_private_bytes(&self) -> u64 {
+        self.last_private.load(Ordering::Acquire)
+    }
+    pub fn sample(&self) -> MemoryGuardSample {
+        self.apply(private_bytes())
+    }
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn force_sample(&self, bytes: u64) -> MemoryGuardSample {
+        self.apply(bytes)
+    }
+    fn apply(&self, bytes: u64) -> MemoryGuardSample {
+        self.last_private.store(bytes, Ordering::Release);
+        let was = self.guarded.load(Ordering::Acquire);
+        let now = if was {
+            bytes >= self.recovery_limit()
+        } else {
+            bytes > self.hard_limit
+        };
+        self.guarded.store(now, Ordering::Release);
+        MemoryGuardSample {
+            private_bytes: bytes,
+            guarded: now,
+            transition: match (was, now) {
+                (false, true) => MemoryGuardTransition::On,
+                (true, false) => MemoryGuardTransition::Off,
+                _ => MemoryGuardTransition::Unchanged,
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,5 +229,24 @@ mod tests {
         }
         drop(held);
         assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn memory_guard_uses_hysteresis_and_reports_transitions() {
+        let guard = MemoryGuard::new(1_000);
+        assert_eq!(
+            guard.force_sample(1_001).transition,
+            MemoryGuardTransition::On
+        );
+        assert!(guard.is_guarded());
+        assert_eq!(
+            guard.force_sample(950).transition,
+            MemoryGuardTransition::Unchanged
+        );
+        assert_eq!(
+            guard.force_sample(899).transition,
+            MemoryGuardTransition::Off
+        );
+        assert!(!guard.is_guarded());
     }
 }
