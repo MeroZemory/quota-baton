@@ -7,6 +7,7 @@ macro_rules! println_utf8 {
 }
 
 mod accounts_cli;
+mod cutover;
 
 fn print_stdout(args: std::fmt::Arguments<'_>) -> std::io::Result<()> {
     use std::io::{IsTerminal, Write};
@@ -68,6 +69,16 @@ enum Command {
     Accounts {
         #[command(subcommand)]
         command: accounts_cli::AccountsCommand,
+    },
+    #[command(about = "클라이언트 설정을 연결하거나 되돌립니다")]
+    Wire {
+        #[arg(long, help = "실제 파일을 변경합니다; 생략하면 미리보기입니다")]
+        apply: bool,
+    },
+    #[command(about = "클라이언트 설정 연결을 되돌립니다")]
+    Unwire {
+        #[arg(long, help = "실제 파일을 변경합니다; 생략하면 미리보기입니다")]
+        apply: bool,
     },
     #[cfg(feature = "phase0")]
     #[command(about = "디버그 캡처를 재생합니다")]
@@ -376,6 +387,32 @@ async fn run() -> anyhow::Result<()> {
         Command::Accounts { command } => {
             let config = qb_core::config::Config::load(&home)?;
             accounts_cli::run(command, &home, &config).await?;
+        }
+        Command::Wire { apply } => {
+            let paths = cutover::CutoverPaths::from_environment(home)?;
+            let report = cutover::wire(&paths, apply)?;
+            println_utf8!(
+                "{} {}",
+                if apply {
+                    "적용했습니다:"
+                } else {
+                    "미리보기:"
+                },
+                report.changed.join(", ")
+            );
+        }
+        Command::Unwire { apply } => {
+            let paths = cutover::CutoverPaths::from_environment(home)?;
+            let report = cutover::unwire(&paths, apply)?;
+            println_utf8!(
+                "{} {}",
+                if apply {
+                    "되돌렸습니다:"
+                } else {
+                    "미리보기:"
+                },
+                report.changed.join(", ")
+            );
         }
         #[cfg(feature = "phase0")]
         Command::Phase0 {

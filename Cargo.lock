@@ -1246,10 +1246,12 @@ dependencies = [
  "qb-proto",
  "qb-testkit",
  "reqwest",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tokio-tungstenite",
+ "toml_edit",
 ]
 
 [[package]]

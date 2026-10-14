@@ -12,6 +12,8 @@ qb-core.workspace = true
 qb-proto.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
+serde.workspace = true
+toml_edit.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
