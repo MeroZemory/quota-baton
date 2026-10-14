@@ -144,7 +144,8 @@ The user delegated this decision to independent reviewers. Three models answered
    - If none passes, the account with the most headroom is used.
 2. **Live sessions: move only when forced or free ("staged 1B"; Opus and Fable chose 1B, Codex 1A).**
    - **Forced:** the account becomes unusable (a limit, auth still failing after a refresh, or a user pause). A limit that resets within 60 s holds the request instead.
-   - **Free:** after at least 1 h idle, when the cache is cold on every account, but only if the current account fails the gate. V2 confirmed Codex's objection: a move keeps the conversation working but drops its earlier hidden reasoning, so a move that is not needed is avoided.
+   - **Free:** after at least 1 h idle, when the cache is cold on every account, but only if the current account fails the gate (D15 adds: or is at its spread threshold).
+   - **Overload (added by D15):** a bounded rebalance at a request boundary when an account is concentrated and another has room. V2 confirmed Codex's objection: a move keeps the conversation working but drops its earlier hidden reasoning, so a move that is not needed is avoided.
 3. **Rejected:** restoring immediately when a preferred account recovers (unanimous), and moving warm sessions early to use expiring weekly quota (unanimous). New-session placement serves that goal without a cache cost.
 4. **No priority list.** The only manual placement setting is per-account **drain** (no new sessions; existing sessions stay). `allow_credits` stays off by default.
 5. **Tuning from data:** the ledger records moves, the weekly quota left unused at each reset, and forced moves per gate crossing.
@@ -202,17 +203,59 @@ Before M5's credit hold exists, the Phase 0 credit guard applies (architecture �
 
 | Layer | Owns | Never does |
 |---|---|---|
-| quota-baton (proxy) | Account problems: failover for quota, auth and permission; absorbing short rate limits on the same account (rate hold and pacing, contract C6.3); precise native errors with `retry-after` | Moving warm sessions because of a rate limit; deciding how many sessions run |
+| quota-baton (proxy) | Account problems: failover for quota, auth and permission; absorbing short rate limits on the same account (rate hold and pacing, contract C6.3); precise native errors with `retry-after`; spreading sessions across accounts (D15) | Moving a session because of a rate limit **alone** (D15 moves a bounded number only when an account is concentrated and another has room); deciding how many sessions run in total |
 | Client (Codex CLI, Claude Code) | Its own in-turn retries, unchanged | — |
-| Orchestrator (an agent orchestrator, or `/goal` supervision) | How many sessions run per account, and when a stopped session resumes: back off with jitter, resume in the same session (a fork loses the cache), never resume everything at once | Choosing accounts (D4) |
+| Orchestrator (an agent orchestrator, or `/goal` supervision) | How many sessions run in total (quota-baton spreads them across accounts, D15), and when a stopped session resumes: back off with jitter, resume in the same session (a fork loses the cache), never resume everything at once | Choosing accounts (D4) |
 
 **Assignment of the 429 report's proposals:**
 - **A (soft-pin on rate limits)** and **F (`retry-after`):** quota-baton, in C6.3. A rate limit never moves a session and never causes failover, whatever its `Retry-After`.
 - **B (admission control):** quota-baton, in its simple form, which is per-account pacing in C6.3. Token buckets on uncached input are not adopted, because the upstream limits are not published and a guessed bucket would either throttle needlessly or not protect at all.
-- **C (active-session cap with rotation)** and **D (stall watcher with same-session resume):** the orchestrator.
+- **C (active-session cap with rotation):** spreading across accounts belongs to quota-baton (D15). The total and the rotation of stopped sessions belong to the orchestrator.
+- **D (stall watcher with same-session resume):** the orchestrator.
 - **E (account health signals):** quota-baton already covers this with the tray badge, the ledger of every health and user-state change, and its own usage polling (C9). The 401s from the quota-watch script belong to the old setup.
 
 **Limit of absorption.** Under a sustained limit, a Codex HTTP turn survives about 5–6 minutes (C6.3 "Ceiling"). The orchestrator's caps and resume rules must take this into account.
 
 **Review.** Fable independent review, `.sandbox/reviews/D14-rate-hold-review.md`. All five must-fix and six should-fix items were adopted into C6.3 on the same day.
 
+<a id="d15"></a>
+## D15. Session spreading and bounded overload rebalance — Accepted (user direction, 2026-10-15)
+
+**User direction (quoted).** "a계정 빈도찼다고 무조건 b계정 연결해주면 캐시문제로 매우 불편함. 다만 이미 a계정에 너무 많은 세션이 몰려있었으면 분산을 위해 다른 계정으로 이관하는 것까지 허용해야 된다고 생각함. 이때 캐시 적중 안 하는 건 손해보다 이득이 크다고 생각. 그러나 이미 잘 분산되어 있을 때는 429 떴다고 다른 계정으로 바꿔주면 안 될 거라고 생각함."
+
+This gives three rules:
+- A 429 alone never moves a session.
+- When sessions are concentrated on one account, moving some away is allowed despite the cache loss.
+- When sessions are already well spread, a 429 moves nothing.
+
+**Background.** D11 packs sessions: every new session goes to the account with the soonest weekly reset until its 5 h window projects 90 %, so with two idle accounts all sessions land on one. D14 made rate limits never move a session and never fail over. Together they left no way to relieve a concentrated account except through the orchestrator.
+
+**Evidence.** The 2026-10-14 data (`원인보고서.md`, `proxy-rate-10min.tsv`, `tokload-10min.tsv`) does not yield a per-account capacity:
+- On 10-13 (16:20 and 20:00), one Plus account served 61–70 requests per minute with 37–67 rollouts and no rate 429.
+- On 10-14 at 03:10, the same account was limited at 13 requests per minute with 7 rollouts.
+- In the two-account phase (01:20–02:40), the load was already split and both accounts were limited.
+
+The upstream limit behaves dynamically. The spread threshold is therefore a heuristic for where D11's packing should stop, tuned from the ledger. It is not a capacity.
+
+**Decision** (contract C7.1):
+1. **Prevention.** New sessions go first to accounts with fewer than `spread_threshold` (default 5) active session groups, in D11 order within that set. When every account is full, they go to the lowest `active / spread_threshold`. A full account never refuses.
+2. **A bounded cure.** An account counts as overloaded only when all of these hold:
+   - rate 429s that reached clients hit 3 distinct groups within 10 min
+   - the account is above its threshold
+   - another eligible account has room, with an imbalance of at least 2
+
+   Then at most 2 groups per 10 min are marked, cheapest (smallest last request) first. Each marked group moves only at its own next request boundary, and only to an account with room. Marks expire, in-flight work is never touched, and the request that got the 429 is never failed over.
+3. **Well spread.** When no account has room, nothing is marked. A 429 then only paces (C6.3).
+4. **Cold point.** A cold session on an account at or above its threshold is re-placed. The move is free.
+5. **Roles (amends D14).** quota-baton spreads sessions across accounts (prevention and the bounded cure) and publishes `active_sessions` per account. The orchestrator decides the total number of sessions and when stopped sessions resume. quota-baton never queues or refuses a session.
+6. **Amends D11.** Item 2 gains a third, bounded move cause: the overload rebalance at a request boundary. Item 3 stands, because D15 never moves sessions for quota.
+7. **Errors that are not about accounts** never count. Model capacity ("Selected model is at capacity"), 5xx and 529 are the same on every account.
+
+**Tuning from the ledger.** The inputs are:
+- `overload_detected`, including the "well spread, no move" case
+- `binding_move{overload}` with the next turn's cache result
+- `active_sessions` over time
+
+Later candidates: a per-plan default table, once Codex `plan` shows plan-dependent limits, and a lower `active_window_secs` if the count overstates load.
+
+**Review.** Fable independent review, `.sandbox/reviews/D15-review.md`. All six must-fix and seven should-fix items were adopted the same day.

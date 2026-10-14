@@ -219,7 +219,7 @@ Rate limits are therefore absorbed on the same account. A rate limit **never** m
 - Its WebSocket connect timeout is 15 s.
 
 **Pacing state.** Each account has `rate_backoff_until`, `rate_step` and `rate_release_interval`, held in memory only.
-- **Not a health state.** It is not persisted, never changes eligibility and never moves a binding.
+- **Not a health state.** It is not persisted, never changes eligibility and never moves a binding by itself. A persistent, client-visible limit on a concentrated account is handled by C7.1.
 - **Owner.** The account runtime owns it, under one lock. The HTTP relay, the upgrade path and the WebSocket pump all update it there.
 - **Backoff window.** A rate 429 starts or extends the window: `rate_backoff_until = max(rate_backoff_until, now + max(retry_after, 2^rate_step s))`, with ±20 % jitter. The window is never shortened.
 - **Step.** A 429 raises `rate_step` (cap 5) only if its request was **sent after** the current window was set. That makes one step per window, not one per 429 in flight. `rate_step` decays by one after each full backoff interval with no rate 429. A committed 2xx does **not** reset it.
@@ -257,9 +257,9 @@ Phase 0 item **V8** observes the genuine `wss://chatgpt.com` rate-limit shape. I
 
 It also records whether the socket stays usable afterwards.
 
-**Placement.** New placements (C7 steps 3–5) skip an account that is pacing whenever another candidate at the same step is not pacing. This affects placement only. Bound sessions never move because of pacing.
+**Placement.** New placements (C7 steps 3–5) skip an account that is pacing whenever another candidate at the same step is not pacing. This affects placement only. Bound sessions never move because of pacing. Within C7.1's partition (accounts with room first), the skip applies to whichever set is used.
 
-**Ceiling.** Absorption is bounded. Under a sustained limit, a Codex HTTP turn survives about (5 + 1) × (`rate_hold_secs` + the advised delay), roughly 5–6 min. After that, Codex's own budget ends the turn. A limit that lasts that long means too many sessions share the account. Reducing them is the orchestrator's job (D14), never a reason to move warm sessions.
+**Ceiling.** Absorption is bounded. Under a sustained limit, a Codex HTTP turn survives about (5 + 1) × (`rate_hold_secs` + the advised delay), roughly 5–6 min. After that, Codex's own budget ends the turn. A limit that lasts that long means too many sessions share the account. If they are concentrated on it while another account has room, the overload rebalance (C7.1) moves a bounded number of them at their next request. Otherwise the total is too high for the accounts available, and reducing it is the orchestrator's job (D14).
 
 **Observability.**
 - `AccountView` (C11) gains `pacing {backoff_until, step, release_interval_ms, waiting}`.
@@ -301,14 +301,17 @@ These rules come from the P2 blind panel (`.sandbox/reviews/switch-policy-blind-
    - **Cold point:** see below.
 2. Else, if the parent key is bound to account P, P is eligible and P has not been tried, bind the session to P and use it.
 3. Else, let `E` be the eligible accounts that have not been tried, and let `G` be the accounts in `E` that pass the gate.
-4. If `G` is non-empty, order it by:
-   1. the soonest weekly `reset_at`. Resets within 3 h of each other count as tied.
-   2. among tied accounts, the soonest 5-hour `reset_at`, with unstarted windows last
-   3. the lower projected usage on the binding window
-   4. account id
+4. Partition `G` into `G_room` (the accounts with room, C7.1: `active < spread_threshold`) and the rest.
+   - If `G_room` is non-empty, apply the C6.3 pacing skip within it and order it by:
+     1. the soonest weekly `reset_at`. Resets within 3 h of each other count as tied.
+     2. among tied accounts, the soonest 5-hour `reset_at`, with unstarted windows last
+     3. the lower projected usage on the binding window
+     4. account id
 
-   Take the first account.
-5. If `G` is empty but `E` is not, take the account in `E` with the most headroom on its binding window. This is the 2B fallback.
+     Take the first account.
+   - If `G_room` is empty but `G` is not, order `G` by `active / spread_threshold` ascending, then by the pacing skip, then by 1–4 above, and take the first.
+   - A full account is never a refusal.
+5. If `G` is empty but `E` is not, apply the same partition to `E`. Take an account with room and the most headroom on its binding window. If no account has room, take the lowest `active / spread_threshold`, with ties going to the most headroom. This is the 2B fallback.
 6. Bind the session, and the parent if it was unbound, to the chosen account.
 7. If `E` is empty, apply C6 row 14 or row 15.
 
@@ -320,11 +323,14 @@ These rules come from the P2 blind panel (`.sandbox/reviews/switch-policy-blind-
 Overload, 5xx, short rate limits and network errors retry in place (C6).
 
 Further rules:
-- **Thresholds never move a session.** Gates and usage MUST NOT move a bound session. A session moves only when its account fails the eligibility test in C5, or at a cold point.
+- **Usage gates never move a session.** Gates and usage MUST NOT move a bound session. A bound session moves only in three cases, and then only at a request boundary:
+  - its account fails the eligibility test in C5
+  - it is cold and the cold-point rule applies
+  - it is marked by the overload rebalance (C7.1)
 - **`last_used`.** Every HTTP request and every relayed WebSocket `response.create` updates the binding's `last_used`, set to the end of the response. Idle time is measured over the whole session identity group, sub-agents included.
 - **Pinned sockets keep their binding.** A binding referenced by an open pinned WebSocket is never expired or evicted.
 - **Cold point** (staged 1B). A binding is cold when it has been idle (`now - last_used`) for at least `rebalance_idle_secs`, default 3600. That is never below the longest prompt-cache TTL in use for the provider. At a cold point, the cache is cold on every account, so a move costs no extra cache miss.
-  - A cold session is re-placed (steps 3–6) **only if its current account fails the gate**. A forced move would then probably come soon anyway, and doing it at a cold boundary is cheaper than doing it mid-session.
+  - A cold session is re-placed (steps 3–6) **only if its current account fails the gate or has `active ≥ spread_threshold`** (C7.1). In the first case a forced move would probably come soon anyway; in the second the account is already full. Either way, moving at a cold boundary is cheaper than moving mid-session.
   - Otherwise the binding stays, for up to `session_binding_max_secs` (default 7 days).
   - Why not re-place every cold session? V2 showed that a move keeps the conversation working but drops its earlier hidden reasoning (D10). A move that is not needed is therefore not free.
   - `[websocket] idle_close_secs` MUST be smaller than `rebalance_idle_secs`.
@@ -340,6 +346,75 @@ Further rules:
   - Drain stops new placements on the account, and existing sessions stay.
   - Pause (C5 `user_state`) moves existing sessions away at their next request.
   - Neither is required for normal use.
+
+### C7.1 Session spreading and overload rebalance (D15)
+
+D11 places every new session on the account with the soonest weekly reset until its gate fails, so sessions concentrate on one account while others sit idle. D14 made rate limits never move a session. This subsection adds the user's rule (D15):
+- Spread new sessions before an account is full.
+- When sessions are already concentrated on an account that keeps hitting its rate limit while another account has room, move a bounded number of them, even though they lose their cache.
+- When sessions are already well spread, a rate limit moves nothing.
+
+The design was independently reviewed (`.sandbox/reviews/D15-review.md`).
+
+**Terms.**
+- **Group.** The unit C7 binds (C8): the Codex root `session-id`, or a Claude root session together with its agents. Everything in this subsection counts groups, never keys.
+- **Active.** A group bound to account X is active when one of these holds:
+  - it has a request in flight on X
+  - it has an open pinned WebSocket on X with a response in flight
+  - its `last_used` is within `active_window_secs` (default 300)
+
+  `active(X)` is the number of active groups bound to X. It measures current load, not cache warmth.
+- **Spread threshold.** `spread_threshold` (default 5, overridable per account with `[accounts.<id>]`). It is a spreading heuristic, not a measured capacity (D15), and it never refuses a request.
+- **Room.** Account B has room when `active(B) < spread_threshold(B)`.
+- **Request boundary.** A new HTTP request, or a WebSocket upgrade. These are not boundaries: C6.3 in-place retries, C7 reset-hold retries, and same-account token or network retries (C6).
+
+**Placement** of new sessions is C7 steps 3–5:
+- Accounts with room come first.
+- If none has room, the account with the lowest `active / spread_threshold` is used.
+- The C6.3 pacing skip applies within whichever set is used.
+
+**Overload trigger.** The account runtime evaluates it each time a rate 429 reaches a client on account A. Under C6.3 that is a relayed HTTP 429, a relayed WebSocket rate error frame, or a 1012 close for a rate error. A is **overloaded** when all of these hold:
+1. Within the last `overload_window_secs` (default 600), such events hit at least **3 distinct groups** bound to A.
+2. `active(A) > spread_threshold(A)`.
+3. An eligible account B of the family passes the gate, has room, and `active(A) − active(B) ≥ 2`.
+
+Some outcomes never count toward the trigger, because they are not account concentration:
+- upstream 429s that the hold absorbed
+- row 2 (quota)
+- row 10 (5xx, 529, overloaded), including model-capacity errors such as "Selected model is at capacity"
+
+**Marking.** When A is overloaded, victims are chosen among the groups bound to A.
+- **Order:** smallest last request bytes first, since that is the cost of the uncached re-send; ties go to the longest idle time.
+- **Skipped:** any group with a request or a WebSocket response in flight.
+- **How many:** at most `min(active(A) − spread_threshold(A), 2 − marks already made for A in this window)`. Marking stops as soon as `active(A) − active(B) < 2` would hold after the move.
+- **The mark** is `{from: A, expires: now + overload_window_secs}`. It is held in memory with the bindings and is not exported on takeover.
+- **Idle pinned socket:** if the marked group's pinned socket is idle, close the client socket with 1000, as in C6 row 13c. The reconnect's upgrade is then the group's next request boundary.
+- **Ledger:** log `overload_detected {account, active, threshold, groups_hit, marked}`. When conditions 1 and 2 hold but no account has room, log it once per window too, so that "well spread, no move" is visible.
+
+**Moving.** At a marked group's next request boundary:
+- Move if the mark is unexpired, `active(A) > spread_threshold(A)` still holds, and an eligible account with room passes the gate. Then skip step 1, run steps 3–6 restricted to accounts with room, and bind the whole group there (C7 "Moves").
+- Otherwise clear the mark and stay on A.
+- Log the move when it executes: `binding_move` with reason `overload`, the request bytes, and the next turn's cache result.
+
+**What never moves.**
+- The request that received the 429. Row 3 never fails over.
+- Any group that is not marked. A rate limit alone moves nothing.
+- Anything when no account has room. The sessions are then well spread, and a 429 only paces.
+- A running stream, an in-flight request, or a WebSocket with a response in flight.
+
+**No ping-pong.** Rebalance never takes a target over its threshold, and a move never leaves the target more loaded than the source.
+
+**Speed.** The cure is deliberately slow: at most 2 moves per account per window. Placement is the main lever.
+
+**Interaction.**
+- **Pacing (C6.3):** unchanged.
+- **Drain:** a drained account fails the gate, so it is never a target. Its groups may be victims.
+- **Pause:** unchanged; it causes forced moves.
+- **Takeover:** marks, the 429 history and the window budget live in memory only. The new instance rebuilds `active` from the imported `last_used` and starts with an empty history.
+
+**Observability.**
+- `AccountView` (C11) gains `active_sessions` and `spread_threshold`. The tray shows the count against the threshold.
+- The ledger records `overload_detected` and `binding_move{reason: overload}`. These are the inputs for tuning `spread_threshold`.
 
 ## C8. Session keys and the allowed body peek
 
@@ -452,6 +527,7 @@ Base: `http://127.0.0.1:<admin_port>/admin/v1`. Every route requires `Authorizat
 - `windows[]`, `credits`
 - `pacing {backoff_until, step, release_interval_ms, waiting}` (C6.3)
 - `last_used_at`, `bound_sessions`
+- `active_sessions`, `spread_threshold` (C7.1)
 - `token_expires_at`
 
 Tokens are never included.
@@ -477,6 +553,9 @@ reset_hold_secs = 60
 rate_hold_secs = 60                 # C6.3 total hold per request for request-rate 429s
 rate_hold_max_retries = 3           # C6.3 in-place retries per request
 ws_upgrade_hold_secs = 10           # any hold on a WebSocket upgrade; Codex connect timeout is 15 s
+spread_threshold = 5                # C7.1: active session groups per account before placement spills to the next; a heuristic, never a refusal
+active_window_secs = 300            # C7.1: a group counts as active for this long after its last response
+overload_window_secs = 600          # C7.1: overload trigger window, mark budget (2 per account) and mark expiry
 rebalance_idle_secs = 3600          # cold point; >= the longest prompt-cache TTL in use
 session_binding_max_secs = 604800
 
@@ -499,6 +578,7 @@ poll_min_interval_secs = 300
 [accounts.<id>]              # per-account settings (also set from the tray)
 drain = false
 allow_credits = false
+spread_threshold = 5         # optional per-account override (C7.1)
 ```
 
 ### `accounts/<id>.json`
