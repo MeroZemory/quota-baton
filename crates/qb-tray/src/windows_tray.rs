@@ -22,8 +22,8 @@ use windows::{
                 ID2D1Factory,
             },
             Dwm::{
-                DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
-                DwmSetWindowAttribute,
+                DWMWA_BORDER_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
+                DWMWCP_ROUND, DwmSetWindowAttribute,
             },
             Gdi::InvalidateRect,
             Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect},
@@ -545,6 +545,13 @@ pub fn run(
             DWMWA_USE_IMMERSIVE_DARK_MODE,
             &dark_mode as *const _ as *const c_void,
             size_of_val(&dark_mode) as u32,
+        );
+        let border_color: u32 = 0x00D9D9D9;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            &border_color as *const _ as *const c_void,
+            size_of_val(&border_color) as u32,
         );
         SetTimer(Some(hwnd), 1, 60_000, None);
         let mut icon = NOTIFYICONDATAW {
