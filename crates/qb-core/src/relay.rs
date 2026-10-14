@@ -73,7 +73,13 @@ pub struct RelayState {
     websocket: crate::config::WebsocketConfig,
     reconnect_exclusions: Mutex<BTreeMap<(String, String), Instant>>,
     draining: AtomicBool,
+    drain_started: AtomicBool,
+    drain_ready: AtomicBool,
+    lease_released: AtomicBool,
+    drain_gate: tokio::sync::Mutex<()>,
+    drain_timeout_secs: AtomicU64,
     drain_notify: Notify,
+    drain_start_notify: Notify,
     lease_notify: Notify,
     #[cfg(all(feature = "phase0", debug_assertions))]
     close_after_response: bool,
@@ -102,49 +108,80 @@ impl RelayState {
     /// refresh or binding work begins, so a successor cannot observe a writer
     /// still consuming the old credential lease.
     pub async fn begin_drain(&self) -> Result<serde_json::Value, ()> {
-        if self
-            .draining
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Ok(self.bindings.export().unwrap_or_else(|_| {
-                serde_json::json!({
-                    "schema": 2,
-                    "bindings": []
-                })
-            }));
+        let _gate = self.drain_gate.lock().await;
+        if !self.draining.swap(true, Ordering::AcqRel) {
+            self.drain_started.store(true, Ordering::Release);
+            self.drain_start_notify.notify_waiters();
         }
         if self.tokens.shutdown_refreshes().await.is_err() {
-            self.draining.store(false, Ordering::Release);
             return Err(());
         }
         let bindings = self.bindings.clone();
+        let store = self.store.clone();
+        let obs = self.observability.clone();
         let exported = tokio::task::spawn_blocking(move || {
-            bindings.flush()?;
+            store.stop_writes();
+            obs.freeze_quota()?;
+            bindings.freeze()?;
             bindings.export()
         })
         .await
         .ok()
         .and_then(Result::ok)
         .ok_or(())?;
+        self.drain_ready.store(true, Ordering::Release);
         self.drain_notify.notify_waiters();
         Ok(exported)
     }
 
     pub fn release_lease_after_drain(&self) {
         self.store.release_lease();
+        self.lease_released.store(true, Ordering::Release);
         self.lease_notify.notify_waiters();
     }
 
     pub async fn wait_for_lease_release(&self) {
-        self.lease_notify.notified().await;
+        loop {
+            let notified = self.lease_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.lease_released.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
     }
 
     pub async fn wait_for_drain(&self) {
-        if self.draining.load(Ordering::Acquire) {
+        loop {
+            let notified = self.drain_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.drain_ready.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub async fn wait_for_drain_start(&self) {
+        if self.drain_started.load(Ordering::Acquire) {
             return;
         }
-        self.drain_notify.notified().await;
+        let notified = self.drain_start_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !self.drain_started.load(Ordering::Acquire) {
+            notified.await;
+        }
+    }
+
+    pub fn set_drain_timeout(&self, seconds: u64) {
+        self.drain_timeout_secs
+            .store(seconds.clamp(1, 30 * 60), Ordering::Release);
+    }
+    pub fn drain_timeout(&self) -> Duration {
+        Duration::from_secs(self.drain_timeout_secs.load(Ordering::Acquire))
     }
 
     pub fn is_draining(&self) -> bool {
@@ -236,7 +273,13 @@ impl RelayState {
             websocket: config.websocket.clone(),
             reconnect_exclusions: Mutex::new(BTreeMap::new()),
             draining: AtomicBool::new(false),
+            drain_started: AtomicBool::new(false),
+            drain_ready: AtomicBool::new(false),
+            lease_released: AtomicBool::new(false),
+            drain_gate: tokio::sync::Mutex::new(()),
+            drain_timeout_secs: AtomicU64::new(30 * 60),
             drain_notify: Notify::new(),
+            drain_start_notify: Notify::new(),
             lease_notify: Notify::new(),
             #[cfg(all(feature = "phase0", debug_assertions))]
             close_after_response: false,

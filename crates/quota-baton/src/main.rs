@@ -160,7 +160,7 @@ async fn request_takeover(
             reqwest::header::AUTHORIZATION,
             format!("Bearer {}", secrets.admin_token),
         )
-        .json(&serde_json::json!({"drain_timeout_secs": 30}))
+        .json(&serde_json::json!({"drain_timeout_secs": 30 * 60}))
         .send()
         .await?;
     if !response.status().is_success() {
@@ -291,13 +291,19 @@ async fn run() -> anyhow::Result<()> {
             refreshing.abort();
             let _ = polling.await;
             let _ = refreshing.await;
+            // Stop accepting new connections before handing the credential
+            // lease to the successor. Existing handlers remain alive under
+            // axum's graceful-shutdown drain.
+            servers.shutdown();
+            servers.wait_for_listener_close().await;
             if relay.is_draining() {
                 relay.release_lease_after_drain();
             }
-            servers.shutdown();
-            let drain_deadline = std::time::Duration::from_secs(30 * 60);
-            let _ = tokio::time::timeout(drain_deadline, &mut servers.data_task).await;
-            let _ = tokio::time::timeout(drain_deadline, &mut servers.admin_task).await;
+            let drain_deadline = relay.drain_timeout();
+            let _ = tokio::time::timeout(drain_deadline, async {
+                let _ = tokio::join!(&mut servers.data_task, &mut servers.admin_task);
+            })
+            .await;
             drop(servers);
             login.cancel_all().await;
             // The lease must outlive detached token consumption and durable writes.

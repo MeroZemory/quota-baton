@@ -12,7 +12,11 @@ use axum::{
     routing::get,
 };
 use subtle::ConstantTimeEq;
-use tokio::{net::TcpListener, sync::Notify, task::JoinHandle};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::watch,
+    task::JoinHandle,
+};
 
 use crate::{config::Config, local_secrets::LocalSecrets};
 
@@ -21,11 +25,52 @@ pub struct RunningServers {
     pub admin_addr: SocketAddr,
     pub data_task: JoinHandle<std::io::Result<()>>,
     pub admin_task: JoinHandle<std::io::Result<()>>,
-    shutdown: Arc<Notify>,
+    shutdown: watch::Sender<bool>,
+    listener_closed: [watch::Receiver<bool>; 2],
 }
 impl RunningServers {
     pub fn shutdown(&self) {
-        self.shutdown.notify_waiters();
+        self.shutdown.send_replace(true);
+    }
+    pub async fn wait_for_listener_close(&self) {
+        for closed in &self.listener_closed {
+            let mut closed = closed.clone();
+            while !*closed.borrow_and_update() {
+                if closed.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+struct HandoverListener {
+    listener: Option<TcpListener>,
+    closed: watch::Sender<bool>,
+}
+impl axum::serve::Listener for HandoverListener {
+    type Io = TcpStream;
+    type Addr = SocketAddr;
+    async fn accept(&mut self) -> (TcpStream, SocketAddr) {
+        axum::serve::Listener::accept(self.listener.as_mut().expect("listener alive")).await
+    }
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.listener.as_ref().expect("listener alive").local_addr()
+    }
+}
+impl Drop for HandoverListener {
+    fn drop(&mut self) {
+        drop(self.listener.take());
+        self.closed.send_replace(true);
+    }
+}
+#[derive(Clone)]
+struct Peer(SocketAddr);
+impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, HandoverListener>>
+    for Peer
+{
+    fn connect_info(stream: axum::serve::IncomingStream<'_, HandoverListener>) -> Self {
+        Self(*stream.remote_addr())
     }
 }
 impl Drop for RunningServers {
@@ -79,7 +124,10 @@ pub async fn spawn_with_routes(
     let admin = bind_listener(config.server.admin_port).await?;
     let data_addr = data.local_addr()?;
     let admin_addr = admin.local_addr()?;
-    let shutdown = Arc::new(Notify::new());
+    let (shutdown, mut data_shutdown) = watch::channel(false);
+    let mut admin_shutdown = data_shutdown.clone();
+    let (data_closed, data_closed_rx) = watch::channel(false);
+    let (admin_closed, admin_closed_rx) = watch::channel(false);
     let client_key: Arc<str> = secrets.client_key.into();
     let admin_token: Arc<str> = secrets.admin_token.into();
     let data_app = data_routes.layer(middleware::from_fn_with_state(
@@ -115,22 +163,42 @@ pub async fn spawn_with_routes(
             },
             safety,
         ));
-    let data_shutdown = shutdown.clone();
+    let data_closed_signal = data_closed.clone();
     let data_task = tokio::spawn(async move {
         axum::serve(
-            data,
-            data_app.into_make_service_with_connect_info::<SocketAddr>(),
+            HandoverListener {
+                listener: Some(data),
+                closed: data_closed,
+            },
+            data_app.into_make_service_with_connect_info::<Peer>(),
         )
-        .with_graceful_shutdown(async move { data_shutdown.notified().await })
+        .with_graceful_shutdown(async move {
+            while !*data_shutdown.borrow_and_update() {
+                if data_shutdown.changed().await.is_err() {
+                    break;
+                }
+            }
+            data_closed_signal.send_replace(true);
+        })
         .await
     });
-    let admin_shutdown = shutdown.clone();
+    let admin_closed_signal = admin_closed.clone();
     let admin_task = tokio::spawn(async move {
         axum::serve(
-            admin,
-            admin_app.into_make_service_with_connect_info::<SocketAddr>(),
+            HandoverListener {
+                listener: Some(admin),
+                closed: admin_closed,
+            },
+            admin_app.into_make_service_with_connect_info::<Peer>(),
         )
-        .with_graceful_shutdown(async move { admin_shutdown.notified().await })
+        .with_graceful_shutdown(async move {
+            while !*admin_shutdown.borrow_and_update() {
+                if admin_shutdown.changed().await.is_err() {
+                    break;
+                }
+            }
+            admin_closed_signal.send_replace(true);
+        })
         .await
     });
     Ok(RunningServers {
@@ -139,6 +207,7 @@ pub async fn spawn_with_routes(
         data_task,
         admin_task,
         shutdown,
+        listener_closed: [data_closed_rx, admin_closed_rx],
     })
 }
 
@@ -160,7 +229,7 @@ async fn bind_listener(port: u16) -> anyhow::Result<TcpListener> {
 
 async fn safety(
     State(state): State<Safety>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    ConnectInfo(Peer(peer)): ConnectInfo<Peer>,
     request: Request,
     next: Next,
 ) -> Response {

@@ -13,7 +13,10 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -101,6 +104,7 @@ pub struct BindingTable {
     config: RoutingConfig,
     data: Mutex<Data>,
     writer: Mutex<()>,
+    writes_stopped: AtomicBool,
 }
 
 /// A reservation belongs to the actual upstream account, even after a forced
@@ -306,6 +310,7 @@ impl BindingTable {
             config,
             data: Mutex::new(data),
             writer: Mutex::new(()),
+            writes_stopped: AtomicBool::new(false),
         });
         table.prune(
             &mut table.data.lock().unwrap_or_else(|e| e.into_inner()),
@@ -772,14 +777,32 @@ impl BindingTable {
     pub fn flush(&self) -> Result<()> {
         self.flush_with(atomic_write)
     }
+    /// Finish the last snapshot under the writer lock, then retire this
+    /// process as a state-file writer while its streams finish in memory.
+    pub fn freeze(&self) -> Result<()> {
+        self.flush_with_mode(atomic_write, true)
+    }
     fn flush_with(&self, write: impl FnOnce(&Path, &[u8]) -> std::io::Result<()>) -> Result<()> {
+        self.flush_with_mode(write, false)
+    }
+    fn flush_with_mode(
+        &self,
+        write: impl FnOnce(&Path, &[u8]) -> std::io::Result<()>,
+        freeze: bool,
+    ) -> Result<()> {
         // Acquire before taking the snapshot so an older flush can never
         // replace a newer file. Selectors and completion never take this lock.
         let _writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        if self.writes_stopped.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let (state, revision) = {
             let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
             self.prune(&mut d, Utc::now());
             if !d.dirty {
+                if freeze {
+                    self.writes_stopped.store(true, Ordering::Release);
+                }
                 return Ok(());
             }
             (snapshot(&d), d.revision)
@@ -788,6 +811,9 @@ impl BindingTable {
         let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
         if d.revision == revision {
             d.dirty = false;
+        }
+        if freeze {
+            self.writes_stopped.store(true, Ordering::Release);
         }
         Ok(())
     }
