@@ -240,7 +240,7 @@ async fn run() -> anyhow::Result<()> {
                 observability.clone(),
                 pins.clone(),
             )?;
-            #[cfg(all(feature = "testkit", debug_assertions))]
+            #[cfg(debug_assertions)]
             let relay = {
                 let mut relay = relay;
                 for (provider, endpoint) in [
@@ -321,14 +321,17 @@ async fn run() -> anyhow::Result<()> {
             println_utf8!("프록시를 시작했습니다.");
             let polling = relay.quota.start();
             let refreshing = relay.start_refresh_scheduler();
+            let memory_guard = relay.start_memory_guard();
             tokio::select! {
                 result = tokio::signal::ctrl_c() => { result?; }
                 _ = relay.wait_for_drain() => {}
             }
             polling.abort();
             refreshing.abort();
+            memory_guard.abort();
             let _ = polling.await;
             let _ = refreshing.await;
+            let _ = memory_guard.await;
             // Stop accepting new connections before handing the credential
             // lease to the successor. Existing handlers remain alive under
             // axum's graceful-shutdown drain.
