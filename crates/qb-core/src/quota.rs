@@ -133,7 +133,7 @@ impl UsagePoller {
             semaphore: Semaphore::new(2),
         })
     }
-    #[cfg(all(feature = "testkit", debug_assertions))]
+    #[cfg(debug_assertions)]
     pub(crate) fn set_tokens(&self, tokens: TokenGates) {
         *self.tokens.lock().unwrap_or_else(|e| e.into_inner()) = tokens;
     }
