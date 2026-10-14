@@ -51,6 +51,10 @@ pub struct Account {
     #[serde(default)]
     pub bound_sessions: u64,
     #[serde(default)]
+    pub active_sessions: u64,
+    #[serde(default)]
+    pub spread_threshold: u64,
+    #[serde(default)]
     pub source: String,
     #[serde(default)]
     pub pacing: Pacing,
@@ -100,6 +104,7 @@ pub struct Row {
     pub allow_credits: bool,
     pub drain: bool,
     pub bound_sessions: u64,
+    pub session_text: Option<String>,
     pub pacing_until: Option<String>,
 }
 
@@ -215,6 +220,12 @@ pub fn row(account: &Account, now: SystemTime) -> Row {
         allow_credits: account.allow_credits,
         drain: account.drain,
         bound_sessions: account.bound_sessions,
+        session_text: (account.spread_threshold > 0).then(|| {
+            format!(
+                "세션 {}/{}",
+                account.active_sessions, account.spread_threshold
+            )
+        }),
         pacing_until: account
             .pacing
             .backoff_secs
