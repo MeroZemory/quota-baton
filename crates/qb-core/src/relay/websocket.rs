@@ -371,18 +371,13 @@ async fn upgrade_inner(
                     completion.rate_retry();
                     continue;
                 }
-                let (active, threshold, groups_hit, marked) = state.bindings.note_client_rate(
-                    &account.id,
-                    session.key.as_deref(),
-                    chrono::Utc::now(),
-                );
-                state.observability.record_overload(
-                    &account.id,
-                    active,
-                    threshold,
-                    groups_hit,
-                    marked,
-                );
+                state
+                    .note_client_rate(
+                        crate::accounts::Provider::Codex,
+                        &account.id,
+                        session.key.as_deref(),
+                    )
+                    .await;
                 completion.relayed_rate_429();
                 let mut response = error.into_response();
                 if !response.headers().contains_key("retry-after") {

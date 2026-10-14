@@ -204,6 +204,7 @@ mod tests {
             bound_sessions: 0,
             pacing_until: None,
             drain: false,
+            session_text: None,
         }
     }
 
