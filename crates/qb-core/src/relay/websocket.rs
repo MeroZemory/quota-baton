@@ -546,6 +546,7 @@ async fn upgrade_inner(
             zeroize::Zeroizing::new(tokens.access_token.clone()),
         )),
         budget: state.budget.clone(),
+        memory_guard: state.memory_guard.clone(),
         observability: state.observability.clone(),
         account: account.id.clone(),
         session,
