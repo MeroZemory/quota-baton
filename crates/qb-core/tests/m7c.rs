@@ -392,7 +392,15 @@ fn m7c_a1_seeded_soak_records_private_memory() {
                     response.bytes().await.unwrap();
                 }
             });
-            join_all(jobs).await;
+            let completed = join_all(jobs.map(|job| async move {
+                tokio::time::timeout(Duration::from_secs(15), job)
+                    .await
+                    .is_ok()
+            }))
+            .await
+            .into_iter()
+            .filter(|completed| *completed)
+            .count();
             // Exercise reconnect-driven resends without retaining transcripts.
             if rounds.is_multiple_of(6) {
                 for socket in sockets.iter_mut().take(4) {
@@ -408,6 +416,7 @@ fn m7c_a1_seeded_soak_records_private_memory() {
                 "peak_private_bytes": peak,
                 "http_concurrency": 32,
                 "active_websocket_pairs": sockets.len(),
+                "http_completed": completed,
                 "round": rounds,
                 "seed": "0x4d3743"
             });
