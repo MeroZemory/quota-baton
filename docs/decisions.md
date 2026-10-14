@@ -144,8 +144,8 @@ The user delegated this decision to independent reviewers. Three models answered
    - If none passes, the account with the most headroom is used.
 2. **Live sessions: move only when forced or free ("staged 1B"; Opus and Fable chose 1B, Codex 1A).**
    - **Forced:** the account becomes unusable (a limit, auth still failing after a refresh, or a user pause). A limit that resets within 60 s holds the request instead.
-   - **Free:** after at least 1 h idle, when the cache is cold on every account, but only if the current account fails the gate (D15 adds: or is at its spread threshold).
-   - **Overload (added by D15):** a bounded rebalance at a request boundary when an account is concentrated and another has room. V2 confirmed Codex's objection: a move keeps the conversation working but drops its earlier hidden reasoning, so a move that is not needed is avoided.
+   - **Free:** after at least 1 h idle, when the cache is cold on every account, but only if the current account fails the gate (D15 adds: or is at its spread threshold). V2 confirmed Codex's objection: a move keeps the conversation working but drops its earlier hidden reasoning, so a move that is not needed is avoided.
+   - **Overload (added by D15):** a bounded rebalance at a request boundary when an account is concentrated and another has room.
 3. **Rejected:** restoring immediately when a preferred account recovers (unanimous), and moving warm sessions early to use expiring weekly quota (unanimous). New-session placement serves that goal without a cache cost.
 4. **No priority list.** The only manual placement setting is per-account **drain** (no new sessions; existing sessions stay). `allow_credits` stays off by default.
 5. **Tuning from data:** the ledger records moves, the weekly quota left unused at each reset, and forced moves per gate crossing.
