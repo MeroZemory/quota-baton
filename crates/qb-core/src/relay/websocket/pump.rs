@@ -688,6 +688,9 @@ async fn run_with_read_timeout(
                         if matches!(&message, Message::Ping(_)) && to_client.is_none() {
                             to_client = Some(flush(client_sink.take().unwrap()));
                         }
+                        if response_create(if let Message::Text(text) = &message { text.as_str() } else { "" }) && let Some(relay) = &context.relay {
+                            relay.bindings.request_bytes(context.session.key.as_deref(), bytes as u64);
+                        }
                         if let Some(active) = request.and_then(|id| current.get_mut(&id)) { active.completion.input_bytes.fetch_add(bytes as u64, Ordering::Relaxed); }
                         if let Message::Close(frame) = &message {
                             ending = Some((frame.clone(), "client_close"));
@@ -796,11 +799,15 @@ async fn run_with_read_timeout(
                                         }));
                                         suppress_rate_event = true;
                                     } else {
+                                        note_client_rate(&context).await;
                                         ending = Some((Some(CloseFrame { code: 1012.into(), reason: "".into() }), "rate_hold"));
                                         end_deadline = Instant::now() + CLOSE_TIMEOUT;
                                         suppress_rate_event = true;
                                     }
                                 }
+                            }
+                            if !suppress_rate_event && crate::relay::outcome::classify(Codex, axum::http::StatusCode::OK, &HeaderMap::new(), &serde_json::to_vec(event).unwrap_or_default(), None).kind == crate::relay::outcome::Kind::Rate {
+                                note_client_rate(&context).await;
                             }
                             if !suppress_rate_event {
                                 count_type(&mut counts, event);
@@ -875,6 +882,12 @@ async fn run_with_read_timeout(
                     end_deadline = Instant::now() + CLOSE_TIMEOUT;
                 }
             }
+            _ = tokio::time::sleep(Duration::from_millis(100)), if ending.is_none() && !draining && current.is_empty() && !terminal_pending => {
+                if context.relay.as_ref().is_some_and(|relay| relay.bindings.overload_marked(context.session.key.as_deref(), chrono::Utc::now())) {
+                    ending = Some((Some(CloseFrame { code: 1000.into(), reason: "".into() }), "overload"));
+                    end_deadline = Instant::now() + CLOSE_TIMEOUT;
+                }
+            }
             _ = tokio::time::sleep_until(last_activity + context.idle_close), if ending.is_none() && !draining && to_client.is_none() && to_upstream.is_none() => {
                 ending = Some((Some(CloseFrame { code: 1000.into(), reason: "".into() }), "idle_close"));
                 end_deadline = Instant::now() + CLOSE_TIMEOUT;
@@ -923,6 +936,14 @@ async fn run_with_read_timeout(
         code,
         reason,
     );
+}
+
+async fn note_client_rate(context: &Context) {
+    if let Some(relay) = &context.relay {
+        relay
+            .note_client_rate(Codex, &context.account, context.session.key.as_deref())
+            .await;
+    }
 }
 
 #[cfg(test)]

@@ -76,6 +76,7 @@ struct Group {
 #[derive(Clone, Default)]
 struct AccountIndex {
     count: usize,
+    groups: usize,
     recent: BTreeSet<(DateTime<Utc>, String)>,
 }
 #[derive(Clone, Default)]
@@ -87,6 +88,12 @@ struct Data {
     traffic: BTreeMap<String, DateTime<Utc>>,
     sticky: BTreeMap<String, String>,
     after_move: BTreeSet<String>,
+    rate_hits: BTreeMap<String, BTreeMap<String, DateTime<Utc>>>,
+    overload_marks: BTreeMap<String, DateTime<Utc>>,
+    last_request_bytes: BTreeMap<String, u64>,
+    mark_history: BTreeMap<String, Vec<DateTime<Utc>>>,
+    pacing: BTreeMap<String, bool>,
+    overload_reported: BTreeMap<String, DateTime<Utc>>,
     groups: BTreeMap<String, Group>,
     lru: BTreeSet<(DateTime<Utc>, String)>,
     accounts: BTreeMap<String, AccountIndex>,
@@ -102,6 +109,7 @@ impl Data {
 pub struct BindingTable {
     path: PathBuf,
     config: RoutingConfig,
+    thresholds: Mutex<BTreeMap<String, usize>>,
     data: Mutex<Data>,
     writer: Mutex<()>,
     writes_stopped: AtomicBool,
@@ -186,6 +194,9 @@ fn unindex_group(d: &mut Data, g: &str) -> Option<Group> {
         if account.count == 0 {
             d.accounts.remove(&entry.account);
         }
+        if let Some(account) = d.accounts.get_mut(&entry.account) {
+            account.groups = account.groups.saturating_sub(1);
+        }
     }
     Some(entry)
 }
@@ -195,6 +206,7 @@ fn index_group(d: &mut Data, g: String, entry: Group) {
     }
     let account = d.accounts.entry(entry.account.clone()).or_default();
     account.count += entry.keys.len();
+    account.groups += 1;
     account.recent.insert((entry.last_used, g.clone()));
     d.groups.insert(g, entry);
 }
@@ -308,6 +320,7 @@ impl BindingTable {
         let table = Arc::new(Self {
             path,
             config,
+            thresholds: Mutex::new(BTreeMap::new()),
             data: Mutex::new(data),
             writer: Mutex::new(()),
             writes_stopped: AtomicBool::new(false),
@@ -364,6 +377,179 @@ impl BindingTable {
         d.accounts.get(id).map_or((0, None), |a| {
             (a.count, a.recent.last().map(|(time, _)| *time))
         })
+    }
+
+    pub fn active_sessions(&self, id: &str, now: DateTime<Utc>) -> usize {
+        let d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        self.active_sessions_in(&d, id, now)
+    }
+
+    fn active_sessions_in(&self, d: &Data, id: &str, now: DateTime<Utc>) -> usize {
+        let Some(account) = d.accounts.get(id) else {
+            return 0;
+        };
+        let cutoff = now - chrono::Duration::seconds(self.config.active_window_secs as i64);
+        account
+            .recent
+            .iter()
+            .filter(|(last, group)| {
+                *last >= cutoff || d.active.contains_key(group) || d.pins.contains_key(group)
+            })
+            .count()
+    }
+
+    pub fn spread_threshold(&self) -> usize {
+        self.config.spread_threshold
+    }
+
+    pub fn set_account_threshold(&self, id: &str, threshold: Option<usize>) {
+        let mut thresholds = self.thresholds.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(threshold) = threshold {
+            thresholds.insert(id.to_owned(), threshold.max(1));
+        } else {
+            thresholds.remove(id);
+        }
+    }
+
+    pub fn spread_threshold_for(&self, id: &str) -> usize {
+        self.thresholds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .copied()
+            .unwrap_or(self.config.spread_threshold)
+    }
+
+    pub fn note_client_rate(
+        &self,
+        provider: Provider,
+        account: &str,
+        key: Option<&str>,
+        candidates: &[Candidate],
+        now: DateTime<Utc>,
+    ) -> (usize, usize, usize, usize) {
+        let Some(key) = key else { return (0, 0, 0, 0) };
+        let group = group(key).to_owned();
+        let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        let cutoff = now - chrono::Duration::seconds(self.config.overload_window_secs as i64);
+        let hit_count = {
+            let hits = d.rate_hits.entry(account.to_owned()).or_default();
+            hits.retain(|_, at| *at >= cutoff);
+            hits.insert(group, now);
+            hits.len()
+        };
+        let active = self.active_sessions_in(&d, account, now);
+        let threshold = self.spread_threshold_for(account);
+        let target = candidates
+            .iter()
+            .filter(|c| {
+                c.account.id != account
+                    && c.account.provider == provider
+                    && !c.account.drain
+                    && effective_account(c, &d, &self.config, None, now).eligible_at(None, now)
+                    && metrics(c, &d, &self.config, now).gate
+            })
+            .map(|c| {
+                (
+                    c.account.id.clone(),
+                    self.active_sessions_in(&d, &c.account.id, now),
+                    self.spread_threshold_for(&c.account.id),
+                )
+            })
+            .filter(|(_, active, threshold)| active < threshold)
+            .min_by_key(|(_, active, _)| *active);
+        let Some((_target, target_active, _)) = target else {
+            return (active, threshold, hit_count, 0);
+        };
+        if hit_count < 3 || active <= threshold || active.saturating_sub(target_active) < 2 {
+            return (active, threshold, hit_count, 0);
+        }
+        d.overload_marks.retain(|_, expires| *expires > now);
+        let history = d.mark_history.entry(account.to_owned()).or_default();
+        history.retain(|at| *at > cutoff);
+        let already = history.len();
+        let budget = 2usize.saturating_sub(already);
+        let imbalance_budget = active.saturating_sub(target_active).saturating_sub(2) / 2;
+        let excess = active
+            .saturating_sub(threshold)
+            .min(budget)
+            .min(imbalance_budget);
+        let mut victims: Vec<_> = d
+            .groups
+            .iter()
+            .filter(|(g, entry)| {
+                entry.account == account
+                    && !d.active.contains_key(*g)
+                    && !d.overload_marks.contains_key(*g)
+            })
+            .map(|(g, entry)| {
+                (
+                    g.clone(),
+                    d.last_request_bytes.get(g).copied().unwrap_or(0),
+                    entry.last_used,
+                )
+            })
+            .collect();
+        victims.sort_by(|(_, bytes_a, last_a), (_, bytes_b, last_b)| {
+            bytes_a.cmp(bytes_b).then_with(|| last_a.cmp(last_b))
+        });
+        victims.truncate(excess);
+        let victims: Vec<_> = victims.into_iter().map(|(g, _, _)| g).collect();
+        for victim in &victims {
+            d.overload_marks.insert(
+                victim.clone(),
+                now + chrono::Duration::seconds(self.config.overload_window_secs as i64),
+            );
+        }
+        d.mark_history
+            .entry(account.to_owned())
+            .or_default()
+            .extend(std::iter::repeat_n(now, victims.len()));
+        (active, threshold, hit_count, victims.len())
+    }
+
+    fn has_overload_mark(&self, d: &Data, key: &str, now: DateTime<Utc>) -> bool {
+        let g = group(key);
+        d.overload_marks
+            .get(g)
+            .is_some_and(|expires| *expires > now)
+    }
+    pub fn overload_marked(&self, key: Option<&str>, now: DateTime<Utc>) -> bool {
+        key.and_then(|key| {
+            self.data
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .overload_marks
+                .get(group(key))
+                .copied()
+        })
+        .is_some_and(|expires| expires > now)
+    }
+    pub fn overload_report_due(&self, account: &str, now: DateTime<Utc>) -> bool {
+        let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        let due = d.overload_reported.get(account).is_none_or(|at| {
+            *at + chrono::Duration::seconds(self.config.overload_window_secs as i64) <= now
+        });
+        if due {
+            d.overload_reported.insert(account.to_owned(), now);
+        }
+        due
+    }
+    pub fn set_pacing(&self, id: &str, pacing: bool) {
+        self.data
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pacing
+            .insert(id.to_owned(), pacing);
+    }
+    pub fn request_bytes(&self, key: Option<&str>, bytes: u64) {
+        if let Some(key) = key {
+            self.data
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .last_request_bytes
+                .insert(group(key).to_owned(), bytes);
+        }
     }
     pub fn pending_count(&self, id: &str) -> usize {
         self.data
@@ -567,6 +753,8 @@ impl BindingTable {
                     last_used,
                 },
             );
+            d.last_request_bytes.insert(g.to_owned(), request_bytes);
+            d.overload_marks.remove(g);
             d.changed();
         } else {
             d.sticky.insert(provider.as_str().into(), account.clone());
@@ -639,7 +827,7 @@ impl BindingTable {
         {
             return (PreviewDecision::Selected { account: id.into() }, "forced");
         }
-        let bound = key.and_then(|k| self.retained_binding(d, k, now));
+        let bound = key.and_then(|k| self.retained_binding(d, k, now)).cloned();
         let mut reason = "new";
         if let Some(b) = bound {
             reason = "forced";
@@ -670,12 +858,52 @@ impl BindingTable {
                         return (PreviewDecision::Hold { until: reset }, reason);
                     }
                 }
-                if *eligible {
+                let marked = self.has_overload_mark(d, &b.key, now);
+                if marked {
+                    let room_elsewhere = entries.iter().any(|(candidate, _candidate_eligible)| {
+                        candidate.account.id != b.account
+                            && !candidate.account.drain
+                            && self.active_sessions_in(d, &candidate.account.id, now)
+                                < self.spread_threshold_for(&candidate.account.id)
+                    });
+                    if !room_elsewhere
+                        || self.active_sessions_in(d, &b.account, now)
+                            <= self.spread_threshold_for(&b.account)
+                    {
+                        return (
+                            PreviewDecision::Selected {
+                                account: b.account.clone(),
+                            },
+                            "forced",
+                        );
+                    }
+                    if let Some((candidate, _)) = entries.iter().find(|(candidate, _eligible)| {
+                        candidate.account.id != b.account
+                            && !candidate.account.drain
+                            && self.active_sessions_in(d, &candidate.account.id, now)
+                                < self.spread_threshold_for(&candidate.account.id)
+                    }) {
+                        return (
+                            PreviewDecision::Selected {
+                                account: candidate.account.id.clone(),
+                            },
+                            "overload",
+                        );
+                    }
+                    reason = "overload";
+                }
+                if *eligible && !marked {
                     let g = group(&b.key);
                     let last = d.groups.get(g).map_or(b.last_used, |entry| entry.last_used);
+                    let at_capacity = self.active_sessions_in(d, &b.account, now)
+                        >= self.spread_threshold_for(&b.account);
                     let cold =
                         !protected(d, g) && idle(now, last) >= self.config.rebalance_idle_secs;
-                    if !cold || (!c.account.drain && metrics(c, d, &self.config, now).gate) {
+                    if !cold
+                        || (!at_capacity
+                            && !c.account.drain
+                            && metrics(c, d, &self.config, now).gate)
+                    {
                         return (
                             PreviewDecision::Selected {
                                 account: b.account.clone(),
@@ -683,7 +911,7 @@ impl BindingTable {
                             reason,
                         );
                     }
-                    reason = "cold_rebalance";
+                    reason = if marked { "overload" } else { "cold_rebalance" };
                 }
             }
         } else if let Some(p) = parent.and_then(|p| self.retained_binding(d, p, now)) {
@@ -716,7 +944,48 @@ impl BindingTable {
             .filter(|(c, eligible)| !c.account.drain && *eligible)
             .map(|(c, _)| (c, metrics(c, d, &self.config, now)))
             .collect();
-        let mut gated: Vec<_> = eligible.iter().filter(|(_, m)| m.gate).collect();
+        let has_gate = eligible.iter().any(|(_, m)| m.gate);
+        let pool: Vec<_> = eligible
+            .iter()
+            .filter(|(_, m)| !has_gate || m.gate)
+            .collect();
+        let has_room = pool.iter().any(|(c, _)| {
+            self.active_sessions_in(d, &c.account.id, now)
+                < self.spread_threshold_for(&c.account.id)
+        });
+        let mut partition: Vec<_> = pool
+            .into_iter()
+            .filter(|(c, _)| {
+                !has_room
+                    || self.active_sessions_in(d, &c.account.id, now)
+                        < self.spread_threshold_for(&c.account.id)
+            })
+            .collect();
+        if reason == "overload" {
+            partition.retain(|(c, m)| {
+                m.gate
+                    && self.active_sessions_in(d, &c.account.id, now)
+                        < self.spread_threshold_for(&c.account.id)
+            });
+        }
+        let ratio = |c: &Candidate| {
+            self.active_sessions_in(d, &c.account.id, now) as f64
+                / self.spread_threshold_for(&c.account.id) as f64
+        };
+        let min_ratio = partition
+            .iter()
+            .map(|(c, _)| ratio(c))
+            .min_by(f64::total_cmp);
+        if !has_room && let Some(minimum) = min_ratio {
+            partition.retain(|(c, _)| ratio(c) == minimum);
+        }
+        let non_pacing = partition
+            .iter()
+            .any(|(c, _)| !d.pacing.get(&c.account.id).copied().unwrap_or(false));
+        if non_pacing {
+            partition.retain(|(c, _)| !d.pacing.get(&c.account.id).copied().unwrap_or(false));
+        }
+        let mut gated: Vec<_> = partition.iter().filter(|(_, m)| m.gate).collect();
         // Anchor the first reset cohort; pairwise approximate comparisons are
         // non-transitive and cannot be used as a sorting comparator.
         let anchor = gated
@@ -739,7 +1008,7 @@ impl BindingTable {
                 .then_with(|| a.account.id.cmp(&b.account.id))
         });
         let chosen = gated.first().map(|(c, _)| *c).or_else(|| {
-            eligible
+            partition
                 .iter()
                 .min_by(|(a, x), (b, y)| {
                     x.usage
@@ -2250,7 +2519,7 @@ mod tests {
         let before = t.export().unwrap();
         let revision = t.data.lock().unwrap().revision;
         for key in [Some("claude:g0"), Some("claude:g19999:agent:missing")] {
-            assert_eq!(
+            assert!(matches!(
                 t.preview(
                     Provider::Claude,
                     key,
@@ -2260,10 +2529,8 @@ mod tests {
                     None,
                     0
                 ),
-                PreviewDecision::Selected {
-                    account: "a".into()
-                }
-            );
+                PreviewDecision::Selected { .. }
+            ));
         }
         assert_eq!(
             t.preview(

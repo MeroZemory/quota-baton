@@ -371,6 +371,13 @@ async fn upgrade_inner(
                     completion.rate_retry();
                     continue;
                 }
+                state
+                    .note_client_rate(
+                        crate::accounts::Provider::Codex,
+                        &account.id,
+                        session.key.as_deref(),
+                    )
+                    .await;
                 completion.relayed_rate_429();
                 let mut response = error.into_response();
                 if !response.headers().contains_key("retry-after") {

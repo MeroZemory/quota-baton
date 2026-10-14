@@ -1200,6 +1200,22 @@ fn draw_row(
             colors,
         )?;
     }
+    if let Some(session_text) = row.session_text.as_deref() {
+        draw_text(
+            target,
+            small,
+            session_text,
+            260.0,
+            y + if row.meter_windows.is_empty() {
+                42.0
+            } else {
+                90.0
+            },
+            72.0,
+            16.0,
+            brush_color(colors.muted),
+        )?;
+    }
     if row.health_tone != Tone::Good && row.user_chip != "비활성" {
         let reason = if row.user_chip == "비활성" {
             "비활성".to_owned()
