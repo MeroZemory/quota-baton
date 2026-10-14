@@ -394,7 +394,7 @@ fn m7c_a1_seeded_soak_records_private_memory() {
             });
             join_all(jobs).await;
             // Exercise reconnect-driven resends without retaining transcripts.
-            if rounds % 6 == 0 {
+            if rounds.is_multiple_of(6) {
                 for socket in sockets.iter_mut().take(4) {
                     let _ = socket
                         .send(Message::Binary(Bytes::from(vec![b'w'; 64 * 1024])))
