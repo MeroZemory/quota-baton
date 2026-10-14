@@ -1116,6 +1116,7 @@ dependencies = [
  "flate2",
  "fs2",
  "futures-util",
+ "http-body-util",
  "hyper",
  "hyper-util",
  "qb-proto",
