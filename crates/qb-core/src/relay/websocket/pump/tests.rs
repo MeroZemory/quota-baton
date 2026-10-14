@@ -24,6 +24,7 @@ struct Pair {
     home: tempfile::TempDir,
     server: tokio::task::JoinHandle<()>,
     relay: Option<Arc<crate::relay::RelayState>>,
+    drain: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl Drop for Pair {
@@ -129,15 +130,19 @@ async fn pair_with_tracking(
     let handler_obs = obs.clone();
     let handler_budget = budget.clone();
     let handler_relay = relay.clone();
+    let (drain, drained) = tokio::sync::oneshot::channel();
+    let drained = Arc::new(Mutex::new(Some(drained)));
     let router = Router::new().route(
         "/",
         get(move |mut request: Request| {
             let upstream = upstream.clone();
             let obs = handler_obs.clone();
             let budget = handler_budget.clone();
+            let drained = drained.clone();
             let relay = handler_relay.clone();
             async move {
                 let upstream = upstream.lock().await.take().unwrap();
+                let drained = drained.lock().await.take().unwrap();
                 let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(
                     request.headers()["sec-websocket-key"].as_bytes(),
                 );
@@ -159,6 +164,12 @@ async fn pair_with_tracking(
                                 ..Session::default()
                             },
                             relay,
+                            drain_signal: Some(Box::pin(async move {
+                                // Cancellation is not a takeover signal.
+                                if drained.await.is_err() {
+                                    std::future::pending::<()>().await;
+                                }
+                            })),
                             credentials: None,
                             budget,
                             observability: obs,
@@ -200,6 +211,7 @@ async fn pair_with_tracking(
         home,
         server,
         relay,
+        drain: Some(drain),
     }
 }
 
@@ -903,6 +915,7 @@ fn c6_row_13a_only_response_events_commit_the_current_request() {
     let context = Context {
         runtime: None,
         relay: None,
+        drain_signal: None,
         credentials: None,
         budget: InflightBudget::new(PARSE_LIMIT),
         observability: Arc::new(Observability::new(home.path(), None).unwrap()),
@@ -959,4 +972,65 @@ fn auth_retry_marker_expires_before_natural_access_token_expiry() {
     assert!(!marker.matches(&[7; 32], now + Duration::from_secs(120)));
     assert!(!marker.matches(&[7; 32], now + Duration::from_secs(3600)));
     assert!(!marker.matches(&[8; 32], now));
+}
+
+#[tokio::test]
+async fn takeover_drain_closes_idle_socket_with_1001() {
+    let mut pair = pair(Duration::from_secs(60), false, PARSE_LIMIT).await;
+    pair.drain.take().unwrap().send(()).unwrap();
+    assert!(
+        matches!(next(&mut pair.client).await, Message::Close(Some(frame)) if frame.code == 1001.into())
+    );
+    assert!(
+        matches!(next(&mut pair.peer).await, Message::Close(Some(frame)) if frame.code == 1001.into())
+    );
+    assert!(records(&pair).iter().any(|row| row["event"] == "ws_close"
+        && row["close_code"] == 1001
+        && row["reason"] == "takeover_drain"));
+}
+
+#[tokio::test]
+async fn takeover_drain_delivers_current_response_before_1001() {
+    for close_after_response in [false, true] {
+        let mut pair = pair(Duration::from_secs(60), close_after_response, PARSE_LIMIT).await;
+        let create = Message::Text(r#"{"type":"response.create"}"#.into());
+        pair.client.send(create.clone()).await.unwrap();
+        assert_eq!(next(&mut pair.peer).await, create);
+        let created = Message::Text(
+            r#"{"type":"response.created","response":{"id":"synthetic-response"}}"#.into(),
+        );
+        pair.peer.send(created.clone()).await.unwrap();
+        assert_eq!(next(&mut pair.client).await, created);
+        pair.drain.take().unwrap().send(()).unwrap();
+        // Keep the current response open until its terminal event.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(80), pair.client.next())
+                .await
+                .is_err()
+        );
+        // New turns cannot prolong the old core's drain.
+        pair.client.send(create).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(80), pair.peer.next())
+                .await
+                .is_err()
+        );
+        for text in [
+            r#"{"type":"response.output_text.delta","response_id":"synthetic-response","delta":"fixture"}"#,
+            r#"{"type":"response.completed","response":{"id":"synthetic-response"}}"#,
+        ] {
+            let message = Message::Text(text.into());
+            pair.peer.send(message.clone()).await.unwrap();
+            assert_eq!(next(&mut pair.client).await, message);
+        }
+        assert!(
+            matches!(next(&mut pair.client).await, Message::Close(Some(frame)) if frame.code == 1001.into())
+        );
+        assert!(
+            matches!(next(&mut pair.peer).await, Message::Close(Some(frame)) if frame.code == 1001.into())
+        );
+        let rows = requests(&pair, 1).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["outcome"], "ok");
+    }
 }

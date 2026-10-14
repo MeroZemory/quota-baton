@@ -5,7 +5,10 @@ use std::{
     io::Write,
     os::windows::{ffi::OsStrExt, io::AsRawHandle},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use windows::{
     Win32::{
@@ -57,7 +60,8 @@ pub struct AccountStore {
     dir: PathBuf,
     gate: Mutex<()>,
     observer: Mutex<Option<AccountObserver>>,
-    _lease: Lease,
+    lease: Mutex<Option<Lease>>,
+    writes_stopped: AtomicBool,
 }
 
 pub type AccountObserver = Arc<dyn Fn(&Account, &Health) + Send + Sync>;
@@ -125,10 +129,34 @@ impl AccountStore {
             dir,
             gate: Mutex::new(()),
             observer: Mutex::new(None),
-            _lease: lease,
+            lease: Mutex::new(Some(lease)),
+            writes_stopped: AtomicBool::new(false),
         };
         store.recover_login_migration()?;
         Ok(store)
+    }
+
+    /// Release the home lease while read-only runtime objects are still
+    /// alive.  Takeover uses this after all writers and refresh tasks stop;
+    /// ordinary shutdown still releases it through Drop.
+    pub fn release_lease(&self) {
+        self.stop_writes();
+        let lease = self
+            .lease
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        drop(lease);
+    }
+
+    /// Serialize the final write boundary with all account transactions.
+    pub fn stop_writes(&self) {
+        let _guard = self.gate.lock().unwrap_or_else(|error| error.into_inner());
+        self.writes_stopped.store(true, Ordering::Release);
+    }
+
+    pub fn writes_stopped(&self) -> bool {
+        self.writes_stopped.load(Ordering::Acquire)
     }
 
     /// Called after each successful account write, under the transaction gate.
@@ -198,7 +226,7 @@ impl AccountStore {
 
     fn load_unlocked(&self, id: &str) -> Result<Account, StoreError> {
         let mut record = self.read(id)?;
-        if record.account.expire_health(chrono::Utc::now()) {
+        if !self.writes_stopped() && record.account.expire_health(chrono::Utc::now()) {
             let generation = record.account.generation;
             self.write_metadata_record(record, generation)
         } else {
@@ -257,6 +285,9 @@ impl AccountStore {
         update: impl FnOnce(&mut Account),
     ) -> Result<Account, StoreError> {
         let mut record = self.read(id)?;
+        if self.writes_stopped() {
+            return Ok(record.account);
+        }
         let current = record.account.clone();
         record.account.expire_health(chrono::Utc::now());
         update(&mut record.account);
@@ -399,6 +430,9 @@ impl AccountStore {
     }
 
     pub(crate) fn remove_login_record_unlocked(&self, id: &str) -> Result<(), StoreError> {
+        if self.writes_stopped() {
+            return Err(StoreError::LeaseUnavailable);
+        }
         fs::remove_file(self.path(id)?).map_err(|_| StoreError::Io)
     }
 
@@ -429,6 +463,9 @@ impl AccountStore {
         }
     }
     pub(crate) fn finish_login_migration(&self) -> Result<(), StoreError> {
+        if self.writes_stopped() {
+            return Err(StoreError::LeaseUnavailable);
+        }
         fs::remove_file(self.dir.join(".login-migration")).map_err(|_| StoreError::Io)
     }
     fn recover_login_migration(&self) -> Result<(), StoreError> {
@@ -548,6 +585,9 @@ impl AccountStore {
     }
 
     fn atomic_write(&self, destination: &Path, bytes: &[u8]) -> Result<(), StoreError> {
+        if self.writes_stopped() {
+            return Err(StoreError::LeaseUnavailable);
+        }
         let path = self
             .dir
             .join(format!(".write-{:032x}.tmp", rand::random::<u128>()));
