@@ -506,6 +506,25 @@ impl Observability {
         self.record_group_move(key, from, to, reason, bytes, 1, false);
     }
 
+    pub fn record_overload(
+        &self,
+        account: &str,
+        active: usize,
+        threshold: usize,
+        groups_hit: usize,
+        marked: usize,
+    ) {
+        self.enqueue(Command::Ledger(serde_json::json!({
+            "ts": Utc::now().to_rfc3339(),
+            "event": "overload_detected",
+            "account": account,
+            "active": active,
+            "threshold": threshold,
+            "groups_hit": groups_hit,
+            "marked": marked,
+        })));
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn record_group_move(
         &self,
@@ -520,7 +539,7 @@ impl Observability {
         use sha2::{Digest, Sha256};
         if !matches!(
             reason,
-            "forced" | "cold_rebalance" | "reset_hold_timeout" | "new"
+            "forced" | "cold_rebalance" | "reset_hold_timeout" | "overload" | "new"
         ) {
             return;
         }

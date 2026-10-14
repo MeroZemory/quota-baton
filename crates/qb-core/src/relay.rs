@@ -254,6 +254,9 @@ impl RelayState {
         // The lease is held and account expiry/reconciliation precedes affinity restore.
         store.list()?;
         let bindings = crate::bindings::BindingTable::new(store.home(), config.routing.clone())?;
+        for (id, settings) in &config.accounts {
+            bindings.set_account_threshold(id, settings.spread_threshold);
+        }
         Ok(Self {
             accounts,
             quota,
@@ -1357,6 +1360,14 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
                 continue;
             }
             rate_relayed = true;
+            let (active, threshold, groups_hit, marked) = state.bindings.note_client_rate(
+                &account.id,
+                session.key.as_deref(),
+                chrono::Utc::now(),
+            );
+            state
+                .observability
+                .record_overload(&account.id, active, threshold, groups_hit, marked);
             completion.relayed_rate_429();
             completion.outcome(status.as_u16(), "rate_hold_relayed_429");
         } else if let Some(signal) = decision.signal.take()

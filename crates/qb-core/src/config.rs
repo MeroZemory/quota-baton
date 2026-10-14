@@ -125,6 +125,9 @@ pub struct RoutingConfig {
     pub ws_upgrade_hold_secs: u64,
     pub rebalance_idle_secs: u64,
     pub session_binding_max_secs: u64,
+    pub spread_threshold: usize,
+    pub active_window_secs: u64,
+    pub overload_window_secs: u64,
 }
 impl Default for RoutingConfig {
     fn default() -> Self {
@@ -140,6 +143,9 @@ impl Default for RoutingConfig {
             ws_upgrade_hold_secs: 10,
             rebalance_idle_secs: 3600,
             session_binding_max_secs: 604800,
+            spread_threshold: 5,
+            active_window_secs: 300,
+            overload_window_secs: 600,
         }
     }
 }
@@ -161,6 +167,9 @@ impl RoutingConfig {
             self.gate_weekly_near_reset_pct >= self.gate_weekly_pct
                 && self.rebalance_idle_secs > 0
                 && self.session_binding_max_secs > 0
+                && self.spread_threshold > 0
+                && self.active_window_secs > 0
+                && self.overload_window_secs > 0
                 && self.rate_hold_secs > 0
                 && self.rate_hold_max_retries > 0
                 && self.ws_upgrade_hold_secs > 0,
@@ -246,6 +255,7 @@ impl QuotaConfig {
 pub struct AccountConfig {
     pub drain: bool,
     pub allow_credits: bool,
+    pub spread_threshold: Option<usize>,
 }
 
 impl Config {
