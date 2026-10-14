@@ -715,10 +715,13 @@ impl AccountRuntime {
     ) -> Result<Vec<Value>, ()> {
         let mut views = self.views().await?;
         for view in &mut views {
-            if let Some(id) = view["id"].as_str() {
-                let (count, last_used) = bindings.account_stats(id);
+            if let Some(id) = view["id"].as_str().map(str::to_owned) {
+                let (count, last_used) = bindings.account_stats(&id);
                 view["bound_sessions"] = json!(count);
                 view["last_used_at"] = json!(last_used);
+                let active = bindings.active_sessions(&id, Utc::now());
+                view["active_sessions"] = json!(active);
+                view["spread_threshold"] = json!(bindings.spread_threshold_for(&id));
             }
         }
         Ok(views)

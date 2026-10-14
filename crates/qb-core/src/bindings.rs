@@ -76,6 +76,7 @@ struct Group {
 #[derive(Clone, Default)]
 struct AccountIndex {
     count: usize,
+    groups: usize,
     recent: BTreeSet<(DateTime<Utc>, String)>,
 }
 #[derive(Clone, Default)]
@@ -87,6 +88,8 @@ struct Data {
     traffic: BTreeMap<String, DateTime<Utc>>,
     sticky: BTreeMap<String, String>,
     after_move: BTreeSet<String>,
+    rate_hits: BTreeMap<String, BTreeMap<String, DateTime<Utc>>>,
+    overload_marks: BTreeMap<String, DateTime<Utc>>,
     groups: BTreeMap<String, Group>,
     lru: BTreeSet<(DateTime<Utc>, String)>,
     accounts: BTreeMap<String, AccountIndex>,
@@ -102,6 +105,7 @@ impl Data {
 pub struct BindingTable {
     path: PathBuf,
     config: RoutingConfig,
+    thresholds: Mutex<BTreeMap<String, usize>>,
     data: Mutex<Data>,
     writer: Mutex<()>,
     writes_stopped: AtomicBool,
@@ -186,6 +190,9 @@ fn unindex_group(d: &mut Data, g: &str) -> Option<Group> {
         if account.count == 0 {
             d.accounts.remove(&entry.account);
         }
+        if let Some(account) = d.accounts.get_mut(&entry.account) {
+            account.groups = account.groups.saturating_sub(1);
+        }
     }
     Some(entry)
 }
@@ -195,6 +202,7 @@ fn index_group(d: &mut Data, g: String, entry: Group) {
     }
     let account = d.accounts.entry(entry.account.clone()).or_default();
     account.count += entry.keys.len();
+    account.groups += 1;
     account.recent.insert((entry.last_used, g.clone()));
     d.groups.insert(g, entry);
 }
@@ -308,6 +316,7 @@ impl BindingTable {
         let table = Arc::new(Self {
             path,
             config,
+            thresholds: Mutex::new(BTreeMap::new()),
             data: Mutex::new(data),
             writer: Mutex::new(()),
             writes_stopped: AtomicBool::new(false),
@@ -355,7 +364,7 @@ impl BindingTable {
     }
     #[cfg(test)]
     fn has_traffic(&self, id: &str) -> bool {
-        let d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
         d.traffic.contains_key(id) || d.pending.get(id).is_some_and(|count| *count > 0)
     }
     pub fn account_stats(&self, id: &str) -> (usize, Option<DateTime<Utc>>) {
@@ -364,6 +373,127 @@ impl BindingTable {
         d.accounts.get(id).map_or((0, None), |a| {
             (a.count, a.recent.last().map(|(time, _)| *time))
         })
+    }
+
+    pub fn active_sessions(&self, id: &str, now: DateTime<Utc>) -> usize {
+        let d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        self.active_sessions_in(&d, id, now)
+    }
+
+    fn active_sessions_in(&self, d: &Data, id: &str, now: DateTime<Utc>) -> usize {
+        let Some(account) = d.accounts.get(id) else {
+            return 0;
+        };
+        let cutoff = now - chrono::Duration::seconds(self.config.active_window_secs as i64);
+        account
+            .recent
+            .iter()
+            .filter(|(last, group)| {
+                *last >= cutoff || d.active.contains_key(group) || d.pins.contains_key(group)
+            })
+            .count()
+    }
+
+    pub fn spread_threshold(&self) -> usize {
+        self.config.spread_threshold
+    }
+
+    pub fn set_account_threshold(&self, id: &str, threshold: Option<usize>) {
+        let mut thresholds = self.thresholds.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(threshold) = threshold {
+            thresholds.insert(id.to_owned(), threshold.max(1));
+        } else {
+            thresholds.remove(id);
+        }
+    }
+
+    pub fn spread_threshold_for(&self, id: &str) -> usize {
+        self.thresholds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .copied()
+            .unwrap_or(self.config.spread_threshold)
+    }
+
+    pub fn note_client_rate(
+        &self,
+        account: &str,
+        key: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> (usize, usize, usize, usize) {
+        let Some(key) = key else { return (0, 0, 0, 0) };
+        let group = group(key).to_owned();
+        let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        let cutoff = now - chrono::Duration::seconds(self.config.overload_window_secs as i64);
+        let hit_count = {
+            let hits = d.rate_hits.entry(account.to_owned()).or_default();
+            hits.retain(|_, at| *at >= cutoff);
+            hits.insert(group, now);
+            hits.len()
+        };
+        let active = self.active_sessions_in(&d, account, now);
+        let threshold = self.spread_threshold_for(account);
+        let target = d
+            .accounts
+            .iter()
+            .filter(|(id, _)| id.as_str() != account)
+            .map(|(id, _)| {
+                (
+                    id.clone(),
+                    self.active_sessions_in(&d, id, now),
+                    self.spread_threshold_for(id),
+                )
+            })
+            .find(|(_, active, threshold)| *active < *threshold);
+        let Some((_target, target_active, _)) = target else {
+            return (active, threshold, hit_count, 0);
+        };
+        if hit_count < 3 || active <= threshold || active.saturating_sub(target_active) < 2 {
+            return (active, threshold, hit_count, 0);
+        }
+        let already = d
+            .overload_marks
+            .keys()
+            .filter(|g| {
+                d.groups
+                    .get(*g)
+                    .is_some_and(|entry| entry.account == account)
+            })
+            .count();
+        let budget = 2usize.saturating_sub(already);
+        let excess = active.saturating_sub(threshold).min(budget);
+        let mut victims: Vec<_> = d
+            .groups
+            .iter()
+            .filter(|(g, entry)| entry.account == account && !protected(&d, g))
+            .map(|(g, entry)| (g.clone(), entry.last_used))
+            .collect();
+        victims.sort_by_key(|(_, last)| *last);
+        victims.truncate(excess);
+        let victims: Vec<_> = victims.into_iter().map(|(g, _)| g).collect();
+        for victim in &victims {
+            d.overload_marks.insert(
+                victim.clone(),
+                now + chrono::Duration::seconds(self.config.overload_window_secs as i64),
+            );
+        }
+        (active, threshold, hit_count, victims.len())
+    }
+
+    fn take_overload_mark(&self, d: &mut Data, key: &str, now: DateTime<Utc>) -> bool {
+        let g = group(key);
+        match d.overload_marks.get(g).copied() {
+            Some(expires) if expires > now => {
+                d.overload_marks.remove(g);
+                true
+            }
+            Some(_) => {
+                d.overload_marks.remove(g);
+                false
+            }
+            None => false,
+        }
     }
     pub fn pending_count(&self, id: &str) -> usize {
         self.data
@@ -445,9 +575,9 @@ impl BindingTable {
         pinned: Option<&str>,
         _request_bytes: u64,
     ) -> PreviewDecision {
-        let d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
         self.select(
-            &d,
+            &mut d,
             provider,
             key,
             parent,
@@ -500,7 +630,7 @@ impl BindingTable {
         let now = Utc::now();
         self.prune(&mut d, now);
         let (choice, reason) = self.select(
-            &d,
+            &mut d,
             provider,
             key,
             parent,
@@ -613,7 +743,7 @@ impl BindingTable {
     #[allow(clippy::too_many_arguments)]
     fn select(
         &self,
-        d: &Data,
+        d: &mut Data,
         provider: Provider,
         key: Option<&str>,
         parent: Option<&str>,
@@ -639,7 +769,7 @@ impl BindingTable {
         {
             return (PreviewDecision::Selected { account: id.into() }, "forced");
         }
-        let bound = key.and_then(|k| self.retained_binding(d, k, now));
+        let bound = key.and_then(|k| self.retained_binding(d, k, now)).cloned();
         let mut reason = "new";
         if let Some(b) = bound {
             reason = "forced";
@@ -670,7 +800,8 @@ impl BindingTable {
                         return (PreviewDecision::Hold { until: reset }, reason);
                     }
                 }
-                if *eligible {
+                let marked = self.take_overload_mark(d, &b.key, now);
+                if *eligible && !marked {
                     let g = group(&b.key);
                     let last = d.groups.get(g).map_or(b.last_used, |entry| entry.last_used);
                     let cold =
@@ -683,7 +814,7 @@ impl BindingTable {
                             reason,
                         );
                     }
-                    reason = "cold_rebalance";
+                    reason = if marked { "overload" } else { "cold_rebalance" };
                 }
             }
         } else if let Some(p) = parent.and_then(|p| self.retained_binding(d, p, now)) {
@@ -716,7 +847,30 @@ impl BindingTable {
             .filter(|(c, eligible)| !c.account.drain && *eligible)
             .map(|(c, _)| (c, metrics(c, d, &self.config, now)))
             .collect();
-        let mut gated: Vec<_> = eligible.iter().filter(|(_, m)| m.gate).collect();
+        let room: Vec<_> = eligible
+            .iter()
+            .filter(|(c, _)| {
+                self.active_sessions_in(&d, &c.account.id, now)
+                    < self.spread_threshold_for(&c.account.id)
+            })
+            .collect();
+        let has_room = !room.is_empty();
+        let mut partition: Vec<_> = if !has_room {
+            eligible.iter().collect()
+        } else {
+            room
+        };
+        if !has_room {
+            partition.sort_by(|(a, _), (b, _)| {
+                let ar = self.active_sessions_in(&d, &a.account.id, now) as f64
+                    / self.spread_threshold_for(&a.account.id) as f64;
+                let br = self.active_sessions_in(&d, &b.account.id, now) as f64
+                    / self.spread_threshold_for(&b.account.id) as f64;
+                ar.total_cmp(&br)
+                    .then_with(|| a.account.id.cmp(&b.account.id))
+            });
+        }
+        let mut gated: Vec<_> = partition.iter().filter(|(_, m)| m.gate).collect();
         // Anchor the first reset cohort; pairwise approximate comparisons are
         // non-transitive and cannot be used as a sorting comparator.
         let anchor = gated
@@ -739,7 +893,7 @@ impl BindingTable {
                 .then_with(|| a.account.id.cmp(&b.account.id))
         });
         let chosen = gated.first().map(|(c, _)| *c).or_else(|| {
-            eligible
+            partition
                 .iter()
                 .min_by(|(a, x), (b, y)| {
                     x.usage
@@ -1396,8 +1550,8 @@ mod tests {
             })
             .collect();
         let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        assert_eq!(results.iter().filter(|(id, _, _)| id == "a").count(), 1);
-        assert_eq!(results.iter().filter(|(id, _, _)| id == "b").count(), 7);
+        assert_eq!(results.iter().filter(|(id, _, _)| id == "a").count(), 3);
+        assert_eq!(results.iter().filter(|(id, _, _)| id == "b").count(), 5);
         drop(results);
         assert!(t.data.lock().unwrap().pending.is_empty());
     }
