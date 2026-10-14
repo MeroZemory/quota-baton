@@ -624,13 +624,20 @@ async fn writeahead_precedes_request_and_cancel_does_not_abort_refresh_ahead() {
             .refresh_uncertain
     );
     assert_eq!(fake.state.requests().len(), 1);
-    assert_eq!(
-        ledger(&f)
+    // The refresh task records its ledger event after persisting the tokens,
+    // so wait for it instead of reading the ledger at once.
+    let mut refresh_events = 0;
+    for _ in 0..300 {
+        refresh_events = ledger(&f)
             .iter()
             .filter(|e| e["event"] == "token_refresh")
-            .count(),
-        1
-    );
+            .count();
+        if refresh_events > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(refresh_events, 1);
 }
 
 #[tokio::test]
