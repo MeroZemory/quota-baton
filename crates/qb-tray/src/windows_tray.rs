@@ -32,8 +32,9 @@ use windows::{
         UI::{
             HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext},
             Shell::{
-                NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
-                NOTIFYICONIDENTIFIER, Shell_NotifyIconGetRect, Shell_NotifyIconW,
+                NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE,
+                NIM_MODIFY, NOTIFYICONDATAW, NOTIFYICONIDENTIFIER, Shell_NotifyIconGetRect,
+                Shell_NotifyIconW,
             },
             WindowsAndMessaging::{
                 CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW,
@@ -74,6 +75,24 @@ fn supervisor() -> &'static Mutex<Supervisor> {
     })
 }
 
+unsafe fn notify_balloon(hwnd: HWND, title: &str, message: &str) {
+    let mut icon = NOTIFYICONDATAW {
+        cbSize: size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: 1,
+        uFlags: NIF_INFO,
+        dwInfoFlags: NIIF_INFO,
+        ..Default::default()
+    };
+    let title: Vec<u16> = title.encode_utf16().chain([0]).collect();
+    let message: Vec<u16> = message.encode_utf16().chain([0]).collect();
+    let title_len = title.len().min(icon.szInfoTitle.len());
+    let message_len = message.len().min(icon.szInfo.len());
+    icon.szInfoTitle[..title_len].copy_from_slice(&title[..title_len]);
+    icon.szInfo[..message_len].copy_from_slice(&message[..message_len]);
+    let _ = unsafe { Shell_NotifyIconW(NIM_MODIFY, &icon) };
+}
+
 fn model() -> &'static Mutex<(Vec<qb_tray::Row>, String, bool)> {
     MODEL.get_or_init(|| Mutex::new((Vec::new(), "v0.1.0".to_owned(), false)))
 }
@@ -83,8 +102,9 @@ fn view_state() -> &'static Mutex<Option<String>> {
 }
 
 fn flyout_height() -> i32 {
-    let rows = &model().lock().unwrap_or_else(|e| e.into_inner()).0;
-    qb_tray::native_render::content_height(rows, false)
+    let model = model().lock().unwrap_or_else(|e| e.into_inner());
+    let state = view_state().lock().unwrap_or_else(|e| e.into_inner());
+    qb_tray::native_render::state_height(&model.0, false, state.as_deref())
         .ceil()
         .clamp(120.0, 700.0) as i32
 }
@@ -120,7 +140,7 @@ unsafe fn position_flyout(hwnd: HWND) {
     let _ = SetWindowPos(hwnd, None, x, y, width, height, Default::default());
 }
 
-fn update_status(supervise: bool) {
+fn update_status(supervise: bool, notification_hwnd: Option<HWND>) {
     let result = (|| -> Result<String> {
         let client = super::client::AdminClient::from_home()?;
         let runtime = tokio::runtime::Runtime::new()?;
@@ -157,6 +177,15 @@ fn update_status(supervise: bool) {
                     if started {
                         state.last_start = Some(Instant::now());
                         state.delay = (state.delay * 2).min(Duration::from_secs(300));
+                        unsafe {
+                            if let Some(hwnd) = notification_hwnd {
+                                notify_balloon(
+                                    hwnd,
+                                    "quota-baton",
+                                    "코어가 예기치 않게 종료되어 다시 시작했습니다",
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -346,7 +375,7 @@ unsafe extern "system" fn window_proc(
                 return LRESULT(0);
             }
             if !FIXTURE_MODE.load(Ordering::Relaxed) {
-                update_status(SUPERVISE_ENABLED.load(Ordering::Relaxed));
+                update_status(SUPERVISE_ENABLED.load(Ordering::Relaxed), Some(hwnd));
             }
             position_flyout(hwnd);
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
@@ -417,7 +446,7 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         ACTION_DONE => {
-            update_status(false);
+            update_status(false, Some(hwnd));
             *view_state().lock().unwrap_or_else(|e| e.into_inner()) = None;
             let _ = InvalidateRect(Some(hwnd), None, true);
             LRESULT(0)
@@ -443,7 +472,7 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_TIMER => {
-            update_status(SUPERVISE_ENABLED.load(Ordering::Relaxed));
+            update_status(SUPERVISE_ENABLED.load(Ordering::Relaxed), Some(hwnd));
             let _ = InvalidateRect(Some(hwnd), None, true);
             LRESULT(0)
         }
@@ -474,7 +503,7 @@ pub fn run(
         FIXTURE_MODE.store(true, Ordering::Relaxed);
     } else {
         FIXTURE_MODE.store(false, Ordering::Relaxed);
-        update_status(supervise);
+        update_status(supervise, None);
     }
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);

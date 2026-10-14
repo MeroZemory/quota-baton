@@ -5,7 +5,7 @@
 //! JSON shape is the read-only `/admin/v1/state` shape, so fixture and UI tests can
 //! exercise it without starting the core.
 
-use chrono::{DateTime, FixedOffset, Local};
+use chrono::{DateTime, Datelike, FixedOffset, Local, Timelike};
 use serde::Deserialize;
 use std::time::{Duration, SystemTime};
 
@@ -93,6 +93,8 @@ pub struct Row {
     pub health_tone: Tone,
     pub five_hour: Usage,
     pub seven_day: Usage,
+    pub meter_windows: Vec<Usage>,
+    pub reason_button: bool,
     pub attention: bool,
     pub source: String,
     pub allow_credits: bool,
@@ -181,6 +183,11 @@ pub fn row(account: &Account, now: SystemTime) -> Row {
             .filter(|window| window.name == "5h")
             .and_then(|_| account.windows.iter().find(|w| w.name != "5h"))
     });
+    let meter_windows = account
+        .windows
+        .iter()
+        .map(|window| usage(Some(window), now))
+        .collect::<Vec<_>>();
     Row {
         id: account.id.clone(),
         provider: provider_name(&account.provider).into(),
@@ -196,6 +203,8 @@ pub fn row(account: &Account, now: SystemTime) -> Row {
         health_tone,
         five_hour: usage(five_window, now),
         seven_day: usage(weekly_window, now),
+        meter_windows,
+        reason_button: account.source != "linked" && account.health.kind == "needs_relogin",
         attention: account.refresh_attention
             || account.probe_pending
             || account.drain
@@ -211,6 +220,22 @@ pub fn row(account: &Account, now: SystemTime) -> Row {
             .backoff_secs
             .map(|seconds| seconds.to_string()),
     }
+}
+
+pub fn row_height(row: &Row) -> f32 {
+    if row.user_chip == "비활성" {
+        return 44.0;
+    }
+    let has_windows = !row.meter_windows.is_empty();
+    let has_reason = row.health_tone != Tone::Good;
+    10.0 + 24.0
+        + if has_windows { 6.0 + 42.0 } else { 0.0 }
+        + if has_reason {
+            8.0 + if row.reason_button { 24.0 } else { 16.0 }
+        } else {
+            0.0
+        }
+        + 10.0
 }
 
 pub fn user_chip(state: &str) -> String {
@@ -340,7 +365,13 @@ pub fn format_reset(value: &str, now: SystemTime) -> String {
     if remaining > Duration::from_secs(24 * 3600)
         && let Some(local) = local
     {
-        return format!("{} 초기화", local.format("%m/%d %H:%M"));
+        return format!(
+            "{}/{} {:02}:{:02} 초기화",
+            local.month(),
+            local.day(),
+            local.hour(),
+            local.minute()
+        );
     }
     local.map_or_else(
         || value.into(),
@@ -515,12 +546,7 @@ mod tests {
     #[test]
     fn reset_and_date_are_stable() {
         let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        let expected_reset = "2027-01-01T00:00:00Z"
-            .parse::<chrono::DateTime<chrono::FixedOffset>>()
-            .unwrap()
-            .with_timezone(&chrono::Local)
-            .format("%m/%d %H:%M")
-            .to_string();
+        let expected_reset = "1/1 09:00";
         assert_eq!(
             format_reset("2027-01-01T00:00:00Z", now),
             format!("{expected_reset} 초기화")
@@ -551,6 +577,23 @@ mod tests {
             chip_colors(true, Tone::Neutral, true),
             chip_colors(false, Tone::Neutral, true)
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reference_fixture_uses_specified_row_and_flyout_heights() {
+        let rows = rows();
+        assert_eq!(row_height(&rows[0]), 92.0);
+        assert_eq!(row_height(&rows[1]), 124.0);
+        assert_eq!(row_height(&rows[3]), 92.0);
+        assert_eq!(row_height(&rows[4]), 116.0);
+        assert_eq!(row_height(&rows[5]), 92.0);
+        assert_eq!(native_render::content_height(&rows, false), 765.0);
+        assert_eq!(native_render::content_height(&rows, true), 810.0);
+        let mut pacing = rows.clone();
+        pacing[3].health_tone = Tone::Warning;
+        pacing[3].health_chip = "속도 조절 중 · 10초".into();
+        assert_eq!(native_render::content_height(&pacing, false), 789.0);
     }
 
     #[test]

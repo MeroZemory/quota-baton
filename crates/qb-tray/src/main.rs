@@ -60,7 +60,7 @@ fn main() -> anyhow::Result<()> {
             args.theme == "dark",
             &state.version,
             now,
-            args.expand_disabled,
+            args.expand_disabled || args.state == "expanded",
             &output,
             &args.state,
         )
