@@ -71,7 +71,7 @@ impl UpstreamConfig {
             if value == expected {
                 continue;
             }
-            #[cfg(any(test, all(feature = "testkit", debug_assertions)))]
+            #[cfg(any(test, feature = "testkit"))]
             {
                 let url = reqwest::Url::parse(value)
                     .map_err(|_| anyhow::anyhow!("invalid upstream base"))?;

@@ -16,6 +16,9 @@ use crate::guard::{InflightBudget, Reservation};
 const COMPRESS_AFTER: usize = 1024 * 1024;
 pub(super) const PEEK_LIMIT: usize = 1024 * 1024;
 
+#[cfg(test)]
+static TEST_COMPRESS_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+
 pub(super) struct Upload {
     pub prefix: Bytes,
     pub body: reqwest::Body,
@@ -219,6 +222,8 @@ pub(super) async fn read(
     zstd_input: bool,
 ) -> Result<Upload, axum::Error> {
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(8);
+    let queue_budget = budget.clone();
+    let (retain_tx, mut retain_rx) = mpsc::channel::<(Bytes, Reservation)>(256);
     let (prefix_tx, prefix_rx) = oneshot::channel();
     let state = Arc::new(Mutex::new(State {
         retainer: (cap > 0).then(|| Retainer::new(cap, budget, zstd_input)),
@@ -233,6 +238,40 @@ pub(super) async fn read(
     let done = Arc::new(Notify::new());
     let task_state = state.clone();
     let task_done = done.clone();
+    let retain_state = state.clone();
+    let retention_task = tokio::spawn(async move {
+        while let Some((chunk, queued)) = retain_rx.recv().await {
+            if retain_state
+                .lock()
+                .expect("upload state poisoned")
+                .retainer
+                .is_none()
+            {
+                break;
+            }
+            let state = retain_state.clone();
+            let retained = tokio::task::spawn_blocking(move || {
+                drop(queued);
+                #[cfg(test)]
+                {
+                    let delay = TEST_COMPRESS_DELAY_MS.load(Ordering::Relaxed);
+                    if delay != 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(delay));
+                    }
+                }
+                let mut state = state.lock().expect("upload state poisoned");
+                state
+                    .retainer
+                    .as_mut()
+                    .is_some_and(|retainer| retainer.append(&chunk))
+            })
+            .await
+            .unwrap_or(false);
+            if !retained {
+                retain_state.lock().expect("upload state poisoned").retainer = None;
+            }
+        }
+    });
     tokio::spawn(async move {
         let mut input = body.into_data_stream();
         let mut prefix = Vec::new();
@@ -269,19 +308,15 @@ pub(super) async fn read(
             if let Some(sender) = prefix_tx.take() {
                 let _ = sender.send(Bytes::from(prefix.clone()));
             }
-            let retain = {
-                let mut state = task_state.lock().expect("upload state poisoned");
-                state
-                    .retainer
-                    .as_mut()
-                    .is_some_and(|retainer| retainer.append(&chunk))
+            let forwarded = tx.send(Ok(chunk.clone())).await.is_ok();
+            let Some(queued) = queue_budget.try_reserve(chunk.len()) else {
+                task_state.lock().expect("upload state poisoned").retainer = None;
+                continue;
             };
-            if !retain {
-                {
-                    task_state.lock().expect("upload state poisoned").retainer = None;
-                }
+            if retain_tx.try_send((chunk, queued)).is_err() {
+                task_state.lock().expect("upload state poisoned").retainer = None;
             }
-            if tx.send(Ok(chunk)).await.is_err() {
+            if !forwarded {
                 // The upstream response arrived early; continue draining the
                 // client body so retention can finish without blocking it.
                 continue;
@@ -290,6 +325,9 @@ pub(super) async fn read(
         if let Some(sender) = prefix_tx {
             let _ = sender.send(Bytes::from(prefix));
         }
+        drop(tx);
+        drop(retain_tx);
+        let _ = retention_task.await;
         task_state.lock().expect("upload state poisoned").complete = true;
         task_done.notify_waiters();
     });
@@ -310,6 +348,7 @@ pub(super) async fn read(
 mod tests {
     use super::*;
     use http_body_util::BodyExt;
+    use std::time::Duration;
 
     async fn collect(body: reqwest::Body) -> Vec<u8> {
         let mut out = Vec::new();
@@ -515,5 +554,32 @@ mod tests {
             assert_eq!(first, input);
             assert_eq!(retry, input);
         }
+    }
+
+    #[tokio::test]
+    async fn m7b_slow_compressor_never_delays_forwarding_and_drops_only_retention() {
+        TEST_COMPRESS_DELAY_MS.store(250, Ordering::Relaxed);
+        let chunks = (0..512)
+            .map(|_| Ok::<_, io::Error>(Bytes::from(vec![b'x'; 64 * 1024])))
+            .collect::<Vec<_>>();
+        let input = chunks
+            .iter()
+            .flat_map(|chunk| chunk.as_ref().unwrap().iter().copied())
+            .collect::<Vec<_>>();
+        let upload = read(
+            Body::from_stream(stream::iter(chunks)),
+            8 * 1024 * 1024,
+            Arc::new(AtomicU64::new(0)),
+            InflightBudget::new(8 * 1024 * 1024),
+            false,
+        )
+        .await
+        .unwrap();
+        let forwarded = tokio::time::timeout(Duration::from_millis(100), collect(upload.body))
+            .await
+            .expect("forwarding must not wait for compression");
+        assert_eq!(forwarded, input);
+        assert!(upload.retained.unwrap().complete().await.is_none());
+        TEST_COMPRESS_DELAY_MS.store(0, Ordering::Relaxed);
     }
 }
