@@ -495,8 +495,10 @@ async fn c6_3_no_pacing_no_spacing() {
         .max()
         .unwrap()
         .saturating_duration_since(arrivals.iter().copied().min().unwrap());
+    // 250 ms spacing would spread 32 requests over about 7.75 s; 2 s keeps
+    // that detectable while tolerating a loaded machine.
     assert!(
-        span < Duration::from_millis(200),
+        span < Duration::from_secs(2),
         "unpaced span was {span:?}"
     );
 }
@@ -532,8 +534,10 @@ async fn c6_3_spacing_stops_after_decay() {
         .max()
         .unwrap()
         .saturating_duration_since(arrivals.iter().copied().min().unwrap());
+    // 250 ms spacing would spread 32 requests over about 7.75 s; 2 s keeps
+    // that detectable while tolerating a loaded machine.
     assert!(
-        span < Duration::from_millis(200),
+        span < Duration::from_secs(2),
         "decayed span was {span:?}"
     );
 }
