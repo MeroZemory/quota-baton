@@ -29,8 +29,7 @@ Implement quota-baton exactly as specified, milestone by milestone, until M8 is 
 
 | Milestone | Status |
 |---|---|
-| M0, M1a, M2, M3, M4a, M4b, M5, M1b, M6a, M4c, M6b, M7a | merged (M6b visual polish M6b.2 pending) |
-| M6b.2 | tray visual polish against the mockup; brief `M6b.2-fixes.md` (after M7a) |
+| M0, M1a, M2, M3, M4a, M4b, M5, M1b, M6a, M4c, M6b, M7a, M6b.2 | merged |
 | M7b | tee with compressed body retention, memory guard; brief `M7b.md` |
 | M7c | soak test against acceptance criterion A1 |
 | M8 | cutover tool: journaled wire/unwire with dry-run. Building it is in scope; running it on live configs is the user's decision and is out of scope for you |
