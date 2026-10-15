@@ -29,8 +29,8 @@ Implement quota-baton exactly as specified, milestone by milestone, until M8 is 
 
 | Milestone | Status |
 |---|---|
-| M0, M1a, M2, M3, M4a, M4b, M5, M1b, M6a, M4c, M6b, M7a, M6b.2, M7b, M4d, M7c | merged (M7c 24 h trend result pending as an addendum) |
-| M8 | brief `M8.1-fixes.md`; cutover tool: journaled wire/unwire with dry-run. Building it is in scope; running it on live configs is the user's decision and is out of scope for you |
+| M0, M1a, M2, M3, M4a, M4b, M5, M1b, M6a, M4c, M6b, M7a, M6b.2, M7b, M4d, M7c, M8 | merged (M7c 24 h trend result pending as an addendum) |
+| M8 | merged (cutover tool). Running it on the live profile is the user's decision (D9) and out of scope for you |
 
 ## Hard boundaries (never)
 
