@@ -20,14 +20,22 @@ tokio.workspace = true
 windows.workspace = true
 
 [dev-dependencies]
+async-stream.workspace = true
+axum.workspace = true
+bytes.workspace = true
 futures-util.workspace = true
 qb-core = { workspace = true, features = ["testkit"] }
 tempfile.workspace = true
 qb-testkit.workspace = true
 tokio-tungstenite.workspace = true
+zstd.workspace = true
 
 [features]
 default = []
 testkit = ["qb-core/testkit"]
 shape-capture = ["qb-core/shape-capture"]
 phase0 = ["qb-core/phase0"]
+
+[[test]]
+name = "m7c_spawned"
+required-features = ["testkit"]

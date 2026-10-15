@@ -1,5 +1,5 @@
 use std::{
-    io::{self, Cursor, Read},
+    io::{self, Cursor, Read, Write},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -7,7 +7,7 @@ use std::{
 };
 
 use axum::body::Body;
-use bytes::Bytes;
+use bytes::{Buf, Bytes, BytesMut};
 use futures_util::{StreamExt, stream};
 use tokio::sync::{Notify, mpsc, oneshot};
 
@@ -15,6 +15,7 @@ use crate::guard::{InflightBudget, Reservation};
 
 const COMPRESS_AFTER: usize = 1024 * 1024;
 pub(super) const PEEK_LIMIT: usize = 1024 * 1024;
+const FORWARD_BATCH: usize = 256 * 1024;
 
 #[cfg(test)]
 static TEST_COMPRESS_DELAY_MS: AtomicU64 = AtomicU64::new(0);
@@ -76,11 +77,12 @@ struct State {
     complete: bool,
     error: bool,
     head: Vec<u8>,
-    tail: Vec<u8>,
+    tail: BytesMut,
 }
 
 struct Retainer {
     bytes: Vec<u8>,
+    encoder: Option<zstd::stream::write::Encoder<'static, Vec<u8>>>,
     reservations: Vec<Reservation>,
     zstd_input: bool,
     compressed: bool,
@@ -93,6 +95,7 @@ impl Retainer {
     fn new(cap: usize, budget: Arc<InflightBudget>, zstd_input: bool) -> Self {
         Self {
             bytes: Vec::new(),
+            encoder: None,
             reservations: Vec::new(),
             zstd_input,
             compressed: zstd_input,
@@ -111,33 +114,47 @@ impl Retainer {
             return self.append_bytes(chunk);
         }
         if self.compressed {
-            let encoded = match zstd::stream::encode_all(chunk, 1) {
-                Ok(encoded) => encoded,
-                Err(_) => return false,
+            let Some(encoder) = self.encoder.as_mut() else {
+                return false;
             };
-            return self.append_bytes(&encoded);
+            if encoder.write_all(chunk).is_err() {
+                return false;
+            }
+            if self.bytes.len().saturating_add(chunk.len()) > self.cap {
+                return false;
+            }
+            let Some(reservation) = self.budget.try_reserve(chunk.len()) else {
+                return false;
+            };
+            self.bytes.extend(std::iter::repeat_n(0, chunk.len()));
+            self.reservations.push(reservation);
+            return true;
         }
         if self.bytes.len().saturating_add(chunk.len()) <= COMPRESS_AFTER {
             return self.append_bytes(chunk);
         }
 
-        // Stage only the first MiB. Once crossed, replace it with a level-1
-        // zstd frame and retain subsequent chunks as independent frames.
-        let mut first = self.bytes.clone();
-        first.extend_from_slice(chunk);
-        let encoded = match zstd::stream::encode_all(first.as_slice(), 1) {
-            Ok(v) => v,
+        // Stage only the first MiB. Once crossed, replace it with one
+        // streaming level-1 zstd frame. The encoder lives in the retention
+        // worker, so compression never delays the client-facing stream.
+        let mut encoder = match zstd::stream::write::Encoder::new(Vec::new(), 1) {
+            Ok(encoder) => encoder,
             Err(_) => return false,
         };
-        if encoded.len() > self.cap {
+        if encoder.write_all(&self.bytes).is_err() || encoder.write_all(chunk).is_err() {
             return false;
         }
-        let Some(reservation) = self.budget.try_reserve(encoded.len()) else {
+        let staged_len = self.bytes.len().saturating_add(chunk.len());
+        if staged_len > self.cap {
+            return false;
+        }
+        let Some(reservation) = self.budget.try_reserve(staged_len) else {
             return false;
         };
-        self.bytes = encoded;
+        self.bytes = vec![0; staged_len];
         self.reservations.clear();
         self.reservations.push(reservation);
+        self.encoder = Some(encoder);
         self.compressed = true;
         true
     }
@@ -155,10 +172,21 @@ impl Retainer {
     }
 
     fn finish(self) -> RetainedUpload {
+        let Retainer {
+            bytes,
+            encoder,
+            reservations,
+            zstd_input,
+            compressed,
+            ..
+        } = self;
+        let bytes = encoder
+            .map(|encoder| encoder.finish().unwrap_or_default())
+            .unwrap_or(bytes);
         RetainedUpload {
-            bytes: self.bytes.into(),
-            _reservations: self.reservations,
-            compressed: self.compressed && !self.zstd_input,
+            bytes: bytes.into(),
+            _reservations: reservations,
+            compressed: compressed && !zstd_input,
         }
     }
 }
@@ -233,14 +261,23 @@ pub(super) async fn read(
         complete: false,
         error: false,
         head: Vec::new(),
-        tail: Vec::new(),
+        tail: BytesMut::new(),
     }));
     let done = Arc::new(Notify::new());
     let task_state = state.clone();
     let task_done = done.clone();
     let retain_state = state.clone();
-    let retention_task = tokio::spawn(async move {
-        while let Some((chunk, queued)) = retain_rx.recv().await {
+    let retention_task = tokio::task::spawn_blocking(move || {
+        while let Some((chunk, queued)) = retain_rx.blocking_recv() {
+            let mut batch = vec![(chunk, queued)];
+            let mut batch_bytes = batch[0].0.len();
+            while batch_bytes < FORWARD_BATCH {
+                let Ok(next) = retain_rx.try_recv() else {
+                    break;
+                };
+                batch_bytes = batch_bytes.saturating_add(next.0.len());
+                batch.push(next);
+            }
             if retain_state
                 .lock()
                 .expect("upload state poisoned")
@@ -249,30 +286,30 @@ pub(super) async fn read(
             {
                 break;
             }
-            let state = retain_state.clone();
-            let retained = tokio::task::spawn_blocking(move || {
-                drop(queued);
-                #[cfg(test)]
-                {
-                    let delay = TEST_COMPRESS_DELAY_MS.load(Ordering::Relaxed);
-                    if delay != 0 {
-                        std::thread::sleep(std::time::Duration::from_millis(delay));
-                    }
+            let (chunks, reservations): (Vec<_>, Vec<_>) = batch.into_iter().unzip();
+            drop(reservations);
+            #[cfg(test)]
+            {
+                let delay = TEST_COMPRESS_DELAY_MS.load(Ordering::Relaxed);
+                if delay != 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(delay));
                 }
-                let mut state = state.lock().expect("upload state poisoned");
-                state
-                    .retainer
-                    .as_mut()
-                    .is_some_and(|retainer| retainer.append(&chunk))
-            })
-            .await
-            .unwrap_or(false);
+            }
+            let mut state = retain_state.lock().expect("upload state poisoned");
+            let retained = state
+                .retainer
+                .as_mut()
+                .is_some_and(|retainer| chunks.iter().all(|chunk| retainer.append(chunk)));
+            drop(state);
             if !retained {
                 retain_state.lock().expect("upload state poisoned").retainer = None;
             }
         }
     });
     tokio::spawn(async move {
+        // Forward every body frame immediately. Retention batching happens
+        // exclusively on the side channel below and must never delay relay
+        // writes.
         let mut input = body.into_data_stream();
         let mut prefix = Vec::new();
         let mut prefix_tx = Some(prefix_tx);
@@ -302,7 +339,7 @@ pub(super) async fn read(
                 state.tail.extend_from_slice(&chunk);
                 if state.tail.len() > PEEK_LIMIT {
                     let excess = state.tail.len() - PEEK_LIMIT;
-                    state.tail.drain(..excess);
+                    state.tail.advance(excess);
                 }
             }
             if let Some(sender) = prefix_tx.take() {
