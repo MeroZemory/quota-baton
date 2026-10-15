@@ -665,6 +665,7 @@ impl RelayState {
 fn upstream_client() -> anyhow::Result<reqwest::Client> {
     reqwest::Client::builder()
         .use_rustls_tls()
+        .tcp_nodelay(true)
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .no_gzip()
@@ -861,6 +862,7 @@ async fn handover_http(state: Arc<RelayState>, request: Request) -> Response {
             .await
             {
                 Ok(socket) => {
+                    let _ = socket.set_nodelay(true);
                     drop(socket);
                     break;
                 }

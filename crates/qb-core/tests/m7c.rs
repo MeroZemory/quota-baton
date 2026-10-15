@@ -1,4 +1,5 @@
 //! M7c acceptance harness: seeded R7 A2 distribution and private-memory measurement.
+use axum::serve::ListenerExt;
 use axum::{
     Router,
     body::Body,
@@ -27,7 +28,7 @@ use std::{
 };
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async,
+    MaybeTlsStream, WebSocketStream, client_async,
     tungstenite::{Message, client::IntoClientRequest},
 };
 
@@ -65,7 +66,13 @@ impl CombinedUpstream {
                     tokio::spawn(async move { while stream.next().await.is_some() {} });
                     Response::new(Body::from("ok"))
                 });
-            let _ = axum::serve(listener, app).await;
+            let _ = axum::serve(
+                listener.tap_io(|stream| {
+                    let _ = stream.set_nodelay(true);
+                }),
+                app,
+            )
+            .await;
         });
         Self { url, task }
     }
@@ -286,7 +293,14 @@ impl A2Harness {
         request
             .headers_mut()
             .insert("session-id", session.parse().unwrap());
-        connect_async(request).await.unwrap().0
+        let stream = TcpStream::connect(("127.0.0.1", self.servers.data_addr.port()))
+            .await
+            .unwrap();
+        stream.set_nodelay(true).unwrap();
+        client_async(request, MaybeTlsStream::Plain(stream))
+            .await
+            .unwrap()
+            .0
     }
 }
 
@@ -336,12 +350,13 @@ async fn a2_harness() -> (CombinedUpstream, A2Harness) {
     .unwrap();
     let client = reqwest::Client::builder()
         .no_proxy()
+        .tcp_nodelay(true)
         .timeout(Duration::from_secs(60))
         .build()
         .unwrap();
     let harness = A2Harness {
         _root: temp,
-        upstream_url: upstream.url.clone(),
+        upstream_url: format!("{}/v1/responses", upstream.url),
         servers,
         client,
     };
@@ -392,6 +407,40 @@ async fn m7c_synthetic_load_smoke_uses_idle_websockets_and_r7_http() {
     for socket in &mut sockets {
         let _ = socket.close(None).await;
     }
+}
+
+#[tokio::test]
+async fn m7c_paced_small_body_additional_latency_is_bounded() {
+    let (_upstream, h) = a2_harness().await;
+    let shape = A2Shape::Plain(800 * 1024);
+    let (direct_body, _) = a2_body_at_rate(shape, 200);
+    let direct_start = Instant::now();
+    let direct = h
+        .client
+        .post(&h.upstream_url)
+        .body(direct_body)
+        .send()
+        .await
+        .unwrap();
+    let direct_elapsed = direct_start.elapsed();
+    direct.bytes().await.unwrap();
+
+    let (proxy_body, _) = a2_body_at_rate(shape, 200);
+    let proxy_start = Instant::now();
+    let proxy = h
+        .client
+        .post(h.url())
+        .bearer_auth("synthetic-client")
+        .body(proxy_body)
+        .send()
+        .await
+        .unwrap();
+    proxy.bytes().await.unwrap();
+    let added = proxy_start.elapsed().saturating_sub(direct_elapsed);
+    assert!(
+        added < Duration::from_millis(50),
+        "paced proxy overhead was {added:?}"
+    );
 }
 
 #[tokio::test]

@@ -1,6 +1,7 @@
 //! M7c.1: load the real release `serve` process from a separate test process.
 //! All homes, tokens, and upstreams in this file are synthetic.
 
+use axum::serve::ListenerExt;
 use axum::{
     Router,
     body::Body,
@@ -33,7 +34,7 @@ use std::{
 use tempfile::TempDir;
 use tokio::net::{TcpListener as TokioListener, TcpStream};
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async,
+    MaybeTlsStream, WebSocketStream, client_async, connect_async,
     tungstenite::{Message, client::IntoClientRequest},
 };
 use windows::Win32::System::{
@@ -198,7 +199,13 @@ impl FakeUpstream {
         }
         let app = Router::new().route("/responses", post(http).get(websocket));
         let task = tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            let _ = axum::serve(
+                listener.tap_io(|stream| {
+                    let _ = stream.set_nodelay(true);
+                }),
+                app,
+            )
+            .await;
         });
         Self { url, task }
     }
@@ -309,7 +316,12 @@ async fn connect_socket(home: &Home, key: &str, session: String) -> Option<TestS
     let mut request = url.into_client_request().ok()?;
     let value = format!("Bearer {key}").parse().ok()?;
     request.headers_mut().insert("authorization", value);
-    connect_async(request).await.ok().map(|(socket, _)| socket)
+    let mut stream = TcpStream::connect(("127.0.0.1", home.data)).await.ok()?;
+    stream.set_nodelay(true).ok()?;
+    client_async(request, MaybeTlsStream::Plain(stream))
+        .await
+        .ok()
+        .map(|(socket, _)| socket)
 }
 impl Core {
     fn spawn(home: &Home, takeover: bool) -> Self {
@@ -435,6 +447,7 @@ async fn m7c_spawned_core_a1_and_takeover() {
     let home = Home::new().await;
     let client = Client::builder()
         .no_proxy()
+        .tcp_nodelay(true)
         .timeout(Duration::from_secs(300))
         .build()
         .unwrap();
@@ -611,6 +624,7 @@ async fn m7c_spawned_core_300_idle_websockets() {
     let home = Home::new().await;
     let client = Client::builder()
         .no_proxy()
+        .tcp_nodelay(true)
         .timeout(Duration::from_secs(30))
         .build()
         .unwrap();
@@ -656,6 +670,7 @@ async fn m7c_spawned_core_idle_five_minutes() {
     let home = Home::new().await;
     let client = Client::builder()
         .no_proxy()
+        .tcp_nodelay(true)
         .timeout(Duration::from_secs(30))
         .build()
         .unwrap();

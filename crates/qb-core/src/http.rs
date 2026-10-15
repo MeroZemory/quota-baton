@@ -52,7 +52,12 @@ impl axum::serve::Listener for HandoverListener {
     type Io = TcpStream;
     type Addr = SocketAddr;
     async fn accept(&mut self) -> (TcpStream, SocketAddr) {
-        axum::serve::Listener::accept(self.listener.as_mut().expect("listener alive")).await
+        let (stream, addr) =
+            axum::serve::Listener::accept(self.listener.as_mut().expect("listener alive")).await;
+        if let Err(error) = stream.set_nodelay(true) {
+            tracing::debug!(%error, "failed to set TCP_NODELAY on accepted HTTP socket");
+        }
+        (stream, addr)
     }
     fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.listener.as_ref().expect("listener alive").local_addr()

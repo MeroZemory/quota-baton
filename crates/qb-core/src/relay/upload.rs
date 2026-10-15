@@ -307,39 +307,10 @@ pub(super) async fn read(
         }
     });
     tokio::spawn(async move {
+        // Forward every body frame immediately. Retention batching happens
+        // exclusively on the side channel below and must never delay relay
+        // writes.
         let mut input = body.into_data_stream();
-        let mut input = Box::pin(async_stream::stream! {
-            let mut pending = BytesMut::new();
-            let mut first = true;
-            while let Some(chunk) = input.next().await {
-                match chunk {
-                    Ok(chunk) => {
-                        // Preserve streaming latency for the first client
-                        // frame.  Subsequent frames are coalesced into large
-                        // batches to keep the forwarding path inexpensive.
-                        if first && chunk.len() < FORWARD_BATCH {
-                            first = false;
-                            yield Ok::<Bytes, axum::Error>(chunk);
-                            continue;
-                        }
-                        pending.extend_from_slice(&chunk);
-                        while pending.len() >= FORWARD_BATCH {
-                            yield Ok::<Bytes, axum::Error>(pending.split().freeze());
-                        }
-                    }
-                    Err(error) => {
-                        if !pending.is_empty() {
-                            yield Ok::<Bytes, axum::Error>(pending.split().freeze());
-                        }
-                        yield Err(error);
-                        return;
-                    }
-                }
-            }
-            if !pending.is_empty() {
-                yield Ok::<Bytes, axum::Error>(pending.freeze());
-            }
-        });
         let mut prefix = Vec::new();
         let mut prefix_tx = Some(prefix_tx);
         while let Some(chunk) = input.next().await {
