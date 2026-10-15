@@ -4,8 +4,10 @@
 //! line uses the normal user locations, while tests use only temporary files.
 
 use anyhow::{Context, Result, bail};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{
     fs::{self, OpenOptions},
     io::Write,
@@ -14,13 +16,23 @@ use std::{
     time::Duration,
 };
 use toml_edit::DocumentMut;
+use windows::Win32::{
+    Foundation::{HLOCAL, LocalFree},
+    Security::Cryptography::{
+        CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
+    },
+};
+use windows::core::PCWSTR;
 
 const CODEX_BASE_URL: &str = "http://127.0.0.1:10200/v1";
 const CLAUDE_BASE_URL: &str = "http://127.0.0.1:10200";
+const JOURNAL_ENTROPY: &[u8] = b"quota-baton/v1/wiring-journal";
 
 #[derive(Clone, Debug)]
 pub struct CutoverPaths {
     pub qb_home: PathBuf,
+    pub codex_auth: PathBuf,
+    pub codex_session_auth: Vec<PathBuf>,
     pub codex_config: PathBuf,
     pub claude_settings: PathBuf,
     pub client_key: PathBuf,
@@ -35,6 +47,8 @@ impl CutoverPaths {
         let client_key = qb_home.join("client.key");
         Ok(Self {
             qb_home,
+            codex_auth: user.join(".codex").join("auth.json"),
+            codex_session_auth: Vec::new(),
             codex_config: user.join(".codex").join("config.toml"),
             claude_settings: user.join(".claude").join("settings.json"),
             client_key,
@@ -46,7 +60,7 @@ impl CutoverPaths {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct Original {
     present: bool,
     value: Option<String>,
@@ -56,20 +70,54 @@ struct Original {
 struct Journal {
     schema: u8,
     codex_config: String,
+    codex_auth: String,
     claude_settings: String,
     codex_base_url: Original,
     codex_api_key: Original,
+    codex_auth_key: SecretOriginal,
+    #[serde(default)]
+    codex_auth_mode: Original,
     codex_model_catalog: Original,
     claude_base_url: Original,
-    claude_api_key: Original,
+    claude_api_key: SecretOriginal,
+    #[serde(default)]
+    codex_config_before: String,
+    #[serde(default)]
+    codex_config_after: String,
+    #[serde(default)]
+    codex_auth_before: String,
+    #[serde(default)]
+    codex_auth_after: String,
+    #[serde(default)]
+    claude_settings_before: String,
+    #[serde(default)]
+    claude_settings_after: String,
+    #[serde(default)]
+    codex_sessions: Vec<SessionJournal>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SecretOriginal {
+    present: bool,
+    protected_b64: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SessionJournal {
+    path: String,
+    before: String,
+    after: String,
+    auth_mode: Original,
+    api_key: SecretOriginal,
 }
 
 type CodexOriginals = (Original, Original, Original);
-type ClaudeOriginals = (Original, Original);
+type ClaudeOriginals = (Original, SecretOriginal);
 
 #[derive(Clone, Debug, Default)]
 pub struct Report {
     pub changed: Vec<String>,
+    pub warnings: Vec<String>,
 }
 
 pub fn wire(paths: &CutoverPaths, apply: bool) -> Result<Report> {
@@ -81,25 +129,71 @@ pub fn wire(paths: &CutoverPaths, apply: bool) -> Result<Report> {
     } else {
         None
     };
-    let (codex, claude) = read_inputs(paths)?;
+    let (codex, codex_auth, codex_auth_mode, claude) = read_inputs(paths)?;
+    let codex_config_before = hash_file(&paths.codex_config)?;
+    let codex_auth_before = hash_file(&paths.codex_auth)?;
+    let claude_settings_before = hash_file(&paths.claude_settings)?;
+    let preview_key = key.as_deref().unwrap_or("<client key>");
+    let codex_config_after = hash_bytes(&codex_config_bytes(&paths.codex_config, CODEX_BASE_URL)?);
+    let codex_auth_after = hash_bytes(&codex_auth_bytes(&paths.codex_auth, preview_key)?);
+    let claude_settings_after = hash_bytes(&claude_bytes(
+        &paths.claude_settings,
+        CLAUDE_BASE_URL,
+        preview_key,
+    )?);
+    let mut codex_sessions = Vec::new();
+    for path in &paths.codex_session_auth {
+        if path.exists() {
+            if let Some(session) = session_journal(path, preview_key)? {
+                codex_sessions.push(session);
+            }
+        }
+    }
     let journal = Journal {
         schema: 1,
         codex_config: paths.codex_config.display().to_string(),
+        codex_auth: paths.codex_auth.display().to_string(),
         claude_settings: paths.claude_settings.display().to_string(),
         codex_base_url: codex.0.clone(),
         codex_api_key: codex.1.clone(),
+        codex_auth_key: codex_auth.clone(),
+        codex_auth_mode,
         codex_model_catalog: codex.2.clone(),
         claude_base_url: claude.0.clone(),
         claude_api_key: claude.1.clone(),
+        codex_config_before,
+        codex_config_after,
+        codex_auth_before,
+        codex_auth_after,
+        claude_settings_before,
+        claude_settings_after,
+        codex_sessions,
     };
     let report = Report {
         changed: vec![
             "codex.openai_base_url".into(),
             "codex.openai_api_key".into(),
+            "codex.auth.json OPENAI_API_KEY".into(),
             "codex.model_catalog_json (remove)".into(),
             "claude.env.ANTHROPIC_BASE_URL".into(),
-            "claude.env.ANTHROPIC_API_KEY".into(),
+            "claude.env.ANTHROPIC_AUTH_TOKEN".into(),
         ],
+        warnings: paths
+            .codex_session_auth
+            .iter()
+            .filter(|path| path.exists())
+            .filter_map(|path| {
+                let auth = fs::read(path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())?;
+                (auth.get("auth_mode").and_then(Value::as_str) != Some("apikey")).then(|| {
+                    format!(
+                        "Codex 세션 홈은 ChatGPT 인증이라 변경하지 않습니다: {}",
+                        path.display()
+                    )
+                })
+            })
+            .collect(),
     };
     if !apply {
         return Ok(report);
@@ -109,16 +203,23 @@ pub fn wire(paths: &CutoverPaths, apply: bool) -> Result<Report> {
     atomic_json(&paths.journal(), &journal)?;
     // The journal is intentionally retained if either write fails: it is the
     // recovery record for a partially completed cutover.
-    apply_codex(&paths.codex_config, CODEX_BASE_URL, &key)
-        .and_then(|_| apply_claude(&paths.claude_settings, CLAUDE_BASE_URL, &key))?;
+    apply_codex(&paths.codex_config, &paths.codex_auth, CODEX_BASE_URL, &key).and_then(|_| {
+        for path in &paths.codex_session_auth {
+            if path.exists() {
+                apply_session(path, &key)?;
+            }
+        }
+        apply_claude(&paths.claude_settings, CLAUDE_BASE_URL, &key)
+    })?;
     Ok(report)
 }
 
-pub fn unwire(paths: &CutoverPaths, apply: bool) -> Result<Report> {
+pub fn unwire(paths: &CutoverPaths, apply: bool, force: bool) -> Result<Report> {
     let journal: Journal =
         serde_json::from_slice(&fs::read(paths.journal()).context("read wiring journal")?)
             .context("parse wiring journal")?;
     if journal.codex_config != paths.codex_config.display().to_string()
+        || journal.codex_auth != paths.codex_auth.display().to_string()
         || journal.claude_settings != paths.claude_settings.display().to_string()
     {
         bail!("wiring journal paths do not match this home")
@@ -127,21 +228,45 @@ pub fn unwire(paths: &CutoverPaths, apply: bool) -> Result<Report> {
         changed: vec![
             "codex.openai_base_url".into(),
             "codex.openai_api_key".into(),
+            "codex.auth.json OPENAI_API_KEY".into(),
             "codex.model_catalog_json (restore)".into(),
             "claude.env.ANTHROPIC_BASE_URL".into(),
-            "claude.env.ANTHROPIC_API_KEY".into(),
+            "claude.env.ANTHROPIC_AUTH_TOKEN".into(),
         ],
+        warnings: Vec::new(),
     };
     if !apply {
         return Ok(report);
     }
-    restore_codex(&paths.codex_config, &journal)?;
+    if !force {
+        for (path, expected) in [
+            (&paths.codex_config, &journal.codex_config_after),
+            (&paths.codex_auth, &journal.codex_auth_after),
+            (&paths.claude_settings, &journal.claude_settings_after),
+        ] {
+            if !expected.is_empty() && hash_file(path)? != *expected {
+                bail!("파일이 변경되어 되돌릴 수 없습니다: {}", path.display());
+            }
+        }
+        for session in &journal.codex_sessions {
+            let path = Path::new(&session.path);
+            if hash_file(path)? != session.after {
+                bail!("파일이 변경되어 되돌릴 수 없습니다: {}", path.display());
+            }
+        }
+    }
+    restore_codex(&paths.codex_config, &paths.codex_auth, &journal)?;
+    for session in &journal.codex_sessions {
+        restore_session(Path::new(&session.path), session)?;
+    }
     restore_claude(&paths.claude_settings, &journal)?;
     fs::remove_file(paths.journal()).context("remove wiring journal")?;
     Ok(report)
 }
 
-fn read_inputs(paths: &CutoverPaths) -> Result<(CodexOriginals, ClaudeOriginals)> {
+fn read_inputs(
+    paths: &CutoverPaths,
+) -> Result<(CodexOriginals, SecretOriginal, Original, ClaudeOriginals)> {
     let codex_text = fs::read_to_string(&paths.codex_config).context("read Codex config")?;
     let doc = codex_text
         .parse::<DocumentMut>()
@@ -151,14 +276,18 @@ fn read_inputs(paths: &CutoverPaths) -> Result<(CodexOriginals, ClaudeOriginals)
         original_toml(doc.get("openai_api_key")),
         original_toml(doc.get("model_catalog_json")),
     );
+    let auth_text = fs::read_to_string(&paths.codex_auth).context("read Codex auth")?;
+    let auth: Value = serde_json::from_str(&auth_text).context("parse Codex auth")?;
+    let codex_auth = secret_json(auth.get("OPENAI_API_KEY"))?;
+    let codex_auth_mode = original_json(auth.get("auth_mode"));
     let claude_text = fs::read_to_string(&paths.claude_settings).context("read Claude settings")?;
     let json: Value = serde_json::from_str(&claude_text).context("parse Claude settings")?;
     let env = json.get("env").and_then(Value::as_object);
     let claude = (
         original_json(env.and_then(|m| m.get("ANTHROPIC_BASE_URL"))),
-        original_json(env.and_then(|m| m.get("ANTHROPIC_API_KEY"))),
+        secret_json(env.and_then(|m| m.get("ANTHROPIC_AUTH_TOKEN")))?,
     );
-    Ok((codex, claude))
+    Ok((codex, codex_auth, codex_auth_mode, claude))
 }
 
 fn original_toml(item: Option<&toml_edit::Item>) -> Original {
@@ -183,6 +312,19 @@ fn original_json(value: Option<&Value>) -> Original {
             value: None,
         })
 }
+fn secret_json(value: Option<&Value>) -> Result<SecretOriginal> {
+    let Some(value) = value else {
+        return Ok(SecretOriginal {
+            present: false,
+            protected_b64: None,
+        });
+    };
+    let text = value.as_str().context("secret setting is not a string")?;
+    Ok(SecretOriginal {
+        present: true,
+        protected_b64: Some(protect(text.as_bytes())?),
+    })
+}
 fn read_key(path: &Path) -> Result<String> {
     let key = fs::read_to_string(path).context("read client key")?;
     let key = key.trim();
@@ -192,23 +334,81 @@ fn read_key(path: &Path) -> Result<String> {
     Ok(key.to_owned())
 }
 
-fn apply_codex(path: &Path, base: &str, key: &str) -> Result<()> {
+fn hash_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn hash_file(path: &Path) -> Result<String> {
+    Ok(hash_bytes(
+        &fs::read(path).with_context(|| format!("read {}", path.display()))?,
+    ))
+}
+
+fn apply_codex(path: &Path, auth_path: &Path, base: &str, key: &str) -> Result<()> {
+    atomic_preserved(path, &codex_config_bytes(path, base)?)?;
+    atomic_preserved(auth_path, &codex_auth_bytes(auth_path, key)?)
+}
+fn codex_config_bytes(path: &Path, base: &str) -> Result<Vec<u8>> {
     let mut doc = fs::read_to_string(path)?
         .parse::<DocumentMut>()
         .context("parse Codex config")?;
     doc["openai_base_url"] = toml_edit::value(base);
-    doc["openai_api_key"] = toml_edit::value(key);
     doc.remove("model_catalog_json");
-    atomic_bytes(path, doc.to_string().as_bytes())
+    Ok(doc.to_string().into_bytes())
 }
-fn restore_codex(path: &Path, journal: &Journal) -> Result<()> {
+fn codex_auth_bytes(path: &Path, key: &str) -> Result<Vec<u8>> {
+    let mut auth: Value = serde_json::from_slice(&fs::read(path)?)?;
+    let root = auth
+        .as_object_mut()
+        .context("Codex auth root is not an object")?;
+    root.insert("auth_mode".into(), Value::String("apikey".into()));
+    root.insert("OPENAI_API_KEY".into(), Value::String(key.into()));
+    Ok(serde_json::to_vec_pretty(&auth)?)
+}
+fn session_journal(path: &Path, key: &str) -> Result<Option<SessionJournal>> {
+    let auth: Value = serde_json::from_slice(&fs::read(path)?)?;
+    if auth.get("auth_mode").and_then(Value::as_str) != Some("apikey") {
+        return Ok(None);
+    }
+    let mode = original_json(auth.get("auth_mode"));
+    let api_key = secret_json(auth.get("OPENAI_API_KEY"))?;
+    let before = hash_file(path)?;
+    let after = hash_bytes(&codex_auth_bytes(path, key)?);
+    Ok(Some(SessionJournal {
+        path: path.display().to_string(),
+        before,
+        after,
+        auth_mode: mode,
+        api_key,
+    }))
+}
+fn apply_session(path: &Path, key: &str) -> Result<()> {
+    atomic_preserved(path, &codex_auth_bytes(path, key)?)
+}
+fn restore_session(path: &Path, journal: &SessionJournal) -> Result<()> {
+    let mut auth: Value = serde_json::from_slice(&fs::read(path)?)?;
+    let root = auth
+        .as_object_mut()
+        .context("Codex session auth root is not an object")?;
+    restore_secret_json(root, "OPENAI_API_KEY", &journal.api_key)?;
+    restore_json(root, "auth_mode", &journal.auth_mode);
+    atomic_preserved(path, &serde_json::to_vec_pretty(&auth)?)
+}
+fn restore_codex(path: &Path, auth_path: &Path, journal: &Journal) -> Result<()> {
     let mut doc = fs::read_to_string(path)?
         .parse::<DocumentMut>()
         .context("parse Codex config")?;
     restore_toml(&mut doc, "openai_base_url", &journal.codex_base_url);
-    restore_toml(&mut doc, "openai_api_key", &journal.codex_api_key);
     restore_toml(&mut doc, "model_catalog_json", &journal.codex_model_catalog);
-    atomic_bytes(path, doc.to_string().as_bytes())
+    atomic_preserved(path, doc.to_string().as_bytes())?;
+    let mut auth: Value = serde_json::from_slice(&fs::read(auth_path)?)?;
+    let root = auth
+        .as_object_mut()
+        .context("Codex auth root is not an object")?;
+    restore_secret_json(root, "OPENAI_API_KEY", &journal.codex_auth_key)?;
+    restore_json(root, "auth_mode", &journal.codex_auth_mode);
+    atomic_preserved(auth_path, &serde_json::to_vec_pretty(&auth)?)
 }
 fn restore_toml(doc: &mut DocumentMut, key: &str, original: &Original) {
     if original.present {
@@ -218,6 +418,9 @@ fn restore_toml(doc: &mut DocumentMut, key: &str, original: &Original) {
     }
 }
 fn apply_claude(path: &Path, base: &str, key: &str) -> Result<()> {
+    atomic_preserved(path, &claude_bytes(path, base, key)?)
+}
+fn claude_bytes(path: &Path, base: &str, key: &str) -> Result<Vec<u8>> {
     let mut json: Value = serde_json::from_slice(&fs::read(path)?)?;
     let env = json
         .as_object_mut()
@@ -228,8 +431,8 @@ fn apply_claude(path: &Path, base: &str, key: &str) -> Result<()> {
         .as_object_mut()
         .context("Claude settings env is not an object")?;
     env.insert("ANTHROPIC_BASE_URL".into(), Value::String(base.into()));
-    env.insert("ANTHROPIC_API_KEY".into(), Value::String(key.into()));
-    atomic_json(path, &json)
+    env.insert("ANTHROPIC_AUTH_TOKEN".into(), Value::String(key.into()));
+    Ok(serde_json::to_vec_pretty(&json)?)
 }
 fn restore_claude(path: &Path, journal: &Journal) -> Result<()> {
     let mut json: Value = serde_json::from_slice(&fs::read(path)?)?;
@@ -243,11 +446,11 @@ fn restore_claude(path: &Path, journal: &Journal) -> Result<()> {
         .as_object_mut()
         .context("Claude settings env is not an object")?;
     restore_json(env, "ANTHROPIC_BASE_URL", &journal.claude_base_url);
-    restore_json(env, "ANTHROPIC_API_KEY", &journal.claude_api_key);
+    restore_secret_json(env, "ANTHROPIC_AUTH_TOKEN", &journal.claude_api_key)?;
     if env.is_empty() {
         root.remove("env");
     }
-    atomic_json(path, &json)
+    atomic_preserved(path, &serde_json::to_vec_pretty(&json)?)
 }
 fn restore_json(env: &mut serde_json::Map<String, Value>, key: &str, original: &Original) {
     if original.present {
@@ -258,6 +461,94 @@ fn restore_json(env: &mut serde_json::Map<String, Value>, key: &str, original: &
     } else {
         env.remove(key);
     }
+}
+fn restore_secret_json(
+    env: &mut serde_json::Map<String, Value>,
+    key: &str,
+    original: &SecretOriginal,
+) -> Result<()> {
+    if original.present {
+        let encoded = original
+            .protected_b64
+            .as_deref()
+            .context("missing encrypted secret")?;
+        let value = String::from_utf8(unprotect(encoded)?).context("invalid encrypted secret")?;
+        env.insert(key.into(), Value::String(value));
+    } else {
+        env.remove(key);
+    }
+    Ok(())
+}
+
+fn protect(input: &[u8]) -> Result<String> {
+    transform(input, true).map(|bytes| STANDARD.encode(bytes))
+}
+
+fn unprotect(encoded: &str) -> Result<Vec<u8>> {
+    let bytes = STANDARD
+        .decode(encoded)
+        .context("invalid encrypted journal value")?;
+    transform(&bytes, false)
+}
+
+fn transform(input: &[u8], protect: bool) -> Result<Vec<u8>> {
+    let mut input = input.to_vec();
+    let data = CRYPT_INTEGER_BLOB {
+        cbData: input.len() as u32,
+        pbData: input.as_mut_ptr(),
+    };
+    let mut entropy = JOURNAL_ENTROPY.to_vec();
+    let entropy = CRYPT_INTEGER_BLOB {
+        cbData: entropy.len() as u32,
+        pbData: entropy.as_mut_ptr(),
+    };
+    let mut output = CRYPT_INTEGER_BLOB::default();
+    let result = unsafe {
+        if protect {
+            CryptProtectData(
+                &data,
+                PCWSTR::null(),
+                Some(&entropy),
+                None,
+                None,
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut output,
+            )
+        } else {
+            CryptUnprotectData(
+                &data,
+                None,
+                Some(&entropy),
+                None,
+                None,
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut output,
+            )
+        }
+    };
+    result.context("DPAPI journal transform failed")?;
+    let copied =
+        unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(output.pbData.cast())));
+    }
+    Ok(copied)
+}
+
+fn atomic_preserved(path: &Path, bytes: &[u8]) -> Result<()> {
+    let original = fs::read(path).unwrap_or_default();
+    let bom = original.starts_with(&[0xef, 0xbb, 0xbf]);
+    let crlf = original.windows(2).any(|pair| pair == b"\r\n");
+    let mut text = String::from_utf8(bytes.to_vec()).context("configuration is not UTF-8")?;
+    if crlf {
+        text = text.replace("\r\n", "\n").replace('\n', "\r\n");
+    }
+    let mut output = Vec::with_capacity(text.len() + usize::from(bom) * 3);
+    if bom {
+        output.extend_from_slice(&[0xef, 0xbb, 0xbf]);
+    }
+    output.extend_from_slice(text.as_bytes());
+    atomic_bytes(path, &output)
 }
 
 fn atomic_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -298,11 +589,17 @@ mod tests {
     fn paths() -> (tempfile::TempDir, CutoverPaths) {
         let dir = tempdir().unwrap();
         let codex = dir.path().join("codex.toml");
+        let auth = dir.path().join("auth.json");
         let claude = dir.path().join("settings.json");
         fs::write(&codex, "openai_base_url = 'old-url'\nkeep = 'yes'\n").unwrap();
         fs::write(
+            &auth,
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":"old-key"}"#,
+        )
+        .unwrap();
+        fs::write(
             &claude,
-            r#"{"env":{"ANTHROPIC_API_KEY":"old-key"},"keep":true}"#,
+            r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"old-key"},"keep":true}"#,
         )
         .unwrap();
         let qb_home = dir.path().join("qb");
@@ -311,6 +608,8 @@ mod tests {
             dir,
             CutoverPaths {
                 qb_home,
+                codex_auth: auth,
+                codex_session_auth: Vec::new(),
                 codex_config: codex,
                 claude_settings: claude,
                 client_key,
@@ -342,7 +641,7 @@ mod tests {
                 .unwrap()
                 .contains("synthetic-key")
         );
-        unwire(&p, true).unwrap();
+        unwire(&p, true, false).unwrap();
         let codex = fs::read_to_string(&p.codex_config).unwrap();
         let claude = fs::read_to_string(&p.claude_settings).unwrap();
         assert!(codex.contains("old-url") && codex.contains("keep = 'yes'"));

@@ -1240,6 +1240,7 @@ name = "quota-baton"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "clap",
  "futures-util",
  "qb-core",
@@ -1248,10 +1249,12 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tokio-tungstenite",
  "toml_edit",
+ "windows",
 ]
 
 [[package]]
