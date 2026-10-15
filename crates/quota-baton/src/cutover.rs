@@ -41,6 +41,9 @@ pub struct CutoverPaths {
     pub codex_config: PathBuf,
     pub claude_settings: PathBuf,
     pub client_key: PathBuf,
+    /// Realtime endpoints intentionally left on CPA because quota-baton does
+    /// not serve them.
+    codex_realtime_items: Vec<String>,
     /// Injectable report roots; empty in synthetic tests to prevent ambient
     /// profile inspection.
     pub report_roots: Vec<PathBuf>,
@@ -52,7 +55,7 @@ impl CutoverPaths {
         let user = std::env::var_os("USERPROFILE")
             .or_else(|| std::env::var_os("HOME"))
             .map(PathBuf::from)
-            .context("USERPROFILE/HOME is missing")?;
+            .context("USERPROFILE 또는 HOME 환경 변수가 없습니다")?;
         let client_key = qb_home.join("client.key");
         let codex_root = user.join(".codex");
         let (session_homes_file, codex_session_homes, session_homes_warning) =
@@ -69,6 +72,7 @@ impl CutoverPaths {
             session_homes_file,
             session_homes_warning,
             codex_config: codex_root.join("config.toml"),
+            codex_realtime_items: realtime_cpa_items(&codex_root.join("config.toml")),
             claude_settings: user.join(".claude").join("settings.json"),
             client_key,
             report_roots: {
@@ -92,6 +96,7 @@ impl CutoverPaths {
                     ("pi".into(), user.join(".pi")),
                     ("omp".into(), user.join(".omp")),
                     ("config".into(), user.join(".config")),
+                    ("codex".into(), codex_root.clone()),
                 ];
                 roots.extend(
                     codex_session_homes
@@ -114,6 +119,40 @@ struct SessionHome {
     auth: PathBuf,
     sessions: usize,
     shim_exempt: bool,
+}
+
+fn session_home_auth_mode(home: &SessionHome) -> Option<String> {
+    read_text(&home.auth)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|auth| {
+            auth.get("auth_mode")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+}
+
+fn session_home_is_detachable(home: &SessionHome) -> bool {
+    !home.shim_exempt && session_home_auth_mode(home).as_deref() != Some("apikey")
+}
+
+fn realtime_cpa_items(path: &Path) -> Vec<String> {
+    let Ok(text) = read_text(path) else {
+        return Vec::new();
+    };
+    [
+        "experimental_realtime_ws_base_url",
+        "experimental_realtime_webrtc_call_base_url",
+    ]
+    .into_iter()
+    .filter(|key| {
+        text.lines().any(|line| {
+            line.contains(key)
+                && (line.contains("127.0.0.1:10100") || line.contains("localhost:10100"))
+        })
+    })
+    .map(str::to_owned)
+    .collect()
 }
 
 fn normal_path(path: &Path) -> String {
@@ -286,7 +325,7 @@ fn scan_other_clients_10100(roots: &[(String, PathBuf)]) -> Vec<String> {
 fn read_text(path: &Path) -> Result<String> {
     let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
     let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes);
-    String::from_utf8(bytes.to_vec()).context("configuration is not UTF-8")
+    String::from_utf8(bytes.to_vec()).context("설정 파일이 UTF-8이 아닙니다")
 }
 
 fn shorten_path(path: &Path) -> String {
@@ -348,6 +387,8 @@ struct Journal {
     providers: Vec<ProviderJournal>,
     #[serde(default)]
     session_homes_path: Option<String>,
+    #[serde(default)]
+    session_homes_before: Option<String>,
     #[serde(default)]
     session_homes_after: Option<String>,
     #[serde(default)]
@@ -614,7 +655,8 @@ fn home_matches(path: &str, homes: &[SessionHome]) -> bool {
 fn detach_chatgpt_session_homes(path: &Path, homes: &[SessionHome]) -> Result<Vec<u8>> {
     let original = fs::read(path)?;
     let text = read_text(path)?;
-    let mut value: Value = serde_json::from_str(&text).context("parse session-homes.json")?;
+    let mut value: Value =
+        serde_json::from_str(&text).context("session-homes.json을 해석하지 못했습니다")?;
     fn prune(value: &mut Value, homes: &[SessionHome]) {
         match value {
             Value::Object(map) => {
@@ -844,21 +886,34 @@ fn task_enabled(name: &str) -> Option<bool> {
     if !output.status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
-    if text.contains("disabled") {
-        Some(false)
-    } else if text.contains("ready") || text.contains("running") {
-        Some(true)
-    } else {
-        None
+    parse_task_enabled(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_task_enabled(output: &str) -> Option<bool> {
+    let state = output.lines().find_map(|line| {
+        let (label, value) = line.split_once(':')?;
+        let label = label.trim();
+        (label.eq_ignore_ascii_case("Scheduled Task State") || label == "예약된 작업 상태")
+            .then_some(value.trim())
+    })?;
+
+    match state.to_ascii_lowercase().as_str() {
+        "enabled" | "사용" | "activé" | "aktiviert" | "habilitado" | "有効" | "已启用" => {
+            Some(true)
+        }
+        "disabled" | "사용 안 함" | "désactivé" | "deaktiviert" | "deshabilitado" | "無効"
+        | "已禁用" => Some(false),
+        _ => None,
     }
 }
 
-fn cpa_task_journal() -> Vec<TaskJournal> {
+fn cpa_task_journal() -> Result<Vec<TaskJournal>> {
     ["cliproxyapi-proxy", "cliproxyapi-quota-watch"]
         .into_iter()
-        .filter_map(|name| {
-            task_enabled(name).map(|was_enabled| TaskJournal {
+        .map(|name| {
+            let was_enabled = task_enabled(name)
+                .with_context(|| format!("CPA 예약 작업 상태를 확인할 수 없습니다: {name}"))?;
+            Ok(TaskJournal {
                 name: name.into(),
                 was_enabled,
                 after_enabled: false,
@@ -893,6 +948,67 @@ fn restore_cpa_tasks(tasks: &[TaskJournal]) -> Result<()> {
             .with_context(|| format!("{} 작업을 되돌리지 못했습니다", task.name))?;
         if !status.success() {
             bail!("{} 작업 복구를 거부했습니다", task.name);
+        }
+    }
+    Ok(())
+}
+
+fn changed_file_list(paths: &CutoverPaths, journal: &Journal) -> Vec<String> {
+    let mut changed = Vec::new();
+    for (label, path, before) in [
+        (
+            "codex config",
+            &paths.codex_config,
+            &journal.codex_config_before,
+        ),
+        ("codex auth", &paths.codex_auth, &journal.codex_auth_before),
+        (
+            "Claude settings",
+            &paths.claude_settings,
+            &journal.claude_settings_before,
+        ),
+    ] {
+        if !before.is_empty()
+            && hash_file(path)
+                .ok()
+                .is_some_and(|current| current != *before)
+        {
+            changed.push(format!("{label}: {}", path.display()));
+        }
+    }
+    for session in &journal.codex_sessions {
+        let path = Path::new(&session.path);
+        if hash_file(path)
+            .ok()
+            .is_some_and(|current| current != session.before)
+        {
+            changed.push(format!("Codex session auth: {}", path.display()));
+        }
+    }
+    if let (Some(path), Some(before)) = (
+        journal.session_homes_path.as_deref().map(Path::new),
+        journal.session_homes_before.as_deref(),
+    ) && hash_file(path)
+        .ok()
+        .is_some_and(|current| current != before)
+    {
+        changed.push(format!("session-homes.json: {}", path.display()));
+    }
+    changed
+}
+
+pub fn check_optional_preconditions(options: &WireOptions) -> Result<()> {
+    if options.autostart {
+        let _ = read_autostart()?;
+        let key = open_run_key(KEY_SET_VALUE)?;
+        unsafe {
+            let _ = RegCloseKey(key);
+        }
+    }
+    if options.disable_cpa_tasks {
+        for name in ["cliproxyapi-proxy", "cliproxyapi-quota-watch"] {
+            task_enabled(name)
+                .with_context(|| format!("CPA 예약 작업 상태를 확인할 수 없습니다: {name}"))?;
         }
     }
     Ok(())
@@ -933,14 +1049,18 @@ pub fn wire_with_options(
     let mut diff_secrets = Vec::new();
     for original in [&codex_auth, &claude.1] {
         if let Some(encoded) = original.protected_b64.as_deref() {
-            diff_secrets
-                .push(String::from_utf8(unprotect(encoded)?).context("invalid journal secret")?);
+            diff_secrets.push(
+                String::from_utf8(unprotect(encoded)?)
+                    .context("journal secret이 올바르지 않습니다")?,
+            );
         }
     }
     for provider in &providers {
         if let Some(encoded) = provider.experimental_bearer_token.protected_b64.as_deref() {
-            diff_secrets
-                .push(String::from_utf8(unprotect(encoded)?).context("invalid journal secret")?);
+            diff_secrets.push(
+                String::from_utf8(unprotect(encoded)?)
+                    .context("journal secret이 올바르지 않습니다")?,
+            );
         }
     }
     let codex_config_after = hash_bytes(&preserved_bytes(
@@ -952,7 +1072,17 @@ pub fn wire_with_options(
         hash_bytes(&preserved_bytes(&paths.claude_settings, &claude_preview)?);
     let mut codex_sessions = Vec::new();
     let mut session_diffs = Vec::new();
-    for path in &paths.codex_session_auth {
+    let session_auth_paths = if paths.codex_session_homes.is_empty() {
+        paths.codex_session_auth.iter().collect::<Vec<_>>()
+    } else {
+        paths
+            .codex_session_homes
+            .iter()
+            .filter(|home| !home.shim_exempt)
+            .map(|home| &home.auth)
+            .collect::<Vec<_>>()
+    };
+    for path in session_auth_paths {
         if path.exists()
             && let Some(session) = session_journal(path, preview_key)?
         {
@@ -974,7 +1104,7 @@ pub fn wire_with_options(
         None
     };
     let cpa_tasks = if options.disable_cpa_tasks {
-        cpa_task_journal()
+        cpa_task_journal()?
     } else {
         Vec::new()
     };
@@ -983,7 +1113,15 @@ pub fn wire_with_options(
             .session_homes_file
             .as_deref()
             .filter(|path| path.exists())
-            .map(|path| detach_chatgpt_session_homes(path, &paths.codex_session_homes))
+            .map(|path| {
+                let homes = paths
+                    .codex_session_homes
+                    .iter()
+                    .filter(|home| session_home_is_detachable(home))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                detach_chatgpt_session_homes(path, &homes)
+            })
             .transpose()?
     } else {
         None
@@ -1026,6 +1164,12 @@ pub fn wire_with_options(
             .session_homes_file
             .as_ref()
             .map(|path| path.display().to_string()),
+        session_homes_before: paths
+            .session_homes_file
+            .as_ref()
+            .filter(|path| path.exists())
+            .map(|path| hash_file(path))
+            .transpose()?,
         session_homes_after: session_homes_preview
             .as_ref()
             .map(|bytes| hash_bytes(bytes)),
@@ -1035,28 +1179,25 @@ pub fn wire_with_options(
         .codex_session_homes
         .iter()
         .map(|home| {
-            let mode = read_text(&home.auth)
-                .ok()
-                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-                .and_then(|auth| auth.get("auth_mode").and_then(Value::as_str).map(str::to_owned))
-                .unwrap_or_else(|| "missing".into());
-            if mode == "apikey" {
+            let mode = session_home_auth_mode(home).unwrap_or_else(|| "missing".into());
+            if home.shim_exempt {
+                format!(
+                    "Codex 세션 홈: {} (auth_mode={}, 세션 {}개). herdr shim이 그대로 두며 직접 ChatGPT로 연결합니다.",
+                    shorten_path(&home.home),
+                    mode,
+                    home.sessions
+                )
+            } else if mode == "apikey" {
                 format!(
                     "Codex 세션 홈: {} (auth_mode={}, 세션 {}개, 연결 대상)",
                     shorten_path(&home.home), mode, home.sessions
                 )
             } else {
-                let consequence = if home.shim_exempt {
-                    "herdr shim이 이 홈에는 proxy override를 적용하지 않아 직접 ChatGPT로 연결됩니다"
-                } else {
-                    "herdr shim을 통해 자체 ChatGPT 토큰으로 quota-baton에 연결되어 재개 시 401이 됩니다"
-                };
                 format!(
-                    "Codex 세션 홈: {} (auth_mode={}, 세션 {}개). {}. 그대로 두거나 session-homes.json에서 분리하거나 CPA를 계속 실행하는 선택이 필요합니다{}",
+                    "Codex 세션 홈: {} (auth_mode={}, 세션 {}개). herdr shim을 통해 자체 ChatGPT 토큰으로 quota-baton에 연결되어 재개 시 401이 됩니다. 그대로 두거나 session-homes.json에서 분리하거나 CPA를 계속 실행할 수 있습니다{}",
                     shorten_path(&home.home),
                     mode,
                     home.sessions,
-                    consequence,
                     if options.detach_chatgpt_session_homes {
                         "; 이번 실행에서 분리를 선택했습니다."
                     } else {
@@ -1096,6 +1237,12 @@ pub fn wire_with_options(
         }));
     }
     warnings.extend(scan_other_clients_10100(&paths.scan_roots));
+    warnings.extend(paths.codex_realtime_items.iter().map(|key| {
+        format!(
+            "CPA에 남는 항목: Codex {}. quota-baton은 realtime/voice 경로를 제공하지 않으므로 CPA를 중지하면 해당 기능도 중지됩니다.",
+            key
+        )
+    }));
     let mut changed = vec![
         "codex.openai_base_url".into(),
         "codex.auth.json OPENAI_API_KEY".into(),
@@ -1134,24 +1281,34 @@ pub fn wire_with_options(
             shorten_path(Path::new(&session.path))
         )
     }));
+    let mut changed_files = std::collections::BTreeSet::from([
+        paths.codex_config.display().to_string(),
+        paths.codex_auth.display().to_string(),
+        paths.claude_settings.display().to_string(),
+    ]);
+    changed_files.extend(codex_sessions.iter().map(|session| session.path.clone()));
+    if let Some(path) = paths
+        .session_homes_file
+        .as_ref()
+        .filter(|_| session_homes_preview.is_some())
+    {
+        changed_files.insert(path.display().to_string());
+    }
     let report = Report {
         summary: vec![
-            format!("요약: 연결 대상 {}개 파일", changed.len()),
+            format!(
+                "요약: 연결 대상 {}개 파일, {}개 항목",
+                changed_files.len(),
+                changed.len()
+            ),
             format!(
                 "CPA에 남는 세션 홈: {}개",
                 paths
                     .codex_session_homes
                     .iter()
                     .filter(|home| {
-                        read_text(&home.auth)
-                            .ok()
-                            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-                            .and_then(|auth| {
-                                auth.get("auth_mode")
-                                    .and_then(Value::as_str)
-                                    .map(|mode| mode != "apikey")
-                            })
-                            .unwrap_or(true)
+                        !home.shim_exempt
+                            && session_home_auth_mode(home).as_deref() != Some("apikey")
                     })
                     .count()
             ),
@@ -1226,18 +1383,34 @@ pub fn wire_with_options(
             for session in &journal.codex_sessions {
                 apply_session(Path::new(&session.path), &key)?;
             }
-            apply_claude(&paths.claude_settings, &claude_base, &key)
+            apply_claude(&paths.claude_settings, &claude_base, &key)?;
+            if let (Some(path), Some(bytes)) = (&paths.session_homes_file, &session_homes_preview) {
+                atomic_preserved(path, bytes)?;
+            }
+            Ok(())
         });
     if let Err(error) = apply_result {
+        let changed_files = changed_file_list(paths, &journal);
         bail!(
-            "적용 중 실패했습니다: {error}. 변경된 파일은 journal에 기록되어 있습니다: {}. 복구 명령: quota-baton unwire --apply",
-            paths.journal().display()
+            "적용 중 실패했습니다: {error}. 실제로 변경된 파일: {}. journal: {}. 복구 명령: quota-baton unwire --apply",
+            if changed_files.is_empty() {
+                "없음".into()
+            } else {
+                changed_files.join(", ")
+            },
+            paths.journal().display(),
         );
     }
     if options.autostart {
         if let Err(error) = set_autostart(&autostart.expect("autostart journal")) {
+            let changed_files = changed_file_list(paths, &journal);
             bail!(
-                "자동 시작 설정 중 실패했습니다: {error}. 변경된 파일은 journal에 기록되어 있습니다: {}. 복구 명령: quota-baton unwire --apply",
+                "자동 시작 설정 중 실패했습니다: {error}. 실제로 변경된 파일: {}. journal: {}. 복구 명령: quota-baton unwire --apply",
+                if changed_files.is_empty() {
+                    "없음".into()
+                } else {
+                    changed_files.join(", ")
+                },
                 paths.journal().display()
             );
         }
@@ -1252,8 +1425,14 @@ pub fn wire_with_options(
     }
     if options.disable_cpa_tasks {
         if let Err(error) = disable_cpa_tasks(&cpa_tasks) {
+            let changed_files = changed_file_list(paths, &journal);
             bail!(
-                "CPA 예약 작업 처리 중 실패했습니다: {error}. 변경된 파일은 journal에 기록되어 있습니다: {}. 복구 명령: quota-baton unwire --apply",
+                "CPA 예약 작업 처리 중 실패했습니다: {error}. 실제로 변경된 파일: {}. journal: {}. 복구 명령: quota-baton unwire --apply",
+                if changed_files.is_empty() {
+                    "없음".into()
+                } else {
+                    changed_files.join(", ")
+                },
                 paths.journal().display()
             );
         }
@@ -1264,14 +1443,17 @@ pub fn wire_with_options(
         }
         atomic_json(&paths.journal(), &journal)?;
     }
-    if let (Some(path), Some(bytes)) = (&paths.session_homes_file, &session_homes_preview) {
-        atomic_preserved(path, bytes)?;
-    }
     Ok(report)
 }
 
 pub fn report_only(paths: &CutoverPaths) -> Report {
     let mut warnings = scan_other_clients_10100(&paths.scan_roots);
+    warnings.extend(paths.codex_realtime_items.iter().map(|key| {
+        format!(
+            "CPA에 남는 항목: Codex {}. quota-baton은 realtime/voice 경로를 제공하지 않으므로 CPA를 중지하면 해당 기능도 중지됩니다.",
+            key
+        )
+    }));
     if let Some(warning) = &paths.session_homes_warning {
         warnings.push(warning.clone());
     }
@@ -1320,12 +1502,28 @@ pub fn unwire(paths: &CutoverPaths, apply: bool, force: bool) -> Result<Report> 
         return Ok(report);
     }
     if !force {
-        for (path, expected) in [
-            (&paths.codex_config, &journal.codex_config_after),
-            (&paths.codex_auth, &journal.codex_auth_after),
-            (&paths.claude_settings, &journal.claude_settings_after),
+        for (path, before, after) in [
+            (
+                &paths.codex_config,
+                &journal.codex_config_before,
+                &journal.codex_config_after,
+            ),
+            (
+                &paths.codex_auth,
+                &journal.codex_auth_before,
+                &journal.codex_auth_after,
+            ),
+            (
+                &paths.claude_settings,
+                &journal.claude_settings_before,
+                &journal.claude_settings_after,
+            ),
         ] {
-            if !expected.is_empty() && hash_file(path)? != *expected {
+            let current = hash_file(path)?;
+            if !before.is_empty() && current == *before {
+                continue;
+            }
+            if !after.is_empty() && current != *after {
                 bail!("파일이 변경되어 되돌릴 수 없습니다: {}", path.display());
             }
         }
@@ -1338,65 +1536,96 @@ pub fn unwire(paths: &CutoverPaths, apply: bool, force: bool) -> Result<Report> 
                 ));
                 continue;
             }
-            if hash_file(path)? != session.after {
+            let current = hash_file(path)?;
+            if !session.before.is_empty() && current == session.before {
+                continue;
+            }
+            if current != session.after {
                 bail!("파일이 변경되어 되돌릴 수 없습니다: {}", path.display());
             }
         }
         if let Some(autostart) = &journal.autostart {
             let current = read_autostart()?.0;
-            if current.value != Some(autostart.after.clone()) {
+            if current.value != autostart.before.value
+                && current.value != Some(autostart.after.clone())
+            {
                 bail!("autostart 설정이 변경되어 되돌릴 수 없습니다");
             }
         }
         for task in &journal.cpa_tasks {
-            if task_enabled(&task.name) != Some(task.after_enabled) {
+            let Some(current) = task_enabled(&task.name) else {
+                bail!("{} 예약 작업 상태를 확인할 수 없습니다", task.name);
+            };
+            if current == task.was_enabled {
+                continue;
+            }
+            if current != task.after_enabled {
                 bail!("{} 예약 작업이 변경되어 되돌릴 수 없습니다", task.name);
             }
         }
         if let (Some(path), Some(expected)) = (
             journal.session_homes_path.as_deref().map(Path::new),
             journal.session_homes_after.as_deref(),
-        ) && hash_file(path)? != expected
-        {
-            bail!("session-homes.json이 변경되어 되돌릴 수 없습니다");
+        ) {
+            let current = hash_file(path)?;
+            let untouched = journal
+                .session_homes_before
+                .as_deref()
+                .is_some_and(|before| current == before);
+            if !untouched && current != expected {
+                bail!("session-homes.json이 변경되어 되돌릴 수 없습니다");
+            }
         }
     }
-    let config_exact = journal.codex_config_original.as_deref().is_some_and(|_| {
-        hash_file(&paths.codex_config).ok().as_deref() == Some(journal.codex_config_after.as_str())
-    });
-    if config_exact {
-        restore_exact(
-            &paths.codex_config,
-            journal.codex_config_original.as_deref().unwrap(),
-        )?;
-    } else {
-        restore_codex_config(&paths.codex_config, &journal)?;
-    }
-    let auth_exact = journal.codex_auth_original.as_deref().is_some_and(|_| {
-        hash_file(&paths.codex_auth).ok().as_deref() == Some(journal.codex_auth_after.as_str())
-    });
-    if auth_exact {
-        restore_exact(
-            &paths.codex_auth,
-            journal.codex_auth_original.as_deref().unwrap(),
-        )?;
-    } else {
-        restore_codex_auth(&paths.codex_auth, &journal)?;
-    }
-    let claude_exact = journal
-        .claude_settings_original
-        .as_deref()
-        .is_some_and(|_| {
-            hash_file(&paths.claude_settings).ok().as_deref()
-                == Some(&journal.claude_settings_after)
+    if journal.codex_config_before.is_empty()
+        || hash_file(&paths.codex_config)? != journal.codex_config_before
+    {
+        let config_exact = journal.codex_config_original.as_deref().is_some_and(|_| {
+            hash_file(&paths.codex_config).ok().as_deref()
+                == Some(journal.codex_config_after.as_str())
         });
-    if claude_exact {
-        restore_exact(
-            &paths.claude_settings,
-            journal.claude_settings_original.as_deref().unwrap(),
-        )?;
-    } else {
-        restore_claude(&paths.claude_settings, &journal)?;
+        if config_exact {
+            restore_exact(
+                &paths.codex_config,
+                journal.codex_config_original.as_deref().unwrap(),
+            )?;
+        } else {
+            restore_codex_config(&paths.codex_config, &journal)?;
+        }
+    }
+    if journal.codex_auth_before.is_empty()
+        || hash_file(&paths.codex_auth)? != journal.codex_auth_before
+    {
+        let auth_exact = journal.codex_auth_original.as_deref().is_some_and(|_| {
+            hash_file(&paths.codex_auth).ok().as_deref() == Some(journal.codex_auth_after.as_str())
+        });
+        if auth_exact {
+            restore_exact(
+                &paths.codex_auth,
+                journal.codex_auth_original.as_deref().unwrap(),
+            )?;
+        } else {
+            restore_codex_auth(&paths.codex_auth, &journal)?;
+        }
+    }
+    if journal.claude_settings_before.is_empty()
+        || hash_file(&paths.claude_settings)? != journal.claude_settings_before
+    {
+        let claude_exact = journal
+            .claude_settings_original
+            .as_deref()
+            .is_some_and(|_| {
+                hash_file(&paths.claude_settings).ok().as_deref()
+                    == Some(&journal.claude_settings_after)
+            });
+        if claude_exact {
+            restore_exact(
+                &paths.claude_settings,
+                journal.claude_settings_original.as_deref().unwrap(),
+            )?;
+        } else {
+            restore_claude(&paths.claude_settings, &journal)?;
+        }
     }
     for session in &journal.codex_sessions {
         let path = Path::new(&session.path);
@@ -1405,6 +1634,10 @@ pub fn unwire(paths: &CutoverPaths, apply: bool, force: bool) -> Result<Report> 
                 "세션 auth.json이 없어 복구를 건너뜁니다: {}",
                 shorten_path(path)
             ));
+        } else if !session.before.is_empty()
+            && hash_file(path).ok().as_deref() == Some(&session.before)
+        {
+            continue;
         } else if session.original.is_some()
             && hash_file(path).ok().as_deref() == Some(session.after.as_str())
         {
@@ -1414,16 +1647,34 @@ pub fn unwire(paths: &CutoverPaths, apply: bool, force: bool) -> Result<Report> 
         }
     }
     if let Some(autostart) = &journal.autostart {
-        restore_autostart(&autostart.before, autostart.before_type)?;
+        let current = read_autostart()?.0;
+        if current.value != autostart.before.value {
+            restore_autostart(&autostart.before, autostart.before_type)?;
+        }
     }
-    restore_cpa_tasks(&journal.cpa_tasks)?;
+    let mut tasks_to_restore = Vec::new();
+    for task in &journal.cpa_tasks {
+        let current = task_enabled(&task.name)
+            .with_context(|| format!("{} 예약 작업 상태를 확인할 수 없습니다", task.name))?;
+        if current != task.was_enabled {
+            tasks_to_restore.push(task.clone());
+        }
+    }
+    restore_cpa_tasks(&tasks_to_restore)?;
     if let (Some(path), Some(original)) = (
         journal.session_homes_path.as_deref().map(Path::new),
         journal.session_homes_original.as_deref(),
     ) {
-        restore_exact(path, original)?;
+        let should_restore = journal
+            .session_homes_before
+            .as_deref()
+            .and_then(|before| hash_file(path).ok().map(|current| current != before))
+            .unwrap_or(true);
+        if should_restore {
+            restore_exact(path, original)?;
+        }
     }
-    fs::remove_file(paths.journal()).context("remove wiring journal")?;
+    fs::remove_file(paths.journal()).context("wiring journal을 삭제하지 못했습니다")?;
     Ok(report)
 }
 
@@ -1485,7 +1736,9 @@ fn secret_json(value: Option<&Value>) -> Result<SecretOriginal> {
             protected_b64: None,
         });
     };
-    let text = value.as_str().context("secret setting is not a string")?;
+    let text = value
+        .as_str()
+        .context("secret 설정 값이 문자열이 아닙니다")?;
     Ok(SecretOriginal {
         present: true,
         protected_b64: Some(protect(text.as_bytes())?),
@@ -1519,7 +1772,7 @@ fn apply_codex(path: &Path, auth_path: &Path, base: &str, key: &str) -> Result<(
 fn codex_config_bytes(path: &Path, base: &str, key: &str) -> Result<Vec<u8>> {
     let mut doc = read_text(path)?
         .parse::<DocumentMut>()
-        .context("parse Codex config")?;
+        .context("Codex 설정을 해석하지 못했습니다")?;
     doc["openai_base_url"] = toml_edit::value(base);
     doc.remove("model_catalog_json");
     if let Some(providers) = doc
@@ -1589,7 +1842,7 @@ fn secret_toml(item: Option<&toml_edit::Item>) -> Result<SecretOriginal> {
     };
     let value = item
         .as_str()
-        .context("Codex provider secret is not a string")?;
+        .context("Codex provider secret이 문자열이 아닙니다")?;
     Ok(SecretOriginal {
         present: true,
         protected_b64: Some(protect(value.as_bytes())?),
@@ -1605,7 +1858,7 @@ fn codex_auth_bytes(path: &Path, key: &str) -> Result<Vec<u8>> {
     let mut auth: Value = serde_json::from_str(&text)?;
     let root = auth
         .as_object_mut()
-        .context("Codex auth root is not an object")?;
+        .context("Codex auth의 최상위 값이 객체가 아닙니다")?;
     root.insert("auth_mode".into(), Value::String("apikey".into()));
     root.insert("OPENAI_API_KEY".into(), Value::String(key.into()));
     Ok(serde_json::to_vec_pretty(&auth)?)
@@ -1635,7 +1888,7 @@ fn restore_session(path: &Path, journal: &SessionJournal) -> Result<()> {
     let mut auth: Value = serde_json::from_str(&read_text(path)?)?;
     let root = auth
         .as_object_mut()
-        .context("Codex session auth root is not an object")?;
+        .context("Codex session auth의 최상위 값이 객체가 아닙니다")?;
     restore_secret_json(root, "OPENAI_API_KEY", &journal.api_key)?;
     restore_json(root, "auth_mode", &journal.auth_mode);
     atomic_preserved(path, &serde_json::to_vec_pretty(&auth)?)
@@ -1647,7 +1900,7 @@ fn restore_exact(path: &Path, protected: &str) -> Result<()> {
 fn restore_codex_config(path: &Path, journal: &Journal) -> Result<()> {
     let mut doc = read_text(path)?
         .parse::<DocumentMut>()
-        .context("parse Codex config")?;
+        .context("Codex 설정을 해석하지 못했습니다")?;
     restore_toml(&mut doc, "openai_base_url", &journal.codex_base_url);
     restore_toml(&mut doc, "model_catalog_json", &journal.codex_model_catalog);
     for provider in &journal.providers {
@@ -1673,7 +1926,7 @@ fn restore_codex_auth(auth_path: &Path, journal: &Journal) -> Result<()> {
     let mut auth: Value = serde_json::from_str(&read_text(auth_path)?)?;
     let root = auth
         .as_object_mut()
-        .context("Codex auth root is not an object")?;
+        .context("Codex auth의 최상위 값이 객체가 아닙니다")?;
     restore_secret_json(root, "OPENAI_API_KEY", &journal.codex_auth_key)?;
     restore_json(root, "auth_mode", &journal.codex_auth_mode);
     atomic_preserved(auth_path, &serde_json::to_vec_pretty(&auth)?)
@@ -1706,8 +1959,9 @@ fn restore_secret_toml(
         let encoded = original
             .protected_b64
             .as_deref()
-            .context("missing encrypted provider secret")?;
-        let value = String::from_utf8(unprotect(encoded)?).context("invalid provider secret")?;
+            .context("암호화된 provider secret이 없습니다")?;
+        let value = String::from_utf8(unprotect(encoded)?)
+            .context("provider secret이 올바르지 않습니다")?;
         table.insert(key, toml_edit::value(value));
     } else {
         table.remove(key);
@@ -1719,26 +1973,88 @@ fn apply_claude(path: &Path, base: &str, key: &str) -> Result<()> {
 }
 fn claude_bytes(path: &Path, base: &str, key: &str) -> Result<Vec<u8>> {
     let text = read_text(path)?;
-    if let Some(updated) = replace_json_string(&text, "ANTHROPIC_BASE_URL", base)
-        .and_then(|updated| replace_json_string(&updated, "ANTHROPIC_AUTH_TOKEN", key))
+    if let Some(updated) = replace_json_string_in_env(&text, "ANTHROPIC_BASE_URL", base)
+        .and_then(|updated| replace_json_string_in_env(&updated, "ANTHROPIC_AUTH_TOKEN", key))
     {
         return Ok(updated.into_bytes());
     }
     let mut json: Value = serde_json::from_str(&text)?;
     let env = json
         .as_object_mut()
-        .context("Claude settings root is not an object")?
+        .context("Claude settings의 최상위 값이 객체가 아닙니다")?
         .entry("env")
         .or_insert_with(|| Value::Object(Default::default()));
     let env = env
         .as_object_mut()
-        .context("Claude settings env is not an object")?;
+        .context("Claude settings의 env가 객체가 아닙니다")?;
     env.insert("ANTHROPIC_BASE_URL".into(), Value::String(base.into()));
     env.insert("ANTHROPIC_AUTH_TOKEN".into(), Value::String(key.into()));
     Ok(serde_json::to_vec_pretty(&json)?)
 }
 
 fn replace_json_string(text: &str, key: &str, value: &str) -> Option<String> {
+    let result = replace_json_string_raw(text, key, value)?;
+    let parsed: Value = serde_json::from_str(&result).ok()?;
+    (parsed.get(key).and_then(Value::as_str) == Some(value)).then_some(result)
+}
+
+fn replace_json_string_in_env(text: &str, key: &str, value: &str) -> Option<String> {
+    let (start, end) = json_object_span(text, "env")?;
+    let updated_env = replace_json_string_raw(&text[start..end], key, value)?;
+    let mut result = text.to_owned();
+    result.replace_range(start..end, &updated_env);
+    let parsed: Value = serde_json::from_str(&result).ok()?;
+    (parsed
+        .get("env")
+        .and_then(Value::as_object)
+        .and_then(|env| env.get(key))
+        .and_then(Value::as_str)
+        == Some(value))
+    .then_some(result)
+}
+
+fn json_object_span(text: &str, object_key: &str) -> Option<(usize, usize)> {
+    let needle = format!("\"{object_key}\"");
+    let key_start = text.find(&needle)?;
+    let colon = text[key_start + needle.len()..].find(':')? + key_start + needle.len();
+    let value_start = text[colon + 1..]
+        .bytes()
+        .position(|byte| !byte.is_ascii_whitespace())?
+        + colon
+        + 1;
+    if text.as_bytes().get(value_start) != Some(&b'{') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, byte) in text.as_bytes()[value_start..].iter().copied().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some((value_start, value_start + offset + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn replace_json_string_raw(text: &str, key: &str, value: &str) -> Option<String> {
     let needle = format!("\"{key}\"");
     let key_start = text.find(&needle)?;
     let colon = text[key_start + needle.len()..].find(':')? + key_start + needle.len();
@@ -1772,13 +2088,13 @@ fn restore_claude(path: &Path, journal: &Journal) -> Result<()> {
     let mut json: Value = serde_json::from_str(&read_text(path)?)?;
     let root = json
         .as_object_mut()
-        .context("Claude settings root is not an object")?;
+        .context("Claude settings의 최상위 값이 객체가 아닙니다")?;
     let env = root
         .entry("env")
         .or_insert_with(|| Value::Object(Default::default()));
     let env = env
         .as_object_mut()
-        .context("Claude settings env is not an object")?;
+        .context("Claude settings의 env가 객체가 아닙니다")?;
     restore_json(env, "ANTHROPIC_BASE_URL", &journal.claude_base_url);
     restore_secret_json(env, "ANTHROPIC_AUTH_TOKEN", &journal.claude_api_key)?;
     if env.is_empty() {
@@ -1805,8 +2121,9 @@ fn restore_secret_json(
         let encoded = original
             .protected_b64
             .as_deref()
-            .context("missing encrypted secret")?;
-        let value = String::from_utf8(unprotect(encoded)?).context("invalid encrypted secret")?;
+            .context("암호화된 secret이 없습니다")?;
+        let value = String::from_utf8(unprotect(encoded)?)
+            .context("암호화된 secret이 올바르지 않습니다")?;
         env.insert(key.into(), Value::String(value));
     } else {
         env.remove(key);
@@ -1821,7 +2138,7 @@ fn protect(input: &[u8]) -> Result<String> {
 fn unprotect(encoded: &str) -> Result<Vec<u8>> {
     let bytes = STANDARD
         .decode(encoded)
-        .context("invalid encrypted journal value")?;
+        .context("암호화된 journal 값이 올바르지 않습니다")?;
     transform(&bytes, false)
 }
 
@@ -1860,7 +2177,7 @@ fn transform(input: &[u8], protect: bool) -> Result<Vec<u8>> {
             )
         }
     };
-    result.context("DPAPI journal transform failed")?;
+    result.context("DPAPI journal 변환에 실패했습니다")?;
     let copied =
         unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
     unsafe {
@@ -1878,7 +2195,7 @@ fn preserved_bytes(path: &Path, bytes: &[u8]) -> Result<Vec<u8>> {
     let original = fs::read(path).unwrap_or_default();
     let bom = original.starts_with(&[0xef, 0xbb, 0xbf]);
     let crlf = original.windows(2).any(|pair| pair == b"\r\n");
-    let mut text = String::from_utf8(bytes.to_vec()).context("configuration is not UTF-8")?;
+    let mut text = String::from_utf8(bytes.to_vec()).context("설정 파일이 UTF-8이 아닙니다")?;
     if crlf {
         text = text.replace("\r\n", "\n").replace('\n', "\r\n");
     }
@@ -1956,12 +2273,33 @@ mod tests {
                 session_homes_file: None,
                 session_homes_warning: None,
                 codex_config: codex,
+                codex_realtime_items: Vec::new(),
                 claude_settings: claude,
                 client_key,
                 report_roots: Vec::new(),
                 scan_roots: Vec::new(),
             },
         )
+    }
+
+    #[test]
+    fn scheduled_task_parser_ignores_disabled_idle_time() {
+        let output = "Scheduled Task State: Enabled\nIdle Time: Disabled\n";
+        assert_eq!(parse_task_enabled(output), Some(true));
+    }
+
+    #[test]
+    fn scheduled_task_parser_accepts_localized_state() {
+        let output = "예약된 작업 상태: 사용\n유휴 시간: 사용 안 함\n";
+        assert_eq!(parse_task_enabled(output), Some(true));
+    }
+
+    #[test]
+    fn scheduled_task_parser_rejects_unknown_state() {
+        assert_eq!(
+            parse_task_enabled("Scheduled Task State: Paused\nIdle Time: Disabled\n"),
+            None
+        );
     }
 
     #[test]
@@ -2039,6 +2377,137 @@ mod tests {
         assert_eq!(homes[0].sessions, 2);
         assert_eq!(homes[0].home, home);
         assert!(!homes[0].shim_exempt);
+    }
+
+    #[test]
+    fn detach_keeps_exempt_and_apikey_homes_on_real_session_map_shape() {
+        let (dir, _p) = paths();
+        let exempt = dir.path().join(".codex-acct").join("one");
+        let apikey = dir.path().join("apikey-home");
+        let chatgpt = dir.path().join("chatgpt-home");
+        for home in [&exempt, &apikey, &chatgpt] {
+            fs::create_dir_all(home).unwrap();
+        }
+        fs::write(exempt.join("auth.json"), r#"{"auth_mode":"chatgpt"}"#).unwrap();
+        fs::write(
+            apikey.join("auth.json"),
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":"key"}"#,
+        )
+        .unwrap();
+        fs::write(chatgpt.join("auth.json"), r#"{"auth_mode":"chatgpt"}"#).unwrap();
+        let map = dir.path().join("session-homes.json");
+        let value = serde_json::json!({
+            "sessions": {
+                "exempt": exempt.display().to_string(),
+                "apikey": apikey.display().to_string(),
+                "chatgpt": chatgpt.display().to_string()
+            }
+        });
+        fs::write(&map, serde_json::to_vec(&value).unwrap()).unwrap();
+        let homes = [
+            SessionHome {
+                home: exempt.clone(),
+                auth: exempt.join("auth.json"),
+                sessions: 1,
+                shim_exempt: true,
+            },
+            SessionHome {
+                home: apikey.clone(),
+                auth: apikey.join("auth.json"),
+                sessions: 1,
+                shim_exempt: false,
+            },
+            SessionHome {
+                home: chatgpt.clone(),
+                auth: chatgpt.join("auth.json"),
+                sessions: 1,
+                shim_exempt: false,
+            },
+        ];
+        let after = detach_chatgpt_session_homes(&map, &[homes[2].clone()]).unwrap();
+        let after: Value = serde_json::from_slice(&after).unwrap();
+        let sessions = after["sessions"].as_object().unwrap();
+        assert!(sessions.contains_key("exempt"));
+        assert!(sessions.contains_key("apikey"));
+        assert!(!sessions.contains_key("chatgpt"));
+    }
+
+    #[test]
+    fn exempt_apikey_home_is_reported_but_never_wired() {
+        let (dir, mut p) = paths();
+        let home = dir.path().join(".codex-acct").join("apikey");
+        fs::create_dir_all(&home).unwrap();
+        let auth = home.join("auth.json");
+        fs::write(&auth, r#"{"auth_mode":"apikey","OPENAI_API_KEY":"old"}"#).unwrap();
+        p.codex_session_homes.push(SessionHome {
+            home,
+            auth: auth.clone(),
+            sessions: 1,
+            shim_exempt: true,
+        });
+        p.codex_session_auth.push(auth.clone());
+        let before = fs::read(&auth).unwrap();
+        let report = wire(&p, false).unwrap();
+        assert_eq!(before, fs::read(&auth).unwrap());
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("herdr shim이 그대로"))
+        );
+        assert!(
+            !report
+                .changed
+                .iter()
+                .any(|item| item.contains("session-auth"))
+        );
+    }
+
+    #[test]
+    fn unwire_succeeds_when_journaled_session_auth_disappears() {
+        let (dir, mut p) = paths();
+        let home = dir.path().join("session-home");
+        fs::create_dir_all(&home).unwrap();
+        let auth = home.join("auth.json");
+        fs::write(&auth, r#"{"auth_mode":"apikey","OPENAI_API_KEY":"old"}"#).unwrap();
+        p.codex_session_auth.push(auth.clone());
+        fs::write(&p.client_key, "synthetic-key\n").unwrap();
+        wire(&p, true).unwrap();
+        fs::remove_file(&auth).unwrap();
+        unwire(&p, true, false).unwrap();
+        assert!(!p.journal().exists());
+    }
+
+    #[test]
+    fn partial_apply_recovery_accepts_an_untouched_file() {
+        let (_dir, p) = paths();
+        let original_config = fs::read(&p.codex_config).unwrap();
+        let original_auth = fs::read(&p.codex_auth).unwrap();
+        let original_claude = fs::read(&p.claude_settings).unwrap();
+        fs::write(&p.client_key, "synthetic-key\n").unwrap();
+        wire(&p, true).unwrap();
+        // Simulate a failure before the first file write while later files had
+        // already been changed by the apply sequence.
+        fs::write(&p.codex_config, &original_config).unwrap();
+        unwire(&p, true, false).unwrap();
+        assert_eq!(original_config, fs::read(&p.codex_config).unwrap());
+        assert_eq!(original_auth, fs::read(&p.codex_auth).unwrap());
+        assert_eq!(original_claude, fs::read(&p.claude_settings).unwrap());
+        assert!(!p.journal().exists());
+    }
+
+    #[test]
+    fn apply_refuses_chatgpt_default_home() {
+        let (_dir, p) = paths();
+        fs::write(
+            &p.codex_auth,
+            r#"{"auth_mode":"chatgpt","OPENAI_API_KEY":"old"}"#,
+        )
+        .unwrap();
+        fs::write(&p.client_key, "synthetic-key\n").unwrap();
+        let error = wire(&p, true).unwrap_err().to_string();
+        assert!(error.contains("apikey"));
+        assert!(!p.journal().exists());
     }
 
     #[test]
@@ -2139,9 +2608,47 @@ mod tests {
     }
 
     #[test]
+    fn realistic_toml_keeps_unrelated_lines_when_previewing() {
+        let (_dir, p) = paths();
+        let mut source = String::from("openai_base_url = \"https://old.invalid/v1\"\n");
+        for index in 0..120 {
+            source.push_str(&format!("filler_{index} = \"value_{index}\"\n"));
+        }
+        fs::write(&p.codex_config, &source).unwrap();
+        let preview =
+            codex_config_bytes(&p.codex_config, "http://127.0.0.1:10200/v1", "<client key>")
+                .unwrap();
+        let preview = String::from_utf8(preview).unwrap();
+        assert_eq!(preview.lines().count(), source.lines().count());
+        assert!(preview.contains("filler_119 = \"value_119\""));
+        assert!(preview.contains("openai_base_url = \"http://127.0.0.1:10200/v1\""));
+    }
+
+    #[test]
+    fn realtime_cpa_items_are_reported_without_wiring() {
+        let (_dir, mut p) = paths();
+        p.codex_realtime_items = vec!["experimental_realtime_ws_base_url".into()];
+        let report = wire(&p, false).unwrap();
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("realtime/voice")
+                    && warning.contains("experimental_realtime_ws_base_url"))
+        );
+        assert!(
+            !report
+                .changed
+                .iter()
+                .any(|item| item.contains("realtime_ws"))
+        );
+    }
+
+    #[test]
     fn pretty_json_files_keep_layout_and_unrelated_order_when_wired() {
         let (_dir, p) = paths();
         let settings = r#"{
+  "ANTHROPIC_AUTH_TOKEN": "old-token-outside-env",
   "env": {
     "ANTHROPIC_BASE_URL": "https://old.invalid",
     "ANTHROPIC_AUTH_TOKEN": "old-token",
@@ -2161,6 +2668,15 @@ mod tests {
                 && wired.contains("\"last\": true")
         );
         assert!(wired.contains("\"CLAUDE_CODE_SUBAGENT_MODEL\": \"keep-model\""));
+        let wired_json: Value = serde_json::from_str(&wired).unwrap();
+        assert_eq!(
+            wired_json["ANTHROPIC_AUTH_TOKEN"],
+            Value::String("old-token-outside-env".into())
+        );
+        assert_eq!(
+            wired_json["env"]["ANTHROPIC_AUTH_TOKEN"],
+            Value::String("synthetic-key".into())
+        );
         unwire(&p, true, false).unwrap();
         assert_eq!(
             settings.as_bytes(),

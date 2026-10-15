@@ -200,15 +200,20 @@ async fn request_takeover(
         .send()
         .await?;
     if !response.status().is_success() {
-        anyhow::bail!("running core refused takeover ({})", response.status());
+        anyhow::bail!(
+            "실행 중인 코어가 takeover를 거부했습니다 ({})",
+            response.status()
+        );
     }
     Ok(response.json().await?)
 }
 
 async fn check_wire_preconditions(
     home: &std::path::Path,
-    _options: &cutover::WireOptions,
+    options: &cutover::WireOptions,
 ) -> anyhow::Result<()> {
+    cutover::check_optional_preconditions(options)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let config = qb_core::config::Config::load(home)?;
     let secrets = qb_core::local_secrets::load_existing(home).map_err(|_| {
         anyhow::anyhow!("적용하려면 client.key와 admin.token이 먼저 있어야 합니다.")
@@ -530,13 +535,13 @@ async fn run() -> anyhow::Result<()> {
             let config = qb_core::config::Config::load(&home)?;
             let capture = capture
                 .canonicalize()
-                .map_err(|_| anyhow::anyhow!("Capture path must exist"))?;
+                .map_err(|_| anyhow::anyhow!("capture 경로가 존재해야 합니다"))?;
             let provider = if account.starts_with("cl-") {
                 qb_core::accounts::Provider::Claude
             } else if account.starts_with("cx-") {
                 qb_core::accounts::Provider::Codex
             } else {
-                anyhow::bail!("Invalid phase0 account");
+                anyhow::bail!("phase0 계정 ID가 올바르지 않습니다");
             };
             let capture_path = capture.clone();
             let strip_encrypted: qb_core::phase0::StripMode =
