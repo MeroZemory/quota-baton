@@ -2253,7 +2253,43 @@ mod tests {
     #[test]
     #[ignore = "regenerates the cited synthetic M8.2 dry-run artifact"]
     fn write_synthetic_dry_run_sample() {
-        let (_dir, p) = paths();
+        let (dir, mut p) = paths();
+        // Keep the cited artifact representative of the reviewed live shape:
+        // a CPA provider table, an MCP secret in the surrounding hunk, and a
+        // ChatGPT session-home entry.  Everything remains synthetic and
+        // isolated in this temporary directory.
+        fs::write(
+            &p.codex_config,
+            "openai_base_url = \"https://old.invalid/v1\"\n\n[mcp_servers.synthetic.env]\nFOO_SECRET = \"synthetic-mcp-secret\"\n\n[model_providers.cliproxyapi]\nname = \"CPA\"\nbase_url = \"http://127.0.0.1:10100/v1\"\nmodel_catalog_url = \"http://127.0.0.1:10100/v1/models\"\nexperimental_bearer_token = \"synthetic-cpa-key\"\nwire_api = \"responses\"\nmodel_provider = \"cliproxyapi\"\n",
+        )
+        .unwrap();
+        let session_home = dir.path().join("chatgpt-session-home");
+        fs::create_dir_all(&session_home).unwrap();
+        let session_auth = session_home.join("auth.json");
+        fs::write(
+            &session_auth,
+            r#"{"auth_mode":"chatgpt","OPENAI_API_KEY":"synthetic-session-key"}"#,
+        )
+        .unwrap();
+        let session_homes_file = dir.path().join("session-homes.json");
+        fs::write(
+            &session_homes_file,
+            serde_json::to_vec(&serde_json::json!({
+                "sessions": {
+                    "synthetic-session": session_home.display().to_string()
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        p.codex_session_auth.push(session_auth.clone());
+        p.codex_session_homes.push(SessionHome {
+            home: session_home.clone(),
+            auth: session_auth,
+            sessions: 1,
+            shim_exempt: false,
+        });
+        p.session_homes_file = Some(session_homes_file);
         let report = wire(&p, false).unwrap();
         let mut output = String::new();
         for line in &report.summary {
