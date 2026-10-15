@@ -74,6 +74,10 @@ enum Command {
     Wire {
         #[arg(long, help = "실제 파일을 변경합니다; 생략하면 미리보기입니다")]
         apply: bool,
+        #[arg(long, help = "현재 사용자 트레이 자동 시작을 연결합니다")]
+        autostart: bool,
+        #[arg(long, help = "CPA 예약 작업을 삭제하지 않고 비활성화합니다")]
+        disable_cpa_tasks: bool,
     },
     #[command(about = "클라이언트 설정 연결을 되돌립니다")]
     Unwire {
@@ -427,12 +431,23 @@ async fn run() -> anyhow::Result<()> {
             let config = qb_core::config::Config::load(&home)?;
             accounts_cli::run(command, &home, &config).await?;
         }
-        Command::Wire { apply } => {
+        Command::Wire {
+            apply,
+            autostart,
+            disable_cpa_tasks,
+        } => {
             if apply {
                 check_wire_preconditions(&home).await?;
             }
             let paths = cutover::CutoverPaths::from_environment(home)?;
-            let report = cutover::wire(&paths, apply)?;
+            let report = cutover::wire_with_options(
+                &paths,
+                apply,
+                cutover::WireOptions {
+                    autostart,
+                    disable_cpa_tasks,
+                },
+            )?;
             println_utf8!(
                 "{} {}",
                 if apply {
@@ -444,6 +459,12 @@ async fn run() -> anyhow::Result<()> {
             );
             for warning in report.warnings {
                 println_utf8!("경고: {warning}");
+            }
+            for line in report.diff {
+                println_utf8!("{line}");
+            }
+            for item in report.report_only {
+                println_utf8!("보고: {item}");
             }
         }
         Command::Unwire { apply, force } => {
