@@ -7,26 +7,28 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
 clap.workspace = true
 qb-core.workspace = true
 qb-proto.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
 serde.workspace = true
+sha2.workspace = true
 toml_edit.workspace = true
 tokio.workspace = true
+windows.workspace = true
 
 [dev-dependencies]
-axum.workspace = true
 async-stream.workspace = true
+axum.workspace = true
 bytes.workspace = true
-zstd.workspace = true
 futures-util.workspace = true
 qb-core = { workspace = true, features = ["testkit"] }
 tempfile.workspace = true
 qb-testkit.workspace = true
 tokio-tungstenite.workspace = true
-windows.workspace = true
+zstd.workspace = true
 
 [features]
 default = []
