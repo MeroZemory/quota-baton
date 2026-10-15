@@ -64,7 +64,10 @@ enum Command {
         takeover: bool,
     },
     #[command(about = "상태를 확인합니다")]
-    Status,
+    Status {
+        #[arg(long, help = "M8 전환용 보고 전용 항목을 함께 표시합니다")]
+        cutover_report: bool,
+    },
     #[command(about = "계정을 관리합니다")]
     Accounts {
         #[command(subcommand)]
@@ -78,6 +81,11 @@ enum Command {
         autostart: bool,
         #[arg(long, help = "CPA 예약 작업을 삭제하지 않고 비활성화합니다")]
         disable_cpa_tasks: bool,
+        #[arg(
+            long,
+            help = "ChatGPT 인증 세션 홈을 session-homes.json에서 분리합니다"
+        )]
+        detach_chatgpt_session_homes: bool,
     },
     #[command(about = "클라이언트 설정 연결을 되돌립니다")]
     Unwire {
@@ -197,9 +205,14 @@ async fn request_takeover(
     Ok(response.json().await?)
 }
 
-async fn check_wire_preconditions(home: &std::path::Path) -> anyhow::Result<()> {
+async fn check_wire_preconditions(
+    home: &std::path::Path,
+    _options: &cutover::WireOptions,
+) -> anyhow::Result<()> {
     let config = qb_core::config::Config::load(home)?;
-    let secrets = qb_core::local_secrets::load_or_create(home)?;
+    let secrets = qb_core::local_secrets::load_existing(home).map_err(|_| {
+        anyhow::anyhow!("적용하려면 client.key와 admin.token이 먼저 있어야 합니다.")
+    })?;
     let client = reqwest::Client::builder()
         .no_proxy()
         .tcp_nodelay(true)
@@ -219,6 +232,9 @@ async fn check_wire_preconditions(home: &std::path::Path) -> anyhow::Result<()> 
     if !response.status().is_success() {
         anyhow::bail!("적용하려면 정상 상태의 코어가 실행 중이어야 합니다.");
     }
+    tokio::net::TcpStream::connect(("127.0.0.1", config.server.data_port))
+        .await
+        .map_err(|_| anyhow::anyhow!("설정된 데이터 포트에 연결할 수 없습니다."))?;
     let accounts = qb_core::accounts::AccountStore::list_metadata(home)?;
     for provider in [
         qb_core::accounts::Provider::Codex,
@@ -423,9 +439,21 @@ async fn run() -> anyhow::Result<()> {
             })
             .await??;
         }
-        Command::Status => {
+        Command::Status { cutover_report } => {
             let config = qb_core::config::Config::load(&home)?;
             accounts_cli::status(&home, &config).await?;
+            if cutover_report {
+                let report = cutover::report_only(&cutover::CutoverPaths::from_environment(home)?);
+                for line in report.summary {
+                    println_utf8!("{line}");
+                }
+                for warning in report.warnings {
+                    println_utf8!("경고: {warning}");
+                }
+                for item in report.report_only {
+                    println_utf8!("보고: {item}");
+                }
+            }
         }
         Command::Accounts { command } => {
             let config = qb_core::config::Config::load(&home)?;
@@ -435,19 +463,22 @@ async fn run() -> anyhow::Result<()> {
             apply,
             autostart,
             disable_cpa_tasks,
+            detach_chatgpt_session_homes,
         } => {
+            let options = cutover::WireOptions {
+                data_port: qb_core::config::Config::load(&home)?.server.data_port,
+                autostart,
+                disable_cpa_tasks,
+                detach_chatgpt_session_homes,
+            };
             if apply {
-                check_wire_preconditions(&home).await?;
+                check_wire_preconditions(&home, &options).await?;
             }
             let paths = cutover::CutoverPaths::from_environment(home)?;
-            let report = cutover::wire_with_options(
-                &paths,
-                apply,
-                cutover::WireOptions {
-                    autostart,
-                    disable_cpa_tasks,
-                },
-            )?;
+            let report = cutover::wire_with_options(&paths, apply, options)?;
+            for line in report.summary {
+                println_utf8!("{line}");
+            }
             println_utf8!(
                 "{} {}",
                 if apply {
@@ -470,6 +501,9 @@ async fn run() -> anyhow::Result<()> {
         Command::Unwire { apply, force } => {
             let paths = cutover::CutoverPaths::from_environment(home)?;
             let report = cutover::unwire(&paths, apply, force)?;
+            for line in report.summary {
+                println_utf8!("{line}");
+            }
             println_utf8!(
                 "{} {}",
                 if apply {

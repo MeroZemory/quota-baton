@@ -1240,7 +1240,10 @@ name = "quota-baton"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-stream",
+ "axum",
  "base64 0.22.1",
+ "bytes",
  "clap",
  "futures-util",
  "qb-core",
@@ -1255,6 +1258,7 @@ dependencies = [
  "tokio-tungstenite",
  "toml_edit",
  "windows",
+ "zstd",
 ]
 
 [[package]]
