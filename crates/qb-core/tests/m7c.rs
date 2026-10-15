@@ -183,18 +183,27 @@ fn a2_body(shape: A2Shape, paced: bool) -> (reqwest::Body, bool) {
             (reqwest::Body::wrap_stream(stream), false)
         }
         A2Shape::Zstd(size) => {
-            let encoder =
-                zstd::stream::read::Encoder::new(A2Reader { remaining: size }, 1).unwrap();
-            let stream = futures_util::stream::unfold(encoder, |mut encoder| async move {
-                tokio::task::yield_now().await;
-                let mut chunk = vec![0; CHUNK];
-                let count = std::io::Read::read(&mut encoder, &mut chunk).unwrap();
-                if count == 0 {
-                    None
-                } else {
+            let (sender, receiver) = tokio::sync::mpsc::channel(2);
+            tokio::task::spawn_blocking(move || {
+                let mut encoder =
+                    zstd::stream::read::Encoder::new(A2Reader { remaining: size }, 1).unwrap();
+                loop {
+                    let mut chunk = vec![0; CHUNK];
+                    let count = std::io::Read::read(&mut encoder, &mut chunk).unwrap();
+                    if count == 0 {
+                        break;
+                    }
                     chunk.truncate(count);
-                    Some((Ok::<_, std::io::Error>(Bytes::from(chunk)), encoder))
+                    if sender
+                        .blocking_send(Ok::<_, std::io::Error>(Bytes::from(chunk)))
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
+            });
+            let stream = futures_util::stream::unfold(receiver, |mut receiver| async move {
+                receiver.recv().await.map(|item| (item, receiver))
             });
             (reqwest::Body::wrap_stream(stream), true)
         }
