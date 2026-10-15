@@ -193,6 +193,43 @@ async fn request_takeover(
     Ok(response.json().await?)
 }
 
+async fn check_wire_preconditions(home: &std::path::Path) -> anyhow::Result<()> {
+    let config = qb_core::config::Config::load(home)?;
+    let secrets = qb_core::local_secrets::load_or_create(home)?;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .tcp_nodelay(true)
+        .timeout(std::time::Duration::from_secs(3))
+        .build()?;
+    let port = config.server.admin_port;
+    let response = client
+        .get(format!("http://127.0.0.1:{port}/admin/v1/health"))
+        .header(reqwest::header::HOST, format!("127.0.0.1:{port}"))
+        .header(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {}", secrets.admin_token),
+        )
+        .send()
+        .await
+        .map_err(|_| anyhow::anyhow!("적용하려면 정상 상태의 코어가 실행 중이어야 합니다."))?;
+    if !response.status().is_success() {
+        anyhow::bail!("적용하려면 정상 상태의 코어가 실행 중이어야 합니다.");
+    }
+    let accounts = qb_core::accounts::AccountStore::list_metadata(home)?;
+    for provider in [
+        qb_core::accounts::Provider::Codex,
+        qb_core::accounts::Provider::Claude,
+    ] {
+        if !accounts
+            .iter()
+            .any(|account| account.provider == provider && account.eligible(None))
+        {
+            anyhow::bail!("각 프로바이더에 적용 가능한 활성 계정이 하나 이상 필요합니다.");
+        }
+    }
+    Ok(())
+}
+
 async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let home = qb_core::home()?;
@@ -391,6 +428,9 @@ async fn run() -> anyhow::Result<()> {
             accounts_cli::run(command, &home, &config).await?;
         }
         Command::Wire { apply } => {
+            if apply {
+                check_wire_preconditions(&home).await?;
+            }
             let paths = cutover::CutoverPaths::from_environment(home)?;
             let report = cutover::wire(&paths, apply)?;
             println_utf8!(
