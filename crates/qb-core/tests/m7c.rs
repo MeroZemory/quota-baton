@@ -374,6 +374,7 @@ fn m7c_a1_seeded_soak_records_private_memory() {
         }))
         .await;
         let mut sockets: Vec<_> = socket_results.into_iter().flatten().collect();
+        eprintln!("M7c A1: idle sockets ready={}", sockets.len());
         let duration = std::env::var("M7C_DURATION_SECS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
@@ -391,6 +392,7 @@ fn m7c_a1_seeded_soak_records_private_memory() {
         let mut peak = private_bytes();
         let mut rounds = 0u64;
         while started.elapsed() < Duration::from_secs(duration) {
+            eprintln!("M7c A1: starting round={rounds}");
             let jobs = (0..32).map(|n| {
                 let (_, shape) = sampler.next();
                 let url = h.url();
@@ -418,6 +420,7 @@ fn m7c_a1_seeded_soak_records_private_memory() {
             .into_iter()
             .filter(|completed| *completed)
             .count();
+            eprintln!("M7c A1: completed round={rounds} requests={completed}");
             // Exercise reconnect-driven resends without retaining transcripts.
             if rounds.is_multiple_of(6) {
                 for socket in sockets.iter_mut().take(4) {
