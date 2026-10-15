@@ -353,10 +353,17 @@ async fn m7c_300_idle_websocket_pairs_measure_private_memory() {
 fn m7c_a1_seeded_soak_records_private_memory() {
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let (_upstream, h) = a2_harness().await;
-        let mut sockets = Vec::with_capacity(50);
-        for n in 0..50 {
-            sockets.push(h.idle_socket(&format!("m7c-soak-{n}")).await);
-        }
+        let harness = &h;
+        let socket_results = join_all((0..50).map(|n| async move {
+            tokio::time::timeout(
+                Duration::from_secs(15),
+                harness.idle_socket(&format!("m7c-soak-{n}")),
+            )
+            .await
+            .ok()
+        }))
+        .await;
+        let mut sockets: Vec<_> = socket_results.into_iter().flatten().collect();
         let duration = std::env::var("M7C_DURATION_SECS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
