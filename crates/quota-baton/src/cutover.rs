@@ -45,11 +45,13 @@ impl CutoverPaths {
             .map(PathBuf::from)
             .context("USERPROFILE/HOME is missing")?;
         let client_key = qb_home.join("client.key");
+        let codex_root = user.join(".codex");
+        let codex_session_auth = discover_session_auth(&user);
         Ok(Self {
             qb_home,
-            codex_auth: user.join(".codex").join("auth.json"),
-            codex_session_auth: Vec::new(),
-            codex_config: user.join(".codex").join("config.toml"),
+            codex_auth: codex_root.join("auth.json"),
+            codex_session_auth,
+            codex_config: codex_root.join("config.toml"),
             claude_settings: user.join(".claude").join("settings.json"),
             client_key,
         })
@@ -58,6 +60,82 @@ impl CutoverPaths {
     fn journal(&self) -> PathBuf {
         self.qb_home.join("journal").join("wiring.json")
     }
+}
+
+fn discover_session_auth(user: &Path) -> Vec<PathBuf> {
+    let Some(appdata) = std::env::var_os("APPDATA").map(PathBuf::from) else {
+        return Vec::new();
+    };
+    let path = appdata.join("herdr").join("session-homes.json");
+    let Ok(bytes) = fs::read(path) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        return Vec::new();
+    };
+    let mut homes = Vec::new();
+    fn walk(value: &Value, homes: &mut Vec<PathBuf>) {
+        match value {
+            Value::Object(map) => {
+                for (key, value) in map {
+                    if key.to_ascii_lowercase().contains("home") {
+                        if let Some(path) = value.as_str() {
+                            homes.push(PathBuf::from(path));
+                        }
+                    }
+                    walk(value, homes);
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|item| walk(item, homes)),
+            _ => {}
+        }
+    }
+    walk(&value, &mut homes);
+    homes
+        .into_iter()
+        .map(|home| {
+            if home.is_absolute() {
+                home
+            } else {
+                user.join(home)
+            }
+        })
+        .map(|home| home.join("auth.json"))
+        .filter(|path| path.exists())
+        .collect()
+}
+
+fn scan_other_clients_10100() -> Vec<String> {
+    let Some(user) = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+    else {
+        return Vec::new();
+    };
+    let mut warnings = Vec::new();
+    for root in [user.join(".pi"), user.join(".omp"), user.join(".config")] {
+        if !root.exists() {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            for (line, value) in text.lines().enumerate() {
+                if value.contains("127.0.0.1:10100") || value.contains("localhost:10100") {
+                    warnings.push(format!("10100 참조: {}:{}", path.display(), line + 1));
+                }
+            }
+        }
+    }
+    warnings
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -169,6 +247,23 @@ pub fn wire(paths: &CutoverPaths, apply: bool) -> Result<Report> {
         claude_settings_after,
         codex_sessions,
     };
+    let mut warnings = paths
+        .codex_session_auth
+        .iter()
+        .filter(|path| path.exists())
+        .filter_map(|path| {
+            let auth = fs::read(path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())?;
+            (auth.get("auth_mode").and_then(Value::as_str) != Some("apikey")).then(|| {
+                format!(
+                    "Codex 세션 홈은 ChatGPT 인증이라 변경하지 않습니다: {}",
+                    path.display()
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    warnings.extend(scan_other_clients_10100());
     let report = Report {
         changed: vec![
             "codex.openai_base_url".into(),
@@ -178,22 +273,7 @@ pub fn wire(paths: &CutoverPaths, apply: bool) -> Result<Report> {
             "claude.env.ANTHROPIC_BASE_URL".into(),
             "claude.env.ANTHROPIC_AUTH_TOKEN".into(),
         ],
-        warnings: paths
-            .codex_session_auth
-            .iter()
-            .filter(|path| path.exists())
-            .filter_map(|path| {
-                let auth = fs::read(path)
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())?;
-                (auth.get("auth_mode").and_then(Value::as_str) != Some("apikey")).then(|| {
-                    format!(
-                        "Codex 세션 홈은 ChatGPT 인증이라 변경하지 않습니다: {}",
-                        path.display()
-                    )
-                })
-            })
-            .collect(),
+        warnings,
     };
     if !apply {
         return Ok(report);
