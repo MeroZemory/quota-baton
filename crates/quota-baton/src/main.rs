@@ -79,6 +79,8 @@ enum Command {
     Unwire {
         #[arg(long, help = "실제 파일을 변경합니다; 생략하면 미리보기입니다")]
         apply: bool,
+        #[arg(long, help = "사용자 변경 감지를 무시하고 되돌립니다")]
+        force: bool,
     },
     #[cfg(feature = "phase0")]
     #[command(about = "디버그 캡처를 재생합니다")]
@@ -400,10 +402,13 @@ async fn run() -> anyhow::Result<()> {
                 },
                 report.changed.join(", ")
             );
+            for warning in report.warnings {
+                println_utf8!("경고: {warning}");
+            }
         }
-        Command::Unwire { apply } => {
+        Command::Unwire { apply, force } => {
             let paths = cutover::CutoverPaths::from_environment(home)?;
-            let report = cutover::unwire(&paths, apply)?;
+            let report = cutover::unwire(&paths, apply, force)?;
             println_utf8!(
                 "{} {}",
                 if apply {
@@ -413,6 +418,9 @@ async fn run() -> anyhow::Result<()> {
                 },
                 report.changed.join(", ")
             );
+            for warning in report.warnings {
+                println_utf8!("경고: {warning}");
+            }
         }
         #[cfg(feature = "phase0")]
         Command::Phase0 {
