@@ -253,7 +253,9 @@ pub struct WireOptions {
 
 fn redacted_diff_line(line: &str) -> String {
     let lower = line.to_ascii_lowercase();
-    let replacement = if lower.contains("openai_api_key") || lower.contains("api_key") {
+    let replacement = if line.contains("<client key>") {
+        Some("<client key>")
+    } else if lower.contains("openai_api_key") || lower.contains("api_key") {
         Some("<previous key: redacted>")
     } else if lower.contains("anthropic_auth_token")
         || lower.contains("refresh_token")
