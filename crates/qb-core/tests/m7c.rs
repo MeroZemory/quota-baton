@@ -209,6 +209,61 @@ fn a2_body(shape: A2Shape, paced: bool) -> (reqwest::Body, bool) {
     }
 }
 
+fn a2_body_at_rate(shape: A2Shape, mib_per_second: u64) -> (reqwest::Body, bool) {
+    const CHUNK: usize = 64 * 1024;
+    let pace = move |bytes: usize| {
+        tokio::time::sleep(Duration::from_secs_f64(
+            bytes as f64 / (mib_per_second as f64 * 1_048_576.0),
+        ))
+    };
+    match shape {
+        A2Shape::Plain(size) => {
+            let stream = futures_util::stream::unfold(0usize, move |offset| async move {
+                if offset >= size {
+                    return None;
+                }
+                let count = (size - offset).min(CHUNK);
+                pace(count).await;
+                Some((
+                    Ok::<_, std::io::Error>(Bytes::from(vec![b'p'; count])),
+                    offset + count,
+                ))
+            });
+            (reqwest::Body::wrap_stream(stream), false)
+        }
+        A2Shape::Zstd(size) => {
+            let (sender, receiver) = tokio::sync::mpsc::channel(2);
+            tokio::task::spawn_blocking(move || {
+                let mut encoder =
+                    zstd::stream::read::Encoder::new(A2Reader { remaining: size }, 1).unwrap();
+                loop {
+                    let mut chunk = vec![0; CHUNK];
+                    let count = std::io::Read::read(&mut encoder, &mut chunk).unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    chunk.truncate(count);
+                    if sender
+                        .blocking_send(Ok::<_, std::io::Error>(Bytes::from(chunk)))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            let stream =
+                futures_util::stream::unfold((receiver, pace), |(mut receiver, pace)| async move {
+                    let item = receiver.recv().await?;
+                    if let Ok(ref bytes) = item {
+                        pace(bytes.len()).await;
+                    }
+                    Some((item, (receiver, pace)))
+                });
+            (reqwest::Body::wrap_stream(stream), true)
+        }
+    }
+}
+
 struct A2Harness {
     _root: tempfile::TempDir,
     upstream_url: String,
@@ -563,5 +618,56 @@ fn a2_benchmark_200_requests_per_shape_and_private_memory() {
             mib / direct_elapsed.as_secs_f64(),
             mib / proxy_elapsed.as_secs_f64()
         );
+
+        for rate in [10_u64, 50, 200] {
+            let mut sampler = R7Sampler::new(0x4d_3743);
+            let mut buckets: std::collections::BTreeMap<&'static str, Vec<Duration>> =
+                std::collections::BTreeMap::new();
+            let mut overall = Vec::new();
+            for _ in 0..sample_count {
+                let (bucket, shape) = sampler.next();
+                let (direct_body, compressed) = a2_body_at_rate(shape, rate);
+                let direct_start = Instant::now();
+                let mut direct_request = h.client.post(&h.upstream_url).body(direct_body);
+                if compressed {
+                    direct_request = direct_request.header("content-encoding", "zstd");
+                }
+                let direct = direct_request.send().await.unwrap();
+                let direct_ttfb = direct_start.elapsed();
+                direct.bytes().await.unwrap();
+
+                let (proxy_body, _) = a2_body_at_rate(shape, rate);
+                let mut request = h
+                    .client
+                    .post(h.url())
+                    .bearer_auth("synthetic-client")
+                    .body(proxy_body);
+                if compressed {
+                    request = request.header("content-encoding", "zstd");
+                }
+                let proxy_start = Instant::now();
+                let proxy = request.send().await.unwrap();
+                let added = proxy_start.elapsed().saturating_sub(direct_ttfb);
+                buckets.entry(bucket).or_default().push(added);
+                overall.push(added);
+                proxy.bytes().await.unwrap();
+            }
+            for (bucket, mut added) in buckets {
+                added.sort_unstable();
+                let p50 = added[added.len() / 2];
+                let p95 = added[(added.len() * 95 / 100).min(added.len() - 1)];
+                println!(
+                    "A2 paced {rate} MiB/s {bucket}: samples={} added TTFB p50={p50:?} p95={p95:?}",
+                    added.len()
+                );
+            }
+            overall.sort_unstable();
+            let p50 = overall[overall.len() / 2];
+            let p95 = overall[(overall.len() * 95 / 100).min(overall.len() - 1)];
+            println!(
+                "A2 paced {rate} MiB/s overall: samples={} added TTFB p50={p50:?} p95={p95:?}",
+                overall.len()
+            );
+        }
     });
 }
