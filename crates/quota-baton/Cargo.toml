@@ -12,17 +12,28 @@ qb-core.workspace = true
 qb-proto.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
+serde.workspace = true
+toml_edit.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+axum.workspace = true
+async-stream.workspace = true
+bytes.workspace = true
+zstd.workspace = true
 futures-util.workspace = true
 qb-core = { workspace = true, features = ["testkit"] }
 tempfile.workspace = true
 qb-testkit.workspace = true
 tokio-tungstenite.workspace = true
+windows.workspace = true
 
 [features]
 default = []
 testkit = ["qb-core/testkit"]
 shape-capture = ["qb-core/shape-capture"]
 phase0 = ["qb-core/phase0"]
+
+[[test]]
+name = "m7c_spawned"
+required-features = ["testkit"]
