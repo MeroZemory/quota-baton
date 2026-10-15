@@ -463,6 +463,7 @@ fn a2_benchmark_200_requests_per_shape_and_private_memory() {
         let mut sampler = R7Sampler::new(0x4d_3743);
         let mut buckets: std::collections::BTreeMap<&'static str, Vec<Duration>> =
             std::collections::BTreeMap::new();
+        let mut overall = Vec::new();
         for _ in 0..sample_count {
             let (bucket, shape) = sampler.next();
             let (direct_body, compressed) = a2_body(shape, false);
@@ -486,10 +487,9 @@ fn a2_benchmark_200_requests_per_shape_and_private_memory() {
             }
             let proxy_start = Instant::now();
             let proxy = request.send().await.unwrap();
-            buckets
-                .entry(bucket)
-                .or_default()
-                .push(proxy_start.elapsed().saturating_sub(direct_ttfb));
+            let added = proxy_start.elapsed().saturating_sub(direct_ttfb);
+            buckets.entry(bucket).or_default().push(added);
+            overall.push(added);
             proxy.bytes().await.unwrap();
         }
         for (bucket, mut added) in buckets {
@@ -501,6 +501,13 @@ fn a2_benchmark_200_requests_per_shape_and_private_memory() {
                 added.len()
             );
         }
+        overall.sort_unstable();
+        let p50 = overall[overall.len() / 2];
+        let p95 = overall[(overall.len() * 95 / 100).min(overall.len() - 1)];
+        println!(
+            "A2 overall: samples={} added TTFB p50={p50:?} p95={p95:?}",
+            overall.len()
+        );
 
         let baseline = private_bytes();
         let (body, _) = a2_body(A2Shape::Plain(50 * 1024 * 1024), true);
@@ -525,6 +532,37 @@ fn a2_benchmark_200_requests_per_shape_and_private_memory() {
         println!(
             "A2 50MiB plain upload: baseline={baseline} peak={peak} delta={} samples={samples}",
             peak.saturating_sub(baseline)
+        );
+
+        let size = 30 * 1024 * 1024;
+        let (direct_body, _) = a2_body(A2Shape::Plain(size), false);
+        let direct_start = Instant::now();
+        let direct = h
+            .client
+            .post(&h.upstream_url)
+            .body(direct_body)
+            .send()
+            .await
+            .unwrap();
+        direct.bytes().await.unwrap();
+        let direct_elapsed = direct_start.elapsed();
+        let (proxy_body, _) = a2_body(A2Shape::Plain(size), false);
+        let proxy_start = Instant::now();
+        let proxy = h
+            .client
+            .post(h.url())
+            .bearer_auth("synthetic-client")
+            .body(proxy_body)
+            .send()
+            .await
+            .unwrap();
+        proxy.bytes().await.unwrap();
+        let proxy_elapsed = proxy_start.elapsed();
+        let mib = size as f64 / 1_048_576.0;
+        println!(
+            "A2 30MiB plain throughput: direct={:.2} MiB/s proxy={:.2} MiB/s",
+            mib / direct_elapsed.as_secs_f64(),
+            mib / proxy_elapsed.as_secs_f64()
         );
     });
 }
