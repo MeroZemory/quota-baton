@@ -78,10 +78,10 @@ fn discover_session_auth(user: &Path) -> Vec<PathBuf> {
         match value {
             Value::Object(map) => {
                 for (key, value) in map {
-                    if key.to_ascii_lowercase().contains("home") {
-                        if let Some(path) = value.as_str() {
-                            homes.push(PathBuf::from(path));
-                        }
+                    if key.to_ascii_lowercase().contains("home")
+                        && let Some(path) = value.as_str()
+                    {
+                        homes.push(PathBuf::from(path));
                     }
                     walk(value, homes);
                 }
@@ -221,10 +221,10 @@ pub fn wire(paths: &CutoverPaths, apply: bool) -> Result<Report> {
     )?);
     let mut codex_sessions = Vec::new();
     for path in &paths.codex_session_auth {
-        if path.exists() {
-            if let Some(session) = session_journal(path, preview_key)? {
-                codex_sessions.push(session);
-            }
+        if path.exists()
+            && let Some(session) = session_journal(path, preview_key)?
+        {
+            codex_sessions.push(session);
         }
     }
     let journal = Journal {
