@@ -7,7 +7,7 @@ use std::{
 };
 
 use axum::body::Body;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures_util::{StreamExt, stream};
 use tokio::sync::{Notify, mpsc, oneshot};
 
@@ -15,6 +15,7 @@ use crate::guard::{InflightBudget, Reservation};
 
 const COMPRESS_AFTER: usize = 1024 * 1024;
 pub(super) const PEEK_LIMIT: usize = 1024 * 1024;
+const FORWARD_BATCH: usize = 256 * 1024;
 
 #[cfg(test)]
 static TEST_COMPRESS_DELAY_MS: AtomicU64 = AtomicU64::new(0);
@@ -274,6 +275,29 @@ pub(super) async fn read(
     });
     tokio::spawn(async move {
         let mut input = body.into_data_stream();
+        let mut input = Box::pin(async_stream::stream! {
+            let mut pending = BytesMut::new();
+            while let Some(chunk) = input.next().await {
+                match chunk {
+                    Ok(chunk) => {
+                        pending.extend_from_slice(&chunk);
+                        while pending.len() >= FORWARD_BATCH {
+                            yield Ok::<Bytes, axum::Error>(pending.split().freeze());
+                        }
+                    }
+                    Err(error) => {
+                        if !pending.is_empty() {
+                            yield Ok::<Bytes, axum::Error>(pending.split().freeze());
+                        }
+                        yield Err(error);
+                        return;
+                    }
+                }
+            }
+            if !pending.is_empty() {
+                yield Ok::<Bytes, axum::Error>(pending.freeze());
+            }
+        });
         let mut prefix = Vec::new();
         let mut prefix_tx = Some(prefix_tx);
         while let Some(chunk) = input.next().await {

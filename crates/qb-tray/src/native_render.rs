@@ -12,7 +12,7 @@ use windows::{
                 ID2D1Factory, ID2D1RenderTarget,
             },
             DirectWrite::{
-                DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FACTORY_TYPE_ISOLATED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
                 DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_TRAILING, DWriteCreateFactory,
                 IDWriteFactory,
             },
@@ -583,7 +583,11 @@ pub fn paint_with_state(
 ) -> Result<()> {
     let rows = display_rows(rows, state);
     let colors = colors(dark);
-    let dwrite: IDWriteFactory = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) }?;
+    // The flyout owns its text factory for the paint pass.  An isolated
+    // factory lets DirectWrite release device-dependent state when the
+    // flyout is hidden instead of retaining it in the process-wide shared
+    // factory cache.
+    let dwrite: IDWriteFactory = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED) }?;
     let title = text_format(&dwrite, 14.0, true)?;
     let body = text_format(&dwrite, 13.0, false)?;
     let small = text_format(&dwrite, 11.0, false)?;

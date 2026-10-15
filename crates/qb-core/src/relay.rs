@@ -671,6 +671,8 @@ fn upstream_client() -> anyhow::Result<reqwest::Client> {
         .no_brotli()
         .no_deflate()
         .no_zstd()
+        .pool_idle_timeout(Duration::from_secs(30))
+        .pool_max_idle_per_host(16)
         .connect_timeout(Duration::from_secs(10))
         .read_timeout(Duration::from_secs(600))
         .build()
