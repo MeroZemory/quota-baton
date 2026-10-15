@@ -268,6 +268,13 @@ pub(super) async fn read(
             while let Some(chunk) = input.next().await {
                 match chunk {
                     Ok(chunk) => {
+                        // Preserve streaming latency for the first client
+                        // frame.  Subsequent frames are coalesced into large
+                        // batches to keep the forwarding path inexpensive.
+                        if pending.is_empty() && chunk.len() < FORWARD_BATCH {
+                            yield Ok::<Bytes, axum::Error>(chunk);
+                            continue;
+                        }
                         pending.extend_from_slice(&chunk);
                         while pending.len() >= FORWARD_BATCH {
                             yield Ok::<Bytes, axum::Error>(pending.split().freeze());
