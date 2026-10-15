@@ -16,7 +16,7 @@ use crate::guard::{InflightBudget, Reservation};
 #[cfg(test)]
 const COMPRESS_AFTER: usize = 1024 * 1024;
 pub(super) const PEEK_LIMIT: usize = 1024 * 1024;
-const FORWARD_BATCH: usize = 256 * 1024;
+const FORWARD_BATCH: usize = 1024 * 1024;
 
 #[cfg(test)]
 static TEST_COMPRESS_DELAY_MS: AtomicU64 = AtomicU64::new(0);
@@ -230,6 +230,15 @@ pub(super) async fn read(
     let retain_state = state.clone();
     let retention_task = tokio::spawn(async move {
         while let Some((chunk, queued)) = retain_rx.recv().await {
+            let mut batch = vec![(chunk, queued)];
+            let mut batch_bytes = batch[0].0.len();
+            while batch_bytes < FORWARD_BATCH {
+                let Ok(next) = retain_rx.try_recv() else {
+                    break;
+                };
+                batch_bytes = batch_bytes.saturating_add(next.0.len());
+                batch.push(next);
+            }
             if retain_state
                 .lock()
                 .expect("upload state poisoned")
@@ -240,7 +249,8 @@ pub(super) async fn read(
             }
             let state = retain_state.clone();
             let retained = tokio::task::spawn_blocking(move || {
-                drop(queued);
+                let (chunks, reservations): (Vec<_>, Vec<_>) = batch.into_iter().unzip();
+                drop(reservations);
                 #[cfg(test)]
                 {
                     let delay = TEST_COMPRESS_DELAY_MS.load(Ordering::Relaxed);
@@ -252,7 +262,7 @@ pub(super) async fn read(
                 state
                     .retainer
                     .as_mut()
-                    .is_some_and(|retainer| retainer.append(&chunk))
+                    .is_some_and(|retainer| chunks.iter().all(|chunk| retainer.append(chunk)))
             })
             .await
             .unwrap_or(false);
