@@ -12,7 +12,7 @@ use axum::{
     routing::post,
 };
 use bytes::Bytes;
-use futures_util::{SinkExt, future::join_all};
+use futures_util::{SinkExt, StreamExt, future::join_all};
 use qb_core::accounts::{
     Account, AccountStore, Health, Identity, Provider, Source, TokenMeta, Tokens, UserState,
 };
@@ -162,7 +162,10 @@ impl FakeUpstream {
     async fn start() -> Self {
         let listener = TokioListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
-        async fn http(_request: Request) -> Response {
+        async fn http(request: Request) -> Response {
+            let (_, body) = request.into_parts();
+            let mut body = body.into_data_stream();
+            while body.next().await.is_some() {}
             let stream = async_stream::stream! {
                 yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"data: {\"type\":\"response.output_text.delta\"}\n\n"));
                 tokio::time::sleep(Duration::from_millis(200)).await;

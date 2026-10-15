@@ -54,8 +54,7 @@ impl CombinedUpstream {
                     .post(|request: Request| async move {
                         let (_, body) = request.into_parts();
                         let mut stream = body.into_data_stream();
-                        let _ = stream.next().await;
-                        tokio::spawn(async move { while stream.next().await.is_some() {} });
+                        while stream.next().await.is_some() {}
                         Response::new(Body::from("ok"))
                     }),
                 )

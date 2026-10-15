@@ -7,12 +7,13 @@ use std::{
 };
 
 use axum::body::Body;
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use futures_util::{StreamExt, stream};
 use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::guard::{InflightBudget, Reservation};
 
+#[cfg(test)]
 const COMPRESS_AFTER: usize = 1024 * 1024;
 pub(super) const PEEK_LIMIT: usize = 1024 * 1024;
 const FORWARD_BATCH: usize = 256 * 1024;
@@ -77,7 +78,7 @@ struct State {
     complete: bool,
     error: bool,
     head: Vec<u8>,
-    tail: Vec<u8>,
+    tail: BytesMut,
 }
 
 struct Retainer {
@@ -108,39 +109,11 @@ impl Retainer {
         if !self.zstd_input && self.input_bytes > self.cap {
             return false;
         }
-        if self.zstd_input {
-            return self.append_bytes(chunk);
-        }
-        if self.compressed {
-            let encoded = match zstd::stream::encode_all(chunk, 1) {
-                Ok(encoded) => encoded,
-                Err(_) => return false,
-            };
-            return self.append_bytes(&encoded);
-        }
-        if self.bytes.len().saturating_add(chunk.len()) <= COMPRESS_AFTER {
-            return self.append_bytes(chunk);
-        }
-
-        // Stage only the first MiB. Once crossed, replace it with a level-1
-        // zstd frame and retain subsequent chunks as independent frames.
-        let mut first = self.bytes.clone();
-        first.extend_from_slice(chunk);
-        let encoded = match zstd::stream::encode_all(first.as_slice(), 1) {
-            Ok(v) => v,
-            Err(_) => return false,
-        };
-        if encoded.len() > self.cap {
-            return false;
-        }
-        let Some(reservation) = self.budget.try_reserve(encoded.len()) else {
-            return false;
-        };
-        self.bytes = encoded;
-        self.reservations.clear();
-        self.reservations.push(reservation);
-        self.compressed = true;
-        true
+        // Keep plain input byte-for-byte while it is being forwarded. The
+        // level-1 zstd frame is made once after the stream completes, so the
+        // retention worker never compresses every small hyper frame on the
+        // forwarding path.
+        self.append_bytes(chunk)
     }
 
     fn append_bytes(&mut self, chunk: &[u8]) -> bool {
@@ -156,10 +129,25 @@ impl Retainer {
     }
 
     fn finish(self) -> RetainedUpload {
+        let Retainer {
+            bytes,
+            reservations,
+            zstd_input,
+            compressed,
+            ..
+        } = self;
+        let (bytes, compressed) = if !zstd_input && !compressed && bytes.len() > 1024 * 1024 {
+            match zstd::stream::encode_all(bytes.as_slice(), 1) {
+                Ok(encoded) => (encoded, true),
+                Err(_) => (bytes, false),
+            }
+        } else {
+            (bytes, compressed && !zstd_input)
+        };
         RetainedUpload {
-            bytes: self.bytes.into(),
-            _reservations: self.reservations,
-            compressed: self.compressed && !self.zstd_input,
+            bytes: bytes.into(),
+            _reservations: reservations,
+            compressed,
         }
     }
 }
@@ -234,7 +222,7 @@ pub(super) async fn read(
         complete: false,
         error: false,
         head: Vec::new(),
-        tail: Vec::new(),
+        tail: BytesMut::new(),
     }));
     let done = Arc::new(Notify::new());
     let task_state = state.clone();
@@ -326,7 +314,7 @@ pub(super) async fn read(
                 state.tail.extend_from_slice(&chunk);
                 if state.tail.len() > PEEK_LIMIT {
                     let excess = state.tail.len() - PEEK_LIMIT;
-                    state.tail.drain(..excess);
+                    state.tail.advance(excess);
                 }
             }
             if let Some(sender) = prefix_tx.take() {
