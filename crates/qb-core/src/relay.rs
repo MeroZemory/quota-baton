@@ -673,12 +673,15 @@ impl RelayState {
 fn upstream_client() -> anyhow::Result<reqwest::Client> {
     reqwest::Client::builder()
         .use_rustls_tls()
+        .tcp_nodelay(true)
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .no_gzip()
         .no_brotli()
         .no_deflate()
         .no_zstd()
+        .pool_idle_timeout(Duration::from_secs(30))
+        .pool_max_idle_per_host(16)
         .connect_timeout(Duration::from_secs(10))
         .read_timeout(Duration::from_secs(600))
         .build()
@@ -867,6 +870,7 @@ async fn handover_http(state: Arc<RelayState>, request: Request) -> Response {
             .await
             {
                 Ok(socket) => {
+                    let _ = socket.set_nodelay(true);
                     drop(socket);
                     break;
                 }

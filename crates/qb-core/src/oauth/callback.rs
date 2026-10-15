@@ -81,6 +81,9 @@ fn spawn_callback_read(
     let Ok((mut stream, peer)) = accepted else {
         return;
     };
+    if let Err(error) = stream.set_nodelay(true) {
+        tracing::debug!(%error, "failed to set TCP_NODELAY on OAuth callback socket");
+    }
     if !peer.ip().is_loopback() {
         return;
     }
