@@ -316,7 +316,7 @@ async fn connect_socket(home: &Home, key: &str, session: String) -> Option<TestS
     let mut request = url.into_client_request().ok()?;
     let value = format!("Bearer {key}").parse().ok()?;
     request.headers_mut().insert("authorization", value);
-    let mut stream = TcpStream::connect(("127.0.0.1", home.data)).await.ok()?;
+    let stream = TcpStream::connect(("127.0.0.1", home.data)).await.ok()?;
     stream.set_nodelay(true).ok()?;
     client_async(request, MaybeTlsStream::Plain(stream))
         .await
