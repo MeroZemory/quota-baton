@@ -125,7 +125,7 @@ fn scan_other_clients_10100() -> Vec<String> {
             if !path.is_file() {
                 continue;
             }
-            let Ok(text) = fs::read_to_string(&path) else {
+            let Ok(text) = read_text(&path) else {
                 continue;
             };
             for (line, value) in text.lines().enumerate() {
@@ -136,6 +136,12 @@ fn scan_other_clients_10100() -> Vec<String> {
         }
     }
     warnings
+}
+
+fn read_text(path: &Path) -> Result<String> {
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes);
+    String::from_utf8(bytes.to_vec()).context("configuration is not UTF-8")
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -252,9 +258,9 @@ pub fn wire(paths: &CutoverPaths, apply: bool) -> Result<Report> {
         .iter()
         .filter(|path| path.exists())
         .filter_map(|path| {
-            let auth = fs::read(path)
+            let auth = read_text(path)
                 .ok()
-                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())?;
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())?;
             (auth.get("auth_mode").and_then(Value::as_str) != Some("apikey")).then(|| {
                 format!(
                     "Codex 세션 홈은 ChatGPT 인증이라 변경하지 않습니다: {}",
@@ -347,7 +353,7 @@ pub fn unwire(paths: &CutoverPaths, apply: bool, force: bool) -> Result<Report> 
 fn read_inputs(
     paths: &CutoverPaths,
 ) -> Result<(CodexOriginals, SecretOriginal, Original, ClaudeOriginals)> {
-    let codex_text = fs::read_to_string(&paths.codex_config).context("read Codex config")?;
+    let codex_text = read_text(&paths.codex_config).context("read Codex config")?;
     let doc = codex_text
         .parse::<DocumentMut>()
         .context("parse Codex config")?;
@@ -356,11 +362,11 @@ fn read_inputs(
         original_toml(doc.get("openai_api_key")),
         original_toml(doc.get("model_catalog_json")),
     );
-    let auth_text = fs::read_to_string(&paths.codex_auth).context("read Codex auth")?;
+    let auth_text = read_text(&paths.codex_auth).context("read Codex auth")?;
     let auth: Value = serde_json::from_str(&auth_text).context("parse Codex auth")?;
     let codex_auth = secret_json(auth.get("OPENAI_API_KEY"))?;
     let codex_auth_mode = original_json(auth.get("auth_mode"));
-    let claude_text = fs::read_to_string(&paths.claude_settings).context("read Claude settings")?;
+    let claude_text = read_text(&paths.claude_settings).context("read Claude settings")?;
     let json: Value = serde_json::from_str(&claude_text).context("parse Claude settings")?;
     let env = json.get("env").and_then(Value::as_object);
     let claude = (
@@ -430,7 +436,7 @@ fn apply_codex(path: &Path, auth_path: &Path, base: &str, key: &str) -> Result<(
     atomic_preserved(auth_path, &codex_auth_bytes(auth_path, key)?)
 }
 fn codex_config_bytes(path: &Path, base: &str) -> Result<Vec<u8>> {
-    let mut doc = fs::read_to_string(path)?
+    let mut doc = read_text(path)?
         .parse::<DocumentMut>()
         .context("parse Codex config")?;
     doc["openai_base_url"] = toml_edit::value(base);
@@ -438,7 +444,7 @@ fn codex_config_bytes(path: &Path, base: &str) -> Result<Vec<u8>> {
     Ok(doc.to_string().into_bytes())
 }
 fn codex_auth_bytes(path: &Path, key: &str) -> Result<Vec<u8>> {
-    let mut auth: Value = serde_json::from_slice(&fs::read(path)?)?;
+    let mut auth: Value = serde_json::from_str(&read_text(path)?)?;
     let root = auth
         .as_object_mut()
         .context("Codex auth root is not an object")?;
@@ -447,7 +453,7 @@ fn codex_auth_bytes(path: &Path, key: &str) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec_pretty(&auth)?)
 }
 fn session_journal(path: &Path, key: &str) -> Result<Option<SessionJournal>> {
-    let auth: Value = serde_json::from_slice(&fs::read(path)?)?;
+    let auth: Value = serde_json::from_str(&read_text(path)?)?;
     if auth.get("auth_mode").and_then(Value::as_str) != Some("apikey") {
         return Ok(None);
     }
@@ -467,7 +473,7 @@ fn apply_session(path: &Path, key: &str) -> Result<()> {
     atomic_preserved(path, &codex_auth_bytes(path, key)?)
 }
 fn restore_session(path: &Path, journal: &SessionJournal) -> Result<()> {
-    let mut auth: Value = serde_json::from_slice(&fs::read(path)?)?;
+    let mut auth: Value = serde_json::from_str(&read_text(path)?)?;
     let root = auth
         .as_object_mut()
         .context("Codex session auth root is not an object")?;
@@ -476,13 +482,13 @@ fn restore_session(path: &Path, journal: &SessionJournal) -> Result<()> {
     atomic_preserved(path, &serde_json::to_vec_pretty(&auth)?)
 }
 fn restore_codex(path: &Path, auth_path: &Path, journal: &Journal) -> Result<()> {
-    let mut doc = fs::read_to_string(path)?
+    let mut doc = read_text(path)?
         .parse::<DocumentMut>()
         .context("parse Codex config")?;
     restore_toml(&mut doc, "openai_base_url", &journal.codex_base_url);
     restore_toml(&mut doc, "model_catalog_json", &journal.codex_model_catalog);
     atomic_preserved(path, doc.to_string().as_bytes())?;
-    let mut auth: Value = serde_json::from_slice(&fs::read(auth_path)?)?;
+    let mut auth: Value = serde_json::from_str(&read_text(auth_path)?)?;
     let root = auth
         .as_object_mut()
         .context("Codex auth root is not an object")?;
@@ -501,7 +507,7 @@ fn apply_claude(path: &Path, base: &str, key: &str) -> Result<()> {
     atomic_preserved(path, &claude_bytes(path, base, key)?)
 }
 fn claude_bytes(path: &Path, base: &str, key: &str) -> Result<Vec<u8>> {
-    let mut json: Value = serde_json::from_slice(&fs::read(path)?)?;
+    let mut json: Value = serde_json::from_str(&read_text(path)?)?;
     let env = json
         .as_object_mut()
         .context("Claude settings root is not an object")?
@@ -515,7 +521,7 @@ fn claude_bytes(path: &Path, base: &str, key: &str) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec_pretty(&json)?)
 }
 fn restore_claude(path: &Path, journal: &Journal) -> Result<()> {
-    let mut json: Value = serde_json::from_slice(&fs::read(path)?)?;
+    let mut json: Value = serde_json::from_str(&read_text(path)?)?;
     let root = json
         .as_object_mut()
         .context("Claude settings root is not an object")?;
@@ -727,5 +733,29 @@ mod tests {
         assert!(codex.contains("old-url") && codex.contains("keep = 'yes'"));
         assert!(claude.contains("old-key") && claude.contains("\"keep\": true"));
         assert!(!p.journal().exists());
+    }
+
+    #[test]
+    fn bom_prefixed_client_files_are_read_without_exposing_the_bom_to_parsers() {
+        let (_dir, p) = paths();
+        let codex = fs::read(&p.codex_config).unwrap();
+        let auth = fs::read(&p.codex_auth).unwrap();
+        let claude = fs::read(&p.claude_settings).unwrap();
+        fs::write(
+            &p.codex_config,
+            [b"\xef\xbb\xbf".as_slice(), codex.as_slice()].concat(),
+        )
+        .unwrap();
+        fs::write(
+            &p.codex_auth,
+            [b"\xef\xbb\xbf".as_slice(), auth.as_slice()].concat(),
+        )
+        .unwrap();
+        fs::write(
+            &p.claude_settings,
+            [b"\xef\xbb\xbf".as_slice(), claude.as_slice()].concat(),
+        )
+        .unwrap();
+        assert!(wire(&p, false).is_ok());
     }
 }
