@@ -186,6 +186,7 @@ fn a2_body(shape: A2Shape, paced: bool) -> (reqwest::Body, bool) {
             let encoder =
                 zstd::stream::read::Encoder::new(A2Reader { remaining: size }, 1).unwrap();
             let stream = futures_util::stream::unfold(encoder, |mut encoder| async move {
+                tokio::task::yield_now().await;
                 let mut chunk = vec![0; CHUNK];
                 let count = std::io::Read::read(&mut encoder, &mut chunk).unwrap();
                 if count == 0 {
