@@ -34,6 +34,36 @@ pub fn load_or_create(home: &Path) -> anyhow::Result<LocalSecrets> {
     })
 }
 
+/// Read the local secret files without creating or changing anything.
+pub fn load_existing(home: &Path) -> anyhow::Result<LocalSecrets> {
+    let client_key = load_existing_file(&home.join("client.key"))?;
+    let admin_token = load_existing_file(&home.join("admin.token"))?;
+    anyhow::ensure!(client_key != admin_token, "local secrets must be distinct");
+    Ok(LocalSecrets {
+        client_key,
+        admin_token,
+    })
+}
+
+fn load_existing_file(path: &Path) -> anyhow::Result<String> {
+    anyhow::ensure!(path.exists(), "local secret is missing: {}", path.display());
+    anyhow::ensure!(
+        !fs::symlink_metadata(path)?.file_type().is_symlink(),
+        "local secret must be a regular file"
+    );
+    let mut value = String::new();
+    fs::File::open(path)?.take(128).read_to_string(&mut value)?;
+    let value = value.trim();
+    let decoded = URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| anyhow::anyhow!("invalid local secret encoding"))?;
+    anyhow::ensure!(
+        decoded.len() == 32 && value.len() == 43,
+        "invalid local secret length"
+    );
+    Ok(value.to_owned())
+}
+
 fn load_file(path: &Path) -> anyhow::Result<String> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
