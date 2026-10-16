@@ -167,6 +167,7 @@ impl AdminClient {
             .send()
             .await
             .map_err(ClientError::Transport)?;
+        test_response_delay().await;
         Self::check_response(response).await
     }
 
@@ -204,12 +205,22 @@ impl AdminClient {
             .send()
             .await
             .map_err(ClientError::Transport)?;
+        test_response_delay().await;
         let response = Self::check_response(response).await?;
         response.json().await.map_err(ClientError::Decode)
     }
 
     fn host(&self) -> String {
         self.base_url.trim_start_matches("http://").to_owned()
+    }
+}
+
+async fn test_response_delay() {
+    let Some(path) = std::env::var_os("QB_TRAY_TEST_DELAY_FILE") else {
+        return;
+    };
+    if std::path::Path::new(&path).exists() {
+        tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }
 

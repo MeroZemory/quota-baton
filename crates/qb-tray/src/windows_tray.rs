@@ -64,6 +64,7 @@ static SUPERVISE_ENABLED: AtomicBool = AtomicBool::new(true);
 static FIXTURE_MODE: AtomicBool = AtomicBool::new(false);
 static LOGIN_ID: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static LOGIN_URL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static REFRESH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
 fn login_id() -> &'static Mutex<Option<String>> {
     LOGIN_ID.get_or_init(|| Mutex::new(None))
@@ -340,6 +341,20 @@ unsafe fn position_flyout(hwnd: HWND) {
 }
 
 fn update_status(supervise: bool, notification_hwnd: Option<HWND>) {
+    if REFRESH_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    let notification_hwnd = notification_hwnd.map(|hwnd| hwnd.0 as isize);
+    let _ = std::thread::Builder::new()
+        .name("quota-baton-tray-refresh".into())
+        .spawn(move || update_status_worker(supervise, notification_hwnd));
+}
+
+fn update_status_worker(supervise: bool, notification_hwnd: Option<isize>) {
+    let notification_hwnd = notification_hwnd.map(|value| HWND(value as *mut c_void));
     let result = (|| -> Result<String> {
         let client = super::client::AdminClient::from_home()?;
         let runtime = tokio::runtime::Runtime::new()?;
@@ -404,6 +419,12 @@ fn update_status(supervise: bool, notification_hwnd: Option<HWND>) {
         let mut model = model().lock().unwrap_or_else(|e| e.into_inner());
         model.0.clear();
         model.2 = false;
+    }
+    REFRESH_IN_FLIGHT.store(false, Ordering::Release);
+    if let Some(hwnd) = notification_hwnd {
+        unsafe {
+            let _ = PostMessageW(Some(hwnd), STATE_CHANGED, WPARAM(0), LPARAM(0));
+        }
     }
 }
 
@@ -551,19 +572,17 @@ fn activate_menu(hwnd: HWND) {
                     .map_err(|e| anyhow::anyhow!(e))
                 })
             })();
-            if result.is_ok() {
-                unsafe {
-                    let _ = PostMessageW(
-                        Some(HWND(hwnd_value as *mut c_void)),
-                        ACTION_DONE,
-                        WPARAM(0),
-                        LPARAM(0),
-                    );
-                }
-            } else if let (Err(error), Some(path)) =
-                (&result, std::env::var_os("QB_TRAY_TEST_ERROR_LOG"))
+            if let (Err(error), Some(path)) = (&result, std::env::var_os("QB_TRAY_TEST_ERROR_LOG"))
             {
                 let _ = std::fs::write(path, error.to_string());
+            }
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(hwnd_value as *mut c_void)),
+                    ACTION_DONE,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
             }
         });
 }
@@ -599,9 +618,7 @@ fn launch_login(hwnd: HWND, provider: String) {
                 }
                 // The browser is a product action; tests set this hook to avoid opening one.
                 if std::env::var_os("QB_TRAY_TEST_NO_BROWSER").is_none() {
-                    let _ = Command::new("cmd")
-                        .args(["/C", "start", "", &start.auth_url])
-                        .spawn();
+                    let _ = open_browser(&start.auth_url);
                 }
                 for _ in 0..600 {
                     std::thread::sleep(Duration::from_secs(1));
@@ -753,6 +770,11 @@ fn activate_hit(hwnd: HWND, target: HitTarget) {
         HitTarget::LoginCancel => {
             cancel_login();
             *view_state().lock().unwrap_or_else(|e| e.into_inner()) = Some("list".into());
+            if std::env::var_os("QB_TRAY_TEST_KEEP_OPEN").is_some() {
+                unsafe {
+                    let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                }
+            }
         }
         HitTarget::FooterAdd => {
             *view_state().lock().unwrap_or_else(|e| e.into_inner()) = Some("add-menu".into());
@@ -831,6 +853,41 @@ fn open_folder(relative: &str) {
     }
 }
 
+fn open_browser(url: &str) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn ShellExecuteW(
+            window: *mut c_void,
+            operation: *const u16,
+            file: *const u16,
+            parameters: *const u16,
+            directory: *const u16,
+            show: i32,
+        ) -> *mut c_void;
+    }
+    let operation: Vec<u16> = "open\0".encode_utf16().collect();
+    let file: Vec<u16> = std::ffi::OsStr::new(url)
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+        )
+    };
+    if result as isize <= 32 {
+        Err(std::io::Error::other("브라우저를 열지 못했습니다."))
+    } else {
+        Ok(())
+    }
+}
+
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe extern "system" fn window_proc(
     hwnd: HWND,
@@ -865,6 +922,22 @@ unsafe extern "system" fn window_proc(
             let (x, y) = point_from_lparam(lparam);
             if let Some(target) = hit_target(x, y) {
                 activate_hit(hwnd, target);
+            } else if view_state()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none()
+                && (flyout_height() as f32 - 40.0..flyout_height() as f32).contains(&y)
+            {
+                let target = if (171.0..225.0).contains(&x) {
+                    Some(HitTarget::FooterSettings)
+                } else if (283.0..337.0).contains(&x) {
+                    Some(HitTarget::FooterQuit)
+                } else {
+                    None
+                };
+                if let Some(target) = target {
+                    activate_hit(hwnd, target);
+                }
             } else if view_state()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -911,10 +984,11 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_KILLFOCUS => {
-            if view_state()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_none()
+            if std::env::var_os("QB_TRAY_TEST_KEEP_OPEN").is_none()
+                && view_state()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_none()
             {
                 let _ = ShowWindow(hwnd, SW_HIDE);
             }
@@ -1077,6 +1151,9 @@ pub fn run(
             &border_color as *const _ as *const c_void,
             size_of_val(&border_color) as u32,
         );
+        if !FIXTURE_MODE.load(Ordering::Relaxed) {
+            update_status(supervise, Some(hwnd));
+        }
         SetTimer(Some(hwnd), 1, 60_000, None);
         let mut icon = NOTIFYICONDATAW {
             cbSize: size_of::<NOTIFYICONDATAW>() as u32,
