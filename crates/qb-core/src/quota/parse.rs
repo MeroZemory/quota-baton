@@ -158,6 +158,22 @@ pub(super) fn snapshot(provider: Provider, body: &[u8], now: DateTime<Utc>) -> O
     )
 }
 
+/// A Codex usage response is complete only when both provider window slots
+/// were present. Some responses are intentionally partial and must retain the
+/// other known window until a complete snapshot arrives.
+pub(super) fn is_complete_snapshot(provider: Provider, body: &[u8]) -> bool {
+    let Ok(root) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    match provider {
+        Provider::Codex => {
+            root["rate_limit"]["primary_window"].is_object()
+                && root["rate_limit"]["secondary_window"].is_object()
+        }
+        Provider::Claude => true,
+    }
+}
+
 #[cfg(any(test, all(feature = "shape-capture", debug_assertions)))]
 fn usage_scalar(provider: Provider, path: &[&str], value: &Value) -> Option<Value> {
     match (provider, path) {

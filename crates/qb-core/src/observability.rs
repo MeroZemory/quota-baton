@@ -360,11 +360,12 @@ impl Observability {
         &self,
         id: &str,
         value: serde_json::Value,
+        replace_windows: bool,
     ) -> Option<serde_json::Value> {
         let next: Snapshot = serde_json::from_value(value).ok()?;
-        // Poll responses are complete snapshots. Missing windows are stale,
-        // unlike partial response headers which are merged below.
-        self.remember(id, &next, false);
+        // Complete poll responses replace the window set. Partial responses
+        // retain known windows just like partial response headers.
+        self.remember(id, &next, !replace_windows);
         let merged = self.quota_snapshot(id)?;
         let persisted: Snapshot = serde_json::from_value(merged.clone()).ok()?;
         self.enqueue(Command::PollQuota(id.into(), Box::new(persisted)));
@@ -1307,8 +1308,8 @@ mod tests {
             "plan":null,"credits":null,"source":"poll",
             "observed_at":"2030-01-01T00:01:00Z","signals":{}
         });
-        obs.observe_poll("cx-synthetic", first).unwrap();
-        let snapshot = obs.observe_poll("cx-synthetic", second).unwrap();
+        obs.observe_poll("cx-synthetic", first, true).unwrap();
+        let snapshot = obs.observe_poll("cx-synthetic", second, true).unwrap();
         let windows = snapshot["windows"].as_array().unwrap();
         assert_eq!(windows.len(), 1);
         assert_eq!(windows[0]["name"], "5h");
