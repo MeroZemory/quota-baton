@@ -226,7 +226,18 @@ pub fn account_menu_height(row: &Row) -> f32 {
         .enumerate()
         .filter(|(i, _)| *i == 2 || *i == 3)
         .count() as f32;
-    9.0 + items.len() as f32 * 32.0 + separators * 10.0
+    // Keep a bottom inset for the final glyph and the popup shadow. The inset
+    // is part of the geometry so a grown flyout cannot clip the last action.
+    9.0 + items.len() as f32 * 32.0 + separators * 10.0 + 16.0
+}
+
+pub fn account_menu_item_top(row: &Row, index: usize) -> f32 {
+    let separators_before = actions::menu_items(row)
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i <= index && (*i == 2 || *i == 3))
+        .count() as f32;
+    9.0 + index as f32 * 32.0 + separators_before * 9.0
 }
 
 pub fn popup_rect(rows: &[Row], expand_disabled: bool, state: &str, height: f32) -> Option<Rect> {
@@ -477,9 +488,9 @@ pub fn layout_targets(rows: &[Row], expand_disabled: bool, state: Option<&str>) 
                     index,
                     rect: Rect::new(
                         popup.left + 41.0,
-                        popup.top + 9.0 + index as f32 * 32.0,
+                        popup.top + account_menu_item_top(row, index),
                         popup.right - 15.0,
-                        popup.top + 9.0 + index as f32 * 32.0 + 30.0,
+                        popup.top + account_menu_item_top(row, index) + 30.0,
                     ),
                 });
             }
@@ -1050,6 +1061,15 @@ mod tests {
             let popup = popup_rect(&fixture, false, &menu_state, menu_height).unwrap();
             assert!(popup.left >= 0.0 && popup.top >= 0.0);
             assert!(popup.right <= FLYOUT_WIDTH && popup.bottom <= menu_height - FOOTER_HEIGHT);
+            let menu_targets = layout_targets(&fixture, false, Some(&menu_state));
+            let last_item_bottom = menu_targets
+                .iter()
+                .filter_map(|target| match target {
+                    HitTarget::MenuItem { rect, .. } => Some(rect.bottom),
+                    _ => None,
+                })
+                .fold(0.0, f32::max);
+            assert!(last_item_bottom + 16.0 <= menu_height);
             let quit_height = state_height(&fixture, false, Some("quit"));
             let quit = popup_rect(&fixture, false, "quit", quit_height).unwrap();
             assert!(quit.top >= 0.0 && quit.bottom <= quit_height);
