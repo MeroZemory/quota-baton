@@ -102,6 +102,20 @@ fn hit_target(x: f32, y: f32) -> Option<HitTarget> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
+    if state.as_deref() == Some("add-menu") {
+        let top = flyout_height() as f32 - 180.0;
+        return if (128.0..352.0).contains(&x) && (top..top + 110.0).contains(&y) {
+            Some(if y < top + 36.0 {
+                HitTarget::AddChoice(Some("claude".into()))
+            } else if y < top + 72.0 {
+                HitTarget::AddChoice(Some("codex".into()))
+            } else {
+                HitTarget::AddChoice(None)
+            })
+        } else {
+            None
+        };
+    }
     let targets = qb_tray::layout_targets(
         &rows,
         state.as_deref() == Some("expanded"),
@@ -182,21 +196,6 @@ fn hit_target(x: f32, y: f32) -> Option<HitTarget> {
                     HitTarget::LoginCopy
                 } else {
                     HitTarget::LoginCancel
-                });
-            }
-            return None;
-        }
-        if value == "add-menu" {
-            if (128.0..352.0).contains(&x)
-                && (flyout_height() as f32 - 180.0..flyout_height() as f32 - 70.0).contains(&y)
-            {
-                let top = flyout_height() as f32 - 180.0;
-                return Some(if y < top + 36.0 {
-                    HitTarget::AddChoice(Some("claude".into()))
-                } else if y < top + 72.0 {
-                    HitTarget::AddChoice(Some("codex".into()))
-                } else {
-                    HitTarget::AddChoice(None)
                 });
             }
             return None;
@@ -360,7 +359,10 @@ fn update_status(supervise: bool, notification_hwnd: Option<HWND>) {
             state.unreachable_since = None;
             text
         }
-        Err(_) => {
+        Err(error) => {
+            if let Some(path) = std::env::var_os("QB_TRAY_TEST_ERROR_LOG") {
+                let _ = std::fs::write(path, error.to_string());
+            }
             if supervise {
                 let mut state = supervisor().lock().unwrap_or_else(|e| e.into_inner());
                 let since = *state.unreachable_since.get_or_insert_with(Instant::now);
@@ -558,11 +560,16 @@ fn activate_menu(hwnd: HWND) {
                         LPARAM(0),
                     );
                 }
+            } else if let (Err(error), Some(path)) =
+                (&result, std::env::var_os("QB_TRAY_TEST_ERROR_LOG"))
+            {
+                let _ = std::fs::write(path, error.to_string());
             }
         });
 }
 
 fn launch_login(hwnd: HWND, provider: String) {
+    *view_state().lock().unwrap_or_else(|e| e.into_inner()) = Some(format!("login:{provider}"));
     let hwnd_value = hwnd.0 as isize;
     let _ = std::thread::Builder::new()
         .name("quota-baton-tray-login".into())
@@ -577,6 +584,9 @@ fn launch_login(hwnd: HWND, provider: String) {
                     Some(start.login_id.clone());
                 *login_url().lock().unwrap_or_else(|e| e.into_inner()) =
                     Some(start.auth_url.clone());
+                if let Some(path) = std::env::var_os("QB_TRAY_TEST_LOGIN_LOG") {
+                    let _ = std::fs::write(path, format!("pending {}\n", start.login_id));
+                }
                 *view_state().lock().unwrap_or_else(|e| e.into_inner()) =
                     Some(format!("login:{provider}"));
                 unsafe {
@@ -634,6 +644,9 @@ fn launch_login(hwnd: HWND, provider: String) {
 fn cancel_login() {
     let id = login_id().lock().unwrap_or_else(|e| e.into_inner()).take();
     *login_url().lock().unwrap_or_else(|e| e.into_inner()) = None;
+    if let Some(path) = std::env::var_os("QB_TRAY_TEST_LOGIN_LOG") {
+        let _ = std::fs::write(path, "cancelled\n");
+    }
     if let Some(id) = id {
         let _ = std::thread::Builder::new()
             .name("quota-baton-tray-login-cancel".into())
@@ -739,7 +752,7 @@ fn activate_hit(hwnd: HWND, target: HitTarget) {
         }
         HitTarget::LoginCancel => {
             cancel_login();
-            *view_state().lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *view_state().lock().unwrap_or_else(|e| e.into_inner()) = Some("list".into());
         }
         HitTarget::FooterAdd => {
             *view_state().lock().unwrap_or_else(|e| e.into_inner()) = Some("add-menu".into());
@@ -811,7 +824,9 @@ fn open_folder(relative: &str) {
     } else {
         home.join(relative)
     };
-    if std::env::var_os("QB_TRAY_TEST_NO_EXPLORER").is_none() {
+    if let Some(log) = std::env::var_os("QB_TRAY_TEST_EXPLORER_LOG") {
+        let _ = std::fs::write(log, path.to_string_lossy().as_bytes());
+    } else if std::env::var_os("QB_TRAY_TEST_NO_EXPLORER").is_none() {
         let _ = Command::new("explorer.exe").arg(path).spawn();
     }
 }

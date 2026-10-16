@@ -192,7 +192,6 @@ impl AdminClient {
         self.http
             .request(method, url)
             .header(header::HOST, self.host())
-            .header(header::ORIGIN, format!("{}/", self.base_url))
             .header(
                 header::AUTHORIZATION,
                 format!("Bearer {}", self.admin_token),
