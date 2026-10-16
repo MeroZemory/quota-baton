@@ -29,8 +29,7 @@ Implement quota-baton exactly as specified, milestone by milestone, until M8 is 
 
 | Milestone | Status |
 |---|---|
-| M0, M1a, M2, M3, M4a, M4b, M5, M1b, M6a, M4c, M6b, M7a, M6b.2, M7b, M4d, M7c, M8 | merged. Remaining: the M7c 24 h trend addendum. Running the cutover on the live profile is the user's decision (D9) and out of scope for you |
-| M6c | URGENT: live tray works (state decode, in-flyout clicks, all actions) with a live click-injection test; brief `M6c.md` |
+| M0, M1a, M2, M3, M4a, M4b, M5, M1b, M6a, M4c, M6b, M7a, M6b.2, M7b, M4d, M7c, M8, M6c | merged. Remaining: the M7c 24 h trend addendum. Running the cutover on the live profile is the user's decision (D9) and out of scope for you |
 
 ## Hard boundaries (never)
 
