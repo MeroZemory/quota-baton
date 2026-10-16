@@ -140,7 +140,7 @@ Each account has two independent fields:
 | — | Request-rate limit (C6 row 3), whatever its `Retry-After` | **no health change**. Per-account pacing only (C6.3). Data-plane 429s no longer produce `cooling(rate)` (D14, review M5). |
 | `ready` | 403 when the request's model is known (C6 row 6) | `cooling(permission, until=now+1h, model:<model>)` |
 | — | 403 when the model is unknown (always the case for Codex) | **no account-wide change**. Handled per request (C6 row 6). |
-| `ready` | 402 | `cooling(payment, until=now+6h, account)` |
+| `ready` | Billing rejection: 402, or a pre-commit 400 whose `error.type` is `billing_error` (C6 row 7) | `cooling(payment, until=now+6h, account)`, doubling on each repeat up to 24 h. Only that account changes. It clears only when `until` passes. A usage poll or a small successful request never clears it, because a small request proves nothing about funding a large-context one (C6.4). |
 | `ready` | Persisting rotated tokens fails | `cooling(store_error, until=now+5m, account)`, while the write keeps retrying. The tray shows a critical warning. |
 | `cooling` | `until` passes | `ready` (`auth`: after a successful probe) |
 | `cooling(quota)` | **Early reset** (M4a review S3). A **fresh** observation, newer than the cooling's start, of the window that caused the cooling shows `used_pct` < 100 **and** a `reset_at` that differs by more than 300 s from the one recorded when the cooling started. Cooling accounts are polled at least hourly (C9). | `ready` |
@@ -168,9 +168,9 @@ Each account has two independent fields:
 | 5 | Other 401, from the data plane **or a usage poll** (R8 I-07) | If the failed token is not current, retry once with the current token.<br>If it is current:<br>• **owned** account: a single-flight refresh, then one retry<br>• **linked** account: a single re-read of the CPA file, then one retry if the file holds a newer token<br>A terminal refresh error, a 401 with the new token, (linked) no newer token, **or a refresh that is transient, skipped or throttled** triggers failover (M4a review M4). In the last case the account gets `cooling(auth, 5 min)` so it is not reselected at once. | Next account's response; if none, row 14 or row 15 | Per C5: `needs_relogin` on a terminal refresh error. `cooling(auth)` on a 401 with a new token. Linked with no newer token: `cooling(link_stale)` |
 | 6 | 403 | Failover. If a **second** account also returns 403 for the same request, stop and relay that response. | Next account's response, or the second 403 as is | Known model: `cooling(permission, model)`. Unknown model: none. **Account-level denial** (e.g. Claude "OAuth ... not allowed for this organization"): `cooling(permission, account, 6h)` plus a tray notice (R8 I-18). |
 | 6a | 400 "model is not supported when using Codex with a ChatGPT account" (plan cannot serve the model; R8 I-17) | Failover, as for row 6 | Next account's response, or the 400 as is if none | `cooling(permission, model:<model>, 6h)`. The model name comes from the error text, because Codex bodies are not decoded. The C7 gate then skips the account for that model. |
-| 7 | 402 | Failover | Next account's response; if none, upstream response as is | `cooling(payment)` |
+| 7 | Billing rejection: 402, or a 400 whose `error.type` is `billing_error` (Claude; for example "Credit balance is too low"). This is checked **before** row 9. | Failover. The session's binding moves to the account that serves it; no other binding changes. | Next account's response; if none, the upstream billing response as is | `cooling(payment)` for that account only |
 | 8 | 404 | No failover | Upstream response as is | **None** |
-| 9 | 400, 409, 413, 422 | No failover | Upstream response as is | None |
+| 9 | 400 (other than rows 6a, 7 and 12b), 409, 413, 422 | No failover | Upstream response as is | None |
 | 10 | 408, 5xx, 529, 507, `overloaded_error`, `server_is_overloaded` | No failover | Upstream response as is (clients run their own backoff) | None |
 | 11 | Connect, TLS or DNS failure, header timeout, or the upstream closes before any byte | One retry on the same account after 250 ms, then give up | 502 in native shape (C6.2) | None |
 | 12 | Error after commit (SSE `error` or `response.failed` event, connection drop) | **Never retried** | Relayed as is, then the stream ends | Signals inside the event apply (e.g. `usage_limit_reached` leads to `cooling(quota)`) |
@@ -283,7 +283,8 @@ The workaround was applied on the previous proxy side and verified there. This s
 3. **State before selection.** On a quota, rate, auth or billing signal, the health change (reason, scope and `until`, taken from the reset headers when present) is recorded atomically **before** any failover or new selection (C6 "Before acting on a decision"). The next selection, including a concurrent one, cannot pick the account again.
 4. **Unavailable accounts leave the catalog path.** `/v1/models` (O9) is answered by an eligible account, chosen like any other request. A cooling or unavailable account never answers it.
 5. **Native errors, never a rewritten credit error.**
-   - The four classes stay distinct: 429 quota or rate (C6 rows 2 and 3), 401 auth or re-login (rows 4 and 5), 402 credit or billing (row 7), and 5xx or transport (rows 10 and 11).
+   - The four classes stay distinct: 429 quota or rate (C6 rows 2 and 3), 401 auth or re-login (rows 4 and 5), billing (row 7: 402, or a 400 with `error.type` `billing_error`), and 5xx or transport (rows 10 and 11).
+   - A billing rejection is never treated as a rate limit, and a rate limit is never treated as billing.
    - While another account is eligible, the client sees that account's response.
    - When none is eligible, the client sees the genuine upstream response of the right class (row 14 replays a cached genuine limit response, row 15 is the "no usable account" 400).
    - quota-baton never synthesizes or relabels a credit or billing message. A 402 reaches the client only when an upstream sent it.
@@ -296,7 +297,8 @@ The workaround was applied on the previous proxy side and verified there. This s
 - stale affinity after a restart: a binding imported for an account that is now cooling is not used
 - 429 with reset headers: `cooling(quota)` with `until` equal to the header reset, recorded before the failover attempt is sent
 - 401 revocation: `needs_relogin` (owned) or `link_stale` (linked), then failover
-- 402: `cooling(payment)`, failover, and the native 402 is relayed only when no account is eligible
+- 402, and a 400 `billing_error` ("Credit balance is too low"): `cooling(payment)` for that account only, failover, the session's binding moves, other sessions' bindings stay, and the native response is relayed only when no account is eligible
+- after a billing cooling, a small successful request elsewhere or a usage poll does not clear it; only `until` does
 - `/v1/models` while one account cools: answered by the eligible account
 - all accounts exhausted: the genuine 429 is replayed with `retry-after`, and the body never contains a credit or billing message unless one came from upstream
 - a Codex usage poll or 401 never changes a Claude account, and the reverse
