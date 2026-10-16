@@ -961,6 +961,7 @@ unsafe extern "system" fn window_proc(
                     if let Some(row) = model().lock().unwrap_or_else(|e| e.into_inner()).0.first() {
                         *view_state().lock().unwrap_or_else(|e| e.into_inner()) =
                             Some(format!("menu:{}:0", row.id));
+                        resize_flyout(hwnd);
                         let _ = InvalidateRect(Some(hwnd), None, true);
                     }
                 } else {
@@ -1012,6 +1013,7 @@ unsafe extern "system" fn window_proc(
             if let Some(HitTarget::RowMenu(id)) = hit_target(x, y) {
                 *view_state().lock().unwrap_or_else(|e| e.into_inner()) =
                     Some(format!("menu:{id}:0"));
+                resize_flyout(hwnd);
                 let _ = InvalidateRect(Some(hwnd), None, true);
             } else {
                 *view_state().lock().unwrap_or_else(|e| e.into_inner()) = None;

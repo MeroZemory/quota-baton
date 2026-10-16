@@ -497,17 +497,21 @@ async fn next_request_can_hold_again_after_failed_hold_without_a_move() {
     let other = h.ids().into_iter().find(|id| id != &first).unwrap();
     h.pause(&other).await;
     for _ in 0..2 {
+        // Use one clock sample and leave enough margin for a busy full-suite
+        // process before relay selection starts.  The assertion is about the
+        // reset hold, not about racing a two-second wall-clock boundary.
+        let now = Utc::now();
         h.store
             .update_metadata(&first, |account| {
                 account.health = Health::Cooling {
                     reason: HealthReason::Quota,
-                    until: Utc::now() + ChronoDuration::seconds(30),
+                    until: now + ChronoDuration::seconds(30),
                     scope: "account".into(),
                 };
                 account.quota_cooling = Some(QuotaCooling {
                     window: "7d".into(),
-                    reset_at: Utc::now() + ChronoDuration::seconds(2),
-                    started_at: Utc::now(),
+                    reset_at: now + ChronoDuration::milliseconds(2500),
+                    started_at: now,
                 });
             })
             .unwrap();

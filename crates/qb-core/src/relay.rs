@@ -618,6 +618,7 @@ impl RelayState {
         if completion.reset_hold_used
             || self.bindings.current(session.key.as_deref()).as_deref() != Some(id)
         {
+            tracing::debug!(account = %id, reason = "request_hold_already_used_or_binding_changed", "reset hold skipped");
             return Ok(false);
         }
         let store = self.store.clone();
@@ -643,12 +644,17 @@ impl RelayState {
                     .as_ref()
                     .map_or(*until, |q| q.reset_at)
             }
-            _ => return Ok(false),
+            _ => {
+                tracing::debug!(account = %id, reason = "account_not_active_quota_cooling", "reset hold skipped");
+                return Ok(false);
+            }
         };
         let Ok(wait) = (reset - now).to_std() else {
+            tracing::debug!(account = %id, reason = "reset_elapsed", "reset hold skipped");
             return Ok(false);
         };
         if wait > Duration::from_secs(self.reset_hold_secs) {
+            tracing::debug!(account = %id, reason = "reset_beyond_hold_bound", wait_ms = wait.as_millis() as u64, "reset hold skipped");
             return Ok(false);
         }
         completion.end_attempt();
@@ -663,6 +669,7 @@ impl RelayState {
             .map_err(|_| ())?;
         if !account.eligible(model) {
             completion.reset_hold_timed_out = true;
+            tracing::debug!(account = %id, reason = "account_still_ineligible_after_reset", "reset hold skipped");
             return Ok(false);
         }
         completion.binding = Some(self.bindings.begin_request(session.key.as_deref(), id));
