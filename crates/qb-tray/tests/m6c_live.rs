@@ -32,8 +32,9 @@ use windows::{
         },
         Storage::Xps::PrintWindow,
         UI::WindowsAndMessaging::{
-            FindWindowW, GetWindowRect, PostMessageW, SW_SHOW, SetForegroundWindow, ShowWindow,
-            WM_LBUTTONUP, WM_RBUTTONUP,
+            FindWindowW, GetWindowRect, PostMessageW, SMTO_ABORTIFHUNG, SW_SHOW,
+            SendMessageTimeoutW, SetForegroundWindow, ShowWindow, WM_LBUTTONUP, WM_NULL,
+            WM_RBUTTONUP,
         },
     },
     core::w,
@@ -50,6 +51,36 @@ fn click(hwnd: HWND, x: i16, y: i16, message: u32) {
         let _ = SetForegroundWindow(hwnd);
         let _ = PostMessageW(Some(hwnd), message, WPARAM(0), LPARAM(packed as isize));
     }
+}
+
+fn responsive(hwnd: HWND) -> anyhow::Result<()> {
+    let mut result = 0usize;
+    unsafe {
+        let quick = SendMessageTimeoutW(
+            hwnd,
+            WM_NULL,
+            WPARAM(0),
+            LPARAM(0),
+            SMTO_ABORTIFHUNG,
+            200,
+            Some(&mut result),
+        )
+        .0 != 0;
+        if !quick {
+            let slow = SendMessageTimeoutW(
+                hwnd,
+                WM_NULL,
+                WPARAM(0),
+                LPARAM(0),
+                SMTO_ABORTIFHUNG,
+                1000,
+                Some(&mut result),
+            )
+            .0 != 0;
+            anyhow::ensure!(slow, "tray window did not respond within 1000 ms");
+        }
+    }
+    Ok(())
 }
 
 fn capture(hwnd: HWND, path: &std::path::Path) -> anyhow::Result<()> {
@@ -125,7 +156,22 @@ fn capture(hwnd: HWND, path: &std::path::Path) -> anyhow::Result<()> {
         bytes.extend_from_slice(&image_size.to_le_bytes());
         bytes.extend_from_slice(&[0; 16]);
         bytes.extend_from_slice(&pixels);
-        fs::write(path, bytes)?;
+        if path.extension().and_then(|value| value.to_str()) == Some("png") {
+            let bmp = path.with_extension("bmp.tmp");
+            fs::write(&bmp, bytes)?;
+            let status = Command::new("ffmpeg.exe")
+                .args(["-y", "-loglevel", "error"])
+                .arg("-i")
+                .arg(&bmp)
+                .arg("-frames:v")
+                .arg("1")
+                .arg(path)
+                .status()?;
+            anyhow::ensure!(status.success(), "PNG conversion failed");
+            let _ = fs::remove_file(bmp);
+        } else {
+            fs::write(path, bytes)?;
+        }
         let _ = DeleteObject(bitmap.into());
         let _ = DeleteDC(memory);
         let _ = ReleaseDC(None, screen);
@@ -305,6 +351,7 @@ fn m6c_live_spawned_core_clicks_and_captures() -> anyhow::Result<()> {
     let _upstream = prepare_home(&home)?;
     let explorer_log = home.join("explorer-hook.log");
     let login_log = home.join("login-hook.log");
+    let delay_file = home.join("admin-delay");
     let error_log = home.join("tray-error.log");
     unsafe {
         std::env::set_var("QB_TRAY_TEST_EXPLORER_LOG", &explorer_log);
@@ -343,6 +390,8 @@ fn m6c_live_spawned_core_clicks_and_captures() -> anyhow::Result<()> {
     let tray = Command::new(&tray_bin)
         .env("QB_HOME", &home)
         .env("QB_TRAY_TEST_NO_BROWSER", "1")
+        .env("QB_TRAY_TEST_KEEP_OPEN", "1")
+        .env("QB_TRAY_TEST_DELAY_FILE", &delay_file)
         .args([
             "--no-supervise",
             "--open-flyout-live",
@@ -367,7 +416,8 @@ fn m6c_live_spawned_core_clicks_and_captures() -> anyhow::Result<()> {
         "tray failed to read the live core state: {}",
         fs::read_to_string(home.join("tray-error.log")).unwrap_or_default()
     );
-    capture(hwnd, &evidence.join("list.bmp"))?;
+    thread::sleep(Duration::from_millis(200));
+    capture(hwnd, &evidence.join("list.png"))?;
     let state = admin_json(&home, "/admin/v1/state")
         .map_err(|error| anyhow::anyhow!("initial state: {error}"))?;
     let accounts = state["accounts"]
@@ -378,10 +428,25 @@ fn m6c_live_spawned_core_clicks_and_captures() -> anyhow::Result<()> {
         "live tray decoded {} accounts",
         accounts.len()
     );
+    for y in [196, 205, 212, 220, 228, 240] {
+        responsive(hwnd)?;
+        click(hwnd, 200, y, WM_LBUTTONUP);
+        thread::sleep(Duration::from_millis(80));
+        if explorer_log.exists() {
+            break;
+        }
+    }
+    anyhow::ensure!(explorer_log.exists(), "settings test hook was not called");
+    responsive(hwnd)?;
     click(hwnd, 330, 145, WM_RBUTTONUP);
     thread::sleep(Duration::from_millis(100));
-    capture(hwnd, &evidence.join("row-menu.bmp"))?;
+    thread::sleep(Duration::from_millis(200));
+    capture(hwnd, &evidence.join("row-menu.png"))?;
+    fs::write(&delay_file, b"delay")?;
+    responsive(hwnd)?;
     click(hwnd, 220, 180, WM_LBUTTONUP);
+    thread::sleep(Duration::from_secs(6));
+    let _ = fs::remove_file(&delay_file);
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         let state = admin_json(&home, "/admin/v1/state")
@@ -400,42 +465,18 @@ fn m6c_live_spawned_core_clicks_and_captures() -> anyhow::Result<()> {
         );
         thread::sleep(Duration::from_millis(100));
     }
-    // Exercise settings and tray-only quit while the list view is still active.
-    let _ = children.tray.kill();
-    let _ = children.tray.wait();
-    for _ in 0..50 {
-        if window().is_none() {
-            break;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    children.tray = Command::new(&tray_bin)
-        .env("QB_HOME", &home)
-        .env("QB_TRAY_TEST_NO_BROWSER", "1")
-        .args([
-            "--no-supervise",
-            "--open-flyout-live",
-            "--now",
-            "2030-01-01T00:00:00Z",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let hwnd = (0..100)
-        .find_map(|_| {
-            let found = window();
-            if found.is_none() {
-                thread::sleep(Duration::from_millis(100));
-            }
-            found
-        })
-        .ok_or_else(|| anyhow::anyhow!("replacement flyout window not found"))?;
-    click(hwnd, 200, 240, WM_LBUTTONUP);
-    anyhow::ensure!(explorer_log.exists(), "settings test hook was not called");
-    click(hwnd, 320, 240, WM_LBUTTONUP);
-    thread::sleep(Duration::from_millis(100));
-    capture(hwnd, &evidence.join("quit-menu.bmp"))?;
-    click(hwnd, 230, 185, WM_LBUTTONUP);
+    // Exercise settings and tray-only quit on the live list.
+    thread::sleep(Duration::from_secs(1));
+    responsive(hwnd)?;
+    click(hwnd, 50, 212, WM_LBUTTONUP);
+    thread::sleep(Duration::from_millis(150));
+    responsive(hwnd)?;
+    responsive(hwnd)?;
+    click(hwnd, 320, 212, WM_LBUTTONUP);
+    thread::sleep(Duration::from_millis(300));
+    capture(hwnd, &evidence.join("quit-menu.png"))?;
+    responsive(hwnd)?;
+    click(hwnd, 230, 160, WM_LBUTTONUP);
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         if children.tray.try_wait()?.is_some() {
@@ -451,22 +492,29 @@ fn m6c_live_spawned_core_clicks_and_captures() -> anyhow::Result<()> {
         children.core.try_wait()?.is_none(),
         "tray-only quit stopped the core"
     );
-    // Reopen a second tray instance against the same core for the live login panel.
+    anyhow::ensure!(
+        children.core.try_wait()?.is_none(),
+        "tray-only quit stopped the core"
+    );
+    for _ in 0..50 {
+        if window().is_none() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
     let tray = Command::new(&tray_bin)
         .env("QB_HOME", &home)
         .env("QB_TRAY_TEST_NO_BROWSER", "1")
+        .env("QB_TRAY_TEST_KEEP_OPEN", "1")
+        .env("QB_TRAY_TEST_DELAY_FILE", &delay_file)
         .args([
             "--no-supervise",
             "--open-flyout-live",
             "--now",
             "2030-01-01T00:00:00Z",
         ])
-        .stdout(Stdio::from(fs::File::create(
-            home.join("tray2.stdout.log"),
-        )?))
-        .stderr(Stdio::from(fs::File::create(
-            home.join("tray2.stderr.log"),
-        )?))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()?;
     children.tray = tray;
     let hwnd = (0..100)
@@ -477,10 +525,13 @@ fn m6c_live_spawned_core_clicks_and_captures() -> anyhow::Result<()> {
             }
             found
         })
-        .ok_or_else(|| anyhow::anyhow!("second flyout window not found"))?;
-    click(hwnd, 128, 240, WM_LBUTTONUP);
+        .ok_or_else(|| anyhow::anyhow!("login flyout window not found"))?;
     thread::sleep(Duration::from_secs(1));
-    click(hwnd, 220, 120, WM_LBUTTONUP);
+    responsive(hwnd)?;
+    click(hwnd, 128, 240, WM_LBUTTONUP);
+    thread::sleep(Duration::from_millis(300));
+    responsive(hwnd)?;
+    click(hwnd, 220, 130, WM_LBUTTONUP);
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         if fs::read_to_string(&login_log)
@@ -495,10 +546,23 @@ fn m6c_live_spawned_core_clicks_and_captures() -> anyhow::Result<()> {
         );
         thread::sleep(Duration::from_millis(100));
     }
-    capture(hwnd, &evidence.join("login-panel.bmp"))?;
-    anyhow::ensure!(
-        children.core.try_wait()?.is_none(),
-        "login panel test stopped the core"
-    );
+    thread::sleep(Duration::from_millis(200));
+    capture(hwnd, &evidence.join("login-panel.png"))?;
+    responsive(hwnd)?;
+    click(hwnd, 260, 190, WM_LBUTTONUP);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if fs::read_to_string(&login_log)
+            .map(|value| value.trim() == "cancelled")
+            .unwrap_or(false)
+        {
+            break;
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "login cancel did not reach the live tray"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
     Ok(())
 }
