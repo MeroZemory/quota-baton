@@ -699,4 +699,13 @@ Each milestone is independently verifiable and sized for an implementer working 
     3. A manual allow or hide list per model in the tray.
     4. Rely on row 6a cooling only (the current design).
   - The choice affects C1 (`/v1/models`), C7 (eligibility gets a model filter) and C8 (peek scope). It does not change D2: the request body still never changes.
+- **O14. Static API-key credentials and per-credential priority.** Owner decision, not yet decided (raised 2026-10-17, from the previous proxy mixed-pool incident, contract C6.4).
+  - **Today.** Only OAuth subscription accounts exist. D11 item 4 says there is no priority list; drain is the only manual placement setting.
+  - **What the previous proxy now does.** API-key credentials get priority 10 and OAuth gets 0. New or cold sessions take the highest available priority, bound sessions stay on their credential, and failover happens only when the bound one is unavailable.
+  - **Conflict.** Preferring paid API keys over subscription accounts reverses D11's goal of spending perishable subscription quota first, and it spends money. It also reverses D11 item 4.
+  - **Options.**
+    1. Keep OAuth only (the current design).
+    2. Add API keys as a separate pool used only when every subscription account is unavailable (subscription first).
+    3. Add a per-credential `priority`, with placement and failover as the previous proxy does; the owner picks the values.
+  - **Whichever is chosen:** pools never mix unless enabled, bindings stay on an eligible credential, a binding to an unavailable one is re-placed, and native error classes are kept (C6.4).
 - **O12.** `POST /v1/memories/trace_summarize` is used by Codex's `memories` feature, which is off by default (`core/src/client.rs:179`, `features/src/lib.rs:1231-1235`). It returns 404 (unsupported) until the user asks for it.

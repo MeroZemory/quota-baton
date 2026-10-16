@@ -269,6 +269,39 @@ It also records whether the socket stays usable afterwards.
   - the outcome `rate_hold_ok` or `rate_hold_relayed_429`
 - The ledger also counts relayed 429s per session.
 
+### C6.4 Mixed pools, stale affinity and misleading errors (the previous proxy incident, 2026-10-17)
+
+**The incident.** The previous proxy served Claude from one model pool that mixed 4 OAuth subscription credentials with 4 static API-key credentials.
+- The OAuth credentials answered 429 for their weekly or rate limits, and the previous proxy cooled them.
+- They stayed registered in the model pool, so CPA's 1 h session affinity kept binding sessions to exhausted credentials.
+- Claude Code then showed the misleading "Credit balance too low". The proxy logs held only 429 quota evidence; no credit ledger had failed.
+
+The workaround was applied on the previous proxy side and verified there. This section records what quota-baton must guarantee, so that the same failure cannot happen here. Most of it follows from C5–C7; the rules below make it explicit and testable.
+
+1. **One credential kind per pool.** Every account has exactly one kind: an OAuth subscription account (owned or CPA-linked). Static API-key credentials are not a supported kind today. If they are added later (O14), they form a separate pool per provider. A request may mix pools only when a config option explicitly enables it, and the selection order between pools is the owner's decision recorded in O14.
+2. **Affinity is revalidated on every request.** A binding never forces an account. C7 step 1 uses the bound account only if it is eligible (C5) at that moment. A binding to a cooling, unavailable, paused or disabled account is re-placed at the next request boundary. There is no time-based affinity that outlives eligibility.
+3. **State before selection.** On a quota, rate, auth or billing signal, the health change (reason, scope and `until`, taken from the reset headers when present) is recorded atomically **before** any failover or new selection (C6 "Before acting on a decision"). The next selection, including a concurrent one, cannot pick the account again.
+4. **Unavailable accounts leave the catalog path.** `/v1/models` (O9) is answered by an eligible account, chosen like any other request. A cooling or unavailable account never answers it.
+5. **Native errors, never a rewritten credit error.**
+   - The four classes stay distinct: 429 quota or rate (C6 rows 2 and 3), 401 auth or re-login (rows 4 and 5), 402 credit or billing (row 7), and 5xx or transport (rows 10 and 11).
+   - While another account is eligible, the client sees that account's response.
+   - When none is eligible, the client sees the genuine upstream response of the right class (row 14 replays a cached genuine limit response, row 15 is the "no usable account" 400).
+   - quota-baton never synthesizes or relabels a credit or billing message. A 402 reaches the client only when an upstream sent it.
+6. **Billing is per account.** Credits are never aggregated across accounts. Claude's `overage-status` header (C9) is recorded as information only and is never read as a credit balance. A Codex `credits` value belongs to its own account and drives only `allow_credits` (C5).
+7. **Provider isolation.** A usage poll, a monitor or an event of one provider never changes the health or user state of another provider's accounts. The C9 pollers are per provider, and every health write carries the account id and provider.
+8. **Observability.** Per provider, `/state` (C11) and `quota-baton status` show the counts of eligible, cooling (by reason) and unavailable accounts. The ledger and these views show, per account, the provider, the credential source kind, the health reason and `until`, with no secrets.
+
+**Tests** (testkit fakes; each asserts the account that served, its source kind, and the recorded `until`):
+- exhausted bound account plus a healthy one: the next request of the bound session is served by the healthy account, and the binding moves
+- stale affinity after a restart: a binding imported for an account that is now cooling is not used
+- 429 with reset headers: `cooling(quota)` with `until` equal to the header reset, recorded before the failover attempt is sent
+- 401 revocation: `needs_relogin` (owned) or `link_stale` (linked), then failover
+- 402: `cooling(payment)`, failover, and the native 402 is relayed only when no account is eligible
+- `/v1/models` while one account cools: answered by the eligible account
+- all accounts exhausted: the genuine 429 is replayed with `retry-after`, and the body never contains a credit or billing message unless one came from upstream
+- a Codex usage poll or 401 never changes a Claude account, and the reverse
+- the `/state` counts match the scenario
+
 ## C7. Selection policy
 
 These rules come from the P2 blind panel (`.sandbox/reviews/switch-policy-blind-panel.md`, [D11](decisions.md#d11)).
@@ -528,6 +561,7 @@ Base: `http://127.0.0.1:<admin_port>/admin/v1`. Every route requires `Authorizat
 - `pacing {backoff_until, step, release_interval_ms, waiting}` (C6.3)
 - `last_used_at`, `bound_sessions`
 - `active_sessions`, `spread_threshold` (C7.1)
+- `/state` also carries `pools: {<provider>: {eligible, cooling: {<reason>: n}, unavailable}}` (C6.4)
 - `token_expires_at`
 
 Tokens are never included.
