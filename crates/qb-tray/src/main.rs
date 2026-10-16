@@ -23,8 +23,11 @@ struct Args {
     /// login:codex, or quit.
     #[arg(long, default_value = "list", requires = "render_png")]
     state: String,
-    #[arg(long, requires_all = ["fixture", "no_supervise"])]
+    #[arg(long, requires = "no_supervise", conflicts_with = "open_flyout_live")]
     open_flyout: bool,
+    /// Debug-only live flyout mode. It reads the spawned core through the admin API.
+    #[arg(long, requires = "no_supervise", conflicts_with = "open_flyout")]
+    open_flyout_live: bool,
     /// Do not start or restart a missing core.
     #[arg(long)]
     no_supervise: bool,
@@ -36,6 +39,10 @@ mod windows_tray;
 #[cfg(windows)]
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    anyhow::ensure!(
+        !args.open_flyout_live || cfg!(debug_assertions),
+        "--open-flyout-live is debug-only"
+    );
     let now = args
         .now
         .as_deref()
@@ -67,7 +74,12 @@ fn main() -> anyhow::Result<()> {
         .map_err(anyhow::Error::msg)?;
         return Ok(());
     }
-    windows_tray::run(!args.no_supervise, args.open_flyout, args.fixture, now)
+    windows_tray::run(
+        !args.no_supervise,
+        args.open_flyout || args.open_flyout_live,
+        args.fixture,
+        now,
+    )
 }
 
 #[cfg(all(test, windows))]
@@ -80,8 +92,6 @@ mod tests {
         let args = Args::try_parse_from([
             "quota-baton-tray",
             "--open-flyout",
-            "--fixture",
-            "fixture.json",
             "--no-supervise",
             "--now",
             "2026-10-19T07:00:00Z",
@@ -89,6 +99,10 @@ mod tests {
         .expect("debug flyout arguments should parse");
         assert!(args.open_flyout);
         assert!(args.render_png.is_none());
+        let live =
+            Args::try_parse_from(["quota-baton-tray", "--open-flyout-live", "--no-supervise"])
+                .expect("live flyout arguments should parse");
+        assert!(live.open_flyout_live);
     }
 }
 

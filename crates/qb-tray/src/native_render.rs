@@ -13,8 +13,8 @@ use windows::{
             },
             DirectWrite::{
                 DWRITE_FACTORY_TYPE_ISOLATED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-                DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_TRAILING, DWriteCreateFactory,
-                IDWriteFactory,
+                DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TEXT_METRICS,
+                DWriteCreateFactory, IDWriteFactory,
             },
             Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
             Imaging::{
@@ -81,7 +81,7 @@ pub fn state_height(rows: &[Row], expand_disabled: bool, state: Option<&str>) ->
     if state.is_some_and(|value| value.starts_with("login:")) {
         276.0
     } else {
-        content_height(rows, expand_disabled)
+        super::state_height(rows, expand_disabled, state)
     }
 }
 
@@ -184,13 +184,17 @@ fn draw_text(
     let brush = unsafe { target.CreateSolidColorBrush(&color.0, None) }?;
     let text: Vec<u16> = value.encode_utf16().collect();
     unsafe {
-        target.DrawText(
-            &text,
-            format,
-            &rect(x, y, x + width, y + height),
+        let factory: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED)?;
+        let measure = factory.CreateTextLayout(&text, format, width, 4096.0)?;
+        let mut metrics = DWRITE_TEXT_METRICS::default();
+        measure.GetMetrics(&mut metrics)?;
+        let layout =
+            factory.CreateTextLayout(&text, format, width, (metrics.height + 2.0).max(height))?;
+        target.DrawTextLayout(
+            windows_numerics::Vector2 { X: x, Y: y },
+            &layout,
             &brush,
             windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_NONE,
-            windows::Win32::Graphics::DirectWrite::DWRITE_MEASURING_MODE_NATURAL,
         );
         Ok(())
     }
@@ -306,9 +310,11 @@ fn draw_account_menu(
     let items = super::actions::menu_items(row);
     let body = text_format(factory, 13.0, false)?;
     let icons = icon_format(factory, 14.0)?;
+    let popup = super::popup_rect(rows, false, state, content_height(rows, false))
+        .unwrap_or(super::Rect::new(136.0, 126.0, 352.0, 312.0));
     popup_surface(
         target,
-        rect(136.0, 126.0, 352.0, 312.0),
+        rect(popup.left, popup.top, popup.right, popup.bottom),
         dark,
         brush_color(if dark {
             super::Rgb(44, 44, 44)
@@ -317,9 +323,9 @@ fn draw_account_menu(
         }),
     )?;
     let icon_values = [
-        "\u{e769}", "\u{e733}", "\u{e8d7}", "\u{e72c}", "\u{e74d}", "\u{e73e}",
+        "\u{e769}", "\u{e733}", "\u{e8d7}", "\u{e72c}", "\u{e73e}", "\u{e74d}",
     ];
-    let mut y = 135.0;
+    let mut y = popup.top + 9.0;
     for (n, item) in items.iter().enumerate() {
         if n == 2 || n == 3 {
             fill(
@@ -331,7 +337,7 @@ fn draw_account_menu(
                     super::Rgb(212, 212, 212)
                 }),
             )?;
-            y += 9.0;
+            y += 10.0;
         }
         if n == index {
             pill(
@@ -397,7 +403,11 @@ fn draw_account_menu(
             draw_text(
                 target,
                 &icons,
-                icon_values.get(n).copied().unwrap_or(""),
+                if matches!(item, super::actions::MenuItem::Delete) {
+                    "\u{e74d}"
+                } else {
+                    icon_values.get(n).copied().unwrap_or("")
+                },
                 153.0,
                 y + 8.0,
                 16.0,
@@ -641,7 +651,9 @@ pub fn paint_with_state(
         20.0,
         brush_color(colors.text),
     )?;
-    let status = if core_ok {
+    let status = if version.starts_with("error:") {
+        version.trim_start_matches("error:").to_owned()
+    } else if core_ok {
         format!("코어 실행 중 · {version}")
     } else {
         "코어에 연결할 수 없음".to_owned()
@@ -668,7 +680,7 @@ pub fn paint_with_state(
             &brush,
         );
     }
-    let login_state = state.is_some_and(|value| value == "login:claude" || value == "login:codex");
+    let login_state = state.is_some_and(|value| value.starts_with("login:"));
     let mut y = 52.0;
     if !login_state {
         for provider in ["claude", "codex"] {
@@ -753,11 +765,14 @@ pub fn paint_with_state(
             }
         }
     } else {
-        let provider = if state.is_some_and(|value| value.ends_with("claude")) {
+        let provider = if state.is_some_and(|value| value.contains("claude")) {
             "Claude"
         } else {
             "Codex"
         };
+        let outcome = state
+            .and_then(|value| value.rsplit(':').next())
+            .filter(|value| matches!(*value, "completed" | "failed" | "expired" | "cancelled"));
         draw_text(
             target,
             &title,
@@ -772,7 +787,13 @@ pub fn paint_with_state(
         draw_text(
             target,
             &body,
-            "브라우저에서 로그인을 마치면 자동으로",
+            match outcome {
+                Some("completed") => "로그인이 완료되었습니다.",
+                Some("failed") => "로그인에 실패했습니다.",
+                Some("expired") => "로그인 시간이 지났습니다.",
+                Some("cancelled") => "로그인이 취소되었습니다.",
+                _ => "브라우저에서 로그인을 마치면 자동으로",
+            },
             42.0,
             100.0,
             302.0,
@@ -782,7 +803,11 @@ pub fn paint_with_state(
         draw_text(
             target,
             &body,
-            "완료됩니다.",
+            if outcome.is_some() {
+                ""
+            } else {
+                "완료됩니다."
+            },
             42.0,
             120.0,
             302.0,
@@ -941,20 +966,35 @@ pub fn paint_with_state(
                     "남은 시간 9:41".to_owned(),
                 ],
             )
+        } else if state == "add-menu" {
+            (
+                "계정 추가",
+                vec![
+                    "Claude 계정".to_owned(),
+                    "Codex 계정".to_owned(),
+                    "취소".to_owned(),
+                ],
+            )
         } else if state == "quit" {
             (
                 "종료",
                 vec![
                     "트레이만 종료".to_owned(),
                     "트레이와 프록시 종료".to_owned(),
-                    "취소".to_owned(),
                 ],
             )
         } else {
             ("계정 메뉴", vec!["알 수 없는 상태".to_owned()])
         };
         let (left, top, right, bottom) = if state.starts_with("menu:") {
-            (136.0, 126.0, 352.0, 312.0)
+            let popup = super::popup_rect(
+                &rows,
+                expand_disabled,
+                state,
+                content_height(&rows, expand_disabled),
+            )
+            .unwrap();
+            (popup.left, popup.top, popup.right, popup.bottom)
         } else if state.starts_with("confirm-delete:") {
             let card_height = 193.0;
             let flyout = content_height(&rows, expand_disabled);
@@ -964,13 +1004,15 @@ pub fn paint_with_state(
                 344.0,
                 (flyout + card_height).round() / 2.0,
             )
-        } else if state == "quit" {
-            (
-                152.0,
-                content_height(&rows, expand_disabled) - 124.0,
-                352.0,
-                content_height(&rows, expand_disabled) - 52.0,
+        } else if state == "add-menu" || state == "quit" {
+            let popup = super::popup_rect(
+                &rows,
+                expand_disabled,
+                state,
+                content_height(&rows, expand_disabled),
             )
+            .unwrap();
+            (popup.left, popup.top, popup.right, popup.bottom)
         } else {
             (28.0, 68.0, WIDTH - 12.0, 200.0)
         };

@@ -24,3 +24,7 @@ thiserror.workspace = true
 tokio.workspace = true
 windows.workspace = true
 windows-numerics.workspace = true
+
+[features]
+default = []
+testkit = ["qb-core/testkit"]
