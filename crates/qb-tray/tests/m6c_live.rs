@@ -6,10 +6,19 @@
 
 #![cfg(windows)]
 
+use chrono::{TimeZone, Utc};
+use qb_core::accounts::{
+    Account, AccountStore, Health, Identity, Provider, Source, TokenMeta, Tokens, UserState,
+};
 use std::{
     fs,
+    net::{TcpListener, TcpStream},
     path::PathBuf,
     process::{Child, Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::Duration,
 };
@@ -23,7 +32,8 @@ use windows::{
         },
         Storage::Xps::PrintWindow,
         UI::WindowsAndMessaging::{
-            FindWindowW, GetWindowRect, PostMessageW, WM_LBUTTONUP, WM_RBUTTONUP,
+            FindWindowW, GetWindowRect, PostMessageW, SW_SHOW, SetForegroundWindow, ShowWindow,
+            WM_LBUTTONUP, WM_RBUTTONUP,
         },
     },
     core::w,
@@ -36,6 +46,8 @@ fn window() -> Option<HWND> {
 fn click(hwnd: HWND, x: i16, y: i16, message: u32) {
     let packed = ((y as u16 as u32) << 16) | x as u16 as u32;
     unsafe {
+        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = SetForegroundWindow(hwnd);
         let _ = PostMessageW(Some(hwnd), message, WPARAM(0), LPARAM(packed as isize));
     }
 }
@@ -121,14 +133,161 @@ fn capture(hwnd: HWND, path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-struct Children(Vec<Child>);
+struct Children {
+    core: Child,
+    tray: Child,
+}
 impl Drop for Children {
     fn drop(&mut self) {
-        for child in &mut self.0 {
+        for child in [&mut self.tray, &mut self.core] {
             let _ = child.kill();
             let _ = child.wait();
         }
     }
+}
+
+fn free_port() -> anyhow::Result<u16> {
+    Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
+}
+
+struct SyntheticUpstream {
+    stop: Arc<AtomicBool>,
+    join: Option<thread::JoinHandle<()>>,
+    port: u16,
+}
+
+impl SyntheticUpstream {
+    fn start() -> anyhow::Result<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let port = listener.local_addr()?.port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let signal = stop.clone();
+        let join = thread::spawn(move || {
+            while !signal.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => respond(&mut stream),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Ok(Self {
+            stop,
+            join: Some(join),
+            port,
+        })
+    }
+}
+
+impl Drop for SyntheticUpstream {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+fn respond(stream: &mut TcpStream) {
+    use std::io::{Read, Write};
+    let mut request = [0u8; 4096];
+    let _ = stream.read(&mut request);
+    let body = b"{}";
+    let header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(header.as_bytes());
+    let _ = stream.write_all(body);
+}
+
+fn prepare_home(home: &std::path::Path) -> anyhow::Result<SyntheticUpstream> {
+    if home.exists() {
+        fs::remove_dir_all(home)?;
+    }
+    fs::create_dir_all(home)?;
+    let upstream = SyntheticUpstream::start()?;
+    let data = free_port()?;
+    let admin = free_port()?;
+    let store = AccountStore::acquire(home).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    for n in 0..2 {
+        let email = format!("m6c-{n}@example.invalid");
+        let identity = Identity::Codex {
+            account_id: format!("m6c-{n}"),
+            email: email.clone(),
+            user_id: None,
+        };
+        let account = Account {
+            schema: 1,
+            id: identity.id(),
+            provider: Provider::Codex,
+            label: email.clone(),
+            email,
+            plan: Some("synthetic".into()),
+            identity,
+            source: Source::Oauth,
+            user_state: UserState::Active,
+            health: Health::Ready,
+            auth_failures: 0,
+            auth_probe_pending: false,
+            quota_cooling: None,
+            drain: false,
+            allow_credits: false,
+            generation: 0,
+            token_meta: TokenMeta {
+                expires_at: Some(Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).single().unwrap()),
+                last_refresh_at: None,
+                refresh_uncertain: false,
+            },
+        };
+        store
+            .save(
+                &account,
+                &Tokens {
+                    access_token: format!("synthetic-access-{n}"),
+                    refresh_token: format!("synthetic-refresh-{n}"),
+                    id_token: None,
+                },
+                None,
+            )
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    }
+    fs::write(
+        home.join("config.toml"),
+        format!(
+            "[server]\ndata_port={data}\nadmin_port={admin}\ndrain_timeout_secs=20\n[upstream]\ncodex_base='http://127.0.0.1:{port}/'\nanthropic_base='http://127.0.0.1:{port}/'\nclaude_usage_base='http://127.0.0.1:{port}/'\ncodex_usage_base='http://127.0.0.1:{port}/'\nclaude_token_endpoint='http://127.0.0.1:{port}/oauth/token'\ncodex_token_endpoint='http://127.0.0.1:{port}/oauth/token'\n",
+            port = upstream.port
+        ),
+    )?;
+    Ok(upstream)
+}
+
+fn admin_json(home: &std::path::Path, path: &str) -> anyhow::Result<serde_json::Value> {
+    let config = fs::read_to_string(home.join("config.toml"))?;
+    let admin = config
+        .lines()
+        .find_map(|line| line.strip_prefix("admin_port=")?.parse::<u16>().ok())
+        .ok_or_else(|| anyhow::anyhow!("synthetic admin port missing"))?;
+    let token = fs::read_to_string(home.join("admin.token"))?;
+    use std::io::{Read, Write};
+    let mut stream = TcpStream::connect(("127.0.0.1", admin))?;
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+        admin,
+        token.trim()
+    )?;
+    let mut bytes = Vec::new();
+    stream.read_to_end(&mut bytes)?;
+    let text = String::from_utf8(bytes)?;
+    let (head, body) = text
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| anyhow::anyhow!("admin response missing body"))?;
+    anyhow::ensure!(head.starts_with("HTTP/1.1 200"), "admin returned {head}");
+    Ok(serde_json::from_str(body)?)
 }
 
 #[test]
@@ -143,27 +302,57 @@ fn m6c_live_spawned_core_clicks_and_captures() -> anyhow::Result<()> {
     let home = std::env::var_os("M6C_HOME")
         .map(PathBuf::from)
         .ok_or_else(|| anyhow::anyhow!("M6C_HOME is required"))?;
-    let evidence =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/reports/M6c-evidence");
+    let _upstream = prepare_home(&home)?;
+    let explorer_log = home.join("explorer-hook.log");
+    let login_log = home.join("login-hook.log");
+    let error_log = home.join("tray-error.log");
+    unsafe {
+        std::env::set_var("QB_TRAY_TEST_EXPLORER_LOG", &explorer_log);
+    }
+    unsafe {
+        std::env::set_var("QB_TRAY_TEST_LOGIN_LOG", &login_log);
+    }
+    unsafe {
+        std::env::set_var("QB_TRAY_TEST_ERROR_LOG", &error_log);
+    }
+    let evidence = std::env::var_os("M6C_EVIDENCE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/reports/M6c-evidence")
+        });
+    let _ = fs::remove_dir_all(&evidence);
     fs::create_dir_all(&evidence)?;
-    let core = Command::new(core_bin)
+    let core = Command::new(&core_bin)
         .env("QB_HOME", &home)
         .arg("serve")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(fs::File::create(home.join("core.stdout.log"))?))
+        .stderr(Stdio::from(fs::File::create(home.join("core.stderr.log"))?))
         .spawn()?;
-    let tray = Command::new(tray_bin)
+    let core_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if admin_json(&home, "/admin/v1/health").is_ok() {
+            break;
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < core_deadline,
+            "spawned core did not become healthy: {}",
+            fs::read_to_string(home.join("core.stderr.log")).unwrap_or_default()
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    let tray = Command::new(&tray_bin)
         .env("QB_HOME", &home)
+        .env("QB_TRAY_TEST_NO_BROWSER", "1")
         .args([
             "--no-supervise",
             "--open-flyout-live",
             "--now",
             "2030-01-01T00:00:00Z",
         ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(fs::File::create(home.join("tray.stdout.log"))?))
+        .stderr(Stdio::from(fs::File::create(home.join("tray.stderr.log"))?))
         .spawn()?;
-    let _children = Children(vec![core, tray]);
+    let mut children = Children { core, tray };
     let hwnd = (0..100)
         .find_map(|_| {
             let found = window();
@@ -173,12 +362,143 @@ fn m6c_live_spawned_core_clicks_and_captures() -> anyhow::Result<()> {
             found
         })
         .ok_or_else(|| anyhow::anyhow!("flyout window not found"))?;
+    anyhow::ensure!(
+        !home.join("tray-error.log").exists(),
+        "tray failed to read the live core state: {}",
+        fs::read_to_string(home.join("tray-error.log")).unwrap_or_default()
+    );
     capture(hwnd, &evidence.join("list.bmp"))?;
+    let state = admin_json(&home, "/admin/v1/state")
+        .map_err(|error| anyhow::anyhow!("initial state: {error}"))?;
+    let accounts = state["accounts"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("state accounts missing"))?;
+    anyhow::ensure!(
+        accounts.len() == 2,
+        "live tray decoded {} accounts",
+        accounts.len()
+    );
     click(hwnd, 330, 145, WM_RBUTTONUP);
     thread::sleep(Duration::from_millis(100));
     capture(hwnd, &evidence.join("row-menu.bmp"))?;
     click(hwnd, 220, 180, WM_LBUTTONUP);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let state = admin_json(&home, "/admin/v1/state")
+            .map_err(|error| anyhow::anyhow!("pause poll: {error}"))?;
+        if state["accounts"]
+            .as_array()
+            .and_then(|a| a.get(1))
+            .and_then(|a| a["user_state"].as_str())
+            == Some("paused")
+        {
+            break;
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "row 2 pause action did not reach admin API"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    // Exercise settings and tray-only quit while the list view is still active.
+    let _ = children.tray.kill();
+    let _ = children.tray.wait();
+    for _ in 0..50 {
+        if window().is_none() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    children.tray = Command::new(&tray_bin)
+        .env("QB_HOME", &home)
+        .env("QB_TRAY_TEST_NO_BROWSER", "1")
+        .args([
+            "--no-supervise",
+            "--open-flyout-live",
+            "--now",
+            "2030-01-01T00:00:00Z",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let hwnd = (0..100)
+        .find_map(|_| {
+            let found = window();
+            if found.is_none() {
+                thread::sleep(Duration::from_millis(100));
+            }
+            found
+        })
+        .ok_or_else(|| anyhow::anyhow!("replacement flyout window not found"))?;
+    click(hwnd, 200, 240, WM_LBUTTONUP);
+    anyhow::ensure!(explorer_log.exists(), "settings test hook was not called");
+    click(hwnd, 320, 240, WM_LBUTTONUP);
     thread::sleep(Duration::from_millis(100));
-    capture(hwnd, &evidence.join("login-or-action.bmp"))?;
+    capture(hwnd, &evidence.join("quit-menu.bmp"))?;
+    click(hwnd, 230, 185, WM_LBUTTONUP);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if children.tray.try_wait()?.is_some() {
+            break;
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "tray-only quit did not exit"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    anyhow::ensure!(
+        children.core.try_wait()?.is_none(),
+        "tray-only quit stopped the core"
+    );
+    // Reopen a second tray instance against the same core for the live login panel.
+    let tray = Command::new(&tray_bin)
+        .env("QB_HOME", &home)
+        .env("QB_TRAY_TEST_NO_BROWSER", "1")
+        .args([
+            "--no-supervise",
+            "--open-flyout-live",
+            "--now",
+            "2030-01-01T00:00:00Z",
+        ])
+        .stdout(Stdio::from(fs::File::create(
+            home.join("tray2.stdout.log"),
+        )?))
+        .stderr(Stdio::from(fs::File::create(
+            home.join("tray2.stderr.log"),
+        )?))
+        .spawn()?;
+    children.tray = tray;
+    let hwnd = (0..100)
+        .find_map(|_| {
+            let found = window();
+            if found.is_none() {
+                thread::sleep(Duration::from_millis(100));
+            }
+            found
+        })
+        .ok_or_else(|| anyhow::anyhow!("second flyout window not found"))?;
+    click(hwnd, 128, 240, WM_LBUTTONUP);
+    thread::sleep(Duration::from_secs(1));
+    click(hwnd, 220, 120, WM_LBUTTONUP);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if fs::read_to_string(&login_log)
+            .map(|value| value.starts_with("pending "))
+            .unwrap_or(false)
+        {
+            break;
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "add-account did not start a pending login"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    capture(hwnd, &evidence.join("login-panel.bmp"))?;
+    anyhow::ensure!(
+        children.core.try_wait()?.is_none(),
+        "login panel test stopped the core"
+    );
     Ok(())
 }
