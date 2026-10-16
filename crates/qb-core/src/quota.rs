@@ -381,9 +381,10 @@ impl UsagePoller {
                 }
                 return Err(PollError::Unavailable);
             };
+            let replace_windows = parse::is_complete_snapshot(account.provider, &body);
             let snapshot = self
                 .obs
-                .observe_poll(id, snapshot)
+                .observe_poll(id, snapshot, replace_windows)
                 .ok_or(PollError::Unavailable)?;
             if probe.is_some() {
                 self.runtime
@@ -638,6 +639,7 @@ mod tests {
             .observe_poll(
                 &a.id,
                 json!({"windows":[],"source":"poll","observed_at":Utc::now()}),
+                true,
             )
             .unwrap();
         poller.clocks.lock().unwrap().insert(
