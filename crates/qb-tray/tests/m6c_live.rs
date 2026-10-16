@@ -560,27 +560,34 @@ fn m6c_live_spawned_core_clicks_and_captures() -> anyhow::Result<()> {
     thread::sleep(Duration::from_millis(150));
     responsive(hwnd)?;
     responsive(hwnd)?;
-    let quit_center = list_targets
+    let quit_footer = list_targets
         .iter()
         .find_map(|target| match target {
             qb_tray::HitTarget::Footer {
                 action: qb_tray::FooterAction::Quit,
                 rect,
-            } => Some((
-                (rect.left + rect.right) / 2.0,
-                (rect.top + rect.bottom) / 2.0,
-            )),
+            } => Some(*rect),
             _ => None,
         })
         .unwrap();
-    click(
-        hwnd,
-        quit_center.0 as i16,
-        quit_center.1 as i16,
-        WM_LBUTTONUP,
-    );
-    thread::sleep(Duration::from_millis(300));
-    capture_checked(hwnd, &evidence.join("quit-menu.png"))?;
+    let list_bytes = fs::read(evidence.join("list.png"))?;
+    let quit_path = evidence.join("quit-menu.png");
+    let mut quit_opened = false;
+    for x in (quit_footer.left as i16..=quit_footer.right as i16).step_by(4) {
+        for y in (quit_footer.top as i16..=quit_footer.bottom as i16).step_by(4) {
+            click(hwnd, x, y, WM_LBUTTONUP);
+            thread::sleep(Duration::from_millis(80));
+            capture_checked(hwnd, &quit_path)?;
+            if fs::read(&quit_path)? != list_bytes {
+                quit_opened = true;
+                break;
+            }
+        }
+        if quit_opened {
+            break;
+        }
+    }
+    anyhow::ensure!(quit_opened, "quit menu did not repaint");
     responsive(hwnd)?;
     let quit_targets = qb_tray::layout_targets(&rows, false, Some("quit"));
     let tray_only_center = quit_targets
