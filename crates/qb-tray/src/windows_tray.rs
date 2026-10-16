@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::os::windows::process::CommandExt;
 use std::{
+    cell::RefCell,
     ffi::c_void,
     mem::size_of,
     path::PathBuf,
@@ -19,7 +20,7 @@ use windows::{
                 Common::D2D_SIZE_U, D2D1_FACTORY_TYPE_SINGLE_THREADED,
                 D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE,
                 D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1CreateFactory,
-                ID2D1Factory,
+                ID2D1Factory, ID2D1HwndRenderTarget,
             },
             Dwm::{
                 DWMWA_BORDER_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
@@ -29,8 +30,12 @@ use windows::{
             Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect},
         },
         System::LibraryLoader::GetModuleHandleW,
+        UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent},
         UI::{
-            HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext},
+            HiDpi::{
+                DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow,
+                SetProcessDpiAwarenessContext,
+            },
             Shell::{
                 NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE,
                 NIM_MODIFY, NOTIFYICONDATAW, NOTIFYICONIDENTIFIER, Shell_NotifyIconGetRect,
@@ -38,12 +43,14 @@ use windows::{
             },
             WindowsAndMessaging::{
                 CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW,
-                DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, HMENU, IDC_ARROW,
-                IDI_APPLICATION, IsWindowVisible, LoadCursorW, LoadIconW, MSG, PostMessageW,
-                PostQuitMessage, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SetForegroundWindow,
-                SetTimer, SetWindowPos, ShowWindow, TranslateMessage, WM_APP, WM_DESTROY,
-                WM_DPICHANGED, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONUP, WM_PAINT, WM_RBUTTONUP,
-                WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
+                DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos, GetMessageW, HMENU,
+                IDC_ARROW, IDC_HAND, IDI_APPLICATION, IsWindowVisible, LoadCursorW, LoadIconW, MSG,
+                PostMessageW, PostQuitMessage, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE,
+                SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetCursor, SetForegroundWindow, SetTimer,
+                SetWindowPos, ShowWindow, TranslateMessage, WM_APP, WM_CLOSE, WM_DESTROY,
+                WM_DPICHANGED, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT,
+                WM_RBUTTONUP, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW,
+                WS_POPUP,
             },
         },
     },
@@ -52,12 +59,217 @@ use windows::{
 
 const TRAY_MESSAGE: u32 = WM_APP + 1;
 const ACTION_DONE: u32 = WM_APP + 2;
+const STATE_CHANGED: u32 = WM_APP + 3;
+const WM_MOUSELEAVE_MESSAGE: u32 = 0x02A3;
 const WINDOW_CLASS: PCWSTR = w!("QuotaBatonTrayFlyout");
 static MODEL: OnceLock<Mutex<(Vec<qb_tray::Row>, String, bool)>> = OnceLock::new();
 static VIEW_STATE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static SUPERVISOR: OnceLock<Mutex<Supervisor>> = OnceLock::new();
 static SUPERVISE_ENABLED: AtomicBool = AtomicBool::new(true);
 static FIXTURE_MODE: AtomicBool = AtomicBool::new(false);
+static LOGIN_ID: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static LOGIN_URL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static REFRESH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    static RENDER_TARGET: RefCell<Option<ID2D1HwndRenderTarget>> = const { RefCell::new(None) };
+}
+
+fn login_id() -> &'static Mutex<Option<String>> {
+    LOGIN_ID.get_or_init(|| Mutex::new(None))
+}
+
+fn login_url() -> &'static Mutex<Option<String>> {
+    LOGIN_URL.get_or_init(|| Mutex::new(None))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HitTarget {
+    RowMenu(String),
+    RowRelogin(String),
+    MenuItem(String, usize),
+    ConfirmDelete(String, bool),
+    LoginCopy,
+    LoginCancel,
+    FooterAdd,
+    FooterSettings,
+    FooterLogs,
+    FooterQuit,
+    QuitChoice(bool),
+    QuitCancel,
+    AddChoice(Option<String>),
+    Disclosure(String),
+}
+
+fn point_from_lparam(value: LPARAM) -> (f32, f32) {
+    let raw = value.0 as u32;
+    ((raw as i16) as f32, (((raw >> 16) as u16) as i16) as f32)
+}
+
+fn hit_target(x: f32, y: f32) -> Option<HitTarget> {
+    let rows = model().lock().unwrap_or_else(|e| e.into_inner()).0.clone();
+    let state = view_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if state.as_deref() == Some("add-menu") {
+        let rows = model().lock().unwrap_or_else(|e| e.into_inner()).0.clone();
+        let top = qb_tray::popup_rect(&rows, false, "add-menu", flyout_height() as f32)
+            .map(|rect| rect.top)
+            .unwrap_or(flyout_height() as f32 - 180.0);
+        return if (128.0..352.0).contains(&x) && (top..top + 110.0).contains(&y) {
+            Some(if y < top + 36.0 {
+                HitTarget::AddChoice(Some("claude".into()))
+            } else if y < top + 72.0 {
+                HitTarget::AddChoice(Some("codex".into()))
+            } else {
+                HitTarget::AddChoice(None)
+            })
+        } else {
+            None
+        };
+    }
+    let targets = qb_tray::layout_targets(
+        &rows,
+        state.as_deref() == Some("expanded"),
+        state.as_deref(),
+    );
+    if let Some(target) = qb_tray::hit_test(&targets, x, y).cloned() {
+        return Some(match target {
+            qb_tray::HitTarget::RowMenu { id, .. } => HitTarget::RowMenu(id),
+            qb_tray::HitTarget::RowRelogin { id, .. } => HitTarget::RowRelogin(id),
+            qb_tray::HitTarget::MenuItem { id, index, .. } => HitTarget::MenuItem(id, index),
+            qb_tray::HitTarget::Disclosure { provider, .. } => HitTarget::Disclosure(provider),
+            qb_tray::HitTarget::Footer { action, .. } => match action {
+                qb_tray::FooterAction::AddAccount => HitTarget::FooterAdd,
+                qb_tray::FooterAction::Settings => HitTarget::FooterSettings,
+                qb_tray::FooterAction::Logs => HitTarget::FooterLogs,
+                qb_tray::FooterAction::Quit => HitTarget::FooterQuit,
+            },
+            qb_tray::HitTarget::Login { action, .. } => match action {
+                qb_tray::LoginAction::CopyAddress => HitTarget::LoginCopy,
+                qb_tray::LoginAction::Cancel => HitTarget::LoginCancel,
+            },
+            qb_tray::HitTarget::Quit { action, .. } => match action {
+                qb_tray::QuitAction::TrayOnly => HitTarget::QuitChoice(true),
+                qb_tray::QuitAction::TrayAndProxy => HitTarget::QuitChoice(false),
+                qb_tray::QuitAction::Cancel => HitTarget::QuitCancel,
+            },
+            qb_tray::HitTarget::Dialog { action, .. } => match action {
+                qb_tray::DialogAction::ConfirmDelete => HitTarget::ConfirmDelete(
+                    state
+                        .as_deref()
+                        .and_then(|s| s.strip_prefix("confirm-delete:"))
+                        .unwrap_or_default()
+                        .to_owned(),
+                    true,
+                ),
+                qb_tray::DialogAction::Cancel => HitTarget::ConfirmDelete(
+                    state
+                        .as_deref()
+                        .and_then(|s| s.strip_prefix("confirm-delete:"))
+                        .unwrap_or_default()
+                        .to_owned(),
+                    false,
+                ),
+            },
+            qb_tray::HitTarget::Row { .. } => return None,
+        });
+    }
+    if let Some(value) = state.as_deref() {
+        if let Some(rest) = value.strip_prefix("menu:") {
+            let mut pieces = rest.split(':');
+            let id = pieces.next()?.to_owned();
+            let _selected = pieces.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+            if (136.0..=352.0).contains(&x) && (126.0..312.0).contains(&y) {
+                let count = rows
+                    .iter()
+                    .find(|row| row.id == id)
+                    .map(|row| qb_tray::actions::menu_items(row).len())
+                    .unwrap_or(0);
+                let index = ((y - 164.0) / 27.0).floor().max(0.0) as usize;
+                if index < count
+                    && y >= 164.0 + index as f32 * 27.0
+                    && y < 190.0 + index as f32 * 27.0
+                {
+                    return Some(HitTarget::MenuItem(id, index));
+                }
+            }
+            return None;
+        }
+        if let Some(id) = value.strip_prefix("confirm-delete:") {
+            if (16.0..344.0).contains(&x) && y > flyout_height() as f32 - 64.0 {
+                return Some(HitTarget::ConfirmDelete(id.to_owned(), x < 180.0));
+            }
+            return None;
+        }
+        if value.starts_with("login:") {
+            if (176.0..208.0).contains(&y) {
+                return Some(if x < 180.0 {
+                    HitTarget::LoginCopy
+                } else {
+                    HitTarget::LoginCancel
+                });
+            }
+            return None;
+        }
+        if value == "quit" {
+            let top = flyout_height() as f32 - 124.0;
+            if (top..top + 72.0).contains(&y) {
+                return Some(HitTarget::QuitChoice(y < top + 32.0));
+            }
+            return None;
+        }
+    }
+    let mut cursor = 52.0f32;
+    for provider in ["Claude", "Codex"] {
+        let active = rows
+            .iter()
+            .filter(|row| row.provider == provider && row.user_chip != "비활성")
+            .collect::<Vec<_>>();
+        let disabled = rows
+            .iter()
+            .filter(|row| row.provider == provider && row.user_chip == "비활성")
+            .collect::<Vec<_>>();
+        if active.is_empty() && disabled.is_empty() {
+            continue;
+        }
+        cursor += 36.0;
+        for row in active {
+            let height = qb_tray::row_height(row);
+            if (cursor..cursor + height).contains(&y) {
+                if (320.0..360.0).contains(&x) {
+                    return Some(HitTarget::RowMenu(row.id.clone()));
+                }
+                if row.reason_button && x >= 258.0 && y >= cursor + height - 32.0 {
+                    return Some(HitTarget::RowRelogin(row.id.clone()));
+                }
+            }
+            cursor += height;
+        }
+        if !disabled.is_empty() {
+            if (cursor..cursor + 32.0).contains(&y) {
+                return Some(HitTarget::Disclosure(provider.to_owned()));
+            }
+            cursor += 32.0;
+        }
+    }
+    let footer = flyout_height() as f32 - 48.0;
+    if (footer + 8.0..footer + 40.0).contains(&y) {
+        return if (88.0..169.0).contains(&x) {
+            Some(HitTarget::FooterAdd)
+        } else if (169.0..227.0).contains(&x) {
+            Some(HitTarget::FooterSettings)
+        } else if (227.0..283.0).contains(&x) {
+            Some(HitTarget::FooterLogs)
+        } else if (283.0..360.0).contains(&x) {
+            Some(HitTarget::FooterQuit)
+        } else {
+            None
+        };
+    }
+    None
+}
 
 struct Supervisor {
     last_start: Option<Instant>,
@@ -109,6 +321,34 @@ fn flyout_height() -> i32 {
         .clamp(120.0, 700.0) as i32
 }
 
+fn window_scale(hwnd: HWND) -> f32 {
+    unsafe { GetDpiForWindow(hwnd).max(96) as f32 / 96.0 }
+}
+
+fn client_pixel_size(client: RECT) -> D2D_SIZE_U {
+    D2D_SIZE_U {
+        width: (client.right - client.left).max(1) as u32,
+        height: (client.bottom - client.top).max(1) as u32,
+    }
+}
+
+unsafe fn resize_flyout(hwnd: HWND) {
+    let scale = window_scale(hwnd);
+    let width = (360.0 * scale).round() as i32;
+    let height = (flyout_height() as f32 * scale).round() as i32;
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            width,
+            height,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn position_flyout(hwnd: HWND) {
     let identifier = NOTIFYICONIDENTIFIER {
@@ -133,14 +373,29 @@ unsafe fn position_flyout(hwnd: HWND) {
         ..Default::default()
     };
     let _ = GetMonitorInfoW(monitor, &mut info);
-    let height = flyout_height();
-    let width = 360;
+    let scale = window_scale(hwnd);
+    let height = (flyout_height() as f32 * scale).round() as i32;
+    let width = (360.0 * scale).round() as i32;
     let x = (icon.right - width).clamp(info.rcWork.left, info.rcWork.right - width);
     let y = (icon.top - height).max(info.rcWork.top);
     let _ = SetWindowPos(hwnd, None, x, y, width, height, Default::default());
 }
 
 fn update_status(supervise: bool, notification_hwnd: Option<HWND>) {
+    if REFRESH_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    let notification_hwnd = notification_hwnd.map(|hwnd| hwnd.0 as isize);
+    let _ = std::thread::Builder::new()
+        .name("quota-baton-tray-refresh".into())
+        .spawn(move || update_status_worker(supervise, notification_hwnd));
+}
+
+fn update_status_worker(supervise: bool, notification_hwnd: Option<isize>) {
+    let notification_hwnd = notification_hwnd.map(|value| HWND(value as *mut c_void));
     let result = (|| -> Result<String> {
         let client = super::client::AdminClient::from_home()?;
         let runtime = tokio::runtime::Runtime::new()?;
@@ -160,7 +415,10 @@ fn update_status(supervise: bool, notification_hwnd: Option<HWND>) {
             state.unreachable_since = None;
             text
         }
-        Err(_) => {
+        Err(error) => {
+            if let Some(path) = std::env::var_os("QB_TRAY_TEST_ERROR_LOG") {
+                let _ = std::fs::write(path, error.to_string());
+            }
             if supervise {
                 let mut state = supervisor().lock().unwrap_or_else(|e| e.into_inner());
                 let since = *state.unreachable_since.get_or_insert_with(Instant::now);
@@ -189,6 +447,12 @@ fn update_status(supervise: bool, notification_hwnd: Option<HWND>) {
                     }
                 }
             }
+            {
+                let mut model = model().lock().unwrap_or_else(|e| e.into_inner());
+                model.0.clear();
+                model.1 = "error:코어 상태를 읽지 못했습니다 · 로그 열기".to_owned();
+                model.2 = false;
+            }
             "코어에 연결할 수 없습니다".to_owned()
         }
     };
@@ -197,32 +461,48 @@ fn update_status(supervise: bool, notification_hwnd: Option<HWND>) {
         model.0.clear();
         model.2 = false;
     }
+    REFRESH_IN_FLIGHT.store(false, Ordering::Release);
+    if let Some(hwnd) = notification_hwnd {
+        unsafe {
+            let _ = PostMessageW(Some(hwnd), STATE_CHANGED, WPARAM(0), LPARAM(0));
+        }
+    }
 }
 
 fn paint_window(hwnd: HWND) -> Result<()> {
     let (rows, version, core_ok) = model().lock().unwrap_or_else(|e| e.into_inner()).clone();
     unsafe {
-        let factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
-        let props = D2D1_RENDER_TARGET_PROPERTIES {
-            r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
-            dpiX: 96.0,
-            dpiY: 96.0,
-            ..Default::default()
-        };
-        let hwnd_props = D2D1_HWND_RENDER_TARGET_PROPERTIES {
-            hwnd,
-            pixelSize: D2D_SIZE_U {
-                width: 360,
-                height: flyout_height() as u32,
-            },
-            presentOptions: D2D1_PRESENT_OPTIONS_NONE,
-        };
-        let target = factory.CreateHwndRenderTarget(&props, &hwnd_props)?;
+        let mut client = RECT::default();
+        GetClientRect(hwnd, &mut client)?;
+        let pixel_size = client_pixel_size(client);
+        let dpi = GetDpiForWindow(hwnd).max(96) as f32;
+        let target = RENDER_TARGET.with(|slot| -> Result<ID2D1HwndRenderTarget> {
+            if let Some(target) = slot.borrow().as_ref() {
+                let _ = target.Resize(&pixel_size);
+                target.SetDpi(dpi, dpi);
+                return Ok(target.clone());
+            }
+            let factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
+            let props = D2D1_RENDER_TARGET_PROPERTIES {
+                r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+                dpiX: dpi,
+                dpiY: dpi,
+                ..Default::default()
+            };
+            let hwnd_props = D2D1_HWND_RENDER_TARGET_PROPERTIES {
+                hwnd,
+                pixelSize: pixel_size,
+                presentOptions: D2D1_PRESENT_OPTIONS_NONE,
+            };
+            let target = factory.CreateHwndRenderTarget(&props, &hwnd_props)?;
+            *slot.borrow_mut() = Some(target.clone());
+            Ok(target)
+        })?;
         let review_state = view_state()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        qb_tray::native_render::paint_with_state(
+        let result = qb_tray::native_render::paint_with_state(
             &target,
             &rows,
             false,
@@ -231,7 +511,14 @@ fn paint_window(hwnd: HWND) -> Result<()> {
             false,
             core_ok,
             review_state.as_deref(),
-        )?;
+        );
+        if let Err(error) = result {
+            if error.code().0 as u32 == 0x8899000C {
+                RENDER_TARGET.with(|slot| *slot.borrow_mut() = None);
+            } else {
+                return Err(error.into());
+            }
+        }
     }
     Ok(())
 }
@@ -289,6 +576,10 @@ fn activate_menu(hwnd: HWND) {
     let operation = qb_tray::actions::admin_operation(item, &row);
     let provider = row.provider.clone();
     let id = row.id.clone();
+    if item == qb_tray::actions::MenuItem::Relogin {
+        launch_login(hwnd, provider.to_ascii_lowercase());
+        return;
+    }
     let hwnd_value = hwnd.0 as isize;
     let _ = std::thread::Builder::new()
         .name("quota-baton-tray-action".into())
@@ -339,6 +630,79 @@ fn activate_menu(hwnd: HWND) {
                     .map_err(|e| anyhow::anyhow!(e))
                 })
             })();
+            if let (Err(error), Some(path)) = (&result, std::env::var_os("QB_TRAY_TEST_ERROR_LOG"))
+            {
+                let _ = std::fs::write(path, error.to_string());
+            }
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(hwnd_value as *mut c_void)),
+                    ACTION_DONE,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        });
+}
+
+fn launch_login(hwnd: HWND, provider: String) {
+    *view_state().lock().unwrap_or_else(|e| e.into_inner()) = Some(format!("login:{provider}"));
+    let hwnd_value = hwnd.0 as isize;
+    let _ = std::thread::Builder::new()
+        .name("quota-baton-tray-login".into())
+        .spawn(move || {
+            let result = (|| -> anyhow::Result<()> {
+                let client = super::client::AdminClient::from_home()?;
+                let runtime = tokio::runtime::Runtime::new()?;
+                let start = runtime
+                    .block_on(client.start_login(&provider))
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                *login_id().lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(start.login_id.clone());
+                *login_url().lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(start.auth_url.clone());
+                if let Some(path) = std::env::var_os("QB_TRAY_TEST_LOGIN_LOG") {
+                    let _ = std::fs::write(path, format!("pending {}\n", start.login_id));
+                }
+                *view_state().lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(format!("login:{provider}"));
+                unsafe {
+                    let _ = PostMessageW(
+                        Some(HWND(hwnd_value as *mut c_void)),
+                        STATE_CHANGED,
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                }
+                // The browser is a product action; tests set this hook to avoid opening one.
+                if std::env::var_os("QB_TRAY_TEST_NO_BROWSER").is_none() {
+                    let _ = open_browser(&start.auth_url);
+                }
+                for _ in 0..600 {
+                    std::thread::sleep(Duration::from_secs(1));
+                    let status = runtime
+                        .block_on(client.login_status(&start.login_id))
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                    if matches!(
+                        status.status.as_str(),
+                        "completed" | "failed" | "expired" | "cancelled"
+                    ) {
+                        *view_state().lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(format!("login:{provider}:{}", status.status));
+                        unsafe {
+                            let _ = PostMessageW(
+                                Some(HWND(hwnd_value as *mut c_void)),
+                                STATE_CHANGED,
+                                WPARAM(0),
+                                LPARAM(0),
+                            );
+                        }
+                        break;
+                    }
+                }
+                *login_id().lock().unwrap_or_else(|e| e.into_inner()) = None;
+                Ok(())
+            })();
             if result.is_ok() {
                 unsafe {
                     let _ = PostMessageW(
@@ -350,6 +714,237 @@ fn activate_menu(hwnd: HWND) {
                 }
             }
         });
+}
+
+fn cancel_login() {
+    let id = login_id().lock().unwrap_or_else(|e| e.into_inner()).take();
+    *login_url().lock().unwrap_or_else(|e| e.into_inner()) = None;
+    if let Some(path) = std::env::var_os("QB_TRAY_TEST_LOGIN_LOG") {
+        let _ = std::fs::write(path, "cancelled\n");
+    }
+    if let Some(id) = id {
+        let _ = std::thread::Builder::new()
+            .name("quota-baton-tray-login-cancel".into())
+            .spawn(move || {
+                if let Ok(client) = super::client::AdminClient::from_home()
+                    && let Ok(runtime) = tokio::runtime::Runtime::new()
+                {
+                    let _ = runtime.block_on(client.cancel_login(&id));
+                }
+            });
+    }
+}
+
+fn activate_hit(hwnd: HWND, target: HitTarget) {
+    match target {
+        HitTarget::RowMenu(id) => {
+            *view_state().lock().unwrap_or_else(|e| e.into_inner()) = Some(format!("menu:{id}:0"));
+        }
+        HitTarget::RowRelogin(id) => {
+            let provider = model()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .0
+                .iter()
+                .find(|row| row.id == id)
+                .map(|row| row.provider.to_ascii_lowercase())
+                .unwrap_or_else(|| "codex".into());
+            launch_login(hwnd, provider);
+        }
+        HitTarget::MenuItem(id, index) => {
+            let row = model()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .0
+                .iter()
+                .find(|row| row.id == id)
+                .cloned();
+            if let Some(row) = row
+                && let Some(item) = qb_tray::actions::menu_items(&row).get(index).copied()
+            {
+                if item.is_destructive() {
+                    *view_state().lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(format!("confirm-delete:{id}"));
+                } else if item == qb_tray::actions::MenuItem::Relogin {
+                    launch_login(hwnd, row.provider.to_ascii_lowercase());
+                } else {
+                    *view_state().lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(format!("menu:{id}:{index}"));
+                    activate_menu(hwnd);
+                }
+            }
+        }
+        HitTarget::ConfirmDelete(id, yes) => {
+            if yes {
+                let row = model()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0
+                    .iter()
+                    .find(|row| row.id == id)
+                    .cloned();
+                if let Some(row) = row {
+                    let provider = row.provider.clone();
+                    let hwnd_value = hwnd.0 as isize;
+                    let _ = std::thread::Builder::new()
+                        .name("quota-baton-tray-delete".into())
+                        .spawn(move || {
+                            let _ = (|| -> anyhow::Result<()> {
+                                let client = super::client::AdminClient::from_home()?;
+                                let runtime = tokio::runtime::Runtime::new()?;
+                                runtime
+                                    .block_on(client.delete_account(&id))
+                                    .map_err(|e| anyhow::anyhow!(e))?;
+                                Ok(())
+                            })();
+                            unsafe {
+                                let _ = PostMessageW(
+                                    Some(HWND(hwnd_value as *mut c_void)),
+                                    ACTION_DONE,
+                                    WPARAM(0),
+                                    LPARAM(0),
+                                );
+                            };
+                            let _ = provider;
+                        });
+                }
+            } else {
+                *view_state().lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
+        }
+        HitTarget::LoginCopy => {
+            if std::env::var_os("QB_TRAY_TEST_NO_CLIPBOARD").is_none()
+                && let Some(url) = login_url()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+            {
+                let _ = Command::new("powershell.exe")
+                    .args(["-NoProfile", "-Command", "Set-Clipboard -Value $args[0]"])
+                    .arg(url)
+                    .spawn();
+            }
+        }
+        HitTarget::LoginCancel => {
+            cancel_login();
+            *view_state().lock().unwrap_or_else(|e| e.into_inner()) = Some("list".into());
+            if std::env::var_os("QB_TRAY_TEST_KEEP_OPEN").is_some() {
+                unsafe {
+                    let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                }
+            }
+        }
+        HitTarget::FooterAdd => {
+            *view_state().lock().unwrap_or_else(|e| e.into_inner()) = Some("add-menu".into());
+        }
+        HitTarget::FooterSettings => {
+            open_folder(".");
+        }
+        HitTarget::FooterLogs => {
+            open_folder("logs");
+        }
+        HitTarget::FooterQuit => {
+            *view_state().lock().unwrap_or_else(|e| e.into_inner()) = Some("quit".into());
+        }
+        HitTarget::QuitChoice(tray_only) => {
+            if tray_only {
+                unsafe {
+                    let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                }
+            } else {
+                let hwnd_value = hwnd.0 as isize;
+                let _ = std::thread::Builder::new()
+                    .name("quota-baton-tray-shutdown".into())
+                    .spawn(move || {
+                        if let Ok(client) = super::client::AdminClient::from_home()
+                            && let Ok(runtime) = tokio::runtime::Runtime::new()
+                        {
+                            let _ = runtime.block_on(client.shutdown(30));
+                        }
+                        unsafe {
+                            let _ = PostMessageW(
+                                Some(HWND(hwnd_value as *mut c_void)),
+                                WM_CLOSE,
+                                WPARAM(0),
+                                LPARAM(0),
+                            );
+                        }
+                    });
+            }
+        }
+        HitTarget::AddChoice(provider) => {
+            if let Some(provider) = provider {
+                launch_login(hwnd, provider);
+            } else {
+                *view_state().lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
+        }
+        HitTarget::QuitCancel => {
+            *view_state().lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+        HitTarget::Disclosure(provider) => {
+            let _ = provider;
+            let mut state = view_state().lock().unwrap_or_else(|e| e.into_inner());
+            *state = Some(if state.as_deref() == Some("expanded") {
+                "list".into()
+            } else {
+                "expanded".into()
+            });
+        }
+    }
+    unsafe {
+        resize_flyout(hwnd);
+        let _ = InvalidateRect(Some(hwnd), None, true);
+    }
+}
+
+fn open_folder(relative: &str) {
+    let home = qb_core::home().unwrap_or_else(|_| PathBuf::from("."));
+    let path = if relative == "." {
+        home
+    } else {
+        home.join(relative)
+    };
+    if let Some(log) = std::env::var_os("QB_TRAY_TEST_EXPLORER_LOG") {
+        let _ = std::fs::write(log, path.to_string_lossy().as_bytes());
+    } else if std::env::var_os("QB_TRAY_TEST_NO_EXPLORER").is_none() {
+        let _ = Command::new("explorer.exe").arg(path).spawn();
+    }
+}
+
+fn open_browser(url: &str) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn ShellExecuteW(
+            window: *mut c_void,
+            operation: *const u16,
+            file: *const u16,
+            parameters: *const u16,
+            directory: *const u16,
+            show: i32,
+        ) -> *mut c_void;
+    }
+    let operation: Vec<u16> = "open\0".encode_utf16().collect();
+    let file: Vec<u16> = std::ffi::OsStr::new(url)
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+        )
+    };
+    if result as isize <= 32 {
+        Err(std::io::Error::other("브라우저를 열지 못했습니다."))
+    } else {
+        Ok(())
+    }
 }
 
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -365,7 +960,7 @@ unsafe extern "system" fn window_proc(
                 if lparam.0 as u32 == WM_RBUTTONUP {
                     if let Some(row) = model().lock().unwrap_or_else(|e| e.into_inner()).0.first() {
                         *view_state().lock().unwrap_or_else(|e| e.into_inner()) =
-                            Some(format!("menu:{}", row.id));
+                            Some(format!("menu:{}:0", row.id));
                         let _ = InvalidateRect(Some(hwnd), None, true);
                     }
                 } else {
@@ -382,19 +977,77 @@ unsafe extern "system" fn window_proc(
             let _ = SetForegroundWindow(hwnd);
             LRESULT(0)
         }
-        WM_RBUTTONUP if IsWindowVisible(hwnd).as_bool() => {
-            if let Some(row) = model().lock().unwrap_or_else(|e| e.into_inner()).0.first() {
-                *view_state().lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some(format!("menu:{}", row.id));
+        WM_LBUTTONUP if IsWindowVisible(hwnd).as_bool() => {
+            let (x, y) = point_from_lparam(lparam);
+            if let Some(target) = hit_target(x, y) {
+                activate_hit(hwnd, target);
+            } else if view_state()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none()
+                && (flyout_height() as f32 - 40.0..flyout_height() as f32).contains(&y)
+            {
+                let target = if (171.0..225.0).contains(&x) {
+                    Some(HitTarget::FooterSettings)
+                } else if (283.0..337.0).contains(&x) {
+                    Some(HitTarget::FooterQuit)
+                } else {
+                    None
+                };
+                if let Some(target) = target {
+                    activate_hit(hwnd, target);
+                }
+            } else if view_state()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some()
+            {
+                *view_state().lock().unwrap_or_else(|e| e.into_inner()) = None;
                 let _ = InvalidateRect(Some(hwnd), None, true);
             }
             LRESULT(0)
         }
+        WM_RBUTTONUP if IsWindowVisible(hwnd).as_bool() => {
+            let (x, y) = point_from_lparam(lparam);
+            if let Some(HitTarget::RowMenu(id)) = hit_target(x, y) {
+                *view_state().lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(format!("menu:{id}:0"));
+                let _ = InvalidateRect(Some(hwnd), None, true);
+            } else {
+                *view_state().lock().unwrap_or_else(|e| e.into_inner()) = None;
+                let _ = InvalidateRect(Some(hwnd), None, true);
+            }
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE if IsWindowVisible(hwnd).as_bool() => {
+            let mut tracking = TRACKMOUSEEVENT {
+                cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: hwnd,
+                ..Default::default()
+            };
+            let _ = TrackMouseEvent(&mut tracking);
+            let (x, y) = point_from_lparam(lparam);
+            let cursor = if hit_target(x, y).is_some() {
+                LoadCursorW(None, IDC_HAND)
+            } else {
+                LoadCursorW(None, IDC_ARROW)
+            };
+            if let Ok(cursor) = cursor {
+                let _ = SetCursor(Some(cursor));
+            }
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE_MESSAGE => {
+            let _ = SetCursor(LoadCursorW(None, IDC_ARROW).ok());
+            LRESULT(0)
+        }
         WM_KILLFOCUS => {
-            if view_state()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_none()
+            if std::env::var_os("QB_TRAY_TEST_KEEP_OPEN").is_none()
+                && view_state()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_none()
             {
                 let _ = ShowWindow(hwnd, SW_HIDE);
             }
@@ -448,6 +1101,12 @@ unsafe extern "system" fn window_proc(
         ACTION_DONE => {
             update_status(false, Some(hwnd));
             *view_state().lock().unwrap_or_else(|e| e.into_inner()) = None;
+            resize_flyout(hwnd);
+            let _ = InvalidateRect(Some(hwnd), None, true);
+            LRESULT(0)
+        }
+        STATE_CHANGED => {
+            resize_flyout(hwnd);
             let _ = InvalidateRect(Some(hwnd), None, true);
             LRESULT(0)
         }
@@ -468,6 +1127,20 @@ unsafe extern "system" fn window_proc(
                     Default::default(),
                 );
             }
+            resize_flyout(hwnd);
+            let _ = InvalidateRect(Some(hwnd), None, true);
+            LRESULT(0)
+        }
+        WM_SIZE => {
+            RENDER_TARGET.with(|slot| {
+                if let Some(target) = slot.borrow().as_ref() {
+                    let width = (lparam.0 as u32 & 0xffff).max(1);
+                    let height = ((lparam.0 as u32 >> 16) & 0xffff).max(1);
+                    unsafe {
+                        let _ = target.Resize(&D2D_SIZE_U { width, height });
+                    }
+                }
+            });
             let _ = InvalidateRect(Some(hwnd), None, true);
             LRESULT(0)
         }
@@ -553,6 +1226,9 @@ pub fn run(
             &border_color as *const _ as *const c_void,
             size_of_val(&border_color) as u32,
         );
+        if !FIXTURE_MODE.load(Ordering::Relaxed) {
+            update_status(supervise, Some(hwnd));
+        }
         SetTimer(Some(hwnd), 1, 60_000, None);
         let mut icon = NOTIFYICONDATAW {
             cbSize: size_of::<NOTIFYICONDATAW>() as u32,
@@ -582,4 +1258,23 @@ pub fn run(
         DestroyWindow(hwnd)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_target_size_is_the_current_client_rect() {
+        for (width, height) in [(360, 192), (360, 412), (540, 700), (720, 552)] {
+            let client = RECT {
+                left: 0,
+                top: 0,
+                right: width,
+                bottom: height,
+            };
+            let pixels = client_pixel_size(client);
+            assert_eq!((pixels.width, pixels.height), (width as u32, height as u32));
+        }
+    }
 }

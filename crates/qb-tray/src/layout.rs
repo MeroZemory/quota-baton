@@ -6,7 +6,7 @@
 //! exercise it without starting the core.
 
 use chrono::{DateTime, Datelike, FixedOffset, Local, Timelike};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::time::{Duration, SystemTime};
 
 pub mod actions;
@@ -54,10 +54,33 @@ pub struct Account {
     pub active_sessions: u64,
     #[serde(default)]
     pub spread_threshold: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "decode_source")]
     pub source: String,
     #[serde(default)]
     pub pacing: Pacing,
+}
+
+fn decode_source<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value {
+        serde_json::Value::String(value) => value,
+        serde_json::Value::Object(mut object) => {
+            let kind = object
+                .remove("kind")
+                .and_then(|kind| kind.as_str().map(str::to_owned));
+            if kind.as_deref() == Some("cpa")
+                && object.get("mode").and_then(serde_json::Value::as_str) == Some("linked")
+            {
+                "linked".into()
+            } else {
+                kind.unwrap_or_else(|| "⚠ source decode error (missing kind)".into())
+            }
+        }
+        _ => "⚠ source decode error".into(),
+    })
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -146,6 +169,397 @@ pub struct Colors {
     pub critical: Rgb,
     pub track: Rgb,
     pub divider: Rgb,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rect {
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+}
+
+const FLYOUT_WIDTH: f32 = 360.0;
+const FOOTER_HEIGHT: f32 = 48.0;
+
+fn row_anchor(rows: &[Row], expand_disabled: bool, id: &str) -> Option<Rect> {
+    let mut y = 52.0;
+    for provider in ["Claude", "Codex"] {
+        let active = rows
+            .iter()
+            .filter(|r| r.provider == provider && r.user_chip != "비활성")
+            .collect::<Vec<_>>();
+        let disabled = rows
+            .iter()
+            .filter(|r| r.provider == provider && r.user_chip == "비활성")
+            .collect::<Vec<_>>();
+        if active.is_empty() && disabled.is_empty() {
+            continue;
+        }
+        y += 36.0;
+        let expanded = expand_disabled && provider == "Codex";
+        if expanded && !disabled.is_empty() {
+            y += 28.0;
+        }
+        for row in active.into_iter().chain(if expanded {
+            disabled.clone()
+        } else {
+            Vec::new()
+        }) {
+            let h = row_height(row);
+            if row.id == id {
+                return Some(Rect::new(16.0, y, FLYOUT_WIDTH - 16.0, y + h));
+            }
+            y += h;
+        }
+        if !expanded && !disabled.is_empty() {
+            y += 28.0;
+        }
+    }
+    None
+}
+
+pub fn account_menu_height(row: &Row) -> f32 {
+    let items = actions::menu_items(row);
+    let separators = items
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i == 2 || *i == 3)
+        .count() as f32;
+    9.0 + items.len() as f32 * 32.0 + separators * 10.0
+}
+
+pub fn popup_rect(rows: &[Row], expand_disabled: bool, state: &str, height: f32) -> Option<Rect> {
+    let footer_y = height - FOOTER_HEIGHT;
+    if let Some(id) = state
+        .strip_prefix("menu:")
+        .and_then(|v| v.split(':').next())
+    {
+        let row = rows.iter().find(|r| r.id == id).or_else(|| rows.first())?;
+        let anchor = row_anchor(rows, expand_disabled, &row.id)?;
+        let popup_h = account_menu_height(row);
+        let down = anchor.bottom + 4.0;
+        let top = if down + popup_h <= footer_y {
+            down
+        } else if anchor.top >= popup_h + 4.0 {
+            anchor.top - popup_h - 4.0
+        } else {
+            0.0
+        };
+        return Some(Rect::new(136.0, top, 352.0, top + popup_h));
+    }
+    if state == "add-menu" {
+        return Some(Rect::new(128.0, footer_y - 110.0, 352.0, footer_y - 4.0));
+    }
+    if state == "quit" {
+        return Some(Rect::new(152.0, footer_y - 92.0, 352.0, footer_y - 4.0));
+    }
+    None
+}
+
+pub fn popup_required_height(rows: &[Row], expand_disabled: bool, state: &str, base: f32) -> f32 {
+    let Some(popup) = popup_rect(rows, expand_disabled, state, base) else {
+        return base;
+    };
+    base.max(popup.bottom + if popup.top == 0.0 { FOOTER_HEIGHT } else { 0.0 })
+}
+
+impl Rect {
+    pub const fn new(left: f32, top: f32, right: f32, bottom: f32) -> Self {
+        Self {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    pub fn contains(self, x: f32, y: f32) -> bool {
+        x >= self.left && x <= self.right && y >= self.top && y <= self.bottom
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum HitTarget {
+    Row {
+        id: String,
+        rect: Rect,
+    },
+    RowMenu {
+        id: String,
+        rect: Rect,
+    },
+    RowRelogin {
+        id: String,
+        rect: Rect,
+    },
+    Disclosure {
+        provider: String,
+        rect: Rect,
+    },
+    MenuItem {
+        id: String,
+        index: usize,
+        rect: Rect,
+    },
+    Footer {
+        action: FooterAction,
+        rect: Rect,
+    },
+    Login {
+        provider: String,
+        action: LoginAction,
+        rect: Rect,
+    },
+    Quit {
+        action: QuitAction,
+        rect: Rect,
+    },
+    Dialog {
+        action: DialogAction,
+        rect: Rect,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FooterAction {
+    AddAccount,
+    Settings,
+    Logs,
+    Quit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginAction {
+    CopyAddress,
+    Cancel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuitAction {
+    TrayOnly,
+    TrayAndProxy,
+    Cancel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogAction {
+    ConfirmDelete,
+    Cancel,
+}
+
+impl HitTarget {
+    pub fn rect(&self) -> Rect {
+        match self {
+            Self::Row { rect, .. }
+            | Self::RowMenu { rect, .. }
+            | Self::RowRelogin { rect, .. }
+            | Self::MenuItem { rect, .. }
+            | Self::Disclosure { rect, .. }
+            | Self::Footer { rect, .. }
+            | Self::Login { rect, .. }
+            | Self::Quit { rect, .. }
+            | Self::Dialog { rect, .. } => *rect,
+        }
+    }
+}
+
+/// Return targets in paint order. Hit testing should use the last matching
+/// target so modal and menu targets take precedence over the flyout body.
+pub fn layout_targets(rows: &[Row], expand_disabled: bool, state: Option<&str>) -> Vec<HitTarget> {
+    const WIDTH: f32 = FLYOUT_WIDTH;
+    const PADDING: f32 = 16.0;
+    let mut targets = Vec::new();
+    let login = state.is_some_and(|value| value.starts_with("login:"));
+    let height = state_height(rows, expand_disabled, state);
+    let mut y = 52.0;
+
+    if !login {
+        for provider in ["claude", "codex"] {
+            let active = rows
+                .iter()
+                .filter(|r| r.provider == provider_name(provider) && r.user_chip != "비활성")
+                .collect::<Vec<_>>();
+            let disabled = rows
+                .iter()
+                .filter(|r| r.provider == provider_name(provider) && r.user_chip == "비활성")
+                .collect::<Vec<_>>();
+            if active.is_empty() && disabled.is_empty() {
+                continue;
+            }
+            y += 36.0;
+            let expanded = expand_disabled && provider == "codex";
+            if expanded && !disabled.is_empty() {
+                y += 28.0;
+            }
+            for row in active.into_iter().chain(if expanded {
+                disabled.clone()
+            } else {
+                Vec::new()
+            }) {
+                targets.push(HitTarget::Row {
+                    id: row.id.clone(),
+                    rect: Rect::new(PADDING, y, WIDTH - PADDING, y + row_height(row)),
+                });
+                targets.push(HitTarget::RowMenu {
+                    id: row.id.clone(),
+                    rect: Rect::new(324.0, y + 10.0, 352.0, y + 34.0),
+                });
+                if row.reason_button {
+                    targets.push(HitTarget::RowRelogin {
+                        id: row.id.clone(),
+                        rect: Rect::new(
+                            258.0,
+                            y + row_height(row) - 32.0,
+                            344.0,
+                            y + row_height(row) - 8.0,
+                        ),
+                    });
+                }
+                y += row_height(row);
+            }
+            if !expanded && !disabled.is_empty() {
+                targets.push(HitTarget::Disclosure {
+                    provider: provider.into(),
+                    rect: Rect::new(PADDING, y, 236.0, y + 28.0),
+                });
+                y += 28.0;
+            }
+        }
+    } else {
+        targets.push(HitTarget::Login {
+            provider: if state.is_some_and(|v| v.contains("claude")) {
+                "claude".into()
+            } else {
+                "codex".into()
+            },
+            action: LoginAction::CopyAddress,
+            rect: Rect::new(16.0, 176.0, 176.0, 208.0),
+        });
+        targets.push(HitTarget::Login {
+            provider: if state.is_some_and(|v| v.contains("claude")) {
+                "claude".into()
+            } else {
+                "codex".into()
+            },
+            action: LoginAction::Cancel,
+            rect: Rect::new(184.0, 176.0, 344.0, 208.0),
+        });
+        y = 228.0;
+    }
+    let footer_y = if login { y } else { height - 48.0 };
+    for (action, left, right) in [
+        (FooterAction::AddAccount, 88.0, 169.0),
+        (FooterAction::Settings, 171.0, 225.0),
+        (FooterAction::Logs, 227.0, 281.0),
+        (FooterAction::Quit, 283.0, 337.0),
+    ] {
+        if action != FooterAction::AddAccount || !login {
+            targets.push(HitTarget::Footer {
+                action,
+                rect: Rect::new(left, footer_y + 8.0, right, footer_y + 40.0),
+            });
+        }
+    }
+    if state.is_some_and(|v| v.starts_with("menu:")) {
+        if let Some(row) = rows.iter().find(|row| {
+            state
+                .unwrap_or_default()
+                .strip_prefix("menu:")
+                .and_then(|v| v.split(':').next())
+                == Some(row.id.as_str())
+        }) {
+            let popup =
+                popup_rect(rows, expand_disabled, state.unwrap_or_default(), height).unwrap();
+            for (index, _) in actions::menu_items(row).iter().enumerate() {
+                targets.push(HitTarget::MenuItem {
+                    id: row.id.clone(),
+                    index,
+                    rect: Rect::new(
+                        popup.left + 41.0,
+                        popup.top + 9.0 + index as f32 * 32.0,
+                        popup.right - 15.0,
+                        popup.top + 9.0 + index as f32 * 32.0 + 30.0,
+                    ),
+                });
+            }
+        }
+    } else if state.is_some_and(|v| v.starts_with("confirm-delete:")) {
+        let top = (height - 193.0).round() / 2.0;
+        targets.push(HitTarget::Dialog {
+            action: DialogAction::ConfirmDelete,
+            rect: Rect::new(16.0, top + 129.0, 180.0, top + 193.0),
+        });
+        targets.push(HitTarget::Dialog {
+            action: DialogAction::Cancel,
+            rect: Rect::new(180.0, top + 129.0, 344.0, top + 193.0),
+        });
+    } else if state == Some("quit") {
+        let top = popup_rect(rows, expand_disabled, "quit", height)
+            .unwrap()
+            .top;
+        targets.push(HitTarget::Quit {
+            action: QuitAction::TrayOnly,
+            rect: Rect::new(168.0, top + 36.0, 336.0, top + 62.0),
+        });
+        targets.push(HitTarget::Quit {
+            action: QuitAction::TrayAndProxy,
+            rect: Rect::new(168.0, top + 64.0, 336.0, top + 90.0),
+        });
+    }
+    targets
+}
+
+pub fn hit_test(targets: &[HitTarget], x: f32, y: f32) -> Option<&HitTarget> {
+    targets
+        .iter()
+        .rev()
+        .find(|target| target.rect().contains(x, y))
+}
+
+fn layout_content_height(rows: &[Row], expand_disabled: bool) -> f32 {
+    let mut height = 52.0;
+    let mut sections = 0;
+    for provider in ["Claude", "Codex"] {
+        let active = rows
+            .iter()
+            .filter(|r| r.provider == provider && r.user_chip != "비활성")
+            .count();
+        let disabled = rows
+            .iter()
+            .filter(|r| r.provider == provider && r.user_chip == "비활성")
+            .count();
+        if active + disabled == 0 {
+            continue;
+        }
+        sections += 1;
+        height += 36.0
+            + rows
+                .iter()
+                .filter(|r| r.provider == provider && r.user_chip != "비활성")
+                .map(row_height)
+                .sum::<f32>();
+        if expand_disabled && provider == "Codex" {
+            if disabled > 0 {
+                height += 32.0;
+            }
+            height += rows
+                .iter()
+                .filter(|r| r.provider == provider && r.user_chip == "비활성")
+                .map(row_height)
+                .sum::<f32>();
+        } else if disabled > 0 {
+            height += 32.0;
+        }
+    }
+    height + sections as f32 + 3.0 + 8.0 + FOOTER_HEIGHT
+}
+
+pub fn state_height(rows: &[Row], expand_disabled: bool, state: Option<&str>) -> f32 {
+    let base = layout_content_height(rows, expand_disabled);
+    state
+        .map(|value| popup_required_height(rows, expand_disabled, value, base))
+        .unwrap_or(base)
 }
 
 pub fn parse_state(json: &str) -> serde_json::Result<Vec<Row>> {
@@ -574,6 +988,74 @@ mod tests {
     #[test]
     fn colors_differ() {
         assert_ne!(colors(false).background, colors(true).background);
+    }
+
+    #[test]
+    fn source_object_decodes_without_discarding_account() {
+        let rows = parse_state(
+            r#"{
+          "accounts":[{"id":"a","provider":"codex","source":{"kind":"oauth","extra":true}}]
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(rows[0].source, "oauth");
+    }
+
+    #[test]
+    fn hit_testing_prefers_menu_overlay_and_exposes_footer_targets() {
+        let rows = rows();
+        let targets = layout_targets(&rows, false, Some("menu:cx-ready"));
+        let menu = popup_rect(
+            &rows,
+            false,
+            "menu:cx-ready",
+            state_height(&rows, false, Some("menu:cx-ready")),
+        )
+        .unwrap();
+        assert!(matches!(
+            hit_test(&targets, menu.left + 50.0, menu.top + 20.0),
+            Some(HitTarget::MenuItem { id, index: 0, .. }) if id == "cx-ready"
+        ));
+        assert!(targets.iter().any(|target| matches!(
+            target,
+            HitTarget::Footer {
+                action: FooterAction::Quit,
+                ..
+            }
+        )));
+        let login = layout_targets(&rows, false, Some("login:codex"));
+        assert!(matches!(
+            hit_test(&login, 20.0, 180.0),
+            Some(HitTarget::Login {
+                action: LoginAction::CopyAddress,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn popups_fit_one_two_and_eight_row_lists_and_footer_menus_open_up() {
+        let base = rows();
+        for count in [1usize, 2, 8] {
+            let mut fixture = Vec::new();
+            for index in 0..count {
+                let mut row = base[index % base.len()].clone();
+                row.id = format!("row-{index}");
+                row.provider = "Claude".into();
+                fixture.push(row);
+            }
+            let list_height = state_height(&fixture, false, None);
+            let menu_state = format!("menu:{}", fixture.last().unwrap().id);
+            let menu_height = state_height(&fixture, false, Some(&menu_state));
+            let popup = popup_rect(&fixture, false, &menu_state, menu_height).unwrap();
+            assert!(popup.left >= 0.0 && popup.top >= 0.0);
+            assert!(popup.right <= FLYOUT_WIDTH && popup.bottom <= menu_height - FOOTER_HEIGHT);
+            let quit_height = state_height(&fixture, false, Some("quit"));
+            let quit = popup_rect(&fixture, false, "quit", quit_height).unwrap();
+            assert!(quit.top >= 0.0 && quit.bottom <= quit_height);
+            assert!(quit.bottom <= list_height - FOOTER_HEIGHT);
+            assert!(quit.top < list_height - FOOTER_HEIGHT);
+        }
     }
 
     #[test]
