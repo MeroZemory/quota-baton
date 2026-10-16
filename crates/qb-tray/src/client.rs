@@ -6,7 +6,10 @@
 use std::{fs, path::Path, time::Duration};
 
 use reqwest::{StatusCode, header};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{
+    Deserialize, Serialize,
+    de::{DeserializeOwned, Deserializer},
+};
 
 #[derive(Debug, Clone)]
 pub struct AdminClient {
@@ -344,27 +347,39 @@ pub struct TraySnapshot {
     pub memory: Memory,
     #[serde(default)]
     pub bindings: Bindings,
+    #[serde(default)]
     pub data_port: u16,
+    #[serde(default)]
     pub version: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct TrayAccount {
+    #[serde(default)]
     pub id: String,
+    #[serde(default)]
     pub provider: String,
+    #[serde(default)]
     pub label: Option<String>,
+    #[serde(default)]
     pub email: Option<String>,
+    #[serde(default)]
     pub plan: Option<String>,
+    #[serde(default)]
     pub user_state: String,
+    #[serde(default)]
     pub health: serde_json::Value,
     #[serde(default)]
     pub probe_pending: bool,
     #[serde(default)]
     pub windows: Vec<QuotaWindow>,
+    #[serde(default)]
     pub credits: Option<serde_json::Value>,
+    #[serde(default)]
     pub last_used_at: Option<String>,
     #[serde(default)]
     pub bound_sessions: u64,
+    #[serde(default)]
     pub token_expires_at: Option<String>,
     #[serde(default)]
     pub drain: bool,
@@ -372,10 +387,33 @@ pub struct TrayAccount {
     pub allow_credits: bool,
     #[serde(default)]
     pub refresh_attention: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "decode_source")]
     pub source: String,
     #[serde(default)]
     pub pacing: qb_tray::Pacing,
+}
+
+fn decode_source<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value {
+        serde_json::Value::String(value) => value,
+        serde_json::Value::Object(mut object) => {
+            let kind = object
+                .remove("kind")
+                .and_then(|kind| kind.as_str().map(str::to_owned));
+            if kind.as_deref() == Some("cpa")
+                && object.get("mode").and_then(serde_json::Value::as_str) == Some("linked")
+            {
+                "linked".into()
+            } else {
+                kind.unwrap_or_else(|| "⚠ source decode error (missing kind)".into())
+            }
+        }
+        _ => "⚠ source decode error".into(),
+    })
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -504,6 +542,26 @@ mod tests {
         assert_eq!(snapshot.accounts[0].id, "cx-test");
         assert_eq!(snapshot.accounts[0].windows[0].used_pct, Some(42.5));
         assert_eq!(snapshot.inflight.bytes, 12);
+    }
+
+    #[test]
+    fn decodes_source_object_and_keeps_malformed_source_visible() {
+        let snapshot: TraySnapshot = serde_json::from_value(serde_json::json!({
+            "accounts": [
+                {"id":"oauth", "source":{"kind":"oauth","mode":"owned","future":true}},
+                {"id":"linked", "source":{"kind":"cpa","mode":"linked","dir":"ignored"}},
+                {"id":"broken", "source":{"future":true}}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(snapshot.accounts[0].source, "oauth");
+        assert_eq!(snapshot.accounts[1].source, "linked");
+        assert!(
+            snapshot.accounts[2]
+                .source
+                .starts_with("⚠ source decode error")
+        );
+        assert_eq!(snapshot.accounts[0].provider, "");
     }
 
     #[test]

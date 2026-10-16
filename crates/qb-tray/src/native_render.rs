@@ -641,7 +641,9 @@ pub fn paint_with_state(
         20.0,
         brush_color(colors.text),
     )?;
-    let status = if core_ok {
+    let status = if version.starts_with("error:") {
+        version.trim_start_matches("error:").to_owned()
+    } else if core_ok {
         format!("코어 실행 중 · {version}")
     } else {
         "코어에 연결할 수 없음".to_owned()
@@ -668,7 +670,7 @@ pub fn paint_with_state(
             &brush,
         );
     }
-    let login_state = state.is_some_and(|value| value == "login:claude" || value == "login:codex");
+    let login_state = state.is_some_and(|value| value.starts_with("login:"));
     let mut y = 52.0;
     if !login_state {
         for provider in ["claude", "codex"] {
@@ -753,11 +755,14 @@ pub fn paint_with_state(
             }
         }
     } else {
-        let provider = if state.is_some_and(|value| value.ends_with("claude")) {
+        let provider = if state.is_some_and(|value| value.contains("claude")) {
             "Claude"
         } else {
             "Codex"
         };
+        let outcome = state
+            .and_then(|value| value.rsplit(':').next())
+            .filter(|value| matches!(*value, "completed" | "failed" | "expired" | "cancelled"));
         draw_text(
             target,
             &title,
@@ -772,7 +777,13 @@ pub fn paint_with_state(
         draw_text(
             target,
             &body,
-            "브라우저에서 로그인을 마치면 자동으로",
+            match outcome {
+                Some("completed") => "로그인이 완료되었습니다.",
+                Some("failed") => "로그인에 실패했습니다.",
+                Some("expired") => "로그인 시간이 지났습니다.",
+                Some("cancelled") => "로그인이 취소되었습니다.",
+                _ => "브라우저에서 로그인을 마치면 자동으로",
+            },
             42.0,
             100.0,
             302.0,
@@ -782,7 +793,11 @@ pub fn paint_with_state(
         draw_text(
             target,
             &body,
-            "완료됩니다.",
+            if outcome.is_some() {
+                ""
+            } else {
+                "완료됩니다."
+            },
             42.0,
             120.0,
             302.0,
@@ -941,6 +956,15 @@ pub fn paint_with_state(
                     "남은 시간 9:41".to_owned(),
                 ],
             )
+        } else if state == "add-menu" {
+            (
+                "계정 추가",
+                vec![
+                    "Claude 계정".to_owned(),
+                    "Codex 계정".to_owned(),
+                    "취소".to_owned(),
+                ],
+            )
         } else if state == "quit" {
             (
                 "종료",
@@ -963,6 +987,13 @@ pub fn paint_with_state(
                 (flyout - card_height).round() / 2.0,
                 344.0,
                 (flyout + card_height).round() / 2.0,
+            )
+        } else if state == "add-menu" {
+            (
+                128.0,
+                content_height(&rows, expand_disabled) - 180.0,
+                352.0,
+                content_height(&rows, expand_disabled) - 70.0,
             )
         } else if state == "quit" {
             (
