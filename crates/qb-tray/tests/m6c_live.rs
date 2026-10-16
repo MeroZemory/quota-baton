@@ -32,7 +32,7 @@ use windows::{
         },
         Storage::Xps::PrintWindow,
         UI::WindowsAndMessaging::{
-            FindWindowW, GetWindowRect, PostMessageW, SMTO_ABORTIFHUNG, SW_SHOW,
+            FindWindowW, GetClientRect, GetWindowRect, PostMessageW, SMTO_ABORTIFHUNG, SW_SHOW,
             SendMessageTimeoutW, SetForegroundWindow, ShowWindow, WM_LBUTTONUP, WM_NULL,
             WM_RBUTTONUP,
         },
@@ -83,7 +83,7 @@ fn responsive(hwnd: HWND) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn capture(hwnd: HWND, path: &std::path::Path) -> anyhow::Result<()> {
+fn capture(hwnd: HWND, path: &std::path::Path) -> anyhow::Result<(i32, i32)> {
     let mut rect = RECT::default();
     unsafe {
         GetWindowRect(hwnd, &mut rect)?;
@@ -176,6 +176,21 @@ fn capture(hwnd: HWND, path: &std::path::Path) -> anyhow::Result<()> {
         let _ = DeleteDC(memory);
         let _ = ReleaseDC(None, screen);
     }
+    Ok((width, height))
+}
+
+fn capture_checked(hwnd: HWND, path: &std::path::Path) -> anyhow::Result<()> {
+    let (width, height) = capture(hwnd, path)?;
+    let mut client = RECT::default();
+    unsafe {
+        GetClientRect(hwnd, &mut client)?;
+    }
+    anyhow::ensure!(
+        (width, height) == (client.right - client.left, client.bottom - client.top),
+        "capture size {width}x{height} != client {}x{}",
+        client.right - client.left,
+        client.bottom - client.top
+    );
     Ok(())
 }
 
@@ -421,7 +436,7 @@ fn m6c_live_spawned_core_clicks_and_captures() -> anyhow::Result<()> {
         fs::read_to_string(home.join("tray-error.log")).unwrap_or_default()
     );
     thread::sleep(Duration::from_millis(200));
-    capture(hwnd, &evidence.join("list.png"))?;
+    capture_checked(hwnd, &evidence.join("list.png"))?;
     let state = admin_json(&home, "/admin/v1/state")
         .map_err(|error| anyhow::anyhow!("initial state: {error}"))?;
     let accounts = state["accounts"]
@@ -436,11 +451,21 @@ fn m6c_live_spawned_core_clicks_and_captures() -> anyhow::Result<()> {
         "live tray decoded {} accounts",
         accounts.len()
     );
-    let rows = qb_tray::parse_state(&serde_json::to_string(&state)?)?;
-    let list_height = qb_tray::state_height(&rows, false, None)
-        .ceil()
-        .clamp(120.0, 700.0);
-    let footer_center = (list_height - 24.0) as i16;
+    let mut rows = qb_tray::parse_state(&serde_json::to_string(&state)?)?;
+    let mut list_targets = qb_tray::layout_targets(&rows, false, Some("list"));
+    let mut footer_center = list_targets
+        .iter()
+        .find_map(|target| match target {
+            qb_tray::HitTarget::Footer {
+                action: qb_tray::FooterAction::AddAccount,
+                rect,
+            } => Some((
+                (rect.left + rect.right) / 2.0,
+                (rect.top + rect.bottom) / 2.0,
+            )),
+            _ => None,
+        })
+        .unwrap();
     let last_id = rows.last().map(|row| row.id.clone()).unwrap();
     let last_y = 52.0
         + 36.0
@@ -449,7 +474,10 @@ fn m6c_live_spawned_core_clicks_and_captures() -> anyhow::Result<()> {
             .map(qb_tray::row_height)
             .sum::<f32>()
         + 22.0;
-    for y in (footer_center.saturating_sub(24)..footer_center.saturating_add(25)).step_by(4) {
+    for y in ((footer_center.1 as i16).saturating_sub(24)
+        ..(footer_center.1 as i16).saturating_add(25))
+        .step_by(4)
+    {
         responsive(hwnd)?;
         click(hwnd, 195, y, WM_LBUTTONUP);
         thread::sleep(Duration::from_millis(35));
@@ -462,7 +490,7 @@ fn m6c_live_spawned_core_clicks_and_captures() -> anyhow::Result<()> {
     click(hwnd, 330, last_y as i16, WM_RBUTTONUP);
     thread::sleep(Duration::from_millis(100));
     thread::sleep(Duration::from_millis(200));
-    capture(hwnd, &evidence.join("row-menu.png"))?;
+    capture_checked(hwnd, &evidence.join("row-menu.png"))?;
     fs::write(&delay_file, b"delay")?;
     responsive(hwnd)?;
     let menu_height = qb_tray::state_height(&rows, false, Some(&format!("menu:{last_id}")));
@@ -488,21 +516,128 @@ fn m6c_live_spawned_core_clicks_and_captures() -> anyhow::Result<()> {
         );
         thread::sleep(Duration::from_millis(100));
     }
+    let updated = admin_json(&home, "/admin/v1/state")?;
+    rows = qb_tray::parse_state(&serde_json::to_string(&updated)?)?;
+    let list_height = qb_tray::state_height(&rows, false, None)
+        .ceil()
+        .clamp(120.0, 700.0);
+    list_targets = qb_tray::layout_targets(&rows, false, Some("list"));
+    footer_center = list_targets
+        .iter()
+        .find_map(|target| match target {
+            qb_tray::HitTarget::Footer {
+                action: qb_tray::FooterAction::AddAccount,
+                rect,
+            } => Some((
+                (rect.left + rect.right) / 2.0,
+                (rect.top + rect.bottom) / 2.0,
+            )),
+            _ => None,
+        })
+        .unwrap();
     // Exercise settings and tray-only quit on the live list.
     thread::sleep(Duration::from_secs(1));
     responsive(hwnd)?;
-    let footer_y = footer_center;
-    click(hwnd, 195, footer_y, WM_LBUTTONUP);
+    let settings_center = list_targets
+        .iter()
+        .find_map(|target| match target {
+            qb_tray::HitTarget::Footer {
+                action: qb_tray::FooterAction::Settings,
+                rect,
+            } => Some((
+                (rect.left + rect.right) / 2.0,
+                (rect.top + rect.bottom) / 2.0,
+            )),
+            _ => None,
+        })
+        .unwrap();
+    click(
+        hwnd,
+        settings_center.0 as i16,
+        settings_center.1 as i16,
+        WM_LBUTTONUP,
+    );
     thread::sleep(Duration::from_millis(150));
     responsive(hwnd)?;
     responsive(hwnd)?;
-    click(hwnd, 320, footer_y, WM_LBUTTONUP);
+    let quit_center = list_targets
+        .iter()
+        .find_map(|target| match target {
+            qb_tray::HitTarget::Footer {
+                action: qb_tray::FooterAction::Quit,
+                rect,
+            } => Some((
+                (rect.left + rect.right) / 2.0,
+                (rect.top + rect.bottom) / 2.0,
+            )),
+            _ => None,
+        })
+        .unwrap();
+    click(
+        hwnd,
+        quit_center.0 as i16,
+        quit_center.1 as i16,
+        WM_LBUTTONUP,
+    );
     thread::sleep(Duration::from_millis(300));
-    capture(hwnd, &evidence.join("quit-menu.png"))?;
+    capture_checked(hwnd, &evidence.join("quit-menu.png"))?;
     responsive(hwnd)?;
-    let quit_height = list_height;
-    let quit = qb_tray::popup_rect(&rows, false, "quit", quit_height).unwrap();
-    click(hwnd, 230, (quit.top + 48.0) as i16, WM_LBUTTONUP);
+    let quit_targets = qb_tray::layout_targets(&rows, false, Some("quit"));
+    let tray_only_center = quit_targets
+        .iter()
+        .find_map(|target| match target {
+            qb_tray::HitTarget::Quit {
+                action: qb_tray::QuitAction::TrayOnly,
+                rect,
+            } => Some((
+                (rect.left + rect.right) / 2.0,
+                (rect.top + rect.bottom) / 2.0,
+            )),
+            _ => None,
+        })
+        .unwrap();
+    click(
+        hwnd,
+        tray_only_center.0 as i16,
+        tray_only_center.1 as i16,
+        WM_LBUTTONUP,
+    );
+    if children.tray.try_wait()?.is_none() {
+        let footer = list_targets
+            .iter()
+            .find_map(|target| match target {
+                qb_tray::HitTarget::Footer {
+                    action: qb_tray::FooterAction::Quit,
+                    rect,
+                } => Some(*rect),
+                _ => None,
+            })
+            .unwrap();
+        let target = quit_targets
+            .iter()
+            .find_map(|target| match target {
+                qb_tray::HitTarget::Quit {
+                    action: qb_tray::QuitAction::TrayOnly,
+                    rect,
+                } => Some(*rect),
+                _ => None,
+            })
+            .unwrap();
+        'retry_quit: for fx in (footer.left as i16..=footer.right as i16).step_by(8) {
+            for fy in (footer.top as i16..=footer.bottom as i16).step_by(4) {
+                click(hwnd, fx, fy, WM_LBUTTONUP);
+                thread::sleep(Duration::from_millis(20));
+                for x in (target.left as i16..=target.right as i16).step_by(8) {
+                    for y in (target.top as i16..=target.bottom as i16).step_by(4) {
+                        click(hwnd, x, y, WM_LBUTTONUP);
+                        if children.tray.try_wait()?.is_some() {
+                            break 'retry_quit;
+                        }
+                    }
+                }
+            }
+        }
+    }
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         if children.tray.try_wait()?.is_some() {
@@ -555,11 +690,16 @@ fn m6c_live_spawned_core_clicks_and_captures() -> anyhow::Result<()> {
     thread::sleep(Duration::from_secs(1));
     responsive(hwnd)?;
     responsive(hwnd)?;
-    click(hwnd, 128, footer_center, WM_LBUTTONUP);
+    click(
+        hwnd,
+        footer_center.0 as i16,
+        footer_center.1 as i16,
+        WM_LBUTTONUP,
+    );
     thread::sleep(Duration::from_millis(300));
     responsive(hwnd)?;
-    let add_top = footer_center as f32 - 158.0;
-    click(hwnd, 220, (add_top + 54.0) as i16, WM_LBUTTONUP);
+    let add_popup = qb_tray::popup_rect(&rows, false, "add-menu", list_height).unwrap();
+    click(hwnd, 220, (add_popup.top + 54.0) as i16, WM_LBUTTONUP);
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         if fs::read_to_string(&login_log)
@@ -575,9 +715,29 @@ fn m6c_live_spawned_core_clicks_and_captures() -> anyhow::Result<()> {
         thread::sleep(Duration::from_millis(100));
     }
     thread::sleep(Duration::from_millis(200));
-    capture(hwnd, &evidence.join("login-panel.png"))?;
+    capture_checked(hwnd, &evidence.join("login-panel.png"))?;
     responsive(hwnd)?;
-    click(hwnd, 260, 190, WM_LBUTTONUP);
+    let login_targets = qb_tray::layout_targets(&rows, false, Some("login:codex"));
+    let cancel_center = login_targets
+        .iter()
+        .find_map(|target| match target {
+            qb_tray::HitTarget::Login {
+                action: qb_tray::LoginAction::Cancel,
+                rect,
+                ..
+            } => Some((
+                (rect.left + rect.right) / 2.0,
+                (rect.top + rect.bottom) / 2.0,
+            )),
+            _ => None,
+        })
+        .unwrap();
+    click(
+        hwnd,
+        cancel_center.0 as i16,
+        cancel_center.1 as i16,
+        WM_LBUTTONUP,
+    );
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         if fs::read_to_string(&login_log)
