@@ -351,7 +351,7 @@ impl Observability {
 
     pub fn observe_headers(&self, account_id: &str, provider: Provider, headers: &HeaderMap) {
         if let Some(snapshot) = snapshot(provider, headers, Utc::now()) {
-            self.remember(account_id, &snapshot);
+            self.remember(account_id, &snapshot, true);
             self.enqueue(Command::Quota(account_id.into(), Box::new(snapshot)));
         }
     }
@@ -360,9 +360,12 @@ impl Observability {
         &self,
         id: &str,
         value: serde_json::Value,
+        replace_windows: bool,
     ) -> Option<serde_json::Value> {
         let next: Snapshot = serde_json::from_value(value).ok()?;
-        self.remember(id, &next);
+        // Complete poll responses replace the window set. Partial responses
+        // retain known windows just like partial response headers.
+        self.remember(id, &next, !replace_windows);
         let merged = self.quota_snapshot(id)?;
         let persisted: Snapshot = serde_json::from_value(merged.clone()).ok()?;
         self.enqueue(Command::PollQuota(id.into(), Box::new(persisted)));
@@ -436,7 +439,7 @@ impl Observability {
         }
         if let Some(mut snapshot) = snapshot(Provider::Codex, &headers, Utc::now()) {
             snapshot.source = "codex.rate_limits".into();
-            self.remember(account_id, &snapshot);
+            self.remember(account_id, &snapshot, false);
             self.enqueue(Command::Quota(account_id.into(), Box::new(snapshot)));
         }
     }
@@ -559,7 +562,7 @@ impl Observability {
         })));
     }
 
-    fn remember(&self, id: &str, next: &Snapshot) {
+    fn remember(&self, id: &str, next: &Snapshot, preserve_missing_windows: bool) {
         if let Ok(mut snapshots) = self.snapshots.lock()
             && let Ok(mut value) = serde_json::to_value(next)
         {
@@ -579,7 +582,7 @@ impl Observability {
                                     updated[key] = window[key].clone();
                                 }
                             }
-                        } else {
+                        } else if preserve_missing_windows {
                             new.push(window.clone());
                         }
                     }
@@ -1284,6 +1287,32 @@ mod tests {
         assert!(state["accounts"].get("unrelated").is_none());
         assert!(!text.contains("fake-access-marker"));
         assert!(!text.contains("health"));
+    }
+
+    #[test]
+    fn complete_poll_replaces_stale_windows() {
+        let dir = directory();
+        let obs = Observability::new(dir.path(), None).unwrap();
+        let first = serde_json::json!({
+            "windows": [
+                {"name":"5h","used_pct":10.0,"reset_at":null,"observed_at":null,"status":null},
+                {"name":"7d","used_pct":20.0,"reset_at":null,"observed_at":null,"status":null}
+            ],
+            "plan":null,"credits":null,"source":"poll",
+            "observed_at":"2030-01-01T00:00:00Z","signals":{}
+        });
+        let second = serde_json::json!({
+            "windows": [
+                {"name":"5h","used_pct":11.0,"reset_at":null,"observed_at":null,"status":null}
+            ],
+            "plan":null,"credits":null,"source":"poll",
+            "observed_at":"2030-01-01T00:01:00Z","signals":{}
+        });
+        obs.observe_poll("cx-synthetic", first, true).unwrap();
+        let snapshot = obs.observe_poll("cx-synthetic", second, true).unwrap();
+        let windows = snapshot["windows"].as_array().unwrap();
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0]["name"], "5h");
     }
 
     #[test]

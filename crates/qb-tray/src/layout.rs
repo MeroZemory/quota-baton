@@ -226,7 +226,18 @@ pub fn account_menu_height(row: &Row) -> f32 {
         .enumerate()
         .filter(|(i, _)| *i == 2 || *i == 3)
         .count() as f32;
-    9.0 + items.len() as f32 * 32.0 + separators * 10.0
+    // Keep a bottom inset for the final glyph and the popup shadow. The inset
+    // is part of the geometry so a grown flyout cannot clip the last action.
+    9.0 + items.len() as f32 * 32.0 + separators * 10.0 + 16.0
+}
+
+pub fn account_menu_item_top(row: &Row, index: usize) -> f32 {
+    let separators_before = actions::menu_items(row)
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i <= index && (*i == 2 || *i == 3))
+        .count() as f32;
+    9.0 + index as f32 * 32.0 + separators_before * 9.0
 }
 
 pub fn popup_rect(rows: &[Row], expand_disabled: bool, state: &str, height: f32) -> Option<Rect> {
@@ -477,9 +488,9 @@ pub fn layout_targets(rows: &[Row], expand_disabled: bool, state: Option<&str>) 
                     index,
                     rect: Rect::new(
                         popup.left + 41.0,
-                        popup.top + 9.0 + index as f32 * 32.0,
+                        popup.top + account_menu_item_top(row, index),
                         popup.right - 15.0,
-                        popup.top + 9.0 + index as f32 * 32.0 + 30.0,
+                        popup.top + account_menu_item_top(row, index) + 30.0,
                     ),
                 });
             }
@@ -592,20 +603,28 @@ pub fn row(account: &Account, now: SystemTime) -> Row {
         } else {
             health_tone(account)
         };
-    let five_window = account
+    let windows = account
         .windows
+        .iter()
+        .filter(|window| drawable_window_name(&window.name))
+        .collect::<Vec<_>>();
+    let five_window = windows
         .iter()
         .find(|w| w.name == "5h")
-        .or_else(|| account.windows.first());
-    let weekly_window = account.windows.iter().find(|w| w.name == "7d").or_else(|| {
-        five_window
-            .filter(|window| window.name == "5h")
-            .and_then(|_| account.windows.iter().find(|w| w.name != "5h"))
-    });
-    let meter_windows = account
-        .windows
+        .copied()
+        .or_else(|| windows.first().copied());
+    let weekly_window = windows
         .iter()
-        .map(|window| usage(Some(window), now))
+        .find(|w| w.name == "7d")
+        .copied()
+        .or_else(|| {
+            five_window
+                .filter(|window| window.name == "5h")
+                .and_then(|_| windows.iter().find(|w| w.name != "5h").copied())
+        });
+    let meter_windows = windows
+        .iter()
+        .map(|window| usage(Some(*window), now))
         .collect::<Vec<_>>();
     Row {
         id: account.id.clone(),
@@ -817,6 +836,17 @@ fn window_label(name: &str) -> String {
     }
 }
 
+fn drawable_window_name(name: &str) -> bool {
+    match name {
+        "5h" | "7d" | "7d_oi" | "7d_sonnet" => true,
+        value if value.ends_with('m') => value
+            .trim_end_matches('m')
+            .parse::<u64>()
+            .is_ok_and(|minutes| minutes > 0),
+        _ => false,
+    }
+}
+
 pub fn tooltip(rows: &[Row], core_ok: bool) -> String {
     let badge = match badge(rows, core_ok) {
         Badge::Error => "코어 연결 끊김",
@@ -1002,6 +1032,19 @@ mod tests {
     }
 
     #[test]
+    fn phantom_codex_windows_are_not_drawn() {
+        let rows = parse_state(
+            r#"{"accounts":[{"id":"cx","provider":"codex","windows":[
+                {"name":"0m","used_pct":0,"reset_at":"2020-01-01T00:00:00Z"},
+                {"name":"secondary","used_pct":0,"reset_at":"2020-01-01T00:00:00Z"}
+            ]}]}"#,
+        )
+        .unwrap();
+        assert!(rows[0].meter_windows.is_empty());
+        assert_eq!(rows[0].five_hour.percent_text, "–");
+    }
+
+    #[test]
     fn hit_testing_prefers_menu_overlay_and_exposes_footer_targets() {
         let rows = rows();
         let targets = layout_targets(&rows, false, Some("menu:cx-ready"));
@@ -1050,6 +1093,15 @@ mod tests {
             let popup = popup_rect(&fixture, false, &menu_state, menu_height).unwrap();
             assert!(popup.left >= 0.0 && popup.top >= 0.0);
             assert!(popup.right <= FLYOUT_WIDTH && popup.bottom <= menu_height - FOOTER_HEIGHT);
+            let menu_targets = layout_targets(&fixture, false, Some(&menu_state));
+            let last_item_bottom = menu_targets
+                .iter()
+                .filter_map(|target| match target {
+                    HitTarget::MenuItem { rect, .. } => Some(rect.bottom),
+                    _ => None,
+                })
+                .fold(0.0, f32::max);
+            assert!(last_item_bottom + 16.0 <= menu_height);
             let quit_height = state_height(&fixture, false, Some("quit"));
             let quit = popup_rect(&fixture, false, "quit", quit_height).unwrap();
             assert!(quit.top >= 0.0 && quit.bottom <= quit_height);

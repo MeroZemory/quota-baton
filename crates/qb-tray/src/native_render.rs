@@ -325,19 +325,18 @@ fn draw_account_menu(
     let icon_values = [
         "\u{e769}", "\u{e733}", "\u{e8d7}", "\u{e72c}", "\u{e73e}", "\u{e74d}",
     ];
-    let mut y = popup.top + 9.0;
     for (n, item) in items.iter().enumerate() {
+        let y = popup.top + super::account_menu_item_top(row, n);
         if n == 2 || n == 3 {
             fill(
                 target,
-                rect(137.0, y, 351.0, y + 1.0),
+                rect(137.0, y - 9.0, 351.0, y - 8.0),
                 brush_color(if dark {
                     super::Rgb(71, 71, 71)
                 } else {
                     super::Rgb(212, 212, 212)
                 }),
             )?;
-            y += 10.0;
         }
         if n == index {
             pill(
@@ -425,7 +424,6 @@ fn draw_account_menu(
             18.0,
             brush_color(colors(dark).text),
         )?;
-        y += 32.0;
     }
     Ok(())
 }
@@ -613,6 +611,7 @@ pub fn paint_with_state(
     let icons = icon_format(&dwrite, 14.0)?;
     unsafe {
         target.BeginDraw();
+        target.Clear(Some(&brush_color(colors.surface).0));
     }
     fill(
         target,

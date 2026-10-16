@@ -101,12 +101,17 @@ pub(super) fn snapshot(provider: Provider, body: &[u8], now: DateTime<Utc>) -> O
             let rate = &root["rate_limit"];
             for slot in ["primary", "secondary"] {
                 let value = &rate[format!("{slot}_window")];
-                let name = match value["limit_window_seconds"].as_u64().filter(|n| *n > 0) {
-                    Some(18_000) => "5h".to_owned(),
-                    Some(604_800) => "7d".to_owned(),
-                    Some(n) if n % 60 == 0 => format!("{}m", n / 60),
-                    Some(n) => format!("{n}s"),
-                    None => slot.to_owned(),
+                let Some(duration) = value["limit_window_seconds"].as_u64().filter(|n| *n > 0)
+                else {
+                    // CPA has emitted both a zero-minute placeholder and an
+                    // old secondary shape. They are not usage windows.
+                    continue;
+                };
+                let name = match duration {
+                    18_000 => "5h".to_owned(),
+                    604_800 => "7d".to_owned(),
+                    n if n % 60 == 0 => format!("{}m", n / 60),
+                    n => format!("{n}s"),
                 };
                 if let Some(w) = window(&name, value, false, now) {
                     windows.push(w);
@@ -151,6 +156,22 @@ pub(super) fn snapshot(provider: Provider, body: &[u8], now: DateTime<Utc>) -> O
         json!({"windows": windows, "plan": account_plan, "credits": credits,
         "source": "poll", "observed_at": now, "signals": signals}),
     )
+}
+
+/// A Codex usage response is complete only when both provider window slots
+/// were present. Some responses are intentionally partial and must retain the
+/// other known window until a complete snapshot arrives.
+pub(super) fn is_complete_snapshot(provider: Provider, body: &[u8]) -> bool {
+    let Ok(root) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    match provider {
+        Provider::Codex => {
+            root["rate_limit"]["primary_window"].is_object()
+                && root["rate_limit"]["secondary_window"].is_object()
+        }
+        Provider::Claude => true,
+    }
 }
 
 #[cfg(any(test, all(feature = "shape-capture", debug_assertions)))]
@@ -283,23 +304,24 @@ mod tests {
     }
 
     #[test]
-    fn missing_duration_unknown_duration_and_reset_only() {
-        for (duration, expected) in [
-            (Value::Null, "primary"),
-            (json!(3600), "60m"),
-            (json!(61), "61s"),
-        ] {
-            let result = parse(
-                Provider::Codex,
-                json!({"rate_limit": {"primary_window": {
-                "limit_window_seconds": duration, "reset_at": "2027-01-15T08:00:00Z"}}}),
-            );
-            assert_eq!(result["windows"][0]["name"], expected);
-            assert!(result["windows"][0]["used_pct"].is_null());
-            assert!(result["windows"][0]["observed_at"].is_null());
-            assert_eq!(result["windows"][0]["reset_at"], "2027-01-15T08:00:00Z");
-            assert_eq!(result["windows"].as_array().unwrap().len(), 1);
-        }
+    fn drops_zero_and_unknown_codex_windows_but_keeps_real_durations() {
+        let result = parse(
+            Provider::Codex,
+            json!({"rate_limit": {
+                "primary_window": {"limit_window_seconds": 0, "reset_at": "2027-01-15T08:00:00Z"},
+                "secondary_window": {"limit_window_seconds": 604800, "used_percent": 42}
+            }}),
+        );
+        assert_eq!(result["windows"].as_array().unwrap().len(), 1);
+        assert_eq!(result["windows"][0]["name"], "7d");
+
+        let result = parse(
+            Provider::Codex,
+            json!({"rate_limit": {"primary_window": {
+                "limit_window_seconds": 3600, "reset_at": "2027-01-15T08:00:00Z"}}}),
+        );
+        assert_eq!(result["windows"][0]["name"], "60m");
+        assert_eq!(result["windows"][0]["reset_at"], "2027-01-15T08:00:00Z");
     }
 
     #[test]

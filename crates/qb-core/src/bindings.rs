@@ -857,6 +857,18 @@ impl BindingTable {
                     {
                         return (PreviewDecision::Hold { until: reset }, reason);
                     }
+                    let skip_reason = if reset <= now {
+                        "reset_elapsed"
+                    } else if reset.signed_duration_since(now).to_std().is_err() {
+                        "reset_before_now"
+                    } else {
+                        "reset_beyond_hold_bound"
+                    };
+                    tracing::debug!(
+                        account = %b.account,
+                        reason = skip_reason,
+                        "reset hold skipped"
+                    );
                 }
                 let marked = self.has_overload_mark(d, &b.key, now);
                 if marked {
