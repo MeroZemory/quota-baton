@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::os::windows::process::CommandExt;
 use std::{
+    cell::RefCell,
     ffi::c_void,
     mem::size_of,
     path::PathBuf,
@@ -19,7 +20,7 @@ use windows::{
                 Common::D2D_SIZE_U, D2D1_FACTORY_TYPE_SINGLE_THREADED,
                 D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE,
                 D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1CreateFactory,
-                ID2D1Factory,
+                ID2D1Factory, ID2D1HwndRenderTarget,
             },
             Dwm::{
                 DWMWA_BORDER_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
@@ -31,7 +32,10 @@ use windows::{
         System::LibraryLoader::GetModuleHandleW,
         UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent},
         UI::{
-            HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext},
+            HiDpi::{
+                DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow,
+                SetProcessDpiAwarenessContext,
+            },
             Shell::{
                 NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE,
                 NIM_MODIFY, NOTIFYICONDATAW, NOTIFYICONIDENTIFIER, Shell_NotifyIconGetRect,
@@ -39,13 +43,14 @@ use windows::{
             },
             WindowsAndMessaging::{
                 CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW,
-                DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, HMENU, IDC_ARROW,
-                IDC_HAND, IDI_APPLICATION, IsWindowVisible, LoadCursorW, LoadIconW, MSG,
+                DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos, GetMessageW, HMENU,
+                IDC_ARROW, IDC_HAND, IDI_APPLICATION, IsWindowVisible, LoadCursorW, LoadIconW, MSG,
                 PostMessageW, PostQuitMessage, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE,
-                SetCursor, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow,
-                TranslateMessage, WM_APP, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_KEYDOWN,
-                WM_KILLFOCUS, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP, WM_SETTINGCHANGE,
-                WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
+                SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetCursor, SetForegroundWindow, SetTimer,
+                SetWindowPos, ShowWindow, TranslateMessage, WM_APP, WM_CLOSE, WM_DESTROY,
+                WM_DPICHANGED, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT,
+                WM_RBUTTONUP, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW,
+                WS_POPUP,
             },
         },
     },
@@ -65,6 +70,10 @@ static FIXTURE_MODE: AtomicBool = AtomicBool::new(false);
 static LOGIN_ID: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static LOGIN_URL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static REFRESH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    static RENDER_TARGET: RefCell<Option<ID2D1HwndRenderTarget>> = const { RefCell::new(None) };
+}
 
 fn login_id() -> &'static Mutex<Option<String>> {
     LOGIN_ID.get_or_init(|| Mutex::new(None))
@@ -312,6 +321,34 @@ fn flyout_height() -> i32 {
         .clamp(120.0, 700.0) as i32
 }
 
+fn window_scale(hwnd: HWND) -> f32 {
+    unsafe { GetDpiForWindow(hwnd).max(96) as f32 / 96.0 }
+}
+
+fn client_pixel_size(client: RECT) -> D2D_SIZE_U {
+    D2D_SIZE_U {
+        width: (client.right - client.left).max(1) as u32,
+        height: (client.bottom - client.top).max(1) as u32,
+    }
+}
+
+unsafe fn resize_flyout(hwnd: HWND) {
+    let scale = window_scale(hwnd);
+    let width = (360.0 * scale).round() as i32;
+    let height = (flyout_height() as f32 * scale).round() as i32;
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            width,
+            height,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn position_flyout(hwnd: HWND) {
     let identifier = NOTIFYICONIDENTIFIER {
@@ -336,8 +373,9 @@ unsafe fn position_flyout(hwnd: HWND) {
         ..Default::default()
     };
     let _ = GetMonitorInfoW(monitor, &mut info);
-    let height = flyout_height();
-    let width = 360;
+    let scale = window_scale(hwnd);
+    let height = (flyout_height() as f32 * scale).round() as i32;
+    let width = (360.0 * scale).round() as i32;
     let x = (icon.right - width).clamp(info.rcWork.left, info.rcWork.right - width);
     let y = (icon.top - height).max(info.rcWork.top);
     let _ = SetWindowPos(hwnd, None, x, y, width, height, Default::default());
@@ -434,27 +472,37 @@ fn update_status_worker(supervise: bool, notification_hwnd: Option<isize>) {
 fn paint_window(hwnd: HWND) -> Result<()> {
     let (rows, version, core_ok) = model().lock().unwrap_or_else(|e| e.into_inner()).clone();
     unsafe {
-        let factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
-        let props = D2D1_RENDER_TARGET_PROPERTIES {
-            r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
-            dpiX: 96.0,
-            dpiY: 96.0,
-            ..Default::default()
-        };
-        let hwnd_props = D2D1_HWND_RENDER_TARGET_PROPERTIES {
-            hwnd,
-            pixelSize: D2D_SIZE_U {
-                width: 360,
-                height: flyout_height() as u32,
-            },
-            presentOptions: D2D1_PRESENT_OPTIONS_NONE,
-        };
-        let target = factory.CreateHwndRenderTarget(&props, &hwnd_props)?;
+        let mut client = RECT::default();
+        GetClientRect(hwnd, &mut client)?;
+        let pixel_size = client_pixel_size(client);
+        let dpi = GetDpiForWindow(hwnd).max(96) as f32;
+        let target = RENDER_TARGET.with(|slot| -> Result<ID2D1HwndRenderTarget> {
+            if let Some(target) = slot.borrow().as_ref() {
+                let _ = target.Resize(&pixel_size);
+                target.SetDpi(dpi, dpi);
+                return Ok(target.clone());
+            }
+            let factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
+            let props = D2D1_RENDER_TARGET_PROPERTIES {
+                r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+                dpiX: dpi,
+                dpiY: dpi,
+                ..Default::default()
+            };
+            let hwnd_props = D2D1_HWND_RENDER_TARGET_PROPERTIES {
+                hwnd,
+                pixelSize: pixel_size,
+                presentOptions: D2D1_PRESENT_OPTIONS_NONE,
+            };
+            let target = factory.CreateHwndRenderTarget(&props, &hwnd_props)?;
+            *slot.borrow_mut() = Some(target.clone());
+            Ok(target)
+        })?;
         let review_state = view_state()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        qb_tray::native_render::paint_with_state(
+        let result = qb_tray::native_render::paint_with_state(
             &target,
             &rows,
             false,
@@ -463,7 +511,14 @@ fn paint_window(hwnd: HWND) -> Result<()> {
             false,
             core_ok,
             review_state.as_deref(),
-        )?;
+        );
+        if let Err(error) = result {
+            if error.code().0 as u32 == 0x8899000C {
+                RENDER_TARGET.with(|slot| *slot.borrow_mut() = None);
+            } else {
+                return Err(error.into());
+            }
+        }
     }
     Ok(())
 }
@@ -838,6 +893,7 @@ fn activate_hit(hwnd: HWND, target: HitTarget) {
         }
     }
     unsafe {
+        resize_flyout(hwnd);
         let _ = InvalidateRect(Some(hwnd), None, true);
     }
 }
@@ -1045,10 +1101,12 @@ unsafe extern "system" fn window_proc(
         ACTION_DONE => {
             update_status(false, Some(hwnd));
             *view_state().lock().unwrap_or_else(|e| e.into_inner()) = None;
+            resize_flyout(hwnd);
             let _ = InvalidateRect(Some(hwnd), None, true);
             LRESULT(0)
         }
         STATE_CHANGED => {
+            resize_flyout(hwnd);
             let _ = InvalidateRect(Some(hwnd), None, true);
             LRESULT(0)
         }
@@ -1069,6 +1127,20 @@ unsafe extern "system" fn window_proc(
                     Default::default(),
                 );
             }
+            resize_flyout(hwnd);
+            let _ = InvalidateRect(Some(hwnd), None, true);
+            LRESULT(0)
+        }
+        WM_SIZE => {
+            RENDER_TARGET.with(|slot| {
+                if let Some(target) = slot.borrow().as_ref() {
+                    let width = (lparam.0 as u32 & 0xffff).max(1);
+                    let height = ((lparam.0 as u32 >> 16) & 0xffff).max(1);
+                    unsafe {
+                        let _ = target.Resize(&D2D_SIZE_U { width, height });
+                    }
+                }
+            });
             let _ = InvalidateRect(Some(hwnd), None, true);
             LRESULT(0)
         }
@@ -1186,4 +1258,23 @@ pub fn run(
         DestroyWindow(hwnd)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_target_size_is_the_current_client_rect() {
+        for (width, height) in [(360, 192), (360, 412), (540, 700), (720, 552)] {
+            let client = RECT {
+                left: 0,
+                top: 0,
+                right: width,
+                bottom: height,
+            };
+            let pixels = client_pixel_size(client);
+            assert_eq!((pixels.width, pixels.height), (width as u32, height as u32));
+        }
+    }
 }

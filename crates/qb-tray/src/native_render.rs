@@ -323,7 +323,7 @@ fn draw_account_menu(
         }),
     )?;
     let icon_values = [
-        "\u{e769}", "\u{e733}", "\u{e8d7}", "\u{e72c}", "\u{e74d}", "\u{e73e}",
+        "\u{e769}", "\u{e733}", "\u{e8d7}", "\u{e72c}", "\u{e73e}", "\u{e74d}",
     ];
     let mut y = popup.top + 9.0;
     for (n, item) in items.iter().enumerate() {
@@ -403,7 +403,11 @@ fn draw_account_menu(
             draw_text(
                 target,
                 &icons,
-                icon_values.get(n).copied().unwrap_or(""),
+                if matches!(item, super::actions::MenuItem::Delete) {
+                    "\u{e74d}"
+                } else {
+                    icon_values.get(n).copied().unwrap_or("")
+                },
                 153.0,
                 y + 8.0,
                 16.0,
