@@ -559,7 +559,7 @@ fn m6c_live_spawned_core_clicks_and_captures() -> anyhow::Result<()> {
     thread::sleep(Duration::from_millis(300));
     responsive(hwnd)?;
     let add_top = footer_center as f32 - 158.0;
-    click(hwnd, 220, (add_top + 90.0) as i16, WM_LBUTTONUP);
+    click(hwnd, 220, (add_top + 54.0) as i16, WM_LBUTTONUP);
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         if fs::read_to_string(&login_log)
