@@ -259,7 +259,11 @@ fn prepare_home(home: &std::path::Path) -> anyhow::Result<SyntheticUpstream> {
     let data = free_port()?;
     let admin = free_port()?;
     let store = AccountStore::acquire(home).map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    for n in 0..2 {
+    let row_count = std::env::var("M6C_ROWS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(2);
+    for n in 0..row_count {
         let email = format!("m6c-{n}@example.invalid");
         let identity = Identity::Codex {
             account_id: format!("m6c-{n}"),
@@ -423,28 +427,47 @@ fn m6c_live_spawned_core_clicks_and_captures() -> anyhow::Result<()> {
     let accounts = state["accounts"]
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("state accounts missing"))?;
+    let row_count = std::env::var("M6C_ROWS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(2);
     anyhow::ensure!(
-        accounts.len() == 2,
+        accounts.len() == row_count,
         "live tray decoded {} accounts",
         accounts.len()
     );
-    for y in [196, 205, 212, 220, 228, 240] {
+    let rows = qb_tray::parse_state(&serde_json::to_string(&state)?)?;
+    let list_height = qb_tray::state_height(&rows, false, None)
+        .ceil()
+        .clamp(120.0, 700.0);
+    let footer_center = (list_height - 24.0) as i16;
+    let last_id = rows.last().map(|row| row.id.clone()).unwrap();
+    let last_y = 52.0
+        + 36.0
+        + rows[..rows.len() - 1]
+            .iter()
+            .map(qb_tray::row_height)
+            .sum::<f32>()
+        + 22.0;
+    for y in (footer_center.saturating_sub(24)..footer_center.saturating_add(25)).step_by(4) {
         responsive(hwnd)?;
-        click(hwnd, 200, y, WM_LBUTTONUP);
-        thread::sleep(Duration::from_millis(80));
+        click(hwnd, 195, y, WM_LBUTTONUP);
+        thread::sleep(Duration::from_millis(35));
         if explorer_log.exists() {
             break;
         }
     }
     anyhow::ensure!(explorer_log.exists(), "settings test hook was not called");
     responsive(hwnd)?;
-    click(hwnd, 330, 145, WM_RBUTTONUP);
+    click(hwnd, 330, last_y as i16, WM_RBUTTONUP);
     thread::sleep(Duration::from_millis(100));
     thread::sleep(Duration::from_millis(200));
     capture(hwnd, &evidence.join("row-menu.png"))?;
     fs::write(&delay_file, b"delay")?;
     responsive(hwnd)?;
-    click(hwnd, 220, 180, WM_LBUTTONUP);
+    let menu_height = qb_tray::state_height(&rows, false, Some(&format!("menu:{last_id}")));
+    let menu = qb_tray::popup_rect(&rows, false, &format!("menu:{last_id}"), menu_height).unwrap();
+    click(hwnd, 220, (menu.top + 20.0) as i16, WM_LBUTTONUP);
     thread::sleep(Duration::from_secs(6));
     let _ = fs::remove_file(&delay_file);
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -453,7 +476,7 @@ fn m6c_live_spawned_core_clicks_and_captures() -> anyhow::Result<()> {
             .map_err(|error| anyhow::anyhow!("pause poll: {error}"))?;
         if state["accounts"]
             .as_array()
-            .and_then(|a| a.get(1))
+            .and_then(|a| a.get(row_count.saturating_sub(1)))
             .and_then(|a| a["user_state"].as_str())
             == Some("paused")
         {
@@ -468,15 +491,18 @@ fn m6c_live_spawned_core_clicks_and_captures() -> anyhow::Result<()> {
     // Exercise settings and tray-only quit on the live list.
     thread::sleep(Duration::from_secs(1));
     responsive(hwnd)?;
-    click(hwnd, 50, 212, WM_LBUTTONUP);
+    let footer_y = footer_center;
+    click(hwnd, 195, footer_y, WM_LBUTTONUP);
     thread::sleep(Duration::from_millis(150));
     responsive(hwnd)?;
     responsive(hwnd)?;
-    click(hwnd, 320, 212, WM_LBUTTONUP);
+    click(hwnd, 320, footer_y, WM_LBUTTONUP);
     thread::sleep(Duration::from_millis(300));
     capture(hwnd, &evidence.join("quit-menu.png"))?;
     responsive(hwnd)?;
-    click(hwnd, 230, 160, WM_LBUTTONUP);
+    let quit_height = list_height;
+    let quit = qb_tray::popup_rect(&rows, false, "quit", quit_height).unwrap();
+    click(hwnd, 230, (quit.top + 48.0) as i16, WM_LBUTTONUP);
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         if children.tray.try_wait()?.is_some() {
@@ -528,10 +554,12 @@ fn m6c_live_spawned_core_clicks_and_captures() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("login flyout window not found"))?;
     thread::sleep(Duration::from_secs(1));
     responsive(hwnd)?;
-    click(hwnd, 128, 240, WM_LBUTTONUP);
+    responsive(hwnd)?;
+    click(hwnd, 128, footer_center, WM_LBUTTONUP);
     thread::sleep(Duration::from_millis(300));
     responsive(hwnd)?;
-    click(hwnd, 220, 130, WM_LBUTTONUP);
+    let add_top = footer_center as f32 - 158.0;
+    click(hwnd, 220, (add_top + 90.0) as i16, WM_LBUTTONUP);
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         if fs::read_to_string(&login_log)

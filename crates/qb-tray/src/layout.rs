@@ -179,6 +179,91 @@ pub struct Rect {
     pub bottom: f32,
 }
 
+const FLYOUT_WIDTH: f32 = 360.0;
+const FOOTER_HEIGHT: f32 = 48.0;
+
+fn row_anchor(rows: &[Row], expand_disabled: bool, id: &str) -> Option<Rect> {
+    let mut y = 52.0;
+    for provider in ["Claude", "Codex"] {
+        let active = rows
+            .iter()
+            .filter(|r| r.provider == provider && r.user_chip != "비활성")
+            .collect::<Vec<_>>();
+        let disabled = rows
+            .iter()
+            .filter(|r| r.provider == provider && r.user_chip == "비활성")
+            .collect::<Vec<_>>();
+        if active.is_empty() && disabled.is_empty() {
+            continue;
+        }
+        y += 36.0;
+        let expanded = expand_disabled && provider == "Codex";
+        if expanded && !disabled.is_empty() {
+            y += 28.0;
+        }
+        for row in active.into_iter().chain(if expanded {
+            disabled.clone()
+        } else {
+            Vec::new()
+        }) {
+            let h = row_height(row);
+            if row.id == id {
+                return Some(Rect::new(16.0, y, FLYOUT_WIDTH - 16.0, y + h));
+            }
+            y += h;
+        }
+        if !expanded && !disabled.is_empty() {
+            y += 28.0;
+        }
+    }
+    None
+}
+
+pub fn account_menu_height(row: &Row) -> f32 {
+    let items = actions::menu_items(row);
+    let separators = items
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i == 2 || *i == 3)
+        .count() as f32;
+    9.0 + items.len() as f32 * 32.0 + separators * 10.0
+}
+
+pub fn popup_rect(rows: &[Row], expand_disabled: bool, state: &str, height: f32) -> Option<Rect> {
+    let footer_y = height - FOOTER_HEIGHT;
+    if let Some(id) = state
+        .strip_prefix("menu:")
+        .and_then(|v| v.split(':').next())
+    {
+        let row = rows.iter().find(|r| r.id == id).or_else(|| rows.first())?;
+        let anchor = row_anchor(rows, expand_disabled, &row.id)?;
+        let popup_h = account_menu_height(row);
+        let down = anchor.bottom + 4.0;
+        let top = if down + popup_h <= footer_y {
+            down
+        } else if anchor.top >= popup_h + 4.0 {
+            anchor.top - popup_h - 4.0
+        } else {
+            0.0
+        };
+        return Some(Rect::new(136.0, top, 352.0, top + popup_h));
+    }
+    if state == "add-menu" {
+        return Some(Rect::new(128.0, footer_y - 110.0, 352.0, footer_y - 4.0));
+    }
+    if state == "quit" {
+        return Some(Rect::new(152.0, footer_y - 92.0, 352.0, footer_y - 4.0));
+    }
+    None
+}
+
+pub fn popup_required_height(rows: &[Row], expand_disabled: bool, state: &str, base: f32) -> f32 {
+    let Some(popup) = popup_rect(rows, expand_disabled, state, base) else {
+        return base;
+    };
+    base.max(popup.bottom + if popup.top == 0.0 { FOOTER_HEIGHT } else { 0.0 })
+}
+
 impl Rect {
     pub const fn new(left: f32, top: f32, right: f32, bottom: f32) -> Self {
         Self {
@@ -282,11 +367,11 @@ impl HitTarget {
 /// Return targets in paint order. Hit testing should use the last matching
 /// target so modal and menu targets take precedence over the flyout body.
 pub fn layout_targets(rows: &[Row], expand_disabled: bool, state: Option<&str>) -> Vec<HitTarget> {
-    const WIDTH: f32 = 360.0;
+    const WIDTH: f32 = FLYOUT_WIDTH;
     const PADDING: f32 = 16.0;
     let mut targets = Vec::new();
     let login = state.is_some_and(|value| value.starts_with("login:"));
-    let height = layout_content_height(rows, expand_disabled);
+    let height = state_height(rows, expand_disabled, state);
     let mut y = 52.0;
 
     if !login {
@@ -384,15 +469,17 @@ pub fn layout_targets(rows: &[Row], expand_disabled: bool, state: Option<&str>) 
                 .and_then(|v| v.split(':').next())
                 == Some(row.id.as_str())
         }) {
+            let popup =
+                popup_rect(rows, expand_disabled, state.unwrap_or_default(), height).unwrap();
             for (index, _) in actions::menu_items(row).iter().enumerate() {
                 targets.push(HitTarget::MenuItem {
                     id: row.id.clone(),
                     index,
                     rect: Rect::new(
-                        136.0,
-                        164.0 + index as f32 * 27.0,
-                        352.0,
-                        190.0 + index as f32 * 27.0,
+                        popup.left + 41.0,
+                        popup.top + 9.0 + index as f32 * 32.0,
+                        popup.right - 15.0,
+                        popup.top + 9.0 + index as f32 * 32.0 + 30.0,
                     ),
                 });
             }
@@ -408,18 +495,16 @@ pub fn layout_targets(rows: &[Row], expand_disabled: bool, state: Option<&str>) 
             rect: Rect::new(180.0, top + 129.0, 344.0, top + 193.0),
         });
     } else if state == Some("quit") {
-        let top = height - 124.0;
+        let top = popup_rect(rows, expand_disabled, "quit", height)
+            .unwrap()
+            .top;
         targets.push(HitTarget::Quit {
             action: QuitAction::TrayOnly,
-            rect: Rect::new(168.0, top + 38.0, 336.0, top + 62.0),
+            rect: Rect::new(168.0, top + 36.0, 336.0, top + 62.0),
         });
         targets.push(HitTarget::Quit {
             action: QuitAction::TrayAndProxy,
-            rect: Rect::new(168.0, top + 65.0, 336.0, top + 89.0),
-        });
-        targets.push(HitTarget::Quit {
-            action: QuitAction::Cancel,
-            rect: Rect::new(168.0, top + 92.0, 336.0, top + 116.0),
+            rect: Rect::new(168.0, top + 64.0, 336.0, top + 90.0),
         });
     }
     targets
@@ -467,7 +552,14 @@ fn layout_content_height(rows: &[Row], expand_disabled: bool) -> f32 {
             height += 32.0;
         }
     }
-    height + sections as f32 + 3.0 + 8.0 + 48.0
+    height + sections as f32 + 3.0 + 8.0 + FOOTER_HEIGHT
+}
+
+pub fn state_height(rows: &[Row], expand_disabled: bool, state: Option<&str>) -> f32 {
+    let base = layout_content_height(rows, expand_disabled);
+    state
+        .map(|value| popup_required_height(rows, expand_disabled, value, base))
+        .unwrap_or(base)
 }
 
 pub fn parse_state(json: &str) -> serde_json::Result<Vec<Row>> {
@@ -913,8 +1005,15 @@ mod tests {
     fn hit_testing_prefers_menu_overlay_and_exposes_footer_targets() {
         let rows = rows();
         let targets = layout_targets(&rows, false, Some("menu:cx-ready"));
+        let menu = popup_rect(
+            &rows,
+            false,
+            "menu:cx-ready",
+            state_height(&rows, false, Some("menu:cx-ready")),
+        )
+        .unwrap();
         assert!(matches!(
-            hit_test(&targets, 150.0, 170.0),
+            hit_test(&targets, menu.left + 50.0, menu.top + 20.0),
             Some(HitTarget::MenuItem { id, index: 0, .. }) if id == "cx-ready"
         ));
         assert!(targets.iter().any(|target| matches!(
@@ -932,6 +1031,31 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn popups_fit_one_two_and_eight_row_lists_and_footer_menus_open_up() {
+        let base = rows();
+        for count in [1usize, 2, 8] {
+            let mut fixture = Vec::new();
+            for index in 0..count {
+                let mut row = base[index % base.len()].clone();
+                row.id = format!("row-{index}");
+                row.provider = "Claude".into();
+                fixture.push(row);
+            }
+            let list_height = state_height(&fixture, false, None);
+            let menu_state = format!("menu:{}", fixture.last().unwrap().id);
+            let menu_height = state_height(&fixture, false, Some(&menu_state));
+            let popup = popup_rect(&fixture, false, &menu_state, menu_height).unwrap();
+            assert!(popup.left >= 0.0 && popup.top >= 0.0);
+            assert!(popup.right <= FLYOUT_WIDTH && popup.bottom <= menu_height - FOOTER_HEIGHT);
+            let quit_height = state_height(&fixture, false, Some("quit"));
+            let quit = popup_rect(&fixture, false, "quit", quit_height).unwrap();
+            assert!(quit.top >= 0.0 && quit.bottom <= quit_height);
+            assert!(quit.bottom <= list_height - FOOTER_HEIGHT);
+            assert!(quit.top < list_height - FOOTER_HEIGHT);
+        }
     }
 
     #[test]

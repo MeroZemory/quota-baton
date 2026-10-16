@@ -13,8 +13,8 @@ use windows::{
             },
             DirectWrite::{
                 DWRITE_FACTORY_TYPE_ISOLATED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-                DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_TRAILING, DWriteCreateFactory,
-                IDWriteFactory,
+                DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TEXT_METRICS,
+                DWriteCreateFactory, IDWriteFactory,
             },
             Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
             Imaging::{
@@ -81,7 +81,7 @@ pub fn state_height(rows: &[Row], expand_disabled: bool, state: Option<&str>) ->
     if state.is_some_and(|value| value.starts_with("login:")) {
         276.0
     } else {
-        content_height(rows, expand_disabled)
+        super::state_height(rows, expand_disabled, state)
     }
 }
 
@@ -184,13 +184,17 @@ fn draw_text(
     let brush = unsafe { target.CreateSolidColorBrush(&color.0, None) }?;
     let text: Vec<u16> = value.encode_utf16().collect();
     unsafe {
-        target.DrawText(
-            &text,
-            format,
-            &rect(x, y, x + width, y + height),
+        let factory: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED)?;
+        let measure = factory.CreateTextLayout(&text, format, width, 4096.0)?;
+        let mut metrics = DWRITE_TEXT_METRICS::default();
+        measure.GetMetrics(&mut metrics)?;
+        let layout =
+            factory.CreateTextLayout(&text, format, width, (metrics.height + 2.0).max(height))?;
+        target.DrawTextLayout(
+            windows_numerics::Vector2 { X: x, Y: y },
+            &layout,
             &brush,
             windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_NONE,
-            windows::Win32::Graphics::DirectWrite::DWRITE_MEASURING_MODE_NATURAL,
         );
         Ok(())
     }
@@ -306,9 +310,11 @@ fn draw_account_menu(
     let items = super::actions::menu_items(row);
     let body = text_format(factory, 13.0, false)?;
     let icons = icon_format(factory, 14.0)?;
+    let popup = super::popup_rect(rows, false, state, content_height(rows, false))
+        .unwrap_or(super::Rect::new(136.0, 126.0, 352.0, 312.0));
     popup_surface(
         target,
-        rect(136.0, 126.0, 352.0, 312.0),
+        rect(popup.left, popup.top, popup.right, popup.bottom),
         dark,
         brush_color(if dark {
             super::Rgb(44, 44, 44)
@@ -319,7 +325,7 @@ fn draw_account_menu(
     let icon_values = [
         "\u{e769}", "\u{e733}", "\u{e8d7}", "\u{e72c}", "\u{e74d}", "\u{e73e}",
     ];
-    let mut y = 135.0;
+    let mut y = popup.top + 9.0;
     for (n, item) in items.iter().enumerate() {
         if n == 2 || n == 3 {
             fill(
@@ -331,7 +337,7 @@ fn draw_account_menu(
                     super::Rgb(212, 212, 212)
                 }),
             )?;
-            y += 9.0;
+            y += 10.0;
         }
         if n == index {
             pill(
@@ -971,14 +977,20 @@ pub fn paint_with_state(
                 vec![
                     "트레이만 종료".to_owned(),
                     "트레이와 프록시 종료".to_owned(),
-                    "취소".to_owned(),
                 ],
             )
         } else {
             ("계정 메뉴", vec!["알 수 없는 상태".to_owned()])
         };
         let (left, top, right, bottom) = if state.starts_with("menu:") {
-            (136.0, 126.0, 352.0, 312.0)
+            let popup = super::popup_rect(
+                &rows,
+                expand_disabled,
+                state,
+                content_height(&rows, expand_disabled),
+            )
+            .unwrap();
+            (popup.left, popup.top, popup.right, popup.bottom)
         } else if state.starts_with("confirm-delete:") {
             let card_height = 193.0;
             let flyout = content_height(&rows, expand_disabled);
@@ -988,20 +1000,15 @@ pub fn paint_with_state(
                 344.0,
                 (flyout + card_height).round() / 2.0,
             )
-        } else if state == "add-menu" {
-            (
-                128.0,
-                content_height(&rows, expand_disabled) - 180.0,
-                352.0,
-                content_height(&rows, expand_disabled) - 70.0,
+        } else if state == "add-menu" || state == "quit" {
+            let popup = super::popup_rect(
+                &rows,
+                expand_disabled,
+                state,
+                content_height(&rows, expand_disabled),
             )
-        } else if state == "quit" {
-            (
-                152.0,
-                content_height(&rows, expand_disabled) - 124.0,
-                352.0,
-                content_height(&rows, expand_disabled) - 52.0,
-            )
+            .unwrap();
+            (popup.left, popup.top, popup.right, popup.bottom)
         } else {
             (28.0, 68.0, WIDTH - 12.0, 200.0)
         };

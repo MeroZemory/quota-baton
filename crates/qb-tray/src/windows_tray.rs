@@ -104,7 +104,10 @@ fn hit_target(x: f32, y: f32) -> Option<HitTarget> {
         .unwrap_or_else(|e| e.into_inner())
         .clone();
     if state.as_deref() == Some("add-menu") {
-        let top = flyout_height() as f32 - 180.0;
+        let rows = model().lock().unwrap_or_else(|e| e.into_inner()).0.clone();
+        let top = qb_tray::popup_rect(&rows, false, "add-menu", flyout_height() as f32)
+            .map(|rect| rect.top)
+            .unwrap_or(flyout_height() as f32 - 180.0);
         return if (128.0..352.0).contains(&x) && (top..top + 110.0).contains(&y) {
             Some(if y < top + 36.0 {
                 HitTarget::AddChoice(Some("claude".into()))
