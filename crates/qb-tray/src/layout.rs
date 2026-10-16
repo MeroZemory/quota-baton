@@ -603,20 +603,28 @@ pub fn row(account: &Account, now: SystemTime) -> Row {
         } else {
             health_tone(account)
         };
-    let five_window = account
+    let windows = account
         .windows
+        .iter()
+        .filter(|window| drawable_window_name(&window.name))
+        .collect::<Vec<_>>();
+    let five_window = windows
         .iter()
         .find(|w| w.name == "5h")
-        .or_else(|| account.windows.first());
-    let weekly_window = account.windows.iter().find(|w| w.name == "7d").or_else(|| {
-        five_window
-            .filter(|window| window.name == "5h")
-            .and_then(|_| account.windows.iter().find(|w| w.name != "5h"))
-    });
-    let meter_windows = account
-        .windows
+        .copied()
+        .or_else(|| windows.first().copied());
+    let weekly_window = windows
         .iter()
-        .map(|window| usage(Some(window), now))
+        .find(|w| w.name == "7d")
+        .copied()
+        .or_else(|| {
+            five_window
+                .filter(|window| window.name == "5h")
+                .and_then(|_| windows.iter().find(|w| w.name != "5h").copied())
+        });
+    let meter_windows = windows
+        .iter()
+        .map(|window| usage(Some(*window), now))
         .collect::<Vec<_>>();
     Row {
         id: account.id.clone(),
@@ -828,6 +836,17 @@ fn window_label(name: &str) -> String {
     }
 }
 
+fn drawable_window_name(name: &str) -> bool {
+    match name {
+        "5h" | "7d" | "7d_oi" | "7d_sonnet" => true,
+        value if value.ends_with('m') => value
+            .trim_end_matches('m')
+            .parse::<u64>()
+            .is_ok_and(|minutes| minutes > 0),
+        _ => false,
+    }
+}
+
 pub fn tooltip(rows: &[Row], core_ok: bool) -> String {
     let badge = match badge(rows, core_ok) {
         Badge::Error => "코어 연결 끊김",
@@ -1010,6 +1029,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rows[0].source, "oauth");
+    }
+
+    #[test]
+    fn phantom_codex_windows_are_not_drawn() {
+        let rows = parse_state(
+            r#"{"accounts":[{"id":"cx","provider":"codex","windows":[
+                {"name":"0m","used_pct":0,"reset_at":"2020-01-01T00:00:00Z"},
+                {"name":"secondary","used_pct":0,"reset_at":"2020-01-01T00:00:00Z"}
+            ]}]}"#,
+        )
+        .unwrap();
+        assert!(rows[0].meter_windows.is_empty());
+        assert_eq!(rows[0].five_hour.percent_text, "–");
     }
 
     #[test]
