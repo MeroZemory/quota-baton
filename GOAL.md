@@ -29,7 +29,7 @@ Implement quota-baton exactly as specified, milestone by milestone, until M8 is 
 
 | Milestone | Status |
 |---|---|
-| M0, M1a, M2, M3, M4a, M4b, M5, M1b, M6a, M4c, M6b, M7a, M6b.2, M7b, M4d, M7c, M8, M6c | merged. Remaining: the M7c 24 h trend addendum. Running the cutover on the live profile is the user's decision (D9) and out of scope for you |
+| M0, M1a, M2, M3, M4a, M4b, M5, M1b, M6a, M4c, M6b, M7a, M6b.2, M7b, M4d, M7c, M8, M6c | merged, including the M7c 24 h addendum (no upward trend). Nothing remains for you. Running the cutover on the live profile is the user's decision (D9) and out of scope for you |
 | M4e | C6.4 guarantees and tests from the previous proxy mixed-pool incident, plus `/state` pool counts; brief `M4e.md`. No API-key kind, no priority (O14 is open) |
 
 ## Hard boundaries (never)
