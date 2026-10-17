@@ -259,3 +259,24 @@ The upstream limit behaves dynamically. The spread threshold is therefore a heur
 Later candidates: a per-plan default table, once Codex `plan` shows plan-dependent limits, and a lower `active_window_secs` if the count overstates load.
 
 **Review.** Fable independent review, `.sandbox/reviews/D15-review.md`. All six must-fix and seven should-fix items were adopted the same day.
+
+<a id="d16"></a>
+## D16. Subscription OAuth only; API keys out of scope — Accepted (design owner, 2026-10-17)
+
+**Trigger.** The previous proxy mixed four Claude OAuth credentials with four billable Claude API keys in one pool. When the OAuth credentials were rate-limited, session affinity pinned a large session to an API key, which then failed with `Credit balance is too low`. A diagnostic replay of that session cost USD 64.68.
+
+**Decision.**
+1. quota-baton serves only the user's **subscription OAuth accounts** (D5: its own login, or a CPA OAuth import). It never imports or uses API keys, so a billable credential can never enter the pool, and no silent OAuth-to-API fallback can exist.
+2. If API keys are ever wanted, that is a new user decision. It must then follow the cost-safety policy in the incident note:
+   - fallback is off by default
+   - API keys live in a separate opt-in route or profile
+   - existing OAuth sessions are never migrated to an API key
+   - a billing error quarantines the credential without retries across other keys
+   - the class and cost are visible before a request is sent
+   - tests cover the safe default
+3. Points from the note that already hold today:
+   - provider-native errors pass through unchanged (C6 rows 2–7, C6.2)
+   - bindings are reselected after quota, auth, permission or payment failures (C5, C7)
+   - tests and diagnostics use testkit fakes and never replay a real session (AGENTS.md, C13)
+4. **Candidate, not yet scheduled:** an admin action and tray item to view one session's binding and drop it (redacted session key). The note's item 6 asks for this; it is useful for operators. Today the binding is dropped only on forced moves, at cold points or by the D15 rebalance.
+
