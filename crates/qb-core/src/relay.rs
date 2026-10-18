@@ -36,6 +36,7 @@ use crate::{
     session,
 };
 use credentials::TokenGates;
+pub use credentials::{ManualRefreshError, ManualRefreshResult, ManualRefreshTerminal};
 pub use hold::CommitDecision;
 use ledger::Completion;
 
@@ -97,6 +98,44 @@ impl RelayState {
         )
         .with_runtime(self.accounts.clone())
     }
+    /// Manual refresh uses the same lease owner, gate and write-ahead as relay 401s.
+    pub async fn refresh_account(
+        &self,
+        id: String,
+        force: bool,
+    ) -> Result<serde_json::Value, ManualRefreshError> {
+        if self.is_draining() {
+            return Err(ManualRefreshError::Unavailable);
+        }
+        match self
+            .tokens
+            .manual_refresh(
+                self.store.clone(),
+                self.observability.clone(),
+                id.clone(),
+                force,
+            )
+            .await
+        {
+            Ok(summary) => {
+                serde_json::to_value(summary).map_err(|_| ManualRefreshError::Unavailable)
+            }
+            Err(ManualRefreshError::Terminal { outcome }) => {
+                let store = self.store.clone();
+                let account = tokio::task::spawn_blocking(move || store.load(&id))
+                    .await
+                    .map_err(|_| ManualRefreshError::Unavailable)?
+                    .map_err(|_| ManualRefreshError::Unavailable)?;
+                Ok(serde_json::json!({
+                    "outcome":outcome,
+                    "token_expires_at":account.token_meta.expires_at,
+                    "last_refresh_at":account.token_meta.last_refresh_at
+                }))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn start_refresh_scheduler(&self) -> tokio::task::JoinHandle<()> {
         self.tokens
             .start_refresh_scheduler(self.store.clone(), self.observability.clone())

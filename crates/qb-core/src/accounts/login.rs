@@ -114,14 +114,36 @@ pub fn save(
             Identity::Codex { account_id: b, .. },
         ) = (&old.identity, &account.identity)
             && a == b
-            && let Ok(
-                identity @ Identity::Codex {
-                    user_id: Some(_), ..
-                },
-            ) = super::linked::resolve_identity(old)
         {
-            // Resolve metadata only; never install possibly older CPA tokens.
-            old.identity = identity;
+            if matches!(
+                &old.source,
+                Source::Cpa {
+                    mode: ImportMode::Linked,
+                    ..
+                }
+            ) {
+                // Linked recovery still requires current CPA evidence, never stored tokens.
+                if let Ok(
+                    identity @ Identity::Codex {
+                        user_id: Some(_), ..
+                    },
+                ) = super::linked::resolve_identity(old)
+                {
+                    old.identity = identity;
+                }
+            } else {
+                // Owned/adopted recovery uses only the current encrypted stored token.
+                // codex_user_id checks that its claim belongs to this workspace.
+                let current = store.tokens_unlocked(old)?;
+                let user = super::import::codex_user_id(&current, a)
+                    .ok_or(LoginStoreError::IdentityConflict)?;
+                let mut resolved = old.identity.clone();
+                if let Identity::Codex { user_id, .. } = &mut resolved {
+                    *user_id = Some(user);
+                }
+                // Virtual matching identity only: existing journaled migration persists login.
+                old.identity = resolved;
+            }
         }
     }
     // Unresolved Codex users are ambiguous even with the same email. Never

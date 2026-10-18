@@ -96,7 +96,10 @@ async fn import_cpa(
         return error(StatusCode::BAD_REQUEST, "Unsupported account source");
     }
     if request.mode != ImportMode::Linked {
-        return error(StatusCode::BAD_REQUEST, "adopt is a cutover step (M8)");
+        return error(
+            StatusCode::BAD_REQUEST,
+            "소유권 이전은 계정별 adopt 명령을 사용해 주세요.",
+        );
     }
     let dir = match request.dir {
         Some(dir) => dir,
@@ -134,9 +137,33 @@ fn error(status: StatusCode, message: &str) -> Response {
 struct RuntimeAdmin {
     relay: Arc<crate::relay::RelayState>,
     data_port: u16,
+    #[cfg(feature = "testkit")]
+    adoption_probe: Option<fn() -> crate::accounts::adopt::ProbeState>,
 }
 
 pub fn runtime_routes(relay: Arc<crate::relay::RelayState>, data_port: u16) -> Router {
+    runtime_router(RuntimeAdmin {
+        relay,
+        data_port,
+        #[cfg(feature = "testkit")]
+        adoption_probe: None,
+    })
+}
+
+#[cfg(feature = "testkit")]
+pub fn runtime_routes_with_adoption_probe(
+    relay: Arc<crate::relay::RelayState>,
+    data_port: u16,
+    probe: fn() -> crate::accounts::adopt::ProbeState,
+) -> Router {
+    runtime_router(RuntimeAdmin {
+        relay,
+        data_port,
+        adoption_probe: Some(probe),
+    })
+}
+
+fn runtime_router(state: RuntimeAdmin) -> Router {
     Router::new()
         .route("/admin/v1/state", axum::routing::get(runtime_state))
         .route("/admin/v1/events", axum::routing::get(runtime_events))
@@ -147,7 +174,7 @@ pub fn runtime_routes(relay: Arc<crate::relay::RelayState>, data_port: u16) -> R
         )
         .route("/admin/v1/lifecycle/drain", post(lifecycle_drain))
         .route("/admin/v1/lifecycle/shutdown", post(lifecycle_shutdown))
-        .with_state(RuntimeAdmin { relay, data_port })
+        .with_state(state)
 }
 
 #[derive(Default, serde::Deserialize)]
@@ -208,6 +235,8 @@ async fn runtime_state(State(state): State<RuntimeAdmin>) -> Response {
         Ok(accounts) => {
             Json(serde_json::json!({
             "pools": crate::account_runtime::pool_counts(&accounts),
+            "draining": state.relay.is_draining(),
+            "capabilities": {"account_adopt":true,"manual_refresh":true},
             "accounts": accounts,
             "inflight": {
                 "requests": state.relay.inflight_requests.load(std::sync::atomic::Ordering::Relaxed),
@@ -281,6 +310,7 @@ struct AccountPatch {
 async fn account_action(
     State(state): State<RuntimeAdmin>,
     axum::extract::Path((id, action)): axum::extract::Path<(String, String)>,
+    request: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Response {
     if state.relay.is_draining() {
         return error(StatusCode::SERVICE_UNAVAILABLE, "Core is draining");
@@ -288,12 +318,131 @@ async fn account_action(
     use crate::accounts::UserState;
     let user_state = match action.as_str() {
         "refresh-usage" => return refresh_usage(state, id).await,
+        "adopt" => return adopt_account(state, id, request).await,
+        "refresh" => return refresh_account(state, id, request).await,
         "pause" => UserState::Paused,
         "resume" | "enable" => UserState::Active,
         "disable" => UserState::Disabled,
         _ => return error(StatusCode::NOT_FOUND, "Unknown account action"),
     };
     change_account(state, id, Some(user_state), AccountPatch::default()).await
+}
+
+async fn adopt_account(
+    state: RuntimeAdmin,
+    id: String,
+    request: Result<Json<serde_json::Value>, JsonRejection>,
+) -> Response {
+    let Ok(Json(value)) = request else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "소유권 이전 요청이 올바르지 않습니다.",
+        );
+    };
+    let Ok(request) = serde_json::from_value::<crate::accounts::adopt::AdoptRequest>(value) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "소유권 이전 요청이 올바르지 않습니다.",
+        );
+    };
+    let store = state.relay.accounts.store.clone();
+    #[cfg(feature = "testkit")]
+    let probe = state.adoption_probe;
+    let result = tokio::task::spawn_blocking(move || {
+        #[cfg(feature = "testkit")]
+        if let Some(probe) = probe {
+            return crate::accounts::adopt::run_with_probe(&store, &id, request, probe);
+        }
+        crate::accounts::adopt::run(&store, &id, request)
+    })
+    .await;
+    match result {
+        Ok(Ok(result)) => Json(result).into_response(),
+        Ok(Err(error_value)) => {
+            use crate::accounts::adopt::AdoptError;
+            let (status, code, message) = match error_value {
+                AdoptError::NotFound => (
+                    StatusCode::NOT_FOUND,
+                    "not_found",
+                    "계정을 찾을 수 없습니다.",
+                ),
+                AdoptError::NotLinked => (
+                    StatusCode::CONFLICT,
+                    "not_linked",
+                    "CPA 연결 계정만 소유권을 이전할 수 있습니다.",
+                ),
+                AdoptError::Generation { .. } => (
+                    StatusCode::CONFLICT,
+                    "generation_conflict",
+                    "계정이 변경됐습니다. 상태를 다시 읽고 시도해 주세요.",
+                ),
+                AdoptError::IdentityMismatch | AdoptError::AmbiguousIdentity => (
+                    StatusCode::CONFLICT,
+                    "identity_conflict",
+                    "계정의 사용자를 확인할 수 없거나 서로 다른 사용자 파일이 겹칩니다.",
+                ),
+                AdoptError::CpaRunning => (
+                    StatusCode::CONFLICT,
+                    "cpa_running",
+                    "CPA가 아직 이 계정을 갱신할 수 있습니다.",
+                ),
+                AdoptError::ProbeUnavailable => (
+                    StatusCode::CONFLICT,
+                    "cpa_unknown",
+                    "CPA 실행 상태를 확인할 수 없습니다.",
+                ),
+                AdoptError::SourceIo | AdoptError::Store(_) => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "store_unavailable",
+                    "소유권 이전에 필요한 계정 자료를 읽거나 저장할 수 없습니다.",
+                ),
+            };
+            (
+                status,
+                Json(serde_json::json!({"error":{"code":code,"message":message}})),
+            )
+                .into_response()
+        }
+        Err(_) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "소유권 이전 작업을 마치지 못했습니다.",
+        ),
+    }
+}
+
+#[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RefreshRequest {
+    #[serde(default)]
+    force: bool,
+}
+
+async fn refresh_account(
+    state: RuntimeAdmin,
+    id: String,
+    request: Result<Json<serde_json::Value>, JsonRejection>,
+) -> Response {
+    let Ok(Json(value)) = request else {
+        return error(StatusCode::BAD_REQUEST, "갱신 요청이 올바르지 않습니다.");
+    };
+    let Ok(request) = serde_json::from_value::<RefreshRequest>(value) else {
+        return error(StatusCode::BAD_REQUEST, "갱신 요청이 올바르지 않습니다.");
+    };
+    match state.relay.refresh_account(id, request.force).await {
+        Ok(summary) => Json(summary).into_response(),
+        Err(error_value) => {
+            use crate::relay::ManualRefreshError;
+            let status = match error_value {
+                ManualRefreshError::NotFound => StatusCode::NOT_FOUND,
+                ManualRefreshError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+                _ => StatusCode::CONFLICT,
+            };
+            let message = error_value.to_string();
+            let mut value = serde_json::to_value(error_value).unwrap_or_default();
+            value["message"] = serde_json::json!(message);
+            (status, Json(serde_json::json!({"error":value}))).into_response()
+        }
+    }
 }
 
 async fn refresh_usage(state: RuntimeAdmin, id: String) -> Response {

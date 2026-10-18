@@ -660,7 +660,7 @@ async fn offline_online_import_and_admin_refusal() {
         .bounded_output()
         .unwrap();
     assert!(!refused.status.success());
-    assert!(String::from_utf8_lossy(&refused.stderr).contains("M8"));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("소유권 이전"));
     assert!(!home.join("accounts").exists());
     assert!(run_import(&home, &cpa, &[]).contains("비활성"));
     let core = Core::spawn(
@@ -692,7 +692,7 @@ async fn offline_online_import_and_admin_refusal() {
     let token = std::fs::read_to_string(home.join("admin.token")).unwrap();
     let adopted = client.post(format!("{base}/accounts/import")).bearer_auth(token.trim()).json(&serde_json::json!({"source":"cpa","mode":"adopted","dir":root.path().join("does-not-exist")})).send().await.unwrap();
     assert_eq!(adopted.status(), 400);
-    assert!(adopted.text().await.unwrap().contains("M8"));
+    assert!(adopted.text().await.unwrap().contains("소유권 이전"));
     let invalid = client
         .post(format!("{base}/accounts/import"))
         .bearer_auth(token.trim())
@@ -1259,4 +1259,229 @@ fn c6_4_status_renders_per_provider_pool_counts() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("claude: 사용 가능 1 · 대기 [결제 필요 1] · 사용 불가 0"));
     assert!(stdout.contains("codex: 사용 가능 0 · 대기 [] · 사용 불가 1"));
+}
+
+#[cfg(debug_assertions)]
+fn r2a_fixture_account(home: &Path, owned: bool, upstream: &str) -> String {
+    let cpa = home.join("synthetic-r2a-cpa");
+    std::fs::create_dir_all(&cpa).unwrap();
+    let mut value = cpa_fixture(1);
+    value["expired"] = serde_json::json!("2099-01-01T00:00:00Z");
+    value["last_refresh"] = serde_json::json!("2020-01-01T00:00:00Z");
+    let file = cpa.join("fixture.json");
+    std::fs::write(&file, serde_json::to_vec(&value).unwrap()).unwrap();
+    let mut config = std::fs::read_to_string(home.join("config.toml")).unwrap();
+    config.push_str(&format!("[upstream]\ncodex_base={upstream:?}\nanthropic_base={upstream:?}\ncodex_usage_base={upstream:?}\nclaude_usage_base={upstream:?}\ncodex_token_endpoint={upstream:?}\nclaude_token_endpoint={upstream:?}\n"));
+    std::fs::write(home.join("config.toml"), config).unwrap();
+    let store = qb_core::accounts::AccountStore::acquire(home).unwrap();
+    qb_core::accounts::import::run(&store, &cpa, &[], false).unwrap();
+    let mut account = store.list().unwrap().remove(0);
+    if owned {
+        let tokens = store.tokens(&account).unwrap();
+        account.source = qb_core::accounts::Source::Oauth;
+        account = store
+            .save(&account, &tokens, Some(account.generation))
+            .unwrap();
+    }
+    std::fs::remove_file(file).unwrap();
+    account.id
+}
+
+#[cfg(debug_assertions)]
+async fn r2a_core(home: &Path) -> Core {
+    r2a_core_in(home, &std::env::current_dir().unwrap()).await
+}
+
+#[cfg(debug_assertions)]
+async fn r2a_core_in(home: &Path, cwd: &Path) -> Core {
+    let core = Core::spawn(
+        command(home)
+            .current_dir(cwd)
+            .arg("serve")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null()),
+    )
+    .unwrap();
+    let config = qb_core::config::Config::load(home).unwrap();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_millis(200))
+        .build()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(core.try_wait().unwrap().is_none(), "synthetic core exited");
+        let token = std::fs::read_to_string(home.join("admin.token")).unwrap_or_default();
+        if let Ok(response) = client
+            .get(format!(
+                "http://127.0.0.1:{}/admin/v1/health",
+                config.server.admin_port
+            ))
+            .bearer_auth(token.trim())
+            .send()
+            .await
+            && response.status().is_success()
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "synthetic core startup timeout"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    core
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r2a_cli_adopts_offline_or_via_running_lease_owner_without_tokens() {
+    let _serial = SERVE_SERIAL.lock().await;
+    for online in [false, true] {
+        let home = fixture();
+        let fake = qb_testkit::ScriptedUpstream::start().await.unwrap();
+        let id = r2a_fixture_account(home.path(), false, &fake.url);
+        let before = qb_core::accounts::AccountStore::list_metadata(home.path())
+            .unwrap()
+            .remove(0);
+        let core = if online {
+            Some(r2a_core(home.path()).await)
+        } else {
+            None
+        };
+        let result = command(home.path())
+            .args(["accounts", "adopt", &id, "--from", "store"])
+            .bounded_output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let text = String::from_utf8(result.stdout).unwrap();
+        assert!(text.contains("직접 갱신으로 전환"));
+        assert!(text.contains("저장된 토큰"));
+        for secret in ["fake-access", "fake-refresh", "fake-id"] {
+            assert!(!text.contains(secret));
+        }
+        let adopted = qb_core::accounts::AccountStore::list_metadata(home.path())
+            .unwrap()
+            .remove(0);
+        assert_eq!(adopted.id, before.id);
+        assert_eq!(adopted.identity, before.identity);
+        assert_eq!(adopted.generation, before.generation + 1);
+        assert_eq!(adopted.token_meta, before.token_meta);
+        assert_eq!(adopted.user_state, qb_core::accounts::UserState::Disabled);
+        assert!(matches!(
+            adopted.source,
+            qb_core::accounts::Source::Cpa {
+                mode: qb_core::accounts::ImportMode::Adopted,
+                ..
+            }
+        ));
+        assert!(fake.state.requests().is_empty());
+        drop(core);
+        let store = qb_core::accounts::AccountStore::acquire(home.path()).unwrap();
+        assert!(store.tokens(&adopted).unwrap().access_token == "fake-access-1");
+    }
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r2a_cli_adopts_relative_backup_from_client_cwd_online_and_offline() {
+    let _serial = SERVE_SERIAL.lock().await;
+    for online in [false, true] {
+        let home = fixture();
+        let fake = qb_testkit::ScriptedUpstream::start().await.unwrap();
+        let id = r2a_fixture_account(home.path(), false, &fake.url);
+        let core_cwd = home.path().join("core-cwd");
+        let client_cwd = home.path().join("client-cwd");
+        std::fs::create_dir_all(&core_cwd).unwrap();
+        std::fs::create_dir_all(client_cwd.join("backups")).unwrap();
+        assert!(!home.path().join("synthetic-r2a-cpa/fixture.json").exists());
+        let mut backup = cpa_fixture(2);
+        backup["expired"] = serde_json::json!("2099-01-01T00:00:00Z");
+        backup["last_refresh"] = serde_json::json!("2021-01-01T00:00:00Z");
+        std::fs::write(
+            client_cwd.join("backups/latest.json"),
+            serde_json::to_vec(&backup).unwrap(),
+        )
+        .unwrap();
+        let core = if online {
+            Some(r2a_core_in(home.path(), &core_cwd).await)
+        } else {
+            None
+        };
+        let result = command(home.path())
+            .current_dir(&client_cwd)
+            .args(["accounts", "adopt", &id, "--from", "backups/latest.json"])
+            .bounded_output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(String::from_utf8_lossy(&result.stdout).contains("백업"));
+        for bytes in [&result.stdout, &result.stderr] {
+            let text = String::from_utf8_lossy(bytes);
+            for secret in ["fake-access-", "fake-refresh-", "fake-id-"] {
+                assert!(!text.contains(secret));
+            }
+        }
+        assert!(fake.state.requests().is_empty());
+        drop(core);
+        let store = qb_core::accounts::AccountStore::acquire(home.path()).unwrap();
+        let account = store.load(&id).unwrap();
+        let tokens = store.tokens(&account).unwrap();
+        assert!(tokens.access_token == "fake-access-2");
+        assert!(tokens.refresh_token == "fake-refresh-2");
+    }
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r2a_cli_refreshes_disabled_owned_account_online_and_offline() {
+    let _serial = SERVE_SERIAL.lock().await;
+    for online in [false, true] {
+        let home = fixture();
+        let fake = qb_testkit::ScriptedUpstream::start().await.unwrap();
+        let id = r2a_fixture_account(home.path(), true, &fake.url);
+        fake.state.push(qb_testkit::ScriptedResponse::json(reqwest::StatusCode::OK,
+            r#"{"access_token":"synthetic-cli-rotated-access","refresh_token":"synthetic-cli-rotated-refresh","expires_in":3600}"#));
+        let core = if online {
+            Some(r2a_core(home.path()).await)
+        } else {
+            None
+        };
+        let result = command(home.path())
+            .args(["accounts", "refresh", &id])
+            .bounded_output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let text = String::from_utf8(result.stdout).unwrap();
+        assert!(text.contains("갱신 완료"));
+        for secret in ["synthetic-cli-rotated", "fake-access", "fake-refresh"] {
+            assert!(!text.contains(secret));
+        }
+        assert_eq!(fake.state.requests().len(), 1);
+        let account = qb_core::accounts::AccountStore::list_metadata(home.path())
+            .unwrap()
+            .remove(0);
+        assert_eq!(account.user_state, qb_core::accounts::UserState::Disabled);
+        assert_eq!(account.source, qb_core::accounts::Source::Oauth);
+        assert!(!account.token_meta.refresh_uncertain);
+        assert!(
+            std::time::SystemTime::from(account.token_meta.expires_at.unwrap())
+                > std::time::SystemTime::now()
+        );
+        drop(core);
+        let store = qb_core::accounts::AccountStore::acquire(home.path()).unwrap();
+        assert!(store.tokens(&account).unwrap().access_token == "synthetic-cli-rotated-access");
+    }
 }

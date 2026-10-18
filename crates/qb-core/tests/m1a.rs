@@ -330,21 +330,12 @@ fn c6_4_reimport_preserves_payment_counter_and_deadline() {
 }
 
 #[test]
-fn preview_and_adopt_write_nothing() {
-    isolated("preview_and_adopt_write_nothing", |home, cpa| {
+fn preview_write_nothing() {
+    isolated("preview_write_nothing", |home, cpa| {
         write(cpa, "source.json", &fixture("claude", 1));
         let rows =
             import::preview(home, cpa, &["claude:synthetic@example.invalid".into()]).unwrap();
         assert_eq!(rows[0].user_state, Some(UserState::Active));
-        assert!(!home.exists());
-        assert!(matches!(
-            import::refuse_adopt(),
-            Err(StoreError::AdoptUnavailable)
-        ));
-        assert_eq!(
-            import::refuse_adopt().unwrap_err().to_string(),
-            "adopt is a cutover step (M8)"
-        );
         assert!(!home.exists());
         let store = AccountStore::acquire(home).unwrap();
         import::run(&store, cpa, &[], false).unwrap();
