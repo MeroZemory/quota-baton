@@ -53,7 +53,7 @@ Implement quota-baton exactly as specified, milestone by milestone, until M8 is 
 | R3 | merged (codex-qb and claude-qb) |
 | R1-tray.2 | merged (notifications) |
 | R4 | merged (plan tier, credits_in_use, precondition) |
-| R5 | tray v2 (user-approved redesign; light default, remaining-based usage, credits confirm every time); after R4, folds R1-tray.2 wording; brief `R5-tray-v2.md`, spec `.sandbox/design/tray-v2/SPEC-v2.md` |
+| R5 | merged (`6feb99e`; full gate passed, including default/full workspace, standalone core, strict clippy and actual native captures/actions/memory). Report: `.sandbox/reports/R5.md`. Latest approved healthy bars are green; credits confirm every time |
 | R3.2 | codex-qb/claude-qb set the window title (launcher title + Codex `[tui] terminal_title = []`, Claude title env), with an in-place upgrade path; after R5; brief `R3.2-launcher-titles.md` |
 | R6 | D18 warned takeover from another app's home (core + CLI first, tray with R5); after R5 core work, before R2 Part B; brief `R6-takeover.md` |
 | R7 | separate dashboard window (user-approved; sessions by account, activity, 48 h usage; label header stripped upstream); after R6, before R2 Part B; brief `R7-dashboard.md`, spec `.sandbox/design/dashboard/SPEC.md` |
