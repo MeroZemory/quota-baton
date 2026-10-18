@@ -968,6 +968,188 @@ async fn r3_wire_dedicated_apply_with_both_providers_and_unwire_preserves_sessio
 
 #[cfg(debug_assertions)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r4_wire_apply_quota_cooling_binary_regressions() {
+    use qb_core::accounts::{
+        AccountStore, Health, HealthReason, Provider, QuotaCooling, UserState,
+    };
+
+    let _serial = SERVE_SERIAL.lock().await;
+    // A fixed 404 cannot clear cooling or race usage/profile response scripts.
+    // Abort the synthetic server on assertion failure as well as normal exit.
+    struct Upstream(tokio::task::JoinHandle<()>);
+    impl Drop for Upstream {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    assert!(!matches!(address.port(), 10100 | 10101));
+    let upstream = format!("http://{address}");
+    let _upstream = Upstream(tokio::spawn(async move {
+        axum::serve(
+            listener,
+            axum::Router::new().fallback(|| async { axum::http::StatusCode::NOT_FOUND }),
+        )
+        .await
+        .unwrap();
+    }));
+
+    for provider in [Provider::Claude, Provider::Codex] {
+        for scenario in [
+            "known-reset",
+            "disabled",
+            "needs-relogin",
+            "missing",
+            "resetless",
+        ] {
+            let home = r3_apply_fixture(&upstream);
+            let cpa = home.path().join("synthetic-r3-cpa");
+            let mut codex = cpa_fixture(1);
+            codex["expired"] = serde_json::json!("2099-01-01T00:00:00Z");
+            std::fs::write(cpa.join("codex.json"), serde_json::to_vec(&codex).unwrap()).unwrap();
+            let now = chrono::Utc::now();
+            let reset = now + chrono::Duration::hours(2);
+            {
+                let store = AccountStore::acquire(home.path()).unwrap();
+                qb_core::accounts::import::run(
+                    &store,
+                    &cpa,
+                    &["codex:synthetic@example.invalid".to_owned()],
+                    false,
+                )
+                .unwrap();
+                let account = store
+                    .list()
+                    .unwrap()
+                    .into_iter()
+                    .find(|a| a.provider == provider)
+                    .unwrap();
+                if scenario == "missing" {
+                    // Only this fixture's generated account file is removed;
+                    // the other provider stays ready to check provider isolation.
+                    std::fs::remove_file(
+                        home.path()
+                            .join("accounts")
+                            .join(format!("{}.json", account.id)),
+                    )
+                    .unwrap();
+                } else {
+                    store
+                        .update_metadata(&account.id, |a| {
+                            a.health = Health::Cooling {
+                                reason: HealthReason::Quota,
+                                until: reset,
+                                scope: "account".into(),
+                            };
+                            a.quota_cooling = (scenario != "resetless").then(|| QuotaCooling {
+                                window: "5h".into(),
+                                reset_at: reset,
+                                started_at: now,
+                            });
+                            if scenario == "disabled" {
+                                a.user_state = UserState::Disabled;
+                            } else if scenario == "needs-relogin" {
+                                a.health = Health::NeedsRelogin {
+                                    reason: "synthetic-r4".into(),
+                                    since: now,
+                                };
+                            }
+                        })
+                        .unwrap();
+                }
+            }
+            r3_claude_launcher_fixture(home.path());
+            let profile = home
+                .path()
+                .join("synthetic-profile")
+                .canonicalize()
+                .unwrap();
+            let before = r3_apply_profile(&profile);
+            let config_before = std::fs::read(home.path().join("config.toml")).unwrap();
+            let config = qb_core::config::Config::load(home.path()).unwrap();
+            assert!(!matches!(config.server.admin_port, 10100 | 10101));
+            assert!(!matches!(config.server.data_port, 10100 | 10101));
+            // All metadata edits precede the running core's credential lease.
+            let core = r2a_core_in(home.path(), &profile).await;
+            tokio::net::TcpStream::connect(("127.0.0.1", config.server.data_port))
+                .await
+                .unwrap();
+            for mode in ["default", "dedicated"] {
+                let (claude, codex) = if provider == Provider::Claude {
+                    (mode, "none")
+                } else {
+                    ("none", mode)
+                };
+                let output = r3_apply_command(home.path())
+                    .env("PATH", profile.join("AppData/Roaming/npm"))
+                    .args([
+                        "wire",
+                        "--apply",
+                        "--claude-mode",
+                        claude,
+                        "--codex-mode",
+                        codex,
+                    ])
+                    .bounded_output()
+                    .unwrap();
+                let text = r3_apply_output(home.path(), &output);
+                let accepted = scenario == "known-reset" && mode == "dedicated";
+                assert_eq!(
+                    output.status.success(),
+                    accepted,
+                    "{provider:?}/{scenario}/{mode}: {text}"
+                );
+                assert!(core.try_wait().unwrap().is_none());
+                if accepted {
+                    let name = if provider == Provider::Claude {
+                        "Claude"
+                    } else {
+                        "Codex"
+                    };
+                    assert!(
+                        text.contains(&format!(
+                            "경고: 지금은 모든 {name} 계정이 한도에 걸려 있습니다"
+                        )),
+                        "{text}"
+                    );
+                    assert!(
+                        text.contains(&format!(
+                            "{}에 풀립니다",
+                            reset.with_timezone(&chrono::Local).format("%H:%M")
+                        )),
+                        "{text}"
+                    );
+                    assert!(home.path().join("journal/wiring.json").is_file());
+                    let (launcher, settings) = if provider == Provider::Claude {
+                        ("claude-qb.cmd", ".claude-qb/settings.json")
+                    } else {
+                        ("codex-qb.cmd", ".codex-acct/qb/config.toml")
+                    };
+                    assert!(profile.join("AppData/Roaming/npm").join(launcher).is_file());
+                    assert!(profile.join(settings).is_file());
+                } else {
+                    assert!(text.contains("활성 계정"), "{text}");
+                    assert!(!text.contains("에 풀립니다"), "{text}");
+                    assert!(
+                        r3_apply_profile(&profile) == before,
+                        "refusal changed client files"
+                    );
+                    assert!(
+                        std::fs::read(home.path().join("config.toml")).unwrap() == config_before
+                    );
+                    assert!(!home.path().join("journal").exists());
+                    assert!(!profile.join(".codex-acct").exists());
+                    assert!(!profile.join(".claude-qb").exists());
+                }
+            }
+            drop(core);
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r3_wire_apply_refuses_missing_or_unhealthy_core_without_mutation() {
     let _serial = SERVE_SERIAL.lock().await;
     let fake = qb_testkit::ScriptedUpstream::start().await.unwrap();

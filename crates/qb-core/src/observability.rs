@@ -655,6 +655,32 @@ impl Observability {
         self.snapshots.lock().ok()?.get(id).cloned()
     }
 
+    pub(crate) fn record_account(&self, account: &crate::accounts::Account) {
+        // Only canonical subscription names enter the account ledger.
+        let plan = account.plan.as_deref().filter(|plan| {
+            matches!(
+                *plan,
+                "pro"
+                    | "max_5x"
+                    | "max_20x"
+                    | "team"
+                    | "enterprise"
+                    | "free"
+                    | "plus"
+                    | "business"
+                    | "edu"
+                    | "go"
+                    | "max"
+            )
+        });
+        self.enqueue(Command::Ledger(serde_json::json!({
+            "ts": Utc::now().to_rfc3339(), "event": "account_changed",
+            "account": account.id, "provider": account.provider,
+            "generation": account.generation, "plan": plan,
+            "health": account.health, "user_state": account.user_state,
+        })));
+    }
+
     pub fn record_health(
         &self,
         id: &str,
