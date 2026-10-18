@@ -42,6 +42,18 @@ impl MenuItem {
         }
     }
 
+    pub const fn is_toggle(self) -> bool {
+        matches!(self, Self::ToggleDrain | Self::ToggleCredits)
+    }
+
+    pub const fn checked(self, row: &Row) -> Option<bool> {
+        match self {
+            Self::ToggleDrain => Some(row.drain),
+            Self::ToggleCredits => Some(row.allow_credits),
+            _ => None,
+        }
+    }
+
     pub const fn is_destructive(self) -> bool {
         matches!(self, Self::Delete)
     }
@@ -183,6 +195,21 @@ impl ToastDebouncer {
 mod tests {
     use super::*;
     use crate::{Row, Tone, Usage};
+
+    #[test]
+    fn checkbox_values_follow_refreshed_rows() {
+        let mut row = row();
+        for item in [MenuItem::ToggleDrain, MenuItem::ToggleCredits] {
+            assert!(item.is_toggle());
+            assert_eq!(item.checked(&row), Some(false));
+        }
+        row.drain = true;
+        row.allow_credits = true;
+        assert_eq!(MenuItem::ToggleDrain.checked(&row), Some(true));
+        assert_eq!(MenuItem::ToggleCredits.checked(&row), Some(true));
+        assert!(!MenuItem::Pause.is_toggle());
+        assert_eq!(MenuItem::Pause.checked(&row), None);
+    }
 
     fn row() -> Row {
         Row {
