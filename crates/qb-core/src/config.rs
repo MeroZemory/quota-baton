@@ -9,9 +9,24 @@ pub struct Config {
     pub upstream: UpstreamConfig,
     pub routing: RoutingConfig,
     pub guard: GuardConfig,
+    pub tray: TrayConfig,
     pub websocket: WebsocketConfig,
     pub quota: QuotaConfig,
     pub accounts: BTreeMap<String, AccountConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct TrayConfig {
+    pub burst_new_sessions: u32,
+}
+
+impl Default for TrayConfig {
+    fn default() -> Self {
+        Self {
+            burst_new_sessions: 30,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

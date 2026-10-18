@@ -5,6 +5,7 @@ use crate::Row;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdminOperation {
     Relogin,
+    RefreshTokens,
     Account(&'static str),
     Drain(bool),
     Credits(bool),
@@ -21,6 +22,7 @@ pub enum MenuItem {
     ToggleDrain,
     ToggleCredits,
     RefreshUsage,
+    RefreshTokens,
     Delete,
 }
 
@@ -35,6 +37,7 @@ impl MenuItem {
             Self::ToggleDrain => "새 대화 받지 않기",
             Self::ToggleCredits => "유료 크레딧 사용 허용",
             Self::RefreshUsage => "사용량 새로고침",
+            Self::RefreshTokens => "지금 갱신",
             Self::Delete => "계정 삭제…",
         }
     }
@@ -59,6 +62,7 @@ pub fn admin_operation(item: MenuItem, row: &Row) -> Option<AdminOperation> {
             Some(AdminOperation::Credits(!row.allow_credits))
         }
         MenuItem::RefreshUsage => Some(AdminOperation::Account("refresh-usage")),
+        MenuItem::RefreshTokens => Some(AdminOperation::RefreshTokens),
         MenuItem::Delete => Some(AdminOperation::Delete),
         MenuItem::ToggleCredits => None,
     }
@@ -85,6 +89,12 @@ pub fn menu_items(row: &Row) -> Vec<MenuItem> {
     items.push(MenuItem::ToggleDrain);
     if row.provider == "Codex" {
         items.push(MenuItem::ToggleCredits);
+    }
+    if matches!(row.source.as_str(), "oauth" | "adopted")
+        && !row.drain
+        && row.health_chip != "재로그인 필요"
+    {
+        items.push(MenuItem::RefreshTokens);
     }
     items.push(MenuItem::RefreshUsage);
     items.push(MenuItem::Delete);
@@ -203,6 +213,8 @@ mod tests {
             allow_credits: false,
             bound_sessions: 0,
             pacing_until: None,
+            token_expires_at: None,
+            last_refresh_at: None,
             drain: false,
             session_text: None,
         }
@@ -215,6 +227,29 @@ mod tests {
         assert!(items.contains(&MenuItem::ToggleCredits));
         assert!(items.contains(&MenuItem::Delete));
         assert_eq!(MenuItem::Relogin.label(&row()), "다시 로그인");
+    }
+
+    #[test]
+    fn manual_refresh_menu_matches_refresh_ownership_and_health() {
+        let mut row = row();
+        row.health_chip = "준비됨".into();
+        for source in ["oauth", "adopted"] {
+            row.source = source.into();
+            assert!(menu_items(&row).contains(&MenuItem::RefreshTokens));
+            assert_eq!(
+                admin_operation(MenuItem::RefreshTokens, &row),
+                Some(AdminOperation::RefreshTokens)
+            );
+            assert_eq!(MenuItem::RefreshTokens.label(&row), "지금 갱신");
+        }
+        row.source = "linked".into();
+        assert!(!menu_items(&row).contains(&MenuItem::RefreshTokens));
+        row.source = "oauth".into();
+        row.drain = true;
+        assert!(!menu_items(&row).contains(&MenuItem::RefreshTokens));
+        row.drain = false;
+        row.health_chip = "재로그인 필요".into();
+        assert!(!menu_items(&row).contains(&MenuItem::RefreshTokens));
     }
 
     #[test]

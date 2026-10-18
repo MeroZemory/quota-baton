@@ -101,6 +101,21 @@ impl AdminClient {
             .await
     }
 
+    pub async fn refresh_tokens(&self, id: &str) -> Result<(), ClientError> {
+        let response = self
+            .http
+            .post(format!("{}/admin/v1/accounts/{id}/refresh", self.base_url))
+            .timeout(Duration::from_secs(35))
+            .bearer_auth(&self.admin_token)
+            .json(&serde_json::json!({"force":false}))
+            .send()
+            .await
+            .map_err(ClientError::Transport)?;
+        let status = response.status();
+        let summary: serde_json::Value = response.json().await.map_err(ClientError::Decode)?;
+        refresh_result(status, &summary)
+    }
+
     pub async fn delete_account(&self, id: &str) -> Result<(), ClientError> {
         self.send_empty(reqwest::Method::DELETE, &format!("/admin/v1/accounts/{id}"))
             .await
@@ -140,6 +155,7 @@ impl AdminClient {
 
     pub async fn events(&self) -> Result<reqwest::Response, ClientError> {
         self.request(reqwest::Method::GET, "/admin/v1/events")
+            .timeout(Duration::from_secs(3600))
             .send()
             .await
             .map_err(ClientError::Transport)
@@ -291,13 +307,45 @@ pub enum ClientError {
     Transport(#[source] reqwest::Error),
     #[error("admin API returned HTTP {0}")]
     Http(StatusCode),
+    #[error("{0}")]
+    AccountAction(&'static str),
     #[error("admin API returned invalid JSON: {0}")]
     Decode(#[source] reqwest::Error),
+}
+
+fn refresh_result(status: StatusCode, value: &serde_json::Value) -> Result<(), ClientError> {
+    if status.is_success() {
+        return match value["outcome"].as_str() {
+            Some("success") => Ok(()),
+            Some(
+                "refresh_token_invalidated"
+                | "refresh_token_reused"
+                | "refresh_token_expired"
+                | "refresh_token_revoked"
+                | "invalid_grant"
+                | "token_endpoint_401",
+            ) => Err(ClientError::AccountAction(
+                "계정 메뉴에서 다시 로그인하세요",
+            )),
+            _ => Err(ClientError::AccountAction("갱신 응답을 확인할 수 없습니다")),
+        };
+    }
+    let message = match value["error"]["code"].as_str() {
+        Some("linked") => "CPA가 갱신하는 계정입니다",
+        Some("drain") => "드레인 해제 후 다시 시도하세요",
+        Some("needs_relogin") => "계정 메뉴에서 다시 로그인하세요",
+        Some("uncertain") => "이전 갱신 결과가 불확실합니다 · CLI의 --force를 확인하세요",
+        Some("unavailable") => "잠시 후 다시 갱신해 주세요",
+        Some("not_found") => "계정을 찾을 수 없습니다",
+        _ => return Err(ClientError::Http(status)),
+    };
+    Err(ClientError::AccountAction(message))
 }
 
 #[allow(dead_code)]
 pub fn short_error(error: &ClientError) -> &'static str {
     match error {
+        ClientError::AccountAction(message) => message,
         ClientError::Transport(_) => "코어에 연결할 수 없습니다",
         ClientError::Http(StatusCode::TOO_MANY_REQUESTS) => "잠시 후 다시 시도해 주세요",
         ClientError::Http(StatusCode::NOT_FOUND) => "계정을 찾을 수 없습니다",
@@ -348,7 +396,21 @@ pub fn layout_rows(
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TrayWarning {
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub burst_new_sessions: Option<u64>,
+    #[serde(default)]
+    pub observed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TraySnapshot {
+    #[serde(default)]
+    pub warnings: Vec<TrayWarning>,
+    #[serde(default)]
+    pub pools: serde_json::Value,
     #[serde(default)]
     pub accounts: Vec<TrayAccount>,
     #[serde(default)]
@@ -377,7 +439,7 @@ pub struct TrayAccount {
     pub plan: Option<String>,
     #[serde(default)]
     pub user_state: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub health: serde_json::Value,
     #[serde(default)]
     pub probe_pending: bool,
@@ -391,6 +453,8 @@ pub struct TrayAccount {
     pub bound_sessions: u64,
     #[serde(default)]
     pub token_expires_at: Option<String>,
+    #[serde(default)]
+    pub last_refresh_at: Option<String>,
     #[serde(default)]
     pub drain: bool,
     #[serde(default)]
@@ -414,10 +478,11 @@ where
             let kind = object
                 .remove("kind")
                 .and_then(|kind| kind.as_str().map(str::to_owned));
-            if kind.as_deref() == Some("cpa")
-                && object.get("mode").and_then(serde_json::Value::as_str) == Some("linked")
-            {
-                "linked".into()
+            if kind.as_deref() == Some("cpa") {
+                match object.get("mode").and_then(serde_json::Value::as_str) {
+                    Some(mode @ ("linked" | "adopted")) => mode.to_owned(),
+                    _ => "⚠ source decode error (unknown mode)".into(),
+                }
             } else {
                 kind.unwrap_or_else(|| "⚠ source decode error (missing kind)".into())
             }
@@ -455,6 +520,7 @@ pub struct Bindings {
 }
 
 /// Render a compact Korean tooltip line without exposing any secret fields.
+#[cfg(test)]
 pub fn render_status_line(read: &TrayRead) -> String {
     match &read.health {
         CoreHealth::Unreachable { .. } => "코어: 연결할 수 없음".to_owned(),
@@ -484,6 +550,7 @@ pub fn render_status_line(read: &TrayRead) -> String {
 /// Render a deterministic review image from an admin state fixture. The native
 /// flyout consumes the same rows; this compact encoder keeps the aid usable in
 /// CI without a desktop compositor.
+#[cfg(test)]
 pub fn render_flyout(read: &TrayRead) -> String {
     let mut lines = vec![render_status_line(read)];
     for provider in ["claude", "codex"] {
@@ -555,12 +622,29 @@ mod tests {
     }
 
     #[test]
+    fn manual_refresh_errors_are_actionable_and_never_echo_server_payload() {
+        assert!(refresh_result(StatusCode::OK, &serde_json::json!({"outcome":"success"})).is_ok());
+        let uncertain = refresh_result(StatusCode::CONFLICT,
+            &serde_json::json!({"error":{"code":"uncertain","message":"synthetic-secret-never-echo"}})).unwrap_err();
+        assert!(short_error(&uncertain).contains("--force"));
+        assert!(!uncertain.to_string().contains("synthetic-secret"));
+        let terminal = refresh_result(StatusCode::OK,
+            &serde_json::json!({"outcome":"refresh_token_reused","extra":"synthetic-secret-never-echo"})).unwrap_err();
+        assert!(short_error(&terminal).contains("다시 로그인"));
+        let unknown = refresh_result(StatusCode::CONFLICT,
+            &serde_json::json!({"error":{"code":"synthetic-secret-never-echo","message":"synthetic-secret-never-echo"}})).unwrap_err();
+        assert!(!unknown.to_string().contains("synthetic-secret"));
+    }
+
+    #[test]
     fn decodes_source_object_and_keeps_malformed_source_visible() {
         let snapshot: TraySnapshot = serde_json::from_value(serde_json::json!({
             "accounts": [
                 {"id":"oauth", "source":{"kind":"oauth","mode":"owned","future":true}},
                 {"id":"linked", "source":{"kind":"cpa","mode":"linked","dir":"ignored"}},
-                {"id":"broken", "source":{"future":true}}
+                {"id":"broken", "source":{"future":true}},
+                {"id":"adopted", "source":{"kind":"cpa","mode":"adopted"},
+                 "token_expires_at":"2099-10-23T02:00:00Z","last_refresh_at":"2026-10-18T08:00:00Z"}
             ]
         }))
         .unwrap();
@@ -572,6 +656,14 @@ mod tests {
                 .starts_with("⚠ source decode error")
         );
         assert_eq!(snapshot.accounts[0].provider, "");
+        assert_eq!(snapshot.accounts[3].source, "adopted");
+        assert_eq!(
+            snapshot.accounts[3].last_refresh_at.as_deref(),
+            Some("2026-10-18T08:00:00Z")
+        );
+        let rows = qb_tray::parse_state(&serde_json::to_string(&snapshot).unwrap()).unwrap();
+        assert_eq!(rows[3].source, "adopted");
+        assert_eq!(qb_tray::account_menu_metadata(&rows[3])[0], "직접 갱신");
     }
 
     #[test]

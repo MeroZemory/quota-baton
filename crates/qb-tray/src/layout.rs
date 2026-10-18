@@ -58,6 +58,10 @@ pub struct Account {
     pub source: String,
     #[serde(default)]
     pub pacing: Pacing,
+    #[serde(default)]
+    pub token_expires_at: Option<String>,
+    #[serde(default)]
+    pub last_refresh_at: Option<String>,
 }
 
 fn decode_source<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -71,10 +75,11 @@ where
             let kind = object
                 .remove("kind")
                 .and_then(|kind| kind.as_str().map(str::to_owned));
-            if kind.as_deref() == Some("cpa")
-                && object.get("mode").and_then(serde_json::Value::as_str) == Some("linked")
-            {
-                "linked".into()
+            if kind.as_deref() == Some("cpa") {
+                match object.get("mode").and_then(serde_json::Value::as_str) {
+                    Some(mode @ ("linked" | "adopted")) => mode.to_owned(),
+                    _ => "⚠ source decode error (unknown mode)".into(),
+                }
             } else {
                 kind.unwrap_or_else(|| "⚠ source decode error (missing kind)".into())
             }
@@ -129,6 +134,8 @@ pub struct Row {
     pub bound_sessions: u64,
     pub session_text: Option<String>,
     pub pacing_until: Option<String>,
+    pub token_expires_at: Option<String>,
+    pub last_refresh_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -182,7 +189,46 @@ pub struct Rect {
 const FLYOUT_WIDTH: f32 = 360.0;
 const FOOTER_HEIGHT: f32 = 48.0;
 
-fn row_anchor(rows: &[Row], expand_disabled: bool, id: &str) -> Option<Rect> {
+/// Resolve an exact menu account; stale or malformed selections have no actions.
+pub fn menu_target<'a>(rows: &'a [Row], state: &str) -> Option<(&'a Row, usize)> {
+    let mut parts = state.strip_prefix("menu:")?.split(':');
+    let id = parts.next().filter(|id| !id.is_empty())?;
+    let index = match parts.next() {
+        Some(index) => index.parse::<usize>().ok()?,
+        None => 0,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    let row = rows.iter().find(|row| row.id == id)?;
+    (index < actions::menu_items(row).len()).then_some((row, index))
+}
+
+/// Explicit provider states override the legacy Codex-only bool. A menu may
+/// reveal a disabled account, but never changes its user state or activates it.
+pub fn disabled_expanded(
+    rows: &[Row],
+    expand_disabled: bool,
+    state: Option<&str>,
+    provider: &str,
+) -> bool {
+    let provider = match provider {
+        "Claude" | "claude" => "claude",
+        "Codex" | "codex" => "codex",
+        _ => return false,
+    };
+    if let Some(expanded) = state.and_then(|state| state.strip_prefix("expanded:")) {
+        return expanded == provider;
+    }
+    let menu_disabled = state
+        .and_then(|state| menu_target(rows, state))
+        .is_some_and(|(row, _)| {
+            row.provider == provider_name(provider) && row.user_chip == "비활성"
+        });
+    menu_disabled || ((expand_disabled || state == Some("expanded")) && provider == "codex")
+}
+
+fn row_anchor(rows: &[Row], expand_disabled: bool, state: Option<&str>, id: &str) -> Option<Rect> {
     let mut y = 52.0;
     for provider in ["Claude", "Codex"] {
         let active = rows
@@ -197,7 +243,7 @@ fn row_anchor(rows: &[Row], expand_disabled: bool, id: &str) -> Option<Rect> {
             continue;
         }
         y += 36.0;
-        let expanded = expand_disabled && provider == "Codex";
+        let expanded = disabled_expanded(rows, expand_disabled, state, provider);
         if expanded && !disabled.is_empty() {
             y += 28.0;
         }
@@ -219,6 +265,26 @@ fn row_anchor(rows: &[Row], expand_disabled: bool, id: &str) -> Option<Rect> {
     None
 }
 
+const ACCOUNT_MENU_META_HEIGHT: f32 = 68.0;
+
+pub fn account_menu_metadata(row: &Row) -> [String; 3] {
+    let time = |value: Option<&str>| {
+        value
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|time| time.with_timezone(&Local).format("%m/%d %H:%M").to_string())
+            .unwrap_or_else(|| "확인 불가".into())
+    };
+    [
+        match row.source.as_str() {
+            "linked" => "CPA 갱신".into(),
+            "oauth" | "adopted" => "직접 갱신".into(),
+            _ => "갱신 방식 확인 불가".into(),
+        },
+        format!("만료 {}", time(row.token_expires_at.as_deref())),
+        format!("최근 갱신 {}", time(row.last_refresh_at.as_deref())),
+    ]
+}
+
 pub fn account_menu_height(row: &Row) -> f32 {
     let items = actions::menu_items(row);
     let separators = items
@@ -228,7 +294,7 @@ pub fn account_menu_height(row: &Row) -> f32 {
         .count() as f32;
     // Keep a bottom inset for the final glyph and the popup shadow. The inset
     // is part of the geometry so a grown flyout cannot clip the last action.
-    9.0 + items.len() as f32 * 32.0 + separators * 10.0 + 16.0
+    ACCOUNT_MENU_META_HEIGHT + 9.0 + items.len() as f32 * 32.0 + separators * 10.0 + 16.0
 }
 
 pub fn account_menu_item_top(row: &Row, index: usize) -> f32 {
@@ -237,17 +303,14 @@ pub fn account_menu_item_top(row: &Row, index: usize) -> f32 {
         .enumerate()
         .filter(|(i, _)| *i <= index && (*i == 2 || *i == 3))
         .count() as f32;
-    9.0 + index as f32 * 32.0 + separators_before * 9.0
+    ACCOUNT_MENU_META_HEIGHT + 9.0 + index as f32 * 32.0 + separators_before * 9.0
 }
 
 pub fn popup_rect(rows: &[Row], expand_disabled: bool, state: &str, height: f32) -> Option<Rect> {
     let footer_y = height - FOOTER_HEIGHT;
-    if let Some(id) = state
-        .strip_prefix("menu:")
-        .and_then(|v| v.split(':').next())
-    {
-        let row = rows.iter().find(|r| r.id == id).or_else(|| rows.first())?;
-        let anchor = row_anchor(rows, expand_disabled, &row.id)?;
+    if state.starts_with("menu:") {
+        let (row, _) = menu_target(rows, state)?;
+        let anchor = row_anchor(rows, expand_disabled, Some(state), &row.id)?;
         let popup_h = account_menu_height(row);
         let down = anchor.bottom + 4.0;
         let top = if down + popup_h <= footer_y {
@@ -308,6 +371,9 @@ pub enum HitTarget {
         provider: String,
         rect: Rect,
     },
+    MenuSurface {
+        rect: Rect,
+    },
     MenuItem {
         id: String,
         index: usize,
@@ -365,6 +431,7 @@ impl HitTarget {
             Self::Row { rect, .. }
             | Self::RowMenu { rect, .. }
             | Self::RowRelogin { rect, .. }
+            | Self::MenuSurface { rect }
             | Self::MenuItem { rect, .. }
             | Self::Disclosure { rect, .. }
             | Self::Footer { rect, .. }
@@ -399,8 +466,12 @@ pub fn layout_targets(rows: &[Row], expand_disabled: bool, state: Option<&str>) 
                 continue;
             }
             y += 36.0;
-            let expanded = expand_disabled && provider == "codex";
+            let expanded = disabled_expanded(rows, expand_disabled, state, provider);
             if expanded && !disabled.is_empty() {
+                targets.push(HitTarget::Disclosure {
+                    provider: provider.into(),
+                    rect: Rect::new(PADDING, y, 236.0, y + 28.0),
+                });
                 y += 28.0;
             }
             for row in active.into_iter().chain(if expanded {
@@ -416,7 +487,7 @@ pub fn layout_targets(rows: &[Row], expand_disabled: bool, state: Option<&str>) 
                     id: row.id.clone(),
                     rect: Rect::new(324.0, y + 10.0, 352.0, y + 34.0),
                 });
-                if row.reason_button {
+                if row.reason_button && row.user_chip != "비활성" {
                     targets.push(HitTarget::RowRelogin {
                         id: row.id.clone(),
                         rect: Rect::new(
@@ -473,15 +544,11 @@ pub fn layout_targets(rows: &[Row], expand_disabled: bool, state: Option<&str>) 
         }
     }
     if state.is_some_and(|v| v.starts_with("menu:")) {
-        if let Some(row) = rows.iter().find(|row| {
-            state
-                .unwrap_or_default()
-                .strip_prefix("menu:")
-                .and_then(|v| v.split(':').next())
-                == Some(row.id.as_str())
-        }) {
-            let popup =
-                popup_rect(rows, expand_disabled, state.unwrap_or_default(), height).unwrap();
+        if let Some(((row, _), popup)) = menu_target(rows, state.unwrap_or_default()).zip(
+            popup_rect(rows, expand_disabled, state.unwrap_or_default(), height),
+        ) {
+            // The opaque menu metadata and padding consume pointer hits too.
+            targets.push(HitTarget::MenuSurface { rect: popup });
             for (index, _) in actions::menu_items(row).iter().enumerate() {
                 targets.push(HitTarget::MenuItem {
                     id: row.id.clone(),
@@ -528,7 +595,7 @@ pub fn hit_test(targets: &[HitTarget], x: f32, y: f32) -> Option<&HitTarget> {
         .find(|target| target.rect().contains(x, y))
 }
 
-fn layout_content_height(rows: &[Row], expand_disabled: bool) -> f32 {
+fn layout_content_height(rows: &[Row], expand_disabled: bool, state: Option<&str>) -> f32 {
     let mut height = 52.0;
     let mut sections = 0;
     for provider in ["Claude", "Codex"] {
@@ -550,7 +617,7 @@ fn layout_content_height(rows: &[Row], expand_disabled: bool) -> f32 {
                 .filter(|r| r.provider == provider && r.user_chip != "비활성")
                 .map(row_height)
                 .sum::<f32>();
-        if expand_disabled && provider == "Codex" {
+        if disabled_expanded(rows, expand_disabled, state, provider) {
             if disabled > 0 {
                 height += 32.0;
             }
@@ -559,6 +626,9 @@ fn layout_content_height(rows: &[Row], expand_disabled: bool) -> f32 {
                 .filter(|r| r.provider == provider && r.user_chip == "비활성")
                 .map(row_height)
                 .sum::<f32>();
+            if disabled > 0 {
+                height += 1.0;
+            }
         } else if disabled > 0 {
             height += 32.0;
         }
@@ -567,7 +637,10 @@ fn layout_content_height(rows: &[Row], expand_disabled: bool) -> f32 {
 }
 
 pub fn state_height(rows: &[Row], expand_disabled: bool, state: Option<&str>) -> f32 {
-    let base = layout_content_height(rows, expand_disabled);
+    if state.is_some_and(|value| value.starts_with("login:")) {
+        return 276.0;
+    }
+    let base = layout_content_height(rows, expand_disabled, state);
     state
         .map(|value| popup_required_height(rows, expand_disabled, value, base))
         .unwrap_or(base)
@@ -650,6 +723,8 @@ pub fn row(account: &Account, now: SystemTime) -> Row {
             || health_tone == Tone::Warning
             || health_tone == Tone::Critical,
         source: account.source.clone(),
+        token_expires_at: account.token_expires_at.clone(),
+        last_refresh_at: account.last_refresh_at.clone(),
         allow_credits: account.allow_credits,
         drain: account.drain,
         bound_sessions: account.bound_sessions,
@@ -864,9 +939,7 @@ pub fn badge(rows: &[Row], core_ok: bool) -> Badge {
         || rows
             .iter()
             .any(|r| r.attention || r.health_tone == Tone::Critical)
-        || !rows
-            .iter()
-            .any(|r| r.user_chip == "활성" && r.health_tone == Tone::Good)
+        || !rows.iter().any(|r| r.health_tone == Tone::Good)
     {
         Badge::Attention
     } else {
@@ -1008,6 +1081,156 @@ mod tests {
         );
         assert_eq!(format_reset("2020-01-01T00:00:00Z", now), "리셋됨");
     }
+    fn disclosure_rows() -> Vec<Row> {
+        parse_state(
+            r#"{"accounts":[
+            {"id":"cl-active","provider":"claude","user_state":"active"},
+            {"id":"cl-disabled","provider":"claude","user_state":"disabled","source":"oauth"},
+            {"id":"cx-active","provider":"codex","user_state":"active"},
+            {"id":"cx-disabled","provider":"codex","user_state":"disabled","source":"adopted"}
+        ]}"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn provider_disclosures_share_row_anchors_and_legacy_codex_expansion() {
+        let rows = disclosure_rows();
+        for (provider, id, other) in [
+            ("claude", "cl-disabled", "cx-disabled"),
+            ("codex", "cx-disabled", "cl-disabled"),
+        ] {
+            let collapsed = layout_targets(&rows, false, Some("list"));
+            assert!(collapsed.iter().any(|target| matches!(target,
+                HitTarget::Disclosure { provider: actual, .. } if actual == provider)));
+            assert!(!collapsed.iter().any(|target| matches!(target,
+                HitTarget::Row { id: actual, .. } if actual == id)));
+            let state = format!("expanded:{provider}");
+            // Explicit provider state takes precedence over the old bool.
+            let targets = layout_targets(&rows, true, Some(&state));
+            let anchor = row_anchor(&rows, true, Some(&state), id).unwrap();
+            assert!(targets.iter().any(|target| matches!(target,
+                HitTarget::Row { id: actual, rect } if actual == id && *rect == anchor)));
+            assert!(!targets.iter().any(|target| matches!(target,
+                HitTarget::Row { id: actual, .. } if actual == other)));
+            let disclosure = targets
+                .iter()
+                .find(|target| {
+                    matches!(target,
+                HitTarget::Disclosure { provider: actual, .. } if actual == provider)
+                })
+                .unwrap()
+                .rect();
+            assert!(
+                matches!(hit_test(&targets, disclosure.left + 1.0, disclosure.top + 1.0),
+                Some(HitTarget::Disclosure { provider: actual, .. }) if actual == provider)
+            );
+            let height = state_height(&rows, true, Some(&state));
+            assert!(anchor.bottom <= height - FOOTER_HEIGHT);
+        }
+        assert_eq!(
+            layout_targets(&rows, true, None),
+            layout_targets(&rows, false, Some("expanded"))
+        );
+        assert_eq!(
+            state_height(&rows, true, None),
+            state_height(&rows, false, Some("expanded"))
+        );
+    }
+
+    #[test]
+    fn disabled_account_menus_reveal_exact_row_and_fit_above_footer() {
+        let rows = disclosure_rows();
+        for id in ["cl-disabled", "cx-disabled"] {
+            for count in [1, 2, 8] {
+                let mut fixture = (0..count - 1)
+                    .map(|n| {
+                        let mut active = rows[if n % 2 == 0 { 0 } else { 2 }].clone();
+                        active.id = format!("extra-{n}");
+                        active
+                    })
+                    .collect::<Vec<_>>();
+                let mut wanted = rows.iter().find(|row| row.id == id).unwrap().clone();
+                // Even a disabled row needing re-login paints only its compact row.
+                wanted.reason_button = true;
+                fixture.push(wanted);
+                assert_eq!(fixture.len(), count);
+                let before = fixture.clone();
+                let state = format!("menu:{id}:0");
+                let (row, selected) = menu_target(&fixture, &state).unwrap();
+                assert_eq!(row.id, id);
+                assert_eq!(selected, 0);
+                assert_eq!(row.user_chip, "비활성");
+                assert_eq!(actions::menu_items(row)[0], actions::MenuItem::Enable);
+                let height = state_height(&fixture, false, Some(&state));
+                let popup = popup_rect(&fixture, false, &state, height).unwrap();
+                assert!(popup.top >= 0.0 && popup.bottom <= height - FOOTER_HEIGHT);
+                assert!(popup.left >= 0.0 && popup.right <= FLYOUT_WIDTH);
+                let anchor = row_anchor(&fixture, false, Some(&state), id).unwrap();
+                let targets = layout_targets(&fixture, false, Some(&state));
+                assert!(!targets.iter().any(|target| matches!(target,
+                    HitTarget::RowRelogin { id: actual, .. } if actual == id)));
+                assert!(targets.iter().any(|target| matches!(target,
+                    HitTarget::Row { id: actual, rect } if actual == id && *rect == anchor)));
+                assert!(matches!(
+                    hit_test(&targets, popup.left + 4.0, popup.top + 4.0),
+                    Some(HitTarget::MenuSurface { .. })
+                ));
+                let mut items = 0;
+                for target in &targets {
+                    if let HitTarget::MenuItem {
+                        id: actual,
+                        index,
+                        rect,
+                    } = target
+                    {
+                        items += 1;
+                        assert_eq!(actual, id);
+                        assert!(rect.top >= popup.top && rect.bottom <= popup.bottom);
+                        assert!(
+                            matches!(hit_test(&targets, rect.left + 1.0, rect.top + 1.0),
+                            Some(HitTarget::MenuItem { id: actual, index: actual_index, .. })
+                            if actual == id && actual_index == index)
+                        );
+                    }
+                }
+                assert_eq!(items, actions::menu_items(row).len());
+                assert_eq!(
+                    fixture, before,
+                    "opening a menu must not activate an account"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn removed_or_unknown_menu_selection_has_no_popup_or_menu_actions() {
+        let mut rows = disclosure_rows();
+        rows.retain(|row| row.id != "cl-disabled");
+        for state in [
+            "menu:cl-disabled:0",
+            "menu:missing",
+            "menu::0",
+            "menu:cx-active:999",
+            "menu:cx-active:bad",
+            "menu:cx-active:0:extra",
+        ] {
+            assert!(menu_target(&rows, state).is_none());
+            let height = state_height(&rows, false, Some(state));
+            assert!(popup_rect(&rows, false, state, height).is_none());
+            assert_eq!(height, state_height(&rows, false, None));
+            assert!(
+                !layout_targets(&rows, false, Some(state))
+                    .iter()
+                    .any(|target| matches!(
+                        target,
+                        HitTarget::MenuSurface { .. } | HitTarget::MenuItem { .. }
+                    ))
+            );
+        }
+        assert!(menu_target(&[], "menu:missing:0").is_none());
+    }
+
     #[test]
     fn tooltip_and_badge_are_bounded() {
         let r = rows();
@@ -1015,6 +1238,26 @@ mod tests {
         assert_eq!(badge(&r, true), Badge::Attention);
         assert_eq!(badge(&r, false), Badge::Error);
     }
+    #[test]
+    fn healthy_in_use_accounts_keep_normal_badge_and_paused_accounts_do_not() {
+        for bound in [0, 3] {
+            let value = serde_json::json!({"accounts":[{"id":"synthetic-badge", "provider":"codex",
+                "user_state":"active", "health":{"kind":"ready"}, "bound_sessions":bound}]});
+            let rows = parse_state(&value.to_string()).unwrap();
+            assert_eq!(
+                rows[0].user_chip,
+                if bound == 0 { "활성" } else { "사용 중" }
+            );
+            assert_eq!(badge(&rows, true), Badge::Normal);
+            let mut paused = value;
+            paused["accounts"][0]["user_state"] = "paused".into();
+            assert_eq!(
+                badge(&parse_state(&paused.to_string()).unwrap(), true),
+                Badge::Attention
+            );
+        }
+    }
+
     #[test]
     fn colors_differ() {
         assert_ne!(colors(false).background, colors(true).background);
@@ -1029,6 +1272,45 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rows[0].source, "oauth");
+    }
+
+    #[test]
+    fn adoption_metadata_and_manual_action_survive_decode_and_popup_growth() {
+        let rows = parse_state(r#"{"accounts":[
+            {"id":"adopted","provider":"codex","user_state":"active","source":{"kind":"cpa","mode":"adopted"},
+             "token_expires_at":"2099-10-23T02:00:00Z","last_refresh_at":"2026-10-18T08:00:00Z"},
+            {"id":"linked","provider":"claude","source":{"kind":"cpa","mode":"linked"}},
+            {"id":"unknown","provider":"codex","source":{"kind":"cpa","mode":"future"}}
+        ]}"#).unwrap();
+        assert_eq!(rows[0].source, "adopted");
+        assert_eq!(account_menu_metadata(&rows[0])[0], "직접 갱신");
+        assert!(account_menu_metadata(&rows[0])[1].starts_with("만료 10/"));
+        assert!(account_menu_metadata(&rows[0])[2].starts_with("최근 갱신 10/"));
+        assert!(actions::menu_items(&rows[0]).contains(&actions::MenuItem::RefreshTokens));
+        assert_eq!(account_menu_metadata(&rows[1])[0], "CPA 갱신");
+        assert!(!actions::menu_items(&rows[1]).contains(&actions::MenuItem::RefreshTokens));
+        assert_eq!(account_menu_metadata(&rows[2])[0], "갱신 방식 확인 불가");
+        assert!(!actions::menu_items(&rows[2]).contains(&actions::MenuItem::RefreshTokens));
+        for count in [1, 8] {
+            let list = (0..count)
+                .map(|n| {
+                    let mut row = rows[0].clone();
+                    row.id = format!("row-{n}");
+                    row
+                })
+                .collect::<Vec<_>>();
+            let row = list.last().unwrap();
+            let state = format!("menu:{}:0", row.id);
+            let height = state_height(&list, false, Some(&state));
+            let popup = popup_rect(&list, false, &state, height).unwrap();
+            assert!(popup.top >= 0.0 && popup.bottom <= height);
+            assert!(
+                account_menu_item_top(row, 0) >= 64.0,
+                "metadata and first action overlap"
+            );
+            let last = actions::menu_items(row).len() - 1;
+            assert!(popup.top + account_menu_item_top(row, last) + 32.0 <= popup.bottom);
+        }
     }
 
     #[test]
@@ -1056,8 +1338,13 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            hit_test(&targets, menu.left + 50.0, menu.top + 20.0),
+            hit_test(&targets, menu.left + 50.0,
+                menu.top + account_menu_item_top(rows.iter().find(|row| row.id == "cx-ready").unwrap(), 0) + 15.0),
             Some(HitTarget::MenuItem { id, index: 0, .. }) if id == "cx-ready"
+        ));
+        assert!(matches!(
+            hit_test(&targets, menu.left + 50.0, menu.top + 20.0),
+            Some(HitTarget::MenuSurface { .. })
         ));
         assert!(targets.iter().any(|target| matches!(
             target,

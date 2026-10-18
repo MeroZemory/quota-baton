@@ -132,10 +132,19 @@ async fn main() {
 }
 
 fn friendly_error(error: &anyhow::Error) -> String {
+    if error.to_string() == cutover::CPA_DEPENDENCY_REFUSAL {
+        return cutover::CPA_DEPENDENCY_REFUSAL.into();
+    }
     if error.to_string().contains("로그인 시간이 만료되었습니다") {
         return "로그인 시간이 만료되었습니다. 다시 시작해 주세요.".into();
     }
     if let Some(error) = error.downcast_ref::<accounts_cli::UsageCliError>() {
+        return error.to_string();
+    }
+    if let Some(error) = error.downcast_ref::<accounts_cli::AccountCliError>() {
+        return error.to_string();
+    }
+    if let Some(error) = error.downcast_ref::<qb_core::relay::ManualRefreshError>() {
         return error.to_string();
     }
     use qb_core::accounts::StoreError;
@@ -145,7 +154,6 @@ fn friendly_error(error: &anyhow::Error) -> String {
             StoreError::GenerationConflict { .. } => {
                 "계정이 변경되었습니다. 다시 시도해 주세요.".into()
             }
-            StoreError::AdoptUnavailable => "소유권 이전은 M8 전환 단계에서만 가능합니다.".into(),
             _ => "계정 저장소를 확인해 주세요.".into(),
         };
     }
@@ -172,9 +180,6 @@ fn friendly_error(error: &anyhow::Error) -> String {
     }
     if detail.contains("config") || detail.contains("upstream base") {
         return "설정 파일을 확인해 주세요. (config.toml)".into();
-    }
-    if detail.contains("M8") {
-        return "소유권 이전은 M8 전환 단계에서만 가능합니다.".into();
     }
     "요청을 처리하지 못했습니다. 데이터 폴더와 설정을 확인해 주세요.".into()
 }
@@ -212,7 +217,7 @@ async fn check_wire_preconditions(
     home: &std::path::Path,
     options: &cutover::WireOptions,
 ) -> anyhow::Result<()> {
-    cutover::check_optional_preconditions(options)
+    cutover::check_optional_preconditions(home, options)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let config = qb_core::config::Config::load(home)?;
     let secrets = qb_core::local_secrets::load_existing(home).map_err(|_| {
@@ -573,4 +578,21 @@ async fn run() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod r1_cpa_error_tests {
+    #[test]
+    fn r1_cpa_refusal_survives_cli_error_sanitization() {
+        let error = anyhow::anyhow!(crate::cutover::CPA_DEPENDENCY_REFUSAL);
+        assert_eq!(
+            super::friendly_error(&error),
+            crate::cutover::CPA_DEPENDENCY_REFUSAL
+        );
+        let untrusted = anyhow::anyhow!(
+            "{} synthetic-private-detail",
+            crate::cutover::CPA_DEPENDENCY_REFUSAL
+        );
+        assert!(!super::friendly_error(&untrusted).contains("synthetic-private-detail"));
+    }
 }

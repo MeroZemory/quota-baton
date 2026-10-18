@@ -1,4 +1,12 @@
 mod client;
+#[cfg(windows)]
+mod notices;
+#[cfg(windows)]
+mod theme;
+#[cfg(windows)]
+mod tray_icon;
+#[cfg(windows)]
+mod viewport;
 use qb_tray::{parse_state_at, render_png};
 
 use clap::Parser;
