@@ -628,6 +628,19 @@ async fn refresh_usage(home: &Path, config: &Config, id: &str) -> anyhow::Result
     Ok(())
 }
 
+fn status_heading(home: &Path, running: bool) -> anyhow::Result<Vec<String>> {
+    let mut lines = vec![format!(
+        "코어: {}",
+        if running {
+            "실행 중"
+        } else {
+            "중지됨 (저장된 상태)"
+        }
+    )];
+    lines.extend(crate::cutover::cpa_dependency_note(home)?);
+    Ok(lines)
+}
+
 pub async fn status(home: &Path, config: &Config) -> anyhow::Result<()> {
     let (running, accounts) = if let Some((client, base, token)) =
         running_admin(home, config).await?
@@ -672,14 +685,9 @@ pub async fn status(home: &Path, config: &Config) -> anyhow::Result<()> {
             .await??;
         (false, accounts)
     };
-    println_utf8!(
-        "코어: {}",
-        if running {
-            "실행 중"
-        } else {
-            "중지됨 (저장된 상태)"
-        }
-    );
+    for line in status_heading(home, running)? {
+        println_utf8!("{line}");
+    }
     let pools = qb_core::account_runtime::pool_counts(&accounts);
     for provider in ["claude", "codex"] {
         let pool = &pools[provider];
@@ -1095,4 +1103,59 @@ fn open_browser(url: &str) -> std::io::Result<()> {
         return Err(std::io::Error::other("브라우저를 열지 못했습니다."));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod r1_cpa_status_tests {
+    use super::*;
+    use crate::cutover::cpa_dependency_tests::{account, scratch};
+    use serde_json::json;
+
+    #[test]
+    fn r1_cpa_status_heading_shares_wire_note_online_and_offline() {
+        let dir = scratch();
+        for (label, mode, state) in [
+            ("one", "linked", "active"),
+            ("two", "linked", "active"),
+            ("paused", "linked", "paused"),
+            ("disabled", "linked", "disabled"),
+            ("owned", "owned", "active"),
+            ("adopted", "adopted", "active"),
+        ] {
+            account(dir.path(), label, mode, state, json!({"kind":"ready"}));
+        }
+        let _lease = AccountStore::acquire(dir.path()).unwrap();
+        for running in [false, true] {
+            let lines = status_heading(dir.path(), running).unwrap();
+            assert_eq!(lines.len(), 2);
+            assert_eq!(
+                lines[0],
+                if running {
+                    "코어: 실행 중"
+                } else {
+                    "코어: 중지됨 (저장된 상태)"
+                }
+            );
+            assert_eq!(
+                lines[1],
+                "CPA는 계속 실행되어야 합니다 (연결 계정 2개의 토큰 갱신)"
+            );
+        }
+    }
+
+    #[test]
+    fn r1_cpa_status_heading_omits_note_without_active_linked_accounts() {
+        let dir = scratch();
+        for (label, mode, state) in [
+            ("paused", "linked", "paused"),
+            ("disabled", "linked", "disabled"),
+            ("owned", "owned", "active"),
+            ("adopted", "adopted", "active"),
+        ] {
+            account(dir.path(), label, mode, state, json!({"kind":"ready"}));
+        }
+        for running in [false, true] {
+            assert_eq!(status_heading(dir.path(), running).unwrap().len(), 1);
+        }
+    }
 }
