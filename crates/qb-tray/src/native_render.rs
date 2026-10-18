@@ -981,13 +981,13 @@ pub fn paint_with_state(
                 &rows,
                 expand_disabled,
                 state,
-                content_height(&rows, expand_disabled),
+                state_height(&rows, expand_disabled, Some(state)),
             )
             .unwrap();
             (popup.left, popup.top, popup.right, popup.bottom)
         } else if state.starts_with("confirm-delete:") {
             let card_height = 193.0;
-            let flyout = content_height(&rows, expand_disabled);
+            let flyout = state_height(&rows, expand_disabled, Some(state));
             (
                 16.0,
                 (flyout - card_height).round() / 2.0,
@@ -999,7 +999,7 @@ pub fn paint_with_state(
                 &rows,
                 expand_disabled,
                 state,
-                content_height(&rows, expand_disabled),
+                state_height(&rows, expand_disabled, Some(state)),
             )
             .unwrap();
             (popup.left, popup.top, popup.right, popup.bottom)
@@ -1009,7 +1009,12 @@ pub fn paint_with_state(
         if state.starts_with("confirm-delete:") {
             fill(
                 target,
-                rect(0.0, 0.0, WIDTH, content_height(&rows, expand_disabled)),
+                rect(
+                    0.0,
+                    0.0,
+                    WIDTH,
+                    state_height(&rows, expand_disabled, Some(state)),
+                ),
                 BrushColor(D2D1_COLOR_F {
                     r: 0.0,
                     g: 0.0,

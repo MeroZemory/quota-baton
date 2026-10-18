@@ -332,6 +332,13 @@ pub fn popup_rect(rows: &[Row], expand_disabled: bool, state: &str, height: f32)
 }
 
 pub fn popup_required_height(rows: &[Row], expand_disabled: bool, state: &str, base: f32) -> f32 {
+    // Footer popups must fit even before the first account exists.
+    if state == "add-menu" {
+        return base.max(FOOTER_HEIGHT + 130.0);
+    }
+    if state == "quit" {
+        return base.max(FOOTER_HEIGHT + 92.0);
+    }
     let Some(popup) = popup_rect(rows, expand_disabled, state, base) else {
         return base;
     };
@@ -1332,6 +1339,26 @@ mod tests {
                     assert_eq!(rect.bottom - rect.top, 32.0);
                     assert_full_item_hits(&targets, target);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn empty_account_footer_popups_and_every_item_fit_final_window() {
+        for state in ["add-menu", "quit"] {
+            let height = state_height(&[], false, Some(state));
+            let popup = popup_rect(&[], false, state, height).unwrap();
+            assert!(popup.top >= 0.0 && popup.bottom <= height - FOOTER_HEIGHT);
+            let targets = layout_targets(&[], false, Some(state));
+            let items: Vec<_> = targets
+                .iter()
+                .filter(|t| matches!(t, HitTarget::AddChoice { .. } | HitTarget::Quit { .. }))
+                .collect();
+            assert_eq!(items.len(), if state == "add-menu" { 3 } else { 2 });
+            for item in items {
+                let rect = item.rect();
+                assert!(rect.top >= 0.0 && rect.bottom <= height);
+                assert_full_item_hits(&targets, item);
             }
         }
     }
