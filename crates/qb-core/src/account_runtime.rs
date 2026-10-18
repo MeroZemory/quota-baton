@@ -905,7 +905,8 @@ impl AccountRuntime {
         let id = id.to_owned();
         let model = model.map(str::to_owned);
         tokio::task::spawn_blocking(move || {
-            store.load(&id).is_ok_and(|a| a.eligible(model.as_deref()))
+            store.takeover_fenced(&id).is_ok_and(|fenced| !fenced)
+                && store.load(&id).is_ok_and(|a| a.eligible(model.as_deref()))
         })
         .await
         .unwrap_or(false)
@@ -1013,14 +1014,15 @@ impl AccountRuntime {
 
     pub async fn views(&self) -> Result<Vec<Value>, ()> {
         let store = self.store.clone();
-        let (accounts, credential_ids) = tokio::task::spawn_blocking(move || {
+        let (accounts, credential_ids, takeover_fenced) = tokio::task::spawn_blocking(move || {
             let accounts = store.list().map_err(|_| ())?;
+            let takeover_fenced = store.takeover_fenced_ids().map_err(|_| ())?;
             let credential_ids: BTreeSet<_> = accounts
                 .iter()
                 .filter(|a| store.tokens(a).is_ok_and(|t| !t.access_token.is_empty()))
                 .map(|a| a.id.clone())
                 .collect();
-            Ok::<_, ()>((accounts, credential_ids))
+            Ok::<_, ()>((accounts, credential_ids, takeover_fenced))
         })
         .await
         .map_err(|_| ())??;
@@ -1159,7 +1161,7 @@ impl AccountRuntime {
             let health=self.volatile.lock().ok().and_then(|v|v.get(&a.id).cloned()).unwrap_or(a.health.clone());
             let pending = self.probing(&a.id) || ((a.auth_probe_pending || a.auth_failures > 0) && health == Health::Ready);
             let health = if pending { json!({"kind":"cooling","reason":"auth","until":Utc::now(),"scope":"account","probe_pending":true}) } else { json!(health) };
-            json!({"pool_eligible":a.user_state == UserState::Active && !pending && health["kind"] == "ready","quota_cooling":a.quota_cooling,"observed_at":quota["observed_at"],"quota_notice":quota_notice,"credits_in_use":credits_in_use,"has_alternative":has_alternative,"id":a.id,"generation":a.generation,"last_refresh_at":a.token_meta.last_refresh_at,"provider":a.provider,"label":a.label,"email":a.email,"plan":quota["plan"].as_str().map(str::to_owned).or(a.plan.clone()),"user_state":a.user_state,"source":a.source,"health":health,"probe_pending":pending,"pacing":{"backoff_until":backoff_until,"step":pacing.rate_step,"release_interval_ms":pacing.rate_release_interval.as_millis() as u64,"waiting":pacing.waiting},"windows":quota["windows"].as_array().cloned().unwrap_or_default(),"credits":quota["credits"],"last_used_at":null,"bound_sessions":0,"token_expires_at":a.token_meta.expires_at,"drain":a.drain,"allow_credits":a.allow_credits,"refresh_attention":self.refresh_attention.lock().map(|f|f.contains(&a.id)).unwrap_or(false)})
+            json!({"pool_eligible":a.user_state == UserState::Active && !pending && !takeover_fenced.contains(&a.id) && health["kind"] == "ready","takeover_pending":takeover_fenced.contains(&a.id),"quota_cooling":a.quota_cooling,"observed_at":quota["observed_at"],"quota_notice":quota_notice,"credits_in_use":credits_in_use,"has_alternative":has_alternative,"id":a.id,"generation":a.generation,"last_refresh_at":a.token_meta.last_refresh_at,"provider":a.provider,"label":a.label,"email":a.email,"plan":quota["plan"].as_str().map(str::to_owned).or(a.plan.clone()),"user_state":a.user_state,"source":a.source,"health":health,"probe_pending":pending,"pacing":{"backoff_until":backoff_until,"step":pacing.rate_step,"release_interval_ms":pacing.rate_release_interval.as_millis() as u64,"waiting":pacing.waiting},"windows":quota["windows"].as_array().cloned().unwrap_or_default(),"credits":quota["credits"],"last_used_at":null,"bound_sessions":0,"token_expires_at":a.token_meta.expires_at,"drain":a.drain,"allow_credits":a.allow_credits,"refresh_attention":takeover_fenced.contains(&a.id) || self.refresh_attention.lock().map(|f|f.contains(&a.id)).unwrap_or(false)})
         }).collect())
     }
 

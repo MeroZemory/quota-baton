@@ -46,6 +46,8 @@ impl AdminClient {
         anyhow::ensure!(admin_port != 0, "admin port must be non-zero");
         let http = reqwest::Client::builder()
             .no_proxy()
+            // The authenticated admin API is local; redirects must never escape it.
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(5))
             .build()?;
         Ok(Self {
@@ -119,6 +121,41 @@ impl AdminClient {
     pub async fn delete_account(&self, id: &str) -> Result<(), ClientError> {
         self.send_empty(reqwest::Method::DELETE, &format!("/admin/v1/accounts/{id}"))
             .await
+    }
+
+    pub async fn takeover_inspect(
+        &self,
+        provider: &str,
+        path: &str,
+    ) -> Result<TakeoverInspect, ClientError> {
+        self.send_json(
+            reqwest::Method::POST,
+            "/admin/v1/accounts/takeover",
+            &serde_json::json!({"provider":provider,"path":path,"phase":"inspect"}),
+        )
+        .await
+    }
+
+    pub async fn takeover_commit(
+        &self,
+        provider: &str,
+        path: &str,
+        inspect: &TakeoverInspect,
+        replace: bool,
+    ) -> Result<TakeoverCommit, ClientError> {
+        // Refresh follows commit in core; do not retry this mutation in the tray.
+        let response = self
+            .request(reqwest::Method::POST, "/admin/v1/accounts/takeover")
+            .timeout(Duration::from_secs(40))
+            .json(&takeover_commit_body(provider, path, inspect, replace))
+            .send()
+            .await
+            .map_err(ClientError::Transport)?;
+        Self::check_response(response)
+            .await?
+            .json()
+            .await
+            .map_err(ClientError::Decode)
     }
 
     pub async fn start_login(&self, provider: &str) -> Result<LoginStart, ClientError> {
@@ -558,7 +595,13 @@ where
 {
     let value = serde_json::Value::deserialize(deserializer)?;
     Ok(match value {
-        serde_json::Value::String(value) => value,
+        serde_json::Value::String(value) => {
+            if value == "takeover" {
+                "oauth".into()
+            } else {
+                value
+            }
+        }
         serde_json::Value::Object(mut object) => {
             let kind = object
                 .remove("kind")
@@ -569,7 +612,14 @@ where
                     _ => "⚠ source decode error (unknown mode)".into(),
                 }
             } else {
-                kind.unwrap_or_else(|| "⚠ source decode error (missing kind)".into())
+                kind.map(|kind| {
+                    if kind == "takeover" {
+                        "oauth".into()
+                    } else {
+                        kind
+                    }
+                })
+                .unwrap_or_else(|| "⚠ source decode error (missing kind)".into())
             }
         }
         _ => "⚠ source decode error".into(),
@@ -871,5 +921,296 @@ mod tests {
             rendered.contains("Codex") && rendered.contains("준비됨") && rendered.contains("42%")
         );
         assert!(!rendered.contains("synthetic-id"));
+    }
+}
+
+/// Allowlist only. Never retain or render unknown response fields or a token.
+fn takeover_commit_body(
+    provider: &str,
+    path: &str,
+    inspect: &TakeoverInspect,
+    replace: bool,
+) -> serde_json::Value {
+    serde_json::json!({"provider":provider,"path":path,"phase":"commit",
+        "inspect_digest":inspect.inspect_digest,"replace":replace,"keep_source":false})
+}
+
+#[derive(Clone, Deserialize)]
+pub struct TakeoverInspect {
+    pub email: Option<String>,
+    pub plan: Option<String>,
+    pub provider_account_id: Option<String>,
+    pub source_path: String,
+    pub source_last_refresh: Option<String>,
+    pub source_mtime: Option<String>,
+    pub owner_alive: bool,
+    pub existing_id: Option<String>,
+    pub inspect_digest: String,
+}
+impl TakeoverInspect {
+    pub fn can_confirm(&self) -> bool {
+        !self.owner_alive
+            && !self.inspect_digest.trim().is_empty()
+            && !self.source_path.trim().is_empty()
+            && self
+                .existing_id
+                .as_deref()
+                .is_none_or(|id| !id.trim().is_empty())
+            && [
+                Some(self.source_path.as_str()),
+                Some(self.inspect_digest.as_str()),
+                self.email.as_deref(),
+                self.plan.as_deref(),
+                self.provider_account_id.as_deref(),
+                self.source_last_refresh.as_deref(),
+                self.source_mtime.as_deref(),
+                self.existing_id.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .all(|s| !s.chars().any(unsafe_display_char))
+    }
+    pub fn identity(&self, provider: &str) -> String {
+        fn field(value: Option<&str>) -> String {
+            display_field(value.unwrap_or("알 수 없음"))
+        }
+        format!(
+            "제공자: {}\n이메일: {}\n요금제: {}\n제공자 계정 ID: {}\n원본 경로: {}\n마지막 갱신: {}\n파일 수정 시각: {}\n원래 앱 실행 중: {}{}",
+            field(Some(provider)),
+            field(self.email.as_deref()),
+            field(self.plan.as_deref()),
+            field(self.provider_account_id.as_deref()),
+            field(Some(&self.source_path)),
+            field(self.source_last_refresh.as_deref()),
+            field(self.source_mtime.as_deref()),
+            if self.owner_alive {
+                "예 · 먼저 종료하고 다시 검사하세요"
+            } else {
+                "감지되지 않음 (최선의 확인)"
+            },
+            self.existing_id
+                .as_ref()
+                .map(|id| format!(
+                    "\n기존 계정: {} · 다음 단계에서 교체 확인이 필요합니다",
+                    field(Some(id))
+                ))
+                .unwrap_or_default()
+        )
+    }
+    pub fn warning(&self) -> String {
+        // D18 exact Korean wording. No CLI keep-source option is exposed here.
+        format!(
+            "가져오면 quota-baton이 이 계정의 토큰을 관리합니다. 원래 앱({})은 로그아웃되며, 다시 쓰려면 그 앱에서 새로 로그인해야 합니다. 원래 앱이 켜져 있으면 먼저 종료하세요.",
+            display_field(&self.source_path)
+        )
+    }
+}
+fn unsafe_display_char(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+fn display_field(value: &str) -> String {
+    // Preserve evidence that a character was rejected rather than joining its neighbours.
+    value
+        .chars()
+        .map(|c| {
+            if unsafe_display_char(c) {
+                '\u{fffd}'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+#[allow(dead_code)]
+#[derive(Deserialize)]
+pub struct TakeoverCommit {
+    pub id: String,
+    pub renamed_to: Option<String>,
+    pub refresh: TakeoverRefresh,
+}
+#[allow(dead_code)]
+#[derive(Deserialize)]
+pub struct TakeoverRefresh {
+    pub ok: bool,
+    pub token_expires_at: Option<String>,
+}
+
+#[cfg(test)]
+mod r6_takeover_tests {
+    use super::*;
+    fn inspect() -> TakeoverInspect {
+        serde_json::from_value(serde_json::json!({"source_path":"C:/synthetic/home",
+            "owner_alive":false,"inspect_digest":"digest"}))
+        .unwrap()
+    }
+    #[test]
+    fn r6_spoofed_or_incomplete_inspect_cannot_authorize_commit() {
+        for c in [
+            '\0', '\n', '\r', '\t', '\u{061c}', '\u{200e}', '\u{200f}', '\u{2028}', '\u{2029}',
+            '\u{202e}', '\u{2066}',
+        ] {
+            for field in [
+                "email",
+                "plan",
+                "provider_account_id",
+                "source_path",
+                "source_last_refresh",
+                "source_mtime",
+                "existing_id",
+                "inspect_digest",
+            ] {
+                let mut value = serde_json::json!({"source_path":"C:/synthetic/home", "owner_alive":false,"inspect_digest":"digest"});
+                value[field] = format!("before{c}after").into();
+                let unsafe_inspect: TakeoverInspect = serde_json::from_value(value).unwrap();
+                assert!(!unsafe_inspect.can_confirm(), "{field}: {c:?}");
+                assert!(!unsafe_inspect.warning().contains(c));
+                assert!(!unsafe_inspect.identity("Codex").contains(c) || c == '\n');
+            }
+        }
+        for field in ["owner_alive", "source_path", "inspect_digest"] {
+            let mut value = serde_json::json!({"source_path":"C:/synthetic/home", "owner_alive":false,"inspect_digest":"digest"});
+            value.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<TakeoverInspect>(value).is_err());
+        }
+        let mut value = inspect();
+        value.existing_id = Some(" ".into());
+        assert!(!value.can_confirm());
+        value.existing_id = None;
+        value.inspect_digest = " ".into();
+        assert!(!value.can_confirm());
+    }
+    // Synthetic loopback only. An admin redirect must not reach even a second
+    // local listener, for either the read-only inspect or the commit mutation.
+    #[tokio::test]
+    async fn r6_takeover_never_follows_admin_redirects() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for commit in [false, true] {
+            let destination = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            destination.set_nonblocking(true).unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let target = destination.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0; 1];
+                while !request.ends_with(b"\r\n\r\n") {
+                    stream.read_exact(&mut byte).await.unwrap();
+                    request.push(byte[0]);
+                    assert!(request.len() < 8192);
+                }
+                let headers = String::from_utf8(request).unwrap();
+                assert!(headers.starts_with("POST /admin/v1/accounts/takeover HTTP/1.1\r\n"));
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                assert!(length < 8192);
+                let mut body = vec![0; length];
+                stream.read_exact(&mut body).await.unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(
+                    body,
+                    if commit {
+                        takeover_commit_body("codex", "C:/synthetic/home", &inspect(), false)
+                    } else {
+                        serde_json::json!({"provider":"codex","path":"C:/synthetic/home","phase":"inspect"})
+                    }
+                );
+                stream.write_all(format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{target}/unexpected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+            });
+            let client = AdminClient::new(port, "synthetic-admin-token").unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(3), async {
+                if commit {
+                    client
+                        .takeover_commit("codex", "C:/synthetic/home", &inspect(), false)
+                        .await
+                        .map(|_| ())
+                } else {
+                    client
+                        .takeover_inspect("codex", "C:/synthetic/home")
+                        .await
+                        .map(|_| ())
+                }
+            })
+            .await
+            .expect("redirect must return without contacting its target");
+            assert!(matches!(
+                result,
+                Err(ClientError::Http(StatusCode::TEMPORARY_REDIRECT))
+            ));
+            server.await.unwrap();
+            assert_eq!(
+                destination.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+    }
+    #[test]
+    fn safe_identity_warning_and_legacy_owned_source() {
+        let inspect: TakeoverInspect = serde_json::from_value(serde_json::json!({
+            "email":"synthetic@example.invalid", "plan":"pro", "provider_account_id":"synthetic-id",
+            "source_path":"C:/synthetic/home", "source_last_refresh":null, "source_mtime":"2026-10-19T00:00:00Z",
+            "owner_alive":false,"inspect_digest":"digest", "existing_id":"existing",
+            "access_token":"NEVER DISPLAY", "refresh_token":"NEVER DISPLAY"
+        })).unwrap();
+        assert!(inspect.can_confirm());
+        let text = inspect.identity("Codex");
+        for field in [
+            "synthetic@example.invalid",
+            "pro",
+            "synthetic-id",
+            "C:/synthetic/home",
+            "알 수 없음",
+            "2026-10-19T00:00:00Z",
+            "감지되지 않음",
+            "existing",
+        ] {
+            assert!(text.contains(field));
+        }
+        assert!(!text.contains("NEVER DISPLAY"));
+        for replace in [false, true] {
+            assert_eq!(
+                takeover_commit_body("codex", "C:/synthetic/home", &inspect, replace),
+                serde_json::json!({
+                    "provider":"codex","path":"C:/synthetic/home","phase":"commit",
+                    "inspect_digest":"digest","replace":replace,"keep_source":false
+                })
+            );
+        }
+        assert_eq!(
+            inspect.warning(),
+            "가져오면 quota-baton이 이 계정의 토큰을 관리합니다. 원래 앱(C:/synthetic/home)은 로그아웃되며, 다시 쓰려면 그 앱에서 새로 로그인해야 합니다. 원래 앱이 켜져 있으면 먼저 종료하세요."
+        );
+        let mut alive = inspect.clone();
+        alive.owner_alive = true;
+        assert!(!alive.can_confirm());
+        alive.owner_alive = false;
+        alive.inspect_digest.clear();
+        assert!(!alive.can_confirm());
+        for source in [
+            serde_json::json!("takeover"),
+            serde_json::json!({"kind":"takeover","from":"DO NOT LEAK","at":"now"}),
+        ] {
+            let account: TrayAccount =
+                serde_json::from_value(serde_json::json!({"source":source})).unwrap();
+            assert_eq!(account.source, "oauth");
+            assert!(
+                !serde_json::to_string(&account)
+                    .unwrap()
+                    .contains("DO NOT LEAK")
+            );
+            let rows = qb_tray::parse_state(&serde_json::json!({"accounts":[account]}).to_string())
+                .unwrap();
+            assert_eq!(rows[0].source, "oauth");
+            assert_eq!(qb_tray::account_menu_metadata(&rows[0])[0], "직접 갱신");
+            let source: qb_tray::v2::Source = serde_json::from_value(source).unwrap();
+            assert!(source.owned_or_adopted());
+        }
     }
 }

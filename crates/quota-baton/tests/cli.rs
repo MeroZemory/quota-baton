@@ -1536,7 +1536,11 @@ async fn serve_and_status_use_isolated_home() {
     );
     let status = String::from_utf8(output.stdout).unwrap();
     assert!(status.contains("코어: 실행 중"));
-    assert!(status.contains("5시간 사용률"));
+    assert!(status.contains("계정 ID"));
+    assert!(
+        !status.contains("5시간 사용률"),
+        "empty state has no invented quota windows"
+    );
     let key = std::fs::read_to_string(home.path().join("client.key")).unwrap();
     assert_eq!(
         client

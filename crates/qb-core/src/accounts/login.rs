@@ -104,6 +104,10 @@ pub fn save(
     let _guard = store.transaction()?;
     store.check_login_migration_clear()?;
     let mut existing = store.list_unlocked()?;
+    let persisted_identities: std::collections::BTreeMap<_, _> = existing
+        .iter()
+        .map(|old| (old.id.clone(), old.identity.clone()))
+        .collect();
     for old in &mut existing {
         if let (
             Identity::Codex {
@@ -134,14 +138,14 @@ pub fn save(
             } else {
                 // Owned/adopted recovery uses only the current encrypted stored token.
                 // codex_user_id checks that its claim belongs to this workspace.
-                let current = store.tokens_unlocked(old)?;
-                let user = super::import::codex_user_id(&current, a)
+                let user = store
+                    .login_codex_user_unlocked(old, a)?
                     .ok_or(LoginStoreError::IdentityConflict)?;
                 let mut resolved = old.identity.clone();
                 if let Identity::Codex { user_id, .. } = &mut resolved {
                     *user_id = Some(user);
                 }
-                // Virtual matching identity only: existing journaled migration persists login.
+                // Virtual matching only; owned re-login retains the persisted identity/key.
                 old.identity = resolved;
             }
         }
@@ -177,6 +181,15 @@ pub fn save(
     let mut next = account.clone();
     next.source = Source::Oauth;
     if let Some(old) = old {
+        if !replaced_linked {
+            // Match on proven user identity above, but keep the persisted hash key
+            // so existing bindings and history continue to name this account.
+            next.id = old.id.clone();
+            next.identity = persisted_identities
+                .get(&old.id)
+                .ok_or(LoginStoreError::Store)?
+                .clone();
+        }
         next.label = old.label.clone();
         next.user_state = old.user_state;
         next.drain = old.drain;
@@ -206,15 +219,16 @@ pub fn save(
     if let Some(old) = migration {
         store.begin_login_migration(&old.id, &next.id, &next.identity)?;
     }
-    let updated = match store.save_unlocked(&next, tokens, same_file.map(|old| old.generation)) {
-        Ok(updated) => updated,
-        Err(error) => {
-            if migration.is_some() {
-                store.finish_login_migration()?;
+    let updated =
+        match store.save_login_unlocked(&next, tokens, same_file.map(|old| old.generation)) {
+            Ok(updated) => updated,
+            Err(error) => {
+                if migration.is_some() {
+                    store.finish_login_migration()?;
+                }
+                return Err(error.into());
             }
-            return Err(error.into());
-        }
-    };
+        };
     if let Some(old) = old.filter(|old| old.id != next.id) {
         // Migration never exposes two token families to another store reader:
         // both file mutations run under the same transaction and core lease.

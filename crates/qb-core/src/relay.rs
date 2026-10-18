@@ -73,6 +73,8 @@ pub struct RelayState {
     observability: Arc<Observability>,
     pins: Arc<DebugPins>,
     tokens: TokenGates,
+    #[cfg(all(feature = "testkit", debug_assertions))]
+    takeover_test_dependencies: Option<crate::accounts::takeover::Dependencies>,
     websocket: crate::config::WebsocketConfig,
     reconnect_exclusions: Mutex<BTreeMap<(String, String), Instant>>,
     draining: AtomicBool,
@@ -92,6 +94,70 @@ pub struct RelayState {
 }
 
 impl RelayState {
+    #[cfg(all(feature = "testkit", debug_assertions))]
+    pub fn validate_takeover_test_inputs(
+        home: &std::path::Path,
+        source_root: &std::path::Path,
+        profile_endpoint: &str,
+    ) -> anyhow::Result<()> {
+        crate::accounts::takeover_native::validate_synthetic_inputs(
+            home,
+            source_root,
+            profile_endpoint,
+        )
+        .map(|_| ())
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "합성 인계 검사 경로에는 junction을 쓸 수 없으며 .sandbox 안이어야 합니다."
+            )
+        })
+    }
+
+    #[cfg(all(feature = "testkit", debug_assertions))]
+    pub fn with_takeover_test_source(
+        mut self,
+        source_root: &std::path::Path,
+        profile_endpoint: String,
+    ) -> anyhow::Result<Self> {
+        self.takeover_test_dependencies = Some(
+            crate::accounts::takeover_native::synthetic(
+                self.client.clone(),
+                self.store.home(),
+                source_root,
+                profile_endpoint,
+            )
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "합성 인계 검사는 .sandbox 홈과 numeric loopback 주소가 필요합니다."
+                )
+            })?,
+        );
+        Ok(self)
+    }
+
+    pub(crate) async fn takeover_account(
+        &self,
+        request: crate::accounts::takeover::TakeoverRequest,
+    ) -> Result<serde_json::Value, crate::accounts::takeover::TakeoverError> {
+        if self.is_draining() {
+            return Err(crate::accounts::takeover::TakeoverError::Unavailable);
+        }
+        let dependencies = crate::accounts::takeover_native::production(self.client.clone());
+        #[cfg(all(feature = "testkit", debug_assertions))]
+        let dependencies = self
+            .takeover_test_dependencies
+            .clone()
+            .unwrap_or(dependencies);
+        self.tokens
+            .takeover(
+                self.store.clone(),
+                self.observability.clone(),
+                request,
+                dependencies,
+            )
+            .await
+    }
+
     pub(crate) fn recent_warnings(&self) -> Vec<serde_json::Value> {
         self.observability.recent_warnings()
     }
@@ -381,6 +447,8 @@ impl RelayState {
             observability,
             pins,
             tokens,
+            #[cfg(all(feature = "testkit", debug_assertions))]
+            takeover_test_dependencies: None,
             websocket: config.websocket.clone(),
             reconnect_exclusions: Mutex::new(BTreeMap::new()),
             draining: AtomicBool::new(false),

@@ -45,6 +45,18 @@ pub enum AccountsCommand {
         #[arg(long, help = "브라우저를 열지 않고 로그인 주소만 표시합니다")]
         no_browser: bool,
     },
+    #[command(about = "다른 앱에서 계정의 토큰 관리 권한을 가져옵니다")]
+    Takeover {
+        #[arg(value_enum)]
+        provider: LoginProvider,
+        path: PathBuf,
+        #[arg(long)]
+        replace: bool,
+        #[arg(long)]
+        keep_source: bool,
+        #[arg(long, help = "경고와 계정 확인 후 가져오기를 승인합니다")]
+        yes: bool,
+    },
     #[command(about = "계정 목록을 확인합니다")]
     List,
     #[command(about = "계정 사용을 일시 중지합니다")]
@@ -122,6 +134,15 @@ pub async fn run(command: AccountsCommand, home: &Path, config: &Config) -> anyh
         } => {
             login(home, config, provider.into(), replace_linked, no_browser).await?;
         }
+        AccountsCommand::Takeover {
+            provider,
+            path,
+            replace,
+            keep_source,
+            yes,
+        } => {
+            takeover(home, config, provider, path, replace, keep_source, yes).await?;
+        }
         AccountsCommand::Adopt { ids, from } => adopt_accounts(home, config, ids, from).await?,
         AccountsCommand::Refresh { id, force } => refresh_tokens(home, config, id, force).await?,
         AccountsCommand::RefreshUsage { id } => refresh_usage(home, config, &id).await?,
@@ -186,16 +207,21 @@ pub async fn run(command: AccountsCommand, home: &Path, config: &Config) -> anyh
             }
             let rows = match probe.send().await {
                 Ok(health) => {
-                    health.error_for_status()?;
+                    admin_route_response(health, &client, &base, token.as_deref().unwrap_or(""))
+                        .await?
+                        .error_for_status()?;
                     let response = client
                         .post(format!("{base}/accounts/import"))
                         .timeout(Duration::from_secs(60))
                         .bearer_auth(token.as_deref().unwrap_or("").trim())
                         .json(&request)
                         .send()
+                        .await?;
+                    admin_route_response(response, &client, &base, token.as_deref().unwrap_or(""))
                         .await?
-                        .error_for_status()?;
-                    response.json::<serde_json::Value>().await?
+                        .error_for_status()?
+                        .json::<serde_json::Value>()
+                        .await?
                 }
                 Err(error) if error.is_connect() => {
                     if args.dry_run {
@@ -261,6 +287,7 @@ fn translated(value: &serde_json::Value) -> String {
         Some("linked") => "연결".into(),
         Some("adopted") => "소유권 이전".into(),
         Some("oauth") => "직접 로그인".into(),
+        Some("takeover") => "다른 앱에서 가져옴".into(),
         Some("created") => "생성".into(),
         Some("updated") => "갱신".into(),
         Some("skipped") => "건너뜀".into(),
@@ -318,13 +345,225 @@ async fn running_admin(
         .await
     {
         Ok(response) => {
-            let health: qb_proto::HealthResponse = response.error_for_status()?.json().await?;
+            let health: qb_proto::HealthResponse =
+                admin_route_response(response, &client, &base, &token)
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
             anyhow::ensure!(health.ok, "코어 상태를 확인해 주세요.");
             Ok(Some((client, base, token)))
         }
         Err(error) if error.is_connect() => Ok(None),
         Err(error) => Err(error.into()),
     }
+}
+
+/// An inspect-only invocation is intentional and has its own CLI exit status.
+#[derive(Debug)]
+pub struct TakeoverInspectOnly;
+impl std::fmt::Display for TakeoverInspectOnly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("확인만 했습니다. 가져오려면 --yes로 다시 실행해 주세요.")
+    }
+}
+impl std::error::Error for TakeoverInspectOnly {}
+
+#[derive(Debug)]
+pub struct AdminVersionMismatch(String);
+impl std::fmt::Display for AdminVersionMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "CLI와 코어의 관리 API 버전이 맞지 않습니다 (CLI {}, 코어 {}). 같은 버전으로 업데이트해 주세요.",
+            env!("CARGO_PKG_VERSION"),
+            self.0
+        )
+    }
+}
+impl std::error::Error for AdminVersionMismatch {}
+
+fn safe_version(value: &serde_json::Value) -> String {
+    value
+        .as_str()
+        .filter(|version| {
+            !version.is_empty()
+                && version.len() <= 64
+                && version
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
+        })
+        .unwrap_or("알 수 없음")
+        .to_owned()
+}
+
+fn missing_admin_route(status: reqwest::StatusCode, path: &str, value: &serde_json::Value) -> bool {
+    // Resource absence is not evidence of an absent API route.
+    let account_resource = path
+        .strip_prefix("/admin/v1/accounts/")
+        .is_some_and(|tail| tail.contains('/') || !matches!(tail, "takeover" | "login" | "import"));
+    let resource_missing = value["error"]["code"] == "not_found"
+        || value["error"]["message"] == "Account not found"
+        || value["error"]["message"].as_str()
+            == Some(qb_core::oauth::LoginError::NotFound.to_string().as_str());
+    status == reqwest::StatusCode::METHOD_NOT_ALLOWED
+        || (status == reqwest::StatusCode::NOT_FOUND && !(account_resource && resource_missing))
+}
+
+async fn admin_route_response(
+    response: reqwest::Response,
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+) -> anyhow::Result<reqwest::Response> {
+    let status = response.status();
+    if !matches!(
+        status,
+        reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+    ) {
+        return Ok(response);
+    }
+    let path = response.url().path().to_owned();
+    let value = response
+        .json::<serde_json::Value>()
+        .await
+        .unwrap_or_default();
+    if !missing_admin_route(status, &path, &value) {
+        return Err(account_error("계정을 찾을 수 없습니다."));
+    }
+    // Version lookup is best effort, authenticated, and never renders raw server text.
+    let version = match client
+        .get(format!("{base}/health"))
+        .bearer_auth(token.trim())
+        .send()
+        .await
+    {
+        Ok(health) if health.status().is_success() => {
+            let health = health.json::<serde_json::Value>().await.unwrap_or_default();
+            safe_version(&health["version"])
+        }
+        _ => "알 수 없음".into(),
+    };
+    Err(AdminVersionMismatch(version).into())
+}
+
+fn takeover_inspect_lines(value: &serde_json::Value, keep_source: bool) -> Vec<String> {
+    let mut lines = vec![format!(
+        "가져오면 quota-baton이 이 계정의 토큰을 관리합니다. 원래 앱({})은 로그아웃되며, 다시 쓰려면 그 앱에서 새로 로그인해야 합니다. 원래 앱이 켜져 있으면 먼저 종료하세요.",
+        cell(&value["source_path"])
+    )];
+    if keep_source {
+        lines.push("강한 경고: --keep-source는 원본 토큰 파일을 남깁니다. 원래 앱이 이 토큰을 다시 갱신하면 전체 토큰 계열이 폐기되어 양쪽 모두 다시 로그인해야 할 수 있습니다. 원래 앱을 실행하지 마세요.".into());
+    }
+    for (key, label) in [
+        ("email", "이메일"),
+        ("plan", "요금제"),
+        ("provider_account_id", "제공자 계정 ID"),
+        ("source_path", "원본 경로"),
+        ("source_last_refresh", "원본 최근 갱신"),
+        ("source_mtime", "원본 수정 시각"),
+        ("owner_alive", "원래 앱 실행 중"),
+        ("existing_id", "기존 계정 ID"),
+    ] {
+        let display = if key == "owner_alive" {
+            match value[key].as_bool() {
+                Some(true) => "감지됨 · 먼저 종료하세요".into(),
+                Some(false) => "감지되지 않음 (최선의 확인)".into(),
+                None => "알 수 없음".into(),
+            }
+        } else {
+            cell(&value[key])
+        };
+        lines.push(format!("{label}: {display}"));
+    }
+    lines
+}
+
+fn takeover_result_line(value: &serde_json::Value) -> String {
+    format!(
+        "계정 {}: 가져오기 완료 · 원본 이름 변경 {} · 갱신 {} · 만료 {}",
+        cell(&value["id"]),
+        cell(&value["renamed_to"]),
+        match value["refresh"]["ok"].as_bool() {
+            Some(true) => "성공",
+            Some(false) | None => "확인 필요",
+        },
+        cell(&value["refresh"]["token_expires_at"])
+    )
+}
+
+async fn takeover(
+    home: &Path,
+    config: &Config,
+    provider: LoginProvider,
+    path: PathBuf,
+    replace: bool,
+    keep_source: bool,
+    yes: bool,
+) -> anyhow::Result<()> {
+    let (client, base, token) = running_admin(home, config)
+        .await?
+        .ok_or_else(|| account_error("계정을 가져오려면 인증된 코어를 먼저 실행해 주세요."))?;
+    // Resolve relative paths for the core without reading any source file locally.
+    let path = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut request = serde_json::json!({
+        "provider": qb_core::accounts::Provider::from(provider), "path": path,
+        "phase": "inspect", "replace": replace, "keep_source": keep_source,
+    });
+    let inspect = account_response(
+        admin_route_response(
+            client
+                .post(format!("{base}/accounts/takeover"))
+                .bearer_auth(token.trim())
+                .json(&request)
+                .send()
+                .await?,
+            &client,
+            &base,
+            &token,
+        )
+        .await?,
+    )
+    .await?;
+    for line in takeover_inspect_lines(&inspect, keep_source) {
+        println_utf8!("{line}");
+    }
+    if !yes {
+        return Err(TakeoverInspectOnly.into());
+    }
+    let digest = inspect["inspect_digest"]
+        .as_str()
+        .filter(|digest| !digest.is_empty())
+        .ok_or_else(|| account_error("확인 다이제스트가 없습니다. 코어 응답을 확인해 주세요."))?;
+    request["phase"] = serde_json::json!("commit");
+    request["inspect_digest"] = serde_json::json!(digest);
+    let result = account_response(
+        admin_route_response(
+            client
+                .post(format!("{base}/accounts/takeover"))
+                .timeout(Duration::from_secs(40))
+                .bearer_auth(token.trim())
+                .json(&request)
+                .send()
+                .await?,
+            &client,
+            &base,
+            &token,
+        )
+        .await?,
+    )
+    .await?;
+    println_utf8!("{}", takeover_result_line(&result));
+    if result["refresh"]["ok"].as_bool() != Some(true) {
+        return Err(account_error(
+            "계정은 가져왔지만 갱신을 확인하지 못했습니다. 계정 상태를 확인해 주세요.",
+        ));
+    }
+    Ok(())
 }
 
 fn valid_account_id(id: &str) -> anyhow::Result<()> {
@@ -409,11 +648,17 @@ async fn adopt_accounts(
     for id in ids {
         let result = if let Some((client, base, token)) = &admin {
             let state = account_response(
-                client
-                    .get(format!("{base}/state"))
-                    .bearer_auth(token.trim())
-                    .send()
-                    .await?,
+                admin_route_response(
+                    client
+                        .get(format!("{base}/state"))
+                        .bearer_auth(token.trim())
+                        .send()
+                        .await?,
+                    client,
+                    base,
+                    token,
+                )
+                .await?,
             )
             .await?;
             let generation = state["accounts"]
@@ -424,16 +669,22 @@ async fn adopt_accounts(
                     account_error("계정을 찾을 수 없거나 코어가 소유권 이전을 지원하지 않습니다.")
                 })?;
             account_response(
-                client
-                    .post(format!("{base}/accounts/{id}/adopt"))
-                    .timeout(Duration::from_secs(35))
-                    .bearer_auth(token.trim())
-                    .json(&AdoptRequest {
-                        from: from.clone(),
-                        expected_generation: generation,
-                    })
-                    .send()
-                    .await?,
+                admin_route_response(
+                    client
+                        .post(format!("{base}/accounts/{id}/adopt"))
+                        .timeout(Duration::from_secs(35))
+                        .bearer_auth(token.trim())
+                        .json(&AdoptRequest {
+                            from: from.clone(),
+                            expected_generation: generation,
+                        })
+                        .send()
+                        .await?,
+                    client,
+                    base,
+                    token,
+                )
+                .await?,
             )
             .await?
         } else {
@@ -502,13 +753,19 @@ async fn refresh_tokens(
     valid_account_id(&id)?;
     let summary = if let Some((client, base, token)) = running_admin(home, config).await? {
         account_response(
-            client
-                .post(format!("{base}/accounts/{id}/refresh"))
-                .timeout(Duration::from_secs(40))
-                .bearer_auth(token.trim())
-                .json(&serde_json::json!({"force":force}))
-                .send()
-                .await?,
+            admin_route_response(
+                client
+                    .post(format!("{base}/accounts/{id}/refresh"))
+                    .timeout(Duration::from_secs(40))
+                    .bearer_auth(token.trim())
+                    .json(&serde_json::json!({"force":force}))
+                    .send()
+                    .await?,
+                &client,
+                &base,
+                &token,
+            )
+            .await?,
         )
         .await?
     } else {
@@ -581,12 +838,18 @@ async fn action(home: &Path, config: &Config, id: &str, action: &str) -> anyhow:
         "계정 ID를 확인해 주세요."
     );
     if let Some((client, base, token)) = running_admin(home, config).await? {
-        client
-            .post(format!("{base}/accounts/{id}/{action}"))
-            .bearer_auth(token.trim())
-            .send()
-            .await?
-            .error_for_status()?;
+        admin_route_response(
+            client
+                .post(format!("{base}/accounts/{id}/{action}"))
+                .bearer_auth(token.trim())
+                .send()
+                .await?,
+            &client,
+            &base,
+            &token,
+        )
+        .await?
+        .error_for_status()?;
     } else {
         let home = home.to_owned();
         let id = id.to_owned();
@@ -614,12 +877,18 @@ async fn refresh_usage(home: &Path, config: &Config, id: &str) -> anyhow::Result
     let (client, base, token) = running_admin(home, config)
         .await?
         .ok_or(UsageCliError::CoreRequired)?;
-    let response = client
-        .post(format!("{base}/accounts/{id}/refresh-usage"))
-        .timeout(Duration::from_secs(35))
-        .bearer_auth(token.trim())
-        .send()
-        .await?;
+    let response = admin_route_response(
+        client
+            .post(format!("{base}/accounts/{id}/refresh-usage"))
+            .timeout(Duration::from_secs(35))
+            .bearer_auth(token.trim())
+            .send()
+            .await?,
+        &client,
+        &base,
+        &token,
+    )
+    .await?;
     if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
         return Err(UsageCliError::TooSoon.into());
     }
@@ -645,14 +914,20 @@ pub async fn status(home: &Path, config: &Config) -> anyhow::Result<()> {
     let (running, accounts) = if let Some((client, base, token)) =
         running_admin(home, config).await?
     {
-        let state: serde_json::Value = client
-            .get(format!("{base}/state"))
-            .bearer_auth(token.trim())
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let state: serde_json::Value = admin_route_response(
+            client
+                .get(format!("{base}/state"))
+                .bearer_auth(token.trim())
+                .send()
+                .await?,
+            &client,
+            &base,
+            &token,
+        )
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
         let accounts = state["accounts"]
             .as_array()
             .ok_or_else(|| anyhow::anyhow!("Invalid account state"))?
@@ -713,8 +988,25 @@ pub async fn status(home: &Path, config: &Config) -> anyhow::Result<()> {
             pool["unavailable"]
         );
     }
+    let names = status_window_names(&accounts);
+    let columns = names
+        .iter()
+        .map(|name| {
+            format!(
+                "{} 사용률\t{} 초기화",
+                status_window_label(name),
+                status_window_label(name)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\t");
     println_utf8!(
-        "계정 ID\t제공자\t라벨\t사용 상태\t계정 상태\t5시간 사용률\t5시간 초기화\t7일 사용률\t7일 초기화\t상태 이유\t대기 종료"
+        "계정 ID\t제공자\t라벨\t사용 상태\t계정 상태{}\t상태 이유\t대기 종료",
+        if columns.is_empty() {
+            String::new()
+        } else {
+            format!("\t{columns}")
+        }
     );
     let now = std::time::SystemTime::now();
     for account in accounts {
@@ -725,10 +1017,19 @@ pub async fn status(home: &Path, config: &Config) -> anyhow::Result<()> {
                 .cloned()
                 .unwrap_or(serde_json::Value::Null)
         };
-        let five = window("5h");
-        let seven = window("7d");
+        let windows = names
+            .iter()
+            .map(|name| {
+                let value = window(name);
+                format!(
+                    "\t{}\t{}",
+                    percentage(&value, now),
+                    cell(&value["reset_at"])
+                )
+            })
+            .collect::<String>();
         println_utf8!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}{}\t{}\t{}",
             cell(&account["id"]),
             cell(&account["provider"]),
             cell(&account["label"]),
@@ -738,15 +1039,35 @@ pub async fn status(home: &Path, config: &Config) -> anyhow::Result<()> {
             } else {
                 health_label(&account["health"])
             },
-            percentage(&five, now),
-            cell(&five["reset_at"]),
-            percentage(&seven, now),
-            cell(&seven["reset_at"]),
+            windows,
             translated(&account["health"]["reason"]),
             cell(&account["health"]["until"])
         );
     }
     Ok(())
+}
+
+fn status_window_label(name: &str) -> String {
+    match name {
+        "5h" => "5시간".into(),
+        "7d" => "7일".into(),
+        "43200m" => "43200m (30일)".into(),
+        _ => cell(&serde_json::json!(name)),
+    }
+}
+
+fn status_window_names(accounts: &[serde_json::Value]) -> Vec<String> {
+    let mut names = Vec::new();
+    for account in accounts {
+        for window in account["windows"].as_array().into_iter().flatten() {
+            if let Some(name) = window["name"].as_str()
+                && !names.iter().any(|existing| existing == name)
+            {
+                names.push(name.to_owned());
+            }
+        }
+    }
+    names
 }
 
 fn percentage(window: &serde_json::Value, now: std::time::SystemTime) -> String {
@@ -783,14 +1104,20 @@ impl LoginBackend {
                 client,
                 base,
                 token,
-            } => Ok(client
-                .get(format!("{base}/accounts/login/{id}"))
-                .bearer_auth(token.trim())
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
-                .await?),
+            } => Ok(admin_route_response(
+                client
+                    .get(format!("{base}/accounts/login/{id}"))
+                    .bearer_auth(token.trim())
+                    .send()
+                    .await?,
+                client,
+                base,
+                token,
+            )
+            .await?
+            .error_for_status()?
+            .json()
+            .await?),
             Self::Local(service) => Ok(serde_json::to_value(service.status(id).await?)?),
         }
     }
@@ -802,12 +1129,18 @@ impl LoginBackend {
                 base,
                 token,
             } => {
-                client
-                    .post(format!("{base}/accounts/login/{id}/cancel"))
-                    .bearer_auth(token.trim())
-                    .send()
-                    .await?
-                    .error_for_status()?;
+                admin_route_response(
+                    client
+                        .post(format!("{base}/accounts/login/{id}/cancel"))
+                        .bearer_auth(token.trim())
+                        .send()
+                        .await?,
+                    client,
+                    base,
+                    token,
+                )
+                .await?
+                .error_for_status()?;
             }
             Self::Local(service) => {
                 service.cancel(id).await?;
@@ -825,68 +1158,68 @@ async fn login(
     no_browser: bool,
 ) -> anyhow::Result<()> {
     let mut offline_obs = None;
-    let (backend, id, auth_url) = if let Some((client, base, token)) =
-        running_admin(home, config).await?
-    {
-        let response = client
+    let (backend, id, auth_url) =
+        if let Some((client, base, token)) = running_admin(home, config).await? {
+            let response = admin_route_response(client
             .post(format!("{base}/accounts/login"))
             .bearer_auth(token.trim())
             .json(&serde_json::json!({ "provider": provider, "replace_linked": replace_linked }))
             .send()
-            .await?;
-        if let Err(error) = response.error_for_status_ref() {
-            let payload: serde_json::Value = response.json().await.unwrap_or_default();
-            println_utf8!("{}", login_failure(payload["error"]["message"].as_str()));
-            return Err(error.into());
-        }
-        let start: serde_json::Value = response.json().await?;
-        let id = start["login_id"]
-            .as_str()
-            .filter(|id| {
-                !id.is_empty()
-                    && id.len() <= 100
-                    && id
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
-            })
-            .ok_or_else(|| anyhow::anyhow!("로그인 응답을 확인해 주세요."))?
-            .to_owned();
-        let url = start["auth_url"].as_str().unwrap_or_default().to_owned();
-        (
-            LoginBackend::Admin {
-                client,
-                base,
-                token,
-            },
-            id,
-            url,
-        )
-    } else {
-        let home = home.to_owned();
-        let (store, obs) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let store = std::sync::Arc::new(AccountStore::acquire(&home)?);
-            let obs = std::sync::Arc::new(qb_core::observability::Observability::new(&home, None)?);
-            Ok((store, obs))
-        })
-        .await??;
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(30))
-            .user_agent(concat!("quota-baton/", env!("CARGO_PKG_VERSION")))
-            .build()?;
-        let service = qb_core::oauth::LoginService::new(store, client, obs.clone());
-        let start = match service.start(provider, replace_linked).await {
-            Ok(start) => start,
-            Err(error) => {
-                println_utf8!("{}", login_failure(Some(&error.to_string())));
-                finish_offline_login(service, obs).await?;
-                anyhow::bail!("로그인을 시작하지 못했습니다.");
+            .await?, &client, &base, &token).await?;
+            if let Err(error) = response.error_for_status_ref() {
+                let payload: serde_json::Value = response.json().await.unwrap_or_default();
+                println_utf8!("{}", login_failure(payload["error"]["message"].as_str()));
+                return Err(error.into());
             }
+            let start: serde_json::Value = response.json().await?;
+            let id = start["login_id"]
+                .as_str()
+                .filter(|id| {
+                    !id.is_empty()
+                        && id.len() <= 100
+                        && id
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+                })
+                .ok_or_else(|| anyhow::anyhow!("로그인 응답을 확인해 주세요."))?
+                .to_owned();
+            let url = start["auth_url"].as_str().unwrap_or_default().to_owned();
+            (
+                LoginBackend::Admin {
+                    client,
+                    base,
+                    token,
+                },
+                id,
+                url,
+            )
+        } else {
+            let home = home.to_owned();
+            let (store, obs) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                let store = std::sync::Arc::new(AccountStore::acquire(&home)?);
+                let obs =
+                    std::sync::Arc::new(qb_core::observability::Observability::new(&home, None)?);
+                Ok((store, obs))
+            })
+            .await??;
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(Duration::from_secs(30))
+                .user_agent(concat!("quota-baton/", env!("CARGO_PKG_VERSION")))
+                .build()?;
+            let service = qb_core::oauth::LoginService::new(store, client, obs.clone());
+            let start = match service.start(provider, replace_linked).await {
+                Ok(start) => start,
+                Err(error) => {
+                    println_utf8!("{}", login_failure(Some(&error.to_string())));
+                    finish_offline_login(service, obs).await?;
+                    anyhow::bail!("로그인을 시작하지 못했습니다.");
+                }
+            };
+            offline_obs = Some(obs);
+            (LoginBackend::Local(service), start.login_id, start.auth_url)
         };
-        offline_obs = Some(obs);
-        (LoginBackend::Local(service), start.login_id, start.auth_url)
-    };
 
     // Only provider authorization URLs may be printed or opened. Never expose a
     // callback URL, arbitrary admin text, userinfo, or provider error payload.
@@ -1159,3 +1492,7 @@ mod r1_cpa_status_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "accounts_cli_r6_tests.rs"]
+mod r6_tests;

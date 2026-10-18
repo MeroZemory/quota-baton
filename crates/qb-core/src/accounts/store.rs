@@ -52,6 +52,8 @@ struct Record {
     #[serde(flatten)]
     account: Account,
     secret_dpapi_b64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    takeover_receipt: Option<super::takeover::Receipt>,
 }
 
 pub struct AccountStore {
@@ -126,6 +128,9 @@ impl AccountStore {
             lease: Mutex::new(Some(lease)),
             writes_stopped: AtomicBool::new(false),
         };
+        // Validate durable fences before any runtime job can read credentials.
+        // Recovery never touches the native source or presents a token.
+        store.recover_takeovers()?;
         store.recover_login_migration()?;
         Ok(store)
     }
@@ -327,6 +332,9 @@ impl AccountStore {
     pub(crate) fn tokens_unlocked(&self, account: &Account) -> Result<Tokens, StoreError> {
         let record = self.read(&account.id)?;
         Self::check_generation(Some(account.generation), Some(record.account.generation))?;
+        if record.takeover_receipt.as_ref().is_some_and(|r| r.fenced()) {
+            return Err(StoreError::InvalidData);
+        }
         crypto::decrypt(&record.secret_dpapi_b64)
     }
 
@@ -347,6 +355,189 @@ impl AccountStore {
         tokens: &Tokens,
         expected: Option<u64>,
     ) -> Result<Account, StoreError> {
+        self.save_record_unlocked(account, tokens, expected, None)
+    }
+
+    /// Only OAuth completion calls this, after same-user matching under the
+    /// account transaction. The atomic receipt is the old operation's tombstone
+    /// even if the following journal compaction cannot be written immediately.
+    pub(super) fn save_login_unlocked(
+        &self,
+        account: &Account,
+        tokens: &Tokens,
+        expected: Option<u64>,
+    ) -> Result<Account, StoreError> {
+        use super::takeover::{Receipt, ReceiptState};
+        let previous = match self.read(&account.id) {
+            Ok(record) => record.takeover_receipt,
+            Err(StoreError::NotFound) => None,
+            Err(error) => return Err(error),
+        };
+        if let Some(before) = previous.filter(|r| r.fenced()) {
+            if account.source != super::Source::Oauth || account.token_meta.refresh_uncertain {
+                return Err(StoreError::InvalidData);
+            }
+            self.reconcile_retirement_unlocked(&before)?;
+            let after = Receipt {
+                operation: before.operation.clone(),
+                state: ReceiptState::Superseded,
+            };
+            let saved = self.save_record_unlocked(
+                account,
+                tokens,
+                expected,
+                Some((Some(&before), &after)),
+            )?;
+            // Account+new family+Superseded are already durable. Startup and old
+            // commit replay finish this same journal without source/token use.
+            let _ = self.complete_takeover_journal_unlocked(&saved.id, &after);
+            Ok(saved)
+        } else {
+            self.save_unlocked(account, tokens, expected)
+        }
+    }
+
+    /// Identity evidence for fresh OAuth matching only. Return no credentials
+    /// and keep all general token-read fences intact, including for legacy IDs.
+    pub(super) fn login_codex_user_unlocked(
+        &self,
+        account: &Account,
+        workspace: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let record = self.read(&account.id)?;
+        Self::check_generation(Some(account.generation), Some(record.account.generation))?;
+        if matches!(
+            record.account.source,
+            super::Source::Cpa {
+                mode: super::ImportMode::Linked,
+                ..
+            }
+        ) {
+            return Err(StoreError::InvalidData);
+        }
+        let tokens = crypto::decrypt(&record.secret_dpapi_b64)?;
+        Ok(super::import::codex_user_id(&tokens, workspace))
+    }
+
+    pub(crate) fn takeover_intent_reusable(
+        &self,
+        journal: &super::takeover::Journal,
+    ) -> Result<bool, StoreError> {
+        let _guard = self.transaction()?;
+        if journal.result.is_some() || journal.retired {
+            return Ok(true);
+        }
+        match self.read(&journal.account.id) {
+            Ok(record) => Ok(record
+                .takeover_receipt
+                .as_ref()
+                .is_some_and(|r| r.operation == journal.operation)
+                || journal.expected == Some(record.account.generation)),
+            Err(StoreError::NotFound) => Ok(journal.expected.is_none()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn read_takeover_unlocked(
+        &self,
+        operation: &str,
+    ) -> Result<super::takeover::Journal, StoreError> {
+        let path = self.takeover_journal_path(operation)?;
+        let bytes = self
+            .read_takeover_bytes(&path)?
+            .ok_or(StoreError::InvalidData)?;
+        let journal: super::takeover::Journal =
+            serde_json::from_slice(&bytes).map_err(|_| StoreError::InvalidData)?;
+        journal.validate()?;
+        if journal.operation != operation {
+            return Err(StoreError::InvalidData);
+        }
+        Ok(journal)
+    }
+
+    fn reconcile_retirement_unlocked(
+        &self,
+        receipt: &super::takeover::Receipt,
+    ) -> Result<(), StoreError> {
+        let mut journal = self.read_takeover_unlocked(&receipt.operation)?;
+        if journal.retirement_started && !journal.retired && !journal.keep_source {
+            let retired =
+                super::takeover_native::retirement_evidence(&journal.source, &journal.destination)
+                    .unwrap_or(false);
+            if retired {
+                journal.retired = true;
+                // New OAuth is independent evidence. Failure to refine the old
+                // journal must not prevent its atomic supersession tombstone.
+                let _ = self.write_takeover_journal_unlocked(&journal);
+            }
+        }
+        Ok(())
+    }
+
+    /// Synchronous file-only boundary shared with fresh-login supersession.
+    /// Caller holds the async account gate; no HTTP/profile work occurs here.
+    pub(crate) fn retire_takeover(
+        &self,
+        supplied: &super::takeover::Journal,
+        deps: &super::takeover::Dependencies,
+    ) -> Result<super::takeover::Journal, super::takeover::TakeoverError> {
+        use super::takeover::{Receipt, ReceiptState, TakeoverError};
+        let _guard = self.transaction()?;
+        if self.writes_stopped() {
+            return Err(TakeoverError::Unavailable);
+        }
+        let mut journal = self.read_takeover_unlocked(&supplied.operation)?;
+        let record = self.read(&journal.account.id)?;
+        let receipt = record
+            .takeover_receipt
+            .as_ref()
+            .ok_or(TakeoverError::Invalid)?;
+        if receipt.operation != journal.operation {
+            return Err(TakeoverError::Conflict);
+        }
+        if !receipt.fenced() {
+            self.complete_takeover_journal_unlocked(&journal.account.id, receipt)?;
+            return Ok(self.read_takeover_unlocked(&journal.operation)?);
+        }
+        if !journal.retired {
+            if receipt.state != ReceiptState::Installed {
+                return Err(TakeoverError::Invalid);
+            }
+            super::takeover::validate_source(deps, journal.provider, &journal.source)?;
+            journal.retirement_started = true;
+            self.write_takeover_journal_unlocked(&journal)?;
+            deps.source.retire(
+                journal.provider,
+                &journal.source,
+                &journal.destination,
+                journal.keep_source,
+            )?;
+            journal.retired = true;
+            self.write_takeover_journal_unlocked(&journal)?;
+        }
+        if receipt.state == ReceiptState::Installed {
+            let tokens = crypto::decrypt(&record.secret_dpapi_b64)?;
+            let ready = Receipt {
+                operation: journal.operation.clone(),
+                state: ReceiptState::Ready,
+            };
+            self.save_record_unlocked(
+                &record.account,
+                &tokens,
+                Some(record.account.generation),
+                Some((Some(receipt), &ready)),
+            )?;
+        }
+        Ok(journal)
+    }
+
+    fn save_record_unlocked(
+        &self,
+        account: &Account,
+        tokens: &Tokens,
+        expected: Option<u64>,
+        receipt_change: Option<(Option<&super::takeover::Receipt>, &super::takeover::Receipt)>,
+    ) -> Result<Account, StoreError> {
         Self::validate(account)?;
         let old = match self.read(&account.id) {
             Ok(record) => Some(record),
@@ -359,17 +550,56 @@ impl AccountStore {
             return Err(StoreError::IdentityCollision);
         }
         Self::check_generation(expected, old.as_ref().map(|old| old.account.generation))?;
-        if old.as_ref().is_some_and(|old| {
-            account
-                .token_meta
-                .compare(&old.account.token_meta)
-                .is_some_and(|order| order.is_lt())
-        }) {
+        // A response to this exact fenced write-ahead operation is independent
+        // proof of rotation. Native Claude has no prior refresh timestamp and
+        // a legitimate refreshed expiry may be shorter than its imported one.
+        let takeover_rotation = receipt_change.is_some_and(|(before, next)| {
+            before.is_some_and(|before| before.operation == next.operation
+                && before.state == super::takeover::ReceiptState::Started)
+                && matches!(&next.state, super::takeover::ReceiptState::Finished { result } if result.ok)
+        });
+        let fresh_login = receipt_change.is_some_and(|(before, next)| {
+            before.is_some_and(|r| r.fenced() && r.operation == next.operation)
+                && next.state == super::takeover::ReceiptState::Superseded
+                && account.source == super::Source::Oauth
+                && !account.token_meta.refresh_uncertain
+        });
+        if !takeover_rotation
+            && !fresh_login
+            && old.as_ref().is_some_and(|old| {
+                account
+                    .token_meta
+                    .compare(&old.account.token_meta)
+                    .is_some_and(|order| order.is_lt())
+            })
+        {
             return Err(StoreError::OlderToken);
         }
         if expected.is_some_and(|n| n != account.generation) {
             return Err(StoreError::InvalidData);
         }
+        let previous_receipt = old.as_ref().and_then(|r| r.takeover_receipt.as_ref());
+        let receipt = if let Some((expected_receipt, next)) = receipt_change {
+            next.validate()?;
+            if previous_receipt != expected_receipt
+                || previous_receipt.is_some_and(|old| !old.permits(next))
+                || (previous_receipt.is_none()
+                    && next.state != super::takeover::ReceiptState::Installed)
+            {
+                return Err(StoreError::InvalidData);
+            }
+            if next.state == super::takeover::ReceiptState::Started
+                && !account.token_meta.refresh_uncertain
+            {
+                return Err(StoreError::InvalidData);
+            }
+            Some(next.clone())
+        } else {
+            if previous_receipt.is_some_and(|r| r.fenced()) {
+                return Err(StoreError::InvalidData);
+            }
+            previous_receipt.cloned()
+        };
         let mut updated = account.clone();
         let adopting = old.as_ref().is_some_and(|old| {
             matches!(
@@ -400,6 +630,7 @@ impl AccountStore {
         let record = Record {
             account: updated.clone(),
             secret_dpapi_b64: crypto::encrypt(tokens)?,
+            takeover_receipt: receipt,
         };
         let bytes = serde_json::to_vec_pretty(&record).map_err(|_| StoreError::InvalidData)?;
         self.atomic_write(&self.path(&account.id)?, &bytes)?;
@@ -448,6 +679,12 @@ impl AccountStore {
         if self.writes_stopped() {
             return Err(StoreError::LeaseUnavailable);
         }
+        if let Some(receipt) = self.read(id)?.takeover_receipt {
+            if receipt.fenced() {
+                return Err(StoreError::InvalidData);
+            }
+            self.complete_takeover_journal_unlocked(id, &receipt)?;
+        }
         fs::remove_file(self.path(id)?).map_err(|_| StoreError::Io)
     }
 
@@ -458,6 +695,15 @@ impl AccountStore {
         resolved_identity: &super::Identity,
     ) -> Result<(), StoreError> {
         self.check_login_migration_clear()?;
+        for id in [old, new] {
+            match self.read(id) {
+                Ok(record) if record.takeover_receipt.as_ref().is_some_and(|r| r.fenced()) => {
+                    return Err(StoreError::InvalidData);
+                }
+                Ok(_) | Err(StoreError::NotFound) => {}
+                Err(e) => return Err(e),
+            }
+        }
         self.path(old)?;
         self.path(new)?;
         let old_identity = self.read(old)?.account.identity;
@@ -596,7 +842,134 @@ impl AccountStore {
         })?;
         let record: Record = serde_json::from_slice(&bytes).map_err(|_| StoreError::InvalidData)?;
         Self::validate(&record.account)?;
+        if let Some(receipt) = &record.takeover_receipt {
+            receipt.validate()?;
+            if receipt.state == super::takeover::ReceiptState::Started
+                && !record.account.token_meta.refresh_uncertain
+            {
+                return Err(StoreError::InvalidData);
+            }
+        }
         Ok(record)
+    }
+
+    pub(crate) fn finalize_superseded_takeover(
+        &self,
+        id: &str,
+        operation: &str,
+    ) -> Result<super::takeover::Journal, StoreError> {
+        let _guard = self.transaction()?;
+        let receipt = self
+            .read(id)?
+            .takeover_receipt
+            .ok_or(StoreError::InvalidData)?;
+        if receipt.operation != operation
+            || receipt.state != super::takeover::ReceiptState::Superseded
+        {
+            return Err(StoreError::InvalidData);
+        }
+        self.complete_takeover_journal_unlocked(id, &receipt)?;
+        self.read_takeover_unlocked(operation)
+    }
+
+    fn complete_takeover_journal_unlocked(
+        &self,
+        id: &str,
+        receipt: &super::takeover::Receipt,
+    ) -> Result<(), StoreError> {
+        use super::takeover::{Journal, ReceiptState};
+        let (result, superseded) = match &receipt.state {
+            ReceiptState::Finished { result } => (result.clone(), false),
+            ReceiptState::Superseded => (
+                super::takeover::Verification {
+                    ok: false,
+                    token_expires_at: None,
+                },
+                true,
+            ),
+            _ => return Err(StoreError::InvalidData),
+        };
+        let path = self.takeover_journal_path(&receipt.operation)?;
+        let bytes = self
+            .read_takeover_bytes(&path)?
+            .ok_or(StoreError::InvalidData)?;
+        let mut journal: Journal =
+            serde_json::from_slice(&bytes).map_err(|_| StoreError::InvalidData)?;
+        journal.validate()?;
+        let refined = superseded
+            && journal.retirement_started
+            && !journal.retired
+            && !journal.keep_source
+            && super::takeover_native::retirement_evidence(&journal.source, &journal.destination)
+                .unwrap_or(false);
+        if refined {
+            journal.retired = true;
+        }
+        if journal.operation != receipt.operation
+            || journal.account.id != id
+            || (!journal.retired && !superseded)
+        {
+            return Err(StoreError::InvalidData);
+        }
+        if let Some(saved) = &journal.result {
+            return if *saved == result && journal.superseded == superseded {
+                if refined {
+                    self.write_takeover_journal_unlocked(&journal)
+                } else {
+                    Ok(())
+                }
+            } else {
+                Err(StoreError::InvalidData)
+            };
+        }
+        journal.result = Some(result);
+        journal.superseded = superseded;
+        journal.protected_tokens = None;
+        self.write_takeover_journal_unlocked(&journal)
+    }
+
+    fn recover_takeovers(&self) -> Result<(), StoreError> {
+        let journals = self.takeover_journals()?;
+        let _guard = self.transaction()?;
+        for account in Self::read_metadata_dir(&self.dir)? {
+            let record = self.read(&account.id)?;
+            let Some(receipt) = record.takeover_receipt else {
+                continue;
+            };
+            let journal = journals
+                .iter()
+                .find(|j| j.operation == receipt.operation)
+                .ok_or(StoreError::InvalidData)?;
+            if journal.account.id != account.id
+                || journal.account.identity != account.identity
+                || (!matches!(
+                    receipt.state,
+                    super::takeover::ReceiptState::Installed
+                        | super::takeover::ReceiptState::Superseded
+                ) && !journal.retired)
+                || (journal.result.is_some() && receipt.fenced())
+            {
+                return Err(StoreError::InvalidData);
+            }
+            if !receipt.fenced() {
+                self.complete_takeover_journal_unlocked(&account.id, &receipt)?;
+            }
+        }
+        // A published but incomplete operation cannot lose its marker. Prepared
+        // intents without a marker have not consumed tokens; the original store
+        // generation must still pass CAS if explicitly resumed later.
+        for journal in journals {
+            if journal.retired && journal.result.is_none() {
+                let receipt = self
+                    .read(&journal.account.id)?
+                    .takeover_receipt
+                    .ok_or(StoreError::InvalidData)?;
+                if receipt.operation != journal.operation {
+                    return Err(StoreError::InvalidData);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn atomic_write(&self, destination: &Path, bytes: &[u8]) -> Result<(), StoreError> {
@@ -639,6 +1012,194 @@ impl AccountStore {
         result
     }
 }
+
+// The existing isolated m1b harness compiles credentials.rs as source. Keep
+// these internal in production and expose only to explicit testkit builds.
+macro_rules! takeover_store_api {
+    ($visibility:vis) => {
+        #[doc(hidden)]
+        impl AccountStore {
+    $visibility fn takeover_receipt(&self, id: &str) -> Result<Option<super::takeover::Receipt>, StoreError> {
+        let _guard = self.transaction()?;
+        Ok(self.read(id)?.takeover_receipt)
+    }
+
+    $visibility fn takeover_fenced(&self, id: &str) -> Result<bool, StoreError> {
+        Ok(self.takeover_receipt(id)?.is_some_and(|r| r.fenced()))
+    }
+    $visibility fn takeover_fenced_ids(&self) -> Result<std::collections::BTreeSet<String>, StoreError> {
+        let _guard = self.transaction()?;
+        let mut ids = std::collections::BTreeSet::new();
+        for account in Self::read_metadata_dir(&self.dir)? {
+            if self.read(&account.id)?.takeover_receipt.as_ref().is_some_and(|r| r.fenced()) { ids.insert(account.id); }
+        }
+        Ok(ids)
+    }
+
+    $visibility fn takeover_tokens(&self, account: &Account, operation: &str) -> Result<Tokens, StoreError> {
+        let _guard = self.transaction()?;
+        let record = self.read(&account.id)?;
+        Self::check_generation(Some(account.generation), Some(record.account.generation))?;
+        if record.takeover_receipt.as_ref().is_none_or(|r| r.operation != operation || r.state == super::takeover::ReceiptState::Superseded) { return Err(StoreError::InvalidData); }
+        crypto::decrypt(&record.secret_dpapi_b64)
+    }
+
+    $visibility fn save_takeover_receipt(
+        &self, account: &Account, tokens: &Tokens, expected: Option<u64>,
+        before: Option<&super::takeover::Receipt>, after: &super::takeover::Receipt,
+    ) -> Result<Account, StoreError> {
+        let _guard = self.transaction()?;
+        self.save_record_unlocked(account, tokens, expected, Some((before, after)))
+    }
+
+    $visibility fn publish_takeover(&self, journal: &super::takeover::Journal) -> Result<Account, StoreError> {
+        use super::takeover::{Receipt, ReceiptState};
+        let _guard = self.transaction()?;
+        journal.validate()?;
+        let old = match self.read(&journal.account.id) {
+            Ok(record) => Some(record), Err(StoreError::NotFound) => None, Err(e) => return Err(e),
+        };
+        Self::check_generation(journal.expected, old.as_ref().map(|r| r.account.generation))?;
+        Self::validate(&journal.account)?;
+        if old.as_ref().is_some_and(|r| r.account.identity.canonical_key() != journal.account.identity.canonical_key()) {
+            return Err(StoreError::IdentityCollision);
+        }
+        if old.as_ref().is_some_and(|r| journal.account.token_meta.compare(&r.account.token_meta).is_none_or(|o| o.is_lt())) {
+            return Err(StoreError::OlderToken);
+        }
+        for other in Self::read_metadata_dir(&self.dir)? {
+            if other.id == journal.account.id { continue; }
+            let ambiguous = match (&other.identity, &journal.account.identity) {
+                (super::Identity::Codex { account_id:a,user_id:x,.. }, super::Identity::Codex { account_id:b,user_id:y,.. }) =>
+                    a == b && (x.is_none() || y.is_none() || x == y),
+                (super::Identity::Claude { account_uuid:a,organization_uuid:x,.. }, super::Identity::Claude { account_uuid:b,organization_uuid:y,.. }) =>
+                    a == b && (x.is_none() || y.is_none() || x == y),
+                _ => false,
+            };
+            if ambiguous { return Err(StoreError::IdentityCollision); }
+        }
+        let before = old.as_ref().and_then(|r| r.takeover_receipt.as_ref());
+        if before.is_some_and(|r| r.fenced()) { return Err(StoreError::InvalidData); }
+        if let Some(before) = before {
+            // Preserve the previous operation's dedupe proof before replacing
+            // its account receipt. A failed tombstone write blocks publication.
+            self.complete_takeover_journal_unlocked(&journal.account.id, before)?;
+        }
+        let tokens = crypto::decrypt(journal.protected_tokens.as_deref().ok_or(StoreError::InvalidData)?)?;
+        // Keep identity/store CAS and intent publication in one short transaction.
+        // The existing account gate excludes competing token-consuming work.
+        self.write_takeover_journal_unlocked(journal)?;
+        let after = Receipt { operation:journal.operation.clone(), state:ReceiptState::Installed };
+        self.save_record_unlocked(&journal.account, &tokens, journal.expected, Some((before, &after)))
+    }
+
+    /// Caller holds the existing per-account token gate; store lock is short.
+    $visibility fn finish_takeover_attempt(
+        &self, id: &str, operation: &str, result: super::takeover::Verification,
+        terminal: Option<String>,
+    ) -> Result<Account, StoreError> {
+        use super::takeover::{Receipt, ReceiptState};
+        let _guard = self.transaction()?;
+        let record = self.read(id)?;
+        let before = record.takeover_receipt.as_ref().ok_or(StoreError::InvalidData)?;
+        if before.operation != operation || before.state != ReceiptState::Started {
+            return Err(StoreError::InvalidData);
+        }
+        let mut account = record.account;
+        let tokens = crypto::decrypt(&record.secret_dpapi_b64)?;
+        account.token_meta.refresh_uncertain = false;
+        if let Some(reason) = terminal {
+            account.apply_health_signal(super::HealthSignal::TerminalRefresh { reason }, chrono::Utc::now());
+        }
+        let next = Receipt { operation: operation.to_owned(), state: ReceiptState::Finished { result } };
+        self.save_record_unlocked(&account, &tokens, Some(account.generation), Some((Some(before), &next)))
+    }
+
+    /// Journal extension is deliberately not .json: account enumeration ignores it.
+    fn takeover_journal_path(&self, operation: &str) -> Result<PathBuf, StoreError> {
+        super::takeover::Receipt { operation: operation.to_owned(), state: super::takeover::ReceiptState::Installed }.validate()?;
+        Ok(self.dir.join(format!(".takeover-{operation}.journal")))
+    }
+    $visibility fn read_takeover_journal(&self, operation: &str) -> Result<Option<super::takeover::Journal>, StoreError> {
+        let _guard = self.transaction()?;
+        let path = self.takeover_journal_path(operation)?;
+        let Some(bytes) = self.read_takeover_bytes(&path)? else { return Ok(None); };
+        let journal: super::takeover::Journal = serde_json::from_slice(&bytes).map_err(|_| StoreError::InvalidData)?;
+        if journal.operation != operation || journal.schema != 1 { return Err(StoreError::InvalidData); }
+        journal.validate()?;
+        Ok(Some(journal))
+    }
+    $visibility fn write_takeover_journal(&self, journal: &super::takeover::Journal) -> Result<(), StoreError> {
+        let _guard = self.transaction()?;
+        self.write_takeover_journal_unlocked(journal)
+    }
+    fn write_takeover_journal_unlocked(&self, journal: &super::takeover::Journal) -> Result<(), StoreError> {
+        let path = self.takeover_journal_path(&journal.operation)?;
+        journal.validate()?;
+        if let Some(bytes) = self.read_takeover_bytes(&path)? {
+            let old: super::takeover::Journal = serde_json::from_slice(&bytes).map_err(|_| StoreError::InvalidData)?;
+            old.validate()?;
+            let mut old_account = old.account.clone();
+            old_account.generation = journal.account.generation;
+            if old.inspect_digest != journal.inspect_digest || old.source != journal.source
+                || old.account.id != journal.account.id || old.provider != journal.provider
+                || old.operation != journal.operation || old.expected != journal.expected
+                || old_account != journal.account
+                || old.replace != journal.replace || old.keep_source != journal.keep_source
+                || old.destination != journal.destination || old.requested_path != journal.requested_path
+                || (old.retired && !journal.retired) || (old.result.is_some() && old.result != journal.result)
+                || (old.retirement_started && !journal.retirement_started)
+                || (old.superseded && !journal.superseded)
+                || (journal.protected_tokens.is_some() && old.protected_tokens != journal.protected_tokens)
+            { return Err(StoreError::InvalidData); }
+        }
+        let bytes = serde_json::to_vec_pretty(journal).map_err(|_| StoreError::InvalidData)?;
+        self.atomic_write(&path, &bytes)
+    }
+
+    $visibility fn takeover_journals(&self) -> Result<Vec<super::takeover::Journal>, StoreError> {
+        let _guard = self.transaction()?;
+        let mut journals = Vec::new();
+        for entry in fs::read_dir(&self.dir).map_err(|_| StoreError::Io)? {
+            let entry = entry.map_err(|_| StoreError::Io)?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue; };
+            if !name.starts_with(".takeover-") || !name.ends_with(".journal") { continue; }
+            if !entry.file_type().map_err(|_| StoreError::Io)?.is_file() { return Err(StoreError::InvalidData); }
+            let bytes = self.read_takeover_bytes(&entry.path())?.ok_or(StoreError::Io)?;
+            let journal: super::takeover::Journal = serde_json::from_slice(&bytes).map_err(|_| StoreError::InvalidData)?;
+            journal.validate()?;
+            if self.takeover_journal_path(&journal.operation)? != entry.path() { return Err(StoreError::InvalidData); }
+            journals.push(journal);
+        }
+        Ok(journals)
+    }
+
+    fn read_takeover_bytes(&self, path: &Path) -> Result<Option<Vec<u8>>, StoreError> {
+        use std::{io::Read, os::windows::fs::{MetadataExt, OpenOptionsExt}};
+        let file = match OpenOptions::new().read(true).custom_flags(0x00200000).open(path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(StoreError::Io),
+        };
+        let meta = file.metadata().map_err(|_| StoreError::Io)?;
+        if !meta.is_file() || meta.file_attributes() & 0x410 != 0 || meta.len() > 4 * 1024 * 1024 {
+            return Err(StoreError::InvalidData);
+        }
+        let mut bytes = Vec::new();
+        file.take(4 * 1024 * 1024 + 1).read_to_end(&mut bytes).map_err(|_| StoreError::Io)?;
+        if bytes.len() > 4 * 1024 * 1024 { return Err(StoreError::InvalidData); }
+        Ok(Some(bytes))
+    }
+
+    $visibility fn protect_takeover_tokens(tokens: &Tokens) -> Result<String, StoreError> { crypto::encrypt(tokens) }
+        }
+    };
+}
+#[cfg(feature = "testkit")]
+takeover_store_api!(pub);
+#[cfg(not(feature = "testkit"))]
+takeover_store_api!(pub(crate));
 
 #[cfg(test)]
 mod tests {

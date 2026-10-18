@@ -279,6 +279,13 @@ The later API-key providers implement the same trait without OAuth.
   - CPA writes files with truncate-then-write, so a file that fails to parse after the stop is a torn write: adopt from the store and warn.
   - The retired files are renamed `*.json.retired`, because CPA loads and watches only `*.json`.
   - They are never restored except by `restore-cpa`, which writes quota-baton's current tokens first.
+- **Never silently imported:** other apps' homes. Native Codex/Claude homes require the separately confirmed D18 takeover below; they are never linked.
+
+**Warned account takeover** (D18, C11).
+- The lease-holding core inspects native `auth.json` or `.credentials.json`, then commits only the confirmed unchanged source. Claude's native token envelope has no identity: the existing access token makes a bounded, non-refresh OAuth profile GET. Failed identification refuses the operation. Owner detection is best effort; it cannot prevent another app from starting after the check. The warning and 120-second file-age guard remain required.
+- A durable per-operation journal records the source file identity/hash, target generation and DPAPI-protected candidate. The account record carries a private receipt: installed, ready, started, finished, or superseded. Ordinary credential reads and refreshes are fenced until verification has a durable outcome. Source retirement uses the proven file handle and never replaces an existing destination.
+- Verification runs through the same detached D17 gate and shared client. Started is written atomically with refresh uncertainty; rotated credentials and finished are written atomically together. Commit replay and startup never present a started operation's token again. An unknown result keeps its fence; a fresh, same-user OAuth login can atomically supersede it while preserving the original id, bindings and history. Late responses and pending writes from the superseded operation are discarded even if access-token bytes are unchanged. This takeover recovery fence is separate from ordinary D17 uncertainty retries.
+- A never-published intent does not pin a later inspection to a stale account generation. Published/consumed operations retain replay tombstones, including a kept source. Re-login retains the persisted identity and id after independently resolving the same canonical user; it never merges different known users merely because workspace and email match.
 
 ## 7. Selection and session affinity
 
