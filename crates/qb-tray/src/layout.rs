@@ -197,7 +197,7 @@ pub fn menu_target<'a>(rows: &'a [Row], state: &str) -> Option<(&'a Row, usize)>
         Some(index) => index.parse::<usize>().ok()?,
         None => 0,
     };
-    if parts.next().is_some() {
+    if !matches!(parts.next(), None | Some("pending")) || parts.next().is_some() {
         return None;
     }
     let row = rows.iter().find(|row| row.id == id)?;
@@ -323,7 +323,7 @@ pub fn popup_rect(rows: &[Row], expand_disabled: bool, state: &str, height: f32)
         return Some(Rect::new(136.0, top, 352.0, top + popup_h));
     }
     if state == "add-menu" {
-        return Some(Rect::new(128.0, footer_y - 110.0, 352.0, footer_y - 4.0));
+        return Some(Rect::new(128.0, footer_y - 130.0, 352.0, footer_y - 4.0));
     }
     if state == "quit" {
         return Some(Rect::new(152.0, footer_y - 92.0, 352.0, footer_y - 4.0));
@@ -332,6 +332,13 @@ pub fn popup_rect(rows: &[Row], expand_disabled: bool, state: &str, height: f32)
 }
 
 pub fn popup_required_height(rows: &[Row], expand_disabled: bool, state: &str, base: f32) -> f32 {
+    // Footer popups must fit even before the first account exists.
+    if state == "add-menu" {
+        return base.max(FOOTER_HEIGHT + 130.0);
+    }
+    if state == "quit" {
+        return base.max(FOOTER_HEIGHT + 92.0);
+    }
     let Some(popup) = popup_rect(rows, expand_disabled, state, base) else {
         return base;
     };
@@ -377,6 +384,10 @@ pub enum HitTarget {
     MenuItem {
         id: String,
         index: usize,
+        rect: Rect,
+    },
+    AddChoice {
+        provider: Option<String>,
         rect: Rect,
     },
     Footer {
@@ -433,6 +444,7 @@ impl HitTarget {
             | Self::RowRelogin { rect, .. }
             | Self::MenuSurface { rect }
             | Self::MenuItem { rect, .. }
+            | Self::AddChoice { rect, .. }
             | Self::Disclosure { rect, .. }
             | Self::Footer { rect, .. }
             | Self::Login { rect, .. }
@@ -470,7 +482,7 @@ pub fn layout_targets(rows: &[Row], expand_disabled: bool, state: Option<&str>) 
             if expanded && !disabled.is_empty() {
                 targets.push(HitTarget::Disclosure {
                     provider: provider.into(),
-                    rect: Rect::new(PADDING, y, 236.0, y + 28.0),
+                    rect: Rect::new(PADDING, y, WIDTH - PADDING, y + 28.0),
                 });
                 y += 28.0;
             }
@@ -503,7 +515,7 @@ pub fn layout_targets(rows: &[Row], expand_disabled: bool, state: Option<&str>) 
             if !expanded && !disabled.is_empty() {
                 targets.push(HitTarget::Disclosure {
                     provider: provider.into(),
-                    rect: Rect::new(PADDING, y, 236.0, y + 28.0),
+                    rect: Rect::new(PADDING, y, WIDTH - PADDING, y + 28.0),
                 });
                 y += 28.0;
             }
@@ -554,16 +566,33 @@ pub fn layout_targets(rows: &[Row], expand_disabled: bool, state: Option<&str>) 
                     id: row.id.clone(),
                     index,
                     rect: Rect::new(
-                        popup.left + 41.0,
+                        popup.left,
                         popup.top + account_menu_item_top(row, index),
-                        popup.right - 15.0,
-                        popup.top + account_menu_item_top(row, index) + 30.0,
+                        popup.right,
+                        popup.top + account_menu_item_top(row, index) + 32.0,
                     ),
                 });
             }
         }
+    } else if state == Some("add-menu") {
+        let popup = popup_rect(rows, expand_disabled, "add-menu", height).unwrap();
+        targets.push(HitTarget::MenuSurface { rect: popup });
+        for (index, provider) in [Some("claude"), Some("codex"), None]
+            .into_iter()
+            .enumerate()
+        {
+            let top = popup.top + 36.0 + index as f32 * 27.0;
+            targets.push(HitTarget::AddChoice {
+                provider: provider.map(str::to_owned),
+                rect: Rect::new(popup.left, top, popup.right, top + 27.0),
+            });
+        }
     } else if state.is_some_and(|v| v.starts_with("confirm-delete:")) {
         let top = (height - 193.0).round() / 2.0;
+        // A modal consumes hits outside its buttons instead of activating rows below.
+        targets.push(HitTarget::MenuSurface {
+            rect: Rect::new(0.0, 0.0, WIDTH, height),
+        });
         targets.push(HitTarget::Dialog {
             action: DialogAction::ConfirmDelete,
             rect: Rect::new(16.0, top + 129.0, 180.0, top + 193.0),
@@ -573,16 +602,16 @@ pub fn layout_targets(rows: &[Row], expand_disabled: bool, state: Option<&str>) 
             rect: Rect::new(180.0, top + 129.0, 344.0, top + 193.0),
         });
     } else if state == Some("quit") {
-        let top = popup_rect(rows, expand_disabled, "quit", height)
-            .unwrap()
-            .top;
+        let popup = popup_rect(rows, expand_disabled, "quit", height).unwrap();
+        let top = popup.top;
+        targets.push(HitTarget::MenuSurface { rect: popup });
         targets.push(HitTarget::Quit {
             action: QuitAction::TrayOnly,
-            rect: Rect::new(168.0, top + 36.0, 336.0, top + 62.0),
+            rect: Rect::new(popup.left, top + 36.0, popup.right, top + 63.0),
         });
         targets.push(HitTarget::Quit {
             action: QuitAction::TrayAndProxy,
-            rect: Rect::new(168.0, top + 64.0, 336.0, top + 90.0),
+            rect: Rect::new(popup.left, top + 63.0, popup.right, popup.bottom),
         });
     }
     targets
@@ -1214,6 +1243,11 @@ mod tests {
             "menu:cx-active:999",
             "menu:cx-active:bad",
             "menu:cx-active:0:extra",
+            "menu:cx-active:0:",
+            "menu:cx-active:pending",
+            "menu:cx-active:0:pending:extra",
+            "menu:cx-active:0:pending:",
+            "menu:cx-active:0:pending:pending",
         ] {
             assert!(menu_target(&rows, state).is_none());
             let height = state_height(&rows, false, Some(state));
@@ -1229,6 +1263,191 @@ mod tests {
             );
         }
         assert!(menu_target(&[], "menu:missing:0").is_none());
+    }
+
+    #[test]
+    fn pending_menu_selection_preserves_exact_row_index_and_layout() {
+        let rows = disclosure_rows();
+        for row in &rows {
+            for index in 0..actions::menu_items(row).len() {
+                let state = format!("menu:{}:{index}", row.id);
+                let pending = format!("{state}:pending");
+                assert_eq!(menu_target(&rows, &pending), Some((row, index)));
+                assert_eq!(
+                    layout_targets(&rows, false, Some(&pending)),
+                    layout_targets(&rows, false, Some(&state))
+                );
+                assert_eq!(
+                    state_height(&rows, false, Some(&pending)),
+                    state_height(&rows, false, Some(&state))
+                );
+            }
+        }
+        assert!(menu_target(&rows, "menu:missing:0:pending").is_none());
+        assert!(menu_target(&rows, "menu:cx-active:999:pending").is_none());
+    }
+
+    /// Exercise padding, icon/checkbox, text, right edge, and vertical insets.
+    /// Shared horizontal row boundaries belong to the later painted item.
+    fn assert_full_item_hits(targets: &[HitTarget], target: &HitTarget) {
+        let rect = target.rect();
+        let middle = (rect.top + rect.bottom) / 2.0;
+        for (x, y) in [
+            (rect.left, middle),
+            (rect.left + 1.0, middle),
+            (rect.left + 8.0, middle),
+            (rect.left + 22.0, middle),
+            ((rect.left + rect.right) / 2.0, middle),
+            (rect.right - 1.0, middle),
+            (rect.right - 0.01, middle),
+            (rect.left + 1.0, rect.top + 0.25),
+            (rect.right - 1.0, rect.bottom - 0.25),
+        ] {
+            assert_eq!(hit_test(targets, x, y), Some(target), "at ({x}, {y})");
+        }
+    }
+
+    #[test]
+    fn every_account_menu_item_hits_full_width_including_checkbox_and_padding() {
+        let mut rows = rows();
+        rows.extend(disclosure_rows().into_iter().map(|mut row| {
+            row.id = format!("disclosure-{}", row.id);
+            row
+        }));
+        let mut paused = rows[0].clone();
+        paused.id = "paused".into();
+        paused.user_chip = "일시정지".into();
+        rows.push(paused);
+        for row in &rows {
+            for pending in [false, true] {
+                let state = format!("menu:{}:0{}", row.id, if pending { ":pending" } else { "" });
+                let targets = layout_targets(&rows, false, Some(&state));
+                let popup = popup_rect(
+                    &rows,
+                    false,
+                    &state,
+                    state_height(&rows, false, Some(&state)),
+                )
+                .unwrap();
+                let items = targets
+                    .iter()
+                    .filter(|target| matches!(target, HitTarget::MenuItem { .. }));
+                assert_eq!(items.clone().count(), actions::menu_items(row).len());
+                for target in items {
+                    let rect = target.rect();
+                    assert_eq!((rect.left, rect.right), (popup.left, popup.right));
+                    assert_eq!(rect.bottom - rect.top, 32.0);
+                    assert_full_item_hits(&targets, target);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn empty_account_footer_popups_and_every_item_fit_final_window() {
+        for state in ["add-menu", "quit"] {
+            let height = state_height(&[], false, Some(state));
+            let popup = popup_rect(&[], false, state, height).unwrap();
+            assert!(popup.top >= 0.0 && popup.bottom <= height - FOOTER_HEIGHT);
+            let targets = layout_targets(&[], false, Some(state));
+            let items: Vec<_> = targets
+                .iter()
+                .filter(|t| matches!(t, HitTarget::AddChoice { .. } | HitTarget::Quit { .. }))
+                .collect();
+            assert_eq!(items.len(), if state == "add-menu" { 3 } else { 2 });
+            for item in items {
+                let rect = item.rect();
+                assert!(rect.top >= 0.0 && rect.bottom <= height);
+                assert_full_item_hits(&targets, item);
+            }
+        }
+    }
+
+    #[test]
+    fn add_and_quit_items_hit_full_popup_width_without_header_clickthrough() {
+        let rows = disclosure_rows();
+        for state in ["add-menu", "quit"] {
+            let targets = layout_targets(&rows, false, Some(state));
+            let popup =
+                popup_rect(&rows, false, state, state_height(&rows, false, Some(state))).unwrap();
+            assert!(matches!(
+                hit_test(&targets, popup.left + 1.0, popup.top + 1.0),
+                Some(HitTarget::MenuSurface { .. })
+            ));
+            let items = targets.iter().filter(|target| {
+                matches!(target, HitTarget::AddChoice { .. } | HitTarget::Quit { .. })
+            });
+            assert_eq!(
+                items.clone().count(),
+                if state == "add-menu" { 3 } else { 2 }
+            );
+            for (index, target) in items.enumerate() {
+                let rect = target.rect();
+                assert_eq!((rect.left, rect.right), (popup.left, popup.right));
+                assert!(rect.top >= popup.top && rect.bottom <= popup.bottom);
+                assert_full_item_hits(&targets, target);
+                // Sample the actual rendered label row, not only the declared target.
+                assert_eq!(
+                    hit_test(
+                        &targets,
+                        popup.left + 16.0,
+                        popup.top + 38.0 + index as f32 * 27.0
+                    ),
+                    Some(target)
+                );
+                if let HitTarget::AddChoice { provider, .. } = target {
+                    assert_eq!(
+                        provider.as_deref(),
+                        [Some("claude"), Some("codex"), None][index]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn footer_disclosure_and_delete_buttons_hit_whole_controls() {
+        let rows = disclosure_rows();
+        for state in [
+            "list",
+            "expanded:claude",
+            "expanded:codex",
+            "login:codex",
+            "confirm-delete:cx-active",
+        ] {
+            let targets = layout_targets(&rows, false, Some(state));
+            let mut footers = 0;
+            let mut disclosures = 0;
+            let mut buttons = 0;
+            for target in &targets {
+                match target {
+                    HitTarget::Footer { .. } if !state.starts_with("confirm-delete:") => {
+                        footers += 1;
+                        assert_full_item_hits(&targets, target);
+                    }
+                    HitTarget::Disclosure { rect, .. } if !state.starts_with("confirm-delete:") => {
+                        disclosures += 1;
+                        assert_eq!((rect.left, rect.right), (16.0, FLYOUT_WIDTH - 16.0));
+                        assert_full_item_hits(&targets, target);
+                    }
+                    HitTarget::Dialog { .. } => {
+                        buttons += 1;
+                        assert_full_item_hits(&targets, target);
+                    }
+                    _ => {}
+                }
+            }
+            if state.starts_with("confirm-delete:") {
+                assert_eq!(buttons, 2);
+                assert!(matches!(
+                    hit_test(&targets, 20.0, 20.0),
+                    Some(HitTarget::MenuSurface { .. })
+                ));
+            } else {
+                assert_eq!(footers, if state.starts_with("login:") { 3 } else { 4 });
+                assert_eq!(disclosures, if state.starts_with("login:") { 0 } else { 2 });
+            }
+        }
     }
 
     #[test]

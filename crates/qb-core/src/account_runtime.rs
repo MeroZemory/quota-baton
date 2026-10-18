@@ -61,7 +61,8 @@ const MAX_RELEASE: StdDuration = StdDuration::from_secs(5);
 const DEFAULT_RATE_HOLD_SECS: u64 = 60;
 
 struct PacingWaiter {
-    queued_at: Instant,
+    deadline: Instant,
+    forced: std::sync::atomic::AtomicBool,
     notify: Notify,
     cancelled: std::sync::atomic::AtomicBool,
 }
@@ -75,6 +76,9 @@ struct PacingState {
     release_interval: StdDuration,
     last_release: Option<Instant>,
     last_429: Option<Instant>,
+    step_decay_at: Option<Instant>,
+    step_decay_interval: StdDuration,
+    release_decay_at: Option<Instant>,
     waiting: VecDeque<Arc<PacingWaiter>>,
     release_task: bool,
     wake: Arc<Notify>,
@@ -91,6 +95,9 @@ impl Default for PacingState {
             release_interval: MIN_RELEASE,
             last_release: None,
             last_429: None,
+            step_decay_at: None,
+            step_decay_interval: StdDuration::from_secs(1),
+            release_decay_at: None,
             waiting: VecDeque::new(),
             release_task: false,
             wake: Arc::new(Notify::new()),
@@ -113,6 +120,7 @@ pub enum Admission {
 }
 
 pub struct AdmissionGuard {
+    admission: Admission,
     runtime: Weak<AccountRuntime>,
     id: String,
 }
@@ -132,6 +140,12 @@ impl Drop for AdmissionCancellation {
         {
             state.wake.notify_one();
         }
+    }
+}
+
+impl AdmissionGuard {
+    pub fn forced(&self) -> bool {
+        self.admission == Admission::Forced
     }
 }
 
@@ -227,12 +241,14 @@ impl AccountRuntime {
         let mut states = self.pacing.lock().unwrap_or_else(|e| e.into_inner());
         let state = Self::pacing_state(&mut states, id);
         Self::decay_pacing(state, now);
-        let open = state.backoff_until.is_none_or(|until| now >= until)
-            && state
-                .last_release
-                .is_none_or(|last| now.saturating_duration_since(last) >= state.release_interval)
-            && state.waiting.is_empty();
-        if open {
+        let pacing = state.step > 0 || state.backoff_until.is_some();
+        let open = state.waiting.is_empty()
+            && (!pacing
+                || (state.backoff_until.is_none_or(|until| now >= until)
+                    && state.last_release.is_none_or(|last| {
+                        now.saturating_duration_since(last) >= state.release_interval
+                    })));
+        if open && pacing {
             state.last_release = Some(now);
         }
         open
@@ -254,20 +270,30 @@ impl AccountRuntime {
         if state.backoff_until.is_some_and(|until| until <= now) {
             state.backoff_until = None;
         }
-        if let Some(last) = state.last_429 {
-            let quiet = now.saturating_duration_since(last);
-            let drops = (quiet.as_secs() / 60) as u32;
-            if drops > 0 {
-                state.step = state
-                    .step
-                    .saturating_sub(drops.min(state.step as u32) as u8);
-                let mut interval = state.release_interval;
-                for _ in 0..drops {
-                    interval = interval.mul_f64(0.75).max(MIN_RELEASE);
-                }
-                state.release_interval = interval;
-                state.last_429 = Some(last + StdDuration::from_secs(u64::from(drops) * 60));
-            }
+        if state.last_429.is_none() {
+            return;
+        }
+        // A window containing a 429 is not quiet. Each following full quiet
+        // window decays one step; successful responses do not reset this clock.
+        while state.step > 0 && state.step_decay_at.is_some_and(|at| at <= now) {
+            state.step -= 1;
+            state.step_decay_at = state.step_decay_at.map(|at| at + state.step_decay_interval);
+        }
+        if state.step == 0 {
+            state.step_decay_at = None;
+        }
+        // Release spacing has its own sixty-second quiet clock. Never advance
+        // last_429 while lazily applying either kind of decay.
+        while state.release_interval > MIN_RELEASE
+            && state.release_decay_at.is_some_and(|at| at <= now)
+        {
+            state.release_interval = state.release_interval.mul_f64(0.75).max(MIN_RELEASE);
+            state.release_decay_at = state
+                .release_decay_at
+                .map(|at| at + StdDuration::from_secs(60));
+        }
+        if state.release_interval == MIN_RELEASE {
+            state.release_decay_at = None;
         }
     }
 
@@ -314,6 +340,9 @@ impl AccountRuntime {
             state.window_had_429 = true;
         }
         state.last_429 = Some(now);
+        state.step_decay_interval = delay;
+        state.step_decay_at = state.backoff_until.map(|until| until + delay);
+        state.release_decay_at = Some(now + StdDuration::from_secs(60));
         state.wake.notify_one();
         PacingSnapshot {
             rate_backoff_until: state.backoff_until,
@@ -324,8 +353,19 @@ impl AccountRuntime {
     }
 
     pub async fn admit(self: &Arc<Self>, id: &str) -> AdmissionGuard {
+        let deadline =
+            Instant::now() + StdDuration::from_secs(self.rate_hold_secs.load(Ordering::Relaxed));
+        self.admit_until(id, deadline).await
+    }
+
+    /// The request budget also bounds later retries. Normal releases stay FIFO;
+    /// a forced budget expiry bypasses pacing but still updates its release clock.
+    pub async fn admit_until(self: &Arc<Self>, id: &str, deadline: Instant) -> AdmissionGuard {
+        let local_deadline =
+            Instant::now() + StdDuration::from_secs(self.rate_hold_secs.load(Ordering::Relaxed));
         let waiter = Arc::new(PacingWaiter {
-            queued_at: Instant::now(),
+            deadline: deadline.min(local_deadline),
+            forced: std::sync::atomic::AtomicBool::new(false),
             notify: Notify::new(),
             cancelled: std::sync::atomic::AtomicBool::new(false),
         });
@@ -341,13 +381,17 @@ impl AccountRuntime {
                         && state.last_release.is_none_or(|last| {
                             now.saturating_duration_since(last) >= state.release_interval
                         })));
-            if open {
+            if open || now >= waiter.deadline {
+                waiter
+                    .forced
+                    .store(now >= waiter.deadline, Ordering::Release);
                 if pacing {
                     state.last_release = Some(now);
                 }
                 true
             } else {
                 state.waiting.push_back(waiter.clone());
+                state.wake.notify_one(); // a later arrival can have less request budget
                 if !state.release_task {
                     state.release_task = true;
                     let runtime = Arc::clone(self);
@@ -369,6 +413,11 @@ impl AccountRuntime {
             drop(cancellation);
         }
         AdmissionGuard {
+            admission: if waiter.forced.load(Ordering::Acquire) {
+                Admission::Forced
+            } else {
+                Admission::Released
+            },
             runtime: Arc::downgrade(self),
             id: id.to_owned(),
         }
@@ -388,12 +437,16 @@ impl AccountRuntime {
                 {
                     state.waiting.pop_front();
                 }
-                let Some(waiter) = state.waiting.front().cloned() else {
+                let selected = state
+                    .waiting
+                    .iter()
+                    .position(|w| !w.cancelled.load(Ordering::Acquire) && now >= w.deadline)
+                    .unwrap_or(0);
+                let Some(waiter) = state.waiting.get(selected).cloned() else {
                     state.release_task = false;
                     break;
                 };
-                let deadline = waiter.queued_at
-                    + StdDuration::from_secs(self.rate_hold_secs.load(Ordering::Relaxed));
+                let deadline = waiter.deadline;
                 let pacing = state.step > 0 || state.backoff_until.is_some();
                 let gate = if pacing {
                     state.backoff_until.unwrap_or(now).max(
@@ -406,7 +459,7 @@ impl AccountRuntime {
                 };
                 if now >= gate || now >= deadline {
                     let forced = now >= deadline;
-                    state.waiting.pop_front();
+                    state.waiting.remove(selected);
                     if pacing {
                         state.last_release = Some(now);
                     }
@@ -416,8 +469,8 @@ impl AccountRuntime {
                 }
             };
             if let Some(waiter) = wait {
+                waiter.forced.store(done, Ordering::Release);
                 waiter.notify.notify_one();
-                let _ = done;
                 continue;
             }
             let sleep_for = {
@@ -434,17 +487,15 @@ impl AccountRuntime {
                                 .last_release
                                 .map_or(now, |last| last + state.release_interval),
                         )
-                        .min(state.waiting.front().map_or(
-                            now + StdDuration::from_secs(
-                                self.rate_hold_secs.load(Ordering::Relaxed),
-                            ),
-                            |w| {
-                                w.queued_at
-                                    + StdDuration::from_secs(
-                                        self.rate_hold_secs.load(Ordering::Relaxed),
-                                    )
-                            },
-                        ))
+                        .min(
+                            state
+                                .waiting
+                                .iter()
+                                .filter(|w| !w.cancelled.load(Ordering::Acquire))
+                                .map(|w| w.deadline)
+                                .min()
+                                .unwrap_or(now),
+                        )
                 } else {
                     now
                 };
@@ -989,5 +1040,399 @@ mod pool_tests {
                 "codex":{"eligible":0,"cooling":{"quota":1,"store_error":1},"unavailable":1}
             })
         );
+    }
+}
+
+// Tests-only addition for crates/qb-core/src/account_runtime.rs.
+// Append after the staged production candidate; do not replace production code.
+#[cfg(test)]
+mod r1_rate_tests {
+    use super::*;
+    use futures_util::poll;
+    use std::task::Poll;
+
+    const ID: &str = "synthetic-r1-rate";
+
+    struct Fixture {
+        runtime: Arc<AccountRuntime>,
+        // Declared last: runtime/store/observability drop before the home.
+        _home: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../.sandbox/r1-rate-test-fixtures");
+            std::fs::create_dir_all(&base).unwrap();
+            let home = tempfile::tempdir_in(base).unwrap();
+            let store = Arc::new(AccountStore::acquire(home.path()).unwrap());
+            let obs = Arc::new(Observability::new(home.path(), None).unwrap());
+            Self {
+                runtime: AccountRuntime::new(store, obs, 1.0),
+                _home: home,
+            }
+        }
+    }
+
+    fn at(start: Instant, seconds: u64) -> Instant {
+        start + StdDuration::from_secs(seconds)
+    }
+
+    // Two non-quiet windows: [0,2] and [2,6]. Quiet step windows then
+    // end at 10 and 14; independent spacing decay starts at 2+60=62.
+    fn two_windows(runtime: &AccountRuntime, start: Instant) {
+        let first = runtime.observe_429_at(ID, start, start, None, 1.0);
+        assert_eq!(first.rate_step, 1);
+        assert_eq!(first.rate_backoff_until, Some(at(start, 2)));
+        assert_eq!(first.rate_release_interval, MIN_RELEASE);
+        let second = runtime.observe_429_at(ID, at(start, 2), at(start, 2), None, 1.0);
+        assert_eq!(second.rate_step, 2);
+        assert_eq!(second.rate_backoff_until, Some(at(start, 6)));
+        assert_eq!(second.rate_release_interval, StdDuration::from_millis(500));
+    }
+
+    #[test]
+    fn r1_step_decays_at_full_quiet_backoff_boundaries_not_sixty_seconds() {
+        let f = Fixture::new();
+        let start = Instant::now();
+        two_windows(&f.runtime, start);
+        let window_end = f.runtime.pacing_snapshot_at(ID, at(start, 6));
+        assert!(window_end.rate_backoff_until.is_none());
+        assert_eq!(
+            window_end.rate_step, 2,
+            "the 429-bearing window was not quiet"
+        );
+        assert_eq!(
+            f.runtime
+                .pacing_snapshot_at(ID, at(start, 10) - StdDuration::from_nanos(1))
+                .rate_step,
+            2
+        );
+        let first_quiet = f.runtime.pacing_snapshot_at(ID, at(start, 10));
+        assert_eq!(
+            first_quiet.rate_step, 1,
+            "one complete quiet backoff interval"
+        );
+        assert_eq!(
+            first_quiet.rate_release_interval,
+            StdDuration::from_millis(500)
+        );
+        assert_eq!(
+            f.runtime
+                .pacing_snapshot_at(ID, at(start, 14) - StdDuration::from_nanos(1))
+                .rate_step,
+            1
+        );
+        let second_quiet = f.runtime.pacing_snapshot_at(ID, at(start, 14));
+        assert_eq!(second_quiet.rate_step, 0);
+        assert_eq!(
+            second_quiet.rate_release_interval,
+            StdDuration::from_millis(500)
+        );
+    }
+
+    #[test]
+    fn r1_step_snapshots_do_not_move_release_decay_anchor_or_double_apply_decay() {
+        let f = Fixture::new();
+        let start = Instant::now();
+        two_windows(&f.runtime, start);
+        assert_eq!(f.runtime.pacing_snapshot_at(ID, at(start, 14)).rate_step, 0);
+        assert_eq!(
+            f.runtime
+                .pacing_snapshot_at(ID, at(start, 62) - StdDuration::from_nanos(1))
+                .rate_release_interval,
+            StdDuration::from_millis(500)
+        );
+        let first = f.runtime.pacing_snapshot_at(ID, at(start, 62));
+        assert_eq!(first.rate_release_interval, StdDuration::from_millis(375));
+        assert_eq!(
+            f.runtime.pacing_snapshot_at(ID, at(start, 62)),
+            first,
+            "lazy decay is idempotent"
+        );
+        assert_eq!(
+            f.runtime
+                .pacing_snapshot_at(ID, at(start, 122))
+                .rate_release_interval,
+            StdDuration::from_micros(281_250)
+        );
+        assert_eq!(
+            f.runtime
+                .pacing_snapshot_at(ID, at(start, 182))
+                .rate_release_interval,
+            MIN_RELEASE
+        );
+        let states = f.runtime.pacing.lock().unwrap();
+        assert_eq!(
+            states[ID].last_429,
+            Some(at(start, 2)),
+            "a decay is not another 429"
+        );
+    }
+
+    #[test]
+    fn r1_late_inflight_429_extends_window_and_restarts_both_quiet_clocks() {
+        let f = Fixture::new();
+        let start = Instant::now();
+        two_windows(&f.runtime, start);
+        // Sent before this window was set: it may extend the gate but must not
+        // count as a new step. The new quiet boundaries are 13,17 and 65.
+        let late = f.runtime.observe_429_at(ID, start, at(start, 5), None, 1.0);
+        assert_eq!(late.rate_step, 2);
+        assert_eq!(late.rate_backoff_until, Some(at(start, 9)));
+        assert_eq!(f.runtime.pacing_snapshot_at(ID, at(start, 10)).rate_step, 2);
+        assert_eq!(
+            f.runtime
+                .pacing_snapshot_at(ID, at(start, 13) - StdDuration::from_nanos(1))
+                .rate_step,
+            2
+        );
+        assert_eq!(f.runtime.pacing_snapshot_at(ID, at(start, 13)).rate_step, 1);
+        assert_eq!(f.runtime.pacing_snapshot_at(ID, at(start, 17)).rate_step, 0);
+        assert_eq!(
+            f.runtime
+                .pacing_snapshot_at(ID, at(start, 62))
+                .rate_release_interval,
+            StdDuration::from_millis(500)
+        );
+        assert_eq!(
+            f.runtime
+                .pacing_snapshot_at(ID, at(start, 65))
+                .rate_release_interval,
+            StdDuration::from_millis(375)
+        );
+    }
+
+    #[test]
+    fn r1_quiet_step_zero_removes_spacing_before_release_interval_reaches_floor() {
+        let f = Fixture::new();
+        let start = Instant::now();
+        two_windows(&f.runtime, start);
+        let now = at(start, 14);
+        let snapshot = f.runtime.pacing_snapshot_at(ID, now);
+        assert_eq!(snapshot.rate_step, 0);
+        assert_eq!(
+            snapshot.rate_release_interval,
+            StdDuration::from_millis(500)
+        );
+        for _ in 0..32 {
+            assert!(
+                f.runtime.admit_at(ID, now),
+                "step zero must not retain a spacing gate"
+            );
+        }
+    }
+
+    fn queue_deadlines(runtime: &AccountRuntime) -> Vec<Instant> {
+        runtime.pacing.lock().unwrap()[ID]
+            .waiting
+            .iter()
+            .map(|w| w.deadline)
+            .collect()
+    }
+
+    fn last_release(runtime: &AccountRuntime) -> Option<Instant> {
+        runtime.pacing.lock().unwrap()[ID].last_release
+    }
+
+    fn block(runtime: &AccountRuntime) {
+        runtime.observe_429(ID, Some(StdDuration::from_secs(30)));
+    }
+
+    // Open the backoff only; deliberately leave last_release intact so the
+    // real release_loop still enforces normal/forced release spacing.
+    fn open_backoff(runtime: &AccountRuntime) {
+        let mut states = runtime.pacing.lock().unwrap();
+        let state = states.get_mut(ID).unwrap();
+        state.backoff_until = None;
+        state.wake.notify_one();
+    }
+
+    #[tokio::test]
+    async fn r1_admit_until_uses_minimum_of_caller_deadline_and_local_cap() {
+        let f = Fixture::new();
+        block(&f.runtime);
+        f.runtime.set_rate_hold_secs(1);
+        let before = Instant::now();
+        let mut local = Box::pin(f.runtime.admit_until(ID, at(before, 20)));
+        assert!(poll!(local.as_mut()).is_pending());
+        let after = Instant::now();
+        let queued = queue_deadlines(&f.runtime);
+        assert_eq!(queued.len(), 1);
+        assert!(queued[0] >= at(before, 1) && queued[0] <= at(after, 1));
+        drop(local);
+        let caller = Instant::now() + StdDuration::from_millis(100);
+        let mut shorter = Box::pin(f.runtime.admit_until(ID, caller));
+        assert!(poll!(shorter.as_mut()).is_pending());
+        assert_eq!(*queue_deadlines(&f.runtime).last().unwrap(), caller);
+        drop(shorter);
+        tokio::task::yield_now().await;
+        assert!(queue_deadlines(&f.runtime).is_empty());
+        assert!(!f.runtime.pacing.lock().unwrap()[ID].release_task);
+        assert!(last_release(&f.runtime).is_none());
+    }
+
+    #[tokio::test]
+    async fn r1_retries_reuse_one_absolute_budget_and_expired_retry_is_immediate() {
+        let f = Fixture::new();
+        block(&f.runtime);
+        open_backoff(&f.runtime);
+        let deadline = Instant::now() + StdDuration::from_millis(120);
+        let first = f.runtime.admit_until(ID, deadline).await;
+        assert!(!first.forced());
+        block(&f.runtime); // A retry sees a new 429, not a new request budget.
+        let mut retry = Box::pin(f.runtime.admit_until(ID, deadline));
+        assert!(poll!(retry.as_mut()).is_pending());
+        assert_eq!(*queue_deadlines(&f.runtime).last().unwrap(), deadline);
+        let forced = tokio::time::timeout(StdDuration::from_millis(600), retry)
+            .await
+            .expect("retry renewed the total request budget");
+        assert!(forced.forced());
+        assert!(last_release(&f.runtime).unwrap() >= deadline);
+        block(&f.runtime);
+        let mut expired = Box::pin(f.runtime.admit_until(ID, deadline));
+        let Poll::Ready(final_admission) = poll!(expired.as_mut()) else {
+            panic!("already exhausted absolute budget was queued again");
+        };
+        assert!(final_admission.forced());
+        assert!(queue_deadlines(&f.runtime).is_empty());
+    }
+
+    #[tokio::test]
+    async fn r1_forced_admission_updates_shared_clock_before_next_normal_release() {
+        let f = Fixture::new();
+        block(&f.runtime);
+        open_backoff(&f.runtime);
+        let before = Instant::now();
+        let forced = f
+            .runtime
+            .admit_until(ID, before - StdDuration::from_millis(1))
+            .await;
+        assert!(forced.forced());
+        let stamp = last_release(&f.runtime).expect("forced release did not update the clock");
+        assert!(stamp >= before && stamp <= Instant::now());
+        let interval = f.runtime.pacing_snapshot(ID).rate_release_interval;
+        assert!(
+            !f.runtime
+                .admit_at(ID, stamp + interval - StdDuration::from_nanos(1))
+        );
+        assert!(f.runtime.admit_at(ID, stamp + interval));
+    }
+
+    #[tokio::test]
+    async fn r1_normal_waiters_stay_fifo_and_cancelled_middle_consumes_no_release() {
+        let f = Fixture::new();
+        block(&f.runtime);
+        let deadline = at(Instant::now(), 5);
+        let mut first = Box::pin(f.runtime.admit_until(ID, deadline));
+        let mut cancelled = Box::pin(f.runtime.admit_until(ID, deadline));
+        let mut last = Box::pin(f.runtime.admit_until(ID, deadline));
+        assert!(poll!(first.as_mut()).is_pending());
+        assert!(poll!(cancelled.as_mut()).is_pending());
+        assert!(poll!(last.as_mut()).is_pending());
+        assert_eq!(queue_deadlines(&f.runtime).len(), 3);
+        drop(cancelled);
+        open_backoff(&f.runtime);
+        let first_guard = tokio::time::timeout(StdDuration::from_millis(200), first)
+            .await
+            .unwrap();
+        assert!(!first_guard.forced());
+        let first_stamp = last_release(&f.runtime).unwrap();
+        assert!(
+            poll!(last.as_mut()).is_pending(),
+            "normal tail overtook release spacing"
+        );
+        let last_guard = tokio::time::timeout(StdDuration::from_millis(700), last)
+            .await
+            .unwrap();
+        assert!(!last_guard.forced());
+        let last_stamp = last_release(&f.runtime).unwrap();
+        let gap = last_stamp.duration_since(first_stamp);
+        assert!(
+            gap >= MIN_RELEASE && gap < MIN_RELEASE * 2,
+            "cancelled middle consumed a release slot: {gap:?}"
+        );
+        assert!(queue_deadlines(&f.runtime).is_empty());
+    }
+
+    #[tokio::test]
+    async fn r1_earlier_tail_deadline_wakes_sleeping_head_without_normal_fifo_bypass() {
+        let f = Fixture::new();
+        block(&f.runtime);
+        let mut head = Box::pin(f.runtime.admit_until(ID, at(Instant::now(), 5)));
+        assert!(poll!(head.as_mut()).is_pending());
+        // Let the actual release task sleep on the head's later deadline.
+        tokio::task::yield_now().await;
+        let deadline = Instant::now() + StdDuration::from_millis(80);
+        let mut tail = Box::pin(f.runtime.admit_until(ID, deadline));
+        assert!(poll!(tail.as_mut()).is_pending());
+        let tail_guard = tokio::time::timeout(StdDuration::from_millis(600), tail)
+            .await
+            .expect("earlier tail failed to wake the head's release-loop sleep");
+        assert!(tail_guard.forced());
+        let forced_stamp = last_release(&f.runtime).unwrap();
+        assert!(forced_stamp >= deadline);
+        assert!(
+            poll!(head.as_mut()).is_pending(),
+            "head bypassed the still-closed gate"
+        );
+        assert_eq!(queue_deadlines(&f.runtime).len(), 1);
+        open_backoff(&f.runtime);
+        let head_guard = tokio::time::timeout(StdDuration::from_millis(700), head)
+            .await
+            .unwrap();
+        assert!(!head_guard.forced());
+        assert!(
+            last_release(&f.runtime)
+                .unwrap()
+                .duration_since(forced_stamp)
+                >= MIN_RELEASE
+        );
+        assert!(queue_deadlines(&f.runtime).is_empty());
+    }
+
+    #[tokio::test]
+    async fn r1_cancelled_earlier_tail_neither_forces_nor_updates_release_clock() {
+        let f = Fixture::new();
+        block(&f.runtime);
+        let mut head = Box::pin(f.runtime.admit_until(ID, at(Instant::now(), 5)));
+        assert!(poll!(head.as_mut()).is_pending());
+        let mut cancelled = Box::pin(
+            f.runtime
+                .admit_until(ID, Instant::now() + StdDuration::from_millis(30)),
+        );
+        assert!(poll!(cancelled.as_mut()).is_pending());
+        drop(cancelled);
+        tokio::time::sleep(StdDuration::from_millis(60)).await;
+        assert!(
+            last_release(&f.runtime).is_none(),
+            "cancelled deadline created a phantom forced send"
+        );
+        assert!(poll!(head.as_mut()).is_pending());
+        open_backoff(&f.runtime);
+        let head_guard = tokio::time::timeout(StdDuration::from_millis(200), head)
+            .await
+            .unwrap();
+        assert!(!head_guard.forced());
+        assert!(queue_deadlines(&f.runtime).is_empty());
+    }
+
+    #[tokio::test]
+    async fn r1_unpaced_admit_until_never_queues_or_starts_spacing() {
+        let f = Fixture::new();
+        let deadline = at(Instant::now(), 5);
+        let mut guards = Vec::new();
+        for _ in 0..32 {
+            let mut future = Box::pin(f.runtime.admit_until(ID, deadline));
+            let Poll::Ready(guard) = poll!(future.as_mut()) else {
+                panic!("unpaced account was queued or concurrency-limited");
+            };
+            assert!(!guard.forced());
+            guards.push(guard); // Keep all admissions live concurrently.
+        }
+        assert!(queue_deadlines(&f.runtime).is_empty());
+        assert!(last_release(&f.runtime).is_none());
+        assert!(!f.runtime.pacing.lock().unwrap()[ID].release_task);
+        assert_eq!(guards.len(), 32);
     }
 }

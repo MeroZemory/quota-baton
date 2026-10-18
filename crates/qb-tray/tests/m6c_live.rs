@@ -657,6 +657,67 @@ fn m6c_live_spawned_core_clicks_and_captures() -> anyhow::Result<()> {
     )?;
     click_target(hwnd, &rows, "list", row_menu, WM_RBUTTONUP)?;
     let menu_state = format!("menu:{last_id}");
+    if rows
+        .iter()
+        .any(|row| row.id == last_id && row.provider == "Codex")
+    {
+        let row = rows.iter().find(|row| row.id == last_id).unwrap();
+        let index = qb_tray::actions::menu_items(row)
+            .iter()
+            .position(|i| *i == qb_tray::actions::MenuItem::ToggleCredits)
+            .unwrap();
+        let rect = target(
+            &rows,
+            &menu_state,
+            |t| matches!(t, qb_tray::HitTarget::MenuItem { id, index: n, .. } if id == &last_id && *n == index),
+        )?;
+        // Click the checkbox glyph itself (not the label or target midpoint).
+        let glyph = qb_tray::Rect {
+            left: 153.0,
+            right: 169.0,
+            top: rect.top + 8.0,
+            bottom: rect.top + 24.0,
+        };
+        fs::write(&delay_file, b"delay")?;
+        click_target(hwnd, &rows, &menu_state, glyph, WM_LBUTTONUP)?;
+        painted(hwnd)?;
+        thread::sleep(Duration::from_millis(250));
+        responsive(hwnd)?;
+        let pending = latest_shell(&shell_log)?;
+        anyhow::ensure!(
+            pending["state"] == "menu" && pending["menu_pending"] == true,
+            "checkbox pending state was not painted: {pending}"
+        );
+        // A repeated glyph click while pending must not enqueue a second toggle.
+        click_target(hwnd, &rows, &menu_state, glyph, WM_LBUTTONUP)?;
+        capture_checked(hwnd, &evidence.join("credits-pending.png"))?;
+        fs::remove_file(&delay_file)?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(12);
+        loop {
+            responsive(hwnd)?;
+            let state = admin_json(&home, "/admin/v1/state")?;
+            let changed = state["accounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["id"] == last_id && a["allow_credits"] == true);
+            let shell = latest_shell(&shell_log)?;
+            if changed
+                && shell["state"] == "menu"
+                && shell["menu_checked"] == true
+                && shell["menu_pending"] == false
+            {
+                rows = qb_tray::parse_state(&serde_json::to_string(&state)?)?;
+                break;
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "glyph toggle failed or menu closed: {shell}"
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+        capture_checked(hwnd, &evidence.join("credits-checked-menu-open.png"))?;
+    }
     capture_checked(hwnd, &evidence.join("row-menu.png"))?;
     fs::write(&delay_file, b"delay")?;
     let last = rows.iter().find(|row| row.id == last_id).unwrap();
