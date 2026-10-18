@@ -8,6 +8,7 @@ macro_rules! println_utf8 {
 
 mod accounts_cli;
 mod cutover;
+mod launcher_label;
 mod wire_readiness;
 
 fn print_stdout(args: std::fmt::Arguments<'_>) -> std::io::Result<()> {
@@ -39,6 +40,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Internal child launch; no core config or credentials are loaded.
+    #[command(hide = true)]
+    LaunchClient {
+        #[arg(long)]
+        command: std::path::PathBuf,
+        #[arg(long)]
+        settings: std::path::PathBuf,
+        #[arg(last = true, allow_hyphen_values = true)]
+        args: Vec<std::ffi::OsString>,
+    },
     #[command(about = "프록시를 시작합니다")]
     Serve {
         #[cfg(feature = "shape-capture")]
@@ -160,6 +171,7 @@ fn friendly_error(error: &anyhow::Error) -> String {
         "업그레이드 파일 identity/내용이 변경되었습니다. journal을 보존합니다",
         "부분 해제 journal입니다. unwire를 먼저 완료하세요",
         "PATH에서 안전한 Claude 실행 파일을 찾지 못했습니다. Claude 설치를 확인하세요",
+        "quota-baton 실행 파일 경로를 확인해 주세요",
         "Claude 전용 설정 디렉터리 접근 권한을 제한하지 못했습니다",
         "npm 디렉터리가 없습니다. Claude 설치를 확인하세요",
         "전용 Claude 홈이 이미 존재합니다. 덮어쓰지 않습니다",
@@ -327,8 +339,19 @@ async fn check_wire_preconditions(
 
 async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    if let Command::LaunchClient {
+        command,
+        settings,
+        args,
+    } = &cli.command
+    {
+        std::process::exit(launcher_label::run(command, settings, args)?);
+    }
     let home = qb_core::home()?;
     match cli.command {
+        Command::LaunchClient { .. } => {
+            unreachable!("launcher handled before core home resolution")
+        }
         Command::Serve {
             #[cfg(feature = "shape-capture")]
             capture_dir,
@@ -400,6 +423,25 @@ async fn run() -> anyhow::Result<()> {
                 observability.clone(),
                 pins.clone(),
             )?;
+            // Normal product wiring is explicit and lookup remains lazy. A
+            // synthetic home must never cause enumeration of the real profile,
+            // even when the spawned binary has its default features.
+            let synthetic_home = home
+                .components()
+                .any(|part| matches!(part,std::path::Component::Normal(name) if name==".sandbox"));
+            if config.dashboard.resolve_claude_project
+                && !cfg!(feature = "testkit")
+                && !synthetic_home
+            {
+                let projects = std::env::var_os("USERPROFILE")
+                    .map(std::path::PathBuf::from)
+                    .filter(|path| path.is_absolute())
+                    .map(|path| path.join(".claude").join("projects"));
+                relay
+                    .dashboard()
+                    .configure_claude_project_root(projects)
+                    .map_err(anyhow::Error::msg)?;
+            }
             #[cfg(debug_assertions)]
             let relay = {
                 let mut relay = relay;
