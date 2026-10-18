@@ -846,25 +846,44 @@ impl Live {
     }
     fn api(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value> {
         let token = fs::read_to_string(self.home.join("admin.token"))?;
-        self.rt.block_on(async {
-            let mut r = self
-                .client
-                .request(
-                    method.parse()?,
-                    format!("http://127.0.0.1:{}{path}", self.admin),
-                )
-                .bearer_auth(token.trim());
-            if let Some(body) = body {
-                r = r.json(&body);
+        let started = Instant::now();
+        for attempt in 0..2 {
+            let result: Result<Value> = self.rt.block_on(async {
+                let mut r = self
+                    .client
+                    .request(
+                        method.parse()?,
+                        format!("http://127.0.0.1:{}{path}", self.admin),
+                    )
+                    .timeout(Duration::from_secs(2).min(INPUT.saturating_sub(started.elapsed())))
+                    .bearer_auth(token.trim());
+                if let Some(body) = &body {
+                    r = r.json(body);
+                }
+                let response = r.send().await?;
+                ensure!(
+                    response.status().is_success(),
+                    "admin {method} {path}: {}",
+                    response.status()
+                );
+                Ok(response.json().await?)
+            });
+            // Account persistence can temporarily hold the state reader. Retry
+            // observations only, once and within the existing four-second budget.
+            // A timed-out mutation must never be duplicated by the harness.
+            if method == "GET"
+                && attempt == 0
+                && started.elapsed() < INPUT
+                && result.as_ref().is_err_and(|e| {
+                    e.downcast_ref::<reqwest::Error>()
+                        .is_some_and(|e| e.is_timeout() || e.is_connect())
+                })
+            {
+                continue;
             }
-            let response = r.send().await?;
-            ensure!(
-                response.status().is_success(),
-                "admin {method} {path}: {}",
-                response.status()
-            );
-            Ok(response.json().await?)
-        })
+            return result;
+        }
+        unreachable!("bounded observation attempts return their last result")
     }
     fn state(&self) -> Result<Value> {
         self.api("GET", "/admin/v1/state", None)
