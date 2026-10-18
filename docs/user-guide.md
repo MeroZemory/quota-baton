@@ -167,9 +167,12 @@ Codex 기본 홈이 ChatGPT 직접 로그인이거나 CPA 주소를 쓰지 않�
 
 ```powershell
 codex-qb
+claude-qb
 ```
 
 `codex-qb`로 시작한 세션만 quota-baton을 거칩니다. 기존 `codex`·`codex-ib`·`codex-mz`·`codex-cpa`는 바뀌지 않습니다.
+
+Claude는 기본적으로 `claude-qb` 명령을 만듭니다. 클라이언트 키와 연결 주소는 사용자 전용 권한의 `~/.claude-qb/settings.json`에 둡니다. `claude-qb`는 이 설정을 지정해 실행합니다. 기존 `~/.claude/settings.json`과 `claude` 명령은 바뀌지 않습니다. Claude 설정 폴더와 대화 기록은 공유하므로 두 명령에서 이어 열 수 있습니다. 먼저 일반 `claude` 명령이 PATH에 설치되어 있어야 합니다.
 
 기본 홈이 API key 방식으로 CPA에 연결된 예전 구성이라면, `wire`는 기존 방식대로 기본 홈의 연결 주소와 인증을 바꿉니다. 관련 모델 카탈로그와 CPA provider 주소도 바꿉니다. 원래 값은 journal에 보호해 둡니다.
 
@@ -179,9 +182,12 @@ codex-qb
 quota-baton.exe wire --codex-mode dedicated
 quota-baton.exe wire --codex-mode default
 quota-baton.exe wire --codex-mode none
+quota-baton.exe wire --claude-mode dedicated
+quota-baton.exe wire --claude-mode default
+quota-baton.exe wire --claude-mode none
 ```
 
-`dedicated`는 별도 홈을, `default`는 기본 홈을 사용합니다. `none`은 Codex를 연결하지 않고 Claude만 연결합니다. Claude는 이전과 같이 `settings.json`의 `ANTHROPIC_BASE_URL`과 인증 값을 바꿉니다. 그 밖의 설정은 유지합니다.
+각 provider의 `dedicated`는 별도 연결 설정을, `default`는 기존 기본 설정을 바꿉니다. `none`은 해당 provider를 연결하지 않습니다. 두 모드를 따로 고를 수 있습니다. Claude에서 `default`를 명시하면 기존 `settings.json`의 `ANTHROPIC_BASE_URL`과 인증 값을 바꾸고 나머지 설정은 유지합니다.
 
 기존 `.codex-acct` 홈은 덮어쓰지 않습니다. herdr 창에서 `codex-qb` 세션을 재시작 후 이어 열려면 그 세션 ID를 `session-homes.json`에 `~/.codex-acct/qb`로 등록해야 합니다. 이 파일은 자동으로 수정하지 않습니다.
 

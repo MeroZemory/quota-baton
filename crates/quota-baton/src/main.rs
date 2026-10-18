@@ -81,6 +81,8 @@ enum Command {
             help = "Codex 연결 모드를 선택합니다; 생략하면 자동 감지합니다"
         )]
         codex_mode: Option<String>,
+        #[arg(long, value_parser = ["default", "dedicated", "none"], help = "Claude 연결 모드를 선택합니다; 생략하면 별도 설정을 사용합니다")]
+        claude_mode: Option<String>,
         #[arg(long, help = "실제 파일을 변경합니다; 생략하면 미리보기입니다")]
         apply: bool,
         #[arg(long, help = "현재 사용자 트레이 자동 시작을 연결합니다")]
@@ -141,6 +143,13 @@ fn friendly_error(error: &anyhow::Error) -> String {
     // Only exact fixed diagnostics may pass through; parser/transport chains
     // and appended file contents must stay behind the generic safe error.
     const WIRE_DIAGNOSTICS: &[&str] = &[
+        "PATH에서 안전한 Claude 실행 파일을 찾지 못했습니다. Claude 설치를 확인하세요",
+        "Claude 전용 설정 디렉터리 접근 권한을 제한하지 못했습니다",
+        "npm 디렉터리가 없습니다. Claude 설치를 확인하세요",
+        "전용 Claude 홈이 이미 존재합니다. 덮어쓰지 않습니다",
+        "journal의 Claude 모드가 다릅니다. 먼저 unwire를 실행하세요",
+        "Claude 실행 파일이 변경되었습니다. 먼저 unwire를 실행하세요",
+        "Codex와 Claude를 모두 연결 안 함으로 선택할 수 없습니다",
         "적용하려면 client.key와 admin.token이 먼저 있어야 합니다.",
         "적용하려면 정상 상태의 코어가 실행 중이어야 합니다.",
         "설정된 데이터 포트에 연결할 수 없습니다.",
@@ -242,6 +251,7 @@ async fn check_wire_preconditions(
     home: &std::path::Path,
     options: &cutover::WireOptions,
     codex_mode: cutover::CodexMode,
+    claude_mode: cutover::ClaudeMode,
 ) -> anyhow::Result<()> {
     cutover::check_optional_preconditions(home, options)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -278,6 +288,8 @@ async fn check_wire_preconditions(
     ] {
         if provider == qb_core::accounts::Provider::Codex
             && matches!(codex_mode, cutover::CodexMode::None)
+            || provider == qb_core::accounts::Provider::Claude
+                && matches!(claude_mode, cutover::ClaudeMode::None)
         {
             continue;
         }
@@ -502,6 +514,7 @@ async fn run() -> anyhow::Result<()> {
         }
         Command::Wire {
             codex_mode,
+            claude_mode,
             apply,
             autostart,
             disable_cpa_tasks,
@@ -509,6 +522,7 @@ async fn run() -> anyhow::Result<()> {
         } => {
             let mut options = cutover::WireOptions {
                 codex_mode: codex_mode.map(|mode| mode.parse()).transpose()?,
+                claude_mode: claude_mode.map(|mode| mode.parse()).transpose()?,
                 data_port: qb_core::config::Config::load(&home)?.server.data_port,
                 autostart,
                 disable_cpa_tasks,
@@ -516,9 +530,14 @@ async fn run() -> anyhow::Result<()> {
             };
             let paths = cutover::CutoverPaths::from_environment(home.clone())?;
             let codex_mode = cutover::resolve_codex_mode(&paths, &options)?;
+            let claude_mode = cutover::resolve_claude_mode(&paths, &options)?;
+            if codex_mode == cutover::CodexMode::None && claude_mode == cutover::ClaudeMode::None {
+                anyhow::bail!("Codex와 Claude를 모두 연결 안 함으로 선택할 수 없습니다");
+            }
             options.codex_mode = Some(codex_mode);
+            options.claude_mode = Some(claude_mode);
             if apply {
-                check_wire_preconditions(&home, &options, codex_mode).await?;
+                check_wire_preconditions(&home, &options, codex_mode, claude_mode).await?;
             }
             let report = cutover::wire_with_options(&paths, apply, options)?;
             for line in report.summary {
@@ -620,6 +639,9 @@ mod r1_cpa_error_tests {
     #[test]
     fn r3_wire_prerequisites_are_actionable_but_never_echo_appended_details() {
         for message in [
+            "PATH에서 안전한 Claude 실행 파일을 찾지 못했습니다. Claude 설치를 확인하세요",
+            "Claude 전용 설정 디렉터리 접근 권한을 제한하지 못했습니다",
+            "Codex와 Claude를 모두 연결 안 함으로 선택할 수 없습니다",
             "적용하려면 정상 상태의 코어가 실행 중이어야 합니다.",
             "각 프로바이더에 적용 가능한 활성 계정이 하나 이상 필요합니다.",
             "npm 디렉터리 또는 codex.cmd가 없습니다. Codex 설치를 확인하세요",
