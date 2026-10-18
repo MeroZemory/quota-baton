@@ -685,55 +685,95 @@ fn claude_base_url(port: u16) -> String {
     format!("http://127.0.0.1:{port}")
 }
 
+fn secret_diff_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    ["token", "key", "secret", "bearer", "password", "auth"]
+        .iter()
+        .any(|word| key.contains(word))
+}
+
 fn redacted_diff_line(line: &str, secrets: &[String]) -> String {
+    fn redact_json(value: &mut Value, secret: bool) {
+        match value {
+            Value::Object(fields) => {
+                for (key, value) in fields {
+                    redact_json(value, secret || secret_diff_key(key));
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    redact_json(value, secret);
+                }
+            }
+            _ if secret && value.as_str() != Some("<client key>") => {
+                *value = Value::String("<redacted>".into());
+            }
+            _ => {}
+        }
+    }
+    fn redact_toml(item: &mut toml_edit::Item) {
+        if let Some(table) = item.as_table_like_mut() {
+            for (key, item) in table.iter_mut() {
+                if secret_diff_key(key.get()) && item.is_value() {
+                    let value = item.as_value_mut().expect("value checked");
+                    if value.as_str() != Some("<client key>") {
+                        let decor = value.decor().clone();
+                        *value = toml_edit::Value::from("<redacted>");
+                        *value.decor_mut() = decor;
+                    }
+                } else {
+                    redact_toml(item);
+                }
+            }
+        }
+    }
     let mut line = line.to_owned();
     for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
         line = line.replace(secret, "<redacted>");
     }
-    let lower = line.to_ascii_lowercase();
-    let replacement = if line.contains("<client key>") {
-        Some("<client key>")
-    } else if lower.contains("openai_api_key")
-        || lower.contains("api_key")
-        || lower.contains("experimental_bearer_token")
-        || lower.contains("secret")
-        || lower.contains("password")
-        || lower.contains("authorization")
-        || lower.contains("bearer")
-    {
-        Some("<previous key: redacted>")
-    } else if lower.contains("anthropic_auth_token")
-        || lower.contains("refresh_token")
-        || lower.contains("access_token")
-        || lower.contains("token")
-    {
-        Some("<token: redacted>")
-    } else {
-        None
-    };
-    if let Some(replacement) = replacement {
-        let delimiter = line.find('=').or_else(|| line.find(':'));
-        if let Some(index) = delimiter {
-            let whitespace = line[index + 1..]
-                .chars()
-                .take_while(|character| character.is_whitespace())
-                .collect::<String>();
-            // Keep the diff parseable while replacing the complete value.  Both
-            // TOML and JSON use quoted string values for the secrets we wire;
-            // quoting the marker also prevents a TOML line without `:` from
-            // falling through to a verbatim secret-bearing line.
-            let replacement = format!("\"{replacement}\"");
-            let suffix = line
-                .chars()
-                .rev()
-                .take_while(|character| matches!(character, ',' | '}' | ']'))
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect::<String>();
-            return format!("{}{}{}{}", &line[..=index], whitespace, replacement, suffix);
+    let trimmed = line.trim();
+    // Parse complete compact JSON, or one complete pretty-printed member.
+    // An env object is structural; keywords in its children cannot redact env.
+    let member = trimmed.strip_suffix(',').unwrap_or(trimmed);
+    let wrapped = format!("{{{member}}}");
+    let json = serde_json::from_str::<Value>(trimmed)
+        .map(|value| (value, false))
+        .or_else(|_| serde_json::from_str::<Value>(&wrapped).map(|value| (value, true)));
+    if let Ok((mut value, is_member)) = json {
+        let before = value.clone();
+        redact_json(&mut value, false);
+        if value == before {
+            return line;
         }
-        return replacement.into();
+        let rendered = serde_json::to_string(&value).expect("JSON value serializes");
+        let rendered = if is_member {
+            &rendered[1..rendered.len() - 1]
+        } else {
+            &rendered
+        };
+        let leading = &line[..line.len() - line.trim_start().len()];
+        let trailing = &line[line.trim_end().len()..];
+        let comma = if is_member && trimmed.ends_with(',') {
+            ","
+        } else {
+            ""
+        };
+        return format!("{leading}{rendered}{comma}{trailing}");
+    }
+    if let Ok(mut document) = line.parse::<DocumentMut>() {
+        let before = document.to_string();
+        redact_toml(document.as_item_mut());
+        let rendered = document.to_string();
+        if rendered == before {
+            return line;
+        }
+        // DocumentMut appends a line terminator to a standalone assignment.
+        // Diff input is already split into lines; do not inject blank lines.
+        return if line.ends_with('\n') {
+            rendered
+        } else {
+            rendered.strip_suffix('\n').unwrap_or(&rendered).to_owned()
+        };
     }
     line
 }
@@ -3223,6 +3263,112 @@ mod tests {
         let error = wire(&p, true).unwrap_err().to_string();
         assert!(error.contains("apikey"));
         assert!(!p.journal().exists());
+    }
+
+    #[test]
+    fn r31_secret_diff_key_matches_only_the_keyword_list_case_insensitively() {
+        for key in [
+            "API_KEY",
+            "access_TOKEN",
+            "FOO_SECRET",
+            "Bearer",
+            "Password",
+            "Authorization",
+        ] {
+            assert!(secret_diff_key(key), "{key}");
+        }
+        for key in [
+            "env",
+            "service_tier",
+            "log_dir",
+            "model_reasoning_effort",
+            "approvals_reviewer",
+            "notify",
+            "projects",
+        ] {
+            assert!(!secret_diff_key(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn r31_compact_json_keeps_nested_env_and_base_url_with_only_token_redacted() {
+        let line = r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"<client key>","ANTHROPIC_BASE_URL":"http://127.0.0.1:10200"}}"#;
+        assert_eq!(redacted_diff_line(line, &[]), line);
+        assert_eq!(
+            redacted_diff_line(
+                r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"synthetic-private-token","ANTHROPIC_BASE_URL":"http://127.0.0.1:10200"}}"#,
+                &[]
+            ),
+            r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"<redacted>","ANTHROPIC_BASE_URL":"http://127.0.0.1:10200"}}"#
+        );
+        assert_eq!(
+            redacted_diff_line(r#"  "access_token": "synthetic-private-token","#, &[]),
+            r#"  "access_token":"<redacted>","#
+        );
+        assert_eq!(
+            redacted_diff_line(
+                r#"{"env":{"API_KEYS":["synthetic-private-token","<client key>"]}}"#,
+                &[]
+            ),
+            r#"{"env":{"API_KEYS":["<redacted>","<client key>"]}}"#
+        );
+    }
+
+    #[test]
+    fn r31_toml_preserves_harmless_values_and_project_headers() {
+        for line in [
+            "service_tier = 'fast'",
+            "log_dir = 'C:/logs'",
+            "model_reasoning_effort = 'high'",
+            "approvals_reviewer = 'user'",
+            "notify = ['notify-auth-helper', '--token-option']",
+            "[projects.'C:/projects/key-tool']",
+            "trust_level = 'trusted'",
+            "base_url = 'http://127.0.0.1:10200'",
+            "note = 'a # token-shaped harmless value'",
+            "# auth setup",
+            "# token options are documented here",
+            "notify = 'visible' # auth setup",
+        ] {
+            assert_eq!(redacted_diff_line(line, &[]), line);
+        }
+    }
+
+    #[test]
+    fn r31_mcp_inline_secrets_bearer_comments_and_known_substrings_stay_redacted() {
+        for line in [
+            "FOO_SECRET = 'synthetic-mcp-secret'",
+            "experimental_bearer_token = 'synthetic-bearer'",
+            "env = { FOO_SECRET = 'synthetic-mcp-secret', SAFE = 'visible' }",
+        ] {
+            let redacted = redacted_diff_line(line, &[]);
+            for secret in [
+                "synthetic-mcp-secret",
+                "synthetic-bearer",
+                "synthetic-comment-secret",
+            ] {
+                assert!(!redacted.contains(secret), "{redacted}");
+            }
+            if line.starts_with("env") {
+                assert!(redacted.contains("SAFE = 'visible'"));
+            }
+        }
+        assert_eq!(
+            redacted_diff_line(
+                "log_dir = 'prefix-known-private-suffix'",
+                &["known-private".into()]
+            ),
+            "log_dir = 'prefix-<redacted>-suffix'"
+        );
+        for line in [
+            "# token = synthetic-comment-secret",
+            "notify = 'visible' # password: synthetic-comment-secret",
+        ] {
+            assert_eq!(
+                redacted_diff_line(line, &["synthetic-comment-secret".into()]),
+                line.replace("synthetic-comment-secret", "<redacted>")
+            );
+        }
     }
 
     #[test]
