@@ -321,8 +321,7 @@ fn draw_account_menu(
                 )
             }?;
             unsafe { target.DrawRoundedRectangle(&check, &border, 1.0, None) };
-            let checked = (matches!(item, super::actions::MenuItem::ToggleDrain) && row.drain)
-                || (matches!(item, super::actions::MenuItem::ToggleCredits) && row.allow_credits);
+            let checked = item.checked(row).unwrap_or(false);
             if checked {
                 fill(
                     target,
@@ -376,7 +375,11 @@ fn draw_account_menu(
             target,
             factory,
             &body,
-            item.label(row),
+            if n == index && state.ends_with(":pending") {
+                "변경 중…"
+            } else {
+                item.label(row)
+            },
             177.0,
             y + 7.0,
             160.0,
@@ -978,13 +981,13 @@ pub fn paint_with_state(
                 &rows,
                 expand_disabled,
                 state,
-                content_height(&rows, expand_disabled),
+                state_height(&rows, expand_disabled, Some(state)),
             )
             .unwrap();
             (popup.left, popup.top, popup.right, popup.bottom)
         } else if state.starts_with("confirm-delete:") {
             let card_height = 193.0;
-            let flyout = content_height(&rows, expand_disabled);
+            let flyout = state_height(&rows, expand_disabled, Some(state));
             (
                 16.0,
                 (flyout - card_height).round() / 2.0,
@@ -996,7 +999,7 @@ pub fn paint_with_state(
                 &rows,
                 expand_disabled,
                 state,
-                content_height(&rows, expand_disabled),
+                state_height(&rows, expand_disabled, Some(state)),
             )
             .unwrap();
             (popup.left, popup.top, popup.right, popup.bottom)
@@ -1006,7 +1009,12 @@ pub fn paint_with_state(
         if state.starts_with("confirm-delete:") {
             fill(
                 target,
-                rect(0.0, 0.0, WIDTH, content_height(&rows, expand_disabled)),
+                rect(
+                    0.0,
+                    0.0,
+                    WIDTH,
+                    state_height(&rows, expand_disabled, Some(state)),
+                ),
                 BrushColor(D2D1_COLOR_F {
                     r: 0.0,
                     g: 0.0,

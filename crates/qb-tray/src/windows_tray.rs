@@ -199,22 +199,10 @@ fn hit_target(hwnd: HWND, x: f32, y: f32) -> Option<HitTarget> {
     let x = x / scale;
     let rows = frame.rows;
     let state = frame.state;
-    let height = qb_tray::native_render::state_height(&rows, false, state.as_deref());
-    if state.as_deref() == Some("add-menu") {
-        let popup = qb_tray::popup_rect(&rows, false, "add-menu", height)?;
-        return popup.contains(x, y).then(|| {
-            if y < popup.top + 36.0 {
-                HitTarget::AddChoice(Some("claude".into()))
-            } else if y < popup.top + 72.0 {
-                HitTarget::AddChoice(Some("codex".into()))
-            } else {
-                HitTarget::AddChoice(None)
-            }
-        });
-    }
     let targets = qb_tray::layout_targets(&rows, false, state.as_deref());
     if let Some(target) = qb_tray::hit_test(&targets, x, y).cloned() {
         return Some(match target {
+            qb_tray::HitTarget::AddChoice { provider, .. } => HitTarget::AddChoice(provider),
             qb_tray::HitTarget::RowMenu { id, .. } => HitTarget::RowMenu(id),
             qb_tray::HitTarget::RowRelogin { id, .. } => HitTarget::RowRelogin(id),
             qb_tray::HitTarget::MenuItem { id, index, .. } => HitTarget::MenuItem(id, index),
@@ -363,19 +351,28 @@ fn test_shell(hwnd: HWND, event: &str, kind: Option<crate::tray_icon::signals::K
         return;
     };
     let tooltip = SHELL_TOOLTIP.with(|slot| slot.borrow().clone());
-    let state = view_state()
+    let view = view_state()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let rows = model().lock().unwrap_or_else(|e| e.into_inner()).0.clone();
+    let state = view
         .as_deref()
-        .map(|s| s.split(':').next().unwrap_or("list").to_owned())
-        .unwrap_or_else(|| "list".into());
-    let count = model().lock().unwrap_or_else(|e| e.into_inner()).0.len();
+        .map(|s| s.split(':').next().unwrap_or("list"))
+        .unwrap_or("list");
+    let menu_checked = view
+        .as_deref()
+        .and_then(|s| qb_tray::menu_target(&rows, s))
+        .and_then(|(row, index)| qb_tray::actions::menu_items(row)[index].checked(row));
+    let menu_pending = view.as_deref().is_some_and(|s| s.ends_with(":pending"));
+    let count = rows.len();
     let payload = serde_json::json!({
         "sequence": SEQUENCE.fetch_add(1, Ordering::Relaxed), "event": event,
         "badge": match badge { Badge::Normal => "normal", Badge::Attention => "attention", Badge::Error => "error" },
         "tooltip": tooltip, "dark": dark,
         "icon_size": size, "visible": unsafe { IsWindowVisible(hwnd).as_bool() },
         "state": state, "accounts": count, "kind": kind.map(|k| format!("{k:?}")),
+        "menu_checked": menu_checked, "menu_pending": menu_pending,
     });
     if let Some(worker) = WORKER.get() {
         let _ = worker.submit(async move {
@@ -729,6 +726,14 @@ fn change_menu_selection(delta: isize) {
     let Some((row, index)) = menu_target() else {
         return;
     };
+    if view_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_deref()
+        .is_some_and(|s| s.ends_with(":pending"))
+    {
+        return;
+    }
     let count = qb_tray::actions::menu_items(&row).len();
     if count == 0 {
         return;
@@ -749,6 +754,14 @@ fn activate_menu_item(hwnd: HWND, row: qb_tray::Row, index: usize) {
     let Some(item) = qb_tray::actions::menu_items(&row).get(index).copied() else {
         return;
     };
+    if view_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_deref()
+        .is_some_and(|s| s.ends_with(":pending"))
+    {
+        return;
+    }
     if item.is_destructive() {
         set_view(Some(format!("confirm-delete:{}", row.id)));
         unsafe {
@@ -764,7 +777,17 @@ fn activate_menu_item(hwnd: HWND, row: qb_tray::Row, index: usize) {
         return;
     }
     let hwnd_value = hwnd.0 as isize;
-    let owner = begin_operation();
+    let Some(owner) = view_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .begin_menu(&row.id, index, item.is_toggle())
+    else {
+        return;
+    };
+    unsafe {
+        let _ = InvalidateRect(Some(hwnd), None, true);
+    }
+
     submit_job(async move {
         let result: anyhow::Result<()> = async {
             let client = super::client::AdminClient::from_home()?;
@@ -810,7 +833,12 @@ fn activate_menu_item(hwnd: HWND, row: qb_tray::Row, index: usize) {
                 }
                 .map_err(|e| anyhow::anyhow!(e))
             }
-            .await
+            .await?;
+            // Publish the refreshed checked value before ending its pending state.
+            if item.is_toggle() {
+                publish_read(client.read().await?)?;
+            }
+            Ok(())
         }
         .await;
         if let (Err(error), Some(path)) = (&result, std::env::var_os("QB_TRAY_TEST_ERROR_LOG")) {
