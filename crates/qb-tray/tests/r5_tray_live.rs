@@ -204,6 +204,9 @@ fn listener() -> Result<TcpListener> {
 
 // Bounded HTTP/1 parser: no proxy, DNS, remote redirect, unbounded accept/read.
 fn read_request(stream: &mut TcpStream) -> Result<String> {
+    // Windows can inherit the listening socket's nonblocking mode on accept.
+    // A connection may be accepted before its HTTP bytes arrive.
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_millis(250)))?;
     stream.set_write_timeout(Some(Duration::from_millis(250)))?;
     let deadline = Instant::now() + Duration::from_secs(1);
@@ -233,6 +236,46 @@ fn read_request(stream: &mut TcpStream) -> Result<String> {
             }
         }
     }
+}
+
+#[test]
+fn r5_fake_accept_waits_for_http_bytes_instead_of_failing_would_block() -> Result<()> {
+    let server = listener()?;
+    server.set_nonblocking(true)?;
+    let mut client = TcpStream::connect(server.local_addr()?)?;
+    let (mut accepted, _) = server.accept()?;
+    accepted.set_nonblocking(true)?;
+    let mut probe = [0u8; 1];
+    ensure!(
+        accepted
+            .peek(&mut probe)
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::WouldBlock),
+        "precondition: accepted stream has no request yet"
+    );
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let reader = thread::spawn(move || {
+        let _ = started_tx.send(());
+        let _ = result_tx.send(read_request(&mut accepted));
+    });
+    started_rx.recv_timeout(Duration::from_secs(1))?;
+    let premature = result_rx.recv_timeout(Duration::from_millis(100));
+    client.write_all(b"GET /synthetic HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")?;
+    let result = match premature {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            result_rx.recv_timeout(Duration::from_secs(1))?
+        }
+        Err(error) => return Err(error.into()),
+    };
+    reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("fake reader panicked"))?;
+    ensure!(
+        result?.starts_with("GET /synthetic HTTP/1.1"),
+        "expected complete fake request"
+    );
+    Ok(())
 }
 
 struct Upstream {

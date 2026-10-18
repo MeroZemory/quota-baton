@@ -88,6 +88,18 @@ impl Session {
         if !self.open {
             return;
         }
+        // The flyout may open before its first core snapshot. Initialize new
+        // provider recommendations once without replacing open/manual choices.
+        for section in &view.sections {
+            let initial = self
+                .manual_expansion
+                .get(&section.provider)
+                .copied()
+                .unwrap_or(section.auto_expand_recommended);
+            self.expansion
+                .entry(section.provider.clone())
+                .or_insert(initial);
+        }
         let current = slots(view);
         let ids: BTreeSet<_> = current.iter().map(|slot| slot.id.clone()).collect();
         self.slots.retain(|slot| ids.contains(slot.id.as_str()));
@@ -228,6 +240,20 @@ mod tests {
         let off = s.begin("synthetic-codex").unwrap();
         assert!(s.credits_dialog.is_none());
         assert!(s.complete(&off, false, Duration::ZERO));
+    }
+    #[test]
+    fn late_first_snapshot_initializes_expansion_and_keeps_manual_choice() {
+        let empty = v2::project("{}", std::time::SystemTime::now()).unwrap();
+        let mut session = Session::default();
+        session.show(&empty);
+        assert!(session.expansion.is_empty());
+        let blocked = view(false, true);
+        session.update(&blocked);
+        assert_eq!(session.expansion.get("codex"), Some(&true));
+        session.set_expanded("codex", false);
+        session.update(&blocked);
+        assert_eq!(session.expansion.get("codex"), Some(&false));
+        assert!(!session.slots.is_empty());
     }
     #[test]
     fn update_keeps_disabled_slot_and_manual_expansion_until_next_open() {

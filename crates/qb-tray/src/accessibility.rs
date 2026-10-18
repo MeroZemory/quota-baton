@@ -410,6 +410,26 @@ impl Node {
             .map(|e| self.child(e, cache.epoch)))
     }
 
+    fn host_bridge<T>(&self, lookup: impl FnOnce(isize) -> Result<T>) -> Result<Option<T>> {
+        let hwnd = {
+            let cache = self.read()?;
+            if self.ticket.is_some() {
+                return Ok(None);
+            }
+            cache.hwnd
+        };
+        // UIA may re-enter the provider during the native bridge. Never keep
+        // the cache locked across that call or block UI-thread teardown on it.
+        let provider = lookup(hwnd)?;
+        let cache = self.read()?;
+        if cache.hwnd != hwnd {
+            return Err(unavailable());
+        }
+        // A concurrently deactivated owner fails read() above, so no host
+        // provider obtained through an obsolete/reused HWND escapes to UIA.
+        Ok(Some(provider))
+    }
+
     fn bounds(&self) -> Result<[f64; 4]> {
         let cache = self.read()?;
         Ok(self
@@ -704,17 +724,8 @@ unsafe extern "system" fn host(this: *mut c_void, out: *mut *mut c_void) -> HRES
         out.write(ptr::null_mut());
     }
     let n = unsafe { node::<0>(this) };
-    let result: Result<Option<IRawElementProviderSimple>> = (|| {
-        let cache = n.read()?;
-        if n.ticket.is_some() {
-            return Ok(None);
-        }
-        // Required UIA host bridge only; no SendMessage or app callbacks.
-        // Keep teardown from recycling this HWND during the host lookup.
-        Ok(Some(unsafe {
-            UiaHostProviderFromHwnd(HWND(cache.hwnd as *mut c_void))?
-        }))
-    })();
+    let result =
+        n.host_bridge(|hwnd| unsafe { UiaHostProviderFromHwnd(HWND(hwnd as *mut c_void)) });
     match result {
         Ok(Some(provider)) => {
             unsafe {
@@ -906,6 +917,29 @@ mod tests {
 
     // All tests authored UNRUN. Fake HWND integer is NEVER passed to a Win32
     // window API: tests call only cache operations, raw COM, and Ole allocators.
+    #[test]
+    fn native_host_lookup_releases_cache_and_refuses_a_teardown_during_lookup() -> Result<()> {
+        let owner = create_root_provider(1)?;
+        owner.publish(scene(), 1)?;
+        let result = owner.root.host_bridge(|hwnd| {
+            assert_eq!(hwnd, 1);
+            assert!(
+                owner.root.cache.try_lock().is_ok(),
+                "native lookup must be outside the cache lock"
+            );
+            Ok(42)
+        })?;
+        assert_eq!(result, Some(42));
+        let result = owner.root.host_bridge(|_| {
+            deactivate_cache(&owner.root.cache);
+            Ok(99)
+        });
+        assert!(
+            result.is_err(),
+            "discard a result after the owner was deactivated"
+        );
+        Ok(())
+    }
     #[test]
     fn cached_navigation_properties_and_overlap_hit_test() -> Result<()> {
         let owner = create_root_provider(1)?;
