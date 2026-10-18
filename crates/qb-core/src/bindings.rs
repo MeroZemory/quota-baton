@@ -871,10 +871,12 @@ impl BindingTable {
                     );
                 }
                 let marked = self.has_overload_mark(d, &b.key, now);
-                if marked {
-                    let room_elsewhere = entries.iter().any(|(candidate, _candidate_eligible)| {
+                if marked && *eligible {
+                    let room_elsewhere = entries.iter().any(|(candidate, eligible)| {
                         candidate.account.id != b.account
+                            && *eligible
                             && !candidate.account.drain
+                            && metrics(candidate, d, &self.config, now).gate
                             && self.active_sessions_in(d, &candidate.account.id, now)
                                 < self.spread_threshold_for(&candidate.account.id)
                     });
@@ -882,6 +884,8 @@ impl BindingTable {
                         || self.active_sessions_in(d, &b.account, now)
                             <= self.spread_threshold_for(&b.account)
                     {
+                        // choose_with_hold clears this mark when it reserves
+                        // the unchanged binding. Preview remains read-only.
                         return (
                             PreviewDecision::Selected {
                                 account: b.account.clone(),
@@ -889,19 +893,8 @@ impl BindingTable {
                             "forced",
                         );
                     }
-                    if let Some((candidate, _)) = entries.iter().find(|(candidate, _eligible)| {
-                        candidate.account.id != b.account
-                            && !candidate.account.drain
-                            && self.active_sessions_in(d, &candidate.account.id, now)
-                                < self.spread_threshold_for(&candidate.account.id)
-                    }) {
-                        return (
-                            PreviewDecision::Selected {
-                                account: candidate.account.id.clone(),
-                            },
-                            "overload",
-                        );
-                    }
+                    // Use the ordinary C7 ordering below, restricted to real
+                    // eligible targets with room rather than candidate id order.
                     reason = "overload";
                 }
                 if *eligible && !marked {
