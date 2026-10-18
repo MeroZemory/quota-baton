@@ -46,6 +46,7 @@ pub struct CutoverPaths {
     pub codex_qb_home: PathBuf,
     pub npm_dir: PathBuf,
     pub claude_settings: PathBuf,
+    pub claude_command: Option<PathBuf>,
     pub client_key: PathBuf,
     /// Realtime endpoints intentionally left on CPA because quota-baton does
     /// not serve them.
@@ -87,6 +88,10 @@ impl CutoverPaths {
             codex_qb_home: user.join(".codex-acct").join("qb"),
             npm_dir: Self::npm_dir_for(&user, std::env::var_os("APPDATA").map(PathBuf::from)),
             codex_realtime_items: realtime_cpa_items(&codex_root.join("config.toml")),
+            claude_command: resolve_claude_command(
+                std::env::var_os("PATH").as_deref(),
+                std::env::var_os("PATHEXT").as_deref(),
+            ),
             claude_settings: user.join(".claude").join("settings.json"),
             client_key,
             report_roots: {
@@ -485,6 +490,108 @@ impl std::str::FromStr for CodexMode {
     }
 }
 
+/// The serde default is legacy; fresh wire defaults to Dedicated.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClaudeMode {
+    Default,
+    #[default]
+    Dedicated,
+    None,
+}
+fn legacy_claude_mode() -> ClaudeMode {
+    ClaudeMode::Default
+}
+impl std::str::FromStr for ClaudeMode {
+    type Err = anyhow::Error;
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "default" => Ok(Self::Default),
+            "dedicated" => Ok(Self::Dedicated),
+            "none" => Ok(Self::None),
+            _ => bail!("Claude 모드는 default, dedicated, none 중 하나여야 합니다"),
+        }
+    }
+}
+pub fn resolve_claude_mode(paths: &CutoverPaths, options: &WireOptions) -> Result<ClaudeMode> {
+    if let Some(mode) = options.claude_mode {
+        return Ok(mode);
+    }
+    match fs::read(paths.journal()) {
+        Ok(bytes) => {
+            #[derive(Deserialize)]
+            struct Header {
+                schema: u8,
+                #[serde(default = "legacy_claude_mode")]
+                claude_mode: ClaudeMode,
+            }
+            let invalid = || anyhow::anyhow!("연결 journal 형식이 올바르지 않습니다");
+            let header: Header = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+            match header.schema {
+                1 => Ok(ClaudeMode::Default),
+                3 => Ok(header.claude_mode),
+                _ => Err(invalid()),
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ClaudeMode::Dedicated),
+        Err(_) => bail!("연결 journal을 읽지 못했습니다"),
+    }
+}
+fn safe_command_path(path: &Path) -> bool {
+    path.is_absolute()
+        && !path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        && path.to_str().is_some_and(|s| {
+            !s.chars().any(|c| {
+                matches!(
+                    c,
+                    '\r' | '\n' | '"' | '%' | '!' | '^' | '&' | '|' | '<' | '>'
+                )
+            })
+        })
+}
+/// PATH then PATHEXT order, with no execution, CWD search or relative entries.
+pub fn resolve_claude_command(
+    path: Option<&std::ffi::OsStr>,
+    pathext: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    let extensions = pathext
+        .and_then(|s| s.to_str())
+        .unwrap_or(".COM;.EXE;.BAT;.CMD")
+        .split(';')
+        .filter(|s| [".com", ".exe", ".bat", ".cmd"].contains(&s.to_ascii_lowercase().as_str()))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    for directory in std::env::split_paths(path?) {
+        if !safe_command_path(&directory) {
+            continue;
+        }
+        for extension in &extensions {
+            let command = directory.join(format!("claude{extension}"));
+            if safe_command_path(&command)
+                && fs::symlink_metadata(&command).is_ok_and(|m| {
+                    use std::os::windows::fs::MetadataExt;
+                    m.is_file() && m.file_attributes() & 0x400 == 0
+                })
+            {
+                // Canonical spelling matters for the recorded launcher (PATHEXT may be uppercase).
+                let canonical = fs::canonicalize(command).ok()?;
+                let text = canonical.to_str()?;
+                let command = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+                    PathBuf::from(format!(r"\\{rest}"))
+                } else {
+                    PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(text))
+                };
+                if safe_command_path(&command) {
+                    return Some(command);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Reads only injected paths; persisted mode wins over auto-detection on retry.
 pub fn resolve_codex_mode(paths: &CutoverPaths, options: &WireOptions) -> Result<CodexMode> {
     if let Some(mode) = options.codex_mode {
@@ -550,6 +657,7 @@ pub fn resolve_codex_mode(paths: &CutoverPaths, options: &WireOptions) -> Result
 #[derive(Clone, Copy, Debug)]
 pub struct WireOptions {
     pub codex_mode: Option<CodexMode>,
+    pub claude_mode: Option<ClaudeMode>,
     pub data_port: u16,
     pub autostart: bool,
     pub disable_cpa_tasks: bool,
@@ -560,6 +668,7 @@ impl Default for WireOptions {
     fn default() -> Self {
         Self {
             codex_mode: None,
+            claude_mode: None,
             data_port: 10200,
             autostart: false,
             disable_cpa_tasks: false,
@@ -1193,11 +1302,15 @@ fn wire_with_task_query(
     task_query: &dyn Fn(&str) -> Option<bool>,
 ) -> Result<Report> {
     let mode = resolve_codex_mode(paths, &options)?;
-    if mode != CodexMode::Default {
-        if options.detach_chatgpt_session_homes {
+    let claude_mode = resolve_claude_mode(paths, &options)?;
+    if mode == CodexMode::None && claude_mode == ClaudeMode::None {
+        bail!("Codex와 Claude를 모두 연결 안 함으로 선택할 수 없습니다");
+    }
+    if mode != CodexMode::Default || claude_mode != ClaudeMode::Default {
+        if options.detach_chatgpt_session_homes && mode != CodexMode::Default {
             bail!("세션 홈 분리 옵션은 Codex default 모드에서만 사용할 수 있습니다");
         }
-        return dedicated::wire(paths, apply, options, mode, task_query);
+        return dedicated::wire(paths, apply, options, mode, claude_mode, task_query);
     }
     let linked_active = active_linked_count(&paths.qb_home)?;
     check_cpa_dependency(linked_active, &options)?;
@@ -2535,7 +2648,10 @@ mod tests {
             apply,
             WireOptions {
                 codex_mode: Some(CodexMode::Default),
-                ..WireOptions::default()
+                ..WireOptions {
+                    claude_mode: Some(ClaudeMode::Default),
+                    ..WireOptions::default()
+                }
             },
         )
     }
@@ -2571,6 +2687,7 @@ mod tests {
                 npm_dir: qb_home.parent().unwrap().join("npm"),
                 codex_config: codex,
                 codex_realtime_items: Vec::new(),
+                claude_command: None,
                 claude_settings: claude,
                 client_key,
                 report_roots: Vec::new(),
@@ -2603,10 +2720,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            resolve_codex_mode(&p, &WireOptions::default()).unwrap(),
+            resolve_codex_mode(
+                &p,
+                &WireOptions {
+                    claude_mode: Some(ClaudeMode::Default),
+                    ..WireOptions::default()
+                }
+            )
+            .unwrap(),
             CodexMode::Default
         );
-        super::wire(&p, true).unwrap();
+        // Seed a legacy journal explicitly; only its retry is flagless.
+        wire(&p, true).unwrap();
         assert!(
             fs::read_to_string(&p.codex_config)
                 .unwrap()
@@ -2620,7 +2745,14 @@ mod tests {
         ]
         .map(|path| fs::read(path).unwrap());
         assert_eq!(
-            resolve_codex_mode(&p, &WireOptions::default()).unwrap(),
+            resolve_codex_mode(
+                &p,
+                &WireOptions {
+                    claude_mode: Some(ClaudeMode::Default),
+                    ..WireOptions::default()
+                }
+            )
+            .unwrap(),
             CodexMode::Default
         );
         // Schema 1 retains its existing already-wired refusal; never reroute
@@ -2650,12 +2782,22 @@ mod tests {
             true,
             WireOptions {
                 codex_mode: Some(CodexMode::None),
-                ..WireOptions::default()
+                ..WireOptions {
+                    claude_mode: Some(ClaudeMode::Default),
+                    ..WireOptions::default()
+                }
             },
         )
         .unwrap();
         assert_eq!(
-            resolve_codex_mode(&p, &WireOptions::default()).unwrap(),
+            resolve_codex_mode(
+                &p,
+                &WireOptions {
+                    claude_mode: Some(ClaudeMode::Default),
+                    ..WireOptions::default()
+                }
+            )
+            .unwrap(),
             CodexMode::None
         );
         super::wire(&p, true).unwrap();
@@ -2679,7 +2821,14 @@ mod tests {
         ] {
             fs::write(&p.codex_config, source).unwrap();
             assert_eq!(
-                resolve_codex_mode(&p, &WireOptions::default()).unwrap(),
+                resolve_codex_mode(
+                    &p,
+                    &WireOptions {
+                        claude_mode: Some(ClaudeMode::Default),
+                        ..WireOptions::default()
+                    }
+                )
+                .unwrap(),
                 CodexMode::Dedicated
             );
             // Header selection alone must not authorize an incomplete manifest.
@@ -2703,7 +2852,14 @@ mod tests {
             "{\"schema\":3,\"mode\":\"none\",\"secret\":\"synthetic-mode-secret",
         ] {
             fs::write(p.journal(), header).unwrap();
-            let error = resolve_codex_mode(&p, &WireOptions::default()).unwrap_err();
+            let error = resolve_codex_mode(
+                &p,
+                &WireOptions {
+                    claude_mode: Some(ClaudeMode::Default),
+                    ..WireOptions::default()
+                },
+            )
+            .unwrap_err();
             assert_eq!(error.to_string(), "연결 journal 형식이 올바르지 않습니다");
             assert!(!format!("{error:#}\n{error:?}").contains("synthetic-mode-secret"));
             for mode in [CodexMode::Default, CodexMode::Dedicated, CodexMode::None] {
@@ -2712,7 +2868,10 @@ mod tests {
                         &p,
                         &WireOptions {
                             codex_mode: Some(mode),
-                            ..WireOptions::default()
+                            ..WireOptions {
+                                claude_mode: Some(ClaudeMode::Default),
+                                ..WireOptions::default()
+                            }
                         }
                     )
                     .unwrap(),
@@ -3271,7 +3430,10 @@ mod tests {
             WireOptions {
                 detach_chatgpt_session_homes: true,
                 codex_mode: Some(CodexMode::Default),
-                ..WireOptions::default()
+                ..WireOptions {
+                    claude_mode: Some(ClaudeMode::Default),
+                    ..WireOptions::default()
+                }
             },
         )
         .unwrap();
@@ -3289,7 +3451,10 @@ mod tests {
             WireOptions {
                 detach_chatgpt_session_homes: true,
                 codex_mode: Some(CodexMode::Default),
-                ..WireOptions::default()
+                ..WireOptions {
+                    claude_mode: Some(ClaudeMode::Default),
+                    ..WireOptions::default()
+                }
             },
         )
         .unwrap();
@@ -3446,7 +3611,10 @@ pub(crate) mod cpa_dependency_tests {
         WireOptions {
             disable_cpa_tasks: true,
             codex_mode: Some(CodexMode::Default),
-            ..WireOptions::default()
+            ..WireOptions {
+                claude_mode: Some(ClaudeMode::Default),
+                ..WireOptions::default()
+            }
         }
     }
 
@@ -3553,7 +3721,10 @@ pub(crate) mod cpa_dependency_tests {
             false,
             WireOptions {
                 codex_mode: Some(CodexMode::Default),
-                ..WireOptions::default()
+                ..WireOptions {
+                    claude_mode: Some(ClaudeMode::Default),
+                    ..WireOptions::default()
+                }
             },
             &|_| panic!("flagless wire queried tasks"),
         )
@@ -3630,6 +3801,7 @@ pub(crate) mod cpa_dependency_tests {
                 npm_dir: qb_home.parent().unwrap().join("npm"),
                 codex_config: codex,
                 codex_realtime_items: Vec::new(),
+                claude_command: None,
                 claude_settings: claude,
                 client_key,
                 report_roots: Vec::new(),

@@ -279,11 +279,58 @@ struct Entry {
     payload: Option<String>,
     done: bool,
     removed: bool,
+    #[serde(default)]
+    original: Option<ExistingFile>,
 }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ExistingFile {
+    hash: String,
+    identity: Identity,
+    payload: String,
+    #[serde(default)]
+    restoring: bool,
+}
+#[derive(Serialize, Deserialize)]
+struct CommandRecord {
+    path: PathBuf,
+    hash: String,
+    identity: Identity,
+}
+fn claude_home(paths: &CutoverPaths) -> Result<PathBuf> {
+    Ok(paths
+        .codex_qb_home
+        .parent()
+        .and_then(Path::parent)
+        .context("사용자 홈 경로가 없습니다")?
+        .join(".claude-qb"))
+}
+fn claude_launcher(command: &Path) -> Result<Vec<u8>> {
+    if !safe_command_path(command) {
+        bail!("PATH에서 안전한 Claude 실행 파일을 찾지 못했습니다. Claude 설치를 확인하세요");
+    }
+    Ok(format!("@echo off\r\nsetlocal DisableDelayedExpansion\r\nrem quota-baton Claude launcher\r\ncall \"{}\" --settings \"%USERPROFILE%\\.claude-qb\\settings.json\" %*\r\n", command.display()).into_bytes())
+}
+fn check_command(record: &CommandRecord) -> Result<()> {
+    if !safe_command_path(&record.path)
+        || !record.path.is_file()
+        || reparse(&record.path)?
+        || identity(&record.path)? != record.identity
+        || hash_file(&record.path)? != record.hash
+    {
+        bail!("Claude 실행 파일이 변경되었습니다. 먼저 unwire를 실행하세요");
+    }
+    ancestors_safe(&record.path)?;
+    Ok(())
+}
+
 #[derive(Serialize, Deserialize)]
 struct Manifest {
     schema: u8,
     mode: CodexMode,
+    #[serde(default = "legacy_claude_mode")]
+    claude_mode: ClaudeMode,
+    #[serde(default)]
+    command: Option<CommandRecord>,
     home: PathBuf,
     npm: PathBuf,
     claude: PathBuf,
@@ -291,7 +338,7 @@ struct Manifest {
     claude_after: String,
     claude_original: String,
     claude_payload: String,
-    claude_identity: Identity,
+    claude_identity: Option<Identity>,
     claude_restored: bool,
     autostart: Option<OptionalActionJournal>,
     tasks: Vec<TaskJournal>,
@@ -457,6 +504,7 @@ fn new_entry(
         },
         done: false,
         removed: false,
+        original: None,
     })
 }
 fn add_dirs(entries: &mut Vec<Entry>, path: &Path, apply: bool) -> Result<()> {
@@ -480,11 +528,14 @@ fn add_dirs(entries: &mut Vec<Entry>, path: &Path, apply: bool) -> Result<()> {
 }
 
 fn validate_manifest(paths: &CutoverPaths, m: &Manifest) -> Result<()> {
+    if m.mode == CodexMode::None && m.claude_mode == ClaudeMode::None {
+        bail!("Codex와 Claude를 모두 연결 안 함으로 선택할 수 없습니다");
+    }
     if m.schema != 3
         || m.home != paths.codex_qb_home
         || m.npm != paths.npm_dir
         || m.claude != paths.claude_settings
-        || m.mode == CodexMode::Default
+        || (m.mode == CodexMode::Default && m.claude_mode == ClaudeMode::Default)
     {
         bail!("wiring journal의 경로/모드가 현재 홈과 일치하지 않습니다");
     }
@@ -498,6 +549,18 @@ fn validate_manifest(paths: &CutoverPaths, m: &Manifest) -> Result<()> {
         {
             bail!("journal의 CPA 예약 작업 범위/상태가 올바르지 않습니다");
         }
+    }
+    let ch = claude_home(paths)?;
+    if m.claude_mode == ClaudeMode::Dedicated {
+        let command = m
+            .command
+            .as_ref()
+            .context("Claude 실행 파일 journal이 없습니다")?;
+        if !safe_command_path(&command.path) {
+            bail!("Claude 실행 파일 journal 경로가 올바르지 않습니다");
+        }
+    } else if m.command.is_some() {
+        bail!("Claude 실행 파일 journal 모드가 다릅니다");
     }
     let mut seen = std::collections::HashSet::new();
     let mut scratch_seen = std::collections::HashSet::new();
@@ -514,37 +577,62 @@ fn validate_manifest(paths: &CutoverPaths, m: &Manifest) -> Result<()> {
         {
             bail!("journal 임시 경로가 올바르지 않습니다");
         }
-        let allowed_home = e.path == m.home
-            || e.path == m.home.join("log")
-            || ["config.toml", "auth.json", "AGENTS.md", "hooks.json"]
-                .iter()
-                .any(|n| e.path == m.home.join(n))
-            || SHARED.iter().any(|n| e.path == m.home.join(n));
-        let allowed_parent = e.kind == Kind::Directory && m.home.parent() == Some(e.path.as_path());
+        let allowed_claude = m.claude_mode == ClaudeMode::Dedicated
+            && (e.path == ch
+                || e.path == ch.join("settings.json")
+                || e.path == m.npm.join("claude-qb.cmd"));
+        let allowed_existing = m.mode == CodexMode::Default
+            && e.original.is_some()
+            && (e.path == paths.codex_config
+                || e.path == paths.codex_auth
+                || paths
+                    .codex_session_auth
+                    .iter()
+                    .any(|p| *p == e.path && !normal_path(p).contains("\\.codex-acct\\"))
+                || paths.session_homes_file.as_ref() == Some(&e.path));
+        if e.original.is_some() && (!allowed_existing || e.kind != Kind::File || e.target.is_some())
+        {
+            bail!("journal의 기존 파일 범위가 올바르지 않습니다");
+        }
+        let allowed_home = m.mode == CodexMode::Dedicated
+            && (e.path == m.home
+                || e.path == m.home.join("log")
+                || ["config.toml", "auth.json", "AGENTS.md", "hooks.json"]
+                    .iter()
+                    .any(|n| e.path == m.home.join(n))
+                || SHARED.iter().any(|n| e.path == m.home.join(n)));
+        let allowed_parent = m.mode == CodexMode::Dedicated
+            && e.kind == Kind::Directory
+            && m.home.parent() == Some(e.path.as_path());
         if !e.path.is_absolute()
             || e.path
                 .components()
                 .any(|c| matches!(c, std::path::Component::ParentDir))
-            || !(allowed_home || allowed_parent || e.path == m.npm.join("codex-qb.cmd"))
+            || !(allowed_existing
+                || allowed_claude
+                || allowed_home
+                || allowed_parent
+                || (m.mode == CodexMode::Dedicated && e.path == m.npm.join("codex-qb.cmd")))
             || !seen.insert(e.path.clone())
         {
             bail!("journal에 허용되지 않은 생성 경로가 있습니다");
         }
-        if m.mode == CodexMode::None {
+        if m.mode == CodexMode::None && !allowed_claude {
             bail!("none journal에 Codex 생성 경로가 있습니다");
         }
-        let expected_kind = if e.path == m.home || e.path == m.home.join("log") || allowed_parent {
-            Kind::Directory
-        } else if SHARED.iter().any(|name| e.path == m.home.join(name)) {
-            Kind::Junction
-        } else if ["AGENTS.md", "hooks.json"]
-            .iter()
-            .any(|name| e.path == m.home.join(name))
-        {
-            Kind::Hardlink
-        } else {
-            Kind::File
-        };
+        let expected_kind =
+            if e.path == ch || e.path == m.home || e.path == m.home.join("log") || allowed_parent {
+                Kind::Directory
+            } else if SHARED.iter().any(|name| e.path == m.home.join(name)) {
+                Kind::Junction
+            } else if ["AGENTS.md", "hooks.json"]
+                .iter()
+                .any(|name| e.path == m.home.join(name))
+            {
+                Kind::Hardlink
+            } else {
+                Kind::File
+            };
         if e.kind != expected_kind {
             bail!("journal 경로의 파일 종류가 올바르지 않습니다");
         }
@@ -560,9 +648,11 @@ fn validate_manifest(paths: &CutoverPaths, m: &Manifest) -> Result<()> {
             }
         }
     }
-    ancestors_safe(&paths.claude_settings)?;
-    if reparse(&paths.claude_settings)? || !paths.claude_settings.is_file() {
-        bail!("Claude 설정이 일반 파일이 아닙니다");
+    if m.claude_mode == ClaudeMode::Default {
+        ancestors_safe(&paths.claude_settings)?;
+        if reparse(&paths.claude_settings)? || !paths.claude_settings.is_file() {
+            bail!("Claude 설정이 일반 파일이 아닙니다");
+        }
     }
     ancestors_safe(&paths.journal())?;
     if exists(&paths.journal())? && reparse(&paths.journal())? {
@@ -732,6 +822,83 @@ fn prepare_scratch(paths: &CutoverPaths, m: &mut Manifest, i: usize) -> Result<(
     }
 }
 
+fn restrict_claude_directory(path: &Path) -> anyhow::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::{
+        Win32::{
+            Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree},
+            Security::{
+                Authorization::{
+                    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+                    SDDL_REVISION_1,
+                },
+                DACL_SECURITY_INFORMATION, GetTokenInformation,
+                PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SetFileSecurityW,
+                TOKEN_QUERY, TOKEN_USER, TokenUser,
+            },
+            System::Threading::{GetCurrentProcess, OpenProcessToken},
+        },
+        core::{PCWSTR, PWSTR},
+    };
+    struct Token(HANDLE);
+    impl Drop for Token {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+    struct Allocation(HLOCAL);
+    impl Drop for Allocation {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = LocalFree(Some(self.0));
+            }
+        }
+    }
+    #[cfg(test)]
+    interrupt(path, "before-acl")?;
+    // 토큰 버퍼는 TOKEN_USER 정렬을 보장하고 모든 Windows 할당은 RAII로 해제한다.
+    unsafe {
+        let mut handle = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut handle)?;
+        let token = Token(handle);
+        let mut size = 0;
+        let _ = GetTokenInformation(token.0, TokenUser, None, 0, &mut size);
+        anyhow::ensure!(size > 0, "cannot determine current user token size");
+        let mut buffer = vec![0usize; (size as usize).div_ceil(std::mem::size_of::<usize>())];
+        GetTokenInformation(
+            token.0,
+            TokenUser,
+            Some(buffer.as_mut_ptr().cast()),
+            size,
+            &mut size,
+        )?;
+        let user = &*buffer.as_ptr().cast::<TOKEN_USER>();
+        let mut sid = PWSTR::null();
+        ConvertSidToStringSidW(user.User.Sid, &mut sid)?;
+        let _sid_allocation = Allocation(HLOCAL(sid.0.cast()));
+        let sddl = format!("D:P(A;OICI;FA;;;{})", sid.to_string()?);
+        let sddl: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl.as_ptr()),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            None,
+        )?;
+        let _descriptor_allocation = Allocation(HLOCAL(descriptor.0));
+        let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        SetFileSecurityW(
+            PCWSTR(path.as_ptr()),
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            descriptor,
+        )
+        .ok()?;
+    }
+    Ok(())
+}
+
 fn install_directory(paths: &CutoverPaths, m: &mut Manifest, i: usize) -> Result<()> {
     prepare_scratch(paths, m, i)?;
     let e = &m.entries[i];
@@ -760,6 +927,11 @@ fn install_directory(paths: &CutoverPaths, m: &mut Manifest, i: usize) -> Result
     }
     // No MOVEFILE_REPLACE_EXISTING: even a collision after the check is refused.
     // The source identity was made durable before this publication.
+    if e.kind == Kind::Directory && e.path == claude_home(paths)? {
+        restrict_claude_directory(&tmp).map_err(|_| {
+            anyhow::anyhow!("Claude 전용 설정 디렉터리 접근 권한을 제한하지 못했습니다")
+        })?;
+    }
     publish_directory(&tmp, &e.path)?;
     #[cfg(test)]
     interrupt(&e.path, "after-publish")?;
@@ -786,6 +958,20 @@ fn publish_directory(source: &Path, destination: &Path) -> Result<()> {
 
 fn install_file(paths: &CutoverPaths, m: &mut Manifest, i: usize) -> Result<()> {
     let e = &m.entries[i];
+    if e.path == claude_home(paths)?.join("settings.json") {
+        let home = claude_home(paths)?;
+        let directory = m
+            .entries
+            .iter()
+            .find(|e| e.path == home)
+            .context("Claude 홈 journal이 없습니다")?;
+        if !matches_entry(directory, false)? {
+            bail!("Claude 홈 identity가 다릅니다");
+        }
+        restrict_claude_directory(&home).map_err(|_| {
+            anyhow::anyhow!("Claude 전용 설정 디렉터리 접근 권한을 제한하지 못했습니다")
+        })?;
+    }
     let bytes = unprotect(e.payload.as_deref().context("파일 payload가 없습니다")?)?;
     if hash_bytes(&bytes) != e.hash {
         bail!("journal payload hash가 다릅니다");
@@ -810,6 +996,111 @@ fn install_file(paths: &CutoverPaths, m: &mut Manifest, i: usize) -> Result<()> 
     Ok(())
 }
 
+fn install_existing(paths: &CutoverPaths, m: &mut Manifest, i: usize) -> Result<()> {
+    if matches_entry(&m.entries[i], false)? {
+        return Ok(());
+    }
+    let e = &m.entries[i];
+    let before = e
+        .original
+        .as_ref()
+        .context("기존 파일 journal이 없습니다")?;
+    if reparse(&e.path)?
+        || identity(&e.path)? != before.identity
+        || hash_file(&e.path)? != before.hash
+    {
+        bail!("기존 Codex 파일이 변경되었습니다");
+    }
+    prepare_scratch(paths, m, i)?;
+    let e = &m.entries[i];
+    if !pending_matches(e, true)? {
+        bail!("기존 파일 임시 identity가 다릅니다");
+    }
+    let bytes = unprotect(e.payload.as_deref().context("payload가 없습니다")?)?;
+    if hash_bytes(&bytes) != e.hash {
+        bail!("journal payload hash가 다릅니다");
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .access_mode(0x40000000 | 0x00010000)
+        .open(pending_path(e))?;
+    file.set_len(0)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    let before = e.original.as_ref().unwrap();
+    if identity(&e.path)? != before.identity || hash_file(&e.path)? != before.hash {
+        bail!("기존 Codex 파일이 변경되었습니다");
+    }
+    replace_owned_scratch(&file, &e.path)?;
+    #[cfg(test)]
+    interrupt(&e.path, "after-publish")?;
+    Ok(())
+}
+fn restore_existing_text(paths: &CutoverPaths, e: &Entry) -> Result<Vec<u8>> {
+    let original = unprotect(&e.original.as_ref().context("원본이 없습니다")?.payload)?;
+    if e.path == paths.codex_config {
+        let text = std::str::from_utf8(strip_utf8_bom(&original))?.parse::<DocumentMut>()?;
+        let mut current = read_text(&e.path)?.parse::<DocumentMut>()?;
+        for key in ["openai_base_url", "model_catalog_json"] {
+            restore_toml(&mut current, key, &original_toml(text.get(key)));
+        }
+        let providers = text
+            .get("model_providers")
+            .and_then(toml_edit::Item::as_table_like);
+        if let Some(providers) = providers {
+            for (name, old) in providers.iter() {
+                if !old
+                    .get("base_url")
+                    .and_then(toml_edit::Item::as_str)
+                    .is_some_and(is_cpa_url)
+                {
+                    continue;
+                }
+                if let Some(table) = current
+                    .get_mut("model_providers")
+                    .and_then(|v| v.get_mut(name))
+                    .and_then(toml_edit::Item::as_table_like_mut)
+                {
+                    for key in ["base_url", "model_catalog_url", "experimental_bearer_token"] {
+                        restore_toml_in_table(table, key, &original_toml(old.get(key)));
+                    }
+                }
+            }
+        }
+        preserved_bytes(&e.path, current.to_string().as_bytes())
+    } else if e.path == paths.codex_auth || paths.codex_session_auth.contains(&e.path) {
+        let old: Value = serde_json::from_slice(strip_utf8_bom(&original))?;
+        let mut current: Value = serde_json::from_str(&read_text(&e.path)?)?;
+        let root = current
+            .as_object_mut()
+            .context("Codex auth 형식이 올바르지 않습니다")?;
+        for key in ["auth_mode", "OPENAI_API_KEY"] {
+            restore_json(root, key, &original_json(old.get(key)));
+        }
+        preserved_bytes(&e.path, &serde_json::to_vec_pretty(&current)?)
+    } else {
+        bail!("변경된 세션 홈 매핑은 보존합니다");
+    }
+}
+fn existing_entry(path: PathBuf, after: &[u8], apply: bool) -> Result<Entry> {
+    ancestors_safe(&path)?;
+    if reparse(&path)? || !path.is_file() {
+        bail!("기존 Codex 파일이 일반 파일이 아닙니다");
+    }
+    let mut e = new_entry(path.clone(), Kind::File, None, Some(after), apply)?;
+    e.original = Some(ExistingFile {
+        hash: hash_file(&path)?,
+        identity: identity(&path)?,
+        payload: if apply {
+            protect(&fs::read(&path)?)?
+        } else {
+            String::new()
+        },
+        restoring: false,
+    });
+    Ok(e)
+}
+
 fn install(paths: &CutoverPaths, m: &mut Manifest) -> Result<()> {
     validate_manifest(paths, m)?;
     for i in 0..m.entries.len() {
@@ -817,7 +1108,12 @@ fn install(paths: &CutoverPaths, m: &mut Manifest) -> Result<()> {
         if e.removed {
             bail!("부분 해제 journal입니다. unwire를 먼저 완료하세요");
         }
-        if exists(&e.path)? {
+        if e.original.is_some() {
+            if e.original.as_ref().is_some_and(|o| o.restoring) {
+                bail!("부분 해제 journal입니다. unwire를 먼저 완료하세요");
+            }
+            install_existing(paths, m, i)?;
+        } else if exists(&e.path)? {
             // Recover the precise file installed before its completion write.
             if e.kind == Kind::Junction
                 && !reparse(&e.path)?
@@ -865,15 +1161,17 @@ fn install(paths: &CutoverPaths, m: &mut Manifest) -> Result<()> {
             fs::remove_file(pending_path(&m.entries[i]))?;
         }
     }
-    let current = hash_file(&m.claude)?;
-    if current == m.claude_before {
-        // Payload already preserves the source BOM/line endings. A second
-        // preservation wrapper would prepend another BOM.
-        atomic_bytes(&m.claude, &unprotect(&m.claude_payload)?)?;
-        m.claude_identity = identity(&m.claude)?;
-        atomic_json(&paths.journal(), m)?;
-    } else if current != m.claude_after {
-        bail!("Claude 설정이 변경되어 적용을 중단했습니다");
+    if m.claude_mode == ClaudeMode::Default {
+        let current = hash_file(&m.claude)?;
+        if current == m.claude_before {
+            // Payload already preserves the source BOM/line endings. A second
+            // preservation wrapper would prepend another BOM.
+            atomic_bytes(&m.claude, &unprotect(&m.claude_payload)?)?;
+            m.claude_identity = Some(identity(&m.claude)?);
+            atomic_json(&paths.journal(), m)?;
+        } else if current != m.claude_after {
+            bail!("Claude 설정이 변경되어 적용을 중단했습니다");
+        }
     }
     if let Some(action) = &m.autostart {
         set_autostart(action)?;
@@ -905,21 +1203,43 @@ fn validate_resume_inputs(paths: &CutoverPaths, options: &WireOptions, m: &Manif
         || anyhow::anyhow!("기존 연결의 포트/키가 현재 설정과 다릅니다. 먼저 unwire를 실행하세요");
     let invalid = || anyhow::anyhow!("기존 연결 journal 형식이 올바르지 않습니다");
     let key = read_key(&paths.client_key)?;
-    let claude = unprotect(&m.claude_payload).map_err(|_| invalid())?;
-    let claude: Value = serde_json::from_slice(strip_utf8_bom(&claude)).map_err(|_| invalid())?;
-    let env = claude.get("env").ok_or_else(invalid)?;
-    if env.get("ANTHROPIC_AUTH_TOKEN").and_then(Value::as_str) != Some(key.as_str())
-        || env.get("ANTHROPIC_BASE_URL").and_then(Value::as_str)
-            != Some(claude_base_url(options.data_port).as_str())
-    {
-        return Err(mismatch());
+    if m.claude_mode != ClaudeMode::None {
+        let home = claude_home(paths)?;
+        let claude_payload = if m.claude_mode == ClaudeMode::Dedicated {
+            m.entries
+                .iter()
+                .find(|e| e.path == home.join("settings.json"))
+                .and_then(|e| e.payload.as_deref())
+                .ok_or_else(invalid)?
+        } else {
+            &m.claude_payload
+        };
+        let claude = unprotect(claude_payload).map_err(|_| invalid())?;
+        let claude: Value =
+            serde_json::from_slice(strip_utf8_bom(&claude)).map_err(|_| invalid())?;
+        let env = claude.get("env").ok_or_else(invalid)?;
+        if env.get("ANTHROPIC_AUTH_TOKEN").and_then(Value::as_str) != Some(key.as_str())
+            || env.get("ANTHROPIC_BASE_URL").and_then(Value::as_str)
+                != Some(claude_base_url(options.data_port).as_str())
+        {
+            return Err(mismatch());
+        }
     }
-    if m.mode == CodexMode::Dedicated {
+    if m.mode != CodexMode::None {
         let payload = |name: &str| -> Result<Vec<u8>> {
             let e = m
                 .entries
                 .iter()
-                .find(|e| e.path == m.home.join(name))
+                .find(|e| {
+                    e.path
+                        == if m.mode == CodexMode::Dedicated {
+                            m.home.join(name)
+                        } else if name == "auth.json" {
+                            paths.codex_auth.clone()
+                        } else {
+                            paths.codex_config.clone()
+                        }
+                })
                 .ok_or_else(invalid)?;
             unprotect(e.payload.as_deref().ok_or_else(invalid)?).map_err(|_| invalid())
         };
@@ -948,6 +1268,7 @@ pub(super) fn wire(
     apply: bool,
     options: WireOptions,
     mode: CodexMode,
+    claude_mode: ClaudeMode,
     task_query: &dyn Fn(&str) -> Option<bool>,
 ) -> Result<Report> {
     let count = active_linked_count(&paths.qb_home)?;
@@ -962,6 +1283,17 @@ pub(super) fn wire(
         validate_manifest(paths, &old)?;
         if old.mode != mode {
             bail!("journal의 Codex 모드가 다릅니다. 먼저 unwire를 실행하세요");
+        }
+        if old.claude_mode != claude_mode {
+            bail!("journal의 Claude 모드가 다릅니다. 먼저 unwire를 실행하세요");
+        }
+        if claude_mode == ClaudeMode::Dedicated
+            && paths.claude_command.as_ref() != old.command.as_ref().map(|c| &c.path)
+        {
+            bail!("Claude 실행 파일이 변경되었습니다. 먼저 unwire를 실행하세요");
+        }
+        if let Some(command) = &old.command {
+            check_command(command)?;
         }
         if !old.retained {
             let mut report = Report {
@@ -988,18 +1320,29 @@ pub(super) fn wire(
     } else {
         "<client key>".into()
     };
-    let claude_before =
-        fs::read(&paths.claude_settings).context("Claude 설정을 읽지 못했습니다")?;
-    let json: Value = serde_json::from_slice(strip_utf8_bom(&claude_before))
-        .map_err(|_| anyhow::anyhow!("Claude 설정 형식이 올바르지 않습니다"))?;
-    let claude_after = preserved_bytes_from_original(
-        &claude_before,
-        &claude_bytes(
-            &paths.claude_settings,
-            &claude_base_url(options.data_port),
-            &key,
-        )?,
-    );
+    let claude_before = if claude_mode == ClaudeMode::Default {
+        fs::read(&paths.claude_settings).context("Claude 설정을 읽지 못했습니다")?
+    } else {
+        Vec::new()
+    };
+    let json: Value = if claude_mode == ClaudeMode::Default {
+        serde_json::from_slice(strip_utf8_bom(&claude_before))
+            .map_err(|_| anyhow::anyhow!("Claude 설정 형식이 올바르지 않습니다"))?
+    } else {
+        Value::Null
+    };
+    let claude_after = if claude_mode == ClaudeMode::Default {
+        preserved_bytes_from_original(
+            &claude_before,
+            &claude_bytes(
+                &paths.claude_settings,
+                &claude_base_url(options.data_port),
+                &key,
+            )?,
+        )
+    } else {
+        Vec::new()
+    };
     let mut secrets = Vec::new();
     if apply {
         string_patterns(&key, &mut secrets);
@@ -1012,15 +1355,91 @@ pub(super) fn wire(
         CodexMode::None => "연결 안 함",
     };
     let mut report = Report {
-        summary: vec![format!("요약: Codex {mode_label}, Claude 연결 계획")],
+        summary: vec![format!(
+            "요약: Codex {mode_label}, Claude {}",
+            match claude_mode {
+                ClaudeMode::Default => "연결 계획",
+                ClaudeMode::Dedicated => "별도 설정 연결 계획",
+                ClaudeMode::None => "연결 안 함",
+            }
+        )],
         ..Report::default()
     };
-    report.diff.extend(safe_diff(
-        &paths.claude_settings,
-        &claude_before,
-        &claude_after,
-        &secrets,
-    ));
+    if claude_mode == ClaudeMode::Default {
+        report.diff.extend(safe_diff(
+            &paths.claude_settings,
+            &claude_before,
+            &claude_after,
+            &secrets,
+        ));
+    }
+    let command = if claude_mode == ClaudeMode::Dedicated {
+        if !paths.npm_dir.is_dir() {
+            bail!("npm 디렉터리가 없습니다. Claude 설치를 확인하세요");
+        }
+        let command = paths.claude_command.as_ref().context(
+            "PATH에서 안전한 Claude 실행 파일을 찾지 못했습니다. Claude 설치를 확인하세요",
+        )?;
+        let record = CommandRecord {
+            path: command.clone(),
+            hash: hash_file(command)?,
+            identity: identity(command)?,
+        };
+        check_command(&record)?;
+        let home = claude_home(paths)?;
+        if exists(&home)?
+            && !(retained_home
+                && entries.iter().any(|e| {
+                    e.path == home
+                        && e.kind == Kind::Directory
+                        && matches_entry(e, false).unwrap_or(false)
+                }))
+        {
+            bail!("전용 Claude 홈이 이미 존재합니다. 덮어쓰지 않습니다");
+        }
+        let settings = serde_json::to_vec(&serde_json::json!({"env": {
+            "ANTHROPIC_BASE_URL": claude_base_url(options.data_port), "ANTHROPIC_AUTH_TOKEN": key
+        }}))?;
+        add_dirs(&mut entries, &home, apply)?;
+        entries.push(new_entry(
+            home.join("settings.json"),
+            Kind::File,
+            None,
+            Some(&settings),
+            apply,
+        )?);
+        entries.push(new_entry(
+            paths.npm_dir.join("claude-qb.cmd"),
+            Kind::File,
+            None,
+            Some(&claude_launcher(command)?),
+            apply,
+        )?);
+        report.summary.push(format!(
+            "Claude 별도 설정: {}",
+            home.join("settings.json").display()
+        ));
+        report.summary.push(format!(
+            "실행 파일: {}",
+            paths.npm_dir.join("claude-qb.cmd").display()
+        ));
+        report.diff.extend(safe_diff(
+            &home.join("settings.json"),
+            &[],
+            &settings,
+            &secrets,
+        ));
+        report.diff.extend(safe_diff(
+            &paths.npm_dir.join("claude-qb.cmd"),
+            &[],
+            &claude_launcher(command)?,
+            &secrets,
+        ));
+        report.warnings.push("claude-qb로 시작한 세션만 quota-baton을 거칩니다. 기본 Claude 설정은 그대로이며 기록과 이어 열기는 양방향으로 공유합니다.".into());
+        Some(record)
+    } else {
+        None
+    };
     if mode == CodexMode::Dedicated {
         if !paths.npm_dir.is_dir() || !paths.npm_dir.join("codex.cmd").is_file() {
             bail!("npm 디렉터리 또는 codex.cmd가 없습니다. Codex 설치를 확인하세요");
@@ -1112,7 +1531,8 @@ pub(super) fn wire(
             apply,
         )?);
         for e in &entries {
-            if exists(&e.path)?
+            if e.original.is_none()
+                && exists(&e.path)?
                 && !(e.done && e.kind == Kind::Directory && matches_entry(e, false)?)
             {
                 bail!("생성 경로가 이미 존재합니다: {}", e.path.display());
@@ -1122,15 +1542,89 @@ pub(super) fn wire(
             }
         }
     }
+    for e in &entries {
+        if e.original.is_none()
+            && exists(&e.path)?
+            && !(e.done && e.kind == Kind::Directory && matches_entry(e, false)?)
+        {
+            bail!("생성 경로가 이미 존재합니다: {}", e.path.display());
+        }
+    }
+    if mode == CodexMode::Default {
+        let auth: Value = serde_json::from_str(&read_text(&paths.codex_auth)?)
+            .map_err(|_| anyhow::anyhow!("Codex auth.json 형식이 올바르지 않습니다"))?;
+        if apply && auth.get("auth_mode").and_then(Value::as_str) != Some("apikey") {
+            bail!("기본 Codex auth.json이 apikey 인증이 아니어서 연결을 중단했습니다.");
+        }
+        json_strings(&auth, &mut secrets);
+        let config = preserved_bytes(
+            &paths.codex_config,
+            &codex_config_bytes(
+                &paths.codex_config,
+                &codex_base_url(options.data_port),
+                &key,
+            )?,
+        )?;
+        let auth = preserved_bytes(
+            &paths.codex_auth,
+            &codex_auth_bytes(&paths.codex_auth, &key)?,
+        )?;
+        for (path, bytes) in [(&paths.codex_config, config), (&paths.codex_auth, auth)] {
+            let before = fs::read(path)?;
+            if path == &paths.codex_config {
+                toml_strings(
+                    read_text(path)?
+                        .parse::<DocumentMut>()
+                        .map_err(|_| anyhow::anyhow!("Codex config 형식이 올바르지 않습니다"))?
+                        .as_item(),
+                    &mut secrets,
+                );
+            } else {
+                json_strings(
+                    &serde_json::from_slice::<Value>(strip_utf8_bom(&before))?,
+                    &mut secrets,
+                );
+            }
+            report
+                .diff
+                .extend(safe_diff(path, &before, &bytes, &secrets));
+            entries.push(existing_entry(path.clone(), &bytes, apply)?);
+        }
+        for path in &paths.codex_session_auth {
+            if normal_path(path).contains("\\.codex-acct\\") || !path.exists() {
+                continue;
+            }
+            if session_journal(path, &key)?.is_some() {
+                let bytes = preserved_bytes(path, &codex_auth_bytes(path, &key)?)?;
+                entries.push(existing_entry(path.clone(), &bytes, apply)?);
+            }
+        }
+        if options.detach_chatgpt_session_homes
+            && let Some(path) = paths.session_homes_file.as_ref().filter(|p| p.exists())
+        {
+            let homes = paths
+                .codex_session_homes
+                .iter()
+                .filter(|h| session_home_is_detachable(h))
+                .cloned()
+                .collect::<Vec<_>>();
+            let bytes = detach_chatgpt_session_homes(path, &homes)?;
+            entries.push(existing_entry(path.clone(), &bytes, apply)?);
+        }
+    }
     report
         .changed
         .extend(entries.iter().map(|e| e.path.display().to_string()));
-    report
-        .changed
-        .push("claude.env.ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN".into());
+    if claude_mode == ClaudeMode::Default {
+        report
+            .changed
+            .push("claude.env.ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN".into());
+    }
     let mut manifest = Manifest {
         schema: 3,
         mode,
+        claude_mode,
+        command,
         home: paths.codex_qb_home.clone(),
         npm: paths.npm_dir.clone(),
         claude: paths.claude_settings.clone(),
@@ -1146,8 +1640,12 @@ pub(super) fn wire(
         } else {
             String::new()
         },
-        claude_identity: identity(&paths.claude_settings)?,
-        claude_restored: false,
+        claude_identity: if claude_mode == ClaudeMode::Default {
+            Some(identity(&paths.claude_settings)?)
+        } else {
+            None
+        },
+        claude_restored: claude_mode != ClaudeMode::Default,
         autostart: if options.autostart {
             let (before, before_type) = read_autostart()?;
             Some(OptionalActionJournal {
@@ -1329,6 +1827,61 @@ pub(super) fn unwire(paths: &CutoverPaths, apply: bool, force: bool) -> Result<R
             continue;
         }
         ancestors_safe(&e.path)?;
+        if let Some(original) = e.original.clone() {
+            if !original.restoring {
+                if identity(&e.path)? == original.identity && hash_file(&e.path)? == original.hash {
+                    if let Some(tmp) = &e.pending
+                        && exists(tmp)?
+                    {
+                        if e.pending_identity.is_some() && pending_matches(e, true)? {
+                            fs::remove_file(tmp)?;
+                        } else if scratch_scoped(e, tmp) {
+                            report.warnings.push(format!(
+                                "identity가 기록되지 않은 임시 경로를 보존합니다: {}",
+                                tmp.display()
+                            ));
+                        } else {
+                            refused.push(tmp.display().to_string());
+                            continue;
+                        }
+                    }
+                    m.entries[i].removed = true;
+                    atomic_json(&paths.journal(), &m)?;
+                    continue;
+                }
+                if !matches_entry(e, force)? {
+                    refused.push(e.path.display().to_string());
+                    continue;
+                }
+                let bytes = if hash_file(&e.path)? == e.hash {
+                    unprotect(&original.payload)?
+                } else {
+                    restore_existing_text(paths, e)?
+                };
+                let path = e.path.clone();
+                let mut reverse = existing_entry(path, &bytes, true)?;
+                reverse.original.as_mut().unwrap().restoring = true;
+                // Keep any old unproven scratch visible in the durable record.
+                reverse.abandoned.extend(e.abandoned.clone());
+                if let Some(tmp) = &e.pending
+                    && exists(tmp)?
+                {
+                    if pending_matches(e, false)? {
+                        fs::remove_file(tmp)?;
+                    } else {
+                        refused.push(tmp.display().to_string());
+                        continue;
+                    }
+                }
+                m.entries[i] = reverse;
+                atomic_json(&paths.journal(), &m)?;
+            }
+            install_existing(paths, &mut m, i)?;
+            m.entries[i].identity = Some(identity(&m.entries[i].path)?);
+            m.entries[i].removed = true;
+            atomic_json(&paths.journal(), &m)?;
+            continue;
+        }
         if let Some(tmp) = e.pending.as_ref().filter(|_| !e.removed)
             && exists(tmp)?
         {
@@ -1398,7 +1951,7 @@ pub(super) fn unwire(paths: &CutoverPaths, apply: bool, force: bool) -> Result<R
         if current == m.claude_before {
             m.claude_restored = true;
         } else if current == m.claude_after
-            || (force && identity(&m.claude)? == m.claude_identity && !reparse(&m.claude)?)
+            || (force && Some(identity(&m.claude)?) == m.claude_identity && !reparse(&m.claude)?)
         {
             // Exact restore only while unchanged. Forced cleanup preserves unrelated keys.
             if current == m.claude_after {
@@ -1463,6 +2016,7 @@ mod tests {
         fs::create_dir_all(&source).unwrap();
         fs::create_dir_all(&npm).unwrap();
         fs::write(npm.join("codex.cmd"), "synthetic").unwrap();
+        fs::write(npm.join("claude.cmd"), "synthetic-never-executed").unwrap();
         fs::write(
             source.join("config.toml"),
             format!(
@@ -1509,12 +2063,13 @@ trusted_hash = "synthetic-hook-hash"
             codex_auth: source.join("auth.json"),
             codex_config: source.join("config.toml"),
             codex_qb_home: dir.path().join(".codex-acct/qb"),
-            npm_dir: npm,
+            npm_dir: npm.clone(),
             codex_session_auth: Vec::new(),
             codex_session_homes: Vec::new(),
             session_homes_file: None,
             session_homes_warning: None,
             codex_realtime_items: Vec::new(),
+            claude_command: Some(npm.join("claude.cmd")),
             claude_settings,
             client_key,
             report_roots: Vec::new(),
@@ -1525,6 +2080,7 @@ trusted_hash = "synthetic-hook-hash"
     fn opts(mode: Option<CodexMode>) -> WireOptions {
         WireOptions {
             codex_mode: mode,
+            claude_mode: Some(ClaudeMode::Default),
             ..WireOptions::default()
         }
     }
@@ -2591,5 +3147,410 @@ trusted_hash = "synthetic-hook-hash"
             CodexMode::Default
         );
         assert!(config_bytes(&p, 10200).is_ok()); // implicit CPA override is removed, restoring builtin openai
+    }
+    fn claude_options(codex: CodexMode, claude: Option<ClaudeMode>) -> WireOptions {
+        WireOptions {
+            codex_mode: Some(codex),
+            claude_mode: claude,
+            ..WireOptions::default()
+        }
+    }
+    fn claude_run(
+        p: &CutoverPaths,
+        apply: bool,
+        codex: CodexMode,
+        claude: Option<ClaudeMode>,
+    ) -> Result<Report> {
+        wire_with_task_query(p, apply, claude_options(codex, claude), &|_| {
+            panic!("unrequested task backend")
+        })
+    }
+    #[test]
+    fn claude_default_is_dedicated_but_old_journals_are_legacy() {
+        let (_dir, p) = fixture();
+        assert_eq!(ClaudeMode::default(), ClaudeMode::Dedicated);
+        assert_eq!(
+            resolve_claude_mode(&p, &WireOptions::default()).unwrap(),
+            ClaudeMode::Dedicated
+        );
+        fs::create_dir_all(p.journal().parent().unwrap()).unwrap();
+        for bytes in [r#"{"schema":1}"#, r#"{"schema":3,"mode":"none"}"#] {
+            fs::write(p.journal(), bytes).unwrap();
+            assert_eq!(
+                resolve_claude_mode(&p, &WireOptions::default()).unwrap(),
+                ClaudeMode::Default
+            );
+        }
+        fs::write(p.journal(), r#"{"schema":3,"claude_mode":"none"}"#).unwrap();
+        assert_eq!(
+            resolve_claude_mode(&p, &WireOptions::default()).unwrap(),
+            ClaudeMode::None
+        );
+        fs::write(
+            p.journal(),
+            r#"{"schema":3,"claude_mode":"private-bad-mode"}"#,
+        )
+        .unwrap();
+        assert!(
+            !resolve_claude_mode(&p, &WireOptions::default())
+                .unwrap_err()
+                .to_string()
+                .contains("private-bad-mode")
+        );
+        assert_eq!(
+            resolve_claude_mode(
+                &p,
+                &claude_options(CodexMode::None, Some(ClaudeMode::Dedicated))
+            )
+            .unwrap(),
+            ClaudeMode::Dedicated
+        );
+    }
+    #[test]
+    fn claude_path_lookup_is_injected_ordered_and_never_executes() {
+        let (dir, p) = fixture();
+        let first = dir.path().join("first bin");
+        fs::create_dir(&first).unwrap();
+        fs::write(first.join("claude.exe"), "not executable").unwrap();
+        fs::write(first.join("claude.cmd"), "not executable").unwrap();
+        let path = std::env::join_paths([&first, &p.npm_dir]).unwrap();
+        assert_eq!(
+            resolve_claude_command(Some(&path), Some(std::ffi::OsStr::new(".CMD;.EXE")))
+                .map(|p| normal_path(&p)),
+            Some(
+                normal_path(&first.join("claude.cmd"))
+                    .trim_start_matches(r"\\?\")
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            resolve_claude_command(Some(&path), Some(std::ffi::OsStr::new(".EXE;.CMD")))
+                .map(|p| normal_path(&p)),
+            Some(
+                normal_path(&first.join("claude.exe"))
+                    .trim_start_matches(r"\\?\")
+                    .to_owned()
+            )
+        );
+        assert!(resolve_claude_command(None, None).is_none());
+        assert!(resolve_claude_command(Some(std::ffi::OsStr::new(".;relative")), None).is_none());
+        assert!(claude_launcher(&dir.path().join("bad%name/claude.cmd")).is_err());
+        assert!(claude_launcher(&dir.path().join("bad!name/claude.cmd")).is_err());
+    }
+    #[test]
+    fn claude_dedicated_exact_payload_launcher_preview_roundtrip_and_untouched_sources() {
+        let (_dir, p) = fixture();
+        let before = snapshot(&p);
+        let home = claude_home(&p).unwrap();
+        let claude_before = fs::read(&p.claude_settings).unwrap();
+        let preview = claude_run(&p, false, CodexMode::None, None).unwrap();
+        assert!(!home.exists());
+        assert!(!p.journal().exists());
+        assert!(output(&preview).contains("--settings"));
+        for secret in [KEY, SECRET] {
+            assert!(!output(&preview).contains(secret));
+        }
+        let report = claude_run(&p, true, CodexMode::None, None).unwrap();
+        assert!(!output(&report).contains(KEY));
+        let expected = serde_json::json!({"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:10200","ANTHROPIC_AUTH_TOKEN":KEY}});
+        assert_eq!(
+            fs::read(home.join("settings.json")).unwrap(),
+            serde_json::to_vec(&expected).unwrap()
+        );
+        let launcher = fs::read_to_string(p.npm_dir.join("claude-qb.cmd")).unwrap();
+        assert!(launcher.contains("setlocal DisableDelayedExpansion\r\n"));
+        assert!(launcher.contains(&format!(
+            "call \"{}\" --settings \"%USERPROFILE%\\.claude-qb\\settings.json\" %*\r\n",
+            p.claude_command.as_ref().unwrap().display()
+        )));
+        assert_eq!(before, snapshot(&p));
+        assert_eq!(claude_before, fs::read(&p.claude_settings).unwrap());
+        assert_private_claude_acl(&home, true);
+        assert_private_claude_acl(&home.join("settings.json"), false);
+        claude_run(&p, true, CodexMode::None, None).unwrap();
+        unwire(&p, true, false).unwrap();
+        assert!(!home.exists());
+        assert!(!p.npm_dir.join("claude-qb.cmd").exists());
+        assert_eq!(before, snapshot(&p));
+        assert_eq!(claude_before, fs::read(&p.claude_settings).unwrap());
+    }
+    #[test]
+    fn claude_modes_are_independent_and_none_never_reads_claude_inputs() {
+        for codex in [CodexMode::Default, CodexMode::Dedicated, CodexMode::None] {
+            for claude in [ClaudeMode::Default, ClaudeMode::Dedicated, ClaudeMode::None] {
+                let (_dir, mut p) = fixture();
+                if codex == CodexMode::Default {
+                    fs::write(
+                        &p.codex_auth,
+                        r#"{"auth_mode":"apikey","OPENAI_API_KEY":"old"}"#,
+                    )
+                    .unwrap();
+                }
+                if claude == ClaudeMode::None {
+                    fs::remove_file(&p.claude_settings).unwrap();
+                    p.claude_command = None;
+                }
+                if codex == CodexMode::None && claude == ClaudeMode::None {
+                    assert!(claude_run(&p, true, codex, Some(claude)).is_err());
+                    assert!(!p.journal().exists());
+                    continue;
+                }
+                let config = fs::read(&p.codex_config).unwrap();
+                let auth = fs::read(&p.codex_auth).unwrap();
+                claude_run(&p, false, codex, Some(claude)).unwrap();
+                claude_run(&p, true, codex, Some(claude)).unwrap();
+                if codex != CodexMode::Default || claude != ClaudeMode::Default {
+                    claude_run(&p, true, codex, None).unwrap();
+                }
+                super::super::unwire(&p, true, false).unwrap();
+                assert_eq!(fs::read(&p.codex_config).unwrap(), config);
+                assert_eq!(fs::read(&p.codex_auth).unwrap(), auth);
+                if claude == ClaudeMode::None {
+                    assert!(!p.claude_settings.exists());
+                }
+            }
+        }
+    }
+    #[test]
+    fn claude_creation_and_publication_crashes_recover_with_unknown_scratch_preserved() {
+        for name in ["home", "settings.json", "launcher"] {
+            for stage in ["after-create", "after-publish"] {
+                for resume in [false, true] {
+                    let (_dir, p) = fixture();
+                    let home = claude_home(&p).unwrap();
+                    let path = match name {
+                        "home" => home.clone(),
+                        "launcher" => p.npm_dir.join("claude-qb.cmd"),
+                        n => home.join(n),
+                    };
+                    INTERRUPT.with(|s| *s.borrow_mut() = Some((path.clone(), stage)));
+                    assert!(claude_run(&p, true, CodexMode::None, None).is_err());
+                    let m = manifest(&p);
+                    let e = m.entries.iter().find(|e| e.path == path).unwrap();
+                    let scratch = pending_path(e);
+                    let marker = if stage == "after-create" {
+                        let marker = if name == "home" {
+                            scratch.join("unknown")
+                        } else {
+                            scratch.clone()
+                        };
+                        fs::write(&marker, "unowned").unwrap();
+                        Some(marker)
+                    } else {
+                        None
+                    };
+                    if resume {
+                        claude_run(&p, true, CodexMode::None, None).unwrap();
+                    }
+                    unwire(&p, true, false).unwrap();
+                    if let Some(marker) = marker {
+                        assert_eq!(fs::read_to_string(marker).unwrap(), "unowned");
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn claude_unknown_paths_modes_command_changes_and_resume_key_mismatch_refuse() {
+        let (_dir, p) = fixture();
+        claude_run(&p, true, CodexMode::None, None).unwrap();
+        assert!(claude_run(&p, true, CodexMode::None, Some(ClaudeMode::None)).is_err());
+        fs::write(&p.client_key, "different-key").unwrap();
+        assert!(claude_run(&p, true, CodexMode::None, None).is_err());
+        fs::write(&p.client_key, KEY).unwrap();
+        fs::write(p.claude_command.as_ref().unwrap(), "changed-command").unwrap();
+        assert!(claude_run(&p, true, CodexMode::None, None).is_err());
+        let mut m = manifest(&p);
+        let original = fs::read(p.journal()).unwrap();
+        m.entries[1].path = p.claude_settings.clone();
+        atomic_json(&p.journal(), &m).unwrap();
+        assert!(unwire(&p, true, true).is_err());
+        fs::write(p.journal(), original).unwrap();
+        // Removal does not depend on the continued availability of Claude.
+        unwire(&p, true, false).unwrap();
+    }
+    #[test]
+    fn claude_changed_payload_requires_force_and_replacement_identity_is_never_adopted() {
+        for replace in [false, true] {
+            let (_dir, p) = fixture();
+            claude_run(&p, true, CodexMode::None, None).unwrap();
+            let path = claude_home(&p).unwrap().join("settings.json");
+            if replace {
+                fs::rename(&path, path.with_extension("kept")).unwrap();
+            }
+            fs::write(&path, "edited").unwrap();
+            assert!(unwire(&p, true, false).is_err());
+            if replace {
+                assert!(unwire(&p, true, true).is_err());
+                assert_eq!(fs::read_to_string(path).unwrap(), "edited");
+            } else {
+                unwire(&p, true, true).unwrap();
+                assert!(!path.exists());
+            }
+        }
+    }
+    /// Native DACL inspection only: no external command and no ambient profile.
+    fn assert_private_claude_acl(path: &Path, directory: bool) {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::{
+            Win32::{
+                Foundation::{CloseHandle, HANDLE},
+                Security::{
+                    ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
+                    GetFileSecurityW, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+                    GetTokenInformation, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
+                    TOKEN_QUERY, TOKEN_USER, TokenUser,
+                },
+                System::Threading::{GetCurrentProcess, OpenProcessToken},
+            },
+            core::{BOOL, PCWSTR},
+        };
+        let path = path
+            .as_os_str()
+            .encode_wide()
+            .chain([0])
+            .collect::<Vec<_>>();
+        unsafe {
+            let mut size = 0;
+            let _ = GetFileSecurityW(
+                PCWSTR(path.as_ptr()),
+                DACL_SECURITY_INFORMATION.0,
+                None,
+                0,
+                &mut size,
+            );
+            assert!(size > 0);
+            let mut storage = vec![0usize; (size as usize).div_ceil(std::mem::size_of::<usize>())];
+            let descriptor = PSECURITY_DESCRIPTOR(storage.as_mut_ptr().cast());
+            GetFileSecurityW(
+                PCWSTR(path.as_ptr()),
+                DACL_SECURITY_INFORMATION.0,
+                Some(descriptor),
+                size,
+                &mut size,
+            )
+            .ok()
+            .unwrap();
+            let mut control = 0;
+            let mut revision = 0;
+            GetSecurityDescriptorControl(descriptor, &mut control, &mut revision).unwrap();
+            if directory {
+                assert_ne!(control & SE_DACL_PROTECTED.0, 0);
+            }
+            let mut present = BOOL::default();
+            let mut defaulted = BOOL::default();
+            let mut acl: *mut ACL = std::ptr::null_mut();
+            GetSecurityDescriptorDacl(descriptor, &mut present, &mut acl, &mut defaulted).unwrap();
+            assert!(present.as_bool() && !acl.is_null());
+            assert_eq!((*acl).AceCount, 1);
+            let mut ace = std::ptr::null_mut();
+            GetAce(acl, 0, &mut ace).unwrap();
+            let ace = &*ace.cast::<ACCESS_ALLOWED_ACE>();
+            assert_eq!(ace.Header.AceType, 0);
+            if directory {
+                assert_eq!(ace.Header.AceFlags & 3, 3);
+            }
+            assert_eq!(ace.Mask & 0x001f01ff, 0x001f01ff);
+            let mut token = HANDLE::default();
+            OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).unwrap();
+            let mut size = 0;
+            let _ = GetTokenInformation(token, TokenUser, None, 0, &mut size);
+            let mut buffer = vec![0usize; (size as usize).div_ceil(std::mem::size_of::<usize>())];
+            let result = GetTokenInformation(
+                token,
+                TokenUser,
+                Some(buffer.as_mut_ptr().cast()),
+                size,
+                &mut size,
+            );
+            CloseHandle(token).unwrap();
+            result.unwrap();
+            let user = &*buffer.as_ptr().cast::<TOKEN_USER>();
+            EqualSid(
+                PSID((&ace.SidStart as *const u32).cast_mut().cast()),
+                user.User.Sid,
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn claude_acl_failure_stops_before_any_secret_scratch_or_launcher() {
+        let (_dir, p) = fixture();
+        let home = claude_home(&p).unwrap();
+        INTERRUPT.with(|s| *s.borrow_mut() = Some((home.clone(), "before-acl")));
+        let error = claude_run(&p, true, CodexMode::None, None).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Claude 전용 설정 디렉터리 접근 권한을 제한하지 못했습니다"
+        );
+        assert!(!home.join("settings.json").exists());
+        assert!(!p.npm_dir.join("claude-qb.cmd").exists());
+        assert!(fs::read_dir(&home).unwrap().next().is_none());
+        claude_run(&p, true, CodexMode::None, None).unwrap();
+        assert_private_claude_acl(&home, true);
+        unwire(&p, true, false).unwrap();
+    }
+    #[test]
+    fn codex_default_claude_none_replacement_publication_recovers_and_restores_sessions() {
+        for resume in [false, true] {
+            let (dir, mut p) = fixture();
+            fs::write(
+                &p.codex_auth,
+                r#"{"auth_mode":"apikey","OPENAI_API_KEY":"old"}"#,
+            )
+            .unwrap();
+            let session = dir.path().join("session-auth.json");
+            fs::write(
+                &session,
+                r#"{"auth_mode":"apikey","OPENAI_API_KEY":"old-session","keep":1}"#,
+            )
+            .unwrap();
+            p.codex_session_auth.push(session.clone());
+            let before = snapshot(&p);
+            let original_session = fs::read(&session).unwrap();
+            INTERRUPT.with(|s| *s.borrow_mut() = Some((p.codex_config.clone(), "after-publish")));
+            assert!(claude_run(&p, true, CodexMode::Default, Some(ClaudeMode::None)).is_err());
+            if resume {
+                claude_run(&p, true, CodexMode::Default, None).unwrap();
+            }
+            unwire(&p, true, false).unwrap();
+            assert_eq!(snapshot(&p), before);
+            assert_eq!(fs::read(session).unwrap(), original_session);
+        }
+    }
+    #[test]
+    fn codex_default_claude_none_force_restores_owned_values_preserving_user_edits() {
+        let (_dir, p) = fixture();
+        fs::write(
+            &p.codex_auth,
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":"old"}"#,
+        )
+        .unwrap();
+        claude_run(&p, true, CodexMode::Default, Some(ClaudeMode::None)).unwrap();
+        let mut config = fs::read_to_string(&p.codex_config).unwrap();
+        config.push_str("\nuser_added = true\n");
+        fs::write(&p.codex_config, config).unwrap();
+        assert!(unwire(&p, true, false).is_err());
+        unwire(&p, true, true).unwrap();
+        let text = fs::read_to_string(&p.codex_config).unwrap();
+        assert!(text.contains("user_added = true"));
+        assert!(!text.contains("10200"));
+        assert!(text.contains(SECRET));
+    }
+    #[test]
+    fn claude_dedicated_does_not_require_default_settings_and_unknown_home_content_survives() {
+        let (_dir, p) = fixture();
+        fs::remove_file(&p.claude_settings).unwrap();
+        claude_run(&p, true, CodexMode::None, None).unwrap();
+        let home = claude_home(&p).unwrap();
+        let unknown = home.join("unknown");
+        fs::write(&unknown, "keep").unwrap();
+        unwire(&p, true, false).unwrap();
+        assert_eq!(fs::read_to_string(&unknown).unwrap(), "keep");
+        claude_run(&p, true, CodexMode::None, None).unwrap();
+        unwire(&p, true, false).unwrap();
+        assert_eq!(fs::read_to_string(unknown).unwrap(), "keep");
+        assert!(!p.claude_settings.exists());
     }
 }

@@ -391,7 +391,13 @@ fn r3_wire_help_and_invalid_codex_mode() {
         .unwrap();
     let text = r3_output(&help);
     assert!(help.status.success(), "{text}");
-    for expected in ["--codex-mode", "default", "dedicated", "none"] {
+    for expected in [
+        "--codex-mode",
+        "--claude-mode",
+        "default",
+        "dedicated",
+        "none",
+    ] {
         assert!(text.contains(expected), "missing help: {expected}");
     }
     for args in [
@@ -416,7 +422,7 @@ fn r3_wire_none_dry_run_without_codex_inputs_or_accounts() {
     let before = r3_tree(home.path());
     let output = r3_wire_command(home.path())
         .env_remove("APPDATA")
-        .args(["wire", "--codex-mode", "none"])
+        .args(["wire", "--claude-mode", "default", "--codex-mode", "none"])
         .bounded_output()
         .unwrap();
     let text = r3_output(&output);
@@ -429,7 +435,16 @@ fn r3_wire_none_dry_run_without_codex_inputs_or_accounts() {
 
 #[test]
 fn r3_wire_dedicated_and_auto_dry_runs_leave_source_and_launcher_untouched() {
-    for args in [vec!["wire"], vec!["wire", "--codex-mode", "dedicated"]] {
+    for args in [
+        vec!["wire", "--claude-mode", "default"],
+        vec![
+            "wire",
+            "--claude-mode",
+            "default",
+            "--codex-mode",
+            "dedicated",
+        ],
+    ] {
         let home = r3_wire_fixture(true);
         let before = r3_tree(home.path());
         let output = r3_wire_command(home.path())
@@ -479,7 +494,13 @@ fn r3_wire_explicit_default_preserves_legacy_preview() {
     .unwrap();
     let before = r3_tree(home.path());
     let output = r3_wire_command(home.path())
-        .args(["wire", "--codex-mode", "default"])
+        .args([
+            "wire",
+            "--claude-mode",
+            "default",
+            "--codex-mode",
+            "default",
+        ])
         .bounded_output()
         .unwrap();
     let text = r3_output(&output);
@@ -683,7 +704,14 @@ async fn r3_wire_none_apply_with_real_claude_only_core_and_exact_unwire() {
     r3_apply_core_state(home.path(), 0).await;
     let output = r3_apply_command(home.path())
         .env_remove("APPDATA")
-        .args(["wire", "--apply", "--codex-mode", "none"])
+        .args([
+            "wire",
+            "--claude-mode",
+            "default",
+            "--apply",
+            "--codex-mode",
+            "none",
+        ])
         .bounded_output()
         .unwrap();
     let text = r3_apply_output(home.path(), &output);
@@ -740,7 +768,14 @@ async fn r3_wire_dedicated_refuses_real_healthy_claude_only_core_without_mutatio
     let before = r3_apply_profile(&profile);
     let config_before = std::fs::read(home.path().join("config.toml")).unwrap();
     let output = r3_apply_command(home.path())
-        .args(["wire", "--apply", "--codex-mode", "dedicated"])
+        .args([
+            "wire",
+            "--claude-mode",
+            "default",
+            "--apply",
+            "--codex-mode",
+            "dedicated",
+        ])
         .bounded_output()
         .unwrap();
     let text = r3_apply_output(home.path(), &output);
@@ -764,134 +799,171 @@ async fn r3_wire_dedicated_refuses_real_healthy_claude_only_core_without_mutatio
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r3_wire_dedicated_apply_with_both_providers_and_unwire_preserves_sessions() {
     let _serial = SERVE_SERIAL.lock().await;
-    let fake = qb_testkit::ScriptedUpstream::start().await.unwrap();
-    let home = r3_apply_fixture(&fake.url);
-    let cpa = home.path().join("synthetic-r3-cpa");
-    let mut codex = cpa_fixture(1);
-    codex["expired"] = serde_json::json!("2099-01-01T00:00:00Z");
-    std::fs::write(cpa.join("codex.json"), serde_json::to_vec(&codex).unwrap()).unwrap();
-    {
-        let store = qb_core::accounts::AccountStore::acquire(home.path()).unwrap();
-        qb_core::accounts::import::run(
-            &store,
-            &cpa,
-            &["codex:synthetic@example.invalid".to_owned()],
-            false,
-        )
-        .unwrap();
-    }
-    let accounts = qb_core::accounts::AccountStore::list_metadata(home.path()).unwrap();
-    assert_eq!(accounts.len(), 2);
-    for provider in [
-        qb_core::accounts::Provider::Claude,
-        qb_core::accounts::Provider::Codex,
-    ] {
-        assert!(
-            accounts
-                .iter()
-                .any(|a| a.provider == provider && a.eligible(None))
-        );
-    }
-    let profile = home
-        .path()
-        .join("synthetic-profile")
-        .canonicalize()
-        .unwrap();
-    let direct_sessions = profile.join(".codex/sessions");
-    std::fs::create_dir(&direct_sessions).unwrap();
-    let direct_session = direct_sessions.join("synthetic-direct.jsonl");
-    let direct_bytes = b"{\"session\":\"synthetic-direct\"}\r\n";
-    std::fs::write(&direct_session, direct_bytes).unwrap();
-    let before = r3_apply_profile(&profile);
-    let core = r2a_core_in(home.path(), &profile).await;
-    r3_apply_core_state(home.path(), 1).await;
-    let output = r3_apply_command(home.path())
-        .args(["wire", "--apply", "--codex-mode", "dedicated"])
-        .bounded_output()
-        .unwrap();
-    let text = r3_apply_output(home.path(), &output);
-    assert!(output.status.success(), "{text}");
-    assert!(home.path().join("journal/wiring.json").is_file());
-    let qb = profile.join(".codex-acct/qb");
-    let auth: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(qb.join("auth.json")).unwrap()).unwrap();
-    let secrets = qb_core::local_secrets::load_existing(home.path()).unwrap();
-    assert!(auth["auth_mode"] == "apikey");
-    assert!(auth["OPENAI_API_KEY"].as_str() == Some(secrets.client_key.as_str()));
-    assert!(auth.get("tokens").is_none());
-    let claude: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(profile.join(".claude/settings.json")).unwrap())
-            .unwrap();
-    assert!(claude["env"]["ANTHROPIC_AUTH_TOKEN"].as_str() == Some(secrets.client_key.as_str()));
-    let config = std::fs::read_to_string(qb.join("config.toml"))
-        .unwrap()
-        .parse::<toml_edit::DocumentMut>()
-        .unwrap();
-    let core_config = qb_core::config::Config::load(home.path()).unwrap();
-    assert_eq!(
-        config["openai_base_url"].as_str(),
-        Some(format!("http://127.0.0.1:{}/v1", core_config.server.data_port).as_str())
-    );
-    assert_eq!(
-        config["log_dir"].as_str(),
-        Some(qb.join("log").to_string_lossy().as_ref())
-    );
-    assert_eq!(config["model"].as_str(), Some("synthetic-model"));
-    assert_eq!(config["features"]["keep"].as_bool(), Some(true));
-    assert!(config.get("model_catalog_json").is_none());
-    let launcher = profile.join("AppData/Roaming/npm/codex-qb.cmd");
-    let launcher_text = std::fs::read_to_string(&launcher).unwrap();
-    assert!(launcher_text.starts_with("@echo off\r\nsetlocal\r\n"));
-    assert!(launcher_text.contains("set \"CODEX_HOME=%USERPROFILE%\\.codex-acct\\qb\"\r\n"));
-    assert!(launcher_text.ends_with("call \"%APPDATA%\\npm\\codex.cmd\" %*\r\n"));
-    let wired = r3_apply_profile(&profile);
-    for (path, bytes) in &before {
-        if path.starts_with(".codex")
-            || path.starts_with("AppData/Roaming/herdr")
-            || path == Path::new("AppData/Roaming/npm/codex.cmd")
+    for claude_mode in ["default", "dedicated"] {
+        let fake = qb_testkit::ScriptedUpstream::start().await.unwrap();
+        let home = r3_apply_fixture(&fake.url);
+        let cpa = home.path().join("synthetic-r3-cpa");
+        let mut codex = cpa_fixture(1);
+        codex["expired"] = serde_json::json!("2099-01-01T00:00:00Z");
+        std::fs::write(cpa.join("codex.json"), serde_json::to_vec(&codex).unwrap()).unwrap();
         {
+            let store = qb_core::accounts::AccountStore::acquire(home.path()).unwrap();
+            qb_core::accounts::import::run(
+                &store,
+                &cpa,
+                &["codex:synthetic@example.invalid".to_owned()],
+                false,
+            )
+            .unwrap();
+        }
+        let accounts = qb_core::accounts::AccountStore::list_metadata(home.path()).unwrap();
+        assert_eq!(accounts.len(), 2);
+        for provider in [
+            qb_core::accounts::Provider::Claude,
+            qb_core::accounts::Provider::Codex,
+        ] {
             assert!(
-                wired.get(path) == Some(bytes),
-                "Dedicated changed direct source files"
+                accounts
+                    .iter()
+                    .any(|a| a.provider == provider && a.eligible(None))
             );
         }
-    }
-    assert!(std::fs::read(&direct_session).unwrap() == direct_bytes);
-    // Only direct, known paths are touched: never enumerate shared junctions.
-    let sessions = qb.join("sessions");
-    std::fs::create_dir(&sessions).unwrap();
-    let session = sessions.join("synthetic-qb.jsonl");
-    let session_bytes = b"{\"session\":\"synthetic-qb\"}\r\n";
-    std::fs::write(&session, session_bytes).unwrap();
-    let output = r3_apply_command(home.path())
-        .args(["unwire", "--apply"])
-        .bounded_output()
-        .unwrap();
-    let text = r3_apply_output(home.path(), &output);
-    assert!(output.status.success(), "{text}");
-    assert!(std::fs::read(session).unwrap() == session_bytes);
-    assert!(std::fs::read(direct_session).unwrap() == direct_bytes);
-    assert!(!qb.join("auth.json").exists());
-    assert!(!qb.join("config.toml").exists());
-    assert!(!launcher.exists());
-    let journal: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(home.path().join("journal/wiring.json")).unwrap())
+        if claude_mode == "dedicated" {
+            r3_claude_launcher_fixture(home.path());
+        }
+        let profile = home
+            .path()
+            .join("synthetic-profile")
+            .canonicalize()
             .unwrap();
-    assert!(journal["retained"] == true);
-    // Retained QB sessions keep .codex-acct at the profile root; every original
-    // directory listing and source/settings byte must otherwise be identical.
-    let mut expected = before;
-    let root_entries = expected.get_mut(Path::new("<entries>")).unwrap();
-    let mut names: Vec<String> = serde_json::from_slice(root_entries.as_ref().unwrap()).unwrap();
-    names.push(".codex-acct".to_owned());
-    names.sort();
-    *root_entries = Some(serde_json::to_vec(&names).unwrap());
-    assert!(
-        r3_apply_profile(&profile) == expected,
-        "unwire changed original profile bytes"
-    );
-    assert!(core.try_wait().unwrap().is_none());
-    drop(core);
+        let direct_sessions = profile.join(".codex/sessions");
+        std::fs::create_dir(&direct_sessions).unwrap();
+        let direct_session = direct_sessions.join("synthetic-direct.jsonl");
+        let direct_bytes = b"{\"session\":\"synthetic-direct\"}\r\n";
+        std::fs::write(&direct_session, direct_bytes).unwrap();
+        let before = r3_apply_profile(&profile);
+        let core = r2a_core_in(home.path(), &profile).await;
+        r3_apply_core_state(home.path(), 1).await;
+        let output = r3_apply_command(home.path())
+            .env("PATH", profile.join("AppData/Roaming/npm"))
+            .args([
+                "wire",
+                "--claude-mode",
+                claude_mode,
+                "--apply",
+                "--codex-mode",
+                "dedicated",
+            ])
+            .bounded_output()
+            .unwrap();
+        let text = r3_apply_output(home.path(), &output);
+        assert!(output.status.success(), "{text}");
+        assert!(home.path().join("journal/wiring.json").is_file());
+        let qb = profile.join(".codex-acct/qb");
+        let auth: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(qb.join("auth.json")).unwrap()).unwrap();
+        let secrets = qb_core::local_secrets::load_existing(home.path()).unwrap();
+        assert!(auth["auth_mode"] == "apikey");
+        assert!(auth["OPENAI_API_KEY"].as_str() == Some(secrets.client_key.as_str()));
+        assert!(auth.get("tokens").is_none());
+        let claude: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(profile.join(if claude_mode == "dedicated" {
+                ".claude-qb/settings.json"
+            } else {
+                ".claude/settings.json"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            claude["env"]["ANTHROPIC_AUTH_TOKEN"].as_str() == Some(secrets.client_key.as_str())
+        );
+        if claude_mode == "dedicated" {
+            assert!(
+                std::fs::read(profile.join(".claude/settings.json"))
+                    .unwrap()
+                    .as_slice()
+                    == before
+                        .get(Path::new(".claude/settings.json"))
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .as_slice()
+            );
+            assert!(profile.join("AppData/Roaming/npm/claude-qb.cmd").is_file());
+        }
+        let config = std::fs::read_to_string(qb.join("config.toml"))
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        let core_config = qb_core::config::Config::load(home.path()).unwrap();
+        assert_eq!(
+            config["openai_base_url"].as_str(),
+            Some(format!("http://127.0.0.1:{}/v1", core_config.server.data_port).as_str())
+        );
+        assert_eq!(
+            config["log_dir"].as_str(),
+            Some(qb.join("log").to_string_lossy().as_ref())
+        );
+        assert_eq!(config["model"].as_str(), Some("synthetic-model"));
+        assert_eq!(config["features"]["keep"].as_bool(), Some(true));
+        assert!(config.get("model_catalog_json").is_none());
+        let launcher = profile.join("AppData/Roaming/npm/codex-qb.cmd");
+        let launcher_text = std::fs::read_to_string(&launcher).unwrap();
+        assert!(launcher_text.starts_with("@echo off\r\nsetlocal\r\n"));
+        assert!(launcher_text.contains("set \"CODEX_HOME=%USERPROFILE%\\.codex-acct\\qb\"\r\n"));
+        assert!(launcher_text.ends_with("call \"%APPDATA%\\npm\\codex.cmd\" %*\r\n"));
+        let wired = r3_apply_profile(&profile);
+        for (path, bytes) in &before {
+            if path.starts_with(".codex")
+                || path.starts_with("AppData/Roaming/herdr")
+                || path == Path::new("AppData/Roaming/npm/codex.cmd")
+            {
+                assert!(
+                    wired.get(path) == Some(bytes),
+                    "Dedicated changed direct source files"
+                );
+            }
+        }
+        assert!(std::fs::read(&direct_session).unwrap() == direct_bytes);
+        // Only direct, known paths are touched: never enumerate shared junctions.
+        let sessions = qb.join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let session = sessions.join("synthetic-qb.jsonl");
+        let session_bytes = b"{\"session\":\"synthetic-qb\"}\r\n";
+        std::fs::write(&session, session_bytes).unwrap();
+        let output = r3_apply_command(home.path())
+            .args(["unwire", "--apply"])
+            .bounded_output()
+            .unwrap();
+        let text = r3_apply_output(home.path(), &output);
+        assert!(output.status.success(), "{text}");
+        assert!(std::fs::read(session).unwrap() == session_bytes);
+        assert!(std::fs::read(direct_session).unwrap() == direct_bytes);
+        assert!(!qb.join("auth.json").exists());
+        assert!(!qb.join("config.toml").exists());
+        assert!(!launcher.exists());
+        let journal: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(home.path().join("journal/wiring.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(journal["retained"] == true);
+        // Retained QB sessions keep .codex-acct at the profile root; every original
+        // directory listing and source/settings byte must otherwise be identical.
+        let mut expected = before;
+        let root_entries = expected.get_mut(Path::new("<entries>")).unwrap();
+        let mut names: Vec<String> =
+            serde_json::from_slice(root_entries.as_ref().unwrap()).unwrap();
+        names.push(".codex-acct".to_owned());
+        names.sort();
+        *root_entries = Some(serde_json::to_vec(&names).unwrap());
+        assert!(
+            r3_apply_profile(&profile) == expected,
+            "unwire changed original profile bytes"
+        );
+        assert!(core.try_wait().unwrap().is_none());
+        drop(core);
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -935,7 +1007,14 @@ async fn r3_wire_apply_refuses_missing_or_unhealthy_core_without_mutation() {
             // No real core is running here, so whole-home equality is safe.
             let before = r3_tree(home.path());
             let output = r3_apply_command(home.path())
-                .args(["wire", "--apply", "--codex-mode", mode])
+                .args([
+                    "wire",
+                    "--claude-mode",
+                    "default",
+                    "--apply",
+                    "--codex-mode",
+                    mode,
+                ])
                 .bounded_output()
                 .unwrap();
             if let Some(server) = server {
@@ -2184,4 +2263,168 @@ async fn r2a_cli_refreshes_disabled_owned_account_online_and_offline() {
         let store = qb_core::accounts::AccountStore::acquire(home.path()).unwrap();
         assert!(store.tokens(&account).unwrap().access_token == "synthetic-cli-rotated-access");
     }
+}
+
+// R3 Claude opt-in: fake PATH entries are never executed by wire.
+fn r3_claude_command(home: &Path) -> Command {
+    let profile = home.join("synthetic-profile").canonicalize().unwrap();
+    let mut command = r3_wire_command(home);
+    command
+        .env("PATH", profile.join("AppData/Roaming/npm"))
+        .env("PATHEXT", ".COM;.EXE;.BAT;.CMD");
+    command
+}
+
+fn r3_claude_launcher_fixture(home: &Path) -> std::path::PathBuf {
+    let npm = home.join("synthetic-profile/AppData/Roaming/npm");
+    std::fs::create_dir_all(&npm).unwrap();
+    let command = npm.join("claude.cmd");
+    std::fs::write(
+        &command,
+        b"@echo off\r\nrem synthetic command: must not execute during cutover\r\nexit /b 93\r\n",
+    )
+    .unwrap();
+    command.canonicalize().unwrap()
+}
+
+#[test]
+fn r3_claude_dedicated_default_preview_writes_nothing_and_preserves_default_settings() {
+    let home = r3_wire_fixture(false);
+    r3_claude_launcher_fixture(home.path());
+    let before = r3_tree(home.path());
+    for mode in [None, Some("dedicated")] {
+        let mut command = r3_claude_command(home.path());
+        command.args(["wire", "--codex-mode", "none"]);
+        if let Some(mode) = mode {
+            command.args(["--claude-mode", mode]);
+        }
+        let output = command.bounded_output().unwrap();
+        let text = r3_output(&output);
+        assert!(output.status.success(), "{text}");
+        for expected in ["claude-qb.cmd", ".claude-qb", "--settings", "<client key>"] {
+            assert!(text.contains(expected), "missing preview {expected}");
+        }
+        assert!(
+            r3_tree(home.path()) == before,
+            "dedicated Claude preview wrote files"
+        );
+    }
+}
+
+#[test]
+fn r3_claude_dedicated_missing_command_and_invalid_mode_refuse_without_writes() {
+    let home = r3_wire_fixture(false);
+    std::fs::create_dir_all(home.path().join("synthetic-profile/AppData/Roaming/npm")).unwrap();
+    let before = r3_tree(home.path());
+    let output = r3_claude_command(home.path())
+        .args(["wire", "--codex-mode", "none"])
+        .bounded_output()
+        .unwrap();
+    let text = r3_output(&output);
+    assert!(!output.status.success());
+    assert!(text.contains("Claude") || text.contains("claude"), "{text}");
+    let output = r3_claude_command(home.path())
+        .args(["wire", "--claude-mode", "invalid"])
+        .bounded_output()
+        .unwrap();
+    let text = r3_output(&output);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(text.contains("--claude-mode"));
+    assert!(
+        r3_tree(home.path()) == before,
+        "Claude refusal changed fixture"
+    );
+}
+
+#[test]
+fn r3_claude_none_skips_missing_claude_settings_and_command() {
+    let home = r3_wire_fixture(true);
+    std::fs::remove_file(home.path().join("synthetic-profile/.claude/settings.json")).unwrap();
+    let before = r3_tree(home.path());
+    let output = r3_claude_command(home.path())
+        .args(["wire", "--codex-mode", "dedicated", "--claude-mode", "none"])
+        .bounded_output()
+        .unwrap();
+    let text = r3_output(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("codex-qb.cmd"));
+    assert!(!text.contains("claude-qb.cmd"));
+    assert!(
+        r3_tree(home.path()) == before,
+        "Claude none preview wrote fixture"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r3_claude_dedicated_apply_real_core_exact_payload_launcher_and_round_trip() {
+    let _serial = SERVE_SERIAL.lock().await;
+    let fake = qb_testkit::ScriptedUpstream::start().await.unwrap();
+    let home = r3_apply_fixture(&fake.url);
+    let resolved = r3_claude_launcher_fixture(home.path());
+    let profile = home
+        .path()
+        .join("synthetic-profile")
+        .canonicalize()
+        .unwrap();
+    let before = r3_apply_profile(&profile);
+    let source_before = std::fs::read(profile.join(".claude/settings.json")).unwrap();
+    let core = r2a_core_in(home.path(), &profile).await;
+    r3_apply_core_state(home.path(), 0).await;
+    let output = r3_claude_command(home.path())
+        .args(["wire", "--apply", "--codex-mode", "none"])
+        .bounded_output()
+        .unwrap();
+    let text = r3_apply_output(home.path(), &output);
+    assert!(output.status.success(), "{text}");
+    assert!(std::fs::read(profile.join(".claude/settings.json")).unwrap() == source_before);
+    let settings = profile.join(".claude-qb/settings.json");
+    let actual: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+    let secrets = qb_core::local_secrets::load_existing(home.path()).unwrap();
+    let config = qb_core::config::Config::load(home.path()).unwrap();
+    let expected = serde_json::json!({"env":{
+        "ANTHROPIC_BASE_URL":format!("http://127.0.0.1:{}",config.server.data_port),
+        "ANTHROPIC_AUTH_TOKEN":secrets.client_key,
+    }});
+    assert!(
+        actual == expected,
+        "dedicated settings must contain exactly two env entries"
+    );
+    let launcher = profile.join("AppData/Roaming/npm/claude-qb.cmd");
+    let text = std::fs::read_to_string(&launcher).unwrap();
+    // The exact resolved fixture command is journaled; no ambient Claude process runs.
+    let resolved_text = resolved.to_string_lossy();
+    assert!(
+        text.contains(resolved_text.as_ref())
+            || text.contains(resolved_text.trim_start_matches(r"\\?\"))
+    );
+    assert!(text.contains("--settings \"%USERPROFILE%\\.claude-qb\\settings.json\" %*"));
+    assert!(
+        !text.contains(&secrets.client_key),
+        "launcher must not contain client key"
+    );
+    assert!(
+        std::fs::read_to_string(&resolved)
+            .unwrap()
+            .contains("exit /b 93")
+    );
+    let journal = std::fs::read_to_string(home.path().join("journal/wiring.json")).unwrap();
+    assert!(
+        !journal.contains(&secrets.client_key),
+        "journal plaintext key"
+    );
+    let output = r3_claude_command(home.path())
+        .args(["unwire", "--apply"])
+        .bounded_output()
+        .unwrap();
+    let text = r3_apply_output(home.path(), &output);
+    assert!(output.status.success(), "{text}");
+    assert!(!settings.exists() && !launcher.exists());
+    assert!(std::fs::read(profile.join(".claude/settings.json")).unwrap() == source_before);
+    assert!(
+        r3_apply_profile(&profile) == before,
+        "Claude dedicated round trip changed profile"
+    );
+    assert!(core.try_wait().unwrap().is_none());
 }
