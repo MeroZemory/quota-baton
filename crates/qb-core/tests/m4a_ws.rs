@@ -2456,3 +2456,180 @@ async fn r1_ws_upstream_close_cancels_wait_and_releases_deferred_slot() {
         );
     }
 }
+
+
+// R1-tray.2: real fake-upstream WS paths, no UI/native calls.
+fn tray2_ws_notices(events: &mut tokio::sync::broadcast::Receiver<Value>) -> Vec<Value> {
+    let mut notices = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        for secret in ["synthetic-access", "synthetic-refresh", "conversation-marker"] {
+            assert!(!event.to_string().contains(secret));
+        }
+        if event["event"] == "core_warning" && event["data"]["kind"] == "quota_notice" {
+            notices.push(event["data"].clone());
+        }
+    }
+    notices
+}
+
+#[tokio::test]
+async fn tray2_ws_usage_credits_requires_current_serving_and_disable_clears() {
+    for serving in [false, true] {
+        let h = Harness::new(1).await;
+        let id = &h.ids[0];
+        h.state.accounts.change(id, None, None, None, Some(true)).await.unwrap();
+        let (mut client, account) = h.connect().await;
+        let mut events = h.state.accounts.subscribe();
+        let event = json!({"type":"codex.rate_limits", "rate_limits":{
+            "secondary":{"used_percent":99,"window_minutes":10080,"reset_after_seconds":172800},
+            "active_limit":"seven_day", "serving_from_credits":serving,
+            "credits":{"has_credits":true}}}).to_string();
+        h.fake.state.send(Message::Text(event.clone().into())).unwrap();
+        assert_eq!(receive(&mut client).await, Message::Text(event.into()));
+        let notices = tray2_ws_notices(&mut events);
+        let views = h.state.accounts.views().await.unwrap();
+        if serving {
+            assert_eq!(notices.len(), 1);
+            assert_eq!(notices[0]["account"], account);
+            assert_eq!(notices[0]["action"], "credits");
+            assert_eq!(notices[0]["window"], "7d");
+            assert_eq!(views[0]["quota_notice"]["action"], "credits");
+        } else {
+            assert!(notices.is_empty());
+            assert!(views[0]["quota_notice"].is_null());
+        }
+        h.state.accounts.change(id, None, None, None, Some(false)).await.unwrap();
+        assert!(h.state.accounts.views().await.unwrap()[0]["quota_notice"].is_null());
+        assert!(tray2_ws_notices(&mut events).is_empty());
+        let _ = client.close(None).await;
+    }
+}
+
+#[tokio::test]
+async fn tray2_ws_upgrade_actual_credit_headers_publish_flat_context() {
+    let h = Harness::new(1).await;
+    h.state.accounts.change(&h.ids[0], None, None, None, Some(true)).await.unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert("x-codex-credits-has-credits", "true".parse().unwrap());
+    headers.insert("x-codex-active-limit", "credits".parse().unwrap());
+    h.fake.state.set_success_headers(headers);
+    let mut events = h.state.accounts.subscribe();
+    let (mut client, id) = h.connect().await;
+    let notices = tray2_ws_notices(&mut events);
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0]["account"], id);
+    assert_eq!(notices[0]["action"], "credits");
+    assert!(notices[0]["reset_at"].is_null());
+    assert!(notices[0]["earliest_account"].is_null());
+    assert_eq!(h.state.accounts.views().await.unwrap()[0]["quota_notice"]["action"], "credits");
+    let _ = client.close(None).await;
+}
+
+#[tokio::test]
+async fn tray2_ws_upgrade_reset_hold_suppresses_warning_during_and_after_retry() {
+    let h = Harness::new(2).await;
+    let (mut first, original) = h.connect().await;
+    first.close(None).await.unwrap();
+    h.fake.state.push_handshake(StatusCode::TOO_MANY_REQUESTS,
+        r#"{"error":{"type":"usage_limit_reached","resets_in_seconds":2}}"#, HeaderMap::new());
+    let mut events = h.state.accounts.subscribe();
+    let retry = h.connect();
+    tokio::pin!(retry);
+    tokio::select! {
+        _ = &mut retry => panic!("reset hold did not wait"),
+        _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+    }
+    assert!(tray2_ws_notices(&mut events).is_empty());
+    assert!(h.state.accounts.views().await.unwrap().iter().all(|v| v["quota_notice"].is_null()));
+    let (mut client, account) = retry.await;
+    assert_eq!(account, original);
+    assert!(tray2_ws_notices(&mut events).is_empty());
+    assert!(h.state.accounts.views().await.unwrap().iter().all(|v| v["quota_notice"].is_null()));
+    let _ = client.close(None).await;
+}
+
+#[tokio::test]
+async fn tray2_ws_committed_quota_resolves_hold_on_next_connection_without_toast() {
+    let h = Harness::new(2).await;
+    h.fake.state.push_reply([
+        Message::Text(r#"{"type":"response.created"}"#.into()),
+        Message::Text(r#"{"type":"response.failed","response":{"error":{"type":"usage_limit_reached","resets_in_seconds":2}}}"#.into()),
+    ]);
+    let (mut client, original) = h.connect().await;
+    let mut events = h.state.accounts.subscribe();
+    create(&mut client, "synthetic-model").await;
+    assert!(matches!(receive(&mut client).await, Message::Text(_)));
+    assert!(matches!(receive(&mut client).await, Message::Text(_)));
+    assert!(tray2_ws_notices(&mut events).is_empty());
+    let mut other_request = h.request();
+    other_request.headers_mut().insert("session-id", "tray2-unrelated-session".parse().unwrap());
+    let (mut unrelated, _) = connect_async(other_request).await.unwrap();
+    assert!(tray2_ws_notices(&mut events).is_empty());
+    let _ = unrelated.close(None).await;
+    let _ = client.close(None).await;
+    let (mut next, id) = h.connect().await;
+    assert_eq!(id, original);
+    assert!(tray2_ws_notices(&mut events).is_empty());
+    assert!(h.state.accounts.views().await.unwrap().iter().all(|v| v["quota_notice"].is_null()));
+    let _ = next.close(None).await;
+}
+
+
+#[tokio::test]
+async fn tray2_ws_pending_quota_preference_change_cannot_create_delayed_toast() {
+    let h = Harness::new(2).await;
+    h.fake.state.push_reply([
+        Message::Text(r#"{"type":"response.created"}"#.into()),
+        Message::Text(r#"{"type":"response.failed","response":{"error":{"type":"usage_limit_reached","resets_in_seconds":172800}}}"#.into()),
+    ]);
+    let (mut client, original) = h.connect().await;
+    let mut events = h.state.accounts.subscribe();
+    create(&mut client, "synthetic-model").await;
+    assert!(matches!(receive(&mut client).await, Message::Text(_)));
+    assert!(matches!(receive(&mut client).await, Message::Text(_)));
+    h.state.accounts.change(&original, None, None, None, Some(true)).await.unwrap();
+    let _ = client.close(None).await;
+    let (mut next, id) = h.connect().await;
+    assert_ne!(id, original);
+    assert!(tray2_ws_notices(&mut events).is_empty());
+    assert!(h.state.accounts.views().await.unwrap().iter().all(|v| v["quota_notice"].is_null()));
+    let _ = next.close(None).await;
+}
+
+
+#[tokio::test]
+async fn tray2_ws_passive_usage_waits_for_actual_reconnect_or_no_eligible() {
+    for count in [1, 2] {
+        let h = Harness::new(count).await;
+        let (mut client, source) = h.connect().await;
+        let mut events = h.state.accounts.subscribe();
+        let usage = json!({"type":"codex.rate_limits","rate_limits":{
+            "secondary":{"used_percent":100,"window_minutes":10080,"reset_after_seconds":172800},
+            "active_limit":"secondary"}}).to_string();
+        h.fake.state.send(Message::Text(usage.clone().into())).unwrap();
+        assert_eq!(receive(&mut client).await, Message::Text(usage.into()));
+        assert!(tray2_ws_notices(&mut events).is_empty());
+        assert!(h.state.accounts.views().await.unwrap().iter().all(|v| v["quota_notice"].is_null()));
+        assert_close(receive(&mut client).await, 1000);
+        if count == 1 {
+            let (status, _) = h.error().await;
+            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+            let notices = tray2_ws_notices(&mut events);
+            assert_eq!(notices.len(), 1);
+            assert_eq!(notices[0]["account"], source);
+            assert_eq!(notices[0]["action"], "exhausted");
+        } else {
+            let (mut next, served) = h.connect().await;
+            assert_ne!(served, source);
+            let notices = tray2_ws_notices(&mut events);
+            assert_eq!(notices.len(), 1);
+            assert_eq!(notices[0]["account"], source);
+            assert_eq!(notices[0]["action"], "failover");
+            assert_eq!(notices[0]["next_account"], served);
+            let account = h.store.load(&served).unwrap();
+            let token = h.store.tokens(&account).unwrap();
+            assert_eq!(h.fake.state.requests().last().unwrap().headers["authorization"], format!("Bearer {}", token.access_token));
+            let _ = next.close(None).await;
+        }
+    }
+}

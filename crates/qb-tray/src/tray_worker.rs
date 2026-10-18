@@ -842,6 +842,24 @@ mod tests {
         }
     }
     #[test]
+    fn sse_quota_warning_resyncs_authoritative_snapshot_without_projecting_burst() {
+        for newline in ["\n", "\r\n"] {
+            let mut parser = EventParser::default();
+            let frame = format!(
+                "event: core_warning{newline}data: {{\"kind\":\"quota_notice\",\"account\":\"cx-synthetic-notice\",\"action\":\"failover\",\"next_account\":\"cx-synthetic-next\",\"observed_at\":\"2026-10-18T12:00:00Z\"}}{newline}{newline}"
+            );
+            let mut resyncs = 0;
+            for byte in frame.bytes() {
+                if parser.feed(&[byte], |_| panic!("quota warning must not become a burst")) {
+                    resyncs += 1;
+                }
+            }
+            assert_eq!(resyncs, 1);
+            assert!(parser.data.is_empty() && parser.line.is_empty());
+            assert!(!parser.feed(b"\n", |_| panic!("empty frame")));
+        }
+    }
+    #[test]
     fn sse_oversize_still_refreshes_but_never_projects_burst() {
         for data_first in [false, true] {
             let mut p = EventParser::default();
