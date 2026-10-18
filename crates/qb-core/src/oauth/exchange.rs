@@ -19,6 +19,13 @@ pub(super) async fn exchange(
     verifier: &str,
     state: &str,
 ) -> Result<(Account, Tokens), LoginError> {
+    #[cfg(any(test, feature = "testkit"))]
+    if params.provider == Provider::Claude
+        && (!super::claude_profile::synthetic_endpoint(&params.token)
+            || !super::claude_profile::synthetic_endpoint(&params.profile))
+    {
+        return Err(LoginError::ExchangeFailed);
+    }
     let (content_type, payload) = exchange_body(params, code, verifier, state)?;
     let request = client
         .post(&params.token)
@@ -65,7 +72,7 @@ pub(super) async fn exchange(
                     email: email.clone(),
                 },
                 email,
-                None,
+                super::claude_profile::plan(&profile).map(str::to_owned),
             )
         }
         Provider::Codex => {

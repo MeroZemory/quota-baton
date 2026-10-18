@@ -10,10 +10,34 @@ use axum::{
 };
 use qb_proto::{CpaImportRequest, ImportMode};
 
+#[derive(Clone)]
+struct AccountAdmin {
+    store: Arc<AccountStore>,
+    poller: Option<Arc<crate::quota::UsagePoller>>,
+}
+
 pub fn account_routes(store: Arc<AccountStore>) -> Router {
+    account_router(AccountAdmin {
+        store,
+        poller: None,
+    })
+}
+
+/// Live core imports queue profile work; store-only callers remain offline.
+pub fn account_routes_with_poller(
+    store: Arc<AccountStore>,
+    poller: Arc<crate::quota::UsagePoller>,
+) -> Router {
+    account_router(AccountAdmin {
+        store,
+        poller: Some(poller),
+    })
+}
+
+fn account_router(state: AccountAdmin) -> Router {
     Router::new()
         .route("/admin/v1/accounts/import", post(import_cpa))
-        .with_state(store)
+        .with_state(state)
 }
 
 #[derive(serde::Deserialize)]
@@ -85,7 +109,7 @@ fn login_error(error_value: crate::oauth::LoginError) -> Response {
 }
 
 async fn import_cpa(
-    State(store): State<Arc<AccountStore>>,
+    State(state): State<AccountAdmin>,
     request: Result<Json<CpaImportRequest>, JsonRejection>,
 ) -> Response {
     let Json(request) = match request {
@@ -109,7 +133,23 @@ async fn import_cpa(
         },
     };
     match tokio::task::spawn_blocking(move || {
-        import::run(&store, &dir, &request.activate, request.dry_run)
+        let store = state.store;
+        let rows = import::run(&store, &dir, &request.activate, request.dry_run)?;
+        if !request.dry_run
+            && let Some(poller) = state.poller
+        {
+            for row in &rows {
+                if matches!(
+                    row.action,
+                    import::ImportAction::Created | import::ImportAction::Updated
+                ) && let Some(id) = &row.id
+                    && let Ok(account) = store.load(id)
+                {
+                    poller.queue_profile(&account);
+                }
+            }
+        }
+        Ok::<_, StoreError>(rows)
     })
     .await
     {
@@ -347,14 +387,21 @@ async fn adopt_account(
         );
     };
     let store = state.relay.accounts.store.clone();
+    let poller = state.relay.quota.clone();
     #[cfg(feature = "testkit")]
     let probe = state.adoption_probe;
     let result = tokio::task::spawn_blocking(move || {
-        #[cfg(feature = "testkit")]
-        if let Some(probe) = probe {
-            return crate::accounts::adopt::run_with_probe(&store, &id, request, probe);
+        let result = (|| {
+            #[cfg(feature = "testkit")]
+            if let Some(probe) = probe {
+                return crate::accounts::adopt::run_with_probe(&store, &id, request, probe);
+            }
+            crate::accounts::adopt::run(&store, &id, request)
+        })()?;
+        if let Ok(account) = store.load(&result.id) {
+            poller.queue_profile(&account);
         }
-        crate::accounts::adopt::run(&store, &id, request)
+        Ok::<_, crate::accounts::adopt::AdoptError>(result)
     })
     .await;
     match result {

@@ -8,6 +8,7 @@ macro_rules! println_utf8 {
 
 mod accounts_cli;
 mod cutover;
+mod wire_readiness;
 
 fn print_stdout(args: std::fmt::Arguments<'_>) -> std::io::Result<()> {
     use std::io::{IsTerminal, Write};
@@ -293,11 +294,14 @@ async fn check_wire_preconditions(
         {
             continue;
         }
-        if !accounts
-            .iter()
-            .any(|account| account.provider == provider && account.eligible(None))
+        let dedicated = match provider {
+            qb_core::accounts::Provider::Codex => codex_mode == cutover::CodexMode::Dedicated,
+            qb_core::accounts::Provider::Claude => claude_mode == cutover::ClaudeMode::Dedicated,
+        };
+        if let Some(warning) =
+            wire_readiness::check(&accounts, provider, dedicated, chrono::Utc::now())?
         {
-            anyhow::bail!("각 프로바이더에 적용 가능한 활성 계정이 하나 이상 필요합니다.");
+            println_utf8!("경고: {warning}");
         }
     }
     Ok(())
@@ -421,13 +425,14 @@ async fn run() -> anyhow::Result<()> {
                 .await
                 .map_err(|_| anyhow::anyhow!("연결된 계정의 토큰을 다시 읽지 못했습니다."))?;
             let login = relay.login_service();
-            let admin_routes = qb_core::admin::account_routes(store.clone())
-                .merge(qb_core::admin::login_routes(login.clone()))
-                .merge(qb_core::admin::runtime_routes(
-                    relay.clone(),
-                    config.server.data_port,
-                ))
-                .merge(qb_core::debug_pin::routes(store, pins));
+            let admin_routes =
+                qb_core::admin::account_routes_with_poller(store.clone(), relay.quota.clone())
+                    .merge(qb_core::admin::login_routes(login.clone()))
+                    .merge(qb_core::admin::runtime_routes(
+                        relay.clone(),
+                        config.server.data_port,
+                    ))
+                    .merge(qb_core::debug_pin::routes(store, pins));
             #[cfg(feature = "phase0")]
             let admin_routes = admin_routes.merge(qb_core::relay::phase0_routes(relay.clone()));
             let secrets = qb_core::local_secrets::load_or_create(&home)?;

@@ -562,7 +562,7 @@ Base: `http://127.0.0.1:<admin_port>/admin/v1`. Every route requires `Authorizat
 `AccountView` fields:
 - `id`, `provider`, `label`, `email`, `plan`
 - `user_state`, `health` (including `reason`, `until` and `scope`)
-- `windows[]`, `credits`
+- `windows[]`, `credits` (balance retains its decimal value), `credits_in_use` (Codex: paid credits allowed and current successful serving evidence indicates credits under C5; capability alone is insufficient)
 - `pacing {backoff_until, step, release_interval_ms, waiting}` (C6.3)
 - `last_used_at`, `bound_sessions`
 - `active_sessions`, `spread_threshold` (C7.1)
