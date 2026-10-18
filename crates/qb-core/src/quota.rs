@@ -1,5 +1,6 @@
 //! Active usage observations. Polls share the relay credential gates and client.
 mod parse;
+mod profile;
 
 use crate::{
     account_runtime::AccountRuntime,
@@ -36,6 +37,7 @@ struct Clock {
     failures: u32,
     running: bool,
     disabled_until: Option<Instant>,
+    profile: profile::ProfileClock,
 }
 
 pub struct UsagePoller {
@@ -50,6 +52,7 @@ pub struct UsagePoller {
     tray_until: Mutex<Option<Instant>>,
     event_streams: AtomicUsize,
     semaphore: Semaphore,
+    profile_semaphore: Semaphore,
 }
 
 pub(crate) struct EventGuard(Weak<UsagePoller>);
@@ -131,6 +134,7 @@ impl UsagePoller {
             tray_until: Mutex::default(),
             event_streams: AtomicUsize::new(0),
             semaphore: Semaphore::new(2),
+            profile_semaphore: Semaphore::new(1),
         })
     }
     #[cfg(debug_assertions)]
@@ -202,6 +206,7 @@ impl UsagePoller {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         for account in accounts {
+            self.queue_profile(&account);
             if crate::relay::credentials::is_linked(&account) {
                 gates
                     .reload_linked(self.store.clone(), self.obs.clone(), account.id, "startup")
@@ -210,6 +215,70 @@ impl UsagePoller {
             }
         }
         Ok(())
+    }
+
+    async fn poll_after_401(
+        &self,
+        gates: &TokenGates,
+        account: Account,
+        tokens: &crate::accounts::Tokens,
+        body: &[u8],
+        attempt: u8,
+    ) -> Result<Option<(Account, crate::accounts::Tokens)>, PollError> {
+        if !crate::relay::credentials::is_linked(&account)
+            && crate::relay::poll_revoked(account.provider, body)
+            && gates
+                .is_current(self.store.clone(), &account, tokens)
+                .await
+                .map_err(|_| PollError::Unavailable)?
+        {
+            gates
+                .revoke_if_current(self.store.clone(), &account, tokens)
+                .await
+                .map_err(|_| PollError::Unavailable)?;
+            return Ok(None);
+        }
+        if attempt == 0 {
+            let gates_task = gates.clone();
+            let store = self.store.clone();
+            let obs = self.obs.clone();
+            let failed_account = account.clone();
+            let failed_tokens = crate::accounts::Tokens {
+                access_token: tokens.access_token.clone(),
+                refresh_token: tokens.refresh_token.clone(),
+                id_token: tokens.id_token.clone(),
+            };
+            // The refresh and token-conditional failure transition both
+            // survive cancellation of the three-second request hook.
+            if let Some((updated, refreshed)) = tokio::spawn(async move {
+                let retry = gates_task
+                    .after_401(store.clone(), obs, failed_account.clone(), &failed_tokens)
+                    .await?;
+                if retry.is_none() {
+                    gates_task
+                        .cool_unavailable_auth(store, &failed_account, &failed_tokens)
+                        .await?;
+                }
+                Ok::<_, ()>(retry)
+            })
+            .await
+            .map_err(|_| PollError::Unavailable)?
+            .map_err(|_| PollError::Unavailable)?
+            {
+                return Ok(Some((updated, refreshed)));
+            }
+        } else {
+            gates
+                .auth_failed(
+                    self.store.clone(),
+                    self.obs.clone(),
+                    account.clone(),
+                    tokens,
+                )
+                .await
+                .map_err(|_| PollError::Unavailable)?;
+        }
+        Ok(None)
     }
 
     pub async fn poll(&self, id: &str) -> Result<Account, PollError> {
@@ -302,60 +371,13 @@ impl UsagePoller {
                 body.extend_from_slice(&chunk);
             }
             if status == reqwest::StatusCode::UNAUTHORIZED {
-                if !crate::relay::credentials::is_linked(&account)
-                    && crate::relay::poll_revoked(account.provider, &body)
-                    && gates
-                        .is_current(self.store.clone(), &account, &tokens)
-                        .await
-                        .map_err(|_| PollError::Unavailable)?
+                if let Some((updated, refreshed)) = self
+                    .poll_after_401(&gates, account, &tokens, &body, attempt)
+                    .await?
                 {
-                    gates
-                        .revoke_if_current(self.store.clone(), &account, &tokens)
-                        .await
-                        .map_err(|_| PollError::Unavailable)?;
-                    return Err(PollError::Unavailable);
-                }
-                if attempt == 0 {
-                    let gates_task = gates.clone();
-                    let store = self.store.clone();
-                    let obs = self.obs.clone();
-                    let failed_account = account.clone();
-                    let failed_tokens = crate::accounts::Tokens {
-                        access_token: tokens.access_token.clone(),
-                        refresh_token: tokens.refresh_token.clone(),
-                        id_token: tokens.id_token.clone(),
-                    };
-                    // The refresh and token-conditional failure transition both
-                    // survive cancellation of the three-second request hook.
-                    if let Some((updated, refreshed)) = tokio::spawn(async move {
-                        let retry = gates_task
-                            .after_401(store.clone(), obs, failed_account.clone(), &failed_tokens)
-                            .await?;
-                        if retry.is_none() {
-                            gates_task
-                                .cool_unavailable_auth(store, &failed_account, &failed_tokens)
-                                .await?;
-                        }
-                        Ok::<_, ()>(retry)
-                    })
-                    .await
-                    .map_err(|_| PollError::Unavailable)?
-                    .map_err(|_| PollError::Unavailable)?
-                    {
-                        account = updated;
-                        tokens = refreshed;
-                        continue;
-                    }
-                } else {
-                    gates
-                        .auth_failed(
-                            self.store.clone(),
-                            self.obs.clone(),
-                            account.clone(),
-                            &tokens,
-                        )
-                        .await
-                        .map_err(|_| PollError::Unavailable)?;
+                    account = updated;
+                    tokens = refreshed;
+                    continue;
                 }
                 return Err(PollError::Unavailable);
             }
@@ -436,16 +458,32 @@ impl UsagePoller {
     }
     pub async fn tick(&self) {
         let store = self.store.clone();
-        let accounts = tokio::task::spawn_blocking(move || store.list())
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or_default();
+        let Ok(Ok(accounts)) = tokio::task::spawn_blocking(move || store.list()).await else {
+            // A transient read failure must not erase daily profile deadlines.
+            return;
+        };
+        {
+            let ids: std::collections::BTreeSet<_> =
+                accounts.iter().map(|a| a.id.as_str()).collect();
+            self.clocks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|id, clock| {
+                    clock.running || clock.profile.running || ids.contains(id.as_str())
+                });
+        }
         let mut pending = futures_util::stream::FuturesUnordered::new();
         for account in accounts {
-            if self.scheduled(&account) {
+            let usage = self.scheduled(&account);
+            let profile = self.profile_due(&account);
+            if usage || profile {
                 pending.push(async move {
-                    let _ = self.poll(&account.id).await;
+                    if usage {
+                        let _ = self.poll(&account.id).await;
+                    }
+                    if profile {
+                        let _ = self.fetch_profile(&account.id).await;
+                    }
                 });
             }
         }
@@ -547,6 +585,9 @@ mod tests {
     }
     impl Fixture {
         async fn new(count: usize) -> Self {
+            Self::with_provider(count, Provider::Codex).await
+        }
+        async fn with_provider(count: usize, provider: Provider) -> Self {
             let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../.sandbox/usage-unit-tests");
             std::fs::create_dir_all(&base).unwrap();
@@ -564,10 +605,18 @@ mod tests {
             let mut ids = Vec::new();
             for n in 0..count {
                 let mut a = crate::accounts::health::tests::fixture();
-                a.identity = Identity::Codex {
-                    user_id: None,
-                    account_id: format!("synthetic-usage-{n}"),
-                    email: format!("usage-{n}@example.invalid"),
+                a.provider = provider;
+                a.identity = match provider {
+                    Provider::Codex => Identity::Codex {
+                        user_id: None,
+                        account_id: format!("synthetic-usage-{n}"),
+                        email: format!("usage-{n}@example.invalid"),
+                    },
+                    Provider::Claude => Identity::Claude {
+                        account_uuid: format!("synthetic-claude-{n}"),
+                        organization_uuid: Some("synthetic-organization".into()),
+                        email: format!("usage-{n}@example.invalid"),
+                    },
                 };
                 a.id = a.identity.id();
                 a.token_meta.expires_at = Some(Utc::now() + chrono::Duration::days(1));
@@ -581,6 +630,7 @@ mod tests {
             let fake = ScriptedUpstream::start().await.unwrap();
             let mut config = Config::default();
             config.upstream.codex_usage_base = fake.url.clone();
+            config.upstream.claude_usage_base = fake.url.clone();
             let obs = Arc::new(Observability::new(root.path(), None).unwrap());
             let relay = Arc::new(
                 RelayState::new(store, &config, obs, Arc::new(DebugPins::default())).unwrap(),
@@ -751,4 +801,5 @@ mod tests {
         f.relay.quota.tick().await;
         assert_eq!(f.fake.state.requests().len(), 5);
     }
+    include!("quota/profile_tests.rs");
 }

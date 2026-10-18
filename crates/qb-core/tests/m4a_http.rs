@@ -3298,3 +3298,72 @@ async fn tray2_passive_poll_at_99_resolves_only_when_next_request_actually_moves
     assert_eq!(notices[0]["next_account"], served);
     assert_eq!(notices[0]["window"], "5h");
 }
+
+#[tokio::test]
+async fn r4_credits_in_use_requires_actual_serving_and_preserves_decimal_balance() {
+    for (active, serving, expected) in [
+        (false, None, false),
+        (true, None, true),
+        (true, Some(false), false),
+    ] {
+        // Each case starts eligible. A capability-only full-meter response may
+        // legitimately cool the account; do not silently reuse that cooling
+        // account as the next case's successful data-plane request.
+        let h = Harness::new(Provider::Codex, 1, 384, 1024).await;
+        let id = h.ids().remove(0);
+        h.state
+            .accounts
+            .change(&id, None, None, None, Some(true))
+            .await
+            .unwrap();
+        let mut response = ok();
+        for (key, value) in [
+            ("x-codex-secondary-used-percent", "100"),
+            ("x-codex-secondary-window-minutes", "10080"),
+            ("x-codex-secondary-reset-after-seconds", "172800"),
+            ("x-codex-credits-has-credits", "true"),
+            ("x-codex-credits-balance", "2.875"),
+        ] {
+            response.headers.insert(key, value.parse().unwrap());
+        }
+        if active {
+            response
+                .headers
+                .insert("x-codex-active-limit", "credits".parse().unwrap());
+        }
+        if let Some(serving) = serving {
+            response.headers.insert(
+                "x-codex-credits-serving",
+                if serving { "true" } else { "false" }.parse().unwrap(),
+            );
+        }
+        h.fake.state.push(response);
+        let response = h.send(Provider::Codex, "{}").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        response.bytes().await.unwrap();
+        assert_eq!(h.fake.state.requests().len(), 1);
+        let views = h.state.accounts.views().await.unwrap();
+        assert_eq!(views[0]["credits"]["balance"], 2.875);
+        assert_eq!(views[0]["credits_in_use"], expected);
+        if expected {
+            h.state
+                .accounts
+                .change(&id, None, None, None, Some(false))
+                .await
+                .unwrap();
+            assert_eq!(
+                h.state.accounts.views().await.unwrap()[0]["credits_in_use"],
+                false
+            );
+            h.state
+                .accounts
+                .change(&id, None, None, None, Some(true))
+                .await
+                .unwrap();
+            assert_eq!(
+                h.state.accounts.views().await.unwrap()[0]["credits_in_use"],
+                false
+            );
+        }
+    }
+}
