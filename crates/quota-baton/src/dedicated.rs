@@ -1069,18 +1069,82 @@ fn restore_existing_text(paths: &CutoverPaths, e: &Entry) -> Result<Vec<u8>> {
         }
         preserved_bytes(&e.path, current.to_string().as_bytes())
     } else if e.path == paths.codex_auth || paths.codex_session_auth.contains(&e.path) {
-        let old: Value = serde_json::from_slice(strip_utf8_bom(&original))?;
-        let mut current: Value = serde_json::from_str(&read_text(&e.path)?)?;
-        let root = current
-            .as_object_mut()
-            .context("Codex auth 형식이 올바르지 않습니다")?;
-        for key in ["auth_mode", "OPENAI_API_KEY"] {
-            restore_json(root, key, &original_json(old.get(key)));
-        }
-        preserved_bytes(&e.path, &serde_json::to_vec_pretty(&current)?)
+        let text = restore_codex_auth_text(&original, &read_text(&e.path)?)?;
+        preserved_bytes(&e.path, text.as_bytes())
     } else {
         bail!("변경된 세션 홈 매핑은 보존합니다");
     }
+}
+/// Restore only owned root members; nested values and unrelated text survive force.
+fn restore_codex_auth_text(original: &[u8], current: &str) -> Result<String> {
+    let invalid = || anyhow::anyhow!("Codex auth 복구 형식이 올바르지 않습니다");
+    let before: Value = serde_json::from_slice(strip_utf8_bom(original)).map_err(|_| invalid())?;
+    let mut expected: Value = serde_json::from_str(current).map_err(|_| invalid())?;
+    let root = expected.as_object_mut().ok_or_else(invalid)?;
+    let mut text = current.to_owned();
+    for key in ["auth_mode", "OPENAI_API_KEY"] {
+        let value = before.get(key);
+        if let Some(value) = value {
+            root.insert(key.into(), value.clone());
+        } else {
+            root.remove(key);
+        }
+        let start = text
+            .bytes()
+            .position(|byte| !byte.is_ascii_whitespace())
+            .ok_or_else(invalid)?;
+        let members = json_member_spans(&text[start..])
+            .ok_or_else(invalid)?
+            .into_iter()
+            .map(|(key, member, value, end)| (key, member + start, value + start, end + start))
+            .collect::<Vec<_>>();
+        if let Some((index, member)) = members
+            .iter()
+            .enumerate()
+            .find(|(_, member)| member.0 == key)
+        {
+            if let Some(value) = value {
+                text.replace_range(member.2..member.3, &serde_json::to_string(value)?);
+            } else {
+                let range = if index + 1 < members.len() {
+                    let comma = text[member.3..members[index + 1].1]
+                        .find(',')
+                        .ok_or_else(invalid)?
+                        + member.3;
+                    member.1..comma + 1
+                } else if index > 0 {
+                    let comma = text[members[index - 1].3..member.1]
+                        .rfind(',')
+                        .ok_or_else(invalid)?
+                        + members[index - 1].3;
+                    comma..member.3
+                } else {
+                    member.1..member.3
+                };
+                text.replace_range(range, "");
+            }
+        } else if let Some(value) = value {
+            let position = members
+                .last()
+                .map(|member| member.3)
+                .or_else(|| text.find('{').map(|position| position + 1))
+                .ok_or_else(invalid)?;
+            text.insert_str(
+                position,
+                &format!(
+                    "{}{}:{}",
+                    if members.is_empty() { "" } else { "," },
+                    serde_json::to_string(key)?,
+                    serde_json::to_string(value)?
+                ),
+            );
+        }
+    }
+    let actual: Value = serde_json::from_str(&text).map_err(|_| invalid())?;
+    if actual != expected {
+        return Err(invalid());
+    }
+    Ok(text)
 }
 fn existing_entry(path: PathBuf, after: &[u8], apply: bool) -> Result<Entry> {
     ancestors_safe(&path)?;
@@ -3537,6 +3601,64 @@ trusted_hash = "synthetic-hook-hash"
         assert!(text.contains("user_added = true"));
         assert!(!text.contains("10200"));
         assert!(text.contains(SECRET));
+    }
+    #[test]
+    fn forced_codex_auth_restore_preserves_bom_crlf_spacing_order_and_nested_keys() {
+        let (_dir, p) = fixture();
+        let original = b"\xef\xbb\xbf{\r\n  \"keep\" : {\"OPENAI_API_KEY\":\"nested-old\"},\r\n  \"auth_mode\" : \"apikey\",\r\n  \"OPENAI_API_KEY\" : \"old-root\"\r\n}\r\n";
+        fs::write(&p.codex_auth, original).unwrap();
+        claude_run(&p, true, CodexMode::Default, Some(ClaudeMode::None)).unwrap();
+        let changed = b"\xef\xbb\xbf{\r\n  \"keep\" : {\"OPENAI_API_KEY\":\"nested-user-edit\"},\r\n  \"auth_mode\" : \"apikey\",\r\n  \"OPENAI_API_KEY\" : \"changed-root\",\r\n  \"user_added\" : [ 1,  2 ]\r\n}\r\n";
+        fs::write(&p.codex_auth, changed).unwrap();
+        let expected = String::from_utf8(changed.to_vec())
+            .unwrap()
+            .replace("changed-root", "old-root")
+            .into_bytes();
+        unwire(&p, true, true).unwrap();
+        assert!(
+            fs::read(&p.codex_auth).unwrap() == expected,
+            "forced auth restore changed unrelated bytes"
+        );
+    }
+    #[test]
+    fn forced_codex_auth_root_patch_handles_missing_and_nonstring_owned_members() {
+        for (before, current, expected) in [
+            (
+                r#"{}"#,
+                r#"{"auth_mode":"apikey","OPENAI_API_KEY":"added","keep" : [ 1, 2 ]}"#,
+                r#"{"keep" : [ 1, 2 ]}"#,
+            ),
+            (
+                r#"{"auth_mode":"apikey"}"#,
+                r#"{"keep" : [ 1, 2 ],"OPENAI_API_KEY":"added","auth_mode":"apikey"}"#,
+                r#"{"keep" : [ 1, 2 ],"auth_mode":"apikey"}"#,
+            ),
+            (
+                r#"{}"#,
+                r#"{"keep":true,"auth_mode":"apikey","OPENAI_API_KEY":"added"}"#,
+                r#"{"keep":true}"#,
+            ),
+            (
+                r#"{}"#,
+                r#"{"auth_mode":"apikey","OPENAI_API_KEY":"added"}"#,
+                r#"{}"#,
+            ),
+            (
+                r#"{"auth_mode":"apikey","OPENAI_API_KEY":"before"}"#,
+                " \r\n{ \"keep\" : { \"auth_mode\":\"nested\" } }\r\n",
+                " \r\n{ \"keep\" : { \"auth_mode\":\"nested\" },\"auth_mode\":\"apikey\",\"OPENAI_API_KEY\":\"before\" }\r\n",
+            ),
+            (
+                r#"{"auth_mode":"apikey","OPENAI_API_KEY":null}"#,
+                r#"{"auth_mode":false,"OPENAI_API_KEY":[1],"keep":"same"}"#,
+                r#"{"auth_mode":"apikey","OPENAI_API_KEY":null,"keep":"same"}"#,
+            ),
+        ] {
+            assert!(
+                restore_codex_auth_text(before.as_bytes(), current).unwrap() == expected,
+                "unrelated auth text changed"
+            );
+        }
     }
     #[test]
     fn claude_dedicated_does_not_require_default_settings_and_unknown_home_content_survives() {
