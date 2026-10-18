@@ -307,6 +307,9 @@ fn refresh_shell(hwnd: HWND) {
             .as_ref()
             .is_none_or(|(s, d, b, _)| (*s, *d, *b) != (size, dark, presentation.badge))
     });
+    if !changed && SHELL_TOOLTIP.with(|slot| *slot.borrow() == presentation.tooltip) {
+        return;
+    }
     let candidate = if changed {
         NotifyIcon::new(size, dark, presentation.badge).ok()
     } else {

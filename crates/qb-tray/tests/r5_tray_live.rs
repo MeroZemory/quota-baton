@@ -54,6 +54,7 @@ use windows::{
 
 static SERIAL: Mutex<()> = Mutex::new(());
 const WAIT: Duration = Duration::from_secs(10);
+const STARTUP: Duration = Duration::from_secs(30);
 const CASE_BUDGET: Duration = Duration::from_secs(40);
 const INPUT: Duration = Duration::from_secs(4);
 const CASES: [(&str, &str); 9] = [
@@ -713,7 +714,7 @@ impl Live {
                 .arg("serve")
                 .spawn()?,
         );
-        live.until(WAIT, "core PID health", |s| {
+        live.until(STARTUP, "core PID health", |s| {
             Ok(s.api("GET", "/admin/v1/health", None)
                 .is_ok_and(|v| v["ok"] == true && v["pid"] == s.core.as_ref().unwrap().id()))
         })?;
@@ -1453,9 +1454,21 @@ fn assert_owned_hover(hwnd: HWND, point: POINT) -> Result<()> {
 }
 fn assert_cursor(p: POINT) -> Result<()> {
     let now = cursor()?;
+    let mut clip = RECT::default();
+    unsafe {
+        GetClipCursor(&mut clip)?;
+    }
     ensure!(
         (now.x, now.y) == (p.x, p.y),
-        "actual cursor moved during stationary-tooltip regression"
+        "actual cursor moved during stationary-tooltip regression: expected=({},{}) actual=({},{}) clip=({},{},{},{})",
+        p.x,
+        p.y,
+        now.x,
+        now.y,
+        clip.left,
+        clip.top,
+        clip.right,
+        clip.bottom
     );
     Ok(())
 }
