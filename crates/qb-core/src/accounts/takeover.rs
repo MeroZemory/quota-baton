@@ -584,7 +584,6 @@ fn finish_prepare(
                 &snapshot.proof,
                 &profile.identity,
                 existing.as_ref().map(|a| (&a.id, a.generation)),
-                request.replace,
                 request.keep_source,
             ))
             .map_err(|_| TakeoverError::Invalid)?,
@@ -604,6 +603,9 @@ fn finish_prepare(
         })));
     }
     validate_source(deps, request.provider, &snapshot.proof)?;
+    // Inspection discovers whether this identity already exists. Replacement
+    // consent follows that read; it is not a different source proof. The bound
+    // target generation still rejects a concurrent identity/settings change.
     if request.inspect_digest.as_deref() != Some(inspect_digest.as_str())
         || (existing.is_some() && !request.replace)
     {
