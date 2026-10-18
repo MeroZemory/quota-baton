@@ -163,15 +163,33 @@ quota-baton.exe wire --apply
 
 활성 연결 계정이 남아 있으면 CPA가 토큰을 갱신해야 합니다. 연결 결과와 `status`에 필요한 계정 수가 표시됩니다. 이때 `wire --disable-cpa-tasks`는 거절됩니다. 계정을 직접 갱신으로 이전하거나 직접 로그인으로 전환한 뒤 다시 확인하세요.
 
-전환은 다음 항목을 바꿉니다.
+Codex 기본 홈이 ChatGPT 직접 로그인이거나 CPA 주소를 쓰지 않으면 `wire`는 별도 홈 `~/.codex-acct/qb`와 `codex-qb` 명령을 만듭니다. 기본 홈의 설정과 인증은 그대로 둡니다. 새 홈은 기본 설정을 복사하고 quota-baton 주소와 클라이언트 키를 넣습니다. 공용 agents·skills·hooks 등은 연결해서 사용합니다. 로그는 새 홈에 남깁니다.
 
-- Codex 기본 홈의 `openai_base_url`을 quota-baton으로 바꿉니다.
-- Codex의 관련 모델 카탈로그 주소와 CPA provider 연결 주소를 quota-baton 주소로 바꿉니다.
-- Claude 설정의 `ANTHROPIC_BASE_URL`과 인증 값을 quota-baton에 맞춥니다.
-- 기존 provider id와 그 밖의 설정은 유지합니다.
-- 원래 값은 되돌리기 위한 journal에 보호해 둡니다.
+```powershell
+codex-qb
+claude-qb
+```
 
-`.codex-acct` 홈은 herdr shim의 예외 대상입니다. 이 홈은 전환으로 덮어쓰지 않습니다. `session-homes.json`에 남은 ChatGPT 세션 홈은 dry-run 경고를 확인한 뒤 별도로 처리합니다.
+`codex-qb`로 시작한 세션만 quota-baton을 거칩니다. 기존 `codex`·`codex-ib`·`codex-mz`·`codex-cpa`는 바뀌지 않습니다.
+
+Claude는 기본적으로 `claude-qb` 명령을 만듭니다. 클라이언트 키와 연결 주소는 사용자 전용 권한의 `~/.claude-qb/settings.json`에 둡니다. `claude-qb`는 이 설정을 지정해 실행합니다. 기존 `~/.claude/settings.json`과 `claude` 명령은 바뀌지 않습니다. Claude 설정 폴더와 대화 기록은 공유하므로 두 명령에서 이어 열 수 있습니다. 먼저 일반 `claude` 명령이 PATH에 설치되어 있어야 합니다.
+
+기본 홈이 API key 방식으로 CPA에 연결된 예전 구성이라면, `wire`는 기존 방식대로 기본 홈의 연결 주소와 인증을 바꿉니다. 관련 모델 카탈로그와 CPA provider 주소도 바꿉니다. 원래 값은 journal에 보호해 둡니다.
+
+모드를 직접 고를 수도 있습니다. 각 명령은 먼저 미리보기만 합니다.
+
+```powershell
+quota-baton.exe wire --codex-mode dedicated
+quota-baton.exe wire --codex-mode default
+quota-baton.exe wire --codex-mode none
+quota-baton.exe wire --claude-mode dedicated
+quota-baton.exe wire --claude-mode default
+quota-baton.exe wire --claude-mode none
+```
+
+각 provider의 `dedicated`는 별도 연결 설정을, `default`는 기존 기본 설정을 바꿉니다. `none`은 해당 provider를 연결하지 않습니다. 두 모드를 따로 고를 수 있습니다. Claude에서 `default`를 명시하면 기존 `settings.json`의 `ANTHROPIC_BASE_URL`과 인증 값을 바꾸고 나머지 설정은 유지합니다.
+
+기존 `.codex-acct` 홈은 덮어쓰지 않습니다. herdr 창에서 `codex-qb` 세션을 재시작 후 이어 열려면 그 세션 ID를 `session-homes.json`에 `~/.codex-acct/qb`로 등록해야 합니다. 이 파일은 자동으로 수정하지 않습니다.
 
 전환을 되돌릴 때도 먼저 미리 봅니다.
 
@@ -179,6 +197,8 @@ quota-baton.exe wire --apply
 quota-baton.exe unwire
 quota-baton.exe unwire --apply
 ```
+
+별도 홈의 세션 기록(`~/.codex-acct/qb/sessions`)은 되돌린 뒤에도 남습니다. `unwire`는 직접 만든 파일과 연결만 변경 여부를 확인해 제거합니다.
 
 사용자가 수정한 파일은 자동으로 덮어쓰지 않습니다. 변경 내용을 확인하고 force가 필요한 경우에만 별도 승인을 사용합니다. 전환은 [C11 관리 API](contract.md#c11-admin-api)와 [C12 저장 형식](contract.md#c12-persistence-formats)에 맞춰 journal과 함께 처리됩니다.
 
