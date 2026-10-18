@@ -58,6 +58,10 @@ pub struct Account {
     pub source: String,
     #[serde(default)]
     pub pacing: Pacing,
+    #[serde(default)]
+    pub token_expires_at: Option<String>,
+    #[serde(default)]
+    pub last_refresh_at: Option<String>,
 }
 
 fn decode_source<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -71,10 +75,11 @@ where
             let kind = object
                 .remove("kind")
                 .and_then(|kind| kind.as_str().map(str::to_owned));
-            if kind.as_deref() == Some("cpa")
-                && object.get("mode").and_then(serde_json::Value::as_str) == Some("linked")
-            {
-                "linked".into()
+            if kind.as_deref() == Some("cpa") {
+                match object.get("mode").and_then(serde_json::Value::as_str) {
+                    Some(mode @ ("linked" | "adopted")) => mode.to_owned(),
+                    _ => "⚠ source decode error (unknown mode)".into(),
+                }
             } else {
                 kind.unwrap_or_else(|| "⚠ source decode error (missing kind)".into())
             }
@@ -129,6 +134,8 @@ pub struct Row {
     pub bound_sessions: u64,
     pub session_text: Option<String>,
     pub pacing_until: Option<String>,
+    pub token_expires_at: Option<String>,
+    pub last_refresh_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -219,6 +226,26 @@ fn row_anchor(rows: &[Row], expand_disabled: bool, id: &str) -> Option<Rect> {
     None
 }
 
+const ACCOUNT_MENU_META_HEIGHT: f32 = 68.0;
+
+pub fn account_menu_metadata(row: &Row) -> [String; 3] {
+    let time = |value: Option<&str>| {
+        value
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|time| time.with_timezone(&Local).format("%m/%d %H:%M").to_string())
+            .unwrap_or_else(|| "확인 불가".into())
+    };
+    [
+        match row.source.as_str() {
+            "linked" => "CPA 갱신".into(),
+            "oauth" | "adopted" => "직접 갱신".into(),
+            _ => "갱신 방식 확인 불가".into(),
+        },
+        format!("만료 {}", time(row.token_expires_at.as_deref())),
+        format!("최근 갱신 {}", time(row.last_refresh_at.as_deref())),
+    ]
+}
+
 pub fn account_menu_height(row: &Row) -> f32 {
     let items = actions::menu_items(row);
     let separators = items
@@ -228,7 +255,7 @@ pub fn account_menu_height(row: &Row) -> f32 {
         .count() as f32;
     // Keep a bottom inset for the final glyph and the popup shadow. The inset
     // is part of the geometry so a grown flyout cannot clip the last action.
-    9.0 + items.len() as f32 * 32.0 + separators * 10.0 + 16.0
+    ACCOUNT_MENU_META_HEIGHT + 9.0 + items.len() as f32 * 32.0 + separators * 10.0 + 16.0
 }
 
 pub fn account_menu_item_top(row: &Row, index: usize) -> f32 {
@@ -237,7 +264,7 @@ pub fn account_menu_item_top(row: &Row, index: usize) -> f32 {
         .enumerate()
         .filter(|(i, _)| *i <= index && (*i == 2 || *i == 3))
         .count() as f32;
-    9.0 + index as f32 * 32.0 + separators_before * 9.0
+    ACCOUNT_MENU_META_HEIGHT + 9.0 + index as f32 * 32.0 + separators_before * 9.0
 }
 
 pub fn popup_rect(rows: &[Row], expand_disabled: bool, state: &str, height: f32) -> Option<Rect> {
@@ -308,6 +335,9 @@ pub enum HitTarget {
         provider: String,
         rect: Rect,
     },
+    MenuSurface {
+        rect: Rect,
+    },
     MenuItem {
         id: String,
         index: usize,
@@ -365,6 +395,7 @@ impl HitTarget {
             Self::Row { rect, .. }
             | Self::RowMenu { rect, .. }
             | Self::RowRelogin { rect, .. }
+            | Self::MenuSurface { rect }
             | Self::MenuItem { rect, .. }
             | Self::Disclosure { rect, .. }
             | Self::Footer { rect, .. }
@@ -482,6 +513,8 @@ pub fn layout_targets(rows: &[Row], expand_disabled: bool, state: Option<&str>) 
         }) {
             let popup =
                 popup_rect(rows, expand_disabled, state.unwrap_or_default(), height).unwrap();
+            // The opaque menu metadata and padding consume pointer hits too.
+            targets.push(HitTarget::MenuSurface { rect: popup });
             for (index, _) in actions::menu_items(row).iter().enumerate() {
                 targets.push(HitTarget::MenuItem {
                     id: row.id.clone(),
@@ -650,6 +683,8 @@ pub fn row(account: &Account, now: SystemTime) -> Row {
             || health_tone == Tone::Warning
             || health_tone == Tone::Critical,
         source: account.source.clone(),
+        token_expires_at: account.token_expires_at.clone(),
+        last_refresh_at: account.last_refresh_at.clone(),
         allow_credits: account.allow_credits,
         drain: account.drain,
         bound_sessions: account.bound_sessions,
@@ -1032,6 +1067,45 @@ mod tests {
     }
 
     #[test]
+    fn adoption_metadata_and_manual_action_survive_decode_and_popup_growth() {
+        let rows = parse_state(r#"{"accounts":[
+            {"id":"adopted","provider":"codex","user_state":"active","source":{"kind":"cpa","mode":"adopted"},
+             "token_expires_at":"2099-10-23T02:00:00Z","last_refresh_at":"2026-10-18T08:00:00Z"},
+            {"id":"linked","provider":"claude","source":{"kind":"cpa","mode":"linked"}},
+            {"id":"unknown","provider":"codex","source":{"kind":"cpa","mode":"future"}}
+        ]}"#).unwrap();
+        assert_eq!(rows[0].source, "adopted");
+        assert_eq!(account_menu_metadata(&rows[0])[0], "직접 갱신");
+        assert!(account_menu_metadata(&rows[0])[1].starts_with("만료 10/"));
+        assert!(account_menu_metadata(&rows[0])[2].starts_with("최근 갱신 10/"));
+        assert!(actions::menu_items(&rows[0]).contains(&actions::MenuItem::RefreshTokens));
+        assert_eq!(account_menu_metadata(&rows[1])[0], "CPA 갱신");
+        assert!(!actions::menu_items(&rows[1]).contains(&actions::MenuItem::RefreshTokens));
+        assert_eq!(account_menu_metadata(&rows[2])[0], "갱신 방식 확인 불가");
+        assert!(!actions::menu_items(&rows[2]).contains(&actions::MenuItem::RefreshTokens));
+        for count in [1, 8] {
+            let list = (0..count)
+                .map(|n| {
+                    let mut row = rows[0].clone();
+                    row.id = format!("row-{n}");
+                    row
+                })
+                .collect::<Vec<_>>();
+            let row = list.last().unwrap();
+            let state = format!("menu:{}:0", row.id);
+            let height = state_height(&list, false, Some(&state));
+            let popup = popup_rect(&list, false, &state, height).unwrap();
+            assert!(popup.top >= 0.0 && popup.bottom <= height);
+            assert!(
+                account_menu_item_top(row, 0) >= 64.0,
+                "metadata and first action overlap"
+            );
+            let last = actions::menu_items(row).len() - 1;
+            assert!(popup.top + account_menu_item_top(row, last) + 32.0 <= popup.bottom);
+        }
+    }
+
+    #[test]
     fn phantom_codex_windows_are_not_drawn() {
         let rows = parse_state(
             r#"{"accounts":[{"id":"cx","provider":"codex","windows":[
@@ -1056,8 +1130,13 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            hit_test(&targets, menu.left + 50.0, menu.top + 20.0),
+            hit_test(&targets, menu.left + 50.0,
+                menu.top + account_menu_item_top(rows.iter().find(|row| row.id == "cx-ready").unwrap(), 0) + 15.0),
             Some(HitTarget::MenuItem { id, index: 0, .. }) if id == "cx-ready"
+        ));
+        assert!(matches!(
+            hit_test(&targets, menu.left + 50.0, menu.top + 20.0),
+            Some(HitTarget::MenuSurface { .. })
         ));
         assert!(targets.iter().any(|target| matches!(
             target,

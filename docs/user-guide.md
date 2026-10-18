@@ -101,6 +101,37 @@ quota-baton.exe accounts login codex --replace-linked
 
 소유 계정의 refresh token은 quota-baton이 관리합니다. 토큰 오류가 terminal 상태가 되면 트레이에서 다시 로그인합니다.
 
+### CPA 연결 계정을 직접 갱신하도록 바꾸는 방법
+
+`accounts list`에서 계정 ID를 확인합니다. 아래의 `<계정-ID>`를 그 값으로 바꿉니다.
+
+```powershell
+quota-baton.exe accounts adopt <계정-ID> --from cpa-file
+quota-baton.exe accounts adopt <계정-ID> --from store
+```
+
+`cpa-file`은 같은 계정의 CPA 파일을 우선 읽습니다. 파일이 없으면 저장된 토큰을 사용합니다. `store`는 quota-baton에 저장된 토큰을 사용합니다. 백업을 지정하려면 `--from <백업-파일-또는-폴더>`를 씁니다. 오래된 토큰으로 되돌리지 않습니다.
+
+CPA가 실행 중이고 해당 계정 파일을 읽을 수 있으면 이전을 거부합니다. 이전해도 계정 ID와 대화 연결은 유지됩니다. 이후에는 quota-baton이 직접 갱신합니다. 트레이의 계정 메뉴에서 `직접 갱신` 또는 `CPA 갱신`, 만료 시각과 최근 갱신 시각을 볼 수 있습니다.
+
+직접 소유하거나 이전한 계정은 일시정지·비활성 상태에서도 토큰을 갱신합니다. 드레인 중이거나 재로그인이 필요한 계정은 자동 갱신하지 않습니다.
+
+### 지금 토큰을 갱신하는 방법
+
+트레이 계정 메뉴의 **지금 갱신**을 누르거나 다음을 실행합니다. CPA 연결 계정은 CPA가 갱신합니다.
+
+```powershell
+quota-baton.exe accounts refresh <계정-ID>
+```
+
+이전 갱신 결과가 불확실하면 일반 수동 갱신을 거부할 수 있습니다. 상태를 확인한 뒤 `--force`로 한 번 시도할 수 있습니다. 이미 무효화된 갱신 토큰이면 다시 로그인해야 합니다.
+
+```powershell
+quota-baton.exe accounts refresh <계정-ID> --force
+```
+
+코어가 실행 중이면 계정 이전과 수동 갱신 CLI는 관리 API를 사용합니다. 코어가 없으면 CLI가 계정 잠금을 직접 잡습니다. 자세한 조건은 [C11 관리 API](contract.md#c11-admin-api)와 [D17 갱신 소유권](decisions.md#d17)을 따릅니다.
+
 ## 속도 제한과 세션 분산
 
 429에는 두 종류가 있습니다.

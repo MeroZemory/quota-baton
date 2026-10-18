@@ -10,10 +10,87 @@ use crate::{
     account_runtime::AccountRuntime,
     accounts::{
         Account, AccountStore, Health, HealthReason, HealthSignal, ImportMode, Provider, Source,
-        StoreError, Tokens, UserState, linked,
+        StoreError, Tokens, linked,
     },
     observability::Observability,
 };
+
+/// Safe admin/CLI response: credential values never cross this boundary.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct ManualRefreshResult {
+    pub outcome: ManualRefreshOutcome,
+    pub token_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_refresh_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManualRefreshOutcome {
+    Success,
+}
+
+/// Allowlisted terminal codes; never provider messages or response bodies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManualRefreshTerminal {
+    RefreshTokenInvalidated,
+    RefreshTokenReused,
+    RefreshTokenExpired,
+    RefreshTokenRevoked,
+    InvalidGrant,
+    #[serde(rename = "token_endpoint_401")]
+    TokenEndpoint401,
+}
+
+impl ManualRefreshTerminal {
+    fn from_code(code: &str) -> Self {
+        match code {
+            "refresh_token_invalidated" => Self::RefreshTokenInvalidated,
+            "refresh_token_reused" => Self::RefreshTokenReused,
+            "refresh_token_expired" => Self::RefreshTokenExpired,
+            "refresh_token_revoked" => Self::RefreshTokenRevoked,
+            "invalid_grant" => Self::InvalidGrant,
+            _ => Self::TokenEndpoint401,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, thiserror::Error)]
+#[serde(tag = "code", rename_all = "snake_case")]
+pub enum ManualRefreshError {
+    #[error("CPA가 갱신하는 계정입니다")]
+    Linked,
+    #[error("드레인 중인 계정은 갱신할 수 없습니다")]
+    Drain,
+    #[error("다시 로그인해야 하는 계정입니다")]
+    NeedsRelogin,
+    #[error("이전 갱신 결과가 불확실합니다. 강제 갱신이 필요합니다")]
+    Uncertain,
+    #[error("계정을 찾을 수 없습니다")]
+    NotFound,
+    #[error("지금은 계정을 갱신할 수 없습니다. 잠시 후 다시 시도하세요")]
+    Unavailable,
+    #[error("갱신 자격 증명이 만료되거나 무효화되었습니다. 다시 로그인하세요")]
+    Terminal { outcome: ManualRefreshTerminal },
+}
+
+impl From<()> for ManualRefreshError {
+    fn from(_: ()) -> Self {
+        Self::Unavailable
+    }
+}
+
+fn manual_allowed(account: &Account) -> Result<(), ManualRefreshError> {
+    if is_linked(account) {
+        Err(ManualRefreshError::Linked)
+    } else if account.drain {
+        Err(ManualRefreshError::Drain)
+    } else if matches!(account.health, Health::NeedsRelogin { .. }) {
+        Err(ManualRefreshError::NeedsRelogin)
+    } else {
+        Ok(())
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct TokenGates {
@@ -342,6 +419,61 @@ impl TokenGates {
         .map_err(|_| ())?
     }
 
+    /// Shares the detached, write-ahead refresh engine with ahead and current-401.
+    pub(crate) async fn manual_refresh(
+        &self,
+        store: Arc<AccountStore>,
+        obs: Arc<Observability>,
+        id: String,
+        force: bool,
+    ) -> Result<ManualRefreshResult, ManualRefreshError> {
+        let activity = self
+            .lifecycle
+            .admit()
+            .ok_or(ManualRefreshError::Unavailable)?;
+        let read_store = store.clone();
+        let read_id = id.clone();
+        // Capture access BEFORE waiting for the gate: a concurrent rotation is
+        // our result too, even though manual refresh has no due-time restriction.
+        let (activity, failed, baseline) = tokio::task::spawn_blocking(move || {
+            // The blocking credential read outlives a cancelled requesting future.
+            // Keep it tracked until its result is dropped or handed to refresh.
+            let activity = activity;
+            let account = read_store.load(&read_id).map_err(|error| match error {
+                StoreError::NotFound => ManualRefreshError::NotFound,
+                _ => ManualRefreshError::Unavailable,
+            })?;
+            manual_allowed(&account)?;
+            let (current, tokens) = snapshot(&read_store, &read_id)?;
+            let failed = zeroize::Zeroizing::new(tokens.access_token.clone());
+            Ok::<_, ManualRefreshError>((activity, failed, current.token_meta))
+        })
+        .await
+        .map_err(|_| ManualRefreshError::Unavailable)??;
+        let this = self.clone();
+        tokio::spawn(async move {
+            let _activity = activity;
+            let (account, _) = this
+                .refresh_inner(
+                    store,
+                    obs,
+                    id,
+                    Some(failed),
+                    if force { "manual_force" } else { "manual" },
+                    Some(baseline),
+                )
+                .await?
+                .ok_or(ManualRefreshError::Unavailable)?;
+            Ok(ManualRefreshResult {
+                outcome: ManualRefreshOutcome::Success,
+                token_expires_at: account.token_meta.expires_at,
+                last_refresh_at: account.token_meta.last_refresh_at,
+            })
+        })
+        .await
+        .map_err(|_| ManualRefreshError::Unavailable)?
+    }
+
     /// Stops new refreshes and waits for detached token consumption and writes.
     /// On timeout or an unsaved rotation the caller must retain the lease and retry.
     pub async fn shutdown_refreshes(&self) -> Result<(), ()> {
@@ -399,7 +531,7 @@ impl TokenGates {
                 {
                     for account in accounts {
                         if !is_linked(&account)
-                            && account.user_state == UserState::Active
+                            && !matches!(account.health, Health::NeedsRelogin { .. })
                             && !account.drain
                         {
                             let _ = this
@@ -570,6 +702,21 @@ impl TokenGates {
         failed: Option<zeroize::Zeroizing<String>>,
         trigger: &str,
     ) -> Result<Option<(Account, Tokens)>, ()> {
+        self.refresh_inner(store, obs, id, failed, trigger, None)
+            .await
+            .map_err(|_| ())
+    }
+
+    async fn refresh_inner(
+        &self,
+        store: Arc<AccountStore>,
+        obs: Arc<Observability>,
+        id: String,
+        failed: Option<zeroize::Zeroizing<String>>,
+        trigger: &str,
+        manual_baseline: Option<crate::accounts::TokenMeta>,
+    ) -> Result<Option<(Account, Tokens)>, ManualRefreshError> {
+        let manual = matches!(trigger, "manual" | "manual_force");
         let gate = self.gate(&id).await;
         let mut clock = gate.clone().lock_owned().await;
         if self.lifecycle.stopped() || clock.pending.is_some() {
@@ -584,7 +731,6 @@ impl TokenGates {
                 .map_err(|_| ())?;
             if is_linked(&metadata)
                 || metadata.drain
-                || metadata.user_state != UserState::Active
                 || matches!(metadata.health, Health::NeedsRelogin { .. })
                 || !ahead_due(&metadata, chrono::Utc::now())
             {
@@ -595,6 +741,9 @@ impl TokenGates {
         let (current, tokens) = tokio::task::spawn_blocking(move || snapshot(&read_store, &id))
             .await
             .map_err(|_| ())??;
+        if manual {
+            manual_allowed(&current)?;
+        }
         if is_linked(&current) {
             let Some(failed) = failed else {
                 return Ok(None);
@@ -611,7 +760,8 @@ impl TokenGates {
                 Ok((tokens.access_token != *failed).then_some((updated, tokens)))
             })
             .await
-            .map_err(|_| ())?;
+            .map_err(|_| ())?
+            .map_err(|_: ()| ManualRefreshError::Unavailable);
         }
         assert!(!is_linked(&current), "linked accounts cannot refresh");
         let ahead = failed.is_none();
@@ -619,10 +769,21 @@ impl TokenGates {
         if tokens.access_token != *failed {
             return Ok(Some((current, tokens)));
         }
+        if manual_baseline.as_ref().is_some_and(|baseline| {
+            !current.token_meta.refresh_uncertain
+                && current.token_meta.last_refresh_at != baseline.last_refresh_at
+        }) {
+            // A provider may keep its access-token value on a successful refresh.
+            // Share that durable completion too, rather than consuming the RT twice.
+            return Ok(Some((current, tokens)));
+        }
         let due = ahead_due(&current, chrono::Utc::now());
-        // Per-account drain keeps warm sessions and paused accounts still poll.
-        // Only proactive refresh is restricted by placement settings (C5/C6/C9).
-        if (ahead && (current.drain || current.user_state != UserState::Active || !due))
+        if manual && current.token_meta.refresh_uncertain && trigger != "manual_force" && !due {
+            return Err(ManualRefreshError::Uncertain);
+        }
+        // Account drain stops proactive/manual work; C6 current-token poll 401
+        // remains allowed. Core lifecycle stop excludes every refresh trigger.
+        if (ahead && (current.drain || !due))
             || matches!(current.health, Health::NeedsRelogin { .. })
         {
             return Ok(None);
@@ -634,7 +795,7 @@ impl TokenGates {
         {
             return Ok(None);
         }
-        if ahead
+        if (ahead || manual)
             && current.token_meta.refresh_uncertain
             && clock
                 .uncertain_retry
@@ -645,7 +806,7 @@ impl TokenGates {
         {
             return Ok(None);
         }
-        let serving = if ahead && access_valid(&current, chrono::Utc::now()) {
+        let serving = if (ahead || manual) && access_valid(&current, chrono::Utc::now()) {
             self.ahead_access
                 .lock()
                 .expect("ahead access")
@@ -682,7 +843,7 @@ impl TokenGates {
                     current.token_meta.expires_at,
                 );
                 obs.core_warning(&current.id, "refresh_store_error_writeahead");
-                if !ahead || !access_valid(&current, chrono::Utc::now()) {
+                if (!ahead && !manual) || !access_valid(&current, chrono::Utc::now()) {
                     let mut cooled = current.clone();
                     cooled.apply_health_signal(HealthSignal::StoreFailure, chrono::Utc::now());
                     obs.record_health(&current.id, &current.health, &cooled.health);
@@ -729,6 +890,7 @@ impl TokenGates {
                     .await;
                 }
                 if let RefreshError::Terminal(reason) = error {
+                    let outcome = ManualRefreshTerminal::from_code(&reason);
                     clock.unknown_failures = 0;
                     self.runtime.set_refresh_attention(&current.id, false);
                     tokio::task::spawn_blocking(move || {
@@ -741,7 +903,11 @@ impl TokenGates {
                     })
                     .await
                     .map_err(|_| ())??;
-                    return Ok(None);
+                    return if manual {
+                        Err(ManualRefreshError::Terminal { outcome })
+                    } else {
+                        Ok(None)
+                    };
                 }
                 if matches!(error, RefreshError::Unknown4xx(_)) {
                     clock.unknown_failures = clock.unknown_failures.saturating_add(1);
@@ -1161,6 +1327,11 @@ fn transition(
 ) -> Result<Account, ()> {
     let updated = store
         .update_metadata_for_token(&expected.id, failed, |account| {
+            // Adoption may retain the exact access token while changing its owner.
+            // A late linked reload must not reintroduce CPA-only cooling afterward.
+            if matches!(&signal, HealthSignal::LinkStale { .. }) && !is_linked(account) {
+                return;
+            }
             account.apply_health_signal(signal, chrono::Utc::now());
         })
         .map_err(|_| ())?;
@@ -1255,6 +1426,75 @@ fn reload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn late_linked_failure_cannot_cool_same_token_after_ownership_change() {
+        use crate::accounts::{Identity, ImportMode, SourceMatch};
+        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.sandbox/r2a-ownership-race");
+        std::fs::create_dir_all(&base).unwrap();
+        let root = tempfile::tempdir_in(base).unwrap();
+        let store = AccountStore::acquire(root.path()).unwrap();
+        let identity = Identity::Codex {
+            account_id: "synthetic-ownership-race".into(),
+            user_id: None,
+            email: "race@example.invalid".into(),
+        };
+        let account: Account = serde_json::from_value(serde_json::json!({
+            "schema":1,"id":identity.id(),"provider":"codex","label":"fixture",
+            "email":"race@example.invalid","identity":identity,
+            "source":{"kind":"cpa","mode":"linked","dir":root.path().join("absent-cpa"),
+                "match":SourceMatch::from(&identity)},
+            "user_state":"active","health":{"kind":"ready"},"generation":0,
+            "token_meta":{"refresh_uncertain":false}
+        }))
+        .unwrap();
+        let tokens = Tokens {
+            access_token: "synthetic-same-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            id_token: None,
+        };
+        let old = store.save(&account, &tokens, None).unwrap();
+        let mut adopted = old.clone();
+        if let Source::Cpa { mode, .. } = &mut adopted.source {
+            *mode = ImportMode::Adopted;
+        }
+        let adopted = store.save(&adopted, &tokens, Some(old.generation)).unwrap();
+        // Deterministic interleaving: linked reader captured old; adoption committed;
+        // its late missing-file result now tries the same-token health write.
+        let current = transition(
+            &store,
+            &old,
+            &tokens.access_token,
+            HealthSignal::LinkStale {
+                retry_at: chrono::Utc::now() + chrono::Duration::minutes(5),
+            },
+        )
+        .unwrap();
+        assert_eq!(current, adopted);
+        assert!(!is_linked(&current));
+        assert_eq!(current.health, Health::Ready);
+        assert_eq!(
+            store.tokens(&current).unwrap().access_token,
+            tokens.access_token
+        );
+        // Actual owned-token authentication failures must still take effect.
+        let current = transition(
+            &store,
+            &current,
+            &tokens.access_token,
+            HealthSignal::AuthAfterRefresh,
+        )
+        .unwrap();
+        assert!(matches!(
+            current.health,
+            Health::Cooling {
+                reason: HealthReason::Auth,
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn reload_and_stale_intervals_have_independent_boundaries() {
         let mut clock = ReloadClock::default();

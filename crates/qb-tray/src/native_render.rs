@@ -322,6 +322,19 @@ fn draw_account_menu(
             super::Rgb(252, 252, 252)
         }),
     )?;
+    let metadata_format = text_format(factory, 11.0, false)?;
+    for (line, text) in super::account_menu_metadata(row).iter().enumerate() {
+        draw_text(
+            target,
+            &metadata_format,
+            text,
+            popup.left + 14.0,
+            popup.top + 10.0 + line as f32 * 18.0,
+            popup.right - popup.left - 28.0,
+            18.0,
+            brush_color(colors(dark).text),
+        )?;
+    }
     let icon_values = [
         "\u{e769}", "\u{e733}", "\u{e8d7}", "\u{e72c}", "\u{e73e}", "\u{e74d}",
     ];
@@ -404,6 +417,12 @@ fn draw_account_menu(
                 &icons,
                 if matches!(item, super::actions::MenuItem::Delete) {
                     "\u{e74d}"
+                } else if matches!(
+                    item,
+                    super::actions::MenuItem::RefreshUsage
+                        | super::actions::MenuItem::RefreshTokens
+                ) {
+                    "\u{e72c}"
                 } else {
                     icon_values.get(n).copied().unwrap_or("")
                 },
@@ -850,6 +869,13 @@ pub fn paint_with_state(
             )?;
         }
         y = 228.0;
+    }
+    if !login_state
+        && state.is_some_and(|value| value.starts_with("menu:"))
+        && state_height(&rows, expand_disabled, state) > state_height(&rows, expand_disabled, None)
+    {
+        // A grown menu uses the same footer position as the shared hit targets.
+        y = state_height(&rows, expand_disabled, state) - super::FOOTER_HEIGHT;
     }
     fill(
         target,
