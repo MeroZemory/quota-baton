@@ -149,6 +149,8 @@ struct Interaction {
     next_id: i32,
 }
 thread_local! {
+    #[cfg(all(debug_assertions, feature = "testkit"))]
+    static FRAME_TIMINGS: RefCell<BTreeMap<&'static str, u128>> = const { RefCell::new(BTreeMap::new()) };
     static LOGIN_ANIMATION_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static RENDER_TARGET: RefCell<Option<ID2D1HwndRenderTarget>> = const { RefCell::new(None) };
     static VIEWPORT: RefCell<Viewport> = const { RefCell::new(Viewport { offset: 0.0, content: 0.0, extent: 0.0 }) };
@@ -386,6 +388,8 @@ fn test_shell(hwnd: HWND, event: &str, kind: Option<crate::tray_icon::signals::K
     let count = rows.len();
     let payload = serde_json::json!({
         "sequence": SEQUENCE.fetch_add(1, Ordering::Relaxed), "event": event,
+        "clock_ms": elapsed().as_millis(),
+        "timing_ms": FRAME_TIMINGS.with(|t| t.borrow().clone()),
         "badge": match badge { Badge::Normal => "normal", Badge::Attention => "attention", Badge::Error => "error" },
         "tooltip": tooltip, "dark": dark,
         "icon_size": size, "visible": unsafe { IsWindowVisible(hwnd).as_bool() },
@@ -661,6 +665,8 @@ fn sync_login_animation(hwnd: HWND, visible: bool) {
     });
 }
 fn measured_scene(hwnd: HWND) -> Result<(Renderer, v2::View, geometry::Scene, BTreeSet<String>)> {
+    #[cfg(all(debug_assertions, feature = "testkit"))]
+    let started = Instant::now();
     let state = view_state()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -669,7 +675,15 @@ fn measured_scene(hwnd: HWND) -> Result<(Renderer, v2::View, geometry::Scene, BT
     let mut view = projected();
     let (mut p, errors) = presentation(&mut view, state.as_deref(), core_ok);
     let renderer = Renderer::new(DARK.load(Ordering::Acquire))?;
+    #[cfg(all(debug_assertions, feature = "testkit"))]
+    let created = started.elapsed().as_millis();
     renderer.measure(&view, &mut p)?;
+    #[cfg(all(debug_assertions, feature = "testkit"))]
+    FRAME_TIMINGS.with(|t| {
+        let mut t = t.borrow_mut();
+        t.insert("renderer_create", created);
+        t.insert("measure", started.elapsed().as_millis() - created);
+    });
     let mut scene = geometry::Scene::build(&view, p.clone(), scene_cap(hwnd));
     let reveal = INPUT.with(|i| {
         let mut i = i.borrow_mut();
@@ -726,6 +740,19 @@ fn client_pixel_size(client: RECT) -> D2D_SIZE_U {
         width: (client.right - client.left).max(1) as u32,
         height: (client.bottom - client.top).max(1) as u32,
     }
+}
+fn resize_target(
+    target: &ID2D1HwndRenderTarget,
+    pixels: D2D_SIZE_U,
+) -> windows::core::Result<bool> {
+    unsafe {
+        let current = target.GetPixelSize();
+        if current.width == pixels.width && current.height == pixels.height {
+            return Ok(false);
+        }
+        target.Resize(&pixels)?;
+    }
+    Ok(true)
 }
 unsafe fn work_area(hwnd: HWND) -> Option<RECT> {
     let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
@@ -836,6 +863,8 @@ fn submit_job(job: impl std::future::Future<Output = ()> + Send + 'static) -> bo
 }
 
 fn paint_window(hwnd: HWND) -> Result<()> {
+    #[cfg(all(debug_assertions, feature = "testkit"))]
+    let started = Instant::now();
     sync_login_animation(hwnd, unsafe { IsWindowVisible(hwnd).as_bool() });
     if !unsafe { IsWindowVisible(hwnd).as_bool() } {
         return Ok(());
@@ -852,9 +881,17 @@ fn paint_window(hwnd: HWND) -> Result<()> {
         GetClientRect(hwnd, &mut client)?;
         let pixels = client_pixel_size(client);
         let dpi = GetDpiForWindow(hwnd).max(96);
+        #[cfg(all(debug_assertions, feature = "testkit"))]
+        let target_started = Instant::now();
         let target = RENDER_TARGET.with(|slot| -> Result<ID2D1HwndRenderTarget> {
             if let Some(target) = slot.borrow().as_ref() {
-                target.Resize(&pixels)?;
+                let resized = resize_target(target, pixels)?;
+                #[cfg(all(debug_assertions, feature = "testkit"))]
+                FRAME_TIMINGS.with(|t| {
+                    t.borrow_mut().insert("target_reused", u128::from(!resized));
+                });
+                #[cfg(not(all(debug_assertions, feature = "testkit")))]
+                let _ = resized;
                 target.SetDpi(dpi as f32, dpi as f32);
                 return Ok(target.clone());
             }
@@ -871,9 +908,18 @@ fn paint_window(hwnd: HWND) -> Result<()> {
                 presentOptions: D2D1_PRESENT_OPTIONS_NONE,
             };
             let target = factory.CreateHwndRenderTarget(&properties, &hwnd_properties)?;
+            #[cfg(all(debug_assertions, feature = "testkit"))]
+            FRAME_TIMINGS.with(|t| {
+                t.borrow_mut().insert("target_reused", 0);
+            });
             *slot.borrow_mut() = Some(target.clone());
             Ok(target)
         })?;
+        #[cfg(all(debug_assertions, feature = "testkit"))]
+        FRAME_TIMINGS.with(|t| {
+            t.borrow_mut()
+                .insert("target", target_started.elapsed().as_millis());
+        });
         let offset = scene.offset;
         target.SetTransform(&Matrix3x2::identity());
         INPUT.with(|i| {
@@ -955,6 +1001,8 @@ fn paint_window(hwnd: HWND) -> Result<()> {
                 retry: s.ends_with(":expired") || s.ends_with(":failed"),
             });
         let last_success = *LAST_SUCCESS.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(all(debug_assertions, feature = "testkit"))]
+        let draw_started = Instant::now();
         let result = renderer.paint(
             &target,
             &view,
@@ -973,6 +1021,11 @@ fn paint_window(hwnd: HWND) -> Result<()> {
                 draw_window_border: false,
             },
         );
+        #[cfg(all(debug_assertions, feature = "testkit"))]
+        FRAME_TIMINGS.with(|t| {
+            t.borrow_mut()
+                .insert("draw", draw_started.elapsed().as_millis());
+        });
         match result {
             Ok(()) => {
                 let epoch = FRAME_EPOCH.fetch_add(1, Ordering::AcqRel);
@@ -1006,7 +1059,20 @@ fn paint_window(hwnd: HWND) -> Result<()> {
         }
     }
     #[cfg(all(debug_assertions, feature = "testkit"))]
-    test_shell(hwnd, "paint", None);
+    let drop_started = Instant::now();
+    drop(renderer);
+    #[cfg(all(debug_assertions, feature = "testkit"))]
+    {
+        FRAME_TIMINGS.with(|t| {
+            t.borrow_mut()
+                .insert("renderer_drop", drop_started.elapsed().as_millis());
+        });
+        FRAME_TIMINGS.with(|t| {
+            t.borrow_mut()
+                .insert("paint_total", started.elapsed().as_millis());
+        });
+        test_shell(hwnd, "paint", None);
+    }
     Ok(())
 }
 
@@ -2548,7 +2614,7 @@ unsafe extern "system" fn window_proc(
             if GetClientRect(hwnd, &mut client).is_ok() {
                 RENDER_TARGET.with(|slot| {
                     if let Some(target) = slot.borrow().as_ref() {
-                        let _ = target.Resize(&client_pixel_size(client));
+                        let _ = resize_target(target, client_pixel_size(client));
                         let dpi = GetDpiForWindow(hwnd).max(96) as f32;
                         target.SetDpi(dpi, dpi);
                     }

@@ -1309,10 +1309,14 @@ impl Live {
 
 fn send(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Result<()> {
     let mut result = 0;
+    let started = Instant::now();
+    let sent =
+        unsafe { SendMessageTimeoutW(h, msg, wp, lp, SMTO_ABORTIFHUNG, 1000, Some(&mut result)) }.0;
+    let error = unsafe { windows::Win32::Foundation::GetLastError() }.0;
     ensure!(
-        unsafe { SendMessageTimeoutW(h, msg, wp, lp, SMTO_ABORTIFHUNG, 1000, Some(&mut result)) }.0
-            != 0,
-        "owned window input timeout"
+        sent != 0,
+        "owned window input failed: msg={msg:#x} duration_ms={} win32={error}",
+        started.elapsed().as_millis()
     );
     Ok(())
 }
@@ -2262,6 +2266,22 @@ fn r5_live_relogin_panel_cancel_cleans_core_login() -> Result<()> {
         live.account(&id)?["health"]["kind"] == "needs_relogin",
         "cancel changed account"
     );
+    Ok(())
+}
+
+#[test]
+#[ignore = "manual native render-target reuse against a synthetic spawned core"]
+fn r5_live_same_size_repaints_reuse_native_render_target() -> Result<()> {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _dpi = Dpi::enter()?;
+    let mut live = Live::start("empty")?;
+    for _ in 0..3 {
+        let trace = live.repaint()?;
+        ensure!(
+            trace["timing_ms"]["target_reused"] == 1,
+            "same-size paint recreated or resized its render target"
+        );
+    }
     Ok(())
 }
 
