@@ -56,6 +56,7 @@ pub struct RelayState {
     pub accounts: Arc<crate::account_runtime::AccountRuntime>,
     pub quota: Arc<crate::quota::UsagePoller>,
     pub bindings: Arc<crate::bindings::BindingTable>,
+    burst: Mutex<crate::burst::BurstTracker>,
     reset_hold_secs: u64,
     rate_hold_secs: u64,
     rate_hold_max_retries: u32,
@@ -90,6 +91,9 @@ pub struct RelayState {
 }
 
 impl RelayState {
+    pub(crate) fn recent_warnings(&self) -> Vec<serde_json::Value> {
+        self.observability.recent_warnings()
+    }
     pub fn login_service(&self) -> crate::oauth::LoginService {
         crate::oauth::LoginService::new(
             self.store.clone(),
@@ -347,6 +351,9 @@ impl RelayState {
             rate_hold_secs: config.routing.rate_hold_secs,
             rate_hold_max_retries: config.routing.rate_hold_max_retries,
             ws_upgrade_hold_secs: config.routing.ws_upgrade_hold_secs,
+            burst: Mutex::new(crate::burst::BurstTracker::new(
+                config.tray.burst_new_sessions,
+            )),
             inflight_requests: Arc::new(AtomicU64::new(0)),
             store,
             client,
@@ -614,6 +621,23 @@ impl RelayState {
                         completion.reset_hold_timed_out = false;
                     }
                     for event in moves {
+                        // Shared HTTP/WS path: only creation of a bound group counts.
+                        if event.reason == "new"
+                            && let Some(client) = completion.burst_client
+                        {
+                            let (crossed, excess) = {
+                                let mut tracker =
+                                    self.burst.lock().unwrap_or_else(|e| e.into_inner());
+                                let crossed =
+                                    tracker.new_placement(Instant::now(), client, &event.key);
+                                (crossed, tracker.excess(client))
+                            };
+                            if let Some(count) = crossed {
+                                self.observability.burst_warning(count);
+                            } else if let Some(count) = excess {
+                                self.observability.remember_burst(count);
+                            }
+                        }
                         self.observability.record_group_move(
                             &event.key,
                             event.from.as_deref(),

@@ -35,75 +35,17 @@ const PADDING: f32 = 16.0;
 const SECTION_GAP: f32 = 36.0;
 
 pub fn content_height(rows: &[Row], expand_disabled: bool) -> f32 {
-    let mut height = 52.0;
-    let mut sections = 0;
-    for provider in ["Claude", "Codex"] {
-        let active = rows
-            .iter()
-            .filter(|r| r.provider == provider && r.user_chip != "비활성")
-            .count();
-        let disabled = rows
-            .iter()
-            .filter(|r| r.provider == provider && r.user_chip == "비활성")
-            .count();
-        if active + disabled == 0 {
-            continue;
-        }
-        sections += 1;
-        height += SECTION_GAP
-            + rows
-                .iter()
-                .filter(|row| row.provider == provider && row.user_chip != "비활성")
-                .map(row_height)
-                .sum::<f32>();
-        let expand_section = expand_disabled && provider == "Codex";
-        if expand_section {
-            if disabled > 0 {
-                height += 32.0;
-            }
-            height += rows
-                .iter()
-                .filter(|row| row.provider == provider && row.user_chip == "비활성")
-                .map(row_height)
-                .sum::<f32>();
-            if disabled > 0 {
-                height += 1.0;
-            }
-        } else if disabled > 0 {
-            height += 32.0;
-        }
-    }
-    // One-pixel section/body separators plus the final list inset.
-    height + sections as f32 + 3.0 + 8.0 + 48.0
+    super::state_height(rows, expand_disabled, None)
 }
 
 pub fn state_height(rows: &[Row], expand_disabled: bool, state: Option<&str>) -> f32 {
-    if state.is_some_and(|value| value.starts_with("login:")) {
-        276.0
-    } else {
-        super::state_height(rows, expand_disabled, state)
-    }
+    super::state_height(rows, expand_disabled, state)
 }
 
-fn display_rows(rows: &[Row], state: Option<&str>) -> Vec<Row> {
-    if state.is_none() || state.is_some_and(|value| value == "pacing") {
-        rows.to_vec()
-    } else {
-        rows.iter()
-            .cloned()
-            .map(|mut row| {
-                if row.pacing_until.is_some() {
-                    row.health_chip = "준비됨".to_owned();
-                }
-                row.pacing_until = None;
-                if row.health_chip == "준비됨" {
-                    row.health_tone = Tone::Good;
-                    row.attention = false;
-                }
-                row
-            })
-            .collect()
-    }
+fn display_rows(rows: &[Row], _state: Option<&str>) -> Vec<Row> {
+    // View state controls geometry, never authoritative pacing or attention.
+    // Review fixtures must carry the data they intend to display.
+    rows.to_vec()
 }
 
 #[derive(Clone, Copy)]
@@ -173,6 +115,7 @@ fn icon_format(
 #[allow(clippy::too_many_arguments)]
 fn draw_text(
     target: &ID2D1RenderTarget,
+    factory: &IDWriteFactory,
     format: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
     value: &str,
     x: f32,
@@ -184,7 +127,6 @@ fn draw_text(
     let brush = unsafe { target.CreateSolidColorBrush(&color.0, None) }?;
     let text: Vec<u16> = value.encode_utf16().collect();
     unsafe {
-        let factory: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED)?;
         let measure = factory.CreateTextLayout(&text, format, width, 4096.0)?;
         let mut metrics = DWRITE_TEXT_METRICS::default();
         measure.GetMetrics(&mut metrics)?;
@@ -294,24 +236,18 @@ fn draw_account_menu(
     rows: &[Row],
     dark: bool,
     state: &str,
+    expand_disabled: bool,
+    height: f32,
 ) -> Result<()> {
-    let id = state
-        .strip_prefix("menu:")
-        .and_then(|v| v.split(':').next())
-        .unwrap_or_default();
-    let index = state
-        .rsplit(':')
-        .next()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(0);
-    let Some(row) = rows.iter().find(|r| r.id == id).or_else(|| rows.first()) else {
+    let Some((row, index)) = super::menu_target(rows, state) else {
         return Ok(());
     };
     let items = super::actions::menu_items(row);
     let body = text_format(factory, 13.0, false)?;
     let icons = icon_format(factory, 14.0)?;
-    let popup = super::popup_rect(rows, false, state, content_height(rows, false))
-        .unwrap_or(super::Rect::new(136.0, 126.0, 352.0, 312.0));
+    let Some(popup) = super::popup_rect(rows, expand_disabled, state, height) else {
+        return Ok(());
+    };
     popup_surface(
         target,
         rect(popup.left, popup.top, popup.right, popup.bottom),
@@ -326,6 +262,7 @@ fn draw_account_menu(
     for (line, text) in super::account_menu_metadata(row).iter().enumerate() {
         draw_text(
             target,
+            factory,
             &metadata_format,
             text,
             popup.left + 14.0,
@@ -398,6 +335,7 @@ fn draw_account_menu(
                 )?;
                 draw_text(
                     target,
+                    factory,
                     &icons,
                     "\u{e73e}",
                     155.0,
@@ -414,6 +352,7 @@ fn draw_account_menu(
         } else {
             draw_text(
                 target,
+                factory,
                 &icons,
                 if matches!(item, super::actions::MenuItem::Delete) {
                     "\u{e74d}"
@@ -435,6 +374,7 @@ fn draw_account_menu(
         }
         draw_text(
             target,
+            factory,
             &body,
             item.label(row),
             177.0,
@@ -513,6 +453,7 @@ fn health_colors(row: &Row, dark: bool) -> (BrushColor, BrushColor) {
 #[allow(clippy::too_many_arguments)]
 fn draw_meter_value(
     target: &ID2D1RenderTarget,
+    factory: &IDWriteFactory,
     label_format: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
     percent_format: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
     unknown_format: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
@@ -525,6 +466,7 @@ fn draw_meter_value(
 ) -> Result<()> {
     draw_text(
         target,
+        factory,
         label_format,
         &usage.label,
         x,
@@ -535,6 +477,7 @@ fn draw_meter_value(
     )?;
     draw_text(
         target,
+        factory,
         if usage.percent.is_some() {
             percent_format
         } else {
@@ -566,6 +509,7 @@ fn draw_meter_value(
     }
     draw_text(
         target,
+        factory,
         label_format,
         &usage.reset_text,
         x,
@@ -661,6 +605,7 @@ pub fn paint_with_state(
     unsafe { target.DrawRoundedRectangle(&frame, &frame_brush, 1.0, None) };
     draw_text(
         target,
+        &dwrite,
         &title,
         "quota-baton",
         PADDING,
@@ -678,6 +623,7 @@ pub fn paint_with_state(
     };
     draw_text(
         target,
+        &dwrite,
         &small,
         &status,
         PADDING,
@@ -715,6 +661,7 @@ pub fn paint_with_state(
             }
             draw_text(
                 target,
+                &dwrite,
                 &section,
                 super::provider_name(provider),
                 PADDING,
@@ -724,10 +671,11 @@ pub fn paint_with_state(
                 brush_color(colors.muted),
             )?;
             y += SECTION_GAP;
-            let expand_section = expand_disabled && provider == "codex";
+            let expand_section = super::disabled_expanded(&rows, expand_disabled, state, provider);
             if expand_section && !disabled.is_empty() {
                 draw_text(
                     target,
+                    &dwrite,
                     &small,
                     &format!("비활성 계정 {}개 ⌄", disabled.len()),
                     PADDING,
@@ -745,6 +693,7 @@ pub fn paint_with_state(
             }) {
                 draw_row(
                     target,
+                    &dwrite,
                     &body,
                     &small,
                     row,
@@ -767,6 +716,7 @@ pub fn paint_with_state(
             if !expand_section && !disabled.is_empty() {
                 draw_text(
                     target,
+                    &dwrite,
                     &small,
                     &format!(
                         "비활성 계정 {}개 {}",
@@ -793,6 +743,7 @@ pub fn paint_with_state(
             .filter(|value| matches!(*value, "completed" | "failed" | "expired" | "cancelled"));
         draw_text(
             target,
+            &dwrite,
             &title,
             &format!("{provider} 로그인"),
             16.0,
@@ -804,6 +755,7 @@ pub fn paint_with_state(
         draw_progress(target, dark, now)?;
         draw_text(
             target,
+            &dwrite,
             &body,
             match outcome {
                 Some("completed") => "로그인이 완료되었습니다.",
@@ -820,6 +772,7 @@ pub fn paint_with_state(
         )?;
         draw_text(
             target,
+            &dwrite,
             &body,
             if outcome.is_some() {
                 ""
@@ -834,6 +787,7 @@ pub fn paint_with_state(
         )?;
         draw_text(
             target,
+            &dwrite,
             &text_format(&dwrite, 12.0, false)?,
             "남은 시간 9:41",
             42.0,
@@ -848,6 +802,7 @@ pub fn paint_with_state(
             if x == 16.0 {
                 draw_text(
                     target,
+                    &dwrite,
                     &icons,
                     "\u{E8C8}",
                     x + 41.0,
@@ -859,6 +814,7 @@ pub fn paint_with_state(
             }
             draw_text(
                 target,
+                &dwrite,
                 &body,
                 label,
                 label_x,
@@ -870,11 +826,8 @@ pub fn paint_with_state(
         }
         y = 228.0;
     }
-    if !login_state
-        && state.is_some_and(|value| value.starts_with("menu:"))
-        && state_height(&rows, expand_disabled, state) > state_height(&rows, expand_disabled, None)
-    {
-        // A grown menu uses the same footer position as the shared hit targets.
+    // Painting and hit testing share the final footer position in DIPs.
+    if !login_state {
         y = state_height(&rows, expand_disabled, state) - super::FOOTER_HEIGHT;
     }
     fill(
@@ -889,6 +842,7 @@ pub fn paint_with_state(
     )?;
     draw_text(
         target,
+        &dwrite,
         &footer,
         &format!("갱신 {}", now_time(now)),
         PADDING,
@@ -915,6 +869,7 @@ pub fn paint_with_state(
         )?;
         draw_text(
             target,
+            &dwrite,
             &icons,
             icon,
             x + 6.0,
@@ -925,6 +880,7 @@ pub fn paint_with_state(
         )?;
         draw_text(
             target,
+            &dwrite,
             &footer,
             label,
             x + 24.0,
@@ -935,10 +891,19 @@ pub fn paint_with_state(
         )?;
     }
     if let Some(menu_state) = state.filter(|value| value.starts_with("menu:")) {
-        draw_account_menu(target, &dwrite, &rows, dark, menu_state)?;
+        draw_account_menu(
+            target,
+            &dwrite,
+            &rows,
+            dark,
+            menu_state,
+            expand_disabled,
+            state_height(&rows, expand_disabled, state),
+        )?;
     }
     if let Some(state) = state.filter(|value| {
         !matches!(*value, "list" | "expanded" | "pacing" | "truncation")
+            && !value.starts_with("expanded:")
             && !value.starts_with("menu:")
             && !value.starts_with("login:")
     }) {
@@ -947,10 +912,7 @@ pub fn paint_with_state(
                 .strip_prefix("menu:")
                 .and_then(|value| value.split(':').next())
                 .unwrap_or_default();
-            let menu_row = rows
-                .iter()
-                .find(|row| row.id == id)
-                .or_else(|| rows.first());
+            let menu_row = rows.iter().find(|row| row.id == id);
             let labels = menu_row
                 .map(|row| {
                     super::actions::menu_items(row)
@@ -1065,6 +1027,7 @@ pub fn paint_with_state(
         )?;
         draw_text(
             target,
+            &dwrite,
             &section,
             heading,
             left + 16.0,
@@ -1084,6 +1047,7 @@ pub fn paint_with_state(
             if let Some(icon) = menu_icon {
                 draw_text(
                     target,
+                    &dwrite,
                     &icons,
                     icon,
                     left + 16.0,
@@ -1095,6 +1059,7 @@ pub fn paint_with_state(
             }
             draw_text(
                 target,
+                &dwrite,
                 if menu_icon.is_some() { &body } else { &small },
                 line,
                 left + if menu_icon.is_some() { 40.0 } else { 16.0 },
@@ -1117,6 +1082,7 @@ pub fn paint_with_state(
             )?;
             draw_text(
                 target,
+                &dwrite,
                 &body,
                 "삭제",
                 left + 58.0,
@@ -1127,6 +1093,7 @@ pub fn paint_with_state(
             )?;
             draw_text(
                 target,
+                &dwrite,
                 &body,
                 "취소",
                 left + 204.0,
@@ -1146,6 +1113,7 @@ pub fn paint_with_state(
 #[allow(clippy::too_many_arguments)]
 fn draw_row(
     target: &ID2D1RenderTarget,
+    factory: &IDWriteFactory,
     body: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
     small: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
     row: &Row,
@@ -1192,6 +1160,7 @@ fn draw_row(
     }
     draw_text(
         target,
+        factory,
         body,
         &email,
         PADDING,
@@ -1203,6 +1172,7 @@ fn draw_row(
     // The right edge is laid out first: ellipsis, chip, then the plan pill.
     draw_text(
         target,
+        factory,
         body,
         "⋯",
         330.0,
@@ -1233,6 +1203,7 @@ fn draw_row(
         unsafe { target.DrawRoundedRectangle(&plan_shape, &plan_border, 1.0, None) };
         draw_text(
             target,
+            factory,
             small,
             plan,
             plan_x + 7.0,
@@ -1245,6 +1216,7 @@ fn draw_row(
     pill(target, rect(chip_left, y + 10.0, 320.0, y + 31.0), bg)?;
     draw_text(
         target,
+        factory,
         small,
         display_chip,
         chip_left + 9.0,
@@ -1260,6 +1232,7 @@ fn draw_row(
         let x = if index == 0 { 16.0 } else { 188.0 };
         draw_meter_value(
             target,
+            factory,
             meter_label,
             meter_percent,
             meter_unknown,
@@ -1274,6 +1247,7 @@ fn draw_row(
     if let Some(session_text) = row.session_text.as_deref() {
         draw_text(
             target,
+            factory,
             small,
             session_text,
             260.0,
@@ -1306,6 +1280,7 @@ fn draw_row(
         };
         draw_text(
             target,
+            factory,
             small,
             &reason,
             PADDING,
@@ -1322,6 +1297,7 @@ fn draw_row(
             )?;
             draw_text(
                 target,
+                factory,
                 small,
                 "다시 로그인",
                 274.0,
@@ -1461,4 +1437,74 @@ pub fn render_png(
         encoder.Commit()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+
+    #[test]
+    fn menu_and_review_states_preserve_authoritative_pacing_and_attention() {
+        let mut rows = crate::parse_state(
+            r#"{"accounts":[
+            {"id":"paced","provider":"codex","user_state":"active"},
+            {"id":"attention","provider":"claude","user_state":"active"}
+        ]}"#,
+        )
+        .unwrap();
+        rows[0].pacing_until = Some("2099-10-18T00:00:00Z".into());
+        rows[0].health_chip = "속도 조절 중 · 10초".into();
+        rows[0].health_tone = Tone::Warning;
+        rows[0].attention = true;
+        rows[1].health_chip = "준비됨".into();
+        rows[1].health_tone = Tone::Warning;
+        rows[1].attention = true;
+        for state in [
+            None,
+            Some("menu:paced:0"),
+            Some("menu:attention:0"),
+            Some("list"),
+            Some("expanded"),
+            Some("expanded:claude"),
+            Some("pacing"),
+        ] {
+            let displayed = display_rows(&rows, state);
+            assert_eq!(displayed, rows);
+            assert_eq!(
+                state_height(&displayed, false, state),
+                crate::state_height(&rows, false, state)
+            );
+        }
+    }
+
+    #[test]
+    fn renderer_height_uses_shared_geometry_for_both_providers_and_legacy_states() {
+        let rows = crate::parse_state(
+            r#"{"accounts":[
+            {"id":"cl","provider":"claude","user_state":"disabled"},
+            {"id":"cx","provider":"codex","user_state":"disabled"}
+        ]}"#,
+        )
+        .unwrap();
+        for expanded in [false, true] {
+            for state in [
+                None,
+                Some("expanded"),
+                Some("expanded:claude"),
+                Some("expanded:codex"),
+                Some("menu:cl:0"),
+                Some("menu:cx:0"),
+                Some("login:claude"),
+            ] {
+                assert_eq!(
+                    state_height(&rows, expanded, state),
+                    crate::state_height(&rows, expanded, state)
+                );
+            }
+            assert_eq!(
+                content_height(&rows, expanded),
+                crate::state_height(&rows, expanded, None)
+            );
+        }
+    }
 }

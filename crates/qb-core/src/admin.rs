@@ -235,6 +235,7 @@ async fn runtime_state(State(state): State<RuntimeAdmin>) -> Response {
         Ok(accounts) => {
             Json(serde_json::json!({
             "pools": crate::account_runtime::pool_counts(&accounts),
+            "warnings": state.relay.recent_warnings(),
             "draining": state.relay.is_draining(),
             "capabilities": {"account_adopt":true,"manual_refresh":true},
             "accounts": accounts,

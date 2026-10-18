@@ -1,5 +1,9 @@
+use crate::{
+    notices::{self, Controller},
+    tray_icon::{pixels::Badge, win_icon::NotifyIcon},
+    viewport::{Viewport, pixel_ceil},
+};
 use anyhow::Result;
-use std::os::windows::process::CommandExt;
 use std::{
     cell::RefCell,
     ffi::c_void,
@@ -10,7 +14,7 @@ use std::{
         Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant, SystemTime},
+    time::{Instant, SystemTime},
 };
 use windows::{
     Win32::{
@@ -26,8 +30,10 @@ use windows::{
                 DWMWA_BORDER_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
                 DWMWCP_ROUND, DwmSetWindowAttribute,
             },
-            Gdi::InvalidateRect,
-            Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect},
+            Gdi::{
+                BeginPaint, EndPaint, GetMonitorInfoW, InvalidateRect, MONITOR_DEFAULTTONEAREST,
+                MONITORINFO, MonitorFromRect, MonitorFromWindow, PAINTSTRUCT,
+            },
         },
         System::LibraryLoader::GetModuleHandleW,
         UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent},
@@ -37,42 +43,96 @@ use windows::{
                 SetProcessDpiAwarenessContext,
             },
             Shell::{
-                NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE,
-                NIM_MODIFY, NOTIFYICONDATAW, NOTIFYICONIDENTIFIER, Shell_NotifyIconGetRect,
-                Shell_NotifyIconW,
+                NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIIF_WARNING, NIM_ADD,
+                NIM_DELETE, NIM_MODIFY, NIN_BALLOONHIDE, NIN_BALLOONTIMEOUT, NIN_BALLOONUSERCLICK,
+                NOTIFYICONDATAW, NOTIFYICONIDENTIFIER, Shell_NotifyIconGetRect, Shell_NotifyIconW,
             },
             WindowsAndMessaging::{
                 CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW,
-                DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos, GetMessageW, HMENU,
-                IDC_ARROW, IDC_HAND, IDI_APPLICATION, IsWindowVisible, LoadCursorW, LoadIconW, MSG,
-                PostMessageW, PostQuitMessage, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE,
-                SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetCursor, SetForegroundWindow, SetTimer,
-                SetWindowPos, ShowWindow, TranslateMessage, WM_APP, WM_CLOSE, WM_DESTROY,
-                WM_DPICHANGED, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT,
-                WM_RBUTTONUP, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW,
-                WS_POPUP,
+                DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos, GetMessageW,
+                GetWindowRect, HICON, HMENU, IDC_ARROW, IDC_HAND, IsWindow, IsWindowVisible,
+                LoadCursorW, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SW_HIDE,
+                SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SetCursor, SetForegroundWindow,
+                SetTimer, SetWindowPos, ShowWindow, TranslateMessage, WM_APP, WM_CLOSE, WM_DESTROY,
+                WM_DPICHANGED, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+                WM_PAINT, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_SHOWWINDOW, WM_SIZE, WM_TIMER,
+                WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
             },
         },
     },
     core::{PCWSTR, w},
 };
+use windows_numerics::Matrix3x2;
 
 const TRAY_MESSAGE: u32 = WM_APP + 1;
 const ACTION_DONE: u32 = WM_APP + 2;
 const STATE_CHANGED: u32 = WM_APP + 3;
+// Narrow confirmed-restart hook; main owns final notification integration.
+const CORE_RESTART_CONFIRMED: u32 = WM_APP + 4;
+// WPARAM: validated positive u32 observed session count; LPARAM: zero.
+// Main owns final debounced notification integration.
+const CORE_BURST_OBSERVED: u32 = WM_APP + 5;
 const WM_MOUSELEAVE_MESSAGE: u32 = 0x02A3;
 const WINDOW_CLASS: PCWSTR = w!("QuotaBatonTrayFlyout");
 static MODEL: OnceLock<Mutex<(Vec<qb_tray::Row>, String, bool)>> = OnceLock::new();
-static VIEW_STATE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
-static SUPERVISOR: OnceLock<Mutex<Supervisor>> = OnceLock::new();
+static VIEW_STATE: OnceLock<Mutex<view_ownership::ViewOwnership>> = OnceLock::new();
+#[path = "tray_worker.rs"]
+mod tray_worker;
+#[path = "view_ownership.rs"]
+mod view_ownership;
+static WORKER: OnceLock<tray_worker::Worker> = OnceLock::new();
+static LOGIN_GENERATION: Mutex<u64> = Mutex::new(0);
 static SUPERVISE_ENABLED: AtomicBool = AtomicBool::new(true);
 static FIXTURE_MODE: AtomicBool = AtomicBool::new(false);
 static LOGIN_ID: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static LOGIN_URL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
-static REFRESH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static NOTICES: OnceLock<Mutex<Controller>> = OnceLock::new();
+static STARTED: OnceLock<Instant> = OnceLock::new();
+static DARK: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone)]
+struct PaintedFrame {
+    rows: Vec<qb_tray::Row>,
+    state: Option<String>,
+    owner: usize,
+    pixels: (u32, u32),
+    dpi: u32,
+    offset: f32,
+}
 
 thread_local! {
     static RENDER_TARGET: RefCell<Option<ID2D1HwndRenderTarget>> = const { RefCell::new(None) };
+    static VIEWPORT: RefCell<Viewport> = const { RefCell::new(Viewport { offset: 0.0, content: 0.0, extent: 0.0 }) };
+    static PAINTED: RefCell<Option<PaintedFrame>> = const { RefCell::new(None) };
+    static SHELL_TOOLTIP: RefCell<String> = const { RefCell::new(String::new()) };
+    static SHELL_ICON: RefCell<Option<(u32, bool, Badge, NotifyIcon)>> = const { RefCell::new(None) };
+}
+
+fn notices() -> &'static Mutex<Controller> {
+    NOTICES.get_or_init(|| Mutex::new(Controller::default()))
+}
+fn elapsed() -> std::time::Duration {
+    STARTED.get_or_init(Instant::now).elapsed()
+}
+
+fn publish_read(read: super::client::TrayRead) -> Result<()> {
+    let now = SystemTime::now();
+    let rows = super::client::layout_rows(&read, now)?;
+    let core_ok = matches!(&read.health, super::client::CoreHealth::Healthy(_));
+    let attention = qb_tray::badge(&rows, core_ok) != qb_tray::Badge::Normal;
+    notices()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .snapshot(
+            &read.snapshot,
+            core_ok,
+            attention,
+            rows.len(),
+            now,
+            elapsed(),
+        );
+    *model().lock().unwrap_or_else(|e| e.into_inner()) = (rows, read.snapshot.version, core_ok);
+    Ok(())
 }
 
 fn login_id() -> &'static Mutex<Option<String>> {
@@ -88,6 +148,7 @@ enum HitTarget {
     RowMenu(String),
     RowRelogin(String),
     MenuItem(String, usize),
+    Surface,
     ConfirmDelete(String, bool),
     LoginCopy,
     LoginCancel,
@@ -106,34 +167,52 @@ fn point_from_lparam(value: LPARAM) -> (f32, f32) {
     ((raw as i16) as f32, (((raw >> 16) as u16) as i16) as f32)
 }
 
-fn hit_target(x: f32, y: f32) -> Option<HitTarget> {
-    let rows = model().lock().unwrap_or_else(|e| e.into_inner()).0.clone();
-    let state = view_state()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
+fn painted_frame(hwnd: HWND) -> Option<PaintedFrame> {
+    let frame = PAINTED.with(|slot| slot.borrow().clone())?;
+    let view = view_state().lock().unwrap_or_else(|e| e.into_inner());
+    if view.owner() != frame.owner || view.as_ref() != frame.state.as_ref() {
+        return None;
+    }
+    drop(view);
+    let mut client = RECT::default();
+    unsafe {
+        GetClientRect(hwnd, &mut client).ok()?;
+    }
+    let size = client_pixel_size(client);
+    let offset = VIEWPORT.with(|v| v.borrow().offset);
+    if frame.pixels != (size.width, size.height)
+        || frame.dpi != unsafe { GetDpiForWindow(hwnd).max(96) }
+        || (frame.offset - offset).abs() > 0.01
+    {
+        return None;
+    }
+    Some(frame)
+}
+
+fn hit_target(hwnd: HWND, x: f32, y: f32) -> Option<HitTarget> {
+    let frame = painted_frame(hwnd)?;
+    if x < 0.0 || y < 0.0 || x >= frame.pixels.0 as f32 || y >= frame.pixels.1 as f32 {
+        return None;
+    }
+    let scale = frame.dpi as f32 / 96.0;
+    let y = VIEWPORT.with(|slot| slot.borrow().to_content_y(y / scale));
+    let x = x / scale;
+    let rows = frame.rows;
+    let state = frame.state;
+    let height = qb_tray::native_render::state_height(&rows, false, state.as_deref());
     if state.as_deref() == Some("add-menu") {
-        let rows = model().lock().unwrap_or_else(|e| e.into_inner()).0.clone();
-        let top = qb_tray::popup_rect(&rows, false, "add-menu", flyout_height() as f32)
-            .map(|rect| rect.top)
-            .unwrap_or(flyout_height() as f32 - 180.0);
-        return if (128.0..352.0).contains(&x) && (top..top + 110.0).contains(&y) {
-            Some(if y < top + 36.0 {
+        let popup = qb_tray::popup_rect(&rows, false, "add-menu", height)?;
+        return popup.contains(x, y).then(|| {
+            if y < popup.top + 36.0 {
                 HitTarget::AddChoice(Some("claude".into()))
-            } else if y < top + 72.0 {
+            } else if y < popup.top + 72.0 {
                 HitTarget::AddChoice(Some("codex".into()))
             } else {
                 HitTarget::AddChoice(None)
-            })
-        } else {
-            None
-        };
+            }
+        });
     }
-    let targets = qb_tray::layout_targets(
-        &rows,
-        state.as_deref() == Some("expanded"),
-        state.as_deref(),
-    );
+    let targets = qb_tray::layout_targets(&rows, false, state.as_deref());
     if let Some(target) = qb_tray::hit_test(&targets, x, y).cloned() {
         return Some(match target {
             qb_tray::HitTarget::RowMenu { id, .. } => HitTarget::RowMenu(id),
@@ -173,183 +252,330 @@ fn hit_target(x: f32, y: f32) -> Option<HitTarget> {
                     false,
                 ),
             },
-            qb_tray::HitTarget::Row { .. } | qb_tray::HitTarget::MenuSurface { .. } => return None,
+            qb_tray::HitTarget::MenuSurface { .. } => HitTarget::Surface,
+            qb_tray::HitTarget::Row { .. } => return None,
         });
-    }
-    if let Some(value) = state.as_deref() {
-        if let Some(rest) = value.strip_prefix("menu:") {
-            let mut pieces = rest.split(':');
-            let id = pieces.next()?.to_owned();
-            let _selected = pieces.next().and_then(|v| v.parse().ok()).unwrap_or(0);
-            if (136.0..=352.0).contains(&x) && (126.0..312.0).contains(&y) {
-                let count = rows
-                    .iter()
-                    .find(|row| row.id == id)
-                    .map(|row| qb_tray::actions::menu_items(row).len())
-                    .unwrap_or(0);
-                let index = ((y - 164.0) / 27.0).floor().max(0.0) as usize;
-                if index < count
-                    && y >= 164.0 + index as f32 * 27.0
-                    && y < 190.0 + index as f32 * 27.0
-                {
-                    return Some(HitTarget::MenuItem(id, index));
-                }
-            }
-            return None;
-        }
-        if let Some(id) = value.strip_prefix("confirm-delete:") {
-            if (16.0..344.0).contains(&x) && y > flyout_height() as f32 - 64.0 {
-                return Some(HitTarget::ConfirmDelete(id.to_owned(), x < 180.0));
-            }
-            return None;
-        }
-        if value.starts_with("login:") {
-            if (176.0..208.0).contains(&y) {
-                return Some(if x < 180.0 {
-                    HitTarget::LoginCopy
-                } else {
-                    HitTarget::LoginCancel
-                });
-            }
-            return None;
-        }
-        if value == "quit" {
-            let top = flyout_height() as f32 - 124.0;
-            if (top..top + 72.0).contains(&y) {
-                return Some(HitTarget::QuitChoice(y < top + 32.0));
-            }
-            return None;
-        }
-    }
-    let mut cursor = 52.0f32;
-    for provider in ["Claude", "Codex"] {
-        let active = rows
-            .iter()
-            .filter(|row| row.provider == provider && row.user_chip != "비활성")
-            .collect::<Vec<_>>();
-        let disabled = rows
-            .iter()
-            .filter(|row| row.provider == provider && row.user_chip == "비활성")
-            .collect::<Vec<_>>();
-        if active.is_empty() && disabled.is_empty() {
-            continue;
-        }
-        cursor += 36.0;
-        for row in active {
-            let height = qb_tray::row_height(row);
-            if (cursor..cursor + height).contains(&y) {
-                if (320.0..360.0).contains(&x) {
-                    return Some(HitTarget::RowMenu(row.id.clone()));
-                }
-                if row.reason_button && x >= 258.0 && y >= cursor + height - 32.0 {
-                    return Some(HitTarget::RowRelogin(row.id.clone()));
-                }
-            }
-            cursor += height;
-        }
-        if !disabled.is_empty() {
-            if (cursor..cursor + 32.0).contains(&y) {
-                return Some(HitTarget::Disclosure(provider.to_owned()));
-            }
-            cursor += 32.0;
-        }
-    }
-    let footer = flyout_height() as f32 - 48.0;
-    if (footer + 8.0..footer + 40.0).contains(&y) {
-        return if (88.0..169.0).contains(&x) {
-            Some(HitTarget::FooterAdd)
-        } else if (169.0..227.0).contains(&x) {
-            Some(HitTarget::FooterSettings)
-        } else if (227.0..283.0).contains(&x) {
-            Some(HitTarget::FooterLogs)
-        } else if (283.0..360.0).contains(&x) {
-            Some(HitTarget::FooterQuit)
-        } else {
-            None
-        };
     }
     None
 }
 
-struct Supervisor {
-    last_start: Option<Instant>,
-    delay: Duration,
-    unreachable_since: Option<Instant>,
-}
-
-fn supervisor() -> &'static Mutex<Supervisor> {
-    SUPERVISOR.get_or_init(|| {
-        Mutex::new(Supervisor {
-            last_start: None,
-            delay: Duration::from_secs(5),
-            unreachable_since: None,
-        })
-    })
-}
-
-unsafe fn notify_balloon(hwnd: HWND, title: &str, message: &str) {
-    let mut icon = NOTIFYICONDATAW {
+unsafe fn notify_balloon(
+    hwnd: HWND,
+    title: &str,
+    message: &str,
+    kind: crate::tray_icon::signals::Kind,
+) -> bool {
+    let icon = NOTIFYICONDATAW {
         cbSize: size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
         uID: 1,
         uFlags: NIF_INFO,
-        dwInfoFlags: NIIF_INFO,
+        dwInfoFlags: if kind == crate::tray_icon::signals::Kind::CoreRestart {
+            NIIF_INFO
+        } else {
+            NIIF_WARNING
+        },
+        szInfoTitle: notices::shell_text(title),
+        szInfo: notices::shell_text(message),
         ..Default::default()
     };
-    let title: Vec<u16> = title.encode_utf16().chain([0]).collect();
-    let message: Vec<u16> = message.encode_utf16().chain([0]).collect();
-    let title_len = title.len().min(icon.szInfoTitle.len());
-    let message_len = message.len().min(icon.szInfo.len());
-    icon.szInfoTitle[..title_len].copy_from_slice(&title[..title_len]);
-    icon.szInfo[..message_len].copy_from_slice(&message[..message_len]);
-    let _ = unsafe { Shell_NotifyIconW(NIM_MODIFY, &icon) };
+    unsafe { Shell_NotifyIconW(NIM_MODIFY, &icon).as_bool() }
+}
+
+fn icon_size(hwnd: HWND) -> u32 {
+    let desired = 16.0 * window_scale(hwnd);
+    [16u32, 20, 24, 32]
+        .into_iter()
+        .min_by(|a, b| ((*a as f32 - desired).abs()).total_cmp(&(*b as f32 - desired).abs()))
+        .unwrap_or(16)
+}
+
+unsafe fn apply_window_theme(hwnd: HWND, dark: bool) {
+    let dark_mode = i32::from(dark);
+    let border_color: u32 = if dark { 0x003A3A3A } else { 0x00D9D9D9 };
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            (&dark_mode as *const i32).cast(),
+            size_of::<i32>() as u32,
+        );
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            (&border_color as *const u32).cast(),
+            size_of::<u32>() as u32,
+        );
+    }
+}
+
+fn refresh_shell(hwnd: HWND) {
+    let presentation = notices()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .presentation();
+    let dark = DARK.load(Ordering::Acquire);
+    let size = icon_size(hwnd);
+    let changed = SHELL_ICON.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_none_or(|(s, d, b, _)| (*s, *d, *b) != (size, dark, presentation.badge))
+    });
+    let candidate = if changed {
+        NotifyIcon::new(size, dark, presentation.badge).ok()
+    } else {
+        None
+    };
+    let mut data = NOTIFYICONDATAW {
+        cbSize: size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: 1,
+        uFlags: NIF_TIP,
+        szTip: notices::shell_text(&presentation.tooltip),
+        ..Default::default()
+    };
+    if let Some(icon) = &candidate {
+        data.uFlags |= NIF_ICON;
+        data.hIcon = HICON(icon.as_raw());
+    }
+    if unsafe { Shell_NotifyIconW(NIM_MODIFY, &data).as_bool() } {
+        SHELL_TOOLTIP.with(|slot| *slot.borrow_mut() = presentation.tooltip);
+        if let Some(icon) = candidate {
+            SHELL_ICON
+                .with(|slot| *slot.borrow_mut() = Some((size, dark, presentation.badge, icon)));
+        }
+        unsafe {
+            apply_window_theme(hwnd, dark);
+        }
+    }
+}
+
+// Synthetic live acceptance observes only typed shell state, never core payloads.
+#[cfg(all(debug_assertions, feature = "testkit"))]
+fn test_shell(hwnd: HWND, event: &str, kind: Option<crate::tray_icon::signals::Kind>) {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let Some(path) = std::env::var_os("QB_TRAY_TEST_SHELL_LOG").map(PathBuf::from) else {
+        return;
+    };
+    let Some((size, dark, badge)) =
+        SHELL_ICON.with(|slot| slot.borrow().as_ref().map(|(s, d, b, _)| (*s, *d, *b)))
+    else {
+        return;
+    };
+    let tooltip = SHELL_TOOLTIP.with(|slot| slot.borrow().clone());
+    let state = view_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_deref()
+        .map(|s| s.split(':').next().unwrap_or("list").to_owned())
+        .unwrap_or_else(|| "list".into());
+    let count = model().lock().unwrap_or_else(|e| e.into_inner()).0.len();
+    let payload = serde_json::json!({
+        "sequence": SEQUENCE.fetch_add(1, Ordering::Relaxed), "event": event,
+        "badge": match badge { Badge::Normal => "normal", Badge::Attention => "attention", Badge::Error => "error" },
+        "tooltip": tooltip, "dark": dark,
+        "icon_size": size, "visible": unsafe { IsWindowVisible(hwnd).as_bool() },
+        "state": state, "accounts": count, "kind": kind.map(|k| format!("{k:?}")),
+    });
+    if let Some(worker) = WORKER.get() {
+        let _ = worker.submit(async move {
+            use std::io::Write;
+            let Some(parent) = path.parent().and_then(|p| p.canonicalize().ok()) else {
+                return;
+            };
+            if !parent.components().any(|c| c.as_os_str() == ".sandbox") {
+                return;
+            }
+            let Some(name) = path.file_name() else { return };
+            let path = parent.join(name);
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                let _ = writeln!(file, "{payload}");
+            }
+        });
+    }
+}
+
+fn flush_notices(hwnd: HWND) {
+    refresh_shell(hwnd);
+    #[cfg(all(debug_assertions, feature = "testkit"))]
+    test_shell(hwnd, "shell", None);
+    let notice = notices()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .next(elapsed());
+    if let Some(notice) = notice {
+        let shown = unsafe { notify_balloon(hwnd, notice.title, notice.text, notice.kind) };
+        #[cfg(all(debug_assertions, feature = "testkit"))]
+        if shown {
+            test_shell(hwnd, "balloon", Some(notice.kind));
+        }
+        if !shown {
+            notices().lock().unwrap_or_else(|e| e.into_inner()).finish();
+        }
+    }
+}
+
+fn refresh_theme(hwnd: HWND) {
+    if let Some(worker) = WORKER.get() {
+        let handle = hwnd.0 as isize;
+        let _ = worker.submit(async move {
+            DARK.store(crate::theme::system_dark(), Ordering::Release);
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(handle as *mut c_void)),
+                    STATE_CHANGED,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        });
+    } else {
+        DARK.store(crate::theme::system_dark(), Ordering::Release);
+    }
+}
+
+fn redraw_now(hwnd: HWND) {
+    unsafe {
+        if IsWindowVisible(hwnd).as_bool() {
+            let _ = InvalidateRect(Some(hwnd), None, true);
+            let _ = windows::Win32::Graphics::Gdi::UpdateWindow(hwnd);
+        }
+    }
 }
 
 fn model() -> &'static Mutex<(Vec<qb_tray::Row>, String, bool)> {
     MODEL.get_or_init(|| Mutex::new((Vec::new(), "v0.1.0".to_owned(), false)))
 }
 
-fn view_state() -> &'static Mutex<Option<String>> {
-    VIEW_STATE.get_or_init(|| Mutex::new(None))
+fn view_state() -> &'static Mutex<view_ownership::ViewOwnership> {
+    VIEW_STATE.get_or_init(|| Mutex::new(view_ownership::ViewOwnership::default()))
 }
 
+fn set_view(value: Option<String>) -> usize {
+    view_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .set(value)
+}
+fn begin_operation() -> usize {
+    view_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .begin()
+}
+// Error publication and owner validation share the exact UI view mutex.
+fn action_done(hwnd: isize, owner: usize, error: Option<String>) {
+    let preserve_error = error.is_some();
+    let owner = view_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .completion(owner, error);
+    unsafe {
+        let _ = PostMessageW(
+            Some(HWND(hwnd as *mut c_void)),
+            ACTION_DONE,
+            WPARAM(owner),
+            LPARAM(isize::from(preserve_error)),
+        );
+    }
+    // Refresh regardless of stale completion or failed message posting.
+    update_status(false, None);
+}
+fn admission_error() {
+    set_view(Some("error:코어 작업 스레드를 사용할 수 없습니다".into()));
+}
+
+fn full_height() -> f32 {
+    let rows = model().lock().unwrap_or_else(|e| e.into_inner()).0.clone();
+    let state = view_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    qb_tray::native_render::state_height(&rows, false, state.as_deref())
+}
 fn flyout_height() -> i32 {
-    let model = model().lock().unwrap_or_else(|e| e.into_inner());
-    let state = view_state().lock().unwrap_or_else(|e| e.into_inner());
-    qb_tray::native_render::state_height(&model.0, false, state.as_deref())
-        .ceil()
-        .clamp(120.0, 700.0) as i32
+    full_height().ceil() as i32
 }
-
 fn window_scale(hwnd: HWND) -> f32 {
     unsafe { GetDpiForWindow(hwnd).max(96) as f32 / 96.0 }
 }
-
 fn client_pixel_size(client: RECT) -> D2D_SIZE_U {
     D2D_SIZE_U {
         width: (client.right - client.left).max(1) as u32,
         height: (client.bottom - client.top).max(1) as u32,
     }
 }
-
-unsafe fn resize_flyout(hwnd: HWND) {
-    let scale = window_scale(hwnd);
-    let width = (360.0 * scale).round() as i32;
-    let height = (flyout_height() as f32 * scale).round() as i32;
+unsafe fn work_area(hwnd: HWND) -> Option<RECT> {
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    let mut info = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
     unsafe {
-        let _ = SetWindowPos(
-            hwnd,
-            None,
-            0,
-            0,
-            width,
-            height,
-            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
-        );
+        GetMonitorInfoW(monitor, &mut info)
+            .as_bool()
+            .then_some(info.rcWork)
     }
 }
-
-#[allow(unsafe_op_in_unsafe_fn)]
+fn sync_viewport(hwnd: HWND, reveal: bool) {
+    let mut client = RECT::default();
+    if unsafe { GetClientRect(hwnd, &mut client).is_err() } {
+        return;
+    }
+    let rows = model().lock().unwrap_or_else(|e| e.into_inner()).0.clone();
+    let state = view_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let height = qb_tray::native_render::state_height(&rows, false, state.as_deref());
+    let popup = state
+        .as_deref()
+        .and_then(|s| qb_tray::popup_rect(&rows, false, s, height));
+    let extent = (client.bottom - client.top).max(0) as f32 / window_scale(hwnd);
+    VIEWPORT.with(|slot| {
+        let mut viewport = slot.borrow_mut();
+        viewport.set_geometry(height, extent);
+        if reveal && let Some(popup) = popup {
+            viewport.reveal_popup((popup.top, popup.bottom), 0.0);
+        }
+    });
+}
+unsafe fn resize_flyout(hwnd: HWND) {
+    let dpi = unsafe { GetDpiForWindow(hwnd).max(96) } as f32;
+    let width = pixel_ceil(360.0, dpi).max(1) as i32;
+    let desired = pixel_ceil(full_height(), dpi).max(1) as i32;
+    let area = unsafe { work_area(hwnd) };
+    let height = area.map_or(desired, |area| desired.min((area.bottom - area.top).max(1)));
+    let mut window = RECT::default();
+    if unsafe { GetWindowRect(hwnd, &mut window) }.is_ok() {
+        let (x, y) = area.map_or((window.left, window.top), |area| {
+            (
+                window
+                    .left
+                    .clamp(area.left, (area.right - width).max(area.left)),
+                window
+                    .top
+                    .clamp(area.top, (area.bottom - height).max(area.top)),
+            )
+        });
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                x,
+                y,
+                width,
+                height,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
+    sync_viewport(hwnd, true);
+}
 unsafe fn position_flyout(hwnd: HWND) {
     let identifier = NOTIFYICONIDENTIFIER {
         cbSize: size_of::<NOTIFYICONIDENTIFIER>() as u32,
@@ -357,9 +583,11 @@ unsafe fn position_flyout(hwnd: HWND) {
         uID: 1,
         ..Default::default()
     };
-    let icon = Shell_NotifyIconGetRect(&identifier).unwrap_or_else(|_| {
+    let icon = unsafe { Shell_NotifyIconGetRect(&identifier) }.unwrap_or_else(|_| {
         let mut cursor = POINT::default();
-        let _ = GetCursorPos(&mut cursor);
+        unsafe {
+            let _ = GetCursorPos(&mut cursor);
+        }
         RECT {
             left: cursor.x,
             top: cursor.y,
@@ -367,182 +595,134 @@ unsafe fn position_flyout(hwnd: HWND) {
             bottom: cursor.y + 1,
         }
     });
-    let monitor = MonitorFromRect(&icon, MONITOR_DEFAULTTONEAREST);
+    let monitor = unsafe { MonitorFromRect(&icon, MONITOR_DEFAULTTONEAREST) };
     let mut info = MONITORINFO {
         cbSize: size_of::<MONITORINFO>() as u32,
         ..Default::default()
     };
-    let _ = GetMonitorInfoW(monitor, &mut info);
-    let scale = window_scale(hwnd);
-    let height = (flyout_height() as f32 * scale).round() as i32;
-    let width = (360.0 * scale).round() as i32;
-    let x = (icon.right - width).clamp(info.rcWork.left, info.rcWork.right - width);
-    let y = (icon.top - height).max(info.rcWork.top);
-    let _ = SetWindowPos(hwnd, None, x, y, width, height, Default::default());
-}
-
-fn update_status(supervise: bool, notification_hwnd: Option<HWND>) {
-    if REFRESH_IN_FLIGHT
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-        .is_err()
-    {
+    if !unsafe { GetMonitorInfoW(monitor, &mut info).as_bool() } {
         return;
     }
-    let notification_hwnd = notification_hwnd.map(|hwnd| hwnd.0 as isize);
-    let _ = std::thread::Builder::new()
-        .name("quota-baton-tray-refresh".into())
-        .spawn(move || update_status_worker(supervise, notification_hwnd));
+    let dpi = unsafe { GetDpiForWindow(hwnd).max(96) } as f32;
+    let width = pixel_ceil(360.0, dpi).max(1) as i32;
+    let height = (pixel_ceil(full_height(), dpi).max(1) as i32)
+        .min((info.rcWork.bottom - info.rcWork.top).max(1));
+    let x = (icon.right - width).clamp(
+        info.rcWork.left,
+        (info.rcWork.right - width).max(info.rcWork.left),
+    );
+    let y = (icon.top - height).clamp(
+        info.rcWork.top,
+        (info.rcWork.bottom - height).max(info.rcWork.top),
+    );
+    unsafe {
+        let _ = SetWindowPos(hwnd, None, x, y, width, height, SWP_NOACTIVATE);
+    }
+    sync_viewport(hwnd, true);
 }
 
-fn update_status_worker(supervise: bool, notification_hwnd: Option<isize>) {
-    let notification_hwnd = notification_hwnd.map(|value| HWND(value as *mut c_void));
-    let result = (|| -> Result<String> {
-        let client = super::client::AdminClient::from_home()?;
-        let runtime = tokio::runtime::Runtime::new()?;
-        let read = runtime
-            .block_on(client.read())
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let rows = super::client::layout_rows(&read, std::time::SystemTime::now())?;
-        *model().lock().unwrap_or_else(|e| e.into_inner()) =
-            (rows, read.snapshot.version.clone(), true);
-        Ok(super::client::render_flyout(&read))
-    })();
-    let text = match result {
-        Ok(text) => {
-            let mut state = supervisor().lock().unwrap_or_else(|e| e.into_inner());
-            state.last_start = None;
-            state.delay = Duration::from_secs(5);
-            state.unreachable_since = None;
-            text
-        }
-        Err(error) => {
-            if let Some(path) = std::env::var_os("QB_TRAY_TEST_ERROR_LOG") {
-                let _ = std::fs::write(path, error.to_string());
-            }
-            if supervise {
-                let mut state = supervisor().lock().unwrap_or_else(|e| e.into_inner());
-                let since = *state.unreachable_since.get_or_insert_with(Instant::now);
-                let due = state
-                    .last_start
-                    .is_none_or(|at| at.elapsed() >= state.delay);
-                if since.elapsed() >= Duration::from_secs(30) && due {
-                    // Detached and hidden; an existing core is never terminated.
-                    let started = Command::new("quota-baton")
-                        .args(["serve"])
-                        .creation_flags(0x0800_0000)
-                        .spawn()
-                        .is_ok();
-                    if started {
-                        state.last_start = Some(Instant::now());
-                        state.delay = (state.delay * 2).min(Duration::from_secs(300));
-                        unsafe {
-                            if let Some(hwnd) = notification_hwnd {
-                                notify_balloon(
-                                    hwnd,
-                                    "quota-baton",
-                                    "코어가 예기치 않게 종료되어 다시 시작했습니다",
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-            {
-                let mut model = model().lock().unwrap_or_else(|e| e.into_inner());
-                model.0.clear();
-                model.1 = "error:코어 상태를 읽지 못했습니다 · 로그 열기".to_owned();
-                model.2 = false;
-            }
-            "코어에 연결할 수 없습니다".to_owned()
-        }
-    };
-    if text == "코어에 연결할 수 없습니다" {
-        let mut model = model().lock().unwrap_or_else(|e| e.into_inner());
-        model.0.clear();
-        model.2 = false;
+// UI calls only enqueue; health and state requests run on the dedicated worker.
+fn update_status(_supervise: bool, _notification_hwnd: Option<HWND>) {
+    if let Some(worker) = WORKER.get() {
+        worker.refresh();
     }
-    REFRESH_IN_FLIGHT.store(false, Ordering::Release);
-    if let Some(hwnd) = notification_hwnd {
-        unsafe {
-            let _ = PostMessageW(Some(hwnd), STATE_CHANGED, WPARAM(0), LPARAM(0));
-        }
+}
+
+fn submit_job(job: impl std::future::Future<Output = ()> + Send + 'static) -> bool {
+    let accepted = WORKER.get().is_some_and(|worker| worker.submit(job));
+    if !accepted {
+        admission_error();
     }
+    accepted
 }
 
 fn paint_window(hwnd: HWND) -> Result<()> {
+    if !unsafe { IsWindowVisible(hwnd).as_bool() } {
+        return Ok(());
+    }
+    sync_viewport(hwnd, false);
     let (rows, version, core_ok) = model().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let (state, owner) = {
+        let view = view_state().lock().unwrap_or_else(|e| e.into_inner());
+        (view.clone(), view.owner())
+    };
     unsafe {
         let mut client = RECT::default();
         GetClientRect(hwnd, &mut client)?;
-        let pixel_size = client_pixel_size(client);
-        let dpi = GetDpiForWindow(hwnd).max(96) as f32;
+        let pixels = client_pixel_size(client);
+        let dpi = GetDpiForWindow(hwnd).max(96);
         let target = RENDER_TARGET.with(|slot| -> Result<ID2D1HwndRenderTarget> {
             if let Some(target) = slot.borrow().as_ref() {
-                let _ = target.Resize(&pixel_size);
-                target.SetDpi(dpi, dpi);
+                target.Resize(&pixels)?;
+                target.SetDpi(dpi as f32, dpi as f32);
                 return Ok(target.clone());
             }
             let factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
-            let props = D2D1_RENDER_TARGET_PROPERTIES {
+            let properties = D2D1_RENDER_TARGET_PROPERTIES {
                 r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
-                dpiX: dpi,
-                dpiY: dpi,
+                dpiX: dpi as f32,
+                dpiY: dpi as f32,
                 ..Default::default()
             };
-            let hwnd_props = D2D1_HWND_RENDER_TARGET_PROPERTIES {
+            let hwnd_properties = D2D1_HWND_RENDER_TARGET_PROPERTIES {
                 hwnd,
-                pixelSize: pixel_size,
+                pixelSize: pixels,
                 presentOptions: D2D1_PRESENT_OPTIONS_NONE,
             };
-            let target = factory.CreateHwndRenderTarget(&props, &hwnd_props)?;
+            let target = factory.CreateHwndRenderTarget(&properties, &hwnd_properties)?;
             *slot.borrow_mut() = Some(target.clone());
             Ok(target)
         })?;
-        let review_state = view_state()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let offset = VIEWPORT.with(|v| v.borrow().offset);
+        target.SetTransform(&Matrix3x2::translation(0.0, -offset));
         let result = qb_tray::native_render::paint_with_state(
             &target,
             &rows,
-            false,
+            DARK.load(Ordering::Acquire),
             &version,
             SystemTime::now(),
             false,
             core_ok,
-            review_state.as_deref(),
+            state.as_deref(),
         );
-        if let Err(error) = result {
-            if error.code().0 as u32 == 0x8899000C {
-                RENDER_TARGET.with(|slot| *slot.borrow_mut() = None);
-            } else {
-                return Err(error.into());
+        target.SetTransform(&Matrix3x2::identity());
+        match result {
+            Ok(()) => PAINTED.with(|slot| {
+                *slot.borrow_mut() = Some(PaintedFrame {
+                    rows,
+                    state,
+                    owner,
+                    pixels: (pixels.width, pixels.height),
+                    dpi,
+                    offset,
+                })
+            }),
+            Err(error) => {
+                PAINTED.with(|slot| *slot.borrow_mut() = None);
+                if error.code().0 as u32 == 0x8899000C {
+                    RENDER_TARGET.with(|slot| *slot.borrow_mut() = None);
+                } else {
+                    return Err(error.into());
+                }
             }
         }
     }
+    #[cfg(all(debug_assertions, feature = "testkit"))]
+    test_shell(hwnd, "paint", None);
     Ok(())
 }
 
 fn menu_target() -> Option<(qb_tray::Row, usize)> {
-    let state = view_state()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()?;
-    let rest = state.strip_prefix("menu:")?;
-    let mut parts = rest.split(':');
-    let id = parts.next()?;
-    let index = parts
-        .next()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0);
-    let row = model()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .0
-        .iter()
-        .find(|row| row.id == id)
-        .cloned()?;
-    Some((row, index))
+    let view = view_state().lock().unwrap_or_else(|e| e.into_inner());
+    let state = view.clone()?;
+    let owner = view.owner();
+    drop(view);
+    let frame = PAINTED.with(|slot| slot.borrow().clone())?;
+    if frame.owner != owner {
+        return None;
+    }
+    let (row, index) = qb_tray::menu_target(&frame.rows, &state)?;
+    Some((row.clone(), index))
 }
 
 fn change_menu_selection(delta: isize) {
@@ -555,29 +735,28 @@ fn change_menu_selection(delta: isize) {
     }
     let next = (index as isize + delta).rem_euclid(count as isize) as usize;
     let mut state = view_state().lock().unwrap_or_else(|e| e.into_inner());
-    *state = Some(format!("menu:{}:{next}", row.id));
+    state.set(Some(format!("menu:{}:{next}", row.id)));
 }
 
 fn activate_menu(hwnd: HWND) {
     let Some((row, index)) = menu_target() else {
         return;
     };
+    activate_menu_item(hwnd, row, index);
+}
+
+fn activate_menu_item(hwnd: HWND, row: qb_tray::Row, index: usize) {
     let Some(item) = qb_tray::actions::menu_items(&row).get(index).copied() else {
         return;
     };
     if item.is_destructive() {
-        *view_state().lock().unwrap_or_else(|e| e.into_inner()) =
-            Some(format!("confirm-delete:{}", row.id));
+        set_view(Some(format!("confirm-delete:{}", row.id)));
         unsafe {
             let _ = InvalidateRect(Some(hwnd), None, true);
         }
         return;
     }
     let operation = qb_tray::actions::admin_operation(item, &row);
-    let refreshing = matches!(
-        &operation,
-        Some(qb_tray::actions::AdminOperation::RefreshTokens)
-    );
     let provider = row.provider.clone();
     let id = row.id.clone();
     if item == qb_tray::actions::MenuItem::Relogin {
@@ -585,96 +764,100 @@ fn activate_menu(hwnd: HWND) {
         return;
     }
     let hwnd_value = hwnd.0 as isize;
-    let _ = std::thread::Builder::new()
-        .name("quota-baton-tray-action".into())
-        .spawn(move || {
-            let result = (|| -> anyhow::Result<()> {
-                let client = super::client::AdminClient::from_home()?;
-                let runtime = tokio::runtime::Runtime::new()?;
-                runtime.block_on(async {
-                    match operation {
-                        Some(qb_tray::actions::AdminOperation::Account(action)) => client
-                            .account_action(
-                                &id,
-                                super::client::AccountAction::from_str(action)
-                                    .expect("typed action"),
-                            )
-                            .await
-                            .map(|_| ()),
-                        Some(qb_tray::actions::AdminOperation::RefreshTokens) => {
-                            client.refresh_tokens(&id).await
-                        }
-                        Some(qb_tray::actions::AdminOperation::Drain(value)) => client
-                            .patch_account(
-                                &id,
-                                super::client::AccountPatch {
-                                    drain: Some(value),
-                                    ..Default::default()
-                                },
-                            )
-                            .await
-                            .map(|_| ())
-                            .map(|_| ()),
-                        Some(qb_tray::actions::AdminOperation::Credits(value)) => client
-                            .patch_account(
-                                &id,
-                                super::client::AccountPatch {
-                                    allow_credits: Some(value),
-                                    ..Default::default()
-                                },
-                            )
-                            .await
-                            .map(|_| ())
-                            .map(|_| ()),
-                        Some(qb_tray::actions::AdminOperation::Relogin) => {
-                            client.start_login(&provider).await.map(|_| ())
-                        }
-                        Some(qb_tray::actions::AdminOperation::Delete) => {
-                            client.delete_account(&id).await
-                        }
-                        None => Ok(()),
+    let owner = begin_operation();
+    submit_job(async move {
+        let result: anyhow::Result<()> = async {
+            let client = super::client::AdminClient::from_home()?;
+            async {
+                match operation {
+                    Some(qb_tray::actions::AdminOperation::Account(action)) => client
+                        .account_action(
+                            &id,
+                            super::client::AccountAction::from_str(action).expect("typed action"),
+                        )
+                        .await
+                        .map(|_| ()),
+                    Some(qb_tray::actions::AdminOperation::RefreshTokens) => {
+                        client.refresh_tokens(&id).await
                     }
-                    .map_err(|e| anyhow::anyhow!(e))
-                })
-            })();
-            if let (Err(error), Some(path)) = (&result, std::env::var_os("QB_TRAY_TEST_ERROR_LOG"))
-            {
-                let _ = std::fs::write(path, error.to_string());
+                    Some(qb_tray::actions::AdminOperation::Drain(value)) => client
+                        .patch_account(
+                            &id,
+                            super::client::AccountPatch {
+                                drain: Some(value),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .map(|_| ()),
+                    Some(qb_tray::actions::AdminOperation::Credits(value)) => client
+                        .patch_account(
+                            &id,
+                            super::client::AccountPatch {
+                                allow_credits: Some(value),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .map(|_| ()),
+                    Some(qb_tray::actions::AdminOperation::Relogin) => {
+                        client.start_login(&provider).await.map(|_| ())
+                    }
+                    Some(qb_tray::actions::AdminOperation::Delete) => {
+                        client.delete_account(&id).await
+                    }
+                    None => Ok(()),
+                }
+                .map_err(|e| anyhow::anyhow!(e))
             }
-            let show_error = refreshing && result.is_err();
-            if show_error {
-                let message = result
-                    .as_ref()
-                    .err()
-                    .and_then(|error| error.downcast_ref::<super::client::ClientError>())
-                    .map(super::client::short_error)
-                    .unwrap_or("계정 갱신을 마치지 못했습니다");
-                *view_state().lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some(format!("error:{message}"));
-            }
-            unsafe {
-                let _ = PostMessageW(
-                    Some(HWND(hwnd_value as *mut c_void)),
-                    ACTION_DONE,
-                    WPARAM(usize::from(show_error)),
-                    LPARAM(0),
-                );
-            }
-        });
+            .await
+        }
+        .await;
+        if let (Err(error), Some(path)) = (&result, std::env::var_os("QB_TRAY_TEST_ERROR_LOG")) {
+            let _ = std::fs::write(path, error.to_string());
+        }
+        let show_error = result.is_err();
+        let error = if show_error {
+            let message = result
+                .as_ref()
+                .err()
+                .and_then(|error| error.downcast_ref::<super::client::ClientError>())
+                .map(super::client::short_error)
+                .unwrap_or("계정 갱신을 마치지 못했습니다");
+            Some(format!("error:{message}"))
+        } else {
+            None
+        };
+        action_done(hwnd_value, owner, error);
+    });
+}
+
+// Serialize generation checks with publishing, so cancellation cannot race a
+// late start/status response into restoring a dismissed login dialog.
+fn with_current_login(generation: u64, publish: impl FnOnce()) -> bool {
+    let current = LOGIN_GENERATION.lock().unwrap_or_else(|e| e.into_inner());
+    if *current != generation {
+        return false;
+    }
+    publish();
+    true
 }
 
 fn launch_login(hwnd: HWND, provider: String) {
-    *view_state().lock().unwrap_or_else(|e| e.into_inner()) = Some(format!("login:{provider}"));
+    if !cancel_login() {
+        return;
+    }
+    let generation = *LOGIN_GENERATION.lock().unwrap_or_else(|e| e.into_inner());
+    let owner = set_view(Some(format!("login:{provider}")));
     let hwnd_value = hwnd.0 as isize;
-    let _ = std::thread::Builder::new()
-        .name("quota-baton-tray-login".into())
-        .spawn(move || {
-            let result = (|| -> anyhow::Result<()> {
-                let client = super::client::AdminClient::from_home()?;
-                let runtime = tokio::runtime::Runtime::new()?;
-                let start = runtime
-                    .block_on(client.start_login(&provider))
-                    .map_err(|e| anyhow::anyhow!(e))?;
+    submit_job(async move {
+        let result: anyhow::Result<()> = async {
+            let client = super::client::AdminClient::from_home()?;
+            let start = client
+                .start_login(&provider)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let current = with_current_login(generation, || {
                 *login_id().lock().unwrap_or_else(|e| e.into_inner()) =
                     Some(start.login_id.clone());
                 *login_url().lock().unwrap_or_else(|e| e.into_inner()) =
@@ -682,8 +865,10 @@ fn launch_login(hwnd: HWND, provider: String) {
                 if let Some(path) = std::env::var_os("QB_TRAY_TEST_LOGIN_LOG") {
                     let _ = std::fs::write(path, format!("pending {}\n", start.login_id));
                 }
-                *view_state().lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some(format!("login:{provider}"));
+                view_state()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .publish(owner, Some(format!("login:{provider}")));
                 unsafe {
                     let _ = PostMessageW(
                         Some(HWND(hwnd_value as *mut c_void)),
@@ -692,21 +877,36 @@ fn launch_login(hwnd: HWND, provider: String) {
                         LPARAM(0),
                     );
                 }
-                // The browser is a product action; tests set this hook to avoid opening one.
-                if std::env::var_os("QB_TRAY_TEST_NO_BROWSER").is_none() {
-                    let _ = open_browser(&start.auth_url);
+            });
+            if !current {
+                let _ = client.cancel_login(&start.login_id).await;
+                return Ok(());
+            }
+            // The browser is a product action; tests set this hook to avoid opening one.
+            if std::env::var_os("QB_TRAY_TEST_NO_BROWSER").is_none() {
+                let _ = open_browser(&start.auth_url);
+            }
+            for _ in 0..600 {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                if *LOGIN_GENERATION.lock().unwrap_or_else(|e| e.into_inner()) != generation {
+                    return Ok(());
                 }
-                for _ in 0..600 {
-                    std::thread::sleep(Duration::from_secs(1));
-                    let status = runtime
-                        .block_on(client.login_status(&start.login_id))
-                        .map_err(|e| anyhow::anyhow!(e))?;
-                    if matches!(
-                        status.status.as_str(),
-                        "completed" | "failed" | "expired" | "cancelled"
-                    ) {
-                        *view_state().lock().unwrap_or_else(|e| e.into_inner()) =
-                            Some(format!("login:{provider}:{}", status.status));
+                let status = client
+                    .login_status(&start.login_id)
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                if *LOGIN_GENERATION.lock().unwrap_or_else(|e| e.into_inner()) != generation {
+                    return Ok(());
+                }
+                if matches!(
+                    status.status.as_str(),
+                    "completed" | "failed" | "expired" | "cancelled"
+                ) {
+                    with_current_login(generation, || {
+                        view_state()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .publish(owner, Some(format!("login:{provider}:{}", status.status)));
                         unsafe {
                             let _ = PostMessageW(
                                 Some(HWND(hwnd_value as *mut c_void)),
@@ -715,48 +915,62 @@ fn launch_login(hwnd: HWND, provider: String) {
                                 LPARAM(0),
                             );
                         }
-                        break;
-                    }
-                }
-                *login_id().lock().unwrap_or_else(|e| e.into_inner()) = None;
-                Ok(())
-            })();
-            if result.is_ok() {
-                unsafe {
-                    let _ = PostMessageW(
-                        Some(HWND(hwnd_value as *mut c_void)),
-                        ACTION_DONE,
-                        WPARAM(0),
-                        LPARAM(0),
-                    );
+                    });
+                    break;
                 }
             }
+            Ok(())
+        }
+        .await;
+        with_current_login(generation, || {
+            *login_id().lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *login_url().lock().unwrap_or_else(|e| e.into_inner()) = None;
         });
+        // Always refresh, even when generation/view is stale.
+        action_done(
+            hwnd_value,
+            owner,
+            result
+                .err()
+                .map(|_| "error:로그인을 마치지 못했습니다".into()),
+        );
+    });
 }
 
-fn cancel_login() {
-    let id = login_id().lock().unwrap_or_else(|e| e.into_inner()).take();
+// Invalidate the old poller even on rejection, but retain its ID for retry.
+// A start response not yet assigned an ID cancels itself inside its admitted job.
+fn cancel_login() -> bool {
+    let mut generation = LOGIN_GENERATION.lock().unwrap_or_else(|e| e.into_inner());
+    *generation = generation
+        .checked_add(1)
+        .expect("login generation exhausted");
+    let accepted = view_ownership::admit_cancellation(
+        &mut login_id().lock().unwrap_or_else(|e| e.into_inner()),
+        |id| {
+            WORKER.get().is_some_and(|worker| {
+                worker.submit_cancel(async move {
+                    if let Ok(client) = super::client::AdminClient::from_home() {
+                        let _ = client.cancel_login(&id).await;
+                    }
+                })
+            })
+        },
+    );
     *login_url().lock().unwrap_or_else(|e| e.into_inner()) = None;
+    if !accepted {
+        admission_error();
+        return false;
+    }
     if let Some(path) = std::env::var_os("QB_TRAY_TEST_LOGIN_LOG") {
         let _ = std::fs::write(path, "cancelled\n");
     }
-    if let Some(id) = id {
-        let _ = std::thread::Builder::new()
-            .name("quota-baton-tray-login-cancel".into())
-            .spawn(move || {
-                if let Ok(client) = super::client::AdminClient::from_home()
-                    && let Ok(runtime) = tokio::runtime::Runtime::new()
-                {
-                    let _ = runtime.block_on(client.cancel_login(&id));
-                }
-            });
-    }
+    true
 }
 
 fn activate_hit(hwnd: HWND, target: HitTarget) {
     match target {
         HitTarget::RowMenu(id) => {
-            *view_state().lock().unwrap_or_else(|e| e.into_inner()) = Some(format!("menu:{id}:0"));
+            set_view(Some(format!("menu:{id}:0")));
         }
         HitTarget::RowRelogin(id) => {
             let provider = model()
@@ -765,33 +979,22 @@ fn activate_hit(hwnd: HWND, target: HitTarget) {
                 .0
                 .iter()
                 .find(|row| row.id == id)
-                .map(|row| row.provider.to_ascii_lowercase())
-                .unwrap_or_else(|| "codex".into());
-            launch_login(hwnd, provider);
-        }
-        HitTarget::MenuItem(id, index) => {
-            let row = model()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .0
-                .iter()
-                .find(|row| row.id == id)
-                .cloned();
-            if let Some(row) = row
-                && let Some(item) = qb_tray::actions::menu_items(&row).get(index).copied()
-            {
-                if item.is_destructive() {
-                    *view_state().lock().unwrap_or_else(|e| e.into_inner()) =
-                        Some(format!("confirm-delete:{id}"));
-                } else if item == qb_tray::actions::MenuItem::Relogin {
-                    launch_login(hwnd, row.provider.to_ascii_lowercase());
-                } else {
-                    *view_state().lock().unwrap_or_else(|e| e.into_inner()) =
-                        Some(format!("menu:{id}:{index}"));
-                    activate_menu(hwnd);
-                }
+                .map(|row| row.provider.to_ascii_lowercase());
+            if let Some(provider) = provider {
+                launch_login(hwnd, provider);
             }
         }
+        HitTarget::MenuItem(id, index) => {
+            let row = PAINTED.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .and_then(|frame| frame.rows.iter().find(|row| row.id == id).cloned())
+            });
+            if let Some(row) = row {
+                activate_menu_item(hwnd, row, index);
+            }
+        }
+        HitTarget::Surface => {}
         HitTarget::ConfirmDelete(id, yes) => {
             if yes {
                 let row = model()
@@ -802,32 +1005,27 @@ fn activate_hit(hwnd: HWND, target: HitTarget) {
                     .find(|row| row.id == id)
                     .cloned();
                 if let Some(row) = row {
-                    let provider = row.provider.clone();
+                    let _ = row;
                     let hwnd_value = hwnd.0 as isize;
-                    let _ = std::thread::Builder::new()
-                        .name("quota-baton-tray-delete".into())
-                        .spawn(move || {
-                            let _ = (|| -> anyhow::Result<()> {
-                                let client = super::client::AdminClient::from_home()?;
-                                let runtime = tokio::runtime::Runtime::new()?;
-                                runtime
-                                    .block_on(client.delete_account(&id))
-                                    .map_err(|e| anyhow::anyhow!(e))?;
-                                Ok(())
-                            })();
-                            unsafe {
-                                let _ = PostMessageW(
-                                    Some(HWND(hwnd_value as *mut c_void)),
-                                    ACTION_DONE,
-                                    WPARAM(0),
-                                    LPARAM(0),
-                                );
-                            };
-                            let _ = provider;
-                        });
+                    let owner = begin_operation();
+                    submit_job(async move {
+                        let result: anyhow::Result<()> = async {
+                            let client = super::client::AdminClient::from_home()?;
+                            client.delete_account(&id).await?;
+                            Ok(())
+                        }
+                        .await;
+                        action_done(
+                            hwnd_value,
+                            owner,
+                            result
+                                .err()
+                                .map(|_| "error:계정을 삭제하지 못했습니다".into()),
+                        );
+                    });
                 }
             } else {
-                *view_state().lock().unwrap_or_else(|e| e.into_inner()) = None;
+                set_view(None);
             }
         }
         HitTarget::LoginCopy => {
@@ -844,8 +1042,14 @@ fn activate_hit(hwnd: HWND, target: HitTarget) {
             }
         }
         HitTarget::LoginCancel => {
-            cancel_login();
-            *view_state().lock().unwrap_or_else(|e| e.into_inner()) = Some("list".into());
+            if !cancel_login() {
+                unsafe {
+                    resize_flyout(hwnd);
+                    let _ = InvalidateRect(Some(hwnd), None, true);
+                }
+                return;
+            }
+            set_view(Some("list".into()));
             if std::env::var_os("QB_TRAY_TEST_KEEP_OPEN").is_some() {
                 unsafe {
                     let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
@@ -853,7 +1057,7 @@ fn activate_hit(hwnd: HWND, target: HitTarget) {
             }
         }
         HitTarget::FooterAdd => {
-            *view_state().lock().unwrap_or_else(|e| e.into_inner()) = Some("add-menu".into());
+            set_view(Some("add-menu".into()));
         }
         HitTarget::FooterSettings => {
             open_folder(".");
@@ -862,7 +1066,7 @@ fn activate_hit(hwnd: HWND, target: HitTarget) {
             open_folder("logs");
         }
         HitTarget::FooterQuit => {
-            *view_state().lock().unwrap_or_else(|e| e.into_inner()) = Some("quit".into());
+            set_view(Some("quit".into()));
         }
         HitTarget::QuitChoice(tray_only) => {
             if tray_only {
@@ -871,49 +1075,56 @@ fn activate_hit(hwnd: HWND, target: HitTarget) {
                 }
             } else {
                 let hwnd_value = hwnd.0 as isize;
-                let _ = std::thread::Builder::new()
-                    .name("quota-baton-tray-shutdown".into())
-                    .spawn(move || {
-                        if let Ok(client) = super::client::AdminClient::from_home()
-                            && let Ok(runtime) = tokio::runtime::Runtime::new()
-                        {
-                            let _ = runtime.block_on(client.shutdown(30));
-                        }
-                        unsafe {
-                            let _ = PostMessageW(
-                                Some(HWND(hwnd_value as *mut c_void)),
-                                WM_CLOSE,
-                                WPARAM(0),
-                                LPARAM(0),
-                            );
-                        }
-                    });
+                if let Some(worker) = WORKER.get() {
+                    worker.disable_supervision();
+                }
+                submit_job(async move {
+                    if let Ok(client) = super::client::AdminClient::from_home() {
+                        let _ = client.shutdown(30).await;
+                    }
+                    unsafe {
+                        let _ = PostMessageW(
+                            Some(HWND(hwnd_value as *mut c_void)),
+                            WM_CLOSE,
+                            WPARAM(0),
+                            LPARAM(0),
+                        );
+                    }
+                });
             }
         }
         HitTarget::AddChoice(provider) => {
             if let Some(provider) = provider {
                 launch_login(hwnd, provider);
             } else {
-                *view_state().lock().unwrap_or_else(|e| e.into_inner()) = None;
+                set_view(None);
             }
         }
         HitTarget::QuitCancel => {
-            *view_state().lock().unwrap_or_else(|e| e.into_inner()) = None;
+            set_view(None);
         }
         HitTarget::Disclosure(provider) => {
-            let _ = provider;
-            let mut state = view_state().lock().unwrap_or_else(|e| e.into_inner());
-            *state = Some(if state.as_deref() == Some("expanded") {
+            let provider = provider.to_ascii_lowercase();
+            if !matches!(provider.as_str(), "claude" | "codex") {
+                return;
+            }
+            let current = view_state()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let rows = model().lock().unwrap_or_else(|e| e.into_inner()).0.clone();
+            let expanded = qb_tray::disabled_expanded(&rows, false, current.as_deref(), &provider);
+            set_view(Some(if expanded {
                 "list".into()
             } else {
-                "expanded".into()
-            });
+                format!("expanded:{provider}")
+            }));
         }
     }
     unsafe {
         resize_flyout(hwnd);
-        let _ = InvalidateRect(Some(hwnd), None, true);
     }
+    redraw_now(hwnd);
 }
 
 fn open_folder(relative: &str) {
@@ -975,17 +1186,8 @@ unsafe extern "system" fn window_proc(
     match message {
         TRAY_MESSAGE if lparam.0 as u32 == WM_LBUTTONUP || lparam.0 as u32 == WM_RBUTTONUP => {
             if IsWindowVisible(hwnd).as_bool() {
-                if lparam.0 as u32 == WM_RBUTTONUP {
-                    if let Some(row) = model().lock().unwrap_or_else(|e| e.into_inner()).0.first() {
-                        *view_state().lock().unwrap_or_else(|e| e.into_inner()) =
-                            Some(format!("menu:{}:0", row.id));
-                        resize_flyout(hwnd);
-                        let _ = InvalidateRect(Some(hwnd), None, true);
-                    }
-                } else {
-                    *view_state().lock().unwrap_or_else(|e| e.into_inner()) = None;
-                    let _ = ShowWindow(hwnd, SW_HIDE);
-                }
+                set_view(None);
+                let _ = ShowWindow(hwnd, SW_HIDE);
                 return LRESULT(0);
             }
             if !FIXTURE_MODE.load(Ordering::Relaxed) {
@@ -996,45 +1198,55 @@ unsafe extern "system" fn window_proc(
             let _ = SetForegroundWindow(hwnd);
             LRESULT(0)
         }
+        TRAY_MESSAGE
+            if matches!(
+                lparam.0 as u32,
+                NIN_BALLOONHIDE | NIN_BALLOONTIMEOUT | NIN_BALLOONUSERCLICK
+            ) =>
+        {
+            let target = notices().lock().unwrap_or_else(|e| e.into_inner()).finish();
+            if lparam.0 as u32 == NIN_BALLOONUSERCLICK {
+                let state = match target {
+                    Some(notices::Target::Account(id))
+                        if model()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .0
+                            .iter()
+                            .any(|row| row.id == id) =>
+                    {
+                        Some(format!("menu:{id}:0"))
+                    }
+                    _ => None,
+                };
+                set_view(state);
+                position_flyout(hwnd);
+                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                let _ = SetForegroundWindow(hwnd);
+                redraw_now(hwnd);
+            }
+            flush_notices(hwnd);
+            LRESULT(0)
+        }
         WM_LBUTTONUP if IsWindowVisible(hwnd).as_bool() => {
             let (x, y) = point_from_lparam(lparam);
-            if let Some(target) = hit_target(x, y) {
+            if let Some(target) = hit_target(hwnd, x, y) {
                 activate_hit(hwnd, target);
-            } else if view_state()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_none()
-                && (flyout_height() as f32 - 40.0..flyout_height() as f32).contains(&y)
-            {
-                let target = if (171.0..225.0).contains(&x) {
-                    Some(HitTarget::FooterSettings)
-                } else if (283.0..337.0).contains(&x) {
-                    Some(HitTarget::FooterQuit)
-                } else {
-                    None
-                };
-                if let Some(target) = target {
-                    activate_hit(hwnd, target);
-                }
-            } else if view_state()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_some()
-            {
-                *view_state().lock().unwrap_or_else(|e| e.into_inner()) = None;
-                let _ = InvalidateRect(Some(hwnd), None, true);
+            } else if painted_frame(hwnd).is_some() {
+                set_view(None);
+                resize_flyout(hwnd);
+                redraw_now(hwnd);
             }
             LRESULT(0)
         }
         WM_RBUTTONUP if IsWindowVisible(hwnd).as_bool() => {
             let (x, y) = point_from_lparam(lparam);
-            if let Some(HitTarget::RowMenu(id)) = hit_target(x, y) {
-                *view_state().lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some(format!("menu:{id}:0"));
+            if let Some(HitTarget::RowMenu(id)) = hit_target(hwnd, x, y) {
+                set_view(Some(format!("menu:{id}:0")));
                 resize_flyout(hwnd);
                 let _ = InvalidateRect(Some(hwnd), None, true);
             } else {
-                *view_state().lock().unwrap_or_else(|e| e.into_inner()) = None;
+                set_view(None);
                 let _ = InvalidateRect(Some(hwnd), None, true);
             }
             LRESULT(0)
@@ -1048,7 +1260,7 @@ unsafe extern "system" fn window_proc(
             };
             let _ = TrackMouseEvent(&mut tracking);
             let (x, y) = point_from_lparam(lparam);
-            let cursor = if hit_target(x, y).is_some() {
+            let cursor = if hit_target(hwnd, x, y).is_some() {
                 LoadCursorW(None, IDC_HAND)
             } else {
                 LoadCursorW(None, IDC_ARROW)
@@ -1074,12 +1286,37 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_KEYDOWN if wparam.0 as u32 == 0x1b => {
-            let mut state = view_state().lock().unwrap_or_else(|e| e.into_inner());
-            if state.take().is_none() {
+            let empty = view_state()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+                .is_none();
+            if empty {
                 let _ = ShowWindow(hwnd, SW_HIDE);
             } else {
-                let _ = InvalidateRect(Some(hwnd), None, true);
+                resize_flyout(hwnd);
+                redraw_now(hwnd);
             }
+            LRESULT(0)
+        }
+        WM_MOUSEWHEEL if IsWindowVisible(hwnd).as_bool() => {
+            let delta = ((wparam.0 >> 16) as u16 as i16) as f32;
+            VIEWPORT.with(|slot| slot.borrow_mut().wheel_delta(delta, 72.0));
+            redraw_now(hwnd);
+            LRESULT(0)
+        }
+        WM_KEYDOWN if matches!(wparam.0 as u32, 0x21..=0x24) => {
+            VIEWPORT.with(|slot| {
+                let mut v = slot.borrow_mut();
+                match wparam.0 as u32 {
+                    0x21 => v.offset -= v.extent * 0.8,
+                    0x22 => v.offset += v.extent * 0.8,
+                    0x24 => v.offset = 0.0,
+                    _ => v.offset = v.max_offset(),
+                }
+                v.clamp();
+            });
+            redraw_now(hwnd);
             LRESULT(0)
         }
         WM_KEYDOWN
@@ -1091,7 +1328,7 @@ unsafe extern "system" fn window_proc(
                 && wparam.0 as u32 == 0x26 =>
         {
             change_menu_selection(-1);
-            let _ = InvalidateRect(Some(hwnd), None, true);
+            redraw_now(hwnd);
             LRESULT(0)
         }
         WM_KEYDOWN
@@ -1103,7 +1340,7 @@ unsafe extern "system" fn window_proc(
                 && wparam.0 as u32 == 0x28 =>
         {
             change_menu_selection(1);
-            let _ = InvalidateRect(Some(hwnd), None, true);
+            redraw_now(hwnd);
             LRESULT(0)
         }
         WM_KEYDOWN
@@ -1120,20 +1357,79 @@ unsafe extern "system" fn window_proc(
         }
         ACTION_DONE => {
             update_status(false, Some(hwnd));
-            if wparam.0 == 0 {
-                *view_state().lock().unwrap_or_else(|e| e.into_inner()) = None;
-            }
+            view_state()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .consume(wparam.0, lparam.0 != 0);
             resize_flyout(hwnd);
             let _ = InvalidateRect(Some(hwnd), None, true);
+            LRESULT(0)
+        }
+        CORE_BURST_OBSERVED => {
+            notices()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .burst(wparam.0 as u64, elapsed());
+            flush_notices(hwnd);
+            LRESULT(0)
+        }
+        CORE_RESTART_CONFIRMED => {
+            notices()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .restarted(elapsed());
+            flush_notices(hwnd);
             LRESULT(0)
         }
         STATE_CHANGED => {
+            let state = view_state()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_deref()
+                .map(str::to_owned);
+            if state.as_deref().is_some_and(|s| {
+                s.starts_with("menu:")
+                    && qb_tray::menu_target(&model().lock().unwrap_or_else(|e| e.into_inner()).0, s)
+                        .is_none()
+            }) {
+                set_view(None);
+            }
             resize_flyout(hwnd);
-            let _ = InvalidateRect(Some(hwnd), None, true);
+            flush_notices(hwnd);
+            redraw_now(hwnd);
+            LRESULT(0)
+        }
+        WM_SHOWWINDOW => {
+            if let Some(worker) = WORKER.get() {
+                worker.visible(wparam.0 != 0);
+            }
+            #[cfg(all(debug_assertions, feature = "testkit"))]
+            test_shell(hwnd, "visibility", None);
+            if wparam.0 == 0 {
+                RENDER_TARGET.with(|slot| *slot.borrow_mut() = None);
+                PAINTED.with(|slot| *slot.borrow_mut() = None);
+            }
+            // WM_SHOWWINDOW precedes the visibility change; publish after it.
+            let _ = PostMessageW(Some(hwnd), STATE_CHANGED, WPARAM(0), LPARAM(0));
+            LRESULT(0)
+        }
+        #[cfg(all(debug_assertions, feature = "testkit"))]
+        message if message == WM_APP + 6 && wparam.0 <= 1 => {
+            crate::theme::set_test_dark(wparam.0 == 1);
+            // WM_SETTINGCHANGE carries marshalled system-message parameters;
+            // dispatch synchronously on this same UI thread (handler only queues I/O).
+            let _ = windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+                hwnd,
+                WM_SETTINGCHANGE,
+                Some(WPARAM(0)),
+                Some(LPARAM(0)),
+            );
             LRESULT(0)
         }
         WM_SETTINGCHANGE => {
-            let _ = InvalidateRect(Some(hwnd), None, true);
+            refresh_theme(hwnd);
+            flush_notices(hwnd);
+            redraw_now(hwnd);
             LRESULT(0)
         }
         WM_DPICHANGED => {
@@ -1154,28 +1450,38 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_SIZE => {
-            RENDER_TARGET.with(|slot| {
-                if let Some(target) = slot.borrow().as_ref() {
-                    let width = (lparam.0 as u32 & 0xffff).max(1);
-                    let height = ((lparam.0 as u32 >> 16) & 0xffff).max(1);
-                    unsafe {
-                        let _ = target.Resize(&D2D_SIZE_U { width, height });
+            let mut client = RECT::default();
+            if GetClientRect(hwnd, &mut client).is_ok() {
+                RENDER_TARGET.with(|slot| {
+                    if let Some(target) = slot.borrow().as_ref() {
+                        let _ = target.Resize(&client_pixel_size(client));
+                        let dpi = GetDpiForWindow(hwnd).max(96) as f32;
+                        target.SetDpi(dpi, dpi);
                     }
-                }
-            });
+                });
+                sync_viewport(hwnd, true);
+            }
             let _ = InvalidateRect(Some(hwnd), None, true);
             LRESULT(0)
         }
         WM_TIMER => {
-            update_status(SUPERVISE_ENABLED.load(Ordering::Relaxed), Some(hwnd));
-            let _ = InvalidateRect(Some(hwnd), None, true);
+            if wparam.0 == 1 {
+                update_status(SUPERVISE_ENABLED.load(Ordering::Relaxed), Some(hwnd));
+            }
+            flush_notices(hwnd);
             LRESULT(0)
         }
         WM_PAINT => {
+            let mut paint = PAINTSTRUCT::default();
+            let _ = BeginPaint(hwnd, &mut paint);
             let _ = paint_window(hwnd);
+            let _ = EndPaint(hwnd, &paint);
             LRESULT(0)
         }
         WM_DESTROY => {
+            if let Some(worker) = WORKER.get() {
+                worker.close();
+            }
             PostQuitMessage(0);
             LRESULT(0)
         }
@@ -1190,15 +1496,29 @@ pub fn run(
     now: SystemTime,
 ) -> Result<()> {
     SUPERVISE_ENABLED.store(supervise, Ordering::Relaxed);
+    STARTED.get_or_init(Instant::now);
+    DARK.store(crate::theme::system_dark(), Ordering::Release);
     if let Some(fixture) = fixture {
         let json = std::fs::read_to_string(fixture)?;
         let state: qb_tray::State = serde_json::from_str(&json)?;
         let rows = qb_tray::parse_state_at(&json, now)?;
+        let snapshot: super::client::TraySnapshot = serde_json::from_str(&json)?;
+        notices()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .snapshot(
+                &snapshot,
+                true,
+                qb_tray::badge(&rows, true) != qb_tray::Badge::Normal,
+                rows.len(),
+                now,
+                elapsed(),
+            );
         *model().lock().unwrap_or_else(|e| e.into_inner()) = (rows, state.version, true);
         FIXTURE_MODE.store(true, Ordering::Relaxed);
     } else {
         FIXTURE_MODE.store(false, Ordering::Relaxed);
-        update_status(supervise, None);
+        // Worker starts once the HWND is ready; no admin I/O on the UI thread.
     }
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -1207,7 +1527,6 @@ pub fn run(
             style: CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(window_proc),
             hInstance: instance,
-            hIcon: LoadIconW(None, IDI_APPLICATION)?,
             hCursor: LoadCursorW(None, IDC_ARROW)?,
             lpszClassName: WINDOW_CLASS,
             ..Default::default()
@@ -1234,38 +1553,50 @@ pub fn run(
             &corner as *const _ as *const c_void,
             size_of_val(&corner) as u32,
         );
-        let dark_mode: i32 = 0;
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_USE_IMMERSIVE_DARK_MODE,
-            &dark_mode as *const _ as *const c_void,
-            size_of_val(&dark_mode) as u32,
-        );
-        let border_color: u32 = 0x00D9D9D9;
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_BORDER_COLOR,
-            &border_color as *const _ as *const c_void,
-            size_of_val(&border_color) as u32,
-        );
-        if !FIXTURE_MODE.load(Ordering::Relaxed) {
-            update_status(supervise, Some(hwnd));
-        }
-        SetTimer(Some(hwnd), 1, 60_000, None);
+        apply_window_theme(hwnd, DARK.load(Ordering::Acquire));
+        let presentation = notices()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .presentation();
+        let size = icon_size(hwnd);
+        let dark = DARK.load(Ordering::Acquire);
+        let generated = NotifyIcon::new(size, dark, presentation.badge)?;
         let mut icon = NOTIFYICONDATAW {
             cbSize: size_of::<NOTIFYICONDATAW>() as u32,
             hWnd: hwnd,
             uID: 1,
             uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
             uCallbackMessage: TRAY_MESSAGE,
-            hIcon: class.hIcon,
+            hIcon: HICON(generated.as_raw()),
             ..Default::default()
         };
-        let tip: Vec<u16> = "quota-baton".encode_utf16().chain([0]).collect();
-        icon.szTip[..tip.len()].copy_from_slice(&tip);
+        icon.szTip = notices::shell_text(&presentation.tooltip);
         if !Shell_NotifyIconW(NIM_ADD, &icon).as_bool() {
+            let _ = DestroyWindow(hwnd);
             anyhow::bail!("트레이 아이콘을 만들 수 없습니다");
         }
+        SHELL_TOOLTIP.with(|slot| *slot.borrow_mut() = presentation.tooltip);
+        SHELL_ICON
+            .with(|slot| *slot.borrow_mut() = Some((size, dark, presentation.badge, generated)));
+        if !FIXTURE_MODE.load(Ordering::Relaxed) {
+            let worker = match tray_worker::Worker::start(hwnd.0 as isize, supervise) {
+                Ok(worker) => worker,
+                Err(error) => {
+                    let _ = Shell_NotifyIconW(NIM_DELETE, &icon);
+                    let _ = DestroyWindow(hwnd);
+                    return Err(error);
+                }
+            };
+            if let Err(worker) = WORKER.set(worker) {
+                // Outside all callbacks: even a failed installation owns a thread.
+                worker.finish();
+                let _ = Shell_NotifyIconW(NIM_DELETE, &icon);
+                let _ = DestroyWindow(hwnd);
+                anyhow::bail!("tray worker already started");
+            }
+        }
+        SetTimer(Some(hwnd), 1, 60_000, None);
+        SetTimer(Some(hwnd), 2, 10_000, None);
         if open_flyout {
             position_flyout(hwnd);
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
@@ -1276,8 +1607,20 @@ pub fn run(
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
         }
+        if let Some(worker) = WORKER.get() {
+            worker.close();
+        }
         let _ = Shell_NotifyIconW(NIM_DELETE, &icon);
-        DestroyWindow(hwnd)?;
+        SHELL_ICON.with(|slot| *slot.borrow_mut() = None);
+        let destroyed = if IsWindow(Some(hwnd)).as_bool() {
+            DestroyWindow(hwnd)
+        } else {
+            Ok(())
+        };
+        if let Some(worker) = WORKER.get() {
+            worker.finish();
+        }
+        destroyed?;
     }
     Ok(())
 }

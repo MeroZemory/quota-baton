@@ -2,6 +2,7 @@ pub mod account_runtime;
 pub mod accounts;
 pub mod admin;
 pub mod bindings;
+mod burst;
 #[cfg(feature = "shape-capture")]
 pub mod capture;
 pub mod config;
