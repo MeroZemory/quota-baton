@@ -52,6 +52,14 @@ impl Harness {
         Self::new_with_network_retry(count, owned, false).await
     }
     async fn new_with_network_retry(count: usize, owned: bool, fail_first: bool) -> Self {
+        Self::new_with_rate_options(count, owned, fail_first, None).await
+    }
+    async fn new_with_rate_options(
+        count: usize,
+        owned: bool,
+        fail_first: bool,
+        rate: Option<(u64, u32)>,
+    ) -> Self {
         let serial = SERIAL.lock().await;
         let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/m4a-ws-tests");
         fs::create_dir_all(&base).unwrap();
@@ -102,6 +110,11 @@ impl Harness {
         config.server.data_port = 0;
         config.server.admin_port = 0;
         config.websocket.idle_close_secs = 60;
+        if let Some((hold, retries)) = rate {
+            config.routing.rate_hold_secs = hold;
+            config.routing.ws_upgrade_hold_secs = hold;
+            config.routing.rate_hold_max_retries = retries;
+        }
         let mut retry_proxy = None;
         config.upstream.codex_base = if fail_first {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -423,15 +436,28 @@ async fn c6_3_ws_rate_frame_with_advice_relayed_immediately() {
     let h = Harness::new(1).await;
     let rate = r#"{"type":"error","status":429,"error":{"code":"rate_limit_exceeded"},"headers":{"retry-after":"5"}}"#;
     h.fake.state.push_reply([Message::Text(rate.into())]);
-    let (mut client, _) = h.connect().await;
+    let (mut client, account) = h.connect().await;
+    let started = std::time::Instant::now();
     create(&mut client, "fixture-model").await;
     assert_eq!(receive(&mut client).await, Message::Text(rate.into()));
+    assert!(started.elapsed() < Duration::from_millis(750));
+    let pacing = h.state.accounts.pacing_snapshot(&account);
+    assert!(pacing.rate_step > 0);
+    assert!(
+        pacing
+            .rate_backoff_until
+            .unwrap()
+            .saturating_duration_since(std::time::Instant::now())
+            >= Duration::from_secs(4)
+    );
     client.close(None).await.unwrap();
 }
 
 #[tokio::test]
 async fn c6_3_ws_rate_frame_without_advice_closes_1012_same_account() {
-    let h = Harness::new(2).await;
+    // Real shared pacing now applies; bound the protocol assertion rather than
+    // waiting through the default exponential resend sequence.
+    let h = Harness::new_with_rate_options(2, false, false, Some((1, 3))).await;
     let rate = r#"{"type":"error","status":429,"error":{"code":"rate_limit_exceeded"}}"#;
     h.fake.state.push_reply(
         (0..4)
@@ -1746,4 +1772,687 @@ async fn c6_row_13_transient_refresh_cools_auth_even_while_own_probe_is_held() {
     assert_eq!(h.token_fake.state.requests().len(), 1);
     assert_eq!(h.fake.state.requests().len(), 2);
     client.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn r1_ws_open_and_redial_force_one_send_at_the_same_request_deadline() {
+    for redial in [false, true] {
+        let h = Harness::new_with_rate_options(1, false, false, Some((1, 5))).await;
+        let rate = Message::Text(
+            r#"{"type":"error","status":429,"error":{"code":"rate_limit_exceeded"}}"#.into(),
+        );
+        if redial {
+            h.fake.state.push_reply([
+                rate.clone(),
+                Message::Close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                    code: 1012.into(),
+                    reason: "synthetic close".into(),
+                })),
+            ]);
+        } else {
+            h.fake.state.push_reply([rate.clone()]);
+        }
+        h.fake.state.push_reply([rate]);
+        let (mut client, account) = h.connect().await;
+        let started = std::time::Instant::now();
+        create(&mut client, "fixture-model").await;
+        assert_close(
+            tokio::time::timeout(Duration::from_millis(1800), receive(&mut client))
+                .await
+                .unwrap(),
+            1012,
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(900),
+            "classified Rate must feed the shared gate"
+        );
+        assert!(h.state.accounts.pacing_snapshot(&account).rate_step > 0);
+        assert_eq!(h.store.load(&account).unwrap().health, Health::Ready);
+        assert_eq!(
+            h.fake
+                .state
+                .messages()
+                .iter()
+                .filter(|message| matches!(message, Message::Text(_)))
+                .count(),
+            2
+        );
+        let auth: Vec<_> = h
+            .fake
+            .state
+            .requests()
+            .into_iter()
+            .map(|request| request.headers["authorization"].clone())
+            .collect();
+        assert!(auth.iter().all(|value| value == auth[0]));
+        let row = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(row) = h.ledger().into_iter().find(|row| {
+                    row["transport"] == "ws" && row["outcome"] == "rate_hold_relayed_429"
+                }) {
+                    break row;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(row["attempts"], 2);
+        assert_eq!(row["rate_retries"], 1);
+        assert!(row["rate_wait_ms"].as_u64().unwrap() >= 800);
+    }
+}
+
+#[tokio::test]
+async fn r1_ws_client_close_cancels_rate_wait_and_ledgers_elapsed_wait() {
+    let h = Harness::new_with_rate_options(1, false, false, Some((1, 5))).await;
+    h.fake.state.push_reply([Message::Text(
+        r#"{"type":"error","status":429,"error":{"code":"rate_limit_exceeded"}}"#.into(),
+    )]);
+    let (mut client, account) = h.connect().await;
+    create(&mut client, "fixture-model").await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while h.state.accounts.pacing_snapshot(&account).waiting == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let ping = bytes::Bytes::from_static(b"held-ping");
+    client.send(Message::Ping(ping.clone())).await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_millis(250), receive(&mut client))
+            .await
+            .unwrap(),
+        Message::Pong(ping),
+    );
+    client
+        .send(Message::Pong(bytes::Bytes::from_static(b"held-pong")))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    client.close(None).await.unwrap();
+    // Complete the close exchange; the relay's bounded close handshake may
+    // finish after admission cancellation, which we check independently.
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_millis(500), client.next())
+            .await
+            .unwrap(),
+        Some(Ok(Message::Close(_))) | None
+    ));
+    tokio::time::timeout(Duration::from_millis(100), async {
+        while h.state.accounts.pacing_snapshot(&account).waiting != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let row = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(row) = h
+                .ledger()
+                .into_iter()
+                .find(|row| row["transport"] == "ws" && row["outcome"] == "client_drop")
+            {
+                break row;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("client-close completion missing: {:?}", h.ledger()));
+    assert_eq!(row["attempts"], 1);
+    assert_eq!(row["rate_retries"], 0);
+    assert!(row["rate_wait_ms"].as_u64().unwrap() >= 30);
+    tokio::time::timeout(Duration::from_millis(100), async {
+        while h.state.accounts.pacing_snapshot(&account).waiting != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        h.fake
+            .state
+            .messages()
+            .iter()
+            .filter(|message| matches!(message, Message::Text(_)))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn r1_ws_upgrade_http_date_observed_and_forced_initial_send_is_final() {
+    let h = Harness::new_with_rate_options(1, false, false, Some((1, 5))).await;
+    let id = &h.ids[0];
+    h.state
+        .accounts
+        .observe_429(id, Some(Duration::from_secs(60)));
+    let mut advice = HeaderMap::new();
+    let date = (Utc::now() + ChronoDuration::seconds(120))
+        .format("%a, %d %b %Y %H:%M:%S GMT")
+        .to_string();
+    advice.insert("retry-after", date.parse().unwrap());
+    h.fake.state.push_handshake(
+        StatusCode::TOO_MANY_REQUESTS,
+        r#"{"error":{"code":"rate_limit_exceeded"}}"#,
+        advice,
+    );
+    let started = std::time::Instant::now();
+    let (status, _) = tokio::time::timeout(Duration::from_millis(1800), h.error())
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(started.elapsed() >= Duration::from_millis(900));
+    assert_eq!(
+        h.fake.state.requests().len(),
+        1,
+        "forced initial upgrade cannot retry its 429"
+    );
+    let pacing = h.state.accounts.pacing_snapshot(id);
+    assert!(
+        pacing
+            .rate_backoff_until
+            .unwrap()
+            .saturating_duration_since(std::time::Instant::now())
+            > Duration::from_secs(59),
+        "HTTP-date advice must extend the old window (capped at 60s)"
+    );
+    let row = h
+        .ledger()
+        .into_iter()
+        .find(|row| row["outcome"] == "ws_upgrade_error")
+        .unwrap();
+    assert_eq!(row["attempts"], 1);
+    assert_eq!(row["rate_retries"], 0);
+    assert!(row["rate_wait_ms"].as_u64().unwrap() >= 800);
+    assert_eq!(h.store.load(id).unwrap().health, Health::Ready);
+}
+
+#[tokio::test]
+async fn r1_ws_upgrade_retries_share_the_original_pacing_deadline() {
+    let h = Harness::new_with_rate_options(1, false, false, Some((1, 5))).await;
+    let id = &h.ids[0];
+    // Set a synthetic window whose remaining backoff is 600ms. The first
+    // upgrade consumes that budget before receiving a fresh Rate 429.
+    let old = std::time::Instant::now() - Duration::from_millis(1400);
+    h.state.accounts.observe_429_at(id, old, old, None, 1.0);
+    for _ in 0..2 {
+        h.fake.state.push_handshake(
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"code":"rate_limit_exceeded"}}"#,
+            HeaderMap::new(),
+        );
+    }
+    let started = std::time::Instant::now();
+    let (status, _) = tokio::time::timeout(Duration::from_millis(1400), h.error())
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(started.elapsed() >= Duration::from_millis(900));
+    assert_eq!(h.fake.state.requests().len(), 2);
+    let row = h
+        .ledger()
+        .into_iter()
+        .find(|row| row["outcome"] == "ws_upgrade_error")
+        .unwrap();
+    assert_eq!(row["attempts"], 2);
+    assert_eq!(row["rate_retries"], 1);
+    assert!(row["rate_wait_ms"].as_u64().unwrap() >= 800);
+    assert!(
+        row["rate_wait_ms"].as_u64().unwrap() < 1400,
+        "admission must not restart its hold on retry"
+    );
+}
+
+#[tokio::test]
+async fn r1_ws_rate_wait_defers_one_charged_text_or_binary_and_preserves_bytes() {
+    for extra in [
+        Message::Text("  {\"type\":\"future.unknown\",\"opaque\":\"untouched\"} \n".into()),
+        Message::Binary(vec![0, 255, 128, 13, 10, 0, 42].into()),
+    ] {
+        let h = Harness::new_with_rate_options(1, false, false, Some((1, 5))).await;
+        h.fake.state.push_reply([Message::Text(
+            r#"{"type":"error","status":429,"error":{"code":"rate_limit_exceeded"}}"#.into(),
+        )]);
+        let created = Message::Text(
+            r#"{"type":"response.created","response":{"id":"deferred-fixture"}}"#.into(),
+        );
+        h.fake.state.push_reply([created.clone()]);
+        h.fake.state.set_echo(true);
+        let (mut client, account) = h.connect().await;
+        create(&mut client, "fixture-model").await;
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while h.state.accounts.pacing_snapshot(&account).waiting == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let retry_bytes = h.state.budget.used();
+        assert!(retry_bytes > 0);
+        client.send(extra.clone()).await.unwrap();
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while h.state.budget.used() != retry_bytes + extra.len() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // This reserves accounting only, without allocating a large payload.
+        // The deferred slot must drain even while the shared budget is full.
+        let ballast_bytes = qb_core::guard::mib_bytes(Config::default().guard.inflight_budget_mib);
+        let ballast = h.state.budget.reserve_message(ballast_bytes);
+        let second = Message::Text("second unknown message, still in order".into());
+        client.send(second.clone()).await.unwrap();
+        // Memory protection blocks fresh reads, not an already charged slot.
+        assert!(h.state.force_memory_sample_for_test(u64::MAX).guarded);
+        // The occupied slot must prevent an additional application read.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(
+            h.state.budget.used(),
+            retry_bytes + extra.len() + ballast_bytes
+        );
+        assert_eq!(
+            h.fake
+                .state
+                .messages()
+                .iter()
+                .filter(|message| matches!(message, Message::Text(_) | Message::Binary(_)))
+                .count(),
+            1
+        );
+
+        assert_eq!(receive(&mut client).await, created);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), receive(&mut client))
+                .await
+                .unwrap(),
+            extra,
+            "original payload must pass through, never a 1008 close"
+        );
+        assert!(h.state.force_memory_sample_for_test(u64::MAX).guarded);
+        h.state.force_memory_sample_for_test(0);
+        drop(ballast);
+        assert_eq!(receive(&mut client).await, second);
+        let messages: Vec<_> = h
+            .fake
+            .state
+            .messages()
+            .into_iter()
+            .filter(|message| matches!(message, Message::Text(_) | Message::Binary(_)))
+            .collect();
+        assert_eq!(messages.len(), 4); // initial create, resend, deferred, next
+        assert_eq!(messages[2], extra);
+        assert_eq!(messages[3], second);
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while h.state.budget.used() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        client.close(None).await.unwrap();
+    }
+}
+
+async fn r1_create_wait_for_initial_queue(h: &Harness, account: &str) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while h.state.accounts.pacing_snapshot(account).waiting == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+async fn r1_create_record(h: &Harness, model: &str) -> Value {
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            if let Some(row) = h
+                .ledger()
+                .into_iter()
+                .find(|row| row["transport"] == "ws" && row["model"] == model)
+            {
+                return row;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn r1_create_first_and_subsequent_unpaced_frames_are_fast_and_byte_exact() {
+    let h = Harness::new_with_rate_options(1, false, false, Some((1, 5))).await;
+    let done = Message::Text(r#"{"type":"response.completed"}"#.into());
+    h.fake.state.push_reply([done.clone()]);
+    h.fake.state.push_reply([done.clone()]);
+    let (mut client, account) = h.connect().await;
+    for model in ["initial-unpaced", "next-unpaced"] {
+        let raw = Message::Text(
+            format!("  {{\"type\":\"response.create\",\"model\":\"{model}\",\"input\":[]}} \n")
+                .into(),
+        );
+        client.send(raw.clone()).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(750), receive(&mut client))
+                .await
+                .unwrap(),
+            done
+        );
+        assert_eq!(h.fake.state.messages().last(), Some(&raw));
+        let row = r1_create_record(&h, model).await;
+        assert_eq!(row["attempts"], 1);
+        assert_eq!(row["rate_retries"], 0);
+        assert_eq!(row["account"], account);
+        assert_eq!(row["outcome"], "ok");
+    }
+    client.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn r1_create_first_and_persistent_second_gate_after_other_connection_429() {
+    for previous_turn in [false, true] {
+        // The other connection uses its one allowed retry, returns the native
+        // HTTP 429, and leaves the existing socket's shared gate closed.
+        let h = Harness::new_with_rate_options(1, false, false, Some((1, 1))).await;
+        let done = Message::Text(r#"{"type":"response.completed"}"#.into());
+        let (mut client, account) = h.connect().await;
+        if previous_turn {
+            h.fake.state.push_reply([done.clone()]);
+            create(&mut client, "previous-turn").await;
+            assert_eq!(receive(&mut client).await, done);
+            r1_create_record(&h, "previous-turn").await;
+        }
+        for _ in 0..2 {
+            h.fake.state.push_handshake(
+                StatusCode::TOO_MANY_REQUESTS,
+                r#"{"error":{"code":"rate_limit_exceeded"}}"#,
+                HeaderMap::new(),
+            );
+        }
+        assert_eq!(h.error().await.0, StatusCode::TOO_MANY_REQUESTS);
+        h.fake.state.push_reply([done.clone()]);
+        let before = h.fake.state.messages().len();
+        let started = std::time::Instant::now();
+        create(&mut client, "gated-create").await;
+        r1_create_wait_for_initial_queue(&h, &account).await;
+        assert_eq!(h.state.accounts.inflight_count(&account), 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), client.next())
+                .await
+                .is_err()
+        );
+        assert_eq!(h.fake.state.messages().len(), before);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), receive(&mut client))
+                .await
+                .unwrap(),
+            done
+        );
+        assert!(started.elapsed() >= Duration::from_millis(800));
+        let row = r1_create_record(&h, "gated-create").await;
+        assert_eq!(row["attempts"], 1);
+        assert_eq!(row["rate_retries"], 0);
+        assert_eq!(row["account"], account);
+        assert!(row["rate_wait_ms"].as_u64().unwrap() >= 800);
+        assert_eq!(h.store.load(&account).unwrap().health, Health::Ready);
+        client.close(None).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn r1_create_forced_initial_rate_is_final_without_an_extra_send() {
+    let h = Harness::new_with_rate_options(1, false, false, Some((1, 5))).await;
+    let (mut client, account) = h.connect().await;
+    h.state
+        .accounts
+        .observe_429(&account, Some(Duration::from_secs(3)));
+    h.fake.state.push_reply([Message::Text(
+        r#"{"type":"error","status":429,"error":{"code":"rate_limit_exceeded"}}"#.into(),
+    )]);
+    create(&mut client, "forced-initial").await;
+    assert_close(
+        tokio::time::timeout(Duration::from_secs(2), receive(&mut client))
+            .await
+            .unwrap(),
+        1012,
+    );
+    // Finish the native close exchange before asking for the final ledger row.
+    let _ = client.flush().await;
+    let row = r1_create_record(&h, "forced-initial").await;
+    assert_eq!(row["attempts"], 1);
+    assert_eq!(row["rate_retries"], 0);
+    assert_eq!(row["outcome"], "rate_hold_relayed_429");
+    assert!(row["rate_wait_ms"].as_u64().unwrap() >= 800);
+    assert_eq!(
+        h.fake
+            .state
+            .messages()
+            .iter()
+            .filter(|m| matches!(m, Message::Text(_)))
+            .count(),
+        1
+    );
+    assert_eq!(h.store.load(&account).unwrap().health, Health::Ready);
+}
+
+#[tokio::test]
+async fn r1_create_initial_queue_keeps_ping_and_close_responsive_without_attempt() {
+    let h = Harness::new_with_rate_options(1, false, false, Some((10, 5))).await;
+    let (mut client, account) = h.connect().await;
+    h.state
+        .accounts
+        .observe_429(&account, Some(Duration::from_secs(5)));
+    create(&mut client, "cancel-initial").await;
+    r1_create_wait_for_initial_queue(&h, &account).await;
+    assert_eq!(h.state.accounts.inflight_count(&account), 1);
+    let ping = bytes::Bytes::from_static(b"initial-wait-ping");
+    client.send(Message::Ping(ping.clone())).await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_millis(500), receive(&mut client))
+            .await
+            .unwrap(),
+        Message::Pong(ping)
+    );
+    client
+        .send(Message::Pong(bytes::Bytes::from_static(
+            b"initial-wait-pong",
+        )))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    client.close(None).await.unwrap();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_millis(500), client.next())
+            .await
+            .unwrap(),
+        Some(Ok(Message::Close(_))) | None
+    ));
+    let row = r1_create_record(&h, "cancel-initial").await;
+    assert_eq!(row["attempts"], 0);
+    assert_eq!(row["attempt_details"], json!([]));
+    assert_eq!(row["rate_retries"], 0);
+    assert_eq!(row["account"], account);
+    assert!(row["rate_wait_ms"].as_u64().unwrap() >= 30);
+    assert_eq!(h.state.accounts.inflight_count(&account), 0);
+    assert_eq!(h.state.accounts.pacing_snapshot(&account).waiting, 0);
+    assert_eq!(h.state.budget.used(), 0);
+    assert!(
+        h.fake
+            .state
+            .messages()
+            .iter()
+            .all(|m| !matches!(m, Message::Text(_) | Message::Binary(_)))
+    );
+    assert_eq!(h.store.load(&account).unwrap().health, Health::Ready);
+}
+
+#[tokio::test]
+async fn r1_create_queued_initial_rechecks_eligibility_and_drain_without_dispatch() {
+    for drain in [false, true] {
+        let h = Harness::new_with_rate_options(1, false, false, Some((1, 5))).await;
+        let (mut client, account) = h.connect().await;
+        h.state
+            .accounts
+            .observe_429(&account, Some(Duration::from_secs(3)));
+        create(&mut client, "withdraw-initial").await;
+        r1_create_wait_for_initial_queue(&h, &account).await;
+        let initial_bytes = h.state.budget.used();
+        let extra = Message::Binary(vec![0, 255, 128, 13, 10].into());
+        client.send(extra.clone()).await.unwrap();
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while h.state.budget.used() != initial_bytes + extra.len() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        if drain {
+            h.state.begin_drain().await.unwrap();
+        } else {
+            h.state
+                .accounts
+                .change(&account, Some(UserState::Paused), None, None, None)
+                .await
+                .unwrap();
+        }
+        assert_close(
+            tokio::time::timeout(Duration::from_secs(2), receive(&mut client))
+                .await
+                .unwrap(),
+            if drain { 1001 } else { 1000 },
+        );
+        let _ = client.flush().await;
+        let row = r1_create_record(&h, "withdraw-initial").await;
+        assert_eq!(row["attempts"], 0);
+        assert_eq!(row["rate_retries"], 0);
+        assert_eq!(row["account"], account);
+        assert_eq!(h.state.accounts.inflight_count(&account), 0);
+        assert_eq!(h.state.budget.used(), 0);
+        assert!(
+            h.fake
+                .state
+                .messages()
+                .iter()
+                .all(|m| !matches!(m, Message::Text(_) | Message::Binary(_)))
+        );
+    }
+}
+
+#[tokio::test]
+async fn r1_create_drain_cancels_queued_turn_but_finishes_dispatched_turn() {
+    let h = Harness::new_with_rate_options(1, false, false, Some((10, 5))).await;
+    let created =
+        Message::Text(r#"{"type":"response.created","response":{"id":"older-turn"}}"#.into());
+    h.fake.state.push_reply([created.clone()]);
+    let (mut client, account) = h.connect().await;
+    create(&mut client, "dispatched-turn").await;
+    assert_eq!(receive(&mut client).await, created);
+    h.state
+        .accounts
+        .observe_429(&account, Some(Duration::from_secs(5)));
+    create(&mut client, "queued-during-drain").await;
+    r1_create_wait_for_initial_queue(&h, &account).await;
+    assert_eq!(h.state.accounts.inflight_count(&account), 2);
+    h.state.begin_drain().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while h.state.accounts.inflight_count(&account) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let done =
+        Message::Text(r#"{"type":"response.completed","response":{"id":"older-turn"}}"#.into());
+    h.fake.state.send(done.clone()).unwrap();
+    assert_eq!(receive(&mut client).await, done);
+    assert_close(receive(&mut client).await, 1001);
+    let _ = client.flush().await;
+    let queued = r1_create_record(&h, "queued-during-drain").await;
+    let dispatched = r1_create_record(&h, "dispatched-turn").await;
+    assert_eq!(queued["attempts"], 0);
+    assert_eq!(dispatched["attempts"], 1);
+    assert_eq!(dispatched["outcome"], "ok");
+    assert_eq!(h.state.accounts.inflight_count(&account), 0);
+    assert_eq!(h.state.budget.used(), 0);
+    assert_eq!(
+        h.fake
+            .state
+            .messages()
+            .iter()
+            .filter(|m| matches!(m, Message::Text(_)))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn r1_ws_upstream_close_cancels_wait_and_releases_deferred_slot() {
+    for extra in [
+        Message::Text("  opaque text with original whitespace \n".into()),
+        Message::Binary(vec![0, 255, 128, 13, 10, 0, 42].into()),
+    ] {
+        let h = Harness::new_with_rate_options(1, false, false, Some((1, 5))).await;
+        h.fake.state.push_reply([Message::Text(
+            r#"{"type":"error","status":429,"error":{"code":"rate_limit_exceeded"}}"#.into(),
+        )]);
+        let (mut client, account) = h.connect().await;
+        // A previous_response_id preserves the upstream close without redial.
+        client.send(Message::Text(
+            r#"{"type":"response.create","model":"fixture-model","previous_response_id":"fixture-prior","input":[]}"#.into(),
+        )).await.unwrap();
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while h.state.accounts.pacing_snapshot(&account).waiting == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let retry_bytes = h.state.budget.used();
+        assert!(retry_bytes > 0);
+        client.send(extra.clone()).await.unwrap();
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while h.state.budget.used() != retry_bytes + extra.len() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let close = Message::Close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
+            code: 1001.into(),
+            reason: "synthetic slot cancellation".into(),
+        }));
+        h.fake.state.send(close.clone()).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(500), receive(&mut client))
+                .await
+                .unwrap(),
+            close,
+        );
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while h.state.budget.used() != 0
+                || h.state.accounts.pacing_snapshot(&account).waiting != 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let messages: Vec<_> = h
+            .fake
+            .state
+            .messages()
+            .into_iter()
+            .filter(|message| matches!(message, Message::Text(_) | Message::Binary(_)))
+            .collect();
+        assert_eq!(
+            messages.len(),
+            1,
+            "close cancels the unsent retry and deferred message"
+        );
+    }
 }

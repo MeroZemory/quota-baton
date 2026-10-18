@@ -82,6 +82,25 @@ async fn pair_with_tracking(
     read_timeout: Duration,
     tracking: bool,
 ) -> Pair {
+    pair_with_rate_options(
+        idle_close,
+        close_after_response,
+        limit,
+        read_timeout,
+        tracking,
+        None,
+    )
+    .await
+}
+
+async fn pair_with_rate_options(
+    idle_close: Duration,
+    close_after_response: bool,
+    limit: usize,
+    read_timeout: Duration,
+    tracking: bool,
+    rate: Option<(u64, u32)>,
+) -> Pair {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/pump-tests");
     std::fs::create_dir_all(&root).unwrap();
     let home = tempfile::tempdir_in(root).unwrap();
@@ -105,6 +124,10 @@ async fn pair_with_tracking(
         .await
         .unwrap();
         let mut config = crate::config::Config::default();
+        if let Some((hold, retries)) = rate {
+            config.routing.rate_hold_secs = hold;
+            config.routing.rate_hold_max_retries = retries;
+        }
         config.upstream.codex_base = format!("http://{upstream_address}");
         config.upstream.anthropic_base = format!("http://{upstream_address}");
         let relay = Arc::new(
@@ -1053,5 +1076,261 @@ async fn takeover_drain_delivers_current_response_before_1001() {
         let rows = requests(&pair, 1).await;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["outcome"], "ok");
+    }
+}
+
+// No runtime is attached to these protocol pairs: they exercise pump policy,
+// not exponential backoff, and catch the removed fixed one-second sleep.
+#[tokio::test]
+async fn r1_ws_configured_retry_caps_one_and_above_three() {
+    for cap in [1, 5] {
+        let mut pair = pair_with_rate_options(
+            Duration::from_secs(60),
+            false,
+            PARSE_LIMIT,
+            UPSTREAM_READ_TIMEOUT,
+            true,
+            Some((60, cap)),
+        )
+        .await;
+        let create = Message::Text(r#"{"type":"response.create","model":"fixture"}"#.into());
+        pair.client.send(create.clone()).await.unwrap();
+        assert_eq!(next(&mut pair.peer).await, create);
+        let started = std::time::Instant::now();
+        for _ in 0..cap {
+            pair.peer
+                .send(Message::Text(
+                    r#"{"type":"error","status":429,"error":{"code":"rate_limit_exceeded"}}"#
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_millis(750), pair.peer.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap(),
+                create
+            );
+        }
+        assert!(started.elapsed() < Duration::from_secs(u64::from(cap)));
+        pair.peer
+            .send(Message::Text(
+                r#"{"type":"error","status":429,"error":{"code":"rate_limit_exceeded"}}"#.into(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            matches!(next(&mut pair.client).await, Message::Close(Some(frame)) if frame.code == 1012.into())
+        );
+        let rows = requests(&pair, 1).await;
+        assert_eq!(rows[0]["attempts"], cap + 1);
+        assert_eq!(rows[0]["rate_retries"], cap);
+        assert_eq!(rows[0]["rate_wait_ms"], 0);
+        assert_eq!(rows[0]["outcome"], "rate_hold_relayed_429");
+    }
+}
+
+#[tokio::test]
+async fn r1_ws_cancelled_open_wait_and_redial_share_deadline_and_wait_metadata() {
+    let pair = pair_with_tracking(
+        Duration::from_secs(60),
+        false,
+        PARSE_LIMIT,
+        UPSTREAM_READ_TIMEOUT,
+        true,
+    )
+    .await;
+    let runtime = &pair.relay.as_ref().unwrap().accounts;
+    runtime.observe_429("fake-account", Some(Duration::from_secs(60)));
+    let rate = Arc::new(RateBudget::with_limits(Duration::from_millis(160), 5));
+    let deadline = rate.deadline;
+    let mut open = Box::pin(rate.admit(Some(runtime), "fake-account"));
+    tokio::select! {
+        _ = &mut open => panic!("rate wait was bypassed"),
+        _ = tokio::time::sleep(Duration::from_millis(80)) => {}
+    }
+    drop(open); // the upstream closes while the open-socket wait is pending
+    tokio::time::timeout(Duration::from_millis(30), async {
+        while runtime.pacing_snapshot("fake-account").waiting != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let redial_started = std::time::Instant::now();
+    tokio::time::timeout(
+        Duration::from_millis(140),
+        rate.admit(Some(runtime), "fake-account"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(rate.deadline, deadline);
+    assert!(redial_started.elapsed() < Duration::from_millis(140));
+    rate.sent();
+    assert!(!rate.can_retry(), "the forced send must be final");
+    let state = rate.state.lock().unwrap();
+    assert_eq!(state.retries, 1, "cancelled wait was not an attempt");
+    assert!(state.waited >= Duration::from_millis(140));
+    assert!(state.forced);
+}
+
+#[test]
+fn r1_create_initial_dispatch_is_not_a_retry_and_forcing_is_terminal() {
+    let rate = RateBudget::with_limits(Duration::ZERO, 5);
+    assert!(!rate.initial_sent());
+    rate.initial_dispatch();
+    assert!(rate.initial_sent());
+    assert!(!rate.can_retry());
+    assert_eq!(rate.state.lock().unwrap().retries, 0);
+}
+
+#[tokio::test]
+async fn r1_create_unsent_completion_keeps_guard_but_ledgers_zero_attempts() {
+    let pair = pair_with_tracking(
+        Duration::from_secs(60),
+        false,
+        PARSE_LIMIT,
+        UPSTREAM_READ_TIMEOUT,
+        true,
+    )
+    .await;
+    let relay = pair.relay.as_ref().unwrap();
+    let context = Context {
+        runtime: Some(relay.accounts.clone()),
+        relay: Some(relay.clone()),
+        drain_signal: None,
+        credentials: None,
+        budget: pair.budget.clone(),
+        memory_guard: pair.memory_guard.clone(),
+        observability: pair.obs.clone(),
+        account: "fake-account".into(),
+        session: Session::default(),
+        headers: HeaderMap::new(),
+        upstream_url: String::new(),
+        idle_close: Duration::from_secs(60),
+        close_after_response: false,
+        capture_ticket: None,
+        connection: "queued-fixture".into(),
+    };
+    let active = CurrentCompletion::new(&context);
+    assert_eq!(relay.accounts.inflight_count("fake-account"), 1);
+    let rate = active.rate.clone();
+    let wait = RateWait::new(rate.clone());
+    rate.state.lock().unwrap().waiting_since =
+        Some(std::time::Instant::now() - Duration::from_millis(30));
+    let mut queued = BTreeMap::from([(0, active)]);
+    assert_eq!(
+        response_completion(
+            &mut queued,
+            Some(&serde_json::json!({"type":"response.created","response":{"id":"unsolicited"}}))
+        ),
+        None
+    );
+    assert_eq!(
+        response_completion(
+            &mut queued,
+            Some(&serde_json::json!({"type":"error","status":429}))
+        ),
+        None
+    );
+    let active = queued.remove(&0).unwrap();
+    // The fallback must also work if the completion drops before its wait.
+    active.finish("client_drop");
+    drop(wait);
+    assert_eq!(relay.accounts.inflight_count("fake-account"), 0);
+    let rows = requests(&pair, 1).await;
+    assert_eq!(rows[0]["attempts"], 0);
+    assert_eq!(rows[0]["attempt_details"], serde_json::json!([]));
+    assert_eq!(rows[0]["rate_retries"], 0);
+    assert!(rows[0]["rate_wait_ms"].as_u64().unwrap() >= 30);
+}
+
+#[test]
+fn r1_ws_retry_advice_is_a_sidecopy() {
+    let event = serde_json::json!({"type":"error","status":429,"error":{"code":"slow_down"},"headers":{"ReTrY-AfTeR":"7"}});
+    let original = event.clone();
+    assert!(ws_rate_advice(&event));
+    assert_eq!(ws_retry_after(&event), Some(Duration::from_secs(7)));
+    assert_eq!(event, original);
+}
+
+#[test]
+fn r1_ws_completion_outlives_context_and_snapshots_both_wait_drop_orders() {
+    for explicit_finish in [false, true] {
+        for wait_dropped_first in [false, true] {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/pump-tests");
+            std::fs::create_dir_all(&root).unwrap();
+            let home = tempfile::tempdir_in(root).unwrap();
+            let obs = Arc::new(Observability::new(home.path(), None).unwrap());
+            let context = Context {
+                runtime: None,
+                relay: None,
+                drain_signal: None,
+                credentials: None,
+                budget: InflightBudget::new(PARSE_LIMIT),
+                memory_guard: Arc::new(crate::guard::MemoryGuard::new(u64::MAX)),
+                observability: obs.clone(),
+                account: "fixture".into(),
+                session: Session::default(),
+                headers: HeaderMap::new(),
+                upstream_url: String::new(),
+                idle_close: Duration::from_secs(60),
+                close_after_response: false,
+                capture_ticket: None,
+                connection: "fixture".into(),
+            };
+            let active = CurrentCompletion::new(&context);
+            let rate = active.rate.clone();
+            rate.sent(); // one actual resend, followed by an unsent wait
+            let wait = RateWait::new(rate.clone());
+            rate.state.lock().unwrap().waiting_since =
+                Some(std::time::Instant::now() - Duration::from_millis(25));
+            drop(context);
+            if wait_dropped_first {
+                drop(wait);
+                if explicit_finish {
+                    active.finish("ok");
+                } else {
+                    drop(active);
+                }
+            } else {
+                if explicit_finish {
+                    active.finish("ok");
+                } else {
+                    drop(active);
+                }
+                drop(wait);
+            }
+            obs.flush().unwrap();
+            let mut rows = Vec::<Value>::new();
+            for entry in std::fs::read_dir(home.path().join("ledger")).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_file() {
+                    for line in std::fs::read_to_string(path).unwrap().lines() {
+                        let row: Value = serde_json::from_str(line).unwrap();
+                        if row.get("req").is_some() {
+                            rows.push(row);
+                        }
+                    }
+                }
+            }
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["attempts"], 2);
+            assert_eq!(
+                rows[0]["rate_retries"], 1,
+                "pending wait must not become an attempt"
+            );
+            assert!(rows[0]["rate_wait_ms"].as_u64().unwrap() >= 25);
+            assert_eq!(
+                rows[0]["outcome"],
+                if explicit_finish {
+                    "rate_hold_ok"
+                } else {
+                    "client_drop"
+                }
+            );
+        }
     }
 }
