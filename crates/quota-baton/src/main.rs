@@ -75,6 +75,12 @@ enum Command {
     },
     #[command(about = "클라이언트 설정을 연결하거나 되돌립니다")]
     Wire {
+        #[arg(
+            long,
+            value_parser = ["default", "dedicated", "none"],
+            help = "Codex 연결 모드를 선택합니다; 생략하면 자동 감지합니다"
+        )]
+        codex_mode: Option<String>,
         #[arg(long, help = "실제 파일을 변경합니다; 생략하면 미리보기입니다")]
         apply: bool,
         #[arg(long, help = "현재 사용자 트레이 자동 시작을 연결합니다")]
@@ -132,6 +138,25 @@ async fn main() {
 }
 
 fn friendly_error(error: &anyhow::Error) -> String {
+    // Only exact fixed diagnostics may pass through; parser/transport chains
+    // and appended file contents must stay behind the generic safe error.
+    const WIRE_DIAGNOSTICS: &[&str] = &[
+        "적용하려면 client.key와 admin.token이 먼저 있어야 합니다.",
+        "적용하려면 정상 상태의 코어가 실행 중이어야 합니다.",
+        "설정된 데이터 포트에 연결할 수 없습니다.",
+        "각 프로바이더에 적용 가능한 활성 계정이 하나 이상 필요합니다.",
+        "npm 디렉터리 또는 codex.cmd가 없습니다. Codex 설치를 확인하세요",
+        "전용 Codex 홈이 이미 존재합니다. 덮어쓰지 않습니다",
+        "Codex config 형식이 올바르지 않습니다",
+        "Codex auth.json 형식이 올바르지 않습니다",
+        "선택된 비 CPA model_provider는 별도 홈 모드와 함께 사용할 수 없습니다",
+        "선택된 사용자 정의 model_provider가 별도 홈 연결을 우회할 수 있어 중단했습니다",
+        "journal의 Codex 모드가 다릅니다. 먼저 unwire를 실행하세요",
+    ];
+    let detail = error.to_string();
+    if WIRE_DIAGNOSTICS.contains(&detail.as_str()) {
+        return detail;
+    }
     if error.to_string() == cutover::CPA_DEPENDENCY_REFUSAL {
         return cutover::CPA_DEPENDENCY_REFUSAL.into();
     }
@@ -216,6 +241,7 @@ async fn request_takeover(
 async fn check_wire_preconditions(
     home: &std::path::Path,
     options: &cutover::WireOptions,
+    codex_mode: cutover::CodexMode,
 ) -> anyhow::Result<()> {
     cutover::check_optional_preconditions(home, options)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -250,6 +276,11 @@ async fn check_wire_preconditions(
         qb_core::accounts::Provider::Codex,
         qb_core::accounts::Provider::Claude,
     ] {
+        if provider == qb_core::accounts::Provider::Codex
+            && matches!(codex_mode, cutover::CodexMode::None)
+        {
+            continue;
+        }
         if !accounts
             .iter()
             .any(|account| account.provider == provider && account.eligible(None))
@@ -470,21 +501,25 @@ async fn run() -> anyhow::Result<()> {
             accounts_cli::run(command, &home, &config).await?;
         }
         Command::Wire {
+            codex_mode,
             apply,
             autostart,
             disable_cpa_tasks,
             detach_chatgpt_session_homes,
         } => {
-            let options = cutover::WireOptions {
+            let mut options = cutover::WireOptions {
+                codex_mode: codex_mode.map(|mode| mode.parse()).transpose()?,
                 data_port: qb_core::config::Config::load(&home)?.server.data_port,
                 autostart,
                 disable_cpa_tasks,
                 detach_chatgpt_session_homes,
             };
+            let paths = cutover::CutoverPaths::from_environment(home.clone())?;
+            let codex_mode = cutover::resolve_codex_mode(&paths, &options)?;
+            options.codex_mode = Some(codex_mode);
             if apply {
-                check_wire_preconditions(&home, &options).await?;
+                check_wire_preconditions(&home, &options, codex_mode).await?;
             }
-            let paths = cutover::CutoverPaths::from_environment(home)?;
             let report = cutover::wire_with_options(&paths, apply, options)?;
             for line in report.summary {
                 println_utf8!("{line}");
@@ -582,6 +617,18 @@ async fn run() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod r1_cpa_error_tests {
+    #[test]
+    fn r3_wire_prerequisites_are_actionable_but_never_echo_appended_details() {
+        for message in [
+            "적용하려면 정상 상태의 코어가 실행 중이어야 합니다.",
+            "각 프로바이더에 적용 가능한 활성 계정이 하나 이상 필요합니다.",
+            "npm 디렉터리 또는 codex.cmd가 없습니다. Codex 설치를 확인하세요",
+        ] {
+            assert_eq!(super::friendly_error(&anyhow::anyhow!(message)), message);
+            let untrusted = anyhow::anyhow!("{message} synthetic-private-detail");
+            assert!(!super::friendly_error(&untrusted).contains("synthetic-private-detail"));
+        }
+    }
     #[test]
     fn r1_cpa_refusal_survives_cli_error_sanitization() {
         let error = anyhow::anyhow!(crate::cutover::CPA_DEPENDENCY_REFUSAL);
