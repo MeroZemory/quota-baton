@@ -23,6 +23,16 @@ impl ViewOwnership {
     pub(super) fn begin(&mut self) -> usize {
         self.set(self.value.clone())
     }
+    pub(super) fn begin_menu(&mut self, id: &str, index: usize, toggle: bool) -> Option<usize> {
+        if self
+            .value
+            .as_deref()
+            .is_some_and(|v| v.ends_with(":pending"))
+        {
+            return None;
+        }
+        Some(self.set(toggle.then(|| format!("menu:{id}:{index}:pending"))))
+    }
     pub(super) fn publish(&mut self, owner: usize, value: Option<String>) -> bool {
         if self.owner != owner {
             return false;
@@ -40,7 +50,12 @@ impl ViewOwnership {
     }
     pub(super) fn consume(&mut self, owner: usize, preserve_error: bool) {
         if self.owner == owner && !preserve_error {
-            self.set(None);
+            let menu = self
+                .value
+                .as_deref()
+                .and_then(|v| v.strip_suffix(":pending"))
+                .map(str::to_owned);
+            self.set(menu);
         }
     }
     pub(super) fn take(&mut self) -> Option<String> {
@@ -68,6 +83,29 @@ pub(super) fn admit_cancellation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn checkbox_refresh_keeps_menu_and_command_closes_it() {
+        let mut view = ViewOwnership::default();
+        view.set(Some("menu:codex:3".into()));
+        let owner = view.begin_menu("codex", 3, true).unwrap();
+        assert_eq!(view.as_deref(), Some("menu:codex:3:pending"));
+        assert!(view.begin_menu("codex", 3, true).is_none());
+        view.completion(owner, None);
+        view.consume(owner, false);
+        assert_eq!(view.as_deref(), Some("menu:codex:3"));
+        let owner = view.begin_menu("codex", 0, false).unwrap();
+        assert!(view.is_none());
+        view.consume(owner, false);
+        assert!(view.is_none());
+    }
+    #[test]
+    fn dismissed_checkbox_completion_cannot_reopen_menu() {
+        let mut view = ViewOwnership::default();
+        let owner = view.begin_menu("codex", 3, true).unwrap();
+        view.set(Some("login:claude".into()));
+        view.consume(owner, false);
+        assert_eq!(view.as_deref(), Some("login:claude"));
+    }
     #[test]
     fn action_a_finishing_after_new_login_b_cannot_clear_or_publish_over_b() {
         let mut view = ViewOwnership::default();
