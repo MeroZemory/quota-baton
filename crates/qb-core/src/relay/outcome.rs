@@ -281,7 +281,11 @@ pub(super) fn classify(
                 format!("model:{m}"),
             );
         }
-    } else if effective == StatusCode::PAYMENT_REQUIRED {
+    } else if effective == StatusCode::PAYMENT_REQUIRED
+        || (provider == Provider::Claude
+            && effective == StatusCode::BAD_REQUEST
+            && kind == "billing_error")
+    {
         decision.kind = Kind::Payment;
         decision.signal = cooling(
             HealthReason::Payment,

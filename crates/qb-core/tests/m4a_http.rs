@@ -2,7 +2,7 @@ use axum::http::{HeaderMap, StatusCode};
 use bytes::Bytes;
 use chrono::{Duration as ChronoDuration, Utc};
 use qb_core::{
-    accounts::{AccountStore, Health, HealthReason, Provider, UserState, import},
+    accounts::{Account, AccountStore, Health, HealthReason, Provider, Source, UserState, import},
     config::Config,
     debug_pin::DebugPins,
     http::{self, RunningServers},
@@ -192,6 +192,486 @@ fn ok() -> ScriptedResponse {
 }
 fn quota(reset: i64) -> ScriptedResponse {
     ScriptedResponse::json(StatusCode::TOO_MANY_REQUESTS,json!({"error":{"type":"usage_limit_reached","resets_at":reset,"message":"conversation-marker"}}).to_string())
+}
+
+// AccountStore invokes this observer after a successful persisted write, under
+// its transaction gate. Never query the store from inside the observer.
+fn c6_4_health_writes(h: &Harness) -> Arc<std::sync::Mutex<Vec<(Instant, Account)>>> {
+    let writes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = writes.clone();
+    let obs = h.obs.clone();
+    h.store.set_observer(Arc::new(move |account, previous| {
+        if previous != &account.health {
+            captured
+                .lock()
+                .unwrap()
+                .push((Instant::now(), account.clone()));
+            obs.record_health(&account.id, previous, &account.health);
+        }
+    }));
+    writes
+}
+
+fn c6_4_quota(provider: Provider, reset: i64) -> ScriptedResponse {
+    let mut response = quota(reset);
+    if provider == Provider::Claude {
+        response.headers.insert(
+            "anthropic-ratelimit-unified-5h-status",
+            "rejected".parse().unwrap(),
+        );
+        response.headers.insert(
+            "anthropic-ratelimit-unified-5h-reset",
+            reset.to_string().parse().unwrap(),
+        );
+    }
+    response
+}
+
+fn c6_4_assert_cooling(
+    account: &Account,
+    reason: HealthReason,
+    earliest: chrono::DateTime<Utc>,
+    latest: chrono::DateTime<Utc>,
+) {
+    assert!(matches!(account.source, Source::Cpa { .. }));
+    assert!(
+        matches!(&account.health, Health::Cooling { reason: actual, until, scope }
+        if *actual == reason && *until >= earliest && *until <= latest && scope == "account"),
+        "unexpected health: {:?}",
+        account.health
+    );
+    if reason == HealthReason::Payment {
+        assert!(
+            account
+                .payment_until
+                .is_some_and(|until| until >= earliest && until <= latest)
+        );
+    }
+}
+
+async fn c6_4_assert_served(response: reqwest::Response, h: &Harness, id: &str) {
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-quota-baton-account"], id);
+    response.bytes().await.unwrap();
+    assert!(matches!(
+        h.store.load(id).unwrap().source,
+        Source::Cpa { .. }
+    ));
+    assert_eq!(h.store.load(id).unwrap().health, Health::Ready);
+}
+
+#[tokio::test]
+async fn c6_4_exhausted_bound_account_moves_to_healthy() {
+    for provider in [Provider::Claude, Provider::Codex] {
+        let h = Harness::new(provider, 2, 384, 1024).await;
+        let ids = h.ids();
+        c6_4_assert_served(
+            h.send_with_session(provider, "exhausted").await,
+            &h,
+            &ids[0],
+        )
+        .await;
+        let reset = Utc::now() + ChronoDuration::hours(1);
+        h.store
+            .update_metadata(&ids[0], |a| {
+                a.health = Health::Cooling {
+                    reason: HealthReason::Quota,
+                    until: reset,
+                    scope: "account".into(),
+                }
+            })
+            .unwrap();
+        c6_4_assert_served(
+            h.send_with_session(provider, "exhausted").await,
+            &h,
+            &ids[1],
+        )
+        .await;
+        assert_eq!(
+            h.state
+                .bindings
+                .current(Some(&format!("{}:exhausted", provider.as_str()))),
+            Some(ids[1].clone())
+        );
+        c6_4_assert_cooling(
+            &h.store.load(&ids[0]).unwrap(),
+            HealthReason::Quota,
+            reset,
+            reset,
+        );
+        assert_eq!(h.fake.state.requests().len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn c6_4_stale_imported_binding_not_used() {
+    let h = Harness::new(Provider::Codex, 2, 384, 1024).await;
+    let ids = h.ids();
+    c6_4_assert_served(
+        h.send_with_session(Provider::Codex, "restart").await,
+        &h,
+        &ids[0],
+    )
+    .await;
+    h.state.bindings.flush().unwrap();
+    let reset = Utc::now() + ChronoDuration::hours(1);
+    h.store
+        .update_metadata(&ids[0], |a| {
+            a.health = Health::Cooling {
+                reason: HealthReason::Quota,
+                until: reset,
+                scope: "account".into(),
+            }
+        })
+        .unwrap();
+    let restarted = qb_core::bindings::BindingTable::new(&h.home, Default::default()).unwrap();
+    let imported = restarted.export().unwrap();
+    assert_eq!(imported["bindings"][0]["account"], ids[0]);
+    h.state.bindings.import(imported).unwrap();
+    c6_4_assert_served(
+        h.send_with_session(Provider::Codex, "restart").await,
+        &h,
+        &ids[1],
+    )
+    .await;
+    assert_eq!(
+        h.state.bindings.current(Some("codex:restart")),
+        Some(ids[1].clone())
+    );
+    c6_4_assert_cooling(
+        &h.store.load(&ids[0]).unwrap(),
+        HealthReason::Quota,
+        reset,
+        reset,
+    );
+}
+
+#[tokio::test]
+async fn c6_4_429_reset_headers_recorded_before_failover() {
+    for provider in [Provider::Claude, Provider::Codex] {
+        let h = Harness::new(provider, 2, 384, 1024).await;
+        let ids = h.ids();
+        let writes = c6_4_health_writes(&h);
+        let reset = Utc::now().timestamp() + 3600;
+        // No reset in the body: only the headers can supply the deadline.
+        let mut response = ScriptedResponse::json(
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"type":"usage_limit_reached","message":"synthetic quota limit"}}"#,
+        );
+        let headers = if provider == Provider::Codex {
+            vec![
+                ("x-codex-primary-used-percent", "100".to_owned()),
+                ("x-codex-primary-reset-at", reset.to_string()),
+            ]
+        } else {
+            vec![
+                (
+                    "anthropic-ratelimit-unified-5h-utilization",
+                    "1.0".to_owned(),
+                ),
+                ("anthropic-ratelimit-unified-5h-reset", reset.to_string()),
+                (
+                    "anthropic-ratelimit-unified-5h-status",
+                    "rejected".to_owned(),
+                ),
+            ]
+        };
+        for (name, value) in headers {
+            response.headers.insert(name, value.parse().unwrap());
+        }
+        h.fake.state.push(response);
+        h.fake.state.push(ok());
+        c6_4_assert_served(h.send_with_session(provider, "atomic").await, &h, &ids[1]).await;
+        let requests = h.fake.state.requests();
+        assert_eq!(requests.len(), 2);
+        let writes = writes.lock().unwrap();
+        let (written_at, account) = writes
+            .iter()
+            .find(|(_, a)| {
+                a.id == ids[0]
+                    && matches!(
+                        a.health,
+                        Health::Cooling {
+                            reason: HealthReason::Quota,
+                            ..
+                        }
+                    )
+            })
+            .unwrap();
+        let until = chrono::DateTime::from_timestamp(reset, 0).unwrap();
+        c6_4_assert_cooling(account, HealthReason::Quota, until, until);
+        c6_4_assert_cooling(
+            &h.store.load(&ids[0]).unwrap(),
+            HealthReason::Quota,
+            until,
+            until,
+        );
+        assert!(*written_at < requests[1].received_at);
+        assert_ne!(
+            requests[0].headers["authorization"],
+            requests[1].headers["authorization"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn c6_4_401_revocation_owned_and_linked() {
+    for provider in [Provider::Claude, Provider::Codex] {
+        for owned in [false, true] {
+            let h = Harness::new(provider, 2, 384, 1024).await;
+            let ids = h.ids();
+            if owned {
+                let mut account = h.store.load(&ids[0]).unwrap();
+                let tokens = h.store.tokens(&account).unwrap();
+                account.source = Source::Oauth;
+                h.store
+                    .save(&account, &tokens, Some(account.generation))
+                    .unwrap();
+            }
+            let writes = c6_4_health_writes(&h);
+            let before = Utc::now();
+            let body = if provider == Provider::Claude {
+                r#"{"type":"error","error":{"type":"authentication_error","message":"OAuth token has been revoked"}}"#
+            } else {
+                r#"{"error":{"code":"token_revoked","message":"invalidated oauth token"}}"#
+            };
+            h.fake
+                .state
+                .push(ScriptedResponse::json(StatusCode::UNAUTHORIZED, body));
+            h.fake.state.push(ok());
+            c6_4_assert_served(h.send_with_session(provider, "revoked").await, &h, &ids[1]).await;
+            let failed = h.store.load(&ids[0]).unwrap();
+            if owned {
+                assert_eq!(failed.source, Source::Oauth);
+                assert!(
+                    matches!(failed.health, Health::NeedsRelogin { since, .. } if since >= before && since <= Utc::now())
+                );
+            } else {
+                assert!(matches!(failed.source, Source::Cpa { .. }));
+                c6_4_assert_cooling(
+                    &failed,
+                    HealthReason::LinkStale,
+                    before + ChronoDuration::minutes(5),
+                    Utc::now() + ChronoDuration::minutes(5),
+                );
+            }
+            let requests = h.fake.state.requests();
+            assert_eq!(requests.len(), 2);
+            assert!(writes.lock().unwrap().iter().any(|(at, a)| a.id == ids[0]
+                && a.health == failed.health
+                && *at < requests[1].received_at));
+            assert_eq!(
+                h.state
+                    .bindings
+                    .current(Some(&format!("{}:revoked", provider.as_str()))),
+                Some(ids[1].clone())
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn c6_4_402_payment_failover_and_relay_when_none() {
+    let h = Harness::new(Provider::Codex, 2, 384, 1024).await;
+    let ids = h.ids();
+    let body = r#"{"error":{"type":"payment_required","message":"synthetic billing rejection"}}"#;
+    let writes = c6_4_health_writes(&h);
+    assert_eq!(h.store.load(&ids[0]).unwrap().payment_failures, 0);
+    // Repeated payment failures retain their persisted backoff across expiry.
+    for (index, hours) in [6, 12, 24, 24].into_iter().enumerate() {
+        h.store
+            .update_metadata(&ids[0], |a| {
+                let expired = Utc::now() - ChronoDuration::seconds(1);
+                if let Health::Cooling { until, .. } = &mut a.health {
+                    *until = expired;
+                }
+                a.payment_until = Some(expired);
+            })
+            .unwrap();
+        h.state
+            .bindings
+            .import(json!({"schema":1,"bindings":[]}))
+            .unwrap();
+        h.fake
+            .state
+            .push(ScriptedResponse::json(StatusCode::PAYMENT_REQUIRED, body));
+        h.fake.state.push(ok());
+        let before = Utc::now();
+        c6_4_assert_served(
+            h.send_with_session(Provider::Codex, "payment").await,
+            &h,
+            &ids[1],
+        )
+        .await;
+        let account = h.store.load(&ids[0]).unwrap();
+        c6_4_assert_cooling(
+            &account,
+            HealthReason::Payment,
+            before + ChronoDuration::hours(hours),
+            Utc::now() + ChronoDuration::hours(hours),
+        );
+        assert_eq!(account.payment_failures, index as u32 + 1);
+        let requests = h.fake.state.requests();
+        assert!(writes.lock().unwrap().iter().any(|(at, a)| a.id == ids[0]
+            && a.health == account.health
+            && *at < requests[index * 2 + 1].received_at));
+        assert_eq!(
+            h.state.bindings.current(Some("codex:payment")),
+            Some(ids[1].clone())
+        );
+    }
+    h.fake
+        .state
+        .push(ScriptedResponse::json(StatusCode::PAYMENT_REQUIRED, body));
+    let before = Utc::now();
+    let response = h.send_with_session(Provider::Codex, "payment").await;
+    assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+    assert_eq!(response.bytes().await.unwrap(), body);
+    c6_4_assert_cooling(
+        &h.store.load(&ids[1]).unwrap(),
+        HealthReason::Payment,
+        before + ChronoDuration::hours(6),
+        Utc::now() + ChronoDuration::hours(6),
+    );
+}
+
+#[tokio::test]
+async fn c6_4_400_billing_error_is_row7_not_row9() {
+    let h = Harness::new(Provider::Claude, 2, 384, 1024).await;
+    let ids = h.ids();
+    for session in ["billing", "untouched"] {
+        c6_4_assert_served(
+            h.send_with_session(Provider::Claude, session).await,
+            &h,
+            &ids[0],
+        )
+        .await;
+    }
+    let writes = c6_4_health_writes(&h);
+    let body = r#"{"type":"error","error":{"type":"billing_error","message":"Credit balance is too low"}}"#;
+    h.fake
+        .state
+        .push(ScriptedResponse::json(StatusCode::BAD_REQUEST, body));
+    h.fake.state.push(ok());
+    let before = Utc::now();
+    c6_4_assert_served(
+        h.send_with_session(Provider::Claude, "billing").await,
+        &h,
+        &ids[1],
+    )
+    .await;
+    let failed = h.store.load(&ids[0]).unwrap();
+    c6_4_assert_cooling(
+        &failed,
+        HealthReason::Payment,
+        before + ChronoDuration::hours(6),
+        Utc::now() + ChronoDuration::hours(6),
+    );
+    assert_eq!(
+        h.state.bindings.current(Some("claude:billing")),
+        Some(ids[1].clone())
+    );
+    assert_eq!(
+        h.state.bindings.current(Some("claude:untouched")),
+        Some(ids[0].clone())
+    );
+    let requests = h.fake.state.requests();
+    assert_eq!(requests.len(), 4);
+    assert!(writes.lock().unwrap().iter().any(|(at, a)| a.id == ids[0]
+        && a.health == failed.health
+        && *at < requests[3].received_at));
+    h.fake
+        .state
+        .push(ScriptedResponse::json(StatusCode::BAD_REQUEST, body));
+    let response = h.send_with_session(Provider::Claude, "billing").await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.bytes().await.unwrap(), body);
+    assert_eq!(h.store.load(&ids[0]).unwrap().health, failed.health);
+}
+
+#[tokio::test]
+async fn c6_4_models_answered_by_eligible_account() {
+    for provider in [Provider::Claude, Provider::Codex] {
+        let h = Harness::new(provider, 2, 384, 1024).await;
+        let ids = h.ids();
+        let reset = Utc::now() + ChronoDuration::hours(1);
+        h.store
+            .update_metadata(&ids[0], |a| {
+                a.health = Health::Cooling {
+                    reason: HealthReason::Quota,
+                    until: reset,
+                    scope: "account".into(),
+                }
+            })
+            .unwrap();
+        h.fake.state.push(ScriptedResponse::json(
+            StatusCode::OK,
+            r#"{"object":"list","data":[{"id":"synthetic-model"}]}"#,
+        ));
+        let mut request = reqwest::Client::new()
+            .get(format!("http://{}/v1/models", h.servers.data_addr))
+            .bearer_auth("synthetic-client");
+        if provider == Provider::Claude {
+            request = request.header("anthropic-version", "2023-06-01");
+        }
+        c6_4_assert_served(request.send().await.unwrap(), &h, &ids[1]).await;
+        assert_eq!(h.fake.state.requests().len(), 1);
+        c6_4_assert_cooling(
+            &h.store.load(&ids[0]).unwrap(),
+            HealthReason::Quota,
+            reset,
+            reset,
+        );
+    }
+}
+
+#[tokio::test]
+async fn c6_4_all_exhausted_genuine_429_no_credit_text() {
+    for provider in [Provider::Claude, Provider::Codex] {
+        let h = Harness::new(provider, 2, 384, 1024).await;
+        let ids = h.ids();
+        let now = Utc::now().timestamp();
+        for seconds in [600, 300] {
+            h.fake.state.push(c6_4_quota(provider, now + seconds));
+        }
+        let expected = quota(now + 300).chunks[0].1.clone();
+        for _ in 0..2 {
+            let response = h.send_with_session(provider, "all-exhausted").await;
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            let retry: i64 = response.headers()["retry-after"]
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!((290..=300).contains(&retry));
+            let body = response.bytes().await.unwrap();
+            assert_eq!(body, expected);
+            let text = String::from_utf8_lossy(&body).to_lowercase();
+            assert!(!text.contains("credit") && !text.contains("billing"));
+        }
+        let requests = h.fake.state.requests();
+        assert_eq!(requests.len(), 2);
+        for (request, id) in requests.iter().zip(&ids) {
+            let account = h.store.load(id).unwrap();
+            assert_eq!(
+                request.headers["authorization"],
+                format!("Bearer {}", h.store.tokens(&account).unwrap().access_token)
+            );
+        }
+        assert_ne!(
+            requests[0].headers["authorization"],
+            requests[1].headers["authorization"]
+        );
+        for (id, seconds) in ids.iter().zip([600, 300]) {
+            let reset = chrono::DateTime::from_timestamp(now + seconds, 0).unwrap();
+            c6_4_assert_cooling(
+                &h.store.load(id).unwrap(),
+                HealthReason::Quota,
+                reset,
+                reset,
+            );
+        }
+    }
 }
 
 #[tokio::test]

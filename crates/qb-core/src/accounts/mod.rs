@@ -231,6 +231,12 @@ pub struct Account {
     pub health: Health,
     #[serde(default)]
     pub auth_failures: u32,
+    /// Repeated billing rejections back off for 6/12/24 hours across restarts.
+    #[serde(default)]
+    pub payment_failures: u32,
+    /// Funding remains blocked even if another health reason temporarily wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payment_until: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default)]
     pub auth_probe_pending: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]

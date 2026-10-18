@@ -1330,6 +1330,8 @@ mod tests {
                 scope: "model:X".into(),
             },
             auth_failures: 0,
+            payment_failures: 0,
+            payment_until: None,
             auth_probe_pending: false,
             quota_cooling: None,
             drain: false,

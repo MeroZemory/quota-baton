@@ -768,24 +768,20 @@ mod runtime_regressions {
 
     #[tokio::test]
     async fn s6_all_cooling_reasons_and_volatile_store_error_use_native_row14() {
-        let f = Fixture::new(&[Provider::Codex], 0.0);
-        // A stale cached limit must not be replayed for a different reason.
-        f.runtime.cache_limit(
-            &f.ids[0],
-            StatusCode::TOO_MANY_REQUESTS,
-            &HeaderMap::new(),
-            b"old cached quota",
-        );
         for reason in [
             HealthReason::LinkStale,
             HealthReason::Permission,
             HealthReason::Payment,
             HealthReason::StoreError,
         ] {
-            f.runtime
-                .transition(&f.ids[0], HealthSignal::Ready)
-                .await
-                .unwrap();
+            let f = Fixture::new(&[Provider::Codex], 0.0);
+            // A stale cached limit must not be replayed for a different reason.
+            f.runtime.cache_limit(
+                &f.ids[0],
+                StatusCode::TOO_MANY_REQUESTS,
+                &HeaderMap::new(),
+                b"old cached quota",
+            );
             f.cool(0, reason, Utc::now() + Duration::minutes(5), "account")
                 .await;
             for ws in [false, true] {
@@ -799,10 +795,7 @@ mod runtime_regressions {
                 assert_eq!(body["error"]["type"], "usage_limit_reached");
             }
         }
-        f.runtime
-            .transition(&f.ids[0], HealthSignal::Ready)
-            .await
-            .unwrap();
+        let f = Fixture::new(&[Provider::Codex], 0.0);
         let mut warning = f.load(0);
         warning.health = Health::Cooling {
             reason: HealthReason::StoreError,
@@ -967,11 +960,6 @@ mod runtime_regressions {
 
     #[tokio::test]
     async fn c5_runtime_reason_transitions_preserve_independent_user_state() {
-        let f = Fixture::new(&[Provider::Codex], 0.0);
-        f.runtime
-            .change(&f.ids[0], Some(UserState::Paused), None, None, None)
-            .await
-            .unwrap();
         for reason in [
             HealthReason::Quota,
             HealthReason::Rate,
@@ -980,13 +968,30 @@ mod runtime_regressions {
             HealthReason::StoreError,
             HealthReason::LinkStale,
         ] {
+            let f = Fixture::new(&[Provider::Codex], 0.0);
             f.runtime
-                .transition(&f.ids[0], HealthSignal::Ready)
+                .change(&f.ids[0], Some(UserState::Paused), None, None, None)
                 .await
                 .unwrap();
             let until = Utc::now() + Duration::hours(1);
             let a = f.cool(0, reason, until, "account").await;
-            assert_cooling(&a, reason, until, "account");
+            if reason == HealthReason::Payment {
+                let Health::Cooling {
+                    reason: actual,
+                    until: deadline,
+                    scope,
+                } = &a.health
+                else {
+                    panic!("payment must cool the account");
+                };
+                assert_eq!(*actual, reason);
+                assert_eq!(scope, "account");
+                assert!(*deadline >= until + Duration::hours(5));
+                assert!(*deadline <= Utc::now() + Duration::hours(6));
+                assert_eq!(a.payment_until, Some(*deadline));
+            } else {
+                assert_cooling(&a, reason, until, "account");
+            }
             assert_eq!(a.user_state, UserState::Paused);
         }
     }
