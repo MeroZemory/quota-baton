@@ -51,7 +51,7 @@ impl Palette {
                 disabled: c(0x727272),
                 divider: c(0x313131),
                 track: c(0x3a3a3a),
-                bars: [c(0x5fa4e6), c(0xe0a84a), c(0xef6f61), c(0x727272)],
+                bars: [c(0x5dbb63), c(0xe0a84a), c(0xef6f61), c(0x727272)],
                 dots: [c(0x6ccb8f), c(0xe0a84a), c(0xef6f61), c(0x8a8a8a)],
                 chips: [
                     (c(0x1d3346), c(0x60cdff)),
@@ -82,7 +82,7 @@ impl Palette {
                 disabled: c(0xa3a3a3),
                 divider: c(0xebebeb),
                 track: c(0xe3e6ea),
-                bars: [c(0x2f6fb0), c(0xb7791f), c(0xc42b1c), c(0xa3a3a3)],
+                bars: [c(0x2e7d32), c(0xb7791f), c(0xc42b1c), c(0xa3a3a3)],
                 dots: [c(0x2c7a4b), c(0xb7791f), c(0xc42b1c), c(0x8a8f95)],
                 chips: [
                     (c(0xe8f1fb), c(0x005fb8)),
@@ -131,6 +131,8 @@ mod tests {
         let dark = Palette::new(true);
         assert_eq!(light.surface, Rgb::hex(0xffffff));
         assert_eq!(dark.surface, Rgb::hex(0x202020));
+        assert_eq!(light.bars[0], Rgb::hex(0x2e7d32));
+        assert_eq!(dark.bars[0], Rgb::hex(0x5dbb63));
         for p in [light, dark] {
             assert_eq!(p.chip(Tone::Use).1, p.accent);
             assert_eq!(p.chip(Tone::Warn).1, p.warning);
