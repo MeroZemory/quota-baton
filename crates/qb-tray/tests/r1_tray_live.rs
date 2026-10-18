@@ -815,7 +815,7 @@ fn r1_live_account_events_immediately_refresh_authoritative_shell_state() -> Res
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut live = Live::start("events")?;
     for (action, expected, badge) in [
-        ("pause", "paused", "attention"),
+        ("pause", "paused", "normal"),
         ("resume", "active", "normal"),
     ] {
         let before = live.trace()?.context("initial shell snapshot missing")?;
@@ -852,7 +852,7 @@ fn r1_live_account_events_immediately_refresh_authoritative_shell_state() -> Res
         &format!("/admin/v1/accounts/{}/disable", live.account),
     )?;
     live.wait(IMMEDIATE, "disabled account snapshot missing", |t| {
-        t.sequence > before.sequence && t.event == "paint" && t.badge == "attention"
+        t.sequence > before.sequence && t.event == "paint" && t.badge == "normal"
     })?;
     // Open-lifetime membership stays frozen after disable. Reopen before
     // testing the new disabled section; blocked/off providers auto-expand it.
