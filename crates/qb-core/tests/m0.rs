@@ -388,3 +388,124 @@ fn log_default_info_and_explicit_environment_levels() {
         }
     }
 }
+
+#[tokio::test]
+async fn r1_n5_jwt_hint_is_data_bearer_only_and_never_echoes_credentials() {
+    let mut config = Config::default();
+    config.server.data_port = 0;
+    config.server.admin_port = 0;
+    let servers = http::spawn(&config, secrets()).await.unwrap();
+    let client = client();
+    let jwt = "eyJsynthetic-header.synthetic-payload.synthetic-signature";
+    let hint = "ChatGPT 토큰이 아니라 quota-baton 클라이언트 키를 써야 합니다";
+    // admin, path, Authorization, x-api-key, duplicate Authorization, hint, status
+    for (admin, path, bearer, api_key, duplicate, hinted, status) in [
+        (false, "/v1/messages", Some(jwt), None, false, true, 401),
+        (
+            false,
+            "/v1/messages/count_tokens",
+            Some(jwt),
+            None,
+            false,
+            true,
+            401,
+        ),
+        (false, "/v1/responses", Some(jwt), None, false, true, 401),
+        (true, "/admin/v1/health", Some(jwt), None, false, false, 401),
+        (
+            false,
+            "/v1/responses",
+            Some("fake-invalid-key"),
+            None,
+            false,
+            false,
+            401,
+        ),
+        (false, "/v1/responses", None, None, false, false, 401),
+        (false, "/v1/responses", None, Some(jwt), false, false, 401),
+        (
+            false,
+            "/v1/responses",
+            Some("fake-admin-token"),
+            None,
+            false,
+            false,
+            401,
+        ),
+        (
+            true,
+            "/admin/v1/health",
+            Some("fake-client-key"),
+            None,
+            false,
+            false,
+            401,
+        ),
+        (false, "/v1/responses", Some(jwt), None, true, false, 401),
+        (
+            false,
+            "/v1/responses",
+            Some(jwt),
+            Some("fake-client-key"),
+            false,
+            false,
+            404,
+        ),
+        (
+            false,
+            "/v1/responses",
+            Some(jwt),
+            Some("fake-admin-token"),
+            false,
+            true,
+            401,
+        ),
+    ] {
+        let addr = if admin {
+            servers.admin_addr
+        } else {
+            servers.data_addr
+        };
+        let mut request = client.get(format!("http://{addr}{path}"));
+        if let Some(bearer) = bearer {
+            request = request.bearer_auth(bearer);
+        }
+        if duplicate {
+            request = request.header("authorization", "Bearer fake-invalid-key");
+        }
+        if let Some(api_key) = api_key {
+            request = request.header("x-api-key", api_key);
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status().as_u16(), status);
+        let body = response.text().await.unwrap();
+        for credential in [
+            jwt,
+            "fake-invalid-key",
+            "fake-client-key",
+            "fake-admin-token",
+        ] {
+            assert!(
+                !body.contains(credential),
+                "response echoed a synthetic credential"
+            );
+        }
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        if status == 401 {
+            assert_eq!(body["error"]["type"], "authentication_error");
+            assert_eq!(
+                body["error"]["message"],
+                if hinted {
+                    hint
+                } else {
+                    "Invalid local credential"
+                }
+            );
+            if path.starts_with("/v1/messages") {
+                assert_eq!(body["type"], "error");
+            }
+        } else {
+            assert_eq!(body["error"]["message"], "Route not found");
+        }
+    }
+}

@@ -280,10 +280,15 @@ async fn safety(
         .flatten()
         .any(|key| equal(key, &state.key));
     if wrong_port || !authorized {
+        let message = if !state.admin && bearer.is_some_and(|token| token.starts_with("eyJ")) {
+            "ChatGPT 토큰이 아니라 quota-baton 클라이언트 키를 써야 합니다"
+        } else {
+            "Invalid local credential"
+        };
         return error(
             StatusCode::UNAUTHORIZED,
             "authentication_error",
-            "Invalid local credential",
+            message,
             request.uri().path(),
         );
     }

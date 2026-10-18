@@ -189,6 +189,10 @@ async fn upgrade_inner(
     let mut tried = std::collections::BTreeSet::new();
     let mut forbidden = 0;
     let mut last_error = None;
+    // One pacing deadline for the entire upgrade, including retries and
+    // account selection. C7 reset-hold and token/network budgets stay separate.
+    let upgrade_started = std::time::Instant::now();
+    let upgrade_deadline = upgrade_started + Duration::from_secs(state.ws_upgrade_hold_secs);
     let (upstream, upstream_headers, account, tokens) = 'accounts: loop {
         if tried.len() == 4 {
             return match last_error {
@@ -237,14 +241,16 @@ async fn upgrade_inner(
         let mut network_retry = false;
         let mut token_retry = false;
         let mut rate_retries = 0_u32;
-        let upgrade_started = std::time::Instant::now();
         loop {
-            let _admission = tokio::time::timeout(
-                Duration::from_secs(state.ws_upgrade_hold_secs),
-                state.accounts.admit(&account.id),
-            )
-            .await
-            .ok();
+            let admission_started = std::time::Instant::now();
+            let admission = state
+                .accounts
+                .admit_until(&account.id, upgrade_deadline)
+                .await;
+            completion.rate_wait(
+                u64::try_from(admission_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            );
+            let forced = admission.forced();
             let mut forwarded =
                 match headers::upstream(&parts.headers, &account, &tokens.access_token) {
                     Ok(headers) => headers,
@@ -260,6 +266,7 @@ async fn upgrade_inner(
             );
             completion.record.account = Some(account.id.clone());
             completion.attempt(&account.id);
+            let sent_at = std::time::Instant::now();
             let result = tokio::time::timeout(
                 Duration::from_secs(300),
                 state.client.get(&url).headers(forwarded).send(),
@@ -357,15 +364,18 @@ async fn upgrade_inner(
                 decision.signal = None;
             }
             if decision.kind == super::outcome::Kind::Rate {
-                let retry_after = error
-                    .headers
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .map(|s| Duration::from_secs(s.min(60)));
-                state.accounts.observe_429(&account.id, retry_after);
+                let retry_after = super::outcome::header_seconds(&error.headers, "retry-after")
+                    .map(|seconds| Duration::from_secs((seconds as u64).min(60)));
+                state.accounts.observe_429_at(
+                    &account.id,
+                    sent_at,
+                    std::time::Instant::now(),
+                    retry_after,
+                    1.0,
+                );
                 if rate_retries < state.rate_hold_max_retries
-                    && upgrade_started.elapsed() < Duration::from_secs(state.ws_upgrade_hold_secs)
+                    && !forced
+                    && std::time::Instant::now() < upgrade_deadline
                 {
                     rate_retries += 1;
                     completion.rate_retry();
