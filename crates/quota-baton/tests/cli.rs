@@ -786,6 +786,17 @@ async fn offline_online_import_and_admin_refusal() {
             assert!(!state.to_string().contains(forbidden));
         }
     }
+    let mut status_command = command(&home);
+    status_command.arg("status");
+    let output = tokio::task::spawn_blocking(move || status_command.bounded_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("코어: 실행 중"));
+    assert!(text.contains("CPA는 계속 실행되어야 합니다 (연결 계정 1개의 토큰 갱신)"));
+    assert!(!text.contains("fake-access-"));
     let chunk = tokio::time::timeout(Duration::from_secs(2), events.chunk())
         .await
         .unwrap()
@@ -946,6 +957,7 @@ fn offline_status_and_actions_use_synthetic_metadata_and_quota() {
     let status = String::from_utf8(output.stdout).unwrap();
     for expected in [
         "중지됨",
+        "CPA는 계속 실행되어야 합니다 (연결 계정 1개의 토큰 갱신)",
         "대기 중",
         "할당량 소진",
         "합성 계정",
@@ -979,7 +991,12 @@ fn offline_status_and_actions_use_synthetic_metadata_and_quota() {
     let output = command(home.path()).arg("status").bounded_output().unwrap();
     assert!(output.status.success());
     let status = String::from_utf8(output.stdout).unwrap();
-    let columns: Vec<_> = status.lines().nth(4).unwrap().split('\t').collect();
+    let columns: Vec<_> = status
+        .lines()
+        .find(|line| line.starts_with(&format!("{id}\t")))
+        .unwrap()
+        .split('\t')
+        .collect();
     assert_eq!(columns[5], "리셋됨");
     assert_eq!(columns[7], "리셋됨");
     assert!(!status.contains("100.0%"));
@@ -1019,7 +1036,12 @@ fn offline_status_and_actions_use_synthetic_metadata_and_quota() {
         let output = command(home.path()).arg("status").bounded_output().unwrap();
         assert!(output.status.success());
         let status = String::from_utf8(output.stdout).unwrap();
-        let columns: Vec<_> = status.lines().nth(4).unwrap().split('\t').collect();
+        let columns: Vec<_> = status
+            .lines()
+            .find(|line| line.starts_with(&format!("{id}\t")))
+            .unwrap()
+            .split('\t')
+            .collect();
         assert_eq!(columns[4], expected);
     }
     let store = qb_core::accounts::AccountStore::acquire(home.path()).unwrap();

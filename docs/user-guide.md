@@ -157,6 +157,8 @@ quota-baton.exe wire
 quota-baton.exe wire --apply
 ```
 
+활성 연결 계정이 남아 있으면 CPA가 토큰을 갱신해야 합니다. 연결 결과와 `status`에 필요한 계정 수가 표시됩니다. 이때 `wire --disable-cpa-tasks`는 거절됩니다. 계정을 직접 갱신으로 이전하거나 직접 로그인으로 전환한 뒤 다시 확인하세요.
+
 전환은 다음 항목을 바꿉니다.
 
 - Codex 기본 홈의 `openai_base_url`을 quota-baton으로 바꿉니다.

@@ -132,6 +132,9 @@ async fn main() {
 }
 
 fn friendly_error(error: &anyhow::Error) -> String {
+    if error.to_string() == cutover::CPA_DEPENDENCY_REFUSAL {
+        return cutover::CPA_DEPENDENCY_REFUSAL.into();
+    }
     if error.to_string().contains("로그인 시간이 만료되었습니다") {
         return "로그인 시간이 만료되었습니다. 다시 시작해 주세요.".into();
     }
@@ -214,7 +217,7 @@ async fn check_wire_preconditions(
     home: &std::path::Path,
     options: &cutover::WireOptions,
 ) -> anyhow::Result<()> {
-    cutover::check_optional_preconditions(options)
+    cutover::check_optional_preconditions(home, options)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let config = qb_core::config::Config::load(home)?;
     let secrets = qb_core::local_secrets::load_existing(home).map_err(|_| {
@@ -575,4 +578,21 @@ async fn run() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod r1_cpa_error_tests {
+    #[test]
+    fn r1_cpa_refusal_survives_cli_error_sanitization() {
+        let error = anyhow::anyhow!(crate::cutover::CPA_DEPENDENCY_REFUSAL);
+        assert_eq!(
+            super::friendly_error(&error),
+            crate::cutover::CPA_DEPENDENCY_REFUSAL
+        );
+        let untrusted = anyhow::anyhow!(
+            "{} synthetic-private-detail",
+            crate::cutover::CPA_DEPENDENCY_REFUSAL
+        );
+        assert!(!super::friendly_error(&untrusted).contains("synthetic-private-detail"));
+    }
 }

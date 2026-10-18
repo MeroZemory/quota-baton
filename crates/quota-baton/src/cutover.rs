@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
+use qb_core::accounts::{AccountStore, ImportMode, Source, UserState};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -907,11 +908,11 @@ fn parse_task_enabled(output: &str) -> Option<bool> {
     }
 }
 
-fn cpa_task_journal() -> Result<Vec<TaskJournal>> {
+fn cpa_task_journal(task_query: &dyn Fn(&str) -> Option<bool>) -> Result<Vec<TaskJournal>> {
     ["cliproxyapi-proxy", "cliproxyapi-quota-watch"]
         .into_iter()
         .map(|name| {
-            let was_enabled = task_enabled(name)
+            let was_enabled = task_query(name)
                 .with_context(|| format!("CPA 예약 작업 상태를 확인할 수 없습니다: {name}"))?;
             Ok(TaskJournal {
                 name: name.into(),
@@ -997,7 +998,52 @@ fn changed_file_list(paths: &CutoverPaths, journal: &Journal) -> Vec<String> {
     changed
 }
 
-pub fn check_optional_preconditions(options: &WireOptions) -> Result<()> {
+pub(crate) const CPA_DEPENDENCY_REFUSAL: &str = "CPA가 연결 계정의 토큰을 갱신하고 있어 CPA 작업을 끌 수 없습니다. 먼저 계정을 직접 로그인으로 전환하세요.";
+
+fn active_linked_count(home: &Path) -> Result<usize> {
+    Ok(AccountStore::list_metadata(home)?
+        .iter()
+        .filter(|account| {
+            account.user_state == UserState::Active
+                && matches!(
+                    account.source,
+                    Source::Cpa {
+                        mode: ImportMode::Linked,
+                        ..
+                    }
+                )
+        })
+        .count())
+}
+
+fn dependency_note(count: usize) -> Option<String> {
+    (count > 0).then(|| format!("CPA는 계속 실행되어야 합니다 (연결 계정 {count}개의 토큰 갱신)"))
+}
+
+pub(crate) fn cpa_dependency_note(home: &Path) -> Result<Option<String>> {
+    Ok(dependency_note(active_linked_count(home)?))
+}
+
+fn check_cpa_dependency(count: usize, options: &WireOptions) -> Result<()> {
+    if options.disable_cpa_tasks && count > 0 {
+        bail!(CPA_DEPENDENCY_REFUSAL);
+    }
+    Ok(())
+}
+
+pub fn check_optional_preconditions(home: &Path, options: &WireOptions) -> Result<()> {
+    check_optional_preconditions_with_task_query(home, options, &task_enabled)
+}
+
+fn check_optional_preconditions_with_task_query(
+    home: &Path,
+    options: &WireOptions,
+    task_query: &dyn Fn(&str) -> Option<bool>,
+) -> Result<()> {
+    // Guard before registry checks and every scheduled-task backend read.
+    if options.disable_cpa_tasks {
+        check_cpa_dependency(active_linked_count(home)?, options)?;
+    }
     if options.autostart {
         let _ = read_autostart()?;
         let key = open_run_key(KEY_SET_VALUE)?;
@@ -1007,7 +1053,7 @@ pub fn check_optional_preconditions(options: &WireOptions) -> Result<()> {
     }
     if options.disable_cpa_tasks {
         for name in ["cliproxyapi-proxy", "cliproxyapi-quota-watch"] {
-            task_enabled(name)
+            task_query(name)
                 .with_context(|| format!("CPA 예약 작업 상태를 확인할 수 없습니다: {name}"))?;
         }
     }
@@ -1024,6 +1070,17 @@ pub fn wire_with_options(
     apply: bool,
     options: WireOptions,
 ) -> Result<Report> {
+    wire_with_task_query(paths, apply, options, &task_enabled)
+}
+
+fn wire_with_task_query(
+    paths: &CutoverPaths,
+    apply: bool,
+    options: WireOptions,
+    task_query: &dyn Fn(&str) -> Option<bool>,
+) -> Result<Report> {
+    let linked_active = active_linked_count(&paths.qb_home)?;
+    check_cpa_dependency(linked_active, &options)?;
     if paths.journal().exists() {
         bail!("이미 연결 journal이 있습니다. 먼저 `quota-baton unwire --apply`를 실행하세요")
     }
@@ -1104,7 +1161,7 @@ pub fn wire_with_options(
         None
     };
     let cpa_tasks = if options.disable_cpa_tasks {
-        cpa_task_journal()?
+        cpa_task_journal(task_query)?
     } else {
         Vec::new()
     };
@@ -1209,7 +1266,7 @@ pub fn wire_with_options(
         .collect::<Vec<_>>();
     if options.disable_cpa_tasks {
         for name in ["cliproxyapi-proxy", "cliproxyapi-quota-watch"] {
-            if task_enabled(name).is_none() {
+            if task_query(name).is_none() {
                 warnings.push(format!("CPA 예약 작업 상태를 확인할 수 없습니다: {name}"));
             }
         }
@@ -1330,7 +1387,10 @@ pub fn wire_with_options(
                     "없음"
                 }
             ),
-        ],
+        ]
+        .into_iter()
+        .chain(dependency_note(linked_active))
+        .collect(),
         changed,
         warnings,
         diff: unified_diff(
@@ -1437,7 +1497,7 @@ pub fn wire_with_options(
             );
         }
         for task in &mut journal.cpa_tasks {
-            if let Some(enabled) = task_enabled(&task.name) {
+            if let Some(enabled) = task_query(&task.name) {
                 task.after_enabled = enabled;
             }
         }
@@ -2830,5 +2890,244 @@ mod tests {
             .join("../../../quota-baton/.sandbox/reports/M8.2-synthetic-dry-run.txt");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, output).unwrap();
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod cpa_dependency_tests {
+    use super::*;
+    use serde_json::json;
+    use std::cell::Cell;
+
+    pub(crate) fn scratch() -> tempfile::TempDir {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r1-cpa-tests");
+        fs::create_dir_all(&root).unwrap();
+        tempfile::tempdir_in(root).unwrap()
+    }
+
+    // Deliberately invalid DPAPI payload: these paths must only read metadata.
+    // This is a new synthetic record, never a mutation of a leased real store.
+    pub(crate) fn account(
+        home: &Path,
+        label: &str,
+        mode: &str,
+        state: &str,
+        health: Value,
+    ) -> PathBuf {
+        let identity = qb_core::accounts::Identity::Codex {
+            account_id: format!("synthetic-{label}"),
+            email: format!("{label}@example.invalid"),
+            user_id: None,
+        };
+        let source = if mode == "owned" {
+            json!({"kind":"oauth"})
+        } else {
+            json!({"kind":"cpa", "mode":mode, "dir":home.join("nonexistent-cpa"),
+                "match":{"account_id":format!("synthetic-{label}"), "email":format!("{label}@example.invalid")}})
+        };
+        fs::create_dir_all(home.join("accounts")).unwrap();
+        let path = home
+            .join("accounts")
+            .join(format!("{}.json", identity.id()));
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "schema":1, "id":identity.id(), "provider":"codex", "label":label,
+                "email":format!("{label}@example.invalid"), "plan":null, "identity":identity,
+                "source":source, "user_state":state, "health":health, "generation":1,
+                "token_meta":{"expires_at":null,"last_refresh_at":null,"refresh_uncertain":false},
+                "secret_dpapi_b64":"intentionally-not-dpapi"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        path
+    }
+
+    fn disable_options() -> WireOptions {
+        WireOptions {
+            disable_cpa_tasks: true,
+            ..WireOptions::default()
+        }
+    }
+
+    #[test]
+    fn r1_cpa_active_linked_refuses_dry_run_and_apply_before_task_backend() {
+        for apply in [false, true] {
+            for health in [
+                json!({"kind":"ready"}),
+                json!({"kind":"cooling","reason":"auth","until":"2099-01-01T00:00:00Z","scope":"account"}),
+                json!({"kind":"needs_relogin","reason":"synthetic","since":"2026-01-01T00:00:00Z"}),
+            ] {
+                let (_dir, p) = paths();
+                let record = account(&p.qb_home, "linked", "linked", "active", health);
+                let before = fs::read(&record).unwrap();
+                let config_before = fs::read(&p.codex_config).unwrap();
+                // No client key: refusal must also precede apply credential reads.
+                let error = wire_with_task_query(&p, apply, disable_options(), &|_| {
+                    panic!("task query before dependency refusal")
+                })
+                .unwrap_err();
+                assert_eq!(error.to_string(), CPA_DEPENDENCY_REFUSAL);
+                assert_eq!(fs::read(&record).unwrap(), before);
+                assert_eq!(fs::read(&p.codex_config).unwrap(), config_before);
+                assert!(!p.journal().exists());
+                assert!(!p.client_key.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn r1_cpa_apply_precheck_refuses_before_optional_backends() {
+        let dir = scratch();
+        account(
+            dir.path(),
+            "linked",
+            "linked",
+            "active",
+            json!({"kind":"ready"}),
+        );
+        let mut options = disable_options();
+        options.autostart = true;
+        let error = check_optional_preconditions_with_task_query(dir.path(), &options, &|_| {
+            panic!("task query before precheck refusal")
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), CPA_DEPENDENCY_REFUSAL);
+    }
+
+    #[test]
+    fn r1_cpa_disabled_paused_owned_and_adopted_allow_dry_run_and_apply() {
+        for apply in [false, true] {
+            for (mode, state) in [
+                ("linked", "disabled"),
+                ("linked", "paused"),
+                ("owned", "active"),
+                ("adopted", "active"),
+            ] {
+                let (_dir, p) = paths();
+                let record = account(&p.qb_home, "allowed", mode, state, json!({"kind":"ready"}));
+                let before = fs::read(&record).unwrap();
+                fs::write(&p.client_key, "synthetic-client-key\n").unwrap();
+                let queries = Cell::new(0);
+                let query = |_: &str| {
+                    queries.set(queries.get() + 1);
+                    Some(false)
+                };
+                check_optional_preconditions_with_task_query(
+                    &p.qb_home,
+                    &disable_options(),
+                    &query,
+                )
+                .unwrap();
+                // Tasks are already disabled: no real /Change backend can run.
+                let report = wire_with_task_query(&p, apply, disable_options(), &query).unwrap();
+                assert!(queries.get() >= 4);
+                assert!(
+                    !report
+                        .summary
+                        .iter()
+                        .any(|line| line.contains("CPA는 계속 실행되어야"))
+                );
+                assert_eq!(fs::read(&record).unwrap(), before);
+                assert_eq!(p.journal().exists(), apply);
+            }
+        }
+    }
+
+    #[test]
+    fn r1_cpa_summary_counts_only_active_linked_metadata_with_lease_held() {
+        let (_dir, p) = paths();
+        for (label, mode, state) in [
+            ("one", "linked", "active"),
+            ("two", "linked", "active"),
+            ("paused", "linked", "paused"),
+            ("disabled", "linked", "disabled"),
+            ("owned", "owned", "active"),
+            ("adopted", "adopted", "active"),
+        ] {
+            account(&p.qb_home, label, mode, state, json!({"kind":"ready"}));
+        }
+        let _lease = AccountStore::acquire(&p.qb_home).unwrap();
+        let report = wire_with_task_query(&p, false, WireOptions::default(), &|_| {
+            panic!("flagless wire queried tasks")
+        })
+        .unwrap();
+        assert_eq!(
+            report
+                .summary
+                .iter()
+                .filter(|line| line.as_str()
+                    == "CPA는 계속 실행되어야 합니다 (연결 계정 2개의 토큰 갱신)")
+                .count(),
+            1
+        );
+        assert!(!p.client_key.exists());
+        assert!(!p.journal().exists());
+    }
+
+    #[test]
+    fn r1_cpa_invalid_metadata_fails_closed_before_task_query() {
+        let (_dir, p) = paths();
+        let record = account(
+            &p.qb_home,
+            "broken",
+            "linked",
+            "active",
+            json!({"kind":"ready"}),
+        );
+        fs::write(record, b"not json").unwrap();
+        for apply in [false, true] {
+            assert!(
+                wire_with_task_query(&p, apply, disable_options(), &|_| panic!(
+                    "task query after unreadable metadata"
+                ))
+                .is_err()
+            );
+        }
+        assert!(
+            check_optional_preconditions_with_task_query(
+                &p.qb_home,
+                &disable_options(),
+                &|_| panic!("task query after unreadable metadata")
+            )
+            .is_err()
+        );
+    }
+    fn paths() -> (tempfile::TempDir, CutoverPaths) {
+        let dir = scratch();
+        let codex = dir.path().join("codex.toml");
+        let auth = dir.path().join("auth.json");
+        let claude = dir.path().join("settings.json");
+        fs::write(&codex, "openai_base_url = 'old-url'\nkeep = 'yes'\n").unwrap();
+        fs::write(
+            &auth,
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":"old-key"}"#,
+        )
+        .unwrap();
+        fs::write(
+            &claude,
+            r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"old-key"},"keep":true}"#,
+        )
+        .unwrap();
+        let qb_home = dir.path().join("qb");
+        let client_key = dir.path().join("key");
+        (
+            dir,
+            CutoverPaths {
+                qb_home,
+                codex_auth: auth,
+                codex_session_auth: Vec::new(),
+                codex_session_homes: Vec::new(),
+                session_homes_file: None,
+                session_homes_warning: None,
+                codex_config: codex,
+                codex_realtime_items: Vec::new(),
+                claude_settings: claude,
+                client_key,
+                report_roots: Vec::new(),
+                scan_roots: Vec::new(),
+            },
+        )
     }
 }
