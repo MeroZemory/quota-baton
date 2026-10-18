@@ -45,8 +45,6 @@ pub enum StoreError {
     OlderToken,
     #[error("account store synchronization failed")]
     Synchronization,
-    #[error("adopt is a cutover step (M8)")]
-    AdoptUnavailable,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -220,6 +218,11 @@ impl AccountStore {
         self.load_unlocked(id)
     }
 
+    // Caller holds transaction(); adoption validates before any expiry mutation.
+    pub(crate) fn read_account_unlocked(&self, id: &str) -> Result<Account, StoreError> {
+        Ok(self.read(id)?.account)
+    }
+
     fn load_unlocked(&self, id: &str) -> Result<Account, StoreError> {
         let mut record = self.read(id)?;
         if !self.writes_stopped() && record.account.expire_health(chrono::Utc::now()) {
@@ -368,9 +371,25 @@ impl AccountStore {
             return Err(StoreError::InvalidData);
         }
         let mut updated = account.clone();
-        if old
-            .as_ref()
-            .is_some_and(|old| account.token_meta.newer_than(&old.account.token_meta))
+        let adopting = old.as_ref().is_some_and(|old| {
+            matches!(
+                &old.account.source,
+                super::Source::Cpa {
+                    mode: super::ImportMode::Linked,
+                    ..
+                }
+            )
+        }) && matches!(
+            &account.source,
+            super::Source::Cpa {
+                mode: super::ImportMode::Adopted,
+                ..
+            }
+        );
+        if !adopting
+            && old
+                .as_ref()
+                .is_some_and(|old| account.token_meta.newer_than(&old.account.token_meta))
         {
             updated.apply_health_signal(super::HealthSignal::NewerLinkedToken, chrono::Utc::now());
         }
