@@ -464,8 +464,14 @@ fn claude_home(paths: &CutoverPaths) -> Result<PathBuf> {
         .join(".claude-qb"))
 }
 fn claude_launcher(command: &Path) -> Result<Vec<u8>> {
+    claude_launcher_with_helper(command, &std::env::current_exe()?)
+}
+fn claude_launcher_with_helper(command: &Path, helper: &Path) -> Result<Vec<u8>> {
     if !safe_command_path(command) {
         bail!("PATH에서 안전한 Claude 실행 파일을 찾지 못했습니다. Claude 설치를 확인하세요");
+    }
+    if !safe_command_path(helper) {
+        bail!("quota-baton 실행 파일 경로를 확인해 주세요");
     }
     Ok(format!(
         concat!(
@@ -479,12 +485,12 @@ fn claude_launcher(command: &Path) -> Result<Vec<u8>> {
             "setlocal EnableDelayedExpansion\r\n",
             "title claude-qb · !QB_LAUNCHER_FOLDER!\r\n",
             "endlocal\r\n",
-            "\"%SystemRoot%\\System32\\cmd.exe\" /d /v:off /s /c ^\"\"{}\" --settings \"%USERPROFILE%\\.claude-qb\\settings.json\" %*^\"\r\n",
+            "\"%SystemRoot%\\System32\\cmd.exe\" /d /v:off /s /c ^\"\"{}\" launch-client --command \"{}\" --settings \"%USERPROFILE%\\.claude-qb\\settings.json\" -- %*^\"\r\n",
             "set \"QB_EXIT=%errorlevel%\"\r\n",
             "chcp %QB_CODEPAGE% >nul\r\n",
             "endlocal & exit /b %QB_EXIT%\r\n",
         ),
-        command.display()
+        helper.display(),command.display()
     )
     .into_bytes())
 }
@@ -2836,7 +2842,8 @@ mod tests {
             );
         }
         assert!(codex.contains("set \"CODEX_HOME=%USERPROFILE%\\.codex-acct\\qb\"\r\n"));
-        assert!(claude.contains("--settings \"%USERPROFILE%\\.claude-qb\\settings.json\" %*"));
+        assert!(claude.contains("launch-client --command"));
+        assert!(claude.contains("--settings \"%USERPROFILE%\\.claude-qb\\settings.json\" -- %*"));
         // Opt-in coordinator fixture: exercise the actual generated payloads in
         // separate hidden consoles, without adding a product capture command.
         if let Some(out) = std::env::var_os("QB_R32_NATIVE_OUT") {
@@ -2852,13 +2859,20 @@ mod tests {
             fs::write(out.join("codex-qb.cmd"), launcher()).unwrap();
             fs::write(
                 out.join("claude-qb.cmd"),
-                claude_launcher(&out.join("fake-claude.cmd")).unwrap(),
+                claude_launcher_with_helper(
+                    &out.join("fake-claude.cmd"),
+                    &project.join("target/debug/quota-baton.exe"),
+                )
+                .unwrap(),
             )
             .unwrap();
             fs::write(
                 out.join("claude-qb-exe.cmd"),
-                claude_launcher(&project.join("target").join("debug").join("r32-capture.exe"))
-                    .unwrap(),
+                claude_launcher_with_helper(
+                    &project.join("target").join("debug").join("r32-capture.exe"),
+                    &project.join("target/debug/quota-baton.exe"),
+                )
+                .unwrap(),
             )
             .unwrap();
         }
