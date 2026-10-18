@@ -612,100 +612,115 @@ async fn r6_busy_takeover_gate_never_serves_source_cache_before_rotation_or_fres
         release: Notify,
         posts: AtomicUsize,
     }
-    for supersede in [false, true] {
-        let f = EngineFixture::new();
-        let endpoint = Arc::new(HeldToken {
-            entered: Notify::new(),
-            release: Notify::new(),
-            posts: AtomicUsize::new(0),
-        });
-        let app = axum::Router::new()
-            .route(
-                "/token",
-                axum::routing::post(
-                    |axum::extract::State(held): axum::extract::State<Arc<HeldToken>>| async move {
-                        held.posts.fetch_add(1, Ordering::SeqCst);
-                        held.entered.notify_one();
-                        held.release.notified().await;
-                        axum::Json(
-                            serde_json::json!({"access_token":"synthetic-rotated-access",
-                    "refresh_token":"synthetic-rotated-family","expires_in":3600}),
-                        )
-                    },
-                ),
-            )
-            .with_state(endpoint.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        assert!(!matches!(addr.port(), 10100 | 10101));
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        let gates = f
-            .gates
-            .clone()
-            .with_token_endpoint(Provider::Claude, format!("http://{addr}/token"));
-        let request = f.inspected().await;
-        let (g, s, o, d) = (
-            gates.clone(),
-            f.store.clone(),
-            f.obs.clone(),
-            f.deps.clone(),
-        );
-        let commit = tokio::spawn(async move { g.takeover(s, o, request, d).await });
-        tokio::time::timeout(Duration::from_secs(3), endpoint.entered.notified())
-            .await
-            .unwrap();
-        let mut account = f.store.list().unwrap().remove(0);
-        assert_eq!(
-            f.store
-                .takeover_receipt(&account.id)
-                .unwrap()
-                .unwrap()
-                .state,
-            ReceiptState::Started
-        );
-        assert!(!gates.ahead_access.lock().unwrap().contains_key(&account.id));
-        let waiting = gates.before_request(f.store.clone(), f.obs.clone(), account.id.clone());
-        tokio::pin!(waiting);
-        assert!(futures_util::poll!(waiting.as_mut()).is_pending());
-        if supersede {
-            account.source = Source::Oauth;
-            account.token_meta.refresh_uncertain = false;
-            let fresh = Tokens {
-                access_token: "synthetic-fresh-access".into(),
-                refresh_token: "synthetic-fresh-family".into(),
-                id_token: None,
-            };
-            crate::accounts::login::save(&f.store, &account, &fresh, false).unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        for supersede in [false, true] {
+            let f = EngineFixture::new();
+            let endpoint = Arc::new(HeldToken {
+                entered: Notify::new(),
+                release: Notify::new(),
+                posts: AtomicUsize::new(0),
+            });
+            let app = axum::Router::new()
+                .route(
+                    "/token",
+                    axum::routing::post(
+                        |axum::extract::State(held): axum::extract::State<Arc<HeldToken>>| async move {
+                            held.posts.fetch_add(1, Ordering::SeqCst);
+                            held.entered.notify_one();
+                            held.release.notified().await;
+                            axum::Json(
+                                serde_json::json!({"access_token":"synthetic-rotated-access",
+                        "refresh_token":"synthetic-rotated-family","expires_in":3600}),
+                            )
+                        },
+                    ),
+                )
+                .with_state(endpoint.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            assert!(!matches!(addr.port(), 10100 | 10101));
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let gates = f
+                .gates
+                .clone()
+                .with_token_endpoint(Provider::Claude, format!("http://{addr}/token"));
+            let request = f.inspected().await;
+            let (g, s, o, d) = (
+                gates.clone(),
+                f.store.clone(),
+                f.obs.clone(),
+                f.deps.clone(),
+            );
+            let mut commit = tokio::spawn(async move { g.takeover(s, o, request, d).await });
+            tokio::select! {
+                _ = endpoint.entered.notified() => {},
+                result = &mut commit => match result {
+                    Ok(Err(error)) => panic!(
+                        "takeover failed before held token endpoint entry (supersede={supersede}): {error:?}"
+                    ),
+                    Ok(Ok(_)) => panic!(
+                        "takeover completed before held token endpoint entry (supersede={supersede})"
+                    ),
+                    Err(error) => panic!(
+                        "takeover task failed before held token endpoint entry (supersede={supersede}): {error}"
+                    ),
+                },
+            }
+            let mut account = f.store.list().unwrap().remove(0);
+            assert_eq!(
+                f.store
+                    .takeover_receipt(&account.id)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                ReceiptState::Started
+            );
+            assert!(!gates.ahead_access.lock().unwrap().contains_key(&account.id));
+            let waiting = gates.before_request(f.store.clone(), f.obs.clone(), account.id.clone());
+            tokio::pin!(waiting);
             assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+            if supersede {
+                account.source = Source::Oauth;
+                account.token_meta.refresh_uncertain = false;
+                let fresh = Tokens {
+                    access_token: "synthetic-fresh-access".into(),
+                    refresh_token: "synthetic-fresh-family".into(),
+                    id_token: None,
+                };
+                crate::accounts::login::save(&f.store, &account, &fresh, false).unwrap();
+                assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+            }
+            endpoint.release.notify_one();
+            assert_eq!(commit.await.unwrap().unwrap()["refresh"]["ok"], !supersede);
+            let (served, tokens) = tokio::time::timeout(Duration::from_secs(3), waiting)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                tokens.access_token,
+                if supersede {
+                    "synthetic-fresh-access"
+                } else {
+                    "synthetic-rotated-access"
+                }
+            );
+            assert_eq!(
+                tokens.refresh_token,
+                if supersede {
+                    "synthetic-fresh-family"
+                } else {
+                    "synthetic-rotated-family"
+                }
+            );
+            assert!(!f.store.takeover_fenced(&served.id).unwrap());
+            assert_eq!(endpoint.posts.load(Ordering::SeqCst), 1);
+            gates.shutdown_refreshes().await.unwrap();
+            server.abort();
+            assert!(server.await.unwrap_err().is_cancelled());
         }
-        endpoint.release.notify_one();
-        assert_eq!(commit.await.unwrap().unwrap()["refresh"]["ok"], !supersede);
-        let (served, tokens) = tokio::time::timeout(Duration::from_secs(3), waiting)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            tokens.access_token,
-            if supersede {
-                "synthetic-fresh-access"
-            } else {
-                "synthetic-rotated-access"
-            }
-        );
-        assert_eq!(
-            tokens.refresh_token,
-            if supersede {
-                "synthetic-fresh-family"
-            } else {
-                "synthetic-rotated-family"
-            }
-        );
-        assert!(!f.store.takeover_fenced(&served.id).unwrap());
-        assert_eq!(endpoint.posts.load(Ordering::SeqCst), 1);
-        gates.shutdown_refreshes().await.unwrap();
-        server.abort();
-        assert!(server.await.unwrap_err().is_cancelled());
-    }
+    })
+    .await
+    .expect("busy takeover gate regression exceeded whole-test 30s watchdog");
 }
