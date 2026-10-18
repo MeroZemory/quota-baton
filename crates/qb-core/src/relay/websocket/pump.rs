@@ -464,10 +464,17 @@ async fn apply_error(
     }
     // No replay of a WS response.create across connections. C7 is resolved
     // on the next placement of this session (including precommit reconnect).
-    if decision.kind == Kind::Quota && let Some(runtime) = &context.runtime {
+    if decision.kind == Kind::Quota
+        && let Some(runtime) = &context.runtime
+    {
         runtime.observe_quota_reset(&context.account, decision.quota_reset);
-        let _ = runtime.pending_quota(&context.account,
-            crate::account_runtime::quota_session(context.session.key.as_deref()), model).await;
+        let _ = runtime
+            .pending_quota(
+                &context.account,
+                crate::account_runtime::quota_session(context.session.key.as_deref()),
+                model,
+            )
+            .await;
     }
     Ok(decision)
 }

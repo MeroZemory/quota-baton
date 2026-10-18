@@ -258,21 +258,46 @@ impl AccountRuntime {
 
     /// Only typed notification fields enter this bounded, process-local map.
     pub(crate) fn set_quota_notice(&self, account: &Account, notice: Value, model: Option<&str>) {
-        if account.user_state != UserState::Active || account.drain { return; }
-        let Ok(mut notices) = self.quota_notices.lock() else { return };
-        if notices.len() >= 4096 && !notices.contains_key(&account.id) { return; }
+        if account.user_state != UserState::Active || account.drain {
+            return;
+        }
+        let Ok(mut notices) = self.quota_notices.lock() else {
+            return;
+        };
+        if notices.len() >= 4096 && !notices.contains_key(&account.id) {
+            return;
+        }
         if notices.get(&account.id).is_some_and(|entry| {
             entry.model.as_deref() == model
-                && ["action", "window", "reset_at", "next_account", "earliest_account", "model_limited"]
-                    .iter().all(|key| entry.notice[*key] == notice[*key])
-        }) { return; }
-        notices.insert(account.id.clone(), QuotaNoticeEntry { provider: account.provider, notice: notice.clone(),
-            state: notice_state(account), model: model.map(str::to_owned) });
+                && [
+                    "action",
+                    "window",
+                    "reset_at",
+                    "next_account",
+                    "earliest_account",
+                    "model_limited",
+                ]
+                .iter()
+                .all(|key| entry.notice[*key] == notice[*key])
+        }) {
+            return;
+        }
+        notices.insert(
+            account.id.clone(),
+            QuotaNoticeEntry {
+                provider: account.provider,
+                notice: notice.clone(),
+                state: notice_state(account),
+                model: model.map(str::to_owned),
+            },
+        );
         drop(notices);
         let mut data = notice;
         data["kind"] = json!("quota_notice");
         data["account"] = json!(account.id);
-        let _ = self.events.send(json!({"event":"core_warning","data":data}));
+        let _ = self
+            .events
+            .send(json!({"event":"core_warning","data":data}));
     }
 
     pub(crate) fn observe_quota_reset(&self, id: &str, reset: Option<DateTime<Utc>>) {
@@ -280,44 +305,93 @@ impl AccountRuntime {
             resets.retain(|_, reset| *reset > Utc::now());
             resets.remove(id);
             if let Some(reset) = reset.filter(|r| *r > Utc::now())
-                && resets.len() < 4096 { resets.insert(id.to_owned(), reset); }
+                && resets.len() < 4096
+            {
+                resets.insert(id.to_owned(), reset);
+            }
         }
     }
 
     pub(crate) fn observed_quota_reset(&self, account: &Account) -> Option<DateTime<Utc>> {
         let reset = self.quota_resets.lock().ok()?.get(&account.id).copied()?;
         matches!(&account.health, Health::Cooling { reason: HealthReason::Quota, until, .. }
-            if *until == reset && reset > Utc::now()).then_some(reset)
+            if *until == reset && reset > Utc::now())
+        .then_some(reset)
     }
 
     /// Observation-only entries serialize as quota_notice:null until traffic
     /// resolves an actual forced placement. They share the existing bounded map.
-    pub(crate) fn quota_observations(&self, provider: Provider, prior: Option<&str>) -> Vec<(String, Value, Option<String>)> {
-        self.quota_notices.lock().map(|entries| entries.iter()
-            .filter(|(id, entry)| entry.provider == provider && prior.is_none_or(|prior| prior == id.as_str()))
-            .map(|(id, entry)| (id.clone(), entry.state.clone(), entry.model.clone())).collect()).unwrap_or_default()
+    pub(crate) fn quota_observations(
+        &self,
+        provider: Provider,
+        prior: Option<&str>,
+    ) -> Vec<(String, Value, Option<String>)> {
+        self.quota_notices
+            .lock()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|(id, entry)| {
+                        entry.provider == provider && prior.is_none_or(|prior| prior == id.as_str())
+                    })
+                    .map(|(id, entry)| (id.clone(), entry.state.clone(), entry.model.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub(crate) fn quota_observation_current(&self, id: &str, state: &Value) -> bool {
-        self.quota_notices.lock().map(|entries| entries.get(id).is_some_and(|entry| &entry.state == state)).unwrap_or(false)
+        self.quota_notices
+            .lock()
+            .map(|entries| entries.get(id).is_some_and(|entry| &entry.state == state))
+            .unwrap_or(false)
     }
 
-    pub(crate) fn pending_quota_tickets(&self, session_hash: Option<&str>) -> Vec<PendingQuotaTicket> {
-        self.pending_quota.lock().map(|pending| pending.values()
-            .filter(|entry| entry.session_hash.as_deref() == session_hash)
-            .cloned().collect()).unwrap_or_default()
+    pub(crate) fn pending_quota_tickets(
+        &self,
+        session_hash: Option<&str>,
+    ) -> Vec<PendingQuotaTicket> {
+        self.pending_quota
+            .lock()
+            .map(|pending| {
+                pending
+                    .values()
+                    .filter(|entry| entry.session_hash.as_deref() == session_hash)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
-    pub(crate) async fn pending_quota(&self, id: &str, session_hash: Option<String>, model: Option<&str>) -> Option<PendingQuotaTicket> {
+    pub(crate) async fn pending_quota(
+        &self,
+        id: &str,
+        session_hash: Option<String>,
+        model: Option<&str>,
+    ) -> Option<PendingQuotaTicket> {
         let store = self.store.clone();
         let key = id.to_owned();
-        let account = tokio::task::spawn_blocking(move || store.load(&key)).await.ok()?.ok()?;
+        let account = tokio::task::spawn_blocking(move || store.load(&key))
+            .await
+            .ok()?
+            .ok()?;
         let mut pending = self.pending_quota.lock().ok()?;
-        if pending.len() >= 4096 && !pending.contains_key(id) { return None; }
-        let version = self.pending_nonce.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
-            |version| version.checked_add(1)).ok()?;
-        let ticket = PendingQuotaTicket { id: id.to_owned(), version, state: notice_state(&account),
-            session_hash, model: model.map(str::to_owned) };
+        if pending.len() >= 4096 && !pending.contains_key(id) {
+            return None;
+        }
+        let version = self
+            .pending_nonce
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |version| {
+                version.checked_add(1)
+            })
+            .ok()?;
+        let ticket = PendingQuotaTicket {
+            id: id.to_owned(),
+            version,
+            state: notice_state(&account),
+            session_hash,
+            model: model.map(str::to_owned),
+        };
         pending.insert(id.to_owned(), ticket.clone());
         Some(ticket)
     }
@@ -325,16 +399,24 @@ impl AccountRuntime {
     /// The captured nonce, session, model and state must ALL still match.
     /// Enumeration followed by any await cannot consume a replacement record.
     pub(crate) fn take_pending_quota(&self, ticket: &PendingQuotaTicket) -> bool {
-        let Ok(mut pending) = self.pending_quota.lock() else { return false };
-        if pending.get(&ticket.id) != Some(ticket) { return false; }
+        let Ok(mut pending) = self.pending_quota.lock() else {
+            return false;
+        };
+        if pending.get(&ticket.id) != Some(ticket) {
+            return false;
+        }
         pending.remove(&ticket.id);
         true
     }
 
     pub(crate) async fn credit_headers(&self, id: &str, headers: &HeaderMap) {
         // Require evidence on THIS successful response, never a merged old signal.
-        let serving = headers.get("x-codex-credits-serving").and_then(|v| v.to_str().ok());
-        let active = headers.get("x-codex-active-limit").and_then(|v| v.to_str().ok());
+        let serving = headers
+            .get("x-codex-credits-serving")
+            .and_then(|v| v.to_str().ok());
+        let active = headers
+            .get("x-codex-active-limit")
+            .and_then(|v| v.to_str().ok());
         if serving == Some("true") || (serving.is_none() && active == Some("credits")) {
             self.credit_notice(id).await;
         }
@@ -343,14 +425,31 @@ impl AccountRuntime {
     async fn credit_notice(&self, id: &str) {
         let store = self.store.clone();
         let key = id.to_owned();
-        let Ok(Ok(account)) = tokio::task::spawn_blocking(move || store.load(&key)).await else { return };
+        let Ok(Ok(account)) = tokio::task::spawn_blocking(move || store.load(&key)).await else {
+            return;
+        };
         let snapshot = self.obs.quota_snapshot(id).unwrap_or_default();
-        if account.provider != Provider::Codex || !account.allow_credits
-            || account.payment_until.is_some_and(|until| until > Utc::now())
-            || !matches!(account.health, Health::Ready | Health::Cooling { reason: HealthReason::Quota, .. })
+        if account.provider != Provider::Codex
+            || !account.allow_credits
+            || account
+                .payment_until
+                .is_some_and(|until| until > Utc::now())
+            || !matches!(
+                account.health,
+                Health::Ready
+                    | Health::Cooling {
+                        reason: HealthReason::Quota,
+                        ..
+                    }
+            )
             || !(snapshot["credits"]["has_credits"] == true
                 || snapshot["credits"]["unlimited"] == true
-                || snapshot["credits"]["balance"].as_f64().is_some_and(|v| v > 0.0)) { return; }
+                || snapshot["credits"]["balance"]
+                    .as_f64()
+                    .is_some_and(|v| v > 0.0))
+        {
+            return;
+        }
         let (window, reset_at) = crate::relay::notices::limiting_window(&account, &snapshot);
         self.set_quota_notice(&account, json!({"action":"credits","window":window,
             "reset_at":reset_at,"next_account":null,"earliest_account":null,"observed_at":Utc::now(),"model_limited":false}), None);
@@ -702,8 +801,12 @@ impl AccountRuntime {
             .unwrap_or(true)
     }
     pub fn clear_memory_health(&self, account: &Account) {
-        if let Ok(mut pending) = self.pending_quota.lock() { pending.remove(&account.id); }
-        if let Ok(mut notices) = self.quota_notices.lock() { notices.remove(&account.id); }
+        if let Ok(mut pending) = self.pending_quota.lock() {
+            pending.remove(&account.id);
+        }
+        if let Ok(mut notices) = self.quota_notices.lock() {
+            notices.remove(&account.id);
+        }
         if let Ok(mut health) = self.volatile.lock() {
             health.remove(&account.id);
         }
@@ -711,7 +814,14 @@ impl AccountRuntime {
     }
     pub fn begin_probe(self: &Arc<Self>, account: &Account) -> Result<Option<Probe>, ProbeBusy> {
         if (!account.auth_probe_pending && account.auth_failures == 0)
-            || !matches!(account.health, Health::Ready | Health::Cooling { reason: HealthReason::Quota, .. })
+            || !matches!(
+                account.health,
+                Health::Ready
+                    | Health::Cooling {
+                        reason: HealthReason::Quota,
+                        ..
+                    }
+            )
         {
             return Ok(None);
         }
@@ -743,8 +853,12 @@ impl AccountRuntime {
     }
 
     pub fn emit_account(&self, account: &Account) {
-        if let Ok(mut pending) = self.pending_quota.lock() { pending.remove(&account.id); }
-        if let Ok(mut notices) = self.quota_notices.lock() { notices.remove(&account.id); }
+        if let Ok(mut pending) = self.pending_quota.lock() {
+            pending.remove(&account.id);
+        }
+        if let Ok(mut notices) = self.quota_notices.lock() {
+            notices.remove(&account.id);
+        }
         if let Ok(mut health) = self.volatile.lock() {
             health.insert(account.id.clone(), account.health.clone());
         }
@@ -886,63 +1000,132 @@ impl AccountRuntime {
         let store = self.store.clone();
         let (accounts, credential_ids) = tokio::task::spawn_blocking(move || {
             let accounts = store.list().map_err(|_| ())?;
-            let credential_ids: BTreeSet<_> = accounts.iter().filter(|a|
-                store.tokens(a).is_ok_and(|t| !t.access_token.is_empty()))
-                .map(|a| a.id.clone()).collect();
+            let credential_ids: BTreeSet<_> = accounts
+                .iter()
+                .filter(|a| store.tokens(a).is_ok_and(|t| !t.access_token.is_empty()))
+                .map(|a| a.id.clone())
+                .collect();
             Ok::<_, ()>((accounts, credential_ids))
         })
-            .await
-            .map_err(|_| ())??;
+        .await
+        .map_err(|_| ())??;
         let now = Utc::now();
-        let eligible: Vec<_> = accounts.iter().filter(|a| credential_ids.contains(&a.id) && !a.drain && a.eligible_at(None, now)
-            && !self.probing(&a.id) && !self.blocked_in_memory(&a.id)
-            && !a.auth_probe_pending && a.auth_failures == 0).collect();
+        let eligible: Vec<_> = accounts
+            .iter()
+            .filter(|a| {
+                credential_ids.contains(&a.id)
+                    && !a.drain
+                    && a.eligible_at(None, now)
+                    && !self.probing(&a.id)
+                    && !self.blocked_in_memory(&a.id)
+                    && !a.auth_probe_pending
+                    && a.auth_failures == 0
+            })
+            .collect();
         if let Ok(mut resets) = self.quota_resets.lock() {
             resets.retain(|id, reset| *reset > now && accounts.iter().any(|a| &a.id == id));
         }
-        let available = |a: &Account, model: Option<&str>| credential_ids.contains(&a.id)
-            && !a.drain && a.eligible_at(model, now) && !self.probing(&a.id)
-            && !self.blocked_in_memory(&a.id) && !a.auth_probe_pending && a.auth_failures == 0;
+        let available = |a: &Account, model: Option<&str>| {
+            credential_ids.contains(&a.id)
+                && !a.drain
+                && a.eligible_at(model, now)
+                && !self.probing(&a.id)
+                && !self.blocked_in_memory(&a.id)
+                && !a.auth_probe_pending
+                && a.auth_failures == 0
+        };
         let mut notices = self.quota_notices.lock().map_err(|_| ())?;
         notices.retain(|id, entry| {
-            let Some(a) = accounts.iter().find(|a| &a.id == id) else { return false };
+            let Some(a) = accounts.iter().find(|a| &a.id == id) else {
+                return false;
+            };
             let model = entry.model.as_deref();
             let notice = &mut entry.notice;
-            if notice_state(a) != entry.state || a.user_state != UserState::Active { return false; }
+            if notice_state(a) != entry.state || a.user_state != UserState::Active {
+                return false;
+            }
             if notice["action"] == "credits" {
-                if !a.allow_credits || a.payment_until.is_some_and(|until| until > now)
-                    || !matches!(a.health, Health::Ready | Health::Cooling { reason: HealthReason::Quota, .. }) { return false; }
-            } else if !crate::relay::notices::quota_applies(a, model) { return false; }
-            if notice["action"] == "failover" && !accounts.iter().any(|other|
-                notice["next_account"] == other.id && other.provider == a.provider && available(other, model)) { return false; }
+                if !a.allow_credits
+                    || a.payment_until.is_some_and(|until| until > now)
+                    || !matches!(
+                        a.health,
+                        Health::Ready
+                            | Health::Cooling {
+                                reason: HealthReason::Quota,
+                                ..
+                            }
+                    )
+                {
+                    return false;
+                }
+            } else if !crate::relay::notices::quota_applies(a, model) {
+                return false;
+            }
+            if notice["action"] == "failover"
+                && !accounts.iter().any(|other| {
+                    notice["next_account"] == other.id
+                        && other.provider == a.provider
+                        && available(other, model)
+                })
+            {
+                return false;
+            }
             if notice["action"] == "exhausted" {
-                if accounts.iter().any(|other| other.provider == a.provider && available(other, model)) { return false; }
+                if accounts
+                    .iter()
+                    .any(|other| other.provider == a.provider && available(other, model))
+                {
+                    return false;
+                }
                 // Re-evaluate the whole participating pool, not only the previous winner.
-                let earliest = accounts.iter().filter(|other| other.provider == a.provider
-                    && other.user_state == UserState::Active && !other.drain)
+                let earliest = accounts
+                    .iter()
+                    .filter(|other| {
+                        other.provider == a.provider
+                            && other.user_state == UserState::Active
+                            && !other.drain
+                    })
                     .filter_map(|other| {
                         let snapshot = self.obs.quota_snapshot(&other.id).unwrap_or_default();
-                        crate::relay::notices::limiting_reset(other, &snapshot, model,
-                            self.observed_quota_reset(other)).map(|reset| (other.id.clone(), reset))
-                    }).min_by_key(|(_, reset)| *reset);
+                        crate::relay::notices::limiting_reset(
+                            other,
+                            &snapshot,
+                            model,
+                            self.observed_quota_reset(other),
+                        )
+                        .map(|reset| (other.id.clone(), reset))
+                    })
+                    .min_by_key(|(_, reset)| *reset);
                 let reset_at = json!(earliest.as_ref().map(|(_, reset)| *reset));
                 let earliest_account = json!(earliest.map(|(id, _)| id));
-                let model_limited = json!(accounts.iter().any(|other| other.provider == a.provider
-                    && other.user_state == UserState::Active && !other.drain
+                let model_limited = json!(accounts.iter().any(|other| other.provider
+                    == a.provider
+                    && other.user_state == UserState::Active
+                    && !other.drain
                     && crate::relay::notices::model_quota_applies(other, model)));
-                if notice["reset_at"] != reset_at || notice["earliest_account"] != earliest_account
-                    || notice["model_limited"] != model_limited {
+                if notice["reset_at"] != reset_at
+                    || notice["earliest_account"] != earliest_account
+                    || notice["model_limited"] != model_limited
+                {
                     notice["reset_at"] = reset_at;
                     notice["earliest_account"] = earliest_account;
                     notice["model_limited"] = model_limited;
                     notice["observed_at"] = json!(now);
                 }
             }
-            notice["reset_at"].as_str().and_then(|v| v.parse::<DateTime<Utc>>().ok()).is_none_or(|r| r > now)
+            notice["reset_at"]
+                .as_str()
+                .and_then(|v| v.parse::<DateTime<Utc>>().ok())
+                .is_none_or(|r| r > now)
         });
         if let Ok(mut pending) = self.pending_quota.lock() {
-            pending.retain(|id, entry| accounts.iter().any(|a| &a.id == id
-                && a.user_state == UserState::Active && notice_state(a) == entry.state));
+            pending.retain(|id, entry| {
+                accounts.iter().any(|a| {
+                    &a.id == id
+                        && a.user_state == UserState::Active
+                        && notice_state(a) == entry.state
+                })
+            });
         }
         Ok(accounts.iter().map(|a| {
             let quota_notice = notices.get(&a.id).map(|entry| entry.notice.clone());
@@ -1020,9 +1203,15 @@ impl AccountRuntime {
             let _ = self.apply_quota_snapshot(id, snapshot, model).await;
         }
         let limits = event.get("rate_limits").unwrap_or(event);
-        let serving = event.get("serving_from_credits").or_else(|| limits.get("serving_from_credits"))
-            .or_else(|| event.get("credits").and_then(|c| c.get("used"))).and_then(Value::as_bool);
-        let active = event.get("active_limit").or_else(|| limits.get("active_limit")).and_then(Value::as_str);
+        let serving = event
+            .get("serving_from_credits")
+            .or_else(|| limits.get("serving_from_credits"))
+            .or_else(|| event.get("credits").and_then(|c| c.get("used")))
+            .and_then(Value::as_bool);
+        let active = event
+            .get("active_limit")
+            .or_else(|| limits.get("active_limit"))
+            .and_then(Value::as_str);
         if serving == Some(true) || (serving.is_none() && active == Some("credits")) {
             self.credit_notice(id).await;
         }
@@ -1060,34 +1249,75 @@ impl AccountRuntime {
         if let Ok(mut notices) = self.quota_notices.lock() {
             let recovered = notices.get(id).is_some_and(|entry| {
                 let notice = &entry.notice;
-                let time = |value: &Value| value.as_str().and_then(|v| v.parse::<DateTime<Utc>>().ok());
+                let time =
+                    |value: &Value| value.as_str().and_then(|v| v.parse::<DateTime<Utc>>().ok());
                 let old_reset = time(&notice["reset_at"]);
                 let observed = time(&notice["observed_at"]);
                 (snapshot["signals"]["serving_from_credits"] == false
                     || snapshot["credits"].is_object()
-                        && !(snapshot["credits"]["has_credits"] == true || snapshot["credits"]["unlimited"] == true
-                            || snapshot["credits"]["balance"].as_f64().is_some_and(|n| n > 0.0)))
+                        && !(snapshot["credits"]["has_credits"] == true
+                            || snapshot["credits"]["unlimited"] == true
+                            || snapshot["credits"]["balance"]
+                                .as_f64()
+                                .is_some_and(|n| n > 0.0)))
                     && notice["action"] == "credits"
-                    || snapshot["windows"].as_array().is_some_and(|windows| !windows.is_empty()
-                        && windows.iter().all(|w| w["used_pct"].as_f64().is_some_and(|p| p < 99.0)
-                            && time(&w["observed_at"]).zip(observed).is_some_and(|(new, old)| new > old && new <= Utc::now())))
-                    || snapshot["windows"].as_array().is_some_and(|windows| windows.iter().any(|w|
-                        w["name"] == notice["window"]
-                        && w["used_pct"].as_f64().is_some_and(|p| p < 100.0)
-                        && time(&w["observed_at"]).zip(observed).is_some_and(|(new, old)| new > old && new <= Utc::now())
-                        && time(&w["reset_at"]).zip(old_reset).is_some_and(|(new, old)| (new-old).abs() > Duration::seconds(300))))
+                    || snapshot["windows"].as_array().is_some_and(|windows| {
+                        !windows.is_empty()
+                            && windows.iter().all(|w| {
+                                w["used_pct"].as_f64().is_some_and(|p| p < 99.0)
+                                    && time(&w["observed_at"])
+                                        .zip(observed)
+                                        .is_some_and(|(new, old)| new > old && new <= Utc::now())
+                            })
+                    })
+                    || snapshot["windows"].as_array().is_some_and(|windows| {
+                        windows.iter().any(|w| {
+                            w["name"] == notice["window"]
+                                && w["used_pct"].as_f64().is_some_and(|p| p < 100.0)
+                                && time(&w["observed_at"])
+                                    .zip(observed)
+                                    .is_some_and(|(new, old)| new > old && new <= Utc::now())
+                                && time(&w["reset_at"])
+                                    .zip(old_reset)
+                                    .is_some_and(|(new, old)| {
+                                        (new - old).abs() > Duration::seconds(300)
+                                    })
+                        })
+                    })
             });
-            if recovered { notices.remove(id); }
+            if recovered {
+                notices.remove(id);
+            }
             // A merged old window on a plan/credit-only update is not new quota evidence.
-            let fresh_usage = snapshot["windows"].as_array().is_some_and(|windows| windows.iter().any(|w|
-                w["observed_at"].as_str().is_some() && w["observed_at"] == snapshot["observed_at"]
-                && w["observed_at"].as_str().and_then(|v| v.parse::<DateTime<Utc>>().ok())
-                    .is_some_and(|time| time <= Utc::now() && Utc::now().signed_duration_since(time).num_seconds() <= 300)));
-            if !notices.contains_key(id) && notices.len() < 4096 && fresh_usage
-                && account.user_state == UserState::Active && !account.drain
-                && crate::relay::notices::quota_applies(&account, origin_model.as_deref()) {
-                notices.insert(id.to_owned(), QuotaNoticeEntry { provider: account.provider,
-                    notice: Value::Null, state: notice_state(&account), model: origin_model });
+            let fresh_usage = snapshot["windows"].as_array().is_some_and(|windows| {
+                windows.iter().any(|w| {
+                    w["observed_at"].as_str().is_some()
+                        && w["observed_at"] == snapshot["observed_at"]
+                        && w["observed_at"]
+                            .as_str()
+                            .and_then(|v| v.parse::<DateTime<Utc>>().ok())
+                            .is_some_and(|time| {
+                                time <= Utc::now()
+                                    && Utc::now().signed_duration_since(time).num_seconds() <= 300
+                            })
+                })
+            });
+            if !notices.contains_key(id)
+                && notices.len() < 4096
+                && fresh_usage
+                && account.user_state == UserState::Active
+                && !account.drain
+                && crate::relay::notices::quota_applies(&account, origin_model.as_deref())
+            {
+                notices.insert(
+                    id.to_owned(),
+                    QuotaNoticeEntry {
+                        provider: account.provider,
+                        notice: Value::Null,
+                        state: notice_state(&account),
+                        model: origin_model,
+                    },
+                );
             }
         }
         let _ = self
@@ -1328,12 +1558,22 @@ mod r1_rate_tests {
             "access_token":"synthetic-access-pending","refresh_token":"synthetic-refresh-pending",
             "expired":"2099-01-01T00:00:00Z"
         })).unwrap()).unwrap();
-        crate::accounts::import::run(&f.runtime.store, &cpa, &["codex:pending@example.invalid".into()], false).unwrap();
+        crate::accounts::import::run(
+            &f.runtime.store,
+            &cpa,
+            &["codex:pending@example.invalid".into()],
+            false,
+        )
+        .unwrap();
         let id = f.runtime.store.list().unwrap()[0].id.clone();
         for replacement_session in ["codex:S", "codex:T"] {
             let s = quota_session(Some("codex:S"));
             let replacement_hash = quota_session(Some(replacement_session));
-            let first = f.runtime.pending_quota(&id, s.clone(), Some("private-model")).await.unwrap();
+            let first = f
+                .runtime
+                .pending_quota(&id, s.clone(), Some("private-model"))
+                .await
+                .unwrap();
             let (enumerated_tx, enumerated_rx) = tokio::sync::oneshot::channel();
             let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
             let runtime = f.runtime.clone();
@@ -1345,11 +1585,18 @@ mod r1_rate_tests {
                 runtime.take_pending_quota(&ticket)
             });
             enumerated_rx.await.unwrap();
-            let replacement = f.runtime.pending_quota(&id, replacement_hash.clone(), Some("private-model")).await.unwrap();
+            let replacement = f
+                .runtime
+                .pending_quota(&id, replacement_hash.clone(), Some("private-model"))
+                .await
+                .unwrap();
             assert_eq!(first.state, replacement.state);
             assert_ne!(first.version, replacement.version);
             resume_tx.send(()).unwrap();
-            assert!(!consumer.await.unwrap(), "stale consumer removed a replacement pending error");
+            assert!(
+                !consumer.await.unwrap(),
+                "stale consumer removed a replacement pending error"
+            );
             let retained = f.runtime.pending_quota_tickets(replacement_hash.as_deref());
             assert_eq!(retained.len(), 1);
             assert!(retained[0] == replacement);
@@ -1721,12 +1968,22 @@ mod r1_rate_tests {
 }
 
 fn notice_state(account: &Account) -> Value {
-    json!([account.health, account.user_state, account.drain, account.allow_credits,
-        account.quota_cooling, account.payment_until])
+    json!([
+        account.health,
+        account.user_state,
+        account.drain,
+        account.allow_credits,
+        account.quota_cooling,
+        account.payment_until
+    ])
 }
 
 /// Same bounded digest used by Completion; raw affinity keys stay private.
 pub(crate) fn quota_session(key: Option<&str>) -> Option<String> {
-    key.map(|key| Sha256::digest(key.as_bytes())[..6].iter()
-        .map(|byte| format!("{byte:02x}")).collect())
+    key.map(|key| {
+        Sha256::digest(key.as_bytes())[..6]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    })
 }

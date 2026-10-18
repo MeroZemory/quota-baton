@@ -196,7 +196,9 @@ async fn upgrade_inner(
     let mut quota_source: Option<String> = None;
     let (upstream, upstream_headers, account, tokens) = 'accounts: loop {
         if tried.len() == 4 {
-            if let Some(id) = quota_source.take() { state.notice_quota(&id, None, None).await; }
+            if let Some(id) = quota_source.take() {
+                state.notice_quota(&id, None, None).await;
+            }
             return match last_error {
                 Some(response) => response,
                 None => {
@@ -206,8 +208,12 @@ async fn upgrade_inner(
                 }
             };
         }
-        let selected = state.select_request(Provider::Codex, &session, completion, None, &tried).await;
-        if let Some(id) = quota_source.take() && let Ok(next) = &selected {
+        let selected = state
+            .select_request(Provider::Codex, &session, completion, None, &tried)
+            .await;
+        if let Some(id) = quota_source.take()
+            && let Ok(next) = &selected
+        {
             state.notice_quota(&id, next.as_ref(), None).await;
         }
         let account = match selected {
@@ -489,7 +495,9 @@ async fn upgrade_inner(
                 forbidden += 1;
             }
             if decision.kind == super::outcome::Kind::Quota {
-                state.accounts.observe_quota_reset(&account.id, decision.quota_reset);
+                state
+                    .accounts
+                    .observe_quota_reset(&account.id, decision.quota_reset);
                 drop(probe.take());
                 match state
                     .retry_after_reset(&session, completion, &account.id, None)

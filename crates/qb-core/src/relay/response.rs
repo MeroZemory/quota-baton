@@ -190,7 +190,9 @@ pub(in crate::relay) fn body(
                     }
                     if decision.kind == crate::relay::outcome::Kind::Quota {
                         runtime.observe_quota_reset(account, decision.quota_reset);
-                        let _ = runtime.pending_quota(account, notice_session.clone(), model.as_deref()).await;
+                        let _ = runtime
+                            .pending_quota(account, notice_session.clone(), model.as_deref())
+                            .await;
                     }
                 }
             }
