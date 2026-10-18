@@ -61,6 +61,13 @@ struct WindowLimiter {
     window: Duration,
     buckets: Arc<Mutex<std::collections::HashMap<String, (Instant, u32)>>>,
     round_429: Arc<Mutex<Vec<u64>>>,
+    start_batch: Arc<Mutex<Option<LimiterStartBatch>>>,
+}
+
+struct LimiterStartBatch {
+    remaining: usize,
+    barrier: Arc<tokio::sync::Barrier>,
+    deadline: Option<tokio::time::Instant>,
 }
 
 impl ScriptedState {
@@ -79,7 +86,47 @@ impl ScriptedState {
             window,
             buckets: Arc::new(Mutex::new(std::collections::HashMap::new())),
             round_429: Arc::new(Mutex::new(Vec::new())),
+            start_batch: Arc::new(Mutex::new(None)),
         });
+    }
+    /// Hold only the first batch before any limiter classification, so its
+    /// genuine 429 feedback cannot pace requests still arriving in that batch.
+    /// The shared five-second deadline starts at its first arrival. An incomplete
+    /// batch returns a fixture 500 instead of waiting forever or fabricating 429s.
+    pub fn gate_first_limiter_batch(&self, participants: usize) {
+        assert!(participants > 0, "limiter start batch must not be empty");
+        let limiter = self.window_limiter.lock().unwrap();
+        let limiter = limiter.as_ref().expect("enable window limiter first");
+        *limiter.start_batch.lock().unwrap() = Some(LimiterStartBatch {
+            remaining: participants,
+            barrier: Arc::new(tokio::sync::Barrier::new(participants)),
+            deadline: None,
+        });
+    }
+    async fn wait_for_limiter_start(&self) -> bool {
+        let limiter = self.window_limiter.lock().unwrap().clone();
+        let Some(limiter) = limiter else {
+            return true;
+        };
+        let (barrier, deadline) = {
+            let mut batch = limiter.start_batch.lock().unwrap();
+            let Some(start) = batch.as_mut() else {
+                return true;
+            };
+            let deadline = *start
+                .deadline
+                .get_or_insert_with(|| tokio::time::Instant::now() + Duration::from_secs(5));
+            start.remaining -= 1;
+            let barrier = start.barrier.clone();
+            if start.remaining == 0 {
+                // Never reuse tokio's cyclic barrier for retries or later rounds.
+                *batch = None;
+            }
+            (barrier, deadline)
+        };
+        tokio::time::timeout_at(deadline, barrier.wait())
+            .await
+            .is_ok()
     }
     pub fn begin_limiter_round(&self) {
         if let Some(limiter) = self.window_limiter.lock().unwrap().as_ref() {
@@ -137,6 +184,12 @@ async fn scripted(State(state): State<ScriptedState>, request: Request) -> Respo
         body,
         received_at: Instant::now(),
     });
+    if !state.wait_for_limiter_start().await {
+        return Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Body::from("synthetic limiter start batch timed out"))
+            .unwrap();
+    }
     let response = state.limiter_response(&parts.headers).unwrap_or_else(|| {
         state
             .responses
@@ -206,6 +259,88 @@ impl Drop for FakeUpstream {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn limiter_start_batch_classifies_after_all_arrivals_and_only_gates_once() {
+        let server = super::ScriptedUpstream::start().await.unwrap();
+        server
+            .state
+            .enable_window_limiter(1, std::time::Duration::from_secs(60));
+        server.state.gate_first_limiter_batch(2);
+        server.state.begin_limiter_round();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let first_client = client.clone();
+        let url = server.url.clone();
+        let first = tokio::spawn(async move {
+            first_client
+                .get(url)
+                .bearer_auth("synthetic-start-batch")
+                .send()
+                .await
+                .unwrap()
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while server.state.requests().len() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first synthetic arrival missing");
+        assert!(!first.is_finished());
+        assert_eq!(server.state.limiter_round_429_counts(), vec![0]);
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client
+                .get(&server.url)
+                .bearer_auth("synthetic-start-batch")
+                .send(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), first)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut statuses = [first.status().as_u16(), second.status().as_u16()];
+        statuses.sort();
+        assert_eq!(statuses, [200, 429]);
+        let third = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client
+                .get(&server.url)
+                .bearer_auth("synthetic-start-batch")
+                .send(),
+        )
+        .await
+        .expect("completed start batch was incorrectly reused")
+        .unwrap();
+        assert_eq!(third.status(), 429);
+        assert_eq!(server.state.limiter_round_429_counts(), vec![2]);
+    }
+    #[tokio::test]
+    async fn limiter_start_batch_incomplete_returns_500_without_counting_a_rate_limit() {
+        let server = super::ScriptedUpstream::start().await.unwrap();
+        server
+            .state
+            .enable_window_limiter(1, std::time::Duration::from_secs(60));
+        server.state.gate_first_limiter_batch(2);
+        server.state.begin_limiter_round();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_millis(5500),
+            client
+                .get(&server.url)
+                .bearer_auth("synthetic-start-timeout")
+                .send(),
+        )
+        .await
+        .expect("incomplete limiter batch did not honor its five-second deadline")
+        .unwrap();
+        assert_eq!(response.status(), 500);
+        assert_eq!(server.state.limiter_round_429_counts(), vec![0]);
+        assert_eq!(server.state.requests().len(), 1);
+    }
+
     #[tokio::test]
     async fn smoke() {
         let server = super::FakeUpstream::start().await.unwrap();

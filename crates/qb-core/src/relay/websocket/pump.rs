@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     path::PathBuf,
-    sync::{Arc, atomic::Ordering},
+    sync::{Arc, Mutex, atomic::Ordering},
     time::Duration,
 };
 
@@ -64,7 +64,7 @@ pub(in crate::relay) struct CurrentCompletion {
     model: Option<String>,
     response_id: Option<String>,
     last_create: Option<Message>,
-    rate_retries: u32,
+    rate: Arc<RateBudget>,
 }
 
 impl CurrentCompletion {
@@ -102,7 +102,7 @@ impl CurrentCompletion {
             model: None,
             response_id: None,
             last_create: None,
-            rate_retries: 0,
+            rate: Arc::new(RateBudget::new(context)),
         }
     }
 
@@ -139,8 +139,155 @@ impl CurrentCompletion {
     }
 }
 
-// Only completion metadata is queued; the pump still holds one wire message
-// per direction. Local IDs keep delivery bookkeeping stable across new creates.
+// One budget belongs to a response.create, including a cancelled open-socket
+// wait followed by a same-account redial. std::Instant matches AccountRuntime.
+struct RateBudget {
+    deadline: std::time::Instant,
+    max_retries: u32,
+    state: Mutex<RateState>,
+}
+
+struct RateState {
+    initial_sent: bool,
+    sent_at: std::time::Instant,
+    retries: u32,
+    forced: bool,
+    waited: Duration,
+    waiting_since: Option<std::time::Instant>,
+}
+
+impl RateBudget {
+    fn new(context: &Context) -> Self {
+        let defaults = crate::config::RoutingConfig::default();
+        let (secs, max_retries) = context.relay.as_ref().map_or(
+            (defaults.rate_hold_secs, defaults.rate_hold_max_retries),
+            |relay| (relay.rate_hold_secs, relay.rate_hold_max_retries),
+        );
+        Self::with_limits(Duration::from_secs(secs), max_retries)
+    }
+
+    fn with_limits(hold: Duration, max_retries: u32) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            deadline: now + hold,
+            max_retries,
+            state: Mutex::new(RateState {
+                initial_sent: false,
+                sent_at: now,
+                retries: 0,
+                forced: false,
+                waited: Duration::ZERO,
+                waiting_since: None,
+            }),
+        }
+    }
+
+    fn can_retry(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        !state.forced && state.retries < self.max_retries
+    }
+
+    fn initial_sent(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .initial_sent
+    }
+
+    async fn admit(
+        self: &Arc<Self>,
+        runtime: Option<&Arc<crate::account_runtime::AccountRuntime>>,
+        account: &str,
+    ) {
+        if let Some(runtime) = runtime {
+            let wait = RateWait::new(self.clone());
+            let admission = runtime.admit_until(account, self.deadline).await;
+            self.state.lock().unwrap_or_else(|e| e.into_inner()).forced |= admission.forced();
+            drop(wait);
+        }
+    }
+
+    fn initial_dispatch(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.initial_sent = true;
+        state.sent_at = std::time::Instant::now();
+        state.forced |= state.sent_at >= self.deadline;
+    }
+
+    fn sent(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.initial_sent = true;
+        state.sent_at = std::time::Instant::now();
+        state.retries += 1;
+        // Also terminal when a runtime-free fixture reaches the deadline.
+        state.forced |= state.sent_at >= self.deadline;
+    }
+}
+
+struct RateWait(Arc<RateBudget>);
+
+impl RateWait {
+    fn new(rate: Arc<RateBudget>) -> Self {
+        rate.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .waiting_since = Some(std::time::Instant::now());
+        Self(rate)
+    }
+}
+
+impl Drop for RateWait {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(start) = state.waiting_since.take() {
+            state.waited += start.elapsed();
+        }
+    }
+}
+
+impl CurrentCompletion {
+    fn finish(mut self, outcome: &str) {
+        self.completion.record.outcome = outcome.into();
+    }
+}
+
+impl Drop for CurrentCompletion {
+    fn drop(&mut self) {
+        let state = self.rate.state.lock().unwrap_or_else(|e| e.into_inner());
+        // A completion can be dropped before its pending write future. Include
+        // the live wait without depending on future/local destruction order.
+        let waited = state.waited
+            + state
+                .waiting_since
+                .map_or(Duration::ZERO, |start| start.elapsed());
+        self.completion
+            .rate_wait(u64::try_from(waited.as_millis()).unwrap_or(u64::MAX));
+        // Keep the accepted request's inflight guard while queued, but do not
+        // ledger an upstream attempt if its initial write was never polled.
+        if !state.initial_sent {
+            self.completion.record.attempts = self.completion.record.attempts.saturating_sub(1);
+            if !self.completion.record.attempt_details.is_empty() {
+                self.completion.record.attempt_details.remove(0);
+            }
+        }
+        if let Some(account) = self.completion.record.account.clone() {
+            for _ in 0..state.retries {
+                self.completion.attempt(&account);
+                self.completion.rate_retry();
+            }
+        }
+        if state.retries > 0 && self.completion.record.outcome == "ok" {
+            self.completion.record.outcome = "rate_hold_ok".into();
+        }
+        if self.completion.record.relayed_rate_429s > 0 {
+            self.completion.record.outcome = "rate_hold_relayed_429".into();
+        }
+    }
+}
+
+// Only completion metadata is queued here. Each direction has one active wire
+// message; a rate wait also permits one reserved, deferred client message.
+// Local IDs keep delivery bookkeeping stable across new creates.
 fn response_completion(
     current: &mut BTreeMap<u64, CurrentCompletion>,
     event: Option<&Value>,
@@ -152,16 +299,15 @@ fn response_completion(
             .or_else(|| event["response"]["id"].as_str())
     });
     if let Some(response_id) = response_id {
-        if let Some((&id, _)) = current
-            .iter()
-            .find(|(_, active)| active.response_id.as_deref() == Some(response_id))
-        {
+        if let Some((&id, _)) = current.iter().find(|(_, active)| {
+            active.rate.initial_sent() && active.response_id.as_deref() == Some(response_id)
+        }) {
             return Some(id);
         }
         if kind == Some("response.created") {
             let (&id, active) = current
                 .iter_mut()
-                .find(|(_, active)| active.response_id.is_none())?;
+                .find(|(_, active)| active.rate.initial_sent() && active.response_id.is_none())?;
             active.response_id = Some(response_id.into());
             return Some(id);
         }
@@ -169,11 +315,16 @@ fn response_completion(
         return None;
     }
     if matches!(kind, Some("response.created" | "error" | "response.failed"))
-        && let Some((&id, _)) = current.iter().find(|(_, active)| !active.committed)
+        && let Some((&id, _)) = current
+            .iter()
+            .find(|(_, active)| active.rate.initial_sent() && !active.committed)
     {
         return Some(id);
     }
-    current.keys().next().copied()
+    current
+        .iter()
+        .find(|(_, active)| active.rate.initial_sent())
+        .map(|(&id, _)| id)
 }
 
 // Error-frame auth reload uses the credential that opened the pinned socket.
@@ -390,6 +541,28 @@ fn ws_rate_advice(event: &Value) -> bool {
         })
 }
 
+fn ws_retry_after(event: &Value) -> Option<Duration> {
+    let headers = event
+        .get("headers")
+        .or_else(|| event.get("error").and_then(|error| error.get("headers")))?
+        .as_object()?;
+    let value = headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("retry-after"))?
+        .1;
+    let text = value
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| value.as_u64().map(|secs| secs.to_string()))?;
+    let mut sidecopy = HeaderMap::new();
+    sidecopy.insert(
+        "retry-after",
+        axum::http::HeaderValue::from_str(&text).ok()?,
+    );
+    crate::relay::outcome::header_seconds(&sidecopy, "retry-after")
+        .map(|seconds| Duration::from_secs(seconds as u64))
+}
+
 fn has_previous_response_id(message: &Message) -> bool {
     let Message::Text(text) = message else {
         return false;
@@ -412,6 +585,14 @@ struct Delivered {
 struct PendingRateResend {
     request: u64,
     message: Message,
+    rate: Arc<RateBudget>,
+}
+
+struct PendingInitial {
+    request: u64,
+    message: Message,
+    reservation: Reservation,
+    rate: Arc<RateBudget>,
 }
 
 type Write<S> = BoxFuture<'static, (S, bool, Delivered)>;
@@ -485,31 +666,49 @@ where
     })
 }
 
-async fn redial_rate(
-    context: &Context,
-    pending: PendingRateResend,
-    upstream_read: &mut SplitStream<UpstreamSocket>,
-    budget: Arc<InflightBudget>,
-) -> Result<Write<SplitSink<UpstreamSocket, Message>>, ()> {
-    if let Some(runtime) = &context.runtime {
-        let _admission = runtime.admit(&context.account).await;
-    }
-    let socket = super::redial_same_account(context).await?;
-    let (sink, read) = socket.split();
-    *upstream_read = read;
-    let bytes = pending.message.len();
-    let reservation = budget.reserve_message(bytes);
-    Ok(write(
-        sink,
-        pending.message,
-        reservation,
-        Delivered {
-            bytes,
-            request: Some(pending.request),
-            terminal: None,
-            completed: false,
-        },
-    ))
+type RateRedial = BoxFuture<
+    'static,
+    Result<
+        (
+            Write<SplitSink<UpstreamSocket, Message>>,
+            SplitStream<UpstreamSocket>,
+        ),
+        (),
+    >,
+>;
+
+fn redial_rate(context: Arc<Context>, pending: PendingRateResend) -> RateRedial {
+    Box::pin(async move {
+        if !pending.rate.can_retry() {
+            return Err(());
+        }
+        pending
+            .rate
+            .admit(context.runtime.as_ref(), &context.account)
+            .await;
+        let socket = super::redial_same_account(&context).await?;
+        let (sink, read) = socket.split();
+        let bytes = pending.message.len();
+        let reservation = context.budget.reserve_message(bytes);
+        // Count a retry only when its write is actually polled, after a dial.
+        let rate = pending.rate;
+        let write = Box::pin(async move {
+            rate.sent();
+            write(
+                sink,
+                pending.message,
+                reservation,
+                Delivered {
+                    bytes,
+                    request: Some(pending.request),
+                    terminal: None,
+                    completed: false,
+                },
+            )
+            .await
+        }) as Write<SplitSink<UpstreamSocket, Message>>;
+        Ok((write, read))
+    })
 }
 
 pub(super) async fn run(client: ClientSocket, upstream: UpstreamSocket, context: Context) {
@@ -529,10 +728,16 @@ async fn run_with_read_timeout(
     let mut to_client: Option<Write<SplitSink<ClientSocket, Message>>> = None;
     let mut to_upstream: Option<Write<SplitSink<UpstreamSocket, Message>>> = None;
     let mut pending_rate_redial: Option<PendingRateResend> = None;
+    let mut rate_redial: Option<RateRedial> = None;
+    let mut deferred_client: Option<(Message, Reservation)> = None;
+    let mut pending_initial: Option<PendingInitial> = None;
+    let mut initial_admission: Option<BoxFuture<'static, bool>> = None;
+    let mut initial_ready = false;
     let mut current = BTreeMap::<u64, CurrentCompletion>::new();
     let mut next_request = 0;
     let mut model: Option<String> = None;
     let mut drain_signal = context.drain_signal.take();
+    let context = Arc::new(context);
     let mut draining = context
         .relay
         .as_ref()
@@ -572,6 +777,14 @@ async fn run_with_read_timeout(
             .relay
             .as_ref()
             .is_some_and(|relay| relay.is_draining());
+        // Keep an admitted payload here until the write arm is polled, so
+        // drain can cancel it without losing the upstream sink or older turns.
+        if draining && let Some(pending) = pending_initial.take() {
+            initial_admission = None;
+            initial_ready = false;
+            deferred_client = None;
+            current.remove(&pending.request);
+        }
         if draining && current.is_empty() && ending.is_none() {
             ending = Some((
                 Some(CloseFrame {
@@ -582,14 +795,54 @@ async fn run_with_read_timeout(
             ));
             end_deadline = Instant::now() + CLOSE_TIMEOUT;
         }
+        if ending.is_some() {
+            initial_admission = None;
+            pending_initial = None;
+            initial_ready = false;
+            rate_redial = None;
+            if pending_rate_redial.take().is_some() {
+                to_upstream = None;
+            }
+            deferred_client = None;
+        }
         if ending.is_some() && to_client.is_none() && to_upstream.is_none() {
             break;
         }
-        // 각 방향은 메시지 하나만 보유한다. split 잠금은 poll 사이에 해제되어
+        // During a rate wait, retain at most one extra, budgeted client message.
+        // Stop client reads once occupied; drain it through the normal path.
+        // split 잠금은 poll 사이에 해제되어
         // 큰 쓰기가 진행되는 동안 같은 소켓의 읽기와 자동 pong을 poll할 수 있다.
         tokio::select! {
             _ = async { drain_signal.as_mut().unwrap().await }, if drain_signal.is_some() && !draining && ending.is_none() => {
                 draining = true;
+            }
+            eligible = async { initial_admission.as_mut().unwrap().await }, if initial_admission.is_some() && to_upstream.is_none() && ending.is_none() => {
+                initial_admission = None;
+                let pending = pending_initial.take().expect("initial admission owns payload");
+                draining |= context.relay.as_ref().is_some_and(|relay| relay.is_draining());
+                if draining {
+                    // Let the loop cancel only this queued turn; any earlier
+                    // dispatched turns still drain before the native 1001.
+                    pending_initial = Some(pending);
+                    continue;
+                }
+                if !eligible {
+                    ending = Some((Some(CloseFrame { code: 1000.into(), reason: "".into() }), "account_ineligible"));
+                    end_deadline = Instant::now() + CLOSE_TIMEOUT;
+                    continue;
+                }
+                pending_initial = Some(pending);
+                initial_ready = true;
+            }
+            result = async { rate_redial.as_mut().unwrap().await }, if rate_redial.is_some() && ending.is_none() => {
+                rate_redial = None;
+                match result {
+                    Ok((write, read)) => { upstream_read = read; to_upstream = Some(write); }
+                    Err(()) => {
+                        ending = Some((None, "upstream_write_error"));
+                        end_deadline = Instant::now() + CLOSE_TIMEOUT;
+                    }
+                }
             }
             result = async { to_client.as_mut().unwrap().await }, if to_client.is_some() => {
                 let (sink, success, delivered) = result;
@@ -606,7 +859,7 @@ async fn run_with_read_timeout(
                             if outcome == "ok" && let (Some(relay), Some((account, token))) = (&context.relay, &context.credentials) {
                                 super::clear_retried_token(relay, &account.id, token);
                             }
-                            active.completion.finish(outcome);
+                            active.finish(outcome);
                         }
                         draining |= context.relay.as_ref().is_some_and(|relay| relay.is_draining());
                         if draining && current.is_empty() && ending.is_none() {
@@ -628,7 +881,21 @@ async fn run_with_read_timeout(
                     end_deadline = Instant::now() + CLOSE_TIMEOUT;
                 }
             }
-            result = async { to_upstream.as_mut().unwrap().await }, if to_upstream.is_some() => {
+            result = async {
+                if initial_ready && to_upstream.is_none() {
+                    let pending = pending_initial.take().expect("ready initial payload");
+                    initial_ready = false;
+                    let sink = upstream_sink.take().expect("initial admission retains upstream sink");
+                    let bytes = pending.message.len();
+                    to_upstream = Some(Box::pin(async move {
+                        pending.rate.initial_dispatch();
+                        write(sink, pending.message, pending.reservation, Delivered {
+                            bytes, request: Some(pending.request), terminal: None, completed: false,
+                        }).await
+                    }));
+                }
+                to_upstream.as_mut().unwrap().await
+            }, if to_upstream.is_some() || (initial_ready && ending.is_none()) => {
                 let (sink, success, _) = result;
                 upstream_sink = Some(sink);
                 to_upstream = None;
@@ -639,13 +906,7 @@ async fn run_with_read_timeout(
                     && let Some(pending) = pending_rate_redial.take()
                     && !has_previous_response_id(&pending.message)
                 {
-                    match redial_rate(&context, pending, &mut upstream_read, context.budget.clone()).await {
-                        Ok(write) => to_upstream = Some(write),
-                        Err(()) => {
-                            ending = Some((None, "upstream_write_error"));
-                            end_deadline = Instant::now() + CLOSE_TIMEOUT;
-                        }
-                    }
+                    rate_redial = Some(redial_rate(context.clone(), pending));
                 } else if !success && ending.is_none() {
                     for active in current.values_mut() { active.completion.record.outcome = "upstream_error".into(); }
                     ending = Some((None, "upstream_write_error"));
@@ -658,7 +919,43 @@ async fn run_with_read_timeout(
             _ = context.memory_guard.changed(), if ending.is_none() => {
                 // Memory protection pauses client reads but leaves existing streams alive.
             }
-            message = client_read.next(), if client_admitted && !context.memory_guard.is_guarded() && to_upstream.is_none() && ending.is_none() && !terminal_pending => {
+            incoming = async {
+                if let Some((message, reservation)) = deferred_client.take() {
+                    (Some(Ok(message)), Some(reservation))
+                } else {
+                    (client_read.next().await, None)
+                }
+            }, if ending.is_none() && (
+                (deferred_client.is_none() && (pending_initial.is_some() || pending_rate_redial.is_some() || rate_redial.is_some()))
+                || ((deferred_client.is_some() || (client_admitted && !context.memory_guard.is_guarded()))
+                    && to_upstream.is_none() && pending_initial.is_none() && rate_redial.is_none() && pending_rate_redial.is_none() && !terminal_pending)
+            ) => {
+                let (message, reservation) = incoming;
+                if pending_initial.is_some() || to_upstream.is_some() || pending_rate_redial.is_some() || rate_redial.is_some() {
+                    match message {
+                        Some(Ok(Message::Ping(_))) => {
+                            if to_client.is_none() { to_client = Some(flush(client_sink.take().unwrap())); }
+                            continue;
+                        }
+                        Some(Ok(Message::Pong(_))) => continue,
+                        Some(Ok(Message::Close(frame))) => {
+                            ending = Some((frame, "client_close"));
+                        }
+                        None | Some(Err(_)) => ending = Some((None, "client_eof")),
+                        Some(Ok(message)) => {
+                            let reservation = context.budget.reserve_message(message.len());
+                            deferred_client = Some((message, reservation));
+                            continue;
+                        }
+                    }
+                    to_upstream = None;
+                    initial_admission = None;
+                    pending_initial = None;
+                    rate_redial = None;
+                    pending_rate_redial = None;
+                    end_deadline = Instant::now() + CLOSE_TIMEOUT;
+                    continue;
+                }
                 client_admitted = false;
                 last_activity = Instant::now();
                 match message {
@@ -696,12 +993,34 @@ async fn run_with_read_timeout(
                             ending = Some((frame.clone(), "client_close"));
                             end_deadline = Instant::now() + CLOSE_TIMEOUT;
                         }
-                        to_upstream = Some(write(upstream_sink.take().unwrap(), message, context.budget.reserve_message(bytes), Delivered { bytes, request, terminal: None, completed: false }));
+                        let initial_rate = if let Message::Text(text) = &message {
+                            response_create(text.as_str()).then(|| request.and_then(|id| current.get(&id)).map(|active| active.rate.clone())).flatten()
+                        } else { None };
+                        // Transfer the deferred slot's reservation into the
+                        // write. Re-admitting its already charged bytes could
+                        // deadlock when the slot itself fills the budget.
+                        let reservation = reservation.unwrap_or_else(|| context.budget.reserve_message(bytes));
+                        if let Some(rate) = initial_rate {
+                            let request = request.expect("response.create has completion");
+                            pending_initial = Some(PendingInitial { request, message, reservation, rate: rate.clone() });
+                            let context = context.clone();
+                            let model = model.clone();
+                            initial_admission = Some(Box::pin(async move {
+                                rate.admit(context.runtime.as_ref(), &context.account).await;
+                                match &context.runtime {
+                                    Some(runtime) => runtime.eligible(&context.account, model.as_deref()).await,
+                                    None => true,
+                                }
+                            }));
+                        } else {
+                            to_upstream = Some(write(upstream_sink.take().unwrap(), message, reservation,
+                                Delivered { bytes, request, terminal: None, completed: false }));
+                        }
                     }
                     _ => { ending = Some((None, "client_eof")); end_deadline = Instant::now() + CLOSE_TIMEOUT; }
                 }
             }
-            message = upstream_read.next(), if to_client.is_none() && ending.is_none() => {
+            message = upstream_read.next(), if to_client.is_none() && rate_redial.is_none() && ending.is_none() => {
                 last_activity = Instant::now();
                 upstream_activity = last_activity;
                 match message {
@@ -738,6 +1057,18 @@ async fn run_with_read_timeout(
                                         }
                                     }
                                 };
+                                if decision.as_ref().is_some_and(|decision| decision.kind == crate::relay::outcome::Kind::Rate) {
+                                    if let Some(runtime) = &context.runtime {
+                                        let sent_at = request.and_then(|id| current.get(&id)).map_or_else(
+                                            std::time::Instant::now,
+                                            |active| active.rate.state.lock().unwrap_or_else(|e| e.into_inner()).sent_at,
+                                        );
+                                        runtime.observe_429_at(&context.account, sent_at, std::time::Instant::now(), ws_retry_after(event), 1.0);
+                                    }
+                                    if ws_rate_advice(event) && let Some(active) = request.and_then(|id| current.get_mut(&id)) {
+                                        active.completion.relayed_rate_429();
+                                    }
+                                }
                                 // Row 13a excludes row 3 rate limits and requires a current request.
                                 if current.len() == 1 && request.and_then(|id| current.get(&id)).is_some_and(|active| !active.committed)
                                     && decision.as_ref().is_some_and(|decision| decision.failover() && decision.kind != crate::relay::outcome::Kind::Rate)
@@ -747,7 +1078,7 @@ async fn run_with_read_timeout(
                                         active
                                             .completion
                                             .failover(decision.as_ref().expect("decision").reason());
-                                        active.completion.finish("failover");
+                                        active.finish("failover");
                                     }
                                     ending = Some((Some(CloseFrame { code: 1012.into(), reason: "".into() }), "precommit_failover"));
                                     end_deadline = Instant::now() + CLOSE_TIMEOUT;
@@ -762,22 +1093,22 @@ async fn run_with_read_timeout(
                                     let resend = request
                                         .and_then(|id| current.get_mut(&id))
                                         .and_then(|active| {
-                                            if active.rate_retries >= 3 {
+                                            if !active.rate.can_retry() {
                                                 active.completion.relayed_rate_429();
                                                 active.completion.record.outcome = "rate_hold_relayed_429".into();
                                                 None
                                             } else {
-                                                active.rate_retries += 1;
-                                                active.completion.rate_retry();
                                                 active.last_create.clone()
                                             }
                                         });
                                     if let Some(message) = resend
                                         && let Some(sink) = upstream_sink.take()
                                     {
+                                        let rate = current[&request.expect("active rate request")].rate.clone();
                                         pending_rate_redial = Some(PendingRateResend {
                                             request: request.expect("active rate request"),
                                             message: message.clone(),
+                                            rate: rate.clone(),
                                         });
                                         let runtime = context.runtime.clone();
                                         let account = context.account.clone();
@@ -785,10 +1116,8 @@ async fn run_with_read_timeout(
                                         let bytes = message.len();
                                         let reservation = budget.reserve_message(bytes);
                                         to_upstream = Some(Box::pin(async move {
-                                            tokio::time::sleep(Duration::from_secs(1)).await;
-                                            if let Some(runtime) = runtime {
-                                                let _ = runtime.admit(&account).await;
-                                            }
+                                            rate.admit(runtime.as_ref(), &account).await;
+                                            rate.sent();
                                             write(
                                                 sink,
                                                 message,
@@ -820,16 +1149,8 @@ async fn run_with_read_timeout(
                             && let Some(pending) = pending_rate_redial.take()
                         {
                             to_upstream = None;
-                            if !has_previous_response_id(&pending.message)
-                                && let Ok(write) = redial_rate(
-                                    &context,
-                                    pending,
-                                    &mut upstream_read,
-                                    context.budget.clone(),
-                                )
-                                .await
-                            {
-                                to_upstream = Some(write);
+                            if !has_previous_response_id(&pending.message) && pending.rate.can_retry() {
+                                rate_redial = Some(redial_rate(context.clone(), pending));
                                 continue;
                             }
                             ending = Some((frame.clone(), "upstream_close"));
@@ -850,15 +1171,8 @@ async fn run_with_read_timeout(
                             && !has_previous_response_id(&pending.message)
                         {
                             to_upstream = None;
-                            if let Ok(write) = redial_rate(
-                                &context,
-                                pending,
-                                &mut upstream_read,
-                                context.budget.clone(),
-                            )
-                            .await
-                            {
-                                to_upstream = Some(write);
+                            if pending.rate.can_retry() {
+                                rate_redial = Some(redial_rate(context.clone(), pending));
                                 continue;
                             }
                         }
@@ -900,6 +1214,14 @@ async fn run_with_read_timeout(
             _ = tokio::time::sleep_until(end_deadline), if ending.is_some() => { break; }
         }
     }
+    // End waits and release retained slots before the close handshake and the
+    // completion snapshot. Direct cancellation still uses the Drop fallback.
+    drop(to_upstream);
+    drop(initial_admission);
+    drop(pending_initial);
+    drop(rate_redial);
+    drop(pending_rate_redial);
+    drop(deferred_client);
     let (frame, reason) = ending.unwrap_or((None, "closed"));
     let code = frame.as_ref().map(|frame| frame.code.into());
     // 종료 handshake도 느린 상대 때문에 무기한 소켓을 붙잡지 않는다.
