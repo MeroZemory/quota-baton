@@ -207,6 +207,7 @@ async fn runtime_state(State(state): State<RuntimeAdmin>) -> Response {
     {
         Ok(accounts) => {
             Json(serde_json::json!({
+            "pools": crate::account_runtime::pool_counts(&accounts),
             "accounts": accounts,
             "inflight": {
                 "requests": state.relay.inflight_requests.load(std::sync::atomic::Ordering::Relaxed),

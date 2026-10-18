@@ -57,6 +57,7 @@ impl Account {
 
     pub fn eligible_at(&self, model: Option<&str>, now: DateTime<Utc>) -> bool {
         self.user_state == UserState::Active
+            && self.payment_until.is_none_or(|until| until <= now)
             && match &self.health {
                 Health::Ready => true,
                 Health::NeedsRelogin { .. } => false,
@@ -71,13 +72,44 @@ impl Account {
 
     /// Expire before reading health for a transition, retaining auth probe history.
     pub(crate) fn expire_health(&mut self, now: DateTime<Utc>) -> bool {
-        let expired_auth = matches!(self.health, Health::Cooling { reason: HealthReason::Auth, until, .. } if until <= now);
-        if !self.health.expire(now) {
-            return false;
+        let before = (
+            self.health.clone(),
+            self.auth_probe_pending,
+            self.quota_cooling.clone(),
+            self.payment_until,
+        );
+        if let Health::Cooling {
+            reason: HealthReason::Payment,
+            until,
+            ..
+        } = self.health
+        {
+            self.payment_until = Some(self.payment_until.map_or(until, |old| old.max(until)));
         }
-        self.auth_probe_pending |= expired_auth;
-        self.quota_cooling = None;
-        true
+        if self.payment_until.is_some_and(|until| until <= now) {
+            self.payment_until = None;
+        }
+        let expired_auth = matches!(self.health, Health::Cooling { reason: HealthReason::Auth, until, .. } if until <= now);
+        if self.health.expire(now) {
+            self.auth_probe_pending |= expired_auth;
+            self.quota_cooling = None;
+        }
+        if self.health == Health::Ready
+            && let Some(until) = self.payment_until
+        {
+            self.health = Health::Cooling {
+                reason: HealthReason::Payment,
+                until,
+                scope: "account".into(),
+            };
+        }
+        before
+            != (
+                self.health.clone(),
+                self.auth_probe_pending,
+                self.quota_cooling.clone(),
+                self.payment_until,
+            )
     }
 
     /// Returns whether health or persisted auth backoff changed. User state is
@@ -86,6 +118,8 @@ impl Account {
         let before = (
             self.health.clone(),
             self.auth_failures,
+            self.payment_failures,
+            self.payment_until,
             self.auth_probe_pending,
             self.quota_cooling.clone(),
         );
@@ -112,10 +146,18 @@ impl Account {
             }
             HealthSignal::StaleToken401 | HealthSignal::NoChange => {}
             HealthSignal::ReloginCompleted => {
-                self.health = Health::Ready;
+                if !matches!(
+                    self.health,
+                    Health::Cooling {
+                        reason: HealthReason::Payment,
+                        ..
+                    }
+                ) {
+                    self.health = Health::Ready;
+                    self.quota_cooling = None;
+                }
                 self.auth_failures = 0;
                 self.auth_probe_pending = false;
-                self.quota_cooling = None;
             }
             HealthSignal::NewerLinkedToken => {
                 if matches!(
@@ -148,10 +190,27 @@ impl Account {
                 until,
                 scope,
             } => {
+                let until = if reason == HealthReason::Payment {
+                    let hours = (6_i64 << self.payment_failures.min(2)).min(24);
+                    self.payment_failures = self.payment_failures.saturating_add(1);
+                    let until = now + Duration::hours(hours);
+                    self.payment_until =
+                        Some(self.payment_until.map_or(until, |old| old.max(until)));
+                    until
+                } else {
+                    until
+                };
                 self.cool(reason, until, scope);
             }
             HealthSignal::Ready => {
-                if !matches!(self.health, Health::NeedsRelogin { .. }) {
+                if !matches!(
+                    self.health,
+                    Health::NeedsRelogin { .. }
+                        | Health::Cooling {
+                            reason: HealthReason::Payment,
+                            ..
+                        }
+                ) {
                     self.health = Health::Ready;
                     self.quota_cooling = None;
                 }
@@ -185,10 +244,13 @@ impl Account {
                 self.cool(HealthReason::LinkStale, retry_at, "account".into());
             }
         }
+        self.expire_health(now);
         before
             != (
                 self.health.clone(),
                 self.auth_failures,
+                self.payment_failures,
+                self.payment_until,
                 self.auth_probe_pending,
                 self.quota_cooling.clone(),
             )
@@ -401,6 +463,8 @@ pub(crate) mod tests {
             user_state: UserState::Active,
             health: Health::Ready,
             auth_failures: 0,
+            payment_failures: 0,
+            payment_until: None,
             auth_probe_pending: false,
             quota_cooling: None,
             drain: false,
@@ -562,5 +626,101 @@ pub(crate) mod tests {
         );
         assert!(!account.eligible_at(None, now));
         assert!(matches!(account.health, Health::Cooling { scope, .. } if scope == "account"));
+    }
+    #[test]
+    fn c6_4_payment_backoff_persists_and_clears_only_after_deadline() {
+        let mut account = fixture();
+        let mut now = Utc::now();
+        for (index, hours) in [6, 12, 24, 24].into_iter().enumerate() {
+            account.apply_health_signal(
+                HealthSignal::Cooling {
+                    reason: HealthReason::Payment,
+                    until: now + Duration::hours(6),
+                    scope: "account".into(),
+                },
+                now,
+            );
+            let expected = Health::Cooling {
+                reason: HealthReason::Payment,
+                until: now + Duration::hours(hours),
+                scope: "account".into(),
+            };
+            assert_eq!(account.health, expected);
+            assert_eq!(account.payment_failures, index as u32 + 1);
+            for signal in [
+                HealthSignal::Ready,
+                HealthSignal::ReloginCompleted,
+                HealthSignal::UsageSnapshot {
+                    snapshot: serde_json::json!({"windows":[{"name":"5h","used_pct":0}]}),
+                    model: None,
+                    projected_allowance: 0.0,
+                },
+            ] {
+                account.apply_health_signal(signal, now);
+                assert_eq!(account.health, expected);
+            }
+            account = serde_json::from_value(serde_json::to_value(&account).unwrap()).unwrap();
+            assert_eq!(account.payment_failures, index as u32 + 1);
+            now += Duration::hours(hours);
+            account.apply_health_signal(HealthSignal::NoChange, now);
+            assert_eq!(account.health, Health::Ready);
+        }
+        let mut legacy = serde_json::to_value(account).unwrap();
+        legacy.as_object_mut().unwrap().remove("payment_failures");
+        let legacy: Account = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.payment_failures, 0);
+    }
+    #[test]
+    fn c6_4_payment_deadline_survives_other_health_and_relogin() {
+        let now = Utc::now();
+        let mut a = fixture();
+        a.source = super::super::Source::Oauth;
+        let payment = now + Duration::hours(6);
+        a.apply_health_signal(
+            HealthSignal::Cooling {
+                reason: HealthReason::Payment,
+                until: payment,
+                scope: "account".into(),
+            },
+            now,
+        );
+        a.apply_health_signal(
+            HealthSignal::Cooling {
+                reason: HealthReason::Quota,
+                until: now + Duration::hours(24),
+                scope: "account".into(),
+            },
+            now,
+        );
+        assert!(matches!(
+            a.health,
+            Health::Cooling {
+                reason: HealthReason::Quota,
+                ..
+            }
+        ));
+        assert_eq!(a.payment_until, Some(payment));
+        a.apply_health_signal(HealthSignal::Ready, now);
+        assert_eq!(
+            a.health,
+            Health::Cooling {
+                reason: HealthReason::Payment,
+                until: payment,
+                scope: "account".into()
+            }
+        );
+        a.apply_health_signal(
+            HealthSignal::Revoked {
+                reason: "synthetic-revocation".into(),
+            },
+            now,
+        );
+        assert!(matches!(a.health, Health::NeedsRelogin { .. }));
+        a.apply_health_signal(HealthSignal::ReloginCompleted, now);
+        assert_eq!(a.payment_until, Some(payment));
+        assert!(!a.eligible_at(None, now));
+        a.apply_health_signal(HealthSignal::NoChange, payment);
+        assert_eq!(a.payment_until, None);
+        assert!(a.eligible_at(None, payment));
     }
 }
