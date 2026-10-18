@@ -29,8 +29,8 @@ Implement quota-baton exactly as specified, milestone by milestone, until M8 is 
 
 | Milestone | Status |
 |---|---|
-| M0, M1a, M2, M3, M4a, M4b, M5, M1b, M6a, M4c, M6b, M7a, M6b.2, M7b, M4d, M7c, M8, M6c | merged, including the M7c 24 h addendum (no upward trend). Nothing remains for you. Running the cutover on the live profile is the user's decision (D9) and out of scope for you |
-| M4e | C6.4 guarantees and tests from the previous proxy mixed-pool incident, plus `/state` pool counts; brief `M4e.md`. No API-key kind, no priority (O14 is open) |
+| M0, M1a, M2, M3, M4a, M4b, M5, M1b, M6a, M4c, M6b, M7a, M6b.2, M7b, M4d, M7c, M8, M6c | merged, including the M7c 24 h addendum (no upward trend). Running the cutover on the live profile is the user's decision (D9) and out of scope for you |
+| R1 | final-review fixes, in order: rebalance target (MF1), M4e (C6.4, brief `M4e.md`), CPA dependency (MF2), tray completeness, rate-hold deviations; brief `R1-final-review-fixes.md` |
 
 ## Hard boundaries (never)
 
