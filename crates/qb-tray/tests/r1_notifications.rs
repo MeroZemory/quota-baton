@@ -21,14 +21,29 @@ use std::{
 
 #[tokio::test]
 async fn quota_relay_events_render_account_and_grounded_next_action() {
-    for action in ["failover", "credits", "exhausted"] {
+    for scenario in [
+        "failover",
+        "credits",
+        "exhausted",
+        "exhausted-disabled",
+        "exhausted-credit-offer",
+    ] {
+        let action = if scenario.starts_with("exhausted") {
+            "exhausted"
+        } else {
+            scenario
+        };
         let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/tray2-bridge");
         fs::create_dir_all(&base).unwrap();
         let root = tempfile::tempdir_in(base).unwrap();
         let home = root.path().join("home");
         let cpa = root.path().join("synthetic-cpa");
         fs::create_dir(&cpa).unwrap();
-        let n = if action == "failover" { 2 } else { 1 };
+        let n = if action == "failover" || scenario == "exhausted-disabled" {
+            2
+        } else {
+            1
+        };
         let mut activate = Vec::new();
         for i in 0..n {
             let email = format!("notification-{i}@example.invalid");
@@ -38,7 +53,9 @@ async fn quota_relay_events_render_account_and_grounded_next_action() {
                 "id_token":"synthetic-notice-id","expired":"2099-01-01T00:00:00Z",
                 "last_refresh":"2026-01-01T00:00:00Z","plan_type":"plus"
             })).unwrap()).unwrap();
-            activate.push(format!("codex:{email}"));
+            if scenario != "exhausted-disabled" || i == 0 {
+                activate.push(format!("codex:{email}"));
+            }
         }
         let store = Arc::new(AccountStore::acquire(&home).unwrap());
         import::run(&store, &cpa, &activate, false).unwrap();
@@ -62,7 +79,7 @@ async fn quota_relay_events_render_account_and_grounded_next_action() {
             ("x-codex-active-limit", "secondary".to_owned()),
             (
                 "x-codex-credits-has-credits",
-                (action == "credits").to_string(),
+                (action == "credits" || scenario == "exhausted-credit-offer").to_string(),
             ),
             ("x-codex-credits-serving", (action == "credits").to_string()),
         ] {
@@ -78,6 +95,13 @@ async fn quota_relay_events_render_account_and_grounded_next_action() {
         config.server.admin_port = 0;
         config.upstream.codex_base = fake.url.clone();
         config.upstream.anthropic_base = fake.url.clone();
+        config.upstream.codex_usage_base = fake.url.clone();
+        config.upstream.claude_usage_base = fake.url.clone();
+        #[cfg(debug_assertions)]
+        {
+            config.upstream.codex_token_endpoint = Some(fake.url.clone());
+            config.upstream.claude_token_endpoint = Some(fake.url.clone());
+        }
         let obs = Arc::new(Observability::new(&home, None).unwrap());
         let state = Arc::new(
             RelayState::new(store.clone(), &config, obs, Arc::new(DebugPins::default())).unwrap(),
@@ -115,44 +139,71 @@ async fn quota_relay_events_render_account_and_grounded_next_action() {
             .iter()
             .find(|a| a["quota_notice"]["action"] == action)
             .expect("core must publish grounded notice");
-        let name_for = |id: &Value| {
-            views.iter().find(|a| a["id"] == *id).map(|a| {
-                qb_tray::notice_account_name(
-                    a["email"].as_str(),
-                    a["label"].as_str(),
-                    a["id"].as_str().unwrap(),
-                )
-            })
-        };
+        let snapshot: Value = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap()
+            .get(format!("http://{}/admin/v1/state", servers.admin_addr))
+            .bearer_auth("synthetic-notice-admin")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let projected = qb_tray::v2::project(&snapshot.to_string(), SystemTime::now()).unwrap();
+        let id = account["id"].as_str().unwrap();
         let context: qb_tray::QuotaNotice =
             serde_json::from_value(account["quota_notice"].clone()).unwrap();
-        let name = qb_tray::notice_account_name(
-            account["email"].as_str(),
-            None,
-            account["id"].as_str().unwrap(),
-        );
-        let next = name_for(&account["quota_notice"]["next_account"]);
-        let earliest = name_for(&account["quota_notice"]["earliest_account"]);
-        let message = qb_tray::quota_message(
-            &context,
-            &name,
+        let name = qb_tray::v2_notices::account_row(&projected, "codex", id)
+            .unwrap()
+            .name
+            .as_str();
+        let next = context
+            .next_account
+            .as_deref()
+            .and_then(|next| qb_tray::v2_notices::account_row(&projected, "codex", next))
+            .map(|row| row.name.as_str());
+        let message = qb_tray::v2_notices::quota_message(
+            &projected,
             "codex",
-            next.as_deref(),
-            earliest.as_deref(),
+            id,
+            &context,
             SystemTime::now(),
         )
         .unwrap();
-        assert!(message.title.contains(&name));
+        if action == "exhausted" {
+            assert_eq!(message.title, "Codex 계정 모두 한도 도달");
+        } else {
+            assert!(message.title.contains(name));
+        }
         match action {
             "failover" => {
                 assert!(message.text.contains("이어서 처리"));
-                assert!(message.text.contains(next.as_deref().unwrap()));
+                assert!(message.text.contains(next.unwrap()));
                 assert_eq!(fake.state.requests().len(), 2);
             }
-            "credits" => assert!(message.text.contains("유료 크레딧으로 계속")),
+            "credits" => assert!(message.text.contains("유료 크레딧으로 계속 처리합니다.")),
             "exhausted" => {
                 assert!(message.title.contains("모두 한도"));
                 assert!(message.text.contains("가장 빠른 초기화"));
+                match scenario {
+                    "exhausted-disabled" => assert!(
+                        message
+                            .text
+                            .contains("꺼진 계정 1개를 켜면 이어서 처리할 수 있습니다.")
+                    ),
+                    "exhausted-credit-offer" => {
+                        assert!(message.text.contains(&format!(
+                            "{name}의 유료 크레딧을 허용하면 바로 이어서 처리합니다."
+                        )));
+                        assert!(!message.text.contains("유료 크레딧으로 계속 처리합니다."));
+                    }
+                    _ => assert!(message.text.contains("그때까지 새 요청은 오류로 끝납니다.")),
+                }
             }
             _ => unreachable!(),
         }

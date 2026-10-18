@@ -70,19 +70,23 @@ impl Default for Controller {
     }
 }
 
-fn presentation(badge: Badge, count: usize) -> Presentation {
-    let label = match badge {
-        Badge::Normal => "정상",
-        Badge::Attention => "주의 필요",
-        Badge::Error => "코어 연결 끊김",
-    };
+fn presentation(badge: Badge, _count: usize) -> Presentation {
     Presentation {
         badge,
-        tooltip: format!("quota-baton · {label} · 계정 {count}개"),
+        tooltip: "quota-baton · 코어에 연결할 수 없음".into(),
     }
 }
 
+fn projection(snapshot: &TraySnapshot, wall: SystemTime) -> Option<qb_tray::v2::View> {
+    qb_tray::v2::project(&serde_json::to_string(snapshot).ok()?, wall).ok()
+}
+
 fn target(signal: Signal<'_>) -> Target {
+    if signal.kind == Kind::QuotaExhausted
+        && let Subject::Account { provider, .. } = signal.subject
+    {
+        return Target::Provider(provider.to_owned());
+    }
     match signal.subject {
         Subject::Account { id, .. } => Target::Account(id.to_owned()),
         Subject::Provider(provider) => Target::Provider(provider.to_owned()),
@@ -91,39 +95,39 @@ fn target(signal: Signal<'_>) -> Target {
 }
 
 fn account_message(
-    _snapshot: &TraySnapshot,
+    snapshot: &TraySnapshot,
     account: &crate::client::TrayAccount,
     kind: Kind,
     wall: SystemTime,
 ) -> (String, String) {
-    let name = qb_tray::notice_account_name(
-        account.email.as_deref(),
-        account.label.as_deref(),
-        &account.id,
-    );
-    let other = account.has_alternative;
-    let alternative = if other {
-        "그동안 다른 계정이 처리합니다."
-    } else {
-        "처리할 다른 계정이 없습니다."
+    use qb_tray::v2_notices::AccountKind;
+    let typed = match kind {
+        Kind::Relogin => Some(AccountKind::Relogin),
+        Kind::LinkStale => Some(AccountKind::LinkStale),
+        Kind::Billing => Some(AccountKind::Billing),
+        Kind::OrganisationDenied => Some(AccountKind::OrganisationDenied),
+        Kind::StoreError => Some(AccountKind::StoreError),
+        _ => None,
     };
-    match kind {
-        Kind::Relogin => (qb_tray::account_notice_title(&name,&account.provider,"다시 로그인 필요"), format!("트레이에서 이 계정의 \"다시 로그인\"을 누르세요. {alternative}")),
-        Kind::LinkStale => (qb_tray::account_notice_title(&name,&account.provider,"CPA 갱신 멈춤"), "CPA가 이 계정의 토큰을 갱신하지 않습니다. CPA 실행을 확인하거나 계정 인수를 고려하세요.".into()),
-        Kind::OrganisationDenied => (qb_tray::account_notice_title(&name,&account.provider,"조직 접근 거부"), "이 계정은 6시간 동안 쉽니다.".into()),
-        Kind::Billing => {
-            let remaining = account.health["until"].as_str()
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                .map(|at| at.signed_duration_since(chrono::DateTime::<chrono::Utc>::from(wall)).num_seconds());
-            let rest = remaining.filter(|s| *s > 0).map_or_else(|| "결제 상태를 확인하는 동안 이 계정을 쉽니다.".into(), |s| {
-                // Do not round a partial hour into an invented full-hour hold.
-                if s % 3600 == 0 { format!("{}시간 동안 이 계정을 쉽니다.", s / 3600) }
-                else { format!("약 {:.1}시간 동안 이 계정을 쉽니다.", s as f64 / 3600.0) }
-            });
-            (qb_tray::account_notice_title(&name,&account.provider,"결제 거절"), format!("{rest} {alternative}"))
-        }
-        _ => { let (title, text) = Signal { subject: Subject::Core, kind }.message(); (title.into(), text.into()) }
+    if let Some(kind) = typed
+        && let Some(view) = projection(snapshot, wall)
+        && let Some(message) = qb_tray::v2_notices::account_message(
+            &view,
+            &account.provider,
+            &account.id,
+            kind,
+            account.has_alternative,
+            wall,
+        )
+    {
+        return message;
     }
+    let (title, text) = Signal {
+        subject: Subject::Core,
+        kind,
+    }
+    .message();
+    (title.into(), text.into())
 }
 
 impl Controller {
@@ -139,7 +143,7 @@ impl Controller {
         &mut self,
         snapshot: &TraySnapshot,
         core_ok: bool,
-        existing_attention: bool,
+        _existing_attention: bool,
         account_count: usize,
         wall: SystemTime,
         elapsed: Duration,
@@ -148,8 +152,11 @@ impl Controller {
             self.unavailable(account_count);
             return;
         }
+        let Some(view) = projection(snapshot, wall) else {
+            self.unavailable(account_count);
+            return;
+        };
         let mut found = Vec::new();
-        let mut quota_attention = false;
         let mut exhausted_providers = HashSet::new();
         let now = chrono::DateTime::<chrono::Utc>::from(wall);
         for warning in &snapshot.warnings {
@@ -181,79 +188,39 @@ impl Controller {
                 health_scope: health["scope"].as_str(),
                 cooling_current,
             });
-            quota_attention |= health_signal.is_some_and(|s| s.kind == Kind::Limit);
             if account.user_state == "active"
                 && !account.id.is_empty()
                 && !account.provider.is_empty()
-                && let Some(context) = account
-                    .quota_notice
-                    .as_ref()
-                    .filter(|q| q.current_since(wall, account.last_relevant_state_at))
-            {
-                let next = context.next_account.as_deref().map(|id| {
-                    snapshot
-                        .accounts
-                        .iter()
-                        .find(|a| a.id == id && a.provider == account.provider)
-                        .map_or_else(
-                            || qb_tray::notice_account_name(None, None, id),
-                            |a| {
-                                qb_tray::notice_account_name(
-                                    a.email.as_deref(),
-                                    a.label.as_deref(),
-                                    id,
-                                )
-                            },
-                        )
-                });
-                let name = qb_tray::notice_account_name(
-                    account.email.as_deref(),
-                    account.label.as_deref(),
-                    &account.id,
-                );
-                let earliest = context.earliest_account.as_deref().map(|id| {
-                    snapshot
-                        .accounts
-                        .iter()
-                        .find(|a| a.id == id && a.provider == account.provider)
-                        .map_or_else(
-                            || qb_tray::notice_account_name(None, None, id),
-                            |a| {
-                                qb_tray::notice_account_name(
-                                    a.email.as_deref(),
-                                    a.label.as_deref(),
-                                    id,
-                                )
-                            },
-                        )
-                });
-                if let Some(message) = qb_tray::quota_message(
-                    context,
-                    &name,
+                && let Some(context) = account.quota_notice.as_ref().filter(|q| {
+                    q.current_since(wall, account.last_relevant_state_at)
+                        && (q.action != qb_tray::QuotaAction::Credits || account.allow_credits)
+                })
+                && let Some(message) = qb_tray::v2_notices::quota_message(
+                    &view,
                     &account.provider,
-                    next.as_deref(),
-                    earliest.as_deref(),
+                    &account.id,
+                    context,
                     wall,
-                ) {
-                    let kind = match context.action {
-                        qb_tray::QuotaAction::Credits => Kind::QuotaCredits,
-                        qb_tray::QuotaAction::Failover => Kind::QuotaFailover,
-                        qb_tray::QuotaAction::Exhausted => {
-                            exhausted_providers.insert(account.provider.as_str());
-                            Kind::QuotaExhausted
-                        }
-                    };
-                    found.push((
-                        Signal {
-                            subject: Subject::Account {
-                                provider: &account.provider,
-                                id: &account.id,
-                            },
-                            kind,
+                )
+            {
+                let kind = match context.action {
+                    qb_tray::QuotaAction::Credits => Kind::QuotaCredits,
+                    qb_tray::QuotaAction::Failover => Kind::QuotaFailover,
+                    qb_tray::QuotaAction::Exhausted => {
+                        exhausted_providers.insert(account.provider.as_str());
+                        Kind::QuotaExhausted
+                    }
+                };
+                found.push((
+                    Signal {
+                        subject: Subject::Account {
+                            provider: &account.provider,
+                            id: &account.id,
                         },
-                        (message.title, message.text),
-                    ));
-                }
+                        kind,
+                    },
+                    (message.title, message.text),
+                ));
             }
             if let Some(signal) = health_signal.filter(|s| s.kind != Kind::Limit) {
                 found.push((
@@ -295,14 +262,13 @@ impl Controller {
                 ));
             }
         }
-        self.presentation = presentation(
-            signals::badge(
-                core_ok,
-                existing_attention || quota_attention,
-                &found.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
-            ),
-            account_count,
-        );
+        self.presentation = Presentation {
+            badge: match view.badge {
+                qb_tray::v2::Badge::Normal => Badge::Normal,
+                qb_tray::v2::Badge::Attention => Badge::Attention,
+            },
+            tooltip: view.tray_tooltip,
+        };
         let current: HashSet<_> = found
             .iter()
             .map(|(signal, _)| (target(*signal), signal.kind))
@@ -407,7 +373,7 @@ mod tests {
     use serde_json::json;
     fn quota_snapshot(action: &str) -> TraySnapshot {
         serde_json::from_value(json!({"accounts":[{"id":"a","provider":"codex","email":"acct-alpha@example.test",
-            "user_state":"active","health":{"kind":"ready"}, "allow_credits":false,
+            "user_state":"active","health":{"kind":"ready"}, "allow_credits":true,
             "quota_notice":{"window":"7d","reset_at":"2099-01-01T00:00:00Z","action":action,
             "next_account":"b","earliest_account":"b","observed_at":"2026-01-01T00:00:00Z"}},
             {"id":"b","provider":"codex","email":"hello.sample-acct@example.test","user_state":"active","health":{"kind":"ready"}}],
@@ -425,7 +391,12 @@ mod tests {
                 Kind::QuotaFailover,
                 "hello.sample-acct 계정으로 이어서 처리",
             ),
-            (2, "exhausted", Kind::QuotaExhausted, "새 요청은 한도 오류"),
+            (
+                2,
+                "exhausted",
+                Kind::QuotaExhausted,
+                "새 요청은 오류로 끝납니다",
+            ),
         ] {
             let mut s = quota_snapshot(action);
             // Keep generic exhaustion out of the first two fixture cases.
@@ -435,7 +406,12 @@ mod tests {
             observe(&mut c, &s, t);
             let n = c.next(Duration::from_secs(t)).unwrap();
             assert_eq!(n.kind, kind);
-            assert!(n.title.contains("acct-alpha"));
+            if action == "exhausted" {
+                assert_eq!(n.title, "Codex 계정 모두 한도 도달");
+                assert_eq!(n.target, Target::Provider("codex".into()));
+            } else {
+                assert!(n.title.contains("acct-alpha"));
+            }
             assert!(!n.title.contains('@'));
             assert!(n.text.contains(text));
             if action == "exhausted" {
@@ -466,9 +442,7 @@ mod tests {
             s.accounts[0].allow_credits = false;
             observe(&mut c, &s, 1);
             assert!(c.next(Duration::from_secs(1)).is_none());
-            if reason == "quota" {
-                assert_eq!(c.presentation().badge, Badge::Attention);
-            }
+            assert_eq!(c.presentation().badge, Badge::Normal);
         }
         let mut s = quota_snapshot("credits");
         s.pools["codex"]["eligible"] = json!(1);
@@ -509,8 +483,13 @@ mod tests {
         s.pools = json!({"claude":{"eligible":0}});
         let (title, body) = account_message(&s, &s.accounts[0], Kind::Billing, wall);
         assert_eq!(title, "hello.sample-acct · Claude 결제 거절");
-        assert!(body.contains("3시간"));
-        assert!(body.contains("처리할 다른 계정이 없습니다"));
+        assert_eq!(
+            body,
+            format!(
+                "{}까지 이 계정을 쉽니다.",
+                qb_tray::v2_notices::time("2026-10-18T15:00:00Z".parse().unwrap(), wall)
+            )
+        );
         let (_, body) = account_message(&s, &s.accounts[0], Kind::Relogin, wall);
         assert!(body.contains("처리할 다른 계정이 없습니다"));
         s.pools["claude"]["eligible"] = json!(1);
@@ -521,12 +500,18 @@ mod tests {
         let (_, body) = account_message(&s, &s.accounts[0], Kind::Relogin, wall);
         assert!(body.contains("그동안 다른 계정이 처리합니다"));
         let (_, body) = account_message(&s, &s.accounts[0], Kind::Billing, wall);
-        assert!(body.contains("그동안 다른 계정이 처리합니다"));
+        assert!(body.ends_with("까지 이 계정을 쉬고 다른 계정이 처리합니다."));
         let (title, body) = account_message(&s, &s.accounts[0], Kind::LinkStale, wall);
         assert!(title.contains("CPA 갱신 멈춤"));
         assert!(body.contains("CPA가 이 계정의 토큰을 갱신하지 않습니다"));
         let (_, body) = account_message(&s, &s.accounts[0], Kind::OrganisationDenied, wall);
-        assert_eq!(body, "이 계정은 6시간 동안 쉽니다.");
+        assert_eq!(
+            body,
+            format!(
+                "이 계정은 {}까지 쉽니다.",
+                qb_tray::v2_notices::time("2026-10-18T15:00:00Z".parse().unwrap(), wall)
+            )
+        );
     }
 
     #[test]
@@ -631,7 +616,7 @@ mod tests {
             c.next(Duration::from_secs(1))
                 .unwrap()
                 .text
-                .contains("가장 빠른 초기화: unknown-id")
+                .starts_with("가장 빠른 초기화:")
         );
         s.accounts[0]
             .quota_notice
@@ -697,7 +682,7 @@ mod tests {
             &snapshot(json!({"kind":"needs_relogin"}), "disabled", None),
             0,
         );
-        assert_eq!(c.presentation().badge, Badge::Attention);
+        assert_eq!(c.presentation().badge, Badge::Normal);
         assert_eq!(c.next(Duration::ZERO).unwrap().kind, Kind::Relogin);
         c.finish();
         assert!(c.next(Duration::ZERO).is_none());
@@ -776,6 +761,69 @@ mod tests {
         c.restarted(Duration::from_secs(601));
         assert!(c.next(Duration::from_secs(601)).is_none());
     }
+    #[test]
+    fn v2_shell_matches_projected_summary_and_ignores_legacy_attention() {
+        for health in [
+            json!({"kind":"ready"}),
+            json!({"kind":"cooling","reason":"quota","scope":"account","until":"2099-01-01T00:00:00Z"}),
+        ] {
+            let s = snapshot(health, "active", Some(1));
+            let now = SystemTime::now();
+            let v = projection(&s, now).unwrap();
+            let mut c = Controller::default();
+            c.snapshot(&s, true, true, s.accounts.len(), now, Duration::ZERO);
+            assert_eq!(c.presentation().badge, Badge::Normal);
+            assert_eq!(c.presentation().tooltip, v.tray_tooltip);
+            assert!(c.presentation().tooltip.contains("Codex 사용 가능"));
+            c.unavailable(s.accounts.len());
+            assert_eq!(c.presentation().badge, Badge::Error);
+            assert_eq!(
+                c.presentation().tooltip,
+                "quota-baton · 코어에 연결할 수 없음"
+            );
+        }
+    }
+
+    #[test]
+    fn allow_off_prunes_unsent_paid_notice_and_preferences_alone_never_notify() {
+        let mut s = quota_snapshot("credits");
+        s.pools["codex"]["eligible"] = json!(1);
+        let mut c = Controller::default();
+        observe(&mut c, &s, 0);
+        assert_eq!(c.pending.len(), 1);
+        s.accounts[0].allow_credits = false;
+        observe(&mut c, &s, 1);
+        assert!(c.pending.is_empty());
+        assert!(c.next(Duration::from_secs(1)).is_none());
+        let mut fresh = Controller::default();
+        observe(&mut fresh, &s, 0);
+        assert!(fresh.next(Duration::ZERO).is_none());
+        s.accounts[0].quota_notice = None;
+        s.accounts[0].allow_credits = true;
+        observe(&mut fresh, &s, 2);
+        assert!(fresh.next(Duration::from_secs(2)).is_none());
+    }
+
+    #[test]
+    fn store_error_uses_critical_kind_and_spec_copy() {
+        let s = snapshot(
+            json!({"kind":"cooling","reason":"store_error","scope":"account","until":"2099-01-01T00:00:00Z"}),
+            "active",
+            Some(0),
+        );
+        let mut c = Controller::default();
+        observe(&mut c, &s, 0);
+        let notice = c.next(Duration::ZERO).unwrap();
+        assert_eq!(notice.kind, Kind::StoreError);
+        assert!(notice.title.ends_with("토큰 저장 실패"));
+        assert_eq!(
+            notice.text,
+            "토큰을 저장하지 못해 다시 시도하고 있습니다. 로그를 확인하세요."
+        );
+        assert_eq!(notice.target, Target::Account("cx-synthetic".into()));
+        assert_eq!(c.presentation().badge, Badge::Attention);
+    }
+
     #[test]
     fn shell_tooltip_is_terminated_and_never_splits_a_surrogate_pair() {
         let short: [u16; 3] = shell_text("가😀나");

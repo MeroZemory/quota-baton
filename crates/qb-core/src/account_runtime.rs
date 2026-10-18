@@ -1145,7 +1145,7 @@ impl AccountRuntime {
             let health=self.volatile.lock().ok().and_then(|v|v.get(&a.id).cloned()).unwrap_or(a.health.clone());
             let pending = self.probing(&a.id) || ((a.auth_probe_pending || a.auth_failures > 0) && health == Health::Ready);
             let health = if pending { json!({"kind":"cooling","reason":"auth","until":Utc::now(),"scope":"account","probe_pending":true}) } else { json!(health) };
-            json!({"quota_notice":quota_notice,"credits_in_use":credits_in_use,"has_alternative":has_alternative,"id":a.id,"generation":a.generation,"last_refresh_at":a.token_meta.last_refresh_at,"provider":a.provider,"label":a.label,"email":a.email,"plan":quota["plan"].as_str().map(str::to_owned).or(a.plan.clone()),"user_state":a.user_state,"source":a.source,"health":health,"probe_pending":pending,"pacing":{"backoff_until":backoff_until,"step":pacing.rate_step,"release_interval_ms":pacing.rate_release_interval.as_millis() as u64,"waiting":pacing.waiting},"windows":quota["windows"].as_array().cloned().unwrap_or_default(),"credits":quota["credits"],"last_used_at":null,"bound_sessions":0,"token_expires_at":a.token_meta.expires_at,"drain":a.drain,"allow_credits":a.allow_credits,"refresh_attention":self.refresh_attention.lock().map(|f|f.contains(&a.id)).unwrap_or(false)})
+            json!({"pool_eligible":a.user_state == UserState::Active && !pending && health["kind"] == "ready","quota_cooling":a.quota_cooling,"observed_at":quota["observed_at"],"quota_notice":quota_notice,"credits_in_use":credits_in_use,"has_alternative":has_alternative,"id":a.id,"generation":a.generation,"last_refresh_at":a.token_meta.last_refresh_at,"provider":a.provider,"label":a.label,"email":a.email,"plan":quota["plan"].as_str().map(str::to_owned).or(a.plan.clone()),"user_state":a.user_state,"source":a.source,"health":health,"probe_pending":pending,"pacing":{"backoff_until":backoff_until,"step":pacing.rate_step,"release_interval_ms":pacing.rate_release_interval.as_millis() as u64,"waiting":pacing.waiting},"windows":quota["windows"].as_array().cloned().unwrap_or_default(),"credits":quota["credits"],"last_used_at":null,"bound_sessions":0,"token_expires_at":a.token_meta.expires_at,"drain":a.drain,"allow_credits":a.allow_credits,"refresh_attention":self.refresh_attention.lock().map(|f|f.contains(&a.id)).unwrap_or(false)})
         }).collect())
     }
 
@@ -1992,4 +1992,98 @@ pub(crate) fn quota_session(key: Option<&str>) -> Option<String> {
             .map(|byte| format!("{byte:02x}"))
             .collect()
     })
+}
+
+// Append as an inline unit module to account_runtime.rs after branch integration.
+#[cfg(test)]
+mod r5_view_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn r5_view_preserves_pool_membership_limiting_window_and_observation_time() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.sandbox/r5-view-fixtures");
+        std::fs::create_dir_all(&base).unwrap();
+        let home = tempfile::tempdir_in(base).unwrap();
+        let store = Arc::new(AccountStore::acquire(home.path()).unwrap());
+        let obs = Arc::new(Observability::new(home.path(), None).unwrap());
+        let runtime = AccountRuntime::new(store.clone(), obs.clone(), 1.0);
+        let now = Utc::now();
+        let reset = now + Duration::hours(2);
+        let mut expected = std::collections::BTreeMap::new();
+        let mut quota_id = String::new();
+        for case in [
+            "ready", "drained", "paused", "disabled", "quota", "auth", "relogin",
+        ] {
+            let mut a = crate::accounts::health::tests::fixture();
+            a.identity = crate::accounts::Identity::Codex {
+                user_id: Some(format!("synthetic-r5-{case}")),
+                account_id: format!("synthetic-r5-workspace-{case}"),
+                email: format!("r5-{case}@example.invalid"),
+            };
+            a.id = a.identity.id();
+            a.token_meta.expires_at = Some(now + Duration::days(1));
+            a.drain = case == "drained";
+            if case == "paused" {
+                a.user_state = UserState::Paused;
+            }
+            if case == "disabled" {
+                a.user_state = UserState::Disabled;
+            }
+            if case == "auth" {
+                a.auth_probe_pending = true;
+            }
+            if case == "relogin" {
+                a.health = Health::NeedsRelogin {
+                    reason: "synthetic".into(),
+                    since: now,
+                };
+            }
+            if case == "quota" {
+                a.health = Health::Cooling {
+                    reason: HealthReason::Quota,
+                    until: reset,
+                    scope: "account".into(),
+                };
+                a.quota_cooling = Some(crate::accounts::QuotaCooling {
+                    window: "7d".into(),
+                    reset_at: reset,
+                    started_at: now,
+                });
+                quota_id = a.id.clone();
+            }
+            let a = store
+                .save(
+                    &a,
+                    &crate::accounts::Tokens {
+                        access_token: format!("synthetic-r5-access-{case}"),
+                        refresh_token: format!("synthetic-r5-refresh-{case}"),
+                        id_token: None,
+                    },
+                    None,
+                )
+                .unwrap();
+            expected.insert(a.id.clone(), matches!(case, "ready" | "drained"));
+            obs.observe_poll(&a.id, json!({"observed_at":now,"source":"poll","windows":[{"name":"7d","used_pct":if case=="quota" {100.0}else{25.0},"reset_at":reset,"observed_at":now}]}), true).unwrap();
+        }
+        let views = runtime.views().await.unwrap();
+        assert_eq!(views.len(), expected.len());
+        for view in &views {
+            assert_eq!(
+                view["pool_eligible"],
+                expected[view["id"].as_str().unwrap()]
+            );
+            assert_eq!(view["observed_at"], json!(now));
+            assert!(view.get("access_token").is_none());
+            assert!(view.get("refresh_token").is_none());
+        }
+        let pools = pool_counts(&views);
+        assert_eq!(
+            pools["codex"]["eligible"].as_u64(),
+            Some(views.iter().filter(|a| a["pool_eligible"] == true).count() as u64)
+        );
+        let quota = views.iter().find(|a| a["id"] == quota_id).unwrap();
+        assert_eq!(quota["quota_cooling"]["window"], "7d");
+        assert_eq!(quota["quota_cooling"]["reset_at"], json!(reset));
+    }
 }

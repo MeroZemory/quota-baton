@@ -10,6 +10,13 @@ use serde::{Deserialize, Deserializer};
 use std::time::{Duration, SystemTime};
 
 pub mod actions;
+pub mod v2;
+pub mod v2_colors;
+pub mod v2_geometry;
+pub mod v2_notices;
+pub mod v2_session;
+#[cfg(windows)]
+pub mod v2_text;
 
 #[cfg(windows)]
 pub mod native_render;
@@ -448,10 +455,21 @@ pub struct Pacing {
     pub backoff_secs: Option<u64>,
     #[serde(default)]
     pub rate_step: u8,
+    #[serde(default)]
+    pub backoff_until: Option<String>,
+    #[serde(default)]
+    pub waiting: u64,
+    #[serde(default)]
+    pub step: u8,
+    #[serde(default)]
+    pub release_interval_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
+    /// Shared complete input for the v2 HWND/WIC projection. No credential fields
+    /// occur in core state. Manual compatibility rows may omit this context.
+    pub view_input: Option<std::sync::Arc<str>>,
     pub id: String,
     pub provider: String,
     pub name: String,
@@ -1018,11 +1036,13 @@ pub fn parse_state(json: &str) -> serde_json::Result<Vec<Row>> {
 
 pub fn parse_state_at(json: &str, now: SystemTime) -> serde_json::Result<Vec<Row>> {
     let state: State = serde_json::from_str(json)?;
+    let view_input: std::sync::Arc<str> = json.into();
     Ok(state
         .accounts
         .iter()
         .map(|account| {
             let mut row = row(account, now);
+            row.view_input = Some(view_input.clone());
             if account.user_state == "active"
                 && let Some(notice) = account
                     .quota_notice
@@ -1100,6 +1120,7 @@ pub fn row(account: &Account, now: SystemTime) -> Row {
         .map(|window| usage(Some(*window), now))
         .collect::<Vec<_>>();
     Row {
+        view_input: None,
         id: account.id.clone(),
         provider: provider_name(&account.provider).into(),
         name,
