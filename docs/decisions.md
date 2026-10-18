@@ -71,7 +71,7 @@ Evidence behind the rule (2026-10-13):
 - Rotated refresh tokens are single-use. Reusing one can revoke the whole token family (R1 §2, R2 §2), as in the 10-10 incident.
 
 **Never imported:**
-- `~/.codex`, `~/.claude`, Orca and the orchestrator homes. Their CLIs refresh the tokens themselves.
+- `~/.codex`, `~/.claude`, Orca and the orchestrator homes. Their CLIs refresh the tokens themselves. Exception since 2026-10-19: an explicit, warned **takeover** from such a home under D18. It is never a silent import and never linked.
 
 <a id="d6"></a>
 ## D6. Implementation language: Rust — Accepted (user, 2026-10-13)
@@ -316,3 +316,33 @@ The design was independently reviewed (`.sandbox/reviews/D17-review.md`); all si
 - The two active plus-plan Codex accounts (cx-413c3b, cx-763c46) were removed from CPA on 10-16 21:11 (CPA log `auth file changed (REMOVE)`).
 - Nobody refreshes them, and their stored refresh tokens equal CPA's last state.
 - They expire on 10-23 and 10-24, so they must be adopted from the store before 10-22, whenever the full retire ships.
+
+<a id="d18"></a>
+## D18. Take over an account from another app's home, with a warning — Accepted (user direction, 2026-10-19)
+
+**User direction (quoted).** "경고하고(원래쪽 로그인된다는) 토큰 가져와서 관리주체 바꾸는 기능도 필요합니다." The first case is `acct-delta@mail.test` (Codex, Pro) in an Orca-managed Codex home.
+
+- **What it does.** quota-baton reads the token pair from another app's home and becomes the account's **sole refresh owner** (`source.kind="takeover"`, owned like `oauth`). Sources:
+  - a Codex home with a ChatGPT `auth.json`: `~/.codex`, `~/.codex-acct/*`, Orca `codex-accounts/*/home`;
+  - a Claude config dir with `.credentials.json`.
+
+  quota-baton has no Orca-specific code. The user points at a directory.
+- **The warning is the point.** After quota-baton's first refresh, the source's stored refresh token is consumed. The source app will fail and must log in again. If it refreshes with the old token first, the reuse can revoke the whole token family (D5 evidence, the 10-10 incident). The command and the tray show the warning and the identity before anything is written:
+  - email, plan, provider account id;
+  - the source path and the source's `last_refresh` and file mtime;
+  - whether a process that owns the home looks alive.
+
+  The user confirms each takeover (`--yes` on the CLI, a confirm dialog in the tray).
+- **Guards.**
+  - Refuse while the source owner looks alive. Examples: an Orca process is running for an Orca home; a `codex` process runs with that `CODEX_HOME`, best effort by command line; the file changed in the last 120 s.
+  - Re-read the file just before commit. Refuse if its bytes changed after the warning was shown.
+  - Refuse an identity that is already in the store, unless `--replace` (same rule as `--replace-linked`). The existing `id`, bindings and history are kept.
+  - Refuse API-key auth (D16).
+- **Retire the source by default.** After a successful takeover, rename the source file to `<name>.taken-over-by-quota-baton-<date>` so the source app cannot present the consumed token again. It then shows "not logged in" rather than revoking the family. `--keep-source` skips the rename and gets a second, stronger warning. Renaming another app's file is a user decision under D9, made per takeover by the confirmation above.
+- **Then verify.** Run one manual refresh (D17 gate) right after the takeover and report it, so a dead refresh token is found at once and not at expiry.
+- **Not covered.** Reverse hand-back to the source app. To use the source app again, the user logs in there afresh.
+
+**Evidence (2026-10-19).**
+- Orca has no service, scheduled task, Run key or startup entry, and was not running.
+- Its homes' `auth.json` were last refreshed when Orca was last used: 09-18, 09-30, 10-11 and 10-12.
+- Orca refreshes only while it (or a Codex CLI in that home) runs. A takeover while Orca is closed is therefore safe, provided Orca is not started on that home afterwards. The source rename guarantees this.
