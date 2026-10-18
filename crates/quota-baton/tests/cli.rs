@@ -979,7 +979,7 @@ fn offline_status_and_actions_use_synthetic_metadata_and_quota() {
     let output = command(home.path()).arg("status").bounded_output().unwrap();
     assert!(output.status.success());
     let status = String::from_utf8(output.stdout).unwrap();
-    let columns: Vec<_> = status.lines().nth(2).unwrap().split('\t').collect();
+    let columns: Vec<_> = status.lines().nth(4).unwrap().split('\t').collect();
     assert_eq!(columns[5], "리셋됨");
     assert_eq!(columns[7], "리셋됨");
     assert!(!status.contains("100.0%"));
@@ -1019,7 +1019,7 @@ fn offline_status_and_actions_use_synthetic_metadata_and_quota() {
         let output = command(home.path()).arg("status").bounded_output().unwrap();
         assert!(output.status.success());
         let status = String::from_utf8(output.stdout).unwrap();
-        let columns: Vec<_> = status.lines().nth(2).unwrap().split('\t').collect();
+        let columns: Vec<_> = status.lines().nth(4).unwrap().split('\t').collect();
         assert_eq!(columns[4], expected);
     }
     let store = qb_core::accounts::AccountStore::acquire(home.path()).unwrap();
@@ -1141,7 +1141,7 @@ fn online_status_unknown_health_is_utf8_safe_and_omits_secret_fields() {
     assert!(status.contains("알 수 없음"));
     assert!(status.contains("합성 🧪 계정"));
     assert!(!status.contains('\u{1b}'));
-    assert_eq!(status.lines().count(), 3);
+    assert_eq!(status.lines().count(), 5);
     for secret in [
         "synthetic-admin-secret",
         "synthetic-access-secret",
@@ -1198,6 +1198,8 @@ fn online_status_piped_and_file_stdout_are_utf8_with_expired_windows_and_probe_p
     });
     let expected = concat!(
         "코어: 실행 중\n",
+        "claude: 사용 가능 0 · 대기 [] · 사용 불가 0\n",
+        "codex: 사용 가능 2 · 대기 [인증 오류 1] · 사용 불가 1\n",
         "계정 ID\t제공자\t라벨\t사용 상태\t계정 상태\t5시간 사용률\t5시간 초기화\t7일 사용률\t7일 초기화\t상태 이유\t대기 종료\n",
         "cx-expired-five\tcodex\t합성 🧪\t활성\t인증 확인 대기\t리셋됨\t2000-01-01T09:00:00.123+09:00\t37.5%\t2099-01-07T00:00:00Z\t-\t-\n",
         "cx-expired-seven\tcodex\t합성 계정\t활성\t준비됨\t91.0%\t2099-01-01T05:00:00Z\t리셋됨\t2000-01-07T00:00:00Z\t-\t-\n",
@@ -1222,4 +1224,39 @@ fn online_status_piped_and_file_stdout_are_utf8_with_expired_windows_and_probe_p
         assert!(!bytes.starts_with(&[0xef, 0xbb, 0xbf]));
     }
     assert!(!home.path().join("accounts").exists());
+}
+
+#[test]
+fn c6_4_status_renders_per_provider_pool_counts() {
+    let home = fixture();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!(
+            "[server]\nadmin_port={}\n",
+            listener.local_addr().unwrap().port()
+        ),
+    )
+    .unwrap();
+    std::fs::write(home.path().join("admin.token"), "synthetic-admin-secret").unwrap();
+    let state = serde_json::json!({"accounts":[
+        {"id":"a","provider":"claude","user_state":"active","health":{"kind":"ready"}},
+        {"id":"b","provider":"claude","user_state":"active","health":{"kind":"cooling","reason":"payment","until":"2099-01-01T00:00:00Z"}},
+        {"id":"c","provider":"codex","user_state":"disabled","health":{"kind":"ready"}}
+    ]});
+    let server = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + MOCK_SERVER_TIMEOUT;
+        for (route, body) in [
+            ("/admin/v1/health", serde_json::json!({"ok":true,"version":"synthetic","pid":0,"started_at":"2030-01-01T00:00:00Z"}).to_string()),
+            ("/admin/v1/state", state.to_string()),
+        ] {
+            mock_response(&listener, deadline, route, "200 OK", &body, Some("synthetic-admin-secret")).unwrap();
+        }
+    });
+    let output = command(home.path()).arg("status").bounded_output().unwrap();
+    server.join().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("claude: 사용 가능 1 · 대기 [결제 필요 1] · 사용 불가 0"));
+    assert!(stdout.contains("codex: 사용 가능 0 · 대기 [] · 사용 불가 1"));
 }

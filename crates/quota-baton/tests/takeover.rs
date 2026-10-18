@@ -303,6 +303,8 @@ fn accounts(home: &Home, count: usize) -> Vec<String> {
                 user_state: UserState::Active,
                 health: Health::Ready,
                 auth_failures: 0,
+                payment_failures: 0,
+                payment_until: None,
                 auth_probe_pending: false,
                 quota_cooling: None,
                 drain: false,
