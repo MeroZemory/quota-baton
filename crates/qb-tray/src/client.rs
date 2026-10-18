@@ -398,11 +398,76 @@ pub fn layout_rows(
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TrayWarning {
     #[serde(default)]
+    pub model_limited: bool,
+    #[serde(default)]
     pub kind: String,
     #[serde(default)]
     pub burst_new_sessions: Option<u64>,
     #[serde(default)]
     pub observed_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub account: Option<String>,
+    #[serde(default)]
+    pub window: Option<String>,
+    #[serde(default)]
+    pub reset_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub action: Option<qb_tray::QuotaAction>,
+    #[serde(default)]
+    pub next_account: Option<String>,
+    #[serde(default)]
+    pub earliest_account: Option<String>,
+}
+
+impl TrayWarning {
+    /// Same flat fields as the per-account context, plus kind/account.
+    /// Event wiring is owned by main; snapshot context remains authoritative.
+    #[allow(dead_code)]
+    pub fn quota_notice(&self) -> Option<qb_tray::QuotaNotice> {
+        if self.kind != "quota_notice" || self.account.as_deref().is_none_or(str::is_empty) {
+            return None;
+        }
+        Some(qb_tray::QuotaNotice {
+            model_limited: self.model_limited,
+            window: self.window.clone(),
+            reset_at: self.reset_at,
+            action: self.action.clone()?,
+            next_account: self.next_account.clone(),
+            earliest_account: self.earliest_account.clone(),
+            observed_at: self.observed_at?,
+        })
+    }
+}
+
+#[cfg(test)]
+mod quota_wire_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn snapshot_and_flat_core_warning_share_typed_context_without_using_raw_reasons() {
+        let context = json!({"window":"5h", "model_limited":true, "reset_at":null, "action":"failover",
+            "next_account":"b", "earliest_account":"c", "observed_at":"2026-10-18T12:00:00Z"});
+        let account: TrayAccount =
+            serde_json::from_value(json!({"id":"a", "quota_notice":context})).unwrap();
+        let mut warning = context.clone();
+        warning["kind"] = json!("quota_notice");
+        warning["account"] = json!("a");
+        warning["reason"] = json!("DO NOT DISPLAY raw body");
+        let warning: TrayWarning = serde_json::from_value(warning).unwrap();
+        let notice = warning.quota_notice().unwrap();
+        assert!(notice.model_limited);
+        assert_eq!(notice.action, qb_tray::QuotaAction::Failover);
+        assert_eq!(notice.window, account.quota_notice.unwrap().window);
+        assert_eq!(notice.next_account.as_deref(), Some("b"));
+        assert_eq!(notice.earliest_account.as_deref(), Some("c"));
+        assert!(notice.reset_at.is_none());
+        let warning: TrayWarning =
+            serde_json::from_value(json!({"kind":"quota_notice","account":"a"})).unwrap();
+        assert!(warning.quota_notice().is_none());
+        let account: TrayAccount = serde_json::from_value(json!({"allow_credits":true})).unwrap();
+        assert!(account.quota_notice.is_none());
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -427,6 +492,12 @@ pub struct TraySnapshot {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct TrayAccount {
+    #[serde(default)]
+    pub has_alternative: bool,
+    #[serde(default)]
+    pub quota_notice: Option<qb_tray::QuotaNotice>,
+    #[serde(default)]
+    pub last_relevant_state_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default)]
     pub id: String,
     #[serde(default)]

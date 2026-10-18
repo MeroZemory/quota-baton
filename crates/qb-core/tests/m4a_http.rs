@@ -2405,3 +2405,896 @@ async fn r1_http_late_inflight_rate_does_not_raise_a_new_window_step() {
     assert_eq!(h.state.accounts.pacing_snapshot(&id).rate_step, 1);
     assert_eq!(h.store.load(&id).unwrap().health, Health::Ready);
 }
+
+// R1-tray.2: core-only event/snapshot contracts; UI bridge is owned separately.
+fn tray2_events(events: &mut tokio::sync::broadcast::Receiver<Value>) -> Vec<Value> {
+    let mut notices = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        let text = event.to_string();
+        for secret in [
+            "synthetic-access",
+            "synthetic-refresh",
+            "conversation-marker",
+        ] {
+            assert!(!text.contains(secret));
+        }
+        if event["event"] == "core_warning" && event["data"]["kind"] == "quota_notice" {
+            notices.push(event["data"].clone());
+        }
+    }
+    notices
+}
+fn tray2_headers(used: u32, reset: i64) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    for (name, value) in [
+        ("x-codex-secondary-window-minutes", "10080".to_owned()),
+        ("x-codex-secondary-used-percent", used.to_string()),
+        ("x-codex-secondary-reset-at", reset.to_string()),
+        ("x-codex-active-limit", "secondary".to_owned()),
+    ] {
+        headers.insert(name, value.parse().unwrap());
+    }
+    headers
+}
+
+#[tokio::test]
+async fn tray2_core_quota_failover_is_ready_c7_target_and_flat_event() {
+    let h = Harness::new(Provider::Codex, 2, 384, 1024).await;
+    let mut events = h.state.accounts.subscribe();
+    let reset = Utc::now().timestamp() + 172800;
+    let mut limited = quota(reset);
+    limited.headers.extend(tray2_headers(100, reset));
+    h.fake.state.push(limited);
+    h.fake.state.push(ok());
+    let response = h.send_with_session(Provider::Codex, "tray2-failover").await;
+    assert_eq!(response.status(), 200);
+    let target = response.headers()["x-quota-baton-account"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    response.bytes().await.unwrap();
+    let notices = tray2_events(&mut events);
+    let notice = notices.iter().find(|n| n["action"] == "failover").unwrap();
+    assert_eq!(notice["next_account"], target);
+    assert_ne!(notice["account"], target);
+    assert_eq!(notice["window"], "7d");
+    assert_eq!(
+        notice["reset_at"],
+        json!(chrono::DateTime::from_timestamp(reset, 0).unwrap())
+    );
+    let views = h.state.accounts.views().await.unwrap();
+    let source = views.iter().find(|v| v["id"] == notice["account"]).unwrap();
+    assert_eq!(source["quota_notice"]["action"], "failover");
+    assert_eq!(source["has_alternative"], true);
+    assert_eq!(
+        views.iter().find(|v| v["id"] == target).unwrap()["has_alternative"],
+        false
+    );
+    assert!(
+        !serde_json::to_string(&views)
+            .unwrap()
+            .contains("synthetic-access")
+    );
+}
+
+#[tokio::test]
+async fn tray2_core_exhausted_earliest_observed_reset_and_unknown_is_null() {
+    for known in [true, false] {
+        let h = Harness::new(Provider::Codex, 1, 384, 1024).await;
+        let mut events = h.state.accounts.subscribe();
+        let reset = Utc::now().timestamp() + 172800;
+        h.fake.state.push(if known {
+            quota(reset)
+        } else {
+            ScriptedResponse::json(
+                StatusCode::TOO_MANY_REQUESTS,
+                r#"{"error":{"type":"usage_limit_reached"}}"#,
+            )
+        });
+        let response = h.send(Provider::Codex, "{}").await;
+        assert_eq!(response.status(), 429);
+        response.bytes().await.unwrap();
+        let notices = tray2_events(&mut events);
+        let notice = notices.iter().find(|n| n["action"] == "exhausted").unwrap();
+        assert!(notice["next_account"].is_null());
+        assert_eq!(notice["reset_at"].is_null(), !known);
+        assert_eq!(notice["earliest_account"].is_null(), !known);
+        if known {
+            assert_eq!(notice["earliest_account"], notice["account"]);
+        }
+        let views = h.state.accounts.views().await.unwrap();
+        assert_eq!(views[0]["quota_notice"]["action"], "exhausted");
+        assert_eq!(views[0]["has_alternative"], false);
+    }
+}
+
+#[tokio::test]
+async fn tray2_core_credits_requires_success_and_disable_clears_without_new_toast() {
+    let h = Harness::new(Provider::Codex, 1, 384, 1024).await;
+    let id = h.ids().remove(0);
+    let mut events = h.state.accounts.subscribe();
+    h.state
+        .accounts
+        .change(&id, None, None, None, Some(true))
+        .await
+        .unwrap();
+    assert!(tray2_events(&mut events).is_empty());
+    assert!(h.state.accounts.views().await.unwrap()[0]["quota_notice"].is_null());
+    let mut response = ok();
+    response
+        .headers
+        .insert("x-codex-credits-serving", "true".parse().unwrap());
+    response
+        .headers
+        .insert("x-codex-credits-has-credits", "true".parse().unwrap());
+    h.fake.state.push(response);
+    h.send(Provider::Codex, "{}").await.bytes().await.unwrap();
+    let notices = tray2_events(&mut events);
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0]["action"], "credits");
+    assert_eq!(notices[0]["account"], id);
+    assert_eq!(
+        h.state.accounts.views().await.unwrap()[0]["quota_notice"]["action"],
+        "credits"
+    );
+    h.state
+        .accounts
+        .change(&id, None, None, None, Some(false))
+        .await
+        .unwrap();
+    assert!(h.state.accounts.views().await.unwrap()[0]["quota_notice"].is_null());
+    assert!(tray2_events(&mut events).is_empty());
+    // Re-enabling and an ordinary success cannot resurrect the cached C9 flag.
+    h.state
+        .accounts
+        .change(&id, None, None, None, Some(true))
+        .await
+        .unwrap();
+    h.fake.state.push(ok());
+    h.send(Provider::Codex, "{}").await.bytes().await.unwrap();
+    assert!(tray2_events(&mut events).is_empty());
+    assert!(h.state.accounts.views().await.unwrap()[0]["quota_notice"].is_null());
+    let mut response = ok();
+    response
+        .headers
+        .insert("x-codex-credits-serving", "true".parse().unwrap());
+    response
+        .headers
+        .insert("x-codex-credits-has-credits", "true".parse().unwrap());
+    h.fake.state.push(response);
+    h.send(Provider::Codex, "{}").await.bytes().await.unwrap();
+    assert_eq!(tray2_events(&mut events).len(), 1);
+    let mut depleted = HeaderMap::new();
+    depleted.insert("x-codex-credits-has-credits", "false".parse().unwrap());
+    h.state
+        .accounts
+        .observe_headers(&id, Provider::Codex, &depleted)
+        .await;
+    assert!(h.state.accounts.views().await.unwrap()[0]["quota_notice"].is_null());
+    assert!(tray2_events(&mut events).is_empty());
+}
+
+#[tokio::test]
+async fn tray2_core_reset_hold_and_successful_retry_never_publish_quota() {
+    let h = Harness::new(Provider::Codex, 2, 384, 1024).await;
+    h.fake.state.push(ok());
+    let warm = h.send_with_session(Provider::Codex, "tray2-hold").await;
+    let original = warm.headers()["x-quota-baton-account"].clone();
+    warm.bytes().await.unwrap();
+    let mut events = h.state.accounts.subscribe();
+    h.fake.state.push(quota(Utc::now().timestamp() + 2));
+    h.fake.state.push(ok());
+    let retry = h.send_with_session(Provider::Codex, "tray2-hold");
+    tokio::pin!(retry);
+    tokio::select! {
+        response = &mut retry => panic!("reset hold did not wait: {}", response.status()),
+        _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+    }
+    assert!(tray2_events(&mut events).is_empty());
+    assert!(
+        h.state
+            .accounts
+            .views()
+            .await
+            .unwrap()
+            .iter()
+            .all(|v| v["quota_notice"].is_null())
+    );
+    let response = retry.await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["x-quota-baton-account"], original);
+    response.bytes().await.unwrap();
+    assert!(tray2_events(&mut events).is_empty());
+    assert!(
+        h.state
+            .accounts
+            .views()
+            .await
+            .unwrap()
+            .iter()
+            .all(|v| v["quota_notice"].is_null())
+    );
+}
+
+#[tokio::test]
+async fn tray2_core_reset_and_disabled_target_invalidate_quota_context() {
+    let h = Harness::new(Provider::Codex, 2, 384, 1024).await;
+    let reset = Utc::now().timestamp() + 172800;
+    let mut response = quota(reset);
+    response.headers.extend(tray2_headers(100, reset));
+    h.fake.state.push(response);
+    h.fake.state.push(ok());
+    h.send_with_session(Provider::Codex, "tray2-clear")
+        .await
+        .bytes()
+        .await
+        .unwrap();
+    let views = h.state.accounts.views().await.unwrap();
+    let limited = views
+        .iter()
+        .find(|v| v["quota_notice"]["action"] == "failover")
+        .unwrap();
+    let source = limited["id"].as_str().unwrap();
+    let target = limited["quota_notice"]["next_account"].as_str().unwrap();
+    h.state
+        .accounts
+        .change(target, Some(UserState::Disabled), None, None, None)
+        .await
+        .unwrap();
+    assert!(
+        h.state
+            .accounts
+            .views()
+            .await
+            .unwrap()
+            .iter()
+            .all(|v| v["quota_notice"].is_null())
+    );
+    h.state
+        .accounts
+        .observe_headers(source, Provider::Codex, &tray2_headers(10, reset + 86400))
+        .await;
+    assert_eq!(h.store.load(source).unwrap().health, Health::Ready);
+    assert!(
+        h.state
+            .accounts
+            .views()
+            .await
+            .unwrap()
+            .iter()
+            .all(|v| v["quota_notice"].is_null())
+    );
+}
+
+#[tokio::test]
+async fn tray2_core_exhaustion_uses_earliest_account_not_last_failure() {
+    let h = Harness::new(Provider::Codex, 2, 384, 1024).await;
+    let first_reset = Utc::now().timestamp() + 86400;
+    h.fake.state.push(quota(first_reset));
+    h.fake.state.push(quota(first_reset + 86400));
+    let response = h.send_with_session(Provider::Codex, "tray2-earliest").await;
+    assert_eq!(response.status(), 429);
+    response.bytes().await.unwrap();
+    let views = h.state.accounts.views().await.unwrap();
+    let exhausted = views
+        .iter()
+        .find(|v| v["quota_notice"]["action"] == "exhausted")
+        .unwrap();
+    let earliest = exhausted["quota_notice"]["earliest_account"]
+        .as_str()
+        .unwrap();
+    assert_ne!(exhausted["id"], earliest);
+    assert_eq!(
+        exhausted["quota_notice"]["reset_at"],
+        json!(chrono::DateTime::from_timestamp(first_reset, 0).unwrap())
+    );
+    assert!(
+        views
+            .iter()
+            .filter(|v| v["id"] != exhausted["id"])
+            .all(|v| v["quota_notice"].is_null())
+    );
+}
+
+#[tokio::test]
+async fn tray2_core_credit_preferences_capability_and_error_are_not_serving_evidence() {
+    for (allow, serving, capable, success) in [
+        (true, false, true, true),
+        (false, true, true, true),
+        (true, true, false, true),
+        (true, true, true, false),
+    ] {
+        let h = Harness::new(Provider::Codex, 1, 384, 1024).await;
+        h.state
+            .accounts
+            .change(&h.ids()[0], None, None, None, Some(allow))
+            .await
+            .unwrap();
+        let mut events = h.state.accounts.subscribe();
+        let mut response = ScriptedResponse::json(
+            if success {
+                StatusCode::OK
+            } else {
+                StatusCode::BAD_REQUEST
+            },
+            "{}",
+        );
+        response.headers.insert(
+            "x-codex-credits-has-credits",
+            capable.to_string().parse().unwrap(),
+        );
+        if serving {
+            response
+                .headers
+                .insert("x-codex-credits-serving", "true".parse().unwrap());
+        }
+        h.fake.state.push(response);
+        h.send(Provider::Codex, "{}").await.bytes().await.unwrap();
+        assert!(tray2_events(&mut events).is_empty());
+        assert!(h.state.accounts.views().await.unwrap()[0]["quota_notice"].is_null());
+    }
+}
+
+#[tokio::test]
+async fn tray2_core_successful_credit_response_at_full_window_still_has_actual_c9_context() {
+    let h = Harness::new(Provider::Codex, 1, 384, 1024).await;
+    let id = h.ids().remove(0);
+    h.state
+        .accounts
+        .change(&id, None, None, None, Some(true))
+        .await
+        .unwrap();
+    let mut response = ok();
+    response
+        .headers
+        .extend(tray2_headers(100, Utc::now().timestamp() + 172800));
+    response
+        .headers
+        .insert("x-codex-credits-serving", "true".parse().unwrap());
+    response
+        .headers
+        .insert("x-codex-credits-has-credits", "true".parse().unwrap());
+    h.fake.state.push(response);
+    let mut events = h.state.accounts.subscribe();
+    let response = h.send(Provider::Codex, "{}").await;
+    assert_eq!(response.status(), 200);
+    response.bytes().await.unwrap();
+    let notices = tray2_events(&mut events);
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0]["action"], "credits");
+    assert_eq!(notices[0]["window"], "7d");
+    assert_eq!(
+        h.state.accounts.views().await.unwrap()[0]["quota_notice"]["action"],
+        "credits"
+    );
+}
+
+#[tokio::test]
+async fn tray2_core_postcommit_quota_context_waits_for_next_request_bound_or_unbound() {
+    for bound in [false, true] {
+        let h = Harness::new(Provider::Codex, 2, 384, 1024).await;
+        let first = Bytes::from_static(b"data: {\"type\":\"response.created\"}\n\n");
+        let error = Bytes::from_static(b"data: {\"type\":\"error\",\"status\":429,\"error\":{\"type\":\"usage_limit_reached\",\"resets_in_seconds\":600}}\n\n");
+        h.fake.state.push(ScriptedResponse::sse(vec![
+            (Duration::ZERO, first.clone()),
+            (Duration::from_millis(10), error.clone()),
+        ]));
+        let mut events = h.state.accounts.subscribe();
+        let response = if bound {
+            h.send_with_session(Provider::Codex, "tray2-postcommit")
+                .await
+        } else {
+            h.send(Provider::Codex, "{}").await
+        };
+        let source = response.headers()["x-quota-baton-account"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            response.bytes().await.unwrap(),
+            [first.as_ref(), error.as_ref()].concat()
+        );
+        assert!(tray2_events(&mut events).is_empty());
+        h.fake.state.push(ok());
+        let response = if bound {
+            h.send_with_session(Provider::Codex, "tray2-postcommit")
+                .await
+        } else {
+            h.send(Provider::Codex, "{}").await
+        };
+        assert_eq!(response.status(), 200);
+        let target = response.headers()["x-quota-baton-account"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(source, target);
+        response.bytes().await.unwrap();
+        let notices = tray2_events(&mut events);
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0]["account"], source);
+        assert_eq!(notices[0]["next_account"], target);
+        assert_eq!(notices[0]["action"], "failover");
+    }
+}
+
+#[tokio::test]
+async fn tray2_model_scoped_exhaustion_survives_authoritative_views_without_model_name_on_wire() {
+    for count in [1, 2] {
+        let h = Harness::new(Provider::Claude, count, 384, 1024).await;
+        let reset = Utc::now().timestamp() + 172800;
+        for _ in 0..count {
+            let mut response = ScriptedResponse::json(
+                StatusCode::TOO_MANY_REQUESTS,
+                r#"{"error":{"type":"rate_limit_error"}}"#,
+            );
+            response.headers.insert(
+                "anthropic-ratelimit-unified-7d_oi-status",
+                "rejected".parse().unwrap(),
+            );
+            response.headers.insert(
+                "anthropic-ratelimit-unified-7d_oi-reset",
+                reset.to_string().parse().unwrap(),
+            );
+            h.fake.state.push(response);
+        }
+        let mut events = h.state.accounts.subscribe();
+        let response = h
+            .send(Provider::Claude, r#"{"model":"private-synthetic-model"}"#)
+            .await;
+        assert_eq!(response.status(), 429);
+        response.bytes().await.unwrap();
+        let notices = tray2_events(&mut events);
+        let exhausted = notices.iter().find(|n| n["action"] == "exhausted").unwrap();
+        assert_eq!(exhausted["model_limited"], true);
+        assert!(!exhausted.to_string().contains("private-synthetic-model"));
+        let views = h.state.accounts.views().await.unwrap();
+        let source = views
+            .iter()
+            .find(|v| v["id"] == exhausted["account"])
+            .unwrap();
+        assert_eq!(source["quota_notice"]["action"], "exhausted");
+        assert_eq!(source["quota_notice"]["model_limited"], true);
+        assert!(
+            !source["quota_notice"]
+                .to_string()
+                .contains("private-synthetic-model")
+        );
+        assert!(h.store.list().unwrap().iter().all(|a| {
+            !a.eligible_at(Some("private-synthetic-model"), Utc::now())
+                && a.eligible_at(Some("other-synthetic-model"), Utc::now())
+        }));
+        assert_eq!(
+            h.state
+                .accounts
+                .views()
+                .await
+                .unwrap()
+                .iter()
+                .find(|v| v["id"] == exhausted["account"])
+                .unwrap()["quota_notice"]["action"],
+            "exhausted"
+        );
+    }
+}
+
+#[tokio::test]
+async fn tray2_exhausted_earliest_recomputes_when_paused_or_drained_account_joins_pool() {
+    for paused in [false, true] {
+        let h = Harness::new(Provider::Codex, 2, 384, 1024).await;
+        let ids = h.ids();
+        let b = &ids[1];
+        let reset_a = Utc::now().timestamp() + 172800;
+        let reset_b = reset_a - 86400;
+        let mut b_headers = tray2_headers(100, reset_b);
+        b_headers.insert("x-codex-primary-window-minutes", "300".parse().unwrap());
+        b_headers.insert("x-codex-primary-used-percent", "100".parse().unwrap());
+        b_headers.insert(
+            "x-codex-primary-reset-at",
+            (reset_b - 43200).to_string().parse().unwrap(),
+        );
+        h.state
+            .accounts
+            .observe_headers(b, Provider::Codex, &b_headers)
+            .await;
+        if paused {
+            h.state
+                .accounts
+                .change(b, Some(UserState::Paused), None, None, None)
+                .await
+                .unwrap();
+        } else {
+            h.state
+                .accounts
+                .change(b, None, None, Some(true), None)
+                .await
+                .unwrap();
+        }
+        let mut response = quota(reset_a);
+        response.headers.extend(tray2_headers(100, reset_a));
+        h.fake.state.push(response);
+        let response = h.send(Provider::Codex, "{}").await;
+        assert_eq!(response.status(), 429);
+        response.bytes().await.unwrap();
+        let before = h.state.accounts.views().await.unwrap();
+        let source = before
+            .iter()
+            .find(|v| v["quota_notice"]["action"] == "exhausted")
+            .unwrap();
+        let a = source["id"].as_str().unwrap();
+        assert_ne!(a, b);
+        assert_eq!(source["quota_notice"]["earliest_account"], a);
+        assert_eq!(
+            source["quota_notice"]["reset_at"],
+            json!(chrono::DateTime::from_timestamp(reset_a, 0).unwrap())
+        );
+        if paused {
+            h.state
+                .accounts
+                .change(b, Some(UserState::Active), None, None, None)
+                .await
+                .unwrap();
+        } else {
+            h.state
+                .accounts
+                .change(b, None, None, Some(false), None)
+                .await
+                .unwrap();
+        }
+        // No new relay request: the snapshot itself must reconcile provider truth.
+        let after = h.state.accounts.views().await.unwrap();
+        let updated = &after.iter().find(|v| v["id"] == a).unwrap()["quota_notice"];
+        assert_eq!(updated["action"], "exhausted");
+        assert_eq!(updated["earliest_account"], b.as_str());
+        assert_eq!(
+            updated["reset_at"],
+            json!(chrono::DateTime::from_timestamp(reset_b, 0).unwrap())
+        );
+        assert_eq!(updated["model_limited"], false);
+        if paused {
+            h.state
+                .accounts
+                .change(b, Some(UserState::Paused), None, None, None)
+                .await
+                .unwrap();
+        } else {
+            h.state
+                .accounts
+                .change(b, None, None, Some(true), None)
+                .await
+                .unwrap();
+        }
+        let removed = h.state.accounts.views().await.unwrap();
+        let updated = &removed.iter().find(|v| v["id"] == a).unwrap()["quota_notice"];
+        assert_eq!(updated["earliest_account"], a);
+        assert_eq!(
+            updated["reset_at"],
+            json!(chrono::DateTime::from_timestamp(reset_a, 0).unwrap())
+        );
+    }
+}
+
+#[tokio::test]
+async fn tray2_exhausted_uses_latest_blocking_window_per_account_before_provider_minimum() {
+    let h = Harness::new(Provider::Codex, 1, 384, 1024).await;
+    let later = Utc::now().timestamp() + 172800;
+    let earlier = later - 86400;
+    let mut response = quota(later);
+    response.headers.extend(tray2_headers(100, later));
+    response
+        .headers
+        .insert("x-codex-primary-window-minutes", "300".parse().unwrap());
+    response
+        .headers
+        .insert("x-codex-primary-used-percent", "100".parse().unwrap());
+    response.headers.insert(
+        "x-codex-primary-reset-at",
+        earlier.to_string().parse().unwrap(),
+    );
+    // Persisted reducer evidence still outranks a conflicting active-limit alias.
+    response
+        .headers
+        .insert("x-codex-active-limit", "primary".parse().unwrap());
+    h.fake.state.push(response);
+    let response = h.send(Provider::Codex, "{}").await;
+    assert_eq!(response.status(), 429);
+    response.bytes().await.unwrap();
+    let views = h.state.accounts.views().await.unwrap();
+    assert_eq!(views[0]["quota_notice"]["action"], "exhausted");
+    assert_eq!(
+        views[0]["quota_notice"]["reset_at"],
+        json!(chrono::DateTime::from_timestamp(later, 0).unwrap())
+    );
+    assert_eq!(views[0]["quota_notice"]["window"], "7d");
+    assert_eq!(views[0]["quota_notice"]["earliest_account"], views[0]["id"]);
+}
+
+#[tokio::test]
+async fn tray2_three_accounts_decayed_pacing_names_actual_upstream_successor() {
+    let h = Harness::new(Provider::Codex, 3, 384, 1024).await;
+    h.fake.state.push(ok());
+    let warm = h
+        .send_with_session(Provider::Codex, "tray2-pacing-selection")
+        .await;
+    let source = warm.headers()["x-quota-baton-account"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    warm.bytes().await.unwrap();
+    let others: Vec<_> = h.ids().into_iter().filter(|id| id != &source).collect();
+    let b = &others[0];
+    let mut limited = quota(Utc::now().timestamp() + 172800);
+    limited.chunks[0].0 = Duration::from_millis(500);
+    h.fake.state.push(limited);
+    h.fake.state.push(ok());
+    let mut events = h.state.accounts.subscribe();
+    let request = h.send_with_session(Provider::Codex, "tray2-pacing-selection");
+    tokio::pin!(request);
+    tokio::select! {
+        _ = &mut request => panic!("quota response did not remain outstanding"),
+        _ = async {
+            while h.fake.state.requests().len() < 2 { tokio::time::sleep(Duration::from_millis(1)).await; }
+        } => {}
+    }
+    let past = Instant::now() - Duration::from_secs(120);
+    h.state.accounts.observe_429_at(b, past, past, None, 1.0);
+    // Reproduce stale cached pacing while A's upstream quota body is outstanding.
+    h.state.bindings.set_pacing(b, true);
+    let response = request.await;
+    assert_eq!(response.status(), 200);
+    let served = response.headers()["x-quota-baton-account"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    response.bytes().await.unwrap();
+    assert_eq!(
+        served, *b,
+        "production candidate collection must refresh decayed pacing"
+    );
+    let notices = tray2_events(&mut events);
+    let notice = notices.iter().find(|n| n["action"] == "failover").unwrap();
+    assert_eq!(notice["account"], source);
+    assert_eq!(notice["next_account"], served);
+    let account = h.store.load(&served).unwrap();
+    let token = h.store.tokens(&account).unwrap();
+    assert_eq!(
+        h.fake.state.requests().last().unwrap().headers["authorization"],
+        format!("Bearer {}", token.access_token)
+    );
+}
+
+#[tokio::test]
+async fn tray2_passive_200_full_window_waits_for_actual_next_placement_or_no_eligible() {
+    for count in [1, 2] {
+        for bound in [false, true] {
+            let h = Harness::new(Provider::Codex, count, 384, 1024).await;
+            let mut observed = ok();
+            observed
+                .headers
+                .extend(tray2_headers(100, Utc::now().timestamp() + 172800));
+            h.fake.state.push(observed);
+            let mut events = h.state.accounts.subscribe();
+            let response = if bound {
+                h.send_with_session(Provider::Codex, "tray2-passive").await
+            } else {
+                h.send(Provider::Codex, "{}").await
+            };
+            assert_eq!(response.status(), 200);
+            let source = response.headers()["x-quota-baton-account"]
+                .to_str()
+                .unwrap()
+                .to_owned();
+            response.bytes().await.unwrap();
+            assert!(
+                tray2_events(&mut events).is_empty(),
+                "passive usage must not guess a successor"
+            );
+            assert!(
+                h.state
+                    .accounts
+                    .views()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|v| v["quota_notice"].is_null())
+            );
+            h.fake.state.push(ok());
+            let response = if bound {
+                h.send_with_session(Provider::Codex, "tray2-passive").await
+            } else {
+                h.send(Provider::Codex, "{}").await
+            };
+            let served = response
+                .headers()
+                .get("x-quota-baton-account")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            assert_eq!(response.status(), if count == 1 { 429 } else { 200 });
+            response.bytes().await.unwrap();
+            let notices = tray2_events(&mut events);
+            assert_eq!(notices.len(), 1);
+            assert_eq!(notices[0]["account"], source);
+            assert_eq!(notices[0]["model_limited"], false);
+            if count == 1 {
+                assert_eq!(notices[0]["action"], "exhausted");
+                assert!(notices[0]["next_account"].is_null());
+            } else {
+                let served = served.unwrap();
+                assert_ne!(served, source);
+                assert_eq!(notices[0]["action"], "failover");
+                assert_eq!(notices[0]["next_account"], served);
+                let target = h.store.load(&served).unwrap();
+                let token = h.store.tokens(&target).unwrap();
+                assert_eq!(
+                    h.fake.state.requests().last().unwrap().headers["authorization"],
+                    format!("Bearer {}", token.access_token)
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn tray2_passive_200_full_window_reset_hold_and_same_account_success_have_no_notice() {
+    let h = Harness::new(Provider::Codex, 2, 384, 1024).await;
+    let mut observed = ok();
+    observed
+        .headers
+        .extend(tray2_headers(100, Utc::now().timestamp() + 2));
+    h.fake.state.push(observed);
+    let response = h
+        .send_with_session(Provider::Codex, "tray2-passive-hold")
+        .await;
+    let original = response.headers()["x-quota-baton-account"].to_owned();
+    response.bytes().await.unwrap();
+    let mut events = h.state.accounts.subscribe();
+    assert!(
+        h.state
+            .accounts
+            .views()
+            .await
+            .unwrap()
+            .iter()
+            .all(|v| v["quota_notice"].is_null())
+    );
+    h.fake.state.push(ok());
+    let request = h.send_with_session(Provider::Codex, "tray2-passive-hold");
+    tokio::pin!(request);
+    tokio::select! {
+        _ = &mut request => panic!("passive reset hold did not wait"),
+        _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+    }
+    assert!(tray2_events(&mut events).is_empty());
+    assert!(
+        h.state
+            .accounts
+            .views()
+            .await
+            .unwrap()
+            .iter()
+            .all(|v| v["quota_notice"].is_null())
+    );
+    let response = request.await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["x-quota-baton-account"], original);
+    response.bytes().await.unwrap();
+    assert!(tray2_events(&mut events).is_empty());
+    assert!(
+        h.state
+            .accounts
+            .views()
+            .await
+            .unwrap()
+            .iter()
+            .all(|v| v["quota_notice"].is_null())
+    );
+}
+
+#[tokio::test]
+async fn tray2_credit_disable_alone_cannot_recreate_passive_quota_notice_on_next_placement() {
+    let h = Harness::new(Provider::Codex, 2, 384, 1024).await;
+    for id in h.ids() {
+        h.state
+            .accounts
+            .change(&id, None, None, None, Some(true))
+            .await
+            .unwrap();
+    }
+    let mut observed = ok();
+    observed
+        .headers
+        .extend(tray2_headers(100, Utc::now().timestamp() + 172800));
+    observed
+        .headers
+        .insert("x-codex-credits-serving", "true".parse().unwrap());
+    observed
+        .headers
+        .insert("x-codex-credits-has-credits", "true".parse().unwrap());
+    h.fake.state.push(observed);
+    let mut events = h.state.accounts.subscribe();
+    let response = h
+        .send_with_session(Provider::Codex, "tray2-toggle-passive")
+        .await;
+    let source = response.headers()["x-quota-baton-account"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    response.bytes().await.unwrap();
+    assert_eq!(tray2_events(&mut events)[0]["action"], "credits");
+    h.state
+        .accounts
+        .change(&source, None, None, None, Some(false))
+        .await
+        .unwrap();
+    assert!(
+        h.state
+            .accounts
+            .views()
+            .await
+            .unwrap()
+            .iter()
+            .all(|v| v["quota_notice"].is_null())
+    );
+    // A new metadata-only observation must not recycle its merged old 100% window.
+    let mut capability = HeaderMap::new();
+    capability.insert("x-codex-credits-has-credits", "false".parse().unwrap());
+    h.state
+        .accounts
+        .observe_headers(&source, Provider::Codex, &capability)
+        .await;
+    h.fake.state.push(ok());
+    let response = h
+        .send_with_session(Provider::Codex, "tray2-toggle-passive")
+        .await;
+    assert_eq!(response.status(), 200);
+    assert_ne!(response.headers()["x-quota-baton-account"], source);
+    response.bytes().await.unwrap();
+    assert!(tray2_events(&mut events).is_empty());
+}
+
+#[tokio::test]
+async fn tray2_passive_poll_at_99_resolves_only_when_next_request_actually_moves() {
+    let h = Harness::new(Provider::Codex, 2, 384, 1024).await;
+    h.fake.state.push(ok());
+    let response = h
+        .send_with_session(Provider::Codex, "tray2-passive-poll")
+        .await;
+    let source = response.headers()["x-quota-baton-account"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    response.bytes().await.unwrap();
+    let now = Utc::now();
+    let mut events = h.state.accounts.subscribe();
+    h.state.accounts.apply_quota_snapshot(&source, json!({
+        "source":"synthetic-poll","observed_at":now,
+        "windows":[{"name":"5h","used_pct":99.0,"reset_at":now + ChronoDuration::hours(5),"observed_at":now}],
+        "signals":{}
+    }), None).await.unwrap();
+    assert!(tray2_events(&mut events).is_empty());
+    assert!(
+        h.state
+            .accounts
+            .views()
+            .await
+            .unwrap()
+            .iter()
+            .all(|v| v["quota_notice"].is_null())
+    );
+    h.fake.state.push(ok());
+    let response = h
+        .send_with_session(Provider::Codex, "tray2-passive-poll")
+        .await;
+    assert_eq!(response.status(), 200);
+    let served = response.headers()["x-quota-baton-account"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(served, source);
+    response.bytes().await.unwrap();
+    let notices = tray2_events(&mut events);
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0]["account"], source);
+    assert_eq!(notices[0]["action"], "failover");
+    assert_eq!(notices[0]["next_account"], served);
+    assert_eq!(notices[0]["window"], "5h");
+}

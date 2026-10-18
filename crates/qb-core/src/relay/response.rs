@@ -74,6 +74,7 @@ pub(in crate::relay) fn body(
         };
         let model = completion.record.model.clone();
         let failed_access = completion.failed_access.clone();
+        let notice_session = completion.record.session.clone();
         let mut observed_error = 0;
         let mut completion = Some(completion);
         let HeldResponse {
@@ -186,6 +187,12 @@ pub(in crate::relay) fn body(
                         && runtime.transition(account, signal).await.is_err()
                     {
                         tracing::error!("Could not persist upstream health signal");
+                    }
+                    if decision.kind == crate::relay::outcome::Kind::Quota {
+                        runtime.observe_quota_reset(account, decision.quota_reset);
+                        let _ = runtime
+                            .pending_quota(account, notice_session.clone(), model.as_deref())
+                            .await;
                     }
                 }
             }
