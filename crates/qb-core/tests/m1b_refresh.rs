@@ -10,7 +10,7 @@ use accounts::{Account, AccountStore, Health, HealthReason, Provider, Source, Us
 use axum::http::StatusCode;
 use bytes::Bytes;
 use chrono::{Duration as ChronoDuration, Utc};
-use credentials::TokenGates;
+use credentials::{ManualRefreshError, ManualRefreshOutcome, ManualRefreshTerminal, TokenGates};
 use observability::Observability;
 use qb_testkit::{ScriptedResponse, ScriptedUpstream};
 use serde_json::json;
@@ -848,46 +848,37 @@ async fn shutdown_retains_lease_on_store_failure_and_persists_on_retry() {
 }
 
 #[tokio::test]
-async fn paused_and_account_drained_skip_ahead_but_current_poll_401_still_refreshes() {
+async fn account_drain_skips_ahead_but_current_poll_401_still_refreshes() {
     let _serial = SERIAL.lock().await;
-    for paused in [true, false] {
-        let f = Fixture::new(false, 60, Provider::Codex);
-        set_lifetime(&f, 100, false);
-        f.store
-            .update_settings(&f.account.id, Some(!paused), None, |a| {
-                a.drain = !paused;
-                a.user_state = if paused {
-                    UserState::Paused
-                } else {
-                    UserState::Active
-                };
-            })
-            .unwrap();
-        let current = f.store.load(&f.account.id).unwrap();
-        let old = f.store.tokens(&current).unwrap();
-        let fake = ScriptedUpstream::start().await.unwrap();
-        let gates = f
-            .gates()
-            .with_token_endpoint(Provider::Codex, fake.url.clone());
-        assert!(
-            gates
-                .refresh_ahead(f.store.clone(), f.obs.clone(), current.id.clone())
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(fake.state.requests().is_empty());
-        fake.state.push(success());
-        assert!(
-            gates
-                .after_401(f.store.clone(), f.obs.clone(), current, &old)
-                .await
-                .unwrap()
-                .is_some()
-        );
-        assert_eq!(fake.state.requests().len(), 1);
-        gates.shutdown_refreshes().await.unwrap();
-    }
+    let f = Fixture::new(false, 60, Provider::Codex);
+    set_lifetime(&f, 100, false);
+    let current = f
+        .store
+        .update_metadata(&f.account.id, |a| a.drain = true)
+        .unwrap();
+    let old = f.store.tokens(&current).unwrap();
+    let fake = ScriptedUpstream::start().await.unwrap();
+    let gates = f
+        .gates()
+        .with_token_endpoint(Provider::Codex, fake.url.clone());
+    assert!(
+        gates
+            .refresh_ahead(f.store.clone(), f.obs.clone(), current.id.clone())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(fake.state.requests().is_empty());
+    fake.state.push(success());
+    assert!(
+        gates
+            .after_401(f.store.clone(), f.obs.clone(), current, &old)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(fake.state.requests().len(), 1);
+    gates.shutdown_refreshes().await.unwrap();
 }
 
 #[tokio::test]
@@ -1389,4 +1380,657 @@ async fn uncertain_near_expiry_spaces_proactive_attempts_but_current401_override
         .unwrap();
     assert_eq!(fake.state.requests().len(), 3);
     gates.shutdown_refreshes().await.unwrap();
+}
+
+// D17 review 7-11. All accounts, CPA files and endpoint replies are synthetic.
+fn synthetic_adopt_from_current_store(f: &Fixture) -> Account {
+    // Source is not mutable through update_metadata. Save the SAME current
+    // credential snapshot when establishing adopted fixture ownership.
+    let mut current = f.store.load(&f.account.id).unwrap();
+    let tokens = f.store.tokens(&current).unwrap();
+    if let Source::Cpa { mode, .. } = &mut current.source {
+        *mode = accounts::ImportMode::Adopted;
+    }
+    f.store
+        .save(&current, &tokens, Some(current.generation))
+        .unwrap()
+}
+
+async fn wait_for_refresh_request(fake: &ScriptedUpstream) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while fake.state.requests().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn scheduler_refreshes_disabled_and_paused_owned_accounts_but_not_drain_or_needs_relogin() {
+    let _serial = SERIAL.lock().await;
+    for adopted in [false, true] {
+        for state in [UserState::Paused, UserState::Disabled] {
+            for blocked in [0, 1, 2] {
+                let f = Fixture::new(adopted, 60, Provider::Codex);
+                set_lifetime(&f, 100, false);
+                if adopted {
+                    synthetic_adopt_from_current_store(&f);
+                }
+                f.store
+                    .update_metadata(&f.account.id, |a| {
+                        a.user_state = state;
+                        a.drain = blocked == 1;
+                        if blocked == 2 {
+                            a.apply_health_signal(
+                                accounts::HealthSignal::TerminalRefresh {
+                                    reason: "invalid_grant".into(),
+                                },
+                                Utc::now(),
+                            );
+                        }
+                    })
+                    .unwrap();
+                let fake = ScriptedUpstream::start().await.unwrap();
+                fake.state.push(success());
+                let gates = f
+                    .gates()
+                    .with_token_endpoint(Provider::Codex, fake.url.clone());
+                let task = gates.start_refresh_scheduler(f.store.clone(), f.obs.clone());
+                if blocked == 0 {
+                    wait_for_refresh_request(&fake).await;
+                } else {
+                    assert!(
+                        gates
+                            .refresh_ahead(f.store.clone(), f.obs.clone(), f.account.id.clone())
+                            .await
+                            .unwrap()
+                            .is_none()
+                    );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                gates.shutdown_refreshes().await.unwrap();
+                task.await.unwrap();
+                assert_eq!(fake.state.requests().len(), usize::from(blocked == 0));
+                let current = f.store.load(&f.account.id).unwrap();
+                assert_eq!(current.user_state, state);
+                assert_eq!(
+                    f.store.tokens(&current).unwrap().access_token,
+                    if blocked == 0 {
+                        "synthetic-access-new"
+                    } else {
+                        "synthetic-access-old"
+                    }
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn manual_refresh_shares_singleflight_with_ahead() {
+    let _serial = SERIAL.lock().await;
+    for (manual_first, same_access) in [(false, false), (true, false), (false, true), (true, true)]
+    {
+        let f = Fixture::new(false, 60, Provider::Codex);
+        set_lifetime(&f, 100, false);
+        let fake = ScriptedUpstream::start().await.unwrap();
+        let mut response = if same_access {
+            ScriptedResponse::json(
+                StatusCode::OK,
+                r#"{"access_token":"synthetic-access-old","expires_in":3600}"#,
+            )
+        } else {
+            success()
+        };
+        response.chunks[0].0 = Duration::from_millis(300);
+        fake.state.push(response);
+        let gates = f
+            .gates()
+            .with_token_endpoint(Provider::Codex, fake.url.clone());
+        if manual_first {
+            let caller = {
+                let (g, s, o, id) = (
+                    gates.clone(),
+                    f.store.clone(),
+                    f.obs.clone(),
+                    f.account.id.clone(),
+                );
+                tokio::spawn(async move { g.manual_refresh(s, o, id, false).await })
+            };
+            wait_for_refresh_request(&fake).await;
+            gates
+                .refresh_ahead(f.store.clone(), f.obs.clone(), f.account.id.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                caller.await.unwrap().unwrap().outcome,
+                ManualRefreshOutcome::Success
+            );
+        } else {
+            let caller = {
+                let (g, s, o, id) = (
+                    gates.clone(),
+                    f.store.clone(),
+                    f.obs.clone(),
+                    f.account.id.clone(),
+                );
+                tokio::spawn(async move { g.refresh_ahead(s, o, id).await })
+            };
+            wait_for_refresh_request(&fake).await;
+            let summary = gates
+                .manual_refresh(f.store.clone(), f.obs.clone(), f.account.id.clone(), false)
+                .await
+                .unwrap();
+            let (current, _) = caller.await.unwrap().unwrap().unwrap();
+            assert_eq!(summary.outcome, ManualRefreshOutcome::Success);
+            assert_eq!(summary.last_refresh_at, current.token_meta.last_refresh_at);
+            assert_eq!(summary.token_expires_at, current.token_meta.expires_at);
+            let json = serde_json::to_value(&summary).unwrap();
+            assert_eq!(json.as_object().unwrap().len(), 3);
+            assert_eq!(json["outcome"], "success");
+            assert!(!json.to_string().contains("synthetic-"));
+        }
+        assert_eq!(fake.state.requests().len(), 1);
+        if same_access {
+            // A later explicit request still refreshes: only the overlapping
+            // caller shares a completion newer than its captured baseline.
+            fake.state.push(success());
+            gates
+                .manual_refresh(f.store.clone(), f.obs.clone(), f.account.id.clone(), false)
+                .await
+                .unwrap();
+            assert_eq!(fake.state.requests().len(), 2);
+        }
+        gates.shutdown_refreshes().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn manual_refresh_refused_for_linked_drain_needs_relogin_and_uncertain_without_force() {
+    let _serial = SERIAL.lock().await;
+    for (case, expected) in [
+        (0, ManualRefreshError::Linked),
+        (1, ManualRefreshError::Drain),
+        (2, ManualRefreshError::NeedsRelogin),
+        (3, ManualRefreshError::Uncertain),
+        (4, ManualRefreshError::NotFound),
+        (5, ManualRefreshError::Unavailable),
+    ] {
+        let f = Fixture::new(case == 0, 60, Provider::Codex);
+        set_long_lifetime(&f, 3600, case == 3);
+        f.store
+            .update_metadata(&f.account.id, |a| {
+                a.drain = case == 1;
+                if case == 2 {
+                    a.apply_health_signal(
+                        accounts::HealthSignal::TerminalRefresh {
+                            reason: "invalid_grant".into(),
+                        },
+                        Utc::now(),
+                    );
+                }
+            })
+            .unwrap();
+        f.newer_link(); // Manual linked refusal must never reload this newer file.
+        let before = f.store.load(&f.account.id).unwrap();
+        let fake = ScriptedUpstream::start().await.unwrap();
+        let gates = f
+            .gates()
+            .with_token_endpoint(Provider::Codex, fake.url.clone());
+        if case == 5 {
+            gates.shutdown_refreshes().await.unwrap();
+        }
+        let id = if case == 4 {
+            "cx-000000".into()
+        } else {
+            f.account.id.clone()
+        };
+        assert_eq!(
+            gates
+                .manual_refresh(f.store.clone(), f.obs.clone(), id, false)
+                .await
+                .unwrap_err(),
+            expected
+        );
+        if case < 3 {
+            assert_eq!(
+                gates
+                    .manual_refresh(f.store.clone(), f.obs.clone(), f.account.id.clone(), true)
+                    .await
+                    .unwrap_err(),
+                expected
+            );
+        }
+        let current = f.store.load(&f.account.id).unwrap();
+        assert_eq!(current.generation, before.generation);
+        assert_eq!(
+            f.store.tokens(&current).unwrap().access_token,
+            "synthetic-access-old"
+        );
+        assert!(fake.state.requests().is_empty());
+        gates.shutdown_refreshes().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn manual_refresh_force_presents_uncertain_token_once() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new(false, 60, Provider::Codex);
+    set_long_lifetime(&f, 3600, true);
+    let fake = ScriptedUpstream::start().await.unwrap();
+    let mut response = ScriptedResponse::json(StatusCode::OK, "synthetic-truncated-json");
+    response.chunks[0].0 = Duration::from_millis(300);
+    fake.state.push(response);
+    let gates = f
+        .gates()
+        .with_token_endpoint(Provider::Codex, fake.url.clone());
+    let caller = {
+        let (g, s, o, id) = (
+            gates.clone(),
+            f.store.clone(),
+            f.obs.clone(),
+            f.account.id.clone(),
+        );
+        tokio::spawn(async move { g.manual_refresh(s, o, id, true).await })
+    };
+    wait_for_refresh_request(&fake).await;
+    assert!(
+        f.store
+            .load(&f.account.id)
+            .unwrap()
+            .token_meta
+            .refresh_uncertain
+    );
+    assert_eq!(
+        gates
+            .manual_refresh(f.store.clone(), f.obs.clone(), f.account.id.clone(), true)
+            .await
+            .unwrap_err(),
+        ManualRefreshError::Unavailable
+    );
+    assert_eq!(
+        caller.await.unwrap().unwrap_err(),
+        ManualRefreshError::Unavailable
+    );
+    assert_eq!(
+        gates
+            .manual_refresh(f.store.clone(), f.obs.clone(), f.account.id.clone(), true)
+            .await
+            .unwrap_err(),
+        ManualRefreshError::Unavailable
+    );
+    assert_eq!(fake.state.requests().len(), 1);
+    gates.shutdown_refreshes().await.unwrap();
+}
+
+#[tokio::test]
+async fn manual_force_preserves_known_transient_backoff() {
+    let _serial = SERIAL.lock().await;
+    for status in [
+        StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::INTERNAL_SERVER_ERROR,
+    ] {
+        let f = Fixture::new(false, 60, Provider::Codex);
+        set_long_lifetime(&f, 3600, true);
+        let fake = ScriptedUpstream::start().await.unwrap();
+        fake.state
+            .push(ScriptedResponse::json(status, "synthetic-provider-error"));
+        let gates = f
+            .gates()
+            .with_token_endpoint(Provider::Codex, fake.url.clone());
+        for _ in 0..2 {
+            assert_eq!(
+                gates
+                    .manual_refresh(f.store.clone(), f.obs.clone(), f.account.id.clone(), true)
+                    .await
+                    .unwrap_err(),
+                ManualRefreshError::Unavailable
+            );
+        }
+        assert_eq!(fake.state.requests().len(), 1);
+        gates.shutdown_refreshes().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn manual_uncertain_inside_expiry_margin_needs_no_force() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new(false, 60, Provider::Codex);
+    set_long_lifetime(&f, 599, true);
+    let fake = ScriptedUpstream::start().await.unwrap();
+    fake.state.push(success());
+    let gates = f
+        .gates()
+        .with_token_endpoint(Provider::Codex, fake.url.clone());
+    assert_eq!(
+        gates
+            .manual_refresh(f.store.clone(), f.obs.clone(), f.account.id.clone(), false)
+            .await
+            .unwrap()
+            .outcome,
+        ManualRefreshOutcome::Success
+    );
+    assert_eq!(fake.state.requests().len(), 1);
+    gates.shutdown_refreshes().await.unwrap();
+}
+
+#[tokio::test]
+async fn manual_refresh_terminal_reply_sets_needs_relogin_and_reports_outcome() {
+    let _serial = SERIAL.lock().await;
+    for (status, code, outcome) in [
+        (
+            StatusCode::BAD_REQUEST,
+            "refresh_token_invalidated",
+            ManualRefreshTerminal::RefreshTokenInvalidated,
+        ),
+        (
+            StatusCode::BAD_REQUEST,
+            "refresh_token_reused",
+            ManualRefreshTerminal::RefreshTokenReused,
+        ),
+        (
+            StatusCode::BAD_REQUEST,
+            "refresh_token_expired",
+            ManualRefreshTerminal::RefreshTokenExpired,
+        ),
+        (
+            StatusCode::BAD_REQUEST,
+            "refresh_token_revoked",
+            ManualRefreshTerminal::RefreshTokenRevoked,
+        ),
+        (
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            ManualRefreshTerminal::InvalidGrant,
+        ),
+        (
+            StatusCode::UNAUTHORIZED,
+            "synthetic-provider-secret",
+            ManualRefreshTerminal::TokenEndpoint401,
+        ),
+    ] {
+        let f = Fixture::new(false, 60, Provider::Claude);
+        let fake = ScriptedUpstream::start().await.unwrap();
+        fake.state.push(ScriptedResponse::json(
+            status,
+            serde_json::to_string(&json!({"error":code,"message":"synthetic-provider-secret"}))
+                .unwrap(),
+        ));
+        let gates = f
+            .gates()
+            .with_token_endpoint(Provider::Claude, fake.url.clone());
+        let error = gates
+            .manual_refresh(f.store.clone(), f.obs.clone(), f.account.id.clone(), false)
+            .await
+            .unwrap_err();
+        assert_eq!(error, ManualRefreshError::Terminal { outcome });
+        assert!(!error.to_string().contains("synthetic-"));
+        let report = serde_json::to_string(&error).unwrap();
+        assert!(report.contains("terminal"));
+        assert!(!report.contains("synthetic-"));
+        let current = f.store.load(&f.account.id).unwrap();
+        assert!(matches!(current.health, Health::NeedsRelogin { .. }));
+        assert!(!current.token_meta.refresh_uncertain);
+        assert_eq!(
+            gates
+                .manual_refresh(f.store.clone(), f.obs.clone(), f.account.id.clone(), true)
+                .await
+                .unwrap_err(),
+            ManualRefreshError::NeedsRelogin
+        );
+        assert_eq!(fake.state.requests().len(), 1);
+        gates.shutdown_refreshes().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn adopted_claude_401_after_refresh_follows_owned_path_and_without_rotation_keeps_old_rt() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new(true, 60, Provider::Claude);
+    let current = synthetic_adopt_from_current_store(&f);
+    let old = f.store.tokens(&current).unwrap();
+    f.newer_link(); // Adopted refresh must ignore this CPA copy.
+    let fake = ScriptedUpstream::start().await.unwrap();
+    fake.state.push(ScriptedResponse::json(
+        StatusCode::OK,
+        r#"{"access_token":"synthetic-access-owned","expires_in":3600}"#,
+    ));
+    let gates = f
+        .gates()
+        .with_token_endpoint(Provider::Claude, fake.url.clone());
+    let (updated, tokens) = gates
+        .after_401(f.store.clone(), f.obs.clone(), current, &old)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(tokens.access_token, "synthetic-access-owned");
+    assert_eq!(tokens.refresh_token, "synthetic-refresh-old");
+    let durable = f
+        .store
+        .tokens(&f.store.load(&f.account.id).unwrap())
+        .unwrap();
+    assert_eq!(durable.refresh_token, old.refresh_token);
+    gates
+        .auth_failed(f.store.clone(), f.obs.clone(), updated, &tokens)
+        .await
+        .unwrap();
+    let current = f.store.load(&f.account.id).unwrap();
+    assert!(matches!(
+        current.health,
+        Health::Cooling {
+            reason: HealthReason::Auth,
+            ..
+        }
+    ));
+    assert_eq!(fake.state.requests().len(), 1);
+    assert!(!ledger(&f).iter().any(|e| e["outcome"] == "link_stale"));
+    gates.shutdown_refreshes().await.unwrap();
+}
+
+#[tokio::test]
+async fn manual_refresh_runs_before_due_for_paused_and_disabled_accounts() {
+    let _serial = SERIAL.lock().await;
+    for state in [UserState::Paused, UserState::Disabled] {
+        let f = Fixture::new(false, 60, Provider::Codex);
+        set_lifetime(&f, 900, false); // Before the refresh-ahead boundary.
+        f.store
+            .update_metadata(&f.account.id, |a| a.user_state = state)
+            .unwrap();
+        let fake = ScriptedUpstream::start().await.unwrap();
+        fake.state.push(success());
+        let gates = f
+            .gates()
+            .with_token_endpoint(Provider::Codex, fake.url.clone());
+        assert!(
+            gates
+                .refresh_ahead(f.store.clone(), f.obs.clone(), f.account.id.clone())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(fake.state.requests().is_empty());
+        gates
+            .manual_refresh(f.store.clone(), f.obs.clone(), f.account.id.clone(), false)
+            .await
+            .unwrap();
+        assert_eq!(f.store.load(&f.account.id).unwrap().user_state, state);
+        assert_eq!(fake.state.requests().len(), 1);
+        gates.shutdown_refreshes().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn manual_force_never_bypasses_durable_writeahead() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new(false, 60, Provider::Codex);
+    set_long_lifetime(&f, 3600, true);
+    let fake = ScriptedUpstream::start().await.unwrap();
+    let gates = f
+        .gates()
+        .with_token_endpoint(Provider::Codex, fake.url.clone());
+    let path = f
+        ._root
+        .path()
+        .join("accounts")
+        .join(format!("{}.json", f.account.id));
+    let permissions = fs::metadata(&path).unwrap().permissions();
+    let mut readonly = permissions.clone();
+    readonly.set_readonly(true);
+    fs::set_permissions(&path, readonly).unwrap();
+    let result = gates
+        .manual_refresh(f.store.clone(), f.obs.clone(), f.account.id.clone(), true)
+        .await;
+    fs::set_permissions(&path, permissions).unwrap();
+    assert_eq!(result.unwrap_err(), ManualRefreshError::Unavailable);
+    assert!(fake.state.requests().is_empty());
+    assert!(
+        f.store
+            .load(&f.account.id)
+            .unwrap()
+            .token_meta
+            .refresh_uncertain
+    );
+    gates.shutdown_refreshes().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_manual_keeps_detached_rotation_and_core_stop_excludes_all_refresh_triggers() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new(false, 60, Provider::Codex);
+    let before = set_lifetime(&f, 900, false);
+    let old = f.store.tokens(&before).unwrap();
+    let fake = ScriptedUpstream::start().await.unwrap();
+    let mut response = success();
+    response.chunks[0].0 = Duration::from_millis(300);
+    fake.state.push(response);
+    let gates = f
+        .gates()
+        .with_token_endpoint(Provider::Codex, fake.url.clone());
+    let caller = {
+        let (g, s, o, id) = (
+            gates.clone(),
+            f.store.clone(),
+            f.obs.clone(),
+            f.account.id.clone(),
+        );
+        tokio::spawn(async move { g.manual_refresh(s, o, id, false).await })
+    };
+    wait_for_refresh_request(&fake).await;
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    gates.shutdown_refreshes().await.unwrap();
+    let current = f.store.load(&f.account.id).unwrap();
+    assert_eq!(
+        f.store.tokens(&current).unwrap().access_token,
+        "synthetic-access-new"
+    );
+    assert!(!current.token_meta.refresh_uncertain);
+    // Core lifecycle is stricter than the separate per-account drain rule.
+    assert!(
+        gates
+            .after_401(f.store.clone(), f.obs.clone(), before, &old)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let current_tokens = f.store.tokens(&current).unwrap();
+    assert!(
+        gates
+            .after_401(
+                f.store.clone(),
+                f.obs.clone(),
+                current.clone(),
+                &current_tokens
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        gates
+            .refresh_ahead(f.store.clone(), f.obs.clone(), current.id.clone())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        gates
+            .manual_refresh(f.store.clone(), f.obs.clone(), current.id, true)
+            .await
+            .unwrap_err(),
+        ManualRefreshError::Unavailable
+    );
+    assert_eq!(fake.state.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn cancelled_manual_preflight_keeps_shutdown_waiting_for_blocking_credential_read() {
+    use std::{future::Future, task::Poll};
+
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new(false, 60, Provider::Codex);
+    let fake = ScriptedUpstream::start().await.unwrap();
+    let gates = f
+        .gates()
+        .with_token_endpoint(Provider::Codex, fake.url.clone());
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    f.store.set_observer(Arc::new(move |_, _| {
+        if let Some(entered_tx) = entered_tx.lock().unwrap().take() {
+            let _ = entered_tx.send(());
+            // Observer runs under AccountStore's transaction gate. Bound the
+            // fixture barrier so a failed assertion cannot strand a worker.
+            release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+        }
+    }));
+    let writer = {
+        let store = f.store.clone();
+        let id = f.account.id.clone();
+        tokio::task::spawn_blocking(move || {
+            store.update_metadata(&id, |a| a.user_state = UserState::Paused)
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(3), entered_rx)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Poll exactly once: admit lifecycle work and submit spawn_blocking while
+    // the store gate is held. No sleeps or worker scheduling guesses are needed.
+    let mut manual =
+        Box::pin(gates.manual_refresh(f.store.clone(), f.obs.clone(), f.account.id.clone(), false));
+    let preflight_pending =
+        std::future::poll_fn(|cx| Poll::Ready(manual.as_mut().poll(cx).is_pending())).await;
+    drop(manual); // Cancel before the blocking preflight can read credentials.
+
+    let mut shutdown = Box::pin(gates.shutdown_refreshes());
+    let shutdown_pending =
+        std::future::poll_fn(|cx| Poll::Ready(shutdown.as_mut().poll(cx).is_pending())).await;
+    // Always release the fixture barrier before asserting the observed states.
+    release_tx.send(()).unwrap();
+    writer.await.unwrap().unwrap();
+    assert!(preflight_pending);
+    assert!(
+        shutdown_pending,
+        "shutdown forgot the cancelled blocking preflight"
+    );
+    tokio::time::timeout(Duration::from_secs(3), shutdown)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(fake.state.requests().is_empty());
+    assert!(
+        !f.store
+            .load(&f.account.id)
+            .unwrap()
+            .token_meta
+            .refresh_uncertain
+    );
 }

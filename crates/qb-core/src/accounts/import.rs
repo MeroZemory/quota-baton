@@ -195,10 +195,6 @@ pub(crate) fn read(path: &Path, dir: &Path) -> Result<Candidate, ReadError> {
     })
 }
 
-pub fn refuse_adopt() -> Result<(), StoreError> {
-    Err(StoreError::AdoptUnavailable)
-}
-
 pub fn run(
     store: &AccountStore,
     dir: &Path,

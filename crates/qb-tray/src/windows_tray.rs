@@ -173,7 +173,7 @@ fn hit_target(x: f32, y: f32) -> Option<HitTarget> {
                     false,
                 ),
             },
-            qb_tray::HitTarget::Row { .. } => return None,
+            qb_tray::HitTarget::Row { .. } | qb_tray::HitTarget::MenuSurface { .. } => return None,
         });
     }
     if let Some(value) = state.as_deref() {
@@ -574,6 +574,10 @@ fn activate_menu(hwnd: HWND) {
         return;
     }
     let operation = qb_tray::actions::admin_operation(item, &row);
+    let refreshing = matches!(
+        &operation,
+        Some(qb_tray::actions::AdminOperation::RefreshTokens)
+    );
     let provider = row.provider.clone();
     let id = row.id.clone();
     if item == qb_tray::actions::MenuItem::Relogin {
@@ -597,6 +601,9 @@ fn activate_menu(hwnd: HWND) {
                             )
                             .await
                             .map(|_| ()),
+                        Some(qb_tray::actions::AdminOperation::RefreshTokens) => {
+                            client.refresh_tokens(&id).await
+                        }
                         Some(qb_tray::actions::AdminOperation::Drain(value)) => client
                             .patch_account(
                                 &id,
@@ -634,11 +641,22 @@ fn activate_menu(hwnd: HWND) {
             {
                 let _ = std::fs::write(path, error.to_string());
             }
+            let show_error = refreshing && result.is_err();
+            if show_error {
+                let message = result
+                    .as_ref()
+                    .err()
+                    .and_then(|error| error.downcast_ref::<super::client::ClientError>())
+                    .map(super::client::short_error)
+                    .unwrap_or("계정 갱신을 마치지 못했습니다");
+                *view_state().lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(format!("error:{message}"));
+            }
             unsafe {
                 let _ = PostMessageW(
                     Some(HWND(hwnd_value as *mut c_void)),
                     ACTION_DONE,
-                    WPARAM(0),
+                    WPARAM(usize::from(show_error)),
                     LPARAM(0),
                 );
             }
@@ -1102,7 +1120,9 @@ unsafe extern "system" fn window_proc(
         }
         ACTION_DONE => {
             update_status(false, Some(hwnd));
-            *view_state().lock().unwrap_or_else(|e| e.into_inner()) = None;
+            if wparam.0 == 0 {
+                *view_state().lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
             resize_flyout(hwnd);
             let _ = InvalidateRect(Some(hwnd), None, true);
             LRESULT(0)

@@ -41,6 +41,17 @@ struct Harness {
 
 impl Harness {
     async fn new(provider: Provider, owned: bool) -> Self {
+        Self::with_adoption_probe(provider, owned, || {
+            qb_core::accounts::adopt::ProbeState::Stopped
+        })
+        .await
+    }
+
+    async fn with_adoption_probe(
+        provider: Provider,
+        owned: bool,
+        probe: fn() -> qb_core::accounts::adopt::ProbeState,
+    ) -> Self {
         let serial = SERIAL.lock().await;
         let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/m5-fixtures");
         fs::create_dir_all(&base).unwrap();
@@ -117,7 +128,7 @@ impl Harness {
                 admin_token: "synthetic-admin".into(),
             },
             relay::router(state.clone()),
-            qb_core::admin::runtime_routes(state.clone(), 0),
+            qb_core::admin::runtime_routes_with_adoption_probe(state.clone(), 0, probe),
         )
         .await
         .unwrap();
@@ -1289,4 +1300,241 @@ async fn cancelled_row_fourteen_poll_still_cools_owned_transient_refresh_failure
     assert_eq!(h.usage.state.requests().len(), 1);
     assert_eq!(h.token.state.requests().len(), 1);
     assert!(h.data.state.requests().is_empty());
+}
+
+#[tokio::test]
+async fn r2a_adoption_admin_enforces_c2_generation_and_metadata_contract() {
+    for provider in [Provider::Claude, Provider::Codex] {
+        let h = Harness::new(provider, false).await;
+        h.data
+            .state
+            .push(ScriptedResponse::json(StatusCode::OK, r#"{"ok":true}"#));
+        let response = c6_4_data(&h, provider).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-quota-baton-account"], h.id);
+        response.bytes().await.unwrap();
+        let key = format!("{}:c6-4", provider.as_str());
+        assert_eq!(h.state.bindings.current(Some(&key)), Some(h.id.clone()));
+        h.store
+            .update_metadata(&h.id, |a| {
+                a.health = Health::Cooling {
+                    reason: HealthReason::LinkStale,
+                    until: Utc::now() + chrono::Duration::minutes(5),
+                    scope: "account".into(),
+                };
+                a.auth_failures = 2;
+            })
+            .unwrap();
+        let before = h.account();
+        let url = format!(
+            "http://{}/admin/v1/accounts/{}/adopt",
+            h.servers.admin_addr, h.id
+        );
+        let body = json!({"from":"store","expected_generation":before.generation});
+        assert!(
+            !h.client
+                .post(&url)
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .is_success()
+        );
+        assert_eq!(
+            h.client
+                .post(&url)
+                .bearer_auth("synthetic-admin")
+                .header("host", "untrusted.invalid")
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::MISDIRECTED_REQUEST
+        );
+        assert_eq!(
+            h.client
+                .post(&url)
+                .bearer_auth("synthetic-admin")
+                .header("origin", "http://127.0.0.1")
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(h.account(), before);
+        assert_eq!(
+            h.client
+                .post(&url)
+                .bearer_auth("synthetic-admin")
+                .json(&json!({"from":"store","expected_generation":before.generation+1}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(h.account(), before);
+        let response = h
+            .client
+            .post(&url)
+            .bearer_auth("synthetic-admin")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let result: Value = response.json().await.unwrap();
+        assert_eq!(result["id"], h.id);
+        assert_eq!(result["generation"], before.generation + 1);
+        assert_eq!(result["from"], "store");
+        assert_eq!(
+            result["token_expires_at"],
+            json!(before.token_meta.expires_at)
+        );
+        let adopted = h.account();
+        assert!(matches!(
+            adopted.source,
+            Source::Cpa {
+                mode: qb_core::accounts::ImportMode::Adopted,
+                ..
+            }
+        ));
+        assert_eq!(adopted.identity, before.identity);
+        assert_eq!(adopted.user_state, before.user_state);
+        assert_eq!(adopted.health, Health::Ready);
+        assert_eq!(adopted.auth_failures, 0);
+        assert_eq!(h.state.bindings.current(Some(&key)), Some(h.id.clone()));
+        let state: Value = h
+            .client
+            .get(format!("http://{}/admin/v1/state", h.servers.admin_addr))
+            .bearer_auth("synthetic-admin")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(state["capabilities"]["account_adopt"], true);
+        assert_eq!(state["capabilities"]["manual_refresh"], true);
+        assert_eq!(state["draining"], false);
+        let view = state["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == h.id)
+            .unwrap();
+        assert_eq!(view["generation"], adopted.generation);
+        assert_eq!(
+            view["last_refresh_at"],
+            json!(adopted.token_meta.last_refresh_at)
+        );
+        for value in [result, state] {
+            assert!(!value.to_string().contains("synthetic-access"));
+            assert!(!value.to_string().contains("synthetic-refresh"));
+        }
+        assert!(h.token.state.requests().is_empty());
+        assert!(h.usage.state.requests().is_empty());
+        assert_eq!(h.data.state.requests().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn r2a_adoption_admin_refuses_loadable_cpa_even_from_store() {
+    let h = Harness::with_adoption_probe(Provider::Codex, false, || {
+        qb_core::accounts::adopt::ProbeState::Running
+    })
+    .await;
+    let before = h.account();
+    let response = h
+        .client
+        .post(format!(
+            "http://{}/admin/v1/accounts/{}/adopt",
+            h.servers.admin_addr, h.id
+        ))
+        .bearer_auth("synthetic-admin")
+        .json(&json!({"from":"store","expected_generation":before.generation}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["error"]["code"],
+        "cpa_running"
+    );
+    assert_eq!(h.account(), before);
+    assert!(h.token.state.requests().is_empty());
+}
+
+#[tokio::test]
+async fn r2a_manual_refresh_admin_returns_safe_success_and_terminal_summary() {
+    for provider in [Provider::Claude, Provider::Codex] {
+        let h = Harness::new(provider, true).await;
+        h.store
+            .update_metadata(&h.id, |a| a.user_state = UserState::Disabled)
+            .unwrap();
+        h.token.state.push(ScriptedResponse::json(StatusCode::OK,
+            r#"{"access_token":"synthetic-manual-new","refresh_token":"synthetic-manual-rotated","expires_in":3600}"#));
+        let url = format!(
+            "http://{}/admin/v1/accounts/{}/refresh",
+            h.servers.admin_addr, h.id
+        );
+        let response = h
+            .client
+            .post(&url)
+            .bearer_auth("synthetic-admin")
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let summary: Value = response.json().await.unwrap();
+        assert_eq!(summary.as_object().unwrap().len(), 3);
+        assert_eq!(summary["outcome"], "success");
+        assert_eq!(
+            summary["token_expires_at"],
+            json!(h.account().token_meta.expires_at)
+        );
+        assert_eq!(
+            summary["last_refresh_at"],
+            json!(h.account().token_meta.last_refresh_at)
+        );
+        assert_eq!(h.account().user_state, UserState::Disabled);
+        assert!(!summary.to_string().contains("synthetic-manual"));
+        h.token.state.push(ScriptedResponse::json(StatusCode::BAD_REQUEST,
+            r#"{"error":"refresh_token_reused","error_description":"synthetic-secret-error-do-not-return"}"#));
+        let response = h
+            .client
+            .post(&url)
+            .bearer_auth("synthetic-admin")
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let summary: Value = response.json().await.unwrap();
+        assert_eq!(summary.as_object().unwrap().len(), 3);
+        assert_eq!(summary["outcome"], "refresh_token_reused");
+        assert!(matches!(h.account().health, Health::NeedsRelogin { .. }));
+        assert_eq!(h.account().user_state, UserState::Disabled);
+        assert!(!summary.to_string().contains("synthetic-secret"));
+        assert_eq!(h.token.state.requests().len(), 2);
+        let response = h
+            .client
+            .post(&url)
+            .bearer_auth("synthetic-admin")
+            .json(&json!({"force":true}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"]["code"],
+            "needs_relogin"
+        );
+        assert_eq!(h.token.state.requests().len(), 2);
+    }
 }
