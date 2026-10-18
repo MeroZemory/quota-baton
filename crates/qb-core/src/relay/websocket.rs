@@ -110,6 +110,15 @@ async fn redial_same_account(context: &pump::Context) -> Result<UpstreamSocket, 
     {
         return Err(());
     }
+    if let Some(key) = context.session.key.as_deref() {
+        relay.observability.dashboard().response_model(
+            key,
+            response
+                .headers()
+                .get("openai-model")
+                .and_then(|v| v.to_str().ok()),
+        );
+    }
     let stream = response.upgrade().await.map_err(|_| ())?;
     let limit = mib_bytes(relay.websocket.max_message_size_mib);
     let config = WebSocketConfig::default()
@@ -127,6 +136,7 @@ pub(super) async fn upgrade(state: Arc<RelayState>, request: Request) -> Respons
         Provider::Codex,
         request.headers(),
     );
+    completion.dashboard_enabled = false;
     completion.record.transport = "ws".into();
     completion.track(state.inflight_requests.clone());
     completion.runtime = Some(state.accounts.clone());
@@ -171,6 +181,10 @@ async fn upgrade_inner(
     }
     let client_accept = derive_accept_key(key.expect("validated key").as_bytes());
     let client_upgrade = hyper::upgrade::on(&mut request);
+    let launcher_label = request
+        .extensions_mut()
+        .remove::<crate::dashboard::labels::IngressLabel>()
+        .and_then(|e| e.0);
     let (parts, _) = request.into_parts();
     let session = session::classify(Provider::Codex, "/v1/responses", &parts.headers, &[]);
     completion.session(&session);
@@ -546,6 +560,18 @@ async fn upgrade_inner(
     state
         .observability
         .capture_ws_response(ticket.as_deref(), &upstream_headers);
+    if let Some(key) = session.key.as_deref() {
+        state
+            .observability
+            .dashboard()
+            .evidence(key, &parts.headers, launcher_label);
+        state.observability.dashboard().response_model(
+            key,
+            upstream_headers
+                .get("openai-model")
+                .and_then(|v| v.to_str().ok()),
+        );
+    }
     let forwarded = headers::filtered(&upstream_headers, false);
     let close_after_response = {
         #[cfg(all(feature = "phase0", debug_assertions))]
@@ -597,8 +623,14 @@ async fn upgrade_inner(
     }
     state.inflight_requests.fetch_add(1, Ordering::AcqRel);
     let activity = SocketActivity(state.inflight_requests.clone());
+    let dashboard_socket = context
+        .session
+        .key
+        .as_deref()
+        .and_then(|key| state.observability.dashboard().socket(key));
     tokio::spawn(async move {
         let _activity = activity;
+        let _dashboard_socket = dashboard_socket;
         let _socket_pin = socket_pin;
         if let Ok(client) = client_upgrade.await {
             let client = WebSocketStream::from_raw_socket(

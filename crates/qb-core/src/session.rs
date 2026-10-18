@@ -19,6 +19,19 @@ fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     (!value.is_empty() && values.next().is_none()).then_some(value)
 }
 
+/// The explicitly JSON metadata singleton permits UTF-8 obs-text. Other
+/// protocol headers continue to use strict HeaderValue::to_str parsing.
+pub(crate) fn json_turn_metadata(headers: &HeaderMap) -> Option<&str> {
+    let mut values = headers.get_all("x-codex-turn-metadata").iter();
+    let bytes = values.next()?.as_bytes();
+    if bytes.len() > SCAN_LIMIT || values.next().is_some() {
+        return None;
+    }
+    std::str::from_utf8(bytes)
+        .ok()
+        .filter(|raw| !raw.trim().is_empty())
+}
+
 pub fn classify(provider: Provider, path: &str, headers: &HeaderMap, body: &[u8]) -> Session {
     match provider {
         Provider::Codex => {
@@ -30,7 +43,7 @@ pub fn classify(provider: Provider, path: &str, headers: &HeaderMap, body: &[u8]
                 .or_else(|| header(headers, "session_id"))
                 .map(str::to_owned)
                 .or_else(|| {
-                    let raw = header(headers, "x-codex-turn-metadata")?;
+                    let raw = json_turn_metadata(headers)?;
                     if raw.len() > SCAN_LIMIT {
                         return None;
                     }
@@ -501,6 +514,42 @@ mod tests {
         assert_eq!(
             tail_session(br#"{"nested":{"metadata":{"user_id":"fixture_session_nested"}}} "#),
             None
+        );
+    }
+}
+
+#[cfg(test)]
+mod r7_unicode_tests {
+    use super::*;
+    #[test]
+    fn r7_utf8_metadata_preserves_c8_sid_fallback_without_relaxing_other_headers() {
+        let mut headers = HeaderMap::new();
+        let raw = r#"{"session_id":"fixture-utf8","workspaces":{"C:\\private\\한글":{}}}"#;
+        headers.insert(
+            "x-codex-turn-metadata",
+            axum::http::HeaderValue::from_bytes(raw.as_bytes()).unwrap(),
+        );
+        assert_eq!(
+            classify(Provider::Codex, "/v1/responses", &headers, &[])
+                .key
+                .as_deref(),
+            Some("codex:fixture-utf8")
+        );
+        headers.insert(
+            "x-codex-turn-metadata",
+            axum::http::HeaderValue::from_bytes(b"{\"session_id\":\"\xff\"}").unwrap(),
+        );
+        assert!(
+            classify(Provider::Codex, "/v1/responses", &headers, &[])
+                .key
+                .is_none()
+        );
+        headers.insert("session-id", "strict-header-wins".parse().unwrap());
+        assert_eq!(
+            classify(Provider::Codex, "/v1/responses", &headers, &[])
+                .key
+                .as_deref(),
+            Some("codex:strict-header-wins")
         );
     }
 }

@@ -75,7 +75,7 @@ These rules apply to the data port and the admin port alike.
 
 ### Request header read and removed (dashboard label, R6)
 
-- `x-quota-baton-label`: an optional, client-side session label (the launcher's folder name). The core reads it into memory for the dashboard and **removes it before forwarding**, so it never reaches the provider. It is never persisted or logged.
+- `x-quota-baton-label`: an optional, client-side session label (the launcher's folder name). The core reads it into memory for the dashboard and **removes every occurrence before capture or forwarding**, including HTTP retries and WebSocket handshakes. Duplicate or invalid values supply no label. The launcher encodes a UTF-8 basename as `qb1:<base64url without padding>` so Korean names fit ASCII header APIs; a bounded plain label is also accepted. The decoded basename lives in memory only and is never persisted or logged.
 
 ### Response to client
 
@@ -548,7 +548,11 @@ Base: `http://127.0.0.1:<admin_port>/admin/v1`. Every route requires `Authorizat
 |---|---|
 | `GET /health` | `{ok, version, pid, started_at}` |
 | `GET /state` | `{accounts:[AccountView], inflight:{requests, bytes}, memory:{private_bytes}, bindings:{count}, data_port, version}` |
-| `GET /events` | SSE stream of `account_changed`, `quota_updated`, `core_warning` and `login_progress` |
+| `GET /events` | SSE stream of `account_changed`, `quota_updated`, `core_warning`, `login_progress`, `sessions_changed` and `activity`. The tray and dashboard share one subscription. Session changes are debounced to at most once per second; a lag marker requires resynchronization. |
+| `GET /sessions?range=active\|hour\|today\|all` | Bounded account-grouped session metadata. IDs are the 12-hex ledger root hash; counts distinguish missing evidence from zero. Folder basenames and client/model metadata are memory-only. |
+| `GET /sessions/{id}` | Session detail, bounded request summaries and placement timeline. Only this route may include `original_short_id`, the first 8 characters of the root ID, retained in memory only. Full raw IDs, content and paths are never returned. |
+| `GET /activity?days=1..7&limit=1..2000&since_seq=...` | Bounded 7-day activity, with stable sequence numbers for updated aggregates. No labels, raw ID prefixes, paths or upstream error bodies. |
+| `GET /usage-history?hours=1..48` | Observed account-window history and reset/credit spans. Unknown observations remain gaps; remaining usage is a dashboard projection. |
 | `POST /accounts/login` `{provider}` | Returns `{login_id, auth_url}`. The core runs the callback listener. |
 | `POST /accounts/import` `{source:"cpa", mode:"linked"\|"adopted", activate:[...]}` | Imports from CPA's auth directory (D5). Returns per-identity metadata, never tokens. `mode:"adopted"` is refused: adoption is per existing account via `/accounts/{id}/adopt`. |
 | `POST /accounts/{id}/adopt` `{from:"cpa_file"\|"store"\|{"path":"..."}, expected_generation}` | Takes refresh ownership of a linked account (D17). Refused with 409 while CPA can still refresh it (process running and file loadable), on a generation mismatch, or when the file's identity does not match. Returns `{id, generation, from, token_expires_at}`; never tokens. |
@@ -663,9 +667,19 @@ Each step is journaled before it runs and marked after it completes. `retire-cpa
 
 ### `state/bindings.json`
 
-`{ "schema": 1, "bindings": [{ "key": "<session key>", "account": "<id>", "last_used": "..." }] }`
+`{ "schema": 1, "bindings": [{ "key": "<session key>", "account": "<id>", "last_used": "...", "first_seen_at": "...", "client_kind": "codex_cli" }] }`
 
 It is written behind, at most 60 s late, and flushed on drain and exit. It holds no conversation content.
+
+`first_seen_at`, `bound_since` and `client_kind` are optional for backward compatibility. Dashboard labels, paths, model evidence, request counters and displayed raw-ID prefixes do not enter this file.
+
+### Dashboard history and window geometry
+
+`state/activity.jsonl` holds bounded, compacted 7-day typed activity. `state/usage-history.json` holds bounded 48-hour account-window observations, reset markers and credit spans. Both use atomic replacement and write-behind no more than 60 s late. Retention bounds account counts, points and physical allocations as well as time. Restart cannot reconstruct volatile counters; views mark that evidence unknown.
+
+The activity archive also retains a typed sequence checkpoint when all events have expired. New activity after restart must have a sequence greater than every previously issued cursor; the checkpoint is not an activity event and is not returned in queries.
+
+The tray writes `state/ui.json` atomically with schema and geometry only: position, size, DPI and maximized state. It never writes search text, selected session, filters, labels, charts or detail payloads. Dashboard data routes require the same authentication and Host/Origin checks as all other admin routes.
 
 ### Ledger line
 

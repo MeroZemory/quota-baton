@@ -19,7 +19,8 @@ pub(super) fn filtered(headers: &HeaderMap, request: bool) -> HeaderMap {
         .collect();
     let mut result = HeaderMap::new();
     for (name, value) in headers {
-        if per_hop(name.as_str())
+        if name.as_str() == crate::dashboard::labels::LABEL_HEADER
+            || per_hop(name.as_str())
             || connection
                 .iter()
                 .any(|hop| name.as_str().eq_ignore_ascii_case(hop))

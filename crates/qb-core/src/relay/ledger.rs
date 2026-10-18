@@ -17,6 +17,11 @@ use crate::{
 
 pub(in crate::relay) struct Completion {
     pub record: RequestRecord,
+    pub dashboard_enabled: bool,
+    pub dashboard_label: Option<crate::dashboard::labels::MemoryLabel>,
+    dashboard_key: Option<String>,
+    dashboard_client: crate::dashboard::ClientView,
+    pub(super) dashboard_request: Option<crate::dashboard::runtime::RequestGuard>,
     pub burst_client: Option<crate::burst::Identity>,
     pub start: Instant,
     pub input_bytes: Arc<AtomicU64>,
@@ -40,6 +45,19 @@ impl Completion {
         headers: &HeaderMap,
     ) -> Self {
         Self {
+            dashboard_enabled: true,
+            dashboard_label: if provider == Provider::Codex {
+                crate::dashboard::labels::codex_workspace(headers)
+            } else {
+                None
+            },
+            dashboard_key: None,
+            dashboard_client: crate::dashboard::ClientView::from_headers(
+                headers.get("originator").and_then(|v| v.to_str().ok()),
+                headers.get("user-agent").and_then(|v| v.to_str().ok()),
+                headers.get("x-app").and_then(|v| v.to_str().ok()),
+            ),
+            dashboard_request: None,
             start: Instant::now(),
             burst_client: crate::burst::client_identity(headers),
             reset_hold_used: false,
@@ -87,6 +105,12 @@ impl Completion {
     }
 
     pub fn session(&mut self, session: &Session) {
+        self.dashboard_key = session.key.as_ref().filter(|key| key.len() <= 256).cloned();
+        if let Some(key) = session.key.as_deref().filter(|key| key.len() > 256) {
+            self.observability
+                .dashboard()
+                .incomplete(crate::dashboard::SessionId::from_key(key));
+        }
         self.record.session = session.key.as_ref().map(|key| {
             let digest = Sha256::digest(key.as_bytes());
             digest[..6]
@@ -95,8 +119,50 @@ impl Completion {
                 .collect()
         });
         self.record.model = session.model.clone();
+        self.dashboard_begin();
+        if session
+            .key
+            .as_deref()
+            .is_some_and(|key| key.starts_with("claude:"))
+        {
+            self.dashboard_model(session.model.as_deref());
+        }
     }
 
+    pub fn dashboard_begin(&mut self) {
+        if !self.dashboard_enabled || self.dashboard_request.is_some() {
+            return;
+        }
+        if let Some(key) = &self.dashboard_key {
+            let at = self
+                .record
+                .ts
+                .parse()
+                .unwrap_or_else(|_| chrono::Utc::now());
+            self.dashboard_request = self.observability.dashboard().request_observed(
+                key,
+                self.dashboard_client.clone(),
+                self.dashboard_label.clone(),
+                at,
+                if self.record.transport == "ws" {
+                    crate::dashboard::Transport::Websocket
+                } else {
+                    crate::dashboard::Transport::Http
+                },
+            );
+            if self.dashboard_request.is_some() {
+                self.dashboard_label = None;
+            }
+        }
+    }
+    pub fn dashboard_pacing(&self) -> Option<crate::dashboard::runtime::PacingGuard> {
+        self.dashboard_request.as_ref().map(|guard| guard.pacing())
+    }
+    pub fn dashboard_model(&self, value: Option<&str>) {
+        if let Some(key) = &self.dashboard_key {
+            self.observability.dashboard().response_model(key, value);
+        }
+    }
     pub fn elapsed_ms(&self) -> u64 {
         u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
@@ -107,6 +173,7 @@ impl Completion {
     }
 
     pub fn attempt(&mut self, account: &str) {
+        self.dashboard_begin();
         if self
             .account_inflight
             .as_ref()
@@ -167,6 +234,61 @@ impl Drop for Completion {
         }
         self.record.dur_ms = self.elapsed_ms();
         self.record.bytes_in = self.input_bytes.load(Ordering::Relaxed);
+        if let Some(guard) = self.dashboard_request.take() {
+            if self.record.after_move
+                && let Some(cached) = self
+                    .record
+                    .cache_usage
+                    .as_ref()
+                    .and_then(|usage| usage.cached_tokens)
+            {
+                guard.cache_result(if cached > 0 {
+                    crate::dashboard::CacheResult::Hit
+                } else {
+                    crate::dashboard::CacheResult::Miss
+                });
+            }
+            guard.finish(crate::dashboard::RequestEnd {
+                at: chrono::Utc::now(),
+                outcome: crate::dashboard::runtime::request_outcome(&self.record.outcome),
+                status: self.record.status,
+                ttfb_ms: self.record.ttfb_ms,
+                dur_ms: self.record.dur_ms,
+                rate_wait_ms: self.record.rate_wait_ms,
+                rate_retries: self.record.rate_retries,
+                failover: self.record.attempt_details.first().and_then(|attempt| {
+                    let to = self.record.account.as_ref()?;
+                    if &attempt.account == to {
+                        return None;
+                    }
+                    Some(crate::dashboard::FailoverView {
+                        from: attempt.account.clone().try_into().ok()?,
+                        to: to.clone().try_into().ok()?,
+                    })
+                }),
+            });
+        }
+        if let Some(account) = self
+            .record
+            .account
+            .as_ref()
+            .and_then(|id| id.clone().try_into().ok())
+        {
+            self.observability.dashboard().rate_hold(
+                crate::dashboard::history::RateHoldObservation {
+                    ts: chrono::Utc::now(),
+                    provider: if self.record.family == "claude" {
+                        Provider::Claude
+                    } else {
+                        Provider::Codex
+                    },
+                    account,
+                    wait_ms: self.record.rate_wait_ms,
+                    retries: self.record.rate_retries,
+                    relayed: self.record.relayed_rate_429s,
+                },
+            );
+        }
         self.observability.record_request(self.record.clone());
     }
 }

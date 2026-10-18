@@ -224,6 +224,7 @@ enum Command {
 }
 
 pub struct Observability {
+    dashboard: Arc<crate::dashboard::runtime::Runtime>,
     // One recent aggregate only; hidden trays recover transient broadcast loss.
     recent_burst: std::sync::Mutex<Option<(std::time::Instant, DateTime<Utc>, u32)>>,
     events: std::sync::Mutex<Option<tokio::sync::broadcast::Sender<serde_json::Value>>>,
@@ -236,6 +237,10 @@ pub struct Observability {
 }
 
 impl Observability {
+    pub fn dashboard(&self) -> &Arc<crate::dashboard::runtime::Runtime> {
+        &self.dashboard
+    }
+
     pub fn record_takeover(&self, phase: &str) {
         self.enqueue(Command::Ledger(serde_json::json!({
             "ts": Utc::now().to_rfc3339(), "event": "takeover",
@@ -243,6 +248,7 @@ impl Observability {
         })));
     }
     pub(crate) fn set_events(&self, sender: tokio::sync::broadcast::Sender<serde_json::Value>) {
+        self.dashboard.set_events(sender.clone());
         *self.events.lock().unwrap_or_else(|e| e.into_inner()) = Some(sender);
     }
     fn progress(&self, event: serde_json::Value) {
@@ -262,6 +268,15 @@ impl Observability {
         status: &str,
         account_id: Option<&str>,
     ) {
+        if status == "completed" || status == "success" {
+            self.dashboard.account_event(
+                crate::dashboard::history::ActivityKind::Login,
+                provider,
+                account_id,
+                None,
+                None,
+            );
+        }
         self.enqueue(Command::Ledger(serde_json::json!({"ts":Utc::now().to_rfc3339(),"event":"login","provider":provider,"login_id":login_id,"outcome":status,"account":account_id})));
         self.progress(serde_json::json!({"event":"login_progress","data":{"login_id":login_id,"status":status,"account_id":account_id}}));
     }
@@ -272,6 +287,13 @@ impl Observability {
         outcome: &str,
         expires_at: Option<DateTime<Utc>>,
     ) {
+        self.dashboard.account_event(
+            crate::dashboard::history::ActivityKind::TokenRefresh,
+            provider_for(account),
+            Some(account),
+            Some(refresh_activity_outcome(outcome)),
+            expires_at,
+        );
         self.enqueue(Command::Ledger(serde_json::json!({"ts":Utc::now().to_rfc3339(),"event":"token_refresh","account":account,"trigger":trigger,"outcome":outcome,"expires_at":expires_at})));
     }
     pub(crate) fn recent_warnings(&self) -> Vec<serde_json::Value> {
@@ -291,6 +313,19 @@ impl Observability {
             Some((std::time::Instant::now(), Utc::now(), observed_count));
     }
     pub(crate) fn burst_warning(&self, observed_count: u32) {
+        self.dashboard
+            .activity(crate::dashboard::history::ActivityInput {
+                ts: Utc::now(),
+                kind: crate::dashboard::history::ActivityKind::Burst,
+                provider: Provider::Codex,
+                account: None,
+                account_to: None,
+                notable: true,
+                data: crate::dashboard::history::ActivityData {
+                    count: observed_count,
+                    ..Default::default()
+                },
+            });
         self.remember_burst(observed_count);
         self.enqueue(Command::Ledger(serde_json::json!({
             "ts": Utc::now().to_rfc3339(), "event": "core_warning",
@@ -354,6 +389,9 @@ impl Observability {
                 empty()
             }
         };
+        let dashboard = crate::dashboard::runtime::Runtime::new();
+        restore_dashboard(home, &dashboard);
+        let worker_dashboard = dashboard.clone();
         // 요청 경로에서는 큐가 가득 차도 디스크나 작성자를 기다리지 않는다.
         let (tx, rx) = mpsc::sync_channel(256);
         let dropped = Arc::new(AtomicU64::new(0));
@@ -366,8 +404,9 @@ impl Observability {
             .collect();
         let worker = thread::Builder::new()
             .name("qb-observability".into())
-            .spawn(move || run(home, state, rx, worker_dropped))?;
+            .spawn(move || run(home, state, rx, worker_dropped, worker_dashboard))?;
         Ok(Self {
+            dashboard,
             recent_burst: std::sync::Mutex::new(None),
             events: std::sync::Mutex::new(None),
             snapshots: std::sync::Mutex::new(snapshots),
@@ -502,7 +541,7 @@ impl Observability {
                     .collect();
                 values.insert(name.as_str(), entries);
             }
-            self.enqueue(Command::Capture(serde_json::json!({"destination":destination,"shape":{"response_header_names":headers.keys().map(|n|n.as_str()).collect::<Vec<_>>(),"response_header_values":values}})));
+            self.enqueue(Command::Capture(serde_json::json!({"destination":destination,"shape":{"response_header_names":headers.keys().map(|n|n.as_str()).filter(|name|crate::dashboard::labels::capture_header_allowed(name)).collect::<Vec<_>>(),"response_header_values":values}})));
         }
         #[cfg(not(all(feature = "shape-capture", debug_assertions)))]
         let _ = (ticket, headers);
@@ -554,6 +593,21 @@ impl Observability {
         groups_hit: usize,
         marked: usize,
     ) {
+        self.dashboard
+            .activity(crate::dashboard::history::ActivityInput {
+                ts: Utc::now(),
+                kind: crate::dashboard::history::ActivityKind::OverloadDetected,
+                provider: provider_for(account),
+                account: account.to_owned().try_into().ok(),
+                account_to: None,
+                notable: true,
+                data: crate::dashboard::history::ActivityData {
+                    active: Some(active.min(u32::MAX as usize) as u32),
+                    threshold: Some(threshold.min(u32::MAX as usize) as u32),
+                    groups_hit: Some(groups_hit.min(u32::MAX as usize) as u32),
+                    ..Default::default()
+                },
+            });
         self.enqueue(Command::Ledger(serde_json::json!({
             "ts": Utc::now().to_rfc3339(),
             "event": "overload_detected",
@@ -576,6 +630,7 @@ impl Observability {
         keys: usize,
         debug_pin: bool,
     ) {
+        self.dashboard.placement(key, from, to, reason);
         use sha2::{Digest, Sha256};
         if !matches!(
             reason,
@@ -593,6 +648,25 @@ impl Observability {
     }
 
     fn remember(&self, id: &str, next: &Snapshot, preserve_missing_windows: bool) {
+        use crate::dashboard::history::*;
+        if let Ok(account) = crate::dashboard::AccountId::try_from(id.to_owned()) {
+            for window in &next.windows {
+                if let Ok(name) = window.name.clone().try_into() {
+                    self.dashboard.usage(UsageObservation {
+                        account: account.clone(),
+                        observed_at: window.observed_at.unwrap_or(next.observed_at),
+                        window: Some(WindowObservation {
+                            name,
+                            scope: WindowScope::Account,
+                            used_pct: window.used_pct,
+                            reset_at: window.reset_at,
+                        }),
+                        credits: None,
+                    });
+                }
+            }
+        }
+
         if let Ok(mut snapshots) = self.snapshots.lock()
             && let Ok(mut value) = serde_json::to_value(next)
         {
@@ -656,6 +730,7 @@ impl Observability {
     }
 
     pub(crate) fn record_account(&self, account: &crate::accounts::Account) {
+        self.dashboard.account_changed(account);
         // Only canonical subscription names enter the account ledger.
         let plan = account.plan.as_deref().filter(|plan| {
             matches!(
@@ -687,6 +762,7 @@ impl Observability {
         from: &crate::accounts::Health,
         to: &crate::accounts::Health,
     ) {
+        self.dashboard.health(id, from, to);
         let value = serde_json::to_value(to).unwrap_or_default();
         self.enqueue(Command::Ledger(serde_json::json!({"ts":Utc::now().to_rfc3339(),"event":"health_changed","account":id,"from":from,"to":to,"reason":value["reason"],"until":value["until"]})));
     }
@@ -698,6 +774,13 @@ impl Observability {
         outcome: &str,
         expires_at: Option<DateTime<Utc>>,
     ) {
+        self.dashboard.account_event(
+            crate::dashboard::history::ActivityKind::LinkedReload,
+            provider_for(account_id),
+            Some(account_id),
+            Some(reload_activity_outcome(outcome)),
+            expires_at,
+        );
         self.enqueue(Command::Ledger(serde_json::json!({"ts": Utc::now().to_rfc3339(), "event": "linked_reload", "account": account_id, "trigger": trigger, "outcome": outcome, "expires_at": expires_at})));
     }
 
@@ -952,6 +1035,11 @@ impl DropWarnings {
 }
 
 struct Writer {
+    dashboard: Option<Arc<crate::dashboard::runtime::Runtime>>,
+    activity_plan: crate::dashboard::history::WriteBehind,
+    usage_plan: crate::dashboard::history::WriteBehind,
+    dashboard_clock: Instant,
+
     home: PathBuf,
     state: QuotaState,
     quota_dirty: bool,
@@ -967,6 +1055,10 @@ impl Writer {
     fn new(home: PathBuf, state: QuotaState) -> Self {
         let now = Instant::now();
         Self {
+            dashboard: None,
+            activity_plan: Default::default(),
+            usage_plan: Default::default(),
+            dashboard_clock: now,
             home,
             state,
             quota_dirty: false,
@@ -1065,6 +1157,40 @@ impl Writer {
             self.error = true;
         }
     }
+    fn dashboard_persist(&mut self, force: bool) -> Result<(), String> {
+        let Some(runtime) = &self.dashboard else {
+            return Ok(());
+        };
+        let now = u64::try_from(self.dashboard_clock.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let (activity_revision, usage_revision) = runtime.revisions();
+        let activity = self.activity_plan.offer(activity_revision, now, true);
+        let usage = self.usage_plan.offer(usage_revision, now, force);
+        if activity.is_none() && usage.is_none() {
+            return Ok(());
+        }
+        // One clone per offered kind, no snapshot-bearing commands in the queue.
+        let archive = runtime.archive(activity.is_some(), usage.is_some());
+        let mut success = true;
+        if let (Some(revision), Some(snapshot)) = (activity, archive.activity) {
+            let written = snapshot.compact_jsonl().ok().is_some_and(|bytes| {
+                atomic_write(&self.home.join("state/activity.jsonl"), &bytes).is_ok()
+            });
+            self.activity_plan.complete(revision, written, now);
+            success &= written;
+        }
+        if let (Some(revision), Some(snapshot)) = (usage, archive.usage) {
+            let written = snapshot.snapshot_json().ok().is_some_and(|bytes| {
+                atomic_write(&self.home.join("state/usage-history.json"), &bytes).is_ok()
+            });
+            self.usage_plan.complete(revision, written, now);
+            success &= written;
+        }
+        if success {
+            Ok(())
+        } else {
+            Err("dashboard archive write failed".into())
+        }
+    }
     fn persist(&mut self, now: Instant) {
         if self.quota_frozen {
             self.quota_dirty = false;
@@ -1077,6 +1203,9 @@ impl Writer {
             return;
         }
         self.last_sync = now;
+        if !self.quota_frozen && self.dashboard_persist(false).is_err() {
+            tracing::warn!("Dashboard persistence failed; next batch will retry");
+        }
         if !self.quota_dirty && self.dirty_files.is_empty() {
             return;
         }
@@ -1110,6 +1239,7 @@ impl Writer {
         self.last_sync = now.max(Instant::now());
     }
     fn flush(&mut self) -> Result<(), String> {
+        self.dashboard_persist(true)?;
         // 명시적 flush도 이전 배치로부터 1초를 지키고, 수락한 이벤트의 저장을 완료한다.
         if self.quota_dirty || !self.dirty_files.is_empty() {
             thread::sleep(SYNC_INTERVAL.saturating_sub(self.last_sync.elapsed()));
@@ -1122,8 +1252,15 @@ impl Writer {
         }
     }
 }
-fn run(home: PathBuf, state: QuotaState, rx: mpsc::Receiver<Command>, dropped: Arc<AtomicU64>) {
+fn run(
+    home: PathBuf,
+    state: QuotaState,
+    rx: mpsc::Receiver<Command>,
+    dropped: Arc<AtomicU64>,
+    dashboard: Arc<crate::dashboard::runtime::Runtime>,
+) {
     let mut writer = Writer::new(home, state);
+    writer.dashboard = Some(dashboard.clone());
     let mut warnings = DropWarnings {
         last: Instant::now() - WARN_INTERVAL,
     };
@@ -1133,6 +1270,7 @@ fn run(home: PathBuf, state: QuotaState, rx: mpsc::Receiver<Command>, dropped: A
                 let _ = reply.send(writer.flush());
             }
             Ok(Command::FreezeQuota(reply)) => {
+                dashboard.freeze();
                 let result = writer.flush();
                 if result.is_ok() {
                     writer.quota_frozen = true;
@@ -1140,6 +1278,7 @@ fn run(home: PathBuf, state: QuotaState, rx: mpsc::Receiver<Command>, dropped: A
                 let _ = reply.send(result);
             }
             Ok(Command::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                dashboard.freeze();
                 if writer.flush().is_err() {
                     tracing::warn!("Observability shutdown flush failed");
                 }
@@ -1148,10 +1287,175 @@ fn run(home: PathBuf, state: QuotaState, rx: mpsc::Receiver<Command>, dropped: A
             Ok(command) => writer.event(command),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
+        dashboard.tick();
         writer.persist(Instant::now());
         warnings.report(&dropped, Instant::now());
     }
 }
+#[cfg(test)]
+mod r7_archive_tests {
+    use super::*;
+    use crate::dashboard::history::*;
+    #[test]
+    fn r7_credential_activity_maps_checked_successes_without_hiding_real_failures() {
+        use crate::dashboard::RequestOutcome;
+        let temp = tempfile::tempdir().unwrap();
+        let obs = Observability::new(temp.path(), None).unwrap();
+        let account = "cx-123abc";
+        for outcome in ["updated", "unchanged", "success"] {
+            obs.record_reload(account, "selection", outcome, None);
+        }
+        obs.record_refresh(account, "manual", "success", None);
+        let events = obs.dashboard().activity_page(None, 200, 7).unwrap().events;
+        assert_eq!(events.len(), 4);
+        assert!(
+            events
+                .iter()
+                .all(|event| event.data.outcome == Some(RequestOutcome::Ok)
+                    && !event.notable
+                    && !event.data.recovered)
+        );
+        for outcome in ["not_sent", "401", "http_401", "link_stale", "link_invalid"] {
+            obs.record_reload(account, "selection", outcome, None);
+            obs.record_refresh(account, "manual", outcome, None);
+        }
+        let events = obs.dashboard().activity_page(None, 200, 7).unwrap().events;
+        let errors: Vec<_> = events.iter().filter(|event| event.seq > 4).collect();
+        assert_eq!(errors.len(), 10);
+        assert!(errors.iter().all(|event| event.data.outcome
+            == Some(RequestOutcome::UpstreamError)
+            && event.notable));
+        // Domain-specific success names must not accidentally mark an unsent
+        // refresh as successful; unchanged is only a successful linked check.
+        obs.record_refresh(account, "manual", "unchanged", None);
+        obs.record_reload(account, "selection", "unchanged", None);
+        let events = obs.dashboard().activity_page(None, 200, 7).unwrap().events;
+        let latest = events.iter().max_by_key(|event| event.seq).unwrap();
+        assert_eq!(latest.kind, ActivityKind::LinkedReload);
+        assert_eq!(latest.data.outcome, Some(RequestOutcome::Ok));
+        assert!(latest.data.recovered);
+        assert!(!latest.notable);
+        let refresh = events
+            .iter()
+            .filter(|event| event.kind == ActivityKind::TokenRefresh)
+            .max_by_key(|event| event.seq)
+            .unwrap();
+        assert_eq!(refresh.data.outcome, Some(RequestOutcome::UpstreamError));
+        assert!(refresh.notable);
+    }
+    #[test]
+    fn r7_archive_failed_atomic_write_retries_latest_revision_and_freeze_blocks_late_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        fs::create_dir(home.join("state")).unwrap();
+        let runtime = crate::dashboard::runtime::Runtime::new();
+        runtime.account_event(
+            ActivityKind::TokenRefresh,
+            Provider::Codex,
+            Some("cx-123abc"),
+            Some(crate::dashboard::RequestOutcome::UpstreamError),
+            None,
+        );
+        let mut writer = Writer::new(home.to_owned(), QuotaState::default());
+        writer.dashboard = Some(runtime.clone());
+        // Destination is a synthetic directory: atomic replacement must fail, leaving dirty state.
+        fs::create_dir(home.join("state/activity.jsonl")).unwrap();
+        assert!(writer.flush().is_err());
+        assert!(writer.activity_plan.dirty(runtime.revisions().0));
+        runtime.account_event(
+            ActivityKind::TokenRefresh,
+            Provider::Codex,
+            Some("cx-123abc"),
+            Some(crate::dashboard::RequestOutcome::Ok),
+            None,
+        );
+        runtime.usage(UsageObservation {
+            account: "cx-123abc".to_owned().try_into().unwrap(),
+            observed_at: Utc::now(),
+            window: Some(WindowObservation {
+                name: "43200m".to_owned().try_into().unwrap(),
+                scope: WindowScope::Account,
+                used_pct: Some(42.0),
+                reset_at: None,
+            }),
+            credits: None,
+        });
+        fs::remove_dir(home.join("state/activity.jsonl")).unwrap();
+        runtime.freeze();
+        let revisions = runtime.revisions();
+        runtime.account_event(
+            ActivityKind::Login,
+            Provider::Codex,
+            Some("cx-123abc"),
+            None,
+            None,
+        );
+        assert_eq!(runtime.revisions(), revisions);
+        writer.flush().unwrap();
+        assert!(!writer.activity_plan.dirty(revisions.0));
+        assert!(!writer.usage_plan.dirty(revisions.1));
+        let restored = crate::dashboard::runtime::Runtime::new();
+        restore_dashboard(home, &restored);
+        let events = restored.activity_page(None, 200, 7).unwrap().events;
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().any(|event| event.data.recovered));
+        assert_eq!(restored.usage_page(48).unwrap().accounts.len(), 1);
+        assert!(fs::read_dir(home.join("state")).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
+    }
+}
+
+// Credential event results are not request outcomes. In particular, a valid
+// linked token with no newer source is an ordinary successful check.
+fn refresh_activity_outcome(outcome: &str) -> crate::dashboard::RequestOutcome {
+    match outcome {
+        "success" | "ok" => crate::dashboard::RequestOutcome::Ok,
+        _ => crate::dashboard::RequestOutcome::UpstreamError,
+    }
+}
+fn reload_activity_outcome(outcome: &str) -> crate::dashboard::RequestOutcome {
+    match outcome {
+        "updated" | "unchanged" | "success" | "ok" => crate::dashboard::RequestOutcome::Ok,
+        _ => crate::dashboard::RequestOutcome::UpstreamError,
+    }
+}
+
+fn provider_for(id: &str) -> Provider {
+    if id.starts_with("cl-") {
+        Provider::Claude
+    } else {
+        Provider::Codex
+    }
+}
+fn restore_dashboard(home: &Path, dashboard: &crate::dashboard::runtime::Runtime) {
+    use crate::dashboard::history::{ActivityLog, INPUT_BYTES, UsageHistory};
+    fn bounded(path: &Path) -> Option<Vec<u8>> {
+        use std::io::Read;
+        let file = std::fs::File::open(path).ok()?;
+        if file.metadata().ok()?.len() > INPUT_BYTES as u64 {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        file.take(INPUT_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        (bytes.len() <= INPUT_BYTES).then_some(bytes)
+    }
+    let now = Utc::now();
+    let activity = bounded(&home.join("state/activity.jsonl"))
+        .and_then(|bytes| ActivityLog::restore_jsonl(&bytes, now).ok())
+        .unwrap_or_default();
+    let usage = bounded(&home.join("state/usage-history.json"))
+        .and_then(|bytes| UsageHistory::restore_json(&bytes, now).ok())
+        .unwrap_or_default();
+    dashboard.restore(activity, usage);
+}
+
 fn prune(dir: &Path) {
     if retain(dir, Utc::now().date_naive(), LEDGER_MAX_BYTES).is_err() {
         tracing::warn!("Ledger retention failed; next prune will retry");
@@ -1574,6 +1878,7 @@ mod tests {
     fn retained_burst_is_bounded_fresh_and_expires_without_persistence() {
         let (tx, rx) = mpsc::sync_channel(16);
         let obs = Observability {
+            dashboard: crate::dashboard::runtime::Runtime::new(),
             recent_burst: std::sync::Mutex::new(None),
             events: std::sync::Mutex::new(None),
             snapshots: std::sync::Mutex::new(BTreeMap::new()),
@@ -1607,6 +1912,7 @@ mod tests {
         // 작성자가 멈춘 큐로 느린 디스크를 결정적으로 재현한다.
         let (tx, rx) = mpsc::sync_channel(2);
         let obs = Observability {
+            dashboard: crate::dashboard::runtime::Runtime::new(),
             recent_burst: std::sync::Mutex::new(None),
             events: std::sync::Mutex::new(None),
             snapshots: std::sync::Mutex::new(BTreeMap::new()),
@@ -1740,6 +2046,7 @@ mod tests {
             let _ = done_tx.send(drained);
         });
         let obs = Observability {
+            dashboard: crate::dashboard::runtime::Runtime::new(),
             recent_burst: std::sync::Mutex::new(None),
             events: std::sync::Mutex::new(None),
             snapshots: std::sync::Mutex::new(BTreeMap::new()),

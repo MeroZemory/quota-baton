@@ -225,7 +225,18 @@ impl AccountRuntime {
         let notices = quota_notices.clone();
         let pending_quota = Arc::new(Mutex::new(PendingQuota::new()));
         let pending = pending_quota.clone();
-        store.set_observer(Arc::new(move |account,previous| {
+        {
+            // Account callbacks run under this same gate. Seed the pre-mutation
+            // settings before installing the callback; no await/network is involved.
+            let transaction = store.transaction();
+            match transaction.as_ref() {
+                Ok(_) => match store.list_unlocked() {
+                    Ok(existing) => obs.dashboard().baseline_accounts(&existing),
+                    Err(_) => tracing::warn!("Account observer baseline unavailable"),
+                },
+                Err(_) => tracing::warn!("Account observer transaction unavailable"),
+            }
+            store.set_observer(Arc::new(move |account,previous| {
             if let Ok(mut notices) = notices.lock()
                 && notices.get(&account.id).is_some_and(|entry| entry.state != notice_state(account)) {
                 notices.remove(&account.id);
@@ -238,6 +249,7 @@ impl AccountRuntime {
             writer.record_account(account);
             let _=changes.send(json!({"event":"account_changed","data":{"id":account.id,"health":account.health,"user_state":account.user_state,"plan":account.plan,"generation":account.generation}}));
         }));
+        }
         Arc::new(Self {
             store,
             obs,
@@ -451,9 +463,26 @@ impl AccountRuntime {
         {
             return;
         }
+        self.dashboard_credit_observation(id, true, &snapshot);
         let (window, reset_at) = crate::relay::notices::limiting_window(&account, &snapshot);
         self.set_quota_notice(&account, json!({"action":"credits","window":window,
             "reset_at":reset_at,"next_account":null,"earliest_account":null,"observed_at":Utc::now(),"model_limited":false}), None);
+    }
+
+    fn dashboard_credit_observation(&self, id: &str, serving: bool, snapshot: &Value) {
+        if let Ok(account) = id.to_owned().try_into() {
+            self.obs
+                .dashboard()
+                .usage(crate::dashboard::history::UsageObservation {
+                    account,
+                    observed_at: Utc::now(),
+                    window: None,
+                    credits: Some(crate::dashboard::history::CreditsObservation {
+                        serving,
+                        balance: snapshot["credits"]["balance"].as_f64(),
+                    }),
+                });
+        }
     }
 
     pub fn set_rate_hold_secs(&self, secs: u64) {
@@ -1268,6 +1297,13 @@ impl AccountRuntime {
         })
         .await
         .map_err(|_| ())??;
+        if snapshot["signals"]["serving_from_credits"] == false
+            || snapshot["signals"]["active_limit"]
+                .as_str()
+                .is_some_and(|limit| limit != "credits")
+        {
+            self.dashboard_credit_observation(id, false, &snapshot);
+        }
         if let Ok(mut notices) = self.quota_notices.lock() {
             let recovered = notices.get(id).is_some_and(|entry| {
                 let notice = &entry.notice;

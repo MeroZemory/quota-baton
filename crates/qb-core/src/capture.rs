@@ -72,7 +72,11 @@ mod enabled {
             self.remaining
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
                 .ok()?;
-            let names: BTreeSet<_> = headers.keys().map(|h| h.as_str()).collect();
+            let names: BTreeSet<_> = headers
+                .keys()
+                .map(|h| h.as_str())
+                .filter(|name| crate::dashboard::labels::capture_header_allowed(name))
+                .collect();
             let mut values = BTreeMap::new();
             for name in [
                 "anthropic-beta",
