@@ -22,6 +22,35 @@ use std::{
 
 const CAPACITY: usize = 20_000;
 
+#[cfg(test)]
+mod r7_snapshot_tests {
+    use super::*;
+    #[test]
+    fn r7_legacy_binding_snapshot_preserves_unknown_metadata_and_c7_pin_activity() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("state")).unwrap();
+        let now = Utc::now();
+        let key = "codex:r7-synthetic-root";
+        fs::write(root.path().join("state/bindings.json"),serde_json::to_vec(&serde_json::json!({"schema":1,"bindings":[{"key":key,"account":"cx-123abc","last_used":now-chrono::Duration::seconds(1000)}]})).unwrap()).unwrap();
+        let table = BindingTable::new(root.path(), RoutingConfig::default()).unwrap();
+        let before = table.dashboard_snapshot(now);
+        assert_eq!(before.len(), 1);
+        assert!(!before[0].active);
+        assert!(before[0].first_seen_at.is_none());
+        assert!(before[0].client_kind.is_none());
+        assert!(before[0].restored);
+        let pin = table.pin(Some(key));
+        let pinned = table.dashboard_snapshot(now);
+        assert!(pinned[0].active);
+        assert_eq!(
+            pinned.iter().filter(|row| row.active).count(),
+            table.active_sessions("cx-123abc", now)
+        );
+        drop(pin);
+        assert!(!table.dashboard_snapshot(now)[0].active);
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Candidate {
     pub account: Account,
@@ -61,6 +90,14 @@ struct Binding {
     key: String,
     account: String,
     last_used: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    first_seen_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bound_since: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_kind: Option<crate::dashboard::ClientKind>,
+    #[serde(skip)]
+    observed_here: bool,
 }
 #[derive(Serialize, Deserialize)]
 struct Snapshot {
@@ -361,6 +398,99 @@ impl BindingTable {
             }
         }
     }
+    fn dashboard_row(
+        &self,
+        d: &Data,
+        g: &str,
+        now: DateTime<Utc>,
+    ) -> Option<crate::dashboard::BindingGroup> {
+        let entry = d.groups.get(g)?;
+        let metadata = entry
+            .keys
+            .iter()
+            .filter_map(|k| d.bindings.get(k))
+            .min_by_key(|b| b.first_seen_at);
+        Some(crate::dashboard::BindingGroup {
+            id: crate::dashboard::SessionId::from_key(g),
+            provider: if g.starts_with("claude:") {
+                Provider::Claude
+            } else {
+                Provider::Codex
+            },
+            account: entry.account.clone().try_into().ok()?,
+            first_seen_at: metadata.and_then(|b| b.first_seen_at),
+            bound_since: metadata.and_then(|b| b.bound_since),
+            last_used_at: entry.last_used,
+            active: entry.last_used
+                >= now - chrono::Duration::seconds(self.config.active_window_secs as i64)
+                || protected(d, g),
+            marked_for_move: d.overload_marks.contains_key(g),
+            client_kind: metadata.and_then(|b| b.client_kind),
+            restored: metadata.is_none_or(|b| !b.observed_here),
+        })
+    }
+    pub(crate) fn dashboard_snapshot(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Vec<crate::dashboard::BindingGroup> {
+        let d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        d.groups
+            .keys()
+            .filter_map(|g| self.dashboard_row(&d, g, now))
+            .collect()
+    }
+    pub(crate) fn dashboard_group(
+        &self,
+        key: &str,
+        now: DateTime<Utc>,
+    ) -> Option<crate::dashboard::BindingGroup> {
+        let d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        self.dashboard_row(&d, group(key), now)
+    }
+    pub(crate) fn dashboard_lookup_candidates(
+        &self,
+        ids: &BTreeSet<crate::dashboard::SessionId>,
+    ) -> Vec<(crate::dashboard::SessionId, String)> {
+        let d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        d.groups
+            .keys()
+            .filter_map(|key| {
+                let sid = key.strip_prefix("claude:")?;
+                if sid.is_empty()
+                    || sid.len() > 128
+                    || !sid
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+                {
+                    return None;
+                }
+                let id = crate::dashboard::SessionId::from_key(key);
+                ids.contains(&id).then(|| (id, sid.to_owned()))
+            })
+            .take(64)
+            .collect()
+    }
+    pub(crate) fn dashboard_client(&self, key: &str, kind: crate::dashboard::ClientKind) {
+        let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        let keys = d
+            .groups
+            .get(group(key))
+            .map(|entry| entry.keys.clone())
+            .unwrap_or_default();
+        let mut changed = false;
+        for key in keys {
+            if let Some(binding) = d.bindings.get_mut(&key)
+                && binding.client_kind != Some(kind)
+            {
+                binding.client_kind = Some(kind);
+                changed = true;
+            }
+        }
+        if changed {
+            d.changed();
+        }
+    }
+
     pub fn count(&self) -> usize {
         let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
         self.prune(&mut d, Utc::now());
@@ -735,12 +865,21 @@ impl BindingTable {
                 }
             }
             for k in &keys {
+                let previous = d.bindings.get(k).cloned();
                 d.bindings.insert(
                     k.clone(),
                     Binding {
                         key: k.clone(),
                         account: account.clone(),
                         last_used,
+                        first_seen_at: previous.as_ref().map_or(Some(now), |b| b.first_seen_at),
+                        bound_since: if from.as_deref() != Some(account.as_str()) {
+                            Some(now)
+                        } else {
+                            previous.as_ref().and_then(|b| b.bound_since)
+                        },
+                        client_kind: previous.as_ref().and_then(|b| b.client_kind),
+                        observed_here: previous.as_ref().is_none_or(|b| b.observed_here),
                     },
                 );
             }
@@ -1555,6 +1694,10 @@ mod tests {
                         key,
                         account: "a".into(),
                         last_used: Utc::now(),
+                        first_seen_at: None,
+                        bound_since: None,
+                        client_kind: None,
+                        observed_here: false,
                     },
                 );
             }
@@ -2032,6 +2175,10 @@ mod tests {
                         key,
                         account: "a".into(),
                         last_used: now,
+                        first_seen_at: None,
+                        bound_since: None,
+                        client_kind: None,
+                        observed_here: false,
                     },
                 );
             }

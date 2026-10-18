@@ -205,6 +205,16 @@ pub fn runtime_routes_with_adoption_probe(
 
 fn runtime_router(state: RuntimeAdmin) -> Router {
     Router::new()
+        .route("/admin/v1/sessions", axum::routing::get(dashboard_sessions))
+        .route(
+            "/admin/v1/sessions/{id}",
+            axum::routing::get(dashboard_detail),
+        )
+        .route("/admin/v1/activity", axum::routing::get(dashboard_activity))
+        .route(
+            "/admin/v1/usage-history",
+            axum::routing::get(dashboard_usage),
+        )
         .route("/admin/v1/state", axum::routing::get(runtime_state))
         .route("/admin/v1/events", axum::routing::get(runtime_events))
         .route("/admin/v1/accounts/takeover", post(takeover_account))
@@ -297,6 +307,77 @@ async fn runtime_state(State(state): State<RuntimeAdmin>) -> Response {
     }
 }
 
+#[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DashboardQuery {
+    range: Option<String>,
+    since_seq: Option<u64>,
+    limit: Option<usize>,
+    days: Option<u8>,
+    hours: Option<u8>,
+}
+type DashboardParameters =
+    Result<axum::extract::Query<DashboardQuery>, axum::extract::rejection::QueryRejection>;
+fn dashboard_invalid() -> Response {
+    error(StatusCode::BAD_REQUEST, "Invalid dashboard query")
+}
+async fn dashboard_sessions(
+    State(state): State<RuntimeAdmin>,
+    query: DashboardParameters,
+) -> Response {
+    let Ok(axum::extract::Query(query)) = query else {
+        return dashboard_invalid();
+    };
+    let Ok(range) = crate::dashboard::SessionRange::parse(query.range.as_deref()) else {
+        return dashboard_invalid();
+    };
+    Json(state.relay.dashboard().sessions(range)).into_response()
+}
+async fn dashboard_detail(
+    State(state): State<RuntimeAdmin>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    let Ok(id) = crate::dashboard::SessionId::try_from(id) else {
+        return dashboard_invalid();
+    };
+    match state.relay.dashboard().detail(&id) {
+        Some(detail) => Json(detail).into_response(),
+        None => error(StatusCode::NOT_FOUND, "Session expired"),
+    }
+}
+async fn dashboard_activity(
+    State(state): State<RuntimeAdmin>,
+    query: DashboardParameters,
+) -> Response {
+    let Ok(axum::extract::Query(query)) = query else {
+        return dashboard_invalid();
+    };
+    match state.relay.dashboard().activity_page(
+        query.since_seq,
+        query.limit.unwrap_or(200),
+        query.days.unwrap_or(7),
+    ) {
+        Ok(page) => Json(page).into_response(),
+        Err(_) => dashboard_invalid(),
+    }
+}
+async fn dashboard_usage(
+    State(state): State<RuntimeAdmin>,
+    query: DashboardParameters,
+) -> Response {
+    let Ok(axum::extract::Query(query)) = query else {
+        return dashboard_invalid();
+    };
+    match state
+        .relay
+        .dashboard()
+        .usage_page(query.hours.unwrap_or(24))
+    {
+        Ok(page) => Json(page).into_response(),
+        Err(_) => dashboard_invalid(),
+    }
+}
+
 async fn runtime_events(State(state): State<RuntimeAdmin>) -> Response {
     state.relay.quota.mark_tray_open();
     use axum::response::sse::{KeepAlive, Sse};
@@ -324,7 +405,7 @@ fn account_events(
                 Ok(value) => {
                     let Some(
                         name @ ("account_changed" | "quota_updated" | "login_progress"
-                        | "core_warning"),
+                        | "core_warning" | "sessions_changed" | "activity"),
                     ) = value["event"].as_str()
                     else {
                         continue;
@@ -334,7 +415,13 @@ fn account_events(
                     };
                     return Some((Ok::<_, std::convert::Infallible>(event), receiver));
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    let event = Event::default()
+                        .event("sessions_changed")
+                        .json_data(serde_json::json!({"changed":[],"removed":[],"resync":true}))
+                        .expect("safe resync event");
+                    return Some((Ok::<_, std::convert::Infallible>(event), receiver));
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
             }
         }

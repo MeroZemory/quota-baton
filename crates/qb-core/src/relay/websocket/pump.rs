@@ -76,6 +76,7 @@ impl CurrentCompletion {
             Codex,
             &context.headers,
         );
+        completion.record.transport = "ws".into();
         completion.session(&context.session);
         completion.runtime = context.runtime.clone();
         if let Some(relay) = &context.relay {
@@ -95,6 +96,11 @@ impl CurrentCompletion {
         completion.record.status = 101;
         completion.record.upstream_status = Some(101);
         completion.attempt(&context.account);
+        let rate = Arc::new(RateBudget::new(context));
+        *rate.dashboard.lock().unwrap_or_else(|e| e.into_inner()) = completion
+            .dashboard_request
+            .as_ref()
+            .map(|guard| guard.pacing_source());
         Self {
             completion,
             committed: false,
@@ -102,7 +108,7 @@ impl CurrentCompletion {
             model: None,
             response_id: None,
             last_create: None,
-            rate: Arc::new(RateBudget::new(context)),
+            rate,
         }
     }
 
@@ -145,6 +151,7 @@ struct RateBudget {
     deadline: std::time::Instant,
     max_retries: u32,
     state: Mutex<RateState>,
+    dashboard: Mutex<Option<crate::dashboard::runtime::PacingSource>>,
 }
 
 struct RateState {
@@ -169,6 +176,7 @@ impl RateBudget {
     fn with_limits(hold: Duration, max_retries: u32) -> Self {
         let now = std::time::Instant::now();
         Self {
+            dashboard: Mutex::new(None),
             deadline: now + hold,
             max_retries,
             state: Mutex::new(RateState {
@@ -224,7 +232,10 @@ impl RateBudget {
     }
 }
 
-struct RateWait(Arc<RateBudget>);
+struct RateWait(
+    Arc<RateBudget>,
+    Option<crate::dashboard::runtime::PacingGuard>,
+);
 
 impl RateWait {
     fn new(rate: Arc<RateBudget>) -> Self {
@@ -232,7 +243,13 @@ impl RateWait {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .waiting_since = Some(std::time::Instant::now());
-        Self(rate)
+        let pacing = rate
+            .dashboard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|source| source.start());
+        Self(rate, pacing)
     }
 }
 
@@ -242,6 +259,8 @@ impl Drop for RateWait {
         if let Some(start) = state.waiting_since.take() {
             state.waited += start.elapsed();
         }
+        drop(state);
+        drop(self.1.take());
     }
 }
 

@@ -12,7 +12,21 @@ pub struct Config {
     pub tray: TrayConfig,
     pub websocket: WebsocketConfig,
     pub quota: QuotaConfig,
+    pub dashboard: DashboardConfig,
     pub accounts: BTreeMap<String, AccountConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct DashboardConfig {
+    pub resolve_claude_project: bool,
+}
+impl Default for DashboardConfig {
+    fn default() -> Self {
+        Self {
+            resolve_claude_project: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

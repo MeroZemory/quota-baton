@@ -161,6 +161,9 @@ impl RelayState {
     pub(crate) fn recent_warnings(&self) -> Vec<serde_json::Value> {
         self.observability.recent_warnings()
     }
+    pub fn dashboard(&self) -> &Arc<crate::dashboard::runtime::Runtime> {
+        self.observability.dashboard()
+    }
     pub fn login_service(&self) -> crate::oauth::LoginService {
         crate::oauth::LoginService::new(
             self.store.clone(),
@@ -420,6 +423,7 @@ impl RelayState {
         // The lease is held and account expiry/reconciliation precedes affinity restore.
         store.list()?;
         let bindings = crate::bindings::BindingTable::new(store.home(), config.routing.clone())?;
+        observability.dashboard().attach(&bindings, config);
         for (id, settings) in &config.accounts {
             bindings.set_account_threshold(id, settings.spread_threshold);
         }
@@ -1133,7 +1137,13 @@ async fn handover_http(state: Arc<RelayState>, request: Request) -> Response {
     }
 }
 
-async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Response {
+async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Response {
+    let launcher_label = crate::dashboard::labels::take_launcher_label(request.headers_mut());
+    request
+        .extensions_mut()
+        .insert(crate::dashboard::labels::IngressLabel(
+            launcher_label.clone(),
+        ));
     if state.is_draining() {
         if request.method() != Method::GET || !request.headers().contains_key("upgrade") {
             return handover_http(state, request).await;
@@ -1224,6 +1234,7 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
         session_body = handle.metadata();
     }
     let session = session::classify(provider, path, &parts.headers, &session_body);
+    completion.dashboard_label = launcher_label.or(completion.dashboard_label.take());
     completion.session(&session);
     let mut tried = BTreeSet::new();
     let mut request_model = session.model.clone();
@@ -1396,11 +1407,14 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
             continue;
         }
         completion.record.account = Some(account.id.clone());
+        completion.dashboard_begin();
+        let dashboard_pacing = completion.dashboard_pacing();
         let admission_started = Instant::now();
         let admission = state
             .accounts
             .admit_until(&account.id, rate_hold_deadline)
             .await;
+        drop(dashboard_pacing);
         completion.rate_wait(admission_started.elapsed().as_millis() as u64);
         let upstream_headers =
             match headers::upstream(&parts.headers, &account, &tokens.access_token) {
@@ -1448,6 +1462,11 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
         let status = response.status();
         completion.record.upstream_status = Some(status.as_u16());
         let response_headers = response.headers().clone();
+        completion.dashboard_model(
+            response_headers
+                .get("openai-model")
+                .and_then(|v| v.to_str().ok()),
+        );
         if status.is_success() || status == StatusCode::TOO_MANY_REQUESTS {
             state
                 .accounts
