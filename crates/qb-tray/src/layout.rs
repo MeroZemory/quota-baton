@@ -1023,29 +1023,28 @@ pub fn parse_state_at(json: &str, now: SystemTime) -> serde_json::Result<Vec<Row
         .iter()
         .map(|account| {
             let mut row = row(account, now);
-            if account.user_state == "active" {
-                if let Some(notice) = account
+            if account.user_state == "active"
+                && let Some(notice) = account
                     .quota_notice
                     .as_ref()
                     .filter(|q| q.current_since(now, account.last_relevant_state_at))
+            {
+                let next = notice.next_account.as_deref().map(|id| {
+                    state
+                        .accounts
+                        .iter()
+                        .find(|a| a.id == id && a.provider == account.provider)
+                        .map_or_else(
+                            || notice_account_name(None, None, id),
+                            |a| notice_account_name(a.email.as_deref(), a.label.as_deref(), id),
+                        )
+                });
+                if let Some(message) =
+                    quota_message(notice, "", &account.provider, next.as_deref(), None, now)
                 {
-                    let next = notice.next_account.as_deref().map(|id| {
-                        state
-                            .accounts
-                            .iter()
-                            .find(|a| a.id == id && a.provider == account.provider)
-                            .map_or_else(
-                                || notice_account_name(None, None, id),
-                                |a| notice_account_name(a.email.as_deref(), a.label.as_deref(), id),
-                            )
-                    });
-                    if let Some(message) =
-                        quota_message(notice, "", &account.provider, next.as_deref(), None, now)
-                    {
-                        row.health_chip = message.short;
-                        row.health_tone = Tone::Warning;
-                        row.attention = true;
-                    }
+                    row.health_chip = message.short;
+                    row.health_tone = Tone::Warning;
+                    row.attention = true;
                 }
             }
             row
