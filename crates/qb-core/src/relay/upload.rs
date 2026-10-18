@@ -18,7 +18,34 @@ pub(super) const PEEK_LIMIT: usize = 1024 * 1024;
 const FORWARD_BATCH: usize = 256 * 1024;
 
 #[cfg(test)]
-static TEST_COMPRESS_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    // Capture per read, so this test never slows unrelated parallel uploads.
+    static TEST_RETENTION_PAUSE: std::cell::RefCell<Option<Arc<TestRetentionPause>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestRetentionPause {
+    released: Mutex<bool>,
+    changed: std::sync::Condvar,
+    entered: Notify,
+}
+
+#[cfg(test)]
+impl TestRetentionPause {
+    fn wait(&self) {
+        let mut released = self.released.lock().unwrap();
+        self.entered.notify_one();
+        while !*released {
+            released = self.changed.wait(released).unwrap();
+        }
+    }
+
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.changed.notify_all();
+    }
+}
 
 pub(super) struct Upload {
     pub prefix: Bytes,
@@ -267,7 +294,13 @@ pub(super) async fn read(
     let task_state = state.clone();
     let task_done = done.clone();
     let retain_state = state.clone();
+    #[cfg(test)]
+    let retention_pause = TEST_RETENTION_PAUSE.with(|pause| pause.borrow_mut().take());
     let retention_task = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if let Some(pause) = retention_pause {
+            pause.wait();
+        }
         while let Some((chunk, queued)) = retain_rx.blocking_recv() {
             let mut batch = vec![(chunk, queued)];
             let mut batch_bytes = batch[0].0.len();
@@ -288,13 +321,6 @@ pub(super) async fn read(
             }
             let (chunks, reservations): (Vec<_>, Vec<_>) = batch.into_iter().unzip();
             drop(reservations);
-            #[cfg(test)]
-            {
-                let delay = TEST_COMPRESS_DELAY_MS.load(Ordering::Relaxed);
-                if delay != 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(delay));
-                }
-            }
             let mut state = retain_state.lock().expect("upload state poisoned");
             let retained = state
                 .retainer
@@ -595,7 +621,16 @@ mod tests {
 
     #[tokio::test]
     async fn m7b_slow_compressor_never_delays_forwarding_and_drops_only_retention() {
-        TEST_COMPRESS_DELAY_MS.store(250, Ordering::Relaxed);
+        struct ReleaseOnDrop(Arc<TestRetentionPause>);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                TEST_RETENTION_PAUSE.with(|pause| *pause.borrow_mut() = None);
+                self.0.release();
+            }
+        }
+        let pause = Arc::new(TestRetentionPause::default());
+        let release = ReleaseOnDrop(pause.clone());
+        TEST_RETENTION_PAUSE.with(|slot| *slot.borrow_mut() = Some(pause.clone()));
         let chunks = (0..512)
             .map(|_| Ok::<_, io::Error>(Bytes::from(vec![b'x'; 64 * 1024])))
             .collect::<Vec<_>>();
@@ -612,11 +647,22 @@ mod tests {
         )
         .await
         .unwrap();
-        let forwarded = tokio::time::timeout(Duration::from_millis(100), collect(upload.body))
+        tokio::time::timeout(Duration::from_secs(5), pause.entered.notified())
+            .await
+            .expect("retention worker did not start");
+        // The worker cannot compress any frame until we release it. Forwarding
+        // must finish anyway; this proves independence without a 100 ms speed test.
+        let forwarded = tokio::time::timeout(Duration::from_secs(5), collect(upload.body))
             .await
             .expect("forwarding must not wait for compression");
         assert_eq!(forwarded, input);
-        assert!(upload.retained.unwrap().complete().await.is_none());
-        TEST_COMPRESS_DELAY_MS.store(0, Ordering::Relaxed);
+        assert!(!*pause.released.lock().unwrap());
+        drop(release);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), upload.retained.unwrap().complete())
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }
