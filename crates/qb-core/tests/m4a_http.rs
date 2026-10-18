@@ -3,7 +3,7 @@ use bytes::Bytes;
 use chrono::{Duration as ChronoDuration, Utc};
 use qb_core::{
     accounts::{Account, AccountStore, Health, HealthReason, Provider, Source, UserState, import},
-    config::Config,
+    config::{Config, RoutingConfig},
     debug_pin::DebugPins,
     http::{self, RunningServers},
     local_secrets::LocalSecrets,
@@ -41,6 +41,33 @@ impl Harness {
         memory: u64,
         dead: bool,
     ) -> Self {
+        Self::new_with_network_and_routing(
+            provider,
+            n,
+            budget,
+            memory,
+            dead,
+            RoutingConfig::default(),
+        )
+        .await
+    }
+    async fn new_with_routing(
+        provider: Provider,
+        n: usize,
+        budget: u64,
+        memory: u64,
+        routing: RoutingConfig,
+    ) -> Self {
+        Self::new_with_network_and_routing(provider, n, budget, memory, false, routing).await
+    }
+    async fn new_with_network_and_routing(
+        provider: Provider,
+        n: usize,
+        budget: u64,
+        memory: u64,
+        dead: bool,
+        routing: RoutingConfig,
+    ) -> Self {
         let serial = SERIAL.lock().await;
         let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/m4a-http");
         fs::create_dir_all(&base).unwrap();
@@ -77,6 +104,7 @@ impl Harness {
         let mut config = Config::default();
         config.server.data_port = 0;
         config.server.admin_port = 0;
+        config.routing = routing;
         config.guard.inflight_budget_mib = budget;
         config.guard.memory_hard_limit_mib = memory;
         config.upstream.anthropic_base = fake.url.clone();
@@ -1059,7 +1087,11 @@ async fn c6_3_retained_copy_budget_exhausted_falls_back_to_relay() {
 
 #[tokio::test]
 async fn c6_3_storm_simulation() {
-    let h = Harness::new(Provider::Codex, 2, 384, 1024).await;
+    let routing = RoutingConfig {
+        rate_hold_secs: 20,
+        ..RoutingConfig::default()
+    };
+    let h = Harness::new_with_routing(Provider::Codex, 2, 384, 1024, routing).await;
     let ids = h.ids();
     h.state
         .accounts
@@ -1077,10 +1109,13 @@ async fn c6_3_storm_simulation() {
         .change(&ids[1], Some(UserState::Active), None, None, None)
         .await
         .unwrap();
-    h.state.accounts.set_rate_hold_secs(20);
     h.fake
         .state
         .enable_window_limiter(8, Duration::from_secs(1));
+    // Let all 16 actual unpaced upstream requests arrive before the first
+    // limiter decision. Otherwise early 429 feedback paces late arrivals and
+    // makes the first-round baseline depend on client/IOCP scheduling.
+    h.fake.state.gate_first_limiter_batch(16);
     let before = h.fake.state.requests().len();
     let mut round_counts = Vec::new();
     let mut responses_with_bodies = Vec::new();
@@ -1105,9 +1140,9 @@ async fn c6_3_storm_simulation() {
     }
     assert_eq!(round_counts.len(), 3);
     assert!(
-        // How many of the 16 concurrent requests land inside one limiter
-        // window depends on machine load; one 429 already exercises pacing.
-        round_counts[0] >= 1,
+        // All 16 initial arrivals share the real 8/s limiter: at least eight
+        // genuine rejections, with retries and later rounds counted normally.
+        round_counts[0] >= 8,
         "round one must exercise the limiter: {round_counts:?}"
     );
     assert!(
@@ -1957,21 +1992,59 @@ async fn c6_row_9_10_limit_header_does_not_override_plain_status() {
 }
 
 #[tokio::test]
-async fn c6_row_3_http_date_retry_after_fails_over() {
+async fn r1_n3_http_date_retry_after_retries_same_account_after_advice() {
     let h = Harness::new(Provider::Claude, 2, 384, 1024).await;
-    let mut r = ScriptedResponse::json(StatusCode::TOO_MANY_REQUESTS, "{}");
-    r.headers.insert(
+    let mut limited = ScriptedResponse::json(StatusCode::TOO_MANY_REQUESTS, "{}");
+    limited.headers.insert(
         "retry-after",
-        (Utc::now() + ChronoDuration::seconds(60))
+        (Utc::now() + ChronoDuration::seconds(8))
             .format("%a, %d %b %Y %H:%M:%S GMT")
             .to_string()
             .parse()
             .unwrap(),
     );
-    h.fake.state.push(r);
+    h.fake.state.push(limited);
     h.fake.state.push(ok());
+    let started = Instant::now();
     assert_eq!(h.send(Provider::Claude, "{}").await.status(), 200);
-    assert_eq!(h.fake.state.requests().len(), 2);
+    // Whole-second dates and pacing jitter leave margin; the old 1s fallback
+    // plus the default pacing window would retry well before this threshold.
+    assert!(started.elapsed() >= Duration::from_secs(5));
+    let requests = h.fake.state.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].headers["authorization"] == requests[1].headers["authorization"]);
+    assert_eq!(requests[0].body, requests[1].body);
+}
+
+#[tokio::test]
+async fn r1_n3_http_date_retry_after_paces_without_retained_body_and_is_verbatim() {
+    let h = Harness::new(Provider::Claude, 2, 0, 1024).await;
+    let raw = r#"{"error":{"type":"rate_limit_error","message":"synthetic rate limit"}}"#;
+    let advice = (Utc::now() + ChronoDuration::seconds(30))
+        .format("%a, %d %b %Y %H:%M:%S GMT")
+        .to_string();
+    let mut limited = ScriptedResponse::json(StatusCode::TOO_MANY_REQUESTS, raw);
+    limited
+        .headers
+        .insert("retry-after", advice.parse().unwrap());
+    h.fake.state.push(limited);
+    let response = h.send(Provider::Claude, "{}").await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.headers()["retry-after"], advice);
+    let account = response.headers()["x-quota-baton-account"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(response.text().await.unwrap(), raw);
+    let pacing = h.state.accounts.pacing_snapshot(&account);
+    let remaining = pacing
+        .rate_backoff_until
+        .unwrap()
+        .saturating_duration_since(Instant::now());
+    // 29+ seconds before +/-20% jitter; the integer-only baseline paces ~2s.
+    assert!(remaining >= Duration::from_secs(20));
+    assert_eq!(h.fake.state.requests().len(), 1);
+    assert_eq!(h.store.load(&account).unwrap().health, Health::Ready);
 }
 
 #[tokio::test]
@@ -2139,5 +2212,196 @@ async fn c5_postcommit_stale_revocation_is_verbatim_without_health_change() {
         response.bytes().await.unwrap(),
         [first.as_ref(), error.as_ref()].concat()
     );
+    assert_eq!(h.store.load(&id).unwrap().health, Health::Ready);
+}
+
+// This helper includes body EOF in the outer deadline, so a failed old-code
+// run cannot wait for the synthetic 30s Retry-After or a default 60s hold.
+async fn r1_http_total_hold_case(initial_budget_exhausted: bool) {
+    let routing = RoutingConfig {
+        rate_hold_secs: 1,
+        rate_hold_max_retries: 3,
+        ..RoutingConfig::default()
+    };
+    let h = Harness::new_with_routing(Provider::Claude, 2, 384, 1024, routing).await;
+    let account = h.ids()[0].clone();
+    let session = if initial_budget_exhausted {
+        "r1-http-total-hold-initial"
+    } else {
+        "r1-http-total-hold-retry"
+    };
+    let binding = format!("claude:{session}");
+    // Prebind without a warm-up send: exactly the tested attempts reach the
+    // scripted upstream, and another Ready account can expose false failover.
+    h.state
+        .bindings
+        .import(json!({"schema":1,"bindings":[{
+            "key":binding,"account":account,"last_used":Utc::now()
+        }]}))
+        .unwrap();
+    assert_eq!(
+        h.state.bindings.current(Some(&binding)),
+        Some(account.clone())
+    );
+
+    let first_body = r#"{"error":{"type":"rate_limit_error","message":"synthetic first rate"}}"#;
+    let final_body = r#"{"error":{"type":"rate_limit_error","message":"synthetic final rate"}}"#;
+    for body in [first_body, final_body] {
+        let mut limited = ScriptedResponse::json(StatusCode::TOO_MANY_REQUESTS, body);
+        limited.headers.insert("retry-after", "30".parse().unwrap());
+        h.fake.state.push(limited);
+    }
+    let raw =
+        " {\"model\":\"synthetic-model\", \"messages\":[], \"marker\":\"conversation-marker\"}\n";
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let request = client
+        .post(format!("http://{}/v1/messages", h.servers.data_addr))
+        .bearer_auth("synthetic-client")
+        .header("x-claude-code-session-id", session)
+        .body(raw.to_owned());
+    let now = Instant::now();
+    let observed_at = if initial_budget_exhausted {
+        now
+    } else {
+        // First step is 2s; observing it 1.4s in the past leaves ~600ms
+        // of initial admission, followed by only ~400ms of the same budget.
+        now - Duration::from_millis(1400)
+    };
+    h.state.accounts.observe_429_at(
+        &account,
+        observed_at,
+        observed_at,
+        initial_budget_exhausted.then_some(Duration::from_secs(30)),
+        1.0,
+    );
+    let started = Instant::now();
+    let (status, headers, body) = tokio::time::timeout(Duration::from_millis(1600), async {
+        let response = request.send().await.unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response.text().await.unwrap();
+        (status, headers, body)
+    })
+    .await
+    .expect("HTTP total hold exceeded 1.6s: admission/retry must share one absolute deadline");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(900),
+        "hold ended before its one-second budget"
+    );
+    assert!(
+        elapsed <= Duration::from_millis(1600),
+        "total hold reset between admission and retry"
+    );
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(headers["retry-after"], "30");
+    assert_eq!(headers["x-quota-baton-account"], account);
+    assert_eq!(
+        body,
+        if initial_budget_exhausted {
+            first_body
+        } else {
+            final_body
+        }
+    );
+
+    let expected_attempts = if initial_budget_exhausted { 1 } else { 2 };
+    let requests = h.fake.state.requests();
+    assert_eq!(requests.len(), expected_attempts);
+    let first_send_wait = requests[0].received_at.saturating_duration_since(started);
+    if initial_budget_exhausted {
+        assert!(first_send_wait >= Duration::from_millis(900));
+    } else {
+        assert!(
+            (Duration::from_millis(450)..=Duration::from_millis(900)).contains(&first_send_wait),
+            "initial admission must consume the seeded ~600ms before the first attempt"
+        );
+        assert!(
+            requests[1].received_at.saturating_duration_since(started)
+                >= Duration::from_millis(900)
+        );
+    }
+    for request in &requests {
+        assert!(request.headers["authorization"] == requests[0].headers["authorization"]);
+        assert_eq!(request.body.as_ref(), raw.as_bytes());
+        assert_eq!(request.headers["x-claude-code-session-id"], session);
+    }
+    assert_eq!(
+        h.state.bindings.current(Some(&binding)),
+        Some(account.clone())
+    );
+    for id in h.ids() {
+        assert_eq!(h.store.load(&id).unwrap().health, Health::Ready);
+    }
+    let rows: Vec<_> = h
+        .ledger()
+        .into_iter()
+        .filter(|row| row.get("req").is_some())
+        .collect();
+    assert_eq!(rows.len(), 1, "exactly one completed HTTP request");
+    let row = &rows[0];
+    assert_eq!(row["attempts"], expected_attempts as u64);
+    assert_eq!(row["rate_retries"], (expected_attempts - 1) as u64);
+    assert_eq!(row["relayed_rate_429s"], 1);
+    assert_eq!(row["retained_copy"], true);
+    assert_eq!(row["account"], account);
+    assert_eq!(row["status"], 429);
+    assert_eq!(row["outcome"], "rate_hold_relayed_429");
+    let duration = row["dur_ms"].as_u64().unwrap();
+    assert!((900..=1600).contains(&duration));
+    let wait = row["rate_wait_ms"].as_u64().unwrap();
+    assert!(
+        (900..=1600).contains(&wait),
+        "ledger wait must include initial admission once, plus remaining retry hold"
+    );
+    let attempts = row["attempt_details"].as_array().unwrap();
+    assert_eq!(attempts.len(), expected_attempts);
+    for attempt in attempts {
+        assert_eq!(attempt["account"], account);
+        assert!(attempt["failover_reason"].is_null());
+    }
+}
+
+#[tokio::test]
+async fn r1_http_total_hold_absolute_deadline_includes_initial_admission_and_retry() {
+    r1_http_total_hold_case(false).await;
+}
+
+#[tokio::test]
+async fn r1_http_total_hold_initial_admission_expiry_forces_one_send_without_retry() {
+    r1_http_total_hold_case(true).await;
+}
+
+#[tokio::test]
+async fn r1_http_late_inflight_rate_does_not_raise_a_new_window_step() {
+    let h = Harness::new(Provider::Codex, 1, 0, 1024).await;
+    let id = h.ids()[0].clone();
+    let raw = "{\"detail\":\"Rate limit exceeded\"}";
+    let mut late = ScriptedResponse::json(StatusCode::TOO_MANY_REQUESTS, raw);
+    // Another request opens a two-second window while this older response is
+    // still in flight. Its delayed 429 arrives after that window has ended,
+    // but before the four-second quiet-step boundary.
+    late.chunks[0].0 = Duration::from_secs(3);
+    h.fake.state.push(late);
+    let mut response = Box::pin(h.send(Provider::Codex, "{}"));
+    tokio::select! {
+        _ = &mut response => panic!("delayed fixture answered before its first arrival"),
+        arrived = tokio::time::timeout(Duration::from_secs(1), async {
+            while h.fake.state.requests().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        }) => arrived.unwrap(),
+    }
+    let other = Instant::now();
+    h.state
+        .accounts
+        .observe_429_at(&id, other, other, None, 1.0);
+    let response = tokio::time::timeout(Duration::from_secs(5), response)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.text().await.unwrap(), raw);
+    assert_eq!(h.fake.state.requests().len(), 1);
+    assert_eq!(h.state.accounts.pacing_snapshot(&id).rate_step, 1);
     assert_eq!(h.store.load(&id).unwrap().health, Health::Ready);
 }

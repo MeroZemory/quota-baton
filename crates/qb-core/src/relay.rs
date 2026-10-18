@@ -1202,6 +1202,7 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
     let mut token_retry = false;
     let mut rate_retries = 0_u32;
     let rate_hold_started = Instant::now();
+    let rate_hold_deadline = rate_hold_started + Duration::from_secs(state.rate_hold_secs);
     let mut rate_relay_retry_after = None;
     let mut rate_relayed = false;
     let mut permission_denials = 0;
@@ -1253,7 +1254,10 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
         }
         completion.record.account = Some(account.id.clone());
         let admission_started = Instant::now();
-        let _admission = state.accounts.admit(&account.id).await;
+        let admission = state
+            .accounts
+            .admit_until(&account.id, rate_hold_deadline)
+            .await;
         completion.rate_wait(admission_started.elapsed().as_millis() as u64);
         let upstream_headers =
             match headers::upstream(&parts.headers, &account, &tokens.access_token) {
@@ -1269,6 +1273,7 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
                 }
             };
         completion.attempt(&account.id);
+        let sent_at = Instant::now();
         let send = state
             .client
             .request(parts.method.clone(), &url)
@@ -1472,12 +1477,15 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
                 }
             }
         } else if decision.kind == outcome::Kind::Rate {
-            let retry_after = response_headers
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u64>().ok())
-                .map(|s| Duration::from_secs(s.min(60)));
-            let pacing = state.accounts.observe_429(&account.id, retry_after);
+            let retry_after = outcome::header_seconds(&response_headers, "retry-after")
+                .map(|seconds| Duration::from_secs(seconds.min(60) as u64));
+            let pacing = state.accounts.observe_429_at(
+                &account.id,
+                sent_at,
+                Instant::now(),
+                retry_after,
+                1.0,
+            );
             if retry_after.is_none() {
                 rate_relay_retry_after = pacing.rate_backoff_until.map(|until| {
                     let remaining = until.saturating_duration_since(Instant::now());
@@ -1486,25 +1494,16 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
             }
             if let Some(copy) = retained.as_ref()
                 && rate_retries < state.rate_hold_max_retries
-                && rate_hold_started.elapsed() < Duration::from_secs(state.rate_hold_secs)
+                && !admission.forced()
+                && Instant::now() < rate_hold_deadline
+                && let Some(body) = copy.retry_body().await
             {
                 rate_retries += 1;
                 completion.rate_retry();
-                let delay = response_headers
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(1)
-                    .clamp(1, 60);
-                let remaining = Duration::from_secs(state.rate_hold_secs)
-                    .saturating_sub(rate_hold_started.elapsed());
-                let wait = Duration::from_secs(delay).min(remaining);
-                completion.rate_wait(wait.as_millis() as u64);
-                if let Some(body) = copy.retry_body().await {
-                    body_to_send = body;
-                    tokio::time::sleep(wait).await;
-                    continue;
-                }
+                body_to_send = body;
+                // The next shared admission owns all rate delay. Its
+                // absolute deadline is unchanged across same-account retries.
+                continue;
             }
             rate_relayed = true;
             state
