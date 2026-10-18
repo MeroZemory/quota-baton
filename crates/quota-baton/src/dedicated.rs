@@ -151,11 +151,9 @@ fn launcher() -> Vec<u8> {
     b"@echo off\r\nsetlocal\r\nrem quota-baton dedicated Codex home\r\nset \"CODEX_HOME=%USERPROFILE%\\.codex-acct\\qb\"\r\ncall \"%APPDATA%\\npm\\codex.cmd\" %*\r\n".to_vec()
 }
 
-// Preview redacts every source string, including nested and multiline values.
-// The parsed sources are never included in parser error chains or reports.
+// Collect credentials by key, then redact their known values everywhere they recur.
+// Parsed sources never appear in parser error chains or reports.
 fn string_patterns(value: &str, out: &mut Vec<String>) {
-    // Short decoded strings must not become substring patterns for keys, URLs
-    // or our replacement marker. Their quoted lexical forms still get masked.
     let quoted = serde_json::to_string(value).expect("JSON string serialization");
     if value.len() >= 8 {
         out.push(value.to_owned());
@@ -164,56 +162,69 @@ fn string_patterns(value: &str, out: &mut Vec<String>) {
     out.push(quoted);
 }
 
-fn toml_strings(item: &toml_edit::Item, out: &mut Vec<String>) {
-    fn value(v: &toml_edit::Value, out: &mut Vec<String>) {
-        if let Some(s) = v.as_str() {
+fn toml_strings(root: &toml_edit::Item, out: &mut Vec<String>) {
+    fn value(v: &toml_edit::Value, secret: bool, out: &mut Vec<String>) {
+        if secret && let Some(s) = v.as_str() {
             string_patterns(s, out);
-            // Keep the original lexical form too (TOML escape sequences may
-            // differ from JSON or from the decoded string).
             out.push(v.to_string().trim().to_owned());
         }
         if let Some(a) = v.as_array() {
             for v in a {
-                value(v, out);
+                value(v, secret, out);
             }
         }
         if let Some(t) = v.as_inline_table() {
-            for (_, v) in t {
-                value(v, out);
+            for (key, v) in t {
+                value(v, secret || secret_diff_key(key), out);
             }
         }
     }
-    if let Some(v) = item.as_value() {
-        value(v, out);
-    }
-    if let Some(t) = item.as_table_like() {
-        for (_, v) in t.iter() {
-            toml_strings(v, out);
+    fn walk(item: &toml_edit::Item, secret: bool, out: &mut Vec<String>) {
+        if let Some(v) = item.as_value() {
+            value(v, secret, out);
         }
-    }
-    if let Some(a) = item.as_array_of_tables() {
-        for t in a {
-            for (_, v) in t {
-                toml_strings(v, out);
+        if let Some(t) = item.as_table_like() {
+            for (key, v) in t.iter() {
+                if key == "projects"
+                    && let Some(projects) = v.as_table_like()
+                {
+                    // Project paths are structural identifiers, not credential keys.
+                    for (_, project) in projects.iter() {
+                        walk(project, secret, out);
+                    }
+                } else {
+                    walk(v, secret || secret_diff_key(key), out);
+                }
+            }
+        }
+        if let Some(a) = item.as_array_of_tables() {
+            for t in a {
+                for (key, v) in t {
+                    walk(v, secret || secret_diff_key(key), out);
+                }
             }
         }
     }
+    walk(root, false, out);
 }
 fn json_strings(value: &Value, out: &mut Vec<String>) {
-    match value {
-        Value::String(s) => string_patterns(s, out),
-        Value::Array(a) => {
-            for v in a {
-                json_strings(v, out);
+    fn walk(value: &Value, secret: bool, out: &mut Vec<String>) {
+        match value {
+            Value::String(s) if secret => string_patterns(s, out),
+            Value::Array(a) => {
+                for v in a {
+                    walk(v, secret, out);
+                }
             }
-        }
-        Value::Object(o) => {
-            for v in o.values() {
-                json_strings(v, out);
+            Value::Object(o) => {
+                for (key, v) in o {
+                    walk(v, secret || secret_diff_key(key), out);
+                }
             }
+            _ => {}
         }
-        _ => {}
     }
+    walk(value, false, out);
 }
 fn redact_once(input: &str, patterns: &[String]) -> String {
     let mut patterns = patterns
@@ -231,7 +242,14 @@ fn redact_once(input: &str, patterns: &[String]) -> String {
             .iter()
             .find(|pattern| input[position..].starts_with(**pattern))
         {
-            result.push_str("<redacted>");
+            // Quoted lexical patterns must remain valid JSON/TOML values.
+            if (pattern.starts_with('"') && pattern.ends_with('"'))
+                || (pattern.starts_with('\'') && pattern.ends_with('\''))
+            {
+                result.push_str("\"<redacted>\"");
+            } else {
+                result.push_str("<redacted>");
+            }
             position += pattern.len();
         } else {
             let character = input[position..]
@@ -248,7 +266,12 @@ fn redact_once(input: &str, patterns: &[String]) -> String {
 fn safe_diff(path: &Path, before: &[u8], after: &[u8], secrets: &[String]) -> Vec<String> {
     let before = redact_once(&String::from_utf8_lossy(before), secrets);
     let after = redact_once(&String::from_utf8_lossy(after), secrets);
-    unified_diff(path, before.as_bytes(), after.as_bytes(), &[])
+    let mut diff = unified_diff(path, before.as_bytes(), after.as_bytes(), &[]);
+    if before.is_empty() {
+        diff[0] = format!("--- {} (없음)", path.display());
+        diff[1] = format!("+++ {} (새로 만듦)", path.display());
+    }
+    diff
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -1514,12 +1537,18 @@ pub(super) fn wire(
         let config = config_bytes(paths, options.data_port)?;
         let doc = parse_config(paths)?;
         toml_strings(doc.as_item(), &mut secrets);
-        report.diff.extend(safe_diff(
-            &paths.codex_config,
+        let mut config_diff = safe_diff(
+            &paths.codex_qb_home.join("config.toml"),
             &fs::read(&paths.codex_config)?,
             &config,
             &secrets,
-        ));
+        );
+        config_diff[0] = format!("--- {} (원본, 바뀌지 않음)", paths.codex_config.display());
+        config_diff[1] = format!(
+            "+++ {} (새로 만듦)",
+            paths.codex_qb_home.join("config.toml").display()
+        );
+        report.diff.extend(config_diff);
         report.diff.extend([
             "auth.json: {\"auth_mode\":\"apikey\",\"OPENAI_API_KEY\":\"<client key>\"}".into(),
         ]);
@@ -2885,17 +2914,71 @@ trusted_hash = "synthetic-hook-hash"
         fs::remove_dir(source).unwrap(); // unlink only the fixture's original junction
     }
     #[test]
+    fn r31_dry_run_names_created_home_preserves_settings_and_exact_claude_json() {
+        let (_dir, p) = fixture();
+        let source = fs::read_to_string(&p.codex_config).unwrap();
+        let harmless = "service_tier = 'fast'\nlog_dir = 'synthetic-log'\nmodel_reasoning_effort = 'high'\napprovals_reviewer = 'user'\nnotify = ['synthetic-notifier']\n";
+        fs::write(
+            &p.codex_config,
+            format!(
+                "{harmless}{source}\n[projects.'C:/synthetic-project/auth-demo']\ntrust_level = 'trusted'\n"
+            ),
+        )
+        .unwrap();
+        let before = snapshot(&p);
+        let report =
+            claude_run(&p, false, CodexMode::Dedicated, Some(ClaudeMode::Dedicated)).unwrap();
+        let text = output(&report);
+        assert!(report.diff.contains(&format!(
+            "--- {} (원본, 바뀌지 않음)",
+            p.codex_config.display()
+        )));
+        assert!(report.diff.contains(&format!(
+            "+++ {} (새로 만듦)",
+            p.codex_qb_home.join("config.toml").display()
+        )));
+        assert!(
+            !report
+                .diff
+                .contains(&format!("+++ {} (연결 후)", p.codex_config.display()))
+        );
+        let expected = "+{\"env\":{\"ANTHROPIC_BASE_URL\":\"http://127.0.0.1:10200\",\"ANTHROPIC_AUTH_TOKEN\":\"<client key>\"}}";
+        assert!(report.diff.iter().any(|line| line == expected), "{text}");
+        let preview: Value = serde_json::from_str(&expected[1..]).unwrap();
+        assert_eq!(preview["env"]["ANTHROPIC_AUTH_TOKEN"], "<client key>");
+        assert_eq!(
+            preview["env"]["ANTHROPIC_BASE_URL"],
+            "http://127.0.0.1:10200"
+        );
+        for line in harmless.lines() {
+            assert!(text.contains(line), "hidden harmless setting: {line}");
+        }
+        // Unchanged project settings may fall outside the diff's context.
+        let config = String::from_utf8(config_bytes(&p, 10200).unwrap()).unwrap();
+        assert!(config.contains("[projects.'C:/synthetic-project/auth-demo']"));
+        assert!(config.contains("trust_level = 'trusted'"));
+        for secret in [KEY, SECRET] {
+            assert!(!text.contains(secret));
+        }
+        assert_eq!(before, snapshot(&p));
+        assert!(!p.journal().exists());
+        assert!(!p.codex_qb_home.exists());
+        assert!(!claude_home(&p).unwrap().exists());
+        println!("R31_SAMPLE_BEGIN\n{text}\nR31_SAMPLE_END");
+    }
+
+    #[test]
     fn short_strings_do_not_corrupt_preview_keys_endpoint_or_redaction_markers() {
         let (_dir, p) = fixture();
         let long = format!("{SECRET}-quote\"-backslash\\-line\n한글-secret-end");
         let extra = format!(
-            "short = ['a', 'e', 'd', 'v1']\npayload = {}\n# {SECRET}\n",
+            "short = ['a', 'e', 'd', 'v1']\npayload_secret = {}\n# {SECRET}\n",
             toml_edit::value(long.as_str())
         );
         let source = fs::read_to_string(&p.codex_config).unwrap();
         fs::write(&p.codex_config, format!("{extra}{source}")).unwrap();
         let json = serde_json::json!({"env":{"ANTHROPIC_AUTH_TOKEN":"a"},
-            "nested":{"short":["a","e","d","v1"],"payload":long},"unchanged":"e"});
+            "nested":{"short":["a","e","d","v1"],"payload_secret":long},"unchanged":"e"});
         fs::write(
             &p.claude_settings,
             serde_json::to_vec_pretty(&json).unwrap(),
@@ -2915,16 +2998,16 @@ trusted_hash = "synthetic-hook-hash"
         let escaped = serde_json::to_string(&long).unwrap();
         assert!(!text.contains(&escaped[1..escaped.len() - 1]));
         assert!(text.len() < 32 * 1024);
-        // Quoted short credentials and short values remain hidden; their
-        // decoded characters must never be raw substring patterns.
+        // Only short credentials are hidden. Harmless short values remain visible.
         let mut patterns = Vec::new();
         json_strings(&json, &mut patterns);
         toml_strings(parse_config(&p).unwrap().as_item(), &mut patterns);
-        for short in ["a", "e", "d", "v1"] {
-            assert!(!patterns.iter().any(|pattern| pattern == short));
+        assert!(!patterns.iter().any(|pattern| pattern == "a"));
+        assert_eq!(redact_once("\"a\"", &patterns), "\"<redacted>\"");
+        assert_eq!(redact_once("'a'", &patterns), "'a'");
+        for short in ["e", "d", "v1"] {
             let quoted = serde_json::to_string(short).unwrap();
-            assert_eq!(redact_once(&quoted, &patterns), "<redacted>");
-            assert_eq!(redact_once(&format!("'{short}'"), &patterns), "<redacted>");
+            assert_eq!(redact_once(&quoted, &patterns), quoted);
         }
         assert!(!p.journal().exists());
         assert!(!p.codex_qb_home.exists());
@@ -2944,7 +3027,7 @@ trusted_hash = "synthetic-hook-hash"
         let escaped = &quoted[1..quoted.len() - 1];
         assert_eq!(
             redact_once(&format!("{multiline}|{quoted}|{escaped}"), &collected),
-            "<redacted>|<redacted>|<redacted>"
+            "<redacted>|\"<redacted>\"|<redacted>"
         );
     }
     fn resume_snapshot(p: &CutoverPaths) -> Vec<(PathBuf, String)> {
