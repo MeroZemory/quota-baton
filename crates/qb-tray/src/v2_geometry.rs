@@ -132,6 +132,7 @@ pub enum MenuAction {
     Disable,
     Enable,
     Delete,
+    OpenDashboard,
     OpenConfig,
     OpenLogs,
     AddClaude,
@@ -1116,6 +1117,7 @@ fn menu_parts(view: &v2::View, p: &Presentation) -> Option<(f32, Vec<Part>)> {
         Overlay::Settings => (
             240.,
             vec![
+                item("대시보드 열기", MenuAction::OpenDashboard, true),
                 item("설정 파일 열기", MenuAction::OpenConfig, true),
                 item("로그 폴더 열기", MenuAction::OpenLogs, true),
                 Part::Separator,
@@ -2031,7 +2033,7 @@ mod tests {
     fn footer_popups_widths_item_sizes_and_anchors() {
         let v = ready_view();
         for (overlay, width, count, height) in [
-            (Overlay::Settings, 240., 2, 32.),
+            (Overlay::Settings, 240., 3, 32.),
             (Overlay::Quit, 300., 2, 52.),
             (Overlay::Add, 300., 3, 32.),
         ] {

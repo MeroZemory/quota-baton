@@ -28,6 +28,7 @@ pub enum Face {
 #[derive(Clone, Copy, Debug)]
 pub enum Align {
     Leading,
+    Center,
     Trailing,
 }
 
@@ -128,6 +129,7 @@ impl Text {
             format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR)?;
             format.SetTextAlignment(match style.align {
                 Align::Leading => DWRITE_TEXT_ALIGNMENT_LEADING,
+                Align::Center => DWRITE_TEXT_ALIGNMENT_CENTER,
                 Align::Trailing => DWRITE_TEXT_ALIGNMENT_TRAILING,
             })?;
             let sign = self.factory.CreateEllipsisTrimmingSign(&format)?;
@@ -447,6 +449,25 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn r7_center_alignment_keeps_full_width_and_centers_each_shaped_line() -> Result<()> {
+        let text = Text::new()?;
+        let bounds = rect(320., 200.);
+        let mut s = style(Wrap::KeepAll);
+        let leading = text.layout("한글 빈 상태 안내\ncodex-qb claude-qb", bounds, s)?;
+        s.align = Align::Center;
+        let centered = text.layout("한글 빈 상태 안내\ncodex-qb claude-qb", bounds, s)?;
+        assert_eq!(leading.metrics.total_lines, centered.metrics.total_lines);
+        assert!((leading.metrics.natural_width - centered.metrics.natural_width).abs() < 0.1);
+        assert!(!centered.metrics.trimmed);
+        for line in &centered.lines {
+            let metrics = measure(&line.layout)?;
+            assert!(
+                (metrics.left + metrics.widthIncludingTrailingWhitespace / 2. - 160.).abs() < 1.
+            );
+        }
+        Ok(())
+    }
     #[test]
     fn hangul_ink_is_centered_and_trailing_alignment_uses_real_metrics() -> Result<()> {
         let text = Text::new()?;

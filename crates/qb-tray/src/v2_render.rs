@@ -91,6 +91,37 @@ fn account<'a>(view: &'a v2::View, id: &str) -> Option<&'a v2::AccountRow> {
 }
 
 impl Renderer {
+    pub(crate) fn dashboard_text(&self) -> &Text {
+        &self.text
+    }
+    pub(crate) fn dashboard_palette(&self) -> Palette {
+        self.palette
+    }
+    pub(crate) fn dashboard_line(
+        &self,
+        target: &ID2D1RenderTarget,
+        from: [f32; 2],
+        to: [f32; 2],
+        color: Rgb,
+        width: f32,
+        alpha: f32,
+    ) -> Result<()> {
+        let brush = unsafe { target.CreateSolidColorBrush(&rgb(color, alpha), None)? };
+        unsafe {
+            target.DrawLine(
+                windows_numerics::Vector2 {
+                    X: from[0],
+                    Y: from[1],
+                },
+                windows_numerics::Vector2 { X: to[0], Y: to[1] },
+                &brush,
+                width,
+                None,
+            );
+        }
+        Ok(())
+    }
+
     pub fn new(dark: bool) -> Result<Self> {
         Ok(Self {
             text: Text::new()?,
@@ -217,7 +248,7 @@ impl Renderer {
         }
         Ok(())
     }
-    fn fill(
+    pub(crate) fn fill(
         &self,
         target: &ID2D1RenderTarget,
         rect: Rect,
@@ -238,7 +269,7 @@ impl Renderer {
         };
         Ok(())
     }
-    fn stroke(
+    pub(crate) fn stroke(
         &self,
         target: &ID2D1RenderTarget,
         rect: Rect,
@@ -262,7 +293,7 @@ impl Renderer {
         };
         Ok(())
     }
-    fn text(
+    pub(crate) fn text(
         &self,
         target: &ID2D1RenderTarget,
         rect: Rect,
@@ -1421,6 +1452,7 @@ fn menu_glyph(action: &g::MenuAction) -> &'static str {
         g::MenuAction::Disable => "\u{e7e8}",
         g::MenuAction::Enable => "\u{e8fb}",
         g::MenuAction::Delete => "\u{e74d}",
+        g::MenuAction::OpenDashboard => "\u{e9d9}",
         g::MenuAction::OpenConfig => "\u{e8a5}",
         g::MenuAction::OpenLogs => "\u{e838}",
         g::MenuAction::AddClaude | g::MenuAction::AddCodex => "\u{e710}",

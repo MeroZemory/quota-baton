@@ -30,6 +30,7 @@ default = []
 testkit = ["qb-core/testkit"]
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 qb-core = { workspace = true, features = ["testkit"] }
 qb-testkit.workspace = true
 tempfile.workspace = true

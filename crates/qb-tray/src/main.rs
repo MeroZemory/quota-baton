@@ -1,5 +1,7 @@
 mod client;
 #[cfg(windows)]
+mod dashboard_persistence;
+#[cfg(windows)]
 mod notices;
 #[cfg(windows)]
 mod theme;

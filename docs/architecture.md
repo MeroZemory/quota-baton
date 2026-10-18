@@ -461,6 +461,18 @@ The approved [tray v2 specification](tray-v2.md) owns the visual and interaction
   - The tray never kills a live core.
 - **Autostart.** The tray starts at logon through `HKCU\...\Run`, but only after cutover approval.
 
+### Separate dashboard (R7)
+
+The dashboard is a normal, single-instance top-level window opened from settings or a tray-icon double-click. Closing it leaves the tray and core running. Shared Direct2D/DirectWrite geometry drives painting, whole-item hit targets, keyboard navigation and the UIA hierarchy. The render target follows the actual client rectangle and monitor DPI. Only window geometry is persisted, in `state/ui.json`.
+
+Its sessions, activity and usage tabs consume the authenticated [C11 routes](contract.md#c11-admin-api). The existing tray worker owns all admin and filesystem I/O and its one SSE subscription. UI callbacks coalesce bounded owner-scoped intent; stale detail tickets and closed-window publications are rejected. Consumed dirty categories are refetched after a query changes during HTTP. Failed usage reads remain pending through unrelated successful reads, subject to the 30-second usage cadence. The stream-down state/session fallback is five seconds. In-flight ages and relative dates tick locally.
+
+Session statistics and folder basenames are bounded core memory. The relay strips the local label before capture or forwarding, including WebSocket admission. Codex model evidence comes from the response header, without decoding HTTP bodies. Claude filename lookup is lazy, filename-only and bounded under an explicitly configured local projects root; it never reads transcript contents. Synthetic homes and testkit builds never discover the real profile. The launcher merges its ASCII-encoded basename into the child environment only. A client settings override can suppress it; filename resolution remains the fallback. No per-launch settings or label scratch file is written.
+
+Usage charts retain the observed series. Their accessible tables use bounded representative rows when history is large, preserving endpoint and representative unknown/reset boundaries and displaying an explicit incomplete-history notice. Timestamp indexes and binary lookups avoid repeated prefix scans on the window thread; the semantic scene stays within its total node budget.
+
+Activity aggregation and usage retention are typed, bounded, written behind and flushed during lifecycle shutdown. Labels and the detail-only original-ID prefix never enter those archives or the ledger. Restored bindings do not fabricate lost counters. The approved dashboard visual spec is `.sandbox/design/dashboard/SPEC.md`; account mutations remain in the tray.
+
 ## 11. Admin API
 
 The admin API listens on `127.0.0.1:<admin>`, a separate port, and applies the same Host and Origin checks as the data port. It requires a bearer admin token, stored in a user-ACL'd file.

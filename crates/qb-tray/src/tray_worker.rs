@@ -56,11 +56,13 @@ impl AdmissionLane {
 }
 
 pub(super) struct Worker {
+    pub(super) dashboard: Arc<super::dashboard_io::Coordinator>,
     jobs: AdmissionLane,
     urgent: AdmissionLane,
     admission: Mutex<()>,
     refresh: mpsc::Sender<()>,
     visible: watch::Sender<bool>,
+    flyout_visible: AtomicBool,
     closing: watch::Sender<bool>,
     supervise: Arc<AtomicBool>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -68,6 +70,8 @@ pub(super) struct Worker {
 
 impl Worker {
     pub(super) fn start(hwnd: isize, supervise: bool) -> anyhow::Result<Self> {
+        let dashboard = super::dashboard_io::Coordinator::new(hwnd);
+        let dashboard_io = dashboard.clone();
         let (jobs, mut job_rx) = AdmissionLane::new(ORDINARY_BUDGET);
         let (urgent, mut urgent_rx) = AdmissionLane::new(CANCEL_BUDGET);
         let (refresh, mut refresh_rx) = mpsc::channel(1);
@@ -87,7 +91,8 @@ impl Worker {
                 let health = Arc::new(Mutex::new(CoreHealth::Unhealthy { reason: "starting".into() }));
                 let mut tasks = JoinSet::new();
                 let health_task = tokio::spawn(health_loop(hwnd, supervision.clone(), health.clone(), refresh_tx.clone()));
-                let events_task = tokio::spawn(events_loop(hwnd, visible_rx, refresh_tx));
+                let events_task = tokio::spawn(events_loop(hwnd, visible_rx, refresh_tx, dashboard_io.clone()));
+                let mut dashboard_task=tokio::spawn(dashboard_io.clone().run());
                 let mut refreshing: Option<tokio::task::JoinHandle<()>> = None;
                 let mut dirty = false;
                 loop {
@@ -112,6 +117,7 @@ impl Worker {
                 urgent_rx.close();
                 health_task.abort();
                 events_task.abort();
+                dashboard_io.stop();
                 if let Some(task) = refreshing { task.abort(); }
                 // Drain accepted actions for up to five seconds on this worker, never
                 // join from WM_DESTROY. Aborting drops all outstanding HTTP futures.
@@ -120,16 +126,19 @@ impl Worker {
                 let _ = tokio::time::timeout(Duration::from_secs(5), async {
                     while tasks.join_next().await.is_some() {}
                 }).await;
+                if tokio::time::timeout(Duration::from_secs(5),&mut dashboard_task).await.is_err(){dashboard_task.abort();}
                 tasks.abort_all();
                 while tasks.join_next().await.is_some() {}
             });
         })?;
         Ok(Self {
+            dashboard,
             jobs,
             urgent,
             admission: Mutex::new(()),
             refresh,
             visible,
+            flyout_visible: AtomicBool::new(false),
             closing,
             supervise: enabled,
             thread: Mutex::new(Some(thread)),
@@ -147,8 +156,13 @@ impl Worker {
         let _ = self.refresh.try_send(());
     }
     pub(super) fn visible(&self, visible: bool) {
-        if *self.visible.borrow() != visible {
-            self.visible.send_replace(visible);
+        self.flyout_visible.store(visible, Ordering::Release);
+        self.refresh_interest();
+    }
+    pub(super) fn refresh_interest(&self) {
+        let interested = self.flyout_visible.load(Ordering::Acquire) || self.dashboard.is_open();
+        if *self.visible.borrow() != interested {
+            self.visible.send_replace(interested);
         }
     }
     pub(super) fn disable_supervision(&self) {
@@ -164,6 +178,7 @@ impl Worker {
     pub(super) fn close(&self) {
         let _guard = self.admission.lock().unwrap_or_else(|e| e.into_inner());
         self.disable_supervision();
+        self.dashboard.stop();
         self.visible.send_replace(false);
         self.closing.send_replace(true);
     }
@@ -471,6 +486,9 @@ enum EventKind {
     Unknown,
     Refresh,
     CoreWarning,
+    Quota,
+    Sessions,
+    Activity,
 }
 #[derive(serde::Deserialize)]
 enum WarningKind {
@@ -482,6 +500,11 @@ struct BurstWarning {
     kind: WarningKind,
     burst_new_sessions: u32,
 }
+#[derive(serde::Deserialize)]
+struct SessionChangeSignal {
+    #[serde(default)]
+    resync: bool,
+}
 
 /// Bounded frame parser. Only a validated numeric observation crosses to UI.
 /// Oversized data suppresses burst decoding, but recognized events still resync.
@@ -492,6 +515,7 @@ struct EventParser {
     frame_bytes: usize,
     event: EventKind,
     data: Vec<u8>,
+    dashboard_flags: u8,
 }
 impl EventParser {
     fn feed(&mut self, bytes: &[u8], mut burst: impl FnMut(u32)) -> bool {
@@ -499,7 +523,29 @@ impl EventParser {
         for &byte in bytes {
             if byte == b'\n' && !self.line_overflow && (self.line.is_empty() || self.line == b"\r")
             {
-                refresh |= self.event != EventKind::Unknown;
+                use super::dashboard_io as d;
+                refresh |= matches!(
+                    self.event,
+                    EventKind::Refresh | EventKind::CoreWarning | EventKind::Quota
+                );
+                self.dashboard_flags |= match self.event {
+                    EventKind::Refresh => d::STATE | d::SESSIONS | d::ACTIVITY,
+                    EventKind::CoreWarning => d::ACTIVITY,
+                    EventKind::Quota => d::STATE | d::SESSIONS | d::USAGE,
+                    EventKind::Sessions => d::SESSIONS,
+                    EventKind::Activity => d::ACTIVITY,
+                    EventKind::Unknown => 0,
+                };
+                if self.event == EventKind::Sessions
+                    && (self.frame_bytes > MAX_FRAME
+                        || serde_json::from_slice::<SessionChangeSignal>(&self.data)
+                            .map_or(true, |signal| signal.resync))
+                {
+                    // A lag marker can stand in for lost account/activity/quota
+                    // events too. Only the boolean crosses this parser boundary.
+                    self.dashboard_flags |= d::STATE | d::SESSIONS | d::ACTIVITY | d::USAGE;
+                    refresh = true;
+                }
                 if self.event == EventKind::CoreWarning
                     && self.frame_bytes <= MAX_FRAME
                     && let Ok(warning) = serde_json::from_slice::<BurstWarning>(&self.data)
@@ -530,9 +576,10 @@ impl EventParser {
                         } else {
                             match name {
                                 b"core_warning" => EventKind::CoreWarning,
-                                b"account_changed" | b"quota_updated" | b"login_progress" => {
-                                    EventKind::Refresh
-                                }
+                                b"account_changed" | b"login_progress" => EventKind::Refresh,
+                                b"quota_updated" => EventKind::Quota,
+                                b"sessions_changed" => EventKind::Sessions,
+                                b"activity" => EventKind::Activity,
                                 _ => EventKind::Unknown,
                             }
                         };
@@ -569,7 +616,12 @@ fn post_burst(hwnd: isize, count: u32) {
         );
     }
 }
-async fn events_loop(hwnd: isize, mut visible: watch::Receiver<bool>, refresh: mpsc::Sender<()>) {
+async fn events_loop(
+    hwnd: isize,
+    mut visible: watch::Receiver<bool>,
+    refresh: mpsc::Sender<()>,
+    dashboard: Arc<super::dashboard_io::Coordinator>,
+) {
     loop {
         if !*visible.borrow_and_update() {
             if visible.changed().await.is_err() {
@@ -583,6 +635,7 @@ async fn events_loop(hwnd: isize, mut visible: watch::Receiver<bool>, refresh: m
             _ = visible.changed() => {},
             _ = async {
                 loop {
+                    dashboard.stream(false);
                     let _ = refresh.try_send(()); // authoritative resync after any gap
                     if let Ok(client) = AdminClient::from_home()
                         && let Ok(mut response) = client.events().await
@@ -591,24 +644,49 @@ async fn events_loop(hwnd: isize, mut visible: watch::Receiver<bool>, refresh: m
                             .and_then(|h| h.to_str().ok())
                             .is_some_and(|h| h.split(';').next() == Some("text/event-stream"))
                     {
+                        dashboard.stream(true);
+                        dashboard.dirty(super::dashboard_io::STATE|super::dashboard_io::SESSIONS|super::dashboard_io::ACTIVITY|super::dashboard_io::USAGE);
                         // Subscribe first, then resync: events racing with the
                         // state read are now buffered instead of falling in a gap.
                         let _ = refresh.try_send(());
                         let mut parser = EventParser::default();
                         while let Ok(Some(chunk)) = response.chunk().await {
                             if parser.feed(&chunk, |count| post_burst(hwnd, count)) { let _ = refresh.try_send(()); }
+                            dashboard.dirty(std::mem::take(&mut parser.dashboard_flags));
                         }
                     }
+                    dashboard.stream(false);
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
             } => {},
         }
+        dashboard.stream(false);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn dashboard_sse_lag_recovers_all_views_but_regular_sessions_do_not_poll_history() {
+        use super::super::dashboard_io as d;
+        for (resync, expected, refresh) in [
+            (false, d::SESSIONS, false),
+            (true, d::STATE | d::SESSIONS | d::ACTIVITY | d::USAGE, true),
+        ] {
+            let mut parser = EventParser::default();
+            let frame = format!(
+                "event: sessions_changed\ndata: {{\"resync\":{resync},\"changed\":[\"123456abcdef\"],\"removed\":[]}}\n\n"
+            );
+            let mut actual_refresh = false;
+            for byte in frame.bytes() {
+                actual_refresh |= parser.feed(&[byte], |_| panic!("not burst"));
+            }
+            assert_eq!(actual_refresh, refresh);
+            assert_eq!(parser.dashboard_flags, expected);
+            assert!(parser.data.is_empty());
+        }
+    }
     #[test]
     fn admission_bounds_active_jobs_and_reserves_finite_cancellation_lane() {
         let (ordinary, mut rx) = AdmissionLane::new(ORDINARY_BUDGET);
@@ -656,11 +734,13 @@ mod tests {
         let (visible, _visible_rx) = watch::channel(false);
         let (closing, _closing_rx) = watch::channel(false);
         let worker = Worker {
+            dashboard: super::super::dashboard_io::Coordinator::new(0),
             jobs,
             urgent,
             admission: Mutex::new(()),
             refresh,
             visible,
+            flyout_visible: AtomicBool::new(false),
             closing,
             supervise: Arc::new(AtomicBool::new(true)),
             thread: Mutex::new(None),

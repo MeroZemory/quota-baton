@@ -10,6 +10,14 @@ use serde::{Deserialize, Deserializer};
 use std::time::{Duration, SystemTime};
 
 pub mod actions;
+#[cfg(test)]
+mod dashboard_fixtures;
+pub mod dashboard_history;
+pub mod dashboard_model;
+pub mod geometry;
+#[cfg(windows)]
+pub mod render;
+pub mod state;
 pub mod v2;
 pub mod v2_colors;
 pub mod v2_geometry;
