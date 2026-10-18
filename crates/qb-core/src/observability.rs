@@ -841,7 +841,8 @@ fn snapshot(provider: Provider, h: &HeaderMap, now: DateTime<Utc>) -> Option<Sna
                     "seven_day" => Some("7d"),
                     "seven_day_opus" => Some("7d_oi"),
                     _ => None,
-                }).map(str::to_owned);
+                })
+                .map(str::to_owned);
             signals.serving_from_credits = header(h, "x-codex-credits-serving")
                 .and_then(|v| v.parse().ok())
                 .or_else(|| (header(h, "x-codex-active-limit") == Some("credits")).then_some(true));

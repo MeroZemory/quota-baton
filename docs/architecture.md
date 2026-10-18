@@ -452,6 +452,10 @@ Relay design:
   - **a burst**: one client (`originator`/UA) opens more than `burst_new_sessions` (default 30) new sessions within 10 minutes. This is the signature of a runaway loop draining the pool (R8 I-40).
   - a linked account goes stale
   - the core restarted unexpectedly
+- **Account notification context.** The core exposes optional `quota_notice` on each account view and emits a flat `core_warning` with `kind: "quota_notice"` when it resolves a situation. Fields are `action` (`credits`, `failover`, `exhausted`), limiting `window`, real `reset_at`, `next_account`, `earliest_account`, `observed_at`, and `model_limited`. Account references are IDs; the tray resolves their displayed email local parts from the same snapshot. `has_alternative` supplies the core's non-quota recovery context.
+  - Failover names the actual C7 placement; an unresolved reset hold never produces a quota toast. Deferred committed-response failures resolve on later real placement. Fresh usage alone waits for traffic to resolve the action.
+  - Credits require actual successful serving evidence from C9 as well as capability and permission. Preference changes alone do not notify. Model-scoped exhaustion is qualified as such.
+  - The tray refreshes authoritative state after the event, uses the same formatter for row reasons and balloons, and debounces each account/action for 30 minutes. Queued text follows updated authoritative targets and resets; delivered messages stay debounced.
 - **Supervision.**
   - The tray polls the core's health every 10 s.
   - If the core is unreachable for 30 s and its process is gone, the tray restarts it with backoff (5 s doubling to 5 min) and shows a toast. The previous proxy died silently three times with no supervisor (R8 I-03).

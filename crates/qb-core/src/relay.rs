@@ -2,8 +2,8 @@ pub(crate) mod credentials;
 mod headers;
 mod hold;
 mod ledger;
-mod outcome;
 pub(crate) mod notices;
+mod outcome;
 mod response;
 mod upload;
 mod websocket;
@@ -592,15 +592,28 @@ impl RelayState {
         let prior = self.bindings.current(session.key.as_deref());
         let passive_sources = if prior.is_some() || session.key.is_none() {
             self.accounts.quota_observations(provider, prior.as_deref())
-        } else { Vec::new() };
+        } else {
+            Vec::new()
+        };
         let mut quota_sources = Vec::new();
-        for ticket in self.accounts.pending_quota_tickets(crate::account_runtime::quota_session(session.key.as_deref()).as_deref()) {
+        for ticket in self.accounts.pending_quota_tickets(
+            crate::account_runtime::quota_session(session.key.as_deref()).as_deref(),
+        ) {
             let store = self.store.clone();
             let pending_id = ticket.id.clone();
-            let same_provider = tokio::task::spawn_blocking(move || store.load(&pending_id)
-                .is_ok_and(|a| a.provider == provider)).await.unwrap_or(false);
-            if same_provider && self.accounts.take_pending_quota(&ticket)
-                && !self.retry_after_reset(session, completion, &ticket.id, model).await? {
+            let same_provider = tokio::task::spawn_blocking(move || {
+                store
+                    .load(&pending_id)
+                    .is_ok_and(|a| a.provider == provider)
+            })
+            .await
+            .unwrap_or(false);
+            if same_provider
+                && self.accounts.take_pending_quota(&ticket)
+                && !self
+                    .retry_after_reset(session, completion, &ticket.id, model)
+                    .await?
+            {
                 quota_sources.push((ticket.id, ticket.model));
             }
         }
@@ -668,15 +681,25 @@ impl RelayState {
                     }
                     completion.record.after_move |= lease.after_move;
                     completion.binding = Some(lease);
-                    let selected = candidates.into_iter().find(|c| c.account.id == account).map(|c| c.account);
+                    let selected = candidates
+                        .into_iter()
+                        .find(|c| c.account.id == account)
+                        .map(|c| c.account);
                     for (id, origin_model) in &quota_sources {
-                        self.notice_quota(id, selected.as_ref(), origin_model.as_deref()).await;
+                        self.notice_quota(id, selected.as_ref(), origin_model.as_deref())
+                            .await;
                     }
                     for (id, state, observed_model) in &passive_sources {
                         if selected.as_ref().is_none_or(|selected| &selected.id != id)
                             && !quota_sources.iter().any(|(pending, _)| pending == id)
-                            && self.accounts.quota_observation_current(id, state) {
-                            self.notice_quota(id, selected.as_ref(), model.or(observed_model.as_deref())).await;
+                            && self.accounts.quota_observation_current(id, state)
+                        {
+                            self.notice_quota(
+                                id,
+                                selected.as_ref(),
+                                model.or(observed_model.as_deref()),
+                            )
+                            .await;
                         }
                     }
                     return Ok(selected);
@@ -691,8 +714,10 @@ impl RelayState {
                     }
                     for (id, state, observed_model) in &passive_sources {
                         if !quota_sources.iter().any(|(pending, _)| pending == id)
-                            && self.accounts.quota_observation_current(id, state) {
-                            self.notice_quota(id, None, model.or(observed_model.as_deref())).await;
+                            && self.accounts.quota_observation_current(id, state)
+                        {
+                            self.notice_quota(id, None, model.or(observed_model.as_deref()))
+                                .await;
                         }
                     }
                     return Ok(None);
@@ -1391,7 +1416,10 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
         }
         if !before_commit {
             if status.is_success() {
-                state.accounts.credit_headers(&account.id, &response_headers).await;
+                state
+                    .accounts
+                    .credit_headers(&account.id, &response_headers)
+                    .await;
             }
             if probe.is_some()
                 && status.is_success()
@@ -1567,7 +1595,9 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
             );
         }
         if decision.kind == outcome::Kind::Quota {
-            state.accounts.observe_quota_reset(&account.id, decision.quota_reset);
+            state
+                .accounts
+                .observe_quota_reset(&account.id, decision.quota_reset);
         }
         if matches!(decision.kind, outcome::Kind::Quota | outcome::Kind::Rate) && held.complete {
             state
@@ -1578,8 +1608,17 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
             permission_denials += 1;
         }
         let quota_pending = if decision.kind == outcome::Kind::Quota {
-            state.accounts.pending_quota(&account.id, completion.record.session.clone(), request_model.as_deref()).await
-        } else { None };
+            state
+                .accounts
+                .pending_quota(
+                    &account.id,
+                    completion.record.session.clone(),
+                    request_model.as_deref(),
+                )
+                .await
+        } else {
+            None
+        };
         // M4b는 select만 교체한다. 보관본 없는 요청과 commit 이후에는 재전송하지 않는다.
         if !decision.failover() || retained.is_none() || permission_denials >= 2 {
             break (status, response_headers, held);
@@ -1590,7 +1629,9 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
             break (status, response_headers, held);
         }
         if decision.kind == outcome::Kind::Quota {
-            if let Some(ticket) = &quota_pending { state.accounts.take_pending_quota(ticket); }
+            if let Some(ticket) = &quota_pending {
+                state.accounts.take_pending_quota(ticket);
+            }
             drop(probe.take());
             match state
                 .retry_after_reset(
@@ -1650,7 +1691,9 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
         }
         if tried.len() >= 4 {
             if decision.kind == outcome::Kind::Quota {
-                state.notice_quota(&account.id, None, request_model.as_deref()).await;
+                state
+                    .notice_quota(&account.id, None, request_model.as_deref())
+                    .await;
             }
             if state
                 .select(
@@ -1687,8 +1730,12 @@ async fn relay(State(state): State<Arc<RelayState>>, request: Request) -> Respon
                 &tried,
             )
             .await;
-        if decision.kind == outcome::Kind::Quota && let Ok(selected) = &next {
-            state.notice_quota(&account.id, selected.as_ref(), request_model.as_deref()).await;
+        if decision.kind == outcome::Kind::Quota
+            && let Ok(selected) = &next
+        {
+            state
+                .notice_quota(&account.id, selected.as_ref(), request_model.as_deref())
+                .await;
         }
         match next {
             Ok(Some(next)) => {
@@ -1841,11 +1888,13 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn tray2_three_accounts_reconnect_exclusions_name_actual_upstream_or_suppress_false_exhaustion() {
+    async fn tray2_three_accounts_reconnect_exclusions_name_actual_upstream_or_suppress_false_exhaustion()
+     {
         use qb_testkit::{ScriptedResponse, ScriptedUpstream};
         use serde_json::{Value, json};
         for exclude_all in [false, true] {
-            let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r1-tray2-fixtures");
+            let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../.sandbox/r1-tray2-fixtures");
             std::fs::create_dir_all(&base).unwrap();
             let root = tempfile::tempdir_in(base).unwrap();
             let cpa = root.path().join("cpa");
@@ -1869,38 +1918,84 @@ mod tests {
             config.upstream.codex_base = fake.url.clone();
             config.upstream.anthropic_base = fake.url.clone();
             let obs = Arc::new(Observability::new(store.home(), None).unwrap());
-            let state = Arc::new(RelayState::new(store.clone(), &config, obs,
-                Arc::new(DebugPins::default())).unwrap());
-            let servers = crate::http::spawn_with_routes(&config, crate::local_secrets::LocalSecrets {
-                client_key:"synthetic-tray2-key".into(),admin_token:"synthetic-tray2-admin".into()
-            }, router(state.clone()), axum::Router::new()).await.unwrap();
+            let state = Arc::new(
+                RelayState::new(store.clone(), &config, obs, Arc::new(DebugPins::default()))
+                    .unwrap(),
+            );
+            let servers = crate::http::spawn_with_routes(
+                &config,
+                crate::local_secrets::LocalSecrets {
+                    client_key: "synthetic-tray2-key".into(),
+                    admin_token: "synthetic-tray2-admin".into(),
+                },
+                router(state.clone()),
+                axum::Router::new(),
+            )
+            .await
+            .unwrap();
             let client = reqwest::Client::new();
-            let request = || client.post(format!("http://{}/v1/responses", servers.data_addr))
-                .bearer_auth("synthetic-tray2-key").header("session-id", "tray2-exclusions").body("{}");
-            fake.state.push(ScriptedResponse::json(StatusCode::OK, "{}"));
+            let request = || {
+                client
+                    .post(format!("http://{}/v1/responses", servers.data_addr))
+                    .bearer_auth("synthetic-tray2-key")
+                    .header("session-id", "tray2-exclusions")
+                    .body("{}")
+            };
+            fake.state
+                .push(ScriptedResponse::json(StatusCode::OK, "{}"));
             let warm = request().send().await.unwrap();
-            let source = warm.headers()["x-quota-baton-account"].to_str().unwrap().to_owned();
+            let source = warm.headers()["x-quota-baton-account"]
+                .to_str()
+                .unwrap()
+                .to_owned();
             warm.bytes().await.unwrap();
-            let others: Vec<_> = store.list().unwrap().into_iter().filter(|a| a.id != source).collect();
+            let others: Vec<_> = store
+                .list()
+                .unwrap()
+                .into_iter()
+                .filter(|a| a.id != source)
+                .collect();
             state.exclude_reconnect(Some("codex:tray2-exclusions"), &others[0].id);
-            if exclude_all { state.exclude_reconnect(Some("codex:tray2-exclusions"), &others[1].id); }
+            if exclude_all {
+                state.exclude_reconnect(Some("codex:tray2-exclusions"), &others[1].id);
+            }
             let reset = chrono::Utc::now().timestamp() + 172800;
-            fake.state.push(ScriptedResponse::json(StatusCode::TOO_MANY_REQUESTS,
-                json!({"error":{"type":"usage_limit_reached","resets_at":reset}}).to_string()));
-            fake.state.push(ScriptedResponse::json(StatusCode::OK, "{}"));
+            fake.state.push(ScriptedResponse::json(
+                StatusCode::TOO_MANY_REQUESTS,
+                json!({"error":{"type":"usage_limit_reached","resets_at":reset}}).to_string(),
+            ));
+            fake.state
+                .push(ScriptedResponse::json(StatusCode::OK, "{}"));
             let mut events = state.accounts.subscribe();
             let response = request().send().await.unwrap();
             let status = response.status();
-            let served = response.headers().get("x-quota-baton-account").and_then(|v| v.to_str().ok()).map(str::to_owned);
+            let served = response
+                .headers()
+                .get("x-quota-baton-account")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
             response.bytes().await.unwrap();
             let mut notices: Vec<Value> = Vec::new();
             while let Ok(event) = events.try_recv() {
-                if event["event"] == "core_warning" && event["data"]["kind"] == "quota_notice" { notices.push(event["data"].clone()); }
+                if event["event"] == "core_warning" && event["data"]["kind"] == "quota_notice" {
+                    notices.push(event["data"].clone());
+                }
             }
             if exclude_all {
                 assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
-                assert!(notices.is_empty(), "request exclusions are not provider exhaustion");
-                assert!(state.accounts.views().await.unwrap().iter().all(|v| v["quota_notice"].is_null()));
+                assert!(
+                    notices.is_empty(),
+                    "request exclusions are not provider exhaustion"
+                );
+                assert!(
+                    state
+                        .accounts
+                        .views()
+                        .await
+                        .unwrap()
+                        .iter()
+                        .all(|v| v["quota_notice"].is_null())
+                );
             } else {
                 assert_eq!(status, StatusCode::OK);
                 assert_eq!(served.as_deref(), Some(others[1].id.as_str()));
@@ -1908,7 +2003,10 @@ mod tests {
                 assert_eq!(notice["account"], source);
                 assert_eq!(notice["next_account"], served.unwrap());
                 let token = store.tokens(&others[1]).unwrap();
-                assert_eq!(fake.state.requests().last().unwrap().headers["authorization"], format!("Bearer {}", token.access_token));
+                assert_eq!(
+                    fake.state.requests().last().unwrap().headers["authorization"],
+                    format!("Bearer {}", token.access_token)
+                );
             }
         }
     }
