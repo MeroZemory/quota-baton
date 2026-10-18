@@ -548,6 +548,7 @@ Base: `http://127.0.0.1:<admin_port>/admin/v1`. Every route requires `Authorizat
 | `POST /accounts/login` `{provider}` | Returns `{login_id, auth_url}`. The core runs the callback listener. |
 | `POST /accounts/import` `{source:"cpa", mode:"linked"\|"adopted", activate:[...]}` | Imports from CPA's auth directory (D5). Returns per-identity metadata, never tokens. `mode:"adopted"` is refused: adoption is per existing account via `/accounts/{id}/adopt`. |
 | `POST /accounts/{id}/adopt` `{from:"cpa_file"\|"store"\|{"path":"..."}, expected_generation}` | Takes refresh ownership of a linked account (D17). Refused with 409 while CPA can still refresh it (process running and file loadable), on a generation mismatch, or when the file's identity does not match. Returns `{id, generation, from, token_expires_at}`; never tokens. |
+| `POST /accounts/takeover` `{provider:"codex"\|"claude", path, phase:"inspect"\|"commit", inspect_digest?, replace?, keep_source?}` | Takes refresh ownership of an account from another app's home (D18). `inspect` returns `{email, plan, provider_account_id, source_path, source_last_refresh, source_mtime, owner_alive, existing_id?, inspect_digest}` and writes nothing. `commit` needs the `inspect_digest` of unchanged file bytes. It is refused with 409 when the owner looks alive, the file changed within 120 s or since inspect, or the identity exists without `replace`. It is refused with 422 for API-key auth. On success it stores `source.kind="takeover"`, renames the source file to `<name>.taken-over-by-quota-baton-<YYYYMMDD>` unless `keep_source`, runs one manual refresh, and returns `{id, renamed_to?, refresh:{ok, token_expires_at}}`. It never returns tokens. |
 | `POST /accounts/{id}/refresh` `{force?:bool}` | Manual single-flight refresh, with the same gate and write-ahead as refresh-ahead. Refused for linked accounts ("CPA가 갱신하는 계정입니다"), for `drain` or `needs_relogin`, and while `refresh_uncertain=true` unless `force` is given or the current access token can no longer serve. Returns `{outcome, token_expires_at, last_refresh_at}`. |
 | `GET /accounts/login/{login_id}` | `{status: pending\|completed\|failed\|expired, account_id?, error?}` |
 | `POST /accounts/login/{login_id}/cancel` | Cancels the login |
@@ -624,7 +625,7 @@ spread_threshold = 5         # optional per-account override (C7.1)
 
 ### `accounts/<id>.json`
 
-`source` is `{"kind": "oauth"}`, or `{"kind": "cpa", "mode": "linked" | "adopted", "dir": "<CPA auth dir>", "match": {"account_uuid" | "account_id": "...", "email": "..."}}`. A linked account MUST NOT call any token endpoint. Its token comes only from re-reading the matched CPA file (architecture §6).
+`source` is `{"kind": "oauth"}`, `{"kind": "takeover", "from": "<source path>", "at": "<rfc3339>"}` (owned, refreshes like `oauth`; D18), or `{"kind": "cpa", "mode": "linked" | "adopted", "dir": "<CPA auth dir>", "match": {"account_uuid" | "account_id": "...", "email": "..."}}`. A linked account MUST NOT call any token endpoint. Its token comes only from re-reading the matched CPA file (architecture §6).
 
 `source.mode`: `linked` never calls a token endpoint. `adopted` is owned: it uses refresh-ahead, 401 refresh and manual refresh. `dir` and `match` are kept on an adopted account so that `restore-cpa` can re-link it. `id` is stable across mode changes.
 

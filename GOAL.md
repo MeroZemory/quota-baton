@@ -52,8 +52,9 @@ Implement quota-baton exactly as specified, milestone by milestone, until M8 is 
 | R2 | D17: Part A (adopt + manual refresh + refresh regardless of user_state) right after the current R1 group, MUST merge before 10-22; then R1 groups 3-5; then Part B (retire-cpa/restore-cpa); brief `R2-adopt-retire-cpa.md` |
 | R3 | merged (codex-qb and claude-qb) |
 | R1-tray.2 | merged (notifications) |
-| R4 | Claude plan tier (pro/max_5x/max_20x), Codex `credits_in_use`, relaxed wire precondition for dedicated modes; after R1-tray.2; brief `R4-plan-tier-credits.md` |
+| R4 | merged (plan tier, credits_in_use, precondition) |
 | R5 | tray v2 (user-approved redesign; light default, remaining-based usage, credits confirm every time); after R4, folds R1-tray.2 wording; brief `R5-tray-v2.md`, spec `.sandbox/design/tray-v2/SPEC-v2.md` |
+| R6 | D18 warned takeover from another app's home (core + CLI first, tray with R5); after R5 core work, before R2 Part B; brief `R6-takeover.md` |
 
 ## Hard boundaries (never)
 
