@@ -1076,7 +1076,32 @@ fn read_autostart() -> Result<(Original, u32)> {
     ))
 }
 
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq)]
+struct OptionalMutationState {
+    autostart: String,
+    tasks: std::collections::BTreeMap<String, bool>,
+    calls: usize,
+}
+#[cfg(test)]
+thread_local! {
+    static OPTIONAL_MUTATIONS: std::cell::RefCell<Option<OptionalMutationState>> = const { std::cell::RefCell::new(None) };
+}
+
 fn set_autostart(action: &OptionalActionJournal) -> Result<()> {
+    #[cfg(test)]
+    if OPTIONAL_MUTATIONS.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if let Some(state) = slot.as_mut() {
+            state.calls += 1;
+            state.autostart = action.after.clone();
+            true
+        } else {
+            false
+        }
+    }) {
+        return Ok(());
+    }
     let key = open_run_key(KEY_SET_VALUE)?;
     let name = registry_wide("quota-baton-tray");
     let value = registry_wide(&action.after);
@@ -1179,6 +1204,21 @@ fn cpa_task_journal(task_query: &dyn Fn(&str) -> Option<bool>) -> Result<Vec<Tas
 }
 
 fn disable_cpa_tasks(tasks: &[TaskJournal]) -> Result<()> {
+    #[cfg(test)]
+    if OPTIONAL_MUTATIONS.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if let Some(state) = slot.as_mut() {
+            for task in tasks.iter().filter(|task| task.was_enabled) {
+                state.calls += 1;
+                state.tasks.insert(task.name.clone(), false);
+            }
+            true
+        } else {
+            false
+        }
+    }) {
+        return Ok(());
+    }
     #[cfg(test)]
     assert!(
         tasks.iter().all(|task| !task.was_enabled),

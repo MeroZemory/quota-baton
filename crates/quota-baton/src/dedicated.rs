@@ -818,17 +818,16 @@ fn validate_manifest(paths: &CutoverPaths, m: &Manifest) -> Result<()> {
         if e.kind != expected_kind {
             bail!("journal 경로의 파일 종류가 올바르지 않습니다");
         }
-        if let Some(u) = &e.upgrade {
-            if !upgrade_path(m, &e.path)?
+        if let Some(u) = &e.upgrade
+            && (!upgrade_path(m, &e.path)?
                 || e.kind != Kind::File
                 || !e.done
                 || e.removed
                 || e.original.is_some()
                 || e.identity.as_ref() != Some(&u.old_identity)
-                || u.hash != hash_bytes(&unprotect(&u.payload)?)
-            {
-                bail!("업그레이드 journal 범위/내용이 올바르지 않습니다");
-            }
+                || u.hash != hash_bytes(&unprotect(&u.payload)?))
+        {
+            bail!("업그레이드 journal 범위/내용이 올바르지 않습니다");
         }
         ancestors_safe(&e.path)?;
         if e.kind == Kind::Junction || e.kind == Kind::Hardlink {
@@ -1620,6 +1619,28 @@ fn upgrade_completed(
     };
     let mut plans = Vec::new();
     let mut secrets = Vec::new();
+    let mut publication_scratch = Vec::new();
+    // R3 could journal done before unlinking its publication hardlink. Prove
+    // every such leftover before any cleanup or title replacement, even force.
+    for (i, e) in m.entries.iter().enumerate() {
+        if e.kind == Kind::File
+            && e.upgrade.is_none()
+            && let Some(tmp) = &e.pending
+            && exists(tmp)?
+        {
+            if e.identity.is_none()
+                || e.pending_identity != e.identity
+                || !matches_entry(e, false)?
+                || !pending_matches(e, false)?
+            {
+                bail!("기존 임시 파일을 먼저 확인하세요");
+            }
+            publication_scratch.push(i);
+            report
+                .warnings
+                .push(format!("게시 임시 파일을 정리합니다: {}", tmp.display()));
+        }
+    }
     // Preflight all candidates before mutation. No default source/key reads.
     for e in &m.entries {
         if !upgrade_path(m, &e.path)? {
@@ -1652,6 +1673,8 @@ fn upgrade_completed(
                     .path,
             )?
         };
+        validate_upgrade_connection(m, e, &before)?;
+        validate_upgrade_connection(m, e, &after)?;
         for bytes in [&before, &after] {
             if let Ok(doc) = std::str::from_utf8(strip_utf8_bom(bytes))
                 .unwrap_or("")
@@ -1674,6 +1697,11 @@ fn upgrade_completed(
             }
         }
     }
+    if apply {
+        for i in publication_scratch {
+            cleanup_publication_scratch(&m.entries[i])?;
+        }
+    }
     for (path, before, after) in plans {
         let i = m.entries.iter().position(|e| e.path == path).unwrap();
         if before != after || m.entries[i].upgrade.is_some() {
@@ -1689,10 +1717,10 @@ fn upgrade_completed(
                 if !matches_entry(e, force)? || hash_file(&e.path)? != hash_bytes(&before) {
                     bail!("업그레이드 교체 대상이 변경되었습니다");
                 }
-                if let Some(tmp) = &e.pending {
-                    if exists(tmp)? {
-                        bail!("기존 임시 파일을 먼저 확인하세요");
-                    }
+                if let Some(tmp) = &e.pending
+                    && exists(tmp)?
+                {
+                    bail!("기존 임시 파일을 먼저 확인하세요");
                 }
                 e.upgrade = Some(Upgrade {
                     old_hash: hash_bytes(&before),
@@ -1712,6 +1740,85 @@ fn upgrade_completed(
     }
     report.warnings.extend(scratch_warnings(m));
     Ok(report)
+}
+
+fn cleanup_publication_scratch(e: &Entry) -> Result<()> {
+    if !matches_entry(e, false)? || !pending_matches(e, false)? {
+        bail!("기존 임시 파일을 먼저 확인하세요");
+    }
+    // Delete the proven link through its handle, never a swapped path entry.
+    let file = OpenOptions::new()
+        .read(true)
+        .access_mode(0x80000000 | 0x00010000)
+        .custom_flags(0x00200000)
+        .open(pending_path(e))?;
+    let mut info = FileInfo::default();
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let held = Identity {
+        volume: info.volume,
+        index: (u64::from(info.index_high) << 32) | u64::from(info.index_low),
+    };
+    if e.pending_identity.as_ref() != Some(&held)
+        || info.attributes & 0x410 != 0
+        || !pending_matches(e, false)?
+    {
+        bail!("기존 임시 파일을 먼저 확인하세요");
+    }
+    discard_owned_scratch(&file)?;
+    Ok(())
+}
+
+fn validate_upgrade_connection(m: &Manifest, e: &Entry, bytes: &[u8]) -> Result<()> {
+    let invalid = || anyhow::anyhow!("기존 연결 journal 형식이 올바르지 않습니다");
+    let mismatch =
+        || anyhow::anyhow!("기존 연결의 포트/키가 현재 설정과 다릅니다. 먼저 unwire를 실행하세요");
+    if e.path == m.home.join("config.toml") {
+        let saved = unprotect(e.payload.as_deref().ok_or_else(invalid)?)?;
+        let parse = |bytes: &[u8]| -> Result<DocumentMut> {
+            std::str::from_utf8(strip_utf8_bom(bytes))
+                .map_err(|_| invalid())?
+                .parse()
+                .map_err(|_| invalid())
+        };
+        let saved = parse(&saved)?;
+        let current = parse(bytes)?;
+        let expected = saved
+            .get("openai_base_url")
+            .and_then(toml_edit::Item::as_str);
+        if expected.is_none()
+            || current
+                .get("openai_base_url")
+                .and_then(toml_edit::Item::as_str)
+                != expected
+        {
+            return Err(mismatch());
+        }
+    } else if e
+        .path
+        .file_name()
+        .is_some_and(|name| name == "settings.json")
+    {
+        let saved = unprotect(e.payload.as_deref().ok_or_else(invalid)?)?;
+        let saved: Value = serde_json::from_slice(strip_utf8_bom(&saved)).map_err(|_| invalid())?;
+        let current: Value =
+            serde_json::from_slice(strip_utf8_bom(bytes)).map_err(|_| invalid())?;
+        for key in ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"] {
+            let expected = saved
+                .get("env")
+                .and_then(|env| env.get(key))
+                .and_then(Value::as_str);
+            let actual = current
+                .get("env")
+                .and_then(|env| env.get(key))
+                .and_then(Value::as_str);
+            if expected.is_none() || actual != expected {
+                return Err(mismatch());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Check the saved plan before any resume write; retained homes build a fresh plan.
@@ -4835,6 +4942,260 @@ trusted_hash = "synthetic-hook-hash"
             let before = resume_snapshot(&p);
             assert!(r32_run(&p, true, true).is_err());
             assert_eq!(resume_snapshot(&p), before);
+        }
+    }
+
+    #[test]
+    fn r32_upgrade_force_refuses_current_connection_drift_without_mutation() {
+        for field in [
+            "openai_base_url",
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_AUTH_TOKEN",
+        ] {
+            let (_dir, p) = fixture();
+            r32_old_install(&p);
+            let path = if field == "openai_base_url" {
+                p.codex_qb_home.join("config.toml")
+            } else {
+                claude_home(&p).unwrap().join("settings.json")
+            };
+            let id = identity(&path).unwrap();
+            if field == "openai_base_url" {
+                let mut doc = fs::read_to_string(&path)
+                    .unwrap()
+                    .parse::<DocumentMut>()
+                    .unwrap();
+                doc[field] = toml_edit::value("http://127.0.0.1:10291/v1");
+                fs::write(&path, doc.to_string()).unwrap();
+            } else {
+                let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                value["env"][field] = serde_json::json!(if field == "ANTHROPIC_AUTH_TOKEN" {
+                    "synthetic-edited-token"
+                } else {
+                    "http://127.0.0.1:10291"
+                });
+                fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+            }
+            assert_eq!(identity(&path).unwrap(), id);
+            // A proven legacy cleanup must also wait until all connection checks pass.
+            let mut m = manifest(&p);
+            let e = m
+                .entries
+                .iter_mut()
+                .find(|e| e.path == p.npm_dir.join("codex-qb.cmd"))
+                .unwrap();
+            let scratch = pending_path(e);
+            fs::hard_link(&e.path, &scratch).unwrap();
+            e.pending_identity = Some(identity(&scratch).unwrap());
+            atomic_json(&p.journal(), &m).unwrap();
+            let before = resume_snapshot(&p);
+            let owned = r32_owned(&p);
+            let journal = fs::read(p.journal()).unwrap();
+            let edited = fs::read(&path).unwrap();
+            for apply in [false, true] {
+                let error = r32_run(&p, apply, true).unwrap_err();
+                assert!(error.to_string().contains("기존 연결의 포트/키"));
+                assert_eq!(fs::read(&path).unwrap(), edited);
+                assert_eq!(fs::read(p.journal()).unwrap(), journal);
+                assert_eq!(resume_snapshot(&p), before);
+                assert_eq!(r32_owned(&p), owned);
+                assert!(scratch.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn r32_upgrade_legacy_publication_scratch_requires_exact_proof_before_any_mutation() {
+        for control in ["owned", "substituted", "unproven"] {
+            let (_dir, p) = fixture();
+            r32_old_install(&p);
+            let sources = snapshot(&p);
+            let mut m = manifest(&p);
+            assert!(m.install_completed.is_none());
+            let e = m
+                .entries
+                .iter_mut()
+                .find(|e| e.path == p.npm_dir.join("codex-qb.cmd"))
+                .unwrap();
+            let scratch = pending_path(e);
+            fs::hard_link(&e.path, &scratch).unwrap();
+            let id = identity(&scratch).unwrap();
+            e.pending_identity = Some(id.clone());
+            let bytes = fs::read(&scratch).unwrap();
+            if control == "substituted" {
+                fs::remove_file(&scratch).unwrap();
+                fs::write(&scratch, &bytes).unwrap();
+                assert_ne!(identity(&scratch).unwrap(), id); // final link keeps ID alive
+            } else if control == "unproven" {
+                e.pending_identity = None;
+            }
+            atomic_json(&p.journal(), &m).unwrap();
+            let unknown = p.npm_dir.join("unknown-sibling.txt");
+            fs::write(&unknown, "keep unknown").unwrap();
+            let before = resume_snapshot(&p);
+            let journal = fs::read(p.journal()).unwrap();
+            if control == "owned" {
+                r32_run(&p, false, false).unwrap();
+                assert_eq!(resume_snapshot(&p), before);
+                assert_eq!(fs::read(p.journal()).unwrap(), journal);
+                r32_run(&p, true, false).unwrap();
+                assert!(!scratch.exists());
+                assert!(r32_run(&p, true, false).unwrap().changed.is_empty());
+                super::unwire(&p, true, false).unwrap();
+            } else {
+                for apply in [false, true] {
+                    assert!(r32_run(&p, apply, true).is_err());
+                    assert_eq!(resume_snapshot(&p), before);
+                    assert_eq!(fs::read(p.journal()).unwrap(), journal);
+                    assert_eq!(fs::read(&scratch).unwrap(), bytes);
+                }
+            }
+            assert_eq!(fs::read_to_string(unknown).unwrap(), "keep unknown");
+            assert_eq!(snapshot(&p), sources);
+        }
+    }
+
+    #[test]
+    fn r32_upgrade_recorded_optional_actions_and_default_session_entries_are_not_replayed() {
+        struct ResetOptionalMutations;
+        impl Drop for ResetOptionalMutations {
+            fn drop(&mut self) {
+                OPTIONAL_MUTATIONS.with(|slot| *slot.borrow_mut() = None);
+            }
+        }
+        for legacy in [false, true] {
+            for stage in [
+                None,
+                Some("upgrade-before-scratch"),
+                Some("upgrade-after-replace"),
+            ] {
+                let (dir, mut p) = fixture();
+                fs::write(
+                    &p.codex_auth,
+                    r#"{"auth_mode":"apikey","OPENAI_API_KEY":"synthetic-old"}"#,
+                )
+                .unwrap();
+                let session = dir.path().join("default-session");
+                let chatgpt = dir.path().join("chatgpt-session");
+                fs::create_dir(&session).unwrap();
+                fs::create_dir(&chatgpt).unwrap();
+                let auth = session.join("auth.json");
+                fs::write(
+                    &auth,
+                    r#"{"auth_mode":"apikey","OPENAI_API_KEY":"synthetic-session-old"}"#,
+                )
+                .unwrap();
+                fs::write(chatgpt.join("auth.json"), r#"{"auth_mode":"chatgpt"}"#).unwrap();
+                let map = dir.path().join("session-homes.json");
+                let value = serde_json::json!({"sessions":{"api":session,"chatgpt":chatgpt}});
+                fs::write(&map, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+                p.codex_session_homes = session_homes_from_value(&value, dir.path());
+                p.codex_session_auth.push(auth.clone());
+                p.session_homes_file = Some(map.clone());
+                let mut options = claude_options(CodexMode::Default, Some(ClaudeMode::Dedicated));
+                options.detach_chatgpt_session_homes = true;
+                wire_with_task_query(&p, true, options, &|_| panic!("unrequested task query"))
+                    .unwrap();
+                let mut m = manifest(&p);
+                let path = p.npm_dir.join("claude-qb.cmd");
+                fs::write(&path, "@echo off\r\nrem old synthetic wrapper\r\n").unwrap();
+                let e = m.entries.iter_mut().find(|e| e.path == path).unwrap();
+                e.hash = hash_file(&path).unwrap();
+                e.payload = Some(protect(&fs::read(&path).unwrap()).unwrap());
+                if legacy {
+                    // Include the final done-write / publication-cleanup gap.
+                    let scratch = pending_path(e);
+                    fs::hard_link(&path, &scratch).unwrap();
+                    e.pending_identity = Some(identity(&scratch).unwrap());
+                    m.install_completed = None;
+                }
+                m.autostart = Some(OptionalActionJournal {
+                    before: Original {
+                        present: false,
+                        value: None,
+                    },
+                    before_type: 1,
+                    after: "synthetic-recorded-autostart".into(),
+                    after_type: 1,
+                });
+                m.tasks = vec![TaskJournal {
+                    name: "cliproxyapi-proxy".into(),
+                    was_enabled: true,
+                    after_enabled: false,
+                }];
+                atomic_json(&p.journal(), &m).unwrap();
+                let initial = OptionalMutationState {
+                    autostart: "synthetic-current-autostart".into(),
+                    tasks: [("cliproxyapi-proxy".into(), true)].into_iter().collect(),
+                    calls: 0,
+                };
+                let _reset = ResetOptionalMutations;
+                OPTIONAL_MUTATIONS.with(|slot| *slot.borrow_mut() = Some(initial.clone()));
+                // Positive control proves these recorded actions hit the fake mutation backend.
+                set_autostart(m.autostart.as_ref().unwrap()).unwrap();
+                disable_cpa_tasks(&m.tasks).unwrap();
+                OPTIONAL_MUTATIONS.with(|slot| {
+                    let state = slot.borrow();
+                    let state = state.as_ref().unwrap();
+                    assert_eq!(state.calls, 2);
+                    assert_eq!(state.autostart, "synthetic-recorded-autostart");
+                    assert!(!state.tasks["cliproxyapi-proxy"]);
+                });
+                OPTIONAL_MUTATIONS.with(|slot| *slot.borrow_mut() = Some(initial.clone()));
+                let defaults = m
+                    .entries
+                    .iter()
+                    .filter(|e| e.original.is_some())
+                    .map(|e| {
+                        (
+                            e.path.clone(),
+                            serde_json::to_value(e).unwrap(),
+                            fs::read(&e.path).unwrap(),
+                            identity(&e.path).unwrap(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                assert!(defaults.iter().any(|e| e.0 == auth));
+                assert!(defaults.iter().any(|e| e.0 == map));
+                claude_run(&p, false, CodexMode::Default, Some(ClaudeMode::Dedicated)).unwrap();
+                if let Some(stage) = stage {
+                    INTERRUPT.with(|slot| *slot.borrow_mut() = Some((path.clone(), stage)));
+                    assert!(
+                        claude_run(&p, true, CodexMode::Default, Some(ClaudeMode::Dedicated))
+                            .is_err()
+                    );
+                    OPTIONAL_MUTATIONS
+                        .with(|slot| assert_eq!(slot.borrow().as_ref(), Some(&initial)));
+                }
+                claude_run(&p, true, CodexMode::Default, Some(ClaudeMode::Dedicated)).unwrap();
+                assert!(
+                    claude_run(&p, true, CodexMode::Default, Some(ClaudeMode::Dedicated))
+                        .unwrap()
+                        .changed
+                        .is_empty()
+                );
+                OPTIONAL_MUTATIONS.with(|slot| assert_eq!(slot.borrow().as_ref(), Some(&initial)));
+                let after = manifest(&p);
+                assert_eq!(
+                    serde_json::to_value(&m.autostart).unwrap(),
+                    serde_json::to_value(&after.autostart).unwrap()
+                );
+                assert_eq!(
+                    serde_json::to_value(&m.tasks).unwrap(),
+                    serde_json::to_value(&after.tasks).unwrap()
+                );
+                for (path, entry, bytes, id) in defaults {
+                    assert_eq!(
+                        serde_json::to_value(
+                            after.entries.iter().find(|e| e.path == path).unwrap()
+                        )
+                        .unwrap(),
+                        entry
+                    );
+                    assert_eq!(fs::read(&path).unwrap(), bytes);
+                    assert_eq!(identity(&path).unwrap(), id);
+                }
+            }
         }
     }
 }
