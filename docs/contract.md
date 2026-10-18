@@ -131,6 +131,7 @@ Each account has two independent fields:
 | any health | Upstream 401 carrying a revocation or invalidation signal (C6 row 4), on an **owned** account | `needs_relogin` |
 | any health | **Linked account, any 401** (rows 4 and 5, data plane or usage poll; V5 2026-10-13) | Re-read the CPA file first. A newer token means retry with it, and no health change. No newer token means `cooling(link_stale)`. A linked account **never** enters `needs_relogin`, because only CPA can re-login it. Anthropic revokes the old access token as soon as CPA refreshes, so this case is normal. |
 | `needs_relogin` or `cooling(link_stale)` (linked) | A CPA re-import or linked reload finds a newer token for the same identity | `ready` |
+| `cooling(link_stale)` or `ready` (linked) | Adoption (`POST /accounts/{id}/adopt`, D17) | `ready`, `source.mode=adopted`; `auth_failures=0`, `auth_probe_pending=false`. The id is unchanged. |
 | `ready` | Upstream 401 with the **current** token, a refresh succeeds, then a 401 again with the **new** token | `cooling(auth, until=now+15m, account)`, doubling on each repeat up to 4 h. A probe request runs when it expires. |
 | — | Upstream 401 with a token that is **no longer current** (another request already refreshed) | **no change**. The request retries once with the current token. |
 | `needs_relogin` | Re-login completes for the same identity | `ready` |
@@ -545,7 +546,9 @@ Base: `http://127.0.0.1:<admin_port>/admin/v1`. Every route requires `Authorizat
 | `GET /state` | `{accounts:[AccountView], inflight:{requests, bytes}, memory:{private_bytes}, bindings:{count}, data_port, version}` |
 | `GET /events` | SSE stream of `account_changed`, `quota_updated`, `core_warning` and `login_progress` |
 | `POST /accounts/login` `{provider}` | Returns `{login_id, auth_url}`. The core runs the callback listener. |
-| `POST /accounts/import` `{source:"cpa", mode:"linked"\|"adopted", activate:[...]}` | Imports from CPA's auth directory (D5). Returns per-identity metadata, never tokens. `adopted` is refused while CPA can still refresh the account. |
+| `POST /accounts/import` `{source:"cpa", mode:"linked"\|"adopted", activate:[...]}` | Imports from CPA's auth directory (D5). Returns per-identity metadata, never tokens. `mode:"adopted"` is refused: adoption is per existing account via `/accounts/{id}/adopt`. |
+| `POST /accounts/{id}/adopt` `{from:"cpa_file"\|"store"\|{"path":"..."}, expected_generation}` | Takes refresh ownership of a linked account (D17). Refused with 409 while CPA can still refresh it (process running and file loadable), on a generation mismatch, or when the file's identity does not match. Returns `{id, generation, from, token_expires_at}`; never tokens. |
+| `POST /accounts/{id}/refresh` `{force?:bool}` | Manual single-flight refresh, with the same gate and write-ahead as refresh-ahead. Refused for linked accounts ("CPA가 갱신하는 계정입니다"), for `drain` or `needs_relogin`, and while `refresh_uncertain=true` unless `force` is given or the current access token can no longer serve. Returns `{outcome, token_expires_at, last_refresh_at}`. |
 | `GET /accounts/login/{login_id}` | `{status: pending\|completed\|failed\|expired, account_id?, error?}` |
 | `POST /accounts/login/{login_id}/cancel` | Cancels the login |
 | `POST /accounts/{id}/{pause\|resume\|disable\|enable}` | Changes `user_state` |
@@ -621,6 +624,8 @@ spread_threshold = 5         # optional per-account override (C7.1)
 
 `source` is `{"kind": "oauth"}`, or `{"kind": "cpa", "mode": "linked" | "adopted", "dir": "<CPA auth dir>", "match": {"account_uuid" | "account_id": "...", "email": "..."}}`. A linked account MUST NOT call any token endpoint. Its token comes only from re-reading the matched CPA file (architecture §6).
 
+`source.mode`: `linked` never calls a token endpoint. `adopted` is owned: it uses refresh-ahead, 401 refresh and manual refresh. `dir` and `match` are kept on an adopted account so that `restore-cpa` can re-link it. `id` is stable across mode changes.
+
 DPAPI is called with the application entropy, the ASCII bytes `quota-baton/v1/account-secret`, and with `CRYPTPROTECT_UI_FORBIDDEN`.
 
 ```json
@@ -641,6 +646,13 @@ The DPAPI blob decrypts to `{access_token, refresh_token, id_token?}`. Files are
 - It is set to `true` and persisted **before** a refresh request is sent.
 - It is cleared in the same write that persists the new tokens.
 - If it is found `true` at startup, the previous refresh outcome is unknown. Retry at the next refresh-ahead point (architecture §6).
+- `restore-cpa` is refused for an account whose flag is `true`, and the flag is never written into a CPA file.
+
+### `journal/retire-cpa.json`
+
+`{ "schema": 1, "started_at", "tasks": [{"name", "was_enabled", "owned_by": "retire"|"wiring"}], "process": {"pid", "path", "start_time", "stopped"}, "accounts": [{"id", "from": "cpa_file"|"store"|"backup", "cpa_file"?, "before_generation", "after_generation"?, "verified_refresh"?, "status": "pending"|"adopted"|"skipped", "reason"?}], "guard": {"kind": "files", "renames": [["<from>","<to>"]], "done"}, "completed_at"? }`
+
+Each step is journaled before it runs and marked after it completes. `retire-cpa --apply` resumes, and `restore-cpa --apply` reverses from any step. `unwire --apply` is refused while this file exists.
 
 ### `state/bindings.json`
 

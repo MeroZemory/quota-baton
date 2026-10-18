@@ -266,9 +266,19 @@ The later API-key providers implement the same trait without OAuth.
   - It matches by `account_uuid`/`account_id` + email, not by filename, because CPA renames files on re-login.
   - CPA writes files non-atomically, so a partial or unparsable read is retried up to 3 times, 200 ms apart.
   - If the file holds no newer token by expiry, the account goes to `cooling(link_stale)`. The tray then shows "CPA is not refreshing this account".
-- **Adopt** (`--adopt`, M8 only).
-  - The command refuses unless CPA can no longer refresh the account: the CPA process is not running, or the account's file is gone from CPA's directory.
-  - From then on the account is owned like an OAuth login.
+- **Adopt** (`POST /accounts/{id}/adopt`, driven by the `retire-cpa` command; D17).
+  - It runs in the core under the credential lease. The tokens come from the first of these that applies:
+    1. CPA's file for the same identity, matched as in linked mode, when it exists and parses
+    2. the newest copy the user points at (CPA backups), ordered by `last_refresh`, with ties broken by `expired`
+    3. the stored tokens
+  - The id never changes. `cooling(link_stale)` becomes `ready`, and `auth_failures` and `auth_probe_pending` reset.
+  - It is refused while CPA can still refresh the account: the CPA process is running and the file is loadable (`*.json` in CPA's auth dir).
+  - From then on the account is owned like an OAuth login. A verify-refresh may run at once; otherwise refresh-ahead runs normally.
+- **Refresh-ahead covers every owned and adopted account**, whatever its `user_state`. `drain` and `needs_relogin` are the only exclusions.
+- **retire-cpa and restore-cpa** are part of the cutover tool, with the journal `journal\retire-cpa.json`, resumable per step. D17 gives the order and the safe-stop rule.
+  - CPA writes files with truncate-then-write, so a file that fails to parse after the stop is a torn write: adopt from the store and warn.
+  - The retired files are renamed `*.json.retired`, because CPA loads and watches only `*.json`.
+  - They are never restored except by `restore-cpa`, which writes quota-baton's current tokens first.
 
 ## 7. Selection and session affinity
 

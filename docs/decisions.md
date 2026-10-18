@@ -64,7 +64,7 @@ An import runs in one of two modes, so that a single-use refresh token never has
 - **Adopted.**
   - quota-baton becomes the sole refresh owner.
   - This is allowed only after CPA can no longer refresh the account: CPA has stopped for good, or the user has removed the file from CPA's auth directory.
-  - It is a cutover step (M8).
+  - It is a cutover step. The mechanism is D17.
 
 Evidence behind the rule (2026-10-13):
 - CPA refreshes **disabled** accounts as well. Its disabled Claude files were refreshed at 09:14. Disabling an account in CPA therefore does not hand over ownership.
@@ -280,3 +280,39 @@ Later candidates: a per-plan default table, once Codex `plan` shows plan-depende
    - tests and diagnostics use testkit fakes and never replay a real session (AGENTS.md, C13)
 4. **Candidate, not yet scheduled:** an admin action and tray item to view one session's binding and drop it (redacted session key). The note's item 6 asks for this; it is useful for operators. Today the binding is dropped only on forced moves, at cold points or by the D15 rebalance.
 
+<a id="d17"></a>
+## D17. Retire CPA by adopting its accounts; owned accounts always refresh — Accepted (user direction, 2026-10-18)
+
+**User direction (quoted).** "cpa 계정인수기능도 만들고요(더럽지않은 깔끔한방법으로 가능하면), 애초에 qb에 직접등록한계정도 자동 갱신되도록 해야합니다."
+
+The design was independently reviewed (`.sandbox/reviews/D17-review.md`); all six must-fix items are folded in below.
+
+- **Adoption is per account and runs in the lease-holding core** (`POST /accounts/{id}/adopt`, C11).
+  - A linked account is adopted from CPA's file when the file exists and its identity matches.
+  - When CPA no longer has the file, it is adopted from a newer CPA backup copy the user points at, or else from quota-baton's stored tokens. D5 already allows this.
+  - `id`, bindings, quota history and ledger keys never change, and `cooling(link_stale)` becomes `ready`.
+- **`retire-cpa` is a journaled, resumable, reversible sequence** (architecture §6). Its steps, in order:
+  1. Disable CPA's tasks.
+  2. Stop the CPA process, identified by pid file, path, listener and start time. This happens only outside CPA's own refresh window: `expired - now > lead + 5 min` (Claude 4 h, Codex 24 h), and `last_refresh` older than 60 s.
+  3. Do the final read under the lease.
+  4. Adopt each account.
+  5. Make CPA's credential files unloadable: rename them to `*.json.retired` and add a marker file.
+  6. Optionally run a verify-refresh.
+  7. Report.
+
+  A torn (unparsable) file after the stop is adopted from the store and is never restored to CPA. `retire-cpa` requires the clients to be wired to quota-baton first, so CPA has no traffic and therefore no 401-triggered refresh.
+- **`restore-cpa` reverses it.**
+  - It stops quota-baton's refresh for the adopted accounts.
+  - It is refused while any of them has `refresh_uncertain=true` or a refresh still active.
+  - It writes quota-baton's current token pair into each retired file. This is a read-modify-write that changes only the token and time keys and keeps CPA's timestamp shape.
+  - It converts the accounts back to linked, un-retires the files, restores the tasks, and starts CPA through its task. Port 10100 must be free.
+  - Accounts adopted without a CPA file stay owned.
+- **Retired copies and CPA backups must never be loaded into CPA again** while quota-baton owns the accounts. A rotated refresh token presented twice is a reuse that can revoke the family (R1 §2, R2 §2, the 10-10 incident).
+- **Owned and adopted accounts refresh ahead regardless of `user_state`**, disabled and paused included. Only `drain` and `needs_relogin` stop refresh. CPA kept disabled accounts alive the same way (D5 evidence).
+- **A manual refresh** (`POST /accounts/{id}/refresh`, `quota-baton accounts refresh <id>`) makes refresh observable. It uses the same gate as refresh-ahead.
+- **Applying `retire-cpa` changes CPA's auth directory and stops CPA**, so it is a user decision under D9, taken once per `--apply`.
+
+**Evidence (2026-10-18).**
+- The two active plus-plan Codex accounts (cx-413c3b, cx-763c46) were removed from CPA on 10-16 21:11 (CPA log `auth file changed (REMOVE)`).
+- Nobody refreshes them, and their stored refresh tokens equal CPA's last state.
+- They expire on 10-23 and 10-24, so they must be adopted from the store before 10-22, whenever the full retire ships.
