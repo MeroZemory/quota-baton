@@ -1,5 +1,6 @@
 //! Pure classification over a narrow projection of the current core payload.
 //! No parsing of translated chips, clocks, bearer data, or upstream bodies.
+#[cfg(test)]
 use super::pixels::Badge;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -13,6 +14,7 @@ pub enum Kind {
     QuotaFailover,
     QuotaExhausted,
     Billing,
+    StoreError,
     ProviderExhausted,
     OrganisationDenied,
     Burst,
@@ -42,24 +44,28 @@ impl Signal<'_> {
         match self.kind {
             Kind::Relogin => (
                 "다시 로그인 필요",
-                "트레이에서 해당 계정의 다시 로그인을 선택하세요.",
+                "트레이에서 이 계정의 \"다시 로그인\"을 누르세요.",
             ),
             Kind::LinkStale => (
-                "연결 토큰 갱신 필요",
-                "CPA 실행 상태와 연결 계정의 토큰 갱신을 확인하세요.",
+                "CPA 갱신 멈춤",
+                "CPA가 이 계정의 토큰을 갱신하지 않습니다. CPA 실행을 확인하거나 계정 인수를 고려하세요.",
             ),
             Kind::Limit | Kind::QuotaCredits | Kind::QuotaFailover | Kind::QuotaExhausted => (
                 "계정 한도 도달",
-                "트레이에서 한도 초기화 시간을 확인하거나 다른 계정을 활성화하세요.",
+                "트레이에서 한도 초기화 시간을 확인하거나 꺼진 계정을 켜세요.",
             ),
             Kind::ProviderExhausted => (
                 "사용 가능한 계정 없음",
-                "해당 제공자의 계정 상태를 확인하고 계정을 추가하거나 활성화하세요.",
+                "해당 제공자의 계정 상태를 확인하고 계정을 추가하거나 켜세요.",
             ),
             Kind::OrganisationDenied => {
                 ("조직 접근 거부", "해당 계정의 조직 접근 권한을 확인하세요.")
             }
             Kind::Billing => ("결제 거절", "트레이에서 이 계정의 결제 상태를 확인하세요."),
+            Kind::StoreError => (
+                "토큰 저장 실패",
+                "토큰을 저장하지 못해 다시 시도하고 있습니다. 로그를 확인하세요.",
+            ),
             Kind::CoreRestart => (
                 "코어 다시 시작",
                 "예기치 않게 종료된 코어를 다시 시작했습니다. 계정 상태를 확인하세요.",
@@ -105,6 +111,9 @@ pub fn account_signal<'a>(account: &Account<'a>) -> Option<Signal<'a>> {
         ("needs_relogin", _, _) => Kind::Relogin,
         ("cooling", Some("link_stale"), _) if account.cooling_current => Kind::LinkStale,
         ("cooling", Some("quota"), _) if account.cooling_current => Kind::Limit,
+        ("cooling", Some("store_error"), Some("account")) if account.cooling_current => {
+            Kind::StoreError
+        }
         ("cooling", Some("permission"), Some("account")) if account.cooling_current => {
             Kind::OrganisationDenied
         }
@@ -146,10 +155,23 @@ pub fn burst_signal(
     })
 }
 
+#[cfg(test)]
 pub fn badge(core_ok: bool, existing_attention: bool, signals: &[Signal<'_>]) -> Badge {
     if !core_ok {
         Badge::Error
-    } else if existing_attention || !signals.is_empty() {
+    } else if existing_attention
+        || signals.iter().any(|s| {
+            matches!(
+                s.kind,
+                Kind::Relogin
+                    | Kind::LinkStale
+                    | Kind::Billing
+                    | Kind::StoreError
+                    | Kind::OrganisationDenied
+                    | Kind::ProviderExhausted
+            )
+        })
+    {
         Badge::Attention
     } else {
         Badge::Normal
@@ -219,6 +241,7 @@ mod tests {
             ("quota", Kind::Limit),
             ("permission", Kind::OrganisationDenied),
             ("payment", Kind::Billing),
+            ("store_error", Kind::StoreError),
         ] {
             a.health_reason = Some(reason);
             assert_eq!(account_signal(&a).unwrap().kind, expected);
@@ -279,9 +302,53 @@ mod tests {
         assert!(burst_signal(Some("burst"), Some(0)).is_none());
         let burst = burst_signal(Some("burst"), Some(30)).unwrap();
         assert_eq!(badge(false, false, &[burst]), Badge::Error);
-        assert_eq!(badge(true, false, &[burst]), Badge::Attention);
+        assert_eq!(badge(true, false, &[burst]), Badge::Normal);
         assert_eq!(badge(true, false, &[]), Badge::Normal);
         assert_eq!(badge(true, true, &[]), Badge::Attention);
+    }
+
+    #[test]
+    fn quota_money_burst_and_restart_do_not_make_attention_without_provider_failure() {
+        for kind in [
+            Kind::Limit,
+            Kind::QuotaCredits,
+            Kind::QuotaFailover,
+            Kind::QuotaExhausted,
+            Kind::Burst,
+            Kind::CoreRestart,
+        ] {
+            assert_eq!(
+                badge(
+                    true,
+                    false,
+                    &[Signal {
+                        subject: Subject::Core,
+                        kind
+                    }]
+                ),
+                Badge::Normal
+            );
+        }
+        for kind in [
+            Kind::Relogin,
+            Kind::LinkStale,
+            Kind::Billing,
+            Kind::StoreError,
+            Kind::OrganisationDenied,
+            Kind::ProviderExhausted,
+        ] {
+            assert_eq!(
+                badge(
+                    true,
+                    false,
+                    &[Signal {
+                        subject: Subject::Core,
+                        kind
+                    }]
+                ),
+                Badge::Attention
+            );
+        }
     }
 
     #[test]

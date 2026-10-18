@@ -519,9 +519,21 @@ pub struct TrayAccount {
     #[serde(default)]
     pub credits: Option<serde_json::Value>,
     #[serde(default)]
+    pub credits_in_use: Option<bool>,
+    #[serde(default)]
+    pub pool_eligible: Option<bool>,
+    #[serde(default)]
+    pub quota_cooling: Option<serde_json::Value>,
+    #[serde(default)]
+    pub observed_at: Option<String>,
+    #[serde(default)]
     pub last_used_at: Option<String>,
     #[serde(default)]
     pub bound_sessions: u64,
+    #[serde(default)]
+    pub active_sessions: u64,
+    #[serde(default)]
+    pub spread_threshold: u64,
     #[serde(default)]
     pub token_expires_at: Option<String>,
     #[serde(default)]
@@ -568,6 +580,10 @@ pub struct QuotaWindow {
     pub used_pct: Option<f64>,
     pub reset_at: Option<String>,
     pub status: Option<String>,
+    #[serde(default)]
+    pub observed_at: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -582,6 +598,60 @@ pub struct Inflight {
 pub struct Memory {
     #[serde(default)]
     pub private_bytes: u64,
+}
+
+#[cfg(test)]
+mod r5_transport_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn r5_core_fields_survive_dto_and_shared_complete_layout_input() {
+        let at = "2026-10-18T12:05:00Z";
+        let reset = "2026-10-19T01:00:00Z";
+        let input = json!({"version":"synthetic","pools":{"codex":{"eligible":1}},"accounts":[{
+            "id":"synthetic-r5-codex","provider":"codex","email":"sample@example.invalid","plan":"plus",
+            "user_state":"active","health":{"kind":"ready"},"source":{"kind":"cpa","mode":"adopted"},
+            "pool_eligible":true,"credits_in_use":true,"active_sessions":2,"bound_sessions":3,"spread_threshold":8,
+            "allow_credits":true,"credits":{"has_credits":true,"balance":19395.23},"observed_at":at,
+            "quota_cooling":{"window":"5h","reset_at":reset,"started_at":at},
+            "windows":[{"name":"5h","used_pct":100.0,"reset_at":reset,"observed_at":at,"scope":"account"}],
+            "pacing":{"backoff_until":reset,"waiting":2,"step":3,"release_interval_ms":500}
+        }]});
+        let snapshot: TraySnapshot = serde_json::from_value(input).unwrap();
+        let serialized = serde_json::to_value(&snapshot).unwrap();
+        let account = &serialized["accounts"][0];
+        assert_eq!(account["credits_in_use"], true);
+        assert_eq!(account["pool_eligible"], true);
+        assert_eq!(account["active_sessions"], 2);
+        assert_eq!(account["spread_threshold"], 8);
+        assert_eq!(account["credits"]["balance"], 19395.23);
+        assert_eq!(account["quota_cooling"]["window"], "5h");
+        assert_eq!(account["observed_at"], at);
+        assert_eq!(account["windows"][0]["scope"], "account");
+        assert_eq!(account["windows"][0]["observed_at"], at);
+        assert_eq!(account["pacing"]["waiting"], 2);
+        assert_eq!(account["pacing"]["backoff_until"], reset);
+        assert_eq!(account["pacing"]["step"], 3);
+        let now: std::time::SystemTime =
+            at.parse::<chrono::DateTime<chrono::Utc>>().unwrap().into();
+        let read = TrayRead {
+            snapshot,
+            health: CoreHealth::Healthy(HealthResponse {
+                ok: true,
+                version: "synthetic".into(),
+                pid: 1,
+                started_at: at.into(),
+            }),
+        };
+        let rows = layout_rows(&read, now).unwrap();
+        let view = qb_tray::v2::project(rows[0].view_input.as_deref().unwrap(), now).unwrap();
+        let codex = &view.sections[1];
+        assert_eq!(codex.rows[0].state, qb_tray::v2::DisplayState::Credits);
+        assert_eq!(codex.rows[0].raw.active_sessions, 2);
+        assert!(codex.rows[0].raw.source.owned_or_adopted());
+        assert_eq!(view.summaries[1].verdict, qb_tray::v2::Verdict::Credits);
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

@@ -18,14 +18,47 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct TrayConfig {
+    pub theme: TrayTheme,
     pub burst_new_sessions: u32,
 }
 
 impl Default for TrayConfig {
     fn default() -> Self {
         Self {
+            theme: TrayTheme::Light,
             burst_new_sessions: 30,
         }
+    }
+}
+
+/// Flyout v2 defaults to light; system theme is an explicit opt-in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TrayTheme {
+    #[default]
+    Light,
+    Dark,
+    System,
+}
+
+impl<'de> Deserialize<'de> for TrayTheme {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "light" => Self::Light,
+            "dark" => Self::Dark,
+            "system" => Self::System,
+            _ => {
+                static WARN: std::sync::Once = std::sync::Once::new();
+                WARN.call_once(|| {
+                    tracing::warn!(
+                        code = "unknown_tray_theme",
+                        "Unknown tray theme; using light"
+                    )
+                });
+                Self::Light
+            }
+        })
     }
 }
 
@@ -396,5 +429,32 @@ mod upstream_tests {
                 .is_err()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tray_v2_theme_tests {
+    use super::*;
+    #[test]
+    fn r5_light_default_and_explicit_dark_system_with_unknown_fallback() {
+        assert_eq!(Config::default().tray.theme, TrayTheme::Light);
+        for (value, expected) in [
+            ("light", TrayTheme::Light),
+            ("dark", TrayTheme::Dark),
+            ("system", TrayTheme::System),
+            ("unknown", TrayTheme::Light),
+        ] {
+            let config: Config = toml::from_str(&format!("[tray]\ntheme = {value:?}\n")).unwrap();
+            assert_eq!(config.tray.theme, expected);
+            let roundtrip: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+            assert_eq!(roundtrip.tray.theme, expected);
+        }
+        assert_eq!(
+            toml::from_str::<Config>("[tray]\nburst_new_sessions=12")
+                .unwrap()
+                .tray
+                .theme,
+            TrayTheme::Light
+        );
     }
 }

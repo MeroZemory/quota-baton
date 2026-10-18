@@ -213,6 +213,7 @@ mod tests {
 
     fn row() -> Row {
         Row {
+            view_input: None,
             id: "synthetic".into(),
             provider: "Codex".into(),
             name: "a@example.com".into(),
