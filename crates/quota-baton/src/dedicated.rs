@@ -1,0 +1,2595 @@
+//! R3 implementation, deliberately private behind the cutover module boundary.
+use super::*;
+use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+
+const SHARED: &[&str] = &[
+    "agents",
+    "skills",
+    "rules",
+    "plugins",
+    "mcp",
+    "hooks",
+    "memories",
+    "vendor_imports",
+];
+const USAGE: &str = "`codex-qb`로 시작한 세션만 quota-baton을 거칩니다. 기존 `codex`·`codex-ib`·`codex-mz`·`codex-cpa`는 바뀌지 않습니다.";
+const HERDR: &str = "herdr 창에서 `codex-qb` 세션을 재시작 후 이어 열려면 그 세션 ID를 `session-homes.json`에 `~/.codex-acct/qb`로 등록해야 합니다.";
+
+pub(super) fn is_cpa_endpoint(url: &str) -> bool {
+    // Deliberately small, strict authority parser; no DNS or ambient state.
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
+        return false;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let Some((host, port)) = authority.rsplit_once(':') else {
+        return false;
+    };
+    matches!(
+        host.to_ascii_lowercase().as_str(),
+        "127.0.0.1" | "localhost" | "[::1]"
+    ) && port == "10100"
+}
+
+fn parse_config(paths: &CutoverPaths) -> Result<DocumentMut> {
+    read_text(&paths.codex_config)?
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Codex config 형식이 올바르지 않습니다"))
+}
+
+fn is_cpa_realtime_endpoint(url: &str) -> bool {
+    is_cpa_endpoint(url)
+        || url
+            .strip_prefix("ws://")
+            .is_some_and(|rest| is_cpa_endpoint(&format!("http://{rest}")))
+        || url
+            .strip_prefix("wss://")
+            .is_some_and(|rest| is_cpa_endpoint(&format!("https://{rest}")))
+}
+
+fn config_bytes(paths: &CutoverPaths, port: u16) -> Result<Vec<u8>> {
+    let mut doc = parse_config(paths)?;
+    doc.remove("model_catalog_json");
+    for key in [
+        "realtime_base_url",
+        "realtime_api_base_url",
+        "realtime_ws_base_url",
+        "experimental_realtime_ws_base_url",
+        "experimental_realtime_webrtc_call_base_url",
+    ] {
+        if doc
+            .get(key)
+            .and_then(toml_edit::Item::as_str)
+            .is_some_and(is_cpa_realtime_endpoint)
+        {
+            doc.remove(key);
+        }
+    }
+    let selected = doc
+        .get("model_provider")
+        .and_then(toml_edit::Item::as_str)
+        .map(str::to_owned);
+    let mut removed = Vec::new();
+    if let Some(providers) = doc
+        .get_mut("model_providers")
+        .and_then(toml_edit::Item::as_table_like_mut)
+    {
+        removed.extend(
+            providers
+                .iter()
+                .filter(|(_, provider)| {
+                    provider
+                        .get("base_url")
+                        .and_then(toml_edit::Item::as_str)
+                        .is_some_and(is_cpa_endpoint)
+                })
+                .map(|(name, _)| name.to_owned()),
+        );
+        for name in &removed {
+            providers.remove(name);
+        }
+    }
+    // A retained provider could override the new top-level URL. Fail rather
+    // than silently launching a dedicated home that bypasses quota-baton.
+    if let Some(selected) = selected
+        && selected != "openai"
+    {
+        if removed.contains(&selected) {
+            doc.remove("model_provider");
+        } else {
+            bail!("선택된 비 CPA model_provider는 별도 홈 모드와 함께 사용할 수 없습니다");
+        }
+    }
+    let effective = doc
+        .get("model_provider")
+        .and_then(toml_edit::Item::as_str)
+        .unwrap_or("openai");
+    if doc
+        .get("model_providers")
+        .and_then(|providers| providers.get(effective))
+        .is_some()
+    {
+        bail!("선택된 사용자 정의 model_provider가 별도 홈 연결을 우회할 수 있어 중단했습니다");
+    }
+    doc["log_dir"] = toml_edit::value(paths.codex_qb_home.join("log").to_string_lossy().as_ref());
+    doc["openai_base_url"] = toml_edit::value(codex_base_url(port));
+    let trust = doc
+        .get("hooks")
+        .and_then(|h| h.get("state"))
+        .and_then(toml_edit::Item::as_table_like)
+        .and_then(|state| {
+            state.iter().find_map(|(key, item)| {
+                key.ends_with("hooks.json:session_start:0:0")
+                    .then(|| item.get("trusted_hash").cloned())
+                    .flatten()
+            })
+        });
+    if let Some(hash) = trust {
+        let key = format!(
+            "{}:session_start:0:0",
+            paths.codex_qb_home.join("hooks.json").display()
+        );
+        doc["hooks"]["state"][key.as_str()]["trusted_hash"] = hash;
+    }
+    let text = doc.to_string();
+    let reparsed = text
+        .parse::<DocumentMut>()
+        .map_err(|_| anyhow::anyhow!("dedicated config 생성에 실패했습니다"))?;
+    if reparsed
+        .get("openai_base_url")
+        .and_then(toml_edit::Item::as_str)
+        != Some(codex_base_url(port).as_str())
+    {
+        bail!("dedicated config의 최상위 endpoint가 올바르지 않습니다");
+    }
+    Ok(text.into_bytes())
+}
+
+fn launcher() -> Vec<u8> {
+    b"@echo off\r\nsetlocal\r\nrem quota-baton dedicated Codex home\r\nset \"CODEX_HOME=%USERPROFILE%\\.codex-acct\\qb\"\r\ncall \"%APPDATA%\\npm\\codex.cmd\" %*\r\n".to_vec()
+}
+
+// Preview redacts every source string, including nested and multiline values.
+// The parsed sources are never included in parser error chains or reports.
+fn string_patterns(value: &str, out: &mut Vec<String>) {
+    // Short decoded strings must not become substring patterns for keys, URLs
+    // or our replacement marker. Their quoted lexical forms still get masked.
+    let quoted = serde_json::to_string(value).expect("JSON string serialization");
+    if value.len() >= 8 {
+        out.push(value.to_owned());
+        out.push(quoted[1..quoted.len() - 1].to_owned());
+    }
+    out.push(quoted);
+}
+
+fn toml_strings(item: &toml_edit::Item, out: &mut Vec<String>) {
+    fn value(v: &toml_edit::Value, out: &mut Vec<String>) {
+        if let Some(s) = v.as_str() {
+            string_patterns(s, out);
+            // Keep the original lexical form too (TOML escape sequences may
+            // differ from JSON or from the decoded string).
+            out.push(v.to_string().trim().to_owned());
+        }
+        if let Some(a) = v.as_array() {
+            for v in a {
+                value(v, out);
+            }
+        }
+        if let Some(t) = v.as_inline_table() {
+            for (_, v) in t {
+                value(v, out);
+            }
+        }
+    }
+    if let Some(v) = item.as_value() {
+        value(v, out);
+    }
+    if let Some(t) = item.as_table_like() {
+        for (_, v) in t.iter() {
+            toml_strings(v, out);
+        }
+    }
+    if let Some(a) = item.as_array_of_tables() {
+        for t in a {
+            for (_, v) in t {
+                toml_strings(v, out);
+            }
+        }
+    }
+}
+fn json_strings(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(s) => string_patterns(s, out),
+        Value::Array(a) => {
+            for v in a {
+                json_strings(v, out);
+            }
+        }
+        Value::Object(o) => {
+            for v in o.values() {
+                json_strings(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+fn redact_once(input: &str, patterns: &[String]) -> String {
+    let mut patterns = patterns
+        .iter()
+        .map(String::as_str)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>();
+    patterns.sort_unstable_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    patterns.dedup();
+    let mut result = String::with_capacity(input.len());
+    let mut position = 0;
+    while position < input.len() {
+        // Read only the original input. Generated markers are never searched.
+        if let Some(pattern) = patterns
+            .iter()
+            .find(|pattern| input[position..].starts_with(**pattern))
+        {
+            result.push_str("<redacted>");
+            position += pattern.len();
+        } else {
+            let character = input[position..]
+                .chars()
+                .next()
+                .expect("remaining UTF-8 character");
+            result.push(character);
+            position += character.len_utf8();
+        }
+    }
+    result
+}
+
+fn safe_diff(path: &Path, before: &[u8], after: &[u8], secrets: &[String]) -> Vec<String> {
+    let before = redact_once(&String::from_utf8_lossy(before), secrets);
+    let after = redact_once(&String::from_utf8_lossy(after), secrets);
+    unified_diff(path, before.as_bytes(), after.as_bytes(), &[])
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+enum Kind {
+    Directory,
+    File,
+    Junction,
+    Hardlink,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+struct Identity {
+    volume: u32,
+    index: u64,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Entry {
+    path: PathBuf,
+    kind: Kind,
+    target: Option<PathBuf>,
+    hash: String,
+    identity: Option<Identity>,
+    pending_identity: Option<Identity>,
+    pending: Option<PathBuf>,
+    /// Unproven scratch entries are reported, never adopted or removed.
+    #[serde(default)]
+    abandoned: Vec<PathBuf>,
+    /// Protected bytes support retry without rereading a changed source/key.
+    payload: Option<String>,
+    done: bool,
+    removed: bool,
+}
+#[derive(Serialize, Deserialize)]
+struct Manifest {
+    schema: u8,
+    mode: CodexMode,
+    home: PathBuf,
+    npm: PathBuf,
+    claude: PathBuf,
+    claude_before: String,
+    claude_after: String,
+    claude_original: String,
+    claude_payload: String,
+    claude_identity: Identity,
+    claude_restored: bool,
+    autostart: Option<OptionalActionJournal>,
+    tasks: Vec<TaskJournal>,
+    optional_restored: bool,
+    retained: bool,
+    entries: Vec<Entry>,
+}
+
+// Windows handles are opened with OPEN_REPARSE_POINT: never fingerprint a
+// junction target when deciding whether its directory entry belongs to us.
+#[repr(C)]
+#[derive(Default)]
+struct FileInfo {
+    attributes: u32,
+    creation: [u32; 2],
+    access: [u32; 2],
+    write: [u32; 2],
+    volume: u32,
+    size_high: u32,
+    size_low: u32,
+    links: u32,
+    index_high: u32,
+    index_low: u32,
+}
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetFileInformationByHandle(handle: *mut std::ffi::c_void, info: *mut FileInfo) -> i32;
+    fn MoveFileExW(existing: *const u16, destination: *const u16, flags: u32) -> i32;
+    fn DeviceIoControl(
+        handle: *mut std::ffi::c_void,
+        code: u32,
+        input: *const u8,
+        input_size: u32,
+        output: *mut u8,
+        output_size: u32,
+        returned: *mut u32,
+        overlapped: *mut std::ffi::c_void,
+    ) -> i32;
+}
+fn identity(path: &Path) -> Result<Identity> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(0x02200000)
+        .open(path)?;
+    let mut info = FileInfo::default();
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(Identity {
+        volume: info.volume,
+        index: (u64::from(info.index_high) << 32) | u64::from(info.index_low),
+    })
+}
+fn reparse(path: &Path) -> Result<bool> {
+    use std::os::windows::fs::MetadataExt;
+    Ok(fs::symlink_metadata(path)?.file_attributes() & 0x400 != 0)
+}
+fn ancestors_safe(path: &Path) -> Result<()> {
+    for parent in path.ancestors().skip(1) {
+        match fs::symlink_metadata(parent) {
+            Ok(m) if !m.is_dir() || reparse(parent)? => {
+                bail!("상위 경로가 일반 디렉터리가 아닙니다: {}", parent.display())
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+fn exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+fn junction(path: &Path, target: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    // Caller has journaled and exclusively created the empty directory.
+    // Shared sources are read-only targets and may themselves be junctions.
+    // Keep the logical source path, matching the builder's mklink /J pattern.
+    if !target.is_absolute() || !target.is_dir() {
+        bail!("공유 디렉터리 원본이 올바르지 않습니다");
+    }
+    let printed = target
+        .to_string_lossy()
+        .trim_start_matches("\\\\?\\")
+        .to_owned();
+    if printed.starts_with("UNC\\") || printed.starts_with("\\\\") {
+        bail!("UNC 공유 경로는 지원하지 않습니다");
+    }
+    let substitute = format!("\\??\\{printed}");
+    let sub: Vec<u16> = std::ffi::OsStr::new(&substitute).encode_wide().collect();
+    let print: Vec<u16> = std::ffi::OsStr::new(&printed).encode_wide().collect();
+    let mut data = Vec::new();
+    let path_bytes = (sub.len() + print.len() + 2) * 2;
+    data.extend_from_slice(&0xA0000003u32.to_le_bytes());
+    data.extend_from_slice(&u16::try_from(8 + path_bytes)?.to_le_bytes());
+    data.extend_from_slice(&0u16.to_le_bytes());
+    for n in [0, sub.len() * 2, (sub.len() + 1) * 2, print.len() * 2] {
+        data.extend_from_slice(&u16::try_from(n)?.to_le_bytes());
+    }
+    for word in sub.into_iter().chain([0]).chain(print).chain([0]) {
+        data.extend_from_slice(&word.to_le_bytes());
+    }
+    let file = OpenOptions::new()
+        .write(true)
+        .custom_flags(0x02200000)
+        .open(path)?;
+    let mut returned = 0;
+    if unsafe {
+        DeviceIoControl(
+            file.as_raw_handle(),
+            0x000900A4,
+            data.as_ptr(),
+            data.len() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+fn target_same(a: &Path, b: &Path) -> bool {
+    let normalize = |p: &Path| {
+        p.to_string_lossy()
+            .trim_start_matches("\\\\?\\")
+            .replace('/', "\\")
+            .to_lowercase()
+    };
+    normalize(a) == normalize(b)
+}
+fn descriptor(kind: &Kind, target: Option<&Path>) -> String {
+    hash_bytes(format!("{kind:?}:{}", target.map(normal_path).unwrap_or_default()).as_bytes())
+}
+fn new_entry(
+    path: PathBuf,
+    kind: Kind,
+    target: Option<PathBuf>,
+    bytes: Option<&[u8]>,
+    apply: bool,
+) -> Result<Entry> {
+    Ok(Entry {
+        hash: bytes
+            .map(hash_bytes)
+            .unwrap_or_else(|| descriptor(&kind, target.as_deref())),
+        pending: None,
+        abandoned: Vec::new(),
+        path,
+        kind,
+        target,
+        identity: None,
+        pending_identity: None,
+        payload: if apply {
+            bytes.map(protect).transpose()?
+        } else {
+            None
+        },
+        done: false,
+        removed: false,
+    })
+}
+fn add_dirs(entries: &mut Vec<Entry>, path: &Path, apply: bool) -> Result<()> {
+    if exists(path)? {
+        ancestors_safe(&path.join("probe"))?;
+        return Ok(());
+    }
+    if entries.iter().any(|e| e.path == path) {
+        return Ok(());
+    }
+    let parent = path.parent().context("전용 홈 부모 경로가 없습니다")?;
+    add_dirs(entries, parent, apply)?;
+    entries.push(new_entry(
+        path.to_path_buf(),
+        Kind::Directory,
+        None,
+        None,
+        apply,
+    )?);
+    Ok(())
+}
+
+fn validate_manifest(paths: &CutoverPaths, m: &Manifest) -> Result<()> {
+    if m.schema != 3
+        || m.home != paths.codex_qb_home
+        || m.npm != paths.npm_dir
+        || m.claude != paths.claude_settings
+        || m.mode == CodexMode::Default
+    {
+        bail!("wiring journal의 경로/모드가 현재 홈과 일치하지 않습니다");
+    }
+    let mut tasks = std::collections::HashSet::new();
+    for task in &m.tasks {
+        if !matches!(
+            task.name.as_str(),
+            "cliproxyapi-proxy" | "cliproxyapi-quota-watch"
+        ) || !tasks.insert(task.name.as_str())
+            || task.after_enabled
+        {
+            bail!("journal의 CPA 예약 작업 범위/상태가 올바르지 않습니다");
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut scratch_seen = std::collections::HashSet::new();
+    for e in &m.entries {
+        if e.pending.as_ref().is_some_and(|p| {
+            !(scratch_scoped(e, p)
+                || (e.kind == Kind::File && *p == e.path.with_extension("qb-pending")))
+        }) || (e.kind == Kind::Hardlink && e.pending.is_some())
+            || e.abandoned.iter().any(|p| !scratch_scoped(e, p))
+            || e.pending
+                .iter()
+                .chain(&e.abandoned)
+                .any(|p| !scratch_seen.insert(p.clone()))
+        {
+            bail!("journal 임시 경로가 올바르지 않습니다");
+        }
+        let allowed_home = e.path == m.home
+            || e.path == m.home.join("log")
+            || ["config.toml", "auth.json", "AGENTS.md", "hooks.json"]
+                .iter()
+                .any(|n| e.path == m.home.join(n))
+            || SHARED.iter().any(|n| e.path == m.home.join(n));
+        let allowed_parent = e.kind == Kind::Directory && m.home.parent() == Some(e.path.as_path());
+        if !e.path.is_absolute()
+            || e.path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            || !(allowed_home || allowed_parent || e.path == m.npm.join("codex-qb.cmd"))
+            || !seen.insert(e.path.clone())
+        {
+            bail!("journal에 허용되지 않은 생성 경로가 있습니다");
+        }
+        if m.mode == CodexMode::None {
+            bail!("none journal에 Codex 생성 경로가 있습니다");
+        }
+        let expected_kind = if e.path == m.home || e.path == m.home.join("log") || allowed_parent {
+            Kind::Directory
+        } else if SHARED.iter().any(|name| e.path == m.home.join(name)) {
+            Kind::Junction
+        } else if ["AGENTS.md", "hooks.json"]
+            .iter()
+            .any(|name| e.path == m.home.join(name))
+        {
+            Kind::Hardlink
+        } else {
+            Kind::File
+        };
+        if e.kind != expected_kind {
+            bail!("journal 경로의 파일 종류가 올바르지 않습니다");
+        }
+        ancestors_safe(&e.path)?;
+        if e.kind == Kind::Junction || e.kind == Kind::Hardlink {
+            let source = paths
+                .codex_config
+                .parent()
+                .context("Codex 원본 홈이 없습니다")?
+                .join(e.path.file_name().context("링크 이름이 없습니다")?);
+            if e.target.as_ref() != Some(&source) {
+                bail!("journal 링크 대상이 원본과 일치하지 않습니다");
+            }
+        }
+    }
+    ancestors_safe(&paths.claude_settings)?;
+    if reparse(&paths.claude_settings)? || !paths.claude_settings.is_file() {
+        bail!("Claude 설정이 일반 파일이 아닙니다");
+    }
+    ancestors_safe(&paths.journal())?;
+    if exists(&paths.journal())? && reparse(&paths.journal())? {
+        bail!("journal이 일반 파일이 아닙니다");
+    }
+    Ok(())
+}
+
+fn matches_entry(e: &Entry, force: bool) -> Result<bool> {
+    use std::os::windows::fs::MetadataExt;
+    let meta = fs::symlink_metadata(&e.path)?;
+    let same_identity = e
+        .identity
+        .as_ref()
+        .or(e.pending_identity.as_ref())
+        .is_some_and(|expected| identity(&e.path).ok().as_ref() == Some(expected));
+    // Force applies only to the same owned object, never a substituted file,
+    // reparse point, directory or hardlink relationship.
+    match e.kind {
+        Kind::Directory => Ok(meta.is_dir()
+            && !reparse(&e.path)?
+            && same_identity
+            && e.hash == descriptor(&e.kind, None)),
+        // symlink_metadata does not classify a mount-point reparse entry as
+        // a regular directory. Check its native directory attribute without
+        // following the target (which may itself be a junction).
+        Kind::Junction => Ok(meta.file_attributes() & 0x10 != 0
+            && reparse(&e.path)?
+            && same_identity
+            && e.target.as_deref().is_some_and(|target| {
+                fs::read_link(&e.path)
+                    .ok()
+                    .is_some_and(|actual| target_same(&actual, target))
+            })
+            && e.hash == descriptor(&e.kind, e.target.as_deref())),
+        Kind::File => Ok(meta.is_file()
+            && !reparse(&e.path)?
+            && e.identity
+                .as_ref()
+                .or(e.pending_identity.as_ref())
+                .is_some_and(|expected| identity(&e.path).ok().as_ref() == Some(expected))
+            && (force || hash_file(&e.path)? == e.hash)),
+        Kind::Hardlink => Ok(meta.is_file()
+            && !reparse(&e.path)?
+            && same_identity
+            && e.target
+                .as_deref()
+                .is_some_and(|target| identity(target).ok().as_ref() == e.identity.as_ref())
+            && (hash_file(&e.path)? == e.hash || force)),
+    }
+}
+
+fn pending_path(e: &Entry) -> PathBuf {
+    e.pending
+        .clone()
+        .unwrap_or_else(|| e.path.with_extension("qb-pending"))
+}
+
+fn scratch_scoped(e: &Entry, path: &Path) -> bool {
+    if e.kind == Kind::Hardlink || path.parent() != e.path.parent() {
+        return false;
+    }
+    let Some(name) = e.path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let prefix = format!(".qb-scratch-{name}-");
+    let Some(suffix) = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_prefix(&prefix))
+    else {
+        return false;
+    };
+    let parts = suffix.split('-').collect::<Vec<_>>();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|s| !s.is_empty() && s.len() <= 39 && s.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn fresh_scratch(e: &Entry) -> Result<PathBuf> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let nonce = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = e
+        .path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("scratch 이름이 올바르지 않습니다")?;
+    Ok(e.path.with_file_name(format!(
+        ".qb-scratch-{name}-{}-{time}-{nonce}",
+        std::process::id()
+    )))
+}
+
+#[cfg(test)]
+thread_local! {
+    static INTERRUPT: std::cell::RefCell<Option<(PathBuf, &'static str)>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn interrupt(path: &Path, stage: &str) -> Result<()> {
+    INTERRUPT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_ref().is_some_and(|(p, s)| p == path && *s == stage) {
+            *slot = None;
+            bail!("synthetic creation interruption");
+        }
+        Ok(())
+    })
+}
+
+fn pending_matches(e: &Entry, force: bool) -> Result<bool> {
+    let tmp = pending_path(e);
+    if !fs::symlink_metadata(&tmp)?.is_file() || reparse(&tmp)? {
+        return Ok(false);
+    }
+    let same = e
+        .pending_identity
+        .as_ref()
+        .is_some_and(|id| identity(&tmp).ok().as_ref() == Some(id));
+    Ok(same && (force || hash_file(&tmp)? == e.hash))
+}
+
+/// Journal intent, exclusively create a sibling, then journal its identity.
+/// A crash before the second journal write leaves an unproven sibling only.
+fn prepare_scratch(paths: &CutoverPaths, m: &mut Manifest, i: usize) -> Result<()> {
+    loop {
+        if let Some(tmp) = m.entries[i].pending.clone() {
+            if exists(&tmp)? {
+                if m.entries[i].pending_identity.is_some() {
+                    return Ok(()); // Caller checks identity, type and contents before using it.
+                }
+                if !scratch_scoped(&m.entries[i], &tmp) {
+                    bail!("기존 임시 파일의 identity가 없습니다");
+                }
+                m.entries[i].abandoned.push(tmp);
+            } else if m.entries[i].pending_identity.is_some() {
+                bail!("기록된 임시 경로가 사라졌습니다");
+            }
+        }
+        m.entries[i].pending = Some(fresh_scratch(&m.entries[i])?);
+        m.entries[i].pending_identity = None;
+        atomic_json(&paths.journal(), m)?;
+        let tmp = pending_path(&m.entries[i]);
+        let result = if m.entries[i].kind == Kind::File {
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+                .map(|_| ())
+        } else {
+            fs::create_dir(&tmp)
+        };
+        match result {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+        #[cfg(test)]
+        interrupt(&m.entries[i].path, "after-create")?;
+        m.entries[i].pending_identity = Some(identity(&tmp)?);
+        atomic_json(&paths.journal(), m)?;
+        return Ok(());
+    }
+}
+
+fn install_directory(paths: &CutoverPaths, m: &mut Manifest, i: usize) -> Result<()> {
+    prepare_scratch(paths, m, i)?;
+    let e = &m.entries[i];
+    let tmp = pending_path(e);
+    ancestors_safe(&tmp)?;
+    if e.pending_identity.as_ref() != Some(&identity(&tmp)?) {
+        bail!("임시 디렉터리 identity가 다릅니다");
+    }
+    if reparse(&tmp)? {
+        let mut scratch = e.clone();
+        scratch.path = tmp.clone();
+        scratch.identity = e.pending_identity.clone();
+        if e.kind != Kind::Junction || !matches_entry(&scratch, false)? {
+            bail!("임시 링크가 변경되었습니다");
+        }
+    } else {
+        if !tmp.is_dir() || fs::read_dir(&tmp)?.next().is_some() {
+            bail!("임시 디렉터리가 변경되었습니다");
+        }
+        if e.kind == Kind::Junction {
+            junction(&tmp, e.target.as_deref().context("링크 대상이 없습니다")?)?;
+        }
+    }
+    if exists(&e.path)? {
+        bail!("생성 경로 충돌: {}", e.path.display());
+    }
+    // No MOVEFILE_REPLACE_EXISTING: even a collision after the check is refused.
+    // The source identity was made durable before this publication.
+    publish_directory(&tmp, &e.path)?;
+    #[cfg(test)]
+    interrupt(&e.path, "after-publish")?;
+    Ok(())
+}
+
+fn publish_directory(source: &Path, destination: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain([0])
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain([0])
+        .collect::<Vec<_>>();
+    if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), 0) } == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+fn install_file(paths: &CutoverPaths, m: &mut Manifest, i: usize) -> Result<()> {
+    let e = &m.entries[i];
+    let bytes = unprotect(e.payload.as_deref().context("파일 payload가 없습니다")?)?;
+    if hash_bytes(&bytes) != e.hash {
+        bail!("journal payload hash가 다릅니다");
+    }
+    prepare_scratch(paths, m, i)?;
+    let e = &m.entries[i];
+    let tmp = pending_path(e);
+    if !pending_matches(e, true)? {
+        bail!("임시 파일이 변경되었습니다: {}", tmp.display());
+    }
+    if !pending_matches(e, false)? {
+        let mut f = OpenOptions::new().write(true).truncate(true).open(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+    }
+    // Exclusive, atomic publication. The manifest contains this sibling's
+    // intent/hash before it exists; recovery checks its identity and bytes.
+    fs::hard_link(&tmp, &m.entries[i].path)?;
+    #[cfg(test)]
+    interrupt(&m.entries[i].path, "after-publish")?;
+    fs::remove_file(&tmp)?;
+    Ok(())
+}
+
+fn install(paths: &CutoverPaths, m: &mut Manifest) -> Result<()> {
+    validate_manifest(paths, m)?;
+    for i in 0..m.entries.len() {
+        let e = &m.entries[i];
+        if e.removed {
+            bail!("부분 해제 journal입니다. unwire를 먼저 완료하세요");
+        }
+        if exists(&e.path)? {
+            // Recover the precise file installed before its completion write.
+            if e.kind == Kind::Junction
+                && !reparse(&e.path)?
+                && e.path.is_dir()
+                && e.identity.as_ref() == Some(&identity(&e.path)?)
+                && fs::read_dir(&e.path)?.next().is_none()
+            {
+                junction(
+                    &e.path,
+                    e.target.as_deref().context("링크 대상이 없습니다")?,
+                )?;
+            } else if !matches_entry(e, false)? {
+                bail!("생성 경로 충돌 또는 변경: {}", e.path.display());
+            }
+        } else {
+            if e.done {
+                bail!("생성한 경로가 사라졌습니다: {}", e.path.display());
+            }
+            match e.kind {
+                Kind::Directory | Kind::Junction => install_directory(paths, m, i)?,
+                Kind::File => install_file(paths, m, i)?,
+                Kind::Hardlink => {
+                    let target = e.target.as_ref().context("링크 대상이 없습니다")?;
+                    ancestors_safe(target)?;
+                    if reparse(target)? || identity(target).ok().as_ref() != e.identity.as_ref() {
+                        bail!("공유 파일 원본 identity가 변경되었습니다");
+                    }
+                    fs::hard_link(target, &e.path)?;
+                    if !matches_entry(e, false)? {
+                        bail!("생성한 hardlink가 원본과 다릅니다");
+                    }
+                }
+            }
+        }
+        m.entries[i].identity = Some(identity(&m.entries[i].path)?);
+        m.entries[i].done = true;
+        atomic_json(&paths.journal(), m)?;
+        if m.entries[i].kind == Kind::File
+            && m.entries[i].pending.is_some()
+            && exists(&pending_path(&m.entries[i]))?
+        {
+            if !pending_matches(&m.entries[i], false)? {
+                bail!("임시 파일 identity가 다릅니다");
+            }
+            fs::remove_file(pending_path(&m.entries[i]))?;
+        }
+    }
+    let current = hash_file(&m.claude)?;
+    if current == m.claude_before {
+        // Payload already preserves the source BOM/line endings. A second
+        // preservation wrapper would prepend another BOM.
+        atomic_bytes(&m.claude, &unprotect(&m.claude_payload)?)?;
+        m.claude_identity = identity(&m.claude)?;
+        atomic_json(&paths.journal(), m)?;
+    } else if current != m.claude_after {
+        bail!("Claude 설정이 변경되어 적용을 중단했습니다");
+    }
+    if let Some(action) = &m.autostart {
+        set_autostart(action)?;
+    }
+    disable_cpa_tasks(&m.tasks)?;
+    Ok(())
+}
+
+fn scratch_warnings(m: &Manifest) -> Vec<String> {
+    m.entries
+        .iter()
+        .flat_map(|e| &e.abandoned)
+        .map(|p| {
+            format!(
+                "identity가 기록되지 않은 임시 경로를 보존합니다: {}",
+                p.display()
+            )
+        })
+        .collect()
+}
+
+fn strip_utf8_bom(bytes: &[u8]) -> &[u8] {
+    bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes)
+}
+
+/// Check the saved plan before any resume write; retained homes build a fresh plan.
+fn validate_resume_inputs(paths: &CutoverPaths, options: &WireOptions, m: &Manifest) -> Result<()> {
+    let mismatch =
+        || anyhow::anyhow!("기존 연결의 포트/키가 현재 설정과 다릅니다. 먼저 unwire를 실행하세요");
+    let invalid = || anyhow::anyhow!("기존 연결 journal 형식이 올바르지 않습니다");
+    let key = read_key(&paths.client_key)?;
+    let claude = unprotect(&m.claude_payload).map_err(|_| invalid())?;
+    let claude: Value = serde_json::from_slice(strip_utf8_bom(&claude)).map_err(|_| invalid())?;
+    let env = claude.get("env").ok_or_else(invalid)?;
+    if env.get("ANTHROPIC_AUTH_TOKEN").and_then(Value::as_str) != Some(key.as_str())
+        || env.get("ANTHROPIC_BASE_URL").and_then(Value::as_str)
+            != Some(claude_base_url(options.data_port).as_str())
+    {
+        return Err(mismatch());
+    }
+    if m.mode == CodexMode::Dedicated {
+        let payload = |name: &str| -> Result<Vec<u8>> {
+            let e = m
+                .entries
+                .iter()
+                .find(|e| e.path == m.home.join(name))
+                .ok_or_else(invalid)?;
+            unprotect(e.payload.as_deref().ok_or_else(invalid)?).map_err(|_| invalid())
+        };
+        let auth = payload("auth.json")?;
+        let auth: Value = serde_json::from_slice(strip_utf8_bom(&auth)).map_err(|_| invalid())?;
+        let config = payload("config.toml")?;
+        let config = std::str::from_utf8(strip_utf8_bom(&config))
+            .map_err(|_| invalid())?
+            .parse::<DocumentMut>()
+            .map_err(|_| invalid())?;
+        if auth.get("auth_mode").and_then(Value::as_str) != Some("apikey")
+            || auth.get("OPENAI_API_KEY").and_then(Value::as_str) != Some(key.as_str())
+            || config
+                .get("openai_base_url")
+                .and_then(toml_edit::Item::as_str)
+                != Some(codex_base_url(options.data_port).as_str())
+        {
+            return Err(mismatch());
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn wire(
+    paths: &CutoverPaths,
+    apply: bool,
+    options: WireOptions,
+    mode: CodexMode,
+    task_query: &dyn Fn(&str) -> Option<bool>,
+) -> Result<Report> {
+    let count = active_linked_count(&paths.qb_home)?;
+    check_cpa_dependency(count, &options)?;
+    let mut retained_home = false;
+    let mut retained_entries = Vec::new();
+    if paths.journal().exists() {
+        let mut old: Manifest =
+            serde_json::from_slice(&fs::read(paths.journal())?).map_err(|_| {
+                anyhow::anyhow!("이미 연결 journal이 있습니다. 먼저 unwire를 실행하세요")
+            })?;
+        validate_manifest(paths, &old)?;
+        if old.mode != mode {
+            bail!("journal의 Codex 모드가 다릅니다. 먼저 unwire를 실행하세요");
+        }
+        if !old.retained {
+            let mut report = Report {
+                summary: vec!["요약: 기존 journal에서 연결을 재개합니다".into()],
+                ..Report::default()
+            };
+            if apply {
+                validate_resume_inputs(paths, &options, &old)?;
+                install(paths, &mut old)?;
+            }
+            report.warnings.extend(scratch_warnings(&old));
+            return Ok(report);
+        }
+        retained_home = true;
+        for e in old.entries.iter().filter(|e| !e.removed) {
+            if e.kind != Kind::Directory || !matches_entry(e, false)? {
+                bail!("보존된 홈의 identity가 다릅니다");
+            }
+        }
+        retained_entries.extend(old.entries.into_iter().filter(|e| !e.removed));
+    }
+    let key = if apply {
+        read_key(&paths.client_key)?
+    } else {
+        "<client key>".into()
+    };
+    let claude_before =
+        fs::read(&paths.claude_settings).context("Claude 설정을 읽지 못했습니다")?;
+    let json: Value = serde_json::from_slice(strip_utf8_bom(&claude_before))
+        .map_err(|_| anyhow::anyhow!("Claude 설정 형식이 올바르지 않습니다"))?;
+    let claude_after = preserved_bytes_from_original(
+        &claude_before,
+        &claude_bytes(
+            &paths.claude_settings,
+            &claude_base_url(options.data_port),
+            &key,
+        )?,
+    );
+    let mut secrets = Vec::new();
+    if apply {
+        string_patterns(&key, &mut secrets);
+    }
+    json_strings(&json, &mut secrets);
+    let mut entries = retained_entries;
+    let mode_label = match mode {
+        CodexMode::Default => "기본 홈",
+        CodexMode::Dedicated => "별도 홈",
+        CodexMode::None => "연결 안 함",
+    };
+    let mut report = Report {
+        summary: vec![format!("요약: Codex {mode_label}, Claude 연결 계획")],
+        ..Report::default()
+    };
+    report.diff.extend(safe_diff(
+        &paths.claude_settings,
+        &claude_before,
+        &claude_after,
+        &secrets,
+    ));
+    if mode == CodexMode::Dedicated {
+        if !paths.npm_dir.is_dir() || !paths.npm_dir.join("codex.cmd").is_file() {
+            bail!("npm 디렉터리 또는 codex.cmd가 없습니다. Codex 설치를 확인하세요");
+        }
+        if exists(&paths.codex_qb_home)? && !retained_home {
+            bail!("전용 Codex 홈이 이미 존재합니다. 덮어쓰지 않습니다");
+        }
+        let config = config_bytes(paths, options.data_port)?;
+        let doc = parse_config(paths)?;
+        toml_strings(doc.as_item(), &mut secrets);
+        report.diff.extend(safe_diff(
+            &paths.codex_config,
+            &fs::read(&paths.codex_config)?,
+            &config,
+            &secrets,
+        ));
+        report.diff.extend([
+            "auth.json: {\"auth_mode\":\"apikey\",\"OPENAI_API_KEY\":\"<client key>\"}".into(),
+        ]);
+        report
+            .summary
+            .push(format!("전용 홈: {}", paths.codex_qb_home.display()));
+        report.summary.push(format!(
+            "실행 파일: {}",
+            paths.npm_dir.join("codex-qb.cmd").display()
+        ));
+        report.warnings.extend([USAGE.into(), HERDR.into()]);
+        add_dirs(&mut entries, &paths.codex_qb_home, apply)?;
+        add_dirs(&mut entries, &paths.codex_qb_home.join("log"), apply)?;
+        entries.push(new_entry(
+            paths.codex_qb_home.join("config.toml"),
+            Kind::File,
+            None,
+            Some(&config),
+            apply,
+        )?);
+        let auth = serde_json::to_vec_pretty(
+            &serde_json::json!({"auth_mode":"apikey", "OPENAI_API_KEY":key}),
+        )?;
+        entries.push(new_entry(
+            paths.codex_qb_home.join("auth.json"),
+            Kind::File,
+            None,
+            Some(&auth),
+            apply,
+        )?);
+        let source = paths
+            .codex_config
+            .parent()
+            .context("Codex 원본 홈이 없습니다")?;
+        for name in SHARED {
+            let target = source.join(name);
+            if exists(&target)? {
+                if !target.is_dir() {
+                    bail!("공유 디렉터리 원본이 아닙니다");
+                }
+                entries.push(new_entry(
+                    paths.codex_qb_home.join(name),
+                    Kind::Junction,
+                    Some(target),
+                    None,
+                    apply,
+                )?);
+            }
+        }
+        for name in ["AGENTS.md", "hooks.json"] {
+            let target = source.join(name);
+            if exists(&target)? {
+                if reparse(&target)? || !target.is_file() {
+                    bail!("공유 원본이 일반 파일이 아닙니다");
+                }
+                let mut e = new_entry(
+                    paths.codex_qb_home.join(name),
+                    Kind::Hardlink,
+                    Some(target.clone()),
+                    None,
+                    apply,
+                )?;
+                e.hash = hash_file(&target)?;
+                e.identity = Some(identity(&target)?);
+                entries.push(e);
+            }
+        }
+        entries.push(new_entry(
+            paths.npm_dir.join("codex-qb.cmd"),
+            Kind::File,
+            None,
+            Some(&launcher()),
+            apply,
+        )?);
+        for e in &entries {
+            if exists(&e.path)?
+                && !(e.done && e.kind == Kind::Directory && matches_entry(e, false)?)
+            {
+                bail!("생성 경로가 이미 존재합니다: {}", e.path.display());
+            }
+            if e.kind == Kind::File && exists(&e.path.with_extension("qb-pending"))? {
+                bail!("임시 경로가 이미 존재합니다");
+            }
+        }
+    }
+    report
+        .changed
+        .extend(entries.iter().map(|e| e.path.display().to_string()));
+    report
+        .changed
+        .push("claude.env.ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN".into());
+    let mut manifest = Manifest {
+        schema: 3,
+        mode,
+        home: paths.codex_qb_home.clone(),
+        npm: paths.npm_dir.clone(),
+        claude: paths.claude_settings.clone(),
+        claude_before: hash_bytes(&claude_before),
+        claude_after: hash_bytes(&claude_after),
+        claude_original: if apply {
+            protect(&claude_before)?
+        } else {
+            String::new()
+        },
+        claude_payload: if apply {
+            protect(&claude_after)?
+        } else {
+            String::new()
+        },
+        claude_identity: identity(&paths.claude_settings)?,
+        claude_restored: false,
+        autostart: if options.autostart {
+            let (before, before_type) = read_autostart()?;
+            Some(OptionalActionJournal {
+                before,
+                before_type,
+                after: tray_autostart_command()?,
+                after_type: REG_SZ.0,
+            })
+        } else {
+            None
+        },
+        tasks: if options.disable_cpa_tasks {
+            cpa_task_journal(task_query)?
+        } else {
+            Vec::new()
+        },
+        optional_restored: false,
+        retained: false,
+        entries,
+    };
+    validate_manifest(paths, &manifest)?;
+    if !apply {
+        return Ok(report);
+    }
+    atomic_json(&paths.journal(), &manifest)?;
+    install(paths, &mut manifest)?;
+    report.warnings.extend(scratch_warnings(&manifest));
+    Ok(report)
+}
+
+/// Patch only the two owned env members; keep all other text and ordering.
+fn restore_claude_env_text(original: &[u8], current: &str) -> Result<String> {
+    let invalid = || anyhow::anyhow!("Claude 설정 복구 형식이 올바르지 않습니다");
+    let original = std::str::from_utf8(original)
+        .map_err(|_| invalid())?
+        .trim_start_matches('\u{feff}');
+    let before: Value = serde_json::from_str(original).map_err(|_| invalid())?;
+    let mut expected: Value = serde_json::from_str(current).map_err(|_| invalid())?;
+    let env = expected
+        .get_mut("env")
+        .and_then(Value::as_object_mut)
+        .context("Claude env가 없습니다")?;
+    let mut text = current.to_owned();
+    for key in ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"] {
+        let value = before.get("env").and_then(|env| env.get(key));
+        if let Some(v) = value {
+            env.insert(key.into(), v.clone());
+        } else {
+            env.remove(key);
+        }
+        // Use the established string/span helper whenever the key is present.
+        if let Some(updated) = value
+            .and_then(Value::as_str)
+            .and_then(|v| replace_json_string_in_env(&text, key, v))
+        {
+            text = updated;
+            continue;
+        }
+        let (start, end) =
+            json_object_span(&text, "env").context("Claude env 위치를 찾지 못했습니다")?;
+        let mut object = text[start..end].to_owned();
+        let members = json_member_spans(&object).ok_or_else(invalid)?;
+        if let Some((index, member)) = members
+            .iter()
+            .enumerate()
+            .find(|(_, member)| member.0 == key)
+        {
+            if let Some(value) = value {
+                object.replace_range(member.2..member.3, &serde_json::to_string(value)?);
+            } else {
+                // Drop only the member and one separator, preserving surrounding whitespace.
+                let range = if index + 1 < members.len() {
+                    let comma = object[member.3..members[index + 1].1]
+                        .find(',')
+                        .ok_or_else(invalid)?
+                        + member.3;
+                    member.1..comma + 1
+                } else if index > 0 {
+                    let previous = &members[index - 1];
+                    let comma =
+                        object[previous.3..member.1].find(',').ok_or_else(invalid)? + previous.3;
+                    comma..member.3
+                } else {
+                    member.1..member.3
+                };
+                object.replace_range(range, "");
+            }
+        } else if let Some(value) = value {
+            let insertion = format!(
+                "{}{}:{}",
+                if members.is_empty() { "" } else { "," },
+                serde_json::to_string(key)?,
+                serde_json::to_string(value)?
+            );
+            let position = members.last().map_or(1, |member| member.3);
+            object.insert_str(position, &insertion);
+        }
+        text.replace_range(start..end, &object);
+    }
+    // The old span helper can encounter a similarly named nested object first.
+    // A semantic equality check prevents writing anything outside root.env.
+    let actual: Value = serde_json::from_str(&text).map_err(|_| invalid())?;
+    if actual != expected {
+        return Err(invalid());
+    }
+    Ok(text)
+}
+
+/// Direct object members as (decoded key, key start, value start, value end).
+fn json_member_spans(text: &str) -> Option<Vec<(String, usize, usize, usize)>> {
+    let mut members = Vec::new();
+    let bytes = text.as_bytes();
+    let mut position = 1;
+    loop {
+        while bytes.get(position).is_some_and(u8::is_ascii_whitespace) {
+            position += 1;
+        }
+        if bytes.get(position) == Some(&b'}') {
+            return Some(members);
+        }
+        let key_start = position;
+        let mut key = serde_json::Deserializer::from_str(&text[position..]).into_iter::<String>();
+        let name = key.next()?.ok()?;
+        position += key.byte_offset();
+        while bytes.get(position).is_some_and(u8::is_ascii_whitespace) {
+            position += 1;
+        }
+        if bytes.get(position) != Some(&b':') {
+            return None;
+        }
+        position += 1;
+        while bytes.get(position).is_some_and(u8::is_ascii_whitespace) {
+            position += 1;
+        }
+        let value_start = position;
+        let mut value = serde_json::Deserializer::from_str(&text[position..]).into_iter::<Value>();
+        value.next()?.ok()?;
+        position += value.byte_offset();
+        members.push((name, key_start, value_start, position));
+        while bytes.get(position).is_some_and(u8::is_ascii_whitespace) {
+            position += 1;
+        }
+        match bytes.get(position) {
+            Some(b',') => position += 1,
+            Some(b'}') => return Some(members),
+            _ => return None,
+        }
+    }
+}
+
+pub(super) fn unwire(paths: &CutoverPaths, apply: bool, force: bool) -> Result<Report> {
+    let mut m: Manifest = serde_json::from_slice(&fs::read(paths.journal())?)
+        .map_err(|_| anyhow::anyhow!("dedicated journal 형식이 올바르지 않습니다"))?;
+    validate_manifest(paths, &m)?;
+    let mut report = Report {
+        summary: vec!["요약: journal에 기록된 연결만 되돌립니다".into()],
+        ..Report::default()
+    };
+    report.warnings.extend(scratch_warnings(&m));
+    report.changed.extend(
+        m.entries
+            .iter()
+            .filter(|e| !e.removed)
+            .map(|e| e.path.display().to_string()),
+    );
+    if m.mode == CodexMode::Dedicated && exists(&m.home.join("sessions"))? {
+        report.warnings.push(format!(
+            "세션 기록을 보존합니다: {}",
+            m.home.join("sessions").display()
+        ));
+    }
+    if !apply {
+        return Ok(report);
+    }
+    let mut refused = Vec::new();
+    for i in (0..m.entries.len()).rev() {
+        let e = &m.entries[i];
+        if e.removed {
+            continue;
+        }
+        ancestors_safe(&e.path)?;
+        if let Some(tmp) = e.pending.as_ref().filter(|_| !e.removed)
+            && exists(tmp)?
+        {
+            if e.pending_identity.is_none() && scratch_scoped(e, tmp) {
+                report.warnings.push(format!(
+                    "identity가 기록되지 않은 임시 경로를 보존합니다: {}",
+                    tmp.display()
+                ));
+            } else if e.kind == Kind::File && pending_matches(e, force || !e.done)? {
+                fs::remove_file(tmp)?;
+            } else if e.kind == Kind::Directory || e.kind == Kind::Junction {
+                let mut scratch = e.clone();
+                scratch.path = tmp.clone();
+                scratch.identity = e.pending_identity.clone();
+                let empty_backing = e.kind == Kind::Junction
+                    && !reparse(tmp)?
+                    && tmp.is_dir()
+                    && e.pending_identity.as_ref() == Some(&identity(tmp)?)
+                    && fs::read_dir(tmp)?.next().is_none();
+                if matches_entry(&scratch, false)? || empty_backing {
+                    // No recursion, including for owned scratch directories.
+                    fs::remove_dir(tmp)?;
+                } else {
+                    refused.push(tmp.display().to_string());
+                    continue;
+                }
+            } else {
+                refused.push(tmp.display().to_string());
+                continue;
+            }
+        }
+        if !exists(&e.path)? {
+            m.entries[i].removed = true;
+            atomic_json(&paths.journal(), &m)?;
+            continue;
+        }
+        let unfinished_junction = e.kind == Kind::Junction
+            && !e.done
+            && !reparse(&e.path)?
+            && e.path.is_dir()
+            && e.identity.as_ref() == Some(&identity(&e.path)?)
+            && fs::read_dir(&e.path)?.next().is_none();
+        if !matches_entry(e, force)? && !unfinished_junction {
+            refused.push(e.path.display().to_string());
+            continue;
+        }
+        match e.kind {
+            Kind::Directory => {
+                // remove_dir never recurses and cannot remove sessions or unknown content.
+                if fs::read_dir(&e.path)?.next().is_some() {
+                    report.warnings.push(format!(
+                        "비어 있지 않아 보존합니다 (sessions 포함): {}",
+                        e.path.display()
+                    ));
+                    continue;
+                }
+                fs::remove_dir(&e.path)?;
+            }
+            Kind::Junction => fs::remove_dir(&e.path)?,
+            Kind::File | Kind::Hardlink => fs::remove_file(&e.path)?,
+        }
+        m.entries[i].removed = true;
+        atomic_json(&paths.journal(), &m)?;
+    }
+    if !m.claude_restored {
+        let current = hash_file(&m.claude)?;
+        if current == m.claude_before {
+            m.claude_restored = true;
+        } else if current == m.claude_after
+            || (force && identity(&m.claude)? == m.claude_identity && !reparse(&m.claude)?)
+        {
+            // Exact restore only while unchanged. Forced cleanup preserves unrelated keys.
+            if current == m.claude_after {
+                restore_exact(&m.claude, &m.claude_original)?;
+            } else {
+                let original = unprotect(&m.claude_original)?;
+                let restored = restore_claude_env_text(&original, &read_text(&m.claude)?)?;
+                atomic_preserved(&m.claude, restored.as_bytes())?;
+            }
+            m.claude_restored = true;
+        } else {
+            refused.push(m.claude.display().to_string());
+        }
+        atomic_json(&paths.journal(), &m)?;
+    }
+    if !m.optional_restored {
+        if let Some(a) = &m.autostart {
+            let current = read_autostart()?.0;
+            if current.value != a.before.value && current.value != Some(a.after.clone()) && !force {
+                bail!("autostart 설정이 변경되었습니다. journal을 보존합니다");
+            }
+            restore_autostart(&a.before, a.before_type)?;
+        }
+        for task in &m.tasks {
+            let current =
+                task_enabled(&task.name).context("CPA 예약 작업 상태를 확인할 수 없습니다")?;
+            if current != task.was_enabled && current != task.after_enabled && !force {
+                bail!("CPA 예약 작업 상태가 변경되었습니다. journal을 보존합니다");
+            }
+        }
+        restore_cpa_tasks(&m.tasks)?;
+        m.optional_restored = true;
+        atomic_json(&paths.journal(), &m)?;
+    }
+    if !refused.is_empty() {
+        bail!(
+            "변경/identity 불일치로 보존했습니다: {}. journal을 보존합니다",
+            refused.join(", ")
+        );
+    }
+    if m.entries.iter().any(|e| !e.removed) {
+        m.retained = true;
+        atomic_json(&paths.journal(), &m)?;
+    } else {
+        fs::remove_file(paths.journal())?;
+    }
+    Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    const KEY: &str = "synthetic-client-KEY-9281";
+    const SECRET: &str = "synthetic-nested-SECRET-7126";
+    fn fixture() -> (tempfile::TempDir, CutoverPaths) {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r3-cutover-tests");
+        fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let dir = tempfile::tempdir_in(root).unwrap();
+        let source = dir.path().join(".codex");
+        let npm = dir.path().join("App Data/npm");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&npm).unwrap();
+        fs::write(npm.join("codex.cmd"), "synthetic").unwrap();
+        fs::write(
+            source.join("config.toml"),
+            format!(
+                r#"# synthetic direct source
+model = "synthetic-model"
+model_provider = "cliproxyapi"
+model_catalog_json = "catalog.json"
+experimental_realtime_ws_base_url = "ws://127.0.0.1:10100/ws"
+experimental_realtime_webrtc_call_base_url = "http://localhost:10100/realtime"
+unrelated = "preserve-me"
+[model_providers.cliproxyapi]
+base_url = "http://127.0.0.1:10100/v1"
+experimental_bearer_token = "{SECRET}"
+[model_providers.unused]
+base_url = "https://example.invalid/v1"
+[mcp_servers.synthetic.env]
+ARBITRARY_CREDENTIAL = "{SECRET}"
+[hooks.state.'C:\synthetic\hooks.json:session_start:0:0']
+trusted_hash = "synthetic-hook-hash"
+"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            source.join("auth.json"),
+            format!(r#"{{"auth_mode":"chatgpt","tokens":{{"access_token":"{SECRET}"}}}}"#),
+        )
+        .unwrap();
+        for name in SHARED {
+            fs::create_dir(source.join(name)).unwrap();
+            fs::write(source.join(name).join("source-marker"), name).unwrap();
+        }
+        fs::write(source.join("AGENTS.md"), "synthetic instructions").unwrap();
+        fs::write(source.join("hooks.json"), "{}").unwrap();
+        let claude_settings = dir.path().join("claude/settings.json");
+        fs::create_dir(claude_settings.parent().unwrap()).unwrap();
+        fs::write(&claude_settings, format!(r#"{{"env":{{"ANTHROPIC_AUTH_TOKEN":"{SECRET}"}},"nested":{{"innocent":"{SECRET}"}}}}"#)).unwrap();
+        let qb_home = dir.path().join("quota-baton");
+        fs::create_dir(&qb_home).unwrap();
+        let client_key = qb_home.join("client.key");
+        fs::write(&client_key, KEY).unwrap();
+        let p = CutoverPaths {
+            qb_home,
+            codex_auth: source.join("auth.json"),
+            codex_config: source.join("config.toml"),
+            codex_qb_home: dir.path().join(".codex-acct/qb"),
+            npm_dir: npm,
+            codex_session_auth: Vec::new(),
+            codex_session_homes: Vec::new(),
+            session_homes_file: None,
+            session_homes_warning: None,
+            codex_realtime_items: Vec::new(),
+            claude_settings,
+            client_key,
+            report_roots: Vec::new(),
+            scan_roots: Vec::new(),
+        };
+        (dir, p)
+    }
+    fn opts(mode: Option<CodexMode>) -> WireOptions {
+        WireOptions {
+            codex_mode: mode,
+            ..WireOptions::default()
+        }
+    }
+    fn run(p: &CutoverPaths, apply: bool, mode: Option<CodexMode>) -> Result<Report> {
+        wire_with_task_query(p, apply, opts(mode), &|_| {
+            panic!("unrequested task backend")
+        })
+    }
+    fn output(r: &Report) -> String {
+        r.summary
+            .iter()
+            .chain(&r.changed)
+            .chain(&r.warnings)
+            .chain(&r.diff)
+            .chain(&r.report_only)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    fn manifest(p: &CutoverPaths) -> Manifest {
+        serde_json::from_slice(&fs::read(p.journal()).unwrap()).unwrap()
+    }
+    fn snapshot(p: &CutoverPaths) -> Vec<Vec<u8>> {
+        let source = p.codex_config.parent().unwrap();
+        ["config.toml", "auth.json", "AGENTS.md", "hooks.json"]
+            .iter()
+            .map(|n| source.join(n))
+            .chain(SHARED.iter().map(|n| source.join(n).join("source-marker")))
+            .map(|path| fs::read(path).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn detection_uses_auth_effective_endpoint_and_explicit_overrides() {
+        let (_dir, p) = fixture();
+        assert_eq!(
+            resolve_codex_mode(&p, &opts(None)).unwrap(),
+            CodexMode::Dedicated
+        );
+        fs::write(&p.codex_auth, r#"{"auth_mode":"apikey"}"#).unwrap();
+        assert_eq!(
+            resolve_codex_mode(&p, &opts(None)).unwrap(),
+            CodexMode::Default
+        );
+        for url in [
+            "http://127.0.0.1:101000/v1",
+            "https://127.0.0.1:10100.evil.invalid",
+            "http://127.0.0.1:10100@evil.invalid",
+            "https://example.invalid/v1",
+        ] {
+            fs::write(&p.codex_config, format!("openai_base_url = '{url}'\n[model_providers.unused]\nbase_url = 'http://127.0.0.1:10100/v1'\n")).unwrap();
+            assert_eq!(
+                resolve_codex_mode(&p, &opts(None)).unwrap(),
+                CodexMode::Dedicated
+            );
+        }
+        fs::write(
+            &p.codex_config,
+            "model_provider = 'openai'\nopenai_base_url = 'http://[::1]:10100/v1'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_codex_mode(&p, &opts(None)).unwrap(),
+            CodexMode::Default
+        );
+        fs::write(&p.codex_config, "model_provider = 'other'\nopenai_base_url = 'http://127.0.0.1:10100/v1'\n[model_providers.other]\nbase_url = 'https://example.invalid'\n").unwrap();
+        assert_eq!(
+            resolve_codex_mode(&p, &opts(None)).unwrap(),
+            CodexMode::Dedicated
+        );
+        for (name, mode) in [
+            ("default", CodexMode::Default),
+            ("dedicated", CodexMode::Dedicated),
+            ("none", CodexMode::None),
+        ] {
+            assert_eq!(name.parse::<CodexMode>().unwrap(), mode);
+            assert_eq!(resolve_codex_mode(&p, &opts(Some(mode))).unwrap(), mode);
+        }
+        fs::remove_file(&p.codex_auth).unwrap();
+        assert_eq!(
+            resolve_codex_mode(&p, &opts(None)).unwrap(),
+            CodexMode::Dedicated
+        );
+    }
+    #[test]
+    fn malformed_input_errors_have_no_secret_or_parser_source_chain() {
+        let (_dir, p) = fixture();
+        fs::write(&p.codex_config, format!("secret = '{SECRET}\n")).unwrap();
+        for error in [
+            resolve_codex_mode(&p, &opts(None)).unwrap_err(),
+            run(&p, false, Some(CodexMode::Dedicated)).unwrap_err(),
+        ] {
+            let text = format!("{error:#}\n{error:?}");
+            assert!(!text.contains(SECRET));
+            assert!(!text.contains("secret ="));
+        }
+        fs::write(
+            &p.codex_config,
+            "openai_base_url = 'http://localhost:10100/v1'\n",
+        )
+        .unwrap();
+        fs::write(&p.codex_auth, format!("{{\"secret\":\"{SECRET}")).unwrap();
+        let error = resolve_codex_mode(&p, &opts(None)).unwrap_err();
+        assert!(!format!("{error:#}\n{error:?}").contains(SECRET));
+    }
+    #[test]
+    fn preview_writes_nothing_and_redacts_every_report_stream() {
+        let (_dir, p) = fixture();
+        let before = snapshot(&p);
+        fs::remove_file(&p.client_key).unwrap();
+        let text = output(&run(&p, false, None).unwrap());
+        assert!(!text.contains(SECRET));
+        assert!(!text.contains(KEY));
+        assert!(text.contains("<client key>"));
+        assert!(text.contains("@@ "));
+        assert!(text.contains(USAGE));
+        assert!(text.contains(HERDR));
+        assert!(!p.codex_qb_home.exists());
+        assert!(!p.journal().exists());
+        assert!(!p.npm_dir.join("codex-qb.cmd").exists());
+        assert_eq!(before, snapshot(&p));
+    }
+    #[test]
+    fn transform_preserves_unrelated_keys_copies_trust_and_places_endpoint_before_tables() {
+        let (_dir, p) = fixture();
+        let text = String::from_utf8(config_bytes(&p, 10277).unwrap()).unwrap();
+        let doc = text.parse::<DocumentMut>().unwrap();
+        assert_eq!(
+            doc["openai_base_url"].as_str(),
+            Some("http://127.0.0.1:10277/v1")
+        );
+        assert!(text.find("openai_base_url").unwrap() < text.find('[').unwrap());
+        for key in [
+            "model_provider",
+            "model_catalog_json",
+            "experimental_realtime_ws_base_url",
+            "experimental_realtime_webrtc_call_base_url",
+        ] {
+            assert!(doc.get(key).is_none());
+        }
+        assert!(doc["model_providers"].get("cliproxyapi").is_none());
+        assert_eq!(
+            doc["model_providers"]["unused"]["base_url"].as_str(),
+            Some("https://example.invalid/v1")
+        );
+        assert_eq!(doc["unrelated"].as_str(), Some("preserve-me"));
+        let key = format!(
+            "{}:session_start:0:0",
+            p.codex_qb_home.join("hooks.json").display()
+        );
+        assert_eq!(
+            doc["hooks"]["state"][key.as_str()]["trusted_hash"].as_str(),
+            Some("synthetic-hook-hash")
+        );
+        let launcher = String::from_utf8(launcher()).unwrap();
+        assert!(launcher.starts_with("@echo off\r\nsetlocal\r\nrem "));
+        assert!(launcher.contains("set \"CODEX_HOME=%USERPROFILE%\\.codex-acct\\qb\"\r\n"));
+        assert!(launcher.ends_with("call \"%APPDATA%\\npm\\codex.cmd\" %*\r\n"));
+        assert!(normal_path(&p.codex_qb_home).contains(".codex-acct"));
+    }
+    #[test]
+    fn none_without_codex_inputs_and_no_detach_or_task_side_effects() {
+        let (_dir, mut p) = fixture();
+        p.codex_config = p.qb_home.join("missing/config.toml");
+        p.codex_auth = p.qb_home.join("missing/auth.json");
+        p.npm_dir = p.qb_home.join("missing/npm");
+        let original = fs::read(&p.claude_settings).unwrap();
+        for apply in [false, true] {
+            assert!(!output(&run(&p, apply, Some(CodexMode::None)).unwrap()).contains(KEY));
+        }
+        unwire(&p, true, false).unwrap();
+        assert_eq!(original, fs::read(&p.claude_settings).unwrap());
+        assert!(!p.codex_qb_home.exists());
+        for mode in [CodexMode::None, CodexMode::Dedicated] {
+            let options = WireOptions {
+                detach_chatgpt_session_homes: true,
+                ..opts(Some(mode))
+            };
+            assert!(wire_with_task_query(&p, false, options, &|_| panic!("task backend")).is_err());
+        }
+    }
+    #[test]
+    fn roundtrip_keeps_sources_and_sessions_and_retained_home_can_rewire() {
+        let (_dir, p) = fixture();
+        let before = snapshot(&p);
+        let claude = fs::read(&p.claude_settings).unwrap();
+        for pass in 0..2 {
+            assert!(!output(&run(&p, true, None).unwrap()).contains(KEY));
+            for name in SHARED {
+                let link = p.codex_qb_home.join(name);
+                assert!(reparse(&link).unwrap());
+                assert!(target_same(
+                    &fs::read_link(link).unwrap(),
+                    &p.codex_config.parent().unwrap().join(name)
+                ));
+            }
+            for name in ["AGENTS.md", "hooks.json"] {
+                assert_eq!(
+                    identity(&p.codex_qb_home.join(name)).unwrap(),
+                    identity(&p.codex_config.parent().unwrap().join(name)).unwrap()
+                );
+            }
+            let sessions = p.codex_qb_home.join("sessions");
+            fs::create_dir_all(&sessions).unwrap();
+            fs::write(
+                sessions.join(format!("synthetic-{pass}.jsonl")),
+                "synthetic session",
+            )
+            .unwrap();
+            unwire(&p, true, false).unwrap();
+            assert!(sessions.join("synthetic-0.jsonl").exists());
+            assert!(manifest(&p).retained);
+            assert!(!p.codex_qb_home.join("auth.json").exists());
+            assert!(!p.npm_dir.join("codex-qb.cmd").exists());
+            assert_eq!(before, snapshot(&p));
+            assert_eq!(claude, fs::read(&p.claude_settings).unwrap());
+        }
+    }
+    #[test]
+    fn changed_file_refuses_per_file_force_removes_only_owned_identity() {
+        let (_dir, p) = fixture();
+        let before = snapshot(&p);
+        run(&p, true, None).unwrap();
+        let launcher = p.npm_dir.join("codex-qb.cmd");
+        fs::write(&launcher, "edited launcher").unwrap();
+        assert!(
+            unwire(&p, true, false)
+                .unwrap_err()
+                .to_string()
+                .contains("codex-qb.cmd")
+        );
+        assert!(launcher.exists());
+        assert!(p.journal().exists());
+        assert!(!p.codex_qb_home.join("auth.json").exists());
+        unwire(&p, true, true).unwrap();
+        assert!(!launcher.exists());
+        assert!(!p.journal().exists());
+        assert_eq!(before, snapshot(&p));
+    }
+    #[test]
+    fn replacement_identity_and_retargeted_junction_survive_force() {
+        let (_dir, p) = fixture();
+        run(&p, true, None).unwrap();
+        let launcher = p.npm_dir.join("codex-qb.cmd");
+        fs::rename(&launcher, p.npm_dir.join("old-launcher")).unwrap();
+        fs::write(&launcher, "unowned replacement").unwrap();
+        let link = p.codex_qb_home.join("skills");
+        fs::remove_dir(&link).unwrap();
+        fs::create_dir(&link).unwrap();
+        junction(&link, &p.npm_dir).unwrap();
+        assert!(unwire(&p, true, true).is_err());
+        assert_eq!(fs::read_to_string(launcher).unwrap(), "unowned replacement");
+        assert!(reparse(&link).unwrap());
+        assert!(p.npm_dir.join("codex.cmd").exists());
+        fs::remove_dir(link).unwrap();
+    }
+    #[test]
+    fn missing_launcher_and_unowned_collisions_are_refused_before_journal() {
+        let (_dir, p) = fixture();
+        fs::remove_file(p.npm_dir.join("codex.cmd")).unwrap();
+        assert!(run(&p, false, None).is_err());
+        assert!(!p.journal().exists());
+        fs::write(p.npm_dir.join("codex.cmd"), "synthetic").unwrap();
+        fs::write(p.npm_dir.join("codex-qb.cmd"), "unowned").unwrap();
+        assert!(run(&p, true, None).is_err());
+        assert!(!p.journal().exists());
+        fs::remove_file(p.npm_dir.join("codex-qb.cmd")).unwrap();
+        fs::create_dir_all(&p.codex_qb_home).unwrap();
+        assert!(run(&p, false, None).is_err());
+        fs::remove_dir(&p.codex_qb_home).unwrap();
+        for name in ["AGENTS.md", "hooks.json"] {
+            fs::remove_file(p.codex_config.parent().unwrap().join(name)).unwrap();
+        }
+        run(&p, true, None).unwrap();
+        assert!(!p.codex_qb_home.join("hooks.json").exists());
+        unwire(&p, true, false).unwrap();
+    }
+    #[test]
+    fn invalid_task_scope_is_rejected_before_any_mutation() {
+        for mode in [CodexMode::Dedicated, CodexMode::None] {
+            for invalid in 0..3 {
+                let (_dir, p) = fixture();
+                run(&p, true, Some(mode)).unwrap();
+                let mut m = manifest(&p);
+                m.tasks = vec![TaskJournal {
+                    name: if invalid == 0 {
+                        "unrelated-synthetic-task"
+                    } else {
+                        "cliproxyapi-proxy"
+                    }
+                    .into(),
+                    was_enabled: true,
+                    after_enabled: invalid == 2,
+                }];
+                if invalid == 1 {
+                    m.tasks.push(m.tasks[0].clone());
+                }
+                atomic_json(&p.journal(), &m).unwrap();
+                let before = resume_snapshot(&p);
+                let sources = snapshot(&p);
+                for apply in [false, true] {
+                    let error = run(&p, apply, Some(mode)).unwrap_err();
+                    assert!(error.to_string().contains("CPA 예약 작업 범위/상태"));
+                    for force in [false, true] {
+                        // Public dispatcher must validate schema 3 before touching any backend.
+                        let error = super::super::unwire(&p, apply, force).unwrap_err();
+                        assert!(error.to_string().contains("CPA 예약 작업 범위/상태"));
+                        assert_eq!(resume_snapshot(&p), before);
+                        assert_eq!(snapshot(&p), sources);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn creation_and_publication_interruptions_recover_without_adopting_unknown_scratch() {
+        for target in ["parent", "home", "log", "agents", "auth.json"] {
+            for stage in ["after-create", "after-publish"] {
+                for resume in [false, true] {
+                    let (_dir, p) = fixture();
+                    let sources = snapshot(&p);
+                    let path = match target {
+                        "parent" => p.codex_qb_home.parent().unwrap().to_path_buf(),
+                        "home" => p.codex_qb_home.clone(),
+                        name => p.codex_qb_home.join(name),
+                    };
+                    INTERRUPT.with(|slot| *slot.borrow_mut() = Some((path.clone(), stage)));
+                    assert!(
+                        run(&p, true, None)
+                            .unwrap_err()
+                            .to_string()
+                            .contains("synthetic creation interruption")
+                    );
+                    let m = manifest(&p);
+                    let e = m.entries.iter().find(|e| e.path == path).unwrap();
+                    assert!(!e.done);
+                    assert!(e.identity.is_none());
+                    let scratch = pending_path(e);
+                    let mut unproven = None;
+                    if stage == "after-create" {
+                        assert!(!exists(&path).unwrap());
+                        assert!(e.pending_identity.is_none());
+                        let marker = if e.kind == Kind::File {
+                            scratch.clone()
+                        } else {
+                            fs::create_dir(scratch.join("sessions")).unwrap();
+                            scratch.join("sessions/unowned.jsonl")
+                        };
+                        fs::write(&marker, "unowned scratch content").unwrap();
+                        unproven = Some((identity(&scratch).unwrap(), marker));
+                    } else {
+                        assert!(e.pending_identity.is_some());
+                        assert!(matches_entry(e, false).unwrap());
+                    }
+                    let report = if resume {
+                        let report = run(&p, true, None).unwrap();
+                        assert!(manifest(&p).entries.iter().all(|e| e.done));
+                        report
+                    } else {
+                        super::super::unwire(&p, true, true).unwrap()
+                    };
+                    if let Some((id, marker)) = &unproven {
+                        assert_eq!(identity(&scratch).unwrap(), *id);
+                        assert_eq!(
+                            fs::read_to_string(marker).unwrap(),
+                            "unowned scratch content"
+                        );
+                        assert!(output(&report).contains(scratch.to_str().unwrap()));
+                    }
+                    if resume {
+                        let sessions = p.codex_qb_home.join("sessions");
+                        fs::create_dir(&sessions).unwrap();
+                        fs::write(sessions.join("kept.jsonl"), "resumable history").unwrap();
+                        super::super::unwire(&p, true, true).unwrap();
+                        assert_eq!(
+                            fs::read_to_string(sessions.join("kept.jsonl")).unwrap(),
+                            "resumable history"
+                        );
+                    }
+                    if let Some((id, marker)) = unproven {
+                        assert_eq!(identity(&scratch).unwrap(), id);
+                        assert_eq!(
+                            fs::read_to_string(marker).unwrap(),
+                            "unowned scratch content"
+                        );
+                    }
+                    assert_eq!(snapshot(&p), sources);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scratch_scope_rejects_unknown_and_session_paths_without_mutation() {
+        for abandoned in [false, true] {
+            for invalid in [
+                "sessions",
+                "../escape",
+                ".qb-scratch-config.toml-1-2-3:stream",
+                ".qb-scratch-auth.json-1-2-3",
+            ] {
+                let (_dir, p) = fixture();
+                run(&p, true, None).unwrap();
+                let mut m = manifest(&p);
+                let e = m
+                    .entries
+                    .iter_mut()
+                    .find(|e| e.path == p.codex_qb_home.join("config.toml"))
+                    .unwrap();
+                let bad = p.codex_qb_home.join(invalid);
+                if abandoned {
+                    e.abandoned.push(bad);
+                } else {
+                    e.pending = Some(bad);
+                }
+                atomic_json(&p.journal(), &m).unwrap();
+                let before = resume_snapshot(&p);
+                assert!(run(&p, true, None).is_err());
+                assert!(super::super::unwire(&p, true, true).is_err());
+                assert_eq!(resume_snapshot(&p), before);
+            }
+        }
+    }
+
+    #[test]
+    fn publication_refuses_existing_final_objects_without_clobbering() {
+        for name in ["log", "agents", "auth.json"] {
+            let (_dir, p) = fixture();
+            let path = p.codex_qb_home.join(name);
+            INTERRUPT.with(|slot| *slot.borrow_mut() = Some((path.clone(), "after-create")));
+            assert!(run(&p, true, None).is_err());
+            let mut m = manifest(&p);
+            let i = m.entries.iter().position(|e| e.path == path).unwrap();
+            let scratch = pending_path(&m.entries[i]);
+            // Synthetic state immediately after the durable identity write.
+            m.entries[i].pending_identity = Some(identity(&scratch).unwrap());
+            atomic_json(&p.journal(), &m).unwrap();
+            let marker = if m.entries[i].kind == Kind::File {
+                fs::write(&path, "unknown final file").unwrap();
+                path.clone()
+            } else {
+                fs::create_dir(&path).unwrap();
+                fs::create_dir(path.join("sessions")).unwrap();
+                let marker = path.join("sessions/unknown.jsonl");
+                fs::write(&marker, "unknown final directory").unwrap();
+                marker
+            };
+            let id = identity(&path).unwrap();
+            let content = fs::read(&marker).unwrap();
+            if m.entries[i].kind != Kind::File {
+                // Exercise the native no-replace primitive too, independently
+                // of install_directory's earlier exists check.
+                assert!(publish_directory(&scratch, &path).is_err());
+            }
+            let result = if m.entries[i].kind == Kind::File {
+                install_file(&p, &mut m, i)
+            } else {
+                install_directory(&p, &mut m, i)
+            };
+            assert!(result.is_err());
+            assert_eq!(identity(&path).unwrap(), id);
+            assert_eq!(fs::read(&marker).unwrap(), content);
+            assert!(run(&p, true, None).is_err());
+            assert!(super::super::unwire(&p, true, true).is_err());
+            assert_eq!(identity(&path).unwrap(), id);
+            assert_eq!(fs::read(&marker).unwrap(), content);
+        }
+    }
+
+    #[test]
+    fn completed_entry_boundaries_resume_and_unwire_is_idempotent() {
+        let (_dir, p) = fixture();
+        run(&p, true, None).unwrap();
+        let template = manifest(&p);
+        unwire(&p, true, false).unwrap();
+        for boundary in 0..=template.entries.len() {
+            let mut m: Manifest =
+                serde_json::from_slice(&serde_json::to_vec(&template).unwrap()).unwrap();
+            for e in &mut m.entries {
+                e.done = false;
+                e.removed = false;
+                if e.kind != Kind::Hardlink {
+                    e.identity = None;
+                }
+                e.pending_identity = None;
+            }
+            let rest = m.entries.split_off(boundary);
+            atomic_json(&p.journal(), &m).unwrap();
+            install(&p, &mut m).unwrap();
+            m.entries.extend(rest);
+            atomic_json(&p.journal(), &m).unwrap();
+            run(&p, true, None).unwrap();
+            unwire(&p, true, false).unwrap();
+            assert!(!p.journal().exists());
+            assert!(!p.codex_qb_home.exists());
+            // Once the journal is gone, the public dispatcher owns the no-op;
+            // it cannot select this schema-specific helper without a journal.
+            assert!(super::super::unwire(&p, true, false).is_ok());
+        }
+    }
+    #[test]
+    fn unrecorded_directory_identity_and_sessions_manifest_paths_are_refused() {
+        let (_dir, p) = fixture();
+        run(&p, true, None).unwrap();
+        let mut m = manifest(&p);
+        let root = m
+            .entries
+            .iter_mut()
+            .find(|e| e.path == p.codex_qb_home)
+            .unwrap();
+        root.identity = None;
+        root.pending_identity = None;
+        root.done = false;
+        atomic_json(&p.journal(), &m).unwrap();
+        assert!(unwire(&p, true, true).is_err());
+        assert!(p.codex_qb_home.exists());
+        let mut m = manifest(&p);
+        m.entries.push(
+            new_entry(
+                p.codex_qb_home.join("sessions"),
+                Kind::Directory,
+                None,
+                None,
+                true,
+            )
+            .unwrap(),
+        );
+        assert!(validate_manifest(&p, &m).is_err());
+    }
+    #[test]
+    fn interrupted_pending_write_resumes_by_exact_identity_and_publishes_atomic_file() {
+        let (_dir, p) = fixture();
+        run(&p, true, None).unwrap();
+        let mut m = manifest(&p);
+        unwire(&p, true, false).unwrap();
+        for e in &mut m.entries {
+            e.done = false;
+            e.removed = false;
+            if e.kind != Kind::Hardlink {
+                e.identity = None;
+            }
+            e.pending_identity = None;
+        }
+        let first_file = m.entries.iter().position(|e| e.kind == Kind::File).unwrap();
+        let rest = m.entries.split_off(first_file);
+        atomic_json(&p.journal(), &m).unwrap();
+        install(&p, &mut m).unwrap();
+        m.entries.extend(rest);
+        let tmp = pending_path(&m.entries[first_file]);
+        fs::write(&tmp, "interrupted incomplete synthetic bytes").unwrap();
+        m.entries[first_file].pending_identity = Some(identity(&tmp).unwrap());
+        atomic_json(&p.journal(), &m).unwrap();
+        run(&p, true, None).unwrap();
+        assert!(!tmp.exists());
+        assert_eq!(
+            hash_file(&m.entries[first_file].path).unwrap(),
+            m.entries[first_file].hash
+        );
+        unwire(&p, true, false).unwrap();
+        assert!(!p.journal().exists());
+    }
+    #[test]
+    fn junction_conversion_interruption_and_nonempty_log_are_safe() {
+        let (_dir, p) = fixture();
+        run(&p, true, None).unwrap();
+        let mut m = manifest(&p);
+        let entry = m
+            .entries
+            .iter_mut()
+            .find(|e| e.kind == Kind::Junction)
+            .unwrap();
+        fs::remove_dir(&entry.path).unwrap();
+        fs::create_dir(&entry.path).unwrap();
+        entry.identity = Some(identity(&entry.path).unwrap());
+        entry.done = false;
+        atomic_json(&p.journal(), &m).unwrap();
+        run(&p, true, None).unwrap();
+        let log = p.codex_qb_home.join("log/runtime.log");
+        fs::write(&log, "synthetic runtime data").unwrap();
+        let report = unwire(&p, true, false).unwrap();
+        assert_eq!(fs::read_to_string(&log).unwrap(), "synthetic runtime data");
+        assert!(manifest(&p).retained);
+        assert!(report.warnings.iter().any(|line| line.contains("log")));
+    }
+    #[test]
+    fn unproven_matching_file_or_pending_is_preserved_even_with_force() {
+        for force in [false, true] {
+            for pending in [false, true] {
+                let (_dir, p) = fixture();
+                run(&p, true, None).unwrap();
+                let mut m = manifest(&p);
+                let e = m
+                    .entries
+                    .iter_mut()
+                    .find(|e| e.path == p.npm_dir.join("codex-qb.cmd"))
+                    .unwrap();
+                let bytes = fs::read(&e.path).unwrap();
+                // Keep the owned inode alive while creating a byte-identical substitute.
+                fs::rename(&e.path, p.npm_dir.join("owned-launcher-kept")).unwrap();
+                let substitute = if pending {
+                    pending_path(e)
+                } else {
+                    e.path.clone()
+                };
+                fs::write(&substitute, &bytes).unwrap();
+                e.identity = None;
+                e.pending_identity = None;
+                e.done = false;
+                assert_eq!(hash_file(&substitute).unwrap(), e.hash);
+                assert!(
+                    !if pending {
+                        pending_matches(e, force)
+                    } else {
+                        matches_entry(e, force)
+                    }
+                    .unwrap()
+                );
+                atomic_json(&p.journal(), &m).unwrap();
+                let result = unwire(&p, true, force);
+                if pending {
+                    assert!(
+                        output(&result.unwrap()).contains("identity가 기록되지 않은 임시 경로")
+                    );
+                } else {
+                    assert!(result.is_err());
+                    assert!(p.journal().exists());
+                }
+                assert_eq!(fs::read(&substitute).unwrap(), bytes);
+            }
+        }
+    }
+    #[test]
+    fn published_file_recovers_from_pending_identity_before_final_identity_save() {
+        let (_dir, p) = fixture();
+        run(&p, true, None).unwrap();
+        let mut m = manifest(&p);
+        let path = p.npm_dir.join("codex-qb.cmd");
+        let e = m.entries.iter_mut().find(|e| e.path == path).unwrap();
+        assert_eq!(e.pending_identity.as_ref(), Some(&identity(&path).unwrap()));
+        assert!(!pending_path(e).exists()); // publication completed; final state write did not
+        e.identity = None;
+        e.done = false;
+        assert!(matches_entry(e, false).unwrap());
+        atomic_json(&p.journal(), &m).unwrap();
+        run(&p, true, None).unwrap();
+        let recovered = manifest(&p);
+        let e = recovered.entries.iter().find(|e| e.path == path).unwrap();
+        assert!(e.done);
+        assert_eq!(e.identity.as_ref(), Some(&identity(&path).unwrap()));
+        unwire(&p, true, false).unwrap();
+        assert!(!path.exists());
+        assert!(!p.journal().exists());
+    }
+    #[test]
+    fn forced_claude_restore_keeps_bom_crlf_order_spacing_and_user_edits_byte_for_byte() {
+        let (_dir, p) = fixture();
+        let original = concat!(
+            "{\r\n\t\"z-first\" : [1, 2],\r\n",
+            "\t\"env\" : { \"KEEP\" : \"untouched\", \"ANTHROPIC_BASE_URL\" : \"old-url\", ",
+            "\"ANTHROPIC_AUTH_TOKEN\" : \"old-token\" },\r\n\t\"a-last\" : {\"edited\" : false}\r\n}\r\n"
+        );
+        let original_bytes = [b"\xef\xbb\xbf".as_slice(), original.as_bytes()].concat();
+        fs::write(&p.claude_settings, &original_bytes).unwrap();
+        run(&p, true, None).unwrap();
+        let installed = fs::read(&p.claude_settings).unwrap();
+        let edited = String::from_utf8(installed)
+            .unwrap()
+            .replace("\"edited\" : false", "\"edited\" : true");
+        fs::write(&p.claude_settings, edited.as_bytes()).unwrap();
+        assert!(unwire(&p, true, false).is_err());
+        unwire(&p, true, true).unwrap();
+        let expected = String::from_utf8(original_bytes)
+            .unwrap()
+            .replace("\"edited\" : false", "\"edited\" : true");
+        assert_eq!(fs::read(&p.claude_settings).unwrap(), expected.as_bytes());
+    }
+    #[test]
+    fn forced_env_removal_preserves_other_member_text_and_handles_absent_owned_keys() {
+        for (current, expected) in [
+            (
+                r#"{ "env" : { "ANTHROPIC_BASE_URL" : "qb", "KEEP" : [1, 2] }, "last":true }"#,
+                r#"{ "env" : {  "KEEP" : [1, 2] }, "last":true }"#,
+            ),
+            (
+                r#"{ "env" : { "KEEP" : [1, 2], "ANTHROPIC_BASE_URL" : "qb" }, "last":true }"#,
+                r#"{ "env" : { "KEEP" : [1, 2] }, "last":true }"#,
+            ),
+            (
+                r#"{ "env" : { "ANTHROPIC_BASE_URL" : "qb" }, "last":true }"#,
+                r#"{ "env" : {  }, "last":true }"#,
+            ),
+        ] {
+            assert_eq!(
+                restore_claude_env_text(br#"{"env":{"KEEP":[1,2]}}"#, current).unwrap(),
+                expected
+            );
+        }
+    }
+    #[test]
+    fn shared_directory_source_junction_keeps_logical_target_and_survives_unwire() {
+        let (dir, p) = fixture();
+        let source = p.codex_config.parent().unwrap().join("skills");
+        let target = dir.path().join("fixture-shared-skills");
+        fs::create_dir(&target).unwrap();
+        let marker = target.join("source-marker");
+        fs::write(&marker, "skills").unwrap();
+        fs::remove_file(source.join("source-marker")).unwrap();
+        fs::remove_dir(&source).unwrap();
+        fs::create_dir(&source).unwrap();
+        junction(&source, &target).unwrap();
+        let source_identity = identity(&source).unwrap();
+        let source_link = fs::read_link(&source).unwrap();
+        let before = snapshot(&p);
+        run(&p, true, None).unwrap();
+        let own = p.codex_qb_home.join("skills");
+        assert!(reparse(&own).unwrap());
+        let logical = fs::read_link(&own).unwrap();
+        assert!(target_same(&logical, &source));
+        assert!(!target_same(&logical, &target));
+        let m = manifest(&p);
+        assert_eq!(
+            m.entries
+                .iter()
+                .find(|e| e.path == own)
+                .unwrap()
+                .target
+                .as_ref(),
+            Some(&source)
+        );
+        unwire(&p, true, false).unwrap();
+        assert!(!own.exists());
+        assert!(reparse(&source).unwrap());
+        assert_eq!(identity(&source).unwrap(), source_identity);
+        assert_eq!(fs::read_link(&source).unwrap(), source_link);
+        assert_eq!(fs::read(&marker).unwrap(), b"skills");
+        assert_eq!(snapshot(&p), before);
+        fs::remove_dir(source).unwrap(); // unlink only the fixture's original junction
+    }
+    #[test]
+    fn short_strings_do_not_corrupt_preview_keys_endpoint_or_redaction_markers() {
+        let (_dir, p) = fixture();
+        let long = format!("{SECRET}-quote\"-backslash\\-line\n한글-secret-end");
+        let extra = format!(
+            "short = ['a', 'e', 'd', 'v1']\npayload = {}\n# {SECRET}\n",
+            toml_edit::value(long.as_str())
+        );
+        let source = fs::read_to_string(&p.codex_config).unwrap();
+        fs::write(&p.codex_config, format!("{extra}{source}")).unwrap();
+        let json = serde_json::json!({"env":{"ANTHROPIC_AUTH_TOKEN":"a"},
+            "nested":{"short":["a","e","d","v1"],"payload":long},"unchanged":"e"});
+        fs::write(
+            &p.claude_settings,
+            serde_json::to_vec_pretty(&json).unwrap(),
+        )
+        .unwrap();
+        let source_before = snapshot(&p);
+        let report = run(&p, false, None).unwrap();
+        let text = output(&report);
+        assert!(text.contains("openai_base_url"));
+        assert!(text.contains("log_dir"));
+        assert!(text.contains("http://127.0.0.1:10200/v1"));
+        assert!(text.contains("<redacted>"));
+        assert!(!text.contains("<red<"));
+        assert!(!text.contains("<redacted><redacted>"));
+        assert!(!text.contains(SECRET));
+        assert!(!text.contains(&long));
+        let escaped = serde_json::to_string(&long).unwrap();
+        assert!(!text.contains(&escaped[1..escaped.len() - 1]));
+        assert!(text.len() < 32 * 1024);
+        // Quoted short credentials and short values remain hidden; their
+        // decoded characters must never be raw substring patterns.
+        let mut patterns = Vec::new();
+        json_strings(&json, &mut patterns);
+        toml_strings(parse_config(&p).unwrap().as_item(), &mut patterns);
+        for short in ["a", "e", "d", "v1"] {
+            assert!(!patterns.iter().any(|pattern| pattern == short));
+            let quoted = serde_json::to_string(short).unwrap();
+            assert_eq!(redact_once(&quoted, &patterns), "<redacted>");
+            assert_eq!(redact_once(&format!("'{short}'"), &patterns), "<redacted>");
+        }
+        assert!(!p.journal().exists());
+        assert!(!p.codex_qb_home.exists());
+        assert_eq!(source_before, snapshot(&p));
+    }
+    #[test]
+    fn redaction_is_single_pass_longest_first_and_preserves_utf8_boundaries() {
+        let patterns = ["secret", "secret-longer", "redacted"].map(str::to_owned);
+        assert_eq!(
+            redact_once("한글é secret-longer secret 😀", &patterns),
+            "한글é <redacted> <redacted> 😀"
+        );
+        let mut collected = Vec::new();
+        let multiline = "long-multiline\ncredential-한글";
+        string_patterns(multiline, &mut collected);
+        let quoted = serde_json::to_string(multiline).unwrap();
+        let escaped = &quoted[1..quoted.len() - 1];
+        assert_eq!(
+            redact_once(&format!("{multiline}|{quoted}|{escaped}"), &collected),
+            "<redacted>|<redacted>|<redacted>"
+        );
+    }
+    fn resume_snapshot(p: &CutoverPaths) -> Vec<(PathBuf, String)> {
+        let m = manifest(p);
+        let paths = std::iter::once(p.journal())
+            .chain(std::iter::once(p.claude_settings.clone()))
+            .chain(
+                m.entries
+                    .iter()
+                    .flat_map(|e| std::iter::once(e.path.clone()).chain(e.pending.clone())),
+            );
+        paths
+            .map(|path| {
+                let state = if !exists(&path).unwrap() {
+                    "absent".to_owned()
+                } else {
+                    let content = if reparse(&path).unwrap() {
+                        format!("link:{:?}", fs::read_link(&path).unwrap())
+                    } else if path.is_file() {
+                        hash_file(&path).unwrap()
+                    } else {
+                        "directory".to_owned()
+                    };
+                    format!("{:?}:{content}", identity(&path).unwrap())
+                };
+                (path, state)
+            })
+            .collect()
+    }
+    #[test]
+    fn resume_key_or_port_mismatch_refuses_without_mutations_active_or_partial() {
+        for mode in [CodexMode::Dedicated, CodexMode::None] {
+            for partial in [false, true] {
+                for rotate_key in [false, true] {
+                    let (_dir, p) = fixture();
+                    run(&p, true, Some(mode)).unwrap();
+                    if partial {
+                        let mut m = manifest(&p);
+                        atomic_bytes(&p.claude_settings, &unprotect(&m.claude_original).unwrap())
+                            .unwrap();
+                        if mode == CodexMode::Dedicated {
+                            let e = m
+                                .entries
+                                .iter_mut()
+                                .find(|e| e.path == m.home.join("auth.json"))
+                                .unwrap();
+                            fs::remove_file(&e.path).unwrap();
+                            e.identity = None;
+                            e.pending_identity = None;
+                            e.done = false;
+                        }
+                        atomic_json(&p.journal(), &m).unwrap();
+                    }
+                    let mut options = opts(Some(mode));
+                    if rotate_key {
+                        fs::write(&p.client_key, "synthetic-rotated-KEY-7738").unwrap();
+                    } else {
+                        options.data_port = 10291;
+                    }
+                    let before = resume_snapshot(&p);
+                    let error =
+                        wire_with_task_query(&p, true, options, &|_| panic!("task backend"))
+                            .unwrap_err();
+                    let text = format!("{error:#}\n{error:?}");
+                    assert!(text.contains("기존 연결의 포트/키"));
+                    assert!(text.contains("unwire"));
+                    assert!(!text.contains(KEY));
+                    assert!(!text.contains("synthetic-rotated-KEY-7738"));
+                    assert_eq!(resume_snapshot(&p), before);
+                    fs::write(&p.client_key, KEY).unwrap();
+                    run(&p, true, Some(mode)).unwrap(); // unchanged saved plan still resumes
+                    unwire(&p, true, false).unwrap();
+                }
+            }
+        }
+    }
+    #[test]
+    fn resume_checks_dedicated_payloads_as_well_as_claude_payload() {
+        for config in [false, true] {
+            let (_dir, p) = fixture();
+            run(&p, true, None).unwrap();
+            let mut m = manifest(&p);
+            let name = if config { "config.toml" } else { "auth.json" };
+            let path = m.home.join(name);
+            let e = m.entries.iter_mut().find(|e| e.path == path).unwrap();
+            let bytes = if config {
+                config_bytes(&p, 10291).unwrap()
+            } else {
+                br#"{"auth_mode":"apikey","OPENAI_API_KEY":"synthetic-other-key"}"#.to_vec()
+            };
+            e.payload = Some(protect(&bytes).unwrap());
+            atomic_json(&p.journal(), &m).unwrap();
+            let before = resume_snapshot(&p);
+            let error = run(&p, true, None).unwrap_err();
+            assert!(error.to_string().contains("기존 연결의 포트/키"));
+            assert!(!format!("{error:#}").contains("synthetic-other-key"));
+            assert_eq!(resume_snapshot(&p), before);
+        }
+    }
+    #[test]
+    fn retained_home_fresh_plan_accepts_new_key_and_port() {
+        let (_dir, p) = fixture();
+        run(&p, true, None).unwrap();
+        fs::create_dir(p.codex_qb_home.join("sessions")).unwrap();
+        fs::write(
+            p.codex_qb_home.join("sessions/synthetic.jsonl"),
+            "keep history",
+        )
+        .unwrap();
+        unwire(&p, true, false).unwrap();
+        assert!(manifest(&p).retained);
+        fs::write(&p.client_key, "synthetic-fresh-key-7738").unwrap();
+        let options = WireOptions {
+            data_port: 10291,
+            ..opts(Some(CodexMode::Dedicated))
+        };
+        wire_with_task_query(&p, true, options, &|_| panic!("task backend")).unwrap();
+        let auth: Value =
+            serde_json::from_slice(&fs::read(p.codex_qb_home.join("auth.json")).unwrap()).unwrap();
+        assert_eq!(
+            auth["OPENAI_API_KEY"].as_str(),
+            Some("synthetic-fresh-key-7738")
+        );
+        let config = fs::read_to_string(p.codex_qb_home.join("config.toml"))
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            config["openai_base_url"].as_str(),
+            Some("http://127.0.0.1:10291/v1")
+        );
+        unwire(&p, true, false).unwrap();
+        assert_eq!(
+            fs::read_to_string(p.codex_qb_home.join("sessions/synthetic.jsonl")).unwrap(),
+            "keep history"
+        );
+    }
+    #[test]
+    fn initial_claude_bom_crlf_wire_resume_unwire_roundtrip_is_byte_exact() {
+        for mode in [CodexMode::Dedicated, CodexMode::None] {
+            let (_dir, p) = fixture();
+            let original = b"\xef\xbb\xbf{\r\n  \"keep-first\" : true,\r\n  \"env\" : {\"ANTHROPIC_BASE_URL\":\"old-url\", \"ANTHROPIC_AUTH_TOKEN\":\"old-token\"},\r\n  \"keep-last\" : [1, 2]\r\n}\r\n";
+            fs::write(&p.claude_settings, original).unwrap();
+            run(&p, true, Some(mode)).unwrap();
+            let m = manifest(&p);
+            assert_eq!(unprotect(&m.claude_original).unwrap(), original);
+            let installed = fs::read(&p.claude_settings).unwrap();
+            assert!(installed.starts_with(b"\xef\xbb\xbf"));
+            assert!(!installed[3..].starts_with(b"\xef\xbb\xbf"));
+            assert!(installed.ends_with(b"\r\n"));
+            assert_eq!(hash_bytes(&installed), m.claude_after);
+            run(&p, true, Some(mode)).unwrap(); // saved BOM payload is also semantically valid
+            unwire(&p, true, false).unwrap();
+            assert_eq!(fs::read(&p.claude_settings).unwrap(), original);
+        }
+    }
+    #[test]
+    fn npm_appdata_fallback_is_path_only_and_none_default_do_not_require_npm() {
+        let (dir, mut p) = fixture();
+        let fallback = CutoverPaths::npm_dir_for(dir.path(), None);
+        assert_eq!(fallback, dir.path().join("AppData/Roaming/npm"));
+        let custom = dir.path().join("custom-roaming");
+        assert_eq!(
+            CutoverPaths::npm_dir_for(dir.path(), Some(custom.clone())),
+            custom.join("npm")
+        );
+        p.npm_dir = fallback.clone();
+        assert!(!fallback.exists());
+        run(&p, false, Some(CodexMode::None)).unwrap();
+        fs::write(
+            &p.codex_auth,
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":"synthetic-default-key"}"#,
+        )
+        .unwrap();
+        run(&p, false, Some(CodexMode::Default)).unwrap();
+        assert!(!fallback.exists());
+        assert!(!p.journal().exists());
+        assert!(run(&p, false, Some(CodexMode::Dedicated)).is_err());
+    }
+    #[test]
+    fn new_summary_mode_labels_are_korean() {
+        let (_dir, p) = fixture();
+        for (mode, label) in [
+            (CodexMode::Dedicated, "별도 홈"),
+            (CodexMode::None, "연결 안 함"),
+        ] {
+            let report = run(&p, false, Some(mode)).unwrap();
+            let summary = report.summary.join("\n");
+            assert!(summary.contains(&format!("Codex {label}, Claude 연결 계획")));
+            assert!(!summary.contains("Dedicated"));
+            assert!(!summary.contains("None"));
+        }
+    }
+    #[test]
+    fn builtin_explicit_openai_selector_is_preserved_without_a_custom_override() {
+        let (_dir, p) = fixture();
+        for custom_cpa in [false, true] {
+            let extra = if custom_cpa {
+                "[model_providers.openai]\nbase_url = 'http://localhost:10100/v1'\n"
+            } else {
+                ""
+            };
+            let source = format!(
+                "# selector stays explicit\nmodel_provider = 'openai' # keep selector comment\nopenai_base_url = 'http://127.0.0.1:10100/v1'\n{extra}"
+            );
+            fs::write(&p.codex_config, &source).unwrap();
+            fs::write(&p.codex_auth, r#"{"auth_mode":"apikey"}"#).unwrap();
+            assert_eq!(
+                resolve_codex_mode(&p, &opts(None)).unwrap(),
+                CodexMode::Default
+            );
+            let derived = String::from_utf8(config_bytes(&p, 10200).unwrap()).unwrap();
+            let doc = derived.parse::<DocumentMut>().unwrap();
+            assert_eq!(doc["model_provider"].as_str(), Some("openai"));
+            assert!(derived.contains("# keep selector comment"));
+            assert_eq!(
+                doc["openai_base_url"].as_str(),
+                Some("http://127.0.0.1:10200/v1")
+            );
+            assert!(
+                doc.get("model_providers")
+                    .and_then(|providers| providers.get("openai"))
+                    .is_none()
+            );
+            assert_eq!(fs::read_to_string(&p.codex_config).unwrap(), source);
+        }
+    }
+    #[test]
+    fn selected_openai_override_is_checked_for_explicit_implicit_and_removed_cpa_selectors() {
+        let (_dir, p) = fixture();
+        fs::write(&p.codex_auth, r#"{"auth_mode":"apikey"}"#).unwrap();
+        for explicit in [false, true] {
+            for missing_base in [false, true] {
+                let selector = if explicit {
+                    "model_provider = 'openai'\n"
+                } else {
+                    ""
+                };
+                let override_value = if missing_base {
+                    "name = 'custom openai'\n"
+                } else {
+                    "base_url = 'https://example.invalid/v1'\n"
+                };
+                let source = format!(
+                    "{selector}openai_base_url = 'http://127.0.0.1:10100/v1'\n[model_providers.openai]\n{override_value}"
+                );
+                fs::write(&p.codex_config, &source).unwrap();
+                assert_eq!(
+                    resolve_codex_mode(&p, &opts(None)).unwrap(),
+                    CodexMode::Dedicated
+                );
+                let error = run(&p, false, Some(CodexMode::Dedicated)).unwrap_err();
+                assert!(error.to_string().contains("우회"));
+                assert_eq!(fs::read_to_string(&p.codex_config).unwrap(), source);
+                assert!(!p.journal().exists());
+                assert!(!p.codex_qb_home.exists());
+            }
+        }
+        fs::write(&p.codex_config, "model_provider = 'cliproxyapi'\n[model_providers.cliproxyapi]\nbase_url = 'http://127.0.0.1:10100/v1'\n[model_providers.openai]\nbase_url = 'https://example.invalid/v1'\n").unwrap();
+        assert!(config_bytes(&p, 10200).is_err()); // removing CPA would select the conflicting implicit openai
+        fs::write(&p.codex_config, "openai_base_url = 'https://example.invalid/v1'\n[model_providers.openai]\nbase_url = 'http://127.0.0.1:10100/v1'\n").unwrap();
+        assert_eq!(
+            resolve_codex_mode(&p, &opts(None)).unwrap(),
+            CodexMode::Default
+        );
+        assert!(config_bytes(&p, 10200).is_ok()); // implicit CPA override is removed, restoring builtin openai
+    }
+}

@@ -274,6 +274,684 @@ fn fixture() -> tempfile::TempDir {
     home
 }
 
+// Only child processes see these paths. In particular, CutoverPaths must never
+// discover the developer's session map, other clients or plaintext reports.
+fn r3_wire_command(home: &Path) -> Command {
+    let profile = home.join("synthetic-profile").canonicalize().unwrap();
+    let appdata = profile.join("AppData/Roaming");
+    let mut cmd = command(home);
+    cmd.env("USERPROFILE", &profile)
+        .env("HOME", &profile)
+        .env("APPDATA", &appdata)
+        .env("LOCALAPPDATA", profile.join("AppData/Local"))
+        .env("CODEX_HOME", profile.join(".codex"))
+        .env("CLAUDE_CONFIG_DIR", profile.join(".claude"));
+    cmd
+}
+
+const R3_SECRETS: &[&str] = &[
+    "synthetic-r3-client-secret",
+    "synthetic-r3-direct-secret",
+    "synthetic-r3-claude-secret",
+    "synthetic-r3-nested-secret",
+    "synthetic-r3-provider-secret",
+];
+
+fn r3_wire_fixture(codex: bool) -> tempfile::TempDir {
+    let home = fixture();
+    let profile = home.path().join("synthetic-profile");
+    std::fs::create_dir_all(profile.join(".claude")).unwrap();
+    std::fs::create_dir_all(profile.join("AppData/Roaming/herdr")).unwrap();
+    std::fs::write(
+        profile.join("AppData/Roaming/herdr/session-homes.json"),
+        "{}",
+    )
+    .unwrap();
+    std::fs::write(home.path().join("client.key"), R3_SECRETS[0]).unwrap();
+    std::fs::write(
+        profile.join(".claude/settings.json"),
+        format!(
+            r#"{{"env":{{"ANTHROPIC_BASE_URL":"https://old.invalid","ANTHROPIC_AUTH_TOKEN":"{}"}},"nested":{{"api_key":"{}"}}}}"#,
+            R3_SECRETS[2], R3_SECRETS[3]
+        ),
+    )
+    .unwrap();
+    if codex {
+        std::fs::create_dir_all(profile.join(".codex")).unwrap();
+        std::fs::create_dir_all(profile.join("AppData/Roaming/npm")).unwrap();
+        std::fs::write(
+            profile.join("AppData/Roaming/npm/codex.cmd"),
+            "@echo off\r\nrem synthetic launcher; never executed\r\n",
+        )
+        .unwrap();
+        std::fs::write(
+            profile.join(".codex/auth.json"),
+            format!(
+                r#"{{"auth_mode":"chatgpt","tokens":{{"access_token":"{}"}}}}"#,
+                R3_SECRETS[1]
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            profile.join(".codex/config.toml"),
+            format!(
+                "model = \"synthetic-model\"\nmodel_catalog_json = \"synthetic-catalog.json\"\n\n[features]\nkeep = true\n\n[model_providers.cliproxyapi]\nname = \"CPA\"\nbase_url = \"http://127.0.0.1:10100/v1\"\nexperimental_bearer_token = \"{}\"\n\n[mcp_servers.synthetic.env]\nAPI_KEY = \"{}\"\n",
+                R3_SECRETS[4], R3_SECRETS[3]
+            ),
+        )
+        .unwrap();
+    }
+    home
+}
+
+fn r3_tree(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>> {
+    fn visit(
+        root: &Path,
+        dir: &Path,
+        tree: &mut std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>>,
+    ) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let metadata = std::fs::symlink_metadata(&path).unwrap();
+            assert!(
+                !metadata.file_type().is_symlink(),
+                "unexpected fixture link"
+            );
+            let value = if metadata.is_dir() {
+                visit(root, &path, tree);
+                None
+            } else {
+                Some(std::fs::read(&path).unwrap())
+            };
+            tree.insert(path.strip_prefix(root).unwrap().to_owned(), value);
+        }
+    }
+    let mut tree = std::collections::BTreeMap::new();
+    visit(root, root, &mut tree);
+    tree
+}
+
+fn r3_output(output: &Output) -> String {
+    let stdout = std::str::from_utf8(&output.stdout).unwrap();
+    let stderr = std::str::from_utf8(&output.stderr).unwrap();
+    for secret in R3_SECRETS {
+        assert!(!stdout.contains(secret), "A5: secret in stdout");
+        assert!(!stderr.contains(secret), "A5: secret in stderr");
+    }
+    format!("{stdout}\n{stderr}")
+}
+
+#[test]
+fn r3_wire_help_and_invalid_codex_mode() {
+    let home = r3_wire_fixture(false);
+    let before = r3_tree(home.path());
+    let help = r3_wire_command(home.path())
+        .args(["wire", "--help"])
+        .bounded_output()
+        .unwrap();
+    let text = r3_output(&help);
+    assert!(help.status.success(), "{text}");
+    for expected in ["--codex-mode", "default", "dedicated", "none"] {
+        assert!(text.contains(expected), "missing help: {expected}");
+    }
+    for args in [
+        vec!["wire", "--codex-mode", "invalid"],
+        vec!["wire", "--codex-mode"],
+    ] {
+        let output = r3_wire_command(home.path())
+            .args(args)
+            .bounded_output()
+            .unwrap();
+        let text = r3_output(&output);
+        assert!(!output.status.success(), "{text}");
+        assert_eq!(output.status.code(), Some(2), "{text}");
+        assert!(text.contains("--codex-mode"), "{text}");
+    }
+    assert_eq!(r3_tree(home.path()), before);
+}
+
+#[test]
+fn r3_wire_none_dry_run_without_codex_inputs_or_accounts() {
+    let home = r3_wire_fixture(false);
+    let before = r3_tree(home.path());
+    let output = r3_wire_command(home.path())
+        .env_remove("APPDATA")
+        .args(["wire", "--codex-mode", "none"])
+        .bounded_output()
+        .unwrap();
+    let text = r3_output(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("미리보기:"), "{text}");
+    assert!(text.contains("ANTHROPIC_BASE_URL"), "{text}");
+    assert!(text.contains("<client key>"), "{text}");
+    assert_eq!(r3_tree(home.path()), before);
+}
+
+#[test]
+fn r3_wire_dedicated_and_auto_dry_runs_leave_source_and_launcher_untouched() {
+    for args in [vec!["wire"], vec!["wire", "--codex-mode", "dedicated"]] {
+        let home = r3_wire_fixture(true);
+        let before = r3_tree(home.path());
+        let output = r3_wire_command(home.path())
+            .args(args)
+            .bounded_output()
+            .unwrap();
+        let text = r3_output(&output);
+        assert!(output.status.success(), "{text}");
+        for expected in [
+            "미리보기:",
+            "codex-qb.cmd",
+            ".codex-acct",
+            "config.toml",
+            "auth.json",
+            "<client key>",
+            "log_dir",
+            "openai_base_url",
+            "`codex-qb`로 시작한 세션만 quota-baton을 거칩니다. 기존 `codex`·`codex-ib`·`codex-mz`·`codex-cpa`는 바뀌지 않습니다.",
+            "herdr 창에서 `codex-qb` 세션을 재시작 후 이어 열려면 그 세션 ID를 `session-homes.json`에 `~/.codex-acct/qb`로 등록해야 합니다.",
+        ] {
+            assert!(
+                text.contains(expected),
+                "missing plan detail {expected}: {text}"
+            );
+        }
+        assert_eq!(r3_tree(home.path()), before);
+    }
+}
+
+#[test]
+fn r3_wire_explicit_default_preserves_legacy_preview() {
+    let home = r3_wire_fixture(true);
+    let codex = home.path().join("synthetic-profile/.codex");
+    // Old preview fixtures need not describe the new automatic CPA detection.
+    std::fs::write(
+        codex.join("config.toml"),
+        "openai_base_url = 'https://old.invalid/v1'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        codex.join("auth.json"),
+        format!(
+            r#"{{"auth_mode":"apikey","OPENAI_API_KEY":"{}"}}"#,
+            R3_SECRETS[1]
+        ),
+    )
+    .unwrap();
+    let before = r3_tree(home.path());
+    let output = r3_wire_command(home.path())
+        .args(["wire", "--codex-mode", "default"])
+        .bounded_output()
+        .unwrap();
+    let text = r3_output(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("codex.openai_base_url"), "{text}");
+    assert!(text.contains("<client key>"), "{text}");
+    assert!(!text.contains("codex-qb.cmd"), "{text}");
+    assert_eq!(r3_tree(home.path()), before);
+}
+
+// APPLY acceptance uses valid local secrets and only canonical synthetic client
+// roots. No parent-process environment discovery or mutation is needed.
+#[cfg(debug_assertions)]
+fn r3_apply_command(home: &Path) -> Command {
+    let profile = home.join("synthetic-profile").canonicalize().unwrap();
+    let mut cmd = r3_wire_command(home);
+    cmd.env("USERPROFILE", &profile)
+        .env("HOME", &profile)
+        .env("APPDATA", profile.join("AppData/Roaming"))
+        .env("LOCALAPPDATA", profile.join("AppData/Local"))
+        .env("CODEX_HOME", profile.join(".codex"))
+        .env("CLAUDE_CONFIG_DIR", profile.join(".claude"));
+    cmd
+}
+
+#[cfg(debug_assertions)]
+fn r3_apply_fixture(upstream: &str) -> tempfile::TempDir {
+    // Seed Codex source files too: None must leave them byte-exact even though
+    // the only imported/eligible account below is Claude.
+    let home = r3_wire_fixture(true);
+    std::fs::remove_file(home.path().join("client.key")).unwrap();
+    let secrets = qb_core::local_secrets::load_or_create(home.path()).unwrap();
+    assert_eq!(secrets.client_key.len(), 43);
+    let mut config = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+    config.push_str(&format!(
+        "[upstream]\ncodex_base={upstream:?}\nanthropic_base={upstream:?}\ncodex_usage_base={upstream:?}\nclaude_usage_base={upstream:?}\ncodex_token_endpoint={upstream:?}\nclaude_token_endpoint={upstream:?}\n"
+    ));
+    std::fs::write(home.path().join("config.toml"), config).unwrap();
+    let config = qb_core::config::Config::load(home.path()).unwrap();
+    config.upstream.validate().unwrap();
+    config.routing.validate().unwrap();
+    // The copied preview source contains a legacy CPA URL. Replace it in this
+    // fixture too, so every configured endpoint is synthetic numeric loopback.
+    let source = home.path().join("synthetic-profile/.codex/config.toml");
+    let text = std::fs::read_to_string(&source).unwrap();
+    std::fs::write(source, text.replace("http://127.0.0.1:10100/v1", upstream)).unwrap();
+    let cpa = home.path().join("synthetic-r3-cpa");
+    std::fs::create_dir_all(&cpa).unwrap();
+    std::fs::write(
+        cpa.join("claude.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "type": "claude", "email": "r3-claude@example.invalid",
+            "account_uuid": "synthetic-r3-account",
+            "organization_uuid": "synthetic-r3-organization",
+            "access_token": R3_SECRETS[2], "refresh_token": R3_SECRETS[3],
+            "expired": "2099-01-01T00:00:00Z",
+            "last_refresh": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    {
+        let store = qb_core::accounts::AccountStore::acquire(home.path()).unwrap();
+        qb_core::accounts::import::run(
+            &store,
+            &cpa,
+            &["claude:r3-claude@example.invalid".to_owned()],
+            false,
+        )
+        .unwrap();
+    }
+    let accounts = qb_core::accounts::AccountStore::list_metadata(home.path()).unwrap();
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0].provider, qb_core::accounts::Provider::Claude);
+    assert!(accounts[0].eligible(None));
+    assert!(!home.path().join("journal").exists());
+    home
+}
+
+#[cfg(debug_assertions)]
+async fn r3_apply_core_state(home: &Path, codex_eligible: u64) {
+    let config = qb_core::config::Config::load(home).unwrap();
+    let secrets = qb_core::local_secrets::load_existing(home).unwrap();
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .unwrap()
+        .get(format!(
+            "http://127.0.0.1:{}/admin/v1/state",
+            config.server.admin_port
+        ))
+        .bearer_auth(&secrets.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    let state: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(state["pools"]["claude"]["eligible"], 1);
+    assert_eq!(state["pools"]["codex"]["eligible"], codex_eligible);
+    tokio::net::TcpStream::connect(("127.0.0.1", config.server.data_port))
+        .await
+        .unwrap();
+}
+
+#[cfg(debug_assertions)]
+fn r3_apply_profile(
+    root: &Path,
+) -> std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>> {
+    let mut snapshot = std::collections::BTreeMap::new();
+    // List only fixture-owned directories and read only known source files.
+    // In particular, never walk a new .codex-acct shared-directory junction.
+    for dir in [
+        "",
+        ".claude",
+        ".codex",
+        "AppData",
+        "AppData/Roaming",
+        "AppData/Roaming/herdr",
+        "AppData/Roaming/npm",
+    ] {
+        let path = root.join(dir);
+        if dir == "AppData/Roaming/npm" && !path.exists() {
+            snapshot.insert(Path::new(dir).join("<entries>"), None);
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        assert!(
+            !metadata.file_type().is_symlink(),
+            "unexpected fixture link"
+        );
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            assert_eq!(
+                metadata.file_attributes() & 0x400,
+                0,
+                "fixture reparse point"
+            );
+        }
+        let mut names: Vec<_> = std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        snapshot.insert(
+            Path::new(dir).join("<entries>"),
+            Some(serde_json::to_vec(&names).unwrap()),
+        );
+    }
+    for file in [
+        ".claude/settings.json",
+        ".codex/auth.json",
+        ".codex/config.toml",
+        "AppData/Roaming/herdr/session-homes.json",
+        "AppData/Roaming/npm/codex.cmd",
+    ] {
+        let path = root.join(file);
+        let bytes = if file == "AppData/Roaming/npm/codex.cmd" && !path.exists() {
+            None
+        } else {
+            Some(std::fs::read(path).unwrap())
+        };
+        snapshot.insert(file.into(), bytes);
+    }
+    snapshot
+}
+
+#[cfg(debug_assertions)]
+fn r3_apply_output(home: &Path, output: &Output) -> String {
+    let text = r3_output(output);
+    for secret in ["fake-access-", "fake-refresh-", "fake-id-"] {
+        assert!(!text.contains(secret), "synthetic CPA token in CLI output");
+    }
+    let secrets = qb_core::local_secrets::load_existing(home).unwrap();
+    for secret in [&secrets.client_key, &secrets.admin_token] {
+        assert!(
+            !text.contains(secret.as_str()),
+            "generated secret in CLI output"
+        );
+    }
+    text
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r3_wire_none_apply_with_real_claude_only_core_and_exact_unwire() {
+    let _serial = SERVE_SERIAL.lock().await;
+    let fake = qb_testkit::ScriptedUpstream::start().await.unwrap();
+    let home = r3_apply_fixture(&fake.url);
+    let profile = home
+        .path()
+        .join("synthetic-profile")
+        .canonicalize()
+        .unwrap();
+    // No npm installation or APPDATA variable may be required for None.
+    std::fs::remove_file(profile.join("AppData/Roaming/npm/codex.cmd")).unwrap();
+    std::fs::remove_dir(profile.join("AppData/Roaming/npm")).unwrap();
+    let before = r3_apply_profile(&profile);
+    let core = r2a_core_in(home.path(), &profile).await;
+    r3_apply_core_state(home.path(), 0).await;
+    let output = r3_apply_command(home.path())
+        .env_remove("APPDATA")
+        .args(["wire", "--apply", "--codex-mode", "none"])
+        .bounded_output()
+        .unwrap();
+    let text = r3_apply_output(home.path(), &output);
+    assert!(output.status.success(), "{text}");
+    assert!(core.try_wait().unwrap().is_none());
+    assert!(home.path().join("journal/wiring.json").is_file());
+    let settings_path = profile.join(".claude/settings.json");
+    let settings: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
+    let secrets = qb_core::local_secrets::load_existing(home.path()).unwrap();
+    assert!(settings["env"]["ANTHROPIC_AUTH_TOKEN"].as_str() == Some(secrets.client_key.as_str()));
+    let config = qb_core::config::Config::load(home.path()).unwrap();
+    assert_eq!(
+        settings["env"]["ANTHROPIC_BASE_URL"],
+        format!("http://127.0.0.1:{}", config.server.data_port)
+    );
+    assert!(settings["nested"]["api_key"].as_str() == Some(R3_SECRETS[3]));
+    // None creates no new profile, launcher, session map entry or Codex write.
+    let after = r3_apply_profile(&profile);
+    let mut expected = before.clone();
+    expected.insert(
+        ".claude/settings.json".into(),
+        Some(std::fs::read(settings_path).unwrap()),
+    );
+    assert!(
+        after == expected,
+        "None changed files beyond Claude settings"
+    );
+    let output = r3_apply_command(home.path())
+        .env_remove("APPDATA")
+        .args(["unwire", "--apply"])
+        .bounded_output()
+        .unwrap();
+    let text = r3_apply_output(home.path(), &output);
+    assert!(output.status.success(), "{text}");
+    assert!(
+        r3_apply_profile(&profile) == before,
+        "unwire did not restore exact source bytes"
+    );
+    assert!(!home.path().join("journal/wiring.json").exists());
+    assert!(core.try_wait().unwrap().is_none());
+    drop(core);
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r3_wire_dedicated_refuses_real_healthy_claude_only_core_without_mutation() {
+    let _serial = SERVE_SERIAL.lock().await;
+    let fake = qb_testkit::ScriptedUpstream::start().await.unwrap();
+    let home = r3_apply_fixture(&fake.url);
+    let core = r2a_core(home.path()).await;
+    r3_apply_core_state(home.path(), 0).await;
+    let profile = home.path().join("synthetic-profile");
+    let before = r3_apply_profile(&profile);
+    let config_before = std::fs::read(home.path().join("config.toml")).unwrap();
+    let output = r3_apply_command(home.path())
+        .args(["wire", "--apply", "--codex-mode", "dedicated"])
+        .bounded_output()
+        .unwrap();
+    let text = r3_apply_output(home.path(), &output);
+    assert!(!output.status.success());
+    // These are the CLI's provider prerequisite diagnostics, not a path or
+    // connection failure: startup has authenticated the real core's health.
+    assert!(text.contains("활성 계정"), "{text}");
+    assert!(core.try_wait().unwrap().is_none());
+    assert!(
+        r3_apply_profile(&profile) == before,
+        "refusal mutated client files"
+    );
+    assert!(!home.path().join("journal").exists());
+    assert!(std::fs::read(home.path().join("config.toml")).unwrap() == config_before);
+    assert!(!profile.join(".codex-acct").exists());
+    assert!(!profile.join("AppData/Roaming/npm/codex-qb.cmd").exists());
+    drop(core);
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r3_wire_dedicated_apply_with_both_providers_and_unwire_preserves_sessions() {
+    let _serial = SERVE_SERIAL.lock().await;
+    let fake = qb_testkit::ScriptedUpstream::start().await.unwrap();
+    let home = r3_apply_fixture(&fake.url);
+    let cpa = home.path().join("synthetic-r3-cpa");
+    let mut codex = cpa_fixture(1);
+    codex["expired"] = serde_json::json!("2099-01-01T00:00:00Z");
+    std::fs::write(cpa.join("codex.json"), serde_json::to_vec(&codex).unwrap()).unwrap();
+    {
+        let store = qb_core::accounts::AccountStore::acquire(home.path()).unwrap();
+        qb_core::accounts::import::run(
+            &store,
+            &cpa,
+            &["codex:synthetic@example.invalid".to_owned()],
+            false,
+        )
+        .unwrap();
+    }
+    let accounts = qb_core::accounts::AccountStore::list_metadata(home.path()).unwrap();
+    assert_eq!(accounts.len(), 2);
+    for provider in [
+        qb_core::accounts::Provider::Claude,
+        qb_core::accounts::Provider::Codex,
+    ] {
+        assert!(
+            accounts
+                .iter()
+                .any(|a| a.provider == provider && a.eligible(None))
+        );
+    }
+    let profile = home
+        .path()
+        .join("synthetic-profile")
+        .canonicalize()
+        .unwrap();
+    let direct_sessions = profile.join(".codex/sessions");
+    std::fs::create_dir(&direct_sessions).unwrap();
+    let direct_session = direct_sessions.join("synthetic-direct.jsonl");
+    let direct_bytes = b"{\"session\":\"synthetic-direct\"}\r\n";
+    std::fs::write(&direct_session, direct_bytes).unwrap();
+    let before = r3_apply_profile(&profile);
+    let core = r2a_core_in(home.path(), &profile).await;
+    r3_apply_core_state(home.path(), 1).await;
+    let output = r3_apply_command(home.path())
+        .args(["wire", "--apply", "--codex-mode", "dedicated"])
+        .bounded_output()
+        .unwrap();
+    let text = r3_apply_output(home.path(), &output);
+    assert!(output.status.success(), "{text}");
+    assert!(home.path().join("journal/wiring.json").is_file());
+    let qb = profile.join(".codex-acct/qb");
+    let auth: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(qb.join("auth.json")).unwrap()).unwrap();
+    let secrets = qb_core::local_secrets::load_existing(home.path()).unwrap();
+    assert!(auth["auth_mode"] == "apikey");
+    assert!(auth["OPENAI_API_KEY"].as_str() == Some(secrets.client_key.as_str()));
+    assert!(auth.get("tokens").is_none());
+    let claude: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(profile.join(".claude/settings.json")).unwrap())
+            .unwrap();
+    assert!(claude["env"]["ANTHROPIC_AUTH_TOKEN"].as_str() == Some(secrets.client_key.as_str()));
+    let config = std::fs::read_to_string(qb.join("config.toml"))
+        .unwrap()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    let core_config = qb_core::config::Config::load(home.path()).unwrap();
+    assert_eq!(
+        config["openai_base_url"].as_str(),
+        Some(format!("http://127.0.0.1:{}/v1", core_config.server.data_port).as_str())
+    );
+    assert_eq!(
+        config["log_dir"].as_str(),
+        Some(qb.join("log").to_string_lossy().as_ref())
+    );
+    assert_eq!(config["model"].as_str(), Some("synthetic-model"));
+    assert_eq!(config["features"]["keep"].as_bool(), Some(true));
+    assert!(config.get("model_catalog_json").is_none());
+    let launcher = profile.join("AppData/Roaming/npm/codex-qb.cmd");
+    let launcher_text = std::fs::read_to_string(&launcher).unwrap();
+    assert!(launcher_text.starts_with("@echo off\r\nsetlocal\r\n"));
+    assert!(launcher_text.contains("set \"CODEX_HOME=%USERPROFILE%\\.codex-acct\\qb\"\r\n"));
+    assert!(launcher_text.ends_with("call \"%APPDATA%\\npm\\codex.cmd\" %*\r\n"));
+    let wired = r3_apply_profile(&profile);
+    for (path, bytes) in &before {
+        if path.starts_with(".codex")
+            || path.starts_with("AppData/Roaming/herdr")
+            || path == Path::new("AppData/Roaming/npm/codex.cmd")
+        {
+            assert!(
+                wired.get(path) == Some(bytes),
+                "Dedicated changed direct source files"
+            );
+        }
+    }
+    assert!(std::fs::read(&direct_session).unwrap() == direct_bytes);
+    // Only direct, known paths are touched: never enumerate shared junctions.
+    let sessions = qb.join("sessions");
+    std::fs::create_dir(&sessions).unwrap();
+    let session = sessions.join("synthetic-qb.jsonl");
+    let session_bytes = b"{\"session\":\"synthetic-qb\"}\r\n";
+    std::fs::write(&session, session_bytes).unwrap();
+    let output = r3_apply_command(home.path())
+        .args(["unwire", "--apply"])
+        .bounded_output()
+        .unwrap();
+    let text = r3_apply_output(home.path(), &output);
+    assert!(output.status.success(), "{text}");
+    assert!(std::fs::read(session).unwrap() == session_bytes);
+    assert!(std::fs::read(direct_session).unwrap() == direct_bytes);
+    assert!(!qb.join("auth.json").exists());
+    assert!(!qb.join("config.toml").exists());
+    assert!(!launcher.exists());
+    let journal: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(home.path().join("journal/wiring.json")).unwrap())
+            .unwrap();
+    assert!(journal["retained"] == true);
+    // Retained QB sessions keep .codex-acct at the profile root; every original
+    // directory listing and source/settings byte must otherwise be identical.
+    let mut expected = before;
+    let root_entries = expected.get_mut(Path::new("<entries>")).unwrap();
+    let mut names: Vec<String> = serde_json::from_slice(root_entries.as_ref().unwrap()).unwrap();
+    names.push(".codex-acct".to_owned());
+    names.sort();
+    *root_entries = Some(serde_json::to_vec(&names).unwrap());
+    assert!(
+        r3_apply_profile(&profile) == expected,
+        "unwire changed original profile bytes"
+    );
+    assert!(core.try_wait().unwrap().is_none());
+    drop(core);
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r3_wire_apply_refuses_missing_or_unhealthy_core_without_mutation() {
+    let _serial = SERVE_SERIAL.lock().await;
+    let fake = qb_testkit::ScriptedUpstream::start().await.unwrap();
+    for unhealthy in [false, true] {
+        for mode in ["none", "dedicated"] {
+            let home = r3_apply_fixture(&fake.url);
+            let server = if unhealthy {
+                // Explicit 503 exercises the non-success health response. The
+                // two provider acceptance tests above use a spawned real core.
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let port = listener.local_addr().unwrap().port();
+                let config = home.path().join("config.toml");
+                let text = std::fs::read_to_string(&config).unwrap();
+                let old = qb_core::config::Config::load(home.path()).unwrap();
+                std::fs::write(
+                    config,
+                    text.replace(
+                        &format!("admin_port={}", old.server.admin_port),
+                        &format!("admin_port={port}"),
+                    ),
+                )
+                .unwrap();
+                let secrets = qb_core::local_secrets::load_existing(home.path()).unwrap();
+                Some(std::thread::spawn(move || {
+                    mock_response(
+                        &listener,
+                        std::time::Instant::now() + Duration::from_secs(5),
+                        "/admin/v1/health",
+                        "503 Service Unavailable",
+                        "{}",
+                        Some(&secrets.admin_token),
+                    )
+                }))
+            } else {
+                None
+            };
+            // No real core is running here, so whole-home equality is safe.
+            let before = r3_tree(home.path());
+            let output = r3_apply_command(home.path())
+                .args(["wire", "--apply", "--codex-mode", mode])
+                .bounded_output()
+                .unwrap();
+            if let Some(server) = server {
+                server.join().unwrap().unwrap();
+            }
+            let text = r3_apply_output(home.path(), &output);
+            assert!(!output.status.success());
+            assert!(text.contains("정상 상태의 코어"), "{text}");
+            assert!(
+                r3_tree(home.path()) == before,
+                "health refusal mutated fixture"
+            );
+        }
+    }
+}
+
 #[test]
 fn help_is_available() {
     let home = fixture();

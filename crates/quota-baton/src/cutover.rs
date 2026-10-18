@@ -29,6 +29,9 @@ use windows::Win32::{
 };
 use windows::core::PCWSTR;
 
+#[path = "dedicated.rs"]
+mod dedicated;
+
 const JOURNAL_ENTROPY: &[u8] = b"quota-baton/v1/wiring-journal";
 
 #[derive(Clone, Debug)]
@@ -40,6 +43,8 @@ pub struct CutoverPaths {
     pub session_homes_file: Option<PathBuf>,
     session_homes_warning: Option<String>,
     pub codex_config: PathBuf,
+    pub codex_qb_home: PathBuf,
+    pub npm_dir: PathBuf,
     pub claude_settings: PathBuf,
     pub client_key: PathBuf,
     /// Realtime endpoints intentionally left on CPA because quota-baton does
@@ -52,6 +57,12 @@ pub struct CutoverPaths {
 }
 
 impl CutoverPaths {
+    fn npm_dir_for(user: &Path, appdata: Option<PathBuf>) -> PathBuf {
+        appdata
+            .unwrap_or_else(|| user.join("AppData").join("Roaming"))
+            .join("npm")
+    }
+
     pub fn from_environment(qb_home: PathBuf) -> Result<Self> {
         let user = std::env::var_os("USERPROFILE")
             .or_else(|| std::env::var_os("HOME"))
@@ -73,6 +84,8 @@ impl CutoverPaths {
             session_homes_file,
             session_homes_warning,
             codex_config: codex_root.join("config.toml"),
+            codex_qb_home: user.join(".codex-acct").join("qb"),
+            npm_dir: Self::npm_dir_for(&user, std::env::var_os("APPDATA").map(PathBuf::from)),
             codex_realtime_items: realtime_cpa_items(&codex_root.join("config.toml")),
             claude_settings: user.join(".claude").join("settings.json"),
             client_key,
@@ -451,8 +464,92 @@ pub struct Report {
     pub report_only: Vec<String>,
 }
 
+/// CLI-independent mode; main may parse this through `FromStr`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CodexMode {
+    Default,
+    Dedicated,
+    None,
+}
+
+impl std::str::FromStr for CodexMode {
+    type Err = anyhow::Error;
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "default" => Ok(Self::Default),
+            "dedicated" => Ok(Self::Dedicated),
+            "none" => Ok(Self::None),
+            _ => bail!("Codex 모드는 default, dedicated, none 중 하나여야 합니다"),
+        }
+    }
+}
+
+/// Reads only injected paths; persisted mode wins over auto-detection on retry.
+pub fn resolve_codex_mode(paths: &CutoverPaths, options: &WireOptions) -> Result<CodexMode> {
+    if let Some(mode) = options.codex_mode {
+        return Ok(mode);
+    }
+    // Routing by the journal header does not replace the wire path's full
+    // journal validation. Explicit overrides above retain their precedence.
+    match fs::read(paths.journal()) {
+        Ok(bytes) => {
+            #[derive(Deserialize)]
+            struct ModeJournal {
+                schema: u8,
+                #[serde(default)]
+                mode: Option<CodexMode>,
+            }
+            let invalid = || anyhow::anyhow!("연결 journal 형식이 올바르지 않습니다");
+            let saved: ModeJournal = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+            return match saved.schema {
+                1 => Ok(CodexMode::Default),
+                3 => saved.mode.ok_or_else(invalid),
+                _ => Err(invalid()),
+            };
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => bail!("연결 journal을 읽지 못했습니다"),
+    }
+    if !paths.codex_config.exists() {
+        return Ok(CodexMode::Dedicated);
+    }
+    let doc = read_text(&paths.codex_config)?
+        .parse::<DocumentMut>()
+        .map_err(|_| anyhow::anyhow!("Codex config 형식이 올바르지 않습니다"))?;
+    let selected = doc
+        .get("model_provider")
+        .and_then(toml_edit::Item::as_str)
+        .unwrap_or("openai");
+    let provider = doc
+        .get("model_providers")
+        .and_then(|providers| providers.get(selected));
+    let endpoint = if let Some(provider) = provider {
+        provider.get("base_url").and_then(toml_edit::Item::as_str)
+    } else if selected == "openai" {
+        doc.get("openai_base_url").and_then(toml_edit::Item::as_str)
+    } else {
+        None
+    };
+    if !paths.codex_auth.exists() {
+        return Ok(CodexMode::Dedicated);
+    }
+    let auth: Value = serde_json::from_str(&read_text(&paths.codex_auth)?)
+        .map_err(|_| anyhow::anyhow!("Codex auth.json 형식이 올바르지 않습니다"))?;
+    Ok(
+        if auth.get("auth_mode").and_then(Value::as_str) == Some("apikey")
+            && endpoint.is_some_and(dedicated::is_cpa_endpoint)
+        {
+            CodexMode::Default
+        } else {
+            CodexMode::Dedicated
+        },
+    )
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct WireOptions {
+    pub codex_mode: Option<CodexMode>,
     pub data_port: u16,
     pub autostart: bool,
     pub disable_cpa_tasks: bool,
@@ -462,6 +559,7 @@ pub struct WireOptions {
 impl Default for WireOptions {
     fn default() -> Self {
         Self {
+            codex_mode: None,
             data_port: 10200,
             autostart: false,
             disable_cpa_tasks: false,
@@ -879,6 +977,11 @@ fn bytemuck_u8(words: &[u16]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 2) }
 }
 
+#[cfg(test)]
+fn task_enabled(_name: &str) -> Option<bool> {
+    panic!("unit test attempted the real scheduled-task backend")
+}
+#[cfg(not(test))]
 fn task_enabled(name: &str) -> Option<bool> {
     let output = std::process::Command::new("schtasks.exe")
         .args(["/Query", "/TN", name, "/V", "/FO", "LIST"])
@@ -924,6 +1027,11 @@ fn cpa_task_journal(task_query: &dyn Fn(&str) -> Option<bool>) -> Result<Vec<Tas
 }
 
 fn disable_cpa_tasks(tasks: &[TaskJournal]) -> Result<()> {
+    #[cfg(test)]
+    assert!(
+        tasks.iter().all(|task| !task.was_enabled),
+        "unit test attempted the real scheduled-task backend"
+    );
     for task in tasks.iter().filter(|task| task.was_enabled) {
         let status = std::process::Command::new("schtasks.exe")
             .args(["/Change", "/TN", &task.name, "/DISABLE"])
@@ -937,6 +1045,11 @@ fn disable_cpa_tasks(tasks: &[TaskJournal]) -> Result<()> {
 }
 
 fn restore_cpa_tasks(tasks: &[TaskJournal]) -> Result<()> {
+    #[cfg(test)]
+    assert!(
+        tasks.is_empty(),
+        "unit test attempted the real scheduled-task backend"
+    );
     for task in tasks {
         let action = if task.was_enabled {
             "/ENABLE"
@@ -1079,6 +1192,13 @@ fn wire_with_task_query(
     options: WireOptions,
     task_query: &dyn Fn(&str) -> Option<bool>,
 ) -> Result<Report> {
+    let mode = resolve_codex_mode(paths, &options)?;
+    if mode != CodexMode::Default {
+        if options.detach_chatgpt_session_homes {
+            bail!("세션 홈 분리 옵션은 Codex default 모드에서만 사용할 수 있습니다");
+        }
+        return dedicated::wire(paths, apply, options, mode, task_query);
+    }
     let linked_active = active_linked_count(&paths.qb_home)?;
     check_cpa_dependency(linked_active, &options)?;
     if paths.journal().exists() {
@@ -1535,6 +1655,11 @@ pub fn unwire(paths: &CutoverPaths, apply: bool, force: bool) -> Result<Report> 
             diff: Vec::new(),
             report_only: Vec::new(),
         });
+    }
+    let header: Value = serde_json::from_slice(&fs::read(paths.journal())?)
+        .map_err(|_| anyhow::anyhow!("wiring journal 형식이 올바르지 않습니다"))?;
+    if header.get("schema").and_then(Value::as_u64) == Some(3) {
+        return dedicated::unwire(paths, apply, force);
     }
     let journal: Journal =
         serde_json::from_slice(&fs::read(paths.journal()).context("journal을 읽지 못했습니다")?)
@@ -2270,40 +2395,150 @@ fn preserved_bytes(path: &Path, bytes: &[u8]) -> Result<Vec<u8>> {
 fn atomic_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     atomic_bytes(path, serde_json::to_vec_pretty(value)?.as_slice())
 }
+// Handle-based rename/deletion keep cleanup bound to the exclusively created
+// scratch inode, even if other processes are active in the same directory.
+fn replace_owned_scratch(file: &fs::File, path: &Path) -> std::io::Result<()> {
+    use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
+    use windows::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{FILE_RENAME_INFO, FileRenameInfo, SetFileInformationByHandle},
+    };
+    let path = std::path::absolute(path)?;
+    let name = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    let length = u32::try_from(name.len() * 2).map_err(std::io::Error::other)?;
+    let offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+    let size = offset + length as usize + 2; // include the zeroed UTF-16 terminator
+    // SDK-typed storage supplies the authoritative header layout/alignment.
+    let count = size.div_ceil(std::mem::size_of::<FILE_RENAME_INFO>());
+    let mut buffer = vec![std::mem::MaybeUninit::<FILE_RENAME_INFO>::zeroed(); count];
+    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    unsafe {
+        (*info).Anonymous.ReplaceIfExists = true;
+        (*info).RootDirectory = HANDLE::default();
+        (*info).FileNameLength = length;
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            info.cast::<u8>().add(offset).cast::<u16>(),
+            name.len(),
+        );
+        SetFileInformationByHandle(
+            HANDLE(file.as_raw_handle()),
+            FileRenameInfo,
+            info.cast(),
+            u32::try_from(size).map_err(std::io::Error::other)?,
+        )
+        .map_err(std::io::Error::other)?;
+    }
+    Ok(())
+}
+
+fn discard_owned_scratch(file: &fs::File) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{
+            FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+        },
+    };
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    unsafe {
+        SetFileInformationByHandle(
+            HANDLE(file.as_raw_handle()),
+            FileDispositionInfo,
+            (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+        .map_err(std::io::Error::other)?;
+    }
+    Ok(())
+}
+
 fn atomic_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    atomic_bytes_with_counter(path, bytes, &SEQUENCE)
+}
+
+fn atomic_bytes_with_counter(
+    path: &Path,
+    bytes: &[u8],
+    sequence: &std::sync::atomic::AtomicU64,
+) -> Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows::Win32::{
+        Foundation::GENERIC_WRITE,
+        Storage::FileSystem::{DELETE, FILE_SHARE_NONE},
+    };
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-    for attempt in 0..5 {
+    for _ in 0..64 {
+        let serial = sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_extension(format!("tmp-{}-{serial}", std::process::id()));
+        let mut file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .access_mode(GENERIC_WRITE.0 | DELETE.0)
+            .share_mode(FILE_SHARE_NONE.0) // retain exclusive ownership through rename/cleanup
+            .open(&tmp)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("임시 파일을 만들지 못했습니다: {}", tmp.display()));
+            }
+        };
         let result = (|| {
-            let mut file = OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .open(&tmp)?;
             file.write_all(bytes)?;
             file.sync_all()?;
-            fs::rename(&tmp, path)
-        })();
-        match result {
-            Ok(()) => return Ok(()),
-            Err(error) if attempt < 4 => thread::sleep(Duration::from_millis(20 * (attempt + 1))),
-            Err(error) => {
-                let _ = fs::remove_file(&tmp);
-                return Err(error).with_context(|| {
-                    format!("파일을 원자적으로 쓰지 못했습니다: {}", path.display())
-                });
+            for attempt in 0..5 {
+                match replace_owned_scratch(&file, path) {
+                    Ok(()) => return Ok(()),
+                    Err(_) if attempt < 4 => {
+                        thread::sleep(Duration::from_millis(20 * (attempt + 1)))
+                    }
+                    Err(error) => return Err(error),
+                }
             }
+            unreachable!()
+        })();
+        if let Err(error) = result {
+            if let Err(cleanup) = discard_owned_scratch(&file) {
+                bail!(
+                    "파일을 원자적으로 쓰지 못했습니다: {}: {error}. 소유한 임시 파일 정리 실패: {}: {cleanup}",
+                    path.display(),
+                    tmp.display()
+                );
+            }
+            return Err(error)
+                .with_context(|| format!("파일을 원자적으로 쓰지 못했습니다: {}", path.display()));
         }
+        return Ok(());
     }
-    unreachable!()
+    bail!(
+        "기존 임시 파일과 충돌하여 쓰기를 중단했습니다: {}",
+        path.display()
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
+    fn tempdir() -> std::io::Result<tempfile::TempDir> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r3-cutover-tests");
+        fs::create_dir_all(&root)?;
+        tempfile::tempdir_in(root)
+    }
+    fn wire(paths: &CutoverPaths, apply: bool) -> Result<Report> {
+        super::wire_with_options(
+            paths,
+            apply,
+            WireOptions {
+                codex_mode: Some(CodexMode::Default),
+                ..WireOptions::default()
+            },
+        )
+    }
 
     fn paths() -> (tempfile::TempDir, CutoverPaths) {
         let dir = tempdir().unwrap();
@@ -2326,12 +2561,14 @@ mod tests {
         (
             dir,
             CutoverPaths {
-                qb_home,
+                qb_home: qb_home.clone(),
                 codex_auth: auth,
                 codex_session_auth: Vec::new(),
                 codex_session_homes: Vec::new(),
                 session_homes_file: None,
                 session_homes_warning: None,
+                codex_qb_home: qb_home.parent().unwrap().join(".codex-acct/qb"),
+                npm_dir: qb_home.parent().unwrap().join("npm"),
                 codex_config: codex,
                 codex_realtime_items: Vec::new(),
                 claude_settings: claude,
@@ -2340,6 +2577,265 @@ mod tests {
                 scan_roots: Vec::new(),
             },
         )
+    }
+
+    fn r3_retry_paths() -> (tempfile::TempDir, CutoverPaths) {
+        let (dir, mut p) = paths();
+        // Only this synthetic root is normalized, never an ambient profile.
+        let root = fs::canonicalize(dir.path()).unwrap();
+        p.qb_home = root.join("qb");
+        p.codex_config = root.join("codex.toml");
+        p.codex_auth = root.join("auth.json");
+        p.claude_settings = root.join("settings.json");
+        p.client_key = root.join("key");
+        p.codex_qb_home = root.join(".codex-acct/qb");
+        p.npm_dir = root.join("npm");
+        (dir, p)
+    }
+
+    #[test]
+    fn r3_schema1_flagless_retry_keeps_default_after_wired_endpoint_rewrite() {
+        let (_dir, p) = r3_retry_paths();
+        fs::write(&p.client_key, "synthetic-key\n").unwrap();
+        fs::write(
+            &p.codex_config,
+            "openai_base_url = 'http://127.0.0.1:10100/v1'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_codex_mode(&p, &WireOptions::default()).unwrap(),
+            CodexMode::Default
+        );
+        super::wire(&p, true).unwrap();
+        assert!(
+            fs::read_to_string(&p.codex_config)
+                .unwrap()
+                .contains("127.0.0.1:10200/v1")
+        );
+        let before = [
+            p.journal(),
+            p.codex_config.clone(),
+            p.codex_auth.clone(),
+            p.claude_settings.clone(),
+        ]
+        .map(|path| fs::read(path).unwrap());
+        assert_eq!(
+            resolve_codex_mode(&p, &WireOptions::default()).unwrap(),
+            CodexMode::Default
+        );
+        // Schema 1 retains its existing already-wired refusal; never reroute
+        // to schema 3 or reinterpret the rewritten QB URL as a new home.
+        let error = super::wire(&p, true).unwrap_err();
+        assert!(error.to_string().contains("이미 연결 journal"));
+        let after = [
+            p.journal(),
+            p.codex_config.clone(),
+            p.codex_auth.clone(),
+            p.claude_settings.clone(),
+        ]
+        .map(|path| fs::read(path).unwrap());
+        assert_eq!(before, after);
+        unwire(&p, true, false).unwrap();
+    }
+
+    #[test]
+    fn r3_none_journal_flagless_retry_resumes_without_codex_inputs() {
+        let (_dir, mut p) = r3_retry_paths();
+        p.codex_config = p.qb_home.join("missing-config.toml");
+        p.codex_auth = p.qb_home.join("missing-auth.json");
+        fs::write(&p.client_key, "synthetic-key\n").unwrap();
+        let original = fs::read(&p.claude_settings).unwrap();
+        super::wire_with_options(
+            &p,
+            true,
+            WireOptions {
+                codex_mode: Some(CodexMode::None),
+                ..WireOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_codex_mode(&p, &WireOptions::default()).unwrap(),
+            CodexMode::None
+        );
+        super::wire(&p, true).unwrap();
+        assert!(!p.codex_config.exists());
+        assert!(!p.codex_auth.exists());
+        assert!(!p.codex_qb_home.exists());
+        assert!(!p.npm_dir.exists());
+        unwire(&p, true, false).unwrap();
+        assert_eq!(fs::read(&p.claude_settings).unwrap(), original);
+    }
+
+    #[test]
+    fn r3_dedicated_journal_wins_over_changed_source_and_full_validation_still_runs() {
+        let (_dir, p) = r3_retry_paths();
+        fs::create_dir_all(p.journal().parent().unwrap()).unwrap();
+        let header = br#"{"schema":3,"mode":"dedicated"}"#;
+        fs::write(p.journal(), header).unwrap();
+        for source in [
+            "openai_base_url = 'http://127.0.0.1:10100/v1'\n",
+            "secret = 'synthetic-malformed-secret\n",
+        ] {
+            fs::write(&p.codex_config, source).unwrap();
+            assert_eq!(
+                resolve_codex_mode(&p, &WireOptions::default()).unwrap(),
+                CodexMode::Dedicated
+            );
+            // Header selection alone must not authorize an incomplete manifest.
+            let error = super::wire(&p, true).unwrap_err();
+            assert!(!format!("{error:#}\n{error:?}").contains("synthetic-malformed-secret"));
+            assert_eq!(fs::read(p.journal()).unwrap(), header);
+            assert_eq!(fs::read_to_string(&p.codex_config).unwrap(), source);
+            assert!(!p.codex_qb_home.exists());
+        }
+    }
+
+    #[test]
+    fn r3_journal_mode_errors_are_generic_and_explicit_overrides_still_win() {
+        let (_dir, p) = r3_retry_paths();
+        fs::create_dir_all(p.journal().parent().unwrap()).unwrap();
+        for header in [
+            "{\"schema\":3,\"mode\":\"synthetic-mode-secret\"}",
+            "{\"schema\":3,\"secret\":\"synthetic-mode-secret\"}",
+            "{\"schema\":99,\"mode\":\"none\"}",
+            "{\"schema\":\"synthetic-mode-secret\"}",
+            "{\"schema\":3,\"mode\":\"none\",\"secret\":\"synthetic-mode-secret",
+        ] {
+            fs::write(p.journal(), header).unwrap();
+            let error = resolve_codex_mode(&p, &WireOptions::default()).unwrap_err();
+            assert_eq!(error.to_string(), "연결 journal 형식이 올바르지 않습니다");
+            assert!(!format!("{error:#}\n{error:?}").contains("synthetic-mode-secret"));
+            for mode in [CodexMode::Default, CodexMode::Dedicated, CodexMode::None] {
+                assert_eq!(
+                    resolve_codex_mode(
+                        &p,
+                        &WireOptions {
+                            codex_mode: Some(mode),
+                            ..WireOptions::default()
+                        }
+                    )
+                    .unwrap(),
+                    mode
+                );
+            }
+            assert_eq!(fs::read_to_string(p.journal()).unwrap(), header);
+        }
+    }
+
+    #[test]
+    fn r3_atomic_journal_and_settings_scratch_hardlink_collisions_preserve_sentinels() {
+        for settings in [false, true] {
+            let (dir, _p) = r3_retry_paths();
+            let root = fs::canonicalize(dir.path()).unwrap();
+            let target = root.join(if settings {
+                "settings.json"
+            } else {
+                "wiring.json"
+            });
+            let destination_sentinel = root.join("destination-sentinel.json");
+            let original = if settings {
+                b"\xef\xbb\xbf{\r\n  \"keep\" : true\r\n}\r\n".as_slice()
+            } else {
+                b"{\"original\":true}".as_slice()
+            };
+            fs::write(&destination_sentinel, original).unwrap();
+            if target.exists() {
+                fs::remove_file(&target).unwrap();
+            }
+            fs::hard_link(&destination_sentinel, &target).unwrap();
+            let scratch_sentinel = root.join("scratch-sentinel.json");
+            fs::write(&scratch_sentinel, b"unrelated scratch hardlink sentinel").unwrap();
+            let legacy_collision = target.with_extension(format!("tmp-{}", std::process::id()));
+            let collision = target.with_extension(format!("tmp-{}-0", std::process::id()));
+            fs::hard_link(&scratch_sentinel, &legacy_collision).unwrap();
+            fs::hard_link(&scratch_sentinel, &collision).unwrap();
+            let requested = b"{\n  \"updated\" : true\n}\n";
+            let bytes = if settings {
+                preserved_bytes(&target, requested).unwrap()
+            } else {
+                requested.to_vec()
+            };
+            let counter = std::sync::atomic::AtomicU64::new(0);
+            atomic_bytes_with_counter(&target, &bytes, &counter).unwrap();
+            assert_eq!(fs::read(&target).unwrap(), bytes);
+            assert_eq!(fs::read(&destination_sentinel).unwrap(), original);
+            for path in [&scratch_sentinel, &legacy_collision, &collision] {
+                assert_eq!(
+                    fs::read(path).unwrap(),
+                    b"unrelated scratch hardlink sentinel"
+                );
+            }
+            assert!(
+                !target
+                    .with_extension(format!("tmp-{}-1", std::process::id()))
+                    .exists()
+            );
+            if settings {
+                assert_eq!(bytes, b"\xef\xbb\xbf{\r\n  \"updated\" : true\r\n}\r\n");
+            }
+        }
+    }
+
+    #[test]
+    fn r3_atomic_collision_exhaustion_preserves_target_and_all_unowned_hardlinks() {
+        let (dir, _p) = r3_retry_paths();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        for name in ["wiring.json", "settings.json"] {
+            let target = root.join(name);
+            fs::write(&target, b"unchanged destination").unwrap();
+            let sentinel = root.join(format!("{name}-sentinel"));
+            fs::write(&sentinel, b"unrelated hardlink bytes").unwrap();
+            for serial in 0..64 {
+                fs::hard_link(
+                    &sentinel,
+                    target.with_extension(format!("tmp-{}-{serial}", std::process::id())),
+                )
+                .unwrap();
+            }
+            let counter = std::sync::atomic::AtomicU64::new(0);
+            assert!(atomic_bytes_with_counter(&target, b"must not install", &counter).is_err());
+            assert_eq!(fs::read(&target).unwrap(), b"unchanged destination");
+            for serial in 0..64 {
+                assert_eq!(
+                    fs::read(target.with_extension(format!("tmp-{}-{serial}", std::process::id())))
+                        .unwrap(),
+                    b"unrelated hardlink bytes"
+                );
+            }
+            assert_eq!(fs::read(&sentinel).unwrap(), b"unrelated hardlink bytes");
+        }
+    }
+
+    #[test]
+    fn r3_atomic_failed_replace_discards_only_the_exclusively_owned_scratch() {
+        let (dir, _p) = r3_retry_paths();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let target = root.join("blocked.json");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("keep"), b"destination directory stays").unwrap();
+        let sentinel = root.join("unowned-sentinel");
+        fs::write(&sentinel, b"unowned bytes").unwrap();
+        let collision = target.with_extension(format!("tmp-{}-0", std::process::id()));
+        fs::hard_link(&sentinel, &collision).unwrap();
+        let names = || {
+            let mut paths = fs::read_dir(&root)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .collect::<Vec<_>>();
+            paths.sort();
+            paths
+        };
+        let before = names();
+        let counter = std::sync::atomic::AtomicU64::new(0);
+        assert!(atomic_bytes_with_counter(&target, b"cannot replace directory", &counter).is_err());
+        assert_eq!(names(), before);
+        assert_eq!(fs::read(&sentinel).unwrap(), b"unowned bytes");
+        assert_eq!(fs::read(&collision).unwrap(), b"unowned bytes");
+        assert_eq!(
+            fs::read(target.join("keep")).unwrap(),
+            b"destination directory stays"
+        );
     }
 
     #[test]
@@ -2774,6 +3270,7 @@ mod tests {
             false,
             WireOptions {
                 detach_chatgpt_session_homes: true,
+                codex_mode: Some(CodexMode::Default),
                 ..WireOptions::default()
             },
         )
@@ -2791,6 +3288,7 @@ mod tests {
             true,
             WireOptions {
                 detach_chatgpt_session_homes: true,
+                codex_mode: Some(CodexMode::Default),
                 ..WireOptions::default()
             },
         )
@@ -2947,6 +3445,7 @@ pub(crate) mod cpa_dependency_tests {
     fn disable_options() -> WireOptions {
         WireOptions {
             disable_cpa_tasks: true,
+            codex_mode: Some(CodexMode::Default),
             ..WireOptions::default()
         }
     }
@@ -3049,9 +3548,15 @@ pub(crate) mod cpa_dependency_tests {
             account(&p.qb_home, label, mode, state, json!({"kind":"ready"}));
         }
         let _lease = AccountStore::acquire(&p.qb_home).unwrap();
-        let report = wire_with_task_query(&p, false, WireOptions::default(), &|_| {
-            panic!("flagless wire queried tasks")
-        })
+        let report = wire_with_task_query(
+            &p,
+            false,
+            WireOptions {
+                codex_mode: Some(CodexMode::Default),
+                ..WireOptions::default()
+            },
+            &|_| panic!("flagless wire queried tasks"),
+        )
         .unwrap();
         assert_eq!(
             report
@@ -3115,12 +3620,14 @@ pub(crate) mod cpa_dependency_tests {
         (
             dir,
             CutoverPaths {
-                qb_home,
+                qb_home: qb_home.clone(),
                 codex_auth: auth,
                 codex_session_auth: Vec::new(),
                 codex_session_homes: Vec::new(),
                 session_homes_file: None,
                 session_homes_warning: None,
+                codex_qb_home: qb_home.parent().unwrap().join(".codex-acct/qb"),
+                npm_dir: qb_home.parent().unwrap().join("npm"),
                 codex_config: codex,
                 codex_realtime_items: Vec::new(),
                 claude_settings: claude,
