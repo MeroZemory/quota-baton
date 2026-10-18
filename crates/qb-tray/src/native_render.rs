@@ -1,528 +1,124 @@
-use super::{Colors, Row, Tone, Usage, badge_color, chip_colors, colors, row_height};
-use std::{path::Path, time::SystemTime};
+//! PNG compatibility adapter. HWND and WIC both paint through v2_render.
+use crate::{
+    Row, v2, v2_geometry as g,
+    v2_render::{LoginStatus, RenderOptions, Renderer},
+};
+use std::{collections::BTreeSet, path::Path, time::SystemTime};
 use windows::{
     Win32::{
+        Foundation::E_INVALIDARG,
         Graphics::{
             Direct2D::{
-                Common::{
-                    D2D_RECT_F, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
-                },
-                D2D1_ELLIPSE, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_RENDER_TARGET_PROPERTIES,
-                D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_ROUNDED_RECT, D2D1CreateFactory,
-                ID2D1Factory, ID2D1RenderTarget,
-            },
-            DirectWrite::{
-                DWRITE_FACTORY_TYPE_ISOLATED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-                DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TEXT_METRICS,
-                DWriteCreateFactory, IDWriteFactory,
+                Common::{D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT},
+                D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_RENDER_TARGET_PROPERTIES,
+                D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1CreateFactory, ID2D1Factory,
+                ID2D1RenderTarget,
             },
             Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
             Imaging::{
                 CLSID_WICImagingFactory, GUID_ContainerFormatPng, GUID_WICPixelFormat32bppPBGRA,
-                IWICImagingFactory, WICBitmapCacheOnLoad,
+                IWICImagingFactory, WICBitmapCacheOnLoad, WICBitmapEncoderNoCache,
             },
         },
         System::Com::{
             CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+            CoUninitialize,
         },
     },
-    core::{PCWSTR, Result},
+    core::{Error, PCWSTR, Result},
 };
 use windows_numerics::Matrix3x2;
 
-const WIDTH: f32 = 360.0;
-const PADDING: f32 = 16.0;
-const SECTION_GAP: f32 = 36.0;
-
-pub fn content_height(rows: &[Row], expand_disabled: bool) -> f32 {
-    super::state_height(rows, expand_disabled, None)
-}
-
-pub fn state_height(rows: &[Row], expand_disabled: bool, state: Option<&str>) -> f32 {
-    super::state_height(rows, expand_disabled, state)
-}
-
-fn display_rows(rows: &[Row], _state: Option<&str>) -> Vec<Row> {
-    // View state controls geometry, never authoritative pacing or attention.
-    // Review fixtures must carry the data they intend to display.
-    rows.to_vec()
-}
-
-#[derive(Clone, Copy)]
-struct BrushColor(D2D1_COLOR_F);
-
-fn brush_color(rgb: super::Rgb) -> BrushColor {
-    BrushColor(D2D1_COLOR_F {
-        r: rgb.0 as f32 / 255.0,
-        g: rgb.1 as f32 / 255.0,
-        b: rgb.2 as f32 / 255.0,
-        a: 1.0,
-    })
-}
-
-fn rect(left: f32, top: f32, right: f32, bottom: f32) -> D2D_RECT_F {
-    D2D_RECT_F {
-        left,
-        top,
-        right,
-        bottom,
-    }
-}
-
-fn text_format(
-    factory: &IDWriteFactory,
-    size: f32,
-    bold: bool,
-) -> Result<windows::Win32::Graphics::DirectWrite::IDWriteTextFormat> {
-    let family: Vec<u16> = "Segoe UI Variable\0".encode_utf16().collect();
-    let locale: Vec<u16> = "ko-kr\0".encode_utf16().collect();
-    unsafe {
-        factory.CreateTextFormat(
-            PCWSTR(family.as_ptr()),
-            None,
-            if bold {
-                windows::Win32::Graphics::DirectWrite::DWRITE_FONT_WEIGHT_SEMI_BOLD
-            } else {
-                DWRITE_FONT_WEIGHT_NORMAL
-            },
-            DWRITE_FONT_STYLE_NORMAL,
-            DWRITE_FONT_STRETCH_NORMAL,
-            size,
-            PCWSTR(locale.as_ptr()),
-        )
-    }
-}
-
-fn icon_format(
-    factory: &IDWriteFactory,
-    size: f32,
-) -> Result<windows::Win32::Graphics::DirectWrite::IDWriteTextFormat> {
-    let family: Vec<u16> = "Segoe Fluent Icons\0".encode_utf16().collect();
-    let locale: Vec<u16> = "en-us\0".encode_utf16().collect();
-    unsafe {
-        factory.CreateTextFormat(
-            PCWSTR(family.as_ptr()),
-            None,
-            DWRITE_FONT_WEIGHT_NORMAL,
-            DWRITE_FONT_STYLE_NORMAL,
-            DWRITE_FONT_STRETCH_NORMAL,
-            size,
-            PCWSTR(locale.as_ptr()),
-        )
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn draw_text(
-    target: &ID2D1RenderTarget,
-    factory: &IDWriteFactory,
-    format: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
-    value: &str,
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
-    color: BrushColor,
-) -> Result<()> {
-    let brush = unsafe { target.CreateSolidColorBrush(&color.0, None) }?;
-    let text: Vec<u16> = value.encode_utf16().collect();
-    unsafe {
-        let measure = factory.CreateTextLayout(&text, format, width, 4096.0)?;
-        let mut metrics = DWRITE_TEXT_METRICS::default();
-        measure.GetMetrics(&mut metrics)?;
-        let layout =
-            factory.CreateTextLayout(&text, format, width, (metrics.height + 2.0).max(height))?;
-        target.DrawTextLayout(
-            windows_numerics::Vector2 { X: x, Y: y },
-            &layout,
-            &brush,
-            windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_NONE,
-        );
-        Ok(())
-    }
-}
-
-fn fill(target: &ID2D1RenderTarget, bounds: D2D_RECT_F, color: BrushColor) -> Result<()> {
-    let brush = unsafe { target.CreateSolidColorBrush(&color.0, None) }?;
-    unsafe { target.FillRectangle(&bounds, &brush) };
-    Ok(())
-}
-
-fn pill(target: &ID2D1RenderTarget, bounds: D2D_RECT_F, color: BrushColor) -> Result<()> {
-    let brush = unsafe { target.CreateSolidColorBrush(&color.0, None) }?;
-    let rounded = windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT {
-        rect: bounds,
-        radiusX: 8.0,
-        radiusY: 8.0,
+fn input(rows: &[Row], now: SystemTime) -> Result<v2::View> {
+    let json = if rows.is_empty() {
+        "{\"accounts\":[]}"
+    } else {
+        rows[0]
+            .view_input
+            .as_deref()
+            .ok_or_else(|| Error::from_hresult(E_INVALIDARG))?
     };
-    unsafe { target.FillRoundedRectangle(&rounded, &brush) };
-    Ok(())
+    v2::project(json, now).map_err(|_| Error::from_hresult(E_INVALIDARG))
 }
-
-fn standard_button(target: &ID2D1RenderTarget, bounds: D2D_RECT_F, dark: bool) -> Result<()> {
-    let shape = D2D1_ROUNDED_RECT {
-        rect: bounds,
-        radiusX: 4.0,
-        radiusY: 4.0,
+fn presentation(
+    view: &v2::View,
+    expand: bool,
+    state: Option<&str>,
+    core_ok: bool,
+) -> g::Presentation {
+    let mut p = g::Presentation {
+        core_ok,
+        ..Default::default()
     };
-    let fill_brush = unsafe {
-        target.CreateSolidColorBrush(
-            &brush_color(if dark {
-                super::Rgb(45, 45, 45)
-            } else {
-                super::Rgb(251, 251, 251)
-            })
-            .0,
-            None,
-        )
-    }?;
-    let border_brush = unsafe {
-        target.CreateSolidColorBrush(
-            &brush_color(if dark {
-                super::Rgb(61, 61, 61)
-            } else {
-                super::Rgb(209, 209, 209)
-            })
-            .0,
-            None,
-        )
-    }?;
-    unsafe {
-        target.FillRoundedRectangle(&shape, &fill_brush);
-        target.DrawRoundedRectangle(&shape, &border_brush, 1.0, None);
+    if expand || state == Some("expanded") {
+        for s in &view.sections {
+            p.expanded.insert(s.provider.clone(), true);
+        }
     }
-    Ok(())
-}
-
-fn draw_progress(target: &ID2D1RenderTarget, dark: bool, _now: SystemTime) -> Result<()> {
-    let center = windows_numerics::Vector2 { X: 24.0, Y: 110.0 };
-    let track = unsafe {
-        target.CreateSolidColorBrush(
-            &brush_color(if dark {
-                super::Rgb(58, 58, 58)
-            } else {
-                super::Rgb(230, 232, 235)
-            })
-            .0,
-            None,
-        )
-    }?;
-    let accent = unsafe {
-        target.CreateSolidColorBrush(
-            &brush_color(if dark {
-                super::Rgb(96, 205, 255)
-            } else {
-                super::Rgb(0, 95, 184)
-            })
-            .0,
-            None,
-        )
-    }?;
-    let ellipse = D2D1_ELLIPSE {
-        point: center,
-        radiusX: 7.0,
-        radiusY: 7.0,
-    };
-    unsafe {
-        target.DrawEllipse(&ellipse, &track, 2.0, None);
-        target.DrawEllipse(&ellipse, &accent, 2.0, None);
+    if let Some(provider) = state.and_then(|s| s.strip_prefix("expanded:")) {
+        for s in &view.sections {
+            p.expanded
+                .insert(s.provider.clone(), s.provider == provider);
+        }
     }
-    Ok(())
+    if let Some(state) = state {
+        if let Some(id) = state
+            .strip_prefix("menu:")
+            .and_then(|s| s.split(':').next())
+        {
+            p.overlay = g::Overlay::RowMenu(id.into());
+            for s in &view.sections {
+                if s.disabled_rows.iter().any(|r| r.raw.id == id) {
+                    p.expanded.insert(s.provider.clone(), true);
+                }
+            }
+        } else if let Some(id) = state.strip_prefix("confirm-delete:") {
+            p.overlay = g::Overlay::DeleteConfirm(id.into());
+        } else if let Some(id) = state.strip_prefix("confirm-credits:") {
+            p.overlay = g::Overlay::CreditsConfirm(id.into());
+        } else if let Some(provider) = state
+            .strip_prefix("login:")
+            .and_then(|s| s.split(':').next())
+        {
+            p.overlay = g::Overlay::Login(provider.into());
+        } else {
+            p.overlay = match state {
+                "settings" => g::Overlay::Settings,
+                "quit" => g::Overlay::Quit,
+                "add" => g::Overlay::Add,
+                _ => g::Overlay::None,
+            };
+        }
+    }
+    p
 }
-
-fn draw_account_menu(
-    target: &ID2D1RenderTarget,
-    factory: &IDWriteFactory,
+fn prepared(
     rows: &[Row],
     dark: bool,
-    state: &str,
-    expand_disabled: bool,
-    height: f32,
-) -> Result<()> {
-    let Some((row, index)) = super::menu_target(rows, state) else {
-        return Ok(());
-    };
-    let items = super::actions::menu_items(row);
-    let body = text_format(factory, 13.0, false)?;
-    let icons = icon_format(factory, 14.0)?;
-    let Some(popup) = super::popup_rect(rows, expand_disabled, state, height) else {
-        return Ok(());
-    };
-    popup_surface(
-        target,
-        rect(popup.left, popup.top, popup.right, popup.bottom),
-        dark,
-        brush_color(if dark {
-            super::Rgb(44, 44, 44)
-        } else {
-            super::Rgb(252, 252, 252)
-        }),
-    )?;
-    let metadata_format = text_format(factory, 11.0, false)?;
-    for (line, text) in super::account_menu_metadata(row).iter().enumerate() {
-        draw_text(
-            target,
-            factory,
-            &metadata_format,
-            text,
-            popup.left + 14.0,
-            popup.top + 10.0 + line as f32 * 18.0,
-            popup.right - popup.left - 28.0,
-            18.0,
-            brush_color(colors(dark).text),
-        )?;
-    }
-    let icon_values = [
-        "\u{e769}", "\u{e733}", "\u{e8d7}", "\u{e72c}", "\u{e73e}", "\u{e74d}",
-    ];
-    for (n, item) in items.iter().enumerate() {
-        let y = popup.top + super::account_menu_item_top(row, n);
-        if n == 2 || n == 3 {
-            fill(
-                target,
-                rect(137.0, y - 9.0, 351.0, y - 8.0),
-                brush_color(if dark {
-                    super::Rgb(71, 71, 71)
-                } else {
-                    super::Rgb(212, 212, 212)
-                }),
-            )?;
-        }
-        if n == index {
-            pill(
-                target,
-                rect(141.0, y, 347.0, y + 32.0),
-                BrushColor(D2D1_COLOR_F {
-                    r: if dark { 1.0 } else { 0.0 },
-                    g: if dark { 1.0 } else { 0.0 },
-                    b: if dark { 1.0 } else { 0.0 },
-                    a: 0.06,
-                }),
-            )?;
-        }
-        if matches!(
-            item,
-            super::actions::MenuItem::ToggleDrain | super::actions::MenuItem::ToggleCredits
-        ) {
-            let check = D2D1_ROUNDED_RECT {
-                rect: rect(153.0, y + 8.0, 169.0, y + 24.0),
-                radiusX: 3.0,
-                radiusY: 3.0,
-            };
-            let border = unsafe {
-                target.CreateSolidColorBrush(
-                    &brush_color(if dark {
-                        super::Rgb(154, 154, 154)
-                    } else {
-                        super::Rgb(138, 138, 138)
-                    })
-                    .0,
-                    None,
-                )
-            }?;
-            unsafe { target.DrawRoundedRectangle(&check, &border, 1.0, None) };
-            let checked = item.checked(row).unwrap_or(false);
-            if checked {
-                fill(
-                    target,
-                    check.rect,
-                    brush_color(if dark {
-                        super::Rgb(96, 205, 255)
-                    } else {
-                        super::Rgb(0, 95, 184)
-                    }),
-                )?;
-                draw_text(
-                    target,
-                    factory,
-                    &icons,
-                    "\u{e73e}",
-                    155.0,
-                    y + 8.0,
-                    12.0,
-                    16.0,
-                    brush_color(if dark {
-                        super::Rgb(0, 0, 0)
-                    } else {
-                        super::Rgb(255, 255, 255)
-                    }),
-                )?;
-            }
-        } else {
-            draw_text(
-                target,
-                factory,
-                &icons,
-                if matches!(item, super::actions::MenuItem::Delete) {
-                    "\u{e74d}"
-                } else if matches!(
-                    item,
-                    super::actions::MenuItem::RefreshUsage
-                        | super::actions::MenuItem::RefreshTokens
-                ) {
-                    "\u{e72c}"
-                } else {
-                    icon_values.get(n).copied().unwrap_or("")
-                },
-                153.0,
-                y + 8.0,
-                16.0,
-                16.0,
-                brush_color(colors(dark).text),
-            )?;
-        }
-        draw_text(
-            target,
-            factory,
-            &body,
-            if n == index && state.ends_with(":pending") {
-                "변경 중…"
-            } else {
-                item.label(row)
-            },
-            177.0,
-            y + 7.0,
-            160.0,
-            18.0,
-            brush_color(colors(dark).text),
-        )?;
-    }
-    Ok(())
+    now: SystemTime,
+    expand: bool,
+    core_ok: bool,
+    state: Option<&str>,
+) -> Result<(Renderer, v2::View, g::Scene)> {
+    let view = input(rows, now)?;
+    let renderer = Renderer::new(dark)?;
+    let mut p = presentation(&view, expand, state, core_ok);
+    renderer.measure(&view, &mut p)?;
+    let scene = g::Scene::build(&view, p, 8192.);
+    Ok((renderer, view, scene))
 }
-
-fn popup_surface(
-    target: &ID2D1RenderTarget,
-    bounds: D2D_RECT_F,
-    dark: bool,
-    fill_color: BrushColor,
-) -> Result<()> {
-    let shadow = D2D1_ROUNDED_RECT {
-        rect: rect(
-            bounds.left,
-            bounds.top + 4.0,
-            bounds.right,
-            bounds.bottom + 4.0,
-        ),
-        radiusX: 8.0,
-        radiusY: 8.0,
-    };
-    let shadow_color = BrushColor(D2D1_COLOR_F {
-        r: 0.0,
-        g: 0.0,
-        b: 0.0,
-        a: if dark { 0.37 } else { 0.14 },
-    });
-    let shadow_brush = unsafe { target.CreateSolidColorBrush(&shadow_color.0, None) }?;
-    unsafe { target.FillRoundedRectangle(&shadow, &shadow_brush) };
-    let rounded = D2D1_ROUNDED_RECT {
-        rect: bounds,
-        radiusX: 8.0,
-        radiusY: 8.0,
-    };
-    let fill_brush = unsafe { target.CreateSolidColorBrush(&fill_color.0, None) }?;
-    let border = unsafe {
-        target.CreateSolidColorBrush(
-            &brush_color(if dark {
-                super::Rgb(71, 71, 71)
-            } else {
-                super::Rgb(212, 212, 212)
-            })
-            .0,
-            None,
-        )?
-    };
-    unsafe {
-        target.FillRoundedRectangle(&rounded, &fill_brush);
-        target.DrawRoundedRectangle(&rounded, &border, 1.0, None);
-    }
-    Ok(())
+pub fn content_height(rows: &[Row], expand_disabled: bool) -> f32 {
+    state_height(rows, expand_disabled, None)
 }
-
-fn meter_color(row: &Row, pct: Option<f64>, colors: Colors) -> BrushColor {
-    let rgb = match pct {
-        Some(value) if value >= 90.0 => colors.critical,
-        Some(value) if value >= 70.0 => colors.warning,
-        _ => colors.accent,
-    };
-    let _ = row;
-    brush_color(rgb)
-}
-
-fn health_colors(row: &Row, dark: bool) -> (BrushColor, BrushColor) {
-    let (bg, fg) = chip_colors(dark, row.health_tone, row.user_chip == "비활성");
-    (brush_color(bg), brush_color(fg))
+pub fn state_height(rows: &[Row], expand_disabled: bool, state: Option<&str>) -> f32 {
+    // Compatibility callers can construct a Row without its authoritative state;
+    // only their legacy geometry can be measured, never guessed into a painting.
+    prepared(rows, false, SystemTime::now(), expand_disabled, true, state)
+        .map(|(_, _, s)| s.rect.bottom)
+        .unwrap_or_else(|_| crate::state_height(rows, expand_disabled, state))
 }
 
 #[allow(clippy::too_many_arguments)]
-fn draw_meter_value(
-    target: &ID2D1RenderTarget,
-    factory: &IDWriteFactory,
-    label_format: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
-    percent_format: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
-    unknown_format: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
-    row: &Row,
-    usage: &Usage,
-    x: f32,
-    y: f32,
-    width: f32,
-    colors: Colors,
-) -> Result<()> {
-    draw_text(
-        target,
-        factory,
-        label_format,
-        &usage.label,
-        x,
-        y,
-        width,
-        16.0,
-        brush_color(colors.text),
-    )?;
-    draw_text(
-        target,
-        factory,
-        if usage.percent.is_some() {
-            percent_format
-        } else {
-            unknown_format
-        },
-        &usage.percent_text,
-        x + width - 46.0,
-        y,
-        46.0,
-        16.0,
-        if usage.percent.is_some() {
-            brush_color(colors.text)
-        } else {
-            brush_color(colors.muted)
-        },
-    )?;
-    fill(
-        target,
-        rect(x, y + 20.0, x + width, y + 24.0),
-        brush_color(colors.track),
-    )?;
-    if let Some(pct) = usage.percent {
-        let fill_width = (width * (pct as f32 / 100.0).clamp(0.0, 1.0)).max(4.0);
-        fill(
-            target,
-            rect(x, y + 20.0, x + fill_width, y + 24.0),
-            meter_color(row, Some(pct), colors),
-        )?;
-    }
-    draw_text(
-        target,
-        factory,
-        label_format,
-        &usage.reset_text,
-        x,
-        y + 28.0,
-        width,
-        14.0,
-        brush_color(colors.muted),
-    )
-}
-
 pub fn paint(
     target: &ID2D1RenderTarget,
     rows: &[Row],
@@ -543,7 +139,6 @@ pub fn paint(
         None,
     )
 }
-
 #[allow(clippy::too_many_arguments)]
 pub fn paint_with_state(
     target: &ID2D1RenderTarget,
@@ -555,784 +150,87 @@ pub fn paint_with_state(
     core_ok: bool,
     state: Option<&str>,
 ) -> Result<()> {
-    let rows = display_rows(rows, state);
-    let colors = colors(dark);
-    // The flyout owns its text factory for the paint pass.  An isolated
-    // factory lets DirectWrite release device-dependent state when the
-    // flyout is hidden instead of retaining it in the process-wide shared
-    // factory cache.
-    let dwrite: IDWriteFactory = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED) }?;
-    let title = text_format(&dwrite, 14.0, true)?;
-    let body = text_format(&dwrite, 13.0, false)?;
-    let small = text_format(&dwrite, 11.0, false)?;
-    let section = text_format(&dwrite, 12.0, true)?;
-    let meter_label = text_format(&dwrite, 12.0, false)?;
-    let meter_percent = text_format(&dwrite, 12.0, true)?;
-    let meter_unknown = text_format(&dwrite, 12.0, false)?;
-    let footer = text_format(&dwrite, 12.0, false)?;
-    unsafe {
-        meter_percent.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
-        meter_unknown.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
-    }
-    let icons = icon_format(&dwrite, 14.0)?;
-    unsafe {
-        target.BeginDraw();
-        target.Clear(Some(&brush_color(colors.surface).0));
-    }
-    fill(
-        target,
-        rect(0.0, 0.0, WIDTH, state_height(&rows, expand_disabled, state)),
-        brush_color(colors.surface),
-    )?;
-    let frame = D2D1_ROUNDED_RECT {
-        rect: rect(
-            0.5,
-            0.5,
-            WIDTH - 0.5,
-            state_height(&rows, expand_disabled, state) - 0.5,
-        ),
-        radiusX: 8.0,
-        radiusY: 8.0,
-    };
-    let frame_brush = unsafe {
-        target.CreateSolidColorBrush(
-            &brush_color(if dark {
-                super::Rgb(58, 58, 58)
-            } else {
-                super::Rgb(217, 217, 217)
-            })
-            .0,
-            None,
-        )?
-    };
-    unsafe { target.DrawRoundedRectangle(&frame, &frame_brush, 1.0, None) };
-    draw_text(
-        target,
-        &dwrite,
-        &title,
-        "quota-baton",
-        PADDING,
-        10.0,
-        190.0,
-        20.0,
-        brush_color(colors.text),
-    )?;
-    let status = if version.starts_with("error:") {
-        version.trim_start_matches("error:").to_owned()
-    } else if core_ok {
-        format!("코어 실행 중 · {version}")
-    } else {
-        "코어에 연결할 수 없음".to_owned()
-    };
-    draw_text(
-        target,
-        &dwrite,
-        &small,
-        &status,
-        PADDING,
-        30.0,
-        250.0,
-        17.0,
-        brush_color(colors.muted),
-    )?;
-    unsafe {
-        let brush = target
-            .CreateSolidColorBrush(&brush_color(badge_color(&rows, core_ok, dark)).0, None)?;
-        target.FillEllipse(
-            &D2D1_ELLIPSE {
-                point: windows_numerics::Vector2 { X: 344.0, Y: 21.0 },
-                radiusX: 4.0,
-                radiusY: 4.0,
-            },
-            &brush,
-        );
-    }
-    let login_state = state.is_some_and(|value| value.starts_with("login:"));
-    let mut y = 52.0;
-    if !login_state {
-        for provider in ["claude", "codex"] {
-            let active = rows
-                .iter()
-                .filter(|r| r.provider == super::provider_name(provider) && r.user_chip != "비활성")
-                .collect::<Vec<_>>();
-            let disabled = rows
-                .iter()
-                .filter(|r| r.provider == super::provider_name(provider) && r.user_chip == "비활성")
-                .collect::<Vec<_>>();
-            if active.is_empty() && disabled.is_empty() {
-                continue;
-            }
-            draw_text(
-                target,
-                &dwrite,
-                &section,
-                super::provider_name(provider),
-                PADDING,
-                y + 16.0,
-                200.0,
-                18.0,
-                brush_color(colors.muted),
-            )?;
-            y += SECTION_GAP;
-            let expand_section = super::disabled_expanded(&rows, expand_disabled, state, provider);
-            if expand_section && !disabled.is_empty() {
-                draw_text(
-                    target,
-                    &dwrite,
-                    &small,
-                    &format!("비활성 계정 {}개 ⌄", disabled.len()),
-                    PADDING,
-                    y,
-                    220.0,
-                    22.0,
-                    brush_color(colors.muted),
-                )?;
-                y += 28.0;
-            }
-            for row in active.into_iter().chain(if expand_section {
-                disabled.clone()
-            } else {
-                Vec::new()
-            }) {
-                draw_row(
-                    target,
-                    &dwrite,
-                    &body,
-                    &small,
-                    row,
-                    y,
-                    colors,
-                    dark,
-                    now,
-                    state,
-                    &meter_label,
-                    &meter_percent,
-                    &meter_unknown,
-                )?;
-                y += row_height(row);
-                fill(
-                    target,
-                    rect(PADDING, y - 1.0, WIDTH - PADDING, y),
-                    brush_color(colors.divider),
-                )?;
-            }
-            if !expand_section && !disabled.is_empty() {
-                draw_text(
-                    target,
-                    &dwrite,
-                    &small,
-                    &format!(
-                        "비활성 계정 {}개 {}",
-                        disabled.len(),
-                        if expand_section { "⌄" } else { "›" }
-                    ),
-                    PADDING,
-                    y,
-                    220.0,
-                    22.0,
-                    brush_color(colors.muted),
-                )?;
-                y += 28.0;
-            }
-        }
-    } else {
-        let provider = if state.is_some_and(|value| value.contains("claude")) {
-            "Claude"
-        } else {
-            "Codex"
-        };
-        let outcome = state
-            .and_then(|value| value.rsplit(':').next())
-            .filter(|value| matches!(*value, "completed" | "failed" | "expired" | "cancelled"));
-        draw_text(
-            target,
-            &dwrite,
-            &title,
-            &format!("{provider} 로그인"),
-            16.0,
-            68.0,
-            260.0,
-            20.0,
-            brush_color(colors.text),
-        )?;
-        draw_progress(target, dark, now)?;
-        draw_text(
-            target,
-            &dwrite,
-            &body,
-            match outcome {
-                Some("completed") => "로그인이 완료되었습니다.",
-                Some("failed") => "로그인에 실패했습니다.",
-                Some("expired") => "로그인 시간이 지났습니다.",
-                Some("cancelled") => "로그인이 취소되었습니다.",
-                _ => "브라우저에서 로그인을 마치면 자동으로",
-            },
-            42.0,
-            100.0,
-            302.0,
-            20.0,
-            brush_color(colors.text),
-        )?;
-        draw_text(
-            target,
-            &dwrite,
-            &body,
-            if outcome.is_some() {
-                ""
-            } else {
-                "완료됩니다."
-            },
-            42.0,
-            120.0,
-            302.0,
-            20.0,
-            brush_color(colors.text),
-        )?;
-        draw_text(
-            target,
-            &dwrite,
-            &text_format(&dwrite, 12.0, false)?,
-            "남은 시간 9:41",
-            42.0,
-            144.0,
-            180.0,
-            16.0,
-            brush_color(colors.muted),
-        )?;
-        for (x, label) in [(16.0, "주소 복사"), (184.0, "취소")] {
-            standard_button(target, rect(x, 176.0, x + 160.0, 208.0), dark)?;
-            let label_x = if x == 16.0 { x + 63.0 } else { x + 68.0 };
-            if x == 16.0 {
-                draw_text(
-                    target,
-                    &dwrite,
-                    &icons,
-                    "\u{E8C8}",
-                    x + 41.0,
-                    183.0,
-                    14.0,
-                    18.0,
-                    brush_color(colors.text),
-                )?;
-            }
-            draw_text(
-                target,
-                &dwrite,
-                &body,
-                label,
-                label_x,
-                183.0,
-                80.0,
-                18.0,
-                brush_color(colors.text),
-            )?;
-        }
-        y = 228.0;
-    }
-    // Painting and hit testing share the final footer position in DIPs.
-    if !login_state {
-        y = state_height(&rows, expand_disabled, state) - super::FOOTER_HEIGHT;
-    }
-    fill(
-        target,
-        rect(0.0, y, WIDTH, y + 48.0),
-        brush_color(colors.background),
-    )?;
-    fill(
-        target,
-        rect(0.0, y, WIDTH, y + 1.0),
-        brush_color(colors.divider),
-    )?;
-    draw_text(
-        target,
-        &dwrite,
-        &footer,
-        &format!("갱신 {}", now_time(now)),
-        PADDING,
-        y + 16.0,
-        74.0,
-        16.0,
-        brush_color(colors.muted),
-    )?;
-    for (index, (x, width, icon, label)) in [
-        (88.0, 81.0, "\u{E710}", "계정 추가"),
-        (171.0, 54.0, "\u{E713}", "설정"),
-        (227.0, 54.0, "\u{E8A5}", "로그"),
-        (283.0, 54.0, "\u{E7E8}", "종료"),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let disabled = login_state && index == 0;
-        let button_color = if disabled { colors.muted } else { colors.text };
-        pill(
-            target,
-            rect(x, y + 8.0, x + width, y + 40.0),
-            brush_color(colors.background),
-        )?;
-        draw_text(
-            target,
-            &dwrite,
-            &icons,
-            icon,
-            x + 6.0,
-            y + 15.0,
-            14.0,
-            16.0,
-            brush_color(button_color),
-        )?;
-        draw_text(
-            target,
-            &dwrite,
-            &footer,
-            label,
-            x + 24.0,
-            y + 16.0,
-            width - 28.0,
-            16.0,
-            brush_color(button_color),
-        )?;
-    }
-    if let Some(menu_state) = state.filter(|value| value.starts_with("menu:")) {
-        draw_account_menu(
-            target,
-            &dwrite,
-            &rows,
-            dark,
-            menu_state,
-            expand_disabled,
-            state_height(&rows, expand_disabled, state),
-        )?;
-    }
-    if let Some(state) = state.filter(|value| {
-        !matches!(*value, "list" | "expanded" | "pacing" | "truncation")
-            && !value.starts_with("expanded:")
-            && !value.starts_with("menu:")
-            && !value.starts_with("login:")
-    }) {
-        let (heading, lines): (&str, Vec<String>) = if state.starts_with("menu:") {
-            let id = state
-                .strip_prefix("menu:")
-                .and_then(|value| value.split(':').next())
-                .unwrap_or_default();
-            let menu_row = rows.iter().find(|row| row.id == id);
-            let labels = menu_row
-                .map(|row| {
-                    super::actions::menu_items(row)
-                        .into_iter()
-                        .map(|item| item.label(row).to_owned())
-                        .collect()
-                })
-                .unwrap_or_default();
-            ("계정 메뉴", labels)
-        } else if state.starts_with("confirm-delete:") {
-            let id = state.strip_prefix("confirm-delete:").unwrap_or_default();
-            let email = rows
-                .iter()
-                .find(|row| row.id == id)
-                .and_then(|row| row.email.as_deref())
-                .unwrap_or("이 계정");
-            (
-                "계정 삭제",
-                vec![
-                    email.to_owned(),
-                    "계정을 quota-baton에서 삭제할까요?".to_owned(),
-                    "제공자 쪽 로그인은 취소되지 않습니다.".to_owned(),
-                    "[삭제]    [취소]".to_owned(),
-                ],
-            )
-        } else if state == "login:claude" || state == "login:codex" {
-            let provider = if state.ends_with("claude") {
-                "Claude"
-            } else {
-                "Codex"
-            };
-            (
-                "로그인",
-                vec![
-                    provider.to_owned(),
-                    "브라우저에서 로그인을 마치면 자동으로 완료됩니다.".to_owned(),
-                    "주소 복사   취소".to_owned(),
-                    "남은 시간 9:41".to_owned(),
-                ],
-            )
-        } else if state == "add-menu" {
-            (
-                "계정 추가",
-                vec![
-                    "Claude 계정".to_owned(),
-                    "Codex 계정".to_owned(),
-                    "취소".to_owned(),
-                ],
-            )
-        } else if state == "quit" {
-            (
-                "종료",
-                vec![
-                    "트레이만 종료".to_owned(),
-                    "트레이와 프록시 종료".to_owned(),
-                ],
-            )
-        } else {
-            ("계정 메뉴", vec!["알 수 없는 상태".to_owned()])
-        };
-        let (left, top, right, bottom) = if state.starts_with("menu:") {
-            let popup = super::popup_rect(
-                &rows,
-                expand_disabled,
-                state,
-                state_height(&rows, expand_disabled, Some(state)),
-            )
-            .unwrap();
-            (popup.left, popup.top, popup.right, popup.bottom)
-        } else if state.starts_with("confirm-delete:") {
-            let card_height = 193.0;
-            let flyout = state_height(&rows, expand_disabled, Some(state));
-            (
-                16.0,
-                (flyout - card_height).round() / 2.0,
-                344.0,
-                (flyout + card_height).round() / 2.0,
-            )
-        } else if state == "add-menu" || state == "quit" {
-            let popup = super::popup_rect(
-                &rows,
-                expand_disabled,
-                state,
-                state_height(&rows, expand_disabled, Some(state)),
-            )
-            .unwrap();
-            (popup.left, popup.top, popup.right, popup.bottom)
-        } else {
-            (28.0, 68.0, WIDTH - 12.0, 200.0)
-        };
-        if state.starts_with("confirm-delete:") {
-            fill(
-                target,
-                rect(
-                    0.0,
-                    0.0,
-                    WIDTH,
-                    state_height(&rows, expand_disabled, Some(state)),
-                ),
-                BrushColor(D2D1_COLOR_F {
-                    r: 0.0,
-                    g: 0.0,
-                    b: 0.0,
-                    a: if dark { 0.50 } else { 0.30 },
-                }),
-            )?;
-        }
-        popup_surface(
-            target,
-            rect(left, top, right, bottom),
-            dark,
-            brush_color(if dark {
-                super::Rgb(44, 44, 44)
-            } else {
-                super::Rgb(252, 252, 252)
-            }),
-        )?;
-        draw_text(
-            target,
-            &dwrite,
-            &section,
-            heading,
-            left + 16.0,
-            top + 10.0,
-            260.0,
-            20.0,
-            brush_color(colors.text),
-        )?;
-        for (index, line) in lines.iter().enumerate() {
-            let menu_icon = if state.starts_with("menu:") {
-                ["\u{e769}", "\u{e733}", "\u{e8d7}", "\u{e72c}", "\u{e74d}"]
-                    .get(index)
-                    .copied()
-            } else {
-                None
-            };
-            if let Some(icon) = menu_icon {
-                draw_text(
-                    target,
-                    &dwrite,
-                    &icons,
-                    icon,
-                    left + 16.0,
-                    top + 38.0 + index as f32 * 27.0,
-                    16.0,
-                    20.0,
-                    brush_color(colors.text),
-                )?;
-            }
-            draw_text(
-                target,
-                &dwrite,
-                if menu_icon.is_some() { &body } else { &small },
-                line,
-                left + if menu_icon.is_some() { 40.0 } else { 16.0 },
-                top + 38.0 + index as f32 * 27.0,
-                286.0,
-                20.0,
-                brush_color(colors.text),
-            )?;
-        }
-        if state.starts_with("confirm-delete:") {
-            fill(
-                target,
-                rect(left, bottom - 64.0, right, bottom),
-                brush_color(colors.background),
-            )?;
-            fill(
-                target,
-                rect(left, bottom - 64.0, right, bottom - 63.0),
-                brush_color(colors.divider),
-            )?;
-            draw_text(
-                target,
-                &dwrite,
-                &body,
-                "삭제",
-                left + 58.0,
-                bottom - 44.0,
-                70.0,
-                18.0,
-                brush_color(colors.critical),
-            )?;
-            draw_text(
-                target,
-                &dwrite,
-                &body,
-                "취소",
-                left + 204.0,
-                bottom - 44.0,
-                70.0,
-                18.0,
-                brush_color(colors.text),
-            )?;
-        }
-    }
-    unsafe {
-        target.EndDraw(None, None)?;
-    }
-    Ok(())
+    let (renderer, view, scene) = prepared(rows, dark, now, expand_disabled, core_ok, state)?;
+    paint_prepared(target, &renderer, &view, &scene, version, now, state, false)
 }
-
 #[allow(clippy::too_many_arguments)]
-fn draw_row(
+fn paint_prepared(
     target: &ID2D1RenderTarget,
-    factory: &IDWriteFactory,
-    body: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
-    small: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
-    row: &Row,
-    y: f32,
-    colors: Colors,
-    dark: bool,
+    renderer: &Renderer,
+    view: &v2::View,
+    scene: &g::Scene,
+    version: &str,
     now: SystemTime,
     state: Option<&str>,
-    meter_label: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
-    meter_percent: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
-    meter_unknown: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
+    border: bool,
 ) -> Result<()> {
-    let (bg, fg) = health_colors(row, dark);
-    let name = row.email.as_deref().unwrap_or(&row.name);
-    let display_chip = if row.user_chip == "비활성" {
-        "비활성"
-    } else {
-        row.health_chip.as_str()
-    };
-    let chip_width = display_chip.chars().count() as f32 * 9.0 + 22.0;
-    let chip_left = 320.0 - chip_width;
-    let plan_width = row
-        .plan
-        .as_deref()
-        .filter(|plan| !plan.is_empty())
-        .map(|plan| plan.chars().count() as f32 * 7.0 + 14.0)
-        .unwrap_or(0.0);
-    let email_width = (chip_left - 8.0 - plan_width - 6.0 - 16.0).max(40.0);
-    let email = trim_text(name, (email_width / 7.0).floor() as usize);
-    let menu_open = state.is_some_and(|value| {
-        value
-            .strip_prefix("menu:")
-            .and_then(|rest| rest.split(':').next())
-            == Some(row.id.as_str())
+    let errors = BTreeSet::new();
+    let login = scene.login.as_ref().map(|_| LoginStatus {
+        message: "브라우저에서 로그인을 마치면 자동으로 완료됩니다.".into(),
+        countdown: Some("남은 시간 9:55".into()),
+        copy_ready: true,
+        retry: false,
     });
-    if menu_open {
-        let hover = BrushColor(D2D1_COLOR_F {
-            r: 0.0,
-            g: 0.0,
-            b: 0.0,
-            a: if dark { 0.04 } else { 0.06 },
+    let hover = state
+        .filter(|s| s.starts_with("menu:"))
+        .and_then(|s| s.rsplit(':').next())
+        .and_then(|s| s.parse::<usize>().ok())
+        .and_then(|i| scene.popup.as_ref()?.items.get(i))
+        .map(|b| &b.target);
+    let focus_id = state.and_then(|s| s.strip_prefix("focus:"));
+    let focus = focus_id
+        .and_then(|id| {
+            scene
+                .targets
+                .iter()
+                .find(|b| matches!(&b.target,g::Target::Inline{id:row,..} if row==id))
+        })
+        .map(|b| &b.target);
+    let tooltip = state
+        .and_then(|s| s.strip_prefix("tooltip:"))
+        .and_then(|id| {
+            let row = view
+                .sections
+                .iter()
+                .flat_map(|s| s.rows.iter().chain(&s.disabled_rows))
+                .find(|r| r.raw.id == id)?;
+            let rect = scene.row(id)?.usage?;
+            renderer
+                .tooltip(&row.usage.as_ref()?.tooltip, rect, scene.rect)
+                .ok()
         });
-        pill(target, rect(324.0, y + 10.0, 352.0, y + 34.0), hover)?;
-    }
-    draw_text(
+    renderer.paint(
         target,
-        factory,
-        body,
-        &email,
-        PADDING,
-        y + 10.0,
-        290.0,
-        18.0,
-        brush_color(colors.text),
-    )?;
-    // The right edge is laid out first: ellipsis, chip, then the plan pill.
-    draw_text(
-        target,
-        factory,
-        body,
-        "⋯",
-        330.0,
-        y + 10.0,
-        22.0,
-        20.0,
-        brush_color(if menu_open { colors.text } else { colors.muted }),
-    )?;
-    if let Some(plan) = row.plan.as_deref().filter(|p| !p.is_empty()) {
-        let plan_x = 16.0 + email.chars().count() as f32 * 7.0 + 6.0;
-        let plan_rect = rect(plan_x, y + 11.0, plan_x + plan_width, y + 29.0);
-        let plan_border = unsafe {
-            target.CreateSolidColorBrush(
-                &brush_color(if dark {
-                    super::Rgb(74, 74, 74)
-                } else {
-                    super::Rgb(213, 216, 220)
-                })
-                .0,
-                None,
-            )?
-        };
-        let plan_shape = D2D1_ROUNDED_RECT {
-            rect: plan_rect,
-            radiusX: 9.0,
-            radiusY: 9.0,
-        };
-        unsafe { target.DrawRoundedRectangle(&plan_shape, &plan_border, 1.0, None) };
-        draw_text(
-            target,
-            factory,
-            small,
-            plan,
-            plan_x + 7.0,
-            y + 12.0,
-            50.0,
-            16.0,
-            brush_color(colors.muted),
-        )?;
+        view,
+        scene,
+        &RenderOptions {
+            version,
+            now,
+            hover,
+            pressed: None,
+            focus,
+            core_note: None,
+            last_success: None,
+            errors: &errors,
+            login: login.as_ref(),
+            tooltip: tooltip.as_ref(),
+            draw_window_border: border,
+        },
+    )
+}
+
+struct Apartment(bool);
+impl Apartment {
+    fn enter() -> Self {
+        Self(unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok())
     }
-    pill(target, rect(chip_left, y + 10.0, 320.0, y + 31.0), bg)?;
-    draw_text(
-        target,
-        factory,
-        small,
-        display_chip,
-        chip_left + 9.0,
-        y + 12.0,
-        chip_width - 10.0,
-        17.0,
-        fg,
-    )?;
-    if row.user_chip == "비활성" {
-        return Ok(());
-    }
-    for (index, usage) in row.meter_windows.iter().take(2).enumerate() {
-        let x = if index == 0 { 16.0 } else { 188.0 };
-        draw_meter_value(
-            target,
-            factory,
-            meter_label,
-            meter_percent,
-            meter_unknown,
-            row,
-            usage,
-            x,
-            y + 40.0,
-            156.0,
-            colors,
-        )?;
-    }
-    if let Some(session_text) = row.session_text.as_deref() {
-        draw_text(
-            target,
-            factory,
-            small,
-            session_text,
-            260.0,
-            y + if row.meter_windows.is_empty() {
-                42.0
-            } else {
-                90.0
-            },
-            72.0,
-            16.0,
-            brush_color(colors.muted),
-        )?;
-    }
-    if row.health_tone != Tone::Good && row.user_chip != "비활성" {
-        let reason = if row.user_chip == "비활성" {
-            "비활성".to_owned()
-        } else if row.health_chip == "재로그인 필요" {
-            "다시 로그인해야 합니다".to_owned()
-        } else if let Some(until) = row.health_chip.strip_prefix("한도 · ") {
-            format!("한도 대기 · {until}까지")
-        } else if let Some(seconds) = row.health_chip.strip_prefix("속도 조절 중 · ") {
-            format!("요청 속도 조절 중 · {seconds}")
-        } else {
-            row.health_chip.clone()
-        };
-        let reason_y = y + if row.meter_windows.is_empty() {
-            42.0
-        } else {
-            90.0
-        };
-        draw_text(
-            target,
-            factory,
-            small,
-            &reason,
-            PADDING,
-            reason_y,
-            if row.reason_button { 220.0 } else { 328.0 },
-            if row.reason_button { 24.0 } else { 16.0 },
-            brush_color(colors.muted),
-        )?;
-        if row.reason_button {
-            pill(
-                target,
-                rect(264.0, reason_y - 4.0, 344.0, reason_y + 20.0),
-                brush_color(colors.accent),
-            )?;
-            draw_text(
-                target,
-                factory,
-                small,
-                "다시 로그인",
-                274.0,
-                reason_y,
-                62.0,
-                16.0,
-                brush_color(colors.surface),
-            )?;
+}
+impl Drop for Apartment {
+    fn drop(&mut self) {
+        if self.0 {
+            unsafe { CoUninitialize() };
         }
     }
-    let _ = (now, dark);
-    Ok(())
-}
-
-fn now_time(now: SystemTime) -> String {
-    let local = chrono::DateTime::<chrono::Local>::from(chrono::DateTime::<chrono::Utc>::from(now));
-    local.format("%H:%M").to_string()
-}
-
-fn trim_text(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        return value.to_owned();
-    }
-    if max_chars <= 1 {
-        return "…".into();
-    }
-    value.chars().take(max_chars - 1).collect::<String>() + "…"
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1346,22 +244,12 @@ pub fn render_png(
     output: &Path,
     state: &str,
 ) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        [1.0, 1.5, 2.0].contains(&scale),
-        "scale must be 1, 1.5, or 2"
-    );
-    // Keep the same 32-DIP desktop margin as the reference captures. The
-    // margin represents the shell/DWM shadow; the flyout itself is still
-    // painted at the spec's 360-DIP origin.
-    let margin = (32.0 * scale).ceil() as u32;
-    let flyout_width = (WIDTH * scale) as u32;
-    let review_rows = display_rows(rows, Some(state));
-    let flyout_height =
-        (state_height(&review_rows, expand_disabled, Some(state)) * scale).ceil() as u32;
-    let width = flyout_width + margin * 2;
-    let height = flyout_height + margin * 2;
+    anyhow::ensure!([1., 1.5, 2.].contains(&scale), "scale must be 1, 1.5, or 2");
+    let _apartment = Apartment::enter();
+    let (renderer, view, scene) = prepared(rows, dark, now, expand_disabled, true, Some(state))?;
+    let width = (424. * scale).ceil() as u32;
+    let height = ((scene.rect.bottom + 64.) * scale).ceil() as u32;
     unsafe {
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         let wic: IWICImagingFactory =
             CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
         let bitmap = wic.CreateBitmap(
@@ -1370,54 +258,39 @@ pub fn render_png(
             &GUID_WICPixelFormat32bppPBGRA,
             WICBitmapCacheOnLoad,
         )?;
-        let props = D2D1_RENDER_TARGET_PROPERTIES {
-            r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
-            pixelFormat: D2D1_PIXEL_FORMAT {
-                format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-            },
-            dpiX: 96.0 * scale,
-            dpiY: 96.0 * scale,
-            ..Default::default()
-        };
         let factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
-        let target = factory.CreateWicBitmapRenderTarget(&bitmap, &props)?;
-        target.SetDpi(96.0 * scale, 96.0 * scale);
-        let desktop = if dark {
-            D2D1_COLOR_F {
-                r: 14.0 / 255.0,
-                g: 16.0 / 255.0,
-                b: 19.0 / 255.0,
-                a: 1.0,
-            }
-        } else {
-            D2D1_COLOR_F {
-                r: 220.0 / 255.0,
-                g: 227.0 / 255.0,
-                b: 234.0 / 255.0,
-                a: 1.0,
-            }
-        };
+        let target = factory.CreateWicBitmapRenderTarget(
+            &bitmap,
+            &D2D1_RENDER_TARGET_PROPERTIES {
+                r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                },
+                dpiX: 96. * scale,
+                dpiY: 96. * scale,
+                ..Default::default()
+            },
+        )?;
         target.BeginDraw();
-        target.Clear(Some(&desktop));
+        target.Clear(Some(&D2D1_COLOR_F {
+            r: 0.86,
+            g: 0.89,
+            b: 0.92,
+            a: 1.,
+        }));
         target.EndDraw(None, None)?;
-        let transform = Matrix3x2 {
-            M11: 1.0,
-            M22: 1.0,
-            M31: margin as f32,
-            M32: margin as f32,
-            ..Default::default()
-        };
-        target.SetTransform(&transform);
-        paint_with_state(
+        // Translation is in DIPs. Multiplying it by scale again shifted 2x PNGs.
+        target.SetTransform(&Matrix3x2::translation(32., 32.));
+        paint_prepared(
             &target,
-            rows,
-            dark,
+            &renderer,
+            &view,
+            &scene,
             version,
             now,
-            expand_disabled,
-            true,
             Some(state),
+            true,
         )?;
         let stream = wic.CreateStream()?;
         let wide: Vec<u16> = output
@@ -1428,18 +301,15 @@ pub fn render_png(
             .collect();
         stream.InitializeFromFilename(PCWSTR(wide.as_ptr()), 0x40000000)?;
         let encoder = wic.CreateEncoder(&GUID_ContainerFormatPng, std::ptr::null())?;
-        encoder.Initialize(
-            &stream,
-            windows::Win32::Graphics::Imaging::WICBitmapEncoderNoCache,
-        )?;
+        encoder.Initialize(&stream, WICBitmapEncoderNoCache)?;
         let mut frame = None;
         let mut options = None;
         encoder.CreateNewFrame(&mut frame, &mut options)?;
-        let frame = frame.unwrap();
+        let frame = frame.ok_or_else(|| Error::from_hresult(E_INVALIDARG))?;
         frame.Initialize(None)?;
         frame.SetSize(width, height)?;
-        let mut pixel_format = GUID_WICPixelFormat32bppPBGRA;
-        frame.SetPixelFormat(&mut pixel_format)?;
+        let mut format = GUID_WICPixelFormat32bppPBGRA;
+        frame.SetPixelFormat(&mut format)?;
         frame.WriteSource(&bitmap, std::ptr::null())?;
         frame.Commit()?;
         encoder.Commit()?;
@@ -1448,71 +318,43 @@ pub fn render_png(
 }
 
 #[cfg(test)]
-mod state_tests {
+mod tests {
     use super::*;
-
     #[test]
-    fn menu_and_review_states_preserve_authoritative_pacing_and_attention() {
-        let mut rows = crate::parse_state(
-            r#"{"accounts":[
-            {"id":"paced","provider":"codex","user_state":"active"},
-            {"id":"attention","provider":"claude","user_state":"active"}
-        ]}"#,
-        )
-        .unwrap();
-        rows[0].pacing_until = Some("2099-10-18T00:00:00Z".into());
-        rows[0].health_chip = "속도 조절 중 · 10초".into();
-        rows[0].health_tone = Tone::Warning;
-        rows[0].attention = true;
-        rows[1].health_chip = "준비됨".into();
-        rows[1].health_tone = Tone::Warning;
-        rows[1].attention = true;
+    fn review_state_never_replaces_authoritative_pacing_or_attention() {
+        let rows=crate::parse_state(r#"{"accounts":[{"id":"synthetic","provider":"codex","user_state":"active","refresh_attention":true,"pacing":{"backoff_until":"2099-01-01T00:00:00Z","waiting":2}}],"pools":{"codex":{"eligible":1}}}"#).unwrap();
+        let now = SystemTime::now();
         for state in [
             None,
-            Some("menu:paced:0"),
-            Some("menu:attention:0"),
-            Some("list"),
-            Some("expanded"),
-            Some("expanded:claude"),
             Some("pacing"),
+            Some("expanded"),
+            Some("menu:synthetic:0"),
         ] {
-            let displayed = display_rows(&rows, state);
-            assert_eq!(displayed, rows);
+            let (_, view, _) = prepared(&rows, false, now, false, true, state).unwrap();
+            assert_eq!(view.raw.accounts[0].pacing.waiting, 2);
+            assert!(view.raw.accounts[0].refresh_attention);
             assert_eq!(
-                state_height(&displayed, false, state),
-                crate::state_height(&rows, false, state)
+                view.raw.accounts[0].pacing.backoff_until.as_deref(),
+                Some("2099-01-01T00:00:00Z")
             );
         }
     }
-
     #[test]
-    fn renderer_height_uses_shared_geometry_for_both_providers_and_legacy_states() {
-        let rows = crate::parse_state(
-            r#"{"accounts":[
-            {"id":"cl","provider":"claude","user_state":"disabled"},
-            {"id":"cx","provider":"codex","user_state":"disabled"}
-        ]}"#,
+    fn review_height_uses_v2_scene_and_spec_empty_and_login_dimensions() {
+        assert_eq!(state_height(&[], false, None), 298.);
+        let rows=crate::parse_state(r#"{"accounts":[{"id":"cl","provider":"claude","user_state":"disabled"},{"id":"cx","provider":"codex","user_state":"disabled"}]}"#).unwrap();
+        assert_eq!(state_height(&rows, false, None), 419.);
+        assert_eq!(state_height(&rows, false, Some("login:claude")), 337.);
+        let (_, _, scene) = prepared(
+            &rows,
+            false,
+            SystemTime::now(),
+            false,
+            true,
+            Some("menu:cl:0"),
         )
         .unwrap();
-        for expanded in [false, true] {
-            for state in [
-                None,
-                Some("expanded"),
-                Some("expanded:claude"),
-                Some("expanded:codex"),
-                Some("menu:cl:0"),
-                Some("menu:cx:0"),
-                Some("login:claude"),
-            ] {
-                assert_eq!(
-                    state_height(&rows, expanded, state),
-                    crate::state_height(&rows, expanded, state)
-                );
-            }
-            assert_eq!(
-                content_height(&rows, expanded),
-                crate::state_height(&rows, expanded, None)
-            );
-        }
+        let popup = scene.popup.unwrap();
+        assert!(popup.rect.top >= 8. && popup.rect.bottom <= scene.footer.rect.top);
     }
 }

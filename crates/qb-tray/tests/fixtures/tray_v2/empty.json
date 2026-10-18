@@ -1,0 +1,16 @@
+{
+  "accounts": [],
+  "pools": {
+    "claude": {
+      "eligible": 0,
+      "cooling": {},
+      "unavailable": 0
+    },
+    "codex": {
+      "eligible": 0,
+      "cooling": {},
+      "unavailable": 0
+    }
+  },
+  "version": "0.1.0"
+}

@@ -7,6 +7,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub const WIDTH: f32 = 360.;
 pub const FOOTER: f32 = 48.;
+pub const QUIT_DETAILS: [&str; 2] = [
+    "프록시는 계속 실행됩니다. CLI는 그대로 작동합니다.",
+    "quota-baton을 거치는 CLI 요청이 멈춥니다.",
+];
 
 #[derive(Debug, Clone, Default)]
 pub struct FrozenSection {
@@ -42,6 +46,8 @@ pub struct Presentation {
     /// Actual text advance in DIPs, keyed by `text_key`. Missing keys use an
     /// explicit deterministic estimate; native callers should supply font metrics.
     pub text_widths: BTreeMap<String, f32>,
+    /// Actual DirectWrite keep-all line count for each footer-menu subtitle.
+    pub subtitle_lines: BTreeMap<String, usize>,
     /// Dialog body line count after caller's keep-all wrapping. Default is 3.
     pub credits_body_lines: usize,
     /// Optional scroll within a popup when its contents exceed the scene cap.
@@ -57,6 +63,7 @@ impl Default for Presentation {
             core_ok: true,
             pending_ids: BTreeSet::new(),
             text_widths: BTreeMap::new(),
+            subtitle_lines: BTreeMap::new(),
             credits_body_lines: 3,
             popup_offset: 0.,
         }
@@ -727,7 +734,7 @@ fn ordered<'a>(
 
 pub fn row_height(row: &v2::AccountRow, disabled_slot: bool) -> f32 {
     if disabled_slot {
-        return 44.;
+        return 44. + if row.reason.is_some() { 24. } else { 0. };
     }
     let action = row.action.as_ref().map(|a| a.kind);
     44. + if row.usage.is_some() { 30. } else { 0. }
@@ -910,6 +917,9 @@ fn row_box(row: &v2::AccountRow, disabled_slot: bool, y: f32, p: &Presentation) 
             ));
         }
     }
+    if disabled_slot && row.reason.is_some() {
+        reason = Some(r(16., line1.bottom + 8., 344., line1.bottom + 24.));
+    }
     RowBox {
         id: row.raw.id.clone(),
         provider: row.raw.provider.clone(),
@@ -1080,7 +1090,7 @@ fn menu_parts(view: &v2::View, p: &Presentation) -> Option<(f32, Vec<Part>)> {
             vec![
                 Part::Item(
                     "트레이만 닫기".into(),
-                    Some("프록시는 계속 실행됩니다. CLI는 그대로 작동합니다.".into()),
+                    Some(QUIT_DETAILS[0].into()),
                     None,
                     false,
                     Target::Menu {
@@ -1091,7 +1101,7 @@ fn menu_parts(view: &v2::View, p: &Presentation) -> Option<(f32, Vec<Part>)> {
                 ),
                 Part::Item(
                     "트레이와 프록시 종료".into(),
-                    Some("quota-baton을 거치는 CLI 요청이 멈춥니다.".into()),
+                    Some(QUIT_DETAILS[1].into()),
                     None,
                     false,
                     Target::Menu {
@@ -1105,15 +1115,23 @@ fn menu_parts(view: &v2::View, p: &Presentation) -> Option<(f32, Vec<Part>)> {
         _ => return None,
     })
 }
-fn parts_height(parts: &[Part]) -> f32 {
+fn subtitle_height(detail: &str, p: &Presentation) -> f32 {
+    16. * p
+        .subtitle_lines
+        .get(detail)
+        .copied()
+        .unwrap_or(1)
+        .clamp(1, 8) as f32
+}
+fn parts_height(parts: &[Part], p: &Presentation) -> f32 {
     8. + parts
         .iter()
-        .map(|p| match p {
+        .map(|part| match part {
             Part::Info(_, _, height) | Part::Gap(height) => *height,
             Part::Separator => 9.,
             Part::Item(_, subtitle, _, _, _, _) => {
-                if subtitle.is_some() {
-                    52.
+                if let Some(detail) = subtitle {
+                    36. + subtitle_height(detail, p)
                 } else {
                     32.
                 }
@@ -1128,13 +1146,13 @@ fn overlay_min_height(view: &v2::View, p: &Presentation) -> f32 {
             credits_dialog_height(p) + 16.
         }
         _ => menu_parts(view, p)
-            .map(|(_, parts)| parts_height(&parts) + 8. + FOOTER + 12.)
+            .map(|(_, parts)| parts_height(&parts, p) + 8. + FOOTER + 12.)
             .unwrap_or(0.),
     }
 }
 fn build_popup(view: &v2::View, scene: &Scene, p: &Presentation) -> Option<PopupBox> {
     let (width, parts) = menu_parts(view, p)?;
-    let content_height = parts_height(&parts);
+    let content_height = parts_height(&parts, p);
     let available = (scene.footer.rect.top - 8.).max(0.);
     if available <= 0. {
         return None;
@@ -1208,7 +1226,9 @@ fn build_popup(view: &v2::View, scene: &Scene, p: &Presentation) -> Option<Popup
                 y += 9.;
             }
             Part::Item(text, detail, checked, lead, target, enabled) => {
-                let height = if detail.is_some() { 52. } else { 32. };
+                let height = detail
+                    .as_deref()
+                    .map_or(32., |detail| 36. + subtitle_height(detail, p));
                 let item = r(rect.left + 5., y, rect.right - 5., y + height);
                 let lead_rect = lead.then(|| {
                     r(
@@ -1224,9 +1244,14 @@ fn build_popup(view: &v2::View, scene: &Scene, p: &Presentation) -> Option<Popup
                     rect: item,
                     lead: lead_rect,
                     label: r(text_left, ty, item.right - 12., ty + 18.),
-                    subtitle: detail
-                        .as_ref()
-                        .map(|_| r(text_left, ty + 20., item.right - 12., ty + 36.)),
+                    subtitle: detail.as_ref().map(|detail| {
+                        r(
+                            text_left,
+                            ty + 20.,
+                            item.right - 12.,
+                            ty + 20. + subtitle_height(detail, p),
+                        )
+                    }),
                     text,
                     detail,
                     checked,
@@ -1741,6 +1766,40 @@ mod tests {
         assert!(inside(last.rect, popup.clip));
         let (x, y) = center(last.rect);
         assert_eq!(scene.hit_test(x, y), Some(&last.target));
+    }
+    #[test]
+    fn failed_enable_has_a_contained_reason_line_without_losing_the_button() {
+        let mut v = view(vec![disabled("off")], 0);
+        let row = v
+            .sections
+            .iter_mut()
+            .flat_map(|section| &mut section.disabled_rows)
+            .next()
+            .unwrap();
+        row.reason = Some("실패했습니다. 다시 시도하세요.".into());
+        let scene = Scene::build(&v, Presentation::default(), 1000.);
+        let row = scene.row("off").unwrap();
+        assert_eq!(h(row.rect), 68.);
+        assert!(inside(row.reason.unwrap(), row.rect));
+        assert!(inside(row.button.as_ref().unwrap().visual, row.rect));
+        assert!(row.reason.unwrap().top > row.line1.bottom);
+    }
+    #[test]
+    fn quit_subtitles_grow_from_measured_keep_all_lines() {
+        let v = ready_view();
+        let mut p = Presentation {
+            overlay: Overlay::Quit,
+            ..Default::default()
+        };
+        p.subtitle_lines.insert(QUIT_DETAILS[0].into(), 2);
+        let scene = Scene::build(&v, p, 1000.);
+        let popup = scene.popup.unwrap();
+        assert_eq!(h(popup.items[0].rect), 68.);
+        assert_eq!(h(popup.items[0].subtitle.unwrap()), 32.);
+        assert_eq!(h(popup.items[1].rect), 52.);
+        for item in popup.items {
+            assert!(inside(item.subtitle.unwrap(), item.rect));
+        }
     }
     #[test]
     fn footer_popups_widths_item_sizes_and_anchors() {

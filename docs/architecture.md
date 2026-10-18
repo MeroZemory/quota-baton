@@ -429,27 +429,13 @@ Relay design:
 
 ## 10. Tray
 
-- **Icon.** A Win32 notify icon. Its badge shows normal, attention (an account needs re-login or all accounts are exhausted) or error (core unreachable). The tooltip carries a one-line status.
-- **Flyout.** Opened by left **or right** click.
-  - It is a borderless, DPI-aware (Per-Monitor V2) popup anchored to the icon rectangle, with Windows 11 rounded corners and the system light/dark theme.
-  - It closes on focus loss or Esc.
-  - It is keyboard navigable.
-  - UI text is Korean.
-- **Content:**
-  - Header: core status and version.
-  - One section per provider.
-  - Per account:
-    - label or email and plan
-    - a state chip: in use, ready, limit until HH:MM, needs re-login, paused, disabled
-    - 5-hour and weekly usage bars with reset times
-    - row actions: log in / re-login, pause / resume, disable / enable
-    - row menu toggles: "take no new conversations" (`drain`) and, for Codex, "allow paid credits" (`allow_credits`)
-    - These two toggles cover every per-account setting, so the user never edits files for normal use.
-  - Footer:
-    - add account
-    - settings (opens the config folder)
-    - open logs
-    - quit, which offers "tray only" or "tray and proxy"
+The approved [tray v2 specification](tray-v2.md) owns the visual and interaction rules, replacing the old dual-meter layout. Korean text, native Direct2D/DirectWrite and shared HWND/WIC rendering remain.
+
+- **Icon.** A Win32 notify icon. Error means core unreachable. Attention means a provider is unavailable or an account needs user action. Its tooltip uses the same provider verdicts as the flyout.
+- **Flyout.** Left or right click opens a 360-DIP, Per-Monitor V2 popup with Windows 11 rounded corners. Light is the default; `[tray] theme` can opt into dark or system. The header and footer stay fixed, only the list scrolls, and height is capped at 80% of the work area. Esc/focus loss closes it.
+- **Content.** Provider summaries lead. Each account has a short name, plan, optional semantic chip and one remaining-based binding-window meter. Other windows and model buckets appear in tooltips/menu info. Credits distinguish balance, permission and actual spending. Disabled accounts have a disclosure and enable action. Every credits enable attempt requires explicit confirmation; disabling does not.
+- **Actions.** The whole row opens its menu; inline buttons take precedence, and menu icons/checkboxes share the full item target. Checkbox menus remain open. Footer settings opens a menu for the config file, logs and version. Login/delete panels retain their workflows. Notification clicks reveal the row with its menu closed.
+- **Implementation.** Complete typed core state survives the client DTO. Pure projection, open-lifetime order/expansion/consent state and shared DIP geometry drive drawing, pointer/keyboard targets and UIA names. Account controls keep nonce-guarded pending state until checked metadata reloads; failures show a short row error. Admin/filesystem/shell work runs on the worker, not the window thread. A disconnected core keeps the last rows dimmed with actions disabled and settings available.
 - **Updates.** The flyout subscribes to the admin event stream while open and refreshes on a slow timer otherwise.
 - **Toasts** appear only for actionable events:
   - an account needs re-login
@@ -458,10 +444,10 @@ Relay design:
   - **a burst**: one client (`originator`/UA) opens more than `burst_new_sessions` (default 30) new sessions within 10 minutes. This is the signature of a runaway loop draining the pool (R8 I-40).
   - a linked account goes stale
   - the core restarted unexpectedly
-- **Account notification context.** The core exposes optional `quota_notice` on each account view and emits a flat `core_warning` with `kind: "quota_notice"` when it resolves a situation. Fields are `action` (`credits`, `failover`, `exhausted`), limiting `window`, real `reset_at`, `next_account`, `earliest_account`, `observed_at`, and `model_limited`. Account references are IDs; the tray resolves their displayed email local parts from the same snapshot. `has_alternative` supplies the core's non-quota recovery context.
+- **Account notification context.** The core exposes optional `quota_notice` on each account view and emits a flat `core_warning` with `kind: "quota_notice"` when it resolves a situation. Fields are `action` (`credits`, `failover`, `exhausted`), limiting `window`, real `reset_at`, `next_account`, `earliest_account`, `observed_at`, and `model_limited`. Account references are IDs; the tray resolves their display names under the v2 label/collision rules from the same snapshot. `has_alternative` supplies the core's non-quota recovery context.
   - Failover names the actual C7 placement; an unresolved reset hold never produces a quota toast. Deferred committed-response failures resolve on later real placement. Fresh usage alone waits for traffic to resolve the action.
   - Credits require actual successful serving evidence from C9 as well as capability and permission. Preference changes alone do not notify. Model-scoped exhaustion is qualified as such.
-  - The tray refreshes authoritative state after the event, uses the same formatter for row reasons and balloons, and debounces each account/action for 30 minutes. Queued text follows updated authoritative targets and resets; delivered messages stay debounced.
+  - The tray refreshes authoritative state after the event, uses shared names, calendar formatting and core context across row reasons and balloons, and debounces each account/action for 30 minutes. Queued text follows updated authoritative targets and resets; delivered messages stay debounced.
 - **Supervision.**
   - The tray polls the core's health every 10 s.
   - If the core is unreachable for 30 s and its process is gone, the tray restarts it with backoff (5 s doubling to 5 min) and shows a toast. The previous proxy died silently three times with no supervisor (R8 I-03).

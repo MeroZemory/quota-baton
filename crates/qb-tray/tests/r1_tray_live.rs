@@ -12,7 +12,7 @@
 //!    `state` is "list" for the ordinary flyout, including after it is hidden.
 //!    `sequence` increases in capture order; async writes may arrive out of order.
 //! 2. Debug+testkit only: WM_APP+6, WPARAM=0 light / 1 dark, LPARAM=0 changes the
-//!    runtime cached theme, updates shell/window theme and invalidates the native
+//!    cached system theme (only for explicit [tray] theme=system), updates shell/window theme and invalidates the native
 //!    renderer. No registry mutation. Native paint is checked through PrintWindow.
 //!
 //! No core hooks are required: pause/resume use the real admin routes; revoked
@@ -35,6 +35,11 @@ use chrono::{TimeZone, Utc};
 use qb_core::accounts::{
     Account, AccountStore, Health, Identity, Provider, Source, TokenMeta, Tokens, UserState,
 };
+use qb_tray::{
+    v2,
+    v2_geometry::{self as geometry, Target},
+    v2_render::Renderer,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -55,7 +60,8 @@ use windows::Win32::{
     Foundation::{CloseHandle, HWND, LPARAM, RECT, WPARAM},
     Graphics::Gdi::{
         BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleBitmap, CreateCompatibleDC, DIB_RGB_COLORS,
-        DeleteDC, DeleteObject, GetDC, GetDIBits, ReleaseDC, SelectObject,
+        DeleteDC, DeleteObject, GetDC, GetDIBits, RDW_INVALIDATE, RDW_UPDATENOW, RedrawWindow,
+        ReleaseDC, SelectObject,
     },
     Storage::Xps::PrintWindow,
     System::{
@@ -65,8 +71,8 @@ use windows::Win32::{
         Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ},
     },
     UI::WindowsAndMessaging::{
-        FindWindowExW, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible, PostMessageW,
-        WM_APP, WM_LBUTTONUP, WM_RBUTTONUP,
+        FindWindowExW, GetClientRect, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible,
+        PostMessageW, WM_APP, WM_LBUTTONUP, WM_RBUTTONUP,
     },
 };
 use windows::core::w;
@@ -88,6 +94,14 @@ struct Trace {
     tooltip: String,
     #[serde(rename = "accounts")]
     account_count: usize,
+    scene: Option<SceneTrace>,
+}
+#[derive(Clone, Debug, Deserialize)]
+struct SceneTrace {
+    epoch: u64,
+    height: f32,
+    offset: f32,
+    rows: usize,
 }
 
 // Nonblocking accept + bounded reads/writes let Drop join even after a partial
@@ -397,6 +411,13 @@ impl Live {
                 url = format_args!("http://{}", upstream.address),
             ),
         )?;
+        if name == "theme" && !release {
+            use std::io::Write;
+            fs::OpenOptions::new()
+                .append(true)
+                .open(home.join("config.toml"))?
+                .write_all(b"theme='system'\n")?;
+        }
         let mut live = Self {
             tray: None,
             core: None,
@@ -585,6 +606,46 @@ impl Live {
         Ok(())
     }
 
+    fn expected_tooltip(&self) -> Result<String> {
+        let state = self.admin("GET", "/admin/v1/state")?;
+        Ok(v2::project(&serde_json::to_string(&state)?, SystemTime::now())?.tray_tooltip)
+    }
+    fn measured_scene(&self, expanded: Option<bool>) -> Result<geometry::Scene> {
+        let trace = self
+            .trace_matching(|t| t.event == "paint" && t.scene.is_some())?
+            .context("actual Scene paint missing")?;
+        let frame = trace.scene.context("paint Scene missing")?;
+        ensure!(frame.epoch > 0, "paint epoch missing");
+        let view = v2::project(
+            &serde_json::to_string(&self.admin("GET", "/admin/v1/state")?)?,
+            SystemTime::now(),
+        )?;
+        let hwnd = self.hwnd()?;
+        let scale =
+            unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd).max(96) } as f32 / 96.;
+        let mut client = RECT::default();
+        unsafe {
+            GetClientRect(hwnd, &mut client)?;
+        }
+        let extent = (client.bottom - client.top) as f32 / scale;
+        let mut p = geometry::Presentation {
+            offset: frame.offset,
+            frozen: geometry::capture_order(&view),
+            ..Default::default()
+        };
+        if let Some(expanded) = expanded {
+            p.expanded.insert("codex".into(), expanded);
+        }
+        let renderer = Renderer::new(trace.dark)?;
+        renderer.measure(&view, &mut p)?;
+        let scene = geometry::Scene::build(&view, p, extent);
+        ensure!(
+            (frame.height - extent).abs() <= 1.1 / scale
+                && (scene.rect.bottom - extent).abs() <= 1.1 / scale,
+            "Scene/client DPI extent mismatch"
+        );
+        Ok(scene)
+    }
     fn assert_state(
         &self,
         trace: &Trace,
@@ -635,7 +696,7 @@ fn r1_live_badge_tooltip_follow_real_health_and_core_loss() -> Result<()> {
     let normal = live.wait(IMMEDIATE, "normal shell presentation missing", |t| {
         t.badge == "normal"
     })?;
-    assert_eq!(normal.tooltip, "quota-baton · 정상 · 계정 1개");
+    assert_eq!(normal.tooltip, live.expected_tooltip()?);
     ensure!(
         matches!(normal.icon_size, 16 | 20 | 24 | 32),
         "invalid shell icon size"
@@ -645,7 +706,7 @@ fn r1_live_badge_tooltip_follow_real_health_and_core_loss() -> Result<()> {
     let attention = live.wait(IMMEDIATE, "revocation did not update shell badge", |t| {
         t.badge == "attention" && t.sequence > normal.sequence
     })?;
-    assert_eq!(attention.tooltip, "quota-baton · 주의 필요 · 계정 1개");
+    assert_eq!(attention.tooltip, live.expected_tooltip()?);
     live.assert_state(&attention, "active", "needs_relogin")?;
     let toast = live.wait(IMMEDIATE, "actionable re-login balloon missing", |t| {
         t.event == "balloon" && t.kind.as_deref() == Some("Relogin")
@@ -656,9 +717,20 @@ fn r1_live_badge_tooltip_follow_real_health_and_core_loss() -> Result<()> {
         WPARAM(0),
         LPARAM(windows::Win32::UI::Shell::NIN_BALLOONUSERCLICK as isize),
     )?;
-    let focused = live.wait(IMMEDIATE, "balloon click did not focus account menu", |t| {
-        t.sequence > toast.sequence && t.event == "paint" && t.state == "menu" && t.visible
-    })?;
+    let focused = live.wait(
+        IMMEDIATE,
+        "balloon click did not reveal the row with menu closed",
+        |t| t.sequence > toast.sequence && t.event == "paint" && t.state == "list" && t.visible,
+    )?;
+    let scene = live.measured_scene(None)?;
+    let row = scene
+        .row(&live.account)
+        .context("notification account row missing")?;
+    ensure!(
+        row.rect.top >= scene.list.top - 0.5 && row.rect.bottom <= scene.list.bottom + 0.5,
+        "notification row not revealed in actual list viewport"
+    );
+    ensure!(scene.popup.is_none(), "notification opened a menu");
     let after_click = live.admin("GET", "/admin/v1/state")?;
     for field in ["health", "user_state", "drain", "allow_credits", "source"] {
         assert_eq!(
@@ -697,8 +769,11 @@ fn r1_live_badge_tooltip_follow_real_health_and_core_loss() -> Result<()> {
         "core loss did not reach shell",
         |t| t.badge == "error" && t.sequence > attention.sequence,
     )?;
-    assert_eq!(error.tooltip, "quota-baton · 코어 연결 끊김 · 계정 0개");
-    assert_eq!(error.account_count, 0);
+    assert_eq!(error.tooltip, "quota-baton · 코어에 연결할 수 없음");
+    assert_eq!(
+        error.account_count, 1,
+        "core loss discarded last known rows"
+    );
     Ok(())
 }
 
@@ -711,9 +786,9 @@ fn r1_live_runtime_theme_repaints_native_window_and_shell() -> Result<()> {
     capture_theme(
         live.hwnd()?,
         &live.home.join("initial-light.bmp"),
-        [248, 249, 251],
+        [255, 255, 255],
     )?;
-    for (dark, background) in [(true, [30, 30, 30]), (false, [248, 249, 251])] {
+    for (dark, background) in [(true, [32, 32, 32]), (false, [255, 255, 255])] {
         live.post(WM_APP + 6, WPARAM(usize::from(dark)), LPARAM(0))?;
         let after = live.wait(
             IMMEDIATE,
@@ -739,19 +814,9 @@ fn r1_live_runtime_theme_repaints_native_window_and_shell() -> Result<()> {
 fn r1_live_account_events_immediately_refresh_authoritative_shell_state() -> Result<()> {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut live = Live::start("events")?;
-    for (action, expected, badge, tooltip) in [
-        (
-            "pause",
-            "paused",
-            "attention",
-            "quota-baton · 주의 필요 · 계정 1개",
-        ),
-        (
-            "resume",
-            "active",
-            "normal",
-            "quota-baton · 정상 · 계정 1개",
-        ),
+    for (action, expected, badge) in [
+        ("pause", "paused", "attention"),
+        ("resume", "active", "normal"),
     ] {
         let before = live.trace()?.context("initial shell snapshot missing")?;
         // Health polls immediately, then every 10 s. Keep both mutations and
@@ -765,6 +830,7 @@ fn r1_live_account_events_immediately_refresh_authoritative_shell_state() -> Res
             "POST",
             &format!("/admin/v1/accounts/{}/{action}", live.account),
         )?;
+        let tooltip = live.expected_tooltip()?;
         let remaining = IMMEDIATE
             .checked_sub(started.elapsed())
             .context("admin action exceeded immediate budget")?;
@@ -788,39 +854,89 @@ fn r1_live_account_events_immediately_refresh_authoritative_shell_state() -> Res
     live.wait(IMMEDIATE, "disabled account snapshot missing", |t| {
         t.sequence > before.sequence && t.event == "paint" && t.badge == "attention"
     })?;
-    let state = live.admin("GET", "/admin/v1/state")?;
-    let rows = qb_tray::parse_state(&serde_json::to_string(&state)?)?;
-    let targets = qb_tray::layout_targets(&rows, false, Some("list"));
-    let disclosure = targets
-        .iter()
-        .find_map(|target| match target {
-            qb_tray::HitTarget::Disclosure { provider, rect } if provider == "codex" => Some(rect),
-            _ => None,
-        })
-        .context("Codex disabled disclosure missing")?;
+    // Open-lifetime membership stays frozen after disable. Reopen before
+    // testing the new disabled section; blocked/off providers auto-expand it.
+    let before = live.trace()?.context("disabled publication missing")?;
+    live.tray_click(WM_LBUTTONUP)?;
+    let hidden = live.wait(IMMEDIATE, "disabled list did not hide", |t| {
+        t.sequence > before.sequence && !t.visible
+    })?;
+    live.tray_click(WM_LBUTTONUP)?;
+    live.wait(IMMEDIATE, "disabled list did not reopen", |t| {
+        t.sequence > hidden.sequence && t.visible && t.event == "paint" && t.state == "list"
+    })?;
     let hwnd = live.hwnd()?;
-    let mut collapsed = RECT::default();
-    unsafe {
-        GetWindowRect(hwnd, &mut collapsed)?;
-    }
-    let scale = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96) as f32 / 96.0;
-    let x = ((disclosure.left + disclosure.right) / 2.0 * scale).round() as i16;
-    let y = ((disclosure.top + disclosure.bottom) / 2.0 * scale).round() as i16;
-    let packed = ((y as u16 as u32) << 16) | x as u16 as u32;
-    let before = live.trace()?.context("collapsed snapshot missing")?;
-    live.post(WM_LBUTTONUP, WPARAM(0), LPARAM(packed as isize))?;
-    live.wait(
-        IMMEDIATE,
-        "disabled disclosure did not paint expanded rows",
-        |t| t.sequence > before.sequence && t.event == "paint" && t.state == "expanded",
-    )?;
     let mut expanded = RECT::default();
     unsafe {
         GetWindowRect(hwnd, &mut expanded)?;
     }
+    let scene = live.measured_scene(None)?;
+    let section = scene
+        .sections
+        .iter()
+        .find(|s| s.provider == "codex")
+        .context("Codex section missing")?;
+    ensure!(
+        section.expanded && section.disabled_rows.len() == 1,
+        "off provider failed initial auto-expansion"
+    );
+    let disclosure = scene
+        .targets
+        .iter()
+        .find(|h| h.target == Target::Disclosure("codex".into()))
+        .context("disabled disclosure missing")?
+        .rect;
+    let scale = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd).max(96) } as f32 / 96.;
+    let before = live.trace()?.context("expanded publication missing")?;
+    let x = ((disclosure.left + disclosure.right) / 2. * scale).round() as i16;
+    let y = ((disclosure.top + disclosure.bottom) / 2. * scale).round() as i16;
+    live.post(
+        WM_LBUTTONUP,
+        WPARAM(0),
+        LPARAM((((y as u16 as u32) << 16) | x as u16 as u32) as isize),
+    )?;
+    live.wait(IMMEDIATE, "manual collapse did not paint", |t| {
+        t.sequence > before.sequence
+            && t.event == "paint"
+            && t.state == "list"
+            && t.scene.as_ref().is_some_and(|s| s.rows == 0)
+    })?;
+    let mut collapsed = RECT::default();
+    unsafe {
+        GetWindowRect(hwnd, &mut collapsed)?;
+    }
     ensure!(
         expanded.bottom - expanded.top > collapsed.bottom - collapsed.top,
-        "expanded provider state did not reveal its disabled account"
+        "collapse did not reduce disabled section height"
+    );
+    let scene = live.measured_scene(Some(false))?;
+    let disclosure = scene
+        .targets
+        .iter()
+        .find(|h| h.target == Target::Disclosure("codex".into()))
+        .context("collapsed disclosure missing")?
+        .rect;
+    let x = ((disclosure.left + disclosure.right) / 2. * scale).round() as i16;
+    let y = ((disclosure.top + disclosure.bottom) / 2. * scale).round() as i16;
+    let before = live.trace()?.context("collapsed publication missing")?;
+    live.post(
+        WM_LBUTTONUP,
+        WPARAM(0),
+        LPARAM((((y as u16 as u32) << 16) | x as u16 as u32) as isize),
+    )?;
+    live.wait(IMMEDIATE, "manual expansion did not paint", |t| {
+        t.sequence > before.sequence
+            && t.event == "paint"
+            && t.state == "list"
+            && t.scene.as_ref().is_some_and(|s| s.rows == 1)
+    })?;
+    let scene = live.measured_scene(Some(true))?;
+    ensure!(
+        scene
+            .sections
+            .iter()
+            .any(|s| s.provider == "codex" && s.expanded && s.disabled_rows.len() == 1),
+        "expanded Scene omitted disabled account"
     );
     let after = live.admin("GET", "/admin/v1/state")?;
     assert_eq!(
@@ -851,6 +967,10 @@ fn r1_live_tray_right_click_toggles_closed_and_reopens_without_account_menu() ->
 // PrintWindow renders only our owned HWND. Persist an uncompressed BMP and
 // verify native palette pixels, independent of the telemetry's dark flag.
 fn capture_theme(hwnd: HWND, path: &Path, background: [u8; 3]) -> Result<()> {
+    ensure!(
+        unsafe { RedrawWindow(Some(hwnd), None, None, RDW_INVALIDATE | RDW_UPDATENOW).as_bool() },
+        "native repaint before capture failed"
+    );
     let mut rect = RECT::default();
     unsafe {
         GetWindowRect(hwnd, &mut rect)?;

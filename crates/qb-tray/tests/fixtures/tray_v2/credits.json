@@ -1,0 +1,307 @@
+{
+  "accounts": [
+    {
+      "id": "claude-acct-alpha",
+      "provider": "claude",
+      "label": null,
+      "email": "acct-alpha@example.invalid",
+      "plan": "max_20x",
+      "user_state": "active",
+      "health": {
+        "kind": "ready"
+      },
+      "source": {
+        "kind": "oauth"
+      },
+      "generation": 1,
+      "allow_credits": false,
+      "credits_in_use": false,
+      "credits": null,
+      "drain": false,
+      "active_sessions": 2,
+      "bound_sessions": 3,
+      "spread_threshold": 8,
+      "pool_eligible": true,
+      "eligible_for_new_session": true,
+      "observed_at": "2026-10-18T21:02:00+09:00",
+      "token_expires_at": "2026-10-24T21:00:00+09:00",
+      "windows": [
+        {
+          "name": "5h",
+          "used_pct": 64,
+          "reset_at": "2026-10-18T23:30:00+09:00",
+          "observed_at": "2026-10-18T21:02:00+09:00",
+          "status": "allowed"
+        },
+        {
+          "name": "7d",
+          "used_pct": 31,
+          "reset_at": "2026-10-24T14:00:00+09:00",
+          "observed_at": "2026-10-18T21:02:00+09:00",
+          "status": "allowed"
+        }
+      ]
+    },
+    {
+      "id": "claude-hello.sample-acct",
+      "provider": "claude",
+      "label": null,
+      "email": "hello.sample-acct@example.invalid",
+      "plan": "max_5x",
+      "user_state": "active",
+      "health": {
+        "kind": "ready"
+      },
+      "source": {
+        "kind": "oauth"
+      },
+      "generation": 1,
+      "allow_credits": false,
+      "credits_in_use": false,
+      "credits": null,
+      "drain": false,
+      "active_sessions": 0,
+      "bound_sessions": 3,
+      "spread_threshold": 8,
+      "pool_eligible": true,
+      "eligible_for_new_session": true,
+      "observed_at": "2026-10-18T21:02:00+09:00",
+      "token_expires_at": "2026-10-24T21:00:00+09:00",
+      "windows": [
+        {
+          "name": "5h",
+          "used_pct": 0,
+          "reset_at": "2026-10-18T23:30:00+09:00",
+          "observed_at": "2026-10-18T21:02:00+09:00",
+          "status": "allowed"
+        },
+        {
+          "name": "7d",
+          "used_pct": 82,
+          "reset_at": "2026-10-20T09:00:00+09:00",
+          "observed_at": "2026-10-18T21:02:00+09:00",
+          "status": "allowed"
+        }
+      ]
+    },
+    {
+      "id": "claude-sample-acct-c",
+      "provider": "claude",
+      "label": null,
+      "email": "sample-acct-c@example.invalid",
+      "plan": null,
+      "user_state": "disabled",
+      "health": {
+        "kind": "ready"
+      },
+      "source": {
+        "kind": "oauth"
+      },
+      "generation": 1,
+      "allow_credits": false,
+      "credits_in_use": false,
+      "credits": null,
+      "drain": false,
+      "active_sessions": 0,
+      "bound_sessions": 3,
+      "spread_threshold": 8,
+      "pool_eligible": false,
+      "eligible_for_new_session": false,
+      "observed_at": "2026-10-18T21:02:00+09:00",
+      "token_expires_at": "2026-10-24T21:00:00+09:00",
+      "windows": []
+    },
+    {
+      "id": "claude-support",
+      "provider": "claude",
+      "label": null,
+      "email": "support@example.invalid",
+      "plan": null,
+      "user_state": "disabled",
+      "health": {
+        "kind": "ready"
+      },
+      "source": {
+        "kind": "oauth"
+      },
+      "generation": 1,
+      "allow_credits": false,
+      "credits_in_use": false,
+      "credits": null,
+      "drain": false,
+      "active_sessions": 0,
+      "bound_sessions": 3,
+      "spread_threshold": 8,
+      "pool_eligible": false,
+      "eligible_for_new_session": false,
+      "observed_at": "2026-10-18T21:02:00+09:00",
+      "token_expires_at": "2026-10-24T21:00:00+09:00",
+      "windows": []
+    },
+    {
+      "id": "codex-hello.sample-acct",
+      "provider": "codex",
+      "label": null,
+      "email": "hello.sample-acct@example.invalid",
+      "plan": "plus",
+      "user_state": "active",
+      "health": {
+        "kind": "cooling",
+        "reason": "quota",
+        "scope": "account",
+        "until": "2026-10-19T00:10:00+09:00"
+      },
+      "source": {
+        "kind": "oauth"
+      },
+      "generation": 1,
+      "allow_credits": false,
+      "credits_in_use": false,
+      "credits": null,
+      "drain": false,
+      "active_sessions": 0,
+      "bound_sessions": 3,
+      "spread_threshold": 8,
+      "pool_eligible": false,
+      "eligible_for_new_session": false,
+      "observed_at": "2026-10-18T21:02:00+09:00",
+      "token_expires_at": "2026-10-24T21:00:00+09:00",
+      "windows": [
+        {
+          "name": "5h",
+          "used_pct": 100,
+          "reset_at": "2026-10-19T00:10:00+09:00",
+          "observed_at": "2026-10-18T21:02:00+09:00",
+          "status": "rejected"
+        },
+        {
+          "name": "7d",
+          "used_pct": 64,
+          "reset_at": "2026-10-23T11:05:00+09:00",
+          "observed_at": "2026-10-18T21:02:00+09:00",
+          "status": "allowed"
+        }
+      ],
+      "quota_cooling": {
+        "window": "5h",
+        "reset_at": "2026-10-19T00:10:00+09:00",
+        "started_at": "2026-10-18T20:00:00+09:00"
+      }
+    },
+    {
+      "id": "codex-acct-alpha",
+      "provider": "codex",
+      "label": null,
+      "email": "acct-alpha@example.invalid",
+      "plan": "plus",
+      "user_state": "active",
+      "health": {
+        "kind": "ready"
+      },
+      "source": {
+        "kind": "oauth"
+      },
+      "generation": 1,
+      "allow_credits": true,
+      "credits_in_use": true,
+      "credits": {
+        "has_credits": true,
+        "unlimited": false,
+        "balance": 19395.23
+      },
+      "drain": false,
+      "active_sessions": 0,
+      "bound_sessions": 3,
+      "spread_threshold": 8,
+      "pool_eligible": true,
+      "eligible_for_new_session": true,
+      "observed_at": "2026-10-18T21:02:00+09:00",
+      "token_expires_at": "2026-10-24T21:00:00+09:00",
+      "windows": [
+        {
+          "name": "5h",
+          "used_pct": 100,
+          "reset_at": "2026-10-19T01:40:00+09:00",
+          "observed_at": "2026-10-18T21:02:00+09:00",
+          "status": "rejected"
+        },
+        {
+          "name": "7d",
+          "used_pct": 62,
+          "reset_at": "2026-10-22T15:22:00+09:00",
+          "observed_at": "2026-10-18T21:02:00+09:00",
+          "status": "allowed"
+        }
+      ]
+    },
+    {
+      "id": "codex-sample-acct-c",
+      "provider": "codex",
+      "label": null,
+      "email": "sample-acct-c@example.invalid",
+      "plan": "free",
+      "user_state": "disabled",
+      "health": {
+        "kind": "ready"
+      },
+      "source": {
+        "kind": "oauth"
+      },
+      "generation": 1,
+      "allow_credits": false,
+      "credits_in_use": false,
+      "credits": null,
+      "drain": false,
+      "active_sessions": 0,
+      "bound_sessions": 3,
+      "spread_threshold": 8,
+      "pool_eligible": false,
+      "eligible_for_new_session": false,
+      "observed_at": "2026-10-18T21:02:00+09:00",
+      "token_expires_at": "2026-10-24T21:00:00+09:00",
+      "windows": []
+    },
+    {
+      "id": "codex-support",
+      "provider": "codex",
+      "label": null,
+      "email": "support@example.invalid",
+      "plan": "free",
+      "user_state": "disabled",
+      "health": {
+        "kind": "ready"
+      },
+      "source": {
+        "kind": "oauth"
+      },
+      "generation": 1,
+      "allow_credits": false,
+      "credits_in_use": false,
+      "credits": null,
+      "drain": false,
+      "active_sessions": 0,
+      "bound_sessions": 3,
+      "spread_threshold": 8,
+      "pool_eligible": false,
+      "eligible_for_new_session": false,
+      "observed_at": "2026-10-18T21:02:00+09:00",
+      "token_expires_at": "2026-10-24T21:00:00+09:00",
+      "windows": []
+    }
+  ],
+  "pools": {
+    "claude": {
+      "eligible": 2,
+      "cooling": {},
+      "unavailable": 2
+    },
+    "codex": {
+      "eligible": 1,
+      "cooling": {
+        "quota": 1
+      },
+      "unavailable": 2
+    }
+  },
+  "version": "0.1.0"
+}

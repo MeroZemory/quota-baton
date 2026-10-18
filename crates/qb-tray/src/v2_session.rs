@@ -37,6 +37,7 @@ pub struct Session {
     pub expansion: BTreeMap<String, bool>,
     pub credits_dialog: Option<CreditsDialog>,
     pending: BTreeMap<String, u64>,
+    pending_actions: BTreeMap<String, (u64, String)>,
     errors: BTreeMap<String, Duration>,
     next_nonce: u64,
 }
@@ -103,6 +104,8 @@ impl Session {
             self.credits_dialog = None;
         }
         self.pending.retain(|id, _| ids.contains(id.as_str()));
+        self.pending_actions
+            .retain(|id, _| ids.contains(id.as_str()));
         self.errors.retain(|id, _| ids.contains(id.as_str()));
     }
     pub fn set_expanded(&mut self, provider: &str, expanded: bool) {
@@ -119,6 +122,7 @@ impl Session {
             nonce: self.next_nonce,
         };
         self.pending.insert(ticket.id.clone(), ticket.nonce);
+        self.pending_actions.remove(id);
         self.errors.remove(id);
         Some(ticket)
     }
@@ -127,6 +131,7 @@ impl Session {
             return false;
         }
         self.pending.remove(&ticket.id);
+        self.pending_actions.remove(&ticket.id);
         if failed {
             self.errors.insert(
                 ticket.id.clone(),
@@ -137,6 +142,20 @@ impl Session {
     }
     pub fn pending(&self, id: &str) -> bool {
         self.pending.contains_key(id)
+    }
+    pub fn tag_action(&mut self, ticket: &Ticket, action: &str) -> bool {
+        if self.pending.get(&ticket.id) != Some(&ticket.nonce) {
+            return false;
+        }
+        self.pending_actions
+            .insert(ticket.id.clone(), (ticket.nonce, action.into()));
+        true
+    }
+    pub fn pending_action(&self, id: &str) -> Option<&str> {
+        self.pending_actions
+            .get(id)
+            .filter(|(nonce, _)| self.pending.get(id) == Some(nonce))
+            .map(|(_, action)| action.as_str())
     }
     pub fn pending_ids(&self) -> BTreeSet<String> {
         self.pending.keys().cloned().collect()
@@ -235,5 +254,18 @@ mod tests {
         assert!(s.complete(&next, true, Duration::from_secs(5)));
         assert!(s.error("id", Duration::from_secs(14)).is_some());
         assert!(s.error("id", Duration::from_secs(15)).is_none());
+    }
+    #[test]
+    fn pending_toggle_tag_belongs_only_to_its_ticket() {
+        let mut s = Session::default();
+        let first = s.begin("id").unwrap();
+        assert!(s.tag_action(&first, "credits"));
+        assert_eq!(s.pending_action("id"), Some("credits"));
+        assert!(s.complete(&first, false, Duration::ZERO));
+        assert_eq!(s.pending_action("id"), None);
+        let next = s.begin("id").unwrap();
+        assert!(s.tag_action(&next, "drain"));
+        assert!(!s.tag_action(&first, "credits"));
+        assert_eq!(s.pending_action("id"), Some("drain"));
     }
 }

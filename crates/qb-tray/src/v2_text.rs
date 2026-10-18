@@ -76,6 +76,7 @@ pub struct Metrics {
 struct Line {
     layout: IDWriteTextLayout,
     origin: Vector2,
+    text: String,
 }
 
 /// Owns shaped layouts, never the input string. Keep only for this paint pass.
@@ -280,6 +281,7 @@ impl Text {
                 || overhang.right > 0.01;
             lines.push(Line {
                 layout,
+                text: displayed,
                 origin: Vector2 {
                     X: bounds.left,
                     Y: bounds.top
@@ -308,6 +310,29 @@ impl Text {
 }
 
 impl Layout {
+    /// Emphasize shaped values using UTF-16 ranges, including after Korean wraps.
+    pub fn emphasize(&mut self, values: &[&str]) -> Result<()> {
+        for line in &self.lines {
+            for value in values.iter().filter(|value| !value.is_empty()) {
+                for (start, _) in line.text.match_indices(*value) {
+                    let start = u32::try_from(line.text[..start].encode_utf16().count())
+                        .map_err(|_| Error::from_hresult(E_INVALIDARG))?;
+                    let length = u32::try_from(value.encode_utf16().count())
+                        .map_err(|_| Error::from_hresult(E_INVALIDARG))?;
+                    unsafe {
+                        line.layout.SetFontWeight(
+                            DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                            DWRITE_TEXT_RANGE {
+                                startPosition: start,
+                                length,
+                            },
+                        )?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
     /// Caller owns BeginDraw/EndDraw and must propagate EndDraw's deferred D2D
     /// errors. Caller clips must also allow for reported ink overflow.
     pub fn draw(&self, target: &ID2D1RenderTarget, color: D2D1_COLOR_F) -> Result<()> {
@@ -441,6 +466,29 @@ mod tests {
         assert!((m.left + m.width - 240.0).abs() < 0.1);
         let format = text.format(s)?;
         assert!((text.advance("1111", &format)? - text.advance("8888", &format)?).abs() < 0.1);
+        Ok(())
+    }
+    #[test]
+    fn emphasis_ranges_use_utf16_after_korean_and_surrogate_pairs() -> Result<()> {
+        let text = Text::new()?;
+        let base = Style {
+            weight: DWRITE_FONT_WEIGHT_NORMAL,
+            ..style(Wrap::SingleLine)
+        };
+        let mut layout = text.layout("계정 😀 38% 남음", rect(400., 24.), base)?;
+        layout.emphasize(&["38% 남음"])?;
+        let mut weight = DWRITE_FONT_WEIGHT_NORMAL;
+        unsafe {
+            layout.lines[0].layout.GetFontWeight(0, &mut weight, None)?;
+        }
+        assert_eq!(weight, DWRITE_FONT_WEIGHT_NORMAL);
+        let offset = "계정 😀 ".encode_utf16().count() as u32;
+        unsafe {
+            layout.lines[0]
+                .layout
+                .GetFontWeight(offset, &mut weight, None)?;
+        }
+        assert_eq!(weight, DWRITE_FONT_WEIGHT_SEMI_BOLD);
         Ok(())
     }
 }

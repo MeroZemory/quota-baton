@@ -261,6 +261,7 @@ impl AccountAction {
         }
     }
 
+    #[cfg(test)]
     pub fn from_str(value: &str) -> Option<Self> {
         match value {
             "pause" => Some(Self::Pause),
@@ -746,6 +747,20 @@ pub fn render_flyout(read: &TrayRead) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_action_parser_round_trips_typed_actions_and_rejects_unknown() {
+        for action in [
+            AccountAction::Pause,
+            AccountAction::Resume,
+            AccountAction::Disable,
+            AccountAction::Enable,
+            AccountAction::RefreshUsage,
+        ] {
+            assert_eq!(AccountAction::from_str(action.as_str()), Some(action));
+        }
+        assert_eq!(AccountAction::from_str("unknown"), None);
+    }
 
     #[test]
     fn parses_synthetic_state_snapshot() {

@@ -566,6 +566,7 @@ Base: `http://127.0.0.1:<admin_port>/admin/v1`. Every route requires `Authorizat
 - `pacing {backoff_until, step, release_interval_ms, waiting}` (C6.3)
 - `last_used_at`, `bound_sessions`
 - `active_sessions`, `spread_threshold` (C7.1)
+- `pool_eligible` identifies membership in the C6.4 `pools.eligible` count; it is not a new-session placement promise. `quota_cooling` carries the persisted limiting-window evidence (C5), and `observed_at` is the usage snapshot's observation time, not the last admin read time.
 - `/state` also carries `pools: {<provider>: {eligible, cooling: {<reason>: n}, unavailable}}` (C6.4)
 - `token_expires_at`
 
@@ -604,6 +605,7 @@ inflight_budget_mib = 384         # shared: retained HTTP bodies + in-flight WS 
 memory_hard_limit_mib = 1024
 
 [tray]
+theme = "light"                  # "light", "dark", "system"; tray-v2.md §1
 burst_new_sessions = 30           # per client per 10 minutes; toast on excess (R8 I-40)
 
 [websocket]
