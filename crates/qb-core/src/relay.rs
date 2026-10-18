@@ -103,6 +103,19 @@ impl RelayState {
         )
         .with_runtime(self.accounts.clone())
     }
+    #[cfg(all(feature = "testkit", debug_assertions))]
+    pub fn test_login_service(
+        &self,
+        config: crate::oauth::LoginTestConfig,
+    ) -> Result<crate::oauth::LoginService, crate::oauth::LoginError> {
+        crate::oauth::LoginService::with_test_config(
+            self.store.clone(),
+            self.client.clone(),
+            self.observability.clone(),
+            config,
+        )
+        .map(|service| service.with_runtime(self.accounts.clone()))
+    }
     /// Manual refresh uses the same lease owner, gate and write-ahead as relay 401s.
     pub async fn refresh_account(
         &self,

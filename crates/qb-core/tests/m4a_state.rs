@@ -440,6 +440,149 @@ mod runtime_regressions {
     }
 
     #[tokio::test]
+    async fn r5_credit_toggle_reclassifies_cached_paid_usage_atomically() {
+        for allowance in [0.0, 25.0] {
+            let f = Fixture::new(&[Provider::Codex], allowance);
+            let id = &f.ids[0];
+            f.runtime
+                .change(id, None, None, None, Some(true))
+                .await
+                .unwrap();
+            let now = Utc::now();
+            let reset = now + Duration::hours(1);
+            f.runtime.observe_codex_event(id, &json!({
+                "type":"codex.rate_limits",
+                "rate_limits":{
+                    "primary":{"used_percent":99.0,"window_minutes":300,"reset_at":reset.timestamp()},
+                    "secondary":{"used_percent":40.0,"window_minutes":10080,"reset_at":(now + Duration::days(5)).timestamp()}
+                },
+                "credits":{"has_credits":true,"balance":12.5},
+                "serving_from_credits":true
+            })).await;
+            assert_eq!(f.load(0).health, Health::Ready);
+            assert!(f.runtime.eligible(id, None).await);
+            let off = f
+                .runtime
+                .change(id, None, None, None, Some(false))
+                .await
+                .unwrap();
+            let reset = DateTime::from_timestamp(reset.timestamp(), 0).unwrap();
+            assert_cooling(&off, HealthReason::Quota, reset, "account");
+            let evidence = off.quota_cooling.unwrap();
+            assert_eq!(evidence.window, "5h");
+            assert_eq!(evidence.reset_at, reset);
+            assert!(!f.runtime.eligible(id, None).await);
+            assert_eq!(f.runtime.views().await.unwrap()[0]["pool_eligible"], false);
+            let on = f
+                .runtime
+                .change(id, None, None, None, Some(true))
+                .await
+                .unwrap();
+            assert_eq!(on.health, Health::Ready);
+            assert!(on.quota_cooling.is_none());
+            assert!(f.runtime.eligible(id, None).await);
+            assert_eq!(f.runtime.views().await.unwrap()[0]["pool_eligible"], true);
+        }
+    }
+
+    #[tokio::test]
+    async fn r5_credit_toggle_preserves_missing_healthy_and_hard_limit_evidence() {
+        let f = Fixture::new(&[Provider::Codex], 0.0);
+        let id = &f.ids[0];
+        for allow in [true, false] {
+            let account = f
+                .runtime
+                .change(
+                    id,
+                    Some(UserState::Paused),
+                    Some("kept".into()),
+                    Some(true),
+                    Some(allow),
+                )
+                .await
+                .unwrap();
+            assert_eq!(account.health, Health::Ready);
+            assert_eq!(account.user_state, UserState::Paused);
+            assert_eq!(account.label, "kept");
+            assert!(account.drain);
+        }
+        let now = Utc::now();
+        for used in [40.0, 100.0] {
+            f.runtime
+                .observe_headers(id, Provider::Codex, &codex_headers(used, 40.0, now))
+                .await;
+            for allow in [true, false, true] {
+                let account = f
+                    .runtime
+                    .change(id, None, None, None, Some(allow))
+                    .await
+                    .unwrap();
+                if used == 100.0 {
+                    assert_cooling(
+                        &account,
+                        HealthReason::Quota,
+                        DateTime::from_timestamp((now + Duration::hours(1)).timestamp(), 0)
+                            .unwrap(),
+                        "account",
+                    );
+                } else {
+                    assert_eq!(account.health, Health::Ready);
+                }
+                assert_eq!(account.user_state, UserState::Paused);
+                assert_eq!(account.label, "kept");
+                assert!(account.drain);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn r5_credit_toggle_preserves_auth_and_model_cooling() {
+        let f = Fixture::new(&[Provider::Claude], 0.0);
+        let id = &f.ids[0];
+        let reset = Utc::now() + Duration::hours(1);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "anthropic-ratelimit-unified-7d_oi-utilization",
+            "1.0".parse().unwrap(),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-7d_oi-status",
+            "rejected".parse().unwrap(),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-7d_oi-reset",
+            reset.timestamp().to_string().parse().unwrap(),
+        );
+        f.runtime
+            .observe_headers_for_model(id, Provider::Claude, &headers, Some("opus"))
+            .await;
+        let model_health = f.load(0).health;
+        assert!(matches!(&model_health, Health::Cooling { scope, .. } if scope == "model:opus"));
+        for allow in [true, false] {
+            let account = f
+                .runtime
+                .change(id, None, None, None, Some(allow))
+                .await
+                .unwrap();
+            assert_eq!(account.health, model_health);
+            assert!(f.runtime.eligible(id, Some("sonnet")).await);
+            assert!(!f.runtime.eligible(id, Some("opus")).await);
+        }
+        let auth = f
+            .cool(0, HealthReason::Auth, reset + Duration::hours(1), "account")
+            .await;
+        for allow in [true, false] {
+            let account = f
+                .runtime
+                .change(id, None, None, None, Some(allow))
+                .await
+                .unwrap();
+            assert_eq!(account.health, auth.health);
+            assert_eq!(account.auth_probe_pending, auth.auth_probe_pending);
+        }
+    }
+
+    #[tokio::test]
     async fn m2_two_window_credits_hold_uses_only_triggering_future_reset() {
         let f = Fixture::new(&[Provider::Codex], 0.0);
         let now = Utc::now();

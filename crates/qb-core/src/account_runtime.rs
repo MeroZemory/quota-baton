@@ -927,17 +927,7 @@ impl AccountRuntime {
         }
         let store = self.store.clone();
         let id = id.to_owned();
-        let credit_release = allow_credits == Some(true)
-            && self.obs.quota_snapshot(&id).is_some_and(|q| {
-                q["windows"].as_array().is_some_and(|w| {
-                    !w.is_empty()
-                        && w.iter()
-                            .all(|w| w["used_pct"].as_f64().is_some_and(|p| p < 100.0))
-                        && w.iter()
-                            .any(|w| w["used_pct"].as_f64().is_some_and(|p| p >= 99.0))
-                }) && q["signals"]["limit_reached"] != true
-                    && q["signals"]["unified_status"] != "rejected"
-            });
+        let obs = self.obs.clone();
         let account = tokio::task::spawn_blocking(move || {
             store
                 .update_settings(&id, drain, allow_credits, |a| {
@@ -953,16 +943,40 @@ impl AccountRuntime {
                     if let Some(allow) = allow_credits {
                         a.allow_credits = allow;
                     }
-                    if credit_release
-                        && matches!(
-                            a.health,
-                            Health::Cooling {
-                                reason: HealthReason::Quota,
-                                ..
-                            }
-                        )
+                    if allow_credits.is_some()
+                        && let Some(snapshot) = obs.quota_snapshot(&id)
                     {
-                        a.apply_health_signal(crate::accounts::HealthSignal::Ready, Utc::now());
+                        let now = Utc::now();
+                        let signal = || crate::accounts::HealthSignal::UsageSnapshot {
+                            snapshot: snapshot.clone(),
+                            model: None,
+                            projected_allowance: 0.0,
+                        };
+                        if allow_credits == Some(true)
+                            && matches!(&a.health, Health::Cooling {
+                                reason: HealthReason::Quota, scope, ..
+                            } if scope == "account")
+                        {
+                            // Release only a hold that C5 attributes to disabled credits.
+                            // Classify from Ready so existing cooling cannot mask hard limits.
+                            let mut classified = a.clone();
+                            classified.health = Health::Ready;
+                            classified.quota_cooling = None;
+                            classified.allow_credits = false;
+                            classified.apply_health_signal(signal(), now);
+                            let credit_hold = matches!(&classified.health, Health::Cooling {
+                                reason: HealthReason::Quota, scope, ..
+                            } if scope == "account");
+                            classified.health = Health::Ready;
+                            classified.quota_cooling = None;
+                            classified.allow_credits = true;
+                            classified.apply_health_signal(signal(), now);
+                            if credit_hold && classified.health == Health::Ready {
+                                a.apply_health_signal(crate::accounts::HealthSignal::Ready, now);
+                            }
+                        }
+                        // Settings and observed health commit under the same store lock.
+                        a.apply_health_signal(signal(), now);
                     }
                 })
                 .map_err(|_| ())

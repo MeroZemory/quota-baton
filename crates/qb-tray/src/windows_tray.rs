@@ -1328,14 +1328,19 @@ fn launch_login(hwnd: HWND, provider: String) {
             update_status(false, None);
             return;
         }
-        // Always refresh, even when generation/view is stale.
-        action_done(
-            hwnd_value,
-            owner,
-            result
-                .err()
-                .map(|_| "error:로그인을 마치지 못했습니다".into()),
-        );
+        // Serialize completion publication with cancellation just like start/status.
+        // A dismissed login must not publish an error, even before the UI changes owner.
+        if !with_current_login(generation, || {
+            action_done(
+                hwnd_value,
+                owner,
+                result
+                    .err()
+                    .map(|_| "error:로그인을 마치지 못했습니다".into()),
+            );
+        }) {
+            update_status(false, None);
+        }
     });
 }
 
@@ -1343,6 +1348,11 @@ fn launch_login(hwnd: HWND, provider: String) {
 // A start response not yet assigned an ID cancels itself inside its admitted job.
 fn cancel_login() -> bool {
     let mut generation = LOGIN_GENERATION.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(all(debug_assertions, feature = "testkit"))]
+    let had_login = login_id()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some();
     *generation = generation
         .checked_add(1)
         .expect("login generation exhausted");
@@ -1365,7 +1375,7 @@ fn cancel_login() -> bool {
         return false;
     }
     #[cfg(all(debug_assertions, feature = "testkit"))]
-    if let Some(path) = std::env::var_os("QB_TRAY_TEST_LOGIN_LOG") {
+    if had_login && let Some(path) = std::env::var_os("QB_TRAY_TEST_LOGIN_LOG") {
         submit_job(async move {
             let _ = std::fs::write(path, "cancelled\n");
         });
@@ -2767,6 +2777,22 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelled_login_generation_cannot_publish_a_late_completion() {
+        let generation = *LOGIN_GENERATION.lock().unwrap_or_else(|e| e.into_inner());
+        let mut view = view_ownership::ViewOwnership::default();
+        let owner = view.set(Some("login:codex".into()));
+        // The generation guard must reject even before cancellation changes the view owner.
+        assert!(!with_current_login(generation.wrapping_sub(1), || {
+            view.completion(owner, Some("error:late".into()));
+        }));
+        assert_eq!(view.as_deref(), Some("login:codex"));
+        assert!(with_current_login(generation, || {
+            view.completion(owner, Some("error:current".into()));
+        }));
+        assert_eq!(view.as_deref(), Some("error:current"));
+    }
 
     #[test]
     fn render_target_size_is_the_current_client_rect() {

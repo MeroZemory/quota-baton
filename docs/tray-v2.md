@@ -57,7 +57,7 @@ The light theme is the default. The dark theme applies only on opt-in. Contrast 
 | text-disabled | #A3A3A3 | #727272 | disabled controls only, never for information |
 | divider | #EBEBEB | #313131 | |
 | track | #E3E6EA | #3A3A3A | bar background |
-| bar-ok / bar-low / bar-crit | #2F6FB0 / #B7791F / #C42B1C | #5FA4E6 / #E0A84A / #EF6F61 | bar-ok 5.2:1. Bars are non-text, and the number is always printed next to them. |
+| bar-ok / bar-low / bar-crit | #2E7D32 / #B7791F / #C42B1C | #5DBB63 / #E0A84A / #EF6F61 | bar-ok green (user, 2026-10-19: remaining bars go green → amber → red as they drain). Bars are non-text, and the number is always printed next to them. |
 | bar-paused | #A3A3A3 | #727272 | |
 | dot-ok / dot-warn / dot-bad / dot-off | #2C7A4B / #B7791F / #C42B1C / #8A8F95 | #6CCB8F / #E0A84A / #EF6F61 / #8A8A8A | Each dot always has a verdict word next to it. |
 | chip-use bg/fg | #E8F1FB / #005FB8 | #1D3346 / #60CDFF | 5.5:1 / 7.2:1 |

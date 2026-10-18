@@ -425,6 +425,17 @@ async fn run() -> anyhow::Result<()> {
                 .await
                 .map_err(|_| anyhow::anyhow!("연결된 계정의 토큰을 다시 읽지 못했습니다."))?;
             let login = relay.login_service();
+            #[cfg(all(feature = "testkit", debug_assertions))]
+            let login = if let Ok(base) = std::env::var("QB_TEST_LOGIN_BASE") {
+                relay.test_login_service(qb_core::oauth::LoginTestConfig {
+                    authorize_url: format!("{base}/authorize"),
+                    token_url: format!("{base}/token"),
+                    profile_url: format!("{base}/profile"),
+                    callback_port: 0,
+                })?
+            } else {
+                login
+            };
             let admin_routes =
                 qb_core::admin::account_routes_with_poller(store.clone(), relay.quota.clone())
                     .merge(qb_core::admin::login_routes(login.clone()))

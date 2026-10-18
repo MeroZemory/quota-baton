@@ -707,7 +707,12 @@ impl Live {
         let tb = binary(&root, "R5_TRAY_BIN", "quota-baton-tray.exe")?;
         drop(data);
         drop(admin);
-        live.core = Some(child(&cb, &live.home, "core")?.arg("serve").spawn()?);
+        live.core = Some(
+            child(&cb, &live.home, "core")?
+                .env("QB_TEST_LOGIN_BASE", format!("http://127.0.0.1:{up}"))
+                .arg("serve")
+                .spawn()?,
+        );
         live.until(WAIT, "core PID health", |s| {
             Ok(s.api("GET", "/admin/v1/health", None)
                 .is_ok_and(|v| v["ok"] == true && v["pid"] == s.core.as_ref().unwrap().id()))
@@ -2250,10 +2255,9 @@ fn r5_live_relogin_panel_cancel_cleans_core_login() -> Result<()> {
                 == "cancelled",
         )
     })?;
-    ensure!(
-        fs::read_to_string(live.home.join("login.log"))?.trim() == "cancelled",
-        "tray cancellation hook"
-    );
+    live.until(INPUT, "tray cancellation hook", |s| {
+        Ok(fs::read_to_string(s.home.join("login.log"))?.trim() == "cancelled")
+    })?;
     ensure!(
         live.account(&id)?["health"]["kind"] == "needs_relogin",
         "cancel changed account"

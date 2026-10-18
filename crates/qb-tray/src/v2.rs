@@ -777,7 +777,12 @@ fn summarize(
         .flat_map(|r| {
             r.windows
                 .iter()
-                .filter(|w| w.account_scoped && w.raw.used_pct.is_some_and(|u| u >= 100.))
+                .filter(|w| {
+                    w.account_scoped
+                        && w.raw
+                            .used_pct
+                            .is_some_and(|u| u >= 100. || (u >= 99. && actual_credits(&r.raw)))
+                })
                 .filter_map(|w| w.reset)
                 .chain(
                     r.raw
@@ -1657,6 +1662,24 @@ mod tests {
         assert_eq!(v.badge, Badge::Attention);
         let v = project(&json!({"accounts":[a]}).to_string(), now().into()).unwrap();
         assert_eq!(summary(&v).verdict, Verdict::Unknown);
+    }
+    #[test]
+    fn paid_99_percent_summary_uses_observed_reset_without_inventing_credit_use() {
+        let mut a = base("a");
+        a["allow_credits"] = json!(true);
+        a["windows"] = json!([window("5h", 99., "2026-10-22T00:00:00Z")]);
+        let v = view(vec![a.clone()], 1);
+        assert_eq!(summary(&v).verdict, Verdict::Available);
+        a["credits_in_use"] = json!(true);
+        let v = view(vec![a], 1);
+        assert_eq!(summary(&v).verdict, Verdict::Credits);
+        assert_eq!(
+            summary(&v).detail,
+            format!(
+                "{} 한도 초기화",
+                local_time(timestamp("2026-10-22T00:00:00Z").unwrap(), now(), false)
+            )
+        );
     }
     #[test]
     fn actual_spending_requires_core_flag() {
