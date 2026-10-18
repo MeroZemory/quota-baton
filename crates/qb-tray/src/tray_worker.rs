@@ -185,9 +185,8 @@ fn unavailable(hwnd: isize) {
         .unwrap_or_else(|e| e.into_inner())
         .unavailable(0);
     let mut model = super::model().lock().unwrap_or_else(|e| e.into_inner());
-    model.0.clear();
-    model.1 = "error:코어 상태를 읽지 못했습니다 · 로그 열기".into();
     model.2 = false;
+    super::invalidate_model();
     drop(model);
     post(hwnd, super::STATE_CHANGED);
 }

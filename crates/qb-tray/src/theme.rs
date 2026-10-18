@@ -61,3 +61,35 @@ mod tests {
         }
     }
 }
+
+/// Worker-only file read; UI callbacks consume only the cached result.
+pub fn configured() -> qb_core::config::TrayTheme {
+    qb_core::home()
+        .ok()
+        .and_then(|home| qb_core::config::Config::load(&home).ok())
+        .map(|config| config.tray.theme)
+        .unwrap_or_default()
+}
+pub fn resolve(mode: qb_core::config::TrayTheme) -> bool {
+    match mode {
+        qb_core::config::TrayTheme::Light => false,
+        qb_core::config::TrayTheme::Dark => true,
+        qb_core::config::TrayTheme::System => system_dark(),
+    }
+}
+pub const COMMENTED_DEFAULTS: &str = "# quota-baton configuration; uncomment values to override defaults.\n# [tray]\n# theme = \"light\" # light | dark | system\n# burst_new_sessions = 30\n";
+
+#[cfg(test)]
+mod configured_theme_tests {
+    #[test]
+    fn explicit_light_and_dark_do_not_read_system_policy() {
+        assert!(!super::resolve(qb_core::config::TrayTheme::Light));
+        assert!(super::resolve(qb_core::config::TrayTheme::Dark));
+        assert!(
+            super::COMMENTED_DEFAULTS
+                .lines()
+                .all(|line| line.is_empty() || line.starts_with('#'))
+        );
+        assert!(super::COMMENTED_DEFAULTS.contains("theme = \"light\""));
+    }
+}

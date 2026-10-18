@@ -11,6 +11,7 @@ use std::{collections::BTreeMap, time::SystemTime};
 pub struct State {
     pub version: String,
     pub accounts: Vec<Account>,
+    #[serde(deserialize_with = "nullable_pools")]
     pub pools: BTreeMap<String, Pool>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -21,6 +22,16 @@ pub struct Pool {
     pub eligible: Option<u64>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+fn nullable_pools<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, Pool>, D::Error> {
+    let pools = Option::<BTreeMap<String, Option<Pool>>>::deserialize(deserializer)?;
+    Ok(pools
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(provider, pool)| (provider, pool.unwrap_or_default()))
+        .collect())
 }
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
@@ -1370,6 +1381,19 @@ mod tests {
         assert!(!r.accessible_name.contains("not-ui-text"));
         assert_eq!(r.windows[0].raw.extra["surprise"], 1);
         assert_eq!(v.summaries[0].verdict, Verdict::NoAccounts);
+    }
+    #[test]
+    fn nullable_pool_metadata_keeps_accounts_with_an_unknown_verdict() {
+        for pools in [Value::Null, json!({"codex":null})] {
+            let v = project(
+                &json!({"accounts":[base("kept")],"pools":pools}).to_string(),
+                now().into(),
+            )
+            .unwrap();
+            assert_eq!(codex(&v).rows.len(), 1);
+            assert_eq!(v.summaries[1].verdict, Verdict::Unknown);
+            assert_eq!(v.badge, Badge::Normal);
+        }
     }
     #[test]
     fn plans_are_provider_specific() {

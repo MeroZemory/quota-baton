@@ -20,9 +20,11 @@ impl ViewOwnership {
         self.value = value;
         self.owner
     }
+    #[cfg(test)]
     pub(super) fn begin(&mut self) -> usize {
         self.set(self.value.clone())
     }
+    #[cfg(test)]
     pub(super) fn begin_menu(&mut self, id: &str, index: usize, toggle: bool) -> Option<usize> {
         if self
             .value
@@ -58,6 +60,7 @@ impl ViewOwnership {
             self.set(menu);
         }
     }
+    #[cfg(test)]
     pub(super) fn take(&mut self) -> Option<String> {
         let value = self.value.clone();
         self.set(None);
@@ -137,11 +140,18 @@ mod tests {
     #[test]
     fn owned_success_clears_once_and_new_ui_transition_invalidates_publication() {
         let mut view = ViewOwnership::default();
-        let a = view.set(Some("login:A".into()));
+        view.set(Some("login:A".into()));
+        let a = view.begin();
+        assert_eq!(view.as_deref(), Some("login:A"));
         assert!(view.publish(a, Some("login:A:completed".into())));
         view.consume(a, false);
         assert!(view.is_none());
         assert!(!view.publish(a, Some("login:A".into())));
+        view.set(Some("login:B".into()));
+        let b = view.owner();
+        assert_eq!(view.take().as_deref(), Some("login:B"));
+        assert!(view.is_none());
+        assert!(!view.publish(b, Some("login:B".into())));
     }
     #[test]
     fn rejected_cancel_retains_id_blocks_replacement_and_retries_without_transfer() {

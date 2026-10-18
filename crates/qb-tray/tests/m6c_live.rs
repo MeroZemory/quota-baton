@@ -11,6 +11,16 @@ use chrono::{TimeZone, Utc};
 use qb_core::accounts::{
     Account, AccountStore, Health, Identity, Provider, Source, TokenMeta, Tokens, UserState,
 };
+use qb_tray::{
+    v2,
+    v2_geometry::{self as geometry, FooterAction, MenuAction, Overlay, Target},
+    v2_render::Renderer,
+    v2_session::Session,
+};
+use std::{
+    cell::RefCell,
+    time::{Instant, SystemTime},
+};
 use std::{
     fs,
     net::{TcpListener, TcpStream},
@@ -117,79 +127,267 @@ fn click(hwnd: HWND, x: i16, y: i16, message: u32) -> anyhow::Result<()> {
     send(hwnd, message, WPARAM(0), LPARAM(packed as isize))
 }
 
-// Match the live viewport's content DIPs and actual physical client extent.
-// Explicit Home/End avoids inheriting an offset from popup reveal or prior input.
-fn click_target(
-    hwnd: HWND,
-    rows: &[qb_tray::Row],
-    state: &str,
-    rect: qb_tray::Rect,
-    message: u32,
-) -> anyhow::Result<()> {
+// Mirror only the live opening's presentation, never account data. Every scene
+// projects /state from the spawned core and uses the actual painted scroll epoch.
+#[derive(Default)]
+struct Navigation {
+    home: PathBuf,
+    log: PathBuf,
+    session: Session,
+    popup_offset: f32,
+}
+thread_local! { static NAVIGATION: RefCell<Navigation> = RefCell::new(Navigation::default()); }
+fn reset_navigation() {
+    NAVIGATION.with(|n| {
+        let mut n = n.borrow_mut();
+        n.session.hide();
+        n.popup_offset = 0.;
+    });
+}
+fn latest_paint(path: &std::path::Path) -> anyhow::Result<serde_json::Value> {
+    let bytes = fs::read(path)?;
+    bytes
+        .split(|b| *b == b'\n')
+        .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+        .filter(|v| v["event"] == "paint" && v["scene"]["epoch"].as_u64().is_some())
+        .max_by_key(|v| v["sequence"].as_u64())
+        .ok_or_else(|| anyhow::anyhow!("actual Scene paint telemetry missing"))
+}
+fn repaint_trace(hwnd: HWND) -> anyhow::Result<serde_json::Value> {
+    let path = NAVIGATION.with(|n| n.borrow().log.clone());
+    let before = latest_paint(&path)
+        .ok()
+        .and_then(|v| v["scene"]["epoch"].as_u64())
+        .unwrap_or(0);
     painted(hwnd)?;
-    let scale = unsafe { GetDpiForWindow(hwnd).max(96) as f32 / 96.0 };
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        if let Ok(trace) = latest_paint(&path)
+            && trace["scene"]["epoch"].as_u64().is_some_and(|e| e > before)
+        {
+            return Ok(trace);
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "fresh actual Scene publication missing after repaint"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+fn live_scene(hwnd: HWND, state: &str) -> anyhow::Result<geometry::Scene> {
+    let trace = repaint_trace(hwnd)?;
+    let expected = state.split(':').next().unwrap_or("list");
+    anyhow::ensure!(
+        trace["state"] == expected,
+        "actual overlay differs from target request: {trace}"
+    );
+    let home = NAVIGATION.with(|n| n.borrow().home.clone());
+    let snapshot = admin_json(&home, "/admin/v1/state")?;
+    let view = v2::project(&serde_json::to_string(&snapshot)?, SystemTime::now())?;
+    let scale = unsafe { GetDpiForWindow(hwnd).max(96) } as f32 / 96.;
     let mut client = RECT::default();
     unsafe {
         GetClientRect(hwnd, &mut client)?;
     }
     let extent = (client.bottom - client.top) as f32 / scale;
-    let content = qb_tray::state_height(rows, false, Some(state));
-    let center = (
-        (rect.left + rect.right) / 2.0,
-        (rect.top + rect.bottom) / 2.0,
-    );
-    let max_offset = (content - extent).max(0.0);
-    let end = center.1 >= content / 2.0;
-    send(
-        hwnd,
-        WM_KEYDOWN,
-        WPARAM(if end { 0x23 } else { 0x24 }),
-        LPARAM(0),
-    )?;
-    let mut offset = if end { max_offset } else { 0.0 };
-    if center.1 < offset || center.1 >= offset + extent {
-        let desired = (center.1 - extent / 2.0).clamp(0.0, max_offset);
-        let delta = ((offset - desired) * 120.0 / 72.0).round();
-        anyhow::ensure!(
-            delta.abs() <= i16::MAX as f32,
-            "fixture scroll exceeds wheel range"
-        );
-        let delta = delta as i16;
-        send(
-            hwnd,
-            WM_MOUSEWHEEL,
-            WPARAM((delta as u16 as usize) << 16),
-            LPARAM(0),
-        )?;
-        offset = (offset - delta as f32 / 120.0 * 72.0).clamp(0.0, max_offset);
+    let mut p = geometry::Presentation {
+        offset: trace["scene"]["offset"]
+            .as_f64()
+            .ok_or_else(|| anyhow::anyhow!("paint offset missing"))? as f32,
+        ..Default::default()
+    };
+    if trace["menu_pending"] == true
+        && let Some(id) = state.strip_prefix("menu:")
+    {
+        p.pending_ids.insert(id.into());
     }
-    painted(hwnd)?;
-    let x = (center.0 * scale).round() as i32;
-    let y = ((center.1 - offset) * scale).round() as i32;
+    p.overlay = match state {
+        "settings" => Overlay::Settings,
+        "quit" => Overlay::Quit,
+        "add-menu" => Overlay::Add,
+        s if s.starts_with("menu:") => Overlay::RowMenu(s[5..].into()),
+        s if s.starts_with("confirm-credits:") => Overlay::CreditsConfirm(s[16..].into()),
+        s if s.starts_with("login:") => Overlay::Login(s[6..].into()),
+        _ => Overlay::None,
+    };
+    NAVIGATION.with(|n| {
+        let mut n = n.borrow_mut();
+        if !n.session.open {
+            n.session.show(&view);
+        } else {
+            n.session.update(&view);
+        }
+        p.expanded = n.session.expansion.clone();
+        p.popup_offset = n.popup_offset;
+        for slot in &n.session.slots {
+            let section = p.frozen.entry(slot.provider.clone()).or_default();
+            if slot.disabled_on_open {
+                section.disabled_rows.push(slot.id.clone());
+            } else {
+                section.rows.push(slot.id.clone());
+            }
+        }
+    });
+    let renderer = Renderer::new(trace["dark"].as_bool().unwrap_or(false))?;
+    renderer.measure(&view, &mut p)?;
+    // The HWND has already been resized by native Scene construction. Its exact
+    // client extent is the cap for this input lookup; never translate header/footer.
+    let scene = geometry::Scene::build(&view, p, extent);
     anyhow::ensure!(
-        x >= 0 && x < client.right - client.left && y >= 0 && y < client.bottom - client.top,
-        "layout target is outside the actual fixture viewport"
+        (scene.rect.bottom - extent).abs() <= 1.1 / scale,
+        "measured scene/client height mismatch"
     );
-    click(hwnd, i16::try_from(x)?, i16::try_from(y)?, message)
+    anyhow::ensure!(
+        (trace["scene"]["height"].as_f64().unwrap_or(-1.) as f32 - extent).abs() <= 1.1 / scale,
+        "paint telemetry/client height mismatch"
+    );
+    Ok(scene)
+}
+fn target(
+    hwnd: HWND,
+    _rows: &[qb_tray::Row],
+    state: &str,
+    accepts: impl Fn(&Target) -> bool,
+) -> anyhow::Result<Target> {
+    let scene = live_scene(hwnd, state)?;
+    // Logical rows/menu items remain in Scene when clipped out of the target
+    // vector. Resolve identity here; click_target scrolls then rechecks hits.
+    let mut candidates = scene
+        .targets
+        .iter()
+        .map(|h| h.target.clone())
+        .chain(
+            scene
+                .sections
+                .iter()
+                .flat_map(|s| s.rows.iter().chain(&s.disabled_rows))
+                .map(|r| Target::Row(r.id.clone())),
+        )
+        .chain(
+            scene
+                .popup
+                .iter()
+                .flat_map(|p| p.items.iter())
+                .map(|i| i.target.clone()),
+        );
+    candidates
+        .find(accepts)
+        .ok_or_else(|| anyhow::anyhow!("expected shared Scene target missing in {state}"))
 }
 
-fn target(
+fn footer(_rows: &[qb_tray::Row], action: FooterAction) -> anyhow::Result<Target> {
+    Ok(Target::Footer(action))
+}
+fn click_target(
+    hwnd: HWND,
     rows: &[qb_tray::Row],
     state: &str,
-    accepts: impl Fn(&qb_tray::HitTarget) -> bool,
-) -> anyhow::Result<qb_tray::Rect> {
-    qb_tray::layout_targets(rows, false, Some(state))
-        .iter()
-        .find(|t| accepts(t))
-        .map(qb_tray::HitTarget::rect)
-        .ok_or_else(|| anyhow::anyhow!("expected fixture layout target missing in {state}"))
+    target: Target,
+    message: u32,
+) -> anyhow::Result<()> {
+    click_target_part(hwnd, rows, state, target, message, false)
 }
-
-fn footer(rows: &[qb_tray::Row], action: qb_tray::FooterAction) -> anyhow::Result<qb_tray::Rect> {
-    target(
-        rows,
-        "list",
-        |t| matches!(t, qb_tray::HitTarget::Footer { action: a, .. } if *a == action),
+fn click_target_part(
+    hwnd: HWND,
+    _rows: &[qb_tray::Row],
+    state: &str,
+    target: Target,
+    message: u32,
+    icon: bool,
+) -> anyhow::Result<()> {
+    let mut scene = live_scene(hwnd, state)?;
+    // Scroll only when a row or popup item is outside its own viewport.
+    let raw = match &target {
+        Target::Row(id) => scene.row(id).map(|r| r.hover),
+        Target::Menu { .. } => scene
+            .popup
+            .as_ref()
+            .and_then(|p| p.items.iter().find(|i| i.target == target).map(|i| i.rect)),
+        _ => None,
+    };
+    if let Some(rect) = raw {
+        let clip = scene.popup.as_ref().map_or(scene.list, |p| p.clip);
+        let delta = if rect.top < clip.top {
+            rect.top - clip.top
+        } else if rect.bottom > clip.bottom {
+            rect.bottom - clip.bottom
+        } else {
+            0.
+        };
+        if delta != 0. {
+            let step = if scene.popup.is_some() { 48. } else { 72. };
+            let wheel = (-delta * 120. / step).round();
+            anyhow::ensure!(wheel.abs() <= i16::MAX as f32, "scroll exceeds wheel range");
+            send(
+                hwnd,
+                WM_MOUSEWHEEL,
+                WPARAM((wheel as i16 as u16 as usize) << 16),
+                LPARAM(0),
+            )?;
+            if let Some(p) = &scene.popup {
+                NAVIGATION.with(|n| {
+                    n.borrow_mut().popup_offset = (p.offset - wheel / 120. * 48.).clamp(
+                        0.,
+                        (p.content_height - (p.clip.bottom - p.clip.top)).max(0.),
+                    )
+                });
+            }
+            scene = live_scene(hwnd, state)?;
+        }
+    }
+    let hit = scene
+        .targets
+        .iter()
+        .rev()
+        .find(|h| h.target == target)
+        .ok_or_else(|| anyhow::anyhow!("typed target not visible: {target:?}"))?;
+    // Disabled controls remain clickable for the repeated-pending absorption test.
+    let mut rect = hit.rect;
+    if icon {
+        let item = scene
+            .popup
+            .as_ref()
+            .and_then(|p| p.items.iter().find(|i| i.target == target))
+            .ok_or_else(|| anyhow::anyhow!("checkbox item missing"))?;
+        if hit.enabled {
+            anyhow::ensure!(
+                scene.hit_test(
+                    (item.label.left + item.label.right) / 2.,
+                    (item.label.top + item.label.bottom) / 2.
+                ) == Some(&target),
+                "checkbox label is not in full item hit scope"
+            );
+        }
+        rect = scene
+            .popup
+            .as_ref()
+            .and_then(|p| p.items.iter().find(|i| i.target == target))
+            .and_then(|i| i.lead)
+            .ok_or_else(|| anyhow::anyhow!("checkbox icon box missing"))?;
+    }
+    let x = if matches!(target, Target::Row(_)) {
+        rect.left + 2.
+    } else {
+        (rect.left + rect.right) / 2.
+    };
+    let y = (rect.top + rect.bottom) / 2.;
+    if hit.enabled {
+        anyhow::ensure!(
+            scene.hit_test(x, y) == Some(&target),
+            "shared hit test/button precedence mismatch"
+        );
+    } else {
+        anyhow::ensure!(
+            scene.hit_test(x, y).is_none(),
+            "disabled target fell through"
+        );
+    }
+    let scale = unsafe { GetDpiForWindow(hwnd).max(96) } as f32 / 96.;
+    click(
+        hwnd,
+        i16::try_from((x * scale).round() as i32)?,
+        i16::try_from((y * scale).round() as i32)?,
+        message,
     )
 }
 
@@ -333,7 +531,11 @@ fn capture(hwnd: HWND, path: &std::path::Path) -> anyhow::Result<(i32, i32)> {
 }
 
 fn capture_checked(hwnd: HWND, path: &std::path::Path) -> anyhow::Result<()> {
-    painted(hwnd)?;
+    let trace = repaint_trace(hwnd)?;
+    anyhow::ensure!(
+        trace["scene"]["epoch"].as_u64().is_some(),
+        "actual painted Scene missing before capture"
+    );
     let (width, height) = capture(hwnd, path)?;
     let mut client = RECT::default();
     unsafe {
@@ -547,6 +749,11 @@ fn m6c_live_spawned_core_clicks_and_captures() -> anyhow::Result<()> {
     let delay_file = home.join("admin-delay");
     let shell_log = home.join("tray-shell.jsonl");
     let error_log = home.join("tray-error.log");
+    NAVIGATION.with(|n| {
+        let mut n = n.borrow_mut();
+        n.home = home.clone();
+        n.log = shell_log.clone();
+    });
     unsafe {
         std::env::set_var("QB_TRAY_TEST_EXPLORER_LOG", &explorer_log);
     }
@@ -646,14 +853,29 @@ fn m6c_live_spawned_core_clicks_and_captures() -> anyhow::Result<()> {
     );
     let mut rows = qb_tray::parse_state(&serde_json::to_string(&state)?)?;
     let last_id = rows.last().map(|row| row.id.clone()).unwrap();
-    let settings = footer(&rows, qb_tray::FooterAction::Settings)?;
+    let settings = footer(&rows, FooterAction::Settings)?;
     click_target(hwnd, &rows, "list", settings, WM_LBUTTONUP)?;
+    let logs = target(hwnd, &rows, "settings", |t| {
+        matches!(
+            t,
+            Target::Menu {
+                action: MenuAction::OpenLogs,
+                ..
+            }
+        )
+    })?;
+    click_target(hwnd, &rows, "settings", logs, WM_LBUTTONUP)?;
     thread::sleep(Duration::from_millis(150));
-    anyhow::ensure!(explorer_log.exists(), "settings test hook was not called");
+    anyhow::ensure!(
+        explorer_log.exists(),
+        "settings log-folder test hook was not called"
+    );
+    send(hwnd, WM_KEYDOWN, WPARAM(0x1b), LPARAM(0))?;
     let row_menu = target(
+        hwnd,
         &rows,
         "list",
-        |t| matches!(t, qb_tray::HitTarget::RowMenu { id, .. } if id == &last_id),
+        |t| matches!(t, Target::Row(id) if id == &last_id),
     )?;
     click_target(hwnd, &rows, "list", row_menu, WM_RBUTTONUP)?;
     let menu_state = format!("menu:{last_id}");
@@ -661,25 +883,56 @@ fn m6c_live_spawned_core_clicks_and_captures() -> anyhow::Result<()> {
         .iter()
         .any(|row| row.id == last_id && row.provider == "Codex")
     {
-        let row = rows.iter().find(|row| row.id == last_id).unwrap();
-        let index = qb_tray::actions::menu_items(row)
-            .iter()
-            .position(|i| *i == qb_tray::actions::MenuItem::ToggleCredits)
-            .unwrap();
-        let rect = target(
+        let checkbox = target(
+            hwnd,
             &rows,
             &menu_state,
-            |t| matches!(t, qb_tray::HitTarget::MenuItem { id, index: n, .. } if id == &last_id && *n == index),
+            |t| matches!(t,Target::Menu{id:Some(id),action:MenuAction::ToggleCredits} if id==&last_id),
         )?;
-        // Click the checkbox glyph itself (not the label or target midpoint).
-        let glyph = qb_tray::Rect {
-            left: 153.0,
-            right: 169.0,
-            top: rect.top + 8.0,
-            bottom: rect.top + 24.0,
-        };
+        // Every off-to-on attempt asks first. Cancel returns to the same menu,
+        // changes no backend flag, and supplies no remembered consent.
+        click_target_part(
+            hwnd,
+            &rows,
+            &menu_state,
+            checkbox.clone(),
+            WM_LBUTTONUP,
+            true,
+        )?;
+        let dialog_state = format!("confirm-credits:{last_id}");
+        let cancel = target(hwnd, &rows, &dialog_state, |t| {
+            matches!(t, Target::CancelDialog)
+        })?;
+        click_target(hwnd, &rows, &dialog_state, cancel, WM_LBUTTONUP)?;
+        let cancelled = admin_json(&home, "/admin/v1/state")?;
+        anyhow::ensure!(
+            cancelled["accounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["id"] == last_id && a["allow_credits"] == false),
+            "cancel enabled credits"
+        );
+        anyhow::ensure!(
+            repaint_trace(hwnd)?["state"] == "menu",
+            "cancel lost the originating menu"
+        );
+        click_target_part(
+            hwnd,
+            &rows,
+            &menu_state,
+            checkbox.clone(),
+            WM_LBUTTONUP,
+            true,
+        )?;
+        let confirm = target(
+            hwnd,
+            &rows,
+            &dialog_state,
+            |t| matches!(t,Target::ConfirmCredits(id) if id==&last_id),
+        )?;
         fs::write(&delay_file, b"delay")?;
-        click_target(hwnd, &rows, &menu_state, glyph, WM_LBUTTONUP)?;
+        click_target(hwnd, &rows, &dialog_state, confirm, WM_LBUTTONUP)?;
         painted(hwnd)?;
         thread::sleep(Duration::from_millis(250));
         responsive(hwnd)?;
@@ -689,7 +942,14 @@ fn m6c_live_spawned_core_clicks_and_captures() -> anyhow::Result<()> {
             "checkbox pending state was not painted: {pending}"
         );
         // A repeated glyph click while pending must not enqueue a second toggle.
-        click_target(hwnd, &rows, &menu_state, glyph, WM_LBUTTONUP)?;
+        click_target_part(
+            hwnd,
+            &rows,
+            &menu_state,
+            checkbox.clone(),
+            WM_LBUTTONUP,
+            true,
+        )?;
         capture_checked(hwnd, &evidence.join("credits-pending.png"))?;
         fs::remove_file(&delay_file)?;
         let deadline = std::time::Instant::now() + Duration::from_secs(12);
@@ -717,18 +977,44 @@ fn m6c_live_spawned_core_clicks_and_captures() -> anyhow::Result<()> {
             thread::sleep(Duration::from_millis(100));
         }
         capture_checked(hwnd, &evidence.join("credits-checked-menu-open.png"))?;
+        click_target_part(hwnd, &rows, &menu_state, checkbox, WM_LBUTTONUP, true)?;
+        let deadline = Instant::now() + Duration::from_secs(12);
+        loop {
+            responsive(hwnd)?;
+            let state = admin_json(&home, "/admin/v1/state")?;
+            let shell = latest_shell(&shell_log)?;
+            anyhow::ensure!(
+                shell["state"] != "confirm-credits",
+                "off incorrectly requested confirmation"
+            );
+            if state["accounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["id"] == last_id && a["allow_credits"] == false)
+                && shell["state"] == "menu"
+                && shell["menu_checked"] == false
+                && shell["menu_pending"] == false
+            {
+                rows = qb_tray::parse_state(&serde_json::to_string(&state)?)?;
+                break;
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "direct off failed/menu closed: {shell}"
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+        capture_checked(hwnd, &evidence.join("credits-off-menu-open.png"))?;
     }
     capture_checked(hwnd, &evidence.join("row-menu.png"))?;
     fs::write(&delay_file, b"delay")?;
-    let last = rows.iter().find(|row| row.id == last_id).unwrap();
-    let pause_index = qb_tray::actions::menu_items(last)
-        .iter()
-        .position(|item| *item == qb_tray::actions::MenuItem::Pause)
-        .ok_or_else(|| anyhow::anyhow!("synthetic account pause action missing"))?;
-    let pause = target(&rows, &menu_state, |t| {
-        matches!(t, qb_tray::HitTarget::MenuItem { id, index, .. }
-            if id == &last_id && *index == pause_index)
-    })?;
+    let pause = target(
+        hwnd,
+        &rows,
+        &menu_state,
+        |t| matches!(t,Target::Menu{id:Some(id),action:MenuAction::Pause} if id==&last_id),
+    )?;
     click_target(hwnd, &rows, &menu_state, pause, WM_LBUTTONUP)?;
     // Preserve the six-second delayed-admin acceptance and keep checking that
     // the UI responds while its synthetic network action is still pending.
@@ -760,6 +1046,7 @@ fn m6c_live_spawned_core_clicks_and_captures() -> anyhow::Result<()> {
     // The artificial five-second delay may expire a concurrently read state.
     // Dismiss its safe error view, then require a fresh healthy publication;
     // never accept a transient empty/error flyout as the quit-menu evidence.
+    reset_navigation();
     let prior = latest_shell(&shell_log)?["sequence"].as_u64().unwrap_or(0);
     send(hwnd, WM_KEYDOWN, WPARAM(0x1b), LPARAM(0))?;
     unsafe {
@@ -784,15 +1071,15 @@ fn m6c_live_spawned_core_clicks_and_captures() -> anyhow::Result<()> {
     }
     painted(hwnd)?;
     // Exercise settings and tray-only quit on the recovered live list.
-    let settings = footer(&rows, qb_tray::FooterAction::Settings)?;
+    let settings = footer(&rows, FooterAction::Settings)?;
     click_target(hwnd, &rows, "list", settings, WM_LBUTTONUP)?;
     thread::sleep(Duration::from_millis(150));
-    let quit_footer = footer(&rows, qb_tray::FooterAction::Quit)?;
+    send(hwnd, WM_KEYDOWN, WPARAM(0x1b), LPARAM(0))?;
+    let quit_footer = footer(&rows, FooterAction::Quit)?;
     // Compare against the same paused list/scroll position, rather than the
     // initial unpaused list (which already differs before opening any popup).
     painted(hwnd)?;
-    // End is the list footer's offset; click_target will use this same offset.
-    send(hwnd, WM_KEYDOWN, WPARAM(0x23), LPARAM(0))?;
+    // Footer is sticky; no Home/End scrolling or whole-window translation.
     let before_quit = evidence.join("before-quit.png");
     capture_checked(hwnd, &before_quit)?;
     let list_bytes = fs::read(&before_quit)?;
@@ -803,11 +1090,11 @@ fn m6c_live_spawned_core_clicks_and_captures() -> anyhow::Result<()> {
         fs::read(&quit_path)? != list_bytes,
         "quit menu did not repaint"
     );
-    let tray_only = target(&rows, "quit", |t| {
+    let tray_only = target(hwnd, &rows, "quit", |t| {
         matches!(
             t,
-            qb_tray::HitTarget::Quit {
-                action: qb_tray::QuitAction::TrayOnly,
+            Target::Menu {
+                action: MenuAction::QuitTray,
                 ..
             }
         )
@@ -838,6 +1125,7 @@ fn m6c_live_spawned_core_clicks_and_captures() -> anyhow::Result<()> {
         window(children.tray.id()).is_none(),
         "owned quit tray window still exists"
     );
+    fs::rename(&shell_log, evidence.join("first-tray-shell.jsonl"))?;
     let tray = Command::new(&tray_bin)
         .env("QB_HOME", &home)
         .env("QB_TRAY_TEST_NO_BROWSER", "1")
@@ -854,6 +1142,7 @@ fn m6c_live_spawned_core_clicks_and_captures() -> anyhow::Result<()> {
         .stderr(Stdio::null())
         .spawn()?;
     children.tray = tray;
+    reset_navigation();
     let hwnd = (0..100)
         .find_map(|_| {
             let found = window(children.tray.id());
@@ -866,17 +1155,17 @@ fn m6c_live_spawned_core_clicks_and_captures() -> anyhow::Result<()> {
     thread::sleep(Duration::from_secs(1));
     responsive(hwnd)?;
     responsive(hwnd)?;
-    let add = footer(&rows, qb_tray::FooterAction::AddAccount)?;
+    let add = footer(&rows, FooterAction::Add)?;
     click_target(hwnd, &rows, "list", add, WM_LBUTTONUP)?;
-    let add_height = qb_tray::state_height(&rows, false, Some("add-menu"));
-    let add_popup = qb_tray::popup_rect(&rows, false, "add-menu", add_height).unwrap();
-    // Codex is the second 36-DIP provider choice in the actual add popup.
-    let codex = qb_tray::Rect::new(
-        add_popup.left,
-        add_popup.top + 36.0,
-        add_popup.right,
-        add_popup.top + 72.0,
-    );
+    let codex = target(hwnd, &rows, "add-menu", |t| {
+        matches!(
+            t,
+            Target::Menu {
+                action: MenuAction::AddCodex,
+                ..
+            }
+        )
+    })?;
     click_target(hwnd, &rows, "add-menu", codex, WM_LBUTTONUP)?;
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -895,14 +1184,8 @@ fn m6c_live_spawned_core_clicks_and_captures() -> anyhow::Result<()> {
     thread::sleep(Duration::from_millis(200));
     capture_checked(hwnd, &evidence.join("login-panel.png"))?;
     responsive(hwnd)?;
-    let cancel = target(&rows, "login:codex", |t| {
-        matches!(
-            t,
-            qb_tray::HitTarget::Login {
-                action: qb_tray::LoginAction::Cancel,
-                ..
-            }
-        )
+    let cancel = target(hwnd, &rows, "login:codex", |t| {
+        matches!(t, Target::LoginCancel)
     })?;
     click_target(hwnd, &rows, "login:codex", cancel, WM_LBUTTONUP)?;
     let deadline = std::time::Instant::now() + Duration::from_secs(5);

@@ -16,6 +16,7 @@ fn nonnegative(value: f32) -> f32 {
 
 impl Viewport {
     /// Extent is actual client height in DIPs, not full content height.
+    #[cfg(test)]
     pub fn set_geometry(&mut self, content: f32, extent: f32) {
         self.content = nonnegative(content);
         self.extent = nonnegative(extent);
@@ -45,6 +46,7 @@ impl Viewport {
 
     /// Caller first rejects points outside the actual client rectangle.
     /// Nonfinite pointer input maps to viewport top; finite negatives stay negative.
+    #[cfg(test)]
     pub fn to_content_y(self, y: f32) -> f32 {
         let y = if y.is_finite() { y } else { 0.0 };
         (y as f64 + nonnegative(self.offset).min(self.max_offset()) as f64)
@@ -55,6 +57,7 @@ impl Viewport {
     /// Reserve is empty space BELOW the popup, not a sticky footer.
     /// Minimal movement to contain both ends; impossible/invalid requests return
     /// false and leave the normalized offset unchanged. Never claim partial fit.
+    #[cfg(test)]
     pub fn reveal_popup(&mut self, rect: (f32, f32), reserve_footer: f32) -> bool {
         self.clamp();
         let (top, bottom) = rect;
