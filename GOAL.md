@@ -54,7 +54,7 @@ Implement quota-baton exactly as specified, milestone by milestone, until M8 is 
 | R1-tray.2 | merged (notifications) |
 | R4 | merged (plan tier, credits_in_use, precondition) |
 | R5 | merged (`6feb99e`; full gate passed, including default/full workspace, standalone core, strict clippy and actual native captures/actions/memory). Report: `.sandbox/reports/R5.md`. Latest approved healthy bars are green; credits confirm every time |
-| R3.2 | codex-qb/claude-qb set the window title (launcher title + Codex `[tui] terminal_title = []`, Claude title env), with an in-place upgrade path; after R5; brief `R3.2-launcher-titles.md` |
+| R3.2 | merged (`f3fc3f7`; full gate: default 966, full 994, standalone core 328; strict clippy passed). Report: `.sandbox/reports/R3.2.md`. codex-qb/claude-qb set the window title (launcher title + Codex `[tui] terminal_title = []`, Claude title env), with an in-place upgrade path; after R5; brief `R3.2-launcher-titles.md` |
 | R6 | D18 warned takeover from another app's home (core + CLI first, tray with R5); after R5 core work, before R2 Part B; brief `R6-takeover.md` |
 | R7 | separate dashboard window (user-approved; sessions by account, activity, 48 h usage; label header stripped upstream); after R6, before R2 Part B; brief `R7-dashboard.md`, spec `.sandbox/design/dashboard/SPEC.md` |
 
