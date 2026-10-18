@@ -207,6 +207,7 @@ fn runtime_router(state: RuntimeAdmin) -> Router {
     Router::new()
         .route("/admin/v1/state", axum::routing::get(runtime_state))
         .route("/admin/v1/events", axum::routing::get(runtime_events))
+        .route("/admin/v1/accounts/takeover", post(takeover_account))
         .route("/admin/v1/accounts/{id}/{action}", post(account_action))
         .route(
             "/admin/v1/accounts/{id}",
@@ -277,7 +278,7 @@ async fn runtime_state(State(state): State<RuntimeAdmin>) -> Response {
             "pools": crate::account_runtime::pool_counts(&accounts),
             "warnings": state.relay.recent_warnings(),
             "draining": state.relay.is_draining(),
-            "capabilities": {"account_adopt":true,"manual_refresh":true},
+            "capabilities": {"account_adopt":true,"manual_refresh":true,"account_takeover":true},
             "accounts": accounts,
             "inflight": {
                 "requests": state.relay.inflight_requests.load(std::sync::atomic::Ordering::Relaxed),
@@ -367,6 +368,56 @@ async fn account_action(
         _ => return error(StatusCode::NOT_FOUND, "Unknown account action"),
     };
     change_account(state, id, Some(user_state), AccountPatch::default()).await
+}
+
+async fn takeover_account(
+    State(state): State<RuntimeAdmin>,
+    request: Result<Json<crate::accounts::takeover::TakeoverRequest>, JsonRejection>,
+) -> Response {
+    let Ok(Json(request)) = request else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "계정 가져오기 요청이 올바르지 않습니다.",
+        );
+    };
+    match state.relay.takeover_account(request).await {
+        Ok(value) => Json(value).into_response(),
+        Err(problem) => {
+            use crate::accounts::takeover::TakeoverError;
+            let (status, code, message) = match problem {
+                TakeoverError::Conflict => (
+                    StatusCode::CONFLICT,
+                    "takeover_conflict",
+                    "원래 앱 실행 상태, 최근 파일 변경 또는 기존 계정 충돌을 확인하고 다시 검사하세요.",
+                ),
+                TakeoverError::ApiKey => (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "api_key_auth",
+                    "API 키 계정은 가져올 수 없습니다. 구독 계정의 OAuth 로그인이 필요합니다.",
+                ),
+                TakeoverError::Invalid => (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "invalid_takeover",
+                    "원본 계정 형식이나 사용자를 확인할 수 없습니다.",
+                ),
+                TakeoverError::Unavailable => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "takeover_unavailable",
+                    "가져오기에 필요한 파일이나 저장소를 사용할 수 없습니다. 계정 상태를 확인하세요.",
+                ),
+                TakeoverError::Uncertain => (
+                    StatusCode::CONFLICT,
+                    "takeover_uncertain",
+                    "앞선 토큰 갱신의 결과를 확인할 수 없어 다시 보내지 않았습니다. 계정에서 다시 로그인해 주세요.",
+                ),
+            };
+            (
+                status,
+                Json(serde_json::json!({"error":{"code":code,"message":message}})),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn adopt_account(

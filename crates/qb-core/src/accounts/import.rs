@@ -446,6 +446,7 @@ fn owned(account: &Account) -> bool {
     matches!(
         account.source,
         Source::Oauth
+            | Source::Takeover { .. }
             | Source::Cpa {
                 mode: ImportMode::Adopted,
                 ..

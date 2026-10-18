@@ -102,6 +102,8 @@ pub(crate) struct TokenGates {
     ahead_changed: Arc<Notify>,
     claude_endpoint: String,
     codex_endpoint: String,
+    takeover_dependencies: Option<crate::accounts::takeover::Dependencies>,
+    takeover_admission: Arc<Mutex<()>>,
 }
 
 #[derive(Default)]
@@ -177,6 +179,13 @@ struct Rotation {
     tokens: Tokens,
     failed_token: zeroize::Zeroizing<String>,
     store_error_in_memory: bool,
+    takeover_operation: Option<String>,
+}
+
+#[derive(Default)]
+struct RefreshContext {
+    manual_baseline: Option<crate::accounts::TokenMeta>,
+    takeover_operation: Option<String>,
 }
 impl ReloadClock {
     fn admit(last: &mut Option<Instant>, now: Instant, interval: Duration) -> bool {
@@ -213,7 +222,101 @@ impl TokenGates {
             ahead_changed: Arc::default(),
             claude_endpoint: "https://platform.claude.com/v1/oauth/token".into(),
             codex_endpoint: "https://auth.openai.com/oauth/token".into(),
+            takeover_dependencies: None,
+            takeover_admission: Arc::default(),
         }
+    }
+
+    /// Owns the WHOLE admitted transaction after caller cancellation. No
+    /// production fallback exists when the explicit adapter is not installed.
+    pub(crate) async fn takeover(
+        &self,
+        store: Arc<AccountStore>,
+        obs: Arc<Observability>,
+        request: crate::accounts::takeover::TakeoverRequest,
+        dependencies: crate::accounts::takeover::Dependencies,
+    ) -> Result<serde_json::Value, crate::accounts::takeover::TakeoverError> {
+        use crate::accounts::takeover::{self, Preparation, ReceiptState, TakeoverError};
+        #[cfg(any(test, feature = "testkit"))]
+        if !crate::accounts::takeover::synthetic_endpoint(dependencies.profile.endpoint()) {
+            return Err(TakeoverError::Invalid);
+        }
+        let activity = self.lifecycle.admit().ok_or(TakeoverError::Unavailable)?;
+        let mut this = self.clone();
+        this.takeover_dependencies = Some(dependencies.clone());
+        tokio::spawn(async move {
+            let _activity = activity;
+            // Serialize source snapshots as well as new identities. The account
+            // gate below is still shared with every D17 token consumer.
+            let _admission = if request.phase == takeover::Phase::Commit {
+                Some(this.takeover_admission.lock().await)
+            } else {
+                None
+            };
+            // prepare is read-only for inspect. Profile GET never refreshes.
+            let preparation =
+                takeover::prepare(store.clone(), dependencies.clone(), request).await?;
+            let journal = match preparation {
+                Preparation::Inspect(value) => return Ok(value),
+                Preparation::Commit(journal) => *journal,
+            };
+            if journal.result.is_some() {
+                return Ok(takeover::result_value(&journal));
+            }
+            let gate = this.gate(&journal.account.id).await;
+            let guard = gate.lock_owned().await;
+            if guard.pending.is_some() || this.lifecycle.stopped() {
+                return Err(TakeoverError::Unavailable);
+            }
+            let install_store = store.clone();
+            let install_dependencies = dependencies.clone();
+            // The child blocking task retains lifecycle activity if this
+            // detached parent is ever aborted, as do existing D17 read tasks.
+            let write_activity = this.lifecycle.track_write();
+            let journal = tokio::task::spawn_blocking(move || {
+                let _activity = write_activity;
+                let _guard = guard;
+                takeover::install(&install_store, &install_dependencies, journal)
+            })
+            .await
+            .map_err(|_| TakeoverError::Unavailable)??;
+            let receipt = store
+                .takeover_receipt(&journal.account.id)?
+                .ok_or(TakeoverError::Invalid)?;
+            if receipt.operation != journal.operation {
+                return Err(TakeoverError::Conflict);
+            }
+            match receipt.state {
+                ReceiptState::Ready => {
+                    let _ = this
+                        .refresh_inner(
+                            store.clone(),
+                            obs,
+                            journal.account.id.clone(),
+                            None,
+                            "takeover",
+                            RefreshContext {
+                                manual_baseline: None,
+                                takeover_operation: Some(journal.operation.clone()),
+                            },
+                        )
+                        .await;
+                }
+                ReceiptState::Started => return Err(TakeoverError::Uncertain),
+                ReceiptState::Installed => return Err(TakeoverError::Unavailable),
+                ReceiptState::Finished { .. } | ReceiptState::Superseded => {}
+            }
+            // A durable receipt, never uncertainty=false, determines completion.
+            let finalize_activity = this.lifecycle.track_write();
+            tokio::task::spawn_blocking(move || {
+                let _activity = finalize_activity;
+                takeover::finalize(&store, journal)
+            })
+            .await
+            .map_err(|_| TakeoverError::Unavailable)?
+        })
+        .await
+        .map_err(|_| TakeoverError::Unavailable)?
     }
 
     #[cfg(debug_assertions)]
@@ -264,6 +367,9 @@ impl TokenGates {
         let guard = gate.lock_owned().await;
         tokio::task::spawn_blocking(move || {
             let mut clock = guard;
+            if store.takeover_fenced(&account.id).map_err(|_| ())? {
+                return Err(());
+            }
             let (current, _) = snapshot(&store, &account.id)?;
             if !clock.before_expiry() {
                 return Ok(current);
@@ -460,7 +566,10 @@ impl TokenGates {
                     id,
                     Some(failed),
                     if force { "manual_force" } else { "manual" },
-                    Some(baseline),
+                    RefreshContext {
+                        manual_baseline: Some(baseline),
+                        takeover_operation: None,
+                    },
                 )
                 .await?
                 .ok_or(ManualRefreshError::Unavailable)?;
@@ -702,7 +811,7 @@ impl TokenGates {
         failed: Option<zeroize::Zeroizing<String>>,
         trigger: &str,
     ) -> Result<Option<(Account, Tokens)>, ()> {
-        self.refresh_inner(store, obs, id, failed, trigger, None)
+        self.refresh_inner(store, obs, id, failed, trigger, RefreshContext::default())
             .await
             .map_err(|_| ())
     }
@@ -714,15 +823,59 @@ impl TokenGates {
         id: String,
         failed: Option<zeroize::Zeroizing<String>>,
         trigger: &str,
-        manual_baseline: Option<crate::accounts::TokenMeta>,
+        context: RefreshContext,
     ) -> Result<Option<(Account, Tokens)>, ManualRefreshError> {
-        let manual = matches!(trigger, "manual" | "manual_force");
+        let RefreshContext {
+            manual_baseline,
+            takeover_operation,
+        } = context;
+        let manual = matches!(trigger, "manual" | "manual_force" | "takeover");
         let gate = self.gate(&id).await;
         let mut clock = gate.clone().lock_owned().await;
         if self.lifecycle.stopped() || clock.pending.is_some() {
             return Ok(None);
         }
-        if failed.is_none() {
+        let status_store = store.clone();
+        let status_id = id.clone();
+        let operation = takeover_operation.clone();
+        let dependencies = self.takeover_dependencies.clone();
+        tokio::task::spawn_blocking(move || {
+            use crate::accounts::takeover::ReceiptState;
+            let receipt = status_store.takeover_receipt(&status_id).map_err(|_| ())?;
+            if let Some(operation) = operation {
+                let receipt = receipt.ok_or(ManualRefreshError::Unavailable)?;
+                if receipt.operation != operation || receipt.state != ReceiptState::Ready {
+                    return Err(ManualRefreshError::Uncertain);
+                }
+                let journal = status_store
+                    .read_takeover_journal(&operation)
+                    .map_err(|_| ())?
+                    .ok_or(ManualRefreshError::Unavailable)?;
+                if !journal.retired {
+                    return Err(ManualRefreshError::Unavailable);
+                }
+                let deps = dependencies.ok_or(ManualRefreshError::Unavailable)?;
+                if deps.source.owner(journal.provider, &journal.source)
+                    != crate::accounts::takeover::Owner::Stopped
+                {
+                    return Err(ManualRefreshError::Unavailable);
+                }
+                deps.source
+                    .retire(
+                        journal.provider,
+                        &journal.source,
+                        &journal.destination,
+                        journal.keep_source,
+                    )
+                    .map_err(|_| ManualRefreshError::Unavailable)?;
+            } else if receipt.is_some_and(|r| r.fenced()) {
+                return Err(ManualRefreshError::Uncertain);
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| ())??;
+        if failed.is_none() && takeover_operation.is_none() {
             let read_store = store.clone();
             let read_id = id.clone();
             let metadata = tokio::task::spawn_blocking(move || read_store.load(&read_id))
@@ -738,9 +891,20 @@ impl TokenGates {
             }
         }
         let read_store = store.clone();
-        let (current, tokens) = tokio::task::spawn_blocking(move || snapshot(&read_store, &id))
-            .await
-            .map_err(|_| ())??;
+        let read_operation = takeover_operation.clone();
+        let (current, tokens) = tokio::task::spawn_blocking(move || {
+            if let Some(operation) = read_operation {
+                let current = read_store.load(&id).map_err(|_| ())?;
+                let tokens = read_store
+                    .takeover_tokens(&current, &operation)
+                    .map_err(|_| ())?;
+                Ok((current, tokens))
+            } else {
+                snapshot(&read_store, &id)
+            }
+        })
+        .await
+        .map_err(|_| ())??;
         if manual {
             manual_allowed(&current)?;
         }
@@ -764,7 +928,7 @@ impl TokenGates {
             .map_err(|_: ()| ManualRefreshError::Unavailable);
         }
         assert!(!is_linked(&current), "linked accounts cannot refresh");
-        let ahead = failed.is_none();
+        let ahead = failed.is_none() && takeover_operation.is_none();
         let failed = failed.unwrap_or_else(|| zeroize::Zeroizing::new(tokens.access_token.clone()));
         if tokens.access_token != *failed {
             return Ok(Some((current, tokens)));
@@ -806,7 +970,10 @@ impl TokenGates {
         {
             return Ok(None);
         }
-        let serving = if (ahead || manual) && access_valid(&current, chrono::Utc::now()) {
+        let serving = if (ahead || manual)
+            && takeover_operation.is_none()
+            && access_valid(&current, chrono::Utc::now())
+        {
             self.ahead_access
                 .lock()
                 .expect("ahead access")
@@ -825,8 +992,28 @@ impl TokenGates {
         let mut uncertain = current.clone();
         uncertain.token_meta.refresh_uncertain = true;
         let old_tokens = copy_tokens(&tokens);
+        let write_operation = takeover_operation.clone();
         let current = match tokio::task::spawn_blocking(move || {
-            write_store.save(&uncertain, &old_tokens, Some(uncertain.generation))
+            if let Some(operation) = write_operation {
+                use crate::accounts::takeover::{Receipt, ReceiptState};
+                let before = Receipt {
+                    operation: operation.clone(),
+                    state: ReceiptState::Ready,
+                };
+                let after = Receipt {
+                    operation,
+                    state: ReceiptState::Started,
+                };
+                write_store.save_takeover_receipt(
+                    &uncertain,
+                    &old_tokens,
+                    Some(uncertain.generation),
+                    Some(&before),
+                    &after,
+                )
+            } else {
+                write_store.save(&uncertain, &old_tokens, Some(uncertain.generation))
+            }
         })
         .await
         .map_err(|_| ())?
@@ -854,7 +1041,19 @@ impl TokenGates {
             }
         };
         if self.lifecycle.stopped() {
-            restore_uncertainty(store.clone(), &current, &tokens, prior_uncertain).await;
+            if let Some(operation) = &takeover_operation {
+                let _ = store.finish_takeover_attempt(
+                    &current.id,
+                    operation,
+                    crate::accounts::takeover::Verification {
+                        ok: false,
+                        token_expires_at: current.token_meta.expires_at,
+                    },
+                    None,
+                );
+            } else {
+                restore_uncertainty(store.clone(), &current, &tokens, prior_uncertain).await;
+            }
             return Ok(None);
         }
         // Space proactive uncertain retries from the send boundary. A new
@@ -878,6 +1077,30 @@ impl TokenGates {
                     Ok(Ok(_)) => unreachable!(),
                 };
                 obs.record_refresh(&current.id, trigger, &error.outcome(), None);
+                if let Some(operation) = &takeover_operation {
+                    // Only NotSent or terminal results are safe, durable endings.
+                    // Sent transient/transport errors retain Started and its fence.
+                    let terminal = match &error {
+                        RefreshError::Terminal(reason) => Some(reason.clone()),
+                        _ => None,
+                    };
+                    if matches!(&error, RefreshError::NotSent) || terminal.is_some() {
+                        store
+                            .finish_takeover_attempt(
+                                &current.id,
+                                operation,
+                                crate::accounts::takeover::Verification {
+                                    ok: false,
+                                    token_expires_at: current.token_meta.expires_at,
+                                },
+                                terminal,
+                            )
+                            .map_err(|_| ())?;
+                        return Ok(None);
+                    }
+                    obs.core_warning(&current.id, "takeover_refresh_uncertain");
+                    return Err(ManualRefreshError::Uncertain);
+                }
                 if !matches!(error, RefreshError::Uncertain) {
                     clock.uncertain_retry = None;
                     // A request never sent cannot settle uncertainty from an earlier attempt.
@@ -963,6 +1186,7 @@ impl TokenGates {
             },
             failed_token: failed,
             store_error_in_memory: false,
+            takeover_operation: takeover_operation.clone(),
         };
         let result = persist_async(store.clone(), &rotation).await;
         match result {
@@ -1281,6 +1505,7 @@ async fn persist_async(
     let account = rotation.account.clone();
     let tokens = copy_tokens(&rotation.tokens);
     let failed = zeroize::Zeroizing::new(rotation.failed_token.to_string());
+    let operation = rotation.takeover_operation.clone();
     tokio::task::spawn_blocking(move || {
         for _ in 0..3 {
             let mut current = match store.load(&account.id) {
@@ -1288,11 +1513,42 @@ async fn persist_async(
                 Err(StoreError::NotFound) => return Ok(None),
                 Err(_) => return Err(()),
             };
-            let stored_tokens = match store.tokens(&current) {
+            if let Some(operation) = &operation {
+                use crate::accounts::takeover::ReceiptState;
+                let receipt = store.takeover_receipt(&account.id).map_err(|_| ())?;
+                if current.source != account.source
+                    || receipt.as_ref().is_none_or(|r| r.operation != *operation)
+                {
+                    return Ok(None);
+                }
+                match receipt.expect("checked receipt").state {
+                    ReceiptState::Started => {}
+                    ReceiptState::Finished { .. } => {
+                        return snapshot(&store, &account.id).map(Some);
+                    }
+                    _ => return Ok(None),
+                }
+            }
+            let read_tokens = if let Some(operation) = &operation {
+                store.takeover_tokens(&current, operation)
+            } else {
+                store.tokens(&current)
+            };
+            let stored_tokens = match read_tokens {
                 Ok(tokens) => tokens,
                 Err(StoreError::GenerationConflict { .. }) => continue,
                 Err(StoreError::NotFound) => return Ok(None),
-                Err(_) => return Err(()),
+                Err(_) => {
+                    if let Some(operation) = &operation
+                        && store
+                            .takeover_receipt(&account.id)
+                            .map_err(|_| ())?
+                            .is_none_or(|r| r.operation != *operation || !r.fenced())
+                    {
+                        return Ok(None);
+                    }
+                    return Err(());
+                }
             };
             if stored_tokens.access_token != *failed {
                 return Ok(Some((current, stored_tokens)));
@@ -1307,10 +1563,45 @@ async fn persist_async(
             ) {
                 current.health = Health::Ready;
             }
-            match store.save(&current, &tokens, Some(current.generation)) {
+            let saved = if let Some(operation) = &operation {
+                use crate::accounts::takeover::{Receipt, ReceiptState, Verification};
+                let before = Receipt {
+                    operation: operation.clone(),
+                    state: ReceiptState::Started,
+                };
+                let after = Receipt {
+                    operation: operation.clone(),
+                    state: ReceiptState::Finished {
+                        result: Verification {
+                            ok: true,
+                            token_expires_at: current.token_meta.expires_at,
+                        },
+                    },
+                };
+                store.save_takeover_receipt(
+                    &current,
+                    &tokens,
+                    Some(current.generation),
+                    Some(&before),
+                    &after,
+                )
+            } else {
+                store.save(&current, &tokens, Some(current.generation))
+            };
+            match saved {
                 Ok(updated) => return Ok(Some((updated, tokens))),
                 Err(StoreError::GenerationConflict { .. }) => continue,
-                Err(_) => return Err(()),
+                Err(_) => {
+                    if let Some(operation) = &operation
+                        && store
+                            .takeover_receipt(&account.id)
+                            .map_err(|_| ())?
+                            .is_none_or(|r| r.operation != *operation || !r.fenced())
+                    {
+                        return Ok(None);
+                    }
+                    return Err(());
+                }
             }
         }
         Err(())
@@ -1634,3 +1925,7 @@ mod tests {
         assert_eq!(cooled.auth_failures, 0);
     }
 }
+
+#[cfg(test)]
+#[path = "takeover_engine_tests.rs"]
+mod takeover_engine_tests;

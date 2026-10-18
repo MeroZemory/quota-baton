@@ -135,6 +135,13 @@ enum Phase0Command {
 async fn main() {
     qb_core::set_console_utf8();
     if let Err(error) = run().await {
+        if error
+            .downcast_ref::<accounts_cli::TakeoverInspectOnly>()
+            .is_some()
+        {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
         let message = friendly_error(&error);
         if message == "로그인 시간이 만료되었습니다. 다시 시작해 주세요." {
             eprintln!("{message}");
@@ -182,6 +189,9 @@ fn friendly_error(error: &anyhow::Error) -> String {
         return "로그인 시간이 만료되었습니다. 다시 시작해 주세요.".into();
     }
     if let Some(error) = error.downcast_ref::<accounts_cli::UsageCliError>() {
+        return error.to_string();
+    }
+    if let Some(error) = error.downcast_ref::<accounts_cli::AdminVersionMismatch>() {
         return error.to_string();
     }
     if let Some(error) = error.downcast_ref::<accounts_cli::AccountCliError>() {
@@ -332,6 +342,21 @@ async fn run() -> anyhow::Result<()> {
             phase0_close_after_response,
             takeover,
         } => {
+            #[cfg(all(feature = "testkit", debug_assertions))]
+            match (
+                std::env::var_os("QB_TEST_TAKEOVER_HOME"),
+                std::env::var("QB_TEST_TAKEOVER_PROFILE"),
+            ) {
+                (None, Err(std::env::VarError::NotPresent)) => {}
+                (Some(root), Ok(endpoint)) => {
+                    qb_core::relay::RelayState::validate_takeover_test_inputs(
+                        &home,
+                        &std::path::PathBuf::from(root),
+                        &endpoint,
+                    )?
+                }
+                _ => anyhow::bail!("합성 인계 검사의 홈과 프로필 주소를 함께 지정하세요."),
+            }
             let _logs = qb_core::logging::init(&home)?;
             let config = qb_core::config::Config::load(&home)?;
             let mut imported_bindings = None;
@@ -393,6 +418,17 @@ async fn run() -> anyhow::Result<()> {
                     }
                 }
                 relay
+            };
+            #[cfg(all(feature = "testkit", debug_assertions))]
+            let relay = match (
+                std::env::var_os("QB_TEST_TAKEOVER_HOME"),
+                std::env::var("QB_TEST_TAKEOVER_PROFILE"),
+            ) {
+                (None, Err(std::env::VarError::NotPresent)) => relay,
+                (Some(root), Ok(endpoint)) => {
+                    relay.with_takeover_test_source(&std::path::PathBuf::from(root), endpoint)?
+                }
+                _ => anyhow::bail!("합성 인계 검사의 홈과 프로필 주소를 함께 지정하세요."),
             };
             #[cfg(feature = "phase0")]
             let relay = if let Some(dir) = capture_bodies_dir {

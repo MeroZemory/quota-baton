@@ -139,8 +139,8 @@ impl Source {
             || matches!(self, Self::Legacy(s) if s == "linked")
     }
     pub fn owned_or_adopted(&self) -> bool {
-        matches!(self, Self::Object(s) if s.kind == "oauth" || s.mode.as_deref() == Some("adopted"))
-            || matches!(self, Self::Legacy(s) if matches!(s.as_str(), "oauth" | "owned" | "adopted"))
+        matches!(self, Self::Object(s) if matches!(s.kind.as_str(), "oauth" | "takeover") || s.mode.as_deref() == Some("adopted"))
+            || matches!(self, Self::Legacy(s) if matches!(s.as_str(), "oauth" | "owned" | "adopted" | "takeover"))
     }
 }
 

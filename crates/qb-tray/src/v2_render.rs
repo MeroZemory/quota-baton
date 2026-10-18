@@ -108,7 +108,50 @@ impl Renderer {
             .metrics
             .natural_width)
     }
+    // Keep R5's Korean keep-all layout; split only overlong tokens such as paths
+    // using the same DirectWrite font metrics. This keeps every identity byte
+    // readable through vertical scrolling instead of silently ellipsizing it.
+    fn takeover_wrap(&self, text: &str) -> Result<String> {
+        let mut out = String::new();
+        for (index, paragraph) in text.split('\n').enumerate() {
+            if index > 0 {
+                out.push('\n');
+            }
+            for token in paragraph.split_inclusive(' ') {
+                if self.width(token, 13, false)? <= 288. {
+                    out.push_str(token);
+                    continue;
+                }
+                let mut chunk = String::new();
+                for c in token.chars() {
+                    let candidate = format!("{chunk}{c}");
+                    if !chunk.is_empty() && self.width(&candidate, 13, false)? > 288. {
+                        out.push_str(&chunk);
+                        out.push('\n');
+                        chunk.clear();
+                    }
+                    chunk.push(c);
+                }
+                out.push_str(&chunk);
+            }
+        }
+        Ok(out)
+    }
     pub fn measure(&self, view: &v2::View, p: &mut g::Presentation) -> Result<()> {
+        if let g::Overlay::TakeoverCard { body, .. } = &p.overlay {
+            let mut s = style(13., false, 20.);
+            s.wrap = Wrap::KeepAll;
+            p.credits_body_lines = self
+                .text
+                .layout(
+                    &self.takeover_wrap(body)?,
+                    bounds(r(0., 0., 288., 65536.)),
+                    s,
+                )?
+                .metrics
+                .total_lines
+                .max(1);
+        }
         for detail in g::QUIT_DETAILS {
             let mut text_style = style(12., false, 16.);
             text_style.wrap = Wrap::KeepAll;
@@ -1203,10 +1246,34 @@ impl Renderer {
         let credit = credit_id
             .and_then(|id| account(view, id))
             .and_then(|row| row.menu.credits_enable_confirmation.as_ref());
-        let title = credit.map_or("계정 삭제", |c| c.title);
+        let title = if d.takeover_body.is_some() {
+            if d.buttons[0].target == g::Target::TakeoverCommit {
+                "가져오기 확인"
+            } else {
+                "다른 앱에서 계정 가져오기"
+            }
+        } else {
+            credit.map_or("계정 삭제", |c| c.title)
+        };
         self.text(target, d.title, title, style(14., true, 20.), p.text, 1.)?;
         self.clip(target, d.body, || {
-            if let Some(credit) = credit {
+            if let Some(body) = &d.takeover_body {
+                let mut s = style(13., false, 20.);
+                s.wrap = Wrap::KeepAll;
+                self.text(
+                    target,
+                    r(
+                        d.body.left,
+                        d.body.top - d.body_offset,
+                        d.body.right - d.body.left,
+                        d.body_height.max(20.),
+                    ),
+                    &self.takeover_wrap(body)?,
+                    s,
+                    p.text,
+                    1.,
+                )?;
+            } else if let Some(credit) = credit {
                 let mut s = style(13., false, 20.);
                 s.wrap = Wrap::KeepAll;
                 self.text(target, d.body, &credit.body, s, p.text, 1.)?;
@@ -1358,5 +1425,59 @@ fn menu_glyph(action: &g::MenuAction) -> &'static str {
         g::MenuAction::OpenLogs => "\u{e838}",
         g::MenuAction::AddClaude | g::MenuAction::AddCodex => "\u{e710}",
         _ => "",
+    }
+}
+
+#[cfg(test)]
+mod r6_render_tests {
+    use super::*;
+
+    #[test]
+    fn r6_long_paths_measure_the_same_full_body_that_scrolls() -> Result<()> {
+        let renderer = Renderer::new(false)?;
+        let view = v2::project("{\"accounts\":[]}", std::time::SystemTime::UNIX_EPOCH).unwrap();
+        for path in [
+            format!("C:/{}", "long-directory/".repeat(50)),
+            format!("C:/{}", "긴한글폴더/".repeat(50)),
+        ] {
+            let body = format!(
+                "원본 경로: {path}\n마지막 갱신: 알 수 없음\n원래 앱 실행 중: 감지되지 않음"
+            );
+            let wrapped = renderer.takeover_wrap(&body)?;
+            // Presentation line breaks must preserve every path character.
+            assert_eq!(wrapped.replace('\n', ""), body.replace('\n', ""));
+            let mut s = style(13., false, 20.);
+            s.wrap = Wrap::KeepAll;
+            let measured = renderer
+                .text
+                .layout(&wrapped, bounds(r(0., 0., 288., 65536.)), s)?;
+            assert!(!measured.metrics.trimmed);
+            assert!(measured.metrics.total_lines > 10);
+            let mut p = g::Presentation {
+                overlay: g::Overlay::TakeoverCard {
+                    body,
+                    confirming: true,
+                    ready: true,
+                    replace: false,
+                },
+                popup_offset: 100_000.,
+                ..Default::default()
+            };
+            renderer.measure(&view, &mut p)?;
+            assert_eq!(p.credits_body_lines, measured.metrics.total_lines);
+            for cap in [240., 480., 800.] {
+                let scene = g::Scene::build(&view, p.clone(), cap);
+                let dialog = scene.dialog.unwrap();
+                assert_eq!(dialog.body_height, measured.metrics.required_height);
+                assert!((dialog.body_offset + g::h(dialog.body) - dialog.body_height).abs() < 0.1);
+                assert!(
+                    dialog
+                        .buttons
+                        .iter()
+                        .all(|b| b.hit.bottom <= dialog.card.bottom)
+                );
+            }
+        }
+        Ok(())
     }
 }

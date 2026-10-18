@@ -6,6 +6,12 @@ mod lease;
 pub mod linked;
 pub mod login;
 mod store;
+#[cfg(not(feature = "testkit"))]
+pub(crate) mod takeover;
+#[cfg(feature = "testkit")]
+#[doc(hidden)]
+pub mod takeover;
+pub(crate) mod takeover_native;
 
 use chrono::{DateTime, Utc};
 pub use health::HealthSignal;
@@ -144,6 +150,10 @@ pub enum ImportMode {
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Source {
     Oauth,
+    Takeover {
+        from: PathBuf,
+        at: DateTime<Utc>,
+    },
     Cpa {
         mode: ImportMode,
         dir: PathBuf,

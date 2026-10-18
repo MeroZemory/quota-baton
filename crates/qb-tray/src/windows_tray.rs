@@ -94,6 +94,8 @@ static VIEW_STATE: OnceLock<Mutex<view_ownership::ViewOwnership>> = OnceLock::ne
 mod tray_worker;
 #[path = "view_ownership.rs"]
 mod view_ownership;
+#[path = "windows_takeover.rs"]
+mod windows_takeover;
 static WORKER: OnceLock<tray_worker::Worker> = OnceLock::new();
 static LOGIN_GENERATION: Mutex<u64> = Mutex::new(0);
 // The worker spawn gate must also check this while a shutdown is in flight.
@@ -489,10 +491,9 @@ fn view_state() -> &'static Mutex<view_ownership::ViewOwnership> {
 }
 
 fn set_view(value: Option<String>) -> usize {
-    view_state()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .set(value)
+    let mut view = view_state().lock().unwrap_or_else(|e| e.into_inner());
+    windows_takeover::invalidate();
+    view.set(value)
 }
 // Error publication and owner validation share the exact UI view mutex.
 fn action_done(hwnd: isize, owner: usize, error: Option<String>) {
@@ -531,6 +532,14 @@ fn overlay(state: Option<&str>) -> Overlay {
         Some("settings") => Overlay::Settings,
         Some("quit") => Overlay::Quit,
         Some("add-menu") => Overlay::Add,
+        Some("takeover-providers") => Overlay::TakeoverProviders,
+        Some(s) if s.starts_with("takeover-result:") => Overlay::TakeoverCard {
+            body: s[16..].into(),
+            confirming: false,
+            ready: false,
+            replace: false,
+        },
+        Some(s) if s.starts_with("takeover-") => windows_takeover::card(s),
         Some(s) if s.starts_with("confirm-credits:") => Overlay::CreditsConfirm(s[16..].into()),
         Some(s) if s.starts_with("confirm-delete:") => Overlay::DeleteConfirm(s[15..].into()),
         Some(s) if s.starts_with("login:") => {
@@ -614,11 +623,13 @@ fn repeated_activation(key: u32, flags: isize) -> bool {
     matches!(key, 0x0d | 0x20 | 0x79 | 0x5d) && (flags as usize & (1usize << 30)) != 0
 }
 fn modal_default_focus(scene: &geometry::Scene) -> Option<HitTarget> {
-    if scene
-        .targets
-        .iter()
-        .any(|h| h.enabled && matches!(h.target, HitTarget::ConfirmDelete(_)))
-    {
+    if scene.targets.iter().any(|h| {
+        h.enabled
+            && matches!(
+                h.target,
+                HitTarget::ConfirmDelete(_) | HitTarget::TakeoverNext | HitTarget::TakeoverCommit
+            )
+    }) {
         return scene
             .targets
             .iter()
@@ -1563,6 +1574,11 @@ fn activate_hit(hwnd: HWND, target: HitTarget) {
             MenuAction::OpenLogs => open_folder("logs"),
             MenuAction::AddClaude => launch_login(hwnd, "claude".into()),
             MenuAction::AddCodex => launch_login(hwnd, "codex".into()),
+            MenuAction::Takeover => {
+                set_view(Some("takeover-providers".into()));
+            }
+            MenuAction::TakeoverCodex => windows_takeover::select(hwnd, "codex"),
+            MenuAction::TakeoverClaude => windows_takeover::select(hwnd, "claude"),
             MenuAction::QuitTray => unsafe {
                 let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
             },
@@ -1573,6 +1589,8 @@ fn activate_hit(hwnd: HWND, target: HitTarget) {
                 }
             }
         },
+        HitTarget::TakeoverNext => windows_takeover::next(),
+        HitTarget::TakeoverCommit => windows_takeover::commit(hwnd),
         HitTarget::ConfirmCredits(id) => {
             let confirmed = session()
                 .lock()
@@ -1924,6 +1942,27 @@ fn keyboard(hwnd: HWND, key: u32) -> bool {
     let Some(frame) = painted_frame(hwnd) else {
         return false;
     };
+    if let Some(d) = frame
+        .scene
+        .dialog
+        .as_ref()
+        .filter(|d| d.takeover_body.is_some())
+        && matches!(key, 0x21..=0x24)
+    {
+        INPUT.with(|i| {
+            let mut i = i.borrow_mut();
+            let page = geometry::h(d.body).max(20.);
+            let max = (d.body_height - page).max(0.);
+            i.popup_offset = match key {
+                0x21 => (i.popup_offset - page).max(0.),
+                0x22 => (i.popup_offset + page).min(max),
+                0x23 => max,
+                _ => 0.,
+            };
+        });
+        redraw_now(hwnd);
+        return true;
+    }
     let current = INPUT.with(|i| i.borrow().focus.clone());
     if key == 0x1b {
         if matches!(overlay(frame.state.as_deref()), Overlay::None) {
@@ -2120,6 +2159,13 @@ fn element_name(frame: &PaintedFrame, target: &HitTarget) -> String {
                 )
             })
             .unwrap_or_default(),
+        HitTarget::TakeoverNext | HitTarget::TakeoverCommit => frame
+            .scene
+            .dialog
+            .as_ref()
+            .and_then(|d| d.buttons.iter().find(|b| &b.target == target))
+            .map(|b| b.label.clone())
+            .unwrap_or_default(),
         HitTarget::ConfirmCredits(_) => "크레딧 사용".into(),
         HitTarget::ConfirmDelete(_) => "계정 삭제".into(),
         HitTarget::CancelDialog | HitTarget::LoginCancel => "취소".into(),
@@ -2164,6 +2210,20 @@ fn publish_accessibility(hwnd: HWND, frame: &mut PaintedFrame) {
     }
     let scale = frame.dpi as f64 / 96.;
     let mut elements = Vec::new();
+    if let Some(d) = frame.scene.dialog.as_ref()
+        && let Some(body) = &d.takeover_body
+    {
+        elements.push(Element {
+            id: stable_id("takeover:body".into()),
+            name: body.clone(),
+            kind: Kind::Text,
+            bounds: physical(d.body, origin, scale),
+            enabled: true,
+            action: None,
+            focusable: false,
+            focused: false,
+        });
+    }
     for (index, (rect, summary)) in frame
         .scene
         .header
@@ -2454,6 +2514,12 @@ unsafe extern "system" fn window_proc(
                             (popup.content_height - (popup.clip.bottom - popup.clip.top)).max(0.),
                         );
                     });
+                } else if let Some(d) = frame.scene.dialog.filter(|d| d.takeover_body.is_some()) {
+                    INPUT.with(|i| {
+                        let mut i = i.borrow_mut();
+                        i.popup_offset = (i.popup_offset - delta / 120. * 48.)
+                            .clamp(0., (d.body_height - geometry::h(d.body)).max(0.));
+                    });
                 } else {
                     VIEWPORT.with(|slot| slot.borrow_mut().wheel_delta(delta, 72.));
                 }
@@ -2576,6 +2642,15 @@ unsafe extern "system" fn window_proc(
             #[cfg(all(debug_assertions, feature = "testkit"))]
             test_shell(hwnd, "visibility", None);
             if wparam.0 == 0 {
+                // Release the view guard before set_view takes it again.
+                let takeover_open = view_state()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_deref()
+                    .is_some_and(|s| s.starts_with("takeover-"));
+                if takeover_open {
+                    set_view(None);
+                }
                 disconnect_accessibility();
                 session().lock().unwrap_or_else(|e| e.into_inner()).hide();
                 INPUT.with(|i| {
@@ -2598,6 +2673,15 @@ unsafe extern "system" fn window_proc(
             // WM_SHOWWINDOW precedes the visibility change; publish after it.
             let _ = PostMessageW(Some(hwnd), STATE_CHANGED, WPARAM(0), LPARAM(0));
             LRESULT(0)
+        }
+        #[cfg(all(debug_assertions, feature = "testkit"))]
+        message if message == WM_APP + 8 && wparam.0 == 0 && lparam.0 == 0 => {
+            // Readiness only: no paths, config, credentials or I/O in this hook.
+            LRESULT(if windows_takeover::synthetic_picker_ready() {
+                0x5236
+            } else {
+                0
+            })
         }
         #[cfg(all(debug_assertions, feature = "testkit"))]
         message if message == WM_APP + 6 && wparam.0 <= 1 => {

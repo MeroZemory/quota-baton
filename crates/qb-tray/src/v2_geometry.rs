@@ -77,6 +77,13 @@ pub enum Overlay {
     Settings,
     Quit,
     Add,
+    TakeoverProviders,
+    TakeoverCard {
+        body: String,
+        confirming: bool,
+        ready: bool,
+        replace: bool,
+    },
     CreditsConfirm(String),
     DeleteConfirm(String),
     /// Replaces the list; provider identifies the caller-owned login flow.
@@ -129,6 +136,9 @@ pub enum MenuAction {
     OpenLogs,
     AddClaude,
     AddCodex,
+    Takeover,
+    TakeoverCodex,
+    TakeoverClaude,
     QuitTray,
     QuitAll,
 }
@@ -146,6 +156,8 @@ pub enum Target {
         id: Option<String>,
         action: MenuAction,
     },
+    TakeoverNext,
+    TakeoverCommit,
     ConfirmCredits(String),
     ConfirmDelete(String),
     CancelDialog,
@@ -268,6 +280,9 @@ pub struct PopupBox {
 }
 #[derive(Debug, Clone)]
 pub struct DialogBox {
+    pub takeover_body: Option<String>,
+    pub body_offset: f32,
+    pub body_height: f32,
     pub scrim: Rect,
     pub card: Rect,
     /// Desired card height before the work-area cap clips the body viewport.
@@ -443,6 +458,50 @@ impl Scene {
         };
         scene.build_base_targets();
         match &p.overlay {
+            Overlay::TakeoverCard {
+                body,
+                confirming,
+                ready,
+                replace,
+            } => {
+                let mut d = dialog_box(rect, "r6-takeover", false, &p);
+                d.takeover_body = Some(body.clone());
+                d.body_height = p.credits_body_lines as f32 * 20.;
+                d.body_offset = p
+                    .popup_offset
+                    .clamp(0., (d.body_height - h(d.body)).max(0.));
+                d.buttons[0].label = if *confirming {
+                    if *replace {
+                        "교체하고 가져오기"
+                    } else {
+                        "가져오기"
+                    }
+                } else {
+                    "경고 확인"
+                }
+                .into();
+                d.buttons[0].target = if *confirming {
+                    Target::TakeoverCommit
+                } else {
+                    Target::TakeoverNext
+                };
+                d.buttons[0].enabled = p.core_ok && *ready;
+                scene.targets = vec![HitBox {
+                    rect,
+                    target: Target::Blocked,
+                    enabled: true,
+                }];
+                for b in &d.buttons {
+                    push_target(
+                        &mut scene.targets,
+                        b.hit,
+                        d.clip,
+                        b.target.clone(),
+                        b.enabled,
+                    );
+                }
+                scene.dialog = Some(d);
+            }
             Overlay::None | Overlay::Login(_) => {}
             Overlay::CreditsConfirm(id) | Overlay::DeleteConfirm(id)
                 if find_row(view, id).is_some() =>
@@ -1079,10 +1138,26 @@ fn menu_parts(view: &v2::View, p: &Presentation) -> Option<(f32, Vec<Part>)> {
             ],
         ),
         Overlay::Add => (
-            216.,
+            300.,
             vec![
                 item("Claude 계정 로그인", MenuAction::AddClaude, p.core_ok),
                 item("Codex 계정 로그인", MenuAction::AddCodex, p.core_ok),
+                item("다른 앱에서 계정 가져오기", MenuAction::Takeover, p.core_ok),
+            ],
+        ),
+        Overlay::TakeoverProviders => (
+            300.,
+            vec![
+                item(
+                    "Codex 폴더에서 가져오기",
+                    MenuAction::TakeoverCodex,
+                    p.core_ok,
+                ),
+                item(
+                    "Claude 폴더에서 가져오기",
+                    MenuAction::TakeoverClaude,
+                    p.core_ok,
+                ),
             ],
         ),
         Overlay::Quit => (
@@ -1141,6 +1216,7 @@ fn parts_height(parts: &[Part], p: &Presentation) -> f32 {
 }
 fn overlay_min_height(view: &v2::View, p: &Presentation) -> f32 {
     match &p.overlay {
+        Overlay::TakeoverCard { .. } => 149. + p.credits_body_lines as f32 * 20.,
         Overlay::DeleteConfirm(id) if find_row(view, id).is_some() => 193. + 16.,
         Overlay::CreditsConfirm(id) if find_row(view, id).is_some() => {
             credits_dialog_height(p) + 16.
@@ -1173,7 +1249,7 @@ fn build_popup(view: &v2::View, scene: &Scene, p: &Presentation) -> Option<Popup
                 top.max(8.).min((scene.footer.rect.top - height).max(8.)),
             )
         }
-        Overlay::Settings | Overlay::Quit | Overlay::Add => {
+        Overlay::Settings | Overlay::Quit | Overlay::Add | Overlay::TakeoverProviders => {
             let kind = match p.overlay {
                 Overlay::Settings => FooterAction::Settings,
                 Overlay::Quit => FooterAction::Quit,
@@ -1276,7 +1352,10 @@ fn credits_dialog_height(p: &Presentation) -> f32 {
     20. + 20. + 8. + 20. * p.credits_body_lines.clamp(1, 12) as f32 + 20. + 1. + 64.
 }
 fn dialog_box(scene: Rect, id: &str, delete: bool, p: &Presentation) -> DialogBox {
-    let content_height = if delete {
+    let content_height = if matches!(p.overlay, Overlay::TakeoverCard { .. }) {
+        // Body starts at +48, ends 20 above the 65-DIP button bar.
+        133. + p.credits_body_lines as f32 * 20.
+    } else if delete {
         193.
     } else {
         credits_dialog_height(p)
@@ -1292,6 +1371,9 @@ fn dialog_box(scene: Rect, id: &str, delete: bool, p: &Presentation) -> DialogBo
         Target::ConfirmCredits(id.into())
     };
     DialogBox {
+        takeover_body: None,
+        body_offset: 0.,
+        body_height: 0.,
         scrim: scene,
         card,
         content_height,
@@ -1337,6 +1419,150 @@ fn r(left: f32, top: f32, right: f32, bottom: f32) -> Rect {
 }
 pub fn h(rect: Rect) -> f32 {
     (rect.bottom - rect.top).max(0.)
+}
+
+#[cfg(test)]
+mod r6_layout_tests {
+    use super::*;
+    #[test]
+    fn r6_body_fits_exactly_or_scrolls_to_its_last_line() {
+        for lines in [1, 12, 60] {
+            for cap in [240., 480., 800.] {
+                let scene = Scene::build(
+                    &view(),
+                    Presentation {
+                        overlay: Overlay::TakeoverCard {
+                            body: "synthetic".into(),
+                            confirming: true,
+                            ready: true,
+                            replace: false,
+                        },
+                        credits_body_lines: lines,
+                        popup_offset: 100_000.,
+                        ..Default::default()
+                    },
+                    cap,
+                );
+                let d = scene.dialog.unwrap();
+                assert_eq!(h(d.card), (133. + lines as f32 * 20.).min(cap - 16.));
+                assert!(h(d.body) <= d.body_height);
+                assert!((d.body_offset + h(d.body) - d.body_height).abs() < 0.1);
+                if 133. + lines as f32 * 20. <= cap - 16. {
+                    assert_eq!(d.body_offset, 0.);
+                    assert_eq!(h(d.body), d.body_height);
+                } else {
+                    assert!(d.body_offset > 0.);
+                }
+            }
+        }
+    }
+    fn view() -> v2::View {
+        v2::project("{\"accounts\":[]}", std::time::SystemTime::UNIX_EPOCH).unwrap()
+    }
+    #[test]
+    fn takeover_is_third_and_whole_item_clickable() {
+        let scene = Scene::build(
+            &view(),
+            Presentation {
+                overlay: Overlay::Add,
+                ..Default::default()
+            },
+            600.,
+        );
+        let popup = scene.popup.as_ref().unwrap();
+        assert_eq!(popup.items.len(), 3);
+        let item = &popup.items[2];
+        assert_eq!(item.text, "다른 앱에서 계정 가져오기");
+        for x in [item.rect.left + 1., item.rect.right - 1.] {
+            for y in [item.rect.top + 1., item.rect.bottom - 1.] {
+                assert_eq!(scene.hit_test(x, y), Some(&item.target));
+            }
+        }
+        let providers = Scene::build(
+            &view(),
+            Presentation {
+                overlay: Overlay::TakeoverProviders,
+                ..Default::default()
+            },
+            600.,
+        );
+        let popup = providers.popup.as_ref().unwrap();
+        assert_eq!(
+            popup
+                .items
+                .iter()
+                .map(|i| i.text.as_str())
+                .collect::<Vec<_>>(),
+            ["Codex 폴더에서 가져오기", "Claude 폴더에서 가져오기"]
+        );
+        for item in &popup.items {
+            for scale in [1., 1.5, 2.] {
+                for x in [item.rect.left + 1., item.rect.right - 1.] {
+                    for y in [item.rect.top + 1., item.rect.bottom - 1.] {
+                        // Native mouse coordinates are physical; geometry is DIP.
+                        let px = (x * scale).round();
+                        let py = (y * scale).round();
+                        assert_eq!(
+                            providers.hit_test(px / scale, py / scale),
+                            Some(&item.target)
+                        );
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn long_inspect_and_replace_confirmation_keep_buttons_contained_and_underlay_blocked() {
+        for cap in [240., 480., 800.] {
+            for confirming in [false, true] {
+                for ready in [false, true] {
+                    let scene = Scene::build(
+                        &view(),
+                        Presentation {
+                            overlay: Overlay::TakeoverCard {
+                                body: "합성 긴 경로\n".repeat(60),
+                                confirming,
+                                ready,
+                                replace: true,
+                            },
+                            credits_body_lines: 60,
+                            popup_offset: 100_000.,
+                            ..Default::default()
+                        },
+                        cap,
+                    );
+                    let d = scene.dialog.as_ref().unwrap();
+                    assert!(contains(scene.rect, d.card.left, d.card.top));
+                    assert!(d.card.bottom <= scene.rect.bottom);
+                    assert!(d.body.bottom <= d.button_bar.top);
+                    assert!(d.body_offset > 0.);
+                    assert!(d.body_offset + h(d.body) <= d.body_height + 0.1);
+                    assert_eq!(
+                        d.buttons[0].label,
+                        if confirming {
+                            "교체하고 가져오기"
+                        } else {
+                            "경고 확인"
+                        }
+                    );
+                    assert_eq!(d.buttons[0].enabled, ready);
+                    for b in &d.buttons {
+                        assert!(b.hit.left >= d.card.left && b.hit.right <= d.card.right);
+                        assert!(b.hit.top >= d.card.top && b.hit.bottom <= d.card.bottom);
+                        let hit = scene.hit_test(
+                            (b.hit.left + b.hit.right) / 2.,
+                            (b.hit.top + b.hit.bottom) / 2.,
+                        );
+                        assert_eq!(hit, if b.enabled { Some(&b.target) } else { None });
+                    }
+                    assert_eq!(
+                        scene.hit_test(1., scene.rect.bottom - 1.),
+                        Some(&Target::Blocked)
+                    );
+                }
+            }
+        }
+    }
 }
 pub fn contains(rect: Rect, x: f32, y: f32) -> bool {
     x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
@@ -1807,7 +2033,7 @@ mod tests {
         for (overlay, width, count, height) in [
             (Overlay::Settings, 240., 2, 32.),
             (Overlay::Quit, 300., 2, 52.),
-            (Overlay::Add, 216., 2, 32.),
+            (Overlay::Add, 300., 3, 32.),
         ] {
             let scene = Scene::build(
                 &v,
