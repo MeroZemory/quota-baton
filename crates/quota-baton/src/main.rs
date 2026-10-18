@@ -86,6 +86,11 @@ enum Command {
         claude_mode: Option<String>,
         #[arg(long, help = "실제 파일을 변경합니다; 생략하면 미리보기입니다")]
         apply: bool,
+        #[arg(
+            long,
+            help = "같은 전용 파일의 내용 변경을 허용하여 제목 설정을 업그레이드합니다"
+        )]
+        force: bool,
         #[arg(long, help = "현재 사용자 트레이 자동 시작을 연결합니다")]
         autostart: bool,
         #[arg(long, help = "CPA 예약 작업을 삭제하지 않고 비활성화합니다")]
@@ -144,6 +149,9 @@ fn friendly_error(error: &anyhow::Error) -> String {
     // Only exact fixed diagnostics may pass through; parser/transport chains
     // and appended file contents must stay behind the generic safe error.
     const WIRE_DIAGNOSTICS: &[&str] = &[
+        "전용 파일이 변경되었습니다. 같은 파일의 내용 변경만 --force로 허용할 수 있습니다",
+        "업그레이드 파일 identity/내용이 변경되었습니다. journal을 보존합니다",
+        "부분 해제 journal입니다. unwire를 먼저 완료하세요",
         "PATH에서 안전한 Claude 실행 파일을 찾지 못했습니다. Claude 설치를 확인하세요",
         "Claude 전용 설정 디렉터리 접근 권한을 제한하지 못했습니다",
         "npm 디렉터리가 없습니다. Claude 설치를 확인하세요",
@@ -532,6 +540,7 @@ async fn run() -> anyhow::Result<()> {
             codex_mode,
             claude_mode,
             apply,
+            force,
             autostart,
             disable_cpa_tasks,
             detach_chatgpt_session_homes,
@@ -540,6 +549,7 @@ async fn run() -> anyhow::Result<()> {
                 codex_mode: codex_mode.map(|mode| mode.parse()).transpose()?,
                 claude_mode: claude_mode.map(|mode| mode.parse()).transpose()?,
                 data_port: qb_core::config::Config::load(&home)?.server.data_port,
+                force,
                 autostart,
                 disable_cpa_tasks,
                 detach_chatgpt_session_homes,

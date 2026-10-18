@@ -49,6 +49,112 @@ fn is_cpa_realtime_endpoint(url: &str) -> bool {
             .is_some_and(|rest| is_cpa_endpoint(&format!("https://{rest}")))
 }
 
+/// R3.2 dedicated-only merge. Also usable on CURRENT journal-owned file bytes.
+/// Never regenerate upgrade inputs from the default home.
+pub(super) fn dedicated_codex_title_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
+    let text = std::str::from_utf8(strip_utf8_bom(bytes))
+        .map_err(|_| anyhow::anyhow!("전용 Codex config 인코딩이 올바르지 않습니다"))?;
+    let mut doc = text
+        .parse::<DocumentMut>()
+        .map_err(|_| anyhow::anyhow!("전용 Codex config 형식이 올바르지 않습니다"))?;
+    if !doc.contains_key("tui") {
+        doc["tui"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    let tui = doc
+        .get_mut("tui")
+        .and_then(toml_edit::Item::as_table_like_mut)
+        .context("전용 Codex config의 tui가 테이블이 아닙니다")?;
+    if tui
+        .get("terminal_title")
+        .and_then(toml_edit::Item::as_array)
+        .is_some_and(|array| array.is_empty())
+    {
+        return Ok(bytes.to_vec());
+    }
+    let mut title = toml_edit::value(toml_edit::Array::new());
+    if let Some(old) = tui
+        .get("terminal_title")
+        .and_then(toml_edit::Item::as_value)
+    {
+        *title.as_value_mut().expect("array value").decor_mut() = old.decor().clone();
+    }
+    tui.insert("terminal_title", title);
+    let mut result = Vec::new();
+    if bytes.starts_with(b"\xef\xbb\xbf") {
+        result.extend_from_slice(b"\xef\xbb\xbf");
+    }
+    result.extend_from_slice(doc.to_string().as_bytes());
+    Ok(result)
+}
+
+/// Patch only the owned root.env member; preserve all other bytes and ordering.
+pub(super) fn dedicated_claude_title_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
+    let invalid = || anyhow::anyhow!("전용 Claude settings 형식이 올바르지 않습니다");
+    let text = std::str::from_utf8(strip_utf8_bom(bytes)).map_err(|_| invalid())?;
+    let mut expected: Value = serde_json::from_str(text).map_err(|_| invalid())?;
+    let root = expected
+        .as_object_mut()
+        .context("전용 Claude settings가 객체가 아닙니다")?;
+    let env = root
+        .entry("env")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .context("전용 Claude settings의 env가 객체가 아닙니다")?;
+    if env
+        .get("CLAUDE_CODE_DISABLE_TERMINAL_TITLE")
+        .and_then(Value::as_str)
+        == Some("1")
+    {
+        return Ok(bytes.to_vec());
+    }
+    env.insert(
+        "CLAUDE_CODE_DISABLE_TERMINAL_TITLE".into(),
+        Value::String("1".into()),
+    );
+    let root_start = text
+        .bytes()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .ok_or_else(invalid)?;
+    let members = json_member_spans(&text[root_start..]).ok_or_else(invalid)?;
+    let mut patched = text.to_owned();
+    if let Some(member) = members.iter().find(|member| member.0 == "env") {
+        let start = root_start + member.2;
+        let object = &text[start..root_start + member.3];
+        let env_members = json_member_spans(object).ok_or_else(invalid)?;
+        if let Some(member) = env_members
+            .iter()
+            .find(|member| member.0 == "CLAUDE_CODE_DISABLE_TERMINAL_TITLE")
+        {
+            patched.replace_range(start + member.2..start + member.3, "\"1\"");
+        } else {
+            let insertion = format!(
+                "{}\"CLAUDE_CODE_DISABLE_TERMINAL_TITLE\":\"1\"",
+                if env_members.is_empty() { "" } else { "," }
+            );
+            let position = start + env_members.last().map_or(1, |member| member.3);
+            patched.insert_str(position, &insertion);
+        }
+    } else {
+        let insertion = format!(
+            "{}\"env\":{{\"CLAUDE_CODE_DISABLE_TERMINAL_TITLE\":\"1\"}}",
+            if members.is_empty() { "" } else { "," }
+        );
+        let position = root_start + members.last().map_or(1, |member| member.3);
+        patched.insert_str(position, &insertion);
+    }
+    // Check semantics as well as spans, without serializing any unrelated value.
+    let actual: Value = serde_json::from_str(&patched).map_err(|_| invalid())?;
+    if actual != expected {
+        return Err(invalid());
+    }
+    let mut result = Vec::new();
+    if bytes.starts_with(b"\xef\xbb\xbf") {
+        result.extend_from_slice(b"\xef\xbb\xbf");
+    }
+    result.extend_from_slice(patched.as_bytes());
+    Ok(result)
+}
+
 fn config_bytes(paths: &CutoverPaths, port: u16) -> Result<Vec<u8>> {
     let mut doc = parse_config(paths)?;
     doc.remove("model_catalog_json");
@@ -144,11 +250,31 @@ fn config_bytes(paths: &CutoverPaths, port: u16) -> Result<Vec<u8>> {
     {
         bail!("dedicated config의 최상위 endpoint가 올바르지 않습니다");
     }
-    Ok(text.into_bytes())
+    dedicated_codex_title_bytes(text.as_bytes())
 }
 
 fn launcher() -> Vec<u8> {
-    b"@echo off\r\nsetlocal\r\nrem quota-baton dedicated Codex home\r\nset \"CODEX_HOME=%USERPROFILE%\\.codex-acct\\qb\"\r\ncall \"%APPDATA%\\npm\\codex.cmd\" %*\r\n".to_vec()
+    // CALL reparses percent/carets. Protect only the child command's outer
+    // quotes from this parser, retaining the forwarded argument quotes.
+    concat!(
+        "@echo off\r\n",
+        "setlocal DisableDelayedExpansion\r\n",
+        "rem quota-baton dedicated Codex home\r\n",
+        "set \"ERRORLEVEL=\"\r\n",
+        "for /f \"tokens=2 delims=:\" %%P in ('chcp') do set \"QB_CODEPAGE=%%P\"\r\n",
+        "chcp 65001 >nul\r\n",
+        "for %%I in (.) do set \"QB_LAUNCHER_FOLDER=%%~nxI\"\r\n",
+        "setlocal EnableDelayedExpansion\r\n",
+        "title codex-qb · !QB_LAUNCHER_FOLDER!\r\n",
+        "endlocal\r\n",
+        "set \"CODEX_HOME=%USERPROFILE%\\.codex-acct\\qb\"\r\n",
+        "\"%SystemRoot%\\System32\\cmd.exe\" /d /v:off /s /c ^\"\"%APPDATA%\\npm\\codex.cmd\" %*^\"\r\n",
+        "set \"QB_EXIT=%errorlevel%\"\r\n",
+        "chcp %QB_CODEPAGE% >nul\r\n",
+        "endlocal & exit /b %QB_EXIT%\r\n",
+    )
+    .as_bytes()
+    .to_vec()
 }
 
 // Collect credentials by key, then redact their known values everywhere they recur.
@@ -304,6 +430,16 @@ struct Entry {
     removed: bool,
     #[serde(default)]
     original: Option<ExistingFile>,
+    /// Independent from the original unwire backup; absent in R3 journals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    upgrade: Option<Upgrade>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Upgrade {
+    old_hash: String,
+    old_identity: Identity,
+    hash: String,
+    payload: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ExistingFile {
@@ -331,7 +467,26 @@ fn claude_launcher(command: &Path) -> Result<Vec<u8>> {
     if !safe_command_path(command) {
         bail!("PATH에서 안전한 Claude 실행 파일을 찾지 못했습니다. Claude 설치를 확인하세요");
     }
-    Ok(format!("@echo off\r\nsetlocal DisableDelayedExpansion\r\nrem quota-baton Claude launcher\r\ncall \"{}\" --settings \"%USERPROFILE%\\.claude-qb\\settings.json\" %*\r\n", command.display()).into_bytes())
+    Ok(format!(
+        concat!(
+            "@echo off\r\n",
+            "setlocal DisableDelayedExpansion\r\n",
+            "rem quota-baton Claude launcher\r\n",
+            "set \"ERRORLEVEL=\"\r\n",
+            "for /f \"tokens=2 delims=:\" %%P in ('chcp') do set \"QB_CODEPAGE=%%P\"\r\n",
+            "chcp 65001 >nul\r\n",
+            "for %%I in (.) do set \"QB_LAUNCHER_FOLDER=%%~nxI\"\r\n",
+            "setlocal EnableDelayedExpansion\r\n",
+            "title claude-qb · !QB_LAUNCHER_FOLDER!\r\n",
+            "endlocal\r\n",
+            "\"%SystemRoot%\\System32\\cmd.exe\" /d /v:off /s /c ^\"\"{}\" --settings \"%USERPROFILE%\\.claude-qb\\settings.json\" %*^\"\r\n",
+            "set \"QB_EXIT=%errorlevel%\"\r\n",
+            "chcp %QB_CODEPAGE% >nul\r\n",
+            "endlocal & exit /b %QB_EXIT%\r\n",
+        ),
+        command.display()
+    )
+    .into_bytes())
 }
 fn check_command(record: &CommandRecord) -> Result<()> {
     if !safe_command_path(&record.path)
@@ -367,6 +522,9 @@ struct Manifest {
     tasks: Vec<TaskJournal>,
     optional_restored: bool,
     retained: bool,
+    /// None is legacy R3; false is an incomplete new install.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    install_completed: Option<bool>,
     entries: Vec<Entry>,
 }
 
@@ -528,6 +686,7 @@ fn new_entry(
         done: false,
         removed: false,
         original: None,
+        upgrade: None,
     })
 }
 fn add_dirs(entries: &mut Vec<Entry>, path: &Path, apply: bool) -> Result<()> {
@@ -658,6 +817,18 @@ fn validate_manifest(paths: &CutoverPaths, m: &Manifest) -> Result<()> {
             };
         if e.kind != expected_kind {
             bail!("journal 경로의 파일 종류가 올바르지 않습니다");
+        }
+        if let Some(u) = &e.upgrade {
+            if !upgrade_path(m, &e.path)?
+                || e.kind != Kind::File
+                || !e.done
+                || e.removed
+                || e.original.is_some()
+                || e.identity.as_ref() != Some(&u.old_identity)
+                || u.hash != hash_bytes(&unprotect(&u.payload)?)
+            {
+                bail!("업그레이드 journal 범위/내용이 올바르지 않습니다");
+            }
         }
         ancestors_safe(&e.path)?;
         if e.kind == Kind::Junction || e.kind == Kind::Hardlink {
@@ -1260,10 +1431,16 @@ fn install(paths: &CutoverPaths, m: &mut Manifest) -> Result<()> {
             bail!("Claude 설정이 변경되어 적용을 중단했습니다");
         }
     }
-    if let Some(action) = &m.autostart {
-        set_autostart(action)?;
+    // A completed journal can still need file-boundary recovery. Its optional
+    // actions already finished; recovering files must not apply them again.
+    if m.install_completed != Some(true) {
+        if let Some(action) = &m.autostart {
+            set_autostart(action)?;
+        }
+        disable_cpa_tasks(&m.tasks)?;
     }
-    disable_cpa_tasks(&m.tasks)?;
+    m.install_completed = Some(true);
+    atomic_json(&paths.journal(), m)?;
     Ok(())
 }
 
@@ -1282,6 +1459,259 @@ fn scratch_warnings(m: &Manifest) -> Vec<String> {
 
 fn strip_utf8_bom(bytes: &[u8]) -> &[u8] {
     bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes)
+}
+
+// R3.2: only the four dedicated title surfaces; never auth/default homes.
+fn upgrade_path(m: &Manifest, path: &Path) -> Result<bool> {
+    let ch = m
+        .home
+        .parent()
+        .and_then(Path::parent)
+        .context("사용자 홈 경로가 없습니다")?
+        .join(".claude-qb");
+    Ok((m.mode == CodexMode::Dedicated
+        && (path == m.home.join("config.toml") || path == m.npm.join("codex-qb.cmd")))
+        || (m.claude_mode == ClaudeMode::Dedicated
+            && (path == ch.join("settings.json") || path == m.npm.join("claude-qb.cmd"))))
+}
+
+fn completed_install(m: &Manifest) -> Result<bool> {
+    // The terminal marker cannot override an unfinished object boundary,
+    // including default Claude still at the exact journaled pre-install hash.
+    if m.entries.iter().any(|e| !e.done || e.removed)
+        || (m.claude_mode == ClaudeMode::Default
+            && m.claude_before != m.claude_after
+            && hash_file(&m.claude)? == m.claude_before)
+    {
+        return Ok(false);
+    }
+    if let Some(completed) = m.install_completed {
+        return Ok(completed);
+    }
+    // Legacy R3 has no terminal marker. Incomplete file installs still resume.
+    // All-done legacy journals must not replay optional actions, even if a crash
+    // occurred just before those actions; R3 cannot distinguish that last window.
+    Ok(m.entries.iter().all(|e| e.done && !e.removed)
+        && (m.claude_mode != ClaudeMode::Default
+            || hash_file(&m.claude)? != m.claude_before
+            || m.claude_before == m.claude_after))
+}
+
+/// true = the exact staged new object is already at the destination.
+fn upgrade_state(e: &Entry) -> Result<bool> {
+    ancestors_safe(&e.path)?;
+    let u = e.upgrade.as_ref().context("업그레이드 intent가 없습니다")?;
+    let mut probe = e.clone();
+    probe.identity = e.pending_identity.clone();
+    probe.pending_identity = None;
+    probe.hash = u.hash.clone();
+    if matches_entry(&probe, false)? {
+        return Ok(true);
+    }
+    probe.identity = Some(u.old_identity.clone());
+    probe.hash = u.old_hash.clone();
+    if matches_entry(&probe, false)? {
+        return Ok(false);
+    }
+    bail!("업그레이드 파일 identity/내용이 변경되었습니다. journal을 보존합니다");
+}
+
+fn upgrade_directories(m: &Manifest) -> Result<()> {
+    for e in &m.entries {
+        if upgrade_path(m, &e.path)? {
+            for parent in &m.entries {
+                if parent.kind == Kind::Directory
+                    && e.path.starts_with(&parent.path)
+                    && !matches_entry(parent, false)?
+                {
+                    bail!("업그레이드 홈 identity가 다릅니다");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resume_upgrade(paths: &CutoverPaths, m: &mut Manifest, i: usize) -> Result<()> {
+    validate_manifest(paths, m)?;
+    upgrade_directories(m)?;
+    if !upgrade_state(&m.entries[i])? {
+        #[cfg(test)]
+        interrupt(&m.entries[i].path, "upgrade-before-scratch")?;
+        prepare_scratch(paths, m, i)?;
+        #[cfg(test)]
+        interrupt(&m.entries[i].path, "upgrade-after-identity")?;
+        let e = &m.entries[i];
+        if !pending_matches(e, true)? {
+            bail!("업그레이드 임시 파일 identity가 다릅니다");
+        }
+        let u = e.upgrade.as_ref().unwrap();
+        let bytes = unprotect(&u.payload)?;
+        if hash_bytes(&bytes) != u.hash {
+            bail!("업그레이드 journal payload hash가 다릅니다");
+        }
+        let mut file = OpenOptions::new()
+            .write(true)
+            .access_mode(0x40000000 | 0x00010000)
+            .custom_flags(0x00200000)
+            .open(pending_path(e))?;
+        // Bind writes and rename to the journaled scratch handle, not just path.
+        let mut info = FileInfo::default();
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let held = Identity {
+            volume: info.volume,
+            index: (u64::from(info.index_high) << 32) | u64::from(info.index_low),
+        };
+        if e.pending_identity.as_ref() != Some(&held) || info.attributes & 0x410 != 0 {
+            bail!("업그레이드 임시 파일 identity가 다릅니다");
+        }
+        file.set_len(0)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        #[cfg(test)]
+        interrupt(&e.path, "upgrade-after-write")?;
+        let mut staged = e.clone();
+        staged.hash = u.hash.clone();
+        if !pending_matches(&staged, false)? || upgrade_state(e)? {
+            bail!("업그레이드 교체 대상이 변경되었습니다");
+        }
+        replace_owned_scratch(&file, &e.path)?;
+        #[cfg(test)]
+        interrupt(&e.path, "upgrade-after-replace")?;
+    }
+    if !upgrade_state(&m.entries[i])? {
+        bail!("업그레이드 교체가 완료되지 않았습니다");
+    }
+    #[cfg(test)]
+    interrupt(&m.entries[i].path, "upgrade-before-final-journal")?;
+    let e = &mut m.entries[i];
+    let u = e.upgrade.take().unwrap();
+    e.hash = u.hash;
+    e.payload = Some(u.payload);
+    e.identity = e.pending_identity.take();
+    e.pending = None;
+    // e.original is deliberately untouched: it is the unwire backup anchor.
+    atomic_json(&paths.journal(), m)?;
+    Ok(())
+}
+
+fn upgrade_completed(
+    paths: &CutoverPaths,
+    m: &mut Manifest,
+    apply: bool,
+    force: bool,
+) -> Result<Report> {
+    upgrade_directories(m)?;
+    // Title upgrades do not reinstall the other objects, but still enforce
+    // their existing ownership/content boundaries before any upgrade write.
+    for e in &m.entries {
+        if !upgrade_path(m, &e.path)? && !matches_entry(e, false)? {
+            bail!("생성 경로 충돌 또는 변경: {}", e.path.display());
+        }
+    }
+    if m.claude_mode == ClaudeMode::Default && hash_file(&m.claude)? != m.claude_after {
+        bail!("Claude 설정이 변경되어 적용을 중단했습니다");
+    }
+    let mut report = Report {
+        summary: vec!["요약: 별도 홈 제목 설정 업그레이드를 확인합니다".into()],
+        ..Report::default()
+    };
+    let mut plans = Vec::new();
+    let mut secrets = Vec::new();
+    // Preflight all candidates before mutation. No default source/key reads.
+    for e in &m.entries {
+        if !upgrade_path(m, &e.path)? {
+            continue;
+        }
+        if e.upgrade.is_some() {
+            upgrade_state(e)?;
+        } else {
+            ancestors_safe(&e.path)?;
+            if !matches_entry(e, force)? {
+                bail!(
+                    "전용 파일이 변경되었습니다. 같은 파일의 내용 변경만 --force로 허용할 수 있습니다"
+                );
+            }
+        }
+        let before = fs::read(&e.path)?;
+        let after = if let Some(u) = &e.upgrade {
+            unprotect(&u.payload)?
+        } else if e.path == m.home.join("config.toml") {
+            dedicated_codex_title_bytes(&before)?
+        } else if e.path.file_name().is_some_and(|n| n == "settings.json") {
+            dedicated_claude_title_bytes(&before)?
+        } else if e.path == m.npm.join("codex-qb.cmd") {
+            launcher()
+        } else {
+            claude_launcher(
+                &m.command
+                    .as_ref()
+                    .context("Claude 실행 파일 journal이 없습니다")?
+                    .path,
+            )?
+        };
+        for bytes in [&before, &after] {
+            if let Ok(doc) = std::str::from_utf8(strip_utf8_bom(bytes))
+                .unwrap_or("")
+                .parse::<DocumentMut>()
+            {
+                toml_strings(doc.as_item(), &mut secrets);
+            }
+            if let Ok(json) = serde_json::from_slice::<Value>(strip_utf8_bom(bytes)) {
+                json_strings(&json, &mut secrets);
+            }
+        }
+        plans.push((e.path.clone(), before, after));
+    }
+    // Known journal credentials are redacted wherever values recur in the diff.
+    for e in &m.entries {
+        if let Some(payload) = &e.payload {
+            let bytes = unprotect(payload)?;
+            if let Ok(json) = serde_json::from_slice::<Value>(strip_utf8_bom(&bytes)) {
+                json_strings(&json, &mut secrets);
+            }
+        }
+    }
+    for (path, before, after) in plans {
+        let i = m.entries.iter().position(|e| e.path == path).unwrap();
+        if before != after || m.entries[i].upgrade.is_some() {
+            report.changed.push(path.display().to_string());
+            report
+                .diff
+                .extend(safe_diff(&path, &before, &after, &secrets));
+            if !apply {
+                continue;
+            }
+            if m.entries[i].upgrade.is_none() {
+                let e = &mut m.entries[i];
+                if !matches_entry(e, force)? || hash_file(&e.path)? != hash_bytes(&before) {
+                    bail!("업그레이드 교체 대상이 변경되었습니다");
+                }
+                if let Some(tmp) = &e.pending {
+                    if exists(tmp)? {
+                        bail!("기존 임시 파일을 먼저 확인하세요");
+                    }
+                }
+                e.upgrade = Some(Upgrade {
+                    old_hash: hash_bytes(&before),
+                    old_identity: e
+                        .identity
+                        .clone()
+                        .context("업그레이드 identity가 없습니다")?,
+                    hash: hash_bytes(&after),
+                    payload: protect(&after)?,
+                });
+                e.pending = None;
+                e.pending_identity = None;
+                atomic_json(&paths.journal(), m)?;
+            }
+            resume_upgrade(paths, m, i)?;
+        }
+    }
+    report.warnings.extend(scratch_warnings(m));
+    Ok(report)
 }
 
 /// Check the saved plan before any resume write; retained homes build a fresh plan.
@@ -1347,6 +1777,19 @@ fn validate_resume_inputs(paths: &CutoverPaths, options: &WireOptions, m: &Manif
             return Err(mismatch());
         }
     }
+    // Validate every protected file payload even if no file needs rewriting.
+    // Keep semantic key/port diagnostics above, without exposing payload text.
+    for e in m.entries.iter().filter(|e| e.kind == Kind::File) {
+        let bytes = unprotect(e.payload.as_deref().ok_or_else(invalid)?).map_err(|_| invalid())?;
+        if hash_bytes(&bytes) != e.hash {
+            return Err(invalid());
+        }
+    }
+    if m.claude_mode == ClaudeMode::Default
+        && hash_bytes(&unprotect(&m.claude_payload).map_err(|_| invalid())?) != m.claude_after
+    {
+        return Err(invalid());
+    }
     Ok(())
 }
 
@@ -1383,6 +1826,20 @@ pub(super) fn wire(
             check_command(command)?;
         }
         if !old.retained {
+            if old
+                .entries
+                .iter()
+                .any(|e| e.removed || e.original.as_ref().is_some_and(|o| o.restoring))
+                || old.optional_restored
+            {
+                bail!("부분 해제 journal입니다. unwire를 먼저 완료하세요");
+            }
+            if completed_install(&old)? {
+                if apply {
+                    validate_resume_inputs(paths, &options, &old)?;
+                }
+                return upgrade_completed(paths, &mut old, apply, options.force);
+            }
             let mut report = Report {
                 summary: vec!["요약: 기존 journal에서 연결을 재개합니다".into()],
                 ..Report::default()
@@ -1484,9 +1941,11 @@ pub(super) fn wire(
         {
             bail!("전용 Claude 홈이 이미 존재합니다. 덮어쓰지 않습니다");
         }
-        let settings = serde_json::to_vec(&serde_json::json!({"env": {
-            "ANTHROPIC_BASE_URL": claude_base_url(options.data_port), "ANTHROPIC_AUTH_TOKEN": key
-        }}))?;
+        let settings = dedicated_claude_title_bytes(&serde_json::to_vec(
+            &serde_json::json!({"env": {
+                "ANTHROPIC_BASE_URL": claude_base_url(options.data_port), "ANTHROPIC_AUTH_TOKEN": key
+            }}),
+        )?)?;
         add_dirs(&mut entries, &home, apply)?;
         entries.push(new_entry(
             home.join("settings.json"),
@@ -1757,6 +2216,7 @@ pub(super) fn wire(
         },
         optional_restored: false,
         retained: false,
+        install_completed: Some(false),
         entries,
     };
     validate_manifest(paths, &manifest)?;
@@ -1912,6 +2372,16 @@ pub(super) fn unwire(paths: &CutoverPaths, apply: bool, force: bool) -> Result<R
     }
     if !apply {
         return Ok(report);
+    }
+    // Resolve only durable upgrade intents before deleting anything.
+    // Force cannot bless substituted or edited in-flight old/new objects.
+    for e in m.entries.iter().filter(|e| e.upgrade.is_some()) {
+        upgrade_state(e)?;
+    }
+    for i in 0..m.entries.len() {
+        if m.entries[i].upgrade.is_some() {
+            resume_upgrade(paths, &mut m, i)?;
+        }
     }
     let mut refused = Vec::new();
     for i in (0..m.entries.len()).rev() {
@@ -2097,6 +2567,227 @@ pub(super) fn unwire(paths: &CutoverPaths, apply: bool, force: bool) -> Result<R
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Synthetic preparation only: these tests have NOT been executed.
+    #[test]
+    fn r32_codex_title_merge_preserves_unknown_keys_comments_and_inline_tables() {
+        for input in [
+            "# current dedicated config\nmodel = 'keep'\n",
+            "# current dedicated config\nmodel = 'keep'\n[tui]\n# keep this comment\nnotifications = false\nterminal_title = ['model'] # title comment\n",
+            "# current dedicated config\nmodel = 'keep'\ntui = { notifications = false, terminal_title = ['model'] }\n",
+        ] {
+            let result = dedicated_codex_title_bytes(input.as_bytes()).unwrap();
+            let text = std::str::from_utf8(&result).unwrap();
+            let doc: DocumentMut = text.parse().unwrap();
+            assert_eq!(doc["model"].as_str(), Some("keep"));
+            assert!(doc["tui"]["terminal_title"].as_array().unwrap().is_empty());
+            assert!(text.contains("# current dedicated config"));
+            if input.contains("notifications") {
+                assert_eq!(doc["tui"]["notifications"].as_bool(), Some(false));
+            }
+            for comment in ["# keep this comment", "# title comment"] {
+                if input.contains(comment) {
+                    assert!(text.contains(comment));
+                }
+            }
+            assert_eq!(dedicated_codex_title_bytes(&result).unwrap(), result);
+        }
+        let already = b"\xef\xbb\xbf[tui]\r\nterminal_title = [ ] # untouched\r\n";
+        assert_eq!(dedicated_codex_title_bytes(already).unwrap(), already);
+        let bom = b"\xef\xbb\xbf[tui]\nnotifications = false\n";
+        assert!(
+            dedicated_codex_title_bytes(bom)
+                .unwrap()
+                .starts_with(b"\xef\xbb\xbf")
+        );
+        for invalid in [
+            "tui = false",
+            "tui = []",
+            "not TOML = [",
+            "tui = 'private-do-not-print'",
+        ] {
+            let error = dedicated_codex_title_bytes(invalid.as_bytes()).unwrap_err();
+            assert!(!error.to_string().contains("private-do-not-print"));
+        }
+        assert!(dedicated_codex_title_bytes(&[0xff]).is_err());
+    }
+
+    #[test]
+    fn r32_claude_title_merge_preserves_current_env_and_unknown_root_values() {
+        for input in [
+            r#"{}"#,
+            r#"{"env":{"KEEP":"unchanged","ANTHROPIC_AUTH_TOKEN":"synthetic-current-key","ANTHROPIC_CUSTOM_HEADERS":"x-existing: keep","CLAUDE_CODE_DISABLE_TERMINAL_TITLE":"0"},"permissions":{"allow":["synthetic"]},"unknown":[1,true]}"#,
+        ] {
+            let before: Value = serde_json::from_str(input).unwrap();
+            let result = dedicated_claude_title_bytes(input.as_bytes()).unwrap();
+            let after: Value = serde_json::from_slice(&result).unwrap();
+            assert_eq!(after["env"]["CLAUDE_CODE_DISABLE_TERMINAL_TITLE"], "1");
+            for (key, value) in before.as_object().unwrap() {
+                if key == "env" {
+                    for (key, value) in value.as_object().unwrap() {
+                        if key != "CLAUDE_CODE_DISABLE_TERMINAL_TITLE" {
+                            assert_eq!(&after["env"][key], value);
+                        }
+                    }
+                } else {
+                    assert_eq!(&after[key], value);
+                }
+            }
+            assert_eq!(dedicated_claude_title_bytes(&result).unwrap(), result);
+        }
+        let already =
+            b"\xef\xbb\xbf{\r\n \"env\": {\"CLAUDE_CODE_DISABLE_TERMINAL_TITLE\":\"1\"}\r\n}\r\n";
+        assert_eq!(dedicated_claude_title_bytes(already).unwrap(), already);
+        let result = dedicated_claude_title_bytes(b"\xef\xbb\xbf{}").unwrap();
+        assert!(result.starts_with(b"\xef\xbb\xbf"));
+        for invalid in [
+            "[]",
+            "null",
+            r#"{"env":null}"#,
+            r#"{"env":[]}"#,
+            "private-do-not-print",
+        ] {
+            let error = dedicated_claude_title_bytes(invalid.as_bytes()).unwrap_err();
+            assert!(!error.to_string().contains("private-do-not-print"));
+        }
+    }
+
+    #[test]
+    fn r32_claude_title_merge_preserves_noncanonical_bytes_and_is_idempotent() {
+        let noncanonical = concat!(
+            "\u{feff} \r\n{\r\n",
+            "  \"nested-first\" : {\"env\":{\"CLAUDE_CODE_DISABLE_TERMINAL_TITLE\":\"nested-old\"}},\r\n",
+            "\t\"env\" : { \"Z_LAST\" : [ 1,  2 ], \"CLAUDE_CODE_DISABLE_TERMINAL_TITLE\" : \"0\" , \"A_FIRST\" : \"한글\" },\r\n",
+            "  \"tail\" : { \"spacing\" : true }\r\n}\r\n"
+        );
+        let replaced = noncanonical.replace(
+            "\"CLAUDE_CODE_DISABLE_TERMINAL_TITLE\" : \"0\"",
+            "\"CLAUDE_CODE_DISABLE_TERMINAL_TITLE\" : \"1\"",
+        );
+        let existing_env = "\u{feff}{\r\n \"z\":0,\r\n \"env\" : {\r\n  \"Z\" : 1, \"A\" : [ 2,  3 ] \r\n },\r\n \"a\":true\r\n}\r\n";
+        let inserted = existing_env.replace(
+            "[ 2,  3 ]",
+            "[ 2,  3 ],\"CLAUDE_CODE_DISABLE_TERMINAL_TITLE\":\"1\"",
+        );
+        for (input, expected) in [
+            (noncanonical, replaced.as_str()),
+            (existing_env, inserted.as_str()),
+            (
+                " \r\n{ \"z\" : [ 1, 2 ], \"a\" : false \r\n}\r\n",
+                " \r\n{ \"z\" : [ 1, 2 ], \"a\" : false,\"env\":{\"CLAUDE_CODE_DISABLE_TERMINAL_TITLE\":\"1\"} \r\n}\r\n",
+            ),
+            (
+                "\u{feff}{ \"env\" : { \r\n\t } , \"last\":true }\r\n",
+                "\u{feff}{ \"env\" : {\"CLAUDE_CODE_DISABLE_TERMINAL_TITLE\":\"1\" \r\n\t } , \"last\":true }\r\n",
+            ),
+            (
+                "\u{feff}{ \r\n\t }\r\n",
+                "\u{feff}{\"env\":{\"CLAUDE_CODE_DISABLE_TERMINAL_TITLE\":\"1\"} \r\n\t }\r\n",
+            ),
+            (
+                r#"{ "before": {"CLAUDE_CODE_DISABLE_TERMINAL_TITLE":"nested"}, "env" : { "CLAUDE_CODE_DISABLE_TERMINAL_TITLE" : [ false, { "keep":true } ] , "tail" : 1 } }"#,
+                r#"{ "before": {"CLAUDE_CODE_DISABLE_TERMINAL_TITLE":"nested"}, "env" : { "CLAUDE_CODE_DISABLE_TERMINAL_TITLE" : "1" , "tail" : 1 } }"#,
+            ),
+            (
+                r#"{ "\u0065nv" : { "\u0043LAUDE_CODE_DISABLE_TERMINAL_TITLE" : false }, "last":null }"#,
+                r#"{ "\u0065nv" : { "\u0043LAUDE_CODE_DISABLE_TERMINAL_TITLE" : "1" }, "last":null }"#,
+            ),
+        ] {
+            let result = dedicated_claude_title_bytes(input.as_bytes()).unwrap();
+            assert_eq!(
+                result,
+                expected.as_bytes(),
+                "unrelated settings bytes changed"
+            );
+            assert_eq!(dedicated_claude_title_bytes(&result).unwrap(), result);
+        }
+    }
+
+    #[test]
+    fn r32_launcher_bytes_scope_delayed_expansion_and_capture_exit_before_restore() {
+        let codex = String::from_utf8(launcher()).unwrap();
+        let claude =
+            String::from_utf8(claude_launcher(Path::new(r"C:\synthetic bin\claude.cmd")).unwrap())
+                .unwrap();
+        for (script, client) in [(&codex, "codex"), (&claude, "claude")] {
+            assert!(script.starts_with("@echo off\r\nsetlocal DisableDelayedExpansion\r\n"));
+            assert!(script.contains("for /f \"tokens=2 delims=:\" %%P in ('chcp')"));
+            assert!(script.contains("for %%I in (.) do set \"QB_LAUNCHER_FOLDER=%%~nxI\"\r\n"));
+            assert!(script.contains(&format!(
+                "setlocal EnableDelayedExpansion\r\ntitle {client}-qb · !QB_LAUNCHER_FOLDER!\r\nendlocal\r\n"
+            )));
+            let dispatch = script
+                .find("\"%SystemRoot%\\System32\\cmd.exe\" /d /v:off /s /c ^\"\"")
+                .unwrap();
+            assert!(script.find("chcp 65001 >nul").unwrap() < script.find("title ").unwrap());
+            assert!(script.find("endlocal\r\n").unwrap() < dispatch);
+            assert!(script[dispatch..].contains(" %*^\"\r\nset \"QB_EXIT=%errorlevel%\"\r\nchcp %QB_CODEPAGE% >nul\r\nendlocal & exit /b %QB_EXIT%\r\n"));
+            assert!(
+                script
+                    .as_bytes()
+                    .windows(2)
+                    .all(|pair| pair[1] != b'\n' || pair[0] == b'\r')
+            );
+        }
+        assert!(codex.contains("set \"CODEX_HOME=%USERPROFILE%\\.codex-acct\\qb\"\r\n"));
+        assert!(claude.contains("--settings \"%USERPROFILE%\\.claude-qb\\settings.json\" %*"));
+        // Opt-in coordinator fixture: exercise the actual generated payloads in
+        // separate hidden consoles, without adding a product capture command.
+        if let Some(out) = std::env::var_os("QB_R32_NATIVE_OUT") {
+            let out = PathBuf::from(out);
+            let project = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap();
+            let canonical = out.canonicalize().unwrap();
+            assert!(canonical.starts_with(project.canonicalize().unwrap()));
+            assert!(canonical.components().any(|c| c.as_os_str() == ".sandbox"));
+            fs::write(out.join("codex-qb.cmd"), launcher()).unwrap();
+            fs::write(
+                out.join("claude-qb.cmd"),
+                claude_launcher(&out.join("fake-claude.cmd")).unwrap(),
+            )
+            .unwrap();
+            fs::write(
+                out.join("claude-qb-exe.cmd"),
+                claude_launcher(&project.join("target").join("debug").join("r32-capture.exe"))
+                    .unwrap(),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn r32_default_modes_do_not_add_dedicated_title_settings() {
+        let (_dir, p) = fixture();
+        fs::write(
+            &p.codex_auth,
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":"synthetic-old"}"#,
+        )
+        .unwrap();
+        let before = snapshot(&p);
+        let report = claude_run(&p, false, CodexMode::Default, Some(ClaudeMode::Default)).unwrap();
+        let text = output(&report);
+        assert!(!text.contains("terminal_title"));
+        assert!(!text.contains("CLAUDE_CODE_DISABLE_TERMINAL_TITLE"));
+        assert_eq!(snapshot(&p), before);
+    }
+
+    #[test]
+    fn r32_dedicated_config_and_fresh_plan_do_not_mutate_default_inputs() {
+        let (_dir, p) = fixture();
+        let before = snapshot(&p);
+        let config = config_bytes(&p, 10200).unwrap();
+        let doc: DocumentMut = std::str::from_utf8(&config).unwrap().parse().unwrap();
+        assert!(doc["tui"]["terminal_title"].as_array().unwrap().is_empty());
+        let report =
+            claude_run(&p, false, CodexMode::Dedicated, Some(ClaudeMode::Dedicated)).unwrap();
+        assert!(output(&report).contains("CLAUDE_CODE_DISABLE_TERMINAL_TITLE"));
+        assert_eq!(snapshot(&p), before);
+        assert!(!p.codex_qb_home.exists());
+        assert!(!claude_home(&p).unwrap().exists());
+    }
+
     const KEY: &str = "synthetic-client-KEY-9281";
     const SECRET: &str = "synthetic-nested-SECRET-7126";
     fn fixture() -> (tempfile::TempDir, CutoverPaths) {
@@ -2329,9 +3020,10 @@ trusted_hash = "synthetic-hook-hash"
             Some("synthetic-hook-hash")
         );
         let launcher = String::from_utf8(launcher()).unwrap();
-        assert!(launcher.starts_with("@echo off\r\nsetlocal\r\nrem "));
+        assert!(launcher.starts_with("@echo off\r\nsetlocal DisableDelayedExpansion\r\nrem "));
         assert!(launcher.contains("set \"CODEX_HOME=%USERPROFILE%\\.codex-acct\\qb\"\r\n"));
-        assert!(launcher.ends_with("call \"%APPDATA%\\npm\\codex.cmd\" %*\r\n"));
+        assert!(launcher.contains("/s /c ^\"\"%APPDATA%\\npm\\codex.cmd\" %*^\"\r\n"));
+        assert!(launcher.ends_with("chcp %QB_CODEPAGE% >nul\r\nendlocal & exit /b %QB_EXIT%\r\n"));
         assert!(normal_path(&p.codex_qb_home).contains(".codex-acct"));
     }
     #[test]
@@ -2942,7 +3634,7 @@ trusted_hash = "synthetic-hook-hash"
                 .diff
                 .contains(&format!("+++ {} (연결 후)", p.codex_config.display()))
         );
-        let expected = "+{\"env\":{\"ANTHROPIC_BASE_URL\":\"http://127.0.0.1:10200\",\"ANTHROPIC_AUTH_TOKEN\":\"<client key>\"}}";
+        let expected = "+{\"env\":{\"ANTHROPIC_BASE_URL\":\"http://127.0.0.1:10200\",\"ANTHROPIC_AUTH_TOKEN\":\"<client key>\",\"CLAUDE_CODE_DISABLE_TERMINAL_TITLE\":\"1\"}}";
         assert!(report.diff.iter().any(|line| line == expected), "{text}");
         let preview: Value = serde_json::from_str(&expected[1..]).unwrap();
         assert_eq!(preview["env"]["ANTHROPIC_AUTH_TOKEN"], "<client key>");
@@ -3399,7 +4091,7 @@ trusted_hash = "synthetic-hook-hash"
         }
         let report = claude_run(&p, true, CodexMode::None, None).unwrap();
         assert!(!output(&report).contains(KEY));
-        let expected = serde_json::json!({"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:10200","ANTHROPIC_AUTH_TOKEN":KEY}});
+        let expected = serde_json::json!({"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:10200","ANTHROPIC_AUTH_TOKEN":KEY,"CLAUDE_CODE_DISABLE_TERMINAL_TITLE":"1"}});
         assert_eq!(
             fs::read(home.join("settings.json")).unwrap(),
             serde_json::to_vec(&expected).unwrap()
@@ -3407,7 +4099,7 @@ trusted_hash = "synthetic-hook-hash"
         let launcher = fs::read_to_string(p.npm_dir.join("claude-qb.cmd")).unwrap();
         assert!(launcher.contains("setlocal DisableDelayedExpansion\r\n"));
         assert!(launcher.contains(&format!(
-            "call \"{}\" --settings \"%USERPROFILE%\\.claude-qb\\settings.json\" %*\r\n",
+            "/s /c ^\"\"{}\" --settings \"%USERPROFILE%\\.claude-qb\\settings.json\" %*^\"\r\n",
             p.claude_command.as_ref().unwrap().display()
         )));
         assert_eq!(before, snapshot(&p));
@@ -3757,5 +4449,392 @@ trusted_hash = "synthetic-hook-hash"
         unwire(&p, true, false).unwrap();
         assert_eq!(fs::read_to_string(unknown).unwrap(), "keep");
         assert!(!p.claude_settings.exists());
+    }
+
+    // R3.2 candidate tests: SYNTHETIC, UNRUN. Merge the helper/launcher worker
+    // first. Tests call only fixture paths; they never launch the wrappers.
+    fn r32_old_install(p: &CutoverPaths) {
+        claude_run(p, true, CodexMode::Dedicated, Some(ClaudeMode::Dedicated)).unwrap();
+        let config = p.codex_qb_home.join("config.toml");
+        let mut doc = fs::read_to_string(&config)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        if let Some(tui) = doc
+            .get_mut("tui")
+            .and_then(toml_edit::Item::as_table_like_mut)
+        {
+            tui.remove("terminal_title");
+        }
+        // These extras existed in the owned R3 file, not in its default source.
+        doc["r32_extra"] = toml_edit::value("current-dedicated-only");
+        fs::write(&config, doc.to_string()).unwrap();
+        let settings = claude_home(p).unwrap().join("settings.json");
+        let mut json: Value = serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
+        json["env"]
+            .as_object_mut()
+            .unwrap()
+            .remove("CLAUDE_CODE_DISABLE_TERMINAL_TITLE");
+        json["r32_extra"] = serde_json::json!({"current": true});
+        fs::write(&settings, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+        fs::write(
+            p.npm_dir.join("codex-qb.cmd"),
+            b"@echo off\r\nrem synthetic old R3 Codex wrapper\r\n",
+        )
+        .unwrap();
+        fs::write(
+            p.npm_dir.join("claude-qb.cmd"),
+            b"@echo off\r\nrem synthetic old R3 Claude wrapper\r\n",
+        )
+        .unwrap();
+        let mut m = manifest(p);
+        for e in &mut m.entries {
+            if e.kind == Kind::File {
+                let bytes = fs::read(&e.path).unwrap();
+                e.hash = hash_bytes(&bytes);
+                e.payload = Some(protect(&bytes).unwrap());
+                e.identity = Some(identity(&e.path).unwrap());
+            }
+        }
+        // Emit the old schema-3 shape, exercising serde defaults explicitly.
+        let mut old = serde_json::to_value(m).unwrap();
+        old.as_object_mut().unwrap().remove("install_completed");
+        for e in old["entries"].as_array_mut().unwrap() {
+            e.as_object_mut().unwrap().remove("upgrade");
+        }
+        atomic_json(&p.journal(), &old).unwrap();
+    }
+
+    fn r32_run(p: &CutoverPaths, apply: bool, force: bool) -> Result<Report> {
+        let mut options = claude_options(CodexMode::Dedicated, Some(ClaudeMode::Dedicated));
+        options.force = force;
+        wire_with_task_query(p, apply, options, &|_| panic!("upgrade queried tasks"))
+    }
+
+    fn r32_owned(p: &CutoverPaths) -> Vec<(PathBuf, Vec<u8>, Identity)> {
+        let m = manifest(p);
+        m.entries
+            .iter()
+            .filter(|e| upgrade_path(&m, &e.path).unwrap())
+            .map(|e| {
+                (
+                    e.path.clone(),
+                    fs::read(&e.path).unwrap(),
+                    identity(&e.path).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn r32_upgrade_old_r3_preserves_current_extras_and_is_idempotent() {
+        let (_dir, p) = fixture();
+        r32_old_install(&p);
+        let sources = snapshot(&p);
+        let auth = fs::read(p.codex_qb_home.join("auth.json")).unwrap();
+        let auth_id = identity(&p.codex_qb_home.join("auth.json")).unwrap();
+        let before = manifest(&p);
+        // The existing key is validated, but default sources are not regenerated.
+        fs::write(&p.codex_config, "invalid default-source TOML [").unwrap();
+        let report = r32_run(&p, true, false).unwrap();
+        assert_eq!(report.changed.len(), 4);
+        let m = manifest(&p);
+        for e in &m.entries {
+            let prior = before
+                .entries
+                .iter()
+                .find(|old| old.path == e.path)
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&e.original).unwrap(),
+                serde_json::to_value(&prior.original).unwrap()
+            );
+            if !upgrade_path(&m, &e.path).unwrap() {
+                assert_eq!(
+                    serde_json::to_value(e).unwrap(),
+                    serde_json::to_value(prior).unwrap()
+                );
+            }
+        }
+        let config = fs::read_to_string(p.codex_qb_home.join("config.toml")).unwrap();
+        let doc = config.parse::<DocumentMut>().unwrap();
+        assert!(doc["tui"]["terminal_title"].as_array().unwrap().is_empty());
+        assert_eq!(doc["r32_extra"].as_str(), Some("current-dedicated-only"));
+        let json: Value = serde_json::from_slice(
+            &fs::read(claude_home(&p).unwrap().join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(json["env"]["CLAUDE_CODE_DISABLE_TERMINAL_TITLE"], "1");
+        assert_eq!(json["r32_extra"]["current"], true);
+        assert_eq!(fs::read(p.codex_qb_home.join("auth.json")).unwrap(), auth);
+        assert_eq!(
+            identity(&p.codex_qb_home.join("auth.json")).unwrap(),
+            auth_id
+        );
+        let owned = r32_owned(&p);
+        let journal = fs::read(p.journal()).unwrap();
+        assert!(r32_run(&p, true, false).unwrap().changed.is_empty());
+        assert_eq!(r32_owned(&p), owned);
+        assert_eq!(fs::read(p.journal()).unwrap(), journal);
+        // Restore synthetic source only so its unchanged companions can be compared.
+        fs::write(&p.codex_config, &sources[0]).unwrap();
+        assert_eq!(snapshot(&p), sources);
+        super::unwire(&p, true, false).unwrap();
+        assert!(!p.journal().exists());
+        assert!(!p.npm_dir.join("codex-qb.cmd").exists());
+        assert!(!p.npm_dir.join("claude-qb.cmd").exists());
+    }
+
+    #[test]
+    fn r32_upgrade_dry_run_diff_has_no_mutation_or_scratch() {
+        let (_dir, p) = fixture();
+        r32_old_install(&p);
+        let before = r32_owned(&p);
+        let journal = fs::read(p.journal()).unwrap();
+        let siblings = |dir: &Path| {
+            let mut paths = fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .collect::<Vec<_>>();
+            paths.sort();
+            paths
+        };
+        let codex_siblings = siblings(&p.codex_qb_home);
+        let claude_siblings = siblings(&claude_home(&p).unwrap());
+        let npm_siblings = siblings(&p.npm_dir);
+        let report = r32_run(&p, false, false).unwrap();
+        assert_eq!(report.changed.len(), 4);
+        let diff = report.diff.join("\n");
+        assert!(diff.contains("terminal_title"));
+        assert!(diff.contains("CLAUDE_CODE_DISABLE_TERMINAL_TITLE"));
+        assert!(!diff.contains(KEY));
+        assert_eq!(r32_owned(&p), before);
+        assert_eq!(fs::read(p.journal()).unwrap(), journal);
+        assert_eq!(siblings(&p.codex_qb_home), codex_siblings);
+        assert_eq!(siblings(&claude_home(&p).unwrap()), claude_siblings);
+        assert_eq!(siblings(&p.npm_dir), npm_siblings);
+    }
+
+    #[test]
+    fn r32_upgrade_content_refuses_then_force_merges_current_owned_file() {
+        let (_dir, p) = fixture();
+        r32_old_install(&p);
+        let config = p.codex_qb_home.join("config.toml");
+        let before_id = identity(&config).unwrap();
+        let mut text = fs::read_to_string(&config).unwrap();
+        text.insert_str(0, "user_extra = 'keep-force-edit'\n");
+        fs::write(&config, text).unwrap();
+        assert_eq!(identity(&config).unwrap(), before_id);
+        let journal = fs::read(p.journal()).unwrap();
+        assert!(
+            r32_run(&p, true, false)
+                .unwrap_err()
+                .to_string()
+                .contains("--force")
+        );
+        assert_eq!(fs::read(p.journal()).unwrap(), journal);
+        r32_run(&p, true, true).unwrap();
+        assert!(
+            fs::read_to_string(config)
+                .unwrap()
+                .contains("keep-force-edit")
+        );
+        super::unwire(&p, true, false).unwrap();
+    }
+
+    #[test]
+    fn r32_upgrade_force_refuses_same_bytes_substitute() {
+        let (_dir, p) = fixture();
+        r32_old_install(&p);
+        let path = p.codex_qb_home.join("config.toml");
+        let bytes = fs::read(&path).unwrap();
+        // Keep the old object alive, avoiding file-ID reuse in this test.
+        fs::rename(&path, path.with_extension("held-old")).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        let journal = fs::read(p.journal()).unwrap();
+        assert!(r32_run(&p, true, true).is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(fs::read(p.journal()).unwrap(), journal);
+    }
+
+    #[test]
+    fn r32_upgrade_interruptions_resume_and_unwire_exact_owned_objects() {
+        for stage in [
+            "upgrade-before-scratch",
+            "after-create",
+            "upgrade-after-identity",
+            "upgrade-after-write",
+            "upgrade-after-replace",
+            "upgrade-before-final-journal",
+        ] {
+            for reverse in [false, true] {
+                let (_dir, p) = fixture();
+                r32_old_install(&p);
+                let path = p.codex_qb_home.join("config.toml");
+                let unrelated = p.codex_qb_home.join("unrelated.txt");
+                fs::write(&unrelated, "preserve unknown data").unwrap();
+                INTERRUPT.with(|slot| *slot.borrow_mut() = Some((path.clone(), stage)));
+                assert!(
+                    r32_run(&p, true, false)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("synthetic creation interruption")
+                );
+                let m = manifest(&p);
+                let e = m.entries.iter().find(|e| e.path == path).unwrap();
+                assert!(e.upgrade.is_some());
+                let published = identity(&path).unwrap();
+                if reverse {
+                    super::unwire(&p, true, false).unwrap();
+                    assert!(!path.exists());
+                } else {
+                    r32_run(&p, true, false).unwrap();
+                    if stage == "upgrade-after-replace" || stage == "upgrade-before-final-journal" {
+                        assert_eq!(identity(&path).unwrap(), published);
+                    }
+                    assert!(manifest(&p).entries.iter().all(|e| e.upgrade.is_none()));
+                    super::unwire(&p, true, false).unwrap();
+                }
+                assert_eq!(
+                    fs::read_to_string(&unrelated).unwrap(),
+                    "preserve unknown data"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn r32_upgrade_unwire_refuses_substituted_new_object_even_with_force() {
+        let (_dir, p) = fixture();
+        r32_old_install(&p);
+        let path = p.codex_qb_home.join("config.toml");
+        INTERRUPT.with(|slot| *slot.borrow_mut() = Some((path.clone(), "upgrade-after-replace")));
+        assert!(r32_run(&p, true, false).is_err());
+        let bytes = fs::read(&path).unwrap();
+        fs::rename(&path, path.with_extension("held-staged-new")).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        let journal = fs::read(p.journal()).unwrap();
+        assert!(super::unwire(&p, true, true).is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(fs::read(p.journal()).unwrap(), journal);
+        assert!(p.npm_dir.join("claude-qb.cmd").exists());
+    }
+
+    #[test]
+    fn r32_upgrade_mixed_modes_keep_real_original_backup_anchor() {
+        let (_dir, p) = fixture();
+        fs::write(
+            &p.codex_auth,
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":"synthetic-old"}"#,
+        )
+        .unwrap();
+        let original_sources = snapshot(&p);
+        claude_run(&p, true, CodexMode::Default, Some(ClaudeMode::Dedicated)).unwrap();
+        let launcher_path = p.npm_dir.join("claude-qb.cmd");
+        fs::write(&launcher_path, "@echo off\r\nrem old R3 synthetic\r\n").unwrap();
+        let mut m = manifest(&p);
+        let e = m
+            .entries
+            .iter_mut()
+            .find(|e| e.path == launcher_path)
+            .unwrap();
+        e.hash = hash_file(&launcher_path).unwrap();
+        e.payload = Some(protect(&fs::read(&launcher_path).unwrap()).unwrap());
+        atomic_json(&p.journal(), &m).unwrap();
+        let anchors = m
+            .entries
+            .iter()
+            .filter(|e| e.original.is_some())
+            .map(|e| (e.path.clone(), serde_json::to_value(e).unwrap()))
+            .collect::<Vec<_>>();
+        assert!(!anchors.is_empty());
+        claude_run(&p, true, CodexMode::Default, Some(ClaudeMode::Dedicated)).unwrap();
+        let upgraded = manifest(&p);
+        for (path, value) in anchors {
+            assert_eq!(
+                serde_json::to_value(upgraded.entries.iter().find(|e| e.path == path).unwrap())
+                    .unwrap(),
+                value
+            );
+        }
+        super::unwire(&p, true, false).unwrap();
+        assert_eq!(snapshot(&p), original_sources);
+    }
+
+    #[test]
+    fn r32_upgrade_leaves_already_current_config_and_settings_identity_unchanged() {
+        let (_dir, p) = fixture();
+        r32_old_install(&p);
+        r32_run(&p, true, false).unwrap();
+        let prior = r32_owned(&p);
+        let path = p.npm_dir.join("codex-qb.cmd");
+        fs::write(&path, "@echo off\r\nrem old synthetic launcher\r\n").unwrap();
+        let mut m = manifest(&p);
+        let e = m.entries.iter_mut().find(|e| e.path == path).unwrap();
+        e.hash = hash_file(&path).unwrap();
+        e.payload = Some(protect(&fs::read(&path).unwrap()).unwrap());
+        atomic_json(&p.journal(), &m).unwrap();
+        assert_eq!(
+            r32_run(&p, true, false).unwrap().changed,
+            vec![path.display().to_string()]
+        );
+        for (name, bytes, id) in prior {
+            if name != path {
+                assert_eq!(fs::read(&name).unwrap(), bytes);
+                assert_eq!(identity(&name).unwrap(), id);
+            }
+        }
+    }
+
+    #[test]
+    fn r32_upgrade_legacy_partial_install_keeps_resume_path() {
+        let (_dir, p) = fixture();
+        let path = p.codex_qb_home.join("config.toml");
+        INTERRUPT.with(|slot| *slot.borrow_mut() = Some((path.clone(), "after-publish")));
+        assert!(claude_run(&p, true, CodexMode::Dedicated, Some(ClaudeMode::Dedicated)).is_err());
+        let mut old = serde_json::to_value(manifest(&p)).unwrap();
+        old.as_object_mut().unwrap().remove("install_completed");
+        atomic_json(&p.journal(), &old).unwrap();
+        assert!(!completed_install(&manifest(&p)).unwrap());
+        r32_run(&p, true, false).unwrap();
+        assert_eq!(manifest(&p).install_completed, Some(true));
+        assert!(
+            manifest(&p)
+                .entries
+                .iter()
+                .all(|e| e.done && e.upgrade.is_none())
+        );
+        super::unwire(&p, true, false).unwrap();
+    }
+
+    #[test]
+    fn r32_upgrade_rejects_missing_key_and_saved_payload_hash_changes_before_mutation() {
+        for target in [
+            "missing-key",
+            "config.toml",
+            "settings.json",
+            "codex-qb.cmd",
+        ] {
+            let (_dir, p) = fixture();
+            r32_old_install(&p);
+            if target == "missing-key" {
+                fs::remove_file(&p.client_key).unwrap();
+            } else {
+                let mut m = manifest(&p);
+                let e = m
+                    .entries
+                    .iter_mut()
+                    .find(|e| e.path.file_name().is_some_and(|name| name == target))
+                    .unwrap();
+                let mut bytes = unprotect(e.payload.as_deref().unwrap()).unwrap();
+                // Keep parsed key/port values unchanged: the digest must reject.
+                bytes.push(b'\n');
+                e.payload = Some(protect(&bytes).unwrap());
+                atomic_json(&p.journal(), &m).unwrap();
+            }
+            let before = resume_snapshot(&p);
+            assert!(r32_run(&p, true, true).is_err());
+            assert_eq!(resume_snapshot(&p), before);
+        }
     }
 }

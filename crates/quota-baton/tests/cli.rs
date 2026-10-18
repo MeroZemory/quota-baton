@@ -394,6 +394,7 @@ fn r3_wire_help_and_invalid_codex_mode() {
     for expected in [
         "--codex-mode",
         "--claude-mode",
+        "--force",
         "default",
         "dedicated",
         "none",
@@ -462,6 +463,7 @@ fn r3_wire_dedicated_and_auto_dry_runs_leave_source_and_launcher_untouched() {
             "<client key>",
             "log_dir",
             "openai_base_url",
+            "terminal_title",
             "`codex-qb`로 시작한 세션만 quota-baton을 거칩니다. 기존 `codex`·`codex-ib`·`codex-mz`·`codex-cpa`는 바뀌지 않습니다.",
             "herdr 창에서 `codex-qb` 세션을 재시작 후 이어 열려면 그 세션 ID를 `session-homes.json`에 `~/.codex-acct/qb`로 등록해야 합니다.",
         ] {
@@ -908,11 +910,15 @@ async fn r3_wire_dedicated_apply_with_both_providers_and_unwire_preserves_sessio
         assert_eq!(config["model"].as_str(), Some("synthetic-model"));
         assert_eq!(config["features"]["keep"].as_bool(), Some(true));
         assert!(config.get("model_catalog_json").is_none());
+        assert_eq!(config["tui"]["terminal_title"].as_array().unwrap().len(), 0);
         let launcher = profile.join("AppData/Roaming/npm/codex-qb.cmd");
         let launcher_text = std::fs::read_to_string(&launcher).unwrap();
-        assert!(launcher_text.starts_with("@echo off\r\nsetlocal\r\n"));
+        assert!(launcher_text.starts_with("@echo off\r\nsetlocal DisableDelayedExpansion\r\n"));
         assert!(launcher_text.contains("set \"CODEX_HOME=%USERPROFILE%\\.codex-acct\\qb\"\r\n"));
-        assert!(launcher_text.ends_with("call \"%APPDATA%\\npm\\codex.cmd\" %*\r\n"));
+        assert!(launcher_text.contains("/s /c ^\"\"%APPDATA%\\npm\\codex.cmd\" %*^\"\r\n"));
+        assert!(
+            launcher_text.ends_with("chcp %QB_CODEPAGE% >nul\r\nendlocal & exit /b %QB_EXIT%\r\n")
+        );
         let wired = r3_apply_profile(&profile);
         for (path, bytes) in &before {
             if path.starts_with(".codex")
@@ -2483,7 +2489,13 @@ fn r3_claude_dedicated_default_preview_writes_nothing_and_preserves_default_sett
         let output = command.bounded_output().unwrap();
         let text = r3_output(&output);
         assert!(output.status.success(), "{text}");
-        for expected in ["claude-qb.cmd", ".claude-qb", "--settings", "<client key>"] {
+        for expected in [
+            "claude-qb.cmd",
+            ".claude-qb",
+            "--settings",
+            "<client key>",
+            "CLAUDE_CODE_DISABLE_TERMINAL_TITLE",
+        ] {
             assert!(text.contains(expected), "missing preview {expected}");
         }
         assert!(
@@ -2568,10 +2580,11 @@ async fn r3_claude_dedicated_apply_real_core_exact_payload_launcher_and_round_tr
     let expected = serde_json::json!({"env":{
         "ANTHROPIC_BASE_URL":format!("http://127.0.0.1:{}",config.server.data_port),
         "ANTHROPIC_AUTH_TOKEN":secrets.client_key,
+        "CLAUDE_CODE_DISABLE_TERMINAL_TITLE":"1",
     }});
     assert!(
         actual == expected,
-        "dedicated settings must contain exactly two env entries"
+        "dedicated settings must contain exactly the three owned env entries"
     );
     let launcher = profile.join("AppData/Roaming/npm/claude-qb.cmd");
     let text = std::fs::read_to_string(&launcher).unwrap();

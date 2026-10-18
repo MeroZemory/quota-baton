@@ -659,6 +659,8 @@ pub struct WireOptions {
     pub codex_mode: Option<CodexMode>,
     pub claude_mode: Option<ClaudeMode>,
     pub data_port: u16,
+    /// Content override for the same owned dedicated upgrade object only.
+    pub force: bool,
     pub autostart: bool,
     pub disable_cpa_tasks: bool,
     pub detach_chatgpt_session_homes: bool,
@@ -670,6 +672,7 @@ impl Default for WireOptions {
             codex_mode: None,
             claude_mode: None,
             data_port: 10200,
+            force: false,
             autostart: false,
             disable_cpa_tasks: false,
             detach_chatgpt_session_homes: false,
