@@ -321,8 +321,7 @@ fn draw_account_menu(
                 )
             }?;
             unsafe { target.DrawRoundedRectangle(&check, &border, 1.0, None) };
-            let checked = (matches!(item, super::actions::MenuItem::ToggleDrain) && row.drain)
-                || (matches!(item, super::actions::MenuItem::ToggleCredits) && row.allow_credits);
+            let checked = item.checked(row).unwrap_or(false);
             if checked {
                 fill(
                     target,
@@ -376,7 +375,11 @@ fn draw_account_menu(
             target,
             factory,
             &body,
-            item.label(row),
+            if n == index && state.ends_with(":pending") {
+                "변경 중…"
+            } else {
+                item.label(row)
+            },
             177.0,
             y + 7.0,
             160.0,
