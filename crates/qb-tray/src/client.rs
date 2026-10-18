@@ -155,6 +155,7 @@ impl AdminClient {
 
     pub async fn events(&self) -> Result<reqwest::Response, ClientError> {
         self.request(reqwest::Method::GET, "/admin/v1/events")
+            .timeout(Duration::from_secs(3600))
             .send()
             .await
             .map_err(ClientError::Transport)
@@ -395,7 +396,21 @@ pub fn layout_rows(
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TrayWarning {
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub burst_new_sessions: Option<u64>,
+    #[serde(default)]
+    pub observed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TraySnapshot {
+    #[serde(default)]
+    pub warnings: Vec<TrayWarning>,
+    #[serde(default)]
+    pub pools: serde_json::Value,
     #[serde(default)]
     pub accounts: Vec<TrayAccount>,
     #[serde(default)]
@@ -505,6 +520,7 @@ pub struct Bindings {
 }
 
 /// Render a compact Korean tooltip line without exposing any secret fields.
+#[cfg(test)]
 pub fn render_status_line(read: &TrayRead) -> String {
     match &read.health {
         CoreHealth::Unreachable { .. } => "코어: 연결할 수 없음".to_owned(),
@@ -534,6 +550,7 @@ pub fn render_status_line(read: &TrayRead) -> String {
 /// Render a deterministic review image from an admin state fixture. The native
 /// flyout consumes the same rows; this compact encoder keeps the aid usable in
 /// CI without a desktop compositor.
+#[cfg(test)]
 pub fn render_flyout(read: &TrayRead) -> String {
     let mut lines = vec![render_status_line(read)];
     for provider in ["claude", "codex"] {

@@ -17,6 +17,7 @@ use crate::{
 
 pub(in crate::relay) struct Completion {
     pub record: RequestRecord,
+    pub burst_client: Option<crate::burst::Identity>,
     pub start: Instant,
     pub input_bytes: Arc<AtomicU64>,
     pub runtime: Option<Arc<crate::account_runtime::AccountRuntime>>,
@@ -40,6 +41,7 @@ impl Completion {
     ) -> Self {
         Self {
             start: Instant::now(),
+            burst_client: crate::burst::client_identity(headers),
             reset_hold_used: false,
             usage_prepolled: false,
             reset_hold_timed_out: false,

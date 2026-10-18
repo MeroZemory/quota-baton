@@ -224,6 +224,8 @@ enum Command {
 }
 
 pub struct Observability {
+    // One recent aggregate only; hidden trays recover transient broadcast loss.
+    recent_burst: std::sync::Mutex<Option<(std::time::Instant, DateTime<Utc>, u32)>>,
     events: std::sync::Mutex<Option<tokio::sync::broadcast::Sender<serde_json::Value>>>,
     snapshots: std::sync::Mutex<BTreeMap<String, serde_json::Value>>,
     tx: mpsc::SyncSender<Command>,
@@ -271,6 +273,33 @@ impl Observability {
         expires_at: Option<DateTime<Utc>>,
     ) {
         self.enqueue(Command::Ledger(serde_json::json!({"ts":Utc::now().to_rfc3339(),"event":"token_refresh","account":account,"trigger":trigger,"outcome":outcome,"expires_at":expires_at})));
+    }
+    pub(crate) fn recent_warnings(&self) -> Vec<serde_json::Value> {
+        let mut recent = self.recent_burst.lock().unwrap_or_else(|e| e.into_inner());
+        if recent
+            .as_ref()
+            .is_some_and(|(at, _, _)| at.elapsed() >= std::time::Duration::from_secs(600))
+        {
+            *recent = None;
+        }
+        recent.as_ref().map(|(_, ts, count)| {
+            serde_json::json!({"kind":"burst", "burst_new_sessions":count, "observed_at":ts})
+        }).into_iter().collect()
+    }
+    pub(crate) fn remember_burst(&self, observed_count: u32) {
+        *self.recent_burst.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((std::time::Instant::now(), Utc::now(), observed_count));
+    }
+    pub(crate) fn burst_warning(&self, observed_count: u32) {
+        self.remember_burst(observed_count);
+        self.enqueue(Command::Ledger(serde_json::json!({
+            "ts": Utc::now().to_rfc3339(), "event": "core_warning",
+            "kind": "burst", "burst_new_sessions": observed_count,
+        })));
+        self.progress(serde_json::json!({
+            "event": "core_warning",
+            "data": {"kind": "burst", "burst_new_sessions": observed_count},
+        }));
     }
     pub fn core_warning(&self, account: &str, code: &str) {
         self.enqueue(Command::Ledger(serde_json::json!({"ts":Utc::now().to_rfc3339(),"event":"core_warning","account":account,"code":code})));
@@ -339,6 +368,7 @@ impl Observability {
             .name("qb-observability".into())
             .spawn(move || run(home, state, rx, worker_dropped))?;
         Ok(Self {
+            recent_burst: std::sync::Mutex::new(None),
             events: std::sync::Mutex::new(None),
             snapshots: std::sync::Mutex::new(snapshots),
             tx,
@@ -1509,10 +1539,43 @@ mod tests {
     }
 
     #[test]
+    fn retained_burst_is_bounded_fresh_and_expires_without_persistence() {
+        let (tx, rx) = mpsc::sync_channel(16);
+        let obs = Observability {
+            recent_burst: std::sync::Mutex::new(None),
+            events: std::sync::Mutex::new(None),
+            snapshots: std::sync::Mutex::new(BTreeMap::new()),
+            tx,
+            worker: None,
+            dropped: Arc::new(AtomicU64::new(0)),
+            #[cfg(all(feature = "shape-capture", debug_assertions))]
+            capture: None,
+        };
+        assert!(obs.recent_warnings().is_empty());
+        obs.burst_warning(31);
+        obs.remember_burst(32);
+        assert!(
+            matches!(rx.try_recv(), Ok(Command::Ledger(value)) if value["burst_new_sessions"] == 31)
+        );
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        let warnings = obs.recent_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0]["burst_new_sessions"], 32);
+        assert_eq!(warnings[0].as_object().unwrap().len(), 3);
+        obs.recent_burst.lock().unwrap().as_mut().unwrap().0 -= StdDuration::from_secs(600);
+        assert!(obs.recent_warnings().is_empty());
+        assert!(obs.recent_burst.lock().unwrap().is_none());
+        obs.remember_burst(33);
+        assert_eq!(obs.recent_warnings()[0]["burst_new_sessions"], 33);
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[test]
     fn bounded_queue_drops_without_waiting_and_warns_once_per_minute() {
         // 작성자가 멈춘 큐로 느린 디스크를 결정적으로 재현한다.
         let (tx, rx) = mpsc::sync_channel(2);
         let obs = Observability {
+            recent_burst: std::sync::Mutex::new(None),
             events: std::sync::Mutex::new(None),
             snapshots: std::sync::Mutex::new(BTreeMap::new()),
             tx,
@@ -1645,6 +1708,7 @@ mod tests {
             let _ = done_tx.send(drained);
         });
         let obs = Observability {
+            recent_burst: std::sync::Mutex::new(None),
             events: std::sync::Mutex::new(None),
             snapshots: std::sync::Mutex::new(BTreeMap::new()),
             tx,
