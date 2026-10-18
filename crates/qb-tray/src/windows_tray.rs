@@ -138,6 +138,7 @@ struct Interaction {
     focus: Option<HitTarget>,
     hover: Option<HitTarget>,
     pointer_mode: bool,
+    focus_visible: bool,
     pressed: Option<HitTarget>,
     tooltip: Option<(String, qb_tray::Rect)>,
     since: Option<Instant>,
@@ -599,6 +600,13 @@ fn modal_default_focus(scene: &geometry::Scene) -> Option<HitTarget> {
         .find(|h| h.enabled && !matches!(h.target, HitTarget::Blocked | HitTarget::DismissOverlay))
         .map(|h| h.target.clone())
 }
+fn disclosure_intent(scene: &geometry::Scene, provider: &str) -> Option<bool> {
+    scene
+        .sections
+        .iter()
+        .find(|section| section.provider == provider)
+        .map(|section| !section.expanded)
+}
 fn drain_intent(view: &v2::View, id: &str) -> Option<bool> {
     row_view(view, id).map(|row| !row.raw.drain)
 }
@@ -898,7 +906,7 @@ fn paint_window(hwnd: HWND) -> Result<()> {
         let tooltip = tooltip_source
             .as_ref()
             .and_then(|(text, anchor)| renderer.tooltip(text, *anchor, scene.rect).ok());
-        let keyboard_focus = INPUT.with(|i| !i.borrow().pointer_mode);
+        let keyboard_focus = INPUT.with(|i| i.borrow().focus_visible);
         let login = state
             .as_deref()
             .filter(|s| s.starts_with("login:"))
@@ -1334,8 +1342,11 @@ fn cancel_login() -> bool {
         admission_error();
         return false;
     }
+    #[cfg(all(debug_assertions, feature = "testkit"))]
     if let Some(path) = std::env::var_os("QB_TRAY_TEST_LOGIN_LOG") {
-        let _ = std::fs::write(path, "cancelled\n");
+        submit_job(async move {
+            let _ = std::fs::write(path, "cancelled\n");
+        });
     }
     true
 }
@@ -1520,9 +1531,13 @@ fn activate_hit(hwnd: HWND, target: HitTarget) {
         }
         HitTarget::AddProvider(provider) => launch_login(hwnd, provider),
         HitTarget::Disclosure(provider) => {
-            let mut s = session().lock().unwrap_or_else(|e| e.into_inner());
-            let expanded = s.expansion.get(&provider).copied().unwrap_or(false);
-            s.set_expanded(&provider, !expanded);
+            let Some(requested) = disclosure_intent(&frame.scene, &provider) else {
+                return;
+            };
+            session()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_expanded(&provider, requested);
         }
         HitTarget::DismissOverlay => {
             dismiss_overlay();
@@ -1714,6 +1729,7 @@ fn hover_pointer(hwnd: HWND, x: f32, y: f32) {
     let changed = INPUT.with(|i| {
         let mut i = i.borrow_mut();
         i.pointer_mode = true;
+        i.focus_visible = false;
         if i.hover == target && i.tooltip == tooltip {
             return false;
         }
@@ -1735,7 +1751,11 @@ fn hover_pointer(hwnd: HWND, x: f32, y: f32) {
     }
 }
 fn focus_target(hwnd: HWND, target: HitTarget) {
-    INPUT.with(|i| i.borrow_mut().pointer_mode = false);
+    INPUT.with(|i| {
+        let mut i = i.borrow_mut();
+        i.pointer_mode = false;
+        i.focus_visible = true;
+    });
     let frame = painted_frame(hwnd);
     if let Some(popup) = frame.as_ref().and_then(|f| f.scene.popup.as_ref())
         && let Some(item) = popup.items.iter().find(|i| i.target == target)
@@ -2226,6 +2246,7 @@ unsafe extern "system" fn window_proc(
                 let mut i = i.borrow_mut();
                 i.pressed = None;
                 i.pointer_mode = true;
+                i.focus_visible = false;
             });
             let (x, y) = point_from_lparam(lparam);
             if let Some(target) = hit_target(hwnd, x, y) {
@@ -2238,7 +2259,11 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_RBUTTONUP if IsWindowVisible(hwnd).as_bool() => {
-            INPUT.with(|i| i.borrow_mut().pointer_mode = true);
+            INPUT.with(|i| {
+                let mut i = i.borrow_mut();
+                i.pointer_mode = true;
+                i.focus_visible = false;
+            });
             let (x, y) = point_from_lparam(lparam);
             if let Some(HitTarget::Row(id) | HitTarget::Inline { id, .. }) = hit_target(hwnd, x, y)
             {
@@ -2433,6 +2458,7 @@ unsafe extern "system" fn window_proc(
                 INPUT.with(|i| {
                     let mut i = i.borrow_mut();
                     i.focus = None;
+                    i.focus_visible = false;
                     i.hover = None;
                     i.pointer_mode = false;
                     i.pressed = None;
@@ -2873,6 +2899,17 @@ mod tests {
                 .0
                 .contains("50% 남음")
         );
+    }
+    #[test]
+    fn disclosure_click_inverts_the_painted_auto_default_without_a_manual_entry() {
+        let view = v2::project(r#"{"pools":{"codex":{"eligible":0}},"accounts":[{"id":"off","provider":"codex","user_state":"disabled"}]}"#, SystemTime::now()).unwrap();
+        let scene = geometry::Scene::build(&view, geometry::Presentation::default(), 900.);
+        assert_eq!(disclosure_intent(&scene, "codex"), Some(false));
+        let mut p = geometry::Presentation::default();
+        p.expanded.insert("codex".into(), false);
+        let scene = geometry::Scene::build(&view, p, 900.);
+        assert_eq!(disclosure_intent(&scene, "codex"), Some(true));
+        assert_eq!(disclosure_intent(&scene, "missing"), None);
     }
     #[test]
     fn held_activation_cannot_confirm_a_new_dialog_but_navigation_can_repeat() {

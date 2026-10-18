@@ -177,13 +177,13 @@ impl AdminClient {
         path: &str,
         body: &impl Serialize,
     ) -> Result<reqwest::Response, ClientError> {
+        test_response_delay().await;
         let response = self
             .request(method, path)
             .json(body)
             .send()
             .await
             .map_err(ClientError::Transport)?;
-        test_response_delay().await;
         Self::check_response(response).await
     }
 
@@ -216,12 +216,13 @@ impl AdminClient {
     }
 
     async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, ClientError> {
+        // Delay admission on the worker, not an already-timed response body.
+        test_response_delay().await;
         let response = self
             .request(reqwest::Method::GET, path)
             .send()
             .await
             .map_err(ClientError::Transport)?;
-        test_response_delay().await;
         let response = Self::check_response(response).await?;
         response.json().await.map_err(ClientError::Decode)
     }
