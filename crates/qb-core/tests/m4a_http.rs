@@ -664,6 +664,67 @@ async fn c6_3_storm_simulation() {
 }
 
 #[tokio::test]
+async fn c7_1_rebalance_relay_never_ledgers_a_disabled_target() {
+    let h = Harness::new(Provider::Codex, 3, 384, 1024).await;
+    let ids = h.ids();
+    // The disabled id sorts before both the source and the valid target.
+    for index in [0, 2] {
+        h.state
+            .accounts
+            .change(&ids[index], Some(UserState::Disabled), None, None, None)
+            .await
+            .unwrap();
+    }
+    for n in 0..6 {
+        let response = h
+            .send_with_session(Provider::Codex, &format!("r1-mark-{n}"))
+            .await;
+        assert_eq!(response.headers()["x-quota-baton-account"], ids[1]);
+        response.bytes().await.unwrap();
+    }
+    h.state
+        .accounts
+        .change(&ids[2], Some(UserState::Active), None, None, None)
+        .await
+        .unwrap();
+    h.state.accounts.set_rate_hold_secs(1);
+    h.fake
+        .state
+        .enable_window_limiter(0, Duration::from_secs(60));
+    for n in 0..3 {
+        let response = h
+            .send_with_session(Provider::Codex, &format!("r1-mark-{n}"))
+            .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        response.bytes().await.unwrap();
+    }
+    assert!((0..6).any(|n| {
+        h.state
+            .bindings
+            .overload_marked(Some(&format!("codex:r1-mark-{n}")), Utc::now())
+    }));
+    for n in 0..6 {
+        let response = h
+            .send_with_session(Provider::Codex, &format!("r1-mark-{n}"))
+            .await;
+        assert_ne!(response.headers()["x-quota-baton-account"], ids[0]);
+        response.bytes().await.unwrap();
+    }
+    let ledger = h.ledger();
+    let moves = ledger
+        .iter()
+        .filter(|row| row["event"] == "binding_move" && row["reason"] == "overload")
+        .collect::<Vec<_>>();
+    assert!(!moves.is_empty());
+    assert!(
+        moves
+            .iter()
+            .all(|row| row["from"] == ids[1] && row["to"] == ids[2])
+    );
+    assert_eq!(h.state.bindings.active_sessions(&ids[0], Utc::now()), 0);
+}
+
+#[tokio::test]
 async fn c7_1_storm_through_relay_concentrated_then_spread() {
     let h = Harness::new(Provider::Codex, 2, 384, 1024).await;
     let ids = h.ids();

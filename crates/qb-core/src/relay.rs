@@ -486,13 +486,16 @@ impl RelayState {
     }
 
     async fn note_client_rate(&self, provider: Provider, account: &str, key: Option<&str>) {
-        let Ok(candidates) = self
+        let Ok(mut candidates) = self
             .candidates(provider, None, None, &BTreeSet::new())
             .await
         else {
             return;
         };
         let now = chrono::Utc::now();
+        // Cooling/disabled accounts must not supply phantom rebalance room.
+        // Keep them in ordinary selection so near-reset holds still work.
+        candidates.retain(|candidate| candidate.account.eligible_at(None, now));
         let (active, threshold, groups_hit, marked) =
             self.bindings
                 .note_client_rate(provider, account, key, &candidates, now);
