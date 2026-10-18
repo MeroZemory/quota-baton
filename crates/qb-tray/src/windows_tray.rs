@@ -90,12 +90,22 @@ const WM_MOUSELEAVE_MESSAGE: u32 = 0x02A3;
 const WINDOW_CLASS: PCWSTR = w!("QuotaBatonTrayFlyout");
 static MODEL: OnceLock<Mutex<(Vec<qb_tray::Row>, String, bool)>> = OnceLock::new();
 static VIEW_STATE: OnceLock<Mutex<view_ownership::ViewOwnership>> = OnceLock::new();
+#[path = "dashboard_io.rs"]
+mod dashboard_io;
+#[path = "dashboard_window.rs"]
+mod dashboard_window;
 #[path = "tray_worker.rs"]
 mod tray_worker;
 #[path = "view_ownership.rs"]
 mod view_ownership;
 #[path = "windows_takeover.rs"]
 mod windows_takeover;
+const DASHBOARD_HANDOFF: u32 = WM_APP + 0x4c2;
+static DOUBLE_CLICK_RELEASE: Mutex<Option<Instant>> = Mutex::new(None);
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn GetDoubleClickTime() -> u32;
+}
 static WORKER: OnceLock<tray_worker::Worker> = OnceLock::new();
 static LOGIN_GENERATION: Mutex<u64> = Mutex::new(0);
 // The worker spawn gate must also check this while a shutdown is in flight.
@@ -460,6 +470,9 @@ fn refresh_theme(hwnd: HWND, reload: bool) {
                 DARK.store(crate::theme::resolve(mode), Ordering::Release);
             } else if THEME_SYSTEM.load(Ordering::Acquire) {
                 DARK.store(crate::theme::system_dark(), Ordering::Release);
+            }
+            if let Some(worker) = WORKER.get() {
+                worker.dashboard.theme(DARK.load(Ordering::Acquire));
             }
             unsafe {
                 let _ = PostMessageW(
@@ -1540,6 +1553,73 @@ fn quit_all(hwnd: HWND) {
         }
     }
 }
+fn open_dashboard(hwnd: HWND) {
+    let Some(worker) = WORKER.get() else { return };
+    refresh_theme(hwnd, true);
+    let initial =
+        std::sync::Arc::new(qb_tray::dashboard_model::DashboardSnapshot::new(projected()));
+    let bridge: std::sync::Arc<dyn dashboard_window::Bridge> = worker.dashboard.clone();
+    if dashboard_window::open_or_focus(
+        hwnd,
+        bridge,
+        initial,
+        dashboard_io::clock(),
+        DARK.load(Ordering::Acquire),
+    )
+    .is_ok()
+    {
+        set_view(None);
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+    } else {
+        set_view(Some(
+            "error:대시보드 창을 열지 못했습니다. 잠시 후 다시 시도해 주세요.".into(),
+        ));
+        redraw_now(hwnd);
+    }
+}
+fn dashboard_handoff(hwnd: HWND) {
+    let Some(action) = WORKER
+        .get()
+        .and_then(|worker| worker.dashboard.take_handoff())
+    else {
+        return;
+    };
+    let view = projected();
+    {
+        let mut s = session().lock().unwrap_or_else(|e| e.into_inner());
+        if s.open {
+            s.update(&view);
+        } else {
+            s.show(&view);
+        }
+        if let dashboard_io::Handoff::Account(id) = &action
+            && let Some(provider) = s
+                .slots
+                .iter()
+                .find(|slot| &slot.id == id && slot.disabled_on_open)
+                .map(|slot| slot.provider.clone())
+        {
+            s.expansion.insert(provider, true);
+        }
+    }
+    match action {
+        dashboard_io::Handoff::Account(id) => {
+            set_view(None);
+            INPUT.with(|i| i.borrow_mut().reveal = Some(id));
+        }
+        dashboard_io::Handoff::Add => {
+            set_view(Some("add".into()));
+        }
+    }
+    unsafe {
+        position_flyout(hwnd);
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        let _ = SetForegroundWindow(hwnd);
+    }
+    redraw_now(hwnd);
+}
 fn activate_hit(hwnd: HWND, target: HitTarget) {
     let Some(frame) = painted_frame(hwnd) else {
         return;
@@ -1570,6 +1650,7 @@ fn activate_hit(hwnd: HWND, target: HitTarget) {
             v2::ActionKind::OpenLogs => open_folder("logs"),
         },
         HitTarget::Menu { id, action } => match action {
+            MenuAction::OpenDashboard => open_dashboard(hwnd),
             MenuAction::OpenConfig => open_config(),
             MenuAction::OpenLogs => open_folder("logs"),
             MenuAction::AddClaude => launch_login(hwnd, "claude".into()),
@@ -2214,6 +2295,7 @@ fn publish_accessibility(hwnd: HWND, frame: &mut PaintedFrame) {
         && let Some(body) = &d.takeover_body
     {
         elements.push(Element {
+            parent: None,
             id: stable_id("takeover:body".into()),
             name: body.clone(),
             kind: Kind::Text,
@@ -2222,6 +2304,9 @@ fn publish_accessibility(hwnd: HWND, frame: &mut PaintedFrame) {
             action: None,
             focusable: false,
             focused: false,
+            value: None,
+            selected: None,
+            expanded: None,
         });
     }
     for (index, (rect, summary)) in frame
@@ -2233,6 +2318,7 @@ fn publish_accessibility(hwnd: HWND, frame: &mut PaintedFrame) {
         .enumerate()
     {
         elements.push(Element {
+            parent: None,
             id: stable_id(format!("summary:{index}")),
             name: summary.accessible_name.clone(),
             kind: Kind::Text,
@@ -2241,6 +2327,9 @@ fn publish_accessibility(hwnd: HWND, frame: &mut PaintedFrame) {
             action: None,
             focusable: false,
             focused: false,
+            value: None,
+            selected: None,
+            expanded: None,
         });
     }
     let focus = INPUT.with(|i| i.borrow().focus.clone());
@@ -2261,6 +2350,7 @@ fn publish_accessibility(hwnd: HWND, frame: &mut PaintedFrame) {
                 .any(|i| i.target == h.target && i.checked.is_some())
         });
         elements.push(Element {
+            parent: None,
             id,
             name: element_name(frame, &h.target),
             kind: if matches!(h.target, HitTarget::Row(_)) {
@@ -2275,6 +2365,9 @@ fn publish_accessibility(hwnd: HWND, frame: &mut PaintedFrame) {
             action: Some(index),
             focusable: enabled,
             focused: enabled && focus.as_ref() == Some(&h.target),
+            value: None,
+            selected: None,
+            expanded: None,
         });
     }
     UIA.with(|slot| {
@@ -2285,6 +2378,7 @@ fn publish_accessibility(hwnd: HWND, frame: &mut PaintedFrame) {
         if let Some(root) = slot.as_ref() {
             let _ = root.publish(
                 Snapshot {
+                    automation_id: "quota-baton.flyout",
                     name: "quota-baton".into(),
                     bounds: physical(frame.scene.rect, origin, scale),
                     elements,
@@ -2345,7 +2439,28 @@ unsafe extern "system" fn window_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match message {
+        TRAY_MESSAGE
+            if lparam.0 as u32 == windows::Win32::UI::WindowsAndMessaging::WM_LBUTTONDBLCLK =>
+        {
+            *DOUBLE_CLICK_RELEASE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(
+                Instant::now()
+                    + std::time::Duration::from_millis(unsafe { GetDoubleClickTime() } as u64),
+            );
+            open_dashboard(hwnd);
+            LRESULT(0)
+        }
         TRAY_MESSAGE if lparam.0 as u32 == WM_LBUTTONUP || lparam.0 as u32 == WM_RBUTTONUP => {
+            let suppressed = DOUBLE_CLICK_RELEASE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            if lparam.0 as u32 == WM_LBUTTONUP
+                && suppressed.is_some_and(|until| Instant::now() <= until)
+            {
+                return LRESULT(0);
+            }
             if IsWindowVisible(hwnd).as_bool() {
                 set_view(None);
                 let _ = ShowWindow(hwnd, SW_HIDE);
@@ -2407,6 +2522,10 @@ unsafe extern "system" fn window_proc(
                 redraw_now(hwnd);
             }
             flush_notices(hwnd);
+            LRESULT(0)
+        }
+        DASHBOARD_HANDOFF => {
+            dashboard_handoff(hwnd);
             LRESULT(0)
         }
         windows::Win32::UI::WindowsAndMessaging::WM_LBUTTONDOWN
@@ -2768,11 +2887,13 @@ unsafe extern "system" fn window_proc(
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
         WM_CLOSE => {
+            let _ = dashboard_window::close_now_on_ui_thread();
             sync_login_animation(hwnd, false);
             disconnect_accessibility();
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
         WM_DESTROY => {
+            let _ = dashboard_window::close_now_on_ui_thread();
             sync_login_animation(hwnd, false);
             if let Some(worker) = WORKER.get() {
                 worker.close();

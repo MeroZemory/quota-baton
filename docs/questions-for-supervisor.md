@@ -24,7 +24,7 @@ R2 Part B는 모든 단계에서 복원을 지원하면서, 복원 시작 전에
 
 ## R2B: wiring이 이미 끈 CPA 작업으로 복원 시작
 
-상태: R3 관문에 함께 전달할 비차단 질문. 나머지 구현은 계속한다.
+상태: 해결. 감독이 journaled 임시 enable → Run → 10100 listener 검증 → 기록된 disabled 상태 복귀를 승인했다 (2026-10-18). 중단 때도 기록된 상태로 복구한다. 실제 CPA와 설치 설정을 바꾸는 작업은 설계 세션 재개 전까지 보류한다.
 
 D17 review MF5는 wiring.json이 CPA 작업을 소유하면 retire가 그 작업을 다시 끄거나 복원하지 말라고 한다. 같은 복원 절차는 CPA를 `schtasks /Run /TN cliproxyapi-proxy`로 시작하도록 한다. wiring이 해당 작업을 꺼 둔 상태에서는 Run이 실행되지 않는다. 원래 작업이 비활성이었던 경우도 같다.
 

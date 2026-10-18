@@ -41,12 +41,21 @@ pub enum Kind {
     Text,
     Button,
     Checkbox,
+    Tab,
+    Edit,
+    ComboBox,
+    Table,
+    ColumnHeader,
+    DataRow,
+    Chart,
 }
 
 #[derive(Clone, Debug)]
 pub struct Element {
     /// Positive, stable, window-scoped identity; never reassign to another entity.
     pub id: i32,
+    /// None means the HWND root. Child IDs refer to the same snapshot only.
+    pub parent: Option<i32>,
     /// Already-sanitized accessible_name; rows supply their FULL spec §12 name.
     pub name: String,
     pub kind: Kind,
@@ -56,10 +65,14 @@ pub struct Element {
     pub action: Option<usize>,
     pub focusable: bool,
     pub focused: bool,
+    pub value: Option<String>,
+    pub selected: Option<bool>,
+    pub expanded: Option<bool>,
 }
 
 #[derive(Clone, Debug)]
 pub struct Snapshot {
+    pub automation_id: &'static str,
     pub name: String,
     pub bounds: [f64; 4],
     /// Reading/navigation order. Later entries win overlapping hit tests, so
@@ -90,6 +103,7 @@ pub fn create_root_provider(hwnd: isize) -> Result<RootProvider> {
         alive: true,
         epoch: 0,
         snapshot: Snapshot {
+            automation_id: "quota-baton.flyout",
             name: String::new(),
             bounds: [0.0; 4],
             elements: Vec::new(),
@@ -216,6 +230,20 @@ fn validate(snapshot: &Snapshot) -> Result<()> {
     }
     if focus_count > 1 {
         return Err(Error::from_hresult(E_INVALIDARG));
+    }
+    let parents: std::collections::HashMap<_, _> =
+        snapshot.elements.iter().map(|e| (e.id, e.parent)).collect();
+    for e in &snapshot.elements {
+        let mut cursor = e.parent;
+        let mut seen = HashSet::from([e.id]);
+        while let Some(parent) = cursor {
+            if seen.len() > 64 || !seen.insert(parent) {
+                return Err(Error::from_hresult(E_INVALIDARG));
+            }
+            cursor = *parents
+                .get(&parent)
+                .ok_or_else(|| Error::from_hresult(E_INVALIDARG))?;
+        }
     }
     Ok(())
 }
@@ -356,19 +384,30 @@ impl Node {
                 .position(|e| e.id == ticket.id)
                 .ok_or_else(unavailable)?;
             let target = match direction {
-                NavigateDirection_Parent => return Ok(Some(self.root_arc())),
-                NavigateDirection_NextSibling => elements.get(index + 1),
-                NavigateDirection_PreviousSibling => {
-                    index.checked_sub(1).and_then(|i| elements.get(i))
+                NavigateDirection_Parent => match elements[index].parent {
+                    Some(id) => elements.iter().find(|e| e.id == id),
+                    None => return Ok(Some(self.root_arc())),
+                },
+                NavigateDirection_NextSibling => elements[index + 1..]
+                    .iter()
+                    .find(|e| e.parent == elements[index].parent),
+                NavigateDirection_PreviousSibling => elements[..index]
+                    .iter()
+                    .rev()
+                    .find(|e| e.parent == elements[index].parent),
+                NavigateDirection_FirstChild => {
+                    elements.iter().find(|e| e.parent == Some(ticket.id))
                 }
-                NavigateDirection_FirstChild | NavigateDirection_LastChild => None,
+                NavigateDirection_LastChild => {
+                    elements.iter().rev().find(|e| e.parent == Some(ticket.id))
+                }
                 _ => return Err(Error::from_hresult(E_INVALIDARG)),
             };
             Ok(target.map(|e| self.child(e, cache.epoch)))
         } else {
             let target = match direction {
-                NavigateDirection_FirstChild => elements.first(),
-                NavigateDirection_LastChild => elements.last(),
+                NavigateDirection_FirstChild => elements.iter().find(|e| e.parent.is_none()),
+                NavigateDirection_LastChild => elements.iter().rev().find(|e| e.parent.is_none()),
                 NavigateDirection_Parent
                 | NavigateDirection_NextSibling
                 | NavigateDirection_PreviousSibling => None,
@@ -453,15 +492,49 @@ impl Node {
                 Some(Kind::Text) => UIA_TextControlTypeId.0,
                 Some(Kind::Button) => UIA_ButtonControlTypeId.0,
                 Some(Kind::Checkbox) => UIA_CheckBoxControlTypeId.0,
+                Some(Kind::Tab) => UIA_TabItemControlTypeId.0,
+                Some(Kind::Edit) => UIA_EditControlTypeId.0,
+                Some(Kind::ComboBox) => UIA_ComboBoxControlTypeId.0,
+                Some(Kind::Table) => UIA_TableControlTypeId.0,
+                Some(Kind::ColumnHeader) => UIA_HeaderItemControlTypeId.0,
+                Some(Kind::DataRow) => UIA_DataItemControlTypeId.0,
+                Some(Kind::Chart) => UIA_CustomControlTypeId.0,
             }),
             UIA_AutomationIdPropertyId => string_variant(
                 match element {
-                    None => "quota-baton.flyout".to_owned(),
+                    None => cache.snapshot.automation_id.to_owned(),
                     Some(e) => format!("quota-baton.element.{}", e.id),
                 }
                 .as_str(),
             )?,
             UIA_FrameworkIdPropertyId => string_variant("Win32")?,
+            UIA_LocalizedControlTypePropertyId
+                if element.is_some_and(|e| e.kind == Kind::Chart) =>
+            {
+                string_variant("차트")?
+            }
+            UIA_ValueValuePropertyId => element
+                .and_then(|e| e.value.as_deref())
+                .map(string_variant)
+                .transpose()?
+                .unwrap_or_default(),
+            UIA_ValueIsReadOnlyPropertyId => {
+                VARIANT::from(element.is_none_or(|e| e.kind != Kind::Edit))
+            }
+            UIA_SelectionItemIsSelectedPropertyId => element
+                .and_then(|e| e.selected)
+                .map(VARIANT::from)
+                .unwrap_or_default(),
+            UIA_ExpandCollapseExpandCollapseStatePropertyId => element
+                .and_then(|e| e.expanded)
+                .map(|expanded| {
+                    VARIANT::from(if expanded {
+                        ExpandCollapseState_Expanded.0
+                    } else {
+                        ExpandCollapseState_Collapsed.0
+                    })
+                })
+                .unwrap_or_default(),
             UIA_IsEnabledPropertyId => VARIANT::from(element.is_none_or(|e| e.enabled)),
             UIA_IsKeyboardFocusablePropertyId => {
                 VARIANT::from(element.is_some_and(|e| e.focusable))
@@ -878,10 +951,12 @@ mod tests {
 
     fn scene() -> Snapshot {
         Snapshot {
+            automation_id: "quota-baton.flyout",
             name: "계정 사용량".into(),
             bounds: [100.0, 200.0, 360.0, 400.0],
             elements: vec![
                 Element {
+                    parent: None,
                     id: 1,
                     name: "요약 전체 문장".into(),
                     kind: Kind::Text,
@@ -890,8 +965,12 @@ mod tests {
                     action: None,
                     focusable: false,
                     focused: false,
+                    value: None,
+                    selected: None,
+                    expanded: None,
                 },
                 Element {
+                    parent: None,
                     id: 2,
                     name: "계정, Pro, 사용 가능, 5시간 38% 남음, 2시간 초기화".into(),
                     kind: Kind::Row,
@@ -900,8 +979,12 @@ mod tests {
                     action: Some(4),
                     focusable: true,
                     focused: true,
+                    value: None,
+                    selected: None,
+                    expanded: None,
                 },
                 Element {
+                    parent: None,
                     id: 3,
                     name: "사유 보기".into(),
                     kind: Kind::Button,
@@ -910,13 +993,130 @@ mod tests {
                     action: Some(5),
                     focusable: true,
                     focused: false,
+                    value: None,
+                    selected: None,
+                    expanded: None,
                 },
             ],
         }
     }
 
-    // All tests authored UNRUN. Fake HWND integer is NEVER passed to a Win32
+    // Fake HWND integer is NEVER passed to a Win32
     // window API: tests call only cache operations, raw COM, and Ole allocators.
+    #[test]
+    fn dashboard_chart_exposes_hidden_table_children_without_flattening_siblings() -> Result<()> {
+        let owner = create_root_provider(1)?;
+        let mut s = scene();
+        s.automation_id = "quota-baton.dashboard";
+        let mut chart = s.elements[2].clone();
+        chart.id = 10;
+        chart.kind = Kind::Chart;
+        chart.action = None;
+        chart.focusable = false;
+        chart.focused = false;
+        chart.name = "합성 계정 오늘 남은 양".into();
+        let mut table = chart.clone();
+        table.id = 11;
+        table.parent = Some(10);
+        table.kind = Kind::Table;
+        table.bounds = [0.; 4];
+        let mut first = table.clone();
+        first.id = 12;
+        first.parent = Some(11);
+        first.kind = Kind::DataRow;
+        first.name = "13:10 · 5시간 50% 남음".into();
+        let mut second = first.clone();
+        second.id = 13;
+        second.name = "13:20 · 5시간 45% 남음".into();
+        s.elements.truncate(2);
+        s.elements.extend([chart, table, first, second]);
+        owner.publish(s, 1)?;
+        let root_text = owner.root.navigate(NavigateDirection_FirstChild)?.unwrap();
+        let account = root_text.navigate(NavigateDirection_NextSibling)?.unwrap();
+        let chart = account.navigate(NavigateDirection_NextSibling)?.unwrap();
+        assert_eq!(
+            i32::try_from(&chart.property(UIA_ControlTypePropertyId)?)?,
+            UIA_CustomControlTypeId.0
+        );
+        let table = chart.navigate(NavigateDirection_FirstChild)?.unwrap();
+        let first = table.navigate(NavigateDirection_FirstChild)?.unwrap();
+        let second = first.navigate(NavigateDirection_NextSibling)?.unwrap();
+        assert!(second.navigate(NavigateDirection_NextSibling)?.is_none());
+        assert_eq!(
+            BSTR::try_from(&second.property(UIA_NamePropertyId)?)?.to_string(),
+            "13:20 · 5시간 45% 남음"
+        );
+        assert!(bool::try_from(
+            &second.property(UIA_IsOffscreenPropertyId)?
+        )?);
+        assert_eq!(
+            first
+                .navigate(NavigateDirection_Parent)?
+                .unwrap()
+                .ticket
+                .unwrap()
+                .id,
+            11
+        );
+        assert_eq!(
+            table
+                .navigate(NavigateDirection_Parent)?
+                .unwrap()
+                .ticket
+                .unwrap()
+                .id,
+            10
+        );
+        assert!(
+            chart
+                .navigate(NavigateDirection_Parent)?
+                .unwrap()
+                .ticket
+                .is_none()
+        );
+        Ok(())
+    }
+    #[test]
+    fn dashboard_parent_cycles_and_missing_parents_refuse_publication() -> Result<()> {
+        let owner = create_root_provider(1)?;
+        let mut missing = scene();
+        missing.elements[1].parent = Some(999);
+        assert!(owner.publish(missing, 1).is_err());
+        let mut cycle = scene();
+        cycle.elements[0].parent = Some(2);
+        cycle.elements[1].parent = Some(1);
+        assert!(owner.publish(cycle, 1).is_err());
+        owner.publish(scene(), 1)?;
+        Ok(())
+    }
+    #[test]
+    fn dashboard_selected_tabs_and_search_value_have_cached_semantics() -> Result<()> {
+        let owner = create_root_provider(1)?;
+        let mut s = scene();
+        s.elements[1].kind = Kind::Tab;
+        s.elements[1].selected = Some(true);
+        s.elements[2].kind = Kind::Edit;
+        s.elements[2].value = Some("한글 검색".into());
+        owner.publish(s, 1)?;
+        let text = owner.root.navigate(NavigateDirection_FirstChild)?.unwrap();
+        let tab = text.navigate(NavigateDirection_NextSibling)?.unwrap();
+        let edit = tab.navigate(NavigateDirection_NextSibling)?.unwrap();
+        assert!(bool::try_from(
+            &tab.property(UIA_SelectionItemIsSelectedPropertyId)?
+        )?);
+        assert_eq!(
+            i32::try_from(&edit.property(UIA_ControlTypePropertyId)?)?,
+            UIA_EditControlTypeId.0
+        );
+        assert_eq!(
+            BSTR::try_from(&edit.property(UIA_ValueValuePropertyId)?)?.to_string(),
+            "한글 검색"
+        );
+        assert!(!bool::try_from(
+            &edit.property(UIA_ValueIsReadOnlyPropertyId)?
+        )?);
+        Ok(())
+    }
     #[test]
     fn native_host_lookup_releases_cache_and_refuses_a_teardown_during_lookup() -> Result<()> {
         let owner = create_root_provider(1)?;

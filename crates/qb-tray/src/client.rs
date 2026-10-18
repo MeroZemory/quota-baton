@@ -1,4 +1,4 @@
-//! Read-only client for the local core admin API.
+//! Client for the local core admin API. Dashboard methods are read-only.
 //!
 //! This module deliberately has no dependency on the Win32 shell.  The tray
 //! shell can poll [`AdminClient`] and render the returned snapshot later.
@@ -67,6 +67,100 @@ impl AdminClient {
                 reason: error.to_string(),
             }),
         }
+    }
+
+    pub async fn dashboard_sessions(
+        &self,
+        range: qb_tray::state::Range,
+    ) -> Result<qb_tray::dashboard_model::SessionsResponse, ClientError> {
+        self.dashboard_get(
+            &format!("/admin/v1/sessions?range={}", range.query()),
+            "sessions",
+        )
+        .await
+    }
+
+    pub async fn dashboard_session(
+        &self,
+        id: &str,
+    ) -> Result<qb_tray::dashboard_model::SessionDetail, ClientError> {
+        if id.len() != 12
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(ClientError::AccountAction("세션 번호가 올바르지 않습니다"));
+        }
+        let detail: qb_tray::dashboard_model::SessionDetail = self
+            .dashboard_get(&format!("/admin/v1/sessions/{id}"), "id")
+            .await?;
+        if detail.session.id != id {
+            return Err(ClientError::AccountAction(
+                "대시보드 세션 응답이 요청과 다릅니다",
+            ));
+        }
+        Ok(detail)
+    }
+
+    pub async fn dashboard_activity(
+        &self,
+        days: u8,
+    ) -> Result<qb_tray::dashboard_model::ActivityResponse, ClientError> {
+        if !(1..=7).contains(&days) {
+            return Err(ClientError::AccountAction(
+                "기록 조회 기간이 올바르지 않습니다",
+            ));
+        }
+        self.dashboard_get(
+            &format!("/admin/v1/activity?days={days}&limit=2000"),
+            "events",
+        )
+        .await
+    }
+
+    pub async fn dashboard_usage_history(
+        &self,
+    ) -> Result<qb_tray::dashboard_model::UsageHistory, ClientError> {
+        self.dashboard_get("/admin/v1/usage-history?hours=48", "accounts")
+            .await
+    }
+
+    async fn dashboard_get<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        required: &str,
+    ) -> Result<T, ClientError> {
+        const MAX: usize = 8 * 1024 * 1024;
+        test_response_delay().await;
+        let response = self
+            .request(reqwest::Method::GET, path)
+            .send()
+            .await
+            .map_err(ClientError::Transport)?;
+        let mut response = Self::check_response(response).await?;
+        let too_large = || ClientError::AccountAction("대시보드 응답이 너무 큽니다");
+        if response.content_length().is_some_and(|n| n > MAX as u64) {
+            return Err(too_large());
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(ClientError::Transport)? {
+            if chunk.len() > MAX.saturating_sub(bytes.len()) {
+                return Err(too_large());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let invalid = || ClientError::AccountAction("대시보드 응답 형식이 올바르지 않습니다");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+        if !value.get(required).is_some_and(|field| {
+            if required == "id" {
+                field.is_string()
+            } else {
+                field.is_array()
+            }
+        }) {
+            return Err(invalid());
+        }
+        serde_json::from_value(value).map_err(|_| invalid())
     }
 
     pub async fn snapshot(&self) -> Result<TraySnapshot, ClientError> {
@@ -1212,5 +1306,94 @@ mod r6_takeover_tests {
             let source: qb_tray::v2::Source = serde_json::from_value(source).unwrap();
             assert!(source.owned_or_adopted());
         }
+    }
+}
+
+#[cfg(test)]
+mod r7_dashboard_client_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn fake(
+        body: &str,
+        declared: Option<usize>,
+    ) -> (AdminClient, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(![10100, 10101].contains(&port));
+        let body = body.as_bytes().to_vec();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = socket.read(&mut chunk).await.unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&chunk[..n]);
+                assert!(request.len() < 8192);
+            }
+            let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+            assert!(request.contains("authorization: bearer synthetic-r7-admin"));
+            assert!(request.contains(&format!("host: 127.0.0.1:{port}")));
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                declared.unwrap_or(body.len())
+            );
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            let _ = socket.write_all(&body).await;
+        });
+        (AdminClient::new(port, "synthetic-r7-admin").unwrap(), task)
+    }
+    #[tokio::test]
+    async fn dashboard_empty_container_is_valid_but_missing_schema_never_becomes_no_sessions() {
+        for body in [
+            r#"{"sessions":[]}"#,
+            r#"{"sessions":[],"future":{"opaque":"ignored"}}"#,
+        ] {
+            let (client, task) = fake(body, None).await;
+            assert!(
+                client
+                    .dashboard_sessions(qb_tray::state::Range::Hour)
+                    .await
+                    .unwrap()
+                    .sessions
+                    .is_empty()
+            );
+            task.await.unwrap();
+        }
+        for body in [
+            r#"{"error":"synthetic-secret-must-not-echo"}"#,
+            r#"{"sessions":null}"#,
+            "[]",
+        ] {
+            let (client, task) = fake(body, None).await;
+            let error = client
+                .dashboard_sessions(qb_tray::state::Range::Hour)
+                .await
+                .unwrap_err();
+            assert!(!error.to_string().contains("synthetic-secret-must-not-echo"));
+            task.await.unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn dashboard_response_cap_and_selected_identity_are_enforced_without_echo() {
+        let (client, task) = fake("", Some(8 * 1024 * 1024 + 1)).await;
+        assert!(
+            client
+                .dashboard_usage_history()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("너무 큽니다")
+        );
+        task.await.unwrap();
+        let (client, task) = fake(
+            r#"{"id":"000000000000","original_short_id":"12345678"}"#,
+            None,
+        )
+        .await;
+        let error = client.dashboard_session("123456abcdef").await.unwrap_err();
+        assert!(error.to_string().contains("요청과 다릅니다"));
+        assert!(!error.to_string().contains("12345678"));
+        task.await.unwrap();
     }
 }
