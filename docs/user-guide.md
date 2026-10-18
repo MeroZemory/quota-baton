@@ -180,6 +180,12 @@ claude-qb
 
 Claude는 기본적으로 `claude-qb` 명령을 만듭니다. 클라이언트 키와 연결 주소는 사용자 전용 권한의 `~/.claude-qb/settings.json`에 둡니다. `claude-qb`는 이 설정을 지정해 실행합니다. 기존 `~/.claude/settings.json`과 `claude` 명령은 바뀌지 않습니다. Claude 설정 폴더와 대화 기록은 공유하므로 두 명령에서 이어 열 수 있습니다. 먼저 일반 `claude` 명령이 PATH에 설치되어 있어야 합니다.
 
+두 실행기는 창이나 탭 제목을 `codex-qb · 현재 폴더` 또는 `claude-qb · 현재 폴더`로 표시합니다. Codex 전용 설정의 `[tui] terminal_title = []`와 Claude 전용 설정의 `CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1`이 이 제목을 유지합니다.
+
+이미 연결한 환경도 `wire`로 미리 본 뒤 `wire --apply`로 제목 설정을 갱신할 수 있습니다. 바뀔 전용 파일만 표시하고 교체합니다. 전용 설정의 다른 항목과 원래 되돌리기용 백업은 보존합니다.
+
+직접 수정한 파일은 기본적으로 거절합니다. 내용을 확인한 뒤 `wire --apply --force`를 쓸 수 있습니다. 설정의 다른 항목은 유지하지만 실행기 본문은 다시 만듭니다. 다른 파일로 교체된 경로는 `--force`도 덮어쓰지 않습니다.
+
 기본 홈이 API key 방식으로 CPA에 연결된 예전 구성이라면, `wire`는 기존 방식대로 기본 홈의 연결 주소와 인증을 바꿉니다. 관련 모델 카탈로그와 CPA provider 주소도 바꿉니다. 원래 값은 journal에 보호해 둡니다.
 
 모드를 직접 고를 수도 있습니다. 각 명령은 먼저 미리보기만 합니다.

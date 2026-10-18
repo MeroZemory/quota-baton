@@ -549,6 +549,10 @@ Details are in contract C11.
   - A WebSocket gap longer than about 6 s moves active Codex sessions to HTTP permanently (§9).
 - **Configuration** stays deliberately small. Behaviour fixes go into code, with tests, never into config knobs.
 
+**Dedicated launcher upgrades (R3.2).** `codex-qb` and `claude-qb` set the terminal title to their command name, a middle dot and the current folder name. Dedicated Codex disables its own title management with `[tui] terminal_title = []`; dedicated Claude sets `CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1`. Launchers preserve argument forwarding, the child exit status and the caller's console codepage.
+
+An existing completed wiring journal supports a read-only upgrade preview and `wire --apply`. Only changed dedicated configuration/settings and launcher files are replaced. Configuration transforms use current owned bytes and preserve unrelated settings. User-edited content needs `--force`, which never bypasses file identity or reparse checks. Each replacement journals its old identity/hash and protected new payload before staging; recovery accepts only the exact old or staged new object. The final entry payload/hash/identity are published together, preserving the original unwire backup. Pending replacements are checked before unwire removes anything. Completed-install upgrades do not replay autostart, CPA tasks or session-home actions. Legacy journals lack a final completion bit: when their file steps are already complete, optional actions are left as they are rather than guessed and replayed.
+
 ## 15. Technology
 
 Rust, with one workspace and two binaries ([D6](decisions.md#d6), pending confirmation).
