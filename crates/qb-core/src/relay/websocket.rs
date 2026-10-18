@@ -193,8 +193,10 @@ async fn upgrade_inner(
     // account selection. C7 reset-hold and token/network budgets stay separate.
     let upgrade_started = std::time::Instant::now();
     let upgrade_deadline = upgrade_started + Duration::from_secs(state.ws_upgrade_hold_secs);
+    let mut quota_source: Option<String> = None;
     let (upstream, upstream_headers, account, tokens) = 'accounts: loop {
         if tried.len() == 4 {
+            if let Some(id) = quota_source.take() { state.notice_quota(&id, None, None).await; }
             return match last_error {
                 Some(response) => response,
                 None => {
@@ -204,10 +206,11 @@ async fn upgrade_inner(
                 }
             };
         }
-        let account = match state
-            .select_request(Provider::Codex, &session, completion, None, &tried)
-            .await
-        {
+        let selected = state.select_request(Provider::Codex, &session, completion, None, &tried).await;
+        if let Some(id) = quota_source.take() && let Ok(next) = &selected {
+            state.notice_quota(&id, next.as_ref(), None).await;
+        }
+        let account = match selected {
             Ok(Some(account)) => account,
             Ok(None) => {
                 return match last_error {
@@ -308,6 +311,7 @@ async fn upgrade_inner(
                     Ok(stream) => stream,
                     Err(_) => return network_failure(),
                 };
+                state.accounts.credit_headers(&account.id, &headers).await;
                 if probe.is_some() && state.accounts.probe_success(&account.id).await.is_err() {
                     return network_failure();
                 }
@@ -485,6 +489,7 @@ async fn upgrade_inner(
                 forbidden += 1;
             }
             if decision.kind == super::outcome::Kind::Quota {
+                state.accounts.observe_quota_reset(&account.id, decision.quota_reset);
                 drop(probe.take());
                 match state
                     .retry_after_reset(&session, completion, &account.id, None)
@@ -512,7 +517,9 @@ async fn upgrade_inner(
                         };
                         continue;
                     }
-                    Ok(false) => {}
+                    Ok(false) => {
+                        quota_source = Some(account.id.clone());
+                    }
                     Err(()) => return network_failure(),
                 }
             }

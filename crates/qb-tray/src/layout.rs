@@ -27,6 +27,10 @@ pub struct State {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Account {
     #[serde(default)]
+    pub quota_notice: Option<QuotaNotice>,
+    #[serde(default)]
+    pub last_relevant_state_at: Option<DateTime<chrono::Utc>>,
+    #[serde(default)]
     pub id: String,
     #[serde(default)]
     pub provider: String,
@@ -62,6 +66,339 @@ pub struct Account {
     pub token_expires_at: Option<String>,
     #[serde(default)]
     pub last_refresh_at: Option<String>,
+}
+
+/// Core evidence only. UI preferences and quota meters cannot create this context.
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaAction {
+    Credits,
+    Failover,
+    Exhausted,
+}
+
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+pub struct QuotaNotice {
+    #[serde(default)]
+    pub model_limited: bool,
+    pub window: Option<String>,
+    pub reset_at: Option<DateTime<chrono::Utc>>,
+    pub action: QuotaAction,
+    pub next_account: Option<String>,
+    #[serde(default)]
+    pub earliest_account: Option<String>,
+    pub observed_at: DateTime<chrono::Utc>,
+}
+
+impl QuotaNotice {
+    pub fn current_since(
+        &self,
+        now: SystemTime,
+        last_relevant_state_at: Option<DateTime<chrono::Utc>>,
+    ) -> bool {
+        self.current(now) && last_relevant_state_at.is_none_or(|at| self.observed_at >= at)
+    }
+    pub fn current(&self, now: SystemTime) -> bool {
+        let now = DateTime::<chrono::Utc>::from(now);
+        self.observed_at <= now && self.reset_at.is_none_or(|at| at > now)
+    }
+}
+
+pub fn notice_account_name(email: Option<&str>, label: Option<&str>, id: &str) -> String {
+    email
+        .and_then(|s| s.split('@').next())
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| label.filter(|s| !s.trim().is_empty()))
+        .unwrap_or(id)
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(80)
+        .collect()
+}
+
+pub struct QuotaMessage {
+    pub title: String,
+    pub text: String,
+    pub short: String,
+}
+
+// Shell reserves 64 UTF-16 units including NUL. Shorten the name, not the action.
+fn fit_account_title(name: &str, prefix: &str, suffix: &str) -> String {
+    let budget =
+        63usize.saturating_sub(prefix.encode_utf16().count() + suffix.encode_utf16().count());
+    if name.encode_utf16().count() <= budget {
+        return format!("{prefix}{name}{suffix}");
+    }
+    let mut kept = String::new();
+    let mut used = 0;
+    for ch in name.chars() {
+        if used + ch.len_utf16() > budget.saturating_sub(1) {
+            break;
+        }
+        used += ch.len_utf16();
+        kept.push(ch);
+    }
+    if budget > 0 {
+        kept.push('…');
+    }
+    format!("{prefix}{kept}{suffix}")
+}
+
+pub fn account_notice_title(name: &str, provider: &str, reason: &str) -> String {
+    fit_account_title(
+        name,
+        "",
+        &format!(" · {} {reason}", provider_name(provider)),
+    )
+}
+
+/// Shared notification/row wording; callers resolve only the core-selected ID.
+pub fn quota_message(
+    notice: &QuotaNotice,
+    name: &str,
+    provider: &str,
+    next_name: Option<&str>,
+    earliest_name: Option<&str>,
+    now: SystemTime,
+) -> Option<QuotaMessage> {
+    if !notice.current(now) {
+        return None;
+    }
+    let window = match notice.window.as_deref() {
+        Some("5h") => "5시간 한도",
+        Some(name) if name == "7d" || name.starts_with("7d_") => "주간 한도",
+        _ => "한도",
+    };
+    let reset = notice.reset_at.map(|at| {
+        let local = at.with_timezone(&Local);
+        if at.signed_duration_since(DateTime::<chrono::Utc>::from(now))
+            < chrono::Duration::hours(24)
+        {
+            local.format("%H:%M").to_string()
+        } else {
+            format!(
+                "{}/{} {}",
+                local.month(),
+                local.day(),
+                local.format("%H:%M")
+            )
+        }
+    });
+    let reset_text = reset.as_ref().map_or_else(
+        || "초기화 시간 확인 중입니다.".into(),
+        |at| format!("{at} 초기화."),
+    );
+    let scope = if notice.model_limited {
+        "이 모델 "
+    } else {
+        ""
+    };
+    let requests = if notice.model_limited {
+        "이 모델의 새 요청"
+    } else {
+        "새 요청"
+    };
+    let (action, short): (String, String) = match notice.action {
+        QuotaAction::Credits => (
+            "유료 크레딧으로 계속 사용합니다.".into(),
+            "크레딧 사용 중".into(),
+        ),
+        QuotaAction::Failover => next_name.map_or_else(
+            || {
+                (
+                    "다른 계정으로 이어서 처리합니다.".into(),
+                    "다른 계정이 처리".into(),
+                )
+            },
+            |next| {
+                (
+                    format!("{next} 계정으로 이어서 처리합니다."),
+                    format!("{next}가 처리"),
+                )
+            },
+        ),
+        QuotaAction::Exhausted => (
+            format!("처리할 다른 계정이 없습니다. {requests}은 한도 오류가 납니다."),
+            "처리할 다른 계정 없음".into(),
+        ),
+    };
+    Some(QuotaMessage {
+        title: if notice.action == QuotaAction::Exhausted {
+            if notice.model_limited {
+                fit_account_title(
+                    name,
+                    &format!(
+                        "{} · 이 모델 처리 계정 모두 한도 도달 · ",
+                        provider_name(provider)
+                    ),
+                    "",
+                )
+            } else {
+                fit_account_title(
+                    name,
+                    &format!("{} 계정 모두 한도 도달 · ", provider_name(provider)),
+                    "",
+                )
+            }
+        } else {
+            account_notice_title(
+                name,
+                provider,
+                &format!(
+                    "{}{window} 도달",
+                    if notice.model_limited {
+                        "이 모델의 "
+                    } else {
+                        ""
+                    }
+                ),
+            )
+        },
+        text: if notice.action == QuotaAction::Exhausted {
+            match (&reset, earliest_name) {
+                (Some(at), Some(earliest)) => format!(
+                    "가장 빠른 초기화: {earliest} {at}. 그때까지 {requests}은 한도 오류가 납니다."
+                ),
+                (Some(at), None) => {
+                    format!("가장 빠른 초기화: {at}. 그때까지 {requests}은 한도 오류가 납니다.")
+                }
+                (None, _) => format!("{action} {reset_text}"),
+            }
+        } else {
+            format!("{action} {reset_text}")
+        },
+        short: format!(
+            "{scope}{window} · {} · {short}",
+            reset.unwrap_or_else(|| "초기화 시간 확인 중".into())
+        ),
+    })
+}
+
+#[cfg(test)]
+mod quota_notice_tests {
+    use super::*;
+    use chrono::Utc;
+    use serde_json::json;
+
+    fn context(action: QuotaAction, now: DateTime<Utc>, hours: i64) -> QuotaNotice {
+        QuotaNotice {
+            model_limited: false,
+            window: Some("7d".into()),
+            reset_at: Some(now + chrono::Duration::hours(hours)),
+            action,
+            next_account: Some("next-id".into()),
+            earliest_account: None,
+            observed_at: now,
+        }
+    }
+
+    #[test]
+    fn local_time_boundary_names_windows_and_truthful_unknown_reset() {
+        let now = "2026-10-18T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(
+            notice_account_name(Some("hello.sample-acct@example.test"), Some("label"), "id"),
+            "hello.sample-acct"
+        );
+        assert_eq!(notice_account_name(Some(""), Some("label"), "id"), "label");
+        assert_eq!(notice_account_name(None, None, "id"), "id");
+        assert_eq!(
+            notice_account_name(Some("a\nb@example.test"), None, "id"),
+            "ab"
+        );
+        for (seconds, dated) in [(1, false), (86399, false), (86400, true), (86401, true)] {
+            let mut q = context(QuotaAction::Credits, now, 1);
+            q.reset_at = Some(now + chrono::Duration::seconds(seconds));
+            let local = q.reset_at.unwrap().with_timezone(&Local);
+            let expected = if dated {
+                format!(
+                    "{}/{} {}",
+                    local.month(),
+                    local.day(),
+                    local.format("%H:%M")
+                )
+            } else {
+                local.format("%H:%M").to_string()
+            };
+            let m = quota_message(&q, "account", "codex", None, None, now.into()).unwrap();
+            assert!(m.text.contains(&format!("{expected} 초기화.")));
+            assert!(m.title.contains("account · Codex 주간 한도"));
+            assert!(m.short.contains("크레딧 사용 중"));
+        }
+        let mut q = context(QuotaAction::Failover, now, 1);
+        q.window = Some("5h".into());
+        q.reset_at = None;
+        let m = quota_message(&q, "account", "codex", Some("next"), None, now.into()).unwrap();
+        assert!(m.title.contains("5시간 한도"));
+        assert!(m.text.contains("next 계정으로 이어서 처리"));
+        assert!(m.text.contains("초기화 시간 확인 중"));
+        assert!(m.short.contains("next가 처리"));
+        q.action = QuotaAction::Exhausted;
+        let m = quota_message(&q, "account", "codex", None, None, now.into()).unwrap();
+        assert!(m.title.contains("Codex 계정 모두 한도 도달"));
+        assert!(m.text.contains("새 요청은 한도 오류"));
+        q.reset_at = Some(now);
+        assert!(quota_message(&q, "account", "codex", None, None, now.into()).is_none());
+        q.reset_at = None;
+        q.observed_at = now + chrono::Duration::seconds(1);
+        assert!(!q.current(now.into()));
+    }
+
+    #[test]
+    fn scoped_exhaustion_does_not_claim_every_model_is_exhausted() {
+        let now: DateTime<Utc> = "2030-01-01T00:00:00Z".parse().unwrap();
+        let mut notice = context(QuotaAction::Exhausted, now, 48);
+        notice.model_limited = true;
+        notice.window = Some("7d_oi".into());
+        let message = quota_message(
+            &notice,
+            "fixture",
+            "claude",
+            None,
+            Some("earliest"),
+            now.into(),
+        )
+        .unwrap();
+        assert!(message.title.contains("이 모델 처리 계정 모두 한도"));
+        assert!(message.text.contains("이 모델의 새 요청은 한도 오류"));
+        assert!(message.short.starts_with("이 모델 주간 한도"));
+        assert!(!message.text.contains("그때까지 새 요청은"));
+    }
+
+    #[test]
+    fn row_uses_authoritative_name_and_clears_expired_or_removed_context() {
+        let now = "2026-10-18T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let mut payload = json!({"accounts":[{"id":"a","provider":"codex","user_state":"active",
+            "health":{"kind":"ready"}, "quota_notice":context(QuotaAction::Failover, now, 1)},
+            {"id":"next-id","provider":"codex","email":"next@example.test","health":{"kind":"ready"}}]});
+        let rows = parse_state_at(&payload.to_string(), now.into()).unwrap();
+        assert!(rows[0].health_chip.contains("next가 처리"));
+        assert_eq!(rows[0].health_tone, Tone::Warning);
+        payload["accounts"][1]["email"] = serde_json::Value::Null;
+        payload["accounts"][1]["label"] = json!("Next label");
+        let rows = parse_state_at(&payload.to_string(), now.into()).unwrap();
+        assert!(rows[0].health_chip.contains("Next label가 처리"));
+        payload["accounts"][1]["label"] = serde_json::Value::Null;
+        let rows = parse_state_at(&payload.to_string(), now.into()).unwrap();
+        assert!(rows[0].health_chip.contains("next-id가 처리"));
+        payload["accounts"][0]["last_relevant_state_at"] =
+            json!(now + chrono::Duration::seconds(1));
+        let rows = parse_state_at(
+            &payload.to_string(),
+            (now + chrono::Duration::seconds(2)).into(),
+        )
+        .unwrap();
+        assert_eq!(rows[0].health_chip, "준비됨");
+        payload["accounts"][0]["last_relevant_state_at"] = serde_json::Value::Null;
+        let rows = parse_state_at(
+            &payload.to_string(),
+            (now + chrono::Duration::hours(1)).into(),
+        )
+        .unwrap();
+        assert_eq!(rows[0].health_chip, "준비됨");
+        payload["accounts"][0]["quota_notice"] = serde_json::Value::Null;
+        let rows = parse_state_at(&payload.to_string(), now.into()).unwrap();
+        assert_eq!(rows[0].health_chip, "준비됨");
+    }
 }
 
 fn decode_source<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -684,7 +1021,35 @@ pub fn parse_state_at(json: &str, now: SystemTime) -> serde_json::Result<Vec<Row
     Ok(state
         .accounts
         .iter()
-        .map(|account| row(account, now))
+        .map(|account| {
+            let mut row = row(account, now);
+            if account.user_state == "active" {
+                if let Some(notice) = account
+                    .quota_notice
+                    .as_ref()
+                    .filter(|q| q.current_since(now, account.last_relevant_state_at))
+                {
+                    let next = notice.next_account.as_deref().map(|id| {
+                        state
+                            .accounts
+                            .iter()
+                            .find(|a| a.id == id && a.provider == account.provider)
+                            .map_or_else(
+                                || notice_account_name(None, None, id),
+                                |a| notice_account_name(a.email.as_deref(), a.label.as_deref(), id),
+                            )
+                    });
+                    if let Some(message) =
+                        quota_message(notice, "", &account.provider, next.as_deref(), None, now)
+                    {
+                        row.health_chip = message.short;
+                        row.health_tone = Tone::Warning;
+                        row.attention = true;
+                    }
+                }
+            }
+            row
+        })
         .collect())
 }
 
@@ -699,12 +1064,19 @@ pub fn row(account: &Account, now: SystemTime) -> Row {
         .pacing
         .backoff_secs
         .is_some_and(|seconds| seconds > 0);
-    let health_tone =
-        if account.probe_pending || account.drain || account.refresh_attention || pacing {
-            Tone::Warning
-        } else {
-            health_tone(account)
-        };
+    let health_tone = if account.probe_pending
+        || account.drain
+        || account.refresh_attention
+        || pacing
+        || account
+            .quota_notice
+            .as_ref()
+            .is_some_and(|notice| notice.current_since(now, account.last_relevant_state_at))
+    {
+        Tone::Warning
+    } else {
+        health_tone(account)
+    };
     let windows = account
         .windows
         .iter()
@@ -802,6 +1174,21 @@ pub fn health_chip(account: &Account, now: SystemTime) -> String {
     }
     if account.user_state == "paused" {
         return "일시정지".into();
+    }
+    if let Some(notice) = account
+        .quota_notice
+        .as_ref()
+        .filter(|q| q.current_since(now, account.last_relevant_state_at))
+    {
+        let next = notice
+            .next_account
+            .as_deref()
+            .map(|id| notice_account_name(None, None, id));
+        if let Some(message) =
+            quota_message(notice, "", &account.provider, next.as_deref(), None, now)
+        {
+            return message.short;
+        }
     }
     if account.probe_pending {
         return "인증 확인 대기".into();

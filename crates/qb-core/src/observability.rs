@@ -448,7 +448,7 @@ impl Observability {
                 }
             }
         }
-        for key in ["limit_reached", "plan_type"] {
+        for key in ["limit_reached", "plan_type", "active_limit"] {
             if let Some(value) = event.get(key).or_else(|| limits.get(key)) {
                 add(format!("x-codex-{}", key.replace('_', "-")), value);
             }
@@ -835,8 +835,13 @@ fn snapshot(provider: Provider, h: &HeaderMap, now: DateTime<Utc>) -> Option<Sna
         Provider::Codex => {
             signals.limit_reached = header(h, "x-codex-limit-reached").and_then(|v| v.parse().ok());
             signals.active_limit = header(h, "x-codex-active-limit")
-                .filter(|v| matches!(*v, "primary" | "secondary" | "5h" | "7d" | "credits"))
-                .map(str::to_owned);
+                .and_then(|v| match v {
+                    "primary" | "secondary" | "5h" | "7d" | "7d_oi" | "credits" => Some(v),
+                    "five_hour" => Some("5h"),
+                    "seven_day" => Some("7d"),
+                    "seven_day_opus" => Some("7d_oi"),
+                    _ => None,
+                }).map(str::to_owned);
             signals.serving_from_credits = header(h, "x-codex-credits-serving")
                 .and_then(|v| v.parse().ok())
                 .or_else(|| (header(h, "x-codex-active-limit") == Some("credits")).then_some(true));

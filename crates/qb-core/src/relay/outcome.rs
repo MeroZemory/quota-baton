@@ -21,6 +21,7 @@ pub(super) struct Decision {
     pub kind: Kind,
     pub signal: Option<HealthSignal>,
     pub model: Option<String>,
+    pub quota_reset: Option<DateTime<Utc>>,
 }
 impl Decision {
     pub fn failover(&self) -> bool {
@@ -83,6 +84,7 @@ pub(super) fn classify(
     let mut decision = Decision {
         kind: Kind::Relay,
         signal: None,
+        quota_reset: None,
         model: model.map(str::to_owned),
     };
     if matches!(
@@ -211,6 +213,7 @@ pub(super) fn classify(
         {
             return decision;
         }
+        decision.quota_reset = resets.iter().copied().filter(|reset| *reset > now).max();
         let until = resets
             .into_iter()
             .filter(|reset| *reset > now)
