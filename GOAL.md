@@ -42,6 +42,7 @@ Implement quota-baton exactly as specified, milestone by milestone, until M8 is 
 | R1 | merged (all five groups plus R1-tray.1) |
 | R2 | D17: Part A (adopt + manual refresh + refresh regardless of user_state) right after the current R1 group, MUST merge before 10-22; then R1 groups 3-5; then Part B (retire-cpa/restore-cpa); brief `R2-adopt-retire-cpa.md` |
 | R3 | `codex-qb` dedicated Codex home and launcher in the cutover tool (user decision 2026-10-18; the default `~/.codex` is now direct ChatGPT); after R1 group 5, before R2 Part B; brief `R3-codex-qb-home.md` |
+| R1-tray.2 | situation-specific notifications naming the account (user request); right after R3; brief `R1-tray.2-notifications.md` |
 
 ## Hard boundaries (never)
 
