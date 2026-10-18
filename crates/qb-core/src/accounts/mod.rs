@@ -1,3 +1,4 @@
+pub mod adopt;
 mod crypto;
 pub mod health;
 pub mod import;

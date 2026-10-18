@@ -21,6 +21,19 @@ impl std::fmt::Display for UsageCliError {
 }
 impl std::error::Error for UsageCliError {}
 
+/// Only static, reviewed local messages may cross the CLI error boundary.
+#[derive(Debug)]
+pub struct AccountCliError(pub &'static str);
+impl std::fmt::Display for AccountCliError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for AccountCliError {}
+fn account_error(message: &'static str) -> anyhow::Error {
+    AccountCliError(message).into()
+}
+
 #[derive(Subcommand)]
 pub enum AccountsCommand {
     #[command(about = "브라우저로 계정에 로그인합니다")]
@@ -44,6 +57,23 @@ pub enum AccountsCommand {
     Enable { id: String },
     #[command(about = "계정 사용량을 갱신합니다")]
     RefreshUsage { id: String },
+    #[command(about = "CPA 연결 계정을 직접 갱신하도록 전환합니다")]
+    Adopt {
+        #[arg(required = true, num_args = 1..)]
+        ids: Vec<String>,
+        #[arg(
+            long,
+            default_value = "cpa-file",
+            help = "store, cpa-file 또는 백업 파일/폴더 경로"
+        )]
+        from: String,
+    },
+    #[command(about = "계정 토큰을 지금 갱신합니다")]
+    Refresh {
+        id: String,
+        #[arg(long, help = "이전 갱신 결과가 불확실해도 한 번 시도합니다")]
+        force: bool,
+    },
     #[command(about = "CPA 계정을 가져옵니다")]
     Import {
         #[command(subcommand)]
@@ -79,7 +109,7 @@ pub struct CpaArgs {
     activate: Vec<String>,
     #[arg(long, help = "저장하지 않고 결과를 확인합니다")]
     dry_run: bool,
-    #[arg(long, help = "M8 전환 단계에서만 사용할 수 있습니다")]
+    #[arg(long, help = "이 옵션 대신 accounts adopt 명령을 사용해 주세요")]
     adopt: bool,
 }
 
@@ -92,6 +122,8 @@ pub async fn run(command: AccountsCommand, home: &Path, config: &Config) -> anyh
         } => {
             login(home, config, provider.into(), replace_linked, no_browser).await?;
         }
+        AccountsCommand::Adopt { ids, from } => adopt_accounts(home, config, ids, from).await?,
+        AccountsCommand::Refresh { id, force } => refresh_tokens(home, config, id, force).await?,
         AccountsCommand::RefreshUsage { id } => refresh_usage(home, config, &id).await?,
         AccountsCommand::Pause { id } => action(home, config, &id, "pause").await?,
         AccountsCommand::Resume { id } => action(home, config, &id, "resume").await?,
@@ -121,7 +153,11 @@ pub async fn run(command: AccountsCommand, home: &Path, config: &Config) -> anyh
         AccountsCommand::Import {
             source: ImportSource::Cpa(args),
         } => {
-            anyhow::ensure!(!args.adopt, "소유권 이전은 M8 전환 단계에서만 가능합니다.");
+            if args.adopt {
+                return Err(account_error(
+                    "소유권 이전은 accounts adopt 명령을 사용해 주세요.",
+                ));
+            }
             let dir = match args.dir {
                 Some(dir) => dir,
                 None => PathBuf::from(
@@ -291,6 +327,248 @@ async fn running_admin(
     }
 }
 
+fn valid_account_id(id: &str) -> anyhow::Result<()> {
+    if qb_core::observability::safe_identifier(id).is_none() {
+        return Err(account_error("계정 ID를 확인해 주세요."));
+    }
+    Ok(())
+}
+
+async fn account_response(response: reqwest::Response) -> anyhow::Result<serde_json::Value> {
+    let status = response.status();
+    let value: serde_json::Value = response.json().await.unwrap_or_default();
+    // Only allowlisted local error codes are rendered; never echo arbitrary payloads.
+    if !status.is_success() {
+        let message = match value["error"]["code"].as_str() {
+            Some("not_found") => "계정을 찾을 수 없습니다.",
+            Some("linked") => "CPA가 갱신하는 계정입니다.",
+            Some("not_linked") => "CPA 연결 계정만 소유권을 이전할 수 있습니다.",
+            Some("drain") => "드레인 중인 계정은 갱신할 수 없습니다.",
+            Some("needs_relogin") => "다시 로그인해야 하는 계정입니다.",
+            Some("uncertain") => {
+                "이전 갱신 결과가 불확실합니다. 확인 후 --force로 한 번 시도해 주세요."
+            }
+            Some("generation_conflict") => "계정이 변경됐습니다. 상태를 다시 읽고 시도해 주세요.",
+            Some("identity_conflict") => "계정의 사용자를 확인할 수 없거나 사용자 파일이 겹칩니다.",
+            Some("cpa_running") => "CPA가 아직 이 계정을 갱신할 수 있습니다.",
+            Some("cpa_unknown") => "CPA 실행 상태를 확인할 수 없습니다.",
+            _ => "계정 작업을 마치지 못했습니다. 코어 상태를 확인해 주세요.",
+        };
+        return Err(account_error(message));
+    }
+    Ok(value)
+}
+
+fn adoption_error(error: qb_core::accounts::adopt::AdoptError) -> anyhow::Error {
+    use qb_core::accounts::adopt::AdoptError;
+    account_error(match error {
+        AdoptError::NotFound => "계정을 찾을 수 없습니다.",
+        AdoptError::NotLinked => "CPA 연결 계정만 소유권을 이전할 수 있습니다.",
+        AdoptError::Generation { .. } => "계정이 변경됐습니다. 상태를 다시 읽고 시도해 주세요.",
+        AdoptError::IdentityMismatch | AdoptError::AmbiguousIdentity => {
+            "계정의 사용자를 확인할 수 없거나 사용자 파일이 겹칩니다."
+        }
+        AdoptError::CpaRunning => "CPA가 아직 이 계정을 갱신할 수 있습니다.",
+        AdoptError::ProbeUnavailable => "CPA 실행 상태를 확인할 수 없습니다.",
+        AdoptError::SourceIo | AdoptError::Store(_) => "계정 자료를 읽거나 저장할 수 없습니다.",
+    })
+}
+
+async fn adopt_accounts(
+    home: &Path,
+    config: &Config,
+    ids: Vec<String>,
+    from: String,
+) -> anyhow::Result<()> {
+    use qb_core::accounts::adopt::{AdoptFrom, AdoptRequest, AdoptSource};
+    for id in &ids {
+        valid_account_id(id)?;
+    }
+    let from = match from.as_str() {
+        "store" => AdoptFrom::Source(AdoptSource::Store),
+        "cpa-file" | "cpa_file" => AdoptFrom::Source(AdoptSource::CpaFile),
+        _ => {
+            let path = PathBuf::from(from);
+            AdoptFrom::Path {
+                path: if path.is_absolute() {
+                    path
+                } else {
+                    std::env::current_dir()?.join(path)
+                },
+            }
+        }
+    };
+    let admin = running_admin(home, config).await?;
+    // A responding core always owns the lease, including on auth/health failure.
+    let local = if admin.is_none() {
+        Some(std::sync::Arc::new(AccountStore::acquire(home)?))
+    } else {
+        None
+    };
+    println_utf8!("계정 ID\t결과\t토큰 출처\t만료 시각");
+    for id in ids {
+        let result = if let Some((client, base, token)) = &admin {
+            let state = account_response(
+                client
+                    .get(format!("{base}/state"))
+                    .bearer_auth(token.trim())
+                    .send()
+                    .await?,
+            )
+            .await?;
+            let generation = state["accounts"]
+                .as_array()
+                .and_then(|accounts| accounts.iter().find(|account| account["id"] == id))
+                .and_then(|account| account["generation"].as_u64())
+                .ok_or_else(|| {
+                    account_error("계정을 찾을 수 없거나 코어가 소유권 이전을 지원하지 않습니다.")
+                })?;
+            account_response(
+                client
+                    .post(format!("{base}/accounts/{id}/adopt"))
+                    .timeout(Duration::from_secs(35))
+                    .bearer_auth(token.trim())
+                    .json(&AdoptRequest {
+                        from: from.clone(),
+                        expected_generation: generation,
+                    })
+                    .send()
+                    .await?,
+            )
+            .await?
+        } else {
+            let store = local.as_ref().expect("local lease").clone();
+            let from = from.clone();
+            let account_id = id.clone();
+            serde_json::to_value(
+                tokio::task::spawn_blocking(move || {
+                    let account = store
+                        .load(&account_id)
+                        .map_err(qb_core::accounts::adopt::AdoptError::from)?;
+                    qb_core::accounts::adopt::run(
+                        &store,
+                        &account_id,
+                        AdoptRequest {
+                            from,
+                            expected_generation: account.generation,
+                        },
+                    )
+                })
+                .await?
+                .map_err(adoption_error)?,
+            )?
+        };
+        let origin = match result["from"].as_str() {
+            Some("cpa_file") => "CPA 파일",
+            Some("backup") => "백업",
+            _ => "저장된 토큰",
+        };
+        println_utf8!(
+            "{}\t직접 갱신으로 전환\t{}\t{}",
+            id,
+            origin,
+            cell(&result["token_expires_at"])
+        );
+        for warning in result["warnings"].as_array().into_iter().flatten() {
+            let message = match warning.as_str() {
+                Some("cpa_file_missing") => "CPA 파일이 없어 다른 자료를 사용했습니다.",
+                Some("cpa_file_unreadable") => {
+                    "읽을 수 없는 CPA 파일이 있어 다른 자료를 사용했습니다."
+                }
+                Some("backup_missing" | "backup_unreadable") => {
+                    "백업을 읽을 수 없어 저장된 자료를 사용했습니다."
+                }
+                Some("older_or_unordered_candidate_ignored") => {
+                    "오래되었거나 시각을 비교할 수 없는 토큰은 사용하지 않았습니다."
+                }
+                Some("email_updated") => "같은 계정의 이메일 표시를 갱신했습니다.",
+                Some("stored_tokens_may_need_relogin") => {
+                    "저장된 토큰의 만료 또는 불확실 상태를 확인해 주세요."
+                }
+                _ => continue,
+            };
+            println_utf8!("계정 {}: {}", id, message);
+        }
+    }
+    Ok(())
+}
+
+async fn refresh_tokens(
+    home: &Path,
+    config: &Config,
+    id: String,
+    force: bool,
+) -> anyhow::Result<()> {
+    valid_account_id(&id)?;
+    let summary = if let Some((client, base, token)) = running_admin(home, config).await? {
+        account_response(
+            client
+                .post(format!("{base}/accounts/{id}/refresh"))
+                .timeout(Duration::from_secs(40))
+                .bearer_auth(token.trim())
+                .json(&serde_json::json!({"force":force}))
+                .send()
+                .await?,
+        )
+        .await?
+    } else {
+        let store = std::sync::Arc::new(AccountStore::acquire(home)?);
+        let obs = std::sync::Arc::new(qb_core::observability::Observability::new(home, None)?);
+        let relay = qb_core::relay::RelayState::new(
+            store,
+            config,
+            obs.clone(),
+            std::sync::Arc::new(qb_core::debug_pin::DebugPins::default()),
+        )?;
+        #[cfg(debug_assertions)]
+        let relay = {
+            let mut relay = relay;
+            for (provider, endpoint) in [
+                (
+                    qb_core::accounts::Provider::Claude,
+                    &config.upstream.claude_token_endpoint,
+                ),
+                (
+                    qb_core::accounts::Provider::Codex,
+                    &config.upstream.codex_token_endpoint,
+                ),
+            ] {
+                if let Some(endpoint) = endpoint {
+                    relay = relay.with_token_endpoint(provider, endpoint.clone());
+                }
+            }
+            relay
+        };
+        let result = relay.refresh_account(id.clone(), force).await;
+        let mut warned = false;
+        // Never drop a lease while detached consumption or an unsaved rotation survives.
+        while relay.shutdown_refreshes().await.is_err() {
+            if !warned {
+                println_utf8!(
+                    "갱신 결과를 저장하는 동안 계정 잠금을 유지합니다. 저장 공간과 권한을 확인해 주세요."
+                );
+                warned = true;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        obs.flush()?;
+        result?
+    };
+    if summary["outcome"] == "success" {
+        println_utf8!(
+            "계정 {}: 갱신 완료 · 만료 {} · 최근 갱신 {}",
+            id,
+            cell(&summary["token_expires_at"]),
+            cell(&summary["last_refresh_at"])
+        );
+        Ok(())
+    } else {
+        Err(account_error(
+            "갱신 자격 증명이 무효화되거나 만료됐습니다. 다시 로그인해 주세요.",
+        ))
+    }
+}
+
 async fn action(home: &Path, config: &Config, id: &str, action: &str) -> anyhow::Result<()> {
     let state = match action {
         "pause" => qb_core::accounts::UserState::Paused,
@@ -350,6 +628,19 @@ async fn refresh_usage(home: &Path, config: &Config, id: &str) -> anyhow::Result
     Ok(())
 }
 
+fn status_heading(home: &Path, running: bool) -> anyhow::Result<Vec<String>> {
+    let mut lines = vec![format!(
+        "코어: {}",
+        if running {
+            "실행 중"
+        } else {
+            "중지됨 (저장된 상태)"
+        }
+    )];
+    lines.extend(crate::cutover::cpa_dependency_note(home)?);
+    Ok(lines)
+}
+
 pub async fn status(home: &Path, config: &Config) -> anyhow::Result<()> {
     let (running, accounts) = if let Some((client, base, token)) =
         running_admin(home, config).await?
@@ -394,14 +685,9 @@ pub async fn status(home: &Path, config: &Config) -> anyhow::Result<()> {
             .await??;
         (false, accounts)
     };
-    println_utf8!(
-        "코어: {}",
-        if running {
-            "실행 중"
-        } else {
-            "중지됨 (저장된 상태)"
-        }
-    );
+    for line in status_heading(home, running)? {
+        println_utf8!("{line}");
+    }
     let pools = qb_core::account_runtime::pool_counts(&accounts);
     for provider in ["claude", "codex"] {
         let pool = &pools[provider];
@@ -817,4 +1103,59 @@ fn open_browser(url: &str) -> std::io::Result<()> {
         return Err(std::io::Error::other("브라우저를 열지 못했습니다."));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod r1_cpa_status_tests {
+    use super::*;
+    use crate::cutover::cpa_dependency_tests::{account, scratch};
+    use serde_json::json;
+
+    #[test]
+    fn r1_cpa_status_heading_shares_wire_note_online_and_offline() {
+        let dir = scratch();
+        for (label, mode, state) in [
+            ("one", "linked", "active"),
+            ("two", "linked", "active"),
+            ("paused", "linked", "paused"),
+            ("disabled", "linked", "disabled"),
+            ("owned", "owned", "active"),
+            ("adopted", "adopted", "active"),
+        ] {
+            account(dir.path(), label, mode, state, json!({"kind":"ready"}));
+        }
+        let _lease = AccountStore::acquire(dir.path()).unwrap();
+        for running in [false, true] {
+            let lines = status_heading(dir.path(), running).unwrap();
+            assert_eq!(lines.len(), 2);
+            assert_eq!(
+                lines[0],
+                if running {
+                    "코어: 실행 중"
+                } else {
+                    "코어: 중지됨 (저장된 상태)"
+                }
+            );
+            assert_eq!(
+                lines[1],
+                "CPA는 계속 실행되어야 합니다 (연결 계정 2개의 토큰 갱신)"
+            );
+        }
+    }
+
+    #[test]
+    fn r1_cpa_status_heading_omits_note_without_active_linked_accounts() {
+        let dir = scratch();
+        for (label, mode, state) in [
+            ("paused", "linked", "paused"),
+            ("disabled", "linked", "disabled"),
+            ("owned", "owned", "active"),
+            ("adopted", "adopted", "active"),
+        ] {
+            account(dir.path(), label, mode, state, json!({"kind":"ready"}));
+        }
+        for running in [false, true] {
+            assert_eq!(status_heading(dir.path(), running).unwrap().len(), 1);
+        }
+    }
 }
