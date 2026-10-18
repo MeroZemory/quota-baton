@@ -920,3 +920,74 @@ impl AccountRuntime {
         }
     }
 }
+
+/// Per-provider subscription pool counts shared by admin state and CLI status.
+/// Paused/disabled/relogin/probe-pending accounts are unavailable; active
+/// canonical coolings are grouped by reason. No credential fields are read.
+pub fn pool_counts(accounts: &[Value]) -> Value {
+    let mut pools = json!({
+        "claude": {"eligible":0,"cooling":{},"unavailable":0},
+        "codex": {"eligible":0,"cooling":{},"unavailable":0}
+    });
+    for account in accounts {
+        let Some(provider @ ("claude" | "codex")) = account["provider"].as_str() else {
+            continue;
+        };
+        let pool = &mut pools[provider];
+        let kind = account["health"]["kind"].as_str().unwrap_or("unknown");
+        if account["user_state"] != "active"
+            || account["probe_pending"] == true
+            || !matches!(kind, "ready" | "cooling")
+        {
+            pool["unavailable"] = json!(pool["unavailable"].as_u64().unwrap_or(0) + 1);
+        } else if kind == "cooling" {
+            // Store-backed views have already expired their health. A volatile
+            // store-error remains blocked until its pending write succeeds,
+            // even after its displayed retry deadline.
+            let reason = account["health"]["reason"]
+                .as_str()
+                .filter(|reason| {
+                    matches!(
+                        *reason,
+                        "quota"
+                            | "rate"
+                            | "auth"
+                            | "permission"
+                            | "payment"
+                            | "store_error"
+                            | "link_stale"
+                    )
+                })
+                .unwrap_or("unknown");
+            pool["cooling"][reason] = json!(pool["cooling"][reason].as_u64().unwrap_or(0) + 1);
+        } else {
+            pool["eligible"] = json!(pool["eligible"].as_u64().unwrap_or(0) + 1);
+        }
+    }
+    pools
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    #[test]
+    fn c6_4_pools_count_each_provider_and_cooling_reason_without_credentials() {
+        let accounts = vec![
+            json!({"provider":"claude","user_state":"active","health":{"kind":"ready"}}),
+            json!({"provider":"claude","user_state":"active","health":{"kind":"cooling","reason":"payment","until":"2099-01-01T00:00:00Z"}}),
+            json!({"provider":"claude","user_state":"disabled","health":{"kind":"ready"}}),
+            json!({"provider":"codex","user_state":"active","health":{"kind":"cooling","reason":"quota","until":"2099-01-01T00:00:00Z"}}),
+            json!({"provider":"codex","user_state":"active","health":{"kind":"needs_relogin"}}),
+            // Volatile persistence failures do not expire into eligibility.
+            json!({"provider":"codex","user_state":"active","health":{"kind":"cooling","reason":"store_error","until":"2000-01-01T00:00:00Z"}}),
+        ];
+        assert_eq!(
+            pool_counts(&accounts),
+            json!({
+                "claude":{"eligible":1,"cooling":{"payment":1},"unavailable":1},
+                "codex":{"eligible":0,"cooling":{"quota":1,"store_error":1},"unavailable":1}
+            })
+        );
+    }
+}

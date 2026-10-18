@@ -173,6 +173,9 @@ pub fn save(
             next.quota_cooling = None;
         }
         next.auth_failures = 0;
+        next.payment_failures = old.payment_failures;
+        next.payment_until = old.payment_until;
+        next.expire_health(chrono::Utc::now());
         next.auth_probe_pending = false;
     }
     let same_file = old.filter(|old| old.id == next.id);

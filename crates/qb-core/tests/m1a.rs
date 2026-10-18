@@ -248,6 +248,88 @@ fn reimport_activate_equal_and_older() {
 }
 
 #[test]
+fn c6_4_reimport_preserves_payment_counter_and_deadline() {
+    isolated(
+        "c6_4_reimport_preserves_payment_counter_and_deadline",
+        |home, cpa| {
+            for provider in ["claude", "codex"] {
+                write(cpa, &format!("{provider}.json"), &fixture(provider, 1));
+            }
+            let store = AccountStore::acquire(home).unwrap();
+            import::run(
+                &store,
+                cpa,
+                &[
+                    "claude:synthetic@example.invalid".into(),
+                    "codex:synthetic@example.invalid".into(),
+                ],
+                false,
+            )
+            .unwrap();
+            let now = Utc::now();
+            let mut expected = Vec::new();
+            for account in store.list().unwrap() {
+                assert_eq!(account.payment_failures, 0);
+                assert_eq!(account.payment_until, None);
+                let paid = store
+                    .update_metadata(&account.id, |a| {
+                        for _ in 0..2 {
+                            a.apply_health_signal(
+                                qb_core::accounts::HealthSignal::Cooling {
+                                    reason: HealthReason::Payment,
+                                    until: now + Duration::hours(6),
+                                    scope: "account".into(),
+                                },
+                                now,
+                            );
+                        }
+                    })
+                    .unwrap();
+                assert_eq!(paid.payment_failures, 2);
+                assert_eq!(paid.payment_until, Some(now + Duration::hours(12)));
+                expected.push(paid);
+            }
+            drop(store);
+            let store = AccountStore::acquire(home).unwrap();
+            for provider in ["claude", "codex"] {
+                write(cpa, &format!("{provider}.json"), &fixture(provider, 2));
+            }
+            let rows = import::run(&store, cpa, &[], false).unwrap();
+            assert_eq!(rows.len(), 2);
+            assert!(rows.iter().all(|row| row.action == ImportAction::Updated));
+            for paid in &expected {
+                let updated = store.load(&paid.id).unwrap();
+                assert!(matches!(
+                    updated.source,
+                    Source::Cpa {
+                        mode: qb_core::accounts::ImportMode::Linked,
+                        ..
+                    }
+                ));
+                assert_eq!(updated.provider, paid.provider);
+                assert_eq!(updated.user_state, UserState::Active);
+                assert_eq!(updated.payment_failures, paid.payment_failures);
+                assert_eq!(updated.payment_until, paid.payment_until);
+                assert_eq!(updated.health, paid.health);
+                assert!(!updated.eligible(None));
+                assert!(store.tokens(&updated).unwrap().access_token == "fake-access-2");
+                assert!(updated.generation > paid.generation);
+            }
+            drop(store);
+            let restarted = AccountStore::acquire(home).unwrap();
+            assert_eq!(restarted.list().unwrap().len(), 2);
+            for paid in &expected {
+                let persisted = restarted.load(&paid.id).unwrap();
+                assert_eq!(persisted.payment_failures, paid.payment_failures);
+                assert_eq!(persisted.payment_until, paid.payment_until);
+                assert_eq!(persisted.health, paid.health);
+                assert!(!persisted.eligible(None));
+            }
+        },
+    );
+}
+
+#[test]
 fn preview_and_adopt_write_nothing() {
     isolated("preview_and_adopt_write_nothing", |home, cpa| {
         write(cpa, "source.json", &fixture("claude", 1));

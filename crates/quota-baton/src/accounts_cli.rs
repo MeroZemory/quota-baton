@@ -402,6 +402,31 @@ pub async fn status(home: &Path, config: &Config) -> anyhow::Result<()> {
             "중지됨 (저장된 상태)"
         }
     );
+    let pools = qb_core::account_runtime::pool_counts(&accounts);
+    for provider in ["claude", "codex"] {
+        let pool = &pools[provider];
+        let cooling = pool["cooling"]
+            .as_object()
+            .map(|reasons| {
+                reasons
+                    .iter()
+                    .map(|(reason, count)| {
+                        format!(
+                            "{} {count}",
+                            translated(&serde_json::Value::String(reason.clone()))
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        println_utf8!(
+            "{provider}: 사용 가능 {} · 대기 [{}] · 사용 불가 {}",
+            pool["eligible"],
+            cooling,
+            pool["unavailable"]
+        );
+    }
     println_utf8!(
         "계정 ID\t제공자\t라벨\t사용 상태\t계정 상태\t5시간 사용률\t5시간 초기화\t7일 사용률\t7일 초기화\t상태 이유\t대기 종료"
     );

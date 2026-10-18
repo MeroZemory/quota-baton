@@ -113,11 +113,7 @@ impl AccountStore {
     pub fn list_metadata(home: &Path) -> Result<Vec<Account>, StoreError> {
         let mut accounts = Self::read_metadata_dir(&home.join("accounts"))?;
         for account in &mut accounts {
-            let expired_auth = matches!(account.health, Health::Cooling {reason: super::HealthReason::Auth,until,..} if until <= chrono::Utc::now());
-            if account.health.expire(chrono::Utc::now()) {
-                account.auth_probe_pending |= expired_auth;
-                account.quota_cooling = None;
-            }
+            account.expire_health(chrono::Utc::now());
         }
         Ok(accounts)
     }

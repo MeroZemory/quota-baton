@@ -758,6 +758,57 @@ async fn c6_row_13_four_distinct_accounts_maximum() {
 }
 
 #[tokio::test]
+async fn c6_4_402_websocket_upgrade_cools_account_then_moves_binding() {
+    let h = Harness::new(2).await;
+    let body = r#"{"error":{"message":"synthetic payment required"}}"#;
+    h.fake
+        .state
+        .push_handshake(StatusCode::PAYMENT_REQUIRED, body, HeaderMap::new());
+    let started = Utc::now();
+    let (mut client, served) = h.connect().await;
+    assert_eq!(served, h.ids[1]);
+    assert_eq!(
+        h.state.bindings.current(Some("codex:synthetic-ws-session")),
+        Some(served.clone())
+    );
+    let cooled = h.store.load(&h.ids[0]).unwrap();
+    assert!(matches!(
+        cooled.source,
+        qb_core::accounts::Source::Cpa { .. }
+    ));
+    assert_eq!(cooled.payment_failures, 1);
+    assert!(
+        matches!(cooled.health, Health::Cooling { reason: HealthReason::Payment, until, ref scope }
+        if scope == "account" && until >= started + ChronoDuration::hours(6)
+            && until <= Utc::now() + ChronoDuration::hours(6))
+    );
+    assert_eq!(h.store.load(&served).unwrap().health, Health::Ready);
+    client.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn c6_4_402_websocket_native_when_no_account_remains() {
+    let h = Harness::new(2).await;
+    let body = r#"{"error":{"message":"synthetic payment required"}}"#;
+    for _ in 0..2 {
+        h.fake
+            .state
+            .push_handshake(StatusCode::PAYMENT_REQUIRED, body, HeaderMap::new());
+    }
+    let (status, returned) = h.error().await;
+    assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+    assert_eq!(returned, serde_json::from_str::<Value>(body).unwrap());
+    for id in &h.ids {
+        let a = h.store.load(id).unwrap();
+        assert!(matches!(a.source, qb_core::accounts::Source::Cpa { .. }));
+        assert!(
+            matches!(a.health, Health::Cooling { reason: HealthReason::Payment, until, .. }
+            if until > Utc::now() + ChronoDuration::hours(5))
+        );
+    }
+}
+
+#[tokio::test]
 async fn c6_row_13_402_and_6a_exhaustion_keep_last_response() {
     for (status, body) in [
         (

@@ -221,6 +221,371 @@ fn assert_quota(account: &Account, reset: i64) {
     );
 }
 
+fn c6_4_add_linked(h: &Harness, provider: Provider, email: &str) -> String {
+    let dir = h
+        ._root
+        .path()
+        .join(format!("extra-{}-{email}", provider.as_str()));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("fixture.json"), serde_json::to_vec(&json!({
+        "type": provider.as_str(), "email": email,
+        "account_id": format!("synthetic-{email}"), "account_uuid": format!("synthetic-{email}"),
+        "organization_uuid": "synthetic-org", "access_token": format!("synthetic-access-{email}"),
+        "refresh_token": format!("synthetic-refresh-{email}"), "expired": "2099-01-01T00:00:00Z",
+        "last_refresh": "2026-01-01T00:00:00Z"
+    })).unwrap()).unwrap();
+    import::run(
+        &h.store,
+        &dir,
+        &[format!("{}:{email}", provider.as_str())],
+        false,
+    )
+    .unwrap();
+    h.store
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|a| a.provider == provider && a.email == email)
+        .unwrap()
+        .id
+}
+
+async fn c6_4_data(h: &Harness, provider: Provider) -> reqwest::Response {
+    h.client
+        .post(format!(
+            "http://{}{}",
+            h.servers.data_addr,
+            if provider == Provider::Codex {
+                "/v1/responses"
+            } else {
+                "/v1/messages"
+            }
+        ))
+        .bearer_auth("synthetic-client")
+        .header("session-id", "c6-4")
+        .header("x-claude-code-session-id", "c6-4")
+        .json(&json!({"model":"synthetic-model","input":"small"}))
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn c6_4_payment_cooling_not_cleared_by_poll_or_small_success() {
+    for provider in [Provider::Codex, Provider::Claude] {
+        let h = Harness::new(provider, false).await;
+        let healthy = c6_4_add_linked(&h, provider, "zz-healthy@example.invalid");
+        assert_eq!(h.account().payment_failures, 0);
+        // Ids are identity hashes, so seed affinity explicitly rather than
+        // relying on fixture email ordering.
+        h.state
+            .bindings
+            .import(json!({"schema":1,"bindings":[{
+                "key":format!("{}:c6-4", provider.as_str()),"account":h.id,"last_used":Utc::now()
+            }]}))
+            .unwrap();
+        let before = Utc::now();
+        h.data.state.push(ScriptedResponse::json(
+            StatusCode::PAYMENT_REQUIRED,
+            r#"{"error":{"type":"payment_required","message":"synthetic billing rejection"}}"#,
+        ));
+        h.data
+            .state
+            .push(ScriptedResponse::json(StatusCode::OK, r#"{"small":true}"#));
+        let response = c6_4_data(&h, provider).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-quota-baton-account"], healthy);
+        response.bytes().await.unwrap();
+        let paid = h.account();
+        assert!(matches!(paid.source, Source::Cpa { .. }));
+        assert!(
+            matches!(&paid.health, Health::Cooling { reason: HealthReason::Payment, until, scope }
+            if *until >= before + chrono::Duration::hours(6) && *until <= Utc::now() + chrono::Duration::hours(6) && scope == "account")
+        );
+        assert_eq!(paid.payment_failures, 1);
+        assert!(
+            matches!(paid.health, Health::Cooling { until, .. } if paid.payment_until == Some(until))
+        );
+        assert!(matches!(
+            h.store.load(&healthy).unwrap().source,
+            Source::Cpa { .. }
+        ));
+        assert_eq!(h.store.load(&healthy).unwrap().health, Health::Ready);
+
+        // A real successful poll of the rejected account cannot prove that a
+        // future large-context request is funded.
+        let reset = Utc::now().timestamp() + 3600;
+        let response = if provider == Provider::Codex {
+            usage(1.0, reset)
+        } else {
+            ScriptedResponse::json(
+                StatusCode::OK,
+                json!({
+                    "five_hour":{"utilization":1,"resets_at":reset},
+                    "seven_day":{"utilization":1,"resets_at":reset+86400}
+                })
+                .to_string(),
+            )
+        };
+        h.usage.state.push(response);
+        let polled = h.state.quota.poll(&h.id).await.unwrap();
+        assert_eq!(polled.health, paid.health);
+        assert_eq!(polled.payment_failures, 1);
+        assert_eq!(polled.payment_until, paid.payment_until);
+        assert_eq!(h.usage.state.requests().len(), 1);
+        h.state
+            .accounts
+            .transition(&h.id, qb_core::account_runtime::HealthSignal::Ready)
+            .await
+            .unwrap();
+        h.state.accounts.probe_success(&h.id).await.unwrap();
+        let response = c6_4_data(&h, provider).await;
+        assert_eq!(response.headers()["x-quota-baton-account"], healthy);
+        response.bytes().await.unwrap();
+        assert_eq!(h.account().health, paid.health);
+        assert_eq!(h.account().payment_failures, 1);
+        assert_eq!(h.account().payment_until, paid.payment_until);
+        assert_eq!(h.data.state.requests().len(), 3);
+
+        // Only expiration admits a real probe of the original account again.
+        h.store
+            .update_metadata(&h.id, |a| {
+                let expired = Utc::now() - chrono::Duration::seconds(1);
+                if let Health::Cooling { until, .. } = &mut a.health {
+                    *until = expired;
+                }
+                a.payment_until = Some(expired);
+            })
+            .unwrap();
+        h.state
+            .bindings
+            .import(json!({"schema":1,"bindings":[]}))
+            .unwrap();
+        let response = c6_4_data(&h, provider).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-quota-baton-account"], h.id);
+        response.bytes().await.unwrap();
+        assert_eq!(h.account().health, Health::Ready);
+        assert_eq!(h.account().payment_failures, 1);
+        assert_eq!(h.account().payment_until, None);
+    }
+}
+
+async fn c6_4_provider_isolation(provider: Provider) {
+    let other = if provider == Provider::Codex {
+        Provider::Claude
+    } else {
+        Provider::Codex
+    };
+    for signal in ["poll_quota", "poll_401", "data_401"] {
+        let h = Harness::new(provider, false).await;
+        let other_id = c6_4_add_linked(&h, other, "isolated@example.invalid");
+        let untouched = h.store.load(&other_id).unwrap();
+        assert!(matches!(untouched.source, Source::Cpa { .. }));
+        let before = Utc::now();
+        let reset = before.timestamp() + 3600;
+        match signal {
+            "poll_quota" => {
+                h.usage.state.push(if provider == Provider::Codex {
+                    usage(100.0, reset)
+                } else {
+                    ScriptedResponse::json(
+                        StatusCode::OK,
+                        json!({"five_hour":{"utilization":100,"resets_at":reset}}).to_string(),
+                    )
+                });
+                let account = h.state.quota.poll(&h.id).await.unwrap();
+                assert_quota(&account, reset);
+            }
+            "poll_401" => {
+                h.usage.state.push(unauthorized());
+                assert_eq!(
+                    h.state.quota.poll(&h.id).await.unwrap_err(),
+                    PollError::Unavailable
+                );
+            }
+            "data_401" => {
+                let body = if provider == Provider::Codex {
+                    r#"{"error":{"code":"token_revoked"}}"#
+                } else {
+                    r#"{"error":{"type":"authentication_error","message":"OAuth token has been revoked"}}"#
+                };
+                h.data
+                    .state
+                    .push(ScriptedResponse::json(StatusCode::UNAUTHORIZED, body));
+                // The row-14 pre-unavailable poll must also stay synthetic.
+                h.usage.state.push(unauthorized());
+                let response = c6_4_data(&h, provider).await;
+                assert_ne!(response.status(), StatusCode::OK);
+                response.bytes().await.unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let changed = h.account();
+        assert!(matches!(changed.source, Source::Cpa { .. }));
+        if signal != "poll_quota" {
+            assert!(
+                matches!(changed.health, Health::Cooling { reason: HealthReason::LinkStale, until, ref scope }
+                if until >= before + chrono::Duration::minutes(5) && until <= Utc::now() + chrono::Duration::minutes(5) && scope == "account")
+            );
+        }
+        assert_eq!(h.store.load(&other_id).unwrap(), untouched, "{signal}");
+        // Prove the untouched provider still serves from its own credential.
+        h.data.state.push(ScriptedResponse::json(
+            StatusCode::OK,
+            r#"{"isolated":true}"#,
+        ));
+        let response = c6_4_data(&h, other).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-quota-baton-account"], other_id);
+        response.bytes().await.unwrap();
+        assert_eq!(h.store.load(&other_id).unwrap().health, untouched.health);
+        assert_eq!(
+            h.store.load(&other_id).unwrap().user_state,
+            untouched.user_state
+        );
+        assert_eq!(h.store.load(&other_id).unwrap().source, untouched.source);
+        assert!(h.token.state.requests().is_empty());
+        let usage_requests = h.usage.state.requests();
+        assert!(!usage_requests.is_empty());
+        let tokens = h.store.tokens(&untouched).unwrap();
+        let token = &tokens.access_token;
+        assert!(usage_requests.iter().all(|r| {
+            r.headers.get("authorization").and_then(|v| v.to_str().ok())
+                != Some(format!("Bearer {token}").as_str())
+        }));
+    }
+}
+
+#[tokio::test]
+async fn c6_4_provider_isolation_codex_poll_never_touches_claude() {
+    c6_4_provider_isolation(Provider::Codex).await;
+}
+
+#[tokio::test]
+async fn c6_4_provider_isolation_claude_poll_never_touches_codex() {
+    c6_4_provider_isolation(Provider::Claude).await;
+}
+
+#[tokio::test]
+async fn c6_4_state_pool_counts_match_accounts() {
+    let h = Harness::new(Provider::Codex, false).await;
+    let claude_ready = c6_4_add_linked(&h, Provider::Claude, "ready@example.invalid");
+    let claude_paid = c6_4_add_linked(&h, Provider::Claude, "payment@example.invalid");
+    let claude_disabled = c6_4_add_linked(&h, Provider::Claude, "disabled@example.invalid");
+    let codex_quota = c6_4_add_linked(&h, Provider::Codex, "quota@example.invalid");
+    let codex_relogin = c6_4_add_linked(&h, Provider::Codex, "relogin@example.invalid");
+    let until = Utc::now() + chrono::Duration::hours(6);
+    h.store
+        .update_metadata(&claude_paid, |a| {
+            a.health = Health::Cooling {
+                reason: HealthReason::Payment,
+                until,
+                scope: "account".into(),
+            }
+        })
+        .unwrap();
+    h.store
+        .update_metadata(&claude_disabled, |a| {
+            a.user_state = UserState::Disabled;
+            a.health = Health::Cooling {
+                reason: HealthReason::Quota,
+                until,
+                scope: "account".into(),
+            };
+        })
+        .unwrap();
+    h.store
+        .update_metadata(&codex_quota, |a| {
+            a.health = Health::Cooling {
+                reason: HealthReason::Quota,
+                until,
+                scope: "account".into(),
+            }
+        })
+        .unwrap();
+    h.store
+        .update_metadata(&codex_relogin, |a| {
+            a.health = Health::NeedsRelogin {
+                reason: "synthetic revoked".into(),
+                since: Utc::now(),
+            }
+        })
+        .unwrap();
+    let response = h
+        .client
+        .get(format!("http://{}/admin/v1/state", h.servers.admin_addr))
+        .bearer_auth("synthetic-admin")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let state: Value = response.json().await.unwrap();
+    assert_eq!(
+        state["pools"],
+        json!({
+            "claude":{"eligible":1,"cooling":{"payment":1},"unavailable":1},
+            "codex":{"eligible":1,"cooling":{"quota":1},"unavailable":1}
+        })
+    );
+    for id in [
+        &h.id,
+        &claude_ready,
+        &claude_paid,
+        &claude_disabled,
+        &codex_quota,
+        &codex_relogin,
+    ] {
+        assert!(matches!(
+            h.store.load(id).unwrap().source,
+            Source::Cpa { .. }
+        ));
+        let view = state["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == *id)
+            .unwrap();
+        assert_eq!(view["source"]["kind"], "cpa");
+    }
+    assert!(
+        matches!(h.store.load(&claude_paid).unwrap().health, Health::Cooling { until: recorded, .. } if recorded == until)
+    );
+    assert!(
+        matches!(h.store.load(&codex_quota).unwrap().health, Health::Cooling { until: recorded, .. } if recorded == until)
+    );
+    assert!(!state.to_string().contains("synthetic-access"));
+    assert!(!state.to_string().contains("synthetic-refresh"));
+    assert!(h.usage.state.requests().is_empty());
+    assert!(h.data.state.requests().is_empty());
+    // Pending persistence remains blocked beyond its displayed retry deadline.
+    let mut warning = h.account();
+    warning.health = Health::Cooling {
+        reason: HealthReason::StoreError,
+        until: Utc::now() - chrono::Duration::seconds(1),
+        scope: "account".into(),
+    };
+    h.state.accounts.emit_account(&warning);
+    assert!(h.state.accounts.blocked_in_memory(&h.id));
+    assert_eq!(h.account().health, Health::Ready);
+    let blocked: Value = h
+        .client
+        .get(format!("http://{}/admin/v1/state", h.servers.admin_addr))
+        .bearer_auth("synthetic-admin")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        blocked["pools"]["codex"],
+        json!({
+            "eligible":0,"cooling":{"quota":1,"store_error":1},"unavailable":1
+        })
+    );
+}
+
 #[tokio::test]
 async fn poll_linked_401_reloads_newer_cpa_and_retries_once() {
     let h = Harness::new(Provider::Codex, false).await;

@@ -176,6 +176,8 @@ pub(crate) fn read(path: &Path, dir: &Path) -> Result<Candidate, ReadError> {
         user_state: UserState::Disabled,
         health: Health::Ready,
         auth_failures: 0,
+        payment_failures: 0,
+        payment_until: None,
         auth_probe_pending: false,
         quota_cooling: None,
         drain: false,
@@ -381,6 +383,8 @@ fn execute(
             account.label = old.label.clone();
             account.health = old.health.clone();
             account.auth_failures = old.auth_failures;
+            account.payment_failures = old.payment_failures;
+            account.payment_until = old.payment_until;
             account.auth_probe_pending = old.auth_probe_pending;
             account.quota_cooling = old.quota_cooling.clone();
             account.drain = old.drain;
