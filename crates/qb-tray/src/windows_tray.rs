@@ -20,6 +20,7 @@ use std::{
     mem::size_of,
     path::PathBuf,
     process::Command,
+    rc::Rc,
     sync::{
         Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
@@ -153,6 +154,7 @@ thread_local! {
     static FRAME_TIMINGS: RefCell<BTreeMap<&'static str, u128>> = const { RefCell::new(BTreeMap::new()) };
     static LOGIN_ANIMATION_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static RENDER_TARGET: RefCell<Option<ID2D1HwndRenderTarget>> = const { RefCell::new(None) };
+    static VISIBLE_RENDERER: RefCell<Option<(bool, Rc<Renderer>)>> = const { RefCell::new(None) };
     static VIEWPORT: RefCell<Viewport> = const { RefCell::new(Viewport { offset: 0.0, content: 0.0, extent: 0.0 }) };
     static PAINTED: RefCell<Option<PaintedFrame>> = const { RefCell::new(None) };
     static INPUT: RefCell<Interaction> = RefCell::new(Interaction::default());
@@ -667,7 +669,9 @@ fn sync_login_animation(hwnd: HWND, visible: bool) {
         }
     });
 }
-fn measured_scene(hwnd: HWND) -> Result<(Renderer, v2::View, geometry::Scene, BTreeSet<String>)> {
+fn measured_scene(
+    hwnd: HWND,
+) -> Result<(Rc<Renderer>, v2::View, geometry::Scene, BTreeSet<String>)> {
     #[cfg(all(debug_assertions, feature = "testkit"))]
     let started = Instant::now();
     let state = view_state()
@@ -677,7 +681,25 @@ fn measured_scene(hwnd: HWND) -> Result<(Renderer, v2::View, geometry::Scene, BT
     let core_ok = model().lock().unwrap_or_else(|e| e.into_inner()).2;
     let mut view = projected();
     let (mut p, errors) = presentation(&mut view, state.as_deref(), core_ok);
-    let renderer = Renderer::new(DARK.load(Ordering::Acquire))?;
+    let dark = DARK.load(Ordering::Acquire);
+    let renderer = VISIBLE_RENDERER.with(|slot| -> Result<Rc<Renderer>> {
+        if let Some((theme, renderer)) = slot.borrow().as_ref()
+            && *theme == dark
+        {
+            #[cfg(all(debug_assertions, feature = "testkit"))]
+            FRAME_TIMINGS.with(|t| {
+                t.borrow_mut().insert("renderer_reused", 1);
+            });
+            return Ok(renderer.clone());
+        }
+        let renderer = Rc::new(Renderer::new(dark)?);
+        *slot.borrow_mut() = Some((dark, renderer.clone()));
+        #[cfg(all(debug_assertions, feature = "testkit"))]
+        FRAME_TIMINGS.with(|t| {
+            t.borrow_mut().insert("renderer_reused", 0);
+        });
+        Ok(renderer)
+    })?;
     #[cfg(all(debug_assertions, feature = "testkit"))]
     let created = started.elapsed().as_millis();
     renderer.measure(&view, &mut p)?;
@@ -2570,6 +2592,7 @@ unsafe extern "system" fn window_proc(
                 });
                 VIEWPORT.with(|v| v.borrow_mut().offset = 0.);
                 RENDER_TARGET.with(|slot| *slot.borrow_mut() = None);
+                VISIBLE_RENDERER.with(|slot| *slot.borrow_mut() = None);
                 PAINTED.with(|slot| *slot.borrow_mut() = None);
             }
             // WM_SHOWWINDOW precedes the visibility change; publish after it.
@@ -2694,6 +2717,7 @@ impl Drop for UiApartment {
     fn drop(&mut self) {
         disconnect_accessibility();
         RENDER_TARGET.with(|p| *p.borrow_mut() = None);
+        VISIBLE_RENDERER.with(|p| *p.borrow_mut() = None);
         unsafe {
             windows::Win32::System::Com::CoUninitialize();
         }

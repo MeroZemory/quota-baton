@@ -1,5 +1,6 @@
-//! Paint-pass scoped DirectWrite text, shared by native and WIC D2D targets.
-//! Drop Text AND its Layouts at the end of each pass; do not cache in tray state.
+//! DirectWrite text shared by native and WIC D2D targets.
+//! Layouts last one paint pass. The native text engine lasts one visible session
+//! and is released on hide; WIC uses one engine per render.
 #![cfg(target_os = "windows")]
 
 use windows::{
@@ -48,7 +49,7 @@ pub struct Style {
     pub wrap: Wrap,
 }
 
-/// One isolated factory per paint pass. No global factory or font cache.
+/// An isolated factory owned by its renderer, never a global shared font cache.
 pub struct Text {
     factory: IDWriteFactory,
     text_family: &'static str,

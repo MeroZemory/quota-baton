@@ -2294,6 +2294,10 @@ fn r5_live_same_size_repaints_reuse_native_render_target() -> Result<()> {
             trace["timing_ms"]["target_reused"] == 1,
             "same-size paint recreated or resized its render target"
         );
+        ensure!(
+            trace["timing_ms"]["renderer_reused"] == 1,
+            "visible paint recreated its text engine"
+        );
     }
     Ok(())
 }
