@@ -336,6 +336,28 @@ fn refresh_shell(hwnd: HWND) {
 
 // Synthetic live acceptance observes only typed shell state, never core payloads.
 #[cfg(all(debug_assertions, feature = "testkit"))]
+fn scene_stamp(scene: &geometry::Scene) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    for value in [
+        scene.rect.bottom,
+        scene.offset,
+        scene.list.top,
+        scene.list.bottom,
+    ] {
+        value.to_bits().hash(&mut hash);
+    }
+    for hit in &scene.targets {
+        format!("{:?}", hit.target).hash(&mut hash);
+        hit.enabled.hash(&mut hash);
+        for value in [hit.rect.left, hit.rect.top, hit.rect.right, hit.rect.bottom] {
+            value.to_bits().hash(&mut hash);
+        }
+    }
+    hash.finish()
+}
+
+#[cfg(all(debug_assertions, feature = "testkit"))]
 fn test_shell(hwnd: HWND, event: &str, kind: Option<crate::tray_icon::signals::Kind>) {
     static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let Some(path) = std::env::var_os("QB_TRAY_TEST_SHELL_LOG").map(PathBuf::from) else {
@@ -359,7 +381,7 @@ fn test_shell(hwnd: HWND, event: &str, kind: Option<crate::tray_icon::signals::K
     let (menu_checked,menu_pending,scene_trace)=PAINTED.with(|p|p.borrow().as_ref().map(|f| {
         let checked=f.scene.popup.as_ref().and_then(|p|p.items.iter().find_map(|i|i.checked));
         let pending=!session().lock().unwrap_or_else(|e|e.into_inner()).pending_ids().is_empty();
-        (checked,pending,serde_json::json!({"epoch":f.epoch,"height":f.scene.rect.bottom,"offset":f.scene.offset,"targets":f.scene.targets.len(),"rows":f.scene.sections.iter().map(|s|s.rows.len()+s.disabled_rows.len()).sum::<usize>(),"expanded":session().lock().unwrap_or_else(|e|e.into_inner()).expansion,"tooltip_rect":f.tooltip_rect.map(|r|[r.left,r.top,r.right,r.bottom])}))
+        (checked,pending,serde_json::json!({"epoch":f.epoch,"owner":f.owner,"revision":f.revision,"stamp":scene_stamp(&f.scene),"height":f.scene.rect.bottom,"offset":f.scene.offset,"targets":f.scene.targets.len(),"rows":f.scene.sections.iter().map(|s|s.rows.len()+s.disabled_rows.len()).sum::<usize>(),"expanded":session().lock().unwrap_or_else(|e|e.into_inner()).expansion,"tooltip_rect":f.tooltip_rect.map(|r|[r.left,r.top,r.right,r.bottom])}))
     }).unwrap_or((None,false,serde_json::Value::Null)));
     let count = rows.len();
     let payload = serde_json::json!({

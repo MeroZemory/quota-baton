@@ -40,12 +40,12 @@ use windows::{
                 SetThreadDpiAwarenessContext,
             },
             WindowsAndMessaging::{
-                FindWindowExW, GWL_EXSTYLE, GetClientRect, GetCursorPos, GetWindowLongPtrW,
-                GetWindowThreadProcessId, HWND_NOTOPMOST, HWND_TOPMOST, SMTO_ABORTIFHUNG,
-                SPI_GETMOUSEHOVERTIME, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
-                SendMessageTimeoutW, SetCursorPos, SetWindowPos, SystemParametersInfoW, WM_APP,
-                WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WS_EX_TOPMOST,
-                WindowFromPoint,
+                ClipCursor, FindWindowExW, GWL_EXSTYLE, GetClientRect, GetClipCursor, GetCursorPos,
+                GetWindowLongPtrW, GetWindowThreadProcessId, HWND_NOTOPMOST, HWND_TOPMOST,
+                SMTO_ABORTIFHUNG, SPI_GETMOUSEHOVERTIME, SWP_NOACTIVATE, SWP_NOMOVE,
+                SWP_NOOWNERZORDER, SWP_NOSIZE, SendMessageTimeoutW, SetCursorPos, SetWindowPos,
+                SystemParametersInfoW, WM_APP, WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+                WM_MOUSEWHEEL, WS_EX_TOPMOST, WindowFromPoint,
             },
         },
     },
@@ -793,6 +793,7 @@ impl Live {
             .env("QB_TRAY_TEST_KEEP_OPEN", "1")
             .env("QB_TRAY_TEST_SHELL_LOG", live.home.join("trace.jsonl"))
             .env("QB_TRAY_TEST_LOGIN_LOG", live.home.join("login.log"))
+            .env("QB_TRAY_TEST_DELAY_FILE", live.home.join("action-delay"))
             .env(
                 "QB_TRAY_TEST_FILE_LAUNCH_LOG",
                 live.home.join("file-launch.json"),
@@ -1118,8 +1119,10 @@ impl Live {
             GetClientRect(h, &mut latest_client)?;
         }
         ensure!(
-            latest["sequence"] == trace["sequence"]
-                && latest["scene"]["epoch"] == trace["scene"]["epoch"]
+            ["owner", "revision", "stamp"]
+                .iter()
+                .all(|key| trace["scene"][*key].as_u64().is_some()
+                    && latest["scene"][*key] == trace["scene"][*key])
                 && (client.left, client.top, client.right, client.bottom)
                     == (
                         latest_client.left,
@@ -1182,25 +1185,56 @@ impl Live {
         bail!("list did not return to top within bounded wheel inputs")
     }
     fn reveal(&mut self, target: &g::Target) -> Result<()> {
-        // Bounded real list wheel input; never reuse legacy target transforms.
-        for _ in 0..24 {
-            let s = self.scene()?;
-            if s.targets.iter().any(|h| &h.target == target && h.enabled) {
+        let deadline = Instant::now() + INPUT;
+        let mut scrolls = 0;
+        loop {
+            let scene = self.scene()?;
+            if scene
+                .targets
+                .iter()
+                .any(|hit| &hit.target == target && hit.enabled)
+            {
                 return Ok(());
             }
-            let top = match target {
-                g::Target::Row(id) | g::Target::Inline { id, .. } => s.row(id).map(|r| r.rect.top),
-                g::Target::Disclosure(p) => s
+            ensure!(
+                Instant::now() < deadline && scrolls < 24,
+                "target {target:?} did not become visible/enabled; scrolls={scrolls}, offset={}, targets={:?}",
+                scene.offset,
+                scene
+                    .targets
+                    .iter()
+                    .map(|h| (&h.target, h.enabled))
+                    .collect::<Vec<_>>()
+            );
+            // A visible disabled target is pending, not outside the viewport.
+            if scene.targets.iter().any(|hit| &hit.target == target) {
+                thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            let rect = match target {
+                g::Target::Row(id) => scene.row(id).map(|r| r.rect),
+                g::Target::Inline { id, .. } => scene
+                    .row(id)
+                    .and_then(|r| r.button.as_ref())
+                    .filter(|b| &b.target == target)
+                    .map(|b| b.hit),
+                g::Target::Disclosure(provider) => scene
                     .sections
                     .iter()
-                    .find(|s| &s.provider == p)
-                    .and_then(|s| s.disclosure)
-                    .map(|r| r.top),
+                    .find(|s| &s.provider == provider)
+                    .and_then(|s| s.disclosure),
                 _ => None,
             };
-            self.scroll(top.is_none_or(|y| y >= s.list.top))?;
+            if let Some(rect) = rect
+                && (rect.top < scene.list.top || rect.bottom > scene.list.bottom)
+            {
+                self.scroll(rect.bottom > scene.list.bottom)?;
+                scrolls += 1;
+                continue;
+            }
+            // Backend success can precede the worker's checked-state frame.
+            thread::sleep(Duration::from_millis(20));
         }
-        bail!("target not revealed after bounded scrolling")
     }
     fn click(&mut self, target: g::Target, overlay: g::Overlay, state: &str) -> Result<()> {
         self.reveal(&target)?;
@@ -1311,6 +1345,39 @@ fn cursor() -> Result<POINT> {
         GetCursorPos(&mut p)?;
     }
     Ok(p)
+}
+struct CursorPin(RECT);
+impl CursorPin {
+    fn enter(point: POINT) -> Result<Self> {
+        let mut previous = RECT::default();
+        unsafe {
+            GetClipCursor(&mut previous)?;
+        }
+        ensure!(
+            point.x >= previous.left
+                && point.x < previous.right
+                && point.y >= previous.top
+                && point.y < previous.bottom,
+            "owned hover point lies outside existing cursor constraints"
+        );
+        let fixed = RECT {
+            left: point.x,
+            top: point.y,
+            right: point.x + 1,
+            bottom: point.y + 1,
+        };
+        unsafe {
+            ClipCursor(Some(&fixed))?;
+        }
+        Ok(Self(previous))
+    }
+}
+impl Drop for CursorPin {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = ClipCursor(Some(&self.0));
+        }
+    }
 }
 struct CursorRestore(POINT);
 impl Drop for CursorRestore {
@@ -1729,10 +1796,11 @@ fn r5_live_nine_reference_scenes() -> Result<()> {
                         "scope":"test-only owned spawned tray HWND", "pid":live.tray.as_ref().context("tray")?.id(),
                         "was_topmost":topmost.was_topmost, "requested_topmost":true,
                         "activate":false, "restore":"Drop restores original topmost membership",
-                        "physical_hover_verified":true, "verification":"WindowFromPoint(cursor) == owned HWND",
+                        "physical_hover_verified":true, "cursor_constraint":"scoped ClipCursor at owned hover point, prior clip and cursor restored", "verification":"WindowFromPoint(cursor) == owned HWND",
                         "cursor_screen":{"x":screen.x,"y":screen.y}, "fixture_clock":live.fixture_clock
                     }))?,
                 )?;
+                let _pin = CursorPin::enter(screen)?;
                 mouse(
                     live.hwnd()?,
                     WM_MOUSEMOVE,
@@ -2101,14 +2169,13 @@ fn r5_live_mouse_enable_stays_in_disabled_slot_until_reopen() -> Result<()> {
         "initial disabled slot"
     );
     let before = live.trace()?["scene"]["epoch"].as_u64().unwrap();
+    let delay_file = live.home.join("action-delay");
+    fs::write(&delay_file, b"delay")?;
     live.click(
         inline(&id, v2::ActionKind::Enable),
         g::Overlay::None,
         "list",
     )?;
-    live.until(INPUT, "mouse enable reached real core", |s| {
-        Ok(s.account(&id)?["user_state"] == "active")
-    })?;
     live.until(INPUT, "visible pending action frame", |s| {
         let bytes = fs::read(s.home.join("trace.jsonl"))?;
         Ok(bytes
@@ -2120,6 +2187,12 @@ fn r5_live_mouse_enable_stays_in_disabled_slot_until_reopen() -> Result<()> {
                     && t["scene"]["epoch"].as_u64().unwrap_or(0) > before
             }))
     })?;
+    fs::remove_file(&delay_file)?;
+    live.until(
+        WAIT,
+        "mouse enable reached real core after controlled five-second worker delay",
+        |s| Ok(s.account(&id)?["user_state"] == "active"),
+    )?;
     live.until(INPUT, "pending settled", |s| {
         Ok(s.trace()?["menu_pending"] == false)
     })?;
