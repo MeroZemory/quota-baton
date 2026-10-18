@@ -4220,7 +4220,8 @@ trusted_hash = "synthetic-hook-hash"
         let launcher = fs::read_to_string(p.npm_dir.join("claude-qb.cmd")).unwrap();
         assert!(launcher.contains("setlocal DisableDelayedExpansion\r\n"));
         assert!(launcher.contains(&format!(
-            "/s /c ^\"\"{}\" --settings \"%USERPROFILE%\\.claude-qb\\settings.json\" %*^\"\r\n",
+            "/s /c ^\"\"{}\" launch-client --command \"{}\" --settings \"%USERPROFILE%\\.claude-qb\\settings.json\" -- %*^\"\r\n",
+            std::env::current_exe().unwrap().display(),
             p.claude_command.as_ref().unwrap().display()
         )));
         assert_eq!(before, snapshot(&p));

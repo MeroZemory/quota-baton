@@ -1746,12 +1746,29 @@ async fn offline_online_import_and_admin_refusal() {
     assert!(text.contains("코어: 실행 중"));
     assert!(text.contains("CPA는 계속 실행되어야 합니다 (연결 계정 1개의 토큰 갱신)"));
     assert!(!text.contains("fake-access-"));
-    let chunk = tokio::time::timeout(Duration::from_secs(2), events.chunk())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    assert!(String::from_utf8_lossy(&chunk).contains("event: account_changed"));
+    let changed: serde_json::Value = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut pending = Vec::new();
+        while let Some(chunk) = events.chunk().await.unwrap() {
+            pending.extend_from_slice(&chunk);
+            assert!(pending.len() <= 64 * 1024, "bounded synthetic admin SSE");
+            while let Some(end) = pending.windows(2).position(|w| w == b"\n\n") {
+                let frame = String::from_utf8(pending.drain(..end + 2).collect()).unwrap();
+                // Activity can precede account_changed, and TCP chunks need not
+                // coincide with complete events. Keep the actual named frame.
+                if frame.lines().any(|line| line == "event: account_changed") {
+                    let data = frame
+                        .lines()
+                        .find_map(|line| line.strip_prefix("data: "))
+                        .unwrap();
+                    return serde_json::from_str(data).unwrap();
+                }
+            }
+        }
+        panic!("admin SSE ended before account_changed");
+    })
+    .await
+    .unwrap();
+    assert_eq!(changed["id"], id);
     let patch = client
         .patch(format!("{base}/accounts/{id}"))
         .bearer_auth(token.trim())
@@ -2598,7 +2615,8 @@ async fn r3_claude_dedicated_apply_real_core_exact_payload_launcher_and_round_tr
         text.contains(resolved_text.as_ref())
             || text.contains(resolved_text.trim_start_matches(r"\\?\"))
     );
-    assert!(text.contains("--settings \"%USERPROFILE%\\.claude-qb\\settings.json\" %*"));
+    assert!(text.contains("launch-client --command"));
+    assert!(text.contains("--settings \"%USERPROFILE%\\.claude-qb\\settings.json\" -- %*"));
     assert!(
         !text.contains(&secrets.client_key),
         "launcher must not contain client key"

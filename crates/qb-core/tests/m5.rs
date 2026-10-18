@@ -1028,9 +1028,13 @@ async fn admin_refresh_returns_account_view_too_soon_and_quota_updated_event() {
         let mut bytes = Vec::new();
         while let Some(chunk) = stream.next().await {
             bytes.extend_from_slice(&chunk.unwrap());
-            let text = String::from_utf8_lossy(&bytes);
-            if text.contains("event: quota_updated") && text.contains("\n\n") {
-                return text.into_owned();
+            // Select a complete named frame, not the first data line of a
+            // multi-event buffer (activity/account events may precede quota).
+            while let Some(end) = bytes.windows(2).position(|pair| pair == b"\n\n") {
+                let frame = String::from_utf8(bytes.drain(..end + 2).collect()).unwrap();
+                if frame.lines().any(|line| line == "event: quota_updated") {
+                    return frame;
+                }
             }
         }
         panic!("event stream ended before quota_updated");
@@ -1047,6 +1051,7 @@ async fn admin_refresh_returns_account_view_too_soon_and_quota_updated_event() {
     )
     .unwrap();
     assert_eq!(event_data["snapshot"]["source"], "poll");
+    assert_eq!(event_data["snapshot"]["windows"][0]["used_pct"], 25.0);
     let response = h.refresh().await;
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     let retry = response.headers()["retry-after"]
