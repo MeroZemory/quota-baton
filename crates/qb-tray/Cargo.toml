@@ -28,3 +28,8 @@ windows-numerics.workspace = true
 [features]
 default = []
 testkit = ["qb-core/testkit"]
+
+[dev-dependencies]
+qb-core = { workspace = true, features = ["testkit"] }
+qb-testkit.workspace = true
+tempfile.workspace = true

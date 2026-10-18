@@ -9,6 +9,10 @@ pub enum Kind {
     Relogin,
     LinkStale,
     Limit,
+    QuotaCredits,
+    QuotaFailover,
+    QuotaExhausted,
+    Billing,
     ProviderExhausted,
     OrganisationDenied,
     Burst,
@@ -33,7 +37,7 @@ pub struct Signal<'a> {
 }
 
 impl Signal<'_> {
-    /// Static Korean text: never copy secrets, account labels, or raw reasons.
+    /// Generic fallback; account context is formatted by the typed adapter.
     pub fn message(self) -> (&'static str, &'static str) {
         match self.kind {
             Kind::Relogin => (
@@ -44,7 +48,7 @@ impl Signal<'_> {
                 "연결 토큰 갱신 필요",
                 "CPA 실행 상태와 연결 계정의 토큰 갱신을 확인하세요.",
             ),
-            Kind::Limit => (
+            Kind::Limit | Kind::QuotaCredits | Kind::QuotaFailover | Kind::QuotaExhausted => (
                 "계정 한도 도달",
                 "트레이에서 한도 초기화 시간을 확인하거나 다른 계정을 활성화하세요.",
             ),
@@ -55,6 +59,7 @@ impl Signal<'_> {
             Kind::OrganisationDenied => {
                 ("조직 접근 거부", "해당 계정의 조직 접근 권한을 확인하세요.")
             }
+            Kind::Billing => ("결제 거절", "트레이에서 이 계정의 결제 상태를 확인하세요."),
             Kind::CoreRestart => (
                 "코어 다시 시작",
                 "예기치 않게 종료된 코어를 다시 시작했습니다. 계정 상태를 확인하세요.",
@@ -103,6 +108,7 @@ pub fn account_signal<'a>(account: &Account<'a>) -> Option<Signal<'a>> {
         ("cooling", Some("permission"), Some("account")) if account.cooling_current => {
             Kind::OrganisationDenied
         }
+        ("cooling", Some("payment"), Some("account")) if account.cooling_current => Kind::Billing,
         _ => return None,
     };
     Some(Signal {
@@ -212,6 +218,7 @@ mod tests {
             ("link_stale", Kind::LinkStale),
             ("quota", Kind::Limit),
             ("permission", Kind::OrganisationDenied),
+            ("payment", Kind::Billing),
         ] {
             a.health_reason = Some(reason);
             assert_eq!(account_signal(&a).unwrap().kind, expected);

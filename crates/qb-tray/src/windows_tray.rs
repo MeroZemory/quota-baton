@@ -405,7 +405,7 @@ fn flush_notices(hwnd: HWND) {
         .unwrap_or_else(|e| e.into_inner())
         .next(elapsed());
     if let Some(notice) = notice {
-        let shown = unsafe { notify_balloon(hwnd, notice.title, notice.text, notice.kind) };
+        let shown = unsafe { notify_balloon(hwnd, &notice.title, &notice.text, notice.kind) };
         #[cfg(all(debug_assertions, feature = "testkit"))]
         if shown {
             test_shell(hwnd, "balloon", Some(notice.kind));
