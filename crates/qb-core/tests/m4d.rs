@@ -1,7 +1,7 @@
 //! Focused C7.1 session spreading and bounded overload tests.
 use chrono::{Duration, Utc};
 use qb_core::{
-    accounts::{Account, Health, Identity, Provider, Source, TokenMeta, UserState},
+    accounts::{Account, Health, HealthReason, Identity, Provider, Source, TokenMeta, UserState},
     bindings::{BindingTable, Candidate, Decision, PreviewDecision},
     config::RoutingConfig,
 };
@@ -155,6 +155,146 @@ fn c7_1_marked_group_moves_at_next_request_with_ledger_move_and_after_move() {
     assert_eq!(choose(&table, "codex:g3", &both, 200), source);
     assert_eq!(table.active_sessions(source, Utc::now()), 3);
     assert_eq!(table.active_sessions(target, Utc::now()), 1);
+}
+
+fn mark_overloaded_group(table: &std::sync::Arc<BindingTable>, source: &str, ids: &[Candidate]) {
+    let source_only = candidates(&[source]);
+    for (n, bytes) in [10, 20, 30, 40].into_iter().enumerate() {
+        assert_eq!(
+            choose(table, &format!("codex:g{n}"), &source_only, bytes),
+            source
+        );
+    }
+    table.set_account_threshold(source, Some(2));
+    let _ = table.preview(Provider::Codex, None, None, None, ids, None, 0);
+    for key in ["codex:g0", "codex:g1", "codex:g2"] {
+        table.note_client_rate(Provider::Codex, source, Some(key), ids, Utc::now());
+    }
+    assert!(table.overload_marked(Some("codex:g0"), Utc::now()));
+}
+
+#[test]
+fn c7_1_rebalance_never_targets_disabled_or_cooling_account() {
+    for cooling in [false, true] {
+        let (_root, table) = table();
+        let source = "codex:z-source";
+        let target = "codex:b-ready";
+        let mut ids = candidates(&["codex:a-ineligible", target, source]);
+        mark_overloaded_group(&table, source, &ids);
+        if cooling {
+            ids[0].account.health = Health::Cooling {
+                reason: HealthReason::Quota,
+                until: Utc::now() + Duration::hours(1),
+                scope: "account".into(),
+            };
+        } else {
+            ids[0].account.user_state = UserState::Disabled;
+        }
+
+        assert_eq!(choose(&table, "codex:g0", &ids, 10), target);
+        assert_eq!(table.current(Some("codex:g0")), Some(target.into()));
+        assert!(!table.overload_marked(Some("codex:g0"), Utc::now()));
+        assert_eq!(table.active_sessions("codex:a-ineligible", Utc::now()), 0);
+        assert_eq!(table.active_sessions(source, Utc::now()), 3);
+        assert_eq!(table.active_sessions(target, Utc::now()), 1);
+    }
+}
+
+#[test]
+fn c7_1_rebalance_mark_cleared_when_no_eligible_account_has_room() {
+    for unavailable in ["disabled", "cooling", "drained", "gate", "full"] {
+        let (_root, table) = table();
+        let source = "codex:z-source";
+        let target = "codex:a-target";
+        let mut ids = candidates(&[target, source]);
+        mark_overloaded_group(&table, source, &ids);
+        match unavailable {
+            "disabled" => ids[0].account.user_state = UserState::Disabled,
+            "cooling" => {
+                ids[0].account.health = Health::Cooling {
+                    reason: HealthReason::Quota,
+                    until: Utc::now() + Duration::hours(1),
+                    scope: "account".into(),
+                };
+            }
+            "drained" => ids[0].account.drain = true,
+            "gate" => {
+                for window in ids[0].quota.as_mut().unwrap()["windows"]
+                    .as_array_mut()
+                    .unwrap()
+                {
+                    window["used_pct"] = json!(95.0);
+                }
+            }
+            "full" => {
+                table.set_account_threshold(target, Some(1));
+                assert_eq!(choose(&table, "codex:target", &ids[..1], 1), target);
+            }
+            _ => unreachable!(),
+        }
+
+        assert_eq!(
+            choose(&table, "codex:g0", &ids, 10),
+            source,
+            "{unavailable}"
+        );
+        assert_eq!(table.current(Some("codex:g0")), Some(source.into()));
+        assert!(!table.overload_marked(Some("codex:g0"), Utc::now()));
+        assert_eq!(table.active_sessions(source, Utc::now()), 4);
+        // Restoring room must not resurrect the consumed overload mark.
+        let restored = candidates(&[target, source]);
+        table.set_account_threshold(target, Some(5));
+        assert_eq!(choose(&table, "codex:g0", &restored, 10), source);
+    }
+}
+
+#[test]
+fn c7_1_rebalance_target_follows_c7_order() {
+    for order in ["weekly", "five_hour", "usage", "id", "pacing"] {
+        let (_root, table) = table();
+        let source = "codex:z-source";
+        // Start reversed so the id tie-break also tests input-order independence.
+        let mut ids = candidates(&["codex:b", "codex:a", source]);
+        let now = Utc::now();
+        for (index, candidate) in ids[..2].iter_mut().enumerate() {
+            let (weekly, five, used) = match (order, index) {
+                ("weekly", 0) => (8, 4, 20.0),
+                ("weekly", _) => (12, 1, 0.0),
+                ("five_hour", 0) => (10, 2, 20.0),
+                ("five_hour", _) => (8, 4, 0.0),
+                ("usage", 0) => (24, 4, 0.0),
+                ("usage", _) => (24, 4, 20.0),
+                _ => (24, 4, 0.0),
+            };
+            candidate.quota = Some(json!({"windows": [
+                {"name": "primary", "used_pct": used,
+                 "reset_at": now + Duration::hours(five), "observed_at": now},
+                {"name": "secondary", "used_pct": used,
+                 "reset_at": now + Duration::hours(weekly), "observed_at": now}
+            ]}));
+        }
+        // Every case must select a candidate other than the first input entry.
+        if order != "id" {
+            ids.swap(0, 1);
+        }
+        mark_overloaded_group(&table, source, &ids);
+        if order == "pacing" {
+            table.set_pacing("codex:a", true);
+        }
+        let expected = if order == "id" { "codex:a" } else { "codex:b" };
+        assert_eq!(
+            table.preview(Provider::Codex, None, None, None, &ids[..2], None, 0),
+            PreviewDecision::Selected {
+                account: expected.into()
+            },
+            "{order}"
+        );
+        assert_eq!(choose(&table, "codex:g0", &ids, 10), expected, "{order}");
+        assert_eq!(table.current(Some("codex:g0")), Some(expected.into()));
+        assert!(!table.overload_marked(Some("codex:g0"), Utc::now()));
+        assert_eq!(table.active_sessions(source, Utc::now()), 3);
+        assert_eq!(table.active_sessions(expected, Utc::now()), 1);
+    }
 }
 
 #[test]
