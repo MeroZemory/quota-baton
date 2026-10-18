@@ -236,6 +236,96 @@ async fn r6_admin_native_both_providers_retire_refresh_once_and_replay_without_s
 }
 
 #[tokio::test]
+async fn r6_admin_inspect_then_explicit_replace_keeps_id_and_refreshes_once() {
+    for provider in [Provider::Codex, Provider::Claude] {
+        let h = Harness::new().await;
+        h.write(provider);
+        if provider == Provider::Claude {
+            h.profile();
+        }
+        let initial = h
+            .call(
+                &json!({"provider":provider,"path":h.source,"phase":"inspect"}),
+                StatusCode::OK,
+            )
+            .await;
+        if provider == Provider::Claude {
+            h.profile();
+        }
+        h.rotation();
+        let first = h.call(&json!({"provider":provider,"path":h.source,"phase":"commit","inspect_digest":initial["inspect_digest"]}), StatusCode::OK).await;
+        let id = first["id"].as_str().unwrap();
+        let before = h.store.load(id).unwrap();
+
+        // A genuinely new source object, in a separate home so its retirement
+        // destination cannot collide with the first completed operation.
+        let path = h.write(provider);
+        let mut native: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let expiry = (chrono::Utc::now() + chrono::Duration::hours(24)).timestamp();
+        if provider == Provider::Claude {
+            native["claudeAiOauth"]["expiresAt"] = json!(expiry * 1000);
+        } else {
+            native["last_refresh"] = json!(chrono::Utc::now().to_rfc3339());
+        }
+        fs::write(&path, serde_json::to_vec(&native).unwrap()).unwrap();
+        let replacement = h.source.join("replacement");
+        fs::create_dir(&replacement).unwrap();
+        let path2 = replacement.join(path.file_name().unwrap());
+        fs::rename(path, &path2).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path2)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(300))
+            .unwrap();
+        if provider == Provider::Claude {
+            h.profile();
+        }
+        // The UI discovers the existing identity before the user can consent.
+        let inspect = h
+            .call(
+                &json!({"provider":provider,"path":replacement,"phase":"inspect","replace":false}),
+                StatusCode::OK,
+            )
+            .await;
+        assert_eq!(inspect["existing_id"], id);
+        let mut commit = json!({"provider":provider,"path":replacement,"phase":"commit","inspect_digest":inspect["inspect_digest"],"replace":false});
+        if provider == Provider::Claude {
+            h.profile();
+        }
+        h.call(&commit, StatusCode::CONFLICT).await;
+        assert!(path2.exists());
+        assert_eq!(h.store.load(id).unwrap().generation, before.generation);
+        if provider == Provider::Claude {
+            h.profile();
+        }
+        h.rotation();
+        commit["replace"] = json!(true);
+        let result = h.call(&commit, StatusCode::OK).await;
+        assert_eq!(result["id"], id);
+        assert_eq!(result["refresh"]["ok"], true);
+        assert!(!path2.exists());
+        assert_eq!(h.store.list().unwrap().len(), 1);
+        assert!(h.store.load(id).unwrap().generation > before.generation);
+        assert_eq!(h.call(&commit, StatusCode::OK).await, result);
+        let generation = h.store.load(id).unwrap().generation;
+        commit["replace"] = json!(false);
+        h.call(&commit, StatusCode::CONFLICT).await;
+        assert_eq!(h.store.load(id).unwrap().generation, generation);
+        assert_eq!(
+            h.fake
+                .state
+                .requests()
+                .iter()
+                .filter(|r| r.method == reqwest::Method::POST)
+                .count(),
+            2
+        );
+        h.stop().await;
+    }
+}
+
+#[tokio::test]
 async fn r6_admin_guards_auth_recent_mtime_digest_api_key_and_outside_sandbox_source() {
     let h = Harness::new().await;
     let source = h.write(Provider::Codex);
