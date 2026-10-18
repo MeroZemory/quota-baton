@@ -235,7 +235,8 @@ impl AccountRuntime {
                 pending.remove(&account.id);
             }
             if previous != &account.health {writer.record_health(&account.id,previous,&account.health);}
-            let _=changes.send(json!({"event":"account_changed","data":{"id":account.id,"health":account.health,"user_state":account.user_state}}));
+            writer.record_account(account);
+            let _=changes.send(json!({"event":"account_changed","data":{"id":account.id,"health":account.health,"user_state":account.user_state,"plan":account.plan,"generation":account.generation}}));
         }));
         Arc::new(Self {
             store,
@@ -1130,6 +1131,11 @@ impl AccountRuntime {
         Ok(accounts.iter().map(|a| {
             let quota_notice = notices.get(&a.id).map(|entry| entry.notice.clone());
             let has_alternative = eligible.iter().any(|other| other.id != a.id && other.provider == a.provider);
+            // Reuse actual successful C9 paid-serving context, not capability,
+            // allowance, or a projected meter. C5 accepts the upstream credit
+            // claim even when its displayed percent is rounded below 100.
+            let credits_in_use = a.provider == Provider::Codex && a.allow_credits
+                && quota_notice.as_ref().is_some_and(|notice| notice["action"] == "credits");
             let quota = self.obs.quota_snapshot(&a.id).unwrap_or_default();
             let pacing = self.pacing_snapshot(&a.id);
             let backoff_until = pacing.rate_backoff_until.and_then(|until| {
@@ -1139,7 +1145,7 @@ impl AccountRuntime {
             let health=self.volatile.lock().ok().and_then(|v|v.get(&a.id).cloned()).unwrap_or(a.health.clone());
             let pending = self.probing(&a.id) || ((a.auth_probe_pending || a.auth_failures > 0) && health == Health::Ready);
             let health = if pending { json!({"kind":"cooling","reason":"auth","until":Utc::now(),"scope":"account","probe_pending":true}) } else { json!(health) };
-            json!({"quota_notice":quota_notice,"has_alternative":has_alternative,"id":a.id,"generation":a.generation,"last_refresh_at":a.token_meta.last_refresh_at,"provider":a.provider,"label":a.label,"email":a.email,"plan":quota["plan"].as_str().map(str::to_owned).or(a.plan.clone()),"user_state":a.user_state,"source":a.source,"health":health,"probe_pending":pending,"pacing":{"backoff_until":backoff_until,"step":pacing.rate_step,"release_interval_ms":pacing.rate_release_interval.as_millis() as u64,"waiting":pacing.waiting},"windows":quota["windows"].as_array().cloned().unwrap_or_default(),"credits":quota["credits"],"last_used_at":null,"bound_sessions":0,"token_expires_at":a.token_meta.expires_at,"drain":a.drain,"allow_credits":a.allow_credits,"refresh_attention":self.refresh_attention.lock().map(|f|f.contains(&a.id)).unwrap_or(false)})
+            json!({"quota_notice":quota_notice,"credits_in_use":credits_in_use,"has_alternative":has_alternative,"id":a.id,"generation":a.generation,"last_refresh_at":a.token_meta.last_refresh_at,"provider":a.provider,"label":a.label,"email":a.email,"plan":quota["plan"].as_str().map(str::to_owned).or(a.plan.clone()),"user_state":a.user_state,"source":a.source,"health":health,"probe_pending":pending,"pacing":{"backoff_until":backoff_until,"step":pacing.rate_step,"release_interval_ms":pacing.rate_release_interval.as_millis() as u64,"waiting":pacing.waiting},"windows":quota["windows"].as_array().cloned().unwrap_or_default(),"credits":quota["credits"],"last_used_at":null,"bound_sessions":0,"token_expires_at":a.token_meta.expires_at,"drain":a.drain,"allow_credits":a.allow_credits,"refresh_attention":self.refresh_attention.lock().map(|f|f.contains(&a.id)).unwrap_or(false)})
         }).collect())
     }
 

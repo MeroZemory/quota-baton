@@ -1,5 +1,6 @@
 //! Owned OAuth login. This module never opens a browser or logs callback URLs.
 mod callback;
+pub(crate) mod claude_profile;
 mod exchange;
 mod parameters;
 

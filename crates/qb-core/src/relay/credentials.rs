@@ -1082,7 +1082,7 @@ impl TokenGates {
                 "openid profile email",
             ),
         };
-        #[cfg(any(test, all(feature = "testkit", debug_assertions)))]
+        #[cfg(any(test, feature = "testkit"))]
         {
             let safe = reqwest::Url::parse(url).is_ok_and(|url| {
                 url.scheme() == "http"

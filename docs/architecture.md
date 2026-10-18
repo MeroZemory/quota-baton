@@ -351,6 +351,12 @@ Each account keeps a usage snapshot: one entry per window (`5h`, `7d`, and named
 - **Credits hold:** a Codex account that would keep answering from paid credits is held unless `allow_credits` is set for it. This replaces `Watch-CodexQuota.py`.
 - **Early reset:** if a poll shows a different `reset_at` and the usage is below 100 %, the account returns to `ready`. This applies the 10-10 watcher lesson.
 
+**Claude plan metadata (R4).** The existing background scheduler separately reads `GET /api/oauth/profile` at startup, after a successful import/adopt, and no more than once per 24 hours otherwise. This metadata read includes paused and disabled Claude accounts; the usage-poll exclusions above remain unchanged. It uses current credentials and the C9 poll-401 path, an honest UA and `anthropic-beta: oauth-2025-04-20`. A separate bounded permit prevents profiles from occupying usage-poll slots. Relay requests never wait for profiles. A daily reservation survives errors and cancellation; explicit lifecycle events coalesce independently of token rotations and metadata writes.
+
+The profile identity must match the account and organization. A token/generation/source-conditional metadata transaction stores the plan without replacing concurrent edits. Account ledger events include the canonical plan. The shared login/background mapper recognizes `pro`, `max_5x`, `max_20x`, `team`, and `enterprise`; unknown tiers become null with a bounded debug label. The subscription fields and tier aliases are candidate shapes from the R4 brief, pending live verification; the official clients confirms the identity fields only. Max without a known multiplier stays null.
+
+**Dedicated launcher admission (R4).** `wire --apply` in dedicated Codex/Claude mode also accepts an active account with account-scoped quota cooling and a persisted future quota reset, printing the local reset time in Korean. This only permits launcher creation; it does not alter health or selection. Default modes still require a currently eligible account. Missing, disabled, relogin, drain, auth/payment-blocked, and reset-less accounts do not gain this exception.
+
 ## 9. WebSocket relay (Codex `GET /v1/responses`)
 
 Facts from Codex 0.162.1 source (R6):
