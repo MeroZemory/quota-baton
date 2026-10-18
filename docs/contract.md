@@ -73,6 +73,10 @@ These rules apply to the data port and the admin port alike.
    - **H2.** For Claude, add `extended-cache-ttl-2025-04-11` when the body uses 1-hour cache markers. Pending **[V1]**.
    - **H3.** Withdrawn (2026-10-13). V3 passed without a routing hint.
 
+### Request header read and removed (dashboard label, R6)
+
+- `x-quota-baton-label`: an optional, client-side session label (the launcher's folder name). The core reads it into memory for the dashboard and **removes it before forwarding**, so it never reaches the provider. It is never persisted or logged.
+
 ### Response to client
 
 - Forward the status code and every header except hop-by-hop headers. Keep `Content-Encoding` and do not decode.
