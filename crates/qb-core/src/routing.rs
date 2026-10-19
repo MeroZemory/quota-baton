@@ -432,12 +432,66 @@ fn validate_state(state: &State) -> Result<()> {
     Ok(())
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyFence {
+    schema: u32,
+    revision: u64,
+    digest: String,
+}
+fn fence_path(path: &Path) -> PathBuf {
+    path.with_file_name("routing-policies.fence.json")
+}
+fn policy_digest(state: &State) -> Result<String> {
+    Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(state)?)))
+}
+fn write_fence(path: &Path, state: &State) -> Result<()> {
+    let fence = PolicyFence {
+        schema: 1,
+        revision: state.revision,
+        digest: policy_digest(state)?,
+    };
+    crate::bindings::atomic_write(&fence_path(path), &serde_json::to_vec(&fence)?)?;
+    Ok(())
+}
+fn load_fenced(path: &Path) -> Result<Option<State>> {
+    let loaded = load(path)?;
+    match crate::bindings::read_binding_snapshot(&fence_path(path)) {
+        Ok(bytes) => {
+            if bytes.len() > 1024 {
+                bail!("routing policy fence exceeds cap");
+            }
+            let fence: PolicyFence =
+                serde_json::from_value(crate::json_unique::from_slice(&bytes)?)?;
+            let state = loaded.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("routing policy file disappeared; durable fence retained")
+            })?;
+            if fence.schema != 1
+                || fence.revision != state.revision
+                || fence.digest != policy_digest(state)?
+            {
+                bail!("routing policy generation does not match durable fence");
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // One-time adoption of pre-fence files. A fresh home has no fence
+            // until its first intent write. Removing BOTH files is outside
+            // protection against partial loss/rollback of an owned state file.
+            if let Some(state) = &loaded {
+                write_fence(path, state)?;
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(loaded)
+}
+
 impl PolicyStore {
     pub fn new(home: &Path, defaults: Settings) -> Result<Self> {
         defaults.validate()?;
         let path = home.join("state/routing-policies.json");
         fs::create_dir_all(path.parent().expect("policy parent"))?;
-        let loaded = load(&path)?;
+        let loaded = load_fenced(&path)?;
         let file_seen = loaded.is_some();
         let state = loaded.unwrap_or_default();
         Ok(Self {
@@ -476,14 +530,16 @@ impl PolicyStore {
         if bytes.len() as u64 > MAX_FILE {
             bail!("routing policy file exceeds cap");
         }
-        if let Err(error) = crate::bindings::atomic_write(&self.path, &bytes) {
+        if let Err(error) = write_fence(&self.path, &next)
+            .and_then(|()| crate::bindings::atomic_write(&self.path, &bytes).map_err(Into::into))
+        {
             // Replace may have succeeded before a durability failure. Do not
             // keep authorizing from an older in-memory revision afterwards.
             let mut retired = (*state).clone();
             retired.frozen = true;
             *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(retired);
             self.changed.notify_waiters();
-            return Err(error.into());
+            return Err(error);
         }
         self.file_seen.store(true, Ordering::Release);
         next.reindex();
@@ -511,7 +567,7 @@ impl PolicyStore {
         if state.frozen {
             bail!("routing policy writer retired");
         }
-        let loaded = load(&self.path)?;
+        let loaded = load_fenced(&self.path)?;
         if loaded.is_none() && self.file_seen.load(Ordering::Acquire) {
             bail!("routing policy file disappeared; existing intent retained");
         }
@@ -519,6 +575,11 @@ impl PolicyStore {
             self.file_seen.store(true, Ordering::Release);
         }
         let next = loaded.unwrap_or_default();
+        if next.revision < state.revision
+            || (next.revision == state.revision && policy_digest(&next)? != policy_digest(&state)?)
+        {
+            bail!("routing policy revision rollback refused");
+        }
         *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(next);
         Ok(())
     }
@@ -1218,6 +1279,99 @@ mod tests {
         assert!(!store.discretionary_allowed("codex:moving", None, now));
     }
 
+    #[test]
+    fn durable_fence_refuses_missing_rolled_back_and_same_revision_changed_intent() {
+        let home = home();
+        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        store
+            .dispatch(Some("codex:fenced"), "cx-a", None, "first", Utc::now())
+            .unwrap();
+        store
+            .set_session(
+                &session_id("codex:fenced"),
+                Some(settings(Mode::Recover)),
+                None,
+                Some("cx-a"),
+            )
+            .unwrap();
+        let old = fs::read(&store.path).unwrap();
+        let old_fence = fs::read(fence_path(&store.path)).unwrap();
+        store
+            .set_session(
+                &session_id("codex:fenced"),
+                Some(settings(Mode::Strict)),
+                None,
+                Some("cx-a"),
+            )
+            .unwrap();
+        let latest = fs::read(&store.path).unwrap();
+        let latest_fence = fs::read(fence_path(&store.path)).unwrap();
+        for bytes in [
+            None,
+            Some(old.clone()),
+            Some({
+                let mut value: serde_json::Value = serde_json::from_slice(&latest).unwrap();
+                value["sessions"][session_id("codex:fenced")]["explicit"]["mode"] =
+                    "rebalance".into();
+                serde_json::to_vec(&value).unwrap()
+            }),
+        ] {
+            if let Some(bytes) = bytes {
+                fs::write(&store.path, bytes).unwrap();
+            } else {
+                fs::remove_file(&store.path).unwrap();
+            }
+            assert!(store.reload().is_err());
+            for _ in 0..2 {
+                assert!(PolicyStore::new(home.path(), Settings::default()).is_err());
+            }
+            assert_eq!(store.plan(Some("codex:fenced")).settings.mode, Mode::Strict);
+            assert_eq!(fs::read(fence_path(&store.path)).unwrap(), latest_fence);
+            fs::write(&store.path, &latest).unwrap();
+        }
+        // While alive, even a coordinated rollback of both files is rejected.
+        fs::write(&store.path, &old).unwrap();
+        fs::write(fence_path(&store.path), old_fence).unwrap();
+        assert!(store.reload().unwrap_err().to_string().contains("rollback"));
+        fs::write(&store.path, &latest).unwrap();
+        fs::write(fence_path(&store.path), latest_fence).unwrap();
+        store.reload().unwrap();
+        store
+            .set_session(
+                &session_id("codex:fenced"),
+                Some(settings(Mode::Recover)),
+                None,
+                Some("cx-a"),
+            )
+            .unwrap();
+        store.reload().unwrap();
+        assert_eq!(
+            store.plan(Some("codex:fenced")).settings.mode,
+            Mode::Recover
+        );
+        assert!(PolicyStore::new(home.path(), Settings::default()).is_ok());
+    }
+    #[test]
+    fn interrupted_fence_before_policy_replace_refuses_start_and_keeps_evidence() {
+        let home = home();
+        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        store
+            .set_session(
+                &session_id("codex:crash"),
+                Some(settings(Mode::Strict)),
+                None,
+                Some("cx-a"),
+            )
+            .unwrap();
+        let original = fs::read(&store.path).unwrap();
+        let mut pending = (*store.snapshot()).clone();
+        pending.revision += 1;
+        write_fence(&store.path, &pending).unwrap();
+        for _ in 0..2 {
+            assert!(PolicyStore::new(home.path(), Settings::default()).is_err());
+        }
+        assert_eq!(fs::read(&store.path).unwrap(), original);
+    }
     #[test]
     fn recovered_anchor_writer_and_reader_share_identifier_validation() {
         let home = home();

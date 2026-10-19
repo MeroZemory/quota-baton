@@ -637,6 +637,8 @@ async fn registered_project_applies_before_first_dispatch_and_claude_child_inher
         .await,
         first
     );
+    assert_credential(&h, 0, &first);
+    assert_credential(&h, 1, &first);
     for recorded in h.fake.state.requests() {
         assert!(!recorded.headers.contains_key("x-quota-baton-project"));
         assert_eq!(recorded.body.as_ref(), b"{}");
@@ -672,12 +674,14 @@ async fn recover_mode_moves_only_after_real_account_unavailability() {
             .await,
         first
     );
+    assert_credential(&h, 0, &first);
+    assert_credential(&h, 1, &first);
     h.pause(&first).await;
-    assert_ne!(
-        h.turn("/v1/responses", &[("session-id", "recover-root")], RAW)
-            .await,
-        first
-    );
+    let next = h
+        .turn("/v1/responses", &[("session-id", "recover-root")], RAW)
+        .await;
+    assert_credential(&h, 2, &next);
+    assert_ne!(next, first);
 }
 
 #[tokio::test]
@@ -1129,4 +1133,18 @@ async fn disappeared_policy_during_idle_import_preserves_strict_serving_lock() {
     );
     assert_eq!(h.fake.state.requests().len(), 1);
     assert_eq!(h.state.bindings.export().unwrap(), before);
+    // Restart shares the same startup path for HTTP and WebSocket listeners:
+    // no listener/dial can be created from a disappeared fenced policy.
+    for _ in 0..2 {
+        assert!(
+            RelayState::new(
+                h.store.clone(),
+                &Config::default(),
+                h.obs.clone(),
+                Arc::new(DebugPins::default())
+            )
+            .is_err()
+        );
+        assert_eq!(h.fake.state.requests().len(), 1);
+    }
 }
