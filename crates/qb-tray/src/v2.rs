@@ -50,6 +50,7 @@ pub struct Account {
     pub pool_eligible: Option<bool>,
     pub eligible_for_new_session: Option<bool>,
     pub quota_cooling: Option<QuotaCooling>,
+    pub quota_credit_releasable: bool,
     pub observed_at: Option<String>,
     pub source: Source,
     pub pacing: Pacing,
@@ -501,6 +502,25 @@ fn account_cooling(a: &Account) -> bool {
 fn quota(a: &Account) -> bool {
     account_cooling(a) && a.health.reason.as_deref() == Some("quota")
 }
+pub fn credits_eligible_for_resume(a: &Account) -> bool {
+    a.provider == "codex"
+        && a.user_state == "active"
+        && !a.allow_credits
+        && !a.drain
+        && !a.probe_pending
+        && !a.refresh_attention
+        && a.extra.get("takeover_pending") != Some(&Value::Bool(true))
+        && quota(a)
+        && a.quota_credit_releasable
+        && a.credits.as_ref().is_some_and(|c| {
+            qb_core::credits::available(
+                c.has_credits,
+                c.unlimited,
+                c.balance.as_ref().and_then(|n| n.as_f64()),
+            )
+        })
+}
+
 fn actual_credits(a: &Account) -> bool {
     a.provider == "codex" && a.credits_in_use == Some(true)
 }
@@ -970,10 +990,7 @@ fn finish_row(row: &mut AccountRow, summary: &Summary, serving: Option<&str>, no
             ))
         }
         _ if row.group != Group::NeedsAction
-            && a.user_state == "active"
-            && quota(a)
-            && !a.allow_credits
-            && row.credits.is_some()
+            && credits_eligible_for_resume(a)
             && summary.verdict == Verdict::Unavailable =>
         {
             let mut result = action(ActionKind::AllowCredits, "크레딧으로 계속", false);
@@ -1738,6 +1755,7 @@ mod tests {
         let mut a = base("a");
         a["credits"] = json!({"has_credits":true,"balance":19395.23});
         a["health"] = json!({"kind":"cooling","reason":"quota","scope":"account"});
+        a["quota_credit_releasable"] = json!(true);
         let v = view(vec![a.clone()], 0);
         let r = &codex(&v).rows[0];
         let c = r.credits.as_ref().unwrap();
@@ -1751,6 +1769,16 @@ mod tests {
         assert_eq!(confirmation.confirm, "크레딧 사용");
         assert!(confirmation.body.contains("잔액 19,395"));
         assert!(r.menu.credits_enable_confirmation.is_some());
+        let mut hard = a.clone();
+        hard["quota_credit_releasable"] = json!(false);
+        let hard_view = view(vec![hard], 0);
+        assert!(codex(&hard_view).rows[0].action.is_none());
+        assert!(
+            codex(&hard_view).rows[0]
+                .menu
+                .credits_enable_confirmation
+                .is_some()
+        );
         let again = view(vec![a.clone()], 0);
         assert!(
             codex(&again).rows[0]

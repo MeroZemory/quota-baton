@@ -137,13 +137,7 @@ fn credit_candidate<'a>(
         .flat_map(|s| &s.rows)
         .filter(|r| {
             let a = &r.raw;
-            a.user_state == "active"
-                && !a.allow_credits
-                && !a.drain
-                && !a.probe_pending
-                && a.health.kind == "cooling"
-                && a.health.reason.as_deref() == Some("quota")
-                && a.health.scope.as_deref() == Some("account")
+            v2::credits_eligible_for_resume(a)
                 && a.health
                     .until
                     .as_deref()
@@ -154,14 +148,6 @@ fn credit_candidate<'a>(
                     .and_then(|v| v.as_str())
                     .and_then(v2::timestamp)
                     .is_none_or(|at| at <= now)
-                && a.credits.as_ref().is_some_and(|c| {
-                    c.unlimited == Some(true)
-                        || c.balance
-                            .as_ref()
-                            .and_then(|n| n.as_f64())
-                            .is_some_and(|n| n > 0.0)
-                        || c.has_credits == Some(true) && c.balance.is_none()
-                })
         })
         .min_by(|a, b| a.name.cmp(&b.name).then_with(|| a.raw.id.cmp(&b.raw.id)))
 }
@@ -267,6 +253,7 @@ mod tests {
     fn exhausted_offer_priority_disabled_errors_and_aggregate_title() {
         let mut paid = account("paid");
         paid["credits"] = json!({"has_credits":true,"balance":19395.23});
+        paid["quota_credit_releasable"] = json!(true);
         let mut off = account("off");
         off["user_state"] = json!("disabled");
         let q = context(QuotaAction::Exhausted);
@@ -289,7 +276,10 @@ mod tests {
     fn credit_suggestions_exclude_nonrecoverable_accounts_and_model_scope() {
         let mut paid = account("paid");
         paid["credits"] = json!({"has_credits":true,"balance":3});
+        paid["quota_credit_releasable"] = json!(true);
         for (key, value) in [
+            ("quota_credit_releasable", json!(false)),
+            ("credits", json!({"has_credits":false,"balance":12})),
             ("allow_credits", json!(true)),
             ("drain", json!(true)),
             ("user_state", json!("paused")),

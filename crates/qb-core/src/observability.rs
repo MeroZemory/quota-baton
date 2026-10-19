@@ -430,9 +430,17 @@ impl Observability {
     }
 
     pub fn observe_headers(&self, account_id: &str, provider: Provider, headers: &HeaderMap) {
-        if let Some(snapshot) = snapshot(provider, headers, Utc::now()) {
-            self.remember(account_id, &snapshot, true);
-        }
+        let _ = self.observe_headers_snapshot(account_id, provider, headers);
+    }
+
+    pub(crate) fn observe_headers_snapshot(
+        &self,
+        account_id: &str,
+        provider: Provider,
+        headers: &HeaderMap,
+    ) -> Option<serde_json::Value> {
+        let snapshot = snapshot(provider, headers, Utc::now())?;
+        self.remember(account_id, &snapshot, true)
     }
 
     pub(crate) fn observe_poll(
@@ -462,8 +470,16 @@ impl Observability {
     }
 
     pub fn observe_codex_event(&self, account_id: &str, event: &serde_json::Value) {
+        let _ = self.observe_codex_event_snapshot(account_id, event);
+    }
+
+    pub(crate) fn observe_codex_event_snapshot(
+        &self,
+        account_id: &str,
+        event: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
         if event.get("type").and_then(serde_json::Value::as_str) != Some("codex.rate_limits") {
-            return;
+            return None;
         }
         let limits = event.get("rate_limits").unwrap_or(event);
         let mut headers = HeaderMap::new();
@@ -514,8 +530,9 @@ impl Observability {
         }
         if let Some(mut snapshot) = snapshot(Provider::Codex, &headers, Utc::now()) {
             snapshot.source = "codex.rate_limits".into();
-            self.remember(account_id, &snapshot, true);
+            return self.remember(account_id, &snapshot, true);
         }
+        None
     }
 
     pub fn record_ws_connection(

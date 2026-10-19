@@ -306,15 +306,17 @@ async fn upgrade_inner(
                 _ => return network_failure(),
             };
             completion.record.upstream_status = Some(response.status().as_u16());
-            if response.status() == StatusCode::SWITCHING_PROTOCOLS
+            let credit_observation = if response.status() == StatusCode::SWITCHING_PROTOCOLS
                 || response.status().is_success()
                 || response.status() == StatusCode::TOO_MANY_REQUESTS
             {
                 state
                     .accounts
                     .observe_headers(&account.id, Provider::Codex, response.headers())
-                    .await;
-            }
+                    .await
+            } else {
+                Default::default()
+            };
             if response.status() == StatusCode::SWITCHING_PROTOCOLS {
                 let headers = response.headers().clone();
                 if headers
@@ -331,7 +333,10 @@ async fn upgrade_inner(
                     Ok(stream) => stream,
                     Err(_) => return network_failure(),
                 };
-                state.accounts.credit_headers(&account.id, &headers).await;
+                state
+                    .accounts
+                    .credit_headers(&account.id, &headers, &credit_observation)
+                    .await;
                 if probe.is_some() && state.accounts.probe_success(&account.id).await.is_err() {
                     return network_failure();
                 }

@@ -221,7 +221,7 @@ Overview fixture heights:
 |---|---|---|---|
 | serving from credits | 크레딧 19,395 · 지금 사용 중 | warn-text | **[크레딧 사용 끄기]**: `PATCH allow_credits=false` |
 | `allow_credits=true`, not serving | 크레딧 19,395 · 한도 도달 시 사용 | secondary | none |
-| `allow_credits=false` | 크레딧 19,395 · 한도 도달 시 사용 안 함 | secondary | **[크레딧으로 계속]** only when the account is in account-scoped `cooling(quota)` **and** the provider verdict is 사용 불가. It opens the confirmation below; only explicit confirmation sends `PATCH allow_credits=true`. |
+| `allow_credits=false` | 크레딧 19,395 · 한도 도달 시 사용 안 함 | secondary | **[크레딧으로 계속]** only when the account is in account-scoped `cooling(quota)` **and** the provider verdict is 사용 불가, with `quota_credit_releasable=true`. A hard upstream rejection or legacy hold offers the conditional permission setting in the menu, not an immediate-continue action. It opens the confirmation below; only explicit confirmation sends `PATCH allow_credits=true`. |
 
 - An account with no credits (for example hello.sample-acct) shows no credits line.
 

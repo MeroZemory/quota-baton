@@ -1467,7 +1467,7 @@ async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Re
                 .get("openai-model")
                 .and_then(|v| v.to_str().ok()),
         );
-        if status.is_success() || status == StatusCode::TOO_MANY_REQUESTS {
+        let credit_observation = if status.is_success() || status == StatusCode::TOO_MANY_REQUESTS {
             state
                 .accounts
                 .observe_headers_for_model(
@@ -1476,8 +1476,10 @@ async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Re
                     &response_headers,
                     request_model.as_deref(),
                 )
-                .await;
-        }
+                .await
+        } else {
+            Default::default()
+        };
         #[cfg(all(feature = "shape-capture", debug_assertions))]
         state
             .observability
@@ -1518,7 +1520,7 @@ async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Re
             if status.is_success() {
                 state
                     .accounts
-                    .credit_headers(&account.id, &response_headers)
+                    .credit_headers(&account.id, &response_headers, &credit_observation)
                     .await;
             }
             if probe.is_some()

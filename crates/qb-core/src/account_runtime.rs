@@ -62,6 +62,12 @@ pub(crate) struct PendingQuotaTicket {
 }
 type PendingQuota = BTreeMap<String, PendingQuotaTicket>;
 
+/// The exact upstream observation that a later successful commit may confirm.
+#[derive(Clone, Default)]
+pub struct QuotaObservation {
+    observed_at: Value,
+}
+
 pub struct AccountRuntime {
     pub store: Arc<AccountStore>,
     obs: Arc<Observability>,
@@ -383,7 +389,12 @@ impl AccountRuntime {
         true
     }
 
-    pub(crate) async fn credit_headers(&self, id: &str, headers: &HeaderMap) {
+    pub(crate) async fn credit_headers(
+        &self,
+        id: &str,
+        headers: &HeaderMap,
+        observation: &QuotaObservation,
+    ) {
         // Require evidence on THIS successful response, never a merged old signal.
         let serving = headers
             .get("x-codex-credits-serving")
@@ -392,12 +403,15 @@ impl AccountRuntime {
             .get("x-codex-active-limit")
             .and_then(|v| v.to_str().ok());
         if serving == Some("true") || (serving.is_none() && active == Some("credits")) {
-            self.credit_notice(id).await;
+            self.credit_notice(id, observation.observed_at.clone())
+                .await;
         }
     }
 
-    async fn credit_notice(&self, id: &str) {
-        let observed_at = self.obs.quota_snapshot(id).unwrap_or_default()["observed_at"].clone();
+    async fn credit_notice(&self, id: &str, observed_at: Value) {
+        if observed_at.is_null() {
+            return;
+        }
         let store = self.store.clone();
         let obs = self.obs.clone();
         let notices = self.quota_notices.clone();
@@ -1144,7 +1158,7 @@ impl AccountRuntime {
             let health=self.volatile.lock().ok().and_then(|v|v.get(&a.id).cloned()).unwrap_or(a.health.clone());
             let pending = self.probing(&a.id) || ((a.auth_probe_pending || a.auth_failures > 0) && health == Health::Ready);
             let health = if pending { json!({"kind":"cooling","reason":"auth","until":Utc::now(),"scope":"account","probe_pending":true}) } else { json!(health) };
-            json!({"pool_eligible":a.user_state == UserState::Active && !pending && !takeover_fenced.contains(&a.id) && health["kind"] == "ready","takeover_pending":takeover_fenced.contains(&a.id),"quota_cooling":a.quota_cooling,"observed_at":quota["observed_at"],"quota_notice":quota_notice,"credits_in_use":credits_in_use,"has_alternative":has_alternative,"id":a.id,"generation":a.generation,"last_refresh_at":a.token_meta.last_refresh_at,"provider":a.provider,"label":a.label,"email":a.email,"plan":quota["plan"].as_str().map(str::to_owned).or(a.plan.clone()),"user_state":a.user_state,"source":a.source,"health":health,"probe_pending":pending,"pacing":{"backoff_until":backoff_until,"step":pacing.rate_step,"release_interval_ms":pacing.rate_release_interval.as_millis() as u64,"waiting":pacing.waiting},"windows":quota["windows"].as_array().cloned().unwrap_or_default(),"credits":quota["credits"],"last_used_at":null,"bound_sessions":0,"token_expires_at":a.token_meta.expires_at,"drain":a.drain,"allow_credits":a.allow_credits,"refresh_attention":takeover_fenced.contains(&a.id) || self.refresh_attention.lock().map(|f|f.contains(&a.id)).unwrap_or(false)})
+            json!({"pool_eligible":a.user_state == UserState::Active && !pending && !takeover_fenced.contains(&a.id) && health["kind"] == "ready","takeover_pending":takeover_fenced.contains(&a.id),"quota_cooling":a.quota_cooling,"quota_credit_releasable":a.quota_credit_releasable,"observed_at":quota["observed_at"],"quota_notice":quota_notice,"credits_in_use":credits_in_use,"has_alternative":has_alternative,"id":a.id,"generation":a.generation,"last_refresh_at":a.token_meta.last_refresh_at,"provider":a.provider,"label":a.label,"email":a.email,"plan":quota["plan"].as_str().map(str::to_owned).or(a.plan.clone()),"user_state":a.user_state,"source":a.source,"health":health,"probe_pending":pending,"pacing":{"backoff_until":backoff_until,"step":pacing.rate_step,"release_interval_ms":pacing.rate_release_interval.as_millis() as u64,"waiting":pacing.waiting},"windows":quota["windows"].as_array().cloned().unwrap_or_default(),"credits":quota["credits"],"last_used_at":null,"bound_sessions":0,"token_expires_at":a.token_meta.expires_at,"drain":a.drain,"allow_credits":a.allow_credits,"refresh_attention":takeover_fenced.contains(&a.id) || self.refresh_attention.lock().map(|f|f.contains(&a.id)).unwrap_or(false)})
         }).collect())
     }
 
@@ -1169,9 +1183,14 @@ impl AccountRuntime {
         Ok(views)
     }
 
-    pub async fn observe_headers(&self, id: &str, provider: Provider, headers: &HeaderMap) {
+    pub async fn observe_headers(
+        &self,
+        id: &str,
+        provider: Provider,
+        headers: &HeaderMap,
+    ) -> QuotaObservation {
         self.observe_headers_for_model(id, provider, headers, None)
-            .await;
+            .await
     }
 
     pub async fn observe_headers_for_model(
@@ -1180,14 +1199,13 @@ impl AccountRuntime {
         provider: Provider,
         headers: &HeaderMap,
         model: Option<&str>,
-    ) {
-        let previous = self.obs.quota_snapshot(id);
-        self.obs.observe_headers(id, provider, headers);
-        if previous != self.obs.quota_snapshot(id)
-            && let Some(snapshot) = self.obs.quota_snapshot(id)
-        {
-            let _ = self.apply_quota_snapshot(id, snapshot, model).await;
-        }
+    ) -> QuotaObservation {
+        let Some(snapshot) = self.obs.observe_headers_snapshot(id, provider, headers) else {
+            return QuotaObservation::default();
+        };
+        let observed_at = snapshot["observed_at"].clone();
+        let _ = self.apply_quota_snapshot(id, snapshot, model).await;
+        QuotaObservation { observed_at }
     }
 
     pub async fn observe_codex_event(&self, id: &str, event: &Value) {
@@ -1203,10 +1221,11 @@ impl AccountRuntime {
         if event["type"] != "codex.rate_limits" {
             return;
         }
-        self.obs.observe_codex_event(id, event);
-        if let Some(snapshot) = self.obs.quota_snapshot(id) {
-            let _ = self.apply_quota_snapshot(id, snapshot, model).await;
-        }
+        let Some(snapshot) = self.obs.observe_codex_event_snapshot(id, event) else {
+            return;
+        };
+        let observed_at = snapshot["observed_at"].clone();
+        let _ = self.apply_quota_snapshot(id, snapshot, model).await;
         let limits = event.get("rate_limits").unwrap_or(event);
         let serving = event
             .get("serving_from_credits")
@@ -1218,7 +1237,7 @@ impl AccountRuntime {
             .or_else(|| limits.get("active_limit"))
             .and_then(Value::as_str);
         if serving == Some(true) || (serving.is_none() && active == Some("credits")) {
-            self.credit_notice(id).await;
+            self.credit_notice(id, observed_at).await;
         }
     }
 
@@ -2107,6 +2126,68 @@ mod r5_view_tests {
     use super::*;
 
     #[tokio::test]
+    async fn credits_original_http_and_stream_revision_cannot_attach_to_a_later_reset() {
+        use futures_util::poll;
+        for stream in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let store = Arc::new(AccountStore::acquire(home.path()).unwrap());
+            let obs = Arc::new(Observability::new(home.path(), None).unwrap());
+            let runtime = AccountRuntime::new(store.clone(), obs.clone(), 0.0);
+            let mut account = crate::accounts::health::tests::fixture();
+            account.allow_credits = true;
+            let id = account.id.clone();
+            store
+                .save(
+                    &account,
+                    &crate::accounts::Tokens {
+                        access_token: "synthetic-access".into(),
+                        refresh_token: "synthetic-refresh".into(),
+                        id_token: None,
+                    },
+                    None,
+                )
+                .unwrap();
+            let mut paid = HeaderMap::new();
+            paid.insert("x-codex-active-limit", "credits".parse().unwrap());
+            let paid_event = json!({"type":"codex.rate_limits","active_limit":"credits"});
+            let mut delayed = std::pin::pin!(async {
+                if stream {
+                    runtime.observe_codex_event(&id, &paid_event).await;
+                } else {
+                    let revision = runtime.observe_headers(&id, Provider::Codex, &paid).await;
+                    runtime.credit_headers(&id, &paid, &revision).await;
+                }
+            });
+            {
+                let _gate = store.transaction().unwrap();
+                assert!(poll!(delayed.as_mut()).is_pending());
+                let mut reset = HeaderMap::new();
+                reset.insert("x-codex-primary-used-percent", "0".parse().unwrap());
+                reset.insert(
+                    "x-codex-primary-reset-at",
+                    (Utc::now() + Duration::hours(5))
+                        .timestamp()
+                        .to_string()
+                        .parse()
+                        .unwrap(),
+                );
+                obs.observe_headers(&id, Provider::Codex, &reset);
+            }
+            delayed.await;
+            assert_eq!(runtime.views().await.unwrap()[0]["credits_in_use"], false);
+            assert!(obs.quota_snapshot(&id).unwrap()["paid_serving_observed_at"].is_null());
+            assert!(
+                obs.dashboard()
+                    .usage_page(1)
+                    .unwrap()
+                    .accounts
+                    .iter()
+                    .all(|a| a.credits_spans.is_empty())
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn credits_delayed_success_cannot_reopen_a_newer_off_or_empty_span() {
         use futures_util::poll;
         for off in [false, true] {
@@ -2132,9 +2213,20 @@ mod r5_view_tests {
             paid.insert("x-codex-active-limit", "credits".parse().unwrap());
             paid.insert("x-codex-credits-has-credits", "true".parse().unwrap());
             obs.observe_headers(&id, Provider::Codex, &paid);
-            runtime.credit_headers(&id, &paid).await;
+            runtime
+                .credit_headers(
+                    &id,
+                    &paid,
+                    &QuotaObservation {
+                        observed_at: obs.quota_snapshot(&id).unwrap()["observed_at"].clone(),
+                    },
+                )
+                .await;
             assert_eq!(runtime.views().await.unwrap()[0]["credits_in_use"], true);
-            let mut pending = std::pin::pin!(runtime.credit_headers(&id, &paid));
+            let revision = QuotaObservation {
+                observed_at: obs.quota_snapshot(&id).unwrap()["observed_at"].clone(),
+            };
+            let mut pending = std::pin::pin!(runtime.credit_headers(&id, &paid, &revision));
             {
                 let _gate = store.transaction().unwrap();
                 assert!(poll!(pending.as_mut()).is_pending());
@@ -2168,7 +2260,15 @@ mod r5_view_tests {
             if !off {
                 let old_stop = obs.quota_snapshot(&id).unwrap();
                 obs.observe_headers(&id, Provider::Codex, &paid);
-                runtime.credit_headers(&id, &paid).await;
+                runtime
+                    .credit_headers(
+                        &id,
+                        &paid,
+                        &QuotaObservation {
+                            observed_at: obs.quota_snapshot(&id).unwrap()["observed_at"].clone(),
+                        },
+                    )
+                    .await;
                 assert_eq!(runtime.views().await.unwrap()[0]["credits_in_use"], true);
                 runtime
                     .apply_quota_snapshot(&id, old_stop, None)
