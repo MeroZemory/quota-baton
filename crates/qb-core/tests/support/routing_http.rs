@@ -867,3 +867,156 @@ async fn legacy_global_strict_corrupt_restore_refuses_core_start_before_any_b_cr
         }
     }
 }
+
+#[tokio::test]
+async fn legacy_alias_anchor_recovery_and_v2_independence_use_the_actual_serving_credentials() {
+    for (schema, divergent) in [(1, false), (1, true), (2, true)] {
+        let h = Harness::new(Provider::Codex).await;
+        let a = h
+            .turn("/v1/responses", &[("session-id", "alias-proof")], RAW)
+            .await;
+        let b = h.ids().into_iter().find(|id| id != &a).unwrap();
+        let paused = if divergent { &a } else { &b };
+        h.pause(paused).await;
+        let child = h
+            .turn(
+                "/v1/responses",
+                &[("session-id", "alias-proof:agent:x")],
+                RAW,
+            )
+            .await;
+        assert_eq!(child, if divergent { b.clone() } else { a.clone() });
+        assert_credential(&h, 0, &a);
+        assert_credential(&h, 1, &child);
+        h.admin(
+            reqwest::Method::POST,
+            &format!("/admin/v1/accounts/{paused}/resume"),
+            None,
+        )
+        .await;
+        h.state.bindings.freeze().unwrap();
+        h.obs.flush().unwrap();
+        let Harness {
+            mut servers,
+            state,
+            store,
+            obs,
+            fake,
+            client,
+            home,
+            _root,
+            _serial,
+        } = h;
+        servers.data_task.abort();
+        servers.admin_task.abort();
+        let _ = (&mut servers.data_task).await;
+        let _ = (&mut servers.admin_task).await;
+        drop(client);
+        drop(servers);
+        drop(state);
+        let id = qb_core::routing::session_id("codex:alias-proof");
+        let mut policy = json!({"schema":schema,"revision":1,"projects":{},"sessions":{id:{"project":null,"baseline":{"mode":"rebalance","reset_wait_secs":60},"explicit":{"mode":"strict","reset_wait_secs":0},"anchor":null,"movements":[]}}});
+        if schema == 2 {
+            policy["legacy_codex_roots"] = json!([]);
+        }
+        let policy_path = home.join("state/routing-policies.json");
+        let policy_bytes = serde_json::to_vec(&policy).unwrap();
+        fs::write(&policy_path, &policy_bytes).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&policy_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let bindings_bytes = fs::read(home.join("state/bindings.json")).unwrap();
+        let mut config = Config::default();
+        config.server.data_port = 0;
+        config.server.admin_port = 0;
+        config.routing.mode = qb_core::routing::Mode::Strict;
+        config.upstream.codex_base = fake.url.clone();
+        config.upstream.anthropic_base = fake.url.clone();
+        if schema == 1 && divergent {
+            for _ in 0..2 {
+                assert!(
+                    RelayState::new(
+                        store.clone(),
+                        &config,
+                        obs.clone(),
+                        Arc::new(DebugPins::default())
+                    )
+                    .is_err()
+                );
+                assert_eq!(fs::read(&policy_path).unwrap(), policy_bytes);
+                assert_eq!(
+                    fs::read(home.join("state/bindings.json")).unwrap(),
+                    bindings_bytes
+                );
+                assert_eq!(fake.state.requests().len(), 2);
+            }
+            continue;
+        }
+        let state = Arc::new(
+            RelayState::new(
+                store.clone(),
+                &config,
+                obs.clone(),
+                Arc::new(DebugPins::default()),
+            )
+            .unwrap(),
+        );
+        let servers = http::spawn_with_routes(
+            &config,
+            LocalSecrets {
+                client_key: "synthetic-client".into(),
+                admin_token: "synthetic-admin".into(),
+            },
+            relay::router(state.clone()),
+            qb_core::admin::runtime_routes(state.clone(), 0),
+        )
+        .await
+        .unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let h = Harness {
+            servers,
+            state,
+            store,
+            obs,
+            fake,
+            client,
+            home,
+            _root,
+            _serial,
+        };
+        h.pause(&a).await;
+        assert_eq!(
+            h.send("/v1/responses", &[("session-id", "alias-proof")], RAW)
+                .await
+                .0,
+            409
+        );
+        assert_eq!(h.fake.state.requests().len(), 2);
+        if schema == 1 {
+            assert_eq!(
+                h.send(
+                    "/v1/responses",
+                    &[("session-id", "alias-proof:agent:x")],
+                    RAW
+                )
+                .await
+                .0,
+                409
+            );
+            assert_eq!(h.fake.state.requests().len(), 2);
+        } else {
+            assert_eq!(
+                h.turn(
+                    "/v1/responses",
+                    &[("session-id", "alias-proof:agent:x")],
+                    RAW
+                )
+                .await,
+                b
+            );
+            assert_credential(&h, 2, &b);
+        }
+    }
+}
