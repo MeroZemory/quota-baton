@@ -9,7 +9,10 @@ use std::{
     fs,
     io::Read,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 const MAX_SESSIONS: usize = 20_000;
@@ -237,6 +240,8 @@ pub struct PolicyStore {
     limits: ChurnLimits,
     state: Mutex<Arc<State>>,
     writer: Mutex<()>,
+    file_seen: AtomicBool,
+    recovery_blocked: AtomicBool,
     pub(crate) changed: tokio::sync::Notify,
 }
 
@@ -280,10 +285,10 @@ pub fn take_project(headers: &mut axum::http::HeaderMap) -> Result<Option<String
     }
 }
 
-fn load(path: &Path) -> Result<State> {
+fn load(path: &Path) -> Result<Option<State>> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.len() > MAX_FILE => bail!("routing policy file exceeds cap"),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(State::default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
         Ok(metadata) => metadata,
     };
@@ -357,6 +362,12 @@ fn load(path: &Path) -> Result<State> {
         value["schema"] = 2.into();
     }
     let mut state: State = serde_json::from_value(value)?;
+    validate_state(&state)?;
+    state.reindex();
+    Ok(Some(state))
+}
+
+fn validate_state(state: &State) -> Result<()> {
     if state.schema != 2
         || state.projects.len() > MAX_PROJECTS
         || state.sessions.len() > MAX_SESSIONS
@@ -418,8 +429,7 @@ fn load(path: &Path) -> Result<State> {
             bail!("conflicting routing movement identity");
         }
     }
-    state.reindex();
-    Ok(state)
+    Ok(())
 }
 
 impl PolicyStore {
@@ -427,13 +437,17 @@ impl PolicyStore {
         defaults.validate()?;
         let path = home.join("state/routing-policies.json");
         fs::create_dir_all(path.parent().expect("policy parent"))?;
-        let state = load(&path)?;
+        let loaded = load(&path)?;
+        let file_seen = loaded.is_some();
+        let state = loaded.unwrap_or_default();
         Ok(Self {
             path,
             defaults,
             limits: ChurnLimits::default(),
             state: Mutex::new(Arc::new(state)),
             writer: Mutex::new(()),
+            file_seen: AtomicBool::new(file_seen),
+            recovery_blocked: AtomicBool::new(false),
             changed: tokio::sync::Notify::new(),
         })
     }
@@ -456,6 +470,7 @@ impl PolicyStore {
         if next.sessions.len() > MAX_SESSIONS || next.projects.len() > MAX_PROJECTS {
             bail!("routing policy capacity reached");
         }
+        validate_state(&next)?;
         next.revision = next.revision.wrapping_add(1);
         let bytes = serde_json::to_vec(&next)?;
         if bytes.len() as u64 > MAX_FILE {
@@ -470,6 +485,7 @@ impl PolicyStore {
             self.changed.notify_waiters();
             return Err(error.into());
         }
+        self.file_seen.store(true, Ordering::Release);
         next.reindex();
         *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(next);
         self.changed.notify_waiters();
@@ -495,9 +511,26 @@ impl PolicyStore {
         if state.frozen {
             bail!("routing policy writer retired");
         }
-        let next = load(&self.path)?;
+        let loaded = load(&self.path)?;
+        if loaded.is_none() && self.file_seen.load(Ordering::Acquire) {
+            bail!("routing policy file disappeared; existing intent retained");
+        }
+        if loaded.is_some() {
+            self.file_seen.store(true, Ordering::Release);
+        }
+        let next = loaded.unwrap_or_default();
         *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(next);
         Ok(())
+    }
+    /// Import recovery blocks every dispatch until validation and anchor capture finish.
+    /// On failure it remains blocked; only a successful recovery or restart clears it.
+    pub(crate) fn begin_recovery(&self) {
+        self.recovery_blocked.store(true, Ordering::Release);
+        self.changed.notify_waiters();
+    }
+    pub(crate) fn finish_recovery(&self) {
+        self.recovery_blocked.store(false, Ordering::Release);
+        self.changed.notify_waiters();
     }
     fn snapshot(&self) -> Arc<State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -544,7 +577,7 @@ impl PolicyStore {
     /// A queued request cannot use an obsolete account after policy changes.
     pub fn permits_dispatch(&self, key: Option<&str>, account: &str) -> bool {
         let state = self.snapshot();
-        if state.frozen {
+        if state.frozen || self.recovery_blocked.load(Ordering::Acquire) {
             return false;
         }
         let Some(key) = key else {
@@ -804,6 +837,9 @@ impl PolicyStore {
         reason: &str,
         now: DateTime<Utc>,
     ) -> Result<()> {
+        if self.recovery_blocked.load(Ordering::Acquire) {
+            bail!("routing policy recovery incomplete");
+        }
         let Some(key) = key else {
             return Ok(());
         };
@@ -1180,6 +1216,26 @@ mod tests {
             Some("cx-d")
         );
         assert!(!store.discretionary_allowed("codex:moving", None, now));
+    }
+
+    #[test]
+    fn recovered_anchor_writer_and_reader_share_identifier_validation() {
+        let home = home();
+        let store = PolicyStore::new(home.path(), settings(Mode::Strict)).unwrap();
+        for invalid in ["bad/account", "sk-secret", "bad:account"] {
+            assert!(
+                store
+                    .capture_strict_anchors([("codex:recover", invalid)])
+                    .is_err()
+            );
+            assert!(store.plan(Some("codex:recover")).anchor.is_none());
+            assert!(!store.path.exists());
+        }
+        store
+            .capture_strict_anchors([("codex:recover", "cx-safe")])
+            .unwrap();
+        store.reload().unwrap();
+        assert!(store.permits_dispatch(Some("codex:recover"), "cx-safe"));
     }
     #[test]
     fn failed_persistence_never_commits_memory_and_freeze_stops_writes() {
