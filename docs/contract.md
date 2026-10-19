@@ -219,9 +219,9 @@ Rules for answering a WebSocket upgrade:
 
 ### C6.3 Rate hold and per-account pacing (D14)
 
-A request-rate limit (row 3) means the account is being asked too fast, not that it is out of quota. Moving sessions to another account throws away their prompt cache: each moved session re-sends its whole context uncached, and that pushes the other account over its rate limit too. This cascade was observed live on 2026-10-14 under the previous proxy (60 re-bindings at 01:30 KST, 150–350k uncached tokens per moved session).
+A request-rate limit (row 3) means the account is being asked too fast, not that it is out of quota. Moving sessions can lose prompt-cache affinity and require full-context retransmission, which can overload the destination too. Cross-account cache behaviour is not universally established. This cascade was observed live on 2026-10-14 under the previous proxy (60 re-bindings at 01:30 KST, 150–350k uncached tokens per moved session).
 
-Rate limits are therefore absorbed on the same account. A rate limit **never** moves a session and never causes failover. The design was independently reviewed (`.sandbox/reviews/D14-rate-hold-review.md`; F1–F10 refer to facts from the Codex 0.162.1 source).
+Rate limits are therefore absorbed on the same account. An individual rate limit does not directly move a session or cause failover. Persistent overload may cause a separately budgeted C7.1 discretionary move, subject to root policy. The design was independently reviewed (`.sandbox/reviews/D14-rate-hold-review.md`; F1–F10 refer to facts from the Codex 0.162.1 source).
 
 **Codex behaviour this relies on (review F2–F7).**
 - Codex retries a rate 429 only when the response carries retry advice: the HTTP `Retry-After` header, or a `headers` map inside a WebSocket error frame.
@@ -233,7 +233,7 @@ Rate limits are therefore absorbed on the same account. A rate limit **never** m
 **Pacing state.** Each account has `rate_backoff_until`, `rate_step` and `rate_release_interval`, held in memory only.
 - **Not a health state.** It is not persisted, never changes eligibility and never moves a binding by itself. A persistent, client-visible limit on a concentrated account is handled by C7.1.
 - **Owner.** The account runtime owns it, under one lock. The HTTP relay, the upgrade path and the WebSocket pump all update it there.
-- **Backoff window.** A rate 429 starts or extends the window: `rate_backoff_until = max(rate_backoff_until, now + max(retry_after, 2^rate_step s))`, with ±20 % jitter. The window is never shortened.
+- **Backoff window.** A rate 429 starts or extends the window: `rate_backoff_until = max(rate_backoff_until, now + max(retry_after, 2^rate_step s))`, with ±20 % jitter on the proxy estimate, never reducing the server-advised minimum. The window is never shortened.
 - **Step.** A 429 raises `rate_step` (cap 5) only if its request was **sent after** the current window was set. That makes one step per window, not one per 429 in flight. `rate_step` decays by one after each full backoff interval with no rate 429. A committed 2xx does **not** reset it.
 - **Release interval.** It starts at 250 ms. It doubles for each backoff window that saw a rate 429, up to 5 s. It shrinks by 25 % after each 60 s with no rate 429, down to 250 ms.
 
@@ -242,7 +242,7 @@ Rate limits are therefore absorbed on the same account. A rate limit **never** m
 - **While the account is pacing** (`rate_step` > 0, or a future `rate_backoff_until`), the gate is open when `now ≥ rate_backoff_until` and the previous release was at least `rate_release_interval` ago. Once `rate_step` has decayed to 0, spacing stops.
 - Waiting requests are released in arrival order, one per interval. One release task per account enforces the spacing.
 - While a request waits, its body is retained or back-pressured.
-- A request whose wait reaches `rate_hold_secs` (default 60) is sent anyway, once. Its response is relayed as is, and C3 adds `retry-after` to a 429. The proxy never synthesizes a rate 429; answering with a synthesized 429 at once was the previous proxy's fail-fast failure.
+- A request whose wait reaches `rate_hold_secs` (default 60) is not forcibly sent. Return its retained upstream 429 if available, otherwise a provider-shaped local 429 `rate_wait_timeout` with retry advice. This local terminal wait result is distinct from fail-fast before waiting and never creates quota cooling. Concurrent expiries must not become a burst of upstream sends.
 
 **HTTP: retry in place.** This applies to a pre-commit rate 429 when the request has a retained copy.
 - Pass the admission gate again, then retry the same account from the retained copy.
@@ -259,7 +259,7 @@ Rate limits are therefore absorbed on the same account. A rate limit **never** m
 3. **The error frame carries retry advice.** Relay it as is, immediately. Codex retries after the advised delay.
 4. **Otherwise.** Do not relay the frame. Close the client socket with 1012, with **no** reconnect exclusion. Codex treats the close as retryable and reconnects with the full input. The binding is unchanged, so the reconnect goes back to the same account, and admission paces its upgrade (at most `ws_upgrade_hold_secs`). Relaying the frame would end the turn at once (F3).
 
-If the upstream socket closes while a resend is pending, close the client socket with the same code.
+If the upstream socket closes while a resend is pending, close the client socket with the same code. A pending create/resend whose pacing budget expires closes with 1013 without a forced payload send; that terminal rule takes precedence over cases 1–2.
 
 Phase 0 item **V8** observes the genuine `wss://chatgpt.com` rate-limit shape. It records which of these occur:
 - a handshake 429
@@ -341,7 +341,7 @@ These rules come from the P2 blind panel (`.sandbox/reviews/switch-policy-blind-
 
 **Steps:**
 1. If the session key is bound to account A, and A is eligible (C5) and not yet tried, use A. Two exceptions:
-   - **Reset hold:** A is in `cooling(quota)` and its limiting window resets within `reset_hold_secs` (default 60). Hold the request until the reset instead of moving it; the cache is still warm.
+   - **Reset hold:** A is in `cooling(quota)` and its limiting window resets within `reset_hold_secs` (default 60). Hold the request until the reset instead of moving it; the intent is to preserve cache affinity; warmth is not guaranteed.
      - **During a request (F3).** The hold also applies when A answers *this* request with a pre-commit usage limit whose reset is within `reset_hold_secs`. The request then waits until the reset and retries A once from the retained copy, instead of failing over. This applies to HTTP, and to a WebSocket **upgrade**. An error on an already-open socket keeps the row 13a behaviour.
      - **Bound (S2).** The hold never exceeds `reset_hold_secs`, which stays well below both clients' timeouts (Claude Code 600 s; Codex stream idle 300 s). On a WebSocket **upgrade** it never exceeds `ws_upgrade_hold_secs` (10 s), because Codex's connect timeout is 15 s (C6.3). If the reset has not taken effect when the hold ends, normal failover applies at once. No separate client-timeout estimate is used.
      - **Scope (S3).** The hold is per request. A request whose hold ended does not stop the next request of that session from holding.
@@ -398,7 +398,7 @@ Further rules:
 
 D11 places every new session on the account with the soonest weekly reset until its gate fails, so sessions concentrate on one account while others sit idle. D14 made rate limits never move a session. This subsection adds the user's rule (D15):
 - Spread new sessions before an account is full.
-- When sessions are already concentrated on an account that keeps hitting its rate limit while another account has room, move a bounded number of them, even though they lose their cache.
+- When sessions are already concentrated on an account that keeps hitting its rate limit while another account has room, move a bounded number of them, accepting possible cache loss and full-input retransmission cost.
 - When sessions are already well spread, a rate limit moves nothing.
 
 The design was independently reviewed (`.sandbox/reviews/D15-review.md`).
@@ -722,3 +722,13 @@ The tray writes `state/ui.json` atomically with schema and geometry only: positi
 ## C13. Acceptance
 
 See [architecture §16.3](architecture.md#163-acceptance-criteria) (A1–A5). Every row of C5 and C6 MUST have a `qb-testkit` test before M4a/M4b are accepted.
+
+### Routing wait and forecast supplement (cache-routing implementation)
+
+`routing.request_timeout_secs` (1–600, default 300) bounds the whole HTTP pre-commit path: input preparation, selection/reset hold, token refresh waiting, pacing, dial and retries. It does not cut off an already committed stream. WS upgrade uses its own overall `ws_upgrade_hold_secs` envelope (1–14, default 10); pacing leaves 100 ms to return a terminal result within it. Account/policy edits interrupt reset waits, and current authority is checked at actual dispatch, including open-socket resends and redials with the pending request's model. A request owns at most one reset hold; later requests have independent budgets. A generic cooling expiry is not evidence of a provider reset: the hold requires persisted causal quota metadata or a current structured reset observation. Wall reset times are converted once per wait to a monotonic deadline.
+
+`rate_hold_secs` is bounded to 1–600 seconds. Rate wait expiry is terminal, not a send permit. HTTP returns the retained upstream 429 when available, otherwise a provider-shaped local 429 `rate_wait_timeout`. An unsent open-WS create/resend ends with 1013 on wait expiry; no payload is forcibly sent and no quota cooling is synthesized. Retry-After advice is never shortened by the local wait cap or negative jitter. C6.3 defines this terminal wait behaviour. Genuine network/token retry budgets remain independent, and there is no post-commit replay.
+
+Policy schema 2 records conservative aliases for schema-1 Codex `:agent:` hashes. Legacy locks survive independent-root correction and takeover; only an explicit override changes that intent. Discretionary budgets include all recent group moves, while pool budgets count discretionary provider moves. Cost/unknown state is rechecked before choice and after marks. The shared atomic writer uses owner-only files and durable replace; an uncertain policy-write failure retires that process's policy writer and rejects further dispatch until restart rather than serving an older revision.
+
+`routing.forecast_shadow` defaults false. If enabled, at most 1,024 account/window series hold 32 numeric observations each; only canonical 5h/7d/30d account windows are supported. Freshness is 300 s, minimum five observations over 120 s, and reset scenarios require a horizon at most 900 s and no longer than the observed span. Reset, rollback, plan/model/load changes invalidate history. In-flight/unattributed new demand prevents capacity certification. Bands are uncalibrated empirical scenarios (half the minimum recent rate to twice the maximum plus quantization margin), never a probability guarantee. A separate 120 s boundary comparison counts observed coverage only when the next sample arrives within 15 s of the boundary. They are exposed only in authenticated diagnostics, never used to relax gates, cool accounts, move existing groups or refuse work. No session-level percent attribution is claimed; external traffic is included. Existing 90/98% placement gates stay in force until future calibrated acceptance.

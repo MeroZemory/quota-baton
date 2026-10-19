@@ -1,4 +1,6 @@
 use axum::http::{HeaderMap, StatusCode};
+#[path = "support/routing_ws.rs"]
+mod routing_ws;
 use chrono::{Duration as ChronoDuration, Utc};
 use futures_util::{SinkExt, StreamExt};
 use qb_core::{
@@ -467,6 +469,13 @@ async fn c6_3_ws_rate_frame_without_advice_closes_1012_same_account() {
     let (mut client, account) = h.connect().await;
     create(&mut client, "fixture-model").await;
     assert_close(receive(&mut client).await, 1012);
+    let pacing = h.state.accounts.pacing_snapshot(&account);
+    let wait = pacing
+        .rate_backoff_until
+        .unwrap()
+        .saturating_duration_since(std::time::Instant::now())
+        + pacing.rate_release_interval;
+    tokio::time::sleep(wait).await;
     let (mut reconnect, same_account) = h.connect().await;
     assert_eq!(same_account, account);
     assert_eq!(same_account, h.ids[0]);
@@ -1775,7 +1784,7 @@ async fn c6_row_13_transient_refresh_cools_auth_even_while_own_probe_is_held() {
 }
 
 #[tokio::test]
-async fn r1_ws_open_and_redial_force_one_send_at_the_same_request_deadline() {
+async fn r1_ws_open_and_redial_expiry_never_forces_another_send() {
     for redial in [false, true] {
         let h = Harness::new_with_rate_options(1, false, false, Some((1, 5))).await;
         let rate = Message::Text(
@@ -1800,7 +1809,7 @@ async fn r1_ws_open_and_redial_force_one_send_at_the_same_request_deadline() {
             tokio::time::timeout(Duration::from_millis(1800), receive(&mut client))
                 .await
                 .unwrap(),
-            1012,
+            1013,
         );
         assert!(
             started.elapsed() >= Duration::from_millis(900),
@@ -1815,7 +1824,7 @@ async fn r1_ws_open_and_redial_force_one_send_at_the_same_request_deadline() {
                 .iter()
                 .filter(|message| matches!(message, Message::Text(_)))
                 .count(),
-            2
+            1
         );
         let auth: Vec<_> = h
             .fake
@@ -1825,20 +1834,21 @@ async fn r1_ws_open_and_redial_force_one_send_at_the_same_request_deadline() {
             .map(|request| request.headers["authorization"].clone())
             .collect();
         assert!(auth.iter().all(|value| value == auth[0]));
-        let row = tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                if let Some(row) = h.ledger().into_iter().find(|row| {
-                    row["transport"] == "ws" && row["outcome"] == "rate_hold_relayed_429"
-                }) {
-                    break row;
+        let row =
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if let Some(row) = h.ledger().into_iter().find(|row| {
+                        row["transport"] == "ws" && row["outcome"] == "rate_wait_timeout"
+                    }) {
+                        break row;
+                    }
+                    tokio::task::yield_now().await;
                 }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(row["attempts"], 2);
-        assert_eq!(row["rate_retries"], 1);
+            })
+            .await
+            .unwrap();
+        assert_eq!(row["attempts"], 1);
+        assert_eq!(row["rate_retries"], 0);
         assert!(row["rate_wait_ms"].as_u64().unwrap() >= 800);
     }
 }
@@ -1923,12 +1933,9 @@ async fn r1_ws_client_close_cancels_rate_wait_and_ledgers_elapsed_wait() {
 }
 
 #[tokio::test]
-async fn r1_ws_upgrade_http_date_observed_and_forced_initial_send_is_final() {
+async fn r1_ws_upgrade_http_date_advice_is_observed_without_forced_final_send() {
     let h = Harness::new_with_rate_options(1, false, false, Some((1, 5))).await;
     let id = &h.ids[0];
-    h.state
-        .accounts
-        .observe_429(id, Some(Duration::from_secs(60)));
     let mut advice = HeaderMap::new();
     let date = (Utc::now() + ChronoDuration::seconds(120))
         .format("%a, %d %b %Y %H:%M:%S GMT")
@@ -1956,8 +1963,8 @@ async fn r1_ws_upgrade_http_date_observed_and_forced_initial_send_is_final() {
             .rate_backoff_until
             .unwrap()
             .saturating_duration_since(std::time::Instant::now())
-            > Duration::from_secs(59),
-        "HTTP-date advice must extend the old window (capped at 60s)"
+            > Duration::from_secs(118),
+        "HTTP-date advice must not be shortened to the local wait cap"
     );
     let row = h
         .ledger()
@@ -1991,14 +1998,14 @@ async fn r1_ws_upgrade_retries_share_the_original_pacing_deadline() {
         .unwrap();
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     assert!(started.elapsed() >= Duration::from_millis(900));
-    assert_eq!(h.fake.state.requests().len(), 2);
+    assert_eq!(h.fake.state.requests().len(), 1);
     let row = h
         .ledger()
         .into_iter()
         .find(|row| row["outcome"] == "ws_upgrade_error")
         .unwrap();
-    assert_eq!(row["attempts"], 2);
-    assert_eq!(row["rate_retries"], 1);
+    assert_eq!(row["attempts"], 1);
+    assert_eq!(row["rate_retries"], 0);
     assert!(row["rate_wait_ms"].as_u64().unwrap() >= 800);
     assert!(
         row["rate_wait_ms"].as_u64().unwrap() < 1400,
@@ -2012,7 +2019,7 @@ async fn r1_ws_rate_wait_defers_one_charged_text_or_binary_and_preserves_bytes()
         Message::Text("  {\"type\":\"future.unknown\",\"opaque\":\"untouched\"} \n".into()),
         Message::Binary(vec![0, 255, 128, 13, 10, 0, 42].into()),
     ] {
-        let h = Harness::new_with_rate_options(1, false, false, Some((1, 5))).await;
+        let h = Harness::new_with_rate_options(1, false, false, Some((5, 5))).await;
         h.fake.state.push_reply([Message::Text(
             r#"{"type":"error","status":429,"error":{"code":"rate_limit_exceeded"}}"#.into(),
         )]);
@@ -2158,7 +2165,7 @@ async fn r1_create_first_and_persistent_second_gate_after_other_connection_429()
     for previous_turn in [false, true] {
         // The other connection uses its one allowed retry, returns the native
         // HTTP 429, and leaves the existing socket's shared gate closed.
-        let h = Harness::new_with_rate_options(1, false, false, Some((1, 1))).await;
+        let h = Harness::new_with_rate_options(1, false, false, Some((5, 1))).await;
         let done = Message::Text(r#"{"type":"response.completed"}"#.into());
         let (mut client, account) = h.connect().await;
         if previous_turn {
@@ -2188,7 +2195,7 @@ async fn r1_create_first_and_persistent_second_gate_after_other_connection_429()
         );
         assert_eq!(h.fake.state.messages().len(), before);
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(2), receive(&mut client))
+            tokio::time::timeout(Duration::from_secs(6), receive(&mut client))
                 .await
                 .unwrap(),
             done
@@ -2205,7 +2212,7 @@ async fn r1_create_first_and_persistent_second_gate_after_other_connection_429()
 }
 
 #[tokio::test]
-async fn r1_create_forced_initial_rate_is_final_without_an_extra_send() {
+async fn r1_create_wait_expiry_closes_without_any_forced_wire_send() {
     let h = Harness::new_with_rate_options(1, false, false, Some((1, 5))).await;
     let (mut client, account) = h.connect().await;
     h.state
@@ -2219,14 +2226,14 @@ async fn r1_create_forced_initial_rate_is_final_without_an_extra_send() {
         tokio::time::timeout(Duration::from_secs(2), receive(&mut client))
             .await
             .unwrap(),
-        1012,
+        1013,
     );
     // Finish the native close exchange before asking for the final ledger row.
     let _ = client.flush().await;
     let row = r1_create_record(&h, "forced-initial").await;
-    assert_eq!(row["attempts"], 1);
+    assert_eq!(row["attempts"], 0);
     assert_eq!(row["rate_retries"], 0);
-    assert_eq!(row["outcome"], "rate_hold_relayed_429");
+    assert_eq!(row["outcome"], "rate_wait_timeout");
     assert!(row["rate_wait_ms"].as_u64().unwrap() >= 800);
     assert_eq!(
         h.fake
@@ -2235,7 +2242,7 @@ async fn r1_create_forced_initial_rate_is_final_without_an_extra_send() {
             .iter()
             .filter(|m| matches!(m, Message::Text(_)))
             .count(),
-        1
+        0
     );
     assert_eq!(h.store.load(&account).unwrap().health, Health::Ready);
 }

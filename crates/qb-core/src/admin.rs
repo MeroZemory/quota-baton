@@ -249,8 +249,8 @@ enum RoutingUpdate {
     },
 }
 async fn routing_view(State(state): State<RuntimeAdmin>) -> Response {
-    let table = state.relay.bindings.clone();
-    match tokio::task::spawn_blocking(move || table.routing_view()).await {
+    let relay = state.relay.clone();
+    match tokio::task::spawn_blocking(move || relay.routing_view()).await {
         Ok(value) => Json(value).into_response(),
         Err(_) => error(
             StatusCode::SERVICE_UNAVAILABLE,

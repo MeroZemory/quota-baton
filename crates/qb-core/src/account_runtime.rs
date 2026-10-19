@@ -552,7 +552,8 @@ impl AccountRuntime {
         let exponential = StdDuration::from_secs(1u64 << state.step);
         let base = retry_after.unwrap_or_default().max(exponential);
         let factor = jitter.clamp(0.8, 1.2);
-        let delay = base.mul_f64(factor);
+        // Jitter may shorten our exponential guess, never server advice.
+        let delay = base.mul_f64(factor).max(retry_after.unwrap_or_default());
         let candidate = now + delay;
         state.backoff_until = Some(
             state
@@ -583,7 +584,8 @@ impl AccountRuntime {
     }
 
     /// The request budget also bounds later retries. Normal releases stay FIFO;
-    /// a forced budget expiry bypasses pacing but still updates its release clock.
+    /// budget expiry returns Forced as a terminal wait result. Callers must
+    /// not interpret it as permission to send past the server's gate.
     pub async fn admit_until(self: &Arc<Self>, id: &str, deadline: Instant) -> AdmissionGuard {
         let local_deadline =
             Instant::now() + StdDuration::from_secs(self.rate_hold_secs.load(Ordering::Relaxed));

@@ -194,7 +194,14 @@ impl RateBudget {
 
     fn can_retry(&self) -> bool {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        !state.forced && state.retries < self.max_retries
+        !state.forced
+            && state.retries < self.max_retries
+            && std::time::Instant::now() < self.deadline
+    }
+    fn can_send(&self) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.forced |= std::time::Instant::now() >= self.deadline;
+        !state.forced
     }
 
     fn initial_sent(&self) -> bool {
@@ -208,13 +215,14 @@ impl RateBudget {
         self: &Arc<Self>,
         runtime: Option<&Arc<crate::account_runtime::AccountRuntime>>,
         account: &str,
-    ) {
+    ) -> bool {
         if let Some(runtime) = runtime {
             let wait = RateWait::new(self.clone());
             let admission = runtime.admit_until(account, self.deadline).await;
             self.state.lock().unwrap_or_else(|e| e.into_inner()).forced |= admission.forced();
             drop(wait);
         }
+        !self.state.lock().unwrap_or_else(|e| e.into_inner()).forced
     }
 
     fn initial_dispatch(&self) {
@@ -621,6 +629,7 @@ struct PendingRateResend {
     request: u64,
     message: Message,
     rate: Arc<RateBudget>,
+    model: Option<String>,
 }
 
 struct PendingInitial {
@@ -708,20 +717,44 @@ type RateRedial = BoxFuture<
             Write<SplitSink<UpstreamSocket, Message>>,
             SplitStream<UpstreamSocket>,
         ),
-        (),
+        &'static str,
     >,
 >;
 
 fn redial_rate(context: Arc<Context>, pending: PendingRateResend) -> RateRedial {
     Box::pin(async move {
         if !pending.rate.can_retry() {
-            return Err(());
+            return Err("rate_wait_timeout");
         }
-        pending
+        if !pending
             .rate
             .admit(context.runtime.as_ref(), &context.account)
-            .await;
-        let socket = super::redial_same_account(&context).await?;
+            .await
+        {
+            return Err("rate_wait_timeout");
+        }
+        if let Some(relay) = &context.relay
+            && !relay
+                .dispatch_allowed(
+                    context.session.key.as_deref(),
+                    &context.account,
+                    pending.model.as_deref(),
+                )
+                .await
+        {
+            return Err("routing_policy_blocked");
+        }
+        let remaining = pending
+            .rate
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        let socket = tokio::time::timeout(
+            remaining,
+            super::redial_same_account(&context, pending.model.as_deref()),
+        )
+        .await
+        .map_err(|_| "rate_wait_timeout")?
+        .map_err(|_| "upstream_write_error")?;
         let (sink, read) = socket.split();
         let bytes = pending.message.len();
         let reservation = context.budget.reserve_message(bytes);
@@ -730,7 +763,11 @@ fn redial_rate(context: Arc<Context>, pending: PendingRateResend) -> RateRedial 
         let write = Box::pin(async move {
             if let (Some(relay), Some(_)) = (&context.relay, &context.runtime)
                 && !relay
-                    .dispatch_allowed(context.session.key.as_deref(), &context.account, None)
+                    .dispatch_allowed(
+                        context.session.key.as_deref(),
+                        &context.account,
+                        pending.model.as_deref(),
+                    )
                     .await
             {
                 return (
@@ -739,7 +776,19 @@ fn redial_rate(context: Arc<Context>, pending: PendingRateResend) -> RateRedial 
                     Delivered {
                         bytes: 0,
                         request: Some(pending.request),
-                        terminal: None,
+                        terminal: Some("routing_policy_blocked"),
+                        completed: false,
+                    },
+                );
+            }
+            if !rate.can_send() {
+                return (
+                    sink,
+                    false,
+                    Delivered {
+                        bytes: 0,
+                        request: Some(pending.request),
+                        terminal: Some("rate_wait_timeout"),
                         completed: false,
                     },
                 );
@@ -878,7 +927,17 @@ async fn run_with_read_timeout(
                     continue;
                 }
                 if !eligible {
-                    ending = Some((Some(CloseFrame { code: 1000.into(), reason: "".into() }), "account_ineligible"));
+                    let forced = pending.rate.state.lock().unwrap_or_else(|e| e.into_inner()).forced;
+                    let eligible_now = match &context.runtime {
+                        Some(runtime) => runtime.eligible(&context.account, model.as_deref()).await,
+                        None => true,
+                    };
+                    let expired = forced && eligible_now;
+                    let reason = if expired { "rate_wait_timeout" } else { "account_ineligible" };
+                    if let Some(active) = current.get_mut(&pending.request) {
+                        active.completion.record.outcome = reason.into();
+                    }
+                    ending = Some((Some(CloseFrame { code: (if expired { 1013 } else { 1000 }).into(), reason: "".into() }), reason));
                     end_deadline = Instant::now() + CLOSE_TIMEOUT;
                     continue;
                 }
@@ -889,8 +948,9 @@ async fn run_with_read_timeout(
                 rate_redial = None;
                 match result {
                     Ok((write, read)) => { upstream_read = read; to_upstream = Some(write); }
-                    Err(()) => {
-                        ending = Some((None, "upstream_write_error"));
+                    Err(reason) => {
+                        for active in current.values_mut() { active.completion.record.outcome = reason.into(); }
+                        ending = Some((Some(CloseFrame { code: (if reason == "rate_wait_timeout" {1013} else {1000}).into(), reason: "".into() }), reason));
                         end_deadline = Instant::now() + CLOSE_TIMEOUT;
                     }
                 }
@@ -943,7 +1003,10 @@ async fn run_with_read_timeout(
                     to_upstream = Some(Box::pin(async move {
                         if let (Some(relay), Some(_)) = (&context.relay, &context.runtime)
                             && !relay.dispatch_allowed(context.session.key.as_deref(), &context.account, dispatch_model.as_deref()).await {
-                            return (sink, false, Delivered { bytes: 0, request: Some(pending.request), terminal: None, completed: false });
+                            return (sink, false, Delivered { bytes: 0, request: Some(pending.request), terminal: Some("routing_policy_blocked"), completed: false });
+                        }
+                        if !pending.rate.can_send() {
+                            return (sink, false, Delivered {bytes:0,request:Some(pending.request),terminal:Some("rate_wait_timeout"),completed:false});
                         }
                         pending.rate.initial_dispatch();
                         write(sink, pending.message, pending.reservation, Delivered {
@@ -953,12 +1016,16 @@ async fn run_with_read_timeout(
                 }
                 to_upstream.as_mut().unwrap().await
             }, if to_upstream.is_some() || (initial_ready && ending.is_none()) => {
-                let (sink, success, _) = result;
+                let (sink, success, delivered) = result;
                 upstream_sink = Some(sink);
                 to_upstream = None;
                 if success { last_activity = Instant::now(); }
                 if success {
                     pending_rate_redial = None;
+                } else if ending.is_none() && let Some(reason) = delivered.terminal {
+                    if let Some(active) = delivered.request.and_then(|id| current.get_mut(&id)) { active.completion.record.outcome = reason.into(); }
+                    ending = Some((Some(CloseFrame {code: (if reason == "rate_wait_timeout" {1013} else {1000}).into(), reason:"".into()}), reason));
+                    end_deadline = Instant::now() + CLOSE_TIMEOUT;
                 } else if ending.is_none()
                     && let Some(pending) = pending_rate_redial.take()
                     && !has_previous_response_id(&pending.message)
@@ -1069,7 +1136,7 @@ async fn run_with_read_timeout(
                             let context = context.clone();
                             let model = model.clone();
                             initial_admission = Some(Box::pin(async move {
-                                rate.admit(context.runtime.as_ref(), &context.account).await;
+                                if !rate.admit(context.runtime.as_ref(), &context.account).await { return false; }
                                 match &context.runtime {
                                     Some(runtime) => runtime.eligible(&context.account, model.as_deref()).await,
                                     None => true,
@@ -1173,14 +1240,27 @@ async fn run_with_read_timeout(
                                             request: request.expect("active rate request"),
                                             message: message.clone(),
                                             rate: rate.clone(),
+                                            model: current[&request.expect("active rate request")].model.clone(),
                                         });
                                         let runtime = context.runtime.clone();
+                                        let relay = context.relay.clone();
+                                        let key = context.session.key.clone();
+                                        let retry_model = current[&request.expect("active rate request")].model.clone();
                                         let account = context.account.clone();
                                         let budget = context.budget.clone();
                                         let bytes = message.len();
                                         let reservation = budget.reserve_message(bytes);
                                         to_upstream = Some(Box::pin(async move {
-                                            rate.admit(runtime.as_ref(), &account).await;
+                                            if !rate.admit(runtime.as_ref(), &account).await {
+                                                return (sink, false, Delivered {bytes:0, request, terminal:Some("rate_wait_timeout"), completed:false});
+                                            }
+                                            if let (Some(relay), Some(_)) = (&relay, &runtime)
+                                                && !relay.dispatch_allowed(key.as_deref(), &account, retry_model.as_deref()).await {
+                                                return (sink, false, Delivered {bytes:0, request, terminal:Some("routing_policy_blocked"), completed:false});
+                                            }
+                                            if !rate.can_send() {
+                                                return (sink, false, Delivered {bytes:0,request,terminal:Some("rate_wait_timeout"),completed:false});
+                                            }
                                             rate.sent();
                                             write(
                                                 sink,

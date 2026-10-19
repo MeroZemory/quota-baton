@@ -625,6 +625,7 @@ impl BindingTable {
         now: DateTime<Utc>,
     ) -> (usize, usize, usize, usize) {
         let Some(key) = key else { return (0, 0, 0, 0) };
+        let _mutation = self.mutations.lock().unwrap_or_else(|e| e.into_inner());
         let group = group(key).to_owned();
         let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
         let cutoff = now - chrono::Duration::seconds(self.config.overload_window_secs as i64);
@@ -1010,6 +1011,18 @@ impl BindingTable {
         let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
         let now = Utc::now();
         self.prune(&mut d, now);
+        // Current positive full-input evidence must constrain the choice,
+        // rather than being recorded after approving a move. A handshake's
+        // zero bytes never creates known full-context cost.
+        if let Some(key) = key.filter(|_| request_bytes > 0)
+            && !d.unknown_cost.contains(group(key))
+        {
+            let known = d
+                .last_request_bytes
+                .entry(group(key).to_owned())
+                .or_default();
+            *known = (*known).max(request_bytes);
+        }
         let (choice, reason) = self.select(
             &d,
             provider,
@@ -1103,7 +1116,7 @@ impl BindingTable {
                     last_used,
                 },
             );
-            if !d.unknown_cost.contains(g) {
+            if request_bytes > 0 && !d.unknown_cost.contains(g) {
                 let known = d.last_request_bytes.entry(g.to_owned()).or_default();
                 *known = (*known).max(request_bytes);
             }
@@ -1217,17 +1230,14 @@ impl BindingTable {
                         until,
                         scope,
                     } = &c.account.health
+                    && let Some(quota) = &c.account.quota_cooling
                     && *until > now
                     && (scope == "account"
                         || scope
                             .strip_prefix("model:")
                             .is_some_and(|m| model == Some(m)))
                 {
-                    let reset = c
-                        .account
-                        .quota_cooling
-                        .as_ref()
-                        .map_or(*until, |q| q.reset_at);
+                    let reset = quota.reset_at;
                     if reset > now
                         && (reset - now).to_std().is_ok_and(|wait| {
                             wait <= Duration::from_secs(plan.settings.reset_wait_secs)
@@ -1267,25 +1277,30 @@ impl BindingTable {
                 let marked = self.has_overload_mark(d, &b.key, now)
                     && plan.settings.mode == crate::routing::Mode::Rebalance;
                 if marked && *eligible {
-                    let room_elsewhere = entries.iter().any(|(candidate, eligible)| {
-                        candidate.account.id != b.account
-                            && *eligible
-                            && d.overload_marks.get(group(&b.key)).is_some_and(|mark| {
-                                mark.from == b.account && mark.target == candidate.account.id
-                            })
-                            && self.rebalance_target(
-                                d,
-                                &b.account,
-                                candidate,
-                                Some(group(&b.key)),
-                                now,
-                            )
-                            && self.policies.discretionary_allowed(
-                                &b.key,
-                                Some(&candidate.account.id),
-                                now,
-                            )
-                    });
+                    let known_cost = !d.unknown_cost.contains(group(&b.key))
+                        && d.last_request_bytes
+                            .get(group(&b.key))
+                            .is_some_and(|n| *n > 0 && *n <= self.config.churn.max_move_bytes);
+                    let room_elsewhere = known_cost
+                        && entries.iter().any(|(candidate, eligible)| {
+                            candidate.account.id != b.account
+                                && *eligible
+                                && d.overload_marks.get(group(&b.key)).is_some_and(|mark| {
+                                    mark.from == b.account && mark.target == candidate.account.id
+                                })
+                                && self.rebalance_target(
+                                    d,
+                                    &b.account,
+                                    candidate,
+                                    Some(group(&b.key)),
+                                    now,
+                                )
+                                && self.policies.discretionary_allowed(
+                                    &b.key,
+                                    Some(&candidate.account.id),
+                                    now,
+                                )
+                        });
                     if !room_elsewhere
                         || self.active_sessions_in(d, &b.account, now)
                             <= self.spread_threshold_for(&b.account)
@@ -1313,10 +1328,9 @@ impl BindingTable {
                     if !cold
                         || !self.policies.discretionary_allowed(&b.key, None, now)
                         || d.unknown_cost.contains(group(&b.key))
-                        || d
-                            .last_request_bytes
-                            .get(group(&b.key))
-                            .is_none_or(|bytes| *bytes > self.config.churn.max_move_bytes)
+                        || d.last_request_bytes.get(group(&b.key)).is_none_or(|bytes| {
+                            *bytes == 0 || *bytes > self.config.churn.max_move_bytes
+                        })
                         || (!at_capacity
                             && !c.account.drain
                             && metrics(c, d, &self.config, now).gate)
@@ -1479,6 +1493,11 @@ impl BindingTable {
         }
         drop(d);
         self.policies.reload()?;
+        self.policies.capture_strict_anchors(
+            next.groups
+                .iter()
+                .map(|(key, g)| (key.as_str(), g.account.as_str())),
+        )?;
         let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
         self.prune(&mut next, Utc::now());
         // Import must advance the existing table's revision, rather than use
@@ -1686,6 +1705,8 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
             options.mode(0o600);
         }
         let mut file = options.open(&tmp)?;
+        #[cfg(windows)]
+        crate::local_secrets::restrict(&tmp).map_err(std::io::Error::other)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
@@ -1953,6 +1974,11 @@ mod tests {
             until,
             scope: "account".into(),
         };
+        a.account.quota_cooling = Some(crate::accounts::QuotaCooling {
+            window: "5h".into(),
+            reset_at: until,
+            started_at: Utc::now(),
+        });
         assert!(
             matches!(t.choose(Provider::Claude, Some("claude:s"), None, None, &[a.clone(), b.clone()], None, 1), Decision::Hold { until: u } if u == until)
         );
@@ -1979,6 +2005,7 @@ mod tests {
             until: Utc::now() + Delta::seconds(120),
             scope: "account".into(),
         };
+        a.account.quota_cooling.as_mut().unwrap().reset_at = Utc::now() + Delta::seconds(120);
         assert_eq!(choose(&t, Some("claude:far"), &[a, b]).0, "b");
     }
     #[test]
@@ -2647,6 +2674,11 @@ mod tests {
             until,
             scope: "account".into(),
         };
+        a.account.quota_cooling = Some(crate::accounts::QuotaCooling {
+            window: "5h".into(),
+            reset_at: until,
+            started_at: Utc::now(),
+        });
         assert!(matches!(
             t.choose_with_hold(
                 Provider::Claude,
