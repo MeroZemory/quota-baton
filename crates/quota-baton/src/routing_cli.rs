@@ -38,6 +38,7 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let secrets = qb_core::local_secrets::load_existing(home)?;
     let client = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(10))
         .build()?;

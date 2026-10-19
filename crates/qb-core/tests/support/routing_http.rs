@@ -1020,3 +1020,113 @@ async fn legacy_alias_anchor_recovery_and_v2_independence_use_the_actual_serving
         }
     }
 }
+
+#[tokio::test]
+async fn rejected_idle_import_blocks_alias_dispatch_until_successful_recovery() {
+    let h = Harness::new(Provider::Codex).await;
+    let a = h
+        .turn("/v1/responses", &[("session-id", "idle-alias")], RAW)
+        .await;
+    h.pause(&a).await;
+    let b = h
+        .turn(
+            "/v1/responses",
+            &[("session-id", "idle-alias:agent:x")],
+            RAW,
+        )
+        .await;
+    assert_ne!(a, b);
+    assert_credential(&h, 0, &a);
+    assert_credential(&h, 1, &b);
+    h.admin(
+        reqwest::Method::POST,
+        &format!("/admin/v1/accounts/{a}/resume"),
+        None,
+    )
+    .await;
+    let snapshot = h.state.bindings.export().unwrap();
+    let id = qb_core::routing::session_id("codex:idle-alias");
+    let policy = json!({"schema":1,"revision":1,"projects":{},"sessions":{id:{"project":null,"baseline":{"mode":"rebalance","reset_wait_secs":60},"explicit":{"mode":"strict","reset_wait_secs":0},"anchor":null,"movements":[]}}});
+    let path = h.home.join("state/routing-policies.json");
+    let bytes = serde_json::to_vec(&policy).unwrap();
+    fs::write(&path, &bytes).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    assert!(
+        h.state
+            .bindings
+            .import(snapshot.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("strict policy alias")
+    );
+    for session in [
+        "idle-alias:agent:x",
+        "idle-alias",
+        "fresh-after-rejected-import",
+    ] {
+        assert_eq!(
+            h.send("/v1/responses", &[("session-id", session)], RAW)
+                .await
+                .0,
+            409
+        );
+    }
+    assert_eq!(h.fake.state.requests().len(), 2);
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    let mut repaired = snapshot;
+    for binding in repaired["bindings"].as_array_mut().unwrap() {
+        binding["account"] = json!(a);
+    }
+    h.state.bindings.import(repaired).unwrap();
+    for session in ["idle-alias", "idle-alias:agent:x"] {
+        let n = h.fake.state.requests().len();
+        assert_eq!(
+            h.turn("/v1/responses", &[("session-id", session)], RAW)
+                .await,
+            a
+        );
+        assert_credential(&h, n, &a);
+    }
+}
+
+#[tokio::test]
+async fn disappeared_policy_during_idle_import_preserves_strict_serving_lock() {
+    let h = Harness::new(Provider::Codex).await;
+    let a = h
+        .turn("/v1/responses", &[("session-id", "missing-policy")], RAW)
+        .await;
+    assert_credential(&h, 0, &a);
+    h.admin(reqwest::Method::POST,"/admin/v1/routing",Some(json!({"kind":"session","id":qb_core::routing::session_id("codex:missing-policy"),"settings":{"mode":"strict","reset_wait_secs":0}}))).await;
+    let before = h.state.bindings.export().unwrap();
+    fs::remove_file(h.home.join("state/routing-policies.json")).unwrap();
+    assert!(
+        h.state
+            .bindings
+            .import(before.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("disappeared")
+    );
+    assert_eq!(
+        h.state
+            .bindings
+            .policies
+            .plan(Some("codex:missing-policy"))
+            .anchor
+            .as_deref(),
+        Some(a.as_str())
+    );
+    h.pause(&a).await;
+    assert_eq!(
+        h.send("/v1/responses", &[("session-id", "missing-policy")], RAW)
+            .await
+            .0,
+        409
+    );
+    assert_eq!(h.fake.state.requests().len(), 1);
+    assert_eq!(h.state.bindings.export().unwrap(), before);
+}

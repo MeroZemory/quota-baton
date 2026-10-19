@@ -474,7 +474,10 @@ fn decode_scoped(value: Value, strict: bool) -> Result<Data> {
     let mut groups = BTreeMap::new();
     let mut inconsistent = BTreeSet::new();
     for b in state.bindings {
-        if b.key.is_empty() || b.account.is_empty() || d.bindings.contains_key(&b.key) {
+        if b.key.is_empty()
+            || crate::observability::safe_identifier(&b.account).is_none()
+            || d.bindings.contains_key(&b.key)
+        {
             bail!("invalid binding");
         }
         let g = group(&b.key).to_owned();
@@ -1755,6 +1758,7 @@ impl BindingTable {
             bail!("cannot import active binding table");
         }
         drop(d);
+        self.policies.begin_recovery();
         self.policies.reload()?;
         let mut next = decode_scoped(value, self.policies.requires_strict_recovery())?;
         self.policies.capture_strict_anchors(
@@ -1769,6 +1773,7 @@ impl BindingTable {
         next.revision = d.revision;
         next.changed();
         *d = next;
+        self.policies.finish_recovery();
         Ok(())
     }
     pub fn flush(&self) -> Result<()> {
@@ -2535,6 +2540,43 @@ mod tests {
                         .permits_dispatch(Some("codex:alias:agent:x"), "b")
                 );
             }
+        }
+    }
+
+    #[test]
+    fn invalid_recovered_account_never_reaches_policy_writer() {
+        for bad in [
+            "bad/account",
+            "bad:account",
+            "sk-secret",
+            "",
+            &"x".repeat(101),
+        ] {
+            let (dir, t) = table();
+            t.flush().unwrap();
+            let before = t.export().unwrap();
+            let path = dir.path().join("state/routing-policies.json");
+            let existed = fs::read(&path).ok();
+            let value = json!({"schema":1,"bindings":[{"key":"codex:invalid-account","account":bad,"last_used":Utc::now()}]});
+            assert!(t.import(value.clone()).is_err());
+            assert_eq!(t.export().unwrap(), before);
+            assert_eq!(fs::read(&path).ok(), existed);
+            fs::write(&t.path, serde_json::to_vec(&value).unwrap()).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&t.path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            let config = RoutingConfig {
+                mode: crate::routing::Mode::Strict,
+                ..RoutingConfig::default()
+            };
+            assert!(BindingTable::new(dir.path(), config).is_err());
+            assert_eq!(fs::read(&path).ok(), existed);
+            assert_eq!(
+                crate::json_unique::from_slice(&fs::read(&t.path).unwrap()).unwrap(),
+                value
+            );
         }
     }
     #[test]
