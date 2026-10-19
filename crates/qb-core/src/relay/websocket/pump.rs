@@ -154,6 +154,8 @@ struct RateBudget {
     max_retries: u32,
     state: Mutex<RateState>,
     dashboard: Mutex<Option<crate::dashboard::runtime::PacingSource>>,
+    committed: std::sync::atomic::AtomicBool,
+    commit_changed: tokio::sync::Notify,
 }
 
 struct RateState {
@@ -179,6 +181,8 @@ impl RateBudget {
         let now = std::time::Instant::now();
         Self {
             dashboard: Mutex::new(None),
+            committed: std::sync::atomic::AtomicBool::new(false),
+            commit_changed: tokio::sync::Notify::new(),
             deadline: now + hold,
             max_retries,
             state: Mutex::new(RateState {
@@ -192,16 +196,24 @@ impl RateBudget {
         }
     }
 
+    fn is_committed(&self) -> bool {
+        self.committed.load(Ordering::Acquire)
+    }
+    fn commit(&self) {
+        self.committed.store(true, Ordering::Release);
+        self.commit_changed.notify_waiters();
+    }
     fn can_retry(&self) -> bool {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        !state.forced
+        !self.is_committed()
+            && !state.forced
             && state.retries < self.max_retries
             && std::time::Instant::now() < self.deadline
     }
     fn can_send(&self) -> bool {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.forced |= std::time::Instant::now() >= self.deadline;
-        !state.forced
+        !self.is_committed() && !state.forced
     }
 
     fn initial_sent(&self) -> bool {
@@ -216,13 +228,22 @@ impl RateBudget {
         runtime: Option<&Arc<crate::account_runtime::AccountRuntime>>,
         account: &str,
     ) -> bool {
+        let committed = self.commit_changed.notified();
+        tokio::pin!(committed);
+        committed.as_mut().enable();
+        if self.is_committed() {
+            return false;
+        }
         if let Some(runtime) = runtime {
             let wait = RateWait::new(self.clone());
-            let admission = runtime.admit_until(account, self.deadline).await;
+            let admission = tokio::select! {
+                admission = runtime.admit_until(account, self.deadline) => admission,
+                _ = committed => return false,
+            };
             self.state.lock().unwrap_or_else(|e| e.into_inner()).forced |= admission.forced();
             drop(wait);
         }
-        !self.state.lock().unwrap_or_else(|e| e.into_inner()).forced
+        !self.is_committed() && !self.state.lock().unwrap_or_else(|e| e.into_inner()).forced
     }
 
     fn initial_dispatch(&self) {
@@ -276,6 +297,7 @@ impl Drop for RateWait {
 
 impl CurrentCompletion {
     fn finish(mut self, outcome: &str) {
+        self.rate.commit();
         self.completion.record.outcome = outcome.into();
     }
 }
@@ -718,7 +740,7 @@ where
         if matches!(message, Message::Text(_) | Message::Binary(_))
             && let (Some(relay), Some(_)) = (&context.relay, &context.runtime)
             && !relay
-                .dispatch_allowed(
+                .dispatch_data_allowed(
                     context.session.key.as_deref(),
                     &context.account,
                     model.as_deref(),
@@ -795,7 +817,7 @@ fn redial_rate(context: Arc<Context>, pending: PendingRateResend) -> RateRedial 
         }
         if let Some(relay) = &context.relay
             && !relay
-                .dispatch_allowed(
+                .dispatch_data_allowed(
                     context.session.key.as_deref(),
                     &context.account,
                     pending.model.as_deref(),
@@ -823,7 +845,7 @@ fn redial_rate(context: Arc<Context>, pending: PendingRateResend) -> RateRedial 
         let write = Box::pin(async move {
             if let (Some(relay), Some(_)) = (&context.relay, &context.runtime)
                 && !relay
-                    .dispatch_allowed(
+                    .dispatch_data_allowed(
                         context.session.key.as_deref(),
                         &context.account,
                         pending.model.as_deref(),
@@ -837,6 +859,18 @@ fn redial_rate(context: Arc<Context>, pending: PendingRateResend) -> RateRedial 
                         bytes: 0,
                         request: Some(pending.request),
                         terminal: Some("routing_policy_blocked"),
+                        completed: false,
+                    },
+                );
+            }
+            if rate.is_committed() {
+                return (
+                    sink,
+                    true,
+                    Delivered {
+                        bytes: 0,
+                        request: Some(pending.request),
+                        terminal: None,
                         completed: false,
                     },
                 );
@@ -1064,7 +1098,7 @@ async fn run_with_read_timeout(
                     let dispatch_receipt = current.get(&pending.request).and_then(|active| active.completion.binding.as_ref()).map(|binding| binding.receipt());
                     to_upstream = Some(Box::pin(async move {
                         if let (Some(relay), Some(_)) = (&context.relay, &context.runtime)
-                            && !relay.dispatch_allowed(context.session.key.as_deref(), &context.account, dispatch_model.as_deref()).await {
+                            && !relay.dispatch_data_allowed(context.session.key.as_deref(), &context.account, dispatch_model.as_deref()).await {
                             return (sink, false, Delivered { bytes: 0, request: Some(pending.request), terminal: Some("routing_policy_blocked"), completed: false });
                         }
                         if !pending.rate.can_send() {
@@ -1316,12 +1350,15 @@ async fn run_with_read_timeout(
                                         let reservation = budget.reserve_message(bytes);
                                         to_upstream = Some(Box::pin(async move {
                                             if !rate.admit(runtime.as_ref(), &account).await {
+                                                if rate.is_committed() { return (sink,true,Delivered {bytes:0,request,terminal:None,completed:false}); }
                                                 return (sink, false, Delivered {bytes:0, request, terminal:Some("rate_wait_timeout"), completed:false});
                                             }
                                             if let (Some(relay), Some(_)) = (&relay, &runtime)
-                                                && !relay.dispatch_allowed(key.as_deref(), &account, retry_model.as_deref()).await {
+                                                && !relay.dispatch_data_allowed(key.as_deref(), &account, retry_model.as_deref()).await {
+                                                if rate.is_committed() { return (sink,true,Delivered {bytes:0,request,terminal:None,completed:false}); }
                                                 return (sink, false, Delivered {bytes:0, request, terminal:Some("routing_policy_blocked"), completed:false});
                                             }
+                                            if rate.is_committed() { return (sink,true,Delivered {bytes:0,request,terminal:None,completed:false}); }
                                             if !rate.can_send() {
                                                 return (sink, false, Delivered {bytes:0,request,terminal:Some("rate_wait_timeout"),completed:false});
                                             }
@@ -1365,10 +1402,12 @@ async fn run_with_read_timeout(
                             end_deadline = Instant::now() + CLOSE_TIMEOUT;
                             continue;
                         }
-                        if event.is_none() && matches!(message, Message::Text(_) | Message::Binary(_)) {
-                            for active in current.values_mut() { if active.rate.initial_sent() { active.committed = true; } }
+                        let known_control = event.as_ref().and_then(|e|e["type"].as_str()).is_some_and(|kind| matches!(kind,"metadata"|"codex.rate_limits"|"error"|"response.failed") || kind.starts_with("response."));
+                        if !known_control && matches!(message, Message::Text(_) | Message::Binary(_)) {
+                            for active in current.values_mut() { if active.rate.initial_sent() { active.committed = true; active.rate.commit(); } }
                         }
                         let terminal = request.and_then(|id| current.get_mut(&id)).and_then(|active| active.upstream(event.as_ref()));
+                        if let Some(active)=request.and_then(|id|current.get_mut(&id)) && (active.committed || terminal.is_some()) { active.rate.commit(); }
                         terminal_pending = terminal.is_some();
                         let completed = event.as_ref().is_some_and(|event| event["type"] == "response.completed");
                         if let Message::Close(frame) = &message {

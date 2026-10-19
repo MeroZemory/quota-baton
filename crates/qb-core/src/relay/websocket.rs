@@ -82,7 +82,7 @@ async fn redial_same_account(
     let relay = context.relay.as_ref().ok_or(())?;
     let (account, token) = context.credentials.as_ref().ok_or(())?;
     if !relay
-        .dispatch_allowed(context.session.key.as_deref(), &account.id, model)
+        .dispatch_data_allowed(context.session.key.as_deref(), &account.id, model)
         .await
     {
         return Err(());
