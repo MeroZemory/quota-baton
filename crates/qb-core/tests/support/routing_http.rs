@@ -768,42 +768,102 @@ async fn started_rate_budget_does_not_reopen_after_later_slow_auth_retry() {
 
 #[tokio::test]
 async fn legacy_global_strict_corrupt_restore_refuses_core_start_before_any_b_credential() {
-    let h = Harness::new(Provider::Codex).await;
-    let a = h
-        .turn("/v1/responses", &[("session-id", "legacy-corrupt")], RAW)
-        .await;
-    assert_credential(&h, 0, &a);
-    h.pause(&a).await;
-    h.state.bindings.freeze().unwrap();
-    h.obs.flush().unwrap();
-    let Harness {
-        mut servers,
-        state,
-        store,
-        obs,
-        fake,
-        client,
-        home,
-        _root,
-        _serial,
-    } = h;
-    servers.data_task.abort();
-    servers.admin_task.abort();
-    let _ = (&mut servers.data_task).await;
-    let _ = (&mut servers.admin_task).await;
-    drop(client);
-    drop(servers);
-    drop(state);
-    let mut config = Config::default();
-    config.server.data_port = 0;
-    config.server.admin_port = 0;
-    config.routing.mode = qb_core::routing::Mode::Strict;
-    config.upstream.codex_base = fake.url.clone();
-    config.upstream.anthropic_base = fake.url.clone();
-    for raw in ["{".to_owned(),json!({"schema":99,"bindings":[]}).to_string(),json!({"schema":1,"bindings":[{"key":"codex:legacy-corrupt","account":a,"last_used":Utc::now()},{"key":"codex:legacy-corrupt","account":a,"last_used":Utc::now()}]}).to_string()] {
-        let path=home.join("state/bindings.json");fs::write(&path,raw.as_bytes()).unwrap();
-        assert!(RelayState::new(store.clone(),&config,obs.clone(),Arc::new(DebugPins::default())).is_err(),"legacy strict core started with no trustworthy anchor");
-        assert_eq!(fs::read(&path).unwrap(),raw.as_bytes());
-        assert_eq!(fake.state.requests().len(),1,"corrupt restore dispatched an alternate credential");
+    for provider in [Provider::Codex, Provider::Claude] {
+        for global in [true, false] {
+            let h = Harness::new(provider).await;
+            let (path, header) = if provider == Provider::Codex {
+                ("/v1/responses", "session-id")
+            } else {
+                ("/v1/messages", "x-claude-code-session-id")
+            };
+            let key = format!("{}:legacy-corrupt", provider.as_str());
+            let a = h.turn(path, &[(header, "legacy-corrupt")], RAW).await;
+            let b = h.ids().into_iter().find(|id| id != &a).unwrap();
+            assert_credential(&h, 0, &a);
+            h.pause(&a).await;
+            h.state.bindings.freeze().unwrap();
+            h.obs.flush().unwrap();
+            let Harness {
+                mut servers,
+                state,
+                store,
+                obs,
+                fake,
+                client,
+                home,
+                _root,
+                _serial,
+            } = h;
+            servers.data_task.abort();
+            servers.admin_task.abort();
+            let _ = (&mut servers.data_task).await;
+            let _ = (&mut servers.admin_task).await;
+            drop(client);
+            drop(servers);
+            drop(state);
+            let mut config = Config::default();
+            config.server.data_port = 0;
+            config.server.admin_port = 0;
+            config.routing.mode = if global {
+                qb_core::routing::Mode::Strict
+            } else {
+                qb_core::routing::Mode::Rebalance
+            };
+            config.upstream.codex_base = fake.url.clone();
+            config.upstream.anthropic_base = fake.url.clone();
+            if !global {
+                let policy = qb_core::routing::PolicyStore::new(
+                    &home,
+                    qb_core::routing::Settings::default(),
+                )
+                .unwrap();
+                policy
+                    .set_session(
+                        &qb_core::routing::session_id(&key),
+                        Some(qb_core::routing::Settings {
+                            mode: qb_core::routing::Mode::Strict,
+                            reset_wait_secs: 0,
+                        }),
+                        None,
+                        None,
+                    )
+                    .unwrap();
+            }
+            let stamp = json!(Utc::now());
+            let duplicate_field = format!(
+                r#"{{"schema":1,"bindings":[{{"key":"{key}","account":"{a}","account":"{b}","last_used":{stamp}}}]}}"#
+            );
+            let mut cases=vec!["{".to_owned(),json!({"schema":99,"bindings":[]}).to_string(),json!({"schema":1,"bindings":[{"key":key,"account":a,"last_used":stamp},{"key":key,"account":a,"last_used":stamp}]}).to_string(),duplicate_field];
+            if provider == Provider::Claude {
+                cases.push(json!({"schema":1,"bindings":[{"key":key,"account":a,"last_used":stamp},{"key":format!("{key}:agent:x"),"account":b,"last_used":stamp}]}).to_string());
+            }
+            for raw in cases {
+                let path = home.join("state/bindings.json");
+                fs::write(&path, raw.as_bytes()).unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+                }
+                for _ in 0..2 {
+                    assert!(
+                        RelayState::new(
+                            store.clone(),
+                            &config,
+                            obs.clone(),
+                            Arc::new(DebugPins::default())
+                        )
+                        .is_err(),
+                        "legacy strict core started with no trustworthy anchor"
+                    );
+                    assert_eq!(fs::read(&path).unwrap(), raw.as_bytes());
+                    assert_eq!(
+                        fake.state.requests().len(),
+                        1,
+                        "corrupt restore dispatched an alternate credential"
+                    );
+                }
+            }
+        }
     }
 }
