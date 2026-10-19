@@ -6,6 +6,7 @@ mod burst;
 #[cfg(feature = "shape-capture")]
 pub mod capture;
 pub mod config;
+pub mod credits;
 pub mod dashboard;
 pub mod debug_pin;
 pub mod guard;

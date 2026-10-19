@@ -636,6 +636,7 @@ fn finish_prepare(
             quota_cooling: None,
             drain: false,
             allow_credits: false,
+            quota_credit_releasable: false,
             generation: 0,
             token_meta: meta.clone(),
         }

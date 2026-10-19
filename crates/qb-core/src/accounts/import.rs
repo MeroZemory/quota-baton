@@ -182,6 +182,7 @@ pub(crate) fn read(path: &Path, dir: &Path) -> Result<Candidate, ReadError> {
         quota_cooling: None,
         drain: false,
         allow_credits: false,
+        quota_credit_releasable: false,
         generation: 0,
         token_meta: TokenMeta {
             expires_at: file.expired,
@@ -383,6 +384,7 @@ fn execute(
             account.payment_until = old.payment_until;
             account.auth_probe_pending = old.auth_probe_pending;
             account.quota_cooling = old.quota_cooling.clone();
+            account.quota_credit_releasable = old.quota_credit_releasable;
             account.drain = old.drain;
             account.allow_credits = old.allow_credits;
             if account.token_meta.newer_than(&old.token_meta) {

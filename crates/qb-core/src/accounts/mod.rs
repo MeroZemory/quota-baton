@@ -252,6 +252,9 @@ pub struct Account {
     pub auth_probe_pending: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota_cooling: Option<QuotaCooling>,
+    /// A subscription observation, never an upstream rejection, caused this hold.
+    #[serde(default)]
+    pub quota_credit_releasable: bool,
     #[serde(default)]
     pub drain: bool,
     #[serde(default)]

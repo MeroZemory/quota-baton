@@ -1036,7 +1036,11 @@ fn credits_line(a: &Account) -> Option<CreditsLine> {
         return None;
     }
     let c = a.credits.as_ref()?;
-    if c.has_credits != Some(true) && c.unlimited != Some(true) {
+    if !qb_core::credits::available(
+        c.has_credits,
+        c.unlimited,
+        c.balance.as_ref().and_then(|n| n.as_f64()),
+    ) {
         return None;
     }
     let amount = credit_amount(c, false);
@@ -1071,6 +1075,9 @@ fn credits_line(a: &Account) -> Option<CreditsLine> {
 fn credit_amount(c: &Credits, exact: bool) -> String {
     if c.unlimited == Some(true) {
         return "무제한".into();
+    }
+    if c.has_credits == Some(false) {
+        return "없음".into();
     }
     let Some(balance) = &c.balance else {
         return match c.has_credits {
@@ -1710,7 +1717,8 @@ mod tests {
             (json!({"has_credits":false,"balance":null}), "없음"),
             (json!({"has_credits":null,"balance":null}), "확인 전"),
             (json!({"has_credits":true,"balance":null}), "있음"),
-            (json!({"has_credits":false,"balance":0}), "0"),
+            (json!({"has_credits":false,"balance":0}), "없음"),
+            (json!({"has_credits":false,"balance":12}), "없음"),
         ] {
             let mut a = base("a");
             a["credits"] = credits;

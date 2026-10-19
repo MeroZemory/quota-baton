@@ -283,7 +283,7 @@ impl AccountStore {
         self.update_metadata_unlocked(id, update)
     }
 
-    fn update_metadata_unlocked(
+    pub(crate) fn update_metadata_unlocked(
         &self,
         id: &str,
         update: impl FnOnce(&mut Account),

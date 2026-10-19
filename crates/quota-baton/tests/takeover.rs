@@ -309,6 +309,7 @@ fn accounts(home: &Home, count: usize) -> Vec<String> {
                 quota_cooling: None,
                 drain: false,
                 allow_credits: false,
+                quota_credit_releasable: false,
                 generation: 0,
                 token_meta: TokenMeta {
                     expires_at: Some("2099-01-01T00:00:00Z".parse().unwrap()),

@@ -1867,6 +1867,7 @@ mod tests {
             quota_cooling: None,
             drain: false,
             allow_credits: false,
+            quota_credit_releasable: false,
             generation: 0,
             token_meta: TokenMeta::default(),
         };

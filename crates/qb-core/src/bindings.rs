@@ -1439,6 +1439,7 @@ mod tests {
                 quota_cooling: None,
                 drain: false,
                 allow_credits: false,
+                quota_credit_releasable: false,
                 generation: 0,
                 token_meta: TokenMeta::default(),
             },
@@ -2636,6 +2637,7 @@ mod tests {
             }
         );
         // Observed credit thresholds remain actual C5 exclusions.
+        a.quota.as_mut().unwrap()["credits"] = json!({"has_credits":true});
         for observed in [99, 100] {
             for w in a.quota.as_mut().unwrap()["windows"].as_array_mut().unwrap() {
                 w["used_pct"] = json!(observed);

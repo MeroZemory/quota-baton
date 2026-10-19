@@ -157,6 +157,7 @@ fn account(slot: usize, now: DateTime<Utc>) -> Account {
         quota_cooling: cooling,
         drain: slot == 4,
         allow_credits: slot == 3,
+        quota_credit_releasable: false,
         generation: 0,
         token_meta: TokenMeta {
             expires_at: Some(now + Duration::hours(24)),

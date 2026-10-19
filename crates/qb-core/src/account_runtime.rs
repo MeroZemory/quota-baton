@@ -271,46 +271,7 @@ impl AccountRuntime {
 
     /// Only typed notification fields enter this bounded, process-local map.
     pub(crate) fn set_quota_notice(&self, account: &Account, notice: Value, model: Option<&str>) {
-        if account.user_state != UserState::Active || account.drain {
-            return;
-        }
-        let Ok(mut notices) = self.quota_notices.lock() else {
-            return;
-        };
-        if notices.len() >= 4096 && !notices.contains_key(&account.id) {
-            return;
-        }
-        if notices.get(&account.id).is_some_and(|entry| {
-            entry.model.as_deref() == model
-                && [
-                    "action",
-                    "window",
-                    "reset_at",
-                    "next_account",
-                    "earliest_account",
-                    "model_limited",
-                ]
-                .iter()
-                .all(|key| entry.notice[*key] == notice[*key])
-        }) {
-            return;
-        }
-        notices.insert(
-            account.id.clone(),
-            QuotaNoticeEntry {
-                provider: account.provider,
-                notice: notice.clone(),
-                state: notice_state(account),
-                model: model.map(str::to_owned),
-            },
-        );
-        drop(notices);
-        let mut data = notice;
-        data["kind"] = json!("quota_notice");
-        data["account"] = json!(account.id);
-        let _ = self
-            .events
-            .send(json!({"event":"core_warning","data":data}));
+        publish_quota_notice(&self.quota_notices, &self.events, account, notice, model);
     }
 
     pub(crate) fn observe_quota_reset(&self, id: &str, reset: Option<DateTime<Utc>>) {
@@ -436,53 +397,33 @@ impl AccountRuntime {
     }
 
     async fn credit_notice(&self, id: &str) {
+        let observed_at = self.obs.quota_snapshot(id).unwrap_or_default()["observed_at"].clone();
         let store = self.store.clone();
-        let key = id.to_owned();
-        let Ok(Ok(account)) = tokio::task::spawn_blocking(move || store.load(&key)).await else {
-            return;
-        };
-        let snapshot = self.obs.quota_snapshot(id).unwrap_or_default();
-        if account.provider != Provider::Codex
-            || !account.allow_credits
-            || account
-                .payment_until
-                .is_some_and(|until| until > Utc::now())
-            || !matches!(
-                account.health,
-                Health::Ready
-                    | Health::Cooling {
-                        reason: HealthReason::Quota,
-                        ..
-                    }
-            )
-            || !(snapshot["credits"]["has_credits"] == true
-                || snapshot["credits"]["unlimited"] == true
-                || snapshot["credits"]["balance"]
-                    .as_f64()
-                    .is_some_and(|v| v > 0.0))
-        {
-            return;
-        }
-        self.dashboard_credit_observation(id, true, &snapshot);
-        let (window, reset_at) = crate::relay::notices::limiting_window(&account, &snapshot);
-        self.set_quota_notice(&account, json!({"action":"credits","window":window,
-            "reset_at":reset_at,"next_account":null,"earliest_account":null,"observed_at":Utc::now(),"model_limited":false}), None);
-    }
-
-    fn dashboard_credit_observation(&self, id: &str, serving: bool, snapshot: &Value) {
-        if let Ok(account) = id.to_owned().try_into() {
-            self.obs
-                .dashboard()
-                .usage(crate::dashboard::history::UsageObservation {
-                    account,
-                    observed_at: Utc::now(),
-                    window: None,
-                    credits: Some(crate::dashboard::history::CreditsObservation {
-                        serving,
-                        balance: snapshot["credits"]["balance"].as_f64(),
-                    }),
-                });
-        }
+        let obs = self.obs.clone();
+        let notices = self.quota_notices.clone();
+        let events = self.events.clone();
+        let id = id.to_owned();
+        // Serialize the final guard, latest observation, health reclassification,
+        // and display with settings changes. No stale success may reopen a paid
+        // span after off or override newer exhaustion evidence.
+        let _ = tokio::task::spawn_blocking(move || -> Result<(), ()> {
+            let _guard = store.transaction().map_err(|_| ())?;
+            let account = store.read_account_unlocked(&id).map_err(|_| ())?;
+            if !paid_observation_allowed(&account) { return Ok(()); }
+            let Some(snapshot) = obs.paid_serving_proof(&id, &observed_at) else { return Ok(()); };
+            if crate::credits::serving_ended(&snapshot) { return Ok(()); }
+            let account = store.update_metadata_unlocked(&id, |a| {
+                a.apply_health_signal(crate::accounts::HealthSignal::UsageSnapshot {
+                    snapshot:snapshot.clone(), model:None, projected_allowance:0.0
+                }, Utc::now());
+            }).map_err(|_| ())?;
+            if !paid_observation_allowed(&account) { return Ok(()); }
+            dashboard_credit_observation(&obs, &id, true, &snapshot);
+            let (window,reset_at) = crate::relay::notices::limiting_window(&account,&snapshot);
+            publish_quota_notice(&notices,&events,&account,json!({"action":"credits","window":window,
+                "reset_at":reset_at,"next_account":null,"earliest_account":null,"observed_at":Utc::now(),"model_limited":false}),None);
+            Ok(())
+        }).await;
     }
 
     pub fn set_rate_hold_secs(&self, secs: u64) {
@@ -958,6 +899,7 @@ impl AccountRuntime {
         let store = self.store.clone();
         let id = id.to_owned();
         let obs = self.obs.clone();
+        let notices = self.quota_notices.clone();
         let account = tokio::task::spawn_blocking(move || {
             store
                 .update_settings(&id, drain, allow_credits, |a| {
@@ -973,6 +915,17 @@ impl AccountRuntime {
                     if let Some(allow) = allow_credits {
                         a.allow_credits = allow;
                     }
+                    if allow_credits == Some(false) {
+                        let snapshot = obs.quota_snapshot(&a.id).unwrap_or_default();
+                        dashboard_credit_observation(&obs, &a.id, false, &snapshot);
+                        if let Ok(mut notices) = notices.lock()
+                            && notices
+                                .get(&a.id)
+                                .is_some_and(|entry| entry.notice["action"] == "credits")
+                        {
+                            notices.remove(&a.id);
+                        }
+                    }
                     if allow_credits.is_some()
                         && let Some(snapshot) = obs.quota_snapshot(&id)
                     {
@@ -983,6 +936,7 @@ impl AccountRuntime {
                             projected_allowance: 0.0,
                         };
                         if allow_credits == Some(true)
+                            && a.quota_credit_releasable
                             && matches!(&a.health, Health::Cooling {
                                 reason: HealthReason::Quota, scope, ..
                             } if scope == "account")
@@ -1277,107 +1231,49 @@ impl AccountRuntime {
         model: Option<&str>,
     ) -> Result<Account, ()> {
         let store = self.store.clone();
+        let obs = self.obs.clone();
+        let notices = self.quota_notices.clone();
         let account_id = id.to_owned();
-        let origin_model = model.map(str::to_owned);
-        let model = origin_model.clone();
-        let observation = snapshot.clone();
-        let account = tokio::task::spawn_blocking(move || {
-            store
-                .update_metadata(&account_id, |account| {
+        let model = model.map(str::to_owned);
+        let (account, snapshot) = tokio::task::spawn_blocking(move || -> Result<_, ()> {
+            let _guard = store.transaction().map_err(|_| ())?;
+            let time = |v: &Value| v.as_str().and_then(|s| s.parse::<DateTime<Utc>>().ok());
+            let mut snapshot = snapshot;
+            let mut model = model;
+            if let Some(current) = obs.quota_snapshot(&account_id)
+                && let Some((new, incoming)) =
+                    time(&current["observed_at"]).zip(time(&snapshot["observed_at"]))
+                && new >= incoming
+            {
+                if new > incoming {
+                    model = None;
+                }
+                snapshot = current;
+            }
+            let account = store
+                .update_metadata_unlocked(&account_id, |account| {
                     account.apply_health_signal(
                         crate::accounts::HealthSignal::UsageSnapshot {
-                            snapshot: observation,
-                            model,
+                            snapshot: snapshot.clone(),
+                            model: model.clone(),
                             projected_allowance: 0.0,
                         },
                         Utc::now(),
                     );
                 })
-                .map_err(|_| ())
+                .map_err(|_| ())?;
+            apply_snapshot_notices(
+                &obs,
+                &notices,
+                &account_id,
+                &account,
+                &snapshot,
+                model.as_deref(),
+            );
+            Ok((account, snapshot))
         })
         .await
         .map_err(|_| ())??;
-        if snapshot["signals"]["serving_from_credits"] == false
-            || snapshot["signals"]["active_limit"]
-                .as_str()
-                .is_some_and(|limit| limit != "credits")
-        {
-            self.dashboard_credit_observation(id, false, &snapshot);
-        }
-        if let Ok(mut notices) = self.quota_notices.lock() {
-            let recovered = notices.get(id).is_some_and(|entry| {
-                let notice = &entry.notice;
-                let time =
-                    |value: &Value| value.as_str().and_then(|v| v.parse::<DateTime<Utc>>().ok());
-                let old_reset = time(&notice["reset_at"]);
-                let observed = time(&notice["observed_at"]);
-                (snapshot["signals"]["serving_from_credits"] == false
-                    || snapshot["credits"].is_object()
-                        && !(snapshot["credits"]["has_credits"] == true
-                            || snapshot["credits"]["unlimited"] == true
-                            || snapshot["credits"]["balance"]
-                                .as_f64()
-                                .is_some_and(|n| n > 0.0)))
-                    && notice["action"] == "credits"
-                    || snapshot["windows"].as_array().is_some_and(|windows| {
-                        !windows.is_empty()
-                            && windows.iter().all(|w| {
-                                w["used_pct"].as_f64().is_some_and(|p| p < 99.0)
-                                    && time(&w["observed_at"])
-                                        .zip(observed)
-                                        .is_some_and(|(new, old)| new > old && new <= Utc::now())
-                            })
-                    })
-                    || snapshot["windows"].as_array().is_some_and(|windows| {
-                        windows.iter().any(|w| {
-                            w["name"] == notice["window"]
-                                && w["used_pct"].as_f64().is_some_and(|p| p < 100.0)
-                                && time(&w["observed_at"])
-                                    .zip(observed)
-                                    .is_some_and(|(new, old)| new > old && new <= Utc::now())
-                                && time(&w["reset_at"])
-                                    .zip(old_reset)
-                                    .is_some_and(|(new, old)| {
-                                        (new - old).abs() > Duration::seconds(300)
-                                    })
-                        })
-                    })
-            });
-            if recovered {
-                notices.remove(id);
-            }
-            // A merged old window on a plan/credit-only update is not new quota evidence.
-            let fresh_usage = snapshot["windows"].as_array().is_some_and(|windows| {
-                windows.iter().any(|w| {
-                    w["observed_at"].as_str().is_some()
-                        && w["observed_at"] == snapshot["observed_at"]
-                        && w["observed_at"]
-                            .as_str()
-                            .and_then(|v| v.parse::<DateTime<Utc>>().ok())
-                            .is_some_and(|time| {
-                                time <= Utc::now()
-                                    && Utc::now().signed_duration_since(time).num_seconds() <= 300
-                            })
-                })
-            });
-            if !notices.contains_key(id)
-                && notices.len() < 4096
-                && fresh_usage
-                && account.user_state == UserState::Active
-                && !account.drain
-                && crate::relay::notices::quota_applies(&account, origin_model.as_deref())
-            {
-                notices.insert(
-                    id.to_owned(),
-                    QuotaNoticeEntry {
-                        provider: account.provider,
-                        notice: Value::Null,
-                        state: notice_state(&account),
-                        model: origin_model,
-                    },
-                );
-            }
-        }
         let _ = self
             .events
             .send(json!({"event":"quota_updated","data":{"id":id,"snapshot":snapshot}}));
@@ -2025,6 +1921,165 @@ mod r1_rate_tests {
     }
 }
 
+fn apply_snapshot_notices(
+    obs: &Observability,
+    notices: &Mutex<QuotaNotices>,
+    id: &str,
+    account: &Account,
+    snapshot: &Value,
+    origin_model: Option<&str>,
+) {
+    if crate::credits::serving_ended(&snapshot) {
+        dashboard_credit_observation(obs, id, false, snapshot);
+    }
+    if let Ok(mut notices) = notices.lock() {
+        let recovered = notices.get(id).is_some_and(|entry| {
+            let notice = &entry.notice;
+            let time = |value: &Value| value.as_str().and_then(|v| v.parse::<DateTime<Utc>>().ok());
+            let old_reset = time(&notice["reset_at"]);
+            let observed = time(&notice["observed_at"]);
+            crate::credits::serving_ended(&snapshot) && notice["action"] == "credits"
+                || snapshot["windows"].as_array().is_some_and(|windows| {
+                    !windows.is_empty()
+                        && windows.iter().all(|w| {
+                            w["used_pct"].as_f64().is_some_and(|p| p < 99.0)
+                                && time(&w["observed_at"])
+                                    .zip(observed)
+                                    .is_some_and(|(new, old)| new > old && new <= Utc::now())
+                        })
+                })
+                || snapshot["windows"].as_array().is_some_and(|windows| {
+                    windows.iter().any(|w| {
+                        w["name"] == notice["window"]
+                            && w["used_pct"].as_f64().is_some_and(|p| p < 100.0)
+                            && time(&w["observed_at"])
+                                .zip(observed)
+                                .is_some_and(|(new, old)| new > old && new <= Utc::now())
+                            && time(&w["reset_at"])
+                                .zip(old_reset)
+                                .is_some_and(|(new, old)| {
+                                    (new - old).abs() > Duration::seconds(300)
+                                })
+                    })
+                })
+        });
+        if recovered {
+            notices.remove(id);
+        }
+        // A merged old window on a plan/credit-only update is not new quota evidence.
+        let fresh_usage = snapshot["windows"].as_array().is_some_and(|windows| {
+            windows.iter().any(|w| {
+                w["observed_at"].as_str().is_some()
+                    && w["observed_at"] == snapshot["observed_at"]
+                    && w["observed_at"]
+                        .as_str()
+                        .and_then(|v| v.parse::<DateTime<Utc>>().ok())
+                        .is_some_and(|time| {
+                            time <= Utc::now()
+                                && Utc::now().signed_duration_since(time).num_seconds() <= 300
+                        })
+            })
+        });
+        if !notices.contains_key(id)
+            && notices.len() < 4096
+            && fresh_usage
+            && account.user_state == UserState::Active
+            && !account.drain
+            && crate::relay::notices::quota_applies(account, origin_model)
+        {
+            notices.insert(
+                id.to_owned(),
+                QuotaNoticeEntry {
+                    provider: account.provider,
+                    notice: Value::Null,
+                    state: notice_state(account),
+                    model: origin_model.map(str::to_owned),
+                },
+            );
+        }
+    }
+}
+
+fn publish_quota_notice(
+    notices: &Mutex<QuotaNotices>,
+    events: &broadcast::Sender<Value>,
+    account: &Account,
+    notice: Value,
+    model: Option<&str>,
+) {
+    if account.user_state != UserState::Active || account.drain {
+        return;
+    }
+    let Ok(mut notices) = notices.lock() else {
+        return;
+    };
+    if notices.len() >= 4096 && !notices.contains_key(&account.id) {
+        return;
+    }
+    if notices.get(&account.id).is_some_and(|entry| {
+        entry.model.as_deref() == model
+            && [
+                "action",
+                "window",
+                "reset_at",
+                "next_account",
+                "earliest_account",
+                "model_limited",
+            ]
+            .iter()
+            .all(|key| entry.notice[*key] == notice[*key])
+    }) {
+        return;
+    }
+    notices.insert(
+        account.id.clone(),
+        QuotaNoticeEntry {
+            provider: account.provider,
+            notice: notice.clone(),
+            state: notice_state(account),
+            model: model.map(str::to_owned),
+        },
+    );
+    drop(notices);
+    let mut data = notice;
+    data["kind"] = json!("quota_notice");
+    data["account"] = json!(account.id);
+    let _ = events.send(json!({"event":"core_warning","data":data}));
+}
+
+fn dashboard_credit_observation(obs: &Observability, id: &str, serving: bool, snapshot: &Value) {
+    if let Ok(account) = id.to_owned().try_into() {
+        obs.dashboard()
+            .usage(crate::dashboard::history::UsageObservation {
+                account,
+                observed_at: Utc::now(),
+                window: None,
+                credits: Some(crate::dashboard::history::CreditsObservation {
+                    serving,
+                    balance: snapshot["credits"]["balance"]
+                        .as_f64()
+                        .filter(|n| n.is_finite() && *n >= 0.0),
+                }),
+            });
+    }
+}
+
+fn paid_observation_allowed(account: &Account) -> bool {
+    account.provider == Provider::Codex
+        && account.allow_credits
+        && account
+            .payment_until
+            .is_none_or(|until| until <= Utc::now())
+        && matches!(
+            account.health,
+            Health::Ready
+                | Health::Cooling {
+                    reason: HealthReason::Quota,
+                    ..
+                }
+        )
+}
+
 fn notice_state(account: &Account) -> Value {
     json!([
         account.health,
@@ -2050,6 +2105,88 @@ pub(crate) fn quota_session(key: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod r5_view_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn credits_delayed_success_cannot_reopen_a_newer_off_or_empty_span() {
+        use futures_util::poll;
+        for off in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let store = Arc::new(AccountStore::acquire(home.path()).unwrap());
+            let obs = Arc::new(Observability::new(home.path(), None).unwrap());
+            let runtime = AccountRuntime::new(store.clone(), obs.clone(), 0.0);
+            let mut account = crate::accounts::health::tests::fixture();
+            account.allow_credits = true;
+            let id = account.id.clone();
+            store
+                .save(
+                    &account,
+                    &crate::accounts::Tokens {
+                        access_token: "synthetic-access".into(),
+                        refresh_token: "synthetic-refresh".into(),
+                        id_token: None,
+                    },
+                    None,
+                )
+                .unwrap();
+            let mut paid = HeaderMap::new();
+            paid.insert("x-codex-active-limit", "credits".parse().unwrap());
+            paid.insert("x-codex-credits-has-credits", "true".parse().unwrap());
+            obs.observe_headers(&id, Provider::Codex, &paid);
+            runtime.credit_headers(&id, &paid).await;
+            assert_eq!(runtime.views().await.unwrap()[0]["credits_in_use"], true);
+            let mut pending = std::pin::pin!(runtime.credit_headers(&id, &paid));
+            {
+                let _gate = store.transaction().unwrap();
+                assert!(poll!(pending.as_mut()).is_pending());
+                if off {
+                    store
+                        .update_metadata_unlocked(&id, |a| a.allow_credits = false)
+                        .unwrap();
+                } else {
+                    let mut empty = HeaderMap::new();
+                    empty.insert("x-codex-credits-balance", "-1".parse().unwrap());
+                    obs.observe_headers(&id, Provider::Codex, &empty);
+                }
+                dashboard_credit_observation(&obs, &id, false, &obs.quota_snapshot(&id).unwrap());
+            }
+            if !off {
+                runtime
+                    .apply_quota_snapshot(&id, obs.quota_snapshot(&id).unwrap(), None)
+                    .await
+                    .unwrap();
+            }
+            pending.await;
+            assert_eq!(runtime.views().await.unwrap()[0]["credits_in_use"], false);
+            let history = obs.dashboard().usage_page(1).unwrap();
+            assert!(
+                history
+                    .accounts
+                    .iter()
+                    .flat_map(|a| &a.credits_spans)
+                    .all(|s| s.1.is_some())
+            );
+            if !off {
+                let old_stop = obs.quota_snapshot(&id).unwrap();
+                obs.observe_headers(&id, Provider::Codex, &paid);
+                runtime.credit_headers(&id, &paid).await;
+                assert_eq!(runtime.views().await.unwrap()[0]["credits_in_use"], true);
+                runtime
+                    .apply_quota_snapshot(&id, old_stop, None)
+                    .await
+                    .unwrap();
+                assert_eq!(runtime.views().await.unwrap()[0]["credits_in_use"], true);
+                assert!(
+                    obs.dashboard()
+                        .usage_page(1)
+                        .unwrap()
+                        .accounts
+                        .iter()
+                        .flat_map(|a| &a.credits_spans)
+                        .any(|s| s.1.is_none())
+                );
+            }
+        }
+    }
 
     #[tokio::test]
     async fn r5_view_preserves_pool_membership_limiting_window_and_observation_time() {

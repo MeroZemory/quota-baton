@@ -207,6 +207,30 @@ async fn closed(start: &LoginStart) {
 }
 
 #[tokio::test]
+async fn credits_relogin_preserves_subscription_hold_provenance() {
+    use qb_core::accounts::HealthReason;
+    let h = Harness::new().await;
+    let first = h.login(Provider::Codex, false, false).await;
+    let id = first.account_id.unwrap();
+    let before = h
+        .store
+        .update_metadata(&id, |account| {
+            account.health = Health::Cooling {
+                reason: HealthReason::Quota,
+                until: chrono::Utc::now() + chrono::Duration::hours(1),
+                scope: "account".into(),
+            };
+            account.quota_credit_releasable = true;
+        })
+        .unwrap();
+    let again = h.login(Provider::Codex, false, false).await;
+    assert_eq!(again.status, LoginState::Completed);
+    let after = h.store.load(&id).unwrap();
+    assert_eq!(after.health, before.health);
+    assert!(after.quota_credit_releasable);
+}
+
+#[tokio::test]
 async fn both_providers_exchange_identity_persistence_and_pkce() {
     let h = Harness::new().await;
     for provider in [Provider::Claude, Provider::Codex] {

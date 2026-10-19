@@ -133,6 +133,7 @@ pub(super) async fn exchange(
         quota_cooling: None,
         drain: false,
         allow_credits: false,
+        quota_credit_releasable: false,
         generation: 0,
         token_meta: TokenMeta {
             expires_at: Some(expires_at),

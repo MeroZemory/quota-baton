@@ -298,6 +298,18 @@ fn c5_reimport_preserves_metadata_and_only_newer_tokens_clear_needs_relogin() {
         events.lock().unwrap().last(),
         Some((Health::NeedsRelogin { .. }, Health::Ready))
     ));
+    store
+        .update_metadata(&id, |a| {
+            a.health = Health::Cooling {
+                reason: HealthReason::Quota,
+                until: now() + Duration::hours(1),
+                scope: "account".into(),
+            };
+            a.quota_credit_releasable = true;
+        })
+        .unwrap();
+    qb_core::accounts::import::run(&store, &source, &[], false).unwrap();
+    assert!(store.load(&id).unwrap().quota_credit_releasable);
 }
 
 mod runtime_regressions {
@@ -316,6 +328,7 @@ mod runtime_regressions {
 
     struct Fixture {
         runtime: Arc<AccountRuntime>,
+        obs: Arc<Observability>,
         ids: Vec<String>,
         // Drop the store/runtime before removing synthetic files.
         _home: tempfile::TempDir,
@@ -355,7 +368,8 @@ mod runtime_regressions {
             };
             let obs = Arc::new(Observability::new(home.path(), None).unwrap());
             Self {
-                runtime: AccountRuntime::new(store, obs, allowance),
+                runtime: AccountRuntime::new(store, obs.clone(), allowance),
+                obs,
                 ids,
                 _home: home,
             }
@@ -437,6 +451,280 @@ mod runtime_regressions {
             );
         }
         h
+    }
+
+    #[tokio::test]
+    async fn credits_partial_reset_preserves_entitlement_while_weekly_limit_remains_full() {
+        let f = Fixture::new(&[Provider::Codex], 0.0);
+        let id = &f.ids[0];
+        let now = Utc::now();
+        f.runtime
+            .change(id, None, None, None, Some(true))
+            .await
+            .unwrap();
+        f.runtime.observe_codex_event(id,&json!({
+            "type":"codex.rate_limits","active_limit":"credits",
+            "rate_limits":{
+                "primary":{"used_percent":100,"window_minutes":300,"reset_at":(now+Duration::hours(1)).timestamp()},
+                "secondary":{"used_percent":100,"window_minutes":10080,"reset_at":(now+Duration::days(5)).timestamp()}
+            }
+        })).await;
+        f.runtime.observe_codex_event(id,&json!({
+            "type":"codex.rate_limits",
+            "rate_limits":{"primary":{"used_percent":0,"window_minutes":300,"reset_at":(now+Duration::hours(5)).timestamp()}}
+        })).await;
+        assert_eq!(f.load(0).health, Health::Ready);
+        assert!(qb_core::credits::entitled(
+            &f.obs.quota_snapshot(id).unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn credits_resetless_hold_can_release_but_resetless_rejection_cannot() {
+        for hard in [false, true] {
+            let f = Fixture::new(&[Provider::Codex], 0.0);
+            let id = &f.ids[0];
+            f.runtime.observe_codex_event(id, &json!({
+                "type":"codex.rate_limits", "rate_limits":{"primary":{"used_percent":100,"window_minutes":300}},
+                "credits":{"has_credits":true,"balance":12}
+            })).await;
+            assert!(f.load(0).quota_credit_releasable);
+            assert!(f.load(0).quota_cooling.is_none());
+            if hard {
+                f.cool(
+                    0,
+                    HealthReason::Quota,
+                    Utc::now() + Duration::seconds(1),
+                    "account",
+                )
+                .await;
+                assert!(!f.load(0).quota_credit_releasable);
+            }
+            f.runtime
+                .change(id, None, None, None, Some(true))
+                .await
+                .unwrap();
+            assert_eq!(f.runtime.eligible(id, None).await, !hard);
+        }
+    }
+
+    #[tokio::test]
+    async fn credits_process_local_entitlement_survives_off_on_but_is_never_saved() {
+        use qb_core::{
+            bindings::{BindingTable, Candidate, PreviewDecision},
+            config::RoutingConfig,
+        };
+        let f = Fixture::new(&[Provider::Codex], 0.0);
+        let id = &f.ids[0];
+        f.runtime
+            .change(id, None, None, None, Some(true))
+            .await
+            .unwrap();
+        f.runtime.observe_codex_event(id, &json!({
+            "type":"codex.rate_limits", "active_limit":"credits",
+            "rate_limits":{"primary":{"used_percent":100,"window_minutes":300,"reset_at":(Utc::now()+Duration::hours(1)).timestamp()}}
+        })).await;
+        let home = tempfile::tempdir().unwrap();
+        let table = BindingTable::new(home.path(), RoutingConfig::default()).unwrap();
+        let selected = || {
+            table.preview(
+                qb_core::accounts::Provider::Codex,
+                Some("codex:proof"),
+                None,
+                None,
+                &[Candidate {
+                    account: f.load(0),
+                    quota: f.obs.quota_snapshot(id),
+                    inflight: 0,
+                }],
+                None,
+                0,
+            )
+        };
+        assert!(matches!(selected(), PreviewDecision::Selected { .. }));
+        f.runtime
+            .change(id, None, None, None, Some(false))
+            .await
+            .unwrap();
+        assert_eq!(f.runtime.views().await.unwrap()[0]["credits_in_use"], false);
+        assert_eq!(selected(), PreviewDecision::None);
+        let history = f.obs.dashboard().usage_page(1).unwrap();
+        assert!(
+            history
+                .accounts
+                .iter()
+                .flat_map(|a| &a.credits_spans)
+                .all(|s| s.1.is_some())
+        );
+        f.runtime
+            .change(id, None, None, None, Some(true))
+            .await
+            .unwrap();
+        assert!(matches!(selected(), PreviewDecision::Selected { .. }));
+        // Permission alone never reconstructs the actual-spending badge.
+        assert_eq!(f.runtime.views().await.unwrap()[0]["credits_in_use"], false);
+        f.obs.flush().unwrap();
+        let saved = fs::read_to_string(f._home.path().join("state/quota.json")).unwrap();
+        assert!(!saved.contains("paid_serving_observed_at"));
+    }
+
+    #[tokio::test]
+    async fn credits_entitlement_never_bypasses_model_cooling_or_explicit_absence() {
+        let f = Fixture::new(&[Provider::Codex], 0.0);
+        let id = &f.ids[0];
+        f.runtime
+            .change(id, None, None, None, Some(true))
+            .await
+            .unwrap();
+        let a = f
+            .runtime
+            .apply_quota_snapshot(
+                id,
+                json!({
+                    "windows":[window("7d_special",100.0,Utc::now()+Duration::hours(1),Utc::now())],
+                    "credits":{"has_credits":true},"signals":{}
+                }),
+                Some("special"),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(a.health,Health::Cooling {scope,..} if scope == "model:special"));
+        assert!(!a.quota_credit_releasable);
+        let g = Fixture::new(&[Provider::Codex], 0.0);
+        g.runtime
+            .change(&g.ids[0], None, None, None, Some(true))
+            .await
+            .unwrap();
+        g.runtime.observe_codex_event(&g.ids[0], &json!({"type":"codex.rate_limits","active_limit":"credits","credits":{"has_credits":false,"balance":12.5}})).await;
+        assert_eq!(g.runtime.views().await.unwrap()[0]["credits_in_use"], false);
+    }
+
+    #[tokio::test]
+    async fn credits_subscription_full_continues_only_with_entitlement_or_fresh_paid_success() {
+        for credits in [
+            json!({"has_credits":true,"balance":12.5}),
+            json!({"unlimited":true}),
+            json!(null),
+        ] {
+            let f = Fixture::new(&[Provider::Codex], 0.0);
+            let id = &f.ids[0];
+            f.runtime
+                .change(id, None, None, None, Some(true))
+                .await
+                .unwrap();
+            let reset = Utc::now() + Duration::hours(1);
+            f.runtime.observe_codex_event(id, &json!({
+                "type":"codex.rate_limits", "active_limit":"credits",
+                "rate_limits":{"primary":{"used_percent":100.0,"window_minutes":300,"reset_at":reset.timestamp()}},
+                "credits":credits, "serving_from_credits":true
+            })).await;
+            assert_eq!(f.load(0).health, Health::Ready);
+            assert!(f.runtime.eligible(id, None).await);
+            assert_eq!(f.runtime.views().await.unwrap()[0]["credits_in_use"], true);
+        }
+    }
+
+    #[tokio::test]
+    async fn credits_noncredit_update_ends_actual_serving_without_losing_windows() {
+        let f = Fixture::new(&[Provider::Codex], 0.0);
+        let id = &f.ids[0];
+        f.runtime
+            .change(id, None, None, None, Some(true))
+            .await
+            .unwrap();
+        f.runtime.observe_codex_event(id, &json!({
+            "type":"codex.rate_limits", "active_limit":"credits",
+            "rate_limits":{"primary":{"used_percent":99.0,"window_minutes":300,"reset_at":(Utc::now()+Duration::hours(1)).timestamp()}},
+            "credits":{"has_credits":true,"balance":12.5}
+        })).await;
+        assert_eq!(f.runtime.views().await.unwrap()[0]["credits_in_use"], true);
+        f.runtime
+            .observe_codex_event(
+                id,
+                &json!({"type":"codex.rate_limits", "active_limit":"primary"}),
+            )
+            .await;
+        let views = f.runtime.views().await.unwrap();
+        assert_eq!(views[0]["credits_in_use"], false);
+        assert_eq!(views[0]["windows"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn credits_numeric_hold_releases_but_same_deadline_rejection_does_not() {
+        for hard in [false, true] {
+            let f = Fixture::new(&[Provider::Codex], 0.0);
+            let id = &f.ids[0];
+            let reset = Utc::now() + Duration::hours(1);
+            f.runtime.observe_codex_event(id, &json!({
+                "type":"codex.rate_limits", "rate_limits":{"primary":{"used_percent":100.0,"window_minutes":300,"reset_at":reset.timestamp()}},
+                "credits":{"has_credits":true,"balance":12.5}
+            })).await;
+            assert!(!f.runtime.eligible(id, None).await);
+            if hard {
+                f.runtime.apply_quota_snapshot(id, json!({
+                    "windows":[window("5h",100.0,reset,Utc::now())],
+                    "signals":{"limit_reached":true}, "credits":{"has_credits":true,"balance":12.5}
+                }), None).await.unwrap();
+            }
+            let account = f
+                .runtime
+                .change(id, None, None, None, Some(true))
+                .await
+                .unwrap();
+            assert_eq!(account.health == Health::Ready, !hard);
+            assert_eq!(f.runtime.eligible(id, None).await, !hard);
+        }
+    }
+
+    #[tokio::test]
+    async fn credits_absent_or_unknown_does_not_trigger_the_99_percent_guard() {
+        for credits in [
+            json!(null),
+            json!({"has_credits":false}),
+            json!({"balance":0}),
+        ] {
+            let f = Fixture::new(&[Provider::Codex], 0.0);
+            f.runtime.observe_codex_event(&f.ids[0], &json!({
+                "type":"codex.rate_limits", "credits":credits,
+                "rate_limits":{"primary":{"used_percent":99.0,"window_minutes":300,"reset_at":(Utc::now()+Duration::hours(1)).timestamp()}}
+            })).await;
+            assert_eq!(f.load(0).health, Health::Ready);
+        }
+    }
+
+    #[tokio::test]
+    async fn credits_partial_updates_have_identical_live_persisted_and_restarted_state() {
+        let home = tempfile::tempdir().unwrap();
+        let obs = Observability::new(home.path(), None).unwrap();
+        let mut h = codex_headers(40.0, 100.0, Utc::now());
+        h.insert("x-codex-credits-has-credits", "true".parse().unwrap());
+        h.insert("x-codex-credits-balance", "12.5".parse().unwrap());
+        obs.observe_headers("synthetic-audit", Provider::Codex, &h);
+        for update in [
+            json!({"has_credits":false}),
+            json!({"balance":25}),
+            json!({"balance":0}),
+            json!({"has_credits":true}),
+            json!({"unlimited":true}),
+            json!({"has_credits":false}),
+        ] {
+            obs.observe_codex_event(
+                "synthetic-audit",
+                &json!({"type":"codex.rate_limits","credits":update}),
+            );
+            obs.flush().unwrap();
+            let live = obs.quota_snapshot("synthetic-audit").unwrap();
+            let persisted: Value =
+                serde_json::from_slice(&fs::read(home.path().join("state/quota.json")).unwrap())
+                    .unwrap();
+            assert_eq!(live, persisted["accounts"]["synthetic-audit"]);
+            assert_eq!(live["windows"].as_array().unwrap().len(), 2);
+        }
+        let live = obs.quota_snapshot("synthetic-audit").unwrap();
+        assert!(live["credits"]["balance"].is_null());
+        drop(obs);
+        let restarted = Observability::new(home.path(), None).unwrap();
+        assert_eq!(restarted.quota_snapshot("synthetic-audit").unwrap(), live);
     }
 
     #[tokio::test]
@@ -585,6 +873,12 @@ mod runtime_regressions {
     #[tokio::test]
     async fn m2_two_window_credits_hold_uses_only_triggering_future_reset() {
         let f = Fixture::new(&[Provider::Codex], 0.0);
+        f.runtime
+            .observe_codex_event(
+                &f.ids[0],
+                &json!({"type":"codex.rate_limits","credits":{"has_credits":true}}),
+            )
+            .await;
         let now = Utc::now();
         f.runtime
             .observe_headers(&f.ids[0], Provider::Codex, &codex_headers(99.0, 40.0, now))
@@ -1015,9 +1309,9 @@ mod runtime_regressions {
             .await;
         assert_eq!(a.health, Health::Ready);
         assert_eq!(a.quota_cooling, None);
-        let a = f
-            .snapshot(vec![window("5h", 99.0, reset, now)], json!({}), None)
-            .await;
+        let a = f.runtime.apply_quota_snapshot(&f.ids[0], json!({
+            "windows":[window("5h",99.0,reset,now)], "credits":{"has_credits":true}, "signals":{}
+        }), None).await.unwrap();
         assert_cooling(&a, HealthReason::Quota, reset, "account");
         drop(second);
         drop(first);
