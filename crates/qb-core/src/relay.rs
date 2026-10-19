@@ -2083,7 +2083,7 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
             }
             if let Some(copy) = retained.as_ref()
                 && rate_retries < state.rate_hold_max_retries
-                && !admission.forced()
+                && admission.as_ref().is_some_and(|a| !a.forced())
                 && Instant::now() < rate_deadline
                 && let Some(body) = copy.retry_body().await
             {

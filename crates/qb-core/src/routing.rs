@@ -97,7 +97,7 @@ pub struct Project {
     pub name: String,
     pub settings: Settings,
 }
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Movement {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -403,6 +403,19 @@ fn load(path: &Path) -> Result<State> {
         session.baseline.validate()?;
         if let Some(settings) = &session.explicit {
             settings.validate()?;
+        }
+    }
+    let mut movement_ids = BTreeMap::new();
+    for movement in state
+        .sessions
+        .values()
+        .flat_map(|session| &session.movements)
+    {
+        if let Some(id) = &movement.id
+            && let Some(previous) = movement_ids.insert(id, movement)
+            && previous != movement
+        {
+            bail!("conflicting routing movement identity");
         }
     }
     state.reindex();
@@ -983,6 +996,16 @@ mod tests {
         store.reload().unwrap();
         assert_eq!(store.snapshot().pool_moves["cx"].len(), 3);
         assert!(store.discretionary_allowed("codex:new", None, now));
+        let mut bad: serde_json::Value =
+            serde_json::from_slice(&fs::read(&store.path).unwrap()).unwrap();
+        let id = bad["sessions"][session_id("codex:legacy")]["movements"][0]["id"].clone();
+        bad["sessions"][session_id("codex:other2")]["movements"][0]["id"] = id;
+        bad["sessions"][session_id("codex:other2")]["movements"][0]["from"] = "cx-conflict".into();
+        fs::write(&store.path, serde_json::to_vec(&bad).unwrap()).unwrap();
+        assert!(
+            store.reload().is_err(),
+            "conflicting movement IDs were allowed to erase pool history"
+        );
     }
     #[test]
     fn strict_anchor_survives_restart_and_child_inherits() {
