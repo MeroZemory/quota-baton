@@ -1073,7 +1073,12 @@ fn credit_amount(c: &Credits, exact: bool) -> String {
         return "무제한".into();
     }
     let Some(balance) = &c.balance else {
-        return "있음".into();
+        return match c.has_credits {
+            Some(true) => "있음",
+            Some(false) => "없음",
+            None => "확인 전",
+        }
+        .into();
     };
     let text = balance.to_string();
     if exact {
@@ -1179,7 +1184,7 @@ fn menu_info(
     let credits_enable_confirmation = (a.provider == "codex").then(|| Confirmation {
         title: "유료 크레딧 사용",
         body: format!(
-            "{name}가 한도에 도달하면 유료 크레딧(잔액 {})을 씁니다. 계속할까요?",
+            "{name}가 한도에 도달한 뒤, 잔액이 있을 때 유료 크레딧 사용을 허용할까요? (현재 잔액 {})",
             a.credits
                 .as_ref()
                 .map(|c| credit_amount(c, false))
@@ -1698,6 +1703,27 @@ mod tests {
         assert_eq!(r.state, DisplayState::Credits);
         assert_eq!(r.action.as_ref().unwrap().kind, ActionKind::DisableCredits);
         assert!(r.action.as_ref().unwrap().confirmation.is_none());
+    }
+    #[test]
+    fn credits_confirmation_distinguishes_absent_unknown_and_available_balance() {
+        for (credits, expected) in [
+            (json!({"has_credits":false,"balance":null}), "없음"),
+            (json!({"has_credits":null,"balance":null}), "확인 전"),
+            (json!({"has_credits":true,"balance":null}), "있음"),
+            (json!({"has_credits":false,"balance":0}), "0"),
+        ] {
+            let mut a = base("a");
+            a["credits"] = credits;
+            let v = view(vec![a], 1);
+            let confirmation = codex(&v).rows[0]
+                .menu
+                .credits_enable_confirmation
+                .as_ref()
+                .unwrap();
+            assert!(confirmation.body.contains(&format!("현재 잔액 {expected}")));
+            assert!(confirmation.body.contains("잔액이 있을 때"));
+            assert!(confirmation.body.contains("사용을 허용"));
+        }
     }
     #[test]
     fn credit_lines_exact_floor_unlimited_and_every_enable_confirmation() {
