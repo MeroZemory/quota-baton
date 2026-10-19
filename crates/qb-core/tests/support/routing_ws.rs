@@ -540,3 +540,54 @@ async fn upgrade_skips_reset_beyond_remaining_budget_without_overriding_strict()
         }
     }
 }
+
+#[tokio::test]
+async fn pending_quota_reconnect_skips_reset_outside_upgrade_budget_in_each_mode() {
+    for mode in [
+        qb_core::routing::Mode::Recover,
+        qb_core::routing::Mode::Rebalance,
+        qb_core::routing::Mode::Strict,
+    ] {
+        let h = Harness::new_with_options(2, false, false, None, Some((3, 1))).await;
+        let (mut first, a) = h.connect().await;
+        assert_credential(&h, 0, &a);
+        let table = h.state.bindings.clone();
+        tokio::task::spawn_blocking(move || {
+            table.set_routing_session(
+                &qb_core::routing::session_id("codex:synthetic-ws-session"),
+                Some(qb_core::routing::Settings {
+                    mode,
+                    reset_wait_secs: 60,
+                }),
+                None,
+                false,
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        h.fake.state.push_reply([Message::Text(r#"{"type":"error","status":429,"error":{"type":"usage_limit_reached","resets_in_seconds":20}}"#.into())]);
+        create(&mut first, "fixture").await;
+        let end = receive(&mut first).await;
+        if let Message::Close(_) = end {
+        } else {
+            assert!(matches!(end, Message::Text(_)));
+        }
+        assert_eq!(
+            h.state
+                .accounts
+                .pending_quota_count_for_test("codex:synthetic-ws-session"),
+            1,
+            "actual quota frame must create the pending ticket before reconnect"
+        );
+        if mode == qb_core::routing::Mode::Strict {
+            assert_eq!(h.error().await.0, StatusCode::CONFLICT);
+            assert_eq!(h.fake.state.requests().len(), 1);
+        } else {
+            let (mut next, b) = h.connect().await;
+            assert_ne!(a, b);
+            assert_credential(&h, 1, &b);
+            next.close(None).await.unwrap();
+        }
+    }
+}

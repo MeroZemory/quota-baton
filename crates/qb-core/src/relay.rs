@@ -994,11 +994,7 @@ impl RelayState {
                     held_account = self.bindings.current(session.key.as_deref());
                     let wait = (until - chrono::Utc::now()).to_std().unwrap_or_default();
                     completion.reset_hold_used = true;
-                    if completion.record.transport == "ws"
-                        && completion.precommit_deadline.is_some_and(|deadline| {
-                            wait >= deadline.saturating_duration_since(Instant::now())
-                        })
-                    {
+                    if !reset_fits_transport(completion, wait) {
                         // A reset beyond this transport's remaining budget is
                         // not a viable hold. Re-select without waiting; strict
                         // still cannot choose another account.
@@ -1106,6 +1102,11 @@ impl RelayState {
             tracing::debug!(account = %id, reason = "reset_beyond_hold_bound", wait_ms = wait.as_millis() as u64, "reset hold skipped");
             return Ok(false);
         }
+        if !reset_fits_transport(completion, wait) {
+            completion.reset_hold_used = true;
+            tracing::debug!(account = %id, reason = "reset_beyond_transport_budget", "reset hold skipped");
+            return Ok(false);
+        }
         completion.end_attempt();
         completion.reset_hold_used = true;
         completion.failover("reset_hold_retry");
@@ -1139,6 +1140,13 @@ impl RelayState {
         );
         Ok(true)
     }
+}
+
+fn reset_fits_transport(completion: &Completion, wait: Duration) -> bool {
+    completion.record.transport != "ws"
+        || completion
+            .precommit_deadline
+            .is_none_or(|deadline| wait < deadline.saturating_duration_since(Instant::now()))
 }
 
 fn upstream_client() -> anyhow::Result<reqwest::Client> {
@@ -1999,13 +2007,19 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
                 && status.is_success()
                 && state.accounts.probe_success(&account.id).await.is_err()
             {
-                return failure(
-                    &mut completion,
-                    StatusCode::BAD_GATEWAY,
-                    provider,
-                    "store_error",
-                    "Could not persist account probe result",
-                );
+                let mut blocked = account.clone();
+                blocked.health = crate::accounts::Health::Cooling {
+                    reason: crate::accounts::HealthReason::StoreError,
+                    until: chrono::Utc::now() + chrono::Duration::seconds(60),
+                    scope: "account".into(),
+                };
+                state.accounts.emit_account(&blocked);
+                state
+                    .observability
+                    .record_health(&account.id, &account.health, &blocked.health);
+                state
+                    .observability
+                    .core_warning(&account.id, "probe_store_failed_after_commit");
             }
             break (status, response_headers, held);
         }
