@@ -3,7 +3,10 @@ use super::*;
 
 fn fixture() -> (tempfile::TempDir, Arc<BindingTable>, Vec<Candidate>) {
     let root = fixture_dir();
-    let mut cfg = RoutingConfig { spread_threshold: 2, ..RoutingConfig::default() };
+    let mut cfg = RoutingConfig {
+        spread_threshold: 2,
+        ..RoutingConfig::default()
+    };
     cfg.churn.target_quiet_secs = 0;
     let t = BindingTable::new(root.path(), cfg).unwrap();
     let cs = vec![
@@ -201,4 +204,86 @@ fn routing_old_window_cannot_borrow_fresh_snapshot_timestamp() {
     cs[1].quota.as_mut().unwrap()["windows"][0]["observed_at"] =
         serde_json::json!(Utc::now() - chrono::Duration::seconds(301));
     assert_eq!(trigger(&t, &cs[0].account.id, "a", &cs[..2]), 0);
+}
+
+#[test]
+fn routing_full_group_budget_keeps_healthy_source_but_blocks_mandatory_fourth_move() {
+    let (_root, t, mut cs) = fixture();
+    let now = Utc::now();
+    for (from, to) in [
+        ("cl-z", "cl-x"),
+        ("cl-x", "cl-y"),
+        ("cl-y", cs[0].account.id.as_str()),
+    ] {
+        t.policies
+            .dispatch(Some("claude:a0"), to, Some(from), "forced", now)
+            .unwrap();
+    }
+    assert!(
+        !t.policies
+            .discretionary_allowed("claude:a0", Some(&cs[1].account.id), now)
+    );
+    trigger(&t, &cs[0].account.id, "a", &cs[..2]);
+    assert_eq!(place(&t, "claude:a0", &cs[..2], 100), cs[0].account.id);
+    cs[0].account.user_state = UserState::Paused;
+    assert!(matches!(
+        t.choose(
+            Provider::Claude,
+            Some("claude:a0"),
+            None,
+            None,
+            &cs[..2],
+            None,
+            100
+        ),
+        Decision::Blocked
+    ));
+}
+
+#[test]
+fn routing_mark_rechecks_unknown_and_current_oversized_input_before_moving() {
+    for unknown in [false, true] {
+        let (_root, t, cs) = fixture();
+        assert!(trigger(&t, &cs[0].account.id, "a", &cs[..2]) > 0);
+        let key = t
+            .data
+            .lock()
+            .unwrap()
+            .overload_marks
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        let bytes = if unknown {
+            t.unknown_request_cost(Some(&key));
+            100
+        } else {
+            t.config.churn.max_move_bytes + 1
+        };
+        assert_eq!(place(&t, &key, &cs[..2], bytes), cs[0].account.id);
+        assert!(!t.overload_marked(Some(&key), Utc::now()));
+    }
+}
+
+#[test]
+fn routing_unproven_cooling_expiry_is_never_used_as_reset_evidence() {
+    let (_root, t, mut cs) = fixture();
+    cs[0].account.health = Health::Cooling {
+        reason: HealthReason::Quota,
+        until: Utc::now() + chrono::Duration::seconds(10),
+        scope: "account".into(),
+    };
+    cs[0].account.quota_cooling = None;
+    assert!(!matches!(
+        t.choose(
+            Provider::Claude,
+            Some("claude:a0"),
+            None,
+            None,
+            &cs[..2],
+            None,
+            100
+        ),
+        Decision::Hold { .. }
+    ));
 }

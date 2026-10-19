@@ -731,6 +731,65 @@ e2e!(takeover_imports_bindings, {
     assert!(b.status().is_none());
 });
 
+e2e!(
+    routing_legacy_strict_anchor_survives_two_process_takeover,
+    {
+        let upstream = ScriptedUpstream::start().await.unwrap();
+        let home = Home::new(&upstream.url).await;
+        let ids = accounts(&home, 2);
+        fs::create_dir_all(home.path.join("state")).unwrap();
+        let id = qb_core::routing::session_id("codex:held");
+        let policy = serde_json::json!({"schema":1,"revision":9,"projects":{},"sessions":{
+        id:{"project":null,"baseline":{"mode":"rebalance","reset_wait_secs":60},
+        "explicit":{"mode":"strict","reset_wait_secs":0},"anchor":ids[0],"movements":[]}}});
+        fs::write(
+            home.path.join("state/routing-policies.json"),
+            serde_json::to_vec(&policy).unwrap(),
+        )
+        .unwrap();
+        let client = client();
+        let (a, token) = start(&home, &client).await;
+        assert_eq!(
+            data_account(&client, &home, "held:agent:independent").await,
+            ids[0]
+        );
+        assert_eq!(client.post(home.admin_url("/admin/v1/routing")).bearer_auth(&token)
+        .json(&serde_json::json!({"kind":"project","name":"unrelated","settings":{"mode":"rebalance","reset_wait_secs":0}}))
+        .send().await.unwrap().status(),StatusCode::OK);
+        let b = Core::spawn(&home, true);
+        ready(&client, &home, &token, b.pid).await;
+        a.wait(Duration::from_secs(5)).await;
+        until(|| phase(&home, b.pid, "bindings_imported")).await;
+        assert_eq!(
+            data_account(&client, &home, "held:agent:independent").await,
+            ids[0]
+        );
+        for request in upstream.state.requests() {
+            assert_eq!(
+                request.headers["authorization"],
+                "Bearer synthetic-access-0"
+            );
+            assert_eq!(request.headers["chatgpt-account-id"], "synthetic-0");
+        }
+        let response = client
+            .post(home.admin_url(&format!("/admin/v1/accounts/{}/pause", ids[0])))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let before = upstream.state.requests().len();
+        let response = request(&client, &home, "held:agent:independent")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        response.bytes().await.unwrap();
+        assert_eq!(upstream.state.requests().len(), before);
+        lease_busy(&home);
+    }
+);
+
 e2e!(drain_stops_refresh_and_relays_401_unchanged, {
     let mut delayed = Delayed401::start().await;
     let mut home = Home::new(&delayed.url).await;

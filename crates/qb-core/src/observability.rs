@@ -234,6 +234,7 @@ pub struct Observability {
     recent_burst: std::sync::Mutex<Option<(std::time::Instant, DateTime<Utc>, u32)>>,
     events: std::sync::Mutex<Option<tokio::sync::broadcast::Sender<serde_json::Value>>>,
     snapshots: std::sync::Mutex<BTreeMap<String, serde_json::Value>>,
+    shadow: std::sync::Mutex<crate::routing::forecast::Shadow>,
     tx: mpsc::SyncSender<Command>,
     worker: Option<thread::JoinHandle<()>>,
     dropped: Arc<AtomicU64>,
@@ -242,6 +243,28 @@ pub struct Observability {
 }
 
 impl Observability {
+    pub fn configure_forecast(&self, enabled: bool) {
+        self.shadow
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .enable(enabled);
+    }
+    pub fn forecast_load(&self, id: &str, active: usize) {
+        self.shadow
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .regime(id, Some(active), None);
+    }
+    pub fn forecast_view(&self, id: &str, active: usize, inflight: usize) -> serde_json::Value {
+        let snapshot = self.quota_snapshot(id).unwrap_or_default();
+        self.shadow.lock().unwrap_or_else(|e| e.into_inner()).view(
+            id,
+            &snapshot,
+            active,
+            inflight,
+            Utc::now(),
+        )
+    }
     pub fn dashboard(&self) -> &Arc<crate::dashboard::runtime::Runtime> {
         &self.dashboard
     }
@@ -420,6 +443,7 @@ impl Observability {
             dashboard,
             recent_burst: std::sync::Mutex::new(None),
             events: std::sync::Mutex::new(None),
+            shadow: std::sync::Mutex::new(crate::routing::forecast::Shadow::default()),
             snapshots: std::sync::Mutex::new(snapshots),
             tx,
             worker: Some(worker),
@@ -597,6 +621,12 @@ impl Observability {
             .filter(|v| v.len() == 12 && v.bytes().all(|c| c.is_ascii_hexdigit()));
         record.ua = record.ua.as_deref().and_then(product);
         record.model = record.model.as_deref().and_then(safe_identifier);
+        if let Some(id) = &record.account {
+            self.shadow
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .regime(id, None, record.model.as_deref());
+        }
         record.originator = record.originator.as_deref().and_then(safe_identifier);
         if let Ok(value) = serde_json::to_value(record) {
             self.enqueue(Command::Ledger(value));
@@ -765,6 +795,10 @@ impl Observability {
             value["signals"] = serde_json::to_value(signals).ok()?;
             let persisted: Snapshot = serde_json::from_value(value.clone()).ok()?;
             snapshots.insert(id.into(), value.clone());
+            self.shadow
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .observe(id, &value, Utc::now());
             // Persist the exact in-memory result in observation order. The writer
             // must never apply a second, different partial-update reducer.
             self.enqueue(Command::PollQuota(id.into(), Box::new(persisted)));
@@ -1896,6 +1930,7 @@ mod tests {
             dashboard: crate::dashboard::runtime::Runtime::new(),
             recent_burst: std::sync::Mutex::new(None),
             events: std::sync::Mutex::new(None),
+            shadow: std::sync::Mutex::new(crate::routing::forecast::Shadow::default()),
             snapshots: std::sync::Mutex::new(BTreeMap::new()),
             tx,
             worker: None,
@@ -1930,6 +1965,7 @@ mod tests {
             dashboard: crate::dashboard::runtime::Runtime::new(),
             recent_burst: std::sync::Mutex::new(None),
             events: std::sync::Mutex::new(None),
+            shadow: std::sync::Mutex::new(crate::routing::forecast::Shadow::default()),
             snapshots: std::sync::Mutex::new(BTreeMap::new()),
             tx,
             worker: None,
@@ -2064,6 +2100,7 @@ mod tests {
             dashboard: crate::dashboard::runtime::Runtime::new(),
             recent_burst: std::sync::Mutex::new(None),
             events: std::sync::Mutex::new(None),
+            shadow: std::sync::Mutex::new(crate::routing::forecast::Shadow::default()),
             snapshots: std::sync::Mutex::new(BTreeMap::new()),
             tx,
             worker: Some(worker),

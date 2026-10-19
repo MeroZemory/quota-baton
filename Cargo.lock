@@ -1119,6 +1119,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
  "qb-proto",
  "qb-testkit",
  "rand 0.9.2",

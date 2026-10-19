@@ -1,10 +1,11 @@
 //! Durable local routing intent. Display labels and upstream payloads are never selectors.
+pub mod forecast;
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::Read,
     path::{Path, PathBuf},
@@ -139,17 +140,67 @@ struct State {
     revision: u64,
     projects: BTreeMap<String, Project>,
     sessions: BTreeMap<String, SessionPolicy>,
+    legacy_codex_roots: BTreeSet<String>,
+    #[serde(skip)]
+    pool_moves: BTreeMap<String, Vec<DateTime<Utc>>>,
+    #[serde(skip)]
+    arrivals: BTreeMap<String, DateTime<Utc>>,
     #[serde(skip)]
     frozen: bool,
 }
 impl Default for State {
     fn default() -> Self {
         Self {
-            schema: 1,
+            schema: 2,
             revision: 0,
             projects: BTreeMap::new(),
             sessions: BTreeMap::new(),
+            legacy_codex_roots: BTreeSet::new(),
+            pool_moves: BTreeMap::new(),
+            arrivals: BTreeMap::new(),
             frozen: false,
+        }
+    }
+}
+impl State {
+    fn policy_id(&self, key: &str) -> String {
+        let exact = session_id(key);
+        if key.starts_with("codex:")
+            && key.contains(":agent:")
+            && !self.sessions.contains_key(&exact)
+        {
+            let legacy = session_id(key.split(":agent:").next().unwrap_or(key));
+            if self.legacy_codex_roots.contains(&legacy) {
+                return legacy;
+            }
+        }
+        exact
+    }
+    fn reindex(&mut self) {
+        self.pool_moves.clear();
+        self.arrivals.clear();
+        for movement in self.sessions.values().flat_map(|s| &s.movements) {
+            self.arrivals
+                .entry(movement.to.clone())
+                .and_modify(|at| *at = (*at).max(movement.at))
+                .or_insert(movement.at);
+            if movement.discretionary {
+                self.pool_moves
+                    .entry(
+                        movement
+                            .to
+                            .split('-')
+                            .next()
+                            .unwrap_or(&movement.to)
+                            .to_owned(),
+                    )
+                    .or_default()
+                    .push(movement.at);
+            }
+        }
+        for times in self.pool_moves.values_mut() {
+            times.sort_unstable_by(|a, b| b.cmp(a));
+            times.truncate(32);
         }
     }
 }
@@ -168,6 +219,7 @@ pub struct PolicyStore {
     limits: ChurnLimits,
     state: Mutex<Arc<State>>,
     writer: Mutex<()>,
+    pub(crate) changed: tokio::sync::Notify,
 }
 
 pub fn root(key: &str) -> &str {
@@ -226,9 +278,15 @@ fn load(path: &Path) -> Result<State> {
         if metadata.file_attributes() & 0x400 != 0 {
             bail!("routing policy reparse point refused");
         }
+        crate::local_secrets::restrict(path)?;
     }
     let mut options = fs::OpenOptions::new();
     options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
@@ -246,16 +304,48 @@ fn load(path: &Path) -> Result<State> {
             bail!("routing policy reparse handle refused");
         }
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if actual.uid() != unsafe { libc::geteuid() } || actual.mode() & 0o077 != 0 {
+            bail!("routing policy requires owner-only permissions");
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if actual.file_attributes() & 0x400 != 0 {
+            bail!("routing policy reparse handle refused");
+        }
+    }
     let mut bytes = Vec::new();
     file.take(MAX_FILE + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_FILE {
         bail!("routing policy read cap exceeded");
     }
     // A corrupt intent file must stop startup, never silently remove strict pins.
-    let state: State = serde_json::from_slice(&bytes)?;
-    if state.schema != 1
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    if value["schema"] == 1 {
+        if value.get("legacy_codex_roots").is_some() {
+            bail!("invalid legacy policy schema");
+        }
+        value["legacy_codex_roots"] = value["sessions"]
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("invalid legacy sessions"))?
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+            .into();
+        value["schema"] = 2.into();
+    }
+    let mut state: State = serde_json::from_value(value)?;
+    if state.schema != 2
         || state.projects.len() > MAX_PROJECTS
         || state.sessions.len() > MAX_SESSIONS
+        || state
+            .legacy_codex_roots
+            .iter()
+            .any(|id| !state.sessions.contains_key(id))
     {
         bail!("invalid routing policy state");
     }
@@ -279,11 +369,23 @@ fn load(path: &Path) -> Result<State> {
         {
             bail!("invalid routing session");
         }
+        if session
+            .anchor
+            .as_deref()
+            .is_some_and(|a| crate::observability::safe_identifier(a).is_none())
+            || session.movements.iter().any(|m| {
+                crate::observability::safe_identifier(&m.from).is_none()
+                    || crate::observability::safe_identifier(&m.to).is_none()
+            })
+        {
+            bail!("invalid routing account identifier");
+        }
         session.baseline.validate()?;
         if let Some(settings) = &session.explicit {
             settings.validate()?;
         }
     }
+    state.reindex();
     Ok(state)
 }
 
@@ -299,6 +401,7 @@ impl PolicyStore {
             limits: ChurnLimits::default(),
             state: Mutex::new(Arc::new(state)),
             writer: Mutex::new(()),
+            changed: tokio::sync::Notify::new(),
         })
     }
     pub fn with_limits(mut self, limits: ChurnLimits) -> Result<Self> {
@@ -325,8 +428,18 @@ impl PolicyStore {
         if bytes.len() as u64 > MAX_FILE {
             bail!("routing policy file exceeds cap");
         }
-        crate::bindings::atomic_write(&self.path, &bytes)?;
+        if let Err(error) = crate::bindings::atomic_write(&self.path, &bytes) {
+            // Replace may have succeeded before a durability failure. Do not
+            // keep authorizing from an older in-memory revision afterwards.
+            let mut retired = (*state).clone();
+            retired.frozen = true;
+            *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(retired);
+            self.changed.notify_waiters();
+            return Err(error.into());
+        }
+        next.reindex();
         *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(next);
+        self.changed.notify_waiters();
         Ok(result)
     }
     pub fn freeze(&self) {
@@ -357,7 +470,7 @@ impl PolicyStore {
         let missing: BTreeMap<_, _> = bindings
             .into_iter()
             .filter_map(|(key, account)| {
-                let id = session_id(key);
+                let id = state.policy_id(key);
                 let plan = self.resolve(&state, &id);
                 (plan.settings.mode == Mode::Strict && plan.anchor.is_none())
                     .then_some((id, account.to_owned()))
@@ -385,10 +498,13 @@ impl PolicyStore {
     /// A queued request cannot use an obsolete account after policy changes.
     pub fn permits_dispatch(&self, key: Option<&str>, account: &str) -> bool {
         let state = self.snapshot();
+        if state.frozen {
+            return false;
+        }
         let Some(key) = key else {
             return self.defaults.mode != Mode::Strict;
         };
-        let plan = self.resolve(&state, &session_id(key));
+        let plan = self.resolve(&state, &state.policy_id(key));
         plan.settings.mode != Mode::Strict || plan.anchor.as_deref() == Some(account)
     }
     fn resolve(&self, state: &State, id: &str) -> Plan {
@@ -414,7 +530,7 @@ impl PolicyStore {
     }
     pub fn plan(&self, key: Option<&str>) -> Plan {
         let state = self.snapshot();
-        self.resolve(&state, &key.map(session_id).unwrap_or_default())
+        self.resolve(&state, &key.map(|k| state.policy_id(k)).unwrap_or_default())
     }
     pub fn list(&self) -> serde_json::Value {
         let state = self.snapshot();
@@ -501,7 +617,7 @@ impl PolicyStore {
     }
     /// Ingress association is explicit, stable, and cannot reassign an existing root.
     pub fn associate(&self, key: &str, project: &str) -> Result<()> {
-        let id = session_id(key);
+        let id = self.snapshot().policy_id(key);
         {
             let state = self.snapshot();
             if let Some(session) = state.sessions.get(&id) {
@@ -550,33 +666,31 @@ impl PolicyStore {
             "cx"
         };
         let pool_moves = state
-            .sessions
-            .values()
-            .flat_map(|s| s.movements.iter())
-            .filter(|m| {
-                m.discretionary
-                    && (now - m.at).num_seconds() < self.limits.window_secs as i64
-                    && m.to.split('-').next() == Some(prefix)
-            })
+            .pool_moves
+            .get(prefix)
+            .into_iter()
+            .flatten()
+            .filter(|at| (now - **at).num_seconds() < self.limits.window_secs as i64)
             .count();
         if pool_moves >= self.limits.max_pool_moves
             || target.is_some_and(|target| {
-                state
-                    .sessions
-                    .values()
-                    .flat_map(|s| s.movements.iter())
-                    .any(|m| {
-                        m.to == target
-                            && (now - m.at).num_seconds() < self.limits.target_quiet_secs as i64
-                    })
+                state.arrivals.get(target).is_some_and(|at| {
+                    (now - *at).num_seconds() < self.limits.target_quiet_secs as i64
+                })
             })
         {
             return false;
         }
-        let Some(session) = state.sessions.get(&session_id(key)) else {
+        let Some(session) = state.sessions.get(&state.policy_id(key)) else {
             return self.defaults.mode == Mode::Rebalance;
         };
         session.settings(&self.defaults).mode == Mode::Rebalance
+            && session
+                .movements
+                .iter()
+                .filter(|m| (now - m.at).num_seconds() < self.limits.window_secs as i64)
+                .count()
+                < self.limits.max_group_moves
             && !session.movements.iter().any(|m| {
                 (m.discretionary && (now - m.at).num_seconds() < self.limits.dwell_secs as i64)
                     || target.is_some_and(|target| {
@@ -597,7 +711,7 @@ impl PolicyStore {
         let Some(key) = key else {
             return Ok(());
         };
-        let id = session_id(key);
+        let id = self.snapshot().policy_id(key);
         let discretionary = matches!(reason, "overload" | "cold_rebalance");
         {
             let state = self.snapshot();
@@ -878,6 +992,125 @@ mod tests {
         fs::create_dir_all(home.path().join("state")).unwrap();
         fs::write(home.path().join("state/routing-policies.json"), b"not-json").unwrap();
         assert!(PolicyStore::new(home.path(), Settings::default()).is_err());
+    }
+    #[test]
+    fn indexed_policy_checks_remain_bounded_at_maximum_session_capacity() {
+        let home = home();
+        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        store
+            .update(|state| {
+                for n in 0..MAX_SESSIONS {
+                    state.sessions.insert(
+                        session_id(&format!("codex:capacity-{n}")),
+                        SessionPolicy {
+                            project: None,
+                            baseline: Settings::default(),
+                            explicit: None,
+                            anchor: Some("cx-a".into()),
+                            movements: Vec::new(),
+                        },
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+        let start = std::time::Instant::now();
+        for n in 0..MAX_SESSIONS {
+            assert!(store.discretionary_allowed(
+                &format!("codex:capacity-{n}"),
+                Some("cx-b"),
+                Utc::now()
+            ));
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "policy lookup revisited the whole table for every root"
+        );
+    }
+    #[cfg(windows)]
+    #[test]
+    fn policy_create_replace_and_load_have_one_protected_owner_ace() {
+        let home = home();
+        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        for n in 0..2 {
+            store
+                .put_project(
+                    None,
+                    Project {
+                        name: format!("fixture-{n}"),
+                        settings: Settings::default(),
+                    },
+                )
+                .unwrap();
+            let saved = home.path().join("acl.txt");
+            let output = std::process::Command::new("icacls.exe")
+                .arg(&store.path)
+                .arg("/save")
+                .arg(&saved)
+                .arg("/q")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "synthetic policy ACL inspection failed"
+            );
+            let bytes = fs::read(&saved).unwrap();
+            let text = if bytes.starts_with(&[255, 254]) || bytes.contains(&0) {
+                let offset = usize::from(bytes.starts_with(&[255, 254])) * 2;
+                String::from_utf16(
+                    &bytes[offset..]
+                        .chunks_exact(2)
+                        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap()
+            } else {
+                String::from_utf8(bytes).unwrap()
+            };
+            assert!(text.contains("D:P"), "policy ACL must be protected");
+            assert_eq!(
+                text.matches("(A;").count(),
+                1,
+                "only the current owner may access intent"
+            );
+            assert!(PolicyStore::new(home.path(), Settings::default()).is_ok());
+        }
+    }
+    #[test]
+    fn legacy_codex_agent_hash_keeps_strict_intent_through_schema_upgrade() {
+        let home = home();
+        fs::create_dir_all(home.path().join("state")).unwrap();
+        let id = session_id("codex:legacy");
+        let original = serde_json::json!({"schema":1,"revision":7,"projects":{},"sessions":{
+            id:{"project":null,"baseline":{"mode":"rebalance","reset_wait_secs":60},
+            "explicit":{"mode":"strict","reset_wait_secs":7},"anchor":"cx-a","movements":[]}}});
+        fs::write(
+            home.path().join("state/routing-policies.json"),
+            serde_json::to_vec(&original).unwrap(),
+        )
+        .unwrap();
+        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        assert_eq!(
+            store.plan(Some("codex:legacy:agent:one")).settings.mode,
+            Mode::Strict
+        );
+        assert!(!store.permits_dispatch(Some("codex:legacy:agent:one"), "cx-b"));
+        store
+            .put_project(
+                None,
+                Project {
+                    name: "unrelated edit".into(),
+                    settings: Settings::default(),
+                },
+            )
+            .unwrap();
+        drop(store);
+        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        assert!(!store.permits_dispatch(Some("codex:legacy:agent:two"), "cx-b"));
+        assert_eq!(
+            store.plan(Some("codex:legacy:agent:two")).anchor.as_deref(),
+            Some("cx-a")
+        );
     }
     #[test]
     fn implicit_history_follows_current_global_defaults_after_restart() {

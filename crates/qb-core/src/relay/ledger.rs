@@ -24,6 +24,7 @@ pub(in crate::relay) struct Completion {
     pub(super) dashboard_request: Option<crate::dashboard::runtime::RequestGuard>,
     pub burst_client: Option<crate::burst::Identity>,
     pub start: Instant,
+    pub precommit_deadline: Option<Instant>,
     pub input_bytes: Arc<AtomicU64>,
     pub runtime: Option<Arc<crate::account_runtime::AccountRuntime>>,
     pub failed_access: Option<zeroize::Zeroizing<String>>,
@@ -60,6 +61,7 @@ impl Completion {
             ),
             dashboard_request: None,
             start: Instant::now(),
+            precommit_deadline: None,
             burst_client: crate::burst::client_identity(headers),
             reset_hold_used: false,
             policy_blocked: false,
@@ -231,6 +233,14 @@ impl Completion {
 
 impl Drop for Completion {
     fn drop(&mut self) {
+        if self.record.status == 0
+            && self
+                .precommit_deadline
+                .is_some_and(|at| Instant::now() >= at)
+        {
+            self.record.status = 504;
+            self.record.outcome = "request_timeout".into();
+        }
         if matches!(self.record.outcome.as_str(), "ok" | "rate_hold_ok")
             && ((200..300).contains(&self.record.status)
                 || (self.record.transport == "ws" && self.record.status == 101))

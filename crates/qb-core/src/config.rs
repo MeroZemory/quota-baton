@@ -174,7 +174,7 @@ impl Default for ServerConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RoutingConfig {
     pub mode: crate::routing::Mode,
     pub churn: crate::routing::ChurnLimits,
@@ -184,6 +184,8 @@ pub struct RoutingConfig {
     pub near_reset_secs: u64,
     pub inflight_allowance_pct: f64,
     pub reset_hold_secs: u64,
+    pub request_timeout_secs: u64,
+    pub forecast_shadow: bool,
     pub rate_hold_secs: u64,
     pub rate_hold_max_retries: u32,
     pub ws_upgrade_hold_secs: u64,
@@ -204,6 +206,8 @@ impl Default for RoutingConfig {
             near_reset_secs: 18000,
             inflight_allowance_pct: 1.0,
             reset_hold_secs: 60,
+            request_timeout_secs: 300,
+            forecast_shadow: false,
             rate_hold_secs: 60,
             rate_hold_max_retries: 3,
             ws_upgrade_hold_secs: 10,
@@ -219,6 +223,15 @@ impl Default for RoutingConfig {
 impl RoutingConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         self.churn.validate()?;
+        anyhow::ensure!(
+            (1..=600).contains(&self.request_timeout_secs),
+            "routing request timeout must be 1..600 seconds"
+        );
+        anyhow::ensure!(
+            (1..=600).contains(&self.rate_hold_secs)
+                && (1..=14).contains(&self.ws_upgrade_hold_secs),
+            "rate hold must be 1..600 seconds; WebSocket upgrade must be below 15 seconds"
+        );
         anyhow::ensure!(
             self.reset_hold_secs <= 120,
             "routing reset hold cannot exceed 120 seconds"

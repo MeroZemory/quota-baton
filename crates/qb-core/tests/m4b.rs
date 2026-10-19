@@ -44,6 +44,14 @@ impl Harness {
     }
 
     async fn with_hold(provider: Provider, reset_hold_secs: u64) -> Self {
+        Self::with_limits(provider, reset_hold_secs, 300, 60).await
+    }
+    async fn with_limits(
+        provider: Provider,
+        reset_hold_secs: u64,
+        request_timeout_secs: u64,
+        rate_hold_secs: u64,
+    ) -> Self {
         // Waiting behind other bounded cases is separate from the HTTP deadline.
         let serial = tokio::time::timeout(Duration::from_secs(120), SERIAL.lock())
             .await
@@ -91,6 +99,8 @@ impl Harness {
             .unwrap();
         let mut config = Config::default();
         config.routing.reset_hold_secs = reset_hold_secs;
+        config.routing.request_timeout_secs = request_timeout_secs;
+        config.routing.rate_hold_secs = rate_hold_secs;
         config.server.data_port = 0;
         config.server.admin_port = 0;
         config.upstream.anthropic_base = fake.url.clone();
@@ -785,9 +795,16 @@ async fn quota_reset_hold_waits_two_seconds_and_keeps_http_binding() {
     let first = h.turn("/v1/responses", &headers, RAW).await;
     h.store
         .update_metadata(&first, |account| {
+            let now = Utc::now();
+            let reset = now + ChronoDuration::seconds(2);
+            account.quota_cooling = Some(QuotaCooling {
+                window: "5h".into(),
+                reset_at: reset,
+                started_at: now,
+            });
             account.health = Health::Cooling {
                 reason: HealthReason::Quota,
-                until: Utc::now() + ChronoDuration::seconds(2),
+                until: reset,
                 scope: "account".into(),
             }
         })
@@ -852,9 +869,16 @@ async fn rn1_successful_reset_hold_then_payment_failover_is_forced() {
     let first = h.turn("/v1/responses", &headers, RAW).await;
     h.store
         .update_metadata(&first, |a| {
+            let now = Utc::now();
+            let reset = now + ChronoDuration::seconds(2);
+            a.quota_cooling = Some(QuotaCooling {
+                window: "5h".into(),
+                reset_at: reset,
+                started_at: now,
+            });
             a.health = Health::Cooling {
                 reason: HealthReason::Quota,
-                until: Utc::now() + ChronoDuration::seconds(2),
+                until: reset,
                 scope: "account".into(),
             };
         })

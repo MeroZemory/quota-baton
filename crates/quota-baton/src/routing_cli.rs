@@ -42,6 +42,33 @@ pub async fn run(
         "http://127.0.0.1:{}/admin/v1/routing",
         config.server.admin_port
     );
+    let inherited_wait = if let RoutingCommand::Session {
+        id,
+        mode: Some(_),
+        reset_wait_secs: None,
+        ..
+    } = &command
+    {
+        let response = client
+            .get(&url)
+            .bearer_auth(&secrets.admin_token)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(crate::accounts_cli::AccountCliError(
+                "기존 세션 정책을 조회하지 못했습니다.",
+            )
+            .into());
+        }
+        let value: serde_json::Value = response.json().await?;
+        Some(
+            current_wait(&value, id).ok_or(crate::accounts_cli::AccountCliError(
+                "현재 세션 대기 시간을 확인하지 못했습니다.",
+            ))?,
+        )
+    } else {
+        None
+    };
     let body = match command {
         RoutingCommand::List => None,
         RoutingCommand::Project {
@@ -65,7 +92,7 @@ pub async fn run(
                 )
                 .into());
             }
-            let settings=mode.map(|mode|serde_json::json!({"mode":mode,"reset_wait_secs":reset_wait_secs.unwrap_or(config.routing.reset_hold_secs)}));
+            let settings=mode.map(|mode|serde_json::json!({"mode":mode,"reset_wait_secs":reset_wait_secs.or(inherited_wait).unwrap_or(config.routing.reset_hold_secs)}));
             Some(
                 serde_json::json!({"kind":"session","id":id,"settings":settings,"project":project,"inherit":inherit}),
             )
@@ -94,4 +121,31 @@ pub async fn run(
     let value: serde_json::Value = response.json().await?;
     crate::print_stdout(format_args!("{}", serde_json::to_string_pretty(&value)?))?;
     Ok(())
+}
+
+fn current_wait(value: &serde_json::Value, id: &str) -> Option<u64> {
+    value["sessions"][id]["settings"]["reset_wait_secs"]
+        .as_u64()
+        .or_else(|| {
+            value["observed_sessions"]
+                .as_array()?
+                .iter()
+                .find(|s| s["id"] == id)?["policy"]["settings"]["reset_wait_secs"]
+                .as_u64()
+        })
+        .or_else(|| value["defaults"]["reset_wait_secs"].as_u64())
+        .filter(|n| *n <= 120)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn mode_edit_uses_running_root_wait_then_observed_policy_then_running_default() {
+        let mut view = serde_json::json!({"defaults":{"reset_wait_secs":13},"sessions":{"synthetic":{"settings":{"reset_wait_secs":7}}},"observed_sessions":[{"id":"observed","policy":{"settings":{"reset_wait_secs":0}}}]});
+        assert_eq!(current_wait(&view, "synthetic"), Some(7));
+        assert_eq!(current_wait(&view, "observed"), Some(0));
+        assert_eq!(current_wait(&view, "new"), Some(13));
+        view["defaults"]["reset_wait_secs"] = 900.into();
+        assert_eq!(current_wait(&view, "new"), None);
+    }
 }

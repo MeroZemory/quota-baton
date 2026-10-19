@@ -116,14 +116,14 @@ fn load_file(path: &Path) -> anyhow::Result<String> {
 }
 
 #[cfg(unix)]
-fn restrict(path: &Path) -> anyhow::Result<()> {
+pub(crate) fn restrict(path: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
 
 #[cfg(windows)]
-fn restrict(path: &Path) -> anyhow::Result<()> {
+pub(crate) fn restrict(path: &Path) -> anyhow::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows::{
         Win32::{

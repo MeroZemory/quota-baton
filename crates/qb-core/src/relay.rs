@@ -61,6 +61,7 @@ pub struct RelayState {
     rate_hold_secs: u64,
     rate_hold_max_retries: u32,
     ws_upgrade_hold_secs: u64,
+    request_timeout_secs: u64,
     pub inflight_requests: Arc<AtomicU64>,
     store: Arc<AccountStore>,
     client: reqwest::Client,
@@ -93,6 +94,15 @@ pub struct RelayState {
 }
 
 impl RelayState {
+    pub fn routing_view(&self) -> serde_json::Value {
+        let mut view = self.bindings.routing_view();
+        let accounts = self.store.list().unwrap_or_default();
+        view["forecast_shadow"] = serde_json::Value::Array(accounts.iter().map(|a| {
+            serde_json::json!({"account":a.id,"forecast":self.observability.forecast_view(&a.id,
+                self.bindings.active_sessions(&a.id, chrono::Utc::now()), self.accounts.inflight_count(&a.id))})
+        }).collect());
+        view
+    }
     async fn prepare_project(
         &self,
         session: &session::Session,
@@ -445,6 +455,7 @@ impl RelayState {
         // The lease is held and account expiry/reconciliation precedes affinity restore.
         store.list()?;
         let bindings = crate::bindings::BindingTable::new(store.home(), config.routing.clone())?;
+        observability.configure_forecast(config.routing.forecast_shadow);
         observability.dashboard().attach(&bindings, config);
         for (id, settings) in &config.accounts {
             bindings.set_account_threshold(id, settings.spread_threshold);
@@ -456,6 +467,7 @@ impl RelayState {
             rate_hold_secs: config.routing.rate_hold_secs,
             rate_hold_max_retries: config.routing.rate_hold_max_retries,
             ws_upgrade_hold_secs: config.routing.ws_upgrade_hold_secs,
+            request_timeout_secs: config.routing.request_timeout_secs,
             burst: Mutex::new(crate::burst::BurstTracker::new(
                 config.tray.burst_new_sessions,
             )),
@@ -616,7 +628,20 @@ impl RelayState {
                         && !runtime.blocked_in_memory(&a.id)
                         && store.tokens(a).is_ok_and(|t| !t.access_token.is_empty())
                 })
-                .map(|account| {
+                .map(|mut account| {
+                    if account.quota_cooling.is_none()
+                        && let Some(reset) = runtime.observed_quota_reset(&account)
+                    {
+                        account.quota_cooling = Some(crate::accounts::QuotaCooling {
+                            window: "observed".into(),
+                            reset_at: reset,
+                            started_at: chrono::Utc::now(),
+                        });
+                    }
+                    obs.forecast_load(
+                        &account.id,
+                        bindings.active_sessions(&account.id, chrono::Utc::now()),
+                    );
                     let pacing = runtime.pacing_snapshot(&account.id);
                     bindings.set_pacing(
                         &account.id,
@@ -649,9 +674,20 @@ impl RelayState {
         // Cooling/disabled accounts must not supply phantom rebalance room.
         // Keep them in ordinary selection so near-reset holds still work.
         candidates.retain(|candidate| candidate.account.eligible_at(None, now));
-        let (active, threshold, groups_hit, marked) =
-            self.bindings
-                .note_client_rate(provider, account, key, &candidates, now);
+        let table = self.bindings.clone();
+        let owned_account = account.to_owned();
+        let owned_key = key.map(str::to_owned);
+        let (active, threshold, groups_hit, marked) = tokio::task::spawn_blocking(move || {
+            table.note_client_rate(
+                provider,
+                &owned_account,
+                owned_key.as_deref(),
+                &candidates,
+                now,
+            )
+        })
+        .await
+        .unwrap_or_default();
         if marked > 0 || (groups_hit >= 3 && self.bindings.overload_report_due(account, now)) {
             self.observability
                 .record_overload(account, active, threshold, groups_hit, marked);
@@ -724,6 +760,11 @@ impl RelayState {
         eligible
             && !self.accounts.blocked_in_memory(id)
             && self.bindings.policies.permits_dispatch(key, id)
+            && key.is_none_or(|key| {
+                self.bindings
+                    .current(Some(key))
+                    .is_none_or(|current| current == id)
+            })
     }
 
     async fn select_request(
@@ -908,10 +949,41 @@ impl RelayState {
                     held_account = self.bindings.current(session.key.as_deref());
                     let wait = (until - chrono::Utc::now()).to_std().unwrap_or_default();
                     completion.reset_hold_used = true;
-                    tokio::time::sleep(wait).await;
-                    // This flag is request-local; a later turn may hold again.
-                    completion.reset_hold_timed_out = true;
+                    // Convert wall time once; policy/account edits interrupt
+                    // the monotonic wait. A later request has its own budget.
+                    completion.reset_hold_timed_out = self
+                        .wait_reset(session.key.as_deref(), held_account.as_deref(), wait)
+                        .await;
                 }
+            }
+        }
+    }
+
+    async fn wait_reset(&self, key: Option<&str>, id: Option<&str>, wait: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + wait;
+        let mut events = self.accounts.subscribe();
+        loop {
+            let changed = self.bindings.policies.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let plan = self.bindings.policies.plan(key);
+            if self.is_draining()
+                || plan.settings.reset_wait_secs == 0
+                || deadline.saturating_duration_since(tokio::time::Instant::now())
+                    > Duration::from_secs(plan.settings.reset_wait_secs)
+                || id.is_some_and(|id| !self.bindings.policies.permits_dispatch(key, id))
+            {
+                return false;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => return true,
+                _ = &mut changed => return false,
+                _ = self.drain_start_notify.notified() => return false,
+                event = events.recv() => match event {
+                    Ok(event) if id.is_some_and(|id| event["data"]["id"] == id) => return false,
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
+                    Err(_) => return false,
+                },
             }
         }
     }
@@ -941,18 +1013,24 @@ impl RelayState {
         let reset = match &account.health {
             Health::Cooling {
                 reason: HealthReason::Quota,
-                until,
                 scope,
+                ..
             } if account.user_state == UserState::Active
                 && (scope == "account"
                     || scope
                         .strip_prefix("model:")
                         .is_some_and(|m| model == Some(m))) =>
             {
-                account
+                let Some(reset) = account
                     .quota_cooling
                     .as_ref()
-                    .map_or(*until, |q| q.reset_at)
+                    .map(|q| q.reset_at)
+                    .or_else(|| self.accounts.observed_quota_reset(&account))
+                else {
+                    tracing::debug!(account = %id, reason = "no_observed_reset_evidence", "reset hold skipped");
+                    return Ok(false);
+                };
+                reset
             }
             _ => {
                 tracing::debug!(account = %id, reason = "account_not_active_quota_cooling", "reset hold skipped");
@@ -976,7 +1054,13 @@ impl RelayState {
         completion.end_attempt();
         completion.reset_hold_used = true;
         completion.failover("reset_hold_retry");
-        tokio::time::sleep(wait).await;
+        if !self
+            .wait_reset(session.key.as_deref(), Some(id), wait)
+            .await
+        {
+            tracing::debug!(account = %id, reason = "reset_hold_interrupted", "reset hold skipped");
+            return Ok(false);
+        }
         let store = self.store.clone();
         let account_id = id.to_owned();
         let account = tokio::task::spawn_blocking(move || store.load(&account_id))
@@ -1257,7 +1341,31 @@ async fn handover_http(state: Arc<RelayState>, request: Request) -> Response {
     }
 }
 
+#[derive(Clone, Copy)]
+struct RequestDeadline(Instant);
 async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Response {
+    let provider = if request.uri().path().starts_with("/v1/messages") {
+        Provider::Claude
+    } else {
+        Provider::Codex
+    };
+    let timeout = Duration::from_secs(state.request_timeout_secs);
+    request
+        .extensions_mut()
+        .insert(RequestDeadline(Instant::now() + timeout));
+    tokio::time::timeout(timeout, relay_inner(state, request))
+        .await
+        .unwrap_or_else(|_| {
+            native_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                provider,
+                "request_timeout",
+                "계정 선택·대기·재시도의 전체 시간 한도를 초과했습니다.",
+            )
+        })
+}
+
+async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
     let project = match crate::routing::take_project(request.headers_mut()) {
         Ok(project) => project,
         Err(_) => {
@@ -1322,6 +1430,7 @@ async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Re
         provider,
         &parts.headers,
     );
+    completion.precommit_deadline = parts.extensions.get::<RequestDeadline>().map(|d| d.0);
     completion.track(state.inflight_requests.clone());
     completion.runtime = Some(state.accounts.clone());
     let Some((_, upstream_path)) = routed else {
@@ -1519,12 +1628,14 @@ async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Re
     let mut network_retry = false;
     let mut token_retry = false;
     let mut rate_retries = 0_u32;
+    let mut rate_retry_queued = false;
     let rate_hold_started = Instant::now();
     let rate_hold_deadline = rate_hold_started + Duration::from_secs(state.rate_hold_secs);
     let mut rate_relay_retry_after = None;
     let mut rate_relayed = false;
     let mut permission_denials = 0;
     let mut probe = state.claim_probe(&mut account).await;
+    let mut last_rate_response = None;
     let (status, response_headers, held) = loop {
         if !account.eligible(request_model.as_deref()) {
             let next = state
@@ -1580,6 +1691,28 @@ async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Re
             .await;
         drop(dashboard_pacing);
         completion.rate_wait(admission_started.elapsed().as_millis() as u64);
+        if admission.forced() {
+            if let Some(previous) = last_rate_response.take() {
+                rate_relayed = true;
+                state
+                    .note_client_rate(provider, &account.id, session.key.as_deref())
+                    .await;
+                completion.relayed_rate_429();
+                break previous;
+            }
+            let mut response = failure(
+                &mut completion,
+                StatusCode::TOO_MANY_REQUESTS,
+                provider,
+                "rate_wait_timeout",
+                "요청 속도 제한의 대기 한도에 도달했습니다. 잠시 후 다시 요청해 주세요.",
+            );
+            response
+                .headers_mut()
+                .insert("retry-after", HeaderValue::from_static("1"));
+            return response;
+        }
+        drop(last_rate_response.take());
         if !state
             .dispatch_allowed(
                 session.key.as_deref(),
@@ -1611,6 +1744,21 @@ async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Re
                     );
                 }
             };
+        if completion
+            .precommit_deadline
+            .is_some_and(|at| Instant::now() >= at)
+        {
+            return failure(
+                &mut completion,
+                StatusCode::GATEWAY_TIMEOUT,
+                provider,
+                "request_timeout",
+                "전송 전 전체 시간 한도를 초과했습니다.",
+            );
+        }
+        if std::mem::take(&mut rate_retry_queued) {
+            completion.rate_retry();
+        }
         completion.attempt(&account.id);
         let sent_at = Instant::now();
         let send = state
@@ -1831,7 +1979,7 @@ async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Re
         } else if decision.kind == outcome::Kind::Rate {
             state.bindings.note_rate(&account.id, chrono::Utc::now());
             let retry_after = outcome::header_seconds(&response_headers, "retry-after")
-                .map(|seconds| Duration::from_secs(seconds.min(60) as u64));
+                .map(|seconds| Duration::from_secs(seconds as u64));
             let pacing = state.accounts.observe_429_at(
                 &account.id,
                 sent_at,
@@ -1852,8 +2000,9 @@ async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Re
                 && let Some(body) = copy.retry_body().await
             {
                 rate_retries += 1;
-                completion.rate_retry();
+                rate_retry_queued = true;
                 body_to_send = body;
+                last_rate_response = Some((status, response_headers, held));
                 // The next shared admission owns all rate delay. Its
                 // absolute deadline is unchanged across same-account retries.
                 continue;
