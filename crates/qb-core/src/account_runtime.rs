@@ -505,6 +505,12 @@ impl AccountRuntime {
         // A window containing a 429 is not quiet. Each following full quiet
         // window decays one step; successful responses do not reset this clock.
         while state.step > 0 && state.step_decay_at.is_some_and(|at| at <= now) {
+            if state.step == 1 && !state.waiting.is_empty() {
+                // A draining FIFO is still absorbing the storm. Do not erase
+                // its final pacing step and release the entire tail at once.
+                state.step_decay_at = Some(now + state.step_decay_interval);
+                break;
+            }
             state.step -= 1;
             state.step_decay_at = state.step_decay_at.map(|at| at + state.step_decay_interval);
         }
@@ -1643,6 +1649,42 @@ mod r1_rate_tests {
         assert_eq!(second.rate_release_interval, StdDuration::from_millis(500));
     }
 
+    #[test]
+    fn a_queued_tail_keeps_the_last_step_until_a_full_quiet_interval_after_drain() {
+        let f = Fixture::new();
+        let start = Instant::now();
+        f.runtime.observe_429_at(ID, start, start, None, 1.0);
+        let waiter = Arc::new(PacingWaiter {
+            deadline: at(start, 60),
+            forced: std::sync::atomic::AtomicBool::new(false),
+            notify: Notify::new(),
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+        });
+        f.runtime
+            .pacing
+            .lock()
+            .unwrap()
+            .get_mut(ID)
+            .unwrap()
+            .waiting
+            .push_back(waiter);
+        assert_eq!(f.runtime.pacing_snapshot_at(ID, at(start, 10)).rate_step, 1);
+        f.runtime
+            .pacing
+            .lock()
+            .unwrap()
+            .get_mut(ID)
+            .unwrap()
+            .waiting
+            .clear();
+        assert_eq!(
+            f.runtime
+                .pacing_snapshot_at(ID, at(start, 12) - StdDuration::from_nanos(1))
+                .rate_step,
+            1
+        );
+        assert_eq!(f.runtime.pacing_snapshot_at(ID, at(start, 12)).rate_step, 0);
+    }
     #[test]
     fn r1_step_decays_at_full_quiet_backoff_boundaries_not_sixty_seconds() {
         let f = Fixture::new();
