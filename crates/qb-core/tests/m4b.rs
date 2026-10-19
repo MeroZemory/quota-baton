@@ -515,6 +515,12 @@ async fn next_request_can_hold_again_after_failed_hold_without_a_move() {
                 });
             })
             .unwrap();
+        // Atomic metadata writes can consume part of the reset interval under
+        // full-suite IO load. Verify waiting until the actual deadline rather
+        // than charging setup time to the request's elapsed time.
+        let remaining = (now + ChronoDuration::milliseconds(2500) - Utc::now())
+            .to_std()
+            .unwrap_or_default();
         let start = Instant::now();
         let (status, _, body) = h.send("/v1/responses", &headers, RAW).await;
         let elapsed = start.elapsed();
@@ -523,7 +529,10 @@ async fn next_request_can_hold_again_after_failed_hold_without_a_move() {
             serde_json::from_slice::<Value>(&body).unwrap()["error"]["type"],
             "usage_limit_reached"
         );
-        assert!(elapsed >= Duration::from_millis(1500), "{elapsed:?}");
+        assert!(
+            elapsed >= remaining.saturating_sub(Duration::from_millis(100)),
+            "{elapsed:?}, remaining {remaining:?}"
+        );
         assert!(elapsed < Duration::from_millis(3500), "{elapsed:?}");
         assert_eq!(h.fake.state.requests().len(), 1);
         h.counts(&[(&first, 1), (&other, 0)]).await;
