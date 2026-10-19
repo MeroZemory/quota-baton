@@ -3475,3 +3475,44 @@ async fn full_meter_with_permitted_credits_keeps_rate_retry_on_same_account() {
             .all(|a| a.health == Health::Ready)
     );
 }
+
+#[tokio::test]
+async fn committed_probe_store_failure_preserves_success_and_blocks_later_dispatch() {
+    let h = Harness::new(Provider::Claude, 1, 384, 1024).await;
+    let id = h.ids()[0].clone();
+    h.store
+        .update_metadata(&id, |a| {
+            a.auth_probe_pending = true;
+            a.auth_failures = 1;
+        })
+        .unwrap();
+    let path = h.home.join("accounts").join(format!("{id}.json"));
+    let original = fs::metadata(&path).unwrap().permissions();
+    let mut readonly = original.clone();
+    readonly.set_readonly(true);
+    fs::set_permissions(&path, readonly).unwrap();
+    let raw=Bytes::from_static(b"event: message_start\ndata: {\"type\":\"message_start\"}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+    h.fake
+        .state
+        .push(ScriptedResponse::sse(vec![(Duration::ZERO, raw.clone())]));
+    let response = h
+        .send_with_session(Provider::Claude, "committed-probe")
+        .await;
+    let status = response.status();
+    let body = response.bytes().await.unwrap();
+    fs::set_permissions(&path, original).unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, raw);
+    assert_eq!(h.fake.state.requests().len(), 1);
+    assert_eq!(
+        h.fake.state.requests()[0].headers["authorization"],
+        "Bearer synthetic-access-0"
+    );
+    assert!(!h.state.accounts.eligible(&id, None).await);
+    let next = h
+        .send_with_session(Provider::Claude, "committed-probe")
+        .await;
+    assert_ne!(next.status(), StatusCode::OK);
+    assert_eq!(h.fake.state.requests().len(), 1);
+    assert!(h.ledger().iter().any(|r|r["event"]=="core_warning" && r["code"]=="probe_store_failed_after_commit"));
+}

@@ -332,6 +332,12 @@ impl AccountRuntime {
             .unwrap_or(false)
     }
 
+    #[cfg(feature = "testkit")]
+    pub fn pending_quota_count_for_test(&self, key: &str) -> usize {
+        self.pending_quota_tickets(quota_session(Some(key)).as_deref())
+            .len()
+    }
+
     pub(crate) fn pending_quota_tickets(
         &self,
         session_hash: Option<&str>,
@@ -532,6 +538,17 @@ impl AccountRuntime {
         }
     }
 
+    fn finish_queue_transition(state: &mut PacingState, had_waiters: bool, now: Instant) {
+        if had_waiters && state.waiting.is_empty() && state.step > 0 {
+            let after_drain = now + state.step_decay_interval;
+            state.step_decay_at = Some(
+                state
+                    .step_decay_at
+                    .map_or(after_drain, |old| old.max(after_drain)),
+            );
+        }
+    }
+
     pub fn observe_429(&self, id: &str, retry_after: Option<StdDuration>) -> PacingSnapshot {
         self.observe_429_at(id, Instant::now(), Instant::now(), retry_after, 1.0)
     }
@@ -668,6 +685,7 @@ impl AccountRuntime {
                 let state = Self::pacing_state(&mut states, &id);
                 let now = Instant::now();
                 Self::decay_pacing(state, now);
+                let had_waiters = !state.waiting.is_empty();
                 while state
                     .waiting
                     .front()
@@ -675,6 +693,7 @@ impl AccountRuntime {
                 {
                     state.waiting.pop_front();
                 }
+                Self::finish_queue_transition(state, had_waiters, now);
                 let selected = state
                     .waiting
                     .iter()
@@ -698,6 +717,7 @@ impl AccountRuntime {
                 if now >= gate || now >= deadline {
                     let forced = now >= deadline;
                     state.waiting.remove(selected);
+                    Self::finish_queue_transition(state, true, now);
                     if pacing && !forced {
                         state.last_release = Some(now);
                     }
@@ -1649,41 +1669,100 @@ mod r1_rate_tests {
         assert_eq!(second.rate_release_interval, StdDuration::from_millis(500));
     }
 
-    #[test]
-    fn a_queued_tail_keeps_the_last_step_until_a_full_quiet_interval_after_drain() {
+    #[tokio::test]
+    async fn actual_fifo_release_starts_the_last_quiet_interval_at_drain() {
         let f = Fixture::new();
-        let start = Instant::now();
-        f.runtime.observe_429_at(ID, start, start, None, 1.0);
-        let waiter = Arc::new(PacingWaiter {
-            deadline: at(start, 60),
-            forced: std::sync::atomic::AtomicBool::new(false),
-            notify: Notify::new(),
-            cancelled: std::sync::atomic::AtomicBool::new(false),
-        });
-        f.runtime
+        f.runtime.observe_429(ID, None);
+        let guards = futures_util::future::join_all((0..16).map(|_| f.runtime.admit(ID))).await;
+        let drained = f
+            .runtime
             .pacing
             .lock()
             .unwrap()
-            .get_mut(ID)
+            .get(ID)
             .unwrap()
-            .waiting
-            .push_back(waiter);
-        assert_eq!(f.runtime.pacing_snapshot_at(ID, at(start, 10)).rate_step, 1);
-        f.runtime
-            .pacing
-            .lock()
-            .unwrap()
-            .get_mut(ID)
-            .unwrap()
-            .waiting
-            .clear();
+            .last_release
+            .unwrap();
+        tokio::time::sleep_until(tokio::time::Instant::from_std(
+            drained + StdDuration::from_millis(400),
+        ))
+        .await;
         assert_eq!(
-            f.runtime
-                .pacing_snapshot_at(ID, at(start, 12) - StdDuration::from_nanos(1))
-                .rate_step,
-            1
+            f.runtime.pacing_snapshot(ID).rate_step,
+            1,
+            "the FIFO drained between decay boundaries"
         );
-        assert_eq!(f.runtime.pacing_snapshot_at(ID, at(start, 12)).rate_step, 0);
+        let _first = f.runtime.admit(ID).await;
+        let before = Instant::now();
+        let _next = f.runtime.admit(ID).await;
+        assert!(
+            before.elapsed() >= StdDuration::from_millis(180),
+            "post-drain admissions still need spacing"
+        );
+        let until = {
+            let states = f.runtime.pacing.lock().unwrap();
+            states.get(ID).unwrap().step_decay_at.unwrap()
+        };
+        tokio::time::sleep_until(tokio::time::Instant::from_std(
+            until + StdDuration::from_millis(30),
+        ))
+        .await;
+        assert_eq!(f.runtime.pacing_snapshot(ID).rate_step, 0);
+        drop(guards);
+    }
+    #[test]
+    fn a_queued_tail_keeps_a_full_quiet_interval_from_the_actual_drain() {
+        for removal in ["release", "deadline", "cancellation"] {
+            let f = Fixture::new();
+            let start = Instant::now();
+            f.runtime.observe_429_at(ID, start, start, None, 1.0);
+            let waiter = Arc::new(PacingWaiter {
+                deadline: at(start, 60),
+                forced: std::sync::atomic::AtomicBool::new(false),
+                notify: Notify::new(),
+                cancelled: std::sync::atomic::AtomicBool::new(false),
+            });
+            f.runtime
+                .pacing
+                .lock()
+                .unwrap()
+                .get_mut(ID)
+                .unwrap()
+                .waiting
+                .push_back(waiter);
+            assert_eq!(f.runtime.pacing_snapshot_at(ID, at(start, 4)).rate_step, 1);
+            let drained = at(start, 5) + StdDuration::from_millis(750);
+            {
+                let mut states = f.runtime.pacing.lock().unwrap();
+                let state = states.get_mut(ID).unwrap();
+                let waiter = state.waiting.pop_front().unwrap();
+                if removal == "cancellation" {
+                    waiter.cancelled.store(true, Ordering::Release);
+                }
+                if removal == "deadline" {
+                    waiter.forced.store(true, Ordering::Release);
+                }
+                AccountRuntime::finish_queue_transition(state, true, drained);
+            }
+            assert_eq!(
+                f.runtime.pacing_snapshot_at(ID, at(start, 6)).rate_step,
+                1,
+                "{removal}"
+            );
+            let until = drained + StdDuration::from_secs(2);
+            assert_eq!(
+                f.runtime
+                    .pacing_snapshot_at(ID, until - StdDuration::from_nanos(1))
+                    .rate_step,
+                1,
+                "{removal}"
+            );
+            assert_eq!(
+                f.runtime.pacing_snapshot_at(ID, until).rate_step,
+                0,
+                "{removal}"
+            );
+        }
     }
     #[test]
     fn r1_step_decays_at_full_quiet_backoff_boundaries_not_sixty_seconds() {
