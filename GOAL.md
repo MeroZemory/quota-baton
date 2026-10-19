@@ -49,14 +49,14 @@ Implement quota-baton exactly as specified, milestone by milestone, until M8 is 
 |---|---|
 | M0, M1a, M2, M3, M4a, M4b, M5, M1b, M6a, M4c, M6b, M7a, M6b.2, M7b, M4d, M7c, M8, M6c | merged, including the M7c 24 h addendum (no upward trend). Running the cutover on the live profile is the user's decision (D9) and out of scope for you |
 | R1 | merged (all five groups plus R1-tray.1) |
-| R2 | D17: Part A (adopt + manual refresh + refresh regardless of user_state) right after the current R1 group, MUST merge before 10-22; then R1 groups 3-5; then Part B (retire-cpa/restore-cpa); brief `R2-adopt-retire-cpa.md` |
+| R2 | Part A merged (adopt, manual refresh, refresh regardless of user_state). Part B (retire-cpa/restore-cpa) is held by the user's design/review pause below; do not change the real profile or install. Resume only when that hold is lifted. Brief: `R2-adopt-retire-cpa.md` |
 | R3 | merged (codex-qb and claude-qb) |
 | R1-tray.2 | merged (notifications) |
 | R4 | merged (plan tier, credits_in_use, precondition) |
 | R5 | merged (`6feb99e`; full gate passed, including default/full workspace, standalone core, strict clippy and actual native captures/actions/memory). Report: `.sandbox/reports/R5.md`. Latest approved healthy bars are green; credits confirm every time |
 | R3.2 | merged (`f3fc3f7`; full gate: default 966, full 994, standalone core 328; strict clippy passed). Report: `.sandbox/reports/R3.2.md`. codex-qb/claude-qb set the window title (launcher title + Codex `[tui] terminal_title = []`, Claude title env), with an in-place upgrade path; after R5; brief `R3.2-launcher-titles.md` |
 | R6 | merged (`2245050`; full gate: default 1,056, full 1,085, standalone core 363; strict clippy and native Codex/Claude inspect/cancel/new/replace passed). Report: `.sandbox/reports/R6.md`. D18 takeover preserves ids, protects one-use refresh recovery, and keeps 30-day windows visible |
-| R7 | separate dashboard window (user-approved; sessions by account, activity, 48 h usage; label header stripped upstream); after R6, before R2 Part B; brief `R7-dashboard.md`, spec `.sandbox/design/dashboard/SPEC.md` |
+| R7 | merged (`4bbe855`; full gate: default 1,176, full 1,205, standalone core 410; strict clippy and actual spawned-core dashboard captures/actions passed). Report: `.sandbox/reports/R7.md`. Separate dashboard, shared SSE, bounded session/activity/usage views and memory-only labels; no real profile/install changes |
 
 ## Hard boundaries (never)
 
