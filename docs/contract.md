@@ -449,7 +449,7 @@ Some outcomes never count toward the trigger, because they are not account conce
 - Anything when no account has room. The sessions are then well spread, and a 429 only paces.
 - A running stream, an in-flight request, or a WebSocket with a response in flight.
 
-**Local rebalance constraints.** Rebalance never takes a target over its threshold, and a move never leaves the target more loaded than the source. These constraints do not by themselves bound repeated A→B→A moves across changing load and successive requests. Group-level dwell/revisit budgets are proposed separately in the [routing design supplement](account-routing-design.md#4-계정-왕복과-이동-비용); they are not implemented settings in this contract.
+**Local rebalance constraints.** Rebalance never takes a target over its threshold, and a move never leaves the target more loaded than the source. These constraints do not by themselves bound repeated A→B→A moves across changing load and successive requests. Additional persisted group/pool limits are specified in C7.2 and the [routing design supplement](account-routing-design.md#4-계정-왕복과-이동-비용).
 
 **Speed.** The cure is deliberately slow: at most 2 moves per account per window. Placement is the main lever.
 
@@ -471,7 +471,9 @@ The authenticated routing admin API registers opaque projects and applies root-s
 
 Explicit intent, anchor and movement history are atomically persisted in `state/routing-policies.json` before a strict first dispatch or account move. Corrupt intent refuses startup rather than silently forgetting a lock. The file is bounded to 16MiB, 20,000 root records, 1,024 projects and 32 retained movement entries per root. Capacity/write failure fails closed. Takeover retires the old writer and reloads durable intent after lease handover. Normal binding LRU/write-behind cannot erase the lock.
 
-`reset_wait_secs` is a root/project setting in 0–120 seconds; omitted global intent retains `routing.reset_hold_secs` (60). It is separate from paid-credit permission. New defaults do not silently change existing explicit baselines. The broader forecast/churn supplement remains staged; proposed controls must not be advertised as tested until its acceptance cases pass.
+`reset_wait_secs` is a root/project setting in 0–120 seconds; omitted global intent retains `routing.reset_hold_secs` (60). It is separate from paid-credit permission. New defaults do not silently change existing explicit baselines. `routing.churn` bounds discretionary moves: dwell 1,800 s, revisit 3,600 s, group/pool window 600 s, at most 3 group moves and 4 discretionary provider moves per window, target quiet 120 s, recent success within 300 s, and known full-input cost at most 8 MiB. These are configurable local safeguards, not provider limits. Movement reservations count against new-placement room. A healthy current account keeps serving when discretionary movement is forbidden; an exhausted recovery budget fails closed. Targets need fresh per-window observations and recent actual success, and must remain eligible, non-draining and non-pacing at execution. Unknown restored/full-input cost suppresses discretionary movement. Idle socket pins protect bindings but do not count as active demand.
+
+Associating a project preserves an explicit root override unless `inherit: true` / CLI `--inherit` is supplied. A history-only root follows current global defaults. Startup captures strict anchors before pruning legacy bindings. Serving rechecks current intent and account eligibility after pacing/reset waits, including WS create/reconnect. Readers use immutable intent snapshots; disk writers never hold the binding/read lock across I/O. Forecast and total-deadline work remain staged until their tests and final gate pass.
 
 ## C8. Session keys and the allowed body peek
 

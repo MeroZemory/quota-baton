@@ -177,6 +177,7 @@ impl Default for ServerConfig {
 #[serde(default)]
 pub struct RoutingConfig {
     pub mode: crate::routing::Mode,
+    pub churn: crate::routing::ChurnLimits,
     pub gate_5h_pct: f64,
     pub gate_weekly_pct: f64,
     pub gate_weekly_near_reset_pct: f64,
@@ -196,6 +197,7 @@ impl Default for RoutingConfig {
     fn default() -> Self {
         Self {
             mode: crate::routing::Mode::Rebalance,
+            churn: crate::routing::ChurnLimits::default(),
             gate_5h_pct: 90.0,
             gate_weekly_pct: 90.0,
             gate_weekly_near_reset_pct: 98.0,
@@ -216,6 +218,7 @@ impl Default for RoutingConfig {
 
 impl RoutingConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
+        self.churn.validate()?;
         anyhow::ensure!(
             self.reset_hold_secs <= 120,
             "routing reset hold cannot exceed 120 seconds"

@@ -690,6 +690,42 @@ impl RelayState {
         }
     }
 
+    /// Recheck after every await that can outlive a policy/account edit. An
+    /// admitted auth probe owns its slot, so do not reject its own probe flag.
+    async fn dispatch_allowed(&self, key: Option<&str>, id: &str, model: Option<&str>) -> bool {
+        if self.accounts.blocked_in_memory(id) {
+            return false;
+        }
+        let store = self.store.clone();
+        let obs = self.observability.clone();
+        let bindings = self.bindings.clone();
+        let owned_id = id.to_owned();
+        let owned_model = model.map(str::to_owned);
+        let eligible = tokio::task::spawn_blocking(move || {
+            if !store.takeover_fenced(&owned_id).is_ok_and(|fenced| !fenced) {
+                return false;
+            }
+            let Ok(account) = store.load(&owned_id) else {
+                return false;
+            };
+            bindings.account_dispatch_eligible(
+                &crate::bindings::Candidate {
+                    quota: obs.quota_snapshot(&owned_id),
+                    account,
+                    inflight: 0,
+                },
+                owned_model.as_deref(),
+            )
+        })
+        .await
+        .unwrap_or(false);
+        // Last synchronous check: policy publication is immutable and never
+        // waits for the disk writer. No await separates it from the caller.
+        eligible
+            && !self.accounts.blocked_in_memory(id)
+            && self.bindings.policies.permits_dispatch(key, id)
+    }
+
     async fn select_request(
         &self,
         provider: Provider,
@@ -947,12 +983,21 @@ impl RelayState {
             .await
             .map_err(|_| ())?
             .map_err(|_| ())?;
-        if !account.eligible(model) {
+        if !account.eligible(model)
+            || !self
+                .dispatch_allowed(session.key.as_deref(), id, model)
+                .await
+        {
             completion.reset_hold_timed_out = true;
             tracing::debug!(account = %id, reason = "account_still_ineligible_after_reset", "reset hold skipped");
             return Ok(false);
         }
-        completion.binding = Some(self.bindings.begin_request(session.key.as_deref(), id));
+        completion.binding = Some(
+            self.bindings
+                .begin_request_async(session.key.as_deref(), id)
+                .await
+                .map_err(|_| ())?,
+        );
         Ok(true)
     }
 }
@@ -1413,7 +1458,18 @@ async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Re
     // Phase-0 forced replay bypasses affinity, but still participates in the
     // authoritative placement reservation count.
     if completion.binding.is_none() {
-        completion.binding = Some(state.bindings.begin_request(None, &account.id));
+        completion.binding = match state.bindings.begin_request_async(None, &account.id).await {
+            Ok(lease) => Some(lease),
+            Err(_) => {
+                return failure(
+                    &mut completion,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    provider,
+                    "routing_policy_blocked",
+                    "요청 예약을 확정하지 못했습니다.",
+                );
+            }
+        };
     }
     tried.insert(account.id.clone());
     #[cfg(all(feature = "phase0", debug_assertions))]
@@ -1524,6 +1580,24 @@ async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Re
             .await;
         drop(dashboard_pacing);
         completion.rate_wait(admission_started.elapsed().as_millis() as u64);
+        if !state
+            .dispatch_allowed(
+                session.key.as_deref(),
+                &account.id,
+                request_model.as_deref(),
+            )
+            .await
+        {
+            completion.policy_blocked = !state
+                .bindings
+                .policies
+                .permits_dispatch(session.key.as_deref(), &account.id);
+            let response = state
+                .unavailable(&mut completion, provider, false, request_model.as_deref())
+                .await;
+            completion.outcome(response.status().as_u16(), "dispatch_revoked");
+            return response;
+        }
         let upstream_headers =
             match headers::upstream(&parts.headers, &account, &tokens.access_token) {
                 Ok(headers) => headers,
@@ -1755,6 +1829,7 @@ async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Re
                 }
             }
         } else if decision.kind == outcome::Kind::Rate {
+            state.bindings.note_rate(&account.id, chrono::Utc::now());
             let retry_after = outcome::header_seconds(&response_headers, "retry-after")
                 .map(|seconds| Duration::from_secs(seconds.min(60) as u64));
             let pacing = state.accounts.observe_429_at(

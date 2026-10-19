@@ -78,6 +78,12 @@ pub(super) type ClientSocket = WebSocketStream<hyper_util::rt::TokioIo<hyper::up
 async fn redial_same_account(context: &pump::Context) -> Result<UpstreamSocket, ()> {
     let relay = context.relay.as_ref().ok_or(())?;
     let (account, token) = context.credentials.as_ref().ok_or(())?;
+    if !relay
+        .dispatch_allowed(context.session.key.as_deref(), &account.id, None)
+        .await
+    {
+        return Err(());
+    }
     let mut forwarded = headers::upstream(&context.headers, account, token).map_err(|_| ())?;
     let key = generate_key();
     forwarded.insert("connection", HeaderValue::from_static("Upgrade"));
@@ -248,6 +254,11 @@ async fn upgrade_inner(
         let account = match selected {
             Ok(Some(account)) => account,
             Ok(None) => {
+                if completion.policy_blocked {
+                    return state
+                        .unavailable(completion, Provider::Codex, true, None)
+                        .await;
+                }
                 return match last_error {
                     Some(response) => response,
                     None => {
@@ -289,6 +300,18 @@ async fn upgrade_inner(
                 u64::try_from(admission_started.elapsed().as_millis()).unwrap_or(u64::MAX),
             );
             let forced = admission.forced();
+            if !state
+                .dispatch_allowed(session.key.as_deref(), &account.id, None)
+                .await
+            {
+                completion.policy_blocked = !state
+                    .bindings
+                    .policies
+                    .permits_dispatch(session.key.as_deref(), &account.id);
+                return state
+                    .unavailable(completion, Provider::Codex, true, None)
+                    .await;
+            }
             let mut forwarded =
                 match headers::upstream(&parts.headers, &account, &tokens.access_token) {
                     Ok(headers) => headers,
@@ -408,6 +431,7 @@ async fn upgrade_inner(
                 decision.signal = None;
             }
             if decision.kind == super::outcome::Kind::Rate {
+                state.bindings.note_rate(&account.id, chrono::Utc::now());
                 let retry_after = super::outcome::header_seconds(&error.headers, "retry-after")
                     .map(|seconds| Duration::from_secs((seconds as u64).min(60)));
                 state.accounts.observe_429_at(
