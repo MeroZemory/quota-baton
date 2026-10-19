@@ -606,6 +606,13 @@ impl BindingTable {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Data::default(),
             Err(e) => return Err(e.into()),
         };
+        // Validate/capture before constructing an auto-flushing table. A failed
+        // legacy alias recovery must not prune or overwrite the source on Drop.
+        policies.capture_strict_anchors(
+            data.groups
+                .iter()
+                .map(|(key, g)| (key.as_str(), g.account.as_str())),
+        )?;
         let table = Arc::new(Self {
             policies,
             path,
@@ -616,14 +623,6 @@ impl BindingTable {
             mutations: Mutex::new(()),
             writes_stopped: AtomicBool::new(false),
         });
-        {
-            let data = table.data.lock().unwrap_or_else(|e| e.into_inner());
-            table.policies.capture_strict_anchors(
-                data.groups
-                    .iter()
-                    .map(|(key, g)| (key.as_str(), g.account.as_str())),
-            )?;
-        }
         table.prune(
             &mut table.data.lock().unwrap_or_else(|e| e.into_inner()),
             Utc::now(),
@@ -1751,13 +1750,13 @@ impl BindingTable {
     /// Takeover only: reject import while any request or socket owns the table.
     pub fn import(&self, value: Value) -> Result<()> {
         let _mutation = self.mutations.lock().unwrap_or_else(|e| e.into_inner());
-        let mut next = decode_scoped(value, self.policies.requires_strict_recovery())?;
         let d = self.data.lock().unwrap_or_else(|e| e.into_inner());
         if !d.active.is_empty() || !d.pins.is_empty() || !d.pending.is_empty() {
             bail!("cannot import active binding table");
         }
         drop(d);
         self.policies.reload()?;
+        let mut next = decode_scoped(value, self.policies.requires_strict_recovery())?;
         self.policies.capture_strict_anchors(
             next.groups
                 .iter()
@@ -2385,9 +2384,15 @@ mod tests {
                 )
                 .unwrap();
             }
+            drop(lease);
+            assert!(t.data.lock().unwrap().active.is_empty());
             let before = t.export().unwrap();
             let conflict = json!({"schema":1,"bindings":[{"key":"claude:conflict","account":"a","last_used":Utc::now()},{"key":"claude:conflict:agent:x","account":"b","last_used":Utc::now()}]});
-            assert!(t.import(conflict.clone()).is_err());
+            let error = t.import(conflict.clone()).unwrap_err();
+            assert!(
+                error.to_string().contains("strict binding group"),
+                "{error}"
+            );
             assert_eq!(t.export().unwrap(), before);
             t.freeze().unwrap();
             let bytes = serde_json::to_vec(&conflict).unwrap();
@@ -2397,7 +2402,6 @@ mod tests {
                 assert!(BindingTable::new(dir.path(), cfg.clone()).is_err());
                 assert_eq!(fs::read(&t.path).unwrap(), bytes);
             }
-            drop(lease);
         }
     }
     #[test]
@@ -2454,12 +2458,125 @@ mod tests {
         crate::local_secrets::restrict(&path).unwrap();
         let t = BindingTable::new(dir.path(), RoutingConfig::default()).unwrap();
         assert_eq!(t.count(), CAPACITY);
+        let original = fs::read(&path).unwrap();
+        drop(t.begin_request(Some(&format!("codex:{:074}", 0)), "cx-account"));
+        assert!(t.data.lock().unwrap().dirty);
         t.freeze().unwrap();
+        assert_ne!(
+            fs::read(&path).unwrap(),
+            original,
+            "freeze never exercised the writer"
+        );
         assert_eq!(
             BindingTable::new(dir.path(), RoutingConfig::default())
                 .unwrap()
                 .count(),
             CAPACITY
+        );
+    }
+    #[test]
+    fn legacy_policy_alias_conflict_refuses_start_and_idle_import_before_pruning() {
+        for schema in [1, 2] {
+            let dir = fixture_dir();
+            let t = BindingTable::new(dir.path(), RoutingConfig::default()).unwrap();
+            let id = crate::routing::session_id("codex:alias");
+            let mut policy = json!({"schema":schema,"revision":1,"projects":{},"sessions":{id:{"project":null,"baseline":{"mode":"rebalance","reset_wait_secs":60},"explicit":{"mode":"strict","reset_wait_secs":0},"anchor":null,"movements":[]}}});
+            if schema == 2 {
+                policy["legacy_codex_roots"] = json!([]);
+            }
+            let policy_path = dir.path().join("state/routing-policies.json");
+            let policy_bytes = serde_json::to_vec(&policy).unwrap();
+            fs::write(&policy_path, &policy_bytes).unwrap();
+            crate::local_secrets::restrict(&policy_path).unwrap();
+            let value = json!({"schema":1,"bindings":[{"key":"codex:alias","account":"a","last_used":"2020-01-01T00:00:00Z"},{"key":"codex:alias:agent:x","account":"b","last_used":"2020-01-01T00:00:00Z"}]});
+            let bytes = serde_json::to_vec(&value).unwrap();
+            fs::write(&t.path, &bytes).unwrap();
+            crate::local_secrets::restrict(&t.path).unwrap();
+            if schema == 1 {
+                let before = t.export().unwrap();
+                for _ in 0..2 {
+                    let error = t.import(value.clone()).unwrap_err();
+                    assert!(error.to_string().contains("strict policy alias"), "{error}");
+                    assert_eq!(t.export().unwrap(), before);
+                    assert_eq!(fs::read(&t.path).unwrap(), bytes);
+                    assert_eq!(fs::read(&policy_path).unwrap(), policy_bytes);
+                }
+                for _ in 0..2 {
+                    assert!(BindingTable::new(dir.path(), RoutingConfig::default()).is_err());
+                    assert_eq!(fs::read(&t.path).unwrap(), bytes);
+                    assert_eq!(fs::read(&policy_path).unwrap(), policy_bytes);
+                }
+            } else {
+                let cfg = RoutingConfig {
+                    mode: crate::routing::Mode::Strict,
+                    ..RoutingConfig::default()
+                };
+                let restored = BindingTable::new(dir.path(), cfg).unwrap();
+                assert_eq!(
+                    restored
+                        .policies
+                        .plan(Some("codex:alias"))
+                        .anchor
+                        .as_deref(),
+                    Some("a")
+                );
+                assert_eq!(
+                    restored
+                        .policies
+                        .plan(Some("codex:alias:agent:x"))
+                        .anchor
+                        .as_deref(),
+                    Some("b")
+                );
+                assert!(!restored.policies.permits_dispatch(Some("codex:alias"), "b"));
+                assert!(
+                    restored
+                        .policies
+                        .permits_dispatch(Some("codex:alias:agent:x"), "b")
+                );
+            }
+        }
+    }
+    #[test]
+    fn idle_import_validates_the_latest_disk_strict_policy_and_preserves_the_old_table() {
+        let (dir, t) = table();
+        let (_, lease, _) = choose(&t, Some("claude:disk-newer"), &[candidate("a", 10.0, 8, 1)]);
+        drop(lease);
+        t.flush().unwrap();
+        let before = t.export().unwrap();
+        let original = fs::read(&t.path).unwrap();
+        let latest =
+            crate::routing::PolicyStore::new(dir.path(), crate::routing::Settings::default())
+                .unwrap();
+        latest
+            .set_session(
+                &crate::routing::session_id("claude:disk-newer"),
+                Some(crate::routing::Settings {
+                    mode: crate::routing::Mode::Strict,
+                    reset_wait_secs: 0,
+                }),
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            t.policies.plan(Some("claude:disk-newer")).settings.mode,
+            crate::routing::Mode::Rebalance
+        );
+        let policy_path = dir.path().join("state/routing-policies.json");
+        let policy_bytes = fs::read(&policy_path).unwrap();
+        let value = json!({"schema":1,"bindings":[{"key":"claude:disk-newer","account":"a","last_used":Utc::now()},{"key":"claude:disk-newer:agent:x","account":"b","last_used":Utc::now()}]});
+        let error = t.import(value).unwrap_err();
+        assert!(
+            error.to_string().contains("strict binding group"),
+            "{error}"
+        );
+        assert_eq!(t.export().unwrap(), before);
+        assert_eq!(fs::read(&t.path).unwrap(), original);
+        assert_eq!(fs::read(policy_path).unwrap(), policy_bytes);
+        assert_eq!(
+            t.policies.plan(Some("claude:disk-newer")).settings.mode,
+            crate::routing::Mode::Strict
         );
     }
     #[test]

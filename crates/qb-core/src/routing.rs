@@ -508,15 +508,20 @@ impl PolicyStore {
         bindings: impl IntoIterator<Item = (&'a str, &'a str)>,
     ) -> Result<()> {
         let state = self.snapshot();
-        let missing: BTreeMap<_, _> = bindings
-            .into_iter()
-            .filter_map(|(key, account)| {
-                let id = state.policy_id(key);
-                let plan = self.resolve(&state, &id);
-                (plan.settings.mode == Mode::Strict && plan.anchor.is_none())
-                    .then_some((id, account.to_owned()))
-            })
-            .collect();
+        let mut missing = BTreeMap::<String, String>::new();
+        for (key, account) in bindings {
+            let id = state.policy_id(key);
+            let plan = self.resolve(&state, &id);
+            if plan.settings.mode == Mode::Strict && plan.anchor.is_none() {
+                if let Some(previous) = missing.get(&id) {
+                    if previous != account {
+                        bail!("strict policy alias has conflicting binding accounts");
+                    }
+                } else {
+                    missing.insert(id, account.to_owned());
+                }
+            }
+        }
         if missing.is_empty() {
             return Ok(());
         }
