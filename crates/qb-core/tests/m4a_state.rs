@@ -454,6 +454,40 @@ mod runtime_regressions {
     }
 
     #[tokio::test]
+    async fn credits_payment_latch_suppresses_immediate_resume_even_under_longer_soft_quota() {
+        let f = Fixture::new(&[Provider::Codex], 0.0);
+        let id = &f.ids[0];
+        f.runtime.observe_codex_event(id,&json!({"type":"codex.rate_limits",
+            "rate_limits":{"secondary":{"used_percent":100,"window_minutes":10080,"reset_at":(Utc::now()+Duration::days(5)).timestamp()}},
+            "credits":{"has_credits":true,"balance":12}
+        })).await;
+        assert!(f.load(0).quota_credit_releasable);
+        f.cool(
+            0,
+            HealthReason::Payment,
+            Utc::now() + Duration::hours(1),
+            "account",
+        )
+        .await;
+        assert!(matches!(
+            f.load(0).health,
+            Health::Cooling {
+                reason: HealthReason::Quota,
+                ..
+            }
+        ));
+        assert_eq!(
+            f.runtime.views().await.unwrap()[0]["quota_credit_releasable"],
+            false
+        );
+        f.runtime
+            .change(id, None, None, None, Some(true))
+            .await
+            .unwrap();
+        assert!(!f.runtime.eligible(id, None).await);
+    }
+
+    #[tokio::test]
     async fn credits_partial_reset_preserves_entitlement_while_weekly_limit_remains_full() {
         let f = Fixture::new(&[Provider::Codex], 0.0);
         let id = &f.ids[0];

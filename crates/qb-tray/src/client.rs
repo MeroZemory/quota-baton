@@ -798,6 +798,7 @@ mod r5_transport_tests {
         let codex = &view.sections[1];
         assert_eq!(codex.rows[0].state, qb_tray::v2::DisplayState::Credits);
         assert_eq!(codex.rows[0].raw.active_sessions, 2);
+        assert!(codex.rows[0].raw.quota_credit_releasable);
         assert!(codex.rows[0].raw.source.owned_or_adopted());
         assert_eq!(view.summaries[1].verdict, qb_tray::v2::Verdict::Credits);
     }
