@@ -26,7 +26,7 @@ async fn quota_relay_events_render_account_and_grounded_next_action() {
         "credits",
         "exhausted",
         "exhausted-disabled",
-        "exhausted-credit-offer",
+        "exhausted-credits-hard-rejection",
     ] {
         let action = if scenario.starts_with("exhausted") {
             "exhausted"
@@ -79,7 +79,7 @@ async fn quota_relay_events_render_account_and_grounded_next_action() {
             ("x-codex-active-limit", "secondary".to_owned()),
             (
                 "x-codex-credits-has-credits",
-                (action == "credits" || scenario == "exhausted-credit-offer").to_string(),
+                (action == "credits" || scenario == "exhausted-credits-hard-rejection").to_string(),
             ),
             ("x-codex-credits-serving", (action == "credits").to_string()),
         ] {
@@ -196,11 +196,16 @@ async fn quota_relay_events_render_account_and_grounded_next_action() {
                             .text
                             .contains("꺼진 계정 1개를 켜면 이어서 처리할 수 있습니다.")
                     ),
-                    "exhausted-credit-offer" => {
-                        assert!(message.text.contains(&format!(
-                            "{name}의 유료 크레딧을 허용하면 바로 이어서 처리합니다."
-                        )));
-                        assert!(!message.text.contains("유료 크레딧으로 계속 처리합니다."));
+                    "exhausted-credits-hard-rejection" => {
+                        // A real upstream 429 is a hard hold. Credit permission
+                        // cannot promise immediate recovery from that rejection.
+                        assert!(message.text.contains("그때까지 새 요청은 오류로 끝납니다."));
+                        assert!(!message.text.contains("크레딧을 허용하면 바로"));
+                        assert_eq!(account["quota_credit_releasable"], false);
+                        let row =
+                            qb_tray::v2_notices::account_row(&projected, "codex", id).unwrap();
+                        assert!(row.action.is_none());
+                        assert!(row.menu.credits_enable_confirmation.is_some());
                     }
                     _ => assert!(message.text.contains("그때까지 새 요청은 오류로 끝납니다.")),
                 }
