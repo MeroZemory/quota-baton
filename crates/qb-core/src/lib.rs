@@ -10,6 +10,7 @@ pub mod credits;
 pub mod dashboard;
 pub mod debug_pin;
 pub mod guard;
+mod json_unique;
 pub mod oauth;
 pub mod observability;
 #[cfg(all(feature = "phase0", debug_assertions))]

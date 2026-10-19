@@ -304,6 +304,10 @@ async fn small_unclassified_json_output_never_allows_post_publication_rate_repla
         r#"["published"]"#,
         r#""published""#,
         r#"{"type":"unexpected.delta","text":"published"}"#,
+        r#"{"type":"response.output_text.delta","response_id":"unknown","delta":"published"}"#,
+        r#"{"type":"response.future_delta","response_id":"unknown","text":"published"}"#,
+        r#"{"type":"response.failed","response_id":"unknown","response":{"error":{"code":"synthetic"}}}"#,
+        r#"{"type":"response.output_text.delta","type":"metadata","text":"published"}"#,
     ] {
         let h = Harness::new(1).await;
         let rate = r#"{"type":"error","status":429,"error":{"code":"rate_limit_exceeded"}}"#;

@@ -368,7 +368,7 @@ fn response_completion(
     if matches!(kind, Some("response.created" | "error" | "response.failed"))
         && let Some((&id, _)) = current
             .iter()
-            .find(|(_, active)| active.rate.initial_sent() && !active.committed)
+            .find(|(_, active)| active.rate.initial_sent() && active.response_id.is_none())
     {
         return Some(id);
     }
@@ -558,7 +558,7 @@ fn event_affects_account(event: &Value, account: &str) -> bool {
 
 fn parsed(text: &str) -> Option<Value> {
     (text.len() <= PARSE_LIMIT)
-        .then(|| serde_json::from_str(text).ok())
+        .then(|| crate::json_unique::from_slice(text.as_bytes()).ok())
         .flatten()
 }
 
@@ -708,6 +708,13 @@ where
     S: Sink<Message> + Send + Unpin + 'static,
     S::Error: Send,
 {
+    if matches!(message, Message::Text(_) | Message::Binary(_))
+        && let Some(relay) = &context.relay
+    {
+        relay
+            .bindings
+            .unknown_request_cost(context.session.key.as_deref());
+    }
     Box::pin(async move {
         let rate = Arc::new(RateBudget::new(&context));
         if matches!(message, Message::Text(_) | Message::Binary(_)) {
@@ -1402,8 +1409,12 @@ async fn run_with_read_timeout(
                             end_deadline = Instant::now() + CLOSE_TIMEOUT;
                             continue;
                         }
-                        let known_control = event.as_ref().and_then(|e|e["type"].as_str()).is_some_and(|kind| matches!(kind,"metadata"|"codex.rate_limits"|"error"|"response.failed") || kind.starts_with("response."));
-                        if !known_control && matches!(message, Message::Text(_) | Message::Binary(_)) {
+                        let observed_kind = event.as_ref().and_then(|e|e.get("type")).and_then(Value::as_str);
+                        let benign_control = matches!(observed_kind,Some("metadata"|"codex.rate_limits"));
+                        let classified = observed_kind.is_some_and(|kind|kind=="error" || kind.starts_with("response."));
+                        // Attribution and replay authority are independent. An unknown ID
+                        // must not finish another turn, but its publication must stop replay.
+                        if !benign_control && (!classified || request.is_none()) && matches!(message, Message::Text(_) | Message::Binary(_)) {
                             for active in current.values_mut() { if active.rate.initial_sent() { active.committed = true; active.rate.commit(); } }
                         }
                         let terminal = request.and_then(|id| current.get_mut(&id)).and_then(|active| active.upstream(event.as_ref()));

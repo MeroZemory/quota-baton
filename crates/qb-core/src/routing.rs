@@ -342,7 +342,7 @@ fn load(path: &Path) -> Result<State> {
         bail!("routing policy read cap exceeded");
     }
     // A corrupt intent file must stop startup, never silently remove strict pins.
-    let mut value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let mut value: serde_json::Value = crate::json_unique::from_slice(&bytes)?;
     if value["schema"] == 1 {
         if value.get("legacy_codex_roots").is_some() {
             bail!("invalid legacy policy schema");
@@ -920,6 +920,44 @@ mod tests {
         Settings {
             mode,
             reset_wait_secs: 7,
+        }
+    }
+    #[test]
+    fn duplicate_policy_fields_and_session_map_keys_fail_closed_before_migration() {
+        let dir = home();
+        let store = PolicyStore::new(dir.path(), settings(Mode::Rebalance)).unwrap();
+        let id = session_id("codex:duplicate");
+        store
+            .set_session(&id, Some(settings(Mode::Strict)), None, Some("cx-a"))
+            .unwrap();
+        let original = fs::read_to_string(&store.path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&original).unwrap();
+        let entry = serde_json::to_string(&value["sessions"][&id]).unwrap();
+        let duplicate_map = format!(
+            r#"{{"schema":2,"revision":1,"projects":{{}},"sessions":{{"{id}":{entry},"{id}":{entry}}},"legacy_codex_roots":[]}}"#
+        );
+        for raw in [
+            original.replacen(
+                r#""mode":"strict""#,
+                r#""mode":"recover","mode":"strict""#,
+                1,
+            ),
+            original.replacen(
+                r#""anchor":"cx-a""#,
+                r#""anchor":"cx-a","anchor":"cx-b""#,
+                1,
+            ),
+            duplicate_map,
+        ] {
+            assert_ne!(raw, original);
+            fs::write(&store.path, raw.as_bytes()).unwrap();
+            crate::local_secrets::restrict(&store.path).unwrap();
+            assert!(store.reload().is_err());
+            assert_eq!(fs::read_to_string(&store.path).unwrap(), raw);
+            assert_eq!(
+                store.plan(Some("codex:duplicate")).anchor.as_deref(),
+                Some("cx-a")
+            );
         }
     }
     #[test]

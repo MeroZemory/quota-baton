@@ -5,7 +5,10 @@ use std::{path::Path, time::Duration};
 pub enum RoutingCommand {
     #[command(about = "프로젝트와 루트 세션의 계정 전환 정책을 확인합니다")]
     List,
-    #[command(about = "프로젝트 기본 정책을 등록하거나 수정합니다")]
+    #[command(
+        about = "프로젝트 기본 정책을 등록하거나 수정합니다",
+        long_about = "새로 연결할 세션의 프로젝트 기본 정책을 등록하거나 수정합니다. 이미 연결된 세션은 저장된 기존 기본값을 유지합니다."
+    )]
     Project {
         name: String,
         #[arg(long)]

@@ -355,13 +355,14 @@ fn touch_group(d: &mut Data, g: &str, now: DateTime<Utc>) {
     }
 }
 fn binding_bound(key: &str, account: &str) -> usize {
-    // Upper bound includes JSON escaping, fixed field names, optional enum/flags,
-    // and three maximum-length UTC timestamps. No serialization on hot lookups.
-    key.len()
-        .saturating_add(account.len())
-        .saturating_mul(6)
+    // Exact escaped identifier lengths plus a conservative fixed metadata budget.
+    serde_json::to_string(key)
+        .expect("JSON string")
+        .len()
+        .saturating_add(serde_json::to_string(account).expect("JSON string").len())
         .saturating_add(384)
 }
+
 fn rebuild_indexes(d: &mut Data) {
     d.groups.clear();
     d.lru.clear();
@@ -454,10 +455,20 @@ fn read_binding_snapshot(path: &Path) -> std::io::Result<Vec<u8>> {
     }
     Ok(bytes)
 }
+#[derive(Debug, thiserror::Error)]
+#[error("existing binding snapshot exceeds restore capacity; original retained")]
+struct SnapshotCapacity;
+#[cfg(test)]
 fn decode(value: Value) -> Result<Data> {
+    decode_scoped(value, false)
+}
+fn decode_scoped(value: Value, strict: bool) -> Result<Data> {
     let state: Snapshot = serde_json::from_value(value)?;
-    if state.schema != 1 || state.bindings.len() > CAPACITY * 2 {
+    if state.schema != 1 {
         bail!("unsupported binding schema");
+    }
+    if state.bindings.len() > CAPACITY * 2 {
+        return Err(SnapshotCapacity.into());
     }
     let mut d = Data::default();
     let mut groups = BTreeMap::new();
@@ -475,6 +486,9 @@ fn decode(value: Value) -> Result<Data> {
         d.bindings.insert(b.key.clone(), b);
     }
     if !inconsistent.is_empty() {
+        if strict {
+            bail!("strict binding group has conflicting accounts");
+        }
         tracing::warn!(
             groups = inconsistent.len(),
             "Dropping inconsistent binding groups"
@@ -486,7 +500,7 @@ fn decode(value: Value) -> Result<Data> {
     rebuild_indexes(&mut d);
     d.unknown_cost = d.groups.keys().cloned().collect();
     if d.snapshot_weight as u64 + 64 > SNAPSHOT_MAX_BYTES {
-        bail!("binding snapshot exceeds bounded restore size");
+        return Err(SnapshotCapacity.into());
     }
     Ok(d)
 }
@@ -565,12 +579,15 @@ impl BindingTable {
         )?
         .with_limits(config.churn.clone())?;
         let data = match read_binding_snapshot(&path) {
-            Ok(bytes) => match serde_json::from_slice(&bytes)
+            Ok(bytes) => match crate::json_unique::from_slice(&bytes)
                 .map_err(anyhow::Error::from)
-                .and_then(decode)
+                .and_then(|value| decode_scoped(value, policies.requires_strict_recovery()))
             {
                 Ok(data) => data,
                 Err(error) => {
+                    if error.downcast_ref::<SnapshotCapacity>().is_some() {
+                        return Err(error);
+                    }
                     if policies.requires_strict_recovery() {
                         return Err(error.context(
                             "strict binding recovery failed; original snapshot retained",
@@ -1734,7 +1751,7 @@ impl BindingTable {
     /// Takeover only: reject import while any request or socket owns the table.
     pub fn import(&self, value: Value) -> Result<()> {
         let _mutation = self.mutations.lock().unwrap_or_else(|e| e.into_inner());
-        let mut next = decode(value)?;
+        let mut next = decode_scoped(value, self.policies.requires_strict_recovery())?;
         let d = self.data.lock().unwrap_or_else(|e| e.into_inner());
         if !d.active.is_empty() || !d.pins.is_empty() || !d.pending.is_empty() {
             bail!("cannot import active binding table");
@@ -2285,7 +2302,7 @@ mod tests {
             let mut d = t.data.lock().unwrap();
             let mut weight = 64usize;
             for i in 0..CAPACITY * 2 {
-                let key = format!("claude:bounded:agent:{}{i}", "x".repeat(256));
+                let key = format!("claude:bounded:agent:{}{i}", "x".repeat(1024));
                 let next = binding_bound(&key, "a");
                 if weight + next > SNAPSHOT_MAX_BYTES as usize {
                     break;
@@ -2310,7 +2327,7 @@ mod tests {
         }
         let before = t.count();
         assert!(before < CAPACITY);
-        let key = format!("claude:bounded:agent:{}", "y".repeat(512));
+        let key = format!("claude:bounded:agent:{}", "y".repeat(2048));
         assert!(matches!(
             t.choose(
                 Provider::Claude,
@@ -2341,6 +2358,109 @@ mod tests {
             drop(t.begin_request(Some(&format!("claude:unknown-{n}")), "a"));
         }
         assert!(t.data.lock().unwrap().epochs.is_empty());
+    }
+    #[test]
+    fn strict_group_conflict_refuses_start_and_import_without_losing_the_current_state() {
+        for global in [true, false] {
+            let dir = fixture_dir();
+            let cfg = RoutingConfig {
+                mode: if global {
+                    crate::routing::Mode::Strict
+                } else {
+                    crate::routing::Mode::Rebalance
+                },
+                ..RoutingConfig::default()
+            };
+            let t = BindingTable::new(dir.path(), cfg.clone()).unwrap();
+            let (_, lease, _) = choose(&t, Some("claude:conflict"), &[candidate("a", 10.0, 8, 1)]);
+            if !global {
+                t.set_routing_session(
+                    &crate::routing::session_id("claude:conflict"),
+                    Some(crate::routing::Settings {
+                        mode: crate::routing::Mode::Strict,
+                        reset_wait_secs: 0,
+                    }),
+                    None,
+                    false,
+                )
+                .unwrap();
+            }
+            let before = t.export().unwrap();
+            let conflict = json!({"schema":1,"bindings":[{"key":"claude:conflict","account":"a","last_used":Utc::now()},{"key":"claude:conflict:agent:x","account":"b","last_used":Utc::now()}]});
+            assert!(t.import(conflict.clone()).is_err());
+            assert_eq!(t.export().unwrap(), before);
+            t.freeze().unwrap();
+            let bytes = serde_json::to_vec(&conflict).unwrap();
+            fs::write(&t.path, &bytes).unwrap();
+            crate::local_secrets::restrict(&t.path).unwrap();
+            for _ in 0..2 {
+                assert!(BindingTable::new(dir.path(), cfg.clone()).is_err());
+                assert_eq!(fs::read(&t.path).unwrap(), bytes);
+            }
+            drop(lease);
+        }
+    }
+    #[test]
+    fn strict_duplicate_object_field_is_refused_while_private_non_strict_corruption_is_quarantined()
+    {
+        for strict in [false, true] {
+            let dir = fixture_dir();
+            fs::create_dir_all(dir.path().join("state")).unwrap();
+            let path = dir.path().join("state/bindings.json");
+            let raw=br#"{"schema":1,"bindings":[{"key":"codex:old","account":"cx-a","account":"cx-b","last_used":"2026-10-20T00:00:00Z"}]}"#;
+            fs::write(&path, raw).unwrap();
+            crate::local_secrets::restrict(&path).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+            let cfg = RoutingConfig {
+                mode: if strict {
+                    crate::routing::Mode::Strict
+                } else {
+                    crate::routing::Mode::Rebalance
+                },
+                ..RoutingConfig::default()
+            };
+            let result = BindingTable::new(dir.path(), cfg);
+            if strict {
+                assert!(result.is_err());
+                assert_eq!(fs::read(&path).unwrap(), raw);
+            } else {
+                assert_eq!(result.unwrap().count(), 0);
+                assert!(
+                    !path.exists(),
+                    "non-strict contrast never reached JSON quarantine"
+                );
+            }
+        }
+    }
+    #[test]
+    fn legacy_twenty_thousand_normal_eighty_byte_keys_remain_readable() {
+        let dir = fixture_dir();
+        fs::create_dir_all(dir.path().join("state")).unwrap();
+        let now = Utc::now();
+        let bindings: Vec<_> = (0..CAPACITY)
+            .map(|n| json!({"key":format!("codex:{n:074}"),"account":"cx-account","last_used":now}))
+            .collect();
+        let bytes = serde_json::to_vec(&json!({"schema":1,"bindings":bindings})).unwrap();
+        assert!((bytes.len() as u64) < SNAPSHOT_MAX_BYTES);
+        let path = dir.path().join("state/bindings.json");
+        fs::write(&path, bytes).unwrap();
+        crate::local_secrets::restrict(&path).unwrap();
+        let t = BindingTable::new(dir.path(), RoutingConfig::default()).unwrap();
+        assert_eq!(t.count(), CAPACITY);
+        t.freeze().unwrap();
+        assert_eq!(
+            BindingTable::new(dir.path(), RoutingConfig::default())
+                .unwrap()
+                .count(),
+            CAPACITY
+        );
     }
     #[test]
     fn warm_binding_and_unbound_stay_despite_thresholds_and_drain() {

@@ -38,3 +38,5 @@
 - 네 번째 Sol max 검수(`014f732`)의 큰 WS 출력 공개 후 재전송, 순서가 다른 큰 create의 admission/모델 우회, A→B→A receipt, HTTP continuation 비용, legacy 이동 이력 중복, 기존 프로젝트의 빈 anchor 보완, 미전송 timeout의 release slot 소비를 수정했다. payload tree를 만들지 않는 bounded 메타데이터 파서, 살아 있는 배치 epoch receipt, 원장 집계와 전송 승인의 분리를 적용했다. 바인딩 파일도 링크/핸들·소유 권한·16MiB·40,000 항목 상한을 검사한 뒤 legacy anchor 입력으로 사용한다.
 
 - 다섯 번째 Sol max 검수(`07742e6`)의 미분류 소형 JSON 출력, 대기 중 출력에 의한 예약 재전송 취소, 모델 미상 최종 WS 전송 검사, 손상된 strict legacy 복원 거절, writer/reader 상한 일치를 보완했다. 앞선 Option 참조 컴파일 오류는 `010b8b8`에서 수정했고 core 357/357와 rate→느린 auth 회귀 및 clippy로 확인했다. 최종 관문은 이후 코드 commit에 고정한다.
+
+- 여섯 번째 Sol max 검수(`5a99574`)의 strict 충돌 그룹 폐기, 미등록 response ID 출력 공개, 저장 JSON 중복 key의 last-wins를 보완했다. 손상 파싱 fixture는 owner-only 전제와 non-strict 대조군을 확인한다. 실제 80바이트 key/10바이트 계정의 20,000-entry legacy 파일도 freeze·재시작한다. 새 상한에 맞지 않는 기존 파일은 corrupt로 격리하지 않고 보존하며 시작을 거절한다.
