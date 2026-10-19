@@ -295,7 +295,10 @@ impl SourceAccess for NativeSource {
         let name: Vec<u16> = destination.as_os_str().encode_wide().collect();
         let offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
         let size = offset
-            .checked_add(name.len() * 2)
+            // Win32 resolves the full path as a NUL-terminated string even
+            // though FileNameLength excludes the terminator. Do not rely on
+            // incidental padding from the u64 allocation for that NUL.
+            .checked_add((name.len() + 1) * 2)
             .ok_or(TakeoverError::Invalid)?;
         let mut buffer = vec![0u64; size.div_ceil(8)];
         unsafe {
@@ -313,7 +316,13 @@ impl SourceAccess for NativeSource {
                 buffer.as_ptr().cast(),
                 u32::try_from(size).map_err(|_| TakeoverError::Invalid)?,
             )
-            .map_err(|_| TakeoverError::Conflict)?;
+            .map_err(|error| {
+                tracing::warn!(
+                    windows_error = error.code().0,
+                    "takeover source rename failed"
+                );
+                TakeoverError::Conflict
+            })?;
         }
         Ok(())
     }
@@ -639,6 +648,23 @@ mod tests {
             .retire(Provider::Codex, &before.proof, &destination, false)
             .unwrap();
         assert_eq!(fs::read_dir(home.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn r6_native_retirement_handles_a_name_without_incidental_buffer_padding() {
+        let (_home, source, before) = fixture();
+        let mut destination = before.proof.path.with_file_name("retired");
+        let offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+        while (offset + destination.as_os_str().encode_wide().count() * 2) % 8 != 0 {
+            let mut name = destination.file_name().unwrap().to_os_string();
+            name.push("x");
+            destination.set_file_name(name);
+        }
+        NativeSource
+            .retire(Provider::Codex, &before.proof, &destination, false)
+            .unwrap();
+        assert!(!source.exists());
+        assert_eq!(fs::read(destination).unwrap(), before.bytes.as_slice());
     }
 
     #[test]
