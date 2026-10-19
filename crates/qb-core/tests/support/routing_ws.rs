@@ -296,3 +296,120 @@ async fn large_field_reordered_create_obeys_model_cooling_and_rate_wait() {
         assert_credential(&h, 0, &a);
     }
 }
+
+#[tokio::test]
+async fn small_unclassified_json_output_never_allows_post_publication_rate_replay() {
+    for output in [
+        r#"{"opaque":"published"}"#,
+        r#"["published"]"#,
+        r#""published""#,
+        r#"{"type":"unexpected.delta","text":"published"}"#,
+    ] {
+        let h = Harness::new(1).await;
+        let rate = r#"{"type":"error","status":429,"error":{"code":"rate_limit_exceeded"}}"#;
+        h.fake
+            .state
+            .push_reply([Message::Text(output.into()), Message::Text(rate.into())]);
+        let (mut client, a) = h.connect().await;
+        create(&mut client, "fixture-model").await;
+        assert_eq!(receive(&mut client).await, Message::Text(output.into()));
+        assert_eq!(receive(&mut client).await, Message::Text(rate.into()));
+        assert_eq!(h.fake.state.requests().len(), 1);
+        assert_credential(&h, 0, &a);
+        assert_eq!(h.fake.state.messages().len(), 1);
+        let _ = client.close(None).await;
+    }
+}
+
+#[tokio::test]
+async fn output_during_rate_wait_cancels_reserved_replay_and_keeps_the_response_alive() {
+    let h = Harness::new_with_rate_options(1, false, false, Some((5, 3))).await;
+    h.fake.state.push_reply([Message::Text(
+        r#"{"type":"error","status":429,"error":{"code":"rate_limit_exceeded"}}"#.into(),
+    )]);
+    let (mut client, a) = h.connect().await;
+    create(&mut client, "fixture-model").await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while h.state.accounts.pacing_snapshot(&a).waiting == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let delta =
+        Message::Text(r#"{"type":"response.output_text.delta","delta":"published"}"#.into());
+    h.fake.state.send(delta.clone()).unwrap();
+    assert_eq!(receive(&mut client).await, delta);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        h.fake.state.messages().len(),
+        1,
+        "a reserved retry was sent after output became public"
+    );
+    assert_eq!(h.fake.state.requests().len(), 1);
+    assert_credential(&h, 0, &a);
+    let done = Message::Text(r#"{"type":"response.completed"}"#.into());
+    h.fake.state.send(done.clone()).unwrap();
+    assert_eq!(receive(&mut client).await, done);
+    let _ = client.close(None).await;
+}
+
+#[tokio::test]
+async fn unknown_model_is_rechecked_for_initial_retry_and_redial_data() {
+    for mode in ["initial", "retry", "redial"] {
+        let h = Harness::new_with_rate_options(1, false, false, Some((5, 3))).await;
+        if mode != "initial" {
+            let mut reply = vec![Message::Text(
+                r#"{"type":"error","status":429,"error":{"code":"rate_limit_exceeded"}}"#.into(),
+            )];
+            if mode == "redial" {
+                reply.push(Message::Close(Some(
+                    tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                        code: 1012.into(),
+                        reason: "".into(),
+                    },
+                )));
+            }
+            h.fake.state.push_reply(reply);
+        }
+        let (mut client, a) = h.connect().await;
+        if mode == "initial" {
+            h.state
+                .accounts
+                .observe_429(&a, Some(Duration::from_secs(2)));
+        }
+        client
+            .send(Message::Text(
+                r#"{"type":"response.create","input":[]}"#.into(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while h.state.accounts.pacing_snapshot(&a).waiting == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        h.store
+            .update_metadata(&a, |account| {
+                account.health = Health::Cooling {
+                    reason: HealthReason::Permission,
+                    until: Utc::now() + ChronoDuration::hours(1),
+                    scope: "model:blocked".into(),
+                }
+            })
+            .unwrap();
+        assert_close(receive(&mut client).await, 1000);
+        assert_eq!(
+            h.fake.state.messages().len(),
+            usize::from(mode != "initial")
+        );
+        assert_eq!(
+            h.fake.state.requests().len(),
+            1,
+            "model-unknown redial opened an extra socket"
+        );
+        assert_credential(&h, 0, &a);
+    }
+}

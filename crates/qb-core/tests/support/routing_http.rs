@@ -765,3 +765,45 @@ async fn started_rate_budget_does_not_reopen_after_later_slow_auth_retry() {
     );
     assert!(String::from_utf8_lossy(&requests[2].body).contains("refresh_token"));
 }
+
+#[tokio::test]
+async fn legacy_global_strict_corrupt_restore_refuses_core_start_before_any_b_credential() {
+    let h = Harness::new(Provider::Codex).await;
+    let a = h
+        .turn("/v1/responses", &[("session-id", "legacy-corrupt")], RAW)
+        .await;
+    assert_credential(&h, 0, &a);
+    h.pause(&a).await;
+    h.state.bindings.freeze().unwrap();
+    h.obs.flush().unwrap();
+    let Harness {
+        mut servers,
+        state,
+        store,
+        obs,
+        fake,
+        client,
+        home,
+        _root,
+        _serial,
+    } = h;
+    servers.data_task.abort();
+    servers.admin_task.abort();
+    let _ = (&mut servers.data_task).await;
+    let _ = (&mut servers.admin_task).await;
+    drop(client);
+    drop(servers);
+    drop(state);
+    let mut config = Config::default();
+    config.server.data_port = 0;
+    config.server.admin_port = 0;
+    config.routing.mode = qb_core::routing::Mode::Strict;
+    config.upstream.codex_base = fake.url.clone();
+    config.upstream.anthropic_base = fake.url.clone();
+    for raw in ["{".to_owned(),json!({"schema":99,"bindings":[]}).to_string(),json!({"schema":1,"bindings":[{"key":"codex:legacy-corrupt","account":a,"last_used":Utc::now()},{"key":"codex:legacy-corrupt","account":a,"last_used":Utc::now()}]}).to_string()] {
+        let path=home.join("state/bindings.json");fs::write(&path,raw.as_bytes()).unwrap();
+        assert!(RelayState::new(store.clone(),&config,obs.clone(),Arc::new(DebugPins::default())).is_err(),"legacy strict core started with no trustworthy anchor");
+        assert_eq!(fs::read(&path).unwrap(),raw.as_bytes());
+        assert_eq!(fake.state.requests().len(),1,"corrupt restore dispatched an alternate credential");
+    }
+}

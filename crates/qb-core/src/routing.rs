@@ -481,6 +481,14 @@ impl PolicyStore {
         next.frozen = true;
         *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(next);
     }
+    pub(crate) fn requires_strict_recovery(&self) -> bool {
+        self.defaults.mode == Mode::Strict
+            || self
+                .snapshot()
+                .sessions
+                .values()
+                .any(|session| session.settings(&self.defaults).mode == Mode::Strict)
+    }
     pub fn reload(&self) -> Result<()> {
         let _writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let state = self.snapshot();

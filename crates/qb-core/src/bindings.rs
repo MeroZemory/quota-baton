@@ -141,6 +141,7 @@ struct Data {
     sticky: BTreeMap<String, String>,
     accepted_unbound: BTreeSet<String>,
     epochs: BTreeMap<String, Arc<()>>,
+    snapshot_weight: usize,
     after_move: BTreeSet<String>,
     rate_hits: BTreeMap<String, BTreeMap<String, DateTime<Utc>>>,
     overload_marks: BTreeMap<String, OverloadMark>,
@@ -353,10 +354,23 @@ fn touch_group(d: &mut Data, g: &str, now: DateTime<Utc>) {
         d.changed();
     }
 }
+fn binding_bound(key: &str, account: &str) -> usize {
+    // Upper bound includes JSON escaping, fixed field names, optional enum/flags,
+    // and three maximum-length UTC timestamps. No serialization on hot lookups.
+    key.len()
+        .saturating_add(account.len())
+        .saturating_mul(6)
+        .saturating_add(384)
+}
 fn rebuild_indexes(d: &mut Data) {
     d.groups.clear();
     d.lru.clear();
     d.accounts.clear();
+    d.snapshot_weight = d
+        .bindings
+        .values()
+        .map(|b| binding_bound(&b.key, &b.account))
+        .fold(0usize, usize::saturating_add);
     let mut groups = BTreeMap::<String, Group>::new();
     for b in d.bindings.values() {
         let entry = groups
@@ -471,6 +485,9 @@ fn decode(value: Value) -> Result<Data> {
     }
     rebuild_indexes(&mut d);
     d.unknown_cost = d.groups.keys().cloned().collect();
+    if d.snapshot_weight as u64 + 64 > SNAPSHOT_MAX_BYTES {
+        bail!("binding snapshot exceeds bounded restore size");
+    }
     Ok(d)
 }
 impl BindingTable {
@@ -539,13 +556,26 @@ impl BindingTable {
         config.validate()?;
         let path = home.join("state/bindings.json");
         fs::create_dir_all(path.parent().context("binding state directory")?)?;
+        let policies = crate::routing::PolicyStore::new(
+            home,
+            crate::routing::Settings {
+                mode: config.mode,
+                reset_wait_secs: config.reset_hold_secs,
+            },
+        )?
+        .with_limits(config.churn.clone())?;
         let data = match read_binding_snapshot(&path) {
             Ok(bytes) => match serde_json::from_slice(&bytes)
                 .map_err(anyhow::Error::from)
                 .and_then(decode)
             {
                 Ok(data) => data,
-                Err(_) => {
+                Err(error) => {
+                    if policies.requires_strict_recovery() {
+                        return Err(error.context(
+                            "strict binding recovery failed; original snapshot retained",
+                        ));
+                    }
                     let quarantine = path.with_file_name(format!(
                         "bindings.json.corrupt-{}-{:08x}",
                         Utc::now().timestamp_millis(),
@@ -560,14 +590,7 @@ impl BindingTable {
             Err(e) => return Err(e.into()),
         };
         let table = Arc::new(Self {
-            policies: crate::routing::PolicyStore::new(
-                home,
-                crate::routing::Settings {
-                    mode: config.mode,
-                    reset_wait_secs: config.reset_hold_secs,
-                },
-            )?
-            .with_limits(config.churn.clone())?,
+            policies,
             path,
             config,
             thresholds: Mutex::new(BTreeMap::new()),
@@ -613,7 +636,11 @@ impl BindingTable {
             }
             if let Some(entry) = unindex_group(d, &g) {
                 for key in entry.keys {
-                    d.bindings.remove(&key);
+                    if let Some(binding) = d.bindings.remove(&key) {
+                        d.snapshot_weight = d
+                            .snapshot_weight
+                            .saturating_sub(binding_bound(&binding.key, &binding.account));
+                    }
                 }
                 d.after_move.remove(&g);
                 d.overload_marks.remove(&g);
@@ -1106,11 +1133,18 @@ impl BindingTable {
             false
         };
         let epoch_key = g.clone().unwrap_or_else(|| format!("unbound:{account}"));
-        let epoch = d
-            .epochs
-            .entry(epoch_key.clone())
-            .or_insert_with(|| Arc::new(()))
-            .clone();
+        let known_placement = g.as_ref().map_or_else(
+            || d.sticky.values().any(|id| id == account),
+            |g| d.groups.contains_key(g),
+        );
+        let epoch = if known_placement {
+            d.epochs
+                .entry(epoch_key.clone())
+                .or_insert_with(|| Arc::new(()))
+                .clone()
+        } else {
+            Arc::new(())
+        };
         BindingLease {
             epoch_key,
             epoch,
@@ -1216,6 +1250,39 @@ impl BindingTable {
             PreviewDecision::None => return Decision::None,
             PreviewDecision::Selected { account } => account,
         };
+        if let Some(key) = key {
+            let mut extra = BTreeSet::new();
+            if !d.bindings.contains_key(key) {
+                extra.insert(key);
+            }
+            if let Some(parent) =
+                parent.filter(|p| group(p) == group(key) && !d.bindings.contains_key(*p))
+            {
+                extra.insert(parent);
+            }
+            let mut weight = d.snapshot_weight;
+            if let Some(entry) = d.groups.get(group(key))
+                && entry.account != account
+            {
+                for key in &entry.keys {
+                    weight = weight
+                        .saturating_sub(binding_bound(key, &entry.account))
+                        .saturating_add(binding_bound(key, &account));
+                }
+            }
+            weight = extra.iter().fold(weight, |n, key| {
+                n.saturating_add(binding_bound(key, &account))
+            });
+            if d.bindings.len().saturating_add(extra.len()) > CAPACITY * 2
+                || weight as u64 + 64 > SNAPSHOT_MAX_BYTES
+            {
+                tracing::warn!(
+                    code = "binding_capacity",
+                    "New binding refused at the restore-safe snapshot bound"
+                );
+                return Decision::Blocked;
+            }
+        }
         let previous = key
             .and_then(|key| d.groups.get(group(key)))
             .map(|g| g.account.clone());
@@ -1269,6 +1336,12 @@ impl BindingTable {
             }
             for k in &keys {
                 let previous = d.bindings.get(k).cloned();
+                if let Some(previous) = &previous {
+                    d.snapshot_weight = d
+                        .snapshot_weight
+                        .saturating_sub(binding_bound(&previous.key, &previous.account));
+                }
+                d.snapshot_weight = d.snapshot_weight.saturating_add(binding_bound(k, &account));
                 d.bindings.insert(
                     k.clone(),
                     Binding {
@@ -1718,7 +1791,21 @@ impl BindingTable {
             }
             (snapshot(&d), d.revision)
         };
-        write(&self.path, &serde_json::to_vec(&state)?)?;
+        if state.bindings.len() > CAPACITY * 2
+            || state
+                .bindings
+                .iter()
+                .map(|b| binding_bound(&b.key, &b.account))
+                .fold(64usize, usize::saturating_add) as u64
+                > SNAPSHOT_MAX_BYTES
+        {
+            bail!("binding snapshot cannot be restored within its bounds");
+        }
+        let bytes = serde_json::to_vec(&state)?;
+        if bytes.len() as u64 > SNAPSHOT_MAX_BYTES {
+            bail!("binding snapshot byte cap exceeded");
+        }
+        write(&self.path, &bytes)?;
         let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
         if d.revision == revision {
             d.dirty = false;
@@ -2179,6 +2266,81 @@ mod tests {
         file.set_len(SNAPSHOT_MAX_BYTES + 1).unwrap();
         drop(file);
         assert!(BindingTable::new(dir.path(), RoutingConfig::default()).is_err());
+    }
+    #[test]
+    fn strict_corrupt_snapshot_is_retained_and_cannot_be_reinterpreted_as_first_placement() {
+        for raw in [b"{".as_slice(), br#"{"schema":99,"bindings":[]}"#, br#"{"schema":1,"bindings":[{"key":"codex:old","account":"cx-a","last_used":"2026-10-20T00:00:00Z"},{"key":"codex:old","account":"cx-b","last_used":"2026-10-20T00:00:00Z"}]}"#] {
+            let dir=fixture_dir();fs::create_dir_all(dir.path().join("state")).unwrap();let path=dir.path().join("state/bindings.json");fs::write(&path,raw).unwrap();
+            let cfg=RoutingConfig {mode:crate::routing::Mode::Strict,..RoutingConfig::default()};
+            assert!(BindingTable::new(dir.path(),cfg.clone()).is_err());
+            assert_eq!(fs::read(&path).unwrap(),raw);
+            assert!(BindingTable::new(dir.path(),cfg).is_err(),"retry after refusal lost the corrupt legacy evidence");
+        }
+    }
+    #[test]
+    fn pinned_child_capacity_refuses_growth_and_freeze_round_trips_within_reader_bounds() {
+        let (_dir, t) = table();
+        let pin = t.pin(Some("claude:bounded"));
+        {
+            let mut d = t.data.lock().unwrap();
+            let mut weight = 64usize;
+            for i in 0..CAPACITY * 2 {
+                let key = format!("claude:bounded:agent:{}{i}", "x".repeat(256));
+                let next = binding_bound(&key, "a");
+                if weight + next > SNAPSHOT_MAX_BYTES as usize {
+                    break;
+                }
+                weight += next;
+                d.bindings.insert(
+                    key.clone(),
+                    Binding {
+                        key,
+                        account: "a".into(),
+                        last_used: Utc::now(),
+                        accepted: None,
+                        first_seen_at: None,
+                        bound_since: None,
+                        client_kind: None,
+                        observed_here: false,
+                    },
+                );
+            }
+            rebuild_indexes(&mut d);
+            d.changed();
+        }
+        let before = t.count();
+        assert!(before < CAPACITY);
+        let key = format!("claude:bounded:agent:{}", "y".repeat(512));
+        assert!(matches!(
+            t.choose(
+                Provider::Claude,
+                Some(&key),
+                None,
+                None,
+                &[candidate("a", 10.0, 8, 1)],
+                None,
+                42
+            ),
+            Decision::Blocked
+        ));
+        assert_eq!(t.count(), before);
+        t.freeze().unwrap();
+        assert!(fs::metadata(&t.path).unwrap().len() <= SNAPSHOT_MAX_BYTES);
+        let restored = BindingTable::new(
+            t.path.parent().unwrap().parent().unwrap(),
+            RoutingConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(restored.count(), before);
+        drop(pin);
+    }
+    #[test]
+    fn unknown_reservations_cannot_accumulate_placement_epochs() {
+        let (_dir, t) = table();
+        for n in 0..=CAPACITY {
+            drop(t.begin_request(Some(&format!("claude:unknown-{n}")), "a"));
+        }
+        assert!(t.data.lock().unwrap().epochs.is_empty());
     }
     #[test]
     fn warm_binding_and_unbound_stay_despite_thresholds_and_drain() {

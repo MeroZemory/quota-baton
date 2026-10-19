@@ -754,6 +754,23 @@ impl RelayState {
     /// Recheck after every await that can outlive a policy/account edit. An
     /// admitted auth probe owns its slot, so do not reject its own probe flag.
     async fn dispatch_allowed(&self, key: Option<&str>, id: &str, model: Option<&str>) -> bool {
+        self.dispatch_checked(key, id, model, false).await
+    }
+    async fn dispatch_data_allowed(
+        &self,
+        key: Option<&str>,
+        id: &str,
+        model: Option<&str>,
+    ) -> bool {
+        self.dispatch_checked(key, id, model, true).await
+    }
+    async fn dispatch_checked(
+        &self,
+        key: Option<&str>,
+        id: &str,
+        model: Option<&str>,
+        data: bool,
+    ) -> bool {
         if self.accounts.blocked_in_memory(id) {
             return false;
         }
@@ -770,6 +787,7 @@ impl RelayState {
             let Ok(account) = store.load(&owned_id) else {
                 return false;
             };
+            if data && owned_model.is_none() && matches!(&account.health, Health::Cooling {until, scope, ..} if *until>chrono::Utc::now() && scope.starts_with("model:")) { return false; }
             if account.drain && !bindings.existing_placement(owned_key.as_deref(), &owned_id) {
                 return false;
             }
