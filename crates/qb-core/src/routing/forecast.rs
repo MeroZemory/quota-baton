@@ -180,6 +180,10 @@ impl Shadow {
                 windows.push(fallback("reset_changed"));
                 continue;
             }
+            if s.reset <= now {
+                windows.push(fallback("reset_elapsed"));
+                continue;
+            }
             // Remaining quota belongs to the sample time. Include the
             // unobserved interval when estimating demand to the reset.
             let horizon = (s.reset - last.at).num_seconds();
@@ -328,6 +332,32 @@ mod tests {
             s.view("cl-fixture", &fresh, 1, 0, now)["windows"][0]["reason"],
             "reset_changed"
         );
+    }
+    #[test]
+    fn elapsed_reset_cannot_report_pre_reset_spare_capacity() {
+        let last = Utc::now();
+        let reset = last + chrono::Duration::seconds(150);
+        let mut s = Shadow::default();
+        s.enable(true);
+        s.regime("cl-expired", Some(2), None);
+        for i in 0..9 {
+            let at = last - chrono::Duration::seconds(240 - i * 30);
+            s.observe(
+                "cl-expired",
+                &snapshot(at, reset, 20.0 + i as f64 * 0.1),
+                at,
+            );
+        }
+        let view = s.view(
+            "cl-expired",
+            &snapshot(last, reset, 20.8),
+            2,
+            0,
+            reset + chrono::Duration::seconds(10),
+        );
+        assert_eq!(view["windows"][0]["status"], "fallback");
+        assert_eq!(view["windows"][0]["reason"], "reset_elapsed");
+        assert_eq!(view["placement_effect"], false);
     }
     #[test]
     fn observation_gap_consumption_cannot_be_reported_as_spare_capacity() {

@@ -1988,6 +1988,12 @@ async fn c6_row_2_until_uses_exhausted_window_not_unrelated_weekly_reset() {
         h.fake.state.push(r);
         h.fake.state.push(ok());
         assert_eq!(h.send(Provider::Codex, "{}").await.status(), 200);
+        let requests = h.fake.state.requests();
+        assert_eq!(requests.len(), 2);
+        assert_ne!(
+            requests[0].headers.get("chatgpt-account-id").unwrap(),
+            requests[1].headers.get("chatgpt-account-id").unwrap()
+        );
         let cooled = h
             .store
             .list()
@@ -3429,12 +3435,12 @@ async fn full_meter_with_permitted_credits_keeps_rate_retry_on_same_account() {
     let requests = h.fake.state.requests();
     assert_eq!(requests.len(), 2);
     assert_eq!(
-        requests[0].headers.get("authorization"),
-        requests[1].headers.get("authorization")
+        requests[0].headers.get("authorization").unwrap(),
+        requests[1].headers.get("authorization").unwrap()
     );
     assert_eq!(
-        requests[0].headers.get("chatgpt-account-id"),
-        requests[1].headers.get("chatgpt-account-id")
+        requests[0].headers.get("chatgpt-account-id").unwrap(),
+        requests[1].headers.get("chatgpt-account-id").unwrap()
     );
     assert!(
         h.store
