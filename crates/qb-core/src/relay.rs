@@ -994,6 +994,16 @@ impl RelayState {
                     held_account = self.bindings.current(session.key.as_deref());
                     let wait = (until - chrono::Utc::now()).to_std().unwrap_or_default();
                     completion.reset_hold_used = true;
+                    if completion.record.transport == "ws"
+                        && completion.precommit_deadline.is_some_and(|deadline| {
+                            wait >= deadline.saturating_duration_since(Instant::now())
+                        })
+                    {
+                        // A reset beyond this transport's remaining budget is
+                        // not a viable hold. Re-select without waiting; strict
+                        // still cannot choose another account.
+                        continue;
+                    }
                     // Convert wall time once; policy/account edits interrupt
                     // the monotonic wait. A later request has its own budget.
                     completion.reset_hold_timed_out = self
@@ -1402,6 +1412,30 @@ fn routing_input_cost(headers: &HeaderMap, prefix: &[u8], provider: Provider) ->
     }
     headers.get("content-length")?.to_str().ok()?.parse().ok()
 }
+#[derive(Clone)]
+struct CommitSignal(tokio::sync::watch::Sender<bool>);
+async fn precommit_timeout<T>(
+    duration: Duration,
+    mut committed: tokio::sync::watch::Receiver<bool>,
+    work: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::pin!(work);
+    let deadline = tokio::time::Instant::now() + duration;
+    let mut closed = false;
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut work => return Some(result),
+            _ = tokio::time::sleep_until(deadline) => {
+                return if *committed.borrow() { Some(work.await) } else { None };
+            }
+            result = committed.changed(), if !closed => {
+                if result.is_err() { closed = true; }
+                else if *committed.borrow() { return Some(work.await); }
+            }
+        }
+    }
+}
 async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Response {
     let provider = if request.uri().path().starts_with("/v1/messages") {
         Provider::Claude
@@ -1422,9 +1456,11 @@ async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Re
     request
         .extensions_mut()
         .insert(RequestDeadline(Instant::now() + timeout));
-    tokio::time::timeout(timeout, relay_inner(state, request))
+    let (commit, committed) = tokio::sync::watch::channel(false);
+    request.extensions_mut().insert(CommitSignal(commit));
+    precommit_timeout(timeout, committed, relay_inner(state, request))
         .await
-        .unwrap_or_else(|_| {
+        .unwrap_or_else(|| {
             native_error(
                 StatusCode::GATEWAY_TIMEOUT,
                 provider,
@@ -1944,6 +1980,9 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
             );
         }
         let before_commit = !status.is_success() || held.decision == CommitDecision::FirstError;
+        if !before_commit && let Some(commit) = parts.extensions.get::<CommitSignal>() {
+            commit.0.send_replace(true);
+        }
         if state.is_draining() {
             // Once admission closes the old owner only finishes byte relay.
             // In particular a delayed 401 cannot refresh or change health.
@@ -2397,6 +2436,42 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn precommit_timeout_never_replaces_a_committed_response_during_cleanup() {
+        let (commit, observed) = tokio::sync::watch::channel(false);
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let ready = entered.clone();
+        let task = tokio::spawn(super::precommit_timeout(
+            std::time::Duration::from_millis(30),
+            observed,
+            async move {
+                commit.send_replace(true);
+                ready.notify_one();
+                wait.await.unwrap();
+                "original-200-stream"
+            },
+        ));
+        entered.notified().await;
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert!(
+            !task.is_finished(),
+            "commit must disable the precommit deadline, not return504"
+        );
+        release.send(()).unwrap();
+        assert_eq!(task.await.unwrap(), Some("original-200-stream"));
+        let (_sender, observed) = tokio::sync::watch::channel(false);
+        assert_eq!(
+            super::precommit_timeout(
+                std::time::Duration::from_millis(10),
+                observed,
+                std::future::pending::<()>()
+            )
+            .await,
+            None
+        );
+    }
+
     use super::*;
 
     #[test]

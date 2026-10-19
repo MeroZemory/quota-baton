@@ -142,6 +142,17 @@ impl WebSocketState {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "fake WebSocket closed"))
     }
 
+    /// Capture this synthetic connection for overlap/backpressure tests.
+    pub fn sender(&self) -> io::Result<mpsc::UnboundedSender<Message>> {
+        self.0
+            .lock()
+            .unwrap()
+            .active
+            .as_ref()
+            .map(|(_, sender)| sender.clone())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no active fake WebSocket"))
+    }
+
     /// 다음 성공한 연결이 열리면 순서대로 보낸다.
     pub fn queue_send(&self, message: Message) {
         self.0.lock().unwrap().queued.push_back(message);
