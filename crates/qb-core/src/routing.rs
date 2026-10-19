@@ -572,6 +572,20 @@ impl PolicyStore {
         anchor: Option<&str>,
         inherit: bool,
     ) -> Result<()> {
+        self.edit_session_for_key(id, explicit, project, anchor, inherit, None)
+    }
+    pub fn edit_session_for_key(
+        &self,
+        id: &str,
+        explicit: Option<Settings>,
+        project: Option<&str>,
+        anchor: Option<&str>,
+        inherit: bool,
+        key: Option<&str>,
+    ) -> Result<()> {
+        if explicit.is_none() && project.is_none() && !inherit {
+            bail!("routing edit requires policy, project or explicit inherit");
+        }
         if !valid_id(id, 64) {
             bail!("invalid routing session id");
         }
@@ -579,6 +593,27 @@ impl PolicyStore {
             settings.validate()?;
         }
         self.update(|state| {
+            if !state.sessions.contains_key(id) {
+                if let Some(key) = key {
+                    if session_id(key) != id {
+                        bail!("routing handle does not match observed root");
+                    }
+                    let effective = state.policy_id(key);
+                    if effective != id
+                        && let Some(legacy) = state.sessions.get(&effective).cloned()
+                    {
+                        state.sessions.insert(id.to_owned(), legacy);
+                    }
+                } else if project.is_some()
+                    && explicit.is_none()
+                    && !inherit
+                    && !state.legacy_codex_roots.is_empty()
+                {
+                    bail!(
+                        "unobserved legacy root needs an explicit policy or an observed identity"
+                    );
+                }
+            }
             let baseline = match project {
                 Some(p) => state
                     .projects
@@ -617,19 +652,32 @@ impl PolicyStore {
     }
     /// Ingress association is explicit, stable, and cannot reassign an existing root.
     pub fn associate(&self, key: &str, project: &str) -> Result<()> {
+        self.associate_with_anchor(key, project, None)
+    }
+    pub fn associate_with_anchor(
+        &self,
+        key: &str,
+        project: &str,
+        anchor: Option<&str>,
+    ) -> Result<()> {
         let id = self.snapshot().policy_id(key);
         {
             let state = self.snapshot();
             if let Some(session) = state.sessions.get(&id) {
-                if session.project.as_deref() == Some(project) {
+                if session.project.as_deref() == Some(project)
+                    && (session.anchor.is_some() || anchor.is_none())
+                {
                     return Ok(());
                 }
                 bail!("routing project conflicts with existing session");
             }
         }
         self.update(|state| {
-            if let Some(session) = state.sessions.get(&id) {
+            if let Some(session) = state.sessions.get_mut(&id) {
                 if session.project.as_deref() == Some(project) {
+                    if session.anchor.is_none() {
+                        session.anchor = anchor.map(str::to_owned);
+                    }
                     return Ok(());
                 }
                 bail!("routing project conflicts with existing session");
@@ -646,7 +694,7 @@ impl PolicyStore {
                     project: Some(project.to_owned()),
                     baseline,
                     explicit: None,
-                    anchor: None,
+                    anchor: anchor.map(str::to_owned),
                     movements: Vec::new(),
                 },
             );

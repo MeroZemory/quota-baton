@@ -690,6 +690,45 @@ where
     })
 }
 
+/// Classification is an observer, never an authorization boundary. Unknown
+/// and large client data still belongs to this socket's pinned account.
+fn guarded_upstream_write<S>(
+    context: Arc<Context>,
+    sink: S,
+    message: Message,
+    reservation: Reservation,
+    delivered: Delivered,
+    model: Option<String>,
+) -> Write<S>
+where
+    S: Sink<Message> + Send + Unpin + 'static,
+    S::Error: Send,
+{
+    Box::pin(async move {
+        if matches!(message, Message::Text(_) | Message::Binary(_))
+            && let (Some(relay), Some(_)) = (&context.relay, &context.runtime)
+            && !relay
+                .dispatch_allowed(
+                    context.session.key.as_deref(),
+                    &context.account,
+                    model.as_deref(),
+                )
+                .await
+        {
+            return (
+                sink,
+                false,
+                Delivered {
+                    bytes: 0,
+                    terminal: Some("routing_policy_blocked"),
+                    ..delivered
+                },
+            );
+        }
+        write(sink, message, reservation, delivered).await
+    })
+}
+
 fn flush<S, M>(mut sink: S) -> Write<S>
 where
     S: Sink<M> + Send + Unpin + 'static,
@@ -933,6 +972,7 @@ async fn run_with_read_timeout(
                         None => true,
                     };
                     let expired = forced && eligible_now;
+                    if expired { note_client_rate(&context).await; }
                     let reason = if expired { "rate_wait_timeout" } else { "account_ineligible" };
                     if let Some(active) = current.get_mut(&pending.request) {
                         active.completion.record.outcome = reason.into();
@@ -1143,8 +1183,8 @@ async fn run_with_read_timeout(
                                 }
                             }));
                         } else {
-                            to_upstream = Some(write(upstream_sink.take().unwrap(), message, reservation,
-                                Delivered { bytes, request, terminal: None, completed: false }));
+                            to_upstream = Some(guarded_upstream_write(context.clone(), upstream_sink.take().unwrap(), message, reservation,
+                                Delivered { bytes, request, terminal: None, completed: false }, model.clone()));
                         }
                     }
                     _ => { ending = Some((None, "client_eof")); end_deadline = Instant::now() + CLOSE_TIMEOUT; }

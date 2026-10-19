@@ -24,6 +24,18 @@ pub(super) struct Decision {
     pub quota_reset: Option<DateTime<Utc>>,
 }
 impl Decision {
+    // Header observations have already passed the account-aware C5 reducer.
+    // In particular, a paid-credit permission can keep a 100% account ready.
+    // Do not reinterpret that evidence using an account-free header heuristic.
+    pub fn reconcile_quota(&mut self, observation: &crate::account_runtime::QuotaObservation) {
+        if self.kind == Kind::Rate
+            && let Some(until) = observation.quota_until
+        {
+            self.kind = Kind::Quota;
+            self.signal = None; // C5 has durably applied the causal cooling already.
+            self.quota_reset = Some(until);
+        }
+    }
     pub fn failover(&self) -> bool {
         !matches!(self.kind, Kind::Relay | Kind::Rate)
     }

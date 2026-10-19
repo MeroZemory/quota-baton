@@ -7,6 +7,35 @@ use qb_core::{
 };
 use serde_json::json;
 
+// These table tests model successful target probes explicitly. Relay-level
+// counterparts obtain proof from real fake-upstream responses instead.
+trait FixtureRate {
+    fn fixture_rate(
+        &self,
+        provider: Provider,
+        source: &str,
+        key: Option<&str>,
+        candidates: &[Candidate],
+        now: chrono::DateTime<Utc>,
+    ) -> (usize, usize, usize, usize);
+}
+impl FixtureRate for BindingTable {
+    fn fixture_rate(
+        &self,
+        provider: Provider,
+        source: &str,
+        key: Option<&str>,
+        candidates: &[Candidate],
+        now: chrono::DateTime<Utc>,
+    ) -> (usize, usize, usize, usize) {
+        for c in candidates.iter().filter(|c| c.account.id != source) {
+            self.note_success(&c.account.id, now);
+        }
+        self.note_rate(source, now);
+        self.note_client_rate(provider, source, key, candidates, now)
+    }
+}
+
 fn account(id: &str) -> Account {
     Account {
         schema: 1,
@@ -37,14 +66,15 @@ fn account(id: &str) -> Account {
 }
 
 fn candidates(ids: &[&str]) -> Vec<Candidate> {
-    let reset = (Utc::now() + Duration::hours(24)).to_rfc3339();
+    let now = Utc::now();
+    let reset = (now + Duration::hours(24)).to_rfc3339();
     ids.iter()
         .map(|id| Candidate {
             account: account(id),
             quota: Some(json!({
-                "windows": [
-                    {"name": "primary", "used_pct": 0.0, "reset_at": reset, "observed_at": reset},
-                    {"name": "secondary", "used_pct": 0.0, "reset_at": reset, "observed_at": reset}
+                "observed_at":now, "windows": [
+                    {"name": "primary", "used_pct": 0.0, "reset_at": reset, "observed_at": now},
+                    {"name": "secondary", "used_pct": 0.0, "reset_at": reset, "observed_at": now}
                 ]
             })),
             inflight: 0,
@@ -53,13 +83,17 @@ fn candidates(ids: &[&str]) -> Vec<Candidate> {
 }
 
 fn table() -> (tempfile::TempDir, std::sync::Arc<BindingTable>) {
-    let root = tempfile::tempdir().unwrap();
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/m4d-tests");
+    std::fs::create_dir_all(&base).unwrap();
+    let root = tempfile::tempdir_in(base).unwrap();
     let table = BindingTable::new(root.path(), RoutingConfig::default()).unwrap();
     (root, table)
 }
 
 fn table_with(config: RoutingConfig) -> (tempfile::TempDir, std::sync::Arc<BindingTable>) {
-    let root = tempfile::tempdir().unwrap();
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/m4d-tests");
+    std::fs::create_dir_all(&base).unwrap();
+    let root = tempfile::tempdir_in(base).unwrap();
     let table = BindingTable::new(root.path(), config).unwrap();
     (root, table)
 }
@@ -80,6 +114,7 @@ fn choose(
         bytes,
     ) {
         Decision::Selected { account, lease, .. } => {
+            lease.dispatched();
             drop(lease);
             account
         }
@@ -95,6 +130,7 @@ fn choose_provider(
 ) -> String {
     match table.choose(provider, Some(key), None, None, candidates, None, 1) {
         Decision::Selected { account, lease, .. } => {
+            lease.dispatched();
             drop(lease);
             account
         }
@@ -105,29 +141,23 @@ fn choose_provider(
 #[test]
 fn c7_1_placement_fills_soonest_reset_until_threshold_then_spills() {
     let (_root, table) = table();
-    let candidates = candidates(&["codex:127.0.0.1:41001", "codex:127.0.0.1:41002"]);
-    table.set_account_threshold("codex:127.0.0.1:41001", Some(2));
-    table.set_account_threshold("codex:127.0.0.1:41002", Some(2));
+    let candidates = candidates(&["cx-aaaaaa", "cx-bbbbbb"]);
+    table.set_account_threshold("cx-aaaaaa", Some(2));
+    table.set_account_threshold("cx-bbbbbb", Some(2));
     for id in ["s0", "s1", "s2", "s3"] {
         choose(&table, &format!("codex:{id}"), &candidates, 10);
     }
 
-    assert_eq!(
-        table.active_sessions("codex:127.0.0.1:41001", Utc::now()),
-        2
-    );
-    assert_eq!(
-        table.active_sessions("codex:127.0.0.1:41002", Utc::now()),
-        2
-    );
-    assert_eq!(table.spread_threshold_for("codex:127.0.0.1:41001"), 2);
+    assert_eq!(table.active_sessions("cx-aaaaaa", Utc::now()), 2);
+    assert_eq!(table.active_sessions("cx-bbbbbb", Utc::now()), 2);
+    assert_eq!(table.spread_threshold_for("cx-aaaaaa"), 2);
 }
 
 #[test]
 fn c7_1_marked_group_moves_at_next_request_with_ledger_move_and_after_move() {
     let (_root, table) = table();
-    let source = "codex:127.0.0.1:41001";
-    let target = "codex:127.0.0.1:41002";
+    let source = "cx-aaaaaa";
+    let target = "cx-bbbbbb";
     let source_only = candidates(&[source]);
     let both = candidates(&[source, target]);
     for (key, bytes) in [("g0", 400), ("g1", 100), ("g2", 300), ("g3", 200)] {
@@ -140,7 +170,7 @@ fn c7_1_marked_group_moves_at_next_request_with_ledger_move_and_after_move() {
     let _ = table.preview(Provider::Codex, None, None, None, &both, None, 0);
 
     for key in ["codex:g0", "codex:g1", "codex:g2"] {
-        let (active, threshold, groups_hit, marked) = table.note_client_rate(
+        let (active, threshold, groups_hit, marked) = table.fixture_rate(
             Provider::Codex,
             source,
             Some(key),
@@ -171,7 +201,7 @@ fn mark_overloaded_group(table: &std::sync::Arc<BindingTable>, source: &str, ids
     table.set_account_threshold(source, Some(2));
     let _ = table.preview(Provider::Codex, None, None, None, ids, None, 0);
     for key in ["codex:g0", "codex:g1", "codex:g2"] {
-        table.note_client_rate(Provider::Codex, source, Some(key), ids, Utc::now());
+        table.fixture_rate(Provider::Codex, source, Some(key), ids, Utc::now());
     }
     assert!(table.overload_marked(Some("codex:g0"), Utc::now()));
 }
@@ -180,9 +210,9 @@ fn mark_overloaded_group(table: &std::sync::Arc<BindingTable>, source: &str, ids
 fn c7_1_rebalance_never_targets_disabled_or_cooling_account() {
     for cooling in [false, true] {
         let (_root, table) = table();
-        let source = "codex:z-source";
-        let target = "codex:b-ready";
-        let mut ids = candidates(&["codex:a-ineligible", target, source]);
+        let source = "cx-z-source";
+        let target = "cx-b-ready";
+        let mut ids = candidates(&["cx-a-ineligible", target, source]);
         mark_overloaded_group(&table, source, &ids);
         if cooling {
             ids[0].account.health = Health::Cooling {
@@ -194,12 +224,12 @@ fn c7_1_rebalance_never_targets_disabled_or_cooling_account() {
             ids[0].account.user_state = UserState::Disabled;
         }
 
-        assert_eq!(choose(&table, "codex:g0", &ids, 10), target);
-        assert_eq!(table.current(Some("codex:g0")), Some(target.into()));
+        assert_eq!(choose(&table, "codex:g0", &ids, 10), source);
+        assert_eq!(table.current(Some("codex:g0")), Some(source.into()));
         assert!(!table.overload_marked(Some("codex:g0"), Utc::now()));
-        assert_eq!(table.active_sessions("codex:a-ineligible", Utc::now()), 0);
-        assert_eq!(table.active_sessions(source, Utc::now()), 3);
-        assert_eq!(table.active_sessions(target, Utc::now()), 1);
+        assert_eq!(table.active_sessions("cx-a-ineligible", Utc::now()), 0);
+        assert_eq!(table.active_sessions(source, Utc::now()), 4);
+        assert_eq!(table.active_sessions(target, Utc::now()), 0);
     }
 }
 
@@ -207,8 +237,8 @@ fn c7_1_rebalance_never_targets_disabled_or_cooling_account() {
 fn c7_1_rebalance_mark_cleared_when_no_eligible_account_has_room() {
     for unavailable in ["disabled", "cooling", "drained", "gate", "full"] {
         let (_root, table) = table();
-        let source = "codex:z-source";
-        let target = "codex:a-target";
+        let source = "cx-z-source";
+        let target = "cx-a-target";
         let mut ids = candidates(&[target, source]);
         mark_overloaded_group(&table, source, &ids);
         match unavailable {
@@ -255,9 +285,9 @@ fn c7_1_rebalance_mark_cleared_when_no_eligible_account_has_room() {
 fn c7_1_rebalance_target_follows_c7_order() {
     for order in ["weekly", "five_hour", "usage", "id", "pacing"] {
         let (_root, table) = table();
-        let source = "codex:z-source";
+        let source = "cx-z-source";
         // Start reversed so the id tie-break also tests input-order independence.
-        let mut ids = candidates(&["codex:b", "codex:a", source]);
+        let mut ids = candidates(&["cx-b", "cx-a", source]);
         let now = Utc::now();
         for (index, candidate) in ids[..2].iter_mut().enumerate() {
             let (weekly, five, used) = match (order, index) {
@@ -269,7 +299,7 @@ fn c7_1_rebalance_target_follows_c7_order() {
                 ("usage", _) => (24, 4, 20.0),
                 _ => (24, 4, 0.0),
             };
-            candidate.quota = Some(json!({"windows": [
+            candidate.quota = Some(json!({"observed_at":now,"windows": [
                 {"name": "primary", "used_pct": used,
                  "reset_at": now + Duration::hours(five), "observed_at": now},
                 {"name": "secondary", "used_pct": used,
@@ -280,11 +310,11 @@ fn c7_1_rebalance_target_follows_c7_order() {
         if order != "id" {
             ids.swap(0, 1);
         }
-        mark_overloaded_group(&table, source, &ids);
         if order == "pacing" {
-            table.set_pacing("codex:a", true);
+            table.set_pacing("cx-a", true);
         }
-        let expected = if order == "id" { "codex:a" } else { "codex:b" };
+        mark_overloaded_group(&table, source, &ids);
+        let expected = if order == "id" { "cx-a" } else { "cx-b" };
         assert_eq!(
             table.preview(Provider::Codex, None, None, None, &ids[..2], None, 0),
             PreviewDecision::Selected {
@@ -303,23 +333,23 @@ fn c7_1_rebalance_target_follows_c7_order() {
 #[test]
 fn c7_1_target_never_exceeds_threshold_no_ping_pong() {
     let (_root, table) = table();
-    let ids = candidates(&["codex:a", "codex:b"]);
-    table.set_account_threshold("codex:a", Some(2));
-    table.set_account_threshold("codex:b", Some(2));
+    let ids = candidates(&["cx-a", "cx-b"]);
+    table.set_account_threshold("cx-a", Some(2));
+    table.set_account_threshold("cx-b", Some(2));
     for n in 0..4 {
         choose(&table, &format!("codex:g{n}"), &ids, 1);
     }
-    assert!(table.active_sessions("codex:a", Utc::now()) <= 2);
-    assert!(table.active_sessions("codex:b", Utc::now()) <= 2);
+    assert!(table.active_sessions("cx-a", Utc::now()) <= 2);
+    assert!(table.active_sessions("cx-b", Utc::now()) <= 2);
 }
 
 #[test]
 fn c7_1_cold_group_replaced_when_account_at_threshold() {
     let (_root, table) = table();
-    let ids = candidates(&["codex:a", "codex:b"]);
-    table.set_account_threshold("codex:a", Some(1));
+    let ids = candidates(&["cx-a", "cx-b"]);
+    table.set_account_threshold("cx-a", Some(1));
     choose(&table, "codex:g0", &ids, 1);
-    assert_eq!(choose(&table, "codex:g1", &ids, 1), "codex:b");
+    assert_eq!(choose(&table, "codex:g1", &ids, 1), "cx-b");
 }
 
 #[test]
@@ -329,8 +359,8 @@ fn c7_1_mark_cleared_when_target_room_gone_or_expired() {
         ..RoutingConfig::default()
     };
     let (_root, table) = table_with(config);
-    let source = "codex:a";
-    let target = "codex:b";
+    let source = "cx-a";
+    let target = "cx-b";
     let source_only = candidates(&[source]);
     let ids = candidates(&[source, target]);
     for key in ["codex:g0", "codex:g1", "codex:g2", "codex:g3"] {
@@ -339,7 +369,7 @@ fn c7_1_mark_cleared_when_target_room_gone_or_expired() {
     table.set_account_threshold(source, Some(2));
     let _ = table.preview(Provider::Codex, None, None, None, &ids, None, 0);
     for key in ["codex:g0", "codex:g1", "codex:g2"] {
-        table.note_client_rate(
+        table.fixture_rate(
             Provider::Codex,
             source,
             Some(key),
@@ -354,8 +384,8 @@ fn c7_1_mark_cleared_when_target_room_gone_or_expired() {
 #[test]
 fn c7_1_storm_concentrated_then_spread() {
     let (_root, table) = table();
-    let source = "codex:a";
-    let target = "codex:b";
+    let source = "cx-a";
+    let target = "cx-b";
     let source_only = candidates(&[source]);
     let both = candidates(&[source, target]);
     for n in 0..10 {
@@ -366,7 +396,7 @@ fn c7_1_storm_concentrated_then_spread() {
     let mut moved = 0;
     for key in ["codex:storm-0", "codex:storm-1", "codex:storm-2"] {
         let marked = table
-            .note_client_rate(Provider::Codex, source, Some(key), &both, Utc::now())
+            .fixture_rate(Provider::Codex, source, Some(key), &both, Utc::now())
             .3;
         moved += marked;
     }
@@ -381,14 +411,14 @@ fn c7_1_storm_concentrated_then_spread() {
 #[test]
 fn c7_1_well_spread_no_move() {
     let (_root, table) = table();
-    let source = "codex:127.0.0.1:41001";
-    let target = "codex:127.0.0.1:41002";
+    let source = "cx-aaaaaa";
+    let target = "cx-bbbbbb";
     let both = candidates(&[source, target]);
     choose(&table, "codex:source", &both, 10);
     choose(&table, "codex:target", &candidates(&[target]), 10);
 
     for key in ["codex:source", "codex:other", "codex:third"] {
-        let (_, _, _, marked) = table.note_client_rate(
+        let (_, _, _, marked) = table.fixture_rate(
             Provider::Codex,
             source,
             Some(key),
@@ -418,8 +448,8 @@ fn c7_1_well_spread_no_move() {
 #[test]
 fn c7_1_placement_all_full_uses_lowest_ratio_never_refuses() {
     let (_root, table) = table();
-    let source = "codex:127.0.0.1:41001";
-    let target = "codex:127.0.0.1:41002";
+    let source = "cx-aaaaaa";
+    let target = "cx-bbbbbb";
     let both = candidates(&[source, target]);
     table.set_account_threshold(source, Some(1));
     table.set_account_threshold(target, Some(1));
@@ -429,7 +459,7 @@ fn c7_1_placement_all_full_uses_lowest_ratio_never_refuses() {
     let mut marked = 0;
     for key in ["codex:source", "codex:other", "codex:third"] {
         marked = table
-            .note_client_rate(
+            .fixture_rate(
                 Provider::Codex,
                 source,
                 Some(key),
@@ -446,27 +476,27 @@ fn c7_1_placement_all_full_uses_lowest_ratio_never_refuses() {
 #[test]
 fn c7_1_placement_per_account_threshold_override() {
     let (_root, table) = table();
-    let ids = candidates(&["codex:a", "codex:b"]);
-    table.set_account_threshold("codex:a", Some(1));
-    table.set_account_threshold("codex:b", Some(3));
+    let ids = candidates(&["cx-a", "cx-b"]);
+    table.set_account_threshold("cx-a", Some(1));
+    table.set_account_threshold("cx-b", Some(3));
     for n in 0..4 {
         let _ = choose(&table, &format!("codex:g{n}"), &ids, 1);
     }
-    assert_eq!(table.active_sessions("codex:a", Utc::now()), 1);
-    assert_eq!(table.active_sessions("codex:b", Utc::now()), 3);
+    assert_eq!(table.active_sessions("cx-a", Utc::now()), 1);
+    assert_eq!(table.active_sessions("cx-b", Utc::now()), 3);
 }
 
 #[test]
 fn c7_1_group_counts_once_claude_agents_and_codex_root() {
     let (_root, table) = table();
-    let codex = candidates(&["codex:a"]);
+    let codex = candidates(&["cx-a"]);
     choose(&table, "codex:root", &codex, 1);
     let mut claude = candidates(&["claude:a"]);
     claude[0].account.provider = Provider::Claude;
     claude[0].account.id = "claude:a".into();
     choose_provider(&table, Provider::Claude, "claude:root", &claude);
     choose_provider(&table, Provider::Claude, "claude:root:agent:one", &claude);
-    assert_eq!(table.active_sessions("codex:a", Utc::now()), 1);
+    assert_eq!(table.active_sessions("cx-a", Utc::now()), 1);
     assert_eq!(table.active_sessions("claude:a", Utc::now()), 1);
 }
 
@@ -477,32 +507,27 @@ fn c7_1_active_count_includes_inflight_and_pinned_and_expires_after_window() {
         ..RoutingConfig::default()
     };
     let (_root, table) = table_with(config);
-    let ids = candidates(&["codex:a"]);
+    let ids = candidates(&["cx-a"]);
     choose(&table, "codex:g", &ids, 1);
     let pin = table.pin(Some("codex:g"));
-    assert_eq!(table.active_sessions("codex:a", Utc::now()), 1);
+    assert_eq!(table.active_sessions("cx-a", Utc::now()), 1);
     drop(pin);
     std::thread::sleep(std::time::Duration::from_millis(1100));
-    assert_eq!(table.active_sessions("codex:a", Utc::now()), 0);
+    assert_eq!(table.active_sessions("cx-a", Utc::now()), 0);
 }
 
 #[test]
 fn c7_1_rate_429_alone_never_moves_bound_session() {
     let (_root, table) = table();
-    let ids = candidates(&["codex:a", "codex:b"]);
+    let ids = candidates(&["cx-a", "cx-b"]);
     choose(&table, "codex:g", &ids, 1);
-    let (_, _, _, marked) = table.note_client_rate(
-        Provider::Codex,
-        "codex:a",
-        Some("codex:g"),
-        &ids,
-        Utc::now(),
-    );
+    let (_, _, _, marked) =
+        table.fixture_rate(Provider::Codex, "cx-a", Some("codex:g"), &ids, Utc::now());
     assert_eq!(marked, 0);
     assert_eq!(
         table.preview(Provider::Codex, Some("codex:g"), None, None, &ids, None, 1),
         PreviewDecision::Selected {
-            account: "codex:a".into()
+            account: "cx-a".into()
         }
     );
 }
@@ -510,8 +535,8 @@ fn c7_1_rate_429_alone_never_moves_bound_session() {
 #[test]
 fn c7_1_imbalance_floor_blocks_move_at_6_vs_4() {
     let (_root, table) = table();
-    let source = "codex:a";
-    let target = "codex:b";
+    let source = "cx-a";
+    let target = "cx-b";
     let ids = candidates(&[source, target]);
     for n in 0..6 {
         choose(&table, &format!("codex:g{n}"), &candidates(&[source]), 1);
@@ -521,7 +546,7 @@ fn c7_1_imbalance_floor_blocks_move_at_6_vs_4() {
     }
     let _ = table.preview(Provider::Codex, None, None, None, &ids, None, 0);
     for key in ["codex:g0", "codex:g1", "codex:g2"] {
-        table.note_client_rate(
+        table.fixture_rate(
             Provider::Codex,
             source,
             Some(key),
@@ -535,8 +560,8 @@ fn c7_1_imbalance_floor_blocks_move_at_6_vs_4() {
 #[test]
 fn c7_1_inflight_request_or_streaming_socket_never_victim() {
     let (_root, table) = table();
-    let source = "codex:a";
-    let target = "codex:b";
+    let source = "cx-a";
+    let target = "cx-b";
     let source_only = candidates(&[source]);
     let ids = candidates(&[source, target]);
     for key in ["codex:g0", "codex:g1", "codex:g2", "codex:g3"] {
@@ -546,7 +571,7 @@ fn c7_1_inflight_request_or_streaming_socket_never_victim() {
     let lease = table.begin_request(Some("codex:g0"), source);
     let _ = table.preview(Provider::Codex, None, None, None, &ids, None, 0);
     for key in ["codex:g0", "codex:g1", "codex:g2"] {
-        table.note_client_rate(
+        table.fixture_rate(
             Provider::Codex,
             source,
             Some(key),
@@ -561,8 +586,8 @@ fn c7_1_inflight_request_or_streaming_socket_never_victim() {
 #[test]
 fn c7_1_concentrated_marks_cheapest_groups_two_per_window() {
     let (_root, table) = table();
-    let source = "codex:a";
-    let target = "codex:b";
+    let source = "cx-a";
+    let target = "cx-b";
     let source_only = candidates(&[source]);
     let both = candidates(&[source, target]);
     for (n, bytes) in [10, 90, 20, 80, 30, 70, 40, 60].into_iter().enumerate() {
@@ -575,25 +600,24 @@ fn c7_1_concentrated_marks_cheapest_groups_two_per_window() {
     let _ = table.preview(Provider::Codex, None, None, None, &both, None, 0);
     assert_eq!(
         table
-            .note_client_rate(Provider::Codex, source, Some("codex:g0"), &both, Utc::now())
+            .fixture_rate(Provider::Codex, source, Some("codex:g0"), &both, Utc::now())
             .3,
         0
     );
     assert_eq!(
         table
-            .note_client_rate(Provider::Codex, source, Some("codex:g1"), &both, Utc::now())
+            .fixture_rate(Provider::Codex, source, Some("codex:g1"), &both, Utc::now())
             .3,
         0
     );
-    let marked =
-        table.note_client_rate(Provider::Codex, source, Some("codex:g2"), &both, Utc::now());
+    let marked = table.fixture_rate(Provider::Codex, source, Some("codex:g2"), &both, Utc::now());
     assert_eq!(marked.2, 3);
     assert_eq!(marked.3, 2);
     assert!(table.overload_marked(Some("codex:g0"), Utc::now()));
     assert!(table.overload_marked(Some("codex:g2"), Utc::now()));
     assert_eq!(
         table
-            .note_client_rate(Provider::Codex, source, Some("codex:g3"), &both, Utc::now())
+            .fixture_rate(Provider::Codex, source, Some("codex:g3"), &both, Utc::now())
             .3,
         0
     );
@@ -602,8 +626,8 @@ fn c7_1_concentrated_marks_cheapest_groups_two_per_window() {
 #[test]
 fn c7_1_in_place_retry_and_reset_hold_are_not_boundaries() {
     let (_root, table) = table();
-    let source = "codex:a";
-    let target = "codex:b";
+    let source = "cx-a";
+    let target = "cx-b";
     let only_source = candidates(&[source]);
     let both = candidates(&[source, target]);
     for n in 0..6 {
@@ -612,7 +636,7 @@ fn c7_1_in_place_retry_and_reset_hold_are_not_boundaries() {
     table.set_account_threshold(source, Some(5));
     let _ = table.preview(Provider::Codex, None, None, None, &both, None, 0);
     for key in ["codex:g0", "codex:g1", "codex:g2"] {
-        table.note_client_rate(Provider::Codex, source, Some(key), &both, Utc::now());
+        table.fixture_rate(Provider::Codex, source, Some(key), &both, Utc::now());
     }
     assert!(table.overload_marked(Some("codex:g0"), Utc::now()));
     // C6.3 in-place/reset-hold retries reuse the reserved account and do not
@@ -627,8 +651,8 @@ fn c7_1_in_place_retry_and_reset_hold_are_not_boundaries() {
 #[test]
 fn c7_1_row10_and_row2_outcomes_do_not_count() {
     let (_root, table) = table();
-    let source = "codex:a";
-    let target = "codex:b";
+    let source = "cx-a";
+    let target = "cx-b";
     let ids = candidates(&[source, target]);
     for n in 0..6 {
         choose(&table, &format!("codex:g{n}"), &candidates(&[source]), 1);
@@ -642,7 +666,7 @@ fn c7_1_row10_and_row2_outcomes_do_not_count() {
     }
     assert_eq!(
         table
-            .note_client_rate(Provider::Codex, source, Some("codex:g0"), &ids, Utc::now())
+            .fixture_rate(Provider::Codex, source, Some("codex:g0"), &ids, Utc::now())
             .2,
         1
     );

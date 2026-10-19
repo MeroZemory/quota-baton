@@ -98,6 +98,8 @@ struct Binding {
     account: String,
     last_used: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    accepted: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     first_seen_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     bound_since: Option<DateTime<Utc>>,
@@ -137,6 +139,7 @@ struct Data {
     pending: BTreeMap<String, usize>,
     traffic: BTreeMap<String, DateTime<Utc>>,
     sticky: BTreeMap<String, String>,
+    accepted_unbound: BTreeSet<String>,
     after_move: BTreeSet<String>,
     rate_hits: BTreeMap<String, BTreeMap<String, DateTime<Utc>>>,
     overload_marks: BTreeMap<String, OverloadMark>,
@@ -188,6 +191,32 @@ impl std::fmt::Debug for BindingLease {
     }
 }
 impl BindingLease {
+    /// Final admission, immediately before starting the upstream attempt.
+    pub fn dispatched(&self) {
+        let mut d = self.table.data.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(group) = &self.group else {
+            if d.sticky.values().any(|id| id == &self.account) {
+                d.accepted_unbound.insert(self.account.clone());
+            }
+            return;
+        };
+        let Some(entry) = d.groups.get(group).filter(|g| g.account == self.account) else {
+            return;
+        };
+        let keys = entry.keys.clone();
+        let mut changed = false;
+        for key in keys {
+            if let Some(binding) = d.bindings.get_mut(&key)
+                && binding.accepted == Some(false)
+            {
+                binding.accepted = Some(true);
+                changed = true;
+            }
+        }
+        if changed {
+            d.changed();
+        }
+    }
     pub fn successful(&self) {
         self.table.note_success(&self.account, Utc::now());
     }
@@ -348,9 +377,41 @@ fn decode(value: Value) -> Result<Data> {
         d.changed();
     }
     rebuild_indexes(&mut d);
+    d.unknown_cost = d.groups.keys().cloned().collect();
     Ok(d)
 }
 impl BindingTable {
+    fn accepted_in(d: &Data, key: Option<&str>, id: &str) -> bool {
+        if key.is_none() {
+            return d.accepted_unbound.contains(id) && d.sticky.values().any(|sticky| sticky == id);
+        }
+        key.and_then(|key| d.groups.get(group(key)))
+            .is_some_and(|g| {
+                g.account == id
+                    && g.keys
+                        .iter()
+                        .any(|k| d.bindings.get(k).is_some_and(|b| b.accepted != Some(false)))
+            })
+    }
+    pub(crate) fn existing_placement(&self, key: Option<&str>, id: &str) -> bool {
+        Self::accepted_in(
+            &self.data.lock().unwrap_or_else(|e| e.into_inner()),
+            key,
+            id,
+        )
+    }
+    pub fn associate_project(&self, key: &str, project: &str) -> Result<()> {
+        let _mutation = self.mutations.lock().unwrap_or_else(|e| e.into_inner());
+        let anchor = self
+            .data
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .groups
+            .get(group(key))
+            .map(|g| g.account.clone());
+        self.policies
+            .associate_with_anchor(key, project, anchor.as_deref())
+    }
     pub fn routing_view(&self) -> Value {
         let d = self.data.lock().unwrap_or_else(|e| e.into_inner());
         let mut view = self.policies.list();
@@ -366,14 +427,20 @@ impl BindingTable {
     ) -> Result<()> {
         let _mutation = self.mutations.lock().unwrap_or_else(|e| e.into_inner());
         let d = self.data.lock().unwrap_or_else(|e| e.into_inner());
-        let anchor = d
+        let binding = d
             .groups
             .iter()
             .find(|(key, _)| crate::routing::session_id(key) == id)
-            .map(|(_, g)| g.account.clone());
+            .map(|(key, g)| (key.clone(), g.account.clone()));
         drop(d);
-        self.policies
-            .edit_session(id, settings, project, anchor.as_deref(), inherit)
+        self.policies.edit_session_for_key(
+            id,
+            settings,
+            project,
+            binding.as_ref().map(|(_, a)| a.as_str()),
+            inherit,
+            binding.as_ref().map(|(k, _)| k.as_str()),
+        )
     }
     pub fn new(home: &Path, config: RoutingConfig) -> Result<Arc<Self>> {
         config.validate()?;
@@ -645,26 +712,24 @@ impl BindingTable {
         };
         let active = self.active_sessions_in(&d, account, now);
         let threshold = self.spread_threshold_for(account);
-        let target = candidates
+        let mut targets: Vec<_> = candidates
             .iter()
             .filter(|c| {
                 c.account.id != account
                     && c.account.provider == provider
                     && self.rebalance_target(&d, account, c, None, now)
             })
-            .map(|c| {
-                (
-                    c.account.id.clone(),
-                    self.active_sessions_in(&d, &c.account.id, now)
-                        + self.reserved_in(&d, &c.account.id, None, now),
-                    self.spread_threshold_for(&c.account.id),
-                )
-            })
-            .filter(|(_, active, threshold)| active < threshold)
-            .min_by_key(|(_, active, _)| *active);
-        let Some((target, target_active, target_threshold)) = target else {
+            .map(|c| (c, metrics(c, &d, &self.config, now)))
+            .collect();
+        let anchor = targets.iter().filter_map(|(_, m)| m.weekly).min();
+        targets.sort_by(|(a, x), (b, y)| compare_gated(a, x, b, y, anchor));
+        let Some((choice, _)) = targets.first() else {
             return (active, threshold, hit_count, 0);
         };
+        let target = choice.account.id.clone();
+        let target_active =
+            self.active_sessions_in(&d, &target, now) + self.reserved_in(&d, &target, None, now);
+        let target_threshold = self.spread_threshold_for(&target);
         if hit_count < 3 || active <= threshold || active.saturating_sub(target_active) < 2 {
             return (active, threshold, hit_count, 0);
         }
@@ -821,10 +886,19 @@ impl BindingTable {
             .insert(id.to_owned(), pacing);
     }
     pub fn request_bytes(&self, key: Option<&str>, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
         if let Some(key) = key {
             let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
             if d.groups.contains_key(group(key)) {
-                d.unknown_cost.remove(group(key));
+                // Only a complete root input establishes group-wide cost.
+                if key == group(key) {
+                    d.unknown_cost.remove(group(key));
+                }
+                if d.unknown_cost.contains(group(key)) {
+                    return;
+                }
                 let entry = d
                     .last_request_bytes
                     .entry(group(key).to_owned())
@@ -1015,6 +1089,7 @@ impl BindingTable {
         // rather than being recorded after approving a move. A handshake's
         // zero bytes never creates known full-context cost.
         if let Some(key) = key.filter(|_| request_bytes > 0)
+            && d.groups.contains_key(group(key))
             && !d.unknown_cost.contains(group(key))
         {
             let known = d
@@ -1058,6 +1133,7 @@ impl BindingTable {
         let mut moves = Vec::new();
         if let Some(k) = key {
             let g = group(k);
+            let accepted = Self::accepted_in(&d, Some(k), &account);
             let reason = if hold_timed_out {
                 "reset_hold_timeout"
             } else {
@@ -1096,6 +1172,7 @@ impl BindingTable {
                         key: k.clone(),
                         account: account.clone(),
                         last_used,
+                        accepted: Some(accepted),
                         first_seen_at: previous.as_ref().map_or(Some(now), |b| b.first_seen_at),
                         bound_since: if from.as_deref() != Some(account.as_str()) {
                             Some(now)
@@ -1116,14 +1193,19 @@ impl BindingTable {
                     last_used,
                 },
             );
+            if k != g && !d.last_request_bytes.contains_key(g) {
+                d.unknown_cost.insert(g.to_owned());
+            }
             if request_bytes > 0 && !d.unknown_cost.contains(g) {
                 let known = d.last_request_bytes.entry(g.to_owned()).or_default();
                 *known = (*known).max(request_bytes);
             }
             d.overload_marks.remove(g);
             d.changed();
-        } else {
-            d.sticky.insert(provider.as_str().into(), account.clone());
+        } else if let Some(old) = d.sticky.insert(provider.as_str().into(), account.clone())
+            && old != account
+        {
+            d.accepted_unbound.remove(&old);
         }
         let lease = self.reserve(&mut d, key, &account);
         self.prune(&mut d, now);
@@ -1192,8 +1274,9 @@ impl BindingTable {
                         .is_none_or(|anchor| anchor == &c.account.id)
             })
             .map(|c| {
-                let eligible =
-                    effective_account(c, d, &self.config, model, now).eligible_at(model, now);
+                let eligible = effective_account(c, d, &self.config, model, now)
+                    .eligible_at(model, now)
+                    && (!c.account.drain || Self::accepted_in(d, key, &c.account.id));
                 (c, eligible)
             })
             .collect();
@@ -1211,6 +1294,7 @@ impl BindingTable {
                 key: key.to_owned(),
                 account: anchor.clone(),
                 last_used: now,
+                accepted: None,
                 first_seen_at: None,
                 bound_since: None,
                 client_kind: None,
@@ -1448,20 +1532,7 @@ impl BindingTable {
             .filter(|(_, m)| !m.unknown)
             .filter_map(|(_, m)| m.weekly)
             .min();
-        gated.sort_by(|(a, x), (b, y)| {
-            let cohort = |t: Option<DateTime<Utc>>| match (anchor, t) {
-                (Some(start), Some(t)) if (t - start).num_seconds() <= 10800 => (0, None),
-                (_, Some(t)) => (1, Some(t)),
-                (_, None) => (2, None),
-            };
-            x.unknown
-                .cmp(&y.unknown)
-                .then_with(|| cohort(x.weekly).cmp(&cohort(y.weekly)))
-                .then_with(|| x.five.is_none().cmp(&y.five.is_none()))
-                .then_with(|| x.five.cmp(&y.five))
-                .then_with(|| x.usage.total_cmp(&y.usage))
-                .then_with(|| a.account.id.cmp(&b.account.id))
-        });
+        gated.sort_by(|(a, x), (b, y)| compare_gated(a, x, b, y, anchor));
         let chosen = gated.first().map(|(c, _)| *c).or_else(|| {
             partition
                 .iter()
@@ -1571,6 +1642,27 @@ struct Metrics {
     five: Option<DateTime<Utc>>,
     usage: f64,
 }
+fn compare_gated(
+    a: &Candidate,
+    x: &Metrics,
+    b: &Candidate,
+    y: &Metrics,
+    anchor: Option<DateTime<Utc>>,
+) -> std::cmp::Ordering {
+    let cohort = |t: Option<DateTime<Utc>>| match (anchor, t) {
+        (Some(start), Some(t)) if (t - start).num_seconds() <= 10800 => (0, None),
+        (_, Some(t)) => (1, Some(t)),
+        (_, None) => (2, None),
+    };
+    x.unknown
+        .cmp(&y.unknown)
+        .then_with(|| cohort(x.weekly).cmp(&cohort(y.weekly)))
+        .then_with(|| x.five.is_none().cmp(&y.five.is_none()))
+        .then_with(|| x.five.cmp(&y.five))
+        .then_with(|| x.usage.total_cmp(&y.usage))
+        .then_with(|| a.account.id.cmp(&b.account.id))
+}
+
 fn date(v: &Value) -> Option<DateTime<Utc>> {
     v.as_str()
         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
@@ -1830,7 +1922,10 @@ mod tests {
                 account,
                 lease,
                 moves,
-            } => (account, lease, moves),
+            } => {
+                lease.dispatched();
+                (account, lease, moves)
+            }
             other => panic!("{other:?}"),
         }
     }
@@ -1930,6 +2025,24 @@ mod tests {
         assert_eq!(preview(&t, &[a.clone(), b.clone()]), "a");
         a.account.drain = true;
         assert_eq!(preview(&t, &[a, b]), "b");
+    }
+    #[test]
+    fn unbound_selection_without_dispatch_does_not_create_drain_privilege() {
+        let (_dir, t) = table();
+        let mut a = candidate("a", 10.0, 8, 1);
+        let b = candidate("b", 5.0, 30, 2);
+        let pending = t.choose(Provider::Claude, None, None, None, &[a.clone()], None, 42);
+        assert!(!t.existing_placement(None, "a"));
+        a.account.drain = true;
+        assert_eq!(choose(&t, None, &[a, b]).0, "b");
+        if let Decision::Selected { lease, .. } = &pending {
+            lease.dispatched();
+        }
+        assert!(
+            !t.existing_placement(None, "a"),
+            "a stale admission cannot warm the successor"
+        );
+        assert!(t.existing_placement(None, "b"));
     }
     #[test]
     fn warm_binding_and_unbound_stay_despite_thresholds_and_drain() {
@@ -2052,6 +2165,7 @@ mod tests {
                     Binding {
                         key,
                         account: "a".into(),
+                        accepted: None,
                         last_used: Utc::now(),
                         first_seen_at: None,
                         bound_since: None,
@@ -2533,6 +2647,7 @@ mod tests {
                     Binding {
                         key,
                         account: "a".into(),
+                        accepted: None,
                         last_used: now,
                         first_seen_at: None,
                         bound_since: None,

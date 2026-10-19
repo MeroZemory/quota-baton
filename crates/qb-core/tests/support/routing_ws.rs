@@ -1,5 +1,108 @@
 use super::*;
 
+#[tokio::test]
+async fn local_upgrade_rate_wait_expiry_has_typed_json_and_advice_without_a_dial() {
+    let h = Harness::new_with_rate_options(1, false, false, Some((1, 3))).await;
+    h.state
+        .accounts
+        .observe_429(&h.ids[0], Some(Duration::from_secs(30)));
+    let Error::Http(response) = connect_async(h.request()).await.unwrap_err() else {
+        panic!("expected local HTTP error");
+    };
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        response.headers()["retry-after"]
+            .to_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+            >= 28
+    );
+    let json: Value = serde_json::from_slice(response.body().as_ref().unwrap()).unwrap();
+    assert_eq!(json["error"]["type"], "rate_wait_timeout");
+    assert!(h.fake.state.requests().is_empty());
+    assert!(
+        h.ledger()
+            .iter()
+            .any(|row| row["outcome"] == "rate_wait_timeout" && row["attempts"] == 0)
+    );
+}
+
+#[tokio::test]
+async fn large_model_first_payload_cannot_escape_old_socket_after_strict_move() {
+    let h = Harness::new(2).await;
+    h.fake.state.keep_old_connections();
+    h.fake.state.push_reply([Message::Text(
+        r#"{"type":"response.created","response":{"id":"still-active"}}"#.into(),
+    )]);
+    let (mut old, a) = h.connect().await;
+    create(&mut old, "original").await;
+    assert!(matches!(receive(&mut old).await, Message::Text(_)));
+    h.state
+        .accounts
+        .change(&a, Some(UserState::Paused), None, None, None)
+        .await
+        .unwrap();
+    let (mut next, b) = h.connect().await;
+    assert_ne!(a, b);
+    strict(&h).await;
+    h.state
+        .accounts
+        .change(&a, Some(UserState::Active), None, None, None)
+        .await
+        .unwrap();
+    let large = format!(
+        r#"{{"model":"original","type":"response.create","input":"{}"}}"#,
+        "x".repeat(1024 * 1024 + 128)
+    );
+    old.send(Message::Text(large.into())).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3),async {
+        tokio::select! {
+            message = old.next() => assert_close(message.unwrap().unwrap(),1000),
+            _ = async { loop {
+                if h.fake.state.messages().iter().filter(|m|matches!(m,Message::Text(_))).count()>1 { break; }
+                tokio::task::yield_now().await;
+            }} => panic!("large unclassified payload escaped on the old credential"),
+        }
+    }).await.unwrap();
+    assert_eq!(
+        h.fake
+            .state
+            .messages()
+            .iter()
+            .filter(|m| matches!(m, Message::Text(_)))
+            .count(),
+        1
+    );
+    assert_credential(&h, 0, &a);
+    assert_credential(&h, 1, &b);
+    next.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn upgrade_uses_its_own_ingress_deadline_independent_of_http_timeout() {
+    for (http, ws, expected) in [
+        (1, 3, StatusCode::BAD_REQUEST),
+        (3, 1, StatusCode::GATEWAY_TIMEOUT),
+    ] {
+        let h = Harness::new_with_deadlines(http, ws).await;
+        h.fake.state.push_handshake_delayed(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"type":"invalid_request_error","message":"synthetic delayed handshake"}}"#,
+            HeaderMap::new(),
+            Duration::from_secs(2),
+        );
+        let start = std::time::Instant::now();
+        assert_eq!(h.error().await.0, expected);
+        assert!(start.elapsed() < Duration::from_secs(4));
+        if http == 1 {
+            assert!(start.elapsed() >= Duration::from_millis(1800));
+        } else {
+            assert!(start.elapsed() < Duration::from_millis(1800));
+        }
+    }
+}
+
 async fn strict(h: &Harness) {
     let table = h.state.bindings.clone();
     tokio::task::spawn_blocking(move || {

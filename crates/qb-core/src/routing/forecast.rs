@@ -180,7 +180,9 @@ impl Shadow {
                 windows.push(fallback("reset_changed"));
                 continue;
             }
-            let horizon = (s.reset - now).num_seconds();
+            // Remaining quota belongs to the sample time. Include the
+            // unobserved interval when estimating demand to the reset.
+            let horizon = (s.reset - last.at).num_seconds();
             let span = s
                 .samples
                 .front()
@@ -221,7 +223,10 @@ impl Shadow {
             };
             // Evaluate a bounded 120 s forecast separately from the reset
             // scenario. Observed coverage is diagnostic, not certification.
-            if s.prediction.is_none() && horizon > 120 {
+            if s.prediction.is_none()
+                && horizon > 120
+                && last.at + chrono::Duration::seconds(120) > now
+            {
                 s.prediction = Some((
                     last.at + chrono::Duration::seconds(120),
                     last.used,
@@ -323,6 +328,25 @@ mod tests {
             s.view("cl-fixture", &fresh, 1, 0, now)["windows"][0]["reason"],
             "reset_changed"
         );
+    }
+    #[test]
+    fn observation_gap_consumption_cannot_be_reported_as_spare_capacity() {
+        let now = Utc::now();
+        let last = now - chrono::Duration::seconds(240);
+        let reset = now + chrono::Duration::seconds(60);
+        let mut s = Shadow::default();
+        s.enable(true);
+        s.regime("cl-gap", Some(2), None);
+        for i in 0..13 {
+            let at = last - chrono::Duration::seconds(360 - i * 30);
+            s.observe("cl-gap", &snapshot(at, reset, 78.0 + i as f64), at);
+        }
+        let view = s.view("cl-gap", &snapshot(last, reset, 90.0), 2, 0, now);
+        assert_ne!(
+            view["windows"][0]["classification"],
+            "possible_spare_capacity"
+        );
+        assert_eq!(view["windows"][0]["horizon_secs"], 300);
     }
     #[test]
     fn model_and_active_load_changes_invalidate_forecast_and_coverage_is_observed() {
