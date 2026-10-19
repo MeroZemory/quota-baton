@@ -74,6 +74,16 @@ impl Harness {
         rate: Option<(u64, u32)>,
         deadlines: Option<(u64, u64)>,
     ) -> Self {
+        Self::new_with_budget_options(count, owned, fail_first, rate, deadlines, None).await
+    }
+    async fn new_with_budget_options(
+        count: usize,
+        owned: bool,
+        fail_first: bool,
+        rate: Option<(u64, u32)>,
+        deadlines: Option<(u64, u64)>,
+        budget: Option<u64>,
+    ) -> Self {
         let serial = SERIAL.lock().await;
         let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/m4a-ws-tests");
         fs::create_dir_all(&base).unwrap();
@@ -124,6 +134,9 @@ impl Harness {
         config.server.data_port = 0;
         config.server.admin_port = 0;
         config.websocket.idle_close_secs = 60;
+        if let Some(budget) = budget {
+            config.guard.inflight_budget_mib = budget;
+        }
         if let Some((hold, retries)) = rate {
             config.routing.rate_hold_secs = hold;
             config.routing.ws_upgrade_hold_secs = hold;

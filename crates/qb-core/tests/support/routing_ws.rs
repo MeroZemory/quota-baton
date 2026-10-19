@@ -417,3 +417,126 @@ async fn unknown_model_is_rechecked_for_initial_retry_and_redial_data() {
         assert_credential(&h, 0, &a);
     }
 }
+
+#[tokio::test]
+async fn retained_create_stays_charged_across_write_and_backpressures_another_socket() {
+    let h = Harness::new_with_budget_options(1, false, false, None, None, Some(1)).await;
+    h.fake.state.keep_old_connections();
+    let (mut first, a) = h.connect().await;
+    let message = format!(
+        r#"{{"type":"response.create","model":"fixture","input":"{}"}}"#,
+        "x".repeat(2 * 1024 * 1024)
+    );
+    let charged = message.len();
+    first.send(Message::Text(message.into())).await.unwrap();
+    let texts = || {
+        h.fake
+            .state
+            .messages()
+            .iter()
+            .filter(|m| matches!(m, Message::Text(_)))
+            .count()
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while texts() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        h.state.budget.used(),
+        charged,
+        "upstream flush cannot release the retained allocation charge"
+    );
+    let upstream_first = h.fake.state.sender().unwrap();
+    let (mut second, b) = h.connect().await;
+    assert_eq!(a, b);
+    assert_credential(&h, 0, &a);
+    assert_credential(&h, 1, &b);
+    create(&mut second, "fixture").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(texts(), 1, "second socket read must remain backpressured");
+    upstream_first
+        .send(Message::Text(
+            r#"{"type":"response.created","response":{"id":"first"}}"#.into(),
+        ))
+        .unwrap();
+    assert!(matches!(receive(&mut first).await, Message::Text(_)));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while texts() != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    h.fake
+        .state
+        .send(Message::Text(
+            r#"{"type":"response.completed","response":{"id":"second"}}"#.into(),
+        ))
+        .unwrap();
+    assert!(matches!(receive(&mut second).await, Message::Text(_)));
+    first.close(None).await.unwrap();
+    second.close(None).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while h.state.budget.used() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn upgrade_skips_reset_beyond_remaining_budget_without_overriding_strict() {
+    for mode in [
+        qb_core::routing::Mode::Recover,
+        qb_core::routing::Mode::Rebalance,
+        qb_core::routing::Mode::Strict,
+    ] {
+        let h = Harness::new_with_options(2, false, false, None, Some((3, 1))).await;
+        let (mut first, a) = h.connect().await;
+        assert_credential(&h, 0, &a);
+        first.close(None).await.unwrap();
+        let table = h.state.bindings.clone();
+        tokio::task::spawn_blocking(move || {
+            table.set_routing_session(
+                &qb_core::routing::session_id("codex:synthetic-ws-session"),
+                Some(qb_core::routing::Settings {
+                    mode,
+                    reset_wait_secs: 60,
+                }),
+                None,
+                false,
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let until = Utc::now() + ChronoDuration::seconds(20);
+        h.store
+            .update_metadata(&a, |account| {
+                account.health = Health::Cooling {
+                    reason: HealthReason::Quota,
+                    until,
+                    scope: "account".into(),
+                };
+                account.quota_cooling = Some(qb_core::accounts::QuotaCooling {
+                    window: "5h".into(),
+                    reset_at: until,
+                    started_at: Utc::now(),
+                });
+            })
+            .unwrap();
+        if mode == qb_core::routing::Mode::Strict {
+            assert_eq!(h.error().await.0, StatusCode::CONFLICT);
+            assert_eq!(h.fake.state.requests().len(), 1);
+        } else {
+            let (mut next, b) = h.connect().await;
+            assert_ne!(a, b);
+            assert_credential(&h, 1, &b);
+            next.close(None).await.unwrap();
+        }
+    }
+}

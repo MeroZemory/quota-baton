@@ -63,7 +63,7 @@ pub(in crate::relay) struct CurrentCompletion {
     first_message: bool,
     model: Option<String>,
     response_id: Option<String>,
-    last_create: Option<Message>,
+    last_create: Option<(Message, Reservation)>,
     rate: Arc<RateBudget>,
 }
 
@@ -138,6 +138,7 @@ impl CurrentCompletion {
             }
         } else if kind.is_some_and(|kind| kind.starts_with("response.")) {
             self.committed = true;
+            self.last_create = None;
         }
         match kind {
             Some("response.completed" | "response.done") => Some("ok"),
@@ -632,6 +633,7 @@ struct Delivered {
 struct PendingRateResend {
     request: u64,
     message: Message,
+    reservation: Reservation,
     rate: Arc<RateBudget>,
     model: Option<String>,
 }
@@ -846,7 +848,7 @@ fn redial_rate(context: Arc<Context>, pending: PendingRateResend) -> RateRedial 
         .map_err(|_| "upstream_write_error")?;
         let (sink, read) = socket.split();
         let bytes = pending.message.len();
-        let reservation = context.budget.reserve_message(bytes);
+        let reservation = pending.reservation;
         // Count a retry only when its write is actually polled, after a dial.
         let rate = pending.rate;
         let write = Box::pin(async move {
@@ -1188,6 +1190,8 @@ async fn run_with_read_timeout(
                 last_activity = Instant::now();
                 match message {
                     Some(Ok(message)) => {
+                        let bytes = message.len();
+                        let reservation = reservation.unwrap_or_else(|| context.budget.reserve_message(bytes));
                         let mut request = current.keys().next().copied();
                         if let Message::Text(text) = &message && response_create(text.as_str()) {
                             draining |= context.relay.as_ref().is_some_and(|relay| relay.is_draining());
@@ -1208,11 +1212,10 @@ async fn run_with_read_timeout(
                             request = Some(next_request);
                             current.insert(next_request, active);
                             if let Some(active) = current.get_mut(&next_request) {
-                                active.last_create = Some(message.clone());
+                                active.last_create = Some((message.clone(), reservation.clone()));
                             }
                             next_request += 1;
                         }
-                        let bytes = message.len();
                         // 라이브러리가 예약한 로컬 pong을 반대쪽 전달 완료와 독립적으로 flush한다.
                         if matches!(&message, Message::Ping(_)) && to_client.is_none() {
                             to_client = Some(flush(client_sink.take().unwrap()));
@@ -1233,7 +1236,6 @@ async fn run_with_read_timeout(
                         // Transfer the deferred slot's reservation into the
                         // write. Re-admitting its already charged bytes could
                         // deadlock when the slot itself fills the budget.
-                        let reservation = reservation.unwrap_or_else(|| context.budget.reserve_message(bytes));
                         if let Some(rate) = initial_rate {
                             let request = request.expect("response.create has completion");
                             pending_initial = Some(PendingInitial { request, message, reservation, rate: rate.clone() });
@@ -1337,13 +1339,14 @@ async fn run_with_read_timeout(
                                                 active.last_create.clone()
                                             }
                                         });
-                                    if let Some(message) = resend
+                                    if let Some((message, reservation)) = resend
                                         && let Some(sink) = upstream_sink.take()
                                     {
                                         let rate = current[&request.expect("active rate request")].rate.clone();
                                         pending_rate_redial = Some(PendingRateResend {
                                             request: request.expect("active rate request"),
                                             message: message.clone(),
+                                            reservation: reservation.clone(),
                                             rate: rate.clone(),
                                             model: current[&request.expect("active rate request")].model.clone(),
                                         });
@@ -1352,9 +1355,7 @@ async fn run_with_read_timeout(
                                         let key = context.session.key.clone();
                                         let retry_model = current[&request.expect("active rate request")].model.clone();
                                         let account = context.account.clone();
-                                        let budget = context.budget.clone();
                                         let bytes = message.len();
-                                        let reservation = budget.reserve_message(bytes);
                                         to_upstream = Some(Box::pin(async move {
                                             if !rate.admit(runtime.as_ref(), &account).await {
                                                 if rate.is_committed() { return (sink,true,Delivered {bytes:0,request,terminal:None,completed:false}); }
@@ -1415,10 +1416,10 @@ async fn run_with_read_timeout(
                         // Attribution and replay authority are independent. An unknown ID
                         // must not finish another turn, but its publication must stop replay.
                         if !benign_control && (!classified || request.is_none()) && matches!(message, Message::Text(_) | Message::Binary(_)) {
-                            for active in current.values_mut() { if active.rate.initial_sent() { active.committed = true; active.rate.commit(); } }
+                            for active in current.values_mut() { if active.rate.initial_sent() { active.committed = true; active.last_create = None; active.rate.commit(); } }
                         }
                         let terminal = request.and_then(|id| current.get_mut(&id)).and_then(|active| active.upstream(event.as_ref()));
-                        if let Some(active)=request.and_then(|id|current.get_mut(&id)) && (active.committed || terminal.is_some()) { active.rate.commit(); }
+                        if let Some(active)=request.and_then(|id|current.get_mut(&id)) && (active.committed || terminal.is_some()) { active.last_create = None; active.rate.commit(); }
                         terminal_pending = terminal.is_some();
                         let completed = event.as_ref().is_some_and(|event| event["type"] == "response.completed");
                         if let Message::Close(frame) = &message {

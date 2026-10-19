@@ -67,6 +67,12 @@ impl Shadow {
         if !self.enabled || crate::observability::safe_identifier(id).is_none() {
             return;
         }
+        // Observations must share admission with the regime invalidation map.
+        self.regime(id, None, None);
+        if !self.regimes.contains_key(id) {
+            self.series.retain(|(account, _), _| account != id);
+            return;
+        }
         self.series.retain(|_, s| {
             s.samples
                 .back()
@@ -252,6 +258,27 @@ impl Shadow {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn saturated_regimes_cannot_admit_untracked_forecasts() {
+        let mut s = super::Shadow::default();
+        s.enable(true);
+        for i in 0..super::MAX_SERIES {
+            s.regime(&format!("cx-{i}"), Some(1), Some("model-a"));
+        }
+        let now = chrono::Utc::now();
+        let reset = now + chrono::Duration::seconds(150);
+        for i in 0..9 {
+            let at = now - chrono::Duration::seconds(240 - i * 30);
+            s.observe("cx-untracked", &snapshot(at, reset, 70.0 + i as f64), at);
+        }
+        s.regime("cx-untracked", Some(9), Some("model-b"));
+        assert!(s.series.is_empty());
+        assert_eq!(
+            s.view("cx-untracked", &snapshot(now, reset, 78.0), 9, 0, now)["windows"][0]["status"],
+            "fallback"
+        );
+    }
+
     use super::*;
     fn snapshot(at: DateTime<Utc>, reset: DateTime<Utc>, used: f64) -> Value {
         json!({"windows":[{"name":"5h","used_pct":used,"observed_at":at,"reset_at":reset}]})

@@ -524,6 +524,7 @@ impl PolicyStore {
         if next.sessions.len() > MAX_SESSIONS || next.projects.len() > MAX_PROJECTS {
             bail!("routing policy capacity reached");
         }
+        next.reindex();
         validate_state(&next)?;
         next.revision = next.revision.wrapping_add(1);
         let bytes = serde_json::to_vec(&next)?;
@@ -1120,6 +1121,8 @@ mod tests {
             })
             .unwrap();
         assert_eq!(store.snapshot().pool_moves["cx"].len(), 3);
+        store.reload().unwrap();
+        assert!(PolicyStore::new(dir.path(), settings(Mode::Rebalance)).is_ok());
         let project = store
             .put_project(
                 None,
