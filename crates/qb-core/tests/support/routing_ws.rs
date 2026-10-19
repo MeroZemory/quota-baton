@@ -228,3 +228,71 @@ async fn waiting_rate_retry_rechecks_its_model_cooling_before_writing() {
     assert_eq!(h.fake.state.requests().len(), 1);
     assert_credential(&h, 0, &account);
 }
+
+#[tokio::test]
+async fn delivered_large_unparsed_output_never_replays_the_create_on_later_rate_error() {
+    let h = Harness::new(1).await;
+    let large = format!(
+        r#"{{"type":"response.output_text.delta","delta":"{}"}}"#,
+        "x".repeat(1024 * 1024 + 1)
+    );
+    let rate = r#"{"type":"error","status":429,"error":{"code":"rate_limit_exceeded"}}"#;
+    h.fake.state.push_reply([
+        Message::Text(large.clone().into()),
+        Message::Text(rate.into()),
+    ]);
+    let (mut client, a) = h.connect().await;
+    create(&mut client, "fixture-model").await;
+    assert_eq!(receive(&mut client).await, Message::Text(large.into()));
+    assert_eq!(receive(&mut client).await, Message::Text(rate.into()));
+    assert_eq!(h.fake.state.requests().len(), 1);
+    assert_eq!(
+        h.fake
+            .state
+            .messages()
+            .iter()
+            .filter(|m| matches!(m, Message::Text(_)))
+            .count(),
+        1
+    );
+    assert_credential(&h, 0, &a);
+    let _ = client.close(None).await;
+}
+
+#[tokio::test]
+async fn large_field_reordered_create_obeys_model_cooling_and_rate_wait() {
+    for cooling in [true, false] {
+        let h = Harness::new_with_rate_options(1, false, false, Some((1, 3))).await;
+        let (mut client, a) = h.connect().await;
+        if cooling {
+            h.store
+                .update_metadata(&a, |account| {
+                    account.health = Health::Cooling {
+                        reason: HealthReason::Permission,
+                        until: Utc::now() + ChronoDuration::hours(1),
+                        scope: "model:blocked".into(),
+                    }
+                })
+                .unwrap();
+        } else {
+            h.state
+                .accounts
+                .observe_429(&a, Some(Duration::from_secs(30)));
+        }
+        let large = format!(
+            r#"{{"input":"{}","model":"blocked","type":"response.create"}}"#,
+            "x".repeat(1024 * 1024 + 128)
+        );
+        client.send(Message::Text(large.into())).await.unwrap();
+        assert_close(
+            receive(&mut client).await,
+            if cooling { 1000 } else { 1013 },
+        );
+        assert!(
+            h.fake.state.messages().is_empty(),
+            "large create bypassed final model/pacing admission"
+        );
+        assert_eq!(h.fake.state.requests().len(), 1);
+        assert_credential(&h, 0, &a);
+    }
+}

@@ -11,7 +11,7 @@ use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -140,6 +140,7 @@ struct Data {
     traffic: BTreeMap<String, DateTime<Utc>>,
     sticky: BTreeMap<String, String>,
     accepted_unbound: BTreeSet<String>,
+    epochs: BTreeMap<String, Arc<()>>,
     after_move: BTreeSet<String>,
     rate_hits: BTreeMap<String, BTreeMap<String, DateTime<Utc>>>,
     overload_marks: BTreeMap<String, OverloadMark>,
@@ -179,6 +180,8 @@ pub struct BindingLease {
     table: Arc<BindingTable>,
     group: Option<String>,
     account: String,
+    epoch_key: String,
+    epoch: Arc<()>,
     pub after_move: bool,
     defer: bool,
 }
@@ -191,9 +194,45 @@ impl std::fmt::Debug for BindingLease {
     }
 }
 impl BindingLease {
-    /// Final admission, immediately before starting the upstream attempt.
+    /// Final admission is separate from attempt/ledger accounting.
+    pub fn receipt(&self) -> DispatchReceipt {
+        DispatchReceipt {
+            table: self.table.clone(),
+            group: self.group.clone(),
+            account: self.account.clone(),
+            epoch_key: self.epoch_key.clone(),
+            epoch: self.epoch.clone(),
+        }
+    }
+    pub fn dispatched(&self) {
+        self.receipt().dispatched();
+    }
+    pub fn successful(&self) {
+        self.table.note_success(&self.account, Utc::now());
+    }
+    /// Upgrade handshakes have no cache usage. Carry this marker to response.create.
+    pub fn defer_after_move(&mut self) {
+        self.defer = true;
+    }
+}
+#[derive(Clone)]
+pub struct DispatchReceipt {
+    table: Arc<BindingTable>,
+    group: Option<String>,
+    account: String,
+    epoch_key: String,
+    epoch: Arc<()>,
+}
+impl DispatchReceipt {
     pub fn dispatched(&self) {
         let mut d = self.table.data.lock().unwrap_or_else(|e| e.into_inner());
+        if !d
+            .epochs
+            .get(&self.epoch_key)
+            .is_some_and(|epoch| Arc::ptr_eq(epoch, &self.epoch))
+        {
+            return;
+        }
         let Some(group) = &self.group else {
             if d.sticky.values().any(|id| id == &self.account) {
                 d.accepted_unbound.insert(self.account.clone());
@@ -216,13 +255,6 @@ impl BindingLease {
         if changed {
             d.changed();
         }
-    }
-    pub fn successful(&self) {
-        self.table.note_success(&self.account, Utc::now());
-    }
-    /// Upgrade handshakes have no cache usage. Carry this marker to response.create.
-    pub fn defer_after_move(&mut self) {
-        self.defer = true;
     }
 }
 impl Drop for BindingLease {
@@ -347,9 +379,70 @@ fn snapshot(d: &Data) -> Snapshot {
         bindings: d.bindings.values().cloned().collect(),
     }
 }
+const SNAPSHOT_MAX_BYTES: u64 = 16 * 1024 * 1024;
+fn read_binding_snapshot(path: &Path) -> std::io::Result<Vec<u8>> {
+    let invalid = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid binding snapshot trust or size",
+        )
+    };
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > SNAPSHOT_MAX_BYTES
+    {
+        return Err(invalid());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err(invalid());
+        }
+        crate::local_secrets::restrict(path).map_err(std::io::Error::other)?;
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x00200000);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let actual = file.metadata()?;
+    if !actual.is_file() || actual.len() > SNAPSHOT_MAX_BYTES {
+        return Err(invalid());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if actual.file_attributes() & 0x400 != 0 {
+            return Err(invalid());
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if actual.uid() != unsafe { libc::geteuid() } || actual.mode() & 0o077 != 0 {
+            return Err(invalid());
+        }
+    }
+    let mut bytes = Vec::new();
+    file.take(SNAPSHOT_MAX_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > SNAPSHOT_MAX_BYTES {
+        return Err(invalid());
+    }
+    Ok(bytes)
+}
 fn decode(value: Value) -> Result<Data> {
     let state: Snapshot = serde_json::from_value(value)?;
-    if state.schema != 1 {
+    if state.schema != 1 || state.bindings.len() > CAPACITY * 2 {
         bail!("unsupported binding schema");
     }
     let mut d = Data::default();
@@ -446,7 +539,7 @@ impl BindingTable {
         config.validate()?;
         let path = home.join("state/bindings.json");
         fs::create_dir_all(path.parent().context("binding state directory")?)?;
-        let data = match fs::read(&path) {
+        let data = match read_binding_snapshot(&path) {
             Ok(bytes) => match serde_json::from_slice(&bytes)
                 .map_err(anyhow::Error::from)
                 .and_then(decode)
@@ -526,6 +619,7 @@ impl BindingTable {
                 d.overload_marks.remove(&g);
                 d.last_request_bytes.remove(&g);
                 d.unknown_cost.remove(&g);
+                d.epochs.remove(&g);
                 for hits in d.rate_hits.values_mut() {
                     hits.remove(&g);
                 }
@@ -1011,7 +1105,15 @@ impl BindingTable {
         } else {
             false
         };
+        let epoch_key = g.clone().unwrap_or_else(|| format!("unbound:{account}"));
+        let epoch = d
+            .epochs
+            .entry(epoch_key.clone())
+            .or_insert_with(|| Arc::new(()))
+            .clone();
         BindingLease {
+            epoch_key,
+            epoch,
             table: self.clone(),
             group: g,
             account: account.into(),
@@ -1151,6 +1253,7 @@ impl BindingTable {
                 keys.insert(p.into());
             }
             if from.as_deref() != Some(&account) {
+                d.epochs.remove(g);
                 moves.push(MoveEvent {
                     key: g.to_owned(),
                     from: from.clone(),
@@ -1206,6 +1309,7 @@ impl BindingTable {
             && old != account
         {
             d.accepted_unbound.remove(&old);
+            d.epochs.remove(&format!("unbound:{old}"));
         }
         let lease = self.reserve(&mut d, key, &account);
         self.prune(&mut d, now);
@@ -2043,6 +2147,38 @@ mod tests {
             "a stale admission cannot warm the successor"
         );
         assert!(t.existing_placement(None, "b"));
+    }
+    #[test]
+    fn aba_old_receipt_cannot_warm_a_new_placement_for_root_or_unbound() {
+        for key in [Some("claude:aba"), None] {
+            let (_dir, t) = table();
+            let cs = [candidate("a", 10.0, 8, 1), candidate("b", 10.0, 30, 2)];
+            let choose_raw =
+                |id| match t.choose(Provider::Claude, key, None, None, &cs, Some(id), 42) {
+                    Decision::Selected { lease, .. } => lease,
+                    other => panic!("{other:?}"),
+                };
+            let old_a = choose_raw("a");
+            let b = choose_raw("b");
+            let new_a = choose_raw("a");
+            old_a.dispatched();
+            b.dispatched();
+            assert!(
+                !t.existing_placement(key, "a"),
+                "old A→B→A receipt authorized new A"
+            );
+            new_a.dispatched();
+            assert!(t.existing_placement(key, "a"));
+        }
+    }
+    #[test]
+    fn oversized_binding_file_is_refused_before_legacy_anchor_capture() {
+        let dir = fixture_dir();
+        fs::create_dir_all(dir.path().join("state")).unwrap();
+        let file = fs::File::create(dir.path().join("state/bindings.json")).unwrap();
+        file.set_len(SNAPSHOT_MAX_BYTES + 1).unwrap();
+        drop(file);
+        assert!(BindingTable::new(dir.path(), RoutingConfig::default()).is_err());
     }
     #[test]
     fn warm_binding_and_unbound_stay_despite_thresholds_and_drain() {

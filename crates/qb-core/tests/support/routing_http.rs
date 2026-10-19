@@ -679,3 +679,89 @@ async fn recover_mode_moves_only_after_real_account_unavailability() {
         first
     );
 }
+
+#[tokio::test]
+async fn restored_codex_root_continuation_does_not_claim_full_context_cost_or_move() {
+    let h = Harness::new(Provider::Codex).await;
+    let a = h
+        .turn("/v1/responses", &[("session-id", "continued-root")], RAW)
+        .await;
+    h.drain(&a).await;
+    let mut snapshot = h.state.bindings.export().unwrap();
+    for binding in snapshot["bindings"].as_array_mut().unwrap() {
+        binding["last_used"] = json!(Utc::now() - ChronoDuration::seconds(3601));
+    }
+    h.state.bindings.import(snapshot).unwrap();
+    let b = h
+        .turn("/v1/responses", &[("session-id", "continued-target")], RAW)
+        .await;
+    assert_ne!(a, b);
+    let continuation =
+        r#"{"model":"fixture-model","previous_response_id":"synthetic-prior","input":"delta"}"#;
+    assert_eq!(
+        h.turn(
+            "/v1/responses",
+            &[("session-id", "continued-root")],
+            continuation
+        )
+        .await,
+        a
+    );
+    assert_credential(&h, 2, &a);
+    assert_eq!(
+        h.fake.state.requests()[2].body.as_ref(),
+        continuation.as_bytes()
+    );
+    assert!(
+        !h.ledger()
+            .iter()
+            .any(|row| row["event"] == "binding_move" && row["from"] == a && row["to"] == b)
+    );
+}
+
+#[tokio::test]
+async fn started_rate_budget_does_not_reopen_after_later_slow_auth_retry() {
+    let h = Harness::with_limits(Provider::Codex, 60, 10, 3).await;
+    for id in h.ids() {
+        let mut a = h.store.load(&id).unwrap();
+        let tokens = h.store.tokens(&a).unwrap();
+        a.source = qb_core::accounts::Source::Oauth;
+        h.store.save(&a, &tokens, Some(a.generation)).unwrap();
+    }
+    let mut rate = ScriptedResponse::json(
+        StatusCode::TOO_MANY_REQUESTS,
+        r#"{"error":{"type":"rate_limit_error"}}"#,
+    );
+    rate.headers.insert("retry-after", "1".parse().unwrap());
+    h.fake.state.push(rate);
+    let mut auth = ScriptedResponse::json(
+        StatusCode::UNAUTHORIZED,
+        r#"{"error":{"code":"invalid_api_key"}}"#,
+    );
+    auth.chunks[0].0 = Duration::from_millis(2200);
+    h.fake.state.push(auth);
+    h.fake.state.push(ScriptedResponse::json(StatusCode::OK,r#"{"access_token":"synthetic-rotated-access","refresh_token":"synthetic-rotated-refresh","expires_in":3600}"#));
+    h.fake
+        .state
+        .push(ScriptedResponse::json(StatusCode::OK, "{}"));
+    let result = h
+        .send(
+            "/v1/responses",
+            &[("session-id", "rate-then-slow-auth")],
+            RAW,
+        )
+        .await;
+    assert_eq!(result.0, 429);
+    assert!(String::from_utf8_lossy(&result.2).contains("rate_wait_timeout"));
+    let requests = h.fake.state.requests();
+    assert_eq!(
+        requests.len(),
+        3,
+        "a spent rate budget sent one more data request"
+    );
+    assert_eq!(
+        requests[0].headers["chatgpt-account-id"],
+        requests[1].headers["chatgpt-account-id"]
+    );
+    assert!(String::from_utf8_lossy(&requests[2].body).contains("refresh_token"));
+}

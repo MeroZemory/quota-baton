@@ -7,6 +7,7 @@ mod outcome;
 mod response;
 mod upload;
 mod websocket;
+mod wire_metadata;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -1369,7 +1370,12 @@ async fn handover_http(state: Arc<RelayState>, request: Request) -> Response {
 
 #[derive(Clone, Copy)]
 struct RequestDeadline(Instant);
-fn routing_input_cost(headers: &HeaderMap) -> Option<u64> {
+fn routing_input_cost(headers: &HeaderMap, prefix: &[u8], provider: Provider) -> Option<u64> {
+    if provider == Provider::Codex
+        && wire_metadata::Metadata::parse(prefix).is_none_or(|meta| meta.continuation())
+    {
+        return None;
+    }
     if headers
         .get("content-encoding")
         .is_some_and(|v| !v.as_bytes().eq_ignore_ascii_case(b"identity"))
@@ -1527,7 +1533,7 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
     }
     let session = session::classify(provider, path, &parts.headers, &session_body);
     // input_bytes may be only the first streaming chunk, not full context.
-    completion.selection_cost = routing_input_cost(&parts.headers);
+    completion.selection_cost = routing_input_cost(&parts.headers, &upload.prefix, provider);
     if let Some(bytes) = completion.selection_cost {
         state.bindings.request_bytes(session.key.as_deref(), bytes);
     } else {
@@ -1741,16 +1747,24 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
         let admission_started = Instant::now();
         let admission_deadline = rate_hold_deadline
             .unwrap_or_else(|| Instant::now() + Duration::from_secs(state.rate_hold_secs));
-        let admission = state
-            .accounts
-            .admit_until(&account.id, admission_deadline)
-            .await;
-        if admission.waited() {
+        let admission = if rate_hold_deadline.is_some_and(|at| Instant::now() >= at) {
+            None
+        } else {
+            Some(
+                state
+                    .accounts
+                    .admit_until(&account.id, admission_deadline)
+                    .await,
+            )
+        };
+        if admission.as_ref().is_some_and(|a| a.waited()) {
             rate_hold_deadline.get_or_insert(admission_deadline);
         }
         drop(dashboard_pacing);
         completion.rate_wait(admission_started.elapsed().as_millis() as u64);
-        if admission.forced() {
+        if admission.as_ref().is_none_or(|a| a.forced())
+            || rate_hold_deadline.is_some_and(|at| Instant::now() >= at)
+        {
             if let Some(previous) = last_rate_response.take() {
                 rate_relayed = true;
                 state
@@ -1765,7 +1779,6 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
                 .await;
             return state.rate_wait_response(provider, &account.id);
         }
-        drop(last_rate_response.take());
         if !state
             .dispatch_allowed(
                 session.key.as_deref(),
@@ -1809,8 +1822,27 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
                 "전송 전 전체 시간 한도를 초과했습니다.",
             );
         }
+        if rate_hold_deadline.is_some_and(|at| Instant::now() >= at) {
+            if let Some(previous) = last_rate_response.take() {
+                rate_relayed = true;
+                state
+                    .note_client_rate(provider, &account.id, session.key.as_deref())
+                    .await;
+                completion.relayed_rate_429();
+                break previous;
+            }
+            completion.outcome(429, "rate_wait_timeout");
+            state
+                .note_client_rate(provider, &account.id, session.key.as_deref())
+                .await;
+            return state.rate_wait_response(provider, &account.id);
+        }
+        drop(last_rate_response.take());
         if std::mem::take(&mut rate_retry_queued) {
             completion.rate_retry();
+        }
+        if let Some(binding) = &completion.binding {
+            binding.dispatched();
         }
         completion.attempt(&account.id);
         let sent_at = Instant::now();

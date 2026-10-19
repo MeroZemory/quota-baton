@@ -100,6 +100,8 @@ pub struct Project {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Movement {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
     from: String,
     to: String,
     at: DateTime<Utc>,
@@ -179,7 +181,23 @@ impl State {
     fn reindex(&mut self) {
         self.pool_moves.clear();
         self.arrivals.clear();
+        for (root, session) in &mut self.sessions {
+            for (index, movement) in session.movements.iter_mut().enumerate() {
+                if movement.id.is_none() {
+                    // Give old records a stable identity before any alias clones them.
+                    let raw = format!(
+                        "{root}:{index}:{}:{}:{}:{}",
+                        movement.from, movement.to, movement.at, movement.discretionary
+                    );
+                    movement.id = Some(format!("{:x}", Sha256::digest(raw.as_bytes())));
+                }
+            }
+        }
+        let mut seen = BTreeSet::new();
         for movement in self.sessions.values().flat_map(|s| &s.movements) {
+            if !seen.insert(movement.id.as_ref().expect("indexed movement identity")) {
+                continue;
+            }
             self.arrivals
                 .entry(movement.to.clone())
                 .and_modify(|at| *at = (*at).max(movement.at))
@@ -374,7 +392,9 @@ fn load(path: &Path) -> Result<State> {
             .as_deref()
             .is_some_and(|a| crate::observability::safe_identifier(a).is_none())
             || session.movements.iter().any(|m| {
-                crate::observability::safe_identifier(&m.from).is_none()
+                m.id.as_deref()
+                    .is_some_and(|id| !valid_id(id, 32) && !valid_id(id, 64))
+                    || crate::observability::safe_identifier(&m.from).is_none()
                     || crate::observability::safe_identifier(&m.to).is_none()
             })
         {
@@ -669,7 +689,9 @@ impl PolicyStore {
                 {
                     return Ok(());
                 }
-                bail!("routing project conflicts with existing session");
+                if session.project.as_deref() != Some(project) {
+                    bail!("routing project conflicts with existing session");
+                }
             }
         }
         self.update(|state| {
@@ -787,15 +809,13 @@ impl PolicyStore {
         self.update(|state| {
             if discretionary {
                 let prefix = account.split('-').next().unwrap_or(account);
+                // The immutable index de-duplicates inherited legacy history.
                 let pool_moves = state
-                    .sessions
-                    .values()
-                    .flat_map(|s| s.movements.iter())
-                    .filter(|m| {
-                        m.discretionary
-                            && (now - m.at).num_seconds() < self.limits.window_secs as i64
-                            && m.to.split('-').next() == Some(prefix)
-                    })
+                    .pool_moves
+                    .get(prefix)
+                    .into_iter()
+                    .flatten()
+                    .filter(|at| (now - **at).num_seconds() < self.limits.window_secs as i64)
                     .count();
                 if pool_moves >= self.limits.max_pool_moves {
                     bail!("routing pool movement budget exhausted");
@@ -851,6 +871,7 @@ impl PolicyStore {
                     bail!("routing movement budget exhausted");
                 }
                 entry.movements.push(Movement {
+                    id: Some(format!("{:032x}", rand::random::<u128>())),
                     from,
                     to: account.to_owned(),
                     at: now,
@@ -879,6 +900,89 @@ mod tests {
             mode,
             reset_wait_secs: 7,
         }
+    }
+    #[test]
+    fn same_project_empty_anchor_is_completed_without_reassignment() {
+        let dir = home();
+        let store = PolicyStore::new(dir.path(), settings(Mode::Rebalance)).unwrap();
+        let project = store
+            .put_project(
+                None,
+                Project {
+                    name: "fixture".into(),
+                    settings: settings(Mode::Recover),
+                },
+            )
+            .unwrap();
+        store.associate("codex:anchor-fill", &project).unwrap();
+        store
+            .associate_with_anchor("codex:anchor-fill", &project, Some("cx-a"))
+            .unwrap();
+        store.reload().unwrap();
+        assert_eq!(
+            store.plan(Some("codex:anchor-fill")).anchor.as_deref(),
+            Some("cx-a")
+        );
+        assert!(
+            store
+                .associate_with_anchor("codex:anchor-fill", "other", Some("cx-b"))
+                .is_err()
+        );
+    }
+    #[test]
+    fn legacy_alias_copy_keeps_pool_count_and_distinct_real_movements_after_restart() {
+        let dir = home();
+        let store = PolicyStore::new(dir.path(), settings(Mode::Rebalance)).unwrap();
+        let now = Utc::now();
+        store
+            .update(|state| {
+                for key in ["codex:legacy", "codex:other1", "codex:other2"] {
+                    state.sessions.insert(
+                        session_id(key),
+                        SessionPolicy {
+                            project: None,
+                            baseline: settings(Mode::Rebalance),
+                            explicit: Some(settings(Mode::Rebalance)),
+                            anchor: Some("cx-b".into()),
+                            movements: vec![Movement {
+                                id: None,
+                                from: "cx-a".into(),
+                                to: "cx-b".into(),
+                                at: now,
+                                discretionary: true,
+                            }],
+                        },
+                    );
+                }
+                state.legacy_codex_roots.insert(session_id("codex:legacy"));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(store.snapshot().pool_moves["cx"].len(), 3);
+        let project = store
+            .put_project(
+                None,
+                Project {
+                    name: "legacy".into(),
+                    settings: settings(Mode::Rebalance),
+                },
+            )
+            .unwrap();
+        let key = "codex:legacy:agent:one";
+        store
+            .edit_session_for_key(
+                &session_id(key),
+                None,
+                Some(&project),
+                Some("cx-b"),
+                false,
+                Some(key),
+            )
+            .unwrap();
+        assert_eq!(store.snapshot().pool_moves["cx"].len(), 3);
+        store.reload().unwrap();
+        assert_eq!(store.snapshot().pool_moves["cx"].len(), 3);
+        assert!(store.discretionary_allowed("codex:new", None, now));
     }
     #[test]
     fn strict_anchor_survives_restart_and_child_inherits() {

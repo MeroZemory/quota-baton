@@ -34,3 +34,5 @@
 - 기존 전체 관문은 1,223 passed / 15 failed / 12 ignored로 실패했다. 새 무강제전송·영속 anchor 계약과 맞지 않는 fixture는 실제 요청·자격 증명을 확인하도록 수정했다. 분산 예약의 정렬 불일치와 C5 헤더 소진의 rate 오분류는 실제 코드 결함으로 수정했다. 실패 결과를 통과로 집계하지 않는다. 최종 수정 commit에서 관문과 독립 재검수를 다시 실행한다.
 
 - 초기화 시각이 지난 shadow 진단은 `reset_elapsed` fallback으로 전환한다. 관측이 아직 fresh여도 초기화 이전 잔량을 여유 용량처럼 표시하지 않는다. 합성 회귀의 수정 전 실패와 수정 후 통과를 증거에 보존한다.
+
+- 네 번째 Sol max 검수(`014f732`)의 큰 WS 출력 공개 후 재전송, 순서가 다른 큰 create의 admission/모델 우회, A→B→A receipt, HTTP continuation 비용, legacy 이동 이력 중복, 기존 프로젝트의 빈 anchor 보완, 미전송 timeout의 release slot 소비를 수정했다. payload tree를 만들지 않는 bounded 메타데이터 파서, 살아 있는 배치 epoch receipt, 원장 집계와 전송 승인의 분리를 적용했다. 바인딩 파일도 링크/핸들·소유 권한·16MiB·40,000 항목 상한을 검사한 뒤 legacy anchor 입력으로 사용한다.

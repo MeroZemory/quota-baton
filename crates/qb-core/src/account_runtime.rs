@@ -616,7 +616,7 @@ impl AccountRuntime {
                 waiter
                     .forced
                     .store(!open && now >= waiter.deadline, Ordering::Release);
-                if pacing {
+                if pacing && open {
                     state.last_release = Some(now);
                 }
                 true
@@ -692,7 +692,7 @@ impl AccountRuntime {
                 if now >= gate || now >= deadline {
                     let forced = now >= deadline;
                     state.waiting.remove(selected);
-                    if pacing {
+                    if pacing && !forced {
                         state.last_release = Some(now);
                     }
                     (Some(waiter), state.wake.clone(), forced)
@@ -1193,6 +1193,24 @@ impl AccountRuntime {
             }
         }
         Ok(views)
+    }
+
+    pub(crate) async fn eligible_unknown_model(&self, id: &str) -> bool {
+        if !self.eligible(id, None).await {
+            return false;
+        }
+        let volatile = self
+            .volatile
+            .lock()
+            .ok()
+            .and_then(|map| map.get(id).cloned());
+        if matches!(volatile, Some(Health::Cooling { until, scope, .. }) if until > Utc::now() && scope.starts_with("model:"))
+        {
+            return false;
+        }
+        let store = self.store.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || store.load(&id).is_ok_and(|a| !matches!(a.health, Health::Cooling { until, scope, .. } if until > Utc::now() && scope.starts_with("model:")))).await.unwrap_or(false)
     }
 
     pub async fn observe_headers(
@@ -1822,7 +1840,10 @@ mod r1_rate_tests {
             .await
             .expect("retry renewed the total request budget");
         assert!(forced.forced());
-        assert!(last_release(&f.runtime).unwrap() >= deadline);
+        assert!(
+            last_release(&f.runtime).unwrap() < deadline,
+            "an unsent timeout cannot consume a release slot"
+        );
         block(&f.runtime);
         let mut expired = Box::pin(f.runtime.admit_until(ID, deadline));
         let Poll::Ready(final_admission) = poll!(expired.as_mut()) else {
@@ -1832,6 +1853,29 @@ mod r1_rate_tests {
         assert!(queue_deadlines(&f.runtime).is_empty());
     }
 
+    #[tokio::test]
+    async fn unsent_expired_waiter_does_not_spend_the_next_waiters_release_slot() {
+        let f = Fixture::new();
+        block(&f.runtime);
+        let mut expired = Box::pin(
+            f.runtime
+                .admit_until(ID, Instant::now() + StdDuration::from_millis(20)),
+        );
+        let mut next = Box::pin(
+            f.runtime
+                .admit_until(ID, Instant::now() + StdDuration::from_secs(10)),
+        );
+        assert!(poll!(expired.as_mut()).is_pending());
+        assert!(poll!(next.as_mut()).is_pending());
+        assert!(expired.await.forced());
+        assert!(
+            last_release(&f.runtime).is_none(),
+            "an unsent timeout consumed a release slot"
+        );
+        open_backoff(&f.runtime);
+        assert!(!next.await.forced());
+        assert!(last_release(&f.runtime).is_some());
+    }
     #[tokio::test]
     async fn open_gate_after_old_rate_deadline_is_a_normal_release_with_shared_clock() {
         let f = Fixture::new();
@@ -1907,8 +1951,10 @@ mod r1_rate_tests {
             .await
             .expect("earlier tail failed to wake the head's release-loop sleep");
         assert!(tail_guard.forced());
-        let forced_stamp = last_release(&f.runtime).unwrap();
-        assert!(forced_stamp >= deadline);
+        assert!(
+            last_release(&f.runtime).is_none(),
+            "unsent tail expiry must not consume the head's release slot"
+        );
         assert!(
             poll!(head.as_mut()).is_pending(),
             "head bypassed the still-closed gate"
@@ -1919,12 +1965,7 @@ mod r1_rate_tests {
             .await
             .unwrap();
         assert!(!head_guard.forced());
-        assert!(
-            last_release(&f.runtime)
-                .unwrap()
-                .duration_since(forced_stamp)
-                >= MIN_RELEASE
-        );
+        assert!(last_release(&f.runtime).unwrap() >= deadline);
         assert!(queue_deadlines(&f.runtime).is_empty());
     }
 

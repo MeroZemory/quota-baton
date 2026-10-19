@@ -541,20 +541,7 @@ fn parsed(text: &str) -> Option<Value> {
 }
 
 fn response_create(text: &str) -> bool {
-    if text.len() <= PARSE_LIMIT {
-        return parsed(text).is_some_and(|value| value["type"] == "response.create");
-    }
-    // 큰 입력은 Codex의 선두 type 필드만 검사하고 입력 본문을 파싱하지 않는다.
-    let prefix = &text.as_bytes()[..text.len().min(256)];
-    let mut remaining = prefix;
-    for token in [b"{".as_slice(), b"\"type\"", b":", b"\"response.create\""] {
-        remaining = remaining.trim_ascii_start();
-        let Some(rest) = remaining.strip_prefix(token) else {
-            return false;
-        };
-        remaining = rest;
-    }
-    matches!(remaining.trim_ascii_start().first(), Some(b',' | b'}'))
+    super::super::wire_metadata::Metadata::parse(text.as_bytes()).is_some_and(|m| m.create())
 }
 
 fn count_type(counts: &mut BTreeMap<String, u64>, event: &Value) {
@@ -608,14 +595,9 @@ fn ws_retry_after(event: &Value) -> Option<Duration> {
 
 fn has_previous_response_id(message: &Message) -> bool {
     let Message::Text(text) = message else {
-        return false;
+        return true;
     };
-    if text.len() <= PARSE_LIMIT {
-        return parsed(text)
-            .and_then(|value| value.get("previous_response_id").cloned())
-            .is_some_and(|value| !value.is_null());
-    }
-    text[..text.len().min(PARSE_LIMIT)].contains("\"previous_response_id\"")
+    super::super::wire_metadata::Metadata::parse(text.as_bytes()).is_none_or(|m| m.continuation())
 }
 
 struct Delivered {
@@ -705,6 +687,34 @@ where
     S::Error: Send,
 {
     Box::pin(async move {
+        let rate = Arc::new(RateBudget::new(&context));
+        if matches!(message, Message::Text(_) | Message::Binary(_)) {
+            if !rate.admit(context.runtime.as_ref(), &context.account).await {
+                return (
+                    sink,
+                    false,
+                    Delivered {
+                        bytes: 0,
+                        terminal: Some("rate_wait_timeout"),
+                        ..delivered
+                    },
+                );
+            }
+            if let Some(runtime) = &context.runtime
+                && model.is_none()
+                && !runtime.eligible_unknown_model(&context.account).await
+            {
+                return (
+                    sink,
+                    false,
+                    Delivered {
+                        bytes: 0,
+                        terminal: Some("routing_policy_blocked"),
+                        ..delivered
+                    },
+                );
+            }
+        }
         if matches!(message, Message::Text(_) | Message::Binary(_))
             && let (Some(relay), Some(_)) = (&context.relay, &context.runtime)
             && !relay
@@ -721,6 +731,17 @@ where
                 Delivered {
                     bytes: 0,
                     terminal: Some("routing_policy_blocked"),
+                    ..delivered
+                },
+            );
+        }
+        if matches!(message, Message::Text(_) | Message::Binary(_)) && !rate.can_send() {
+            return (
+                sink,
+                false,
+                Delivered {
+                    bytes: 0,
+                    terminal: Some("rate_wait_timeout"),
                     ..delivered
                 },
             );
@@ -1040,6 +1061,7 @@ async fn run_with_read_timeout(
                     let bytes = pending.message.len();
                     let context = context.clone();
                     let dispatch_model = model.clone();
+                    let dispatch_receipt = current.get(&pending.request).and_then(|active| active.completion.binding.as_ref()).map(|binding| binding.receipt());
                     to_upstream = Some(Box::pin(async move {
                         if let (Some(relay), Some(_)) = (&context.relay, &context.runtime)
                             && !relay.dispatch_allowed(context.session.key.as_deref(), &context.account, dispatch_model.as_deref()).await {
@@ -1048,6 +1070,7 @@ async fn run_with_read_timeout(
                         if !pending.rate.can_send() {
                             return (sink, false, Delivered {bytes:0,request:Some(pending.request),terminal:Some("rate_wait_timeout"),completed:false});
                         }
+                        if let Some(receipt) = dispatch_receipt { receipt.dispatched(); }
                         pending.rate.initial_dispatch();
                         write(sink, pending.message, pending.reservation, Delivered {
                             bytes, request: Some(pending.request), terminal: None, completed: false,
@@ -1128,7 +1151,7 @@ async fn run_with_read_timeout(
                         if let Message::Text(text) = &message && response_create(text.as_str()) {
                             draining |= context.relay.as_ref().is_some_and(|relay| relay.is_draining());
                             if draining { continue; }
-                            model = parsed(text.as_str()).and_then(|value| value.get("model").and_then(Value::as_str).map(str::to_owned));
+                            model = super::super::wire_metadata::Metadata::parse(text.as_bytes()).and_then(|meta| meta.model());
                             if let Some(runtime) = &context.runtime && !runtime.eligible(&context.account, model.as_deref()).await {
                                 ending = Some((Some(CloseFrame { code: 1000.into(), reason: "".into() }), "account_ineligible"));
                                 end_deadline = Instant::now() + CLOSE_TIMEOUT;
@@ -1154,7 +1177,7 @@ async fn run_with_read_timeout(
                             to_client = Some(flush(client_sink.take().unwrap()));
                         }
                         if response_create(if let Message::Text(text) = &message { text.as_str() } else { "" }) && let Some(relay) = &context.relay {
-                            let continuation=if let Message::Text(text)=&message {parsed(text.as_str()).is_none_or(|value|value.get("previous_response_id").is_some_and(|id|!id.is_null()))} else {true};
+                            let continuation=has_previous_response_id(&message);
                             if continuation {relay.bindings.unknown_request_cost(context.session.key.as_deref());}
                             else {relay.bindings.request_bytes(context.session.key.as_deref(), bytes as u64);}
                         }
@@ -1178,13 +1201,14 @@ async fn run_with_read_timeout(
                             initial_admission = Some(Box::pin(async move {
                                 if !rate.admit(context.runtime.as_ref(), &context.account).await { return false; }
                                 match &context.runtime {
-                                    Some(runtime) => runtime.eligible(&context.account, model.as_deref()).await,
+                                    Some(runtime) => if model.is_some() { runtime.eligible(&context.account, model.as_deref()).await } else { runtime.eligible_unknown_model(&context.account).await },
                                     None => true,
                                 }
                             }));
                         } else {
+                            let fallback_model = if let Message::Text(text) = &message { super::super::wire_metadata::Metadata::parse(text.as_bytes()).and_then(|meta| meta.model()) } else { None };
                             to_upstream = Some(guarded_upstream_write(context.clone(), upstream_sink.take().unwrap(), message, reservation,
-                                Delivered { bytes, request, terminal: None, completed: false }, model.clone()));
+                                Delivered { bytes, request, terminal: None, completed: false }, fallback_model));
                         }
                     }
                     _ => { ending = Some((None, "client_eof")); end_deadline = Instant::now() + CLOSE_TIMEOUT; }
@@ -1340,6 +1364,9 @@ async fn run_with_read_timeout(
                             ending = Some((frame.clone(), "upstream_close"));
                             end_deadline = Instant::now() + CLOSE_TIMEOUT;
                             continue;
+                        }
+                        if event.is_none() && matches!(message, Message::Text(_) | Message::Binary(_)) {
+                            for active in current.values_mut() { if active.rate.initial_sent() { active.committed = true; } }
                         }
                         let terminal = request.and_then(|id| current.get_mut(&id)).and_then(|active| active.upstream(event.as_ref()));
                         terminal_pending = terminal.is_some();
