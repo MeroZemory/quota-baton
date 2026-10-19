@@ -179,9 +179,6 @@ impl Completion {
     }
 
     pub fn attempt(&mut self, account: &str) {
-        if let Some(binding) = &self.binding {
-            binding.dispatched();
-        }
         self.dashboard_begin();
         if self
             .account_inflight
@@ -314,5 +311,58 @@ impl Drop for Completion {
             );
         }
         self.observability.record_request(self.record.clone());
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    #[test]
+    fn attempt_bookkeeping_never_admits_a_binding_or_spends_a_dispatch_receipt() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.sandbox/ledger-admission");
+        std::fs::create_dir_all(&base).unwrap();
+        let home = tempfile::tempdir_in(base).unwrap();
+        let table = crate::bindings::BindingTable::new(
+            home.path(),
+            crate::config::RoutingConfig::default(),
+        )
+        .unwrap();
+        let account = crate::accounts::health::tests::fixture();
+        let id = account.id.clone();
+        let key = "codex:accounting";
+        let candidate = crate::bindings::Candidate {
+            account,
+            quota: None,
+            inflight: 0,
+        };
+        let crate::bindings::Decision::Selected { lease, .. } = table.choose(
+            Provider::Codex,
+            Some(key),
+            None,
+            None,
+            &[candidate],
+            None,
+            42,
+        ) else {
+            panic!("fixture placement")
+        };
+        let obs = Arc::new(Observability::new(home.path(), None).unwrap());
+        let mut completion = Completion::new(
+            obs,
+            &axum::http::Method::GET,
+            "/v1/responses",
+            Provider::Codex,
+            &axum::http::HeaderMap::new(),
+        );
+        completion.binding = Some(lease);
+        completion.attempt(&id);
+        completion.attempt(&id);
+        assert!(
+            !table.existing_placement(Some(key), &id),
+            "ledger accounting granted dispatch authority"
+        );
+        completion.binding.as_ref().unwrap().dispatched();
+        assert!(table.existing_placement(Some(key), &id));
     }
 }

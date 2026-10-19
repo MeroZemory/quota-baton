@@ -384,6 +384,9 @@ async fn upgrade_inner(
             if std::mem::take(&mut rate_retry_queued) {
                 completion.rate_retry();
             }
+            if let Some(binding) = &completion.binding {
+                binding.dispatched();
+            }
             completion.attempt(&account.id);
             let sent_at = std::time::Instant::now();
             let result = tokio::time::timeout(
