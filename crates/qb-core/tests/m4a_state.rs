@@ -485,6 +485,18 @@ mod runtime_regressions {
             .await
             .unwrap();
         assert!(!f.runtime.eligible(id, None).await);
+        let g = Fixture::new(&[Provider::Codex], 0.0);
+        let gid = &g.ids[0];
+        g.runtime.apply_quota_snapshot(gid,json!({"windows":[window("7d",100.0,Utc::now()+Duration::days(5),Utc::now())],"credits":{"has_credits":true},"signals":{}}),None).await.unwrap();
+        g.runtime
+            .transition(gid, HealthSignal::AuthFailure)
+            .await
+            .unwrap();
+        assert!(g.load(0).auth_failures > 0);
+        assert_eq!(
+            g.runtime.views().await.unwrap()[0]["quota_credit_releasable"],
+            false
+        );
     }
 
     #[tokio::test]
