@@ -918,11 +918,15 @@ async fn poll_terminal_owned_refresh_requires_relogin() {
 
 #[tokio::test]
 async fn poll_observed_exhaustion_and_credit_hold_use_limiting_reset() {
-    for (used, allow_credits, cooling) in [
-        (100.0, true, true),
-        (99.0, false, true),
-        (99.0, true, false),
-        (98.0, false, false),
+    for (used, allow_credits, has_credits, cooling) in [
+        (100.0, true, Some(true), false),
+        (100.0, true, None, true),
+        (100.0, false, Some(true), true),
+        (99.0, false, Some(true), true),
+        (99.0, false, Some(false), false),
+        (99.0, false, None, false),
+        (99.0, true, Some(true), false),
+        (98.0, false, Some(true), false),
     ] {
         let h = Harness::new(Provider::Codex, false).await;
         h.state
@@ -932,6 +936,9 @@ async fn poll_observed_exhaustion_and_credit_hold_use_limiting_reset() {
             .unwrap();
         let reset = Utc::now().timestamp() + 3600;
         let mut body: Value = serde_json::from_slice(&usage(used, reset).chunks[0].1).unwrap();
+        body["credits"] = has_credits
+            .map(|has| json!({"has_credits":has,"balance":if has {10} else {0}}))
+            .unwrap_or(Value::Null);
         body["rate_limit"]["secondary_window"] = json!({"used_percent": 10,
             "limit_window_seconds": 604800, "reset_at": reset + 86400});
         h.usage
