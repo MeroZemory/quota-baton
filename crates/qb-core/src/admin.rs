@@ -244,6 +244,8 @@ enum RoutingUpdate {
         id: String,
         settings: Option<crate::routing::Settings>,
         project: Option<String>,
+        #[serde(default)]
+        inherit: bool,
     },
 }
 async fn routing_view(State(state): State<RuntimeAdmin>) -> Response {
@@ -273,7 +275,7 @@ async fn routing_update(
     let result=tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
         match request {
             RoutingUpdate::Project{id,name,settings}=>Ok(serde_json::json!({"id":table.policies.put_project(id.as_deref(),crate::routing::Project{name,settings})?})),
-            RoutingUpdate::Session{id,settings,project}=>{table.set_routing_session(&id,settings,project.as_deref())?;Ok(serde_json::json!({"updated":true}))},
+            RoutingUpdate::Session{id,settings,project,inherit}=>{table.set_routing_session(&id,settings,project.as_deref(),inherit)?;Ok(serde_json::json!({"updated":true}))},
         }
     }).await;
     match result {

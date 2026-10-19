@@ -16,3 +16,8 @@
 수치가 미결정인 새 정책은 현재 기본값을 유지하거나 명시적 opt-in으로 제공한다. 예측의 효과를 측정 없이 확정하지 않는다. 단위별 commit, focused 테스트; 마지막 gate에서 전체 matrix를 순차 실행한다. Cargo는 default target, incremental=0, debug profile override 없음, 8GiB cap을 지킨다.
 
 이 문서는 현재 진행 목록이다. 완료하지 않은 단위를 완료로 보고하지 않는다. 설계 세션 <pane>에는 보내지 않는다.
+
+## 단위 검증 기록
+
+- `bcaca4f`: 영속 정책·프로젝트·관리 API/CLI 기반. Sol max 독립 검수에서 P1 4건/P2 2건 발견.
+- 후속 단위: 현재 전역 상속, 필수 스키마/링크·읽기 cap, 읽기 스냅샷, 시작 전 anchor 보존, 명시적 inherit, 전송 직전 권한 재검사와 왕복/예약 보호를 수정. core lib 334/334, routing HTTP 4/4, testkit all-targets strict clippy 통과. 실제 fake upstream Authorization/account header와 A 대기→B 이동→strict(B) 경합을 확인했다. 최종 독립 재검수/전체 gate는 남아 있다.

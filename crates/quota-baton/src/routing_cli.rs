@@ -67,7 +67,7 @@ pub async fn run(
             }
             let settings=mode.map(|mode|serde_json::json!({"mode":mode,"reset_wait_secs":reset_wait_secs.unwrap_or(config.routing.reset_hold_secs)}));
             Some(
-                serde_json::json!({"kind":"session","id":id,"settings":settings,"project":project}),
+                serde_json::json!({"kind":"session","id":id,"settings":settings,"project":project,"inherit":inherit}),
             )
         }
     };

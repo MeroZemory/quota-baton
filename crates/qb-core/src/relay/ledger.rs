@@ -231,6 +231,13 @@ impl Completion {
 
 impl Drop for Completion {
     fn drop(&mut self) {
+        if matches!(self.record.outcome.as_str(), "ok" | "rate_hold_ok")
+            && ((200..300).contains(&self.record.status)
+                || (self.record.transport == "ws" && self.record.status == 101))
+            && let Some(binding) = &self.binding
+        {
+            binding.successful();
+        }
         if let Some(counter) = self.inflight.take() {
             counter.fetch_sub(1, Ordering::Relaxed);
         }

@@ -6,8 +6,9 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs,
+    io::Read,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
 const MAX_SESSIONS: usize = 20_000;
@@ -22,8 +23,53 @@ pub enum Mode {
     #[default]
     Rebalance,
 }
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
+pub struct ChurnLimits {
+    pub dwell_secs: u64,
+    pub revisit_secs: u64,
+    pub window_secs: u64,
+    pub max_group_moves: usize,
+    pub max_pool_moves: usize,
+    pub target_quiet_secs: u64,
+    pub target_success_secs: u64,
+    pub max_move_bytes: u64,
+}
+impl Default for ChurnLimits {
+    fn default() -> Self {
+        Self {
+            dwell_secs: 1800,
+            revisit_secs: 3600,
+            window_secs: 600,
+            max_group_moves: 3,
+            max_pool_moves: 4,
+            target_quiet_secs: 120,
+            target_success_secs: 300,
+            max_move_bytes: 8 * 1024 * 1024,
+        }
+    }
+}
+impl ChurnLimits {
+    pub fn validate(&self) -> Result<()> {
+        if self.dwell_secs > 86400
+            || self.revisit_secs > 86400
+            || self.window_secs == 0
+            || self.window_secs > 86400
+            || !(1..=16).contains(&self.max_group_moves)
+            || !(1..=32).contains(&self.max_pool_moves)
+            || self.target_quiet_secs > 3600
+            || self.target_success_secs == 0
+            || self.target_success_secs > 900
+            || self.max_move_bytes == 0
+            || self.max_move_bytes > 64 * 1024 * 1024
+        {
+            bail!("invalid routing churn limits");
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Settings {
     pub mode: Mode,
     pub reset_wait_secs: u64,
@@ -51,6 +97,7 @@ pub struct Project {
     pub settings: Settings,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct Movement {
     from: String,
     to: String,
@@ -58,20 +105,35 @@ struct Movement {
     discretionary: bool,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct SessionPolicy {
+    #[serde(deserialize_with = "required_optional")]
     project: Option<String>,
     baseline: Settings,
+    #[serde(deserialize_with = "required_optional")]
     explicit: Option<Settings>,
+    #[serde(deserialize_with = "required_optional")]
     anchor: Option<String>,
-    #[serde(default)]
     movements: Vec<Movement>,
 }
 impl SessionPolicy {
-    fn settings(&self) -> &Settings {
-        self.explicit.as_ref().unwrap_or(&self.baseline)
+    fn settings<'a>(&'a self, defaults: &'a Settings) -> &'a Settings {
+        self.explicit.as_ref().unwrap_or(if self.project.is_some() {
+            &self.baseline
+        } else {
+            defaults
+        })
     }
 }
+fn required_optional<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(deserializer)
+}
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct State {
     schema: u32,
     revision: u64,
@@ -103,11 +165,17 @@ pub struct Plan {
 pub struct PolicyStore {
     path: PathBuf,
     defaults: Settings,
-    state: Mutex<State>,
+    limits: ChurnLimits,
+    state: Mutex<Arc<State>>,
+    writer: Mutex<()>,
 }
 
 pub fn root(key: &str) -> &str {
-    key.split(":agent:").next().unwrap_or(key)
+    if key.starts_with("claude:") {
+        key.split(":agent:").next().unwrap_or(key)
+    } else {
+        key
+    }
 }
 pub fn session_id(key: &str) -> String {
     format!("{:x}", Sha256::digest(root(key).as_bytes()))
@@ -143,14 +211,48 @@ pub fn take_project(headers: &mut axum::http::HeaderMap) -> Result<Option<String
 }
 
 fn load(path: &Path) -> Result<State> {
-    match fs::metadata(path) {
+    let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.len() > MAX_FILE => bail!("routing policy file exceeds cap"),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(State::default()),
         Err(e) => return Err(e.into()),
-        _ => {}
+        Ok(metadata) => metadata,
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        bail!("routing policy must be a regular non-link file");
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            bail!("routing policy reparse point refused");
+        }
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x00200000);
+    }
+    let file = options.open(path)?;
+    let actual = file.metadata()?;
+    if !actual.is_file() || actual.len() > MAX_FILE {
+        bail!("invalid routing policy handle");
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if actual.file_attributes() & 0x400 != 0 {
+            bail!("routing policy reparse handle refused");
+        }
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_FILE {
+        bail!("routing policy read cap exceeded");
     }
     // A corrupt intent file must stop startup, never silently remove strict pins.
-    let state: State = serde_json::from_slice(&fs::read(path)?)?;
+    let state: State = serde_json::from_slice(&bytes)?;
     if state.schema != 1
         || state.projects.len() > MAX_PROJECTS
         || state.sessions.len() > MAX_SESSIONS
@@ -194,15 +296,26 @@ impl PolicyStore {
         Ok(Self {
             path,
             defaults,
-            state: Mutex::new(state),
+            limits: ChurnLimits::default(),
+            state: Mutex::new(Arc::new(state)),
+            writer: Mutex::new(()),
         })
     }
+    pub fn with_limits(mut self, limits: ChurnLimits) -> Result<Self> {
+        limits.validate()?;
+        self.limits = limits;
+        Ok(self)
+    }
+    pub fn limits(&self) -> &ChurnLimits {
+        &self.limits
+    }
     fn update<T>(&self, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let _writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.snapshot();
         if state.frozen {
             bail!("routing policy writer retired");
         }
-        let mut next = state.clone();
+        let mut next = (*state).clone();
         let result = f(&mut next)?;
         if next.sessions.len() > MAX_SESSIONS || next.projects.len() > MAX_PROJECTS {
             bail!("routing policy capacity reached");
@@ -213,24 +326,78 @@ impl PolicyStore {
             bail!("routing policy file exceeds cap");
         }
         crate::bindings::atomic_write(&self.path, &bytes)?;
-        *state = next;
+        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(next);
         Ok(result)
     }
     pub fn freeze(&self) {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).frozen = true;
+        let _writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let mut next = (*self.snapshot()).clone();
+        next.frozen = true;
+        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(next);
     }
     pub fn reload(&self) -> Result<()> {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let _writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.snapshot();
         if state.frozen {
             bail!("routing policy writer retired");
         }
-        *state = load(&self.path)?;
+        let next = load(&self.path)?;
+        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(next);
         Ok(())
+    }
+    fn snapshot(&self) -> Arc<State> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+    /// Capture existing locks before the disposable binding LRU is pruned.
+    pub fn capture_strict_anchors<'a>(
+        &self,
+        bindings: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Result<()> {
+        let state = self.snapshot();
+        let missing: BTreeMap<_, _> = bindings
+            .into_iter()
+            .filter_map(|(key, account)| {
+                let id = session_id(key);
+                let plan = self.resolve(&state, &id);
+                (plan.settings.mode == Mode::Strict && plan.anchor.is_none())
+                    .then_some((id, account.to_owned()))
+            })
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        self.update(|state| {
+            for (id, account) in missing {
+                let entry = state.sessions.entry(id).or_insert_with(|| SessionPolicy {
+                    project: None,
+                    baseline: self.defaults.clone(),
+                    explicit: None,
+                    anchor: None,
+                    movements: Vec::new(),
+                });
+                if entry.anchor.is_none() {
+                    entry.anchor = Some(account);
+                }
+            }
+            Ok(())
+        })
+    }
+    /// A queued request cannot use an obsolete account after policy changes.
+    pub fn permits_dispatch(&self, key: Option<&str>, account: &str) -> bool {
+        let state = self.snapshot();
+        let Some(key) = key else {
+            return self.defaults.mode != Mode::Strict;
+        };
+        let plan = self.resolve(&state, &session_id(key));
+        plan.settings.mode != Mode::Strict || plan.anchor.as_deref() == Some(account)
     }
     fn resolve(&self, state: &State, id: &str) -> Plan {
         let session = state.sessions.get(id);
         Plan {
-            settings: session.map_or_else(|| self.defaults.clone(), |s| s.settings().clone()),
+            settings: session.map_or_else(
+                || self.defaults.clone(),
+                |s| s.settings(&self.defaults).clone(),
+            ),
             anchor: session.and_then(|s| s.anchor.clone()),
             project: session.and_then(|s| s.project.clone()),
             source: session.map_or("global", |s| {
@@ -246,11 +413,11 @@ impl PolicyStore {
         }
     }
     pub fn plan(&self, key: Option<&str>) -> Plan {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.snapshot();
         self.resolve(&state, &key.map(session_id).unwrap_or_default())
     }
     pub fn list(&self) -> serde_json::Value {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.snapshot();
         serde_json::json!({"revision":state.revision,"defaults":self.defaults,"projects":state.projects,"sessions":state.sessions.keys().map(|id| (id.clone(), self.resolve(&state,id))).collect::<BTreeMap<_,_>>()})
     }
     pub fn put_project(&self, id: Option<&str>, project: Project) -> Result<String> {
@@ -278,6 +445,16 @@ impl PolicyStore {
         explicit: Option<Settings>,
         project: Option<&str>,
         anchor: Option<&str>,
+    ) -> Result<()> {
+        self.edit_session(id, explicit, project, anchor, true)
+    }
+    pub fn edit_session(
+        &self,
+        id: &str,
+        explicit: Option<Settings>,
+        project: Option<&str>,
+        anchor: Option<&str>,
+        inherit: bool,
     ) -> Result<()> {
         if !valid_id(id, 64) {
             bail!("invalid routing session id");
@@ -312,7 +489,9 @@ impl PolicyStore {
                 entry.project = Some(project.to_owned());
                 entry.baseline = baseline;
             }
-            entry.explicit = explicit;
+            if explicit.is_some() || inherit {
+                entry.explicit = explicit;
+            }
             // Editing policy never silently chooses another account.
             if entry.anchor.is_none() {
                 entry.anchor = anchor.map(str::to_owned);
@@ -324,7 +503,7 @@ impl PolicyStore {
     pub fn associate(&self, key: &str, project: &str) -> Result<()> {
         let id = session_id(key);
         {
-            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let state = self.snapshot();
             if let Some(session) = state.sessions.get(&id) {
                 if session.project.as_deref() == Some(project) {
                     return Ok(());
@@ -364,15 +543,46 @@ impl PolicyStore {
         target: Option<&str>,
         now: DateTime<Utc>,
     ) -> bool {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.snapshot();
+        let prefix = if key.starts_with("claude:") {
+            "cl"
+        } else {
+            "cx"
+        };
+        let pool_moves = state
+            .sessions
+            .values()
+            .flat_map(|s| s.movements.iter())
+            .filter(|m| {
+                m.discretionary
+                    && (now - m.at).num_seconds() < self.limits.window_secs as i64
+                    && m.to.split('-').next() == Some(prefix)
+            })
+            .count();
+        if pool_moves >= self.limits.max_pool_moves
+            || target.is_some_and(|target| {
+                state
+                    .sessions
+                    .values()
+                    .flat_map(|s| s.movements.iter())
+                    .any(|m| {
+                        m.to == target
+                            && (now - m.at).num_seconds() < self.limits.target_quiet_secs as i64
+                    })
+            })
+        {
+            return false;
+        }
         let Some(session) = state.sessions.get(&session_id(key)) else {
             return self.defaults.mode == Mode::Rebalance;
         };
-        session.settings().mode == Mode::Rebalance
+        session.settings(&self.defaults).mode == Mode::Rebalance
             && !session.movements.iter().any(|m| {
-                (m.discretionary && (now - m.at).num_seconds() < 1800)
-                    || target
-                        .is_some_and(|target| target == m.from && (now - m.at).num_seconds() < 3600)
+                (m.discretionary && (now - m.at).num_seconds() < self.limits.dwell_secs as i64)
+                    || target.is_some_and(|target| {
+                        target == m.from
+                            && (now - m.at).num_seconds() < self.limits.revisit_secs as i64
+                    })
             })
     }
     /// Persist before a strict first dispatch or any account change. No partial memory commit.
@@ -390,7 +600,7 @@ impl PolicyStore {
         let id = session_id(key);
         let discretionary = matches!(reason, "overload" | "cold_rebalance");
         {
-            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let state = self.snapshot();
             if state.frozen {
                 bail!("routing policy writer retired");
             }
@@ -413,6 +623,33 @@ impl PolicyStore {
             }
         }
         self.update(|state| {
+            if discretionary {
+                let prefix = account.split('-').next().unwrap_or(account);
+                let pool_moves = state
+                    .sessions
+                    .values()
+                    .flat_map(|s| s.movements.iter())
+                    .filter(|m| {
+                        m.discretionary
+                            && (now - m.at).num_seconds() < self.limits.window_secs as i64
+                            && m.to.split('-').next() == Some(prefix)
+                    })
+                    .count();
+                if pool_moves >= self.limits.max_pool_moves {
+                    bail!("routing pool movement budget exhausted");
+                }
+                if state
+                    .sessions
+                    .values()
+                    .flat_map(|s| s.movements.iter())
+                    .any(|m| {
+                        m.to == account
+                            && (now - m.at).num_seconds() < self.limits.target_quiet_secs as i64
+                    })
+                {
+                    bail!("routing destination inflow budget exhausted");
+                }
+            }
             let entry = state.sessions.entry(id).or_insert_with(|| SessionPolicy {
                 project: None,
                 baseline: self.defaults.clone(),
@@ -421,13 +658,13 @@ impl PolicyStore {
                 movements: Vec::new(),
             });
             let from = entry.anchor.as_deref().or(previous).map(str::to_owned);
-            if entry.settings().mode == Mode::Strict
+            if entry.settings(&self.defaults).mode == Mode::Strict
                 && from.as_deref().is_some_and(|a| a != account)
             {
                 bail!("routing session is locked");
             }
             if let Some(from) = from.filter(|from| from != account) {
-                if discretionary && entry.settings().mode != Mode::Rebalance {
+                if discretionary && entry.settings(&self.defaults).mode != Mode::Rebalance {
                     bail!("routing discretionary move forbidden");
                 }
                 entry
@@ -435,8 +672,10 @@ impl PolicyStore {
                     .retain(|m| (now - m.at).num_seconds() < 24 * 3600);
                 if discretionary
                     && entry.movements.iter().any(|m| {
-                        (m.discretionary && (now - m.at).num_seconds() < 1800)
-                            || (m.from == account && (now - m.at).num_seconds() < 3600)
+                        (m.discretionary
+                            && (now - m.at).num_seconds() < self.limits.dwell_secs as i64)
+                            || (m.from == account
+                                && (now - m.at).num_seconds() < self.limits.revisit_secs as i64)
                     })
                 {
                     bail!("routing dwell or revisit budget");
@@ -444,9 +683,9 @@ impl PolicyStore {
                 let recent: Vec<_> = entry
                     .movements
                     .iter()
-                    .filter(|m| (now - m.at).num_seconds() < 600)
+                    .filter(|m| (now - m.at).num_seconds() < self.limits.window_secs as i64)
                     .collect();
-                if recent.len() >= 3 {
+                if recent.len() >= self.limits.max_group_moves {
                     bail!("routing movement budget exhausted");
                 }
                 entry.movements.push(Movement {
@@ -641,7 +880,148 @@ mod tests {
         assert!(PolicyStore::new(home.path(), Settings::default()).is_err());
     }
     #[test]
+    fn implicit_history_follows_current_global_defaults_after_restart() {
+        let home = home();
+        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        store
+            .dispatch(
+                Some("codex:global"),
+                "cx-b",
+                Some("cx-a"),
+                "forced",
+                Utc::now(),
+            )
+            .unwrap();
+        drop(store);
+        let store = PolicyStore::new(home.path(), settings(Mode::Strict)).unwrap();
+        assert_eq!(store.plan(Some("codex:global")).source, "global");
+        assert_eq!(store.plan(Some("codex:global")).settings.mode, Mode::Strict);
+        assert!(!store.permits_dispatch(Some("codex:global"), "cx-a"));
+        assert!(store.permits_dispatch(Some("codex:global"), "cx-b"));
+    }
+    #[test]
+    fn project_assignment_does_not_clear_explicit_policy_without_inherit() {
+        let home = home();
+        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        let id = session_id("codex:explicit");
+        store
+            .edit_session(&id, Some(settings(Mode::Strict)), None, Some("cx-a"), false)
+            .unwrap();
+        let project = store
+            .put_project(
+                None,
+                Project {
+                    name: "project".into(),
+                    settings: settings(Mode::Rebalance),
+                },
+            )
+            .unwrap();
+        store
+            .edit_session(&id, None, Some(&project), None, false)
+            .unwrap();
+        assert_eq!(
+            store.plan(Some("codex:explicit")).settings.mode,
+            Mode::Strict
+        );
+        store.edit_session(&id, None, None, None, true).unwrap();
+        assert_eq!(
+            store.plan(Some("codex:explicit")).settings.mode,
+            Mode::Rebalance
+        );
+    }
+    #[test]
+    fn strict_capture_preserves_lru_anchor_but_never_overwrites_durable_anchor() {
+        let home = home();
+        let store = PolicyStore::new(home.path(), settings(Mode::Strict)).unwrap();
+        store
+            .capture_strict_anchors([("codex:old", "cx-a")])
+            .unwrap();
+        store
+            .capture_strict_anchors([("codex:old", "cx-b")])
+            .unwrap();
+        assert!(store.permits_dispatch(Some("codex:old"), "cx-a"));
+        assert!(!store.permits_dispatch(Some("codex:old"), "cx-b"));
+        assert!(!store.permits_dispatch(None, "cx-a"));
+    }
+    #[test]
+    fn persisted_schema_rejects_missing_or_misspelled_safety_fields() {
+        let home = home();
+        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        let id = session_id("codex:schema");
+        store
+            .set_session(&id, Some(settings(Mode::Strict)), None, Some("cx-a"))
+            .unwrap();
+        let original: serde_json::Value =
+            serde_json::from_slice(&fs::read(&store.path).unwrap()).unwrap();
+        for field in ["explicit", "anchor", "project", "movements"] {
+            let mut bad = original.clone();
+            bad["sessions"][&id].as_object_mut().unwrap().remove(field);
+            fs::write(&store.path, serde_json::to_vec(&bad).unwrap()).unwrap();
+            assert!(
+                PolicyStore::new(home.path(), Settings::default()).is_err(),
+                "missing {field}"
+            );
+        }
+        let mut bad = original.clone();
+        bad["sessions"][&id]["explict"] = bad["sessions"][&id]["explicit"].clone();
+        fs::write(&store.path, serde_json::to_vec(&bad).unwrap()).unwrap();
+        assert!(PolicyStore::new(home.path(), Settings::default()).is_err());
+        let mut bad = original;
+        bad["sessions"][&id]["baseline"]
+            .as_object_mut()
+            .unwrap()
+            .remove("mode");
+        fs::write(&store.path, serde_json::to_vec(&bad).unwrap()).unwrap();
+        assert!(PolicyStore::new(home.path(), Settings::default()).is_err());
+    }
+    #[test]
+    fn policy_load_rejects_nonregular_and_oversized_files() {
+        let home = home();
+        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        fs::create_dir(&store.path).unwrap();
+        assert!(PolicyStore::new(home.path(), Settings::default()).is_err());
+        fs::remove_dir(&store.path).unwrap();
+        fs::File::create(&store.path)
+            .unwrap()
+            .set_len(MAX_FILE + 1)
+            .unwrap();
+        assert!(PolicyStore::new(home.path(), Settings::default()).is_err());
+    }
+    #[test]
+    fn slow_policy_writer_does_not_block_policy_readers() {
+        let home = home();
+        let store = Arc::new(PolicyStore::new(home.path(), Settings::default()).unwrap());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = store.clone();
+        let writer = std::thread::spawn(move || {
+            worker.update(|_| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+        });
+        entered_rx.recv().unwrap();
+        let reader = store.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread =
+            std::thread::spawn(move || tx.send(reader.plan(Some("codex:read")).revision).unwrap());
+        let result = rx.recv_timeout(std::time::Duration::from_secs(1));
+        release_tx.send(()).unwrap();
+        writer.join().unwrap().unwrap();
+        thread.join().unwrap();
+        assert_eq!(result.unwrap(), 0);
+    }
+    #[test]
     fn duplicate_and_invalid_project_headers_are_removed_on_error() {
+        assert_ne!(
+            session_id("codex:root:agent:independent"),
+            session_id("codex:root")
+        );
+        assert_eq!(
+            session_id("claude:root:agent:child"),
+            session_id("claude:root")
+        );
         let mut headers = axum::http::HeaderMap::new();
         headers.append(PROJECT_HEADER, "a".repeat(32).parse().unwrap());
         headers.append(PROJECT_HEADER, "b".repeat(32).parse().unwrap());
