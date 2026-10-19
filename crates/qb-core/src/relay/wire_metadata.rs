@@ -35,6 +35,14 @@ impl<'de> Deserialize<'de> for Small {
 }
 impl Metadata {
     pub fn parse(bytes: &[u8]) -> Option<Self> {
+        if bytes
+            .iter()
+            .copied()
+            .find(|byte| !byte.is_ascii_whitespace())
+            != Some(b'{')
+        {
+            return None;
+        }
         serde_json::from_slice(bytes).ok()
     }
     pub fn create(&self) -> bool {
@@ -63,6 +71,7 @@ mod tests {
         assert_eq!(meta.model().as_deref(), Some("blocked"));
         assert!(meta.continuation());
         assert!(Metadata::parse(br#"{"model":"partial""#).is_none());
+        assert!(Metadata::parse(br#"["response.create","blocked",null]"#).is_none());
         assert!(
             !Metadata::parse(br#"{"previous_response_id":null}"#)
                 .unwrap()

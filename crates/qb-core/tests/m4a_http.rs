@@ -3434,6 +3434,15 @@ async fn full_meter_with_permitted_credits_keeps_rate_retry_on_same_account() {
     response.bytes().await.unwrap();
     let requests = h.fake.state.requests();
     assert_eq!(requests.len(), 2);
+    let suffix = requests[0].headers["chatgpt-account-id"]
+        .to_str()
+        .unwrap()
+        .strip_prefix("synthetic-")
+        .unwrap();
+    assert_eq!(
+        requests[0].headers["authorization"].to_str().unwrap(),
+        format!("Bearer synthetic-access-{suffix}")
+    );
     assert_eq!(
         requests[0].headers.get("authorization").unwrap(),
         requests[1].headers.get("authorization").unwrap()
