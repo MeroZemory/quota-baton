@@ -1075,18 +1075,9 @@ fn enriched_event(
             .filter(|a| a.raw.provider == e.provider && a.raw.user_state == "disabled")
             .count() as u64,
     );
-    d.allow_credits = account_rows(&snapshot.accounts).iter().any(|a| {
-        a.raw.provider == e.provider
-            && !a.raw.allow_credits
-            && a.raw.credits.as_ref().is_some_and(|c| {
-                c.has_credits == Some(true)
-                    || c.unlimited == Some(true)
-                    || c.balance
-                        .as_ref()
-                        .and_then(|n| n.as_f64())
-                        .is_some_and(|v| v > 0.)
-            })
-    });
+    d.allow_credits = account_rows(&snapshot.accounts)
+        .iter()
+        .any(|a| a.raw.provider == e.provider && v2::credits_eligible_for_resume(&a.raw));
     d.actionable = d.allow_credits || d.disabled_accounts.unwrap_or(0) > 0;
     d.ok = d
         .outcome

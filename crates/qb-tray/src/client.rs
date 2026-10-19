@@ -658,6 +658,8 @@ pub struct TrayAccount {
     #[serde(default)]
     pub quota_cooling: Option<serde_json::Value>,
     #[serde(default)]
+    pub quota_credit_releasable: bool,
+    #[serde(default)]
     pub observed_at: Option<String>,
     #[serde(default)]
     pub last_used_at: Option<String>,
@@ -760,7 +762,7 @@ mod r5_transport_tests {
             "user_state":"active","health":{"kind":"ready"},"source":{"kind":"cpa","mode":"adopted"},
             "pool_eligible":true,"credits_in_use":true,"active_sessions":2,"bound_sessions":3,"spread_threshold":8,
             "allow_credits":true,"credits":{"has_credits":true,"balance":19395.23},"observed_at":at,
-            "quota_cooling":{"window":"5h","reset_at":reset,"started_at":at},
+            "quota_cooling":{"window":"5h","reset_at":reset,"started_at":at},"quota_credit_releasable":true,
             "windows":[{"name":"5h","used_pct":100.0,"reset_at":reset,"observed_at":at,"scope":"account"}],
             "pacing":{"backoff_until":reset,"waiting":2,"step":3,"release_interval_ms":500}
         }]});
@@ -773,6 +775,7 @@ mod r5_transport_tests {
         assert_eq!(account["spread_threshold"], 8);
         assert_eq!(account["credits"]["balance"], 19395.23);
         assert_eq!(account["quota_cooling"]["window"], "5h");
+        assert_eq!(account["quota_credit_releasable"], true);
         assert_eq!(account["observed_at"], at);
         assert_eq!(account["windows"][0]["scope"], "account");
         assert_eq!(account["windows"][0]["observed_at"], at);
