@@ -214,8 +214,8 @@ Overview fixture heights:
 
 ### 6.4 Credits line (Codex only)
 
-- **When.** Shown when `credits.has_credits` or `credits.unlimited` is true. It sits 6 below the bar (or below line 1 if there is no usage line). Height 16, or 24 when it carries a button. 12/16. The text is trimmed with an ellipsis before the button.
-- **Amount.** `floor(balance)` with thousands separators ("19,395"). Unlimited shows "무제한". If the balance is unknown but `has_credits` is true, show "있음". The tooltip shows the exact value.
+- **When.** Shown when C5 credit entitlement is available (unlimited, or a positive balance/has_credits with no explicit absence). It sits 6 below the bar (or below line 1 if there is no usage line). Height 16, or 24 when it carries a button. 12/16. The text is trimmed with an ellipsis before the button.
+- **Amount.** `floor(balance)` with thousands separators ("19,395"). Unlimited shows "무제한". If the balance is unknown but `has_credits` is true, show "있음". The tooltip shows the exact value. The enable confirmation also covers accounts without a credits line: explicit absence shows "없음", missing evidence shows "확인 전". A contradictory old positive balance never overrides explicit absence.
 
 | Situation | Text | Colour | Button (standard, right-aligned to 344) |
 |---|---|---|---|
@@ -226,7 +226,7 @@ Overview fixture heights:
 - An account with no credits (for example hello.sample-acct) shows no credits line.
 
 
-**Mandatory credits confirmation (R5 user decision).** Every transition from off to on, including the row-menu checkbox, opens an in-flyout confirmation styled like delete: title "유료 크레딧 사용"; body "<name>가 한도에 도달하면 유료 크레딧(잔액 <amount>)을 씁니다. 계속할까요?"; buttons [크레딧 사용] [취소]. Confirm alone sends `allow_credits=true`; cancel/Esc/dismiss sends nothing. Consent is never remembered. Turning credits **off** never asks. A checkbox-origin dialog returns to that menu.
+**Mandatory credits confirmation (R5 user decision).** Every transition from off to on, including the row-menu checkbox, opens an in-flyout confirmation styled like delete: title "유료 크레딧 사용"; body "<name>가 한도에 도달한 뒤, 잔액이 있을 때 유료 크레딧 사용을 허용할까요? (현재 잔액 <amount>)"; buttons [크레딧 사용] [취소]. Confirm alone sends `allow_credits=true`; cancel/Esc/dismiss sends nothing. Consent is never remembered. Turning credits **off** never asks. A checkbox-origin dialog returns to that menu.
 
 ### 6.5 Reason line
 

@@ -201,8 +201,14 @@ impl Signals {
         self.overage_status = self.overage_status.take().or(old.overage_status);
         self.retry_after_seconds = self.retry_after_seconds.or(old.retry_after_seconds);
         self.limit_reached = self.limit_reached.or(old.limit_reached);
-        self.active_limit = self.active_limit.take().or(old.active_limit);
+        // A new non-credit active limit ends an old paid-serving claim.
+        if self.active_limit.as_deref().is_some_and(|l| l != "credits")
+            && self.serving_from_credits.is_none()
+        {
+            self.serving_from_credits = Some(false);
+        }
         self.serving_from_credits = self.serving_from_credits.or(old.serving_from_credits);
+        self.active_limit = self.active_limit.take().or(old.active_limit);
     }
 }
 #[derive(Serialize, Deserialize)]
@@ -213,7 +219,6 @@ struct Credits {
 }
 
 enum Command {
-    Quota(String, Box<Snapshot>),
     PollQuota(String, Box<Snapshot>),
     Ledger(serde_json::Value),
     #[cfg(all(feature = "shape-capture", debug_assertions))]
@@ -366,7 +371,7 @@ impl Observability {
             schema: 1,
             ..Default::default()
         };
-        let state = match fs::read(&path) {
+        let mut state = match fs::read(&path) {
             Ok(bytes) => match serde_json::from_slice::<QuotaState>(&bytes) {
                 Ok(state) if state.schema == 1 => state,
                 _ => {
@@ -389,6 +394,12 @@ impl Observability {
                 empty()
             }
         };
+        for snapshot in state.accounts.values_mut() {
+            let mut credit = serde_json::to_value(&snapshot.credits).unwrap_or_default();
+            crate::credits::normalize(&mut credit);
+            snapshot.credits = serde_json::from_value(credit).unwrap_or_default();
+            snapshot.signals.merge(Signals::default());
+        }
         let dashboard = crate::dashboard::runtime::Runtime::new();
         restore_dashboard(home, &dashboard);
         let worker_dashboard = dashboard.clone();
@@ -421,7 +432,6 @@ impl Observability {
     pub fn observe_headers(&self, account_id: &str, provider: Provider, headers: &HeaderMap) {
         if let Some(snapshot) = snapshot(provider, headers, Utc::now()) {
             self.remember(account_id, &snapshot, true);
-            self.enqueue(Command::Quota(account_id.into(), Box::new(snapshot)));
         }
     }
 
@@ -434,11 +444,7 @@ impl Observability {
         let next: Snapshot = serde_json::from_value(value).ok()?;
         // Complete poll responses replace the window set. Partial responses
         // retain known windows just like partial response headers.
-        self.remember(id, &next, !replace_windows);
-        let merged = self.quota_snapshot(id)?;
-        let persisted: Snapshot = serde_json::from_value(merged.clone()).ok()?;
-        self.enqueue(Command::PollQuota(id.into(), Box::new(persisted)));
-        Some(merged)
+        self.remember(id, &next, !replace_windows)
     }
 
     pub(crate) fn capture_poll(&self, provider: Provider, body: &[u8]) {
@@ -508,8 +514,7 @@ impl Observability {
         }
         if let Some(mut snapshot) = snapshot(Provider::Codex, &headers, Utc::now()) {
             snapshot.source = "codex.rate_limits".into();
-            self.remember(account_id, &snapshot, false);
-            self.enqueue(Command::Quota(account_id.into(), Box::new(snapshot)));
+            self.remember(account_id, &snapshot, true);
         }
     }
 
@@ -647,7 +652,12 @@ impl Observability {
         })));
     }
 
-    fn remember(&self, id: &str, next: &Snapshot, preserve_missing_windows: bool) {
+    fn remember(
+        &self,
+        id: &str,
+        next: &Snapshot,
+        preserve_missing_windows: bool,
+    ) -> Option<serde_json::Value> {
         use crate::dashboard::history::*;
         if let Ok(account) = crate::dashboard::AccountId::try_from(id.to_owned()) {
             for window in &next.windows {
@@ -715,18 +725,57 @@ impl Observability {
                     next_signals.merge(prior_signals);
                     value["signals"] = serde_json::to_value(next_signals).unwrap_or_default();
                 }
-                for key in ["plan", "credits"] {
-                    if value[key].is_null() {
-                        value[key] = old[key].clone();
-                    }
+                if value["plan"].is_null() {
+                    value["plan"] = old["plan"].clone();
+                }
+                crate::credits::merge(&mut value["credits"], &old["credits"]);
+                let subscription_still_full = value["windows"].as_array().is_some_and(|windows| {
+                    windows.iter().any(|w| {
+                        w["name"].as_str().is_some_and(|n| !n.contains('_'))
+                            && w["used_pct"].as_f64().is_some_and(|p| p >= 99.0)
+                    })
+                });
+                if (!fresh_reset || subscription_still_full)
+                    && !crate::credits::serving_ended(&value)
+                    && old["paid_serving_observed_at"].as_str().is_some()
+                {
+                    value["paid_serving_observed_at"] = old["paid_serving_observed_at"].clone();
                 }
             }
-            snapshots.insert(id.into(), value);
+            crate::credits::normalize(&mut value["credits"]);
+            let mut signals: Signals = serde_json::from_value(value["signals"].clone()).ok()?;
+            signals.merge(Signals::default());
+            value["signals"] = serde_json::to_value(signals).ok()?;
+            let persisted: Snapshot = serde_json::from_value(value.clone()).ok()?;
+            snapshots.insert(id.into(), value.clone());
+            // Persist the exact in-memory result in observation order. The writer
+            // must never apply a second, different partial-update reducer.
+            self.enqueue(Command::PollQuota(id.into(), Box::new(persisted)));
+            return Some(value);
         }
+        None
     }
 
     pub fn quota_snapshot(&self, id: &str) -> Option<serde_json::Value> {
         self.snapshots.lock().ok()?.get(id).cloned()
+    }
+
+    pub(crate) fn paid_serving_proof(
+        &self,
+        id: &str,
+        observed_at: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        let mut snapshots = self.snapshots.lock().ok()?;
+        let snapshot = snapshots.get_mut(id)?;
+        if &snapshot["observed_at"] != observed_at {
+            return None;
+        }
+        snapshot["paid_serving_observed_at"] = if !crate::credits::serving_ended(snapshot) {
+            serde_json::json!(Utc::now())
+        } else {
+            serde_json::Value::Null
+        };
+        Some(snapshot.clone())
     }
 
     pub(crate) fn record_account(&self, account: &crate::accounts::Account) {
@@ -1084,57 +1133,6 @@ impl Writer {
             Command::PollQuota(id, next) => {
                 // observe_poll already merged this snapshot and cleared stale
                 // limit signals; a second merge must not resurrect them.
-                self.state.accounts.insert(id, *next);
-                self.quota_dirty = true;
-                Ok(())
-            }
-            Command::Quota(id, mut next) => {
-                if let Some(mut old) = self.state.accounts.remove(&id) {
-                    let early_reset = next.windows.iter().any(|w| {
-                        old.windows.iter().any(|old| {
-                            old.name == w.name
-                                && w.reset_at.is_some()
-                                && old.reset_at.is_some()
-                                && w.reset_at
-                                    .zip(old.reset_at)
-                                    .is_some_and(|(new, old)| (new - old).num_seconds().abs() > 300)
-                        })
-                    }) && next
-                        .windows
-                        .iter()
-                        .all(|w| w.used_pct.is_some_and(|p| p < 100.0));
-                    if early_reset {
-                        old.signals.unified_status = None;
-                        old.signals.limit_reached = None;
-                        old.signals.serving_from_credits = None;
-                        old.signals.active_limit = None;
-                    }
-                    for mut window in old.windows {
-                        if let Some(new) = next.windows.iter_mut().find(|w| w.name == window.name) {
-                            let reset_changed = new.reset_at.is_some()
-                                && window.reset_at.is_some()
-                                && new.reset_at.zip(window.reset_at).is_some_and(|(new, old)| {
-                                    (new - old).num_seconds().abs() > 300
-                                });
-                            new.used_pct = new.used_pct.or(window.used_pct);
-                            new.reset_at = new.reset_at.or(window.reset_at);
-                            new.observed_at = new.observed_at.or(window.observed_at);
-                            if !reset_changed {
-                                new.status = new.status.take().or(window.status.take());
-                            }
-                        } else {
-                            next.windows.push(window);
-                        }
-                    }
-                    next.plan = next.plan.or(old.plan);
-                    if let (Some(new), Some(old)) = (&mut next.credits, &old.credits) {
-                        new.has_credits = new.has_credits.or(old.has_credits);
-                        new.unlimited = new.unlimited.or(old.unlimited);
-                        new.balance = new.balance.or(old.balance);
-                    }
-                    next.credits = next.credits.or(old.credits);
-                    next.signals.merge(old.signals);
-                }
                 self.state.accounts.insert(id, *next);
                 self.quota_dirty = true;
                 Ok(())
@@ -1857,7 +1855,7 @@ mod tests {
     fn quota_command(percent: &str) -> Command {
         let mut h = HeaderMap::new();
         h.insert("x-codex-primary-used-percent", percent.parse().unwrap());
-        Command::Quota(
+        Command::PollQuota(
             "cx-synthetic".into(),
             Box::new(snapshot(Provider::Codex, &h, Utc::now()).unwrap()),
         )

@@ -1688,6 +1688,7 @@ async fn c5_passive_header_exhaustion_credits_and_early_reset() {
         .observe_headers(id, Provider::Codex, &headers)
         .await;
     assert_eq!(h.store.load(id).unwrap().health, Health::Ready);
+    headers.insert("x-codex-credits-has-credits", "true".parse().unwrap());
     headers.insert("x-codex-primary-used-percent", "99".parse().unwrap());
     h.state
         .accounts
@@ -3268,7 +3269,7 @@ async fn tray2_passive_poll_at_99_resolves_only_when_next_request_actually_moves
     h.state.accounts.apply_quota_snapshot(&source, json!({
         "source":"synthetic-poll","observed_at":now,
         "windows":[{"name":"5h","used_pct":99.0,"reset_at":now + ChronoDuration::hours(5),"observed_at":now}],
-        "signals":{}
+        "credits":{"has_credits":true}, "signals":{}
     }), None).await.unwrap();
     assert!(tray2_events(&mut events).is_empty());
     assert!(

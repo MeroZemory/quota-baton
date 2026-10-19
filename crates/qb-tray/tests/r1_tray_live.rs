@@ -361,6 +361,7 @@ impl Live {
                 quota_cooling: None,
                 drain: false,
                 allow_credits: false,
+                quota_credit_releasable: false,
                 generation: 0,
                 token_meta: TokenMeta {
                     expires_at: Some(Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).single().unwrap()),

@@ -196,6 +196,7 @@ pub fn save(
         next.allow_credits = old.allow_credits;
         next.health = old.health.clone();
         next.quota_cooling = old.quota_cooling.clone();
+        next.quota_credit_releasable = old.quota_credit_releasable;
         if matches!(
             next.health,
             Health::NeedsRelogin { .. }
@@ -206,6 +207,7 @@ pub fn save(
         ) {
             next.health = Health::Ready;
             next.quota_cooling = None;
+            next.quota_credit_releasable = false;
         }
         next.auth_failures = 0;
         next.payment_failures = old.payment_failures;

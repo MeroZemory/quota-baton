@@ -76,6 +76,7 @@ impl Account {
             self.health.clone(),
             self.auth_probe_pending,
             self.quota_cooling.clone(),
+            self.quota_credit_releasable,
             self.payment_until,
         );
         if let Health::Cooling {
@@ -91,6 +92,7 @@ impl Account {
         }
         let expired_auth = matches!(self.health, Health::Cooling { reason: HealthReason::Auth, until, .. } if until <= now);
         if self.health.expire(now) {
+            self.quota_credit_releasable = false;
             self.auth_probe_pending |= expired_auth;
             self.quota_cooling = None;
         }
@@ -108,6 +110,7 @@ impl Account {
                 self.health.clone(),
                 self.auth_probe_pending,
                 self.quota_cooling.clone(),
+                self.quota_credit_releasable,
                 self.payment_until,
             )
     }
@@ -122,6 +125,7 @@ impl Account {
             self.payment_until,
             self.auth_probe_pending,
             self.quota_cooling.clone(),
+            self.quota_credit_releasable,
         );
         self.expire_health(now);
         match signal {
@@ -200,7 +204,11 @@ impl Account {
                 } else {
                     until
                 };
+                let quota_rejection = reason == HealthReason::Quota;
                 self.cool(reason, until, scope);
+                if quota_rejection {
+                    self.quota_credit_releasable = false;
+                }
             }
             HealthSignal::Ready => {
                 if !matches!(
@@ -244,6 +252,15 @@ impl Account {
                 self.cool(HealthReason::LinkStale, retry_at, "account".into());
             }
         }
+        if !matches!(
+            self.health,
+            Health::Cooling {
+                reason: HealthReason::Quota,
+                ..
+            }
+        ) {
+            self.quota_credit_releasable = false;
+        }
         self.expire_health(now);
         before
             != (
@@ -253,6 +270,7 @@ impl Account {
                 self.payment_until,
                 self.auth_probe_pending,
                 self.quota_cooling.clone(),
+                self.quota_credit_releasable,
             )
     }
 
@@ -348,7 +366,20 @@ impl Account {
                 })
             })
         };
-        let credits = self.provider == Provider::Codex && !self.allow_credits;
+        let credit_capable = crate::credits::entitled(snapshot);
+        let paid_signal = snapshot["signals"]["serving_from_credits"] == true
+            || snapshot["signals"]["active_limit"] == "credits";
+        let credits = self.provider == Provider::Codex
+            && !self.allow_credits
+            && (credit_capable || paid_signal);
+        let paid_allowed = self.provider == Provider::Codex && self.allow_credits && credit_capable;
+        let hard_hold = matches!(
+            self.health,
+            Health::Cooling {
+                reason: HealthReason::Quota,
+                ..
+            }
+        ) && !self.quota_credit_releasable;
         let global = snapshot["signals"]["limit_reached"] == true
             || snapshot["signals"]["unified_status"] == "rejected";
         let serving = credits && snapshot["signals"]["serving_from_credits"] == true;
@@ -356,7 +387,10 @@ impl Account {
             w["used_pct"]
                 .as_f64()
                 // C7 projections guide placement; only observed usage cools.
-                .is_some_and(|p| p >= 100.0 || (credits && p >= 99.0))
+                .is_some_and(|p| {
+                    ((!paid_allowed || subbucket(w)) && p >= 100.0)
+                        || (credits && !subbucket(w) && p >= 99.0)
+                })
                 || w["status"] == "rejected"
                 || ((global || serving) && active_matches(w))
         };
@@ -409,7 +443,14 @@ impl Account {
                 .map(|(_, r)| r)
                 .or_else(|| account_windows.iter().filter_map(|w| reset(w)).min())
                 .unwrap_or(now + Duration::minutes(5));
-            if self.cool(HealthReason::Quota, until, scope) {
+            let releasable = self.provider == Provider::Codex
+                && account_hold
+                && !hard_hold
+                && !global
+                && !fresh.iter().any(|w| w["status"] == "rejected");
+            let incoming = self.cool(HealthReason::Quota, until, scope);
+            self.quota_credit_releasable = releasable;
+            if incoming {
                 self.quota_cooling = causing.and_then(|(w, r)| {
                     w["name"].as_str().map(|name| QuotaCooling {
                         window: name.into(),
@@ -418,6 +459,13 @@ impl Account {
                     })
                 });
             }
+        } else if self.quota_credit_releasable
+            && matches!(&self.health, Health::Cooling { scope, .. } if scope == "account")
+            && paid_allowed
+            && !global
+        {
+            self.health = Health::Ready;
+            self.quota_cooling = None;
         } else if let Some(evidence) = &self.quota_cooling {
             let early = windows.iter().any(|w| {
                 w["name"].as_str() == Some(evidence.window.as_str())
@@ -469,6 +517,7 @@ pub(crate) mod tests {
             quota_cooling: None,
             drain: false,
             allow_credits: false,
+            quota_credit_releasable: false,
             generation: 0,
             token_meta: super::super::TokenMeta::default(),
         }
