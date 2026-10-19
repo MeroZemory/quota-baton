@@ -26,6 +26,7 @@ pub(in crate::relay) struct Completion {
     pub start: Instant,
     pub precommit_deadline: Option<Instant>,
     pub input_bytes: Arc<AtomicU64>,
+    pub selection_cost: Option<u64>,
     pub runtime: Option<Arc<crate::account_runtime::AccountRuntime>>,
     pub failed_access: Option<zeroize::Zeroizing<String>>,
     pub binding: Option<crate::bindings::BindingLease>,
@@ -68,6 +69,7 @@ impl Completion {
             usage_prepolled: false,
             reset_hold_timed_out: false,
             input_bytes: Arc::new(AtomicU64::new(0)),
+            selection_cost: None,
             runtime: None,
             failed_access: None,
             binding: None,
@@ -177,6 +179,9 @@ impl Completion {
     }
 
     pub fn attempt(&mut self, account: &str) {
+        if let Some(binding) = &self.binding {
+            binding.dispatched();
+        }
         self.dashboard_begin();
         if self
             .account_inflight

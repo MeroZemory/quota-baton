@@ -262,6 +262,9 @@ fn c6_4_add_linked(h: &Harness, provider: Provider, email: &str) -> String {
 }
 
 async fn c6_4_data(h: &Harness, provider: Provider) -> reqwest::Response {
+    c6_4_data_session(h, provider, "c6-4").await
+}
+async fn c6_4_data_session(h: &Harness, provider: Provider, session: &str) -> reqwest::Response {
     h.client
         .post(format!(
             "http://{}{}",
@@ -273,8 +276,8 @@ async fn c6_4_data(h: &Harness, provider: Provider) -> reqwest::Response {
             }
         ))
         .bearer_auth("synthetic-client")
-        .header("session-id", "c6-4")
-        .header("x-claude-code-session-id", "c6-4")
+        .header("session-id", session)
+        .header("x-claude-code-session-id", session)
         .json(&json!({"model":"synthetic-model","input":"small"}))
         .send()
         .await
@@ -372,7 +375,8 @@ async fn c6_4_payment_cooling_not_cleared_by_poll_or_small_success() {
             .bindings
             .import(json!({"schema":1,"bindings":[]}))
             .unwrap();
-        let response = c6_4_data(&h, provider).await;
+        // Expiry permits a new placement; it does not erase durable affinity.
+        let response = c6_4_data_session(&h, provider, "c6-4-expired-new-placement").await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()["x-quota-baton-account"], h.id);
         response.bytes().await.unwrap();

@@ -29,3 +29,6 @@
 - 실제 두 코어 프로세스 takeover 회귀 `routing_legacy_strict_anchor_survives_two_process_takeover` 1/1 통과. 기존 형식 strict A 유지, 새 코어의 실제 Authorization/ChatGPT-Account-Id 확인, A 중지 후 다른 계정으로 전달되지 않음을 확인했다.
 - 최대 20,000 root의 정책 조회 검사와 Windows 생성/교체/로드의 protected owner ACE 검사를 추가했다. ACL 출력은 BOM 없는 UTF-16도 처리한다. Unix no-follow 코드는 Windows에서 실행 검증했다고 주장하지 않는다.
 - 마지막 testkit all-targets strict clippy(qb-core, quota-baton, qb-testkit) 통과. 최종 commit의 전체 matrix와 Sol max 독립 검수/수정 결과는 관문 보고서에 별도로 남긴다.
+
+- 세 번째 Sol max 검수(`ba6348a`)의 WS 대형/미분류 전송, 프로젝트 anchor 원자성, 실패 루트 비용 맵 상한, 복원/자식 비용, HTTP 일반 재시도와 rate 예산 분리, WS 별도 ingress deadline, legacy 프로젝트 편집, 늦은 drain 검사, 로컬 rate 오류/Retry-After, strict 결제·권한 409 우선순위를 보완했다. shadow 계산은 마지막 관측부터 reset까지의 소비를 포함한다.
+- 기존 전체 관문은 1,223 passed / 15 failed / 12 ignored로 실패했다. 새 무강제전송·영속 anchor 계약과 맞지 않는 fixture는 실제 요청·자격 증명을 확인하도록 수정했다. 분산 예약의 정렬 불일치와 C5 헤더 소진의 rate 오분류는 실제 코드 결함으로 수정했다. 실패 결과를 통과로 집계하지 않는다. 최종 수정 commit에서 관문과 독립 재검수를 다시 실행한다.

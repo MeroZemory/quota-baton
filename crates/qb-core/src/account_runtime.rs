@@ -66,6 +66,7 @@ type PendingQuota = BTreeMap<String, PendingQuotaTicket>;
 #[derive(Clone, Default)]
 pub struct QuotaObservation {
     observed_at: Value,
+    pub(crate) quota_until: Option<DateTime<Utc>>,
 }
 
 pub struct AccountRuntime {
@@ -151,6 +152,7 @@ pub enum Admission {
 
 pub struct AdmissionGuard {
     admission: Admission,
+    waited: bool,
     runtime: Weak<AccountRuntime>,
     id: String,
 }
@@ -174,6 +176,9 @@ impl Drop for AdmissionCancellation {
 }
 
 impl AdmissionGuard {
+    pub fn waited(&self) -> bool {
+        self.waited
+    }
     pub fn forced(&self) -> bool {
         self.admission == Admission::Forced
     }
@@ -610,7 +615,7 @@ impl AccountRuntime {
             if open || now >= waiter.deadline {
                 waiter
                     .forced
-                    .store(now >= waiter.deadline, Ordering::Release);
+                    .store(!open && now >= waiter.deadline, Ordering::Release);
                 if pacing {
                     state.last_release = Some(now);
                 }
@@ -639,6 +644,7 @@ impl AccountRuntime {
             drop(cancellation);
         }
         AdmissionGuard {
+            waited: !immediate,
             admission: if waiter.forced.load(Ordering::Acquire) {
                 Admission::Forced
             } else {
@@ -1210,8 +1216,27 @@ impl AccountRuntime {
             return QuotaObservation::default();
         };
         let observed_at = snapshot["observed_at"].clone();
-        let _ = self.apply_quota_snapshot(id, snapshot, model).await;
-        QuotaObservation { observed_at }
+        let quota_until = self
+            .apply_quota_snapshot(id, snapshot, model)
+            .await
+            .ok()
+            .and_then(|account| match account.health {
+                Health::Cooling {
+                    reason: HealthReason::Quota,
+                    until,
+                    scope,
+                } if until > Utc::now()
+                    && (scope == "account"
+                        || model.is_some_and(|m| scope == format!("model:{m}"))) =>
+                {
+                    Some(until)
+                }
+                _ => None,
+            });
+        QuotaObservation {
+            observed_at,
+            quota_until,
+        }
     }
 
     pub async fn observe_codex_event(&self, id: &str, event: &Value) {
@@ -1808,7 +1833,7 @@ mod r1_rate_tests {
     }
 
     #[tokio::test]
-    async fn r1_forced_admission_updates_shared_clock_before_next_normal_release() {
+    async fn open_gate_after_old_rate_deadline_is_a_normal_release_with_shared_clock() {
         let f = Fixture::new();
         block(&f.runtime);
         open_backoff(&f.runtime);
@@ -1817,8 +1842,11 @@ mod r1_rate_tests {
             .runtime
             .admit_until(ID, before - StdDuration::from_millis(1))
             .await;
-        assert!(forced.forced());
-        let stamp = last_release(&f.runtime).expect("forced release did not update the clock");
+        assert!(
+            !forced.forced(),
+            "an open gate does not spend an expired pacing wait budget"
+        );
+        let stamp = last_release(&f.runtime).expect("normal release did not update the clock");
         assert!(stamp >= before && stamp <= Instant::now());
         let interval = f.runtime.pacing_snapshot(ID).rate_release_interval;
         assert!(
@@ -2225,12 +2253,14 @@ mod r5_view_tests {
                     &paid,
                     &QuotaObservation {
                         observed_at: obs.quota_snapshot(&id).unwrap()["observed_at"].clone(),
+                        ..Default::default()
                     },
                 )
                 .await;
             assert_eq!(runtime.views().await.unwrap()[0]["credits_in_use"], true);
             let revision = QuotaObservation {
                 observed_at: obs.quota_snapshot(&id).unwrap()["observed_at"].clone(),
+                ..Default::default()
             };
             let mut pending = std::pin::pin!(runtime.credit_headers(&id, &paid, &revision));
             {
@@ -2274,6 +2304,7 @@ mod r5_view_tests {
                         &paid,
                         &QuotaObservation {
                             observed_at: obs.quota_snapshot(&id).unwrap()["observed_at"].clone(),
+                            ..Default::default()
                         },
                     )
                     .await;

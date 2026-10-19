@@ -1,6 +1,83 @@
 use super::tests::{candidate, fixture_dir};
 use super::*;
 
+#[test]
+fn failed_root_selection_cannot_accumulate_unbounded_cost_metadata() {
+    let (_root, t, _cs) = fixture();
+    let before = t.data.lock().unwrap().last_request_bytes.len();
+    for n in 0..=CAPACITY {
+        let key = format!("claude:failed-{n}");
+        assert!(matches!(
+            t.choose(Provider::Claude, Some(&key), None, None, &[], None, 100),
+            Decision::None
+        ));
+        t.unknown_request_cost(Some(&key));
+    }
+    let d = t.data.lock().unwrap();
+    assert_eq!(d.last_request_bytes.len(), before);
+    assert!(d.unknown_cost.len() <= d.groups.len());
+}
+
+#[test]
+fn restored_root_stays_unknown_after_small_child_until_full_root_proof() {
+    let (_root, t, cs) = fixture();
+    t.import(t.export().unwrap()).unwrap();
+    t.note_success(&cs[1].account.id, Utc::now());
+    t.request_bytes(Some("claude:a0:agent:small"), 10);
+    assert_eq!(
+        place(&t, "claude:a0:agent:small", &cs[..2], 10),
+        cs[0].account.id
+    );
+    assert_eq!(trigger(&t, &cs[0].account.id, "a", &cs[..2]), 0);
+    assert!(t.data.lock().unwrap().unknown_cost.contains("claude:a0"));
+    t.request_bytes(Some("claude:a0"), 1000);
+    assert!(trigger(&t, &cs[0].account.id, "a", &cs[..2]) > 0);
+}
+
+#[test]
+fn drained_unaccepted_placement_never_becomes_warm_by_merely_retrying() {
+    let (_root, t, mut cs) = fixture();
+    let decision = t.choose(
+        Provider::Claude,
+        Some("claude:new"),
+        None,
+        None,
+        &cs[..1],
+        None,
+        100,
+    );
+    let Decision::Selected { lease: old, .. } = decision else {
+        panic!("fixture selection");
+    };
+    assert!(!t.existing_placement(Some("claude:new"), &cs[0].account.id));
+    cs[0].account.drain = true;
+    let Decision::Selected {
+        account,
+        lease: new,
+        ..
+    } = t.choose(
+        Provider::Claude,
+        Some("claude:new"),
+        None,
+        None,
+        &cs[..2],
+        None,
+        100,
+    )
+    else {
+        panic!("drained unaccepted target must be replaced");
+    };
+    assert_eq!(account, cs[1].account.id);
+    old.dispatched(); // a stale receipt cannot admit the successor.
+    assert!(!t.existing_placement(Some("claude:new"), &account));
+    new.dispatched();
+    assert!(t.existing_placement(Some("claude:new"), &account));
+    drop(old);
+    drop(new);
+    cs[1].account.drain = true;
+    assert_eq!(place(&t, "claude:new", &cs[..2], 100), cs[1].account.id);
+}
+
 fn fixture() -> (tempfile::TempDir, Arc<BindingTable>, Vec<Candidate>) {
     let root = fixture_dir();
     let mut cfg = RoutingConfig {
@@ -23,6 +100,7 @@ fn fixture() -> (tempfile::TempDir, Arc<BindingTable>, Vec<Candidate>) {
 fn place(t: &Arc<BindingTable>, key: &str, cs: &[Candidate], bytes: u64) -> String {
     match t.choose(Provider::Claude, Some(key), None, None, cs, None, bytes) {
         Decision::Selected { account, lease, .. } => {
+            lease.dispatched();
             drop(lease);
             account
         }

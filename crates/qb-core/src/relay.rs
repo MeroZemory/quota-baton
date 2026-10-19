@@ -94,6 +94,30 @@ pub struct RelayState {
 }
 
 impl RelayState {
+    fn rate_wait_response(&self, provider: Provider, id: &str) -> Response {
+        let remaining = self
+            .accounts
+            .pacing_snapshot(id)
+            .rate_backoff_until
+            .map(|at| at.saturating_duration_since(Instant::now()))
+            .unwrap_or(Duration::from_secs(1));
+        let seconds =
+            (remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0)).clamp(1, 31_536_000);
+        let mut response = native_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            provider,
+            "rate_wait_timeout",
+            "요청 속도 제한의 대기 한도에 도달했습니다. 잠시 후 다시 요청해 주세요.",
+        );
+        response.headers_mut().insert(
+            "retry-after",
+            HeaderValue::from_str(&seconds.to_string()).expect("bounded retry advice"),
+        );
+        if let Ok(id) = HeaderValue::from_str(id) {
+            response.headers_mut().insert("x-quota-baton-account", id);
+        }
+        response
+    }
     pub fn routing_view(&self) -> serde_json::Value {
         let mut view = self.bindings.routing_view();
         let accounts = self.store.list().unwrap_or_default();
@@ -113,7 +137,7 @@ impl RelayState {
         };
         let key = session.key.clone().ok_or(())?;
         let table = self.bindings.clone();
-        tokio::task::spawn_blocking(move || table.policies.associate(&key, &project))
+        tokio::task::spawn_blocking(move || table.associate_project(&key, &project))
             .await
             .map_err(|_| ())?
             .map_err(|_| ())
@@ -737,6 +761,7 @@ impl RelayState {
         let bindings = self.bindings.clone();
         let owned_id = id.to_owned();
         let owned_model = model.map(str::to_owned);
+        let owned_key = key.map(str::to_owned);
         let eligible = tokio::task::spawn_blocking(move || {
             if !store.takeover_fenced(&owned_id).is_ok_and(|fenced| !fenced) {
                 return false;
@@ -744,6 +769,9 @@ impl RelayState {
             let Ok(account) = store.load(&owned_id) else {
                 return false;
             };
+            if account.drain && !bindings.existing_placement(owned_key.as_deref(), &owned_id) {
+                return false;
+            }
             bindings.account_dispatch_eligible(
                 &crate::bindings::Candidate {
                     quota: obs.quota_snapshot(&owned_id),
@@ -820,9 +848,7 @@ impl RelayState {
                 .candidates(provider, session.key.as_deref(), model, &excluded)
                 .await?;
             let pinned = self.pins.get(provider, session.key.as_deref());
-            let bytes = completion
-                .input_bytes
-                .load(std::sync::atomic::Ordering::Relaxed);
+            let bytes = completion.selection_cost.unwrap_or(0);
             // Strict anchors/moves are durable before dispatch. Disk I/O must
             // not block a Tokio reactor thread while holding the table gate.
             let table = self.bindings.clone();
@@ -1343,13 +1369,32 @@ async fn handover_http(state: Arc<RelayState>, request: Request) -> Response {
 
 #[derive(Clone, Copy)]
 struct RequestDeadline(Instant);
+fn routing_input_cost(headers: &HeaderMap) -> Option<u64> {
+    if headers
+        .get("content-encoding")
+        .is_some_and(|v| !v.as_bytes().eq_ignore_ascii_case(b"identity"))
+    {
+        return None;
+    }
+    headers.get("content-length")?.to_str().ok()?.parse().ok()
+}
 async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Response {
     let provider = if request.uri().path().starts_with("/v1/messages") {
         Provider::Claude
     } else {
         Provider::Codex
     };
-    let timeout = Duration::from_secs(state.request_timeout_secs);
+    let ws = request.method() == Method::GET
+        && request.uri().path() == "/v1/responses"
+        && request
+            .headers()
+            .get("upgrade")
+            .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"));
+    let timeout = Duration::from_secs(if ws {
+        state.ws_upgrade_hold_secs
+    } else {
+        state.request_timeout_secs
+    });
     request
         .extensions_mut()
         .insert(RequestDeadline(Instant::now() + timeout));
@@ -1481,6 +1526,13 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
         session_body = handle.metadata();
     }
     let session = session::classify(provider, path, &parts.headers, &session_body);
+    // input_bytes may be only the first streaming chunk, not full context.
+    completion.selection_cost = routing_input_cost(&parts.headers);
+    if let Some(bytes) = completion.selection_cost {
+        state.bindings.request_bytes(session.key.as_deref(), bytes);
+    } else {
+        state.bindings.unknown_request_cost(session.key.as_deref());
+    }
     if state
         .prepare_project(
             &session,
@@ -1564,6 +1616,9 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
         }
     };
     completion.record.account = Some(account.id.clone());
+    if completion.selection_cost.is_none() {
+        state.bindings.unknown_request_cost(session.key.as_deref());
+    }
     // Phase-0 forced replay bypasses affinity, but still participates in the
     // authoritative placement reservation count.
     if completion.binding.is_none() {
@@ -1629,8 +1684,7 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
     let mut token_retry = false;
     let mut rate_retries = 0_u32;
     let mut rate_retry_queued = false;
-    let rate_hold_started = Instant::now();
-    let rate_hold_deadline = rate_hold_started + Duration::from_secs(state.rate_hold_secs);
+    let mut rate_hold_deadline: Option<Instant> = None;
     let mut rate_relay_retry_after = None;
     let mut rate_relayed = false;
     let mut permission_denials = 0;
@@ -1685,10 +1739,15 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
         completion.dashboard_begin();
         let dashboard_pacing = completion.dashboard_pacing();
         let admission_started = Instant::now();
+        let admission_deadline = rate_hold_deadline
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(state.rate_hold_secs));
         let admission = state
             .accounts
-            .admit_until(&account.id, rate_hold_deadline)
+            .admit_until(&account.id, admission_deadline)
             .await;
+        if admission.waited() {
+            rate_hold_deadline.get_or_insert(admission_deadline);
+        }
         drop(dashboard_pacing);
         completion.rate_wait(admission_started.elapsed().as_millis() as u64);
         if admission.forced() {
@@ -1700,17 +1759,11 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
                 completion.relayed_rate_429();
                 break previous;
             }
-            let mut response = failure(
-                &mut completion,
-                StatusCode::TOO_MANY_REQUESTS,
-                provider,
-                "rate_wait_timeout",
-                "요청 속도 제한의 대기 한도에 도달했습니다. 잠시 후 다시 요청해 주세요.",
-            );
-            response
-                .headers_mut()
-                .insert("retry-after", HeaderValue::from_static("1"));
-            return response;
+            completion.outcome(429, "rate_wait_timeout");
+            state
+                .note_client_rate(provider, &account.id, session.key.as_deref())
+                .await;
+            return state.rate_wait_response(provider, &account.id);
         }
         drop(last_rate_response.take());
         if !state
@@ -1874,6 +1927,7 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
             &held.prefix,
             request_model.as_deref(),
         );
+        decision.reconcile_quota(&credit_observation);
         completion.record.upstream_error_code = hold::error_code(&response_headers, &held.prefix);
         if let Some(model) = decision.model.take() {
             request_model = Some(model);
@@ -1977,6 +2031,8 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
                 }
             }
         } else if decision.kind == outcome::Kind::Rate {
+            let rate_deadline = *rate_hold_deadline
+                .get_or_insert_with(|| Instant::now() + Duration::from_secs(state.rate_hold_secs));
             state.bindings.note_rate(&account.id, chrono::Utc::now());
             let retry_after = outcome::header_seconds(&response_headers, "retry-after")
                 .map(|seconds| Duration::from_secs(seconds as u64));
@@ -1996,7 +2052,7 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
             if let Some(copy) = retained.as_ref()
                 && rate_retries < state.rate_hold_max_retries
                 && !admission.forced()
-                && Instant::now() < rate_hold_deadline
+                && Instant::now() < rate_deadline
                 && let Some(body) = copy.retry_body().await
             {
                 rate_retries += 1;
@@ -2204,6 +2260,13 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
                     .await
                     .expect("retained body completed")
                     .retry_body();
+            }
+            Ok(None) if completion.policy_blocked => {
+                let response = state
+                    .unavailable(&mut completion, provider, false, request_model.as_deref())
+                    .await;
+                completion.outcome(response.status().as_u16(), "routing_policy_blocked");
+                return response;
             }
             Ok(None)
                 if matches!(

@@ -149,19 +149,33 @@ pub(super) async fn upgrade(state: Arc<RelayState>, request: Request) -> Respons
     completion.record.transport = "ws".into();
     completion.track(state.inflight_requests.clone());
     completion.runtime = Some(state.accounts.clone());
-    let timeout = Duration::from_secs(state.ws_upgrade_hold_secs);
-    let response = tokio::time::timeout(timeout, upgrade_inner(state, request, &mut completion))
-        .await
-        .unwrap_or_else(|_| {
-            native_error(
-                StatusCode::GATEWAY_TIMEOUT,
-                Provider::Codex,
-                "request_timeout",
-                "WebSocket 연결의 전체 대기 한도를 초과했습니다.",
-            )
+    let deadline = request
+        .extensions()
+        .get::<RequestDeadline>()
+        .map(|d| d.0)
+        .unwrap_or_else(|| {
+            std::time::Instant::now() + Duration::from_secs(state.ws_upgrade_hold_secs)
         });
+    completion.precommit_deadline = Some(deadline);
+    let timeout = deadline.saturating_duration_since(std::time::Instant::now());
+    let response = tokio::time::timeout(
+        timeout,
+        upgrade_inner(state, request, &mut completion, deadline),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        native_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            Provider::Codex,
+            "request_timeout",
+            "WebSocket 연결의 전체 대기 한도를 초과했습니다.",
+        )
+    });
     completion.record.status = response.status().as_u16();
-    completion.finish(if response.status() == StatusCode::SWITCHING_PROTOCOLS {
+    let local_rate_timeout = completion.record.outcome == "rate_wait_timeout";
+    completion.finish(if local_rate_timeout {
+        "rate_wait_timeout"
+    } else if response.status() == StatusCode::SWITCHING_PROTOCOLS {
         "ws_upgrade"
     } else if response.status() == StatusCode::GATEWAY_TIMEOUT {
         "request_timeout"
@@ -175,6 +189,7 @@ async fn upgrade_inner(
     state: Arc<RelayState>,
     mut request: Request,
     completion: &mut Completion,
+    deadline: std::time::Instant,
 ) -> Response {
     if let Some(response) = state.memory_rejection(Provider::Codex) {
         return response;
@@ -241,12 +256,11 @@ async fn upgrade_inner(
     let mut last_error = None;
     // One pacing deadline for the entire upgrade, including retries and
     // account selection. C7 reset-hold and token/network budgets stay separate.
-    let upgrade_started = std::time::Instant::now();
     // Leave a small envelope for relaying a terminal wait result before the
     // overall connect deadline cancels the future.
-    let upgrade_deadline = upgrade_started
-        + Duration::from_secs(state.ws_upgrade_hold_secs)
-            .saturating_sub(Duration::from_millis(100));
+    let upgrade_deadline = deadline
+        .checked_sub(Duration::from_millis(100))
+        .unwrap_or(deadline);
     let mut last_rate_error: Option<Response> = None;
     let mut quota_source: Option<String> = None;
     let (upstream, upstream_headers, account, tokens) = 'accounts: loop {
@@ -326,12 +340,11 @@ async fn upgrade_inner(
                     completion.relayed_rate_429();
                     return response;
                 }
-                return native_error(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    Provider::Codex,
-                    "rate_wait_timeout",
-                    "요청 속도 제한의 대기 한도에 도달했습니다.",
-                );
+                completion.outcome(429, "rate_wait_timeout");
+                state
+                    .note_client_rate(Provider::Codex, &account.id, session.key.as_deref())
+                    .await;
+                return state.rate_wait_response(Provider::Codex, &account.id);
             }
             drop(last_rate_error.take());
             if !state
@@ -460,6 +473,7 @@ async fn upgrade_inner(
                 &error.raw,
                 None,
             );
+            decision.reconcile_quota(&credit_observation);
             if super::credentials::is_linked(&account)
                 && decision.kind == super::outcome::Kind::Revoked
             {
