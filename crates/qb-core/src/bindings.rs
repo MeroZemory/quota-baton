@@ -395,7 +395,7 @@ fn snapshot(d: &Data) -> Snapshot {
     }
 }
 const SNAPSHOT_MAX_BYTES: u64 = 16 * 1024 * 1024;
-fn read_binding_snapshot(path: &Path) -> std::io::Result<Vec<u8>> {
+pub(crate) fn read_binding_snapshot(path: &Path) -> std::io::Result<Vec<u8>> {
     let invalid = || {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,

@@ -500,9 +500,10 @@ async fn run() -> anyhow::Result<()> {
                         .cloned()
                         .unwrap_or_else(|| serde_json::json!([])),
                 });
-                relay
-                    .bindings
-                    .import(value)
+                let bindings = relay.bindings.clone();
+                tokio::task::spawn_blocking(move || bindings.import(value))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("인계된 세션 바인딩 복구 작업이 종료되었습니다."))?
                     .map_err(|_| anyhow::anyhow!("인계된 세션 바인딩을 읽지 못했습니다."))?;
                 observability.record_takeover("bindings_imported");
             }
