@@ -1504,7 +1504,14 @@ mod tests {
     use std::time::UNIX_EPOCH;
     const FIXTURE: &str = include_str!("../fixtures/m6a.1-state.json");
     fn rows() -> Vec<Row> {
-        parse_state(FIXTURE).unwrap()
+        parse_state_at(
+            FIXTURE,
+            "2026-10-18T12:00:00Z"
+                .parse::<DateTime<chrono::Utc>>()
+                .unwrap()
+                .into(),
+        )
+        .unwrap()
     }
     #[cfg(windows)]
     #[test]
