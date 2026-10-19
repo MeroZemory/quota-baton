@@ -32,3 +32,5 @@
 
 - 세 번째 Sol max 검수(`ba6348a`)의 WS 대형/미분류 전송, 프로젝트 anchor 원자성, 실패 루트 비용 맵 상한, 복원/자식 비용, HTTP 일반 재시도와 rate 예산 분리, WS 별도 ingress deadline, legacy 프로젝트 편집, 늦은 drain 검사, 로컬 rate 오류/Retry-After, strict 결제·권한 409 우선순위를 보완했다. shadow 계산은 마지막 관측부터 reset까지의 소비를 포함한다.
 - 기존 전체 관문은 1,223 passed / 15 failed / 12 ignored로 실패했다. 새 무강제전송·영속 anchor 계약과 맞지 않는 fixture는 실제 요청·자격 증명을 확인하도록 수정했다. 분산 예약의 정렬 불일치와 C5 헤더 소진의 rate 오분류는 실제 코드 결함으로 수정했다. 실패 결과를 통과로 집계하지 않는다. 최종 수정 commit에서 관문과 독립 재검수를 다시 실행한다.
+
+- 초기화 시각이 지난 shadow 진단은 `reset_elapsed` fallback으로 전환한다. 관측이 아직 fresh여도 초기화 이전 잔량을 여유 용량처럼 표시하지 않는다. 합성 회귀의 수정 전 실패와 수정 후 통과를 증거에 보존한다.
