@@ -95,11 +95,11 @@ These rules apply to the data port and the admin port alike.
 | Id | Status | Rule | Gate |
 |---|---|---|---|
 | E1 | Withdrawn (2026-10-13) | Null a foreign `diagnostics.previous_message_id` | V1: genuine Claude Code does not send `diagnostics`. |
-| E2 | Withdrawn (2026-10-13) | Strip foreign Codex reasoning items | V2: another account ignores them silently, with no error. Genuine Codex replays them verbatim, too. |
-| E3 | Withdrawn (2026-10-13) | Strip foreign Claude thinking blocks | V2: ignored silently, even inside a tool-use turn. Stripping is itself a history edit, which preserved-thinking models may reject. |
-| E2r | Withdrawn (2026-10-13) | Strip and retry after a foreign-content rejection | No rejection for foreign reasoning or thinking exists (V2). Compaction could not be stripped anyway, and binding stickiness already keeps a session on its minting account. |
+| E2 | Withdrawn (2026-10-13) | Strip foreign Codex reasoning items | In the tested V2 HTTP cases, the request completed with token counts consistent with the items being ignored. Genuine Codex replays them verbatim, too. This is not a universal compatibility guarantee. |
+| E3 | Withdrawn (2026-10-13) | Strip foreign Claude thinking blocks | Tested V2 HTTP cases completed, including inside a tool-use turn. Stripping is itself a history edit, which preserved-thinking models may reject. Acceptance and preservation remain model/path dependent. |
+| E2r | Withdrawn (2026-10-13) | Strip and retry after a foreign-content rejection | The tested V2 cases did not establish a need for this rewrite. They do not prove foreign-content rejection impossible. Compaction cannot generally be stripped to recover missing history; sticky bindings reduce moves but cannot guarantee remaining on the minting account. |
 
-The register is empty. Encrypted and signed conversation items are relayed exactly as the client sent them, which is what the genuine clients themselves do ([D10](decisions.md#d10)).
+The register is empty. Encrypted and signed conversation items are relayed exactly as the client sent them, which is what the genuine clients themselves do ([D10](decisions.md#d10)). This preserves pass-through correctness; it does not certify cross-account resumption, cache reuse or preserved reasoning.
 
 ## C5. Account state
 
@@ -375,10 +375,10 @@ Further rules:
   - it is marked by the overload rebalance (C7.1)
 - **`last_used`.** Every HTTP request and every relayed WebSocket `response.create` updates the binding's `last_used`, set to the end of the response. Idle time is measured over the whole session identity group, sub-agents included.
 - **Pinned sockets keep their binding.** A binding referenced by an open pinned WebSocket is never expired or evicted.
-- **Cold point** (staged 1B). A binding is cold when it has been idle (`now - last_used`) for at least `rebalance_idle_secs`, default 3600. That is never below the longest prompt-cache TTL in use for the provider. At a cold point, the cache is cold on every account, so a move costs no extra cache miss.
+- **Cold point** (staged 1B). A binding is cold when it has been idle (`now - last_used`) for at least `rebalance_idle_secs`, default 3600. That is never below the longest prompt-cache TTL in use for the provider. This is an operational idle threshold for considering a move, not proof that every provider cache has expired or that moving preserves reasoning.
   - A cold session is re-placed (steps 3–6) **only if its current account fails the gate or has `active ≥ spread_threshold`** (C7.1). In the first case a forced move would probably come soon anyway; in the second the account is already full. Either way, moving at a cold boundary is cheaper than moving mid-session.
   - Otherwise the binding stays, for up to `session_binding_max_secs` (default 7 days).
-  - Why not re-place every cold session? V2 showed that a move keeps the conversation working but drops its earlier hidden reasoning (D10). A move that is not needed is therefore not free.
+  - Why not re-place every cold session? In the tested V2 cases, moves completed with evidence consistent with earlier hidden reasoning being dropped (D10). Compatibility is not guaranteed outside that evidence. A move that is not needed is therefore not free.
   - `[websocket] idle_close_secs` MUST be smaller than `rebalance_idle_secs`.
 - **Moves.**
   - They happen only at request boundaries, atomically for the whole session group.
@@ -387,7 +387,7 @@ Further rules:
 - **Persistence.** Bindings are persisted write-behind, at most 60 s late, to `state/bindings.json`, and flushed on drain and on exit. LRU capacity is 20 000. They are exported and imported on takeover (C11).
 - **Unbound requests** (no key, C8) stay on the family's **last-used account** until it becomes ineligible. Selection then runs once, and the result becomes the new last-used account.
 - **WebSocket selection** runs once per connection, on the upgrade (C6 row 13). The connection keeps that account until it closes.
-- **Drained account at a cold point (S7).** A drained account fails the gate, so a cold session on it is re-placed. The move is free, because the cache is already cold. A warm session stays until it goes cold.
+- **Drained account at a cold point (S7).** A drained account fails the gate, so a cold session on it is re-placed. The idle threshold is intended to reduce the cache cost of that move; it is not a zero-cost or compatibility guarantee. A warm session stays until it goes cold.
 - **Drain vs pause.**
   - Drain stops new placements on the account, and existing sessions stay.
   - Pause (C5 `user_state`) moves existing sessions away at their next request.
@@ -448,7 +448,7 @@ Some outcomes never count toward the trigger, because they are not account conce
 - Anything when no account has room. The sessions are then well spread, and a 429 only paces.
 - A running stream, an in-flight request, or a WebSocket with a response in flight.
 
-**No ping-pong.** Rebalance never takes a target over its threshold, and a move never leaves the target more loaded than the source.
+**Local rebalance constraints.** Rebalance never takes a target over its threshold, and a move never leaves the target more loaded than the source. These constraints do not by themselves bound repeated A→B→A moves across changing load and successive requests. Group-level dwell/revisit budgets are proposed separately in the [routing design supplement](account-routing-design.md#4-계정-왕복과-이동-비용); they are not implemented settings in this contract.
 
 **Speed.** The cure is deliberately slow: at most 2 moves per account per window. Placement is the main lever.
 
