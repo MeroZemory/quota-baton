@@ -90,9 +90,10 @@ What a design needs follows from those numbers:
   - Codex encrypted reasoning items and Claude signed thinking blocks from account A are **silently ignored** by account B: 200, and the input-token count equals the stripped body. This holds inside a tool-use turn as well.
   - The negative controls (tampered blob or signature on the minting account) are rejected with 400, so validation exists.
   - The first request after a switch is cache-cold.
-  - **Not portable, but harmless:** a moved session keeps working and loses only earlier hidden reasoning. Remote-compaction blobs were not tested; R8 I-16 suggests they are rejected.
-  - The WebSocket cells and the second-day repeat are still pending.
-- **Decision ([D10](decisions.md#d10)): relay as the genuine clients do.** Both CLIs replay these items verbatim and never strip them. The servers verify the items they minted and ignore the ones they did not. quota-baton therefore changes nothing, and has no hand-off rewrite.
+  - **Scope of that result:** the tested moves completed, with token counts consistent with earlier hidden reasoning being ignored. This is not a guarantee that every model, account, reasoning or compaction item remains usable after a move. Remote-compaction blobs were not tested; R8 I-16 suggests they are rejected.
+  - The WebSocket cells and the second-day repeat were pending at that HTTP checkpoint; it must not stand in for evidence about another transport or later client/model version.
+- **Decision ([D10](decisions.md#d10)): relay as the genuine clients do.** Both CLIs replay these items verbatim and never strip them. quota-baton preserves them and has no hand-off rewrite. Server-side acceptance or dropping depends on the item, model and authentication path; pass-through does not manufacture cross-account compatibility.
+- **Evidence clarification (2026-10-20).** Local transcript resumption, prompt-cache reuse and preserved reasoning are separate properties. Current Claude API documentation describes model, account and prefix checks; it does not certify subscription OAuth or Codex hand-offs. See the sourced [routing design supplement](account-routing-design.md#1-서로-다른-세-가지-문제). Its proposed policy controls and forecasting are not implemented defaults.
 
 ## 3. Principles
 
@@ -317,23 +318,22 @@ The later API-key providers implement the same trait without OAuth.
 
 No user-maintained priority order exists. The only manual placement setting is **drain**, which takes no new sessions while existing ones stay.
 
-The gate never moves a bound session. A bound session moves only in two cases:
+The gate never moves a bound session. This avoids gate-driven oscillation; it is not a general guarantee against moves under changing failures or load. C7 is authoritative: a bound session can move in three cases:
 - **Forced:** its account enters `cooling`, `needs_relogin`, `paused` or `disabled`. A quota limit that resets within 60 s holds the request instead of moving it.
-- **Free:** at a cold point, i.e. after one hour idle, when the provider cache is already cold.
-  - Until V2 shows that conversation items are portable, a cold session moves only if its current account fails the gate.
-  - After that, it is placed like a new session ([D11](decisions.md#d11)).
+- **Idle review:** at the cold point, only when its current account fails the gate or is at its spreading threshold (C7, D15). One hour idle is an operational threshold, not proof of expired cache or safe opaque-state portability.
+- **Overload:** bounded moves at the next request boundary under C7.1. Current account-level marking budgets do not supply group-level dwell or revisit protection.
 
 Why not switch a session back as soon as the preferred account recovers? Each switch makes one turn re-read the whole context without cache.
-- Claude caches are isolated per workspace, so a switch is always a full miss.
-- On Claude Opus 5.5 a cache read costs 0.05× the input price, while a write costs 1.25× (5-minute TTL) or 2× (1-hour TTL). So one switched turn costs about 25–40 warm turns of input.
+- Claude API documentation describes workspace/organization cache isolation. Subscription-account sharing is not established by that API rule; the tested V2 moves were cache-cold.
+- API cache-read/write price comparisons illustrate why cold input can be expensive, but do not determine subscription quota debits or establish a fixed number of warm turns per move. Actual cache fields, model/path and quota observations must be measured separately.
 - Codex switches measured cheaper on this machine: 88 % cache hits after a switch versus 95 % before (R6 §3.2).
 
-Switching only when forced or free is therefore the token-optimal policy. Routing new sessions to the quota that expires soonest captures most of the benefit of restoring.
+These are cache-preservation heuristics, not a proof of a token-optimal policy. Routing new sessions toward soon-expiring quota is intended to reduce unused allowance, but does not account for all future demand. The [routing design supplement](account-routing-design.md) proposes bounded churn controls and shadow forecasting before any placement change.
 
 Tuning items, revisited with shadow-run data rather than designed up front. The ledger logs every move, the weekly % left unused at each reset, and the forced moves per gate crossing (C7).
-- A 5-hour gate projected from the burn rate, and headroom measured in absolute tokens (learned from Δ% per token), as the panel suggested.
+- A 5-hour gate informed by burn-rate observations. Subscription percentage points cannot be assumed to have a stable token or dollar conversion; forecasting needs uncertainty, account-level attribution limits and a fallback.
 - The herd of cold turns when a busy account exhausts.
-- Whether Claude Code on a custom base URL uses only the 5-minute TTL. If so, the cold point could be shorter than 1 h. Keeping 1 h is conservative and only delays a free rebalance.
+- Whether the actual Claude Code/authentication path uses a known cache lifetime. Do not shorten the idle threshold or call rebalance free based only on API TTL examples.
 
 ## 8. Quota tracking
 
@@ -428,7 +428,7 @@ Relay design:
   - Pings are answered promptly and never wait behind large writes.
 - **Idle pairs.**
   - A socket pair idle for more than `[websocket] idle_close_secs` (default 1800) is closed. The server's 60-minute limit also applies. This value must stay below `rebalance_idle_secs`.
-  - Codex reconnects silently on its next request and resends full input. That costs upload bandwidth only, because the server-side prompt cache is keyed by session and prefix, not by socket.
+  - Codex reconnects on its next request and resends full input. Preserving the account and session identity is intended to retain cache affinity. A new socket does not by itself prove a cache miss or a hit; upload bandwidth and observed cache/input usage must be measured separately.
   - This keeps the socket count near "sessions active in the last 30 minutes" instead of the 776 that the previous proxy accumulated.
 - **Session moves to HTTP:** a proxy outage longer than about 6 s during an active request switches that Codex session to HTTP for the rest of its life.
   - So HTTP SSE support is mandatory.

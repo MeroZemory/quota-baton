@@ -120,8 +120,10 @@ Codex and Claude Code replay their encrypted or signed conversation items verbat
 
 **Evidence: V2 HTTP cells, 2026-10-13.**
 - Items minted by account A and sent to account B: 200. They are silently ignored, because the input-token count equals the stripped body. This holds inside a tool-use turn as well.
-- Tampered items on the minting account: 400. The server validates what it minted and ignores what it did not.
-- A moved session keeps working. It loses only its earlier hidden reasoning, and the first turn after the move is cache-cold.
+- Tampered items on the minting account: 400. Along with the token-count comparison, this supports validation and dropping in the tested cases; it is not a universal rule about foreign items.
+- The tested moved sessions completed, with the first turn cache-cold and earlier hidden reasoning apparently unused. This observation does not guarantee that every later model/account/path or compaction item can resume without loss or rejection.
+
+**Evidence scope clarified, 2026-10-20 (no relay behaviour change).** Local transcript resumption, cache reuse and preserved reasoning are distinct. Current official Claude API documentation describes separate model, account and prefix checks. Those statements do not establish subscription OAuth or Codex behaviour. The [routing design supplement](account-routing-design.md) records sources and proposed controls; its defaults and forecast policy are not accepted decisions. D10 continues to require verbatim relay, not stripping or rewriting opaque history to force a hand-off.
 
 **Withdrawn:** C4 exceptions E1, E2, E3 and E2r, and header exception H3.
 
@@ -266,7 +268,7 @@ Later candidates: a per-plan default table, once Codex `plan` shows plan-depende
 **Trigger.** The previous proxy mixed four Claude OAuth credentials with four billable Claude API keys in one pool. When the OAuth credentials were rate-limited, session affinity pinned a large session to an API key, which then failed with `Credit balance is too low`. A diagnostic replay of that session cost USD 64.68.
 
 **Decision.**
-1. quota-baton serves only the user's **subscription OAuth accounts** (D5: its own login, or a CPA OAuth import). It never imports or uses API keys, so a billable credential can never enter the pool, and no silent OAuth-to-API fallback can exist.
+1. quota-baton serves only the user's **subscription OAuth accounts** (D5: its own login, or a CPA OAuth import). It never imports or uses API keys, so no silent OAuth-to-API-key fallback can exist. This does not make OAuth usage inherently free: a Codex OAuth account can have separately purchased credits. C5's explicit credit permission and observations apply; the local 99% preventive hold is not an upstream-enforced zero-spend guarantee.
 2. If API keys are ever wanted, that is a new user decision. It must then follow the cost-safety policy in the incident note:
    - fallback is off by default
    - API keys live in a separate opt-in route or profile
