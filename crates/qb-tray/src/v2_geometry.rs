@@ -1694,6 +1694,7 @@ mod tests {
     }
     fn credits() -> Value {
         let mut a = account("a");
+        a["quota_credit_releasable"] = json!(true);
         a["health"] = json!({"kind":"cooling","reason":"quota","scope":"account","until":"2099-01-01T00:00:00Z"});
         a["credits"] = json!({"has_credits":true,"balance":19395.23});
         a["pool_eligible"] = json!(false);
