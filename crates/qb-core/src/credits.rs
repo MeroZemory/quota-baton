@@ -72,7 +72,7 @@ pub fn merge(next: &mut Value, old: &Value) {
         for key in ["has_credits", "unlimited", "balance"] {
             if next[key].is_null()
                 && !(new_entitlement && matches!(key, "has_credits" | "unlimited"))
-                && !(key == "balance" && !next["has_credits"].is_null())
+                && (key != "balance" || next["has_credits"].is_null())
             {
                 next[key] = old[key].clone();
             }

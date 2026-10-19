@@ -1952,7 +1952,7 @@ fn apply_snapshot_notices(
     snapshot: &Value,
     origin_model: Option<&str>,
 ) {
-    if crate::credits::serving_ended(&snapshot) {
+    if crate::credits::serving_ended(snapshot) {
         dashboard_credit_observation(obs, id, false, snapshot);
     }
     if let Ok(mut notices) = notices.lock() {
@@ -1961,7 +1961,7 @@ fn apply_snapshot_notices(
             let time = |value: &Value| value.as_str().and_then(|v| v.parse::<DateTime<Utc>>().ok());
             let old_reset = time(&notice["reset_at"]);
             let observed = time(&notice["observed_at"]);
-            crate::credits::serving_ended(&snapshot) && notice["action"] == "credits"
+            crate::credits::serving_ended(snapshot) && notice["action"] == "credits"
                 || snapshot["windows"].as_array().is_some_and(|windows| {
                     !windows.is_empty()
                         && windows.iter().all(|w| {
@@ -2131,7 +2131,6 @@ mod r5_view_tests {
 
     #[tokio::test]
     async fn credits_original_http_and_stream_revision_cannot_attach_to_a_later_reset() {
-        use futures_util::poll;
         for stream in [false, true] {
             let home = tempfile::tempdir().unwrap();
             let store = Arc::new(AccountStore::acquire(home.path()).unwrap());
@@ -2164,7 +2163,9 @@ mod r5_view_tests {
             });
             {
                 let _gate = store.transaction().unwrap();
-                assert!(poll!(delayed.as_mut()).is_pending());
+                let waker = futures_util::task::noop_waker();
+                let mut context = std::task::Context::from_waker(&waker);
+                assert!(std::future::Future::poll(delayed.as_mut(), &mut context).is_pending());
                 let mut reset = HeaderMap::new();
                 reset.insert("x-codex-primary-used-percent", "0".parse().unwrap());
                 reset.insert(
@@ -2193,7 +2194,6 @@ mod r5_view_tests {
 
     #[tokio::test]
     async fn credits_delayed_success_cannot_reopen_a_newer_off_or_empty_span() {
-        use futures_util::poll;
         for off in [false, true] {
             let home = tempfile::tempdir().unwrap();
             let store = Arc::new(AccountStore::acquire(home.path()).unwrap());
@@ -2233,7 +2233,9 @@ mod r5_view_tests {
             let mut pending = std::pin::pin!(runtime.credit_headers(&id, &paid, &revision));
             {
                 let _gate = store.transaction().unwrap();
-                assert!(poll!(pending.as_mut()).is_pending());
+                let waker = futures_util::task::noop_waker();
+                let mut context = std::task::Context::from_waker(&waker);
+                assert!(std::future::Future::poll(pending.as_mut(), &mut context).is_pending());
                 if off {
                     store
                         .update_metadata_unlocked(&id, |a| a.allow_credits = false)
