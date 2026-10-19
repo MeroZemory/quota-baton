@@ -59,6 +59,7 @@ pub struct Candidate {
 }
 #[derive(Debug)]
 pub enum Decision {
+    Blocked,
     Selected {
         account: String,
         lease: BindingLease,
@@ -144,6 +145,7 @@ impl Data {
     }
 }
 pub struct BindingTable {
+    pub policies: crate::routing::PolicyStore,
     path: PathBuf,
     config: RoutingConfig,
     thresholds: Mutex<BTreeMap<String, usize>>,
@@ -330,6 +332,26 @@ fn decode(value: Value) -> Result<Data> {
     Ok(d)
 }
 impl BindingTable {
+    pub fn routing_view(&self) -> Value {
+        let d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        let mut view = self.policies.list();
+        view["observed_sessions"]=serde_json::to_value(d.groups.iter().map(|(key,g)|serde_json::json!({"id":crate::routing::session_id(key),"account":g.account,"policy":self.policies.plan(Some(key))})).collect::<Vec<_>>()).unwrap_or_default();
+        view
+    }
+    pub fn set_routing_session(
+        &self,
+        id: &str,
+        settings: Option<crate::routing::Settings>,
+        project: Option<&str>,
+    ) -> Result<()> {
+        let d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        let anchor = d
+            .groups
+            .iter()
+            .find(|(key, _)| crate::routing::session_id(key) == id)
+            .map(|(_, g)| g.account.as_str());
+        self.policies.set_session(id, settings, project, anchor)
+    }
     pub fn new(home: &Path, config: RoutingConfig) -> Result<Arc<Self>> {
         config.validate()?;
         let path = home.join("state/bindings.json");
@@ -355,6 +377,13 @@ impl BindingTable {
             Err(e) => return Err(e.into()),
         };
         let table = Arc::new(Self {
+            policies: crate::routing::PolicyStore::new(
+                home,
+                crate::routing::Settings {
+                    mode: config.mode,
+                    reset_wait_secs: config.reset_hold_secs,
+                },
+            )?,
             path,
             config,
             thresholds: Mutex::new(BTreeMap::new()),
@@ -831,6 +860,20 @@ impl BindingTable {
             PreviewDecision::None => return Decision::None,
             PreviewDecision::Selected { account } => account,
         };
+        let previous = key
+            .and_then(|key| d.groups.get(group(key)))
+            .map(|g| g.account.as_str());
+        if self
+            .policies
+            .dispatch(key, &account, previous, reason, now)
+            .is_err()
+        {
+            tracing::warn!(
+                code = "routing_policy_blocked",
+                "Routing intent could not authorize dispatch"
+            );
+            return Decision::Blocked;
+        }
         let mut moves = Vec::new();
         if let Some(k) = key {
             let g = group(k);
@@ -950,9 +993,20 @@ impl BindingTable {
         now: DateTime<Utc>,
         hold_allowed: bool,
     ) -> (PreviewDecision, &'static str) {
+        let plan = self.policies.plan(key);
+        let strict_anchor = plan.anchor.clone().or_else(|| {
+            key.and_then(|k| self.retained_binding(d, k, now))
+                .map(|b| b.account.clone())
+        });
         let entries: Vec<_> = candidates
             .iter()
             .filter(|c| c.account.provider == provider)
+            .filter(|c| {
+                plan.settings.mode != crate::routing::Mode::Strict
+                    || strict_anchor
+                        .as_ref()
+                        .is_none_or(|anchor| anchor == &c.account.id)
+            })
             .map(|c| {
                 let eligible =
                     effective_account(c, d, &self.config, model, now).eligible_at(model, now);
@@ -966,7 +1020,20 @@ impl BindingTable {
         {
             return (PreviewDecision::Selected { account: id.into() }, "forced");
         }
-        let bound = key.and_then(|k| self.retained_binding(d, k, now)).cloned();
+        let mut bound = key.and_then(|k| self.retained_binding(d, k, now)).cloned();
+        // A synchronously saved anchor wins over an older write-behind binding.
+        if let (Some(anchor), Some(key)) = (&plan.anchor, key) {
+            let b = bound.get_or_insert_with(|| Binding {
+                key: key.to_owned(),
+                account: anchor.clone(),
+                last_used: now,
+                first_seen_at: None,
+                bound_since: None,
+                client_kind: None,
+                observed_here: false,
+            });
+            b.account = anchor.clone();
+        }
         let mut reason = "new";
         if let Some(b) = bound {
             reason = "forced";
@@ -991,7 +1058,7 @@ impl BindingTable {
                         .map_or(*until, |q| q.reset_at);
                     if reset > now
                         && (reset - now).to_std().is_ok_and(|wait| {
-                            wait <= Duration::from_secs(self.config.reset_hold_secs)
+                            wait <= Duration::from_secs(plan.settings.reset_wait_secs)
                         })
                     {
                         return (PreviewDecision::Hold { until: reset }, reason);
@@ -1009,7 +1076,16 @@ impl BindingTable {
                         "reset hold skipped"
                     );
                 }
-                let marked = self.has_overload_mark(d, &b.key, now);
+                if *eligible && plan.settings.mode != crate::routing::Mode::Rebalance {
+                    return (
+                        PreviewDecision::Selected {
+                            account: b.account.clone(),
+                        },
+                        "forced",
+                    );
+                }
+                let marked = self.has_overload_mark(d, &b.key, now)
+                    && plan.settings.mode == crate::routing::Mode::Rebalance;
                 if marked && *eligible {
                     let room_elsewhere = entries.iter().any(|(candidate, eligible)| {
                         candidate.account.id != b.account
@@ -1179,6 +1255,7 @@ impl BindingTable {
         if !d.active.is_empty() || !d.pins.is_empty() || !d.pending.is_empty() {
             bail!("cannot import active binding table");
         }
+        self.policies.reload()?;
         self.prune(&mut next, Utc::now());
         // Import must advance the existing table's revision, rather than use
         // the decoded default: a flush may already own an older snapshot.
@@ -1193,7 +1270,9 @@ impl BindingTable {
     /// Finish the last snapshot under the writer lock, then retire this
     /// process as a state-file writer while its streams finish in memory.
     pub fn freeze(&self) -> Result<()> {
-        self.flush_with_mode(atomic_write, true)
+        self.flush_with_mode(atomic_write, true)?;
+        self.policies.freeze();
+        Ok(())
     }
     fn flush_with(&self, write: impl FnOnce(&Path, &[u8]) -> std::io::Result<()>) -> Result<()> {
         self.flush_with_mode(write, false)
@@ -1371,7 +1450,7 @@ fn metrics(c: &Candidate, d: &Data, cfg: &RoutingConfig, now: DateTime<Utc>) -> 
     }
     m
 }
-fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension(format!("{:032x}.tmp", rand::random::<u128>()));
     let result = (|| {
         let mut file = OpenOptions::new().create_new(true).write(true).open(&tmp)?;

@@ -188,6 +188,24 @@ quota-baton.exe accounts refresh <계정-ID> --force
 
 새 세션은 사용량과 활성 세션 수를 함께 고려해 배치합니다. 이미 연결된 세션은 일반적인 사용량 변화만으로 이동하지 않습니다. 이 정책의 자세한 규칙은 [C6.3 속도 대기와 계정별 pacing](contract.md#c63-rate-hold-and-per-account-pacing-d14)과 [C7.1 세션 분산](contract.md#c71-session-spreading-and-overload-rebalance-d15)에 있습니다.
 
+## 프로젝트·세션별 계정 유지
+
+코어가 실행 중일 때 `quota-baton routing list`로 정책과 루트 세션 식별자를 확인합니다. 여기의 긴 식별자는 대시보드의 짧은 표시 ID와 다릅니다.
+
+```powershell
+quota-baton routing session <식별자> --mode strict --reset-wait-secs 0
+quota-baton routing session <식별자> --mode recover
+quota-baton routing session <식별자> --mode rebalance
+quota-baton routing project "작업 프로젝트" --mode strict
+quota-baton routing session <식별자> --project <프로젝트-ID> --inherit
+```
+
+`strict`는 현재 계정을 유지합니다. 그 계정을 사용할 수 없으면 다른 계정으로 옮기지 않고 멈춥니다. 캐시 적중이나 작업 성공을 보장하는 설정은 아닙니다. `recover`는 계정을 사용할 수 없을 때만 전환합니다. `rebalance`는 기존처럼 조건에 맞는 혼잡 분산도 허용합니다. 기본값은 `rebalance`입니다. 자식 에이전트는 루트의 정책을 따릅니다.
+
+프로젝트는 이름과 별개의 ID로 등록됩니다. 같은 이름을 써도 다른 프로젝트입니다. 세션 연결은 명시적으로 지정하며 폴더 이름으로 추측하지 않습니다. 정책과 고정 계정은 재시작 뒤에도 유지됩니다. 프로젝트 기본값을 바꿔도 이미 연결한 세션을 조용히 바꾸지 않습니다. `--inherit`는 명시적 세션 설정을 해제하고 저장된 프로젝트 기본값을 따릅니다.
+
+대기 시간 0은 초기화를 기다리지 않는다는 뜻입니다. 기본 대기 한도는 60초입니다. 추가 크레딧 사용 권한은 이 설정과 별개입니다. 크레딧을 금지하는 99% 예방 차단은 제공자의 추가 청구를 0으로 강제하는 금융 상한이 아닙니다.
+
 ## 클라이언트 설정 전환
 
 전환 전에는 항상 dry-run을 실행합니다.
