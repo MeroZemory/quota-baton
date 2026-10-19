@@ -1089,7 +1089,7 @@ async fn c6_3_retained_copy_budget_exhausted_falls_back_to_relay() {
 #[tokio::test]
 async fn c6_3_storm_simulation() {
     let routing = RoutingConfig {
-        rate_hold_secs: 20,
+        rate_hold_secs: 60,
         ..RoutingConfig::default()
     };
     let h = Harness::new_with_routing(Provider::Codex, 2, 384, 1024, routing).await;
@@ -1118,27 +1118,43 @@ async fn c6_3_storm_simulation() {
     // makes the first-round baseline depend on client/IOCP scheduling.
     h.fake.state.gate_first_limiter_batch(16);
     let before = h.fake.state.requests().len();
-    let mut round_counts = Vec::new();
-    let mut responses_with_bodies = Vec::new();
-    let harness = &h;
-    for _round in 0..3 {
+    // Keep independent sessions producing work rather than inserting a global
+    // quiet gap after every batch. Per-request tags attribute retries to their
+    // originating round even while the three rounds overlap.
+    for _ in 0..3 {
         h.fake.state.begin_limiter_round();
-        let responses = futures_util::future::join_all((0..16).map(|n| {
-            let session = format!("storm-session-{n}");
-            async move { harness.send_with_session(Provider::Codex, &session).await }
-        }))
-        .await;
-        for response in responses {
-            let status = response.status();
-            let account = response.headers()["x-quota-baton-account"]
-                .to_str()
-                .unwrap()
-                .to_owned();
-            assert_eq!(account, ids[0]);
-            responses_with_bodies.push((status, response.bytes().await.unwrap()));
-        }
-        round_counts = h.fake.state.limiter_round_429_counts();
     }
+    let harness = &h;
+    let expected = ids[0].as_str();
+    let batches = futures_util::future::join_all((0..16).map(|n| async move {
+        let mut completed = Vec::new();
+        for round in 0..3 {
+            let response = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(75))
+                .build()
+                .unwrap()
+                .post(format!("http://{}/v1/responses", harness.servers.data_addr))
+                .bearer_auth("synthetic-client")
+                .header("session-id", format!("storm-session-{n}"))
+                .header("user-agent", format!("qb-storm-round/{round}"))
+                .body("{}")
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            assert_eq!(response.headers()["x-quota-baton-account"], expected);
+            completed.push((status, response.bytes().await.unwrap()));
+        }
+        completed
+    }))
+    .await;
+    let responses_with_bodies: Vec<_> = batches.into_iter().flatten().collect();
+    let round_counts = h.fake.state.limiter_round_429_counts();
+    eprintln!(
+        "continuous storm counts={round_counts:?}, pacing={:?}",
+        h.state.accounts.pacing_snapshot(&ids[0])
+    );
     assert_eq!(round_counts.len(), 3);
     assert!(
         // All 16 initial arrivals share the real 8/s limiter: at least eight
