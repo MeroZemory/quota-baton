@@ -58,7 +58,6 @@ pub struct RelayState {
     pub quota: Arc<crate::quota::UsagePoller>,
     pub bindings: Arc<crate::bindings::BindingTable>,
     burst: Mutex<crate::burst::BurstTracker>,
-    reset_hold_secs: u64,
     rate_hold_secs: u64,
     rate_hold_max_retries: u32,
     ws_upgrade_hold_secs: u64,
@@ -94,6 +93,21 @@ pub struct RelayState {
 }
 
 impl RelayState {
+    async fn prepare_project(
+        &self,
+        session: &session::Session,
+        hint: Option<&crate::routing::ProjectHint>,
+    ) -> Result<(), ()> {
+        let Some(project) = hint.and_then(|hint| hint.0.clone()) else {
+            return Ok(());
+        };
+        let key = session.key.clone().ok_or(())?;
+        let table = self.bindings.clone();
+        tokio::task::spawn_blocking(move || table.policies.associate(&key, &project))
+            .await
+            .map_err(|_| ())?
+            .map_err(|_| ())
+    }
     #[cfg(all(feature = "testkit", debug_assertions))]
     pub fn validate_takeover_test_inputs(
         home: &std::path::Path,
@@ -361,6 +375,14 @@ impl RelayState {
         websocket: bool,
         model: Option<&str>,
     ) -> Response {
+        if completion.policy_blocked {
+            return native_error(
+                StatusCode::CONFLICT,
+                provider,
+                "routing_policy_blocked",
+                "자동 계정 전환이 꺼져 있거나 이동 예산이 소진되었습니다. 계정 상태와 세션 정책을 확인해 주세요.",
+            );
+        }
         if !completion.usage_prepolled {
             completion.usage_prepolled = true;
             self.quota.before_unavailable(provider).await;
@@ -431,7 +453,6 @@ impl RelayState {
             accounts,
             quota,
             bindings,
-            reset_hold_secs: config.routing.reset_hold_secs,
             rate_hold_secs: config.routing.rate_hold_secs,
             rate_hold_max_retries: config.routing.rate_hold_max_retries,
             ws_upgrade_hold_secs: config.routing.ws_upgrade_hold_secs,
@@ -645,6 +666,11 @@ impl RelayState {
         model: Option<&str>,
         tried: &BTreeSet<String>,
     ) -> Result<Option<Account>, ()> {
+        if key.is_none()
+            && self.bindings.policies.plan(None).settings.mode == crate::routing::Mode::Strict
+        {
+            return Ok(None);
+        }
         let candidates = self.candidates(provider, key, model, tried).await?;
         let pinned = self.pins.get(provider, key);
         match self.bindings.preview(
@@ -672,6 +698,12 @@ impl RelayState {
         model: Option<&str>,
         tried: &BTreeSet<String>,
     ) -> Result<Option<Account>, ()> {
+        if session.key.is_none()
+            && self.bindings.policies.plan(None).settings.mode == crate::routing::Mode::Strict
+        {
+            completion.policy_blocked = true;
+            return Ok(None);
+        }
         // Post-commit/nonreplayable quota errors cannot retry the old body.
         // On its next request, resolve C7 before publishing any context.
         let prior = self.bindings.current(session.key.as_deref());
@@ -714,18 +746,47 @@ impl RelayState {
             let bytes = completion
                 .input_bytes
                 .load(std::sync::atomic::Ordering::Relaxed);
-            let choice = self.bindings.choose_with_hold(
-                provider,
-                session.key.as_deref(),
-                session.parent.as_deref(),
-                model,
-                &candidates,
-                pinned.as_deref(),
-                bytes,
-                !completion.reset_hold_used,
-                completion.reset_hold_timed_out,
-            );
+            // Strict anchors/moves are durable before dispatch. Disk I/O must
+            // not block a Tokio reactor thread while holding the table gate.
+            let table = self.bindings.clone();
+            let key = session.key.clone();
+            let parent = session.parent.clone();
+            let owned_model = model.map(str::to_owned);
+            let choices = candidates.clone();
+            let hold_allowed = !completion.reset_hold_used;
+            let hold_timed_out = completion.reset_hold_timed_out;
+            let choice = tokio::task::spawn_blocking(move || {
+                table.choose_with_hold(
+                    provider,
+                    key.as_deref(),
+                    parent.as_deref(),
+                    owned_model.as_deref(),
+                    &choices,
+                    pinned.as_deref(),
+                    bytes,
+                    hold_allowed,
+                    hold_timed_out,
+                )
+            })
+            .await
+            .map_err(|_| ())?;
             match choice {
+                crate::bindings::Decision::Blocked => {
+                    completion.policy_blocked = true;
+                    return Ok(None);
+                }
+                crate::bindings::Decision::None
+                    if self
+                        .bindings
+                        .policies
+                        .plan(session.key.as_deref())
+                        .settings
+                        .mode
+                        == crate::routing::Mode::Strict =>
+                {
+                    completion.policy_blocked = true;
+                    return Ok(None);
+                }
                 crate::bindings::Decision::Selected {
                     account,
                     lease,
@@ -811,7 +872,7 @@ impl RelayState {
                     held_account = self.bindings.current(session.key.as_deref());
                     let wait = (until - chrono::Utc::now()).to_std().unwrap_or_default();
                     completion.reset_hold_used = true;
-                    tokio::time::sleep(wait.min(Duration::from_secs(self.reset_hold_secs))).await;
+                    tokio::time::sleep(wait).await;
                     // This flag is request-local; a later turn may hold again.
                     completion.reset_hold_timed_out = true;
                 }
@@ -866,7 +927,13 @@ impl RelayState {
             tracing::debug!(account = %id, reason = "reset_elapsed", "reset hold skipped");
             return Ok(false);
         };
-        if wait > Duration::from_secs(self.reset_hold_secs) {
+        let reset_budget = self
+            .bindings
+            .policies
+            .plan(session.key.as_deref())
+            .settings
+            .reset_wait_secs;
+        if wait > Duration::from_secs(reset_budget) {
             tracing::debug!(account = %id, reason = "reset_beyond_hold_bound", wait_ms = wait.as_millis() as u64, "reset hold skipped");
             return Ok(false);
         }
@@ -1106,6 +1173,14 @@ async fn handover_http(state: Arc<RelayState>, request: Request) -> Response {
     let path = parts.uri.path_and_query().map_or("/", |path| path.as_str());
     let url = format!("http://127.0.0.1:{}{path}", state.handover_port);
     let mut headers = parts.headers;
+    if let Some(project) = parts
+        .extensions
+        .get::<crate::routing::ProjectHint>()
+        .and_then(|hint| hint.0.as_deref())
+        && let Ok(value) = HeaderValue::from_str(project)
+    {
+        headers.insert(crate::routing::PROJECT_HEADER, value);
+    }
     for name in [
         "connection",
         "transfer-encoding",
@@ -1138,6 +1213,24 @@ async fn handover_http(state: Arc<RelayState>, request: Request) -> Response {
 }
 
 async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Response {
+    let project = match crate::routing::take_project(request.headers_mut()) {
+        Ok(project) => project,
+        Err(_) => {
+            return native_error(
+                StatusCode::BAD_REQUEST,
+                if request.uri().path().contains("responses") {
+                    Provider::Codex
+                } else {
+                    Provider::Claude
+                },
+                "invalid_request_error",
+                "프로젝트 식별자가 올바르지 않습니다.",
+            );
+        }
+    };
+    request
+        .extensions_mut()
+        .insert(crate::routing::ProjectHint(project));
     let launcher_label = crate::dashboard::labels::take_launcher_label(request.headers_mut());
     request
         .extensions_mut()
@@ -1234,6 +1327,21 @@ async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Re
         session_body = handle.metadata();
     }
     let session = session::classify(provider, path, &parts.headers, &session_body);
+    if state
+        .prepare_project(
+            &session,
+            parts.extensions.get::<crate::routing::ProjectHint>(),
+        )
+        .await
+        .is_err()
+    {
+        return native_error(
+            StatusCode::CONFLICT,
+            provider,
+            "routing_project_conflict",
+            "등록된 프로젝트와 루트 세션 연결을 확인해 주세요.",
+        );
+    }
     completion.dashboard_label = launcher_label.or(completion.dashboard_label.take());
     completion.session(&session);
     let mut tried = BTreeSet::new();

@@ -16,6 +16,7 @@ pub mod observability;
 pub mod phase0;
 pub mod quota;
 pub mod relay;
+pub mod routing;
 pub mod session;
 
 pub fn set_console_utf8() {

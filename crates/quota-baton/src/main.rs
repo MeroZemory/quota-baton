@@ -9,6 +9,7 @@ macro_rules! println_utf8 {
 mod accounts_cli;
 mod cutover;
 mod launcher_label;
+mod routing_cli;
 mod wire_readiness;
 
 fn print_stdout(args: std::fmt::Arguments<'_>) -> std::io::Result<()> {
@@ -40,6 +41,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    #[command(about = "프로젝트·세션별 계정 전환을 설정합니다")]
+    Routing {
+        #[command(subcommand)]
+        command: routing_cli::RoutingCommand,
+    },
     /// Internal child launch; no core config or credentials are loaded.
     #[command(hide = true)]
     LaunchClient {
@@ -613,6 +619,10 @@ async fn run() -> anyhow::Result<()> {
         Command::Accounts { command } => {
             let config = qb_core::config::Config::load(&home)?;
             accounts_cli::run(command, &home, &config).await?;
+        }
+        Command::Routing { command } => {
+            let config = qb_core::config::Config::load(&home)?;
+            routing_cli::run(command, &home, &config).await?;
         }
         Command::Wire {
             codex_mode,

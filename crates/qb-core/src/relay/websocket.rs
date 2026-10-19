@@ -187,6 +187,21 @@ async fn upgrade_inner(
         .and_then(|e| e.0);
     let (parts, _) = request.into_parts();
     let session = session::classify(Provider::Codex, "/v1/responses", &parts.headers, &[]);
+    if state
+        .prepare_project(
+            &session,
+            parts.extensions.get::<crate::routing::ProjectHint>(),
+        )
+        .await
+        .is_err()
+    {
+        return super::native_error(
+            StatusCode::CONFLICT,
+            Provider::Codex,
+            "routing_project_conflict",
+            "등록된 프로젝트와 루트 세션 연결을 확인해 주세요.",
+        );
+    }
     completion.session(&session);
     let ticket = state.observability.capture_request(&parts.headers, &[]);
     let query = parts

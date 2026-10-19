@@ -76,6 +76,7 @@ These rules apply to the data port and the admin port alike.
 ### Request header read and removed (dashboard label, R6)
 
 - `x-quota-baton-label`: an optional, client-side session label (the launcher's folder name). The core reads it into memory for the dashboard and **removes every occurrence before capture or forwarding**, including HTTP retries and WebSocket handshakes. Duplicate or invalid values supply no label. The launcher encodes a UTF-8 basename as `qb1:<base64url without padding>` so Korean names fit ASCII header APIs; a bounded plain label is also accepted. The decoded basename lives in memory only and is never persisted or logged.
+- `x-quota-baton-project`: an optional registered local project ID (32 lowercase hex digits). All occurrences are removed before capture or upstream forwarding; duplicates/invalid values are rejected. It associates a classified root session with a project policy before first selection. An unknown ID, absent session identity or conflicting existing association is rejected. It is separate from display labels and grants no credit/credential permission. Only authenticated successor handover may carry the validated ID between local cores.
 
 ### Response to client
 
@@ -462,6 +463,16 @@ Some outcomes never count toward the trigger, because they are not account conce
 - `AccountView` (C11) gains `active_sessions` and `spread_threshold`. The tray shows the count against the threshold.
 - The ledger records `overload_detected` and `binding_move{reason: overload}`. These are the inputs for tuning `spread_threshold`.
 
+### C7.2 Explicit root-session routing intent
+
+`routing.mode` defaults to `rebalance` (existing C7/D15 behaviour). `recover` keeps an eligible bound account and permits only recovery from ineligibility. `strict` does not automatically change its local account ID and requires a classified root identity. It may refresh/reconnect that account, but pause, quota, auth, payment and credit restrictions still prevent dispatch. An unavailable locked account returns a provider-shaped HTTP 409 `routing_policy_blocked`; it must not trigger selection of a different account. Exhausted group movement budgets or failure to durably authorize a move use the same explicit local block.
+
+The authenticated routing admin API registers opaque projects and applies root-session overrides. Effective settings are global defaults → explicitly associated project baseline → explicit root override. Children inherit the root. A project edit affects new associations; existing baselines stay until explicitly edited. Display labels never select policy. Session handles are full SHA-256 hashes of canonical C8 root keys, separate from the short dashboard display IDs.
+
+Explicit intent, anchor and movement history are atomically persisted in `state/routing-policies.json` before a strict first dispatch or account move. Corrupt intent refuses startup rather than silently forgetting a lock. The file is bounded to 16MiB, 20,000 root records, 1,024 projects and 32 retained movement entries per root. Capacity/write failure fails closed. Takeover retires the old writer and reloads durable intent after lease handover. Normal binding LRU/write-behind cannot erase the lock.
+
+`reset_wait_secs` is a root/project setting in 0–120 seconds; omitted global intent retains `routing.reset_hold_secs` (60). It is separate from paid-credit permission. New defaults do not silently change existing explicit baselines. The broader forecast/churn supplement remains staged; proposed controls must not be advertised as tested until its acceptance cases pass.
+
 ## C8. Session keys and the allowed body peek
 
 ### Claude
@@ -559,6 +570,8 @@ Base: `http://127.0.0.1:<admin_port>/admin/v1`. Every route requires `Authorizat
 | `GET /sessions/{id}` | Session detail, bounded request summaries and placement timeline. Only this route may include `original_short_id`, the first 8 characters of the root ID, retained in memory only. Full raw IDs, content and paths are never returned. |
 | `GET /activity?days=1..7&limit=1..2000&since_seq=...` | Bounded 7-day activity, with stable sequence numbers for updated aggregates. No labels, raw ID prefixes, paths or upstream error bodies. |
 | `GET /usage-history?hours=1..48` | Observed account-window history and reset/credit spans. Unknown observations remain gaps; remaining usage is a dashboard projection. |
+| `GET /routing` | Global defaults, registered projects, durable root policies and observed full routing handles; never raw root IDs, tokens or project paths. |
+| `POST /routing` | Typed `kind: project` registration/update (`id?`, `name`, `settings`) or `kind: session` update (`id`, `settings?`, `project?`). Mutations require the running owner and are refused during drain. Settings contain `mode: strict\|recover\|rebalance` and `reset_wait_secs: 0..120`. |
 | `POST /accounts/login` `{provider}` | Returns `{login_id, auth_url}`. The core runs the callback listener. |
 | `POST /accounts/import` `{source:"cpa", mode:"linked"\|"adopted", activate:[...]}` | Imports from CPA's auth directory (D5). Returns per-identity metadata, never tokens. `mode:"adopted"` is refused: adoption is per existing account via `/accounts/{id}/adopt`. |
 | `POST /accounts/{id}/adopt` `{from:"cpa_file"\|"store"\|{"path":"..."}, expected_generation}` | Takes refresh ownership of a linked account (D17). Refused with 409 while CPA can still refresh it (process running and file loadable), on a generation mismatch, or when the file's identity does not match. Returns `{id, generation, from, token_expires_at}`; never tokens. |
