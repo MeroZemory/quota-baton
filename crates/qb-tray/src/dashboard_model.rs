@@ -396,11 +396,19 @@ pub struct AccountGroup {
     pub remaining: String,
     pub reset: String,
     pub remaining_pct: Option<u8>,
+    pub windows: Vec<AccountUsageWindow>,
     pub relogin: bool,
     pub disabled: bool,
     pub collapsed: bool,
     pub no_sessions: String,
     pub rows: Vec<SessionRow>,
+}
+#[derive(Clone, Debug)]
+pub struct AccountUsageWindow {
+    pub label: String,
+    pub remaining: String,
+    pub reset: String,
+    pub remaining_pct: u8,
 }
 #[derive(Clone, Debug)]
 pub struct EventRow {
@@ -834,6 +842,18 @@ pub fn project(
             continue;
         }
         let remaining = a.usage.as_ref().and_then(|u| u.binding.as_ref());
+        let windows = a.usage.as_ref().map_or_else(Vec::new, |usage| {
+            usage
+                .lines
+                .iter()
+                .map(|line| AccountUsageWindow {
+                    label: line.window.label.clone(),
+                    remaining: format!("{}% 남음", line.window.remaining.unwrap_or_default()),
+                    reset: line.window.reset_text.clone().unwrap_or_default(),
+                    remaining_pct: line.window.remaining.unwrap_or_default(),
+                })
+                .collect()
+        });
         let blocked =
             a.raw.drain || a.raw.user_state != "active" || a.raw.health.kind == "needs_relogin";
         let away = all
@@ -872,6 +892,7 @@ pub fn project(
                 .map(|v| format!("{} 초기화", clock.time(Some(v))))
                 .unwrap_or_default(),
             remaining_pct: remaining.and_then(|w| w.remaining),
+            windows,
             relogin: a.raw.health.kind == "needs_relogin" && a.menu.show_relogin,
             disabled: a.raw.user_state == "disabled",
             collapsed: state.collapsed.contains(&a.raw.id),

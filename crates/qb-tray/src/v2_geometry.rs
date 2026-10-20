@@ -211,12 +211,20 @@ pub struct RowBox {
     pub plan: Option<Rect>,
     pub chip: Option<Rect>,
     pub usage: Option<Rect>,
+    pub usage_lines: Vec<UsageLineBox>,
     pub reset: Option<Rect>,
     pub bar: Option<Rect>,
     pub bar_fill: Option<Rect>,
     pub credits: Option<Rect>,
     pub reason: Option<Rect>,
     pub button: Option<ButtonBox>,
+}
+#[derive(Debug, Clone)]
+pub struct UsageLineBox {
+    pub line: Rect,
+    pub reset: Option<Rect>,
+    pub bar: Rect,
+    pub fill: Option<Rect>,
 }
 #[derive(Debug, Clone)]
 pub struct SectionBox {
@@ -797,7 +805,10 @@ pub fn row_height(row: &v2::AccountRow, disabled_slot: bool) -> f32 {
         return 44. + if row.reason.is_some() { 24. } else { 0. };
     }
     let action = row.action.as_ref().map(|a| a.kind);
-    44. + if row.usage.is_some() { 30. } else { 0. }
+    44. + row
+        .usage
+        .as_ref()
+        .map_or(0., |u| 30. + u.lines.len().saturating_sub(1) as f32 * 26.)
         + if row.credits.is_some() {
             6. + if matches!(
                 action,
@@ -873,6 +884,7 @@ fn row_box(row: &v2::AccountRow, disabled_slot: bool, y: f32, p: &Presentation) 
     });
     let mut next = line1.bottom;
     let mut usage = None;
+    let mut usage_lines = Vec::new();
     let mut reset = None;
     let mut bar = None;
     let mut bar_fill = None;
@@ -881,39 +893,63 @@ fn row_box(row: &v2::AccountRow, disabled_slot: bool, y: f32, p: &Presentation) 
     if !disabled_slot {
         if let Some(u) = &row.usage {
             next += 6.;
-            let reset_width = u
-                .binding
-                .as_ref()
-                .and_then(|w| w.reset_text.as_deref())
-                .map(|s| advance(p, s, 12, false))
-                .unwrap_or(0.);
-            usage = Some(r(
-                16.,
-                next,
-                if reset_width > 0. {
-                    344. - reset_width - 8.
-                } else {
-                    344.
-                },
-                next + 16.,
-            ));
-            reset = (reset_width > 0.).then(|| r(344. - reset_width, next, 344., next + 16.));
-            next += 20.;
-            bar = Some(r(16., next, 344., next + 4.));
-            bar_fill = u
-                .binding
-                .as_ref()
-                .and_then(|w| w.remaining)
-                .filter(|n| *n > 0)
-                .map(|n| {
+            let lines = u.lines.len().max(1);
+            for (index, item) in u.lines.iter().enumerate() {
+                let top = next + index as f32 * 26.;
+                let reset_width = item
+                    .window
+                    .reset_text
+                    .as_deref()
+                    .map(|s| advance(p, s, 12, false))
+                    .unwrap_or(0.);
+                let text = r(
+                    16.,
+                    top,
+                    if reset_width > 0. {
+                        344. - reset_width - 8.
+                    } else {
+                        344.
+                    },
+                    top + 16.,
+                );
+                let reset_box =
+                    (reset_width > 0.).then(|| r(344. - reset_width, top, 344., top + 16.));
+                let bar_top = top + 20.;
+                let track = r(16., bar_top, 344., bar_top + 4.);
+                let fill = item.window.remaining.filter(|n| *n > 0).map(|n| {
                     r(
                         16.,
-                        next,
+                        bar_top,
                         16. + (328. * f32::from(n) / 100.).round().max(4.),
-                        next + 4.,
+                        bar_top + 4.,
                     )
                 });
-            next += 4.;
+                if index == 0 {
+                    usage = Some(text);
+                    reset = reset_box;
+                    bar = Some(track);
+                    bar_fill = fill;
+                }
+                usage_lines.push(UsageLineBox {
+                    line: text,
+                    reset: reset_box,
+                    bar: track,
+                    fill,
+                });
+            }
+            if u.lines.is_empty() {
+                let top = next;
+                usage = Some(r(16., top, 344., top + 16.));
+                let track = r(16., top + 20., 344., top + 24.);
+                bar = Some(track);
+                usage_lines.push(UsageLineBox {
+                    line: usage.unwrap(),
+                    reset: None,
+                    bar: track,
+                    fill: None,
+                });
+            }
+            next += 24. + lines.saturating_sub(1) as f32 * 26.;
         }
         let action = row.action.as_ref();
         if row.credits.is_some() {
@@ -992,6 +1028,7 @@ fn row_box(row: &v2::AccountRow, disabled_slot: bool, y: f32, p: &Presentation) 
         plan,
         chip,
         usage,
+        usage_lines,
         reset,
         bar,
         bar_fill,
@@ -1623,6 +1660,16 @@ fn shift_row(row: &mut RowBox, dy: f32) {
     {
         shift(rect, dy);
     }
+    for line in &mut row.usage_lines {
+        shift(&mut line.line, dy);
+        if let Some(reset) = &mut line.reset {
+            shift(reset, dy);
+        }
+        shift(&mut line.bar, dy);
+        if let Some(fill) = &mut line.fill {
+            shift(fill, dy);
+        }
+    }
     if let Some(b) = &mut row.button {
         shift_button(b, dy);
     }
@@ -1767,6 +1814,28 @@ mod tests {
         assert_eq!(h(row.rect), 104.);
         assert_eq!(h(row.button.as_ref().unwrap().visual), 24.);
         assert!(row.credits.is_some());
+    }
+    #[test]
+    fn two_usage_windows_add_one_ordered_line_and_bar() {
+        let mut a = account("a");
+        a["windows"] = json!([
+            {"name":"7d","used_pct":99,"reset_at":"2026-10-26T00:00:00Z"},
+            {"name":"5h","used_pct":25,"reset_at":"2026-10-21T20:00:00Z"}
+        ]);
+        let scene = Scene::build(&view(vec![a], 1), Presentation::default(), 1000.);
+        let row = scene.row("a").unwrap();
+        assert_eq!(h(row.rect), 100.);
+        assert_eq!(row.usage_lines.len(), 2);
+        assert_eq!(row.usage_lines[0].line.top, row.usage.unwrap().top);
+        assert_eq!(
+            row.usage_lines[1].line.top - row.usage_lines[0].line.top,
+            26.
+        );
+        assert_eq!(row.usage_lines[1].bar.top - row.usage_lines[0].bar.top, 26.);
+        assert_eq!(
+            row.usage_lines[0].fill.unwrap().right - 16.,
+            (328_f32 * 75. / 100.).round().max(4.)
+        );
     }
     #[test]
     fn bar_fill_is_remaining_minimum_and_no_zero_fill() {

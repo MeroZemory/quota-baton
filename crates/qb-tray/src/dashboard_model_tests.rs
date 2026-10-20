@@ -466,6 +466,25 @@ fn r7_usage_is_remaining_observed_only_with_reset_and_unknown_gaps() {
     assert!(!tiles.iter().any(|t| t.id == "cx-disabled"));
 }
 #[test]
+fn r84_dashboard_group_header_keeps_each_usage_window_and_binding_chip() {
+    let data = snapshot();
+    let c = clock();
+    let view = project(&data, &mut DashboardState::default(), &c);
+    let group = view.groups.iter().find(|g| g.id == "cl-a").unwrap();
+    assert_eq!(
+        group
+            .windows
+            .iter()
+            .map(|w| w.label.as_str())
+            .collect::<Vec<_>>(),
+        ["5시간", "주간"]
+    );
+    assert_eq!(group.windows[0].remaining, "34% 남음");
+    assert!(group.windows[0].reset.contains("초기화"));
+    assert_eq!(group.windows[1].remaining, "88% 남음");
+    assert_eq!(group.chip, "사용 중");
+}
+#[test]
 fn r7_empty_states_are_distinct_and_day_boundary_explicit() {
     let mut data = snapshot();
     let mut state = DashboardState {

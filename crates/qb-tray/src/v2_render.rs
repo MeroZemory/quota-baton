@@ -209,9 +209,26 @@ impl Renderer {
                 labels.push(action.label);
             }
             if let Some(usage) = &row.usage {
-                labels.push(&usage.text);
-                if let Some(reset) = usage.binding.as_ref().and_then(|w| w.reset_text.as_deref()) {
-                    labels.push(reset);
+                if usage.lines.is_empty() {
+                    labels.push(&usage.text);
+                } else {
+                    for line in &usage.lines {
+                        labels.push(&line.window.label);
+                        if let Some(reset) = line.window.reset_text.as_deref() {
+                            labels.push(reset);
+                        }
+                    }
+                }
+                for line in &usage.lines {
+                    if let Some(remaining) = line.window.remaining {
+                        let text = format!("{remaining}% 남음");
+                        for (size, bold) in [(12, true), (13, true)] {
+                            p.text_widths.insert(
+                                g::text_key(&text, size, bold),
+                                self.width(&text, size, bold)?,
+                            );
+                        }
+                    }
                 }
             }
             for text in labels {
@@ -845,43 +862,7 @@ impl Renderer {
         }
         self.icon(target, b.more, "\u{e712}", 16., p.secondary, alpha)?;
         if let (Some(usage), Some(rect)) = (&row.usage, b.usage) {
-            if let Some(binding) = &usage.binding {
-                let label_width = self.width(&binding.label, 12, false)?;
-                self.text(
-                    target,
-                    r(
-                        rect.left,
-                        rect.top,
-                        label_width.min(rect.right - rect.left),
-                        16.,
-                    ),
-                    &binding.label,
-                    style(12., false, 16.),
-                    p.secondary,
-                    alpha,
-                )?;
-                let rest = binding
-                    .remaining
-                    .map_or_else(|| "확인 전".into(), |n| format!("{n}% 남음"));
-                self.text(
-                    target,
-                    r(
-                        rect.left + label_width + 4.,
-                        rect.top,
-                        (rect.right - rect.left - label_width - 4.).max(0.),
-                        16.,
-                    ),
-                    &rest,
-                    style(12., true, 16.),
-                    p.text,
-                    alpha,
-                )?;
-                if let (Some(reset), Some(reset_rect)) = (&binding.reset_text, b.reset) {
-                    let mut s = style(12., false, 16.);
-                    s.align = Align::Trailing;
-                    self.text(target, reset_rect, reset, s, p.secondary, alpha)?;
-                }
-            } else {
+            if usage.lines.is_empty() {
                 self.text(
                     target,
                     rect,
@@ -890,18 +871,57 @@ impl Renderer {
                     p.secondary,
                     alpha,
                 )?;
-            }
-            if let Some(bar) = b.bar {
-                self.fill(target, bar, p.track, alpha, 2.)?;
-            }
-            if let Some(fill) = b.bar_fill {
-                let color = p.bars[match usage.bar_tone {
-                    v2::BarTone::Ok => 0,
-                    v2::BarTone::Low => 1,
-                    v2::BarTone::Critical => 2,
-                    v2::BarTone::Paused => 3,
-                }];
-                self.fill(target, fill, color, alpha, 2.)?;
+            } else {
+                for (line, boxes) in usage.lines.iter().zip(&b.usage_lines) {
+                    let label_width = self.width(&line.window.label, 12, false)?;
+                    self.text(
+                        target,
+                        r(
+                            boxes.line.left,
+                            boxes.line.top,
+                            label_width.min(boxes.line.right - boxes.line.left),
+                            16.,
+                        ),
+                        &line.window.label,
+                        style(12., false, 16.),
+                        p.secondary,
+                        alpha,
+                    )?;
+                    let rest = line
+                        .window
+                        .remaining
+                        .map_or_else(|| "확인 전".into(), |n| format!("{n}% 남음"));
+                    self.text(
+                        target,
+                        r(
+                            boxes.line.left + label_width + 4.,
+                            boxes.line.top,
+                            (boxes.line.right - boxes.line.left - label_width - 4.).max(0.),
+                            16.,
+                        ),
+                        &rest,
+                        style(12., true, 16.),
+                        p.text,
+                        alpha,
+                    )?;
+                    if let Some(reset) = &line.window.reset_text
+                        && let Some(reset_rect) = boxes.reset
+                    {
+                        let mut s = style(12., false, 16.);
+                        s.align = Align::Trailing;
+                        self.text(target, reset_rect, reset, s, p.secondary, alpha)?;
+                    }
+                    self.fill(target, boxes.bar, p.track, alpha, 2.)?;
+                    if let Some(fill) = boxes.fill {
+                        let color = p.bars[match line.bar_tone {
+                            v2::BarTone::Ok => 0,
+                            v2::BarTone::Low => 1,
+                            v2::BarTone::Critical => 2,
+                            v2::BarTone::Paused => 3,
+                        }];
+                        self.fill(target, fill, color, alpha, 2.)?;
+                    }
+                }
             }
         }
         if let (Some(credits), Some(rect)) = (&row.credits, b.credits) {
