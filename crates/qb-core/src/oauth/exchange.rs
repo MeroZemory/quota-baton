@@ -119,7 +119,7 @@ pub(super) async fn exchange(
         schema: 1,
         id: identity.id(),
         provider: params.provider,
-        label: email.clone(),
+        label: String::new(),
         email,
         plan,
         identity,

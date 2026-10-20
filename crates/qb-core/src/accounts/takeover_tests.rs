@@ -3,6 +3,15 @@ use super::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[tokio::test]
+async fn r10_new_takeover_leaves_label_unset() {
+    let f = Fixture::new();
+    let plan = f.plan().await;
+    assert!(plan.account.label.is_empty());
+    let result = install(&f.store, &f.deps, plan).unwrap();
+    assert!(f.store.load(&result.account.id).unwrap().label.is_empty());
+}
+
+#[tokio::test]
 async fn r6_installed_retry_rechecks_owner_before_any_retirement_side_effect() {
     let f = Fixture::new();
     let plan = f.plan().await;

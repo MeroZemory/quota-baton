@@ -146,6 +146,121 @@ impl Drop for Harness {
 }
 
 #[tokio::test]
+async fn r10_relay_quota_extension_keeps_one_activity_and_persists_raw_health_changes() {
+    use qb_core::accounts::{Health, HealthReason};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::{Barrier, Semaphore};
+
+    // Both requests reach upstream before either quota header can cool the pool.
+    // Release response two only after response one's health was persisted.
+    let admitted = Arc::new(Barrier::new(3));
+    let release = Arc::new([Semaphore::new(0), Semaphore::new(0)]);
+    let ordinal = Arc::new(AtomicUsize::new(0));
+    let reset = chrono::Utc::now().timestamp() + 7200;
+    let app = axum::Router::new().fallback({
+        let admitted = admitted.clone();
+        let release = release.clone();
+        move || {
+            let admitted = admitted.clone();
+            let release = release.clone();
+            let index = ordinal.fetch_add(1, Ordering::SeqCst);
+            async move {
+                assert!(index < 2, "unexpected upstream retry");
+                admitted.wait().await;
+                release[index].acquire().await.unwrap().forget();
+                axum::http::Response::builder()
+                    .header("content-type", "application/json")
+                    .header("x-codex-limit-reached", "true")
+                    .header("x-codex-primary-used-percent", "100")
+                    .header("x-codex-primary-window-minutes", "300")
+                    .header(
+                        "x-codex-primary-reset-at",
+                        (reset + index as i64).to_string(),
+                    )
+                    .body(axum::body::Body::from(r#"{"output":[]}"#))
+                    .unwrap()
+            }
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let upstream = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let h = Harness::new(&url).await;
+    let account = h.store.list().unwrap().remove(0);
+    let mut requests = Vec::new();
+    for session in ["r10-quota-one", "r10-quota-two"] {
+        let request = h
+            .client
+            .post(format!("http://{}/v1/responses", h.servers.data_addr))
+            .bearer_auth(CLIENT)
+            .header("session-id", session)
+            .json(&json!({"model":"synthetic-model", "input":[]}));
+        requests.push(tokio::spawn(async move {
+            let response = request.send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            response.bytes().await.unwrap();
+        }));
+    }
+    tokio::time::timeout(Duration::from_secs(5), admitted.wait())
+        .await
+        .unwrap();
+    release[0].add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(h.store.load(&account.id).unwrap().health, Health::Cooling { reason: HealthReason::Quota, until, .. } if until.timestamp() == reset) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    release[1].add_permits(1);
+    for request in requests {
+        request.await.unwrap();
+    }
+    let persisted = h.store.load(&account.id).unwrap();
+    assert!(
+        matches!(persisted.health, Health::Cooling { reason: HealthReason::Quota, scope, until } if scope == "account" && until.timestamp() == reset + 1)
+    );
+    let evidence = persisted.quota_cooling.unwrap();
+    assert_eq!(evidence.window, "5h");
+    assert_eq!(evidence.reset_at.timestamp(), reset + 1);
+    let activity = h.get("activity").await;
+    let events = activity["events"].as_array().unwrap();
+    let reached: Vec<_> = events
+        .iter()
+        .filter(|e| e["kind"] == "quota_reached")
+        .collect();
+    assert_eq!(reached.len(), 1);
+    assert!(!events.iter().any(|e| e["kind"] == "quota_reset"));
+    // Health.scope is account, not the causing window. Do not invent a window.
+    assert!(reached[0]["data"]["window"].is_null());
+    h.obs.flush().unwrap();
+    let mut changes = Vec::new();
+    for entry in fs::read_dir(h.home.join("ledger")).unwrap() {
+        for line in fs::read_to_string(entry.unwrap().path()).unwrap().lines() {
+            let row: Value = serde_json::from_str(line).unwrap();
+            if row["event"] == "health_changed" && row["account"] == account.id {
+                changes.push(row);
+            }
+        }
+    }
+    assert_eq!(changes.len(), 2);
+    assert_eq!(changes[0]["from"]["kind"], "ready");
+    assert_eq!(changes[1]["from"], changes[0]["to"]);
+    assert!(
+        changes
+            .iter()
+            .all(|row| row["to"]["reason"] == "quota" && row["to"]["scope"] == "account")
+    );
+    for (row, expected) in changes.iter().zip([reset, reset + 1]) {
+        let until = chrono::DateTime::parse_from_rfc3339(row["until"].as_str().unwrap()).unwrap();
+        assert_eq!(until.timestamp(), expected);
+    }
+    h.stop().await;
+    upstream.abort();
+}
+
+#[tokio::test]
 async fn r7_first_authenticated_settings_action_after_startup_is_durable() {
     // Each case constructs a new observer AFTER the existing account was saved.
     // No token/health notification or artificial account_changed seeding first.
