@@ -10,6 +10,7 @@ mod accounts_cli;
 mod cutover;
 mod launcher_label;
 mod launcher_script;
+mod routing_cli;
 mod wire_readiness;
 
 fn print_stdout(args: std::fmt::Arguments<'_>) -> std::io::Result<()> {
@@ -41,6 +42,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    #[command(about = "프로젝트·세션별 계정 전환을 설정합니다")]
+    Routing {
+        #[command(subcommand)]
+        command: routing_cli::RoutingCommand,
+    },
     /// Internal child launch; no core config or credentials are loaded.
     #[command(hide = true)]
     LaunchClient {
@@ -503,9 +509,10 @@ async fn run() -> anyhow::Result<()> {
                         .cloned()
                         .unwrap_or_else(|| serde_json::json!([])),
                 });
-                relay
-                    .bindings
-                    .import(value)
+                let bindings = relay.bindings.clone();
+                tokio::task::spawn_blocking(move || bindings.import(value))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("인계된 세션 바인딩 복구 작업이 종료되었습니다."))?
                     .map_err(|_| anyhow::anyhow!("인계된 세션 바인딩을 읽지 못했습니다."))?;
                 observability.record_takeover("bindings_imported");
             }
@@ -622,6 +629,10 @@ async fn run() -> anyhow::Result<()> {
         Command::Accounts { command } => {
             let config = qb_core::config::Config::load(&home)?;
             accounts_cli::run(command, &home, &config).await?;
+        }
+        Command::Routing { command } => {
+            let config = qb_core::config::Config::load(&home)?;
+            routing_cli::run(command, &home, &config).await?;
         }
         Command::Wire {
             codex_mode,

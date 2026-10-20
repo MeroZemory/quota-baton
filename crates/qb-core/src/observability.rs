@@ -234,6 +234,7 @@ pub struct Observability {
     recent_burst: std::sync::Mutex<Option<(std::time::Instant, DateTime<Utc>, u32)>>,
     events: std::sync::Mutex<Option<tokio::sync::broadcast::Sender<serde_json::Value>>>,
     snapshots: std::sync::Mutex<BTreeMap<String, serde_json::Value>>,
+    shadow: std::sync::Mutex<crate::routing::forecast::Shadow>,
     tx: mpsc::SyncSender<Command>,
     worker: Option<thread::JoinHandle<()>>,
     dropped: Arc<AtomicU64>,
@@ -242,6 +243,28 @@ pub struct Observability {
 }
 
 impl Observability {
+    pub fn configure_forecast(&self, enabled: bool) {
+        self.shadow
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .enable(enabled);
+    }
+    pub fn forecast_load(&self, id: &str, active: usize) {
+        self.shadow
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .regime(id, Some(active), None);
+    }
+    pub fn forecast_view(&self, id: &str, active: usize, inflight: usize) -> serde_json::Value {
+        let snapshot = self.quota_snapshot(id).unwrap_or_default();
+        self.shadow.lock().unwrap_or_else(|e| e.into_inner()).view(
+            id,
+            &snapshot,
+            active,
+            inflight,
+            Utc::now(),
+        )
+    }
     pub fn dashboard(&self) -> &Arc<crate::dashboard::runtime::Runtime> {
         &self.dashboard
     }
@@ -420,6 +443,7 @@ impl Observability {
             dashboard,
             recent_burst: std::sync::Mutex::new(None),
             events: std::sync::Mutex::new(None),
+            shadow: std::sync::Mutex::new(crate::routing::forecast::Shadow::default()),
             snapshots: std::sync::Mutex::new(snapshots),
             tx,
             worker: Some(worker),
@@ -439,8 +463,20 @@ impl Observability {
         provider: Provider,
         headers: &HeaderMap,
     ) -> Option<serde_json::Value> {
+        self.observe_headers_reported(account_id, provider, headers)
+            .map(|(merged, _)| merged)
+    }
+
+    pub(crate) fn observe_headers_reported(
+        &self,
+        account_id: &str,
+        provider: Provider,
+        headers: &HeaderMap,
+    ) -> Option<(serde_json::Value, serde_json::Value)> {
         let snapshot = snapshot(provider, headers, Utc::now())?;
-        self.remember(account_id, &snapshot, true)
+        let reported = serde_json::to_value(&snapshot).ok()?;
+        let merged = self.remember(account_id, &snapshot, true)?;
+        Some((merged, reported))
     }
 
     pub(crate) fn observe_poll(
@@ -478,6 +514,15 @@ impl Observability {
         account_id: &str,
         event: &serde_json::Value,
     ) -> Option<serde_json::Value> {
+        self.observe_codex_event_reported(account_id, event)
+            .map(|(merged, _)| merged)
+    }
+
+    pub(crate) fn observe_codex_event_reported(
+        &self,
+        account_id: &str,
+        event: &serde_json::Value,
+    ) -> Option<(serde_json::Value, serde_json::Value)> {
         if event.get("type").and_then(serde_json::Value::as_str) != Some("codex.rate_limits") {
             return None;
         }
@@ -530,9 +575,36 @@ impl Observability {
         }
         if let Some(mut snapshot) = snapshot(Provider::Codex, &headers, Utc::now()) {
             snapshot.source = "codex.rate_limits".into();
-            return self.remember(account_id, &snapshot, true);
+            let reported = serde_json::to_value(&snapshot).ok()?;
+            let merged = self.remember(account_id, &snapshot, true)?;
+            return Some((merged, reported));
         }
         None
+    }
+
+    pub fn record_placement(&self, event: &crate::bindings::MoveEvent) {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(event.key.as_bytes());
+        let session: String = digest[..6].iter().map(|b| format!("{b:02x}")).collect();
+        self.enqueue(Command::Ledger(serde_json::json!({
+            "ts":Utc::now().to_rfc3339(), "event":"placement", "session":session,
+            "account":event.to, "evidence":event.evidence, "capped":event.capped,
+            "placed_since_obs":event.placed_since_obs, "charge":event.placement_charge_pct
+        })));
+    }
+    pub fn record_unknown_cost_skips(&self, count: usize) {
+        if count > 0 {
+            self.enqueue(Command::Ledger(serde_json::json!({
+                "ts":Utc::now().to_rfc3339(), "event":"victim_skipped_unknown_cost",
+                "count":count
+            })));
+        }
+    }
+    pub fn record_placement_poll(&self, account: &str) {
+        self.enqueue(Command::Ledger(serde_json::json!({
+            "ts":Utc::now().to_rfc3339(), "event":"poll", "account":account,
+            "reason":"placement_evidence"
+        })));
     }
 
     pub fn record_ws_connection(
@@ -597,6 +669,12 @@ impl Observability {
             .filter(|v| v.len() == 12 && v.bytes().all(|c| c.is_ascii_hexdigit()));
         record.ua = record.ua.as_deref().and_then(product);
         record.model = record.model.as_deref().and_then(safe_identifier);
+        if let Some(id) = &record.account {
+            self.shadow
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .regime(id, None, record.model.as_deref());
+        }
         record.originator = record.originator.as_deref().and_then(safe_identifier);
         if let Ok(value) = serde_json::to_value(record) {
             self.enqueue(Command::Ledger(value));
@@ -765,6 +843,10 @@ impl Observability {
             value["signals"] = serde_json::to_value(signals).ok()?;
             let persisted: Snapshot = serde_json::from_value(value.clone()).ok()?;
             snapshots.insert(id.into(), value.clone());
+            self.shadow
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .observe(id, &value, Utc::now());
             // Persist the exact in-memory result in observation order. The writer
             // must never apply a second, different partial-update reducer.
             self.enqueue(Command::PollQuota(id.into(), Box::new(persisted)));
@@ -1896,6 +1978,7 @@ mod tests {
             dashboard: crate::dashboard::runtime::Runtime::new(),
             recent_burst: std::sync::Mutex::new(None),
             events: std::sync::Mutex::new(None),
+            shadow: std::sync::Mutex::new(crate::routing::forecast::Shadow::default()),
             snapshots: std::sync::Mutex::new(BTreeMap::new()),
             tx,
             worker: None,
@@ -1930,6 +2013,7 @@ mod tests {
             dashboard: crate::dashboard::runtime::Runtime::new(),
             recent_burst: std::sync::Mutex::new(None),
             events: std::sync::Mutex::new(None),
+            shadow: std::sync::Mutex::new(crate::routing::forecast::Shadow::default()),
             snapshots: std::sync::Mutex::new(BTreeMap::new()),
             tx,
             worker: None,
@@ -2064,6 +2148,7 @@ mod tests {
             dashboard: crate::dashboard::runtime::Runtime::new(),
             recent_burst: std::sync::Mutex::new(None),
             events: std::sync::Mutex::new(None),
+            shadow: std::sync::Mutex::new(crate::routing::forecast::Shadow::default()),
             snapshots: std::sync::Mutex::new(BTreeMap::new()),
             tx,
             worker: Some(worker),

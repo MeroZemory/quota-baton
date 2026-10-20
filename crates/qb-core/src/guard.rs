@@ -29,8 +29,10 @@ impl InflightBudget {
     pub fn reserve_message(self: &Arc<Self>, bytes: usize) -> Reservation {
         self.used.fetch_add(bytes, Ordering::AcqRel);
         Reservation {
-            budget: self.clone(),
-            bytes,
+            _inner: Arc::new(ReservationInner {
+                budget: self.clone(),
+                bytes,
+            }),
         }
     }
 
@@ -53,18 +55,24 @@ impl InflightBudget {
             })
             .ok()?;
         Some(Reservation {
-            budget: self.clone(),
-            bytes,
+            _inner: Arc::new(ReservationInner {
+                budget: self.clone(),
+                bytes,
+            }),
         })
     }
 }
 
+#[derive(Clone)]
 pub struct Reservation {
+    _inner: Arc<ReservationInner>,
+}
+struct ReservationInner {
     budget: Arc<InflightBudget>,
     bytes: usize,
 }
 
-impl Drop for Reservation {
+impl Drop for ReservationInner {
     fn drop(&mut self) {
         self.budget.used.fetch_sub(self.bytes, Ordering::AcqRel);
         self.budget.changed.notify_waiters();
@@ -199,6 +207,32 @@ impl MemoryGuard {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn shared_allocation_reservation_lasts_until_every_owner_releases() {
+        let budget = super::InflightBudget::new(100);
+        let write = budget.reserve_message(100);
+        let history = write.clone();
+        assert_eq!(budget.used(), 100);
+        drop(write);
+        assert_eq!(budget.used(), 100);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                budget.wait_available()
+            )
+            .await
+            .is_err()
+        );
+        drop(history);
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            budget.wait_available(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(budget.used(), 0);
+    }
+
     use super::*;
 
     #[test]

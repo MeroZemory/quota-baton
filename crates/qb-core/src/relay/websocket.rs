@@ -75,9 +75,18 @@ fn clear_retried_token(relay: &Arc<RelayState>, account: &str, token: &str) {
 pub(super) type UpstreamSocket = WebSocketStream<reqwest::Upgraded>;
 pub(super) type ClientSocket = WebSocketStream<hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>>;
 
-async fn redial_same_account(context: &pump::Context) -> Result<UpstreamSocket, ()> {
+async fn redial_same_account(
+    context: &pump::Context,
+    model: Option<&str>,
+) -> Result<UpstreamSocket, ()> {
     let relay = context.relay.as_ref().ok_or(())?;
     let (account, token) = context.credentials.as_ref().ok_or(())?;
+    if !relay
+        .dispatch_data_allowed(context.session.key.as_deref(), &account.id, model)
+        .await
+    {
+        return Err(());
+    }
     let mut forwarded = headers::upstream(&context.headers, account, token).map_err(|_| ())?;
     let key = generate_key();
     forwarded.insert("connection", HeaderValue::from_static("Upgrade"));
@@ -140,10 +149,36 @@ pub(super) async fn upgrade(state: Arc<RelayState>, request: Request) -> Respons
     completion.record.transport = "ws".into();
     completion.track(state.inflight_requests.clone());
     completion.runtime = Some(state.accounts.clone());
-    let response = upgrade_inner(state, request, &mut completion).await;
+    let deadline = request
+        .extensions()
+        .get::<RequestDeadline>()
+        .map(|d| d.0)
+        .unwrap_or_else(|| {
+            std::time::Instant::now() + Duration::from_secs(state.ws_upgrade_hold_secs)
+        });
+    completion.precommit_deadline = Some(deadline);
+    let timeout = deadline.saturating_duration_since(std::time::Instant::now());
+    let response = tokio::time::timeout(
+        timeout,
+        upgrade_inner(state, request, &mut completion, deadline),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        native_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            Provider::Codex,
+            "request_timeout",
+            "WebSocket 연결의 전체 대기 한도를 초과했습니다.",
+        )
+    });
     completion.record.status = response.status().as_u16();
-    completion.finish(if response.status() == StatusCode::SWITCHING_PROTOCOLS {
+    let local_rate_timeout = completion.record.outcome == "rate_wait_timeout";
+    completion.finish(if local_rate_timeout {
+        "rate_wait_timeout"
+    } else if response.status() == StatusCode::SWITCHING_PROTOCOLS {
         "ws_upgrade"
+    } else if response.status() == StatusCode::GATEWAY_TIMEOUT {
+        "request_timeout"
     } else {
         "ws_upgrade_error"
     });
@@ -154,6 +189,7 @@ async fn upgrade_inner(
     state: Arc<RelayState>,
     mut request: Request,
     completion: &mut Completion,
+    deadline: std::time::Instant,
 ) -> Response {
     if let Some(response) = state.memory_rejection(Provider::Codex) {
         return response;
@@ -187,6 +223,21 @@ async fn upgrade_inner(
         .and_then(|e| e.0);
     let (parts, _) = request.into_parts();
     let session = session::classify(Provider::Codex, "/v1/responses", &parts.headers, &[]);
+    if state
+        .prepare_project(
+            &session,
+            parts.extensions.get::<crate::routing::ProjectHint>(),
+        )
+        .await
+        .is_err()
+    {
+        return super::native_error(
+            StatusCode::CONFLICT,
+            Provider::Codex,
+            "routing_project_conflict",
+            "등록된 프로젝트와 루트 세션 연결을 확인해 주세요.",
+        );
+    }
     completion.session(&session);
     let ticket = state.observability.capture_request(&parts.headers, &[]);
     let query = parts
@@ -205,8 +256,11 @@ async fn upgrade_inner(
     let mut last_error = None;
     // One pacing deadline for the entire upgrade, including retries and
     // account selection. C7 reset-hold and token/network budgets stay separate.
-    let upgrade_started = std::time::Instant::now();
-    let upgrade_deadline = upgrade_started + Duration::from_secs(state.ws_upgrade_hold_secs);
+    // Leave a small envelope for the hold's final forced attempt before the
+    // independent overall connect deadline cancels the future.
+    let upgrade_deadline = deadline
+        .checked_sub(Duration::from_millis(100))
+        .unwrap_or(deadline);
     let mut quota_source: Option<String> = None;
     let (upstream, upstream_headers, account, tokens) = 'accounts: loop {
         if tried.len() == 4 {
@@ -233,6 +287,11 @@ async fn upgrade_inner(
         let account = match selected {
             Ok(Some(account)) => account,
             Ok(None) => {
+                if completion.policy_blocked {
+                    return state
+                        .unavailable(completion, Provider::Codex, true, None)
+                        .await;
+                }
                 return match last_error {
                     Some(response) => response,
                     None => {
@@ -264,6 +323,7 @@ async fn upgrade_inner(
         let mut network_retry = false;
         let mut token_retry = false;
         let mut rate_retries = 0_u32;
+        let mut rate_retry_queued = false;
         loop {
             let admission_started = std::time::Instant::now();
             let admission = state
@@ -273,7 +333,19 @@ async fn upgrade_inner(
             completion.rate_wait(
                 u64::try_from(admission_started.elapsed().as_millis()).unwrap_or(u64::MAX),
             );
-            let forced = admission.forced();
+            let mut forced = admission.forced() || std::time::Instant::now() >= upgrade_deadline;
+            if !state
+                .dispatch_allowed(session.key.as_deref(), &account.id, None)
+                .await
+            {
+                completion.policy_blocked = !state
+                    .bindings
+                    .policies
+                    .permits_dispatch(session.key.as_deref(), &account.id);
+                return state
+                    .unavailable(completion, Provider::Codex, true, None)
+                    .await;
+            }
             let mut forwarded =
                 match headers::upstream(&parts.headers, &account, &tokens.access_token) {
                     Ok(headers) => headers,
@@ -288,7 +360,26 @@ async fn upgrade_inner(
                 HeaderValue::from_str(&key).expect("generated key"),
             );
             completion.record.account = Some(account.id.clone());
+            if std::time::Instant::now() >= deadline {
+                return native_error(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    Provider::Codex,
+                    "request_timeout",
+                    "WebSocket 연결 시간 한도를 초과했습니다.",
+                );
+            }
+            forced |= std::time::Instant::now() >= upgrade_deadline;
+            if std::mem::take(&mut rate_retry_queued) {
+                completion.rate_retry();
+            }
+            if let Some(binding) = &completion.binding {
+                binding.dispatched();
+            }
             completion.attempt(&account.id);
+            if forced {
+                state.accounts.record_forced_send(&account.id);
+            }
+            let observation_asof = state.bindings.begin_usage_observation_for(&account.id);
             let sent_at = std::time::Instant::now();
             let result = tokio::time::timeout(
                 Duration::from_secs(300),
@@ -312,7 +403,13 @@ async fn upgrade_inner(
             {
                 state
                     .accounts
-                    .observe_headers(&account.id, Provider::Codex, response.headers())
+                    .observe_headers_asof(
+                        &account.id,
+                        Provider::Codex,
+                        response.headers(),
+                        None,
+                        (&state.bindings, observation_asof),
+                    )
                     .await
             } else {
                 Default::default()
@@ -377,6 +474,7 @@ async fn upgrade_inner(
                 &error.raw,
                 None,
             );
+            decision.reconcile_quota(&credit_observation);
             if super::credentials::is_linked(&account)
                 && decision.kind == super::outcome::Kind::Revoked
             {
@@ -393,8 +491,9 @@ async fn upgrade_inner(
                 decision.signal = None;
             }
             if decision.kind == super::outcome::Kind::Rate {
+                state.bindings.note_rate(&account.id, chrono::Utc::now());
                 let retry_after = super::outcome::header_seconds(&error.headers, "retry-after")
-                    .map(|seconds| Duration::from_secs((seconds as u64).min(60)));
+                    .map(|seconds| Duration::from_secs(seconds as u64));
                 state.accounts.observe_429_at(
                     &account.id,
                     sent_at,
@@ -407,7 +506,7 @@ async fn upgrade_inner(
                     && std::time::Instant::now() < upgrade_deadline
                 {
                     rate_retries += 1;
-                    completion.rate_retry();
+                    rate_retry_queued = true;
                     continue;
                 }
                 state

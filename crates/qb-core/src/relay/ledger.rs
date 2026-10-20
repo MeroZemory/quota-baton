@@ -24,11 +24,14 @@ pub(in crate::relay) struct Completion {
     pub(super) dashboard_request: Option<crate::dashboard::runtime::RequestGuard>,
     pub burst_client: Option<crate::burst::Identity>,
     pub start: Instant,
+    pub precommit_deadline: Option<Instant>,
     pub input_bytes: Arc<AtomicU64>,
+    pub selection_cost: Option<u64>,
     pub runtime: Option<Arc<crate::account_runtime::AccountRuntime>>,
     pub failed_access: Option<zeroize::Zeroizing<String>>,
     pub binding: Option<crate::bindings::BindingLease>,
     pub reset_hold_used: bool,
+    pub policy_blocked: bool,
     pub usage_prepolled: bool,
     pub reset_hold_timed_out: bool,
     observability: Arc<Observability>,
@@ -59,11 +62,14 @@ impl Completion {
             ),
             dashboard_request: None,
             start: Instant::now(),
+            precommit_deadline: None,
             burst_client: crate::burst::client_identity(headers),
             reset_hold_used: false,
+            policy_blocked: false,
             usage_prepolled: false,
             reset_hold_timed_out: false,
             input_bytes: Arc::new(AtomicU64::new(0)),
+            selection_cost: None,
             runtime: None,
             failed_access: None,
             binding: None,
@@ -229,6 +235,21 @@ impl Completion {
 
 impl Drop for Completion {
     fn drop(&mut self) {
+        if self.record.status == 0
+            && self
+                .precommit_deadline
+                .is_some_and(|at| Instant::now() >= at)
+        {
+            self.record.status = 504;
+            self.record.outcome = "request_timeout".into();
+        }
+        if matches!(self.record.outcome.as_str(), "ok" | "rate_hold_ok")
+            && ((200..300).contains(&self.record.status)
+                || (self.record.transport == "ws" && self.record.status == 101))
+            && let Some(binding) = &self.binding
+        {
+            binding.successful();
+        }
         if let Some(counter) = self.inflight.take() {
             counter.fetch_sub(1, Ordering::Relaxed);
         }
@@ -290,5 +311,58 @@ impl Drop for Completion {
             );
         }
         self.observability.record_request(self.record.clone());
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    #[test]
+    fn attempt_bookkeeping_never_admits_a_binding_or_spends_a_dispatch_receipt() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.sandbox/ledger-admission");
+        std::fs::create_dir_all(&base).unwrap();
+        let home = tempfile::tempdir_in(base).unwrap();
+        let table = crate::bindings::BindingTable::new(
+            home.path(),
+            crate::config::RoutingConfig::default(),
+        )
+        .unwrap();
+        let account = crate::accounts::health::tests::fixture();
+        let id = account.id.clone();
+        let key = "codex:accounting";
+        let candidate = crate::bindings::Candidate {
+            account,
+            quota: None,
+            inflight: 0,
+        };
+        let crate::bindings::Decision::Selected { lease, .. } = table.choose(
+            Provider::Codex,
+            Some(key),
+            None,
+            None,
+            &[candidate],
+            None,
+            42,
+        ) else {
+            panic!("fixture placement")
+        };
+        let obs = Arc::new(Observability::new(home.path(), None).unwrap());
+        let mut completion = Completion::new(
+            obs,
+            &axum::http::Method::GET,
+            "/v1/responses",
+            Provider::Codex,
+            &axum::http::HeaderMap::new(),
+        );
+        completion.binding = Some(lease);
+        completion.attempt(&id);
+        completion.attempt(&id);
+        assert!(
+            !table.existing_placement(Some(key), &id),
+            "ledger accounting granted dispatch authority"
+        );
+        completion.binding.as_ref().unwrap().dispatched();
+        assert!(table.existing_placement(Some(key), &id));
     }
 }

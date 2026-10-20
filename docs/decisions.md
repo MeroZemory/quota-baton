@@ -120,8 +120,10 @@ Codex and Claude Code replay their encrypted or signed conversation items verbat
 
 **Evidence: V2 HTTP cells, 2026-10-13.**
 - Items minted by account A and sent to account B: 200. They are silently ignored, because the input-token count equals the stripped body. This holds inside a tool-use turn as well.
-- Tampered items on the minting account: 400. The server validates what it minted and ignores what it did not.
-- A moved session keeps working. It loses only its earlier hidden reasoning, and the first turn after the move is cache-cold.
+- Tampered items on the minting account: 400. Along with the token-count comparison, this supports validation and dropping in the tested cases; it is not a universal rule about foreign items.
+- The tested moved sessions completed, with the first turn cache-cold and earlier hidden reasoning apparently unused. This observation does not guarantee that every later model/account/path or compaction item can resume without loss or rejection.
+
+**Evidence scope clarified, 2026-10-20 (no relay behaviour change).** Local transcript resumption, cache reuse and preserved reasoning are distinct. Current official Claude API documentation describes separate model, account and prefix checks. Those statements do not establish subscription OAuth or Codex behaviour. The [routing design supplement](account-routing-design.md) records sources and routing rationale. Routing controls and churn defaults are accepted under D20; forecasting remains observation-only. D10 continues to require verbatim relay, not stripping or rewriting opaque history to force a hand-off.
 
 **Withdrawn:** C4 exceptions E1, E2, E3 and E2r, and header exception H3.
 
@@ -144,10 +146,10 @@ The user delegated this decision to independent reviewers. Three models answered
    - If none passes, the account with the most headroom is used.
 2. **Live sessions: move only when forced or free ("staged 1B"; Opus and Fable chose 1B, Codex 1A).**
    - **Forced:** the account becomes unusable (a limit, auth still failing after a refresh, or a user pause). A limit that resets within 60 s holds the request instead.
-   - **Free:** after at least 1 h idle, when the cache is cold on every account, but only if the current account fails the gate (D15 adds: or is at its spread threshold). V2 confirmed Codex's objection: a move keeps the conversation working but drops its earlier hidden reasoning, so a move that is not needed is avoided.
+   - **Lower-affinity heuristic:** after at least 1 h idle (this does not establish cache expiry on every account), but only if the current account fails the gate (D15 adds: or is at its spread threshold). V2 confirmed Codex's objection: the tested move kept that conversation working but did not reuse its earlier hidden reasoning, so a move that is not needed is avoided.
    - **Overload (added by D15):** a bounded rebalance at a request boundary when an account is concentrated and another has room.
 3. **Rejected:** restoring immediately when a preferred account recovers (unanimous), and moving warm sessions early to use expiring weekly quota (unanimous). New-session placement serves that goal without a cache cost.
-4. **No priority list.** The only manual placement setting is per-account **drain** (no new sessions; existing sessions stay). `allow_credits` stays off by default.
+4. **No priority list.** Per-account **drain** rejects new sessions while existing sessions stay. D20 supersedes the old drain-only restriction with project/root `strict`, `recover` and default `rebalance` policies. `allow_credits` remains separate and off by default.
 5. **Tuning from data:** the ledger records moves, the weekly quota left unused at each reset, and forced moves per gate crossing.
 6. **Caution:** the 88 % post-switch Codex cache figure may reflect shared prefixes rather than true cross-account sharing. Codex rules are not relaxed before a clean test.
 
@@ -266,7 +268,7 @@ Later candidates: a per-plan default table, once Codex `plan` shows plan-depende
 **Trigger.** The previous proxy mixed four Claude OAuth credentials with four billable Claude API keys in one pool. When the OAuth credentials were rate-limited, session affinity pinned a large session to an API key, which then failed with `Credit balance is too low`. A diagnostic replay of that session cost USD 64.68.
 
 **Decision.**
-1. quota-baton serves only the user's **subscription OAuth accounts** (D5: its own login, or a CPA OAuth import). It never imports or uses API keys, so a billable credential can never enter the pool, and no silent OAuth-to-API fallback can exist.
+1. quota-baton serves only the user's **subscription OAuth accounts** (D5: its own login, or a CPA OAuth import). It never imports or uses API keys, so no silent OAuth-to-API-key fallback can exist. This does not make OAuth usage inherently free: a Codex OAuth account can have separately purchased credits. C5's explicit credit permission and observations apply; the local 99% preventive hold is not an upstream-enforced zero-spend guarantee.
 2. If API keys are ever wanted, that is a new user decision. It must then follow the cost-safety policy in the incident note:
    - fallback is off by default
    - API keys live in a separate opt-in route or profile
@@ -359,6 +361,7 @@ The design was independently reviewed (`.sandbox/reviews/D17-review.md`); all si
 
 **Follow-ups.** Record `quota_credit_releasable` in AccountView and the account file format (C11, C12).
 
+<a id="d20"></a>
 ## D20. Routing policies kept, default rebalance; no herding onto accounts with weak usage evidence — Accepted (user direction, 2026-10-20)
 
 **User direction (quoted).** "기본값은 분산허용입니다 (사용량예측기능이 이미 있다면 분산허용이 올바릅니다). 다만 사용한지 얼마안된계정, 막 사용한계정의 사용량예측이 제대로안될 때 사용량이 적다는이유로 한계정에 여러세션이 몰리는문제를 회피하는 분명한 방법을 적용해주세요."

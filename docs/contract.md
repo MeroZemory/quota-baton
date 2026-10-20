@@ -76,6 +76,7 @@ These rules apply to the data port and the admin port alike.
 ### Request header read and removed (dashboard label, R6)
 
 - `x-quota-baton-label`: an optional, client-side session label (the launcher's folder name). The core reads it into memory for the dashboard and **removes every occurrence before capture or forwarding**, including HTTP retries and WebSocket handshakes. Duplicate or invalid values supply no label. The launcher encodes a UTF-8 basename as `qb1:<base64url without padding>` so Korean names fit ASCII header APIs; a bounded plain label is also accepted. The decoded basename lives in memory only and is never persisted or logged.
+- `x-quota-baton-project`: an optional registered local project ID (32 lowercase hex digits). All occurrences are removed before capture or upstream forwarding; duplicates/invalid values are rejected. It associates a classified root session with a project policy before first selection. An unknown ID, absent session identity or conflicting existing association is rejected. It is separate from display labels and grants no credit/credential permission. Only authenticated successor handover may carry the validated ID between local cores.
 
 ### Response to client
 
@@ -95,11 +96,11 @@ These rules apply to the data port and the admin port alike.
 | Id | Status | Rule | Gate |
 |---|---|---|---|
 | E1 | Withdrawn (2026-10-13) | Null a foreign `diagnostics.previous_message_id` | V1: genuine Claude Code does not send `diagnostics`. |
-| E2 | Withdrawn (2026-10-13) | Strip foreign Codex reasoning items | V2: another account ignores them silently, with no error. Genuine Codex replays them verbatim, too. |
-| E3 | Withdrawn (2026-10-13) | Strip foreign Claude thinking blocks | V2: ignored silently, even inside a tool-use turn. Stripping is itself a history edit, which preserved-thinking models may reject. |
-| E2r | Withdrawn (2026-10-13) | Strip and retry after a foreign-content rejection | No rejection for foreign reasoning or thinking exists (V2). Compaction could not be stripped anyway, and binding stickiness already keeps a session on its minting account. |
+| E2 | Withdrawn (2026-10-13) | Strip foreign Codex reasoning items | In the tested V2 HTTP cases, the request completed with token counts consistent with the items being ignored. Genuine Codex replays them verbatim, too. This is not a universal compatibility guarantee. |
+| E3 | Withdrawn (2026-10-13) | Strip foreign Claude thinking blocks | Tested V2 HTTP cases completed, including inside a tool-use turn. Stripping is itself a history edit, which preserved-thinking models may reject. Acceptance and preservation remain model/path dependent. |
+| E2r | Withdrawn (2026-10-13) | Strip and retry after a foreign-content rejection | The tested V2 cases did not establish a need for this rewrite. They do not prove foreign-content rejection impossible. Compaction cannot generally be stripped to recover missing history; sticky bindings reduce moves but cannot guarantee remaining on the minting account. |
 
-The register is empty. Encrypted and signed conversation items are relayed exactly as the client sent them, which is what the genuine clients themselves do ([D10](decisions.md#d10)).
+The register is empty. Encrypted and signed conversation items are relayed exactly as the client sent them, which is what the genuine clients themselves do ([D10](decisions.md#d10)). This preserves pass-through correctness; it does not certify cross-account resumption, cache reuse or preserved reasoning.
 
 ## C5. Account state
 
@@ -218,9 +219,9 @@ Rules for answering a WebSocket upgrade:
 
 ### C6.3 Rate hold and per-account pacing (D14)
 
-A request-rate limit (row 3) means the account is being asked too fast, not that it is out of quota. Moving sessions to another account throws away their prompt cache: each moved session re-sends its whole context uncached, and that pushes the other account over its rate limit too. This cascade was observed live on 2026-10-14 under the previous proxy (60 re-bindings at 01:30 KST, 150–350k uncached tokens per moved session).
+A request-rate limit (row 3) means the account is being asked too fast, not that it is out of quota. Moving sessions can lose prompt-cache affinity and require full-context retransmission, which can overload the destination too. Cross-account cache behaviour is not universally established. This cascade was observed live on 2026-10-14 under the previous proxy (60 re-bindings at 01:30 KST, 150–350k uncached tokens per moved session).
 
-Rate limits are therefore absorbed on the same account. A rate limit **never** moves a session and never causes failover. The design was independently reviewed (`.sandbox/reviews/D14-rate-hold-review.md`; F1–F10 refer to facts from the Codex 0.162.1 source).
+Rate limits are therefore absorbed on the same account. An individual rate limit does not directly move a session or cause failover. Persistent overload may cause a separately budgeted C7.1 discretionary move, subject to root policy. The design was independently reviewed (`.sandbox/reviews/D14-rate-hold-review.md`; F1–F10 refer to facts from the Codex 0.162.1 source).
 
 **Codex behaviour this relies on (review F2–F7).**
 - Codex retries a rate 429 only when the response carries retry advice: the HTTP `Retry-After` header, or a `headers` map inside a WebSocket error frame.
@@ -232,8 +233,8 @@ Rate limits are therefore absorbed on the same account. A rate limit **never** m
 **Pacing state.** Each account has `rate_backoff_until`, `rate_step` and `rate_release_interval`, held in memory only.
 - **Not a health state.** It is not persisted, never changes eligibility and never moves a binding by itself. A persistent, client-visible limit on a concentrated account is handled by C7.1.
 - **Owner.** The account runtime owns it, under one lock. The HTTP relay, the upgrade path and the WebSocket pump all update it there.
-- **Backoff window.** A rate 429 starts or extends the window: `rate_backoff_until = max(rate_backoff_until, now + max(retry_after, 2^rate_step s))`, with ±20 % jitter. The window is never shortened.
-- **Step.** A 429 raises `rate_step` (cap 5) only if its request was **sent after** the current window was set. That makes one step per window, not one per 429 in flight. `rate_step` decays by one after each full backoff interval with no rate 429. A committed 2xx does **not** reset it.
+- **Backoff window.** A rate 429 starts or extends the window: `rate_backoff_until = max(rate_backoff_until, now + max(retry_after, 2^rate_step s))`, with ±20 % jitter on the proxy estimate, never reducing the server-advised minimum. The window is never shortened.
+- **Step.** A 429 raises `rate_step` (cap 5) only if its request was **sent after** the current window was set. That makes one step per window, not one per 429 in flight. `rate_step` decays by one after each full backoff interval with no rate 429. The final step does not expire while the FIFO still contains waiting requests: a draining queue defers that final quiet interval. Once it drains and a full quiet interval elapses, the last step can reach zero. This prevents decay from releasing the entire queued tail as a new burst. A committed 2xx does **not** reset it.
 - **Release interval.** It starts at 250 ms. It doubles for each backoff window that saw a rate 429, up to 5 s. It shrinks by 25 % after each 60 s with no rate 429, down to 250 ms.
 
 **Admission.** Every request to an account passes its admission gate, whether or not it has a retained copy.
@@ -241,7 +242,7 @@ Rate limits are therefore absorbed on the same account. A rate limit **never** m
 - **While the account is pacing** (`rate_step` > 0, or a future `rate_backoff_until`), the gate is open when `now ≥ rate_backoff_until` and the previous release was at least `rate_release_interval` ago. Once `rate_step` has decayed to 0, spacing stops.
 - Waiting requests are released in arrival order, one per interval. One release task per account enforces the spacing.
 - While a request waits, its body is retained or back-pressured.
-- A request whose wait reaches `rate_hold_secs` (default 60) is sent anyway, once. Its response is relayed as is, and C3 adds `retry-after` to a 429. The proxy never synthesizes a rate 429; answering with a synthesized 429 at once was the previous proxy's fail-fast failure.
+- A request whose wait reaches `rate_hold_secs` (default 60) is sent anyway, once. Its response is relayed as is, and C3 adds `retry-after` to a 429. The proxy never synthesizes a rate 429; answering with a synthesized 429 at once was the previous proxy's fail-fast failure. This send-once rule applies to initial admission, HTTP retries, and WebSocket resends or same-account redials. A forced send receives no further rate retry. Local hold expiries never count toward the C7.1 overload trigger. Eligibility and strict policy are still rechecked before any send (D14, D20 §4).
 
 **HTTP: retry in place.** This applies to a pre-commit rate 429 when the request has a retained copy.
 - Pass the admission gate again, then retry the same account from the retained copy.
@@ -250,7 +251,7 @@ Rate limits are therefore absorbed on the same account. A rate limit **never** m
 - After the last retry, relay the last 429 as is. Do the same at once when the request has no retained copy (C6 row 17).
 - During a storm, retained copies count against the in-flight budget (architecture §13). When it runs out, later requests have no retained copy, so their 429 is relayed.
 
-**WebSocket upgrade.** No hold on an upgrade lasts longer than `ws_upgrade_hold_secs` (default 10), because Codex's connect timeout is 15 s. This covers both the rate hold and the C7 reset hold. If the pacing ends later than that, answer the upgrade at once as if the hold had expired.
+**WebSocket upgrade.** No hold on an upgrade lasts longer than `ws_upgrade_hold_secs` (default 10), because Codex's connect timeout is 15 s. This covers both the rate hold and the C7 reset hold. If the pacing ends later than that, answer the upgrade at once as if the hold had expired. The overall envelope includes refresh and dial (D20 §4); the send-once expiry rule applies within it.
 
 **Open WebSocket, pre-commit rate error.** The proxy keeps the last `response.create` of each socket until commit. Codex sends nothing else on the socket before commit. This copy counts against the in-flight budget, like an HTTP retained copy. Take the first case that applies:
 1. **The upstream socket is still open.** Wait for the pacing delay, then resend the kept message on the same upstream socket. Do not relay the error frame. The pacing delays together stay within `rate_hold_secs`, with at most `rate_hold_max_retries` resends.
@@ -258,7 +259,7 @@ Rate limits are therefore absorbed on the same account. A rate limit **never** m
 3. **The error frame carries retry advice.** Relay it as is, immediately. Codex retries after the advised delay.
 4. **Otherwise.** Do not relay the frame. Close the client socket with 1012, with **no** reconnect exclusion. Codex treats the close as retryable and reconnects with the full input. The binding is unchanged, so the reconnect goes back to the same account, and admission paces its upgrade (at most `ws_upgrade_hold_secs`). Relaying the frame would end the turn at once (F3).
 
-If the upstream socket closes while a resend is pending, close the client socket with the same code.
+If the upstream socket closes while a resend is pending, close the client socket with the same code. Pending resend and same-account redial admission waits follow the send-once rule above when their hold expires. The Codex reconnect behaviour for close 1012 is documented in architecture §9 and D14 review F5. A local expiry is not an upstream client-visible rate observation.
 
 Phase 0 item **V8** observes the genuine `wss://chatgpt.com` rate-limit shape. It records which of these occur:
 - a handshake 429
@@ -317,13 +318,13 @@ The workaround was applied on the previous proxy side and verified there. This s
 
 ## C7. Selection policy
 
-These rules come from the P2 blind panel (`.sandbox/reviews/switch-policy-blind-panel.md`, [D11](decisions.md#d11)).
+These rules originate in D11, with session spreading in D15 and explicit routing and anti-herding in D20 (decisions.md).
 
 **Input:** the family, the request's session key with its optional parent key (C8), the model if known, and the accounts already tried.
 
 **Placement is serialized** per family, so a burst of new sessions sees each earlier decision.
 
-**Projected usage.** For each window it is the last observed `used_pct`, plus an in-flight allowance for each request in flight on that account (`inflight_allowance_pct`). Rules from the M4b review:
+**Projected usage.** For each window it is the last observed `used_pct`, plus an in-flight allowance for each request in flight (`inflight_allowance_pct`), plus outstanding placement charges (`placement_allowance_pct`, default 2 percentage points per new or moved group). Each window retains a charge until its own observation is strictly newer than the placement. Equal or older observations do not clear it. Rules from M4b and D20:
 - **Gating windows.** Only the account windows count for the gate and for ordering: `5h` and `7d` (Codex primary/secondary as named by C9). Sub-buckets such as `7d_oi` and other names never gate the account and never set the weekly ordering. They act only through model-scoped cooling (C5) (S1).
 - **Non-standard Codex windows (design owner, 2026-10-20).** A Codex primary or secondary window with another length (`<n>m`, C9; e.g. the Free plan's single `43200m`) is an account window. It gates and orders in a slot chosen by its length:
   - `n` ≤ 1440 takes the 5-hour slot: `gate_5h_pct` and the 5-hour ordering key.
@@ -337,6 +338,14 @@ These rules come from the P2 blind panel (`.sandbox/reviews/switch-policy-blind-
   - Restored bindings do not count as traffic.
 - **Projection.** The in-flight projection is used only for placement. It never creates a cooling, for example the credits hold (S5). Coolings come only from observed values (C5).
 
+**Evidence and anti-herding (D20).** A placement is a new C7 steps 3–6 group, a C7.1/cold-point move, or a group moved off an ineligible account under C5. Forced C5 moves take the placement charge and apply the cap in target choice (D20 §4). Bound reuse, parent-binding reuse in step 2, restored bindings and same-account retries are not placements. Observations use request-send time for headers/WS events, or poll-start time for polls, in the account's monotonic sequence. Receipt time is not evidence age. Only a strictly later as-of observation clears a charge; the same instant does not.
+
+Evidence is weak when any gating window is unobserved, its observation precedes the latest placement, or its reset passed without a new observation. `placed_since_obs` counts placements newer than the oldest gating-window observation, or all placements while any window is unobserved. An account is capped only when weak and this count is at least `weak_evidence_new_sessions` (default 1).
+
+Apply the cap in both branches of step 4, in step 5 and in C7.1, after the room partition and pacing skip. Uncapped accounts come first in C7 order. When every candidate in that set is capped, use the fewest placements since observation, then C7 order. New-session and forced C5 placement never refuse merely because all accounts are capped; a cap cannot prevent a forced move when an eligible account exists. C7.1 instead retains the group and its unexpired mark when every target with room is capped. Placement charges never affect the cold-point gate check and never cool or move a bound eligible session.
+
+After any placement, wait `placement_poll_after_secs` (120) and check that every gating window has a newer observation. If not, issue one read-only GET poll using its own per-account `placement_poll_min_interval_secs` (300) budget, independent of the normal minimum, while respecting poll backoff and C9 exclusions. If this independent budget refuses a placement poll, the regular poll schedule still runs. The ledger records `placement{evidence: fresh|weak, capped, placed_since_obs, charge}` and `poll{reason: placement_evidence}`.
+
 **The gate** (new-session placement):
 - every 5-hour window is projected below `gate_5h_pct` (default 90)
 - every weekly window is projected below `gate_weekly_pct` (default 90), or below `gate_weekly_near_reset_pct` (default 98) when its weekly reset is within `near_reset_secs` (default 18 000)
@@ -345,7 +354,7 @@ These rules come from the P2 blind panel (`.sandbox/reviews/switch-policy-blind-
 
 **Steps:**
 1. If the session key is bound to account A, and A is eligible (C5) and not yet tried, use A. Two exceptions:
-   - **Reset hold:** A is in `cooling(quota)` and its limiting window resets within `reset_hold_secs` (default 60). Hold the request until the reset instead of moving it; the cache is still warm.
+   - **Reset hold:** A is in `cooling(quota)` and its limiting window resets within `reset_hold_secs` (default 60). Hold the request until the reset instead of moving it; the intent is to preserve cache affinity; warmth is not guaranteed.
      - **During a request (F3).** The hold also applies when A answers *this* request with a pre-commit usage limit whose reset is within `reset_hold_secs`. The request then waits until the reset and retries A once from the retained copy, instead of failing over. This applies to HTTP, and to a WebSocket **upgrade**. An error on an already-open socket keeps the row 13a behaviour.
      - **Bound (S2).** The hold never exceeds `reset_hold_secs`, which stays well below both clients' timeouts (Claude Code 600 s; Codex stream idle 300 s). On a WebSocket **upgrade** it never exceeds `ws_upgrade_hold_secs` (10 s), because Codex's connect timeout is 15 s (C6.3). If the reset has not taken effect when the hold ends, normal failover applies at once. No separate client-timeout estimate is used.
      - **Scope (S3).** The hold is per request. A request whose hold ended does not stop the next request of that session from holding.
@@ -353,16 +362,16 @@ These rules come from the P2 blind panel (`.sandbox/reviews/switch-policy-blind-
 2. Else, if the parent key is bound to account P, P is eligible and P has not been tried, bind the session to P and use it.
 3. Else, let `E` be the eligible accounts that have not been tried, and let `G` be the accounts in `E` that pass the gate.
 4. Partition `G` into `G_room` (the accounts with room, C7.1: `active < spread_threshold`) and the rest.
-   - If `G_room` is non-empty, apply the C6.3 pacing skip within it and order it by:
+   - If `G_room` is non-empty, apply the C6.3 pacing skip and then the D20 uncapped/round-robin preference within it; order the remaining candidates by:
      1. the soonest weekly `reset_at`. Resets within 3 h of each other count as tied.
      2. among tied accounts, the soonest 5-hour `reset_at`, with unstarted windows last
      3. the lower projected usage on the binding window
      4. account id
 
      Take the first account.
-   - If `G_room` is empty but `G` is not, order `G` by `active / spread_threshold` ascending, then by the pacing skip, then by 1–4 above, and take the first.
+   - If `G_room` is empty but `G` is not, order `G` by `active / spread_threshold` ascending, then by the pacing skip, then the D20 uncapped/round-robin preference, then by 1–4 above, and take the first.
    - A full account is never a refusal.
-5. If `G` is empty but `E` is not, apply the same partition to `E`. Take an account with room and the most headroom on its binding window. If no account has room, take the lowest `active / spread_threshold`, with ties going to the most headroom. This is the 2B fallback.
+5. If `G` is empty but `E` is not, apply the same room partition to `E`, then the C6.3 pacing skip and D20 uncapped/round-robin preference. Take the most headroom within that set. If no account has room, first take the lowest `active / spread_threshold`, then apply pacing and D20 preferences, then headroom. This is the 2B fallback.
 6. Bind the session, and the parent if it was unbound, to the chosen account.
 7. If `E` is empty, apply C6 row 14 or row 15.
 
@@ -374,16 +383,17 @@ These rules come from the P2 blind panel (`.sandbox/reviews/switch-policy-blind-
 Overload, 5xx, short rate limits and network errors retry in place (C6).
 
 Further rules:
-- **Usage gates never move a session.** Gates and usage MUST NOT move a bound session. A bound session moves only in three cases, and then only at a request boundary:
+- **Usage gates never move a session.** Placement charges are also excluded from the cold-point gate check. Gates and usage MUST NOT move a bound session. A bound session moves only in three cases, and then only at a request boundary:
   - its account fails the eligibility test in C5
   - it is cold and the cold-point rule applies
   - it is marked by the overload rebalance (C7.1)
 - **`last_used`.** Every HTTP request and every relayed WebSocket `response.create` updates the binding's `last_used`, set to the end of the response. Idle time is measured over the whole session identity group, sub-agents included.
 - **Pinned sockets keep their binding.** A binding referenced by an open pinned WebSocket is never expired or evicted.
-- **Cold point** (staged 1B). A binding is cold when it has been idle (`now - last_used`) for at least `rebalance_idle_secs`, default 3600. That is never below the longest prompt-cache TTL in use for the provider. At a cold point, the cache is cold on every account, so a move costs no extra cache miss.
+- **Cold point.** A binding is cold when it has been idle (`now - last_used`) for at least `rebalance_idle_secs`, default 3600. That is never below the longest prompt-cache TTL in use for the provider. This is an operational idle threshold for considering a move, not proof that every provider cache has expired or that moving preserves reasoning.
   - A cold session is re-placed (steps 3–6) **only if its current account fails the gate or has `active ≥ spread_threshold`** (C7.1). In the first case a forced move would probably come soon anyway; in the second the account is already full. Either way, moving at a cold boundary is cheaper than moving mid-session.
+  - A cold-point target must be eligible, pass the gate, have known non-stale quota and have room, including pending mark reservations. If no such target exists, the session stays (D20 §4).
   - Otherwise the binding stays, for up to `session_binding_max_secs` (default 7 days).
-  - Why not re-place every cold session? V2 showed that a move keeps the conversation working but drops its earlier hidden reasoning (D10). A move that is not needed is therefore not free.
+  - Why not re-place every cold session? In the tested V2 cases, moves completed with evidence consistent with earlier hidden reasoning being dropped (D10). Compatibility is not guaranteed outside that evidence. A move that is not needed is therefore not free.
   - `[websocket] idle_close_secs` MUST be smaller than `rebalance_idle_secs`.
 - **Moves.**
   - They happen only at request boundaries, atomically for the whole session group.
@@ -392,7 +402,7 @@ Further rules:
 - **Persistence.** Bindings are persisted write-behind, at most 60 s late, to `state/bindings.json`, and flushed on drain and on exit. LRU capacity is 20 000. They are exported and imported on takeover (C11).
 - **Unbound requests** (no key, C8) stay on the family's **last-used account** until it becomes ineligible. Selection then runs once, and the result becomes the new last-used account.
 - **WebSocket selection** runs once per connection, on the upgrade (C6 row 13). The connection keeps that account until it closes.
-- **Drained account at a cold point (S7).** A drained account fails the gate, so a cold session on it is re-placed. The move is free, because the cache is already cold. A warm session stays until it goes cold.
+- **Drained account at a cold point (S7).** A drained account fails the gate, so a cold session on it is re-placed. The idle threshold is intended to reduce the cache cost of that move; it is not a zero-cost or compatibility guarantee. A warm session stays until it goes cold.
 - **Drain vs pause.**
   - Drain stops new placements on the account, and existing sessions stay.
   - Pause (C5 `user_state`) moves existing sessions away at their next request.
@@ -402,7 +412,7 @@ Further rules:
 
 D11 places every new session on the account with the soonest weekly reset until its gate fails, so sessions concentrate on one account while others sit idle. D14 made rate limits never move a session. This subsection adds the user's rule (D15):
 - Spread new sessions before an account is full.
-- When sessions are already concentrated on an account that keeps hitting its rate limit while another account has room, move a bounded number of them, even though they lose their cache.
+- When sessions are already concentrated on an account that keeps hitting its rate limit while another account has room, move a bounded number of them, accepting possible cache loss and full-input retransmission cost.
 - When sessions are already well spread, a rate limit moves nothing.
 
 The design was independently reviewed (`.sandbox/reviews/D15-review.md`).
@@ -436,15 +446,16 @@ Some outcomes never count toward the trigger, because they are not account conce
 
 **Marking.** When A is overloaded, victims are chosen among the groups bound to A.
 - **Order:** smallest last request bytes first, since that is the cost of the uncached re-send; ties go to the longest idle time.
-- **Skipped:** any group with a request or a WebSocket response in flight.
+- **Skipped:** any group with a request or a WebSocket response in flight, or unknown full-input cost. Restored and continuation-only input has unknown cost until full input is known; `victim_skipped_unknown_cost` measures this exemption.
 - **How many:** at most `min(active(A) − spread_threshold(A), 2 − marks already made for A in this window)`. Marking stops as soon as `active(A) − active(B) < 2` would hold after the move.
-- **The mark** is `{from: A, expires: now + overload_window_secs}`. It is held in memory with the bindings and is not exported on takeover.
+- **The mark** is `{from: A, target: reserved B, expires: now + overload_window_secs}`. Its reservation counts against destination room until execution, replacement or expiry. It is held in memory with the bindings and is not exported on takeover.
 - **Idle pinned socket:** if the marked group's pinned socket is idle, close the client socket with 1000, as in C6 row 13c. The reconnect's upgrade is then the group's next request boundary.
 - **Ledger:** log `overload_detected {account, active, threshold, groups_hit, marked}`. When conditions 1 and 2 hold but no account has room, log it once per window too, so that "well spread, no move" is visible.
 
 **Moving.** At a marked group's next request boundary:
 - Move if the mark is unexpired, `active(A) > spread_threshold(A)` still holds, and an eligible account with room passes the gate. Then skip step 1, run steps 3–6 restricted to accounts with room, and bind the whole group there (C7 "Moves").
-- If the only targets with room are capped (D20), stay on A and keep the mark. Otherwise clear the mark and stay on A.
+- The marked target is a capacity reservation, not a constraint. At execution, reselect among currently eligible accounts with room, using C7 order and destination-specific guards; a disabled or cooling reserved target cannot prevent moving to another eligible one.
+- If the only targets with room are capped, or any remaining discretionary guard vetoes the move, stay on A and keep the unexpired mark while `active(A) > spread_threshold(A)` still holds (D20 §4). Otherwise clear the mark and stay on A. A guard veto never converts the move to a forced C5 move.
 - Log the move when it executes: `binding_move` with reason `overload`, the request bytes, and the next turn's cache result.
 
 **What never moves.**
@@ -453,7 +464,7 @@ Some outcomes never count toward the trigger, because they are not account conce
 - Anything when no account has room. The sessions are then well spread, and a 429 only paces.
 - A running stream, an in-flight request, or a WebSocket with a response in flight.
 
-**No ping-pong.** Rebalance never takes a target over its threshold, and a move never leaves the target more loaded than the source.
+**Discretionary movement guards (D20).** Rebalance and cold-point moves require dwell 1,800 seconds, revisit 3,600 seconds, at most 3 discretionary group moves and 4 discretionary provider moves per 600 seconds, and known full input at most 8 MiB. Group and provider pool budgets count only discretionary moves. D20 §4 removes the destination-quiet guard. A target needs eligibility, the C7 gate, room, and non-stale quota evidence; no recent successful request is required. Weak targets accept one moved group until observed; all-capped move destinations retain the mark rather than invoking the new-session fallback. A move cannot take the target above its threshold or leave it more loaded than the source. Forced C5 moves are recorded but never blocked by or charged to these guards, including the retained-history cap. Account ID determines the provider movement pool.
 
 **Speed.** The cure is deliberately slow: at most 2 moves per account per window. Placement is the main lever.
 
@@ -466,6 +477,20 @@ Some outcomes never count toward the trigger, because they are not account conce
 **Observability.**
 - `AccountView` (C11) gains `active_sessions` and `spread_threshold`. The tray shows the count against the threshold.
 - The ledger records `overload_detected` and `binding_move{reason: overload}`. These are the inputs for tuning `spread_threshold`.
+
+### C7.2 Explicit root-session routing intent
+
+`routing.mode` defaults to `rebalance` (existing C7/D15 behaviour). `recover` keeps an eligible bound account and permits only recovery from ineligibility. `strict` does not automatically change its local account ID and requires a classified root identity. It may refresh/reconnect that account, but pause, quota, auth, payment and credit restrictions still prevent dispatch. An unavailable locked account returns a provider-shaped HTTP 409 `routing_policy_blocked`; it must not trigger selection of a different account. Discretionary movement guards retain a healthy current account; forced C5 recovery is never refused by those budgets. Strict authority alone fails closed on policy persistence failures.
+
+The authenticated routing admin API registers opaque projects and applies root-session overrides. Effective settings are global defaults → explicitly associated project baseline → explicit root override. Children inherit the root. A project edit affects new associations; existing baselines stay until explicitly edited. Display labels never select policy. Session handles are full SHA-256 hashes of canonical C8 root keys, separate from the short dashboard display IDs.
+
+Only explicit project/session intent and strict anchors require durable policy writes. Default routing history remains in memory. Policy files are bounded to 16 MiB, 20,000 roots and 1,024 projects. A policy write, recovery or startup failure blocks dispatch only for affected strict sessions, including a strict first placement. Non-strict sessions continue on eligible accounts, quarantine damaged evidence and raise `core_warning`. Normal binding LRU eviction cannot erase a strict anchor. Takeover retires the old writer before handover.
+
+`reset_wait_secs` is a root/project setting in 0–120 seconds; global defaults retain `routing.reset_hold_secs` (60). It is separate from credit permission. Global `routing.mode = strict` is rejected: strict requires a classified root policy. Churn safeguards in C7.1 govern discretionary movement only; inability to satisfy them retains a healthy bound account. Unknown full-input cost suppresses discretionary movement. Idle socket pins protect bindings without counting as active demand.
+
+Associating a project preserves an explicit root override unless `inherit: true` / CLI `--inherit` is supplied. A history-only root follows current global defaults. Startup captures strict anchors before pruning legacy bindings. Serving rechecks current intent and account eligibility after pacing/reset waits, including WS create/reconnect. Readers use immutable intent snapshots; disk writers never hold the binding/read lock across I/O. Forecast remains observation-only. The pre-commit deadline and WebSocket upgrade envelope are active, as ratified by D20 §4.
+
+`routing.request_timeout_secs` (default 300 s) bounds the whole HTTP pre-commit path, including preparation, selection and holds, refresh, dial and retries. If it expires before response headers, return a provider-shaped HTTP 504. It never cuts off an already committed stream. The WebSocket upgrade has its own overall `ws_upgrade_hold_secs` envelope (default 10 s), including refresh and dial, below Codex's 15 s connect timeout (C6.3).
 
 ## C8. Session keys and the allowed body peek
 
@@ -564,6 +589,8 @@ Base: `http://127.0.0.1:<admin_port>/admin/v1`. Every route requires `Authorizat
 | `GET /sessions/{id}` | Session detail, bounded request summaries and placement timeline. Only this route may include `original_short_id`, the first 8 characters of the root ID, retained in memory only. Full raw IDs, content and paths are never returned. |
 | `GET /activity?days=1..7&limit=1..2000&since_seq=...` | Bounded 7-day activity, with stable sequence numbers for updated aggregates. No labels, raw ID prefixes, paths or upstream error bodies. |
 | `GET /usage-history?hours=1..48` | Observed account-window history and reset/credit spans. Unknown observations remain gaps; remaining usage is a dashboard projection. |
+| `GET /routing` | Global defaults, registered projects, durable root policies and observed full routing handles; never raw root IDs, tokens or project paths. |
+| `POST /routing` | Typed `kind: project` registration/update (`id?`, `name`, `settings`) or `kind: session` update (`id`, `settings?`, `project?`). Mutations require the running owner and are refused during drain. Settings contain `mode: strict\|recover\|rebalance` and `reset_wait_secs: 0..120`. |
 | `POST /accounts/login` `{provider}` | Returns `{login_id, auth_url}`. The core runs the callback listener. |
 | `POST /accounts/import` `{source:"cpa", mode:"linked"\|"adopted", activate:[...]}` | Imports from CPA's auth directory (D5). Returns per-identity metadata, never tokens. `mode:"adopted"` is refused: adoption is per existing account via `/accounts/{id}/adopt`. |
 | `POST /accounts/{id}/adopt` `{from:"cpa_file"\|"store"\|{"path":"..."}, expected_generation}` | Takes refresh ownership of a linked account (D17). Refused with 409 while CPA can still refresh it (process running and file loadable), on a generation mismatch, or when the file's identity does not match. Returns `{id, generation, from, token_expires_at}`; never tokens. |
@@ -597,7 +624,13 @@ Tokens are never included.
 
 ### `config.toml`
 
-All keys are optional. The defaults are shown.
+All keys are optional. The defaults are shown. Numeric values outside their documented bounds emit a `core_warning` and are clamped to the existing bounds; they do not refuse startup. Unknown keys are ignored with a warning in every table, including `[routing]` and `[routing.churn]` (D20 §4).
+
+Routing bounds: `request_timeout_secs` and `rate_hold_secs` are 1–600; `ws_upgrade_hold_secs` is 1–14; `reset_hold_secs` is 0–120; `weak_evidence_new_sessions` is 1–1000. Percentages are 0–100; non-finite values clamp to an endpoint, with NaN falling back to that field's default. The near-reset weekly percentage cannot be lower than the ordinary weekly percentage. Polling, retry, binding, spreading and activity intervals/counts have a minimum of 1; `near_reset_secs` may be 0. Under `[routing.churn]`, dwell/revisit are 0–86400 seconds, the window is 1–86400 seconds, group moves are 1–16, pool moves 1–32 and retained move bytes 1–67108864. `quota.poll_min_interval_secs` is 1–3600. WebSocket idle time and message size must be positive; idle time is clamped below the rebalance idle interval. The original configuration file is never rewritten by these corrections. Invalid types and unsafe upstream endpoints still refuse startup; global `strict` remains invalid (D20 §3).
+
+An account's optional `spread_threshold` has the same minimum of 1 as the global threshold. Unspecified account thresholds continue to inherit the global value. Routing and WebSocket timer intervals without a tighter bound above are capped at 4294967295 seconds (over 136 years) so Windows and Chrono deadline arithmetic remains representable.
+
+Port numbers are 0–65535 (0 retains the existing ephemeral-port behavior). Server drain time is 0–4294967295 seconds. Guard MiB fields retain their unsigned minimum of 0, and the tray burst count is 0–4294967295. These schema bounds are normalized before unsigned deserialization too. Unknown-key warnings retain the text `Unknown configuration key` and additionally carry the stable `unknown_config_key` code.
 
 ```toml
 [server]
@@ -605,6 +638,13 @@ data_port = 10200            # 10100 after cutover
 admin_port = 10201
 
 [routing]
+mode = "rebalance"                # recover also allowed; strict is per project/root only
+request_timeout_secs = 300
+forecast_shadow = false
+placement_allowance_pct = 2.0     # D20 charge per new or moved group
+weak_evidence_new_sessions = 1
+placement_poll_after_secs = 120
+placement_poll_min_interval_secs = 300
 gate_5h_pct = 90
 gate_weekly_pct = 90
 gate_weekly_near_reset_pct = 98     # applies within near_reset_secs of the weekly reset
@@ -619,6 +659,14 @@ active_window_secs = 300            # C7.1: a group counts as active for this lo
 overload_window_secs = 600          # C7.1: overload trigger window, mark budget (2 per account) and mark expiry
 rebalance_idle_secs = 3600          # cold point; >= the longest prompt-cache TTL in use
 session_binding_max_secs = 604800
+
+[routing.churn]
+dwell_secs = 1800
+revisit_secs = 3600
+window_secs = 600
+max_group_moves = 3
+max_pool_moves = 4
+max_move_bytes = 8388608
 
 [guard]
 retain_max_per_request_mib = 64   # larger bodies are forwarded without retention (no failover)

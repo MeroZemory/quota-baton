@@ -66,6 +66,7 @@ type PendingQuota = BTreeMap<String, PendingQuotaTicket>;
 #[derive(Clone, Default)]
 pub struct QuotaObservation {
     observed_at: Value,
+    pub(crate) quota_until: Option<DateTime<Utc>>,
 }
 
 pub struct AccountRuntime {
@@ -151,6 +152,7 @@ pub enum Admission {
 
 pub struct AdmissionGuard {
     admission: Admission,
+    waited: bool,
     runtime: Weak<AccountRuntime>,
     id: String,
 }
@@ -174,6 +176,9 @@ impl Drop for AdmissionCancellation {
 }
 
 impl AdmissionGuard {
+    pub fn waited(&self) -> bool {
+        self.waited
+    }
     pub fn forced(&self) -> bool {
         self.admission == Admission::Forced
     }
@@ -325,6 +330,12 @@ impl AccountRuntime {
             .lock()
             .map(|entries| entries.get(id).is_some_and(|entry| &entry.state == state))
             .unwrap_or(false)
+    }
+
+    #[cfg(feature = "testkit")]
+    pub fn pending_quota_count_for_test(&self, key: &str) -> usize {
+        self.pending_quota_tickets(quota_session(Some(key)).as_deref())
+            .len()
     }
 
     pub(crate) fn pending_quota_tickets(
@@ -500,6 +511,12 @@ impl AccountRuntime {
         // A window containing a 429 is not quiet. Each following full quiet
         // window decays one step; successful responses do not reset this clock.
         while state.step > 0 && state.step_decay_at.is_some_and(|at| at <= now) {
+            if state.step == 1 && !state.waiting.is_empty() {
+                // A draining FIFO is still absorbing the storm. Do not erase
+                // its final pacing step and release the entire tail at once.
+                state.step_decay_at = Some(now + state.step_decay_interval);
+                break;
+            }
             state.step -= 1;
             state.step_decay_at = state.step_decay_at.map(|at| at + state.step_decay_interval);
         }
@@ -518,6 +535,17 @@ impl AccountRuntime {
         }
         if state.release_interval == MIN_RELEASE {
             state.release_decay_at = None;
+        }
+    }
+
+    fn finish_queue_transition(state: &mut PacingState, had_waiters: bool, now: Instant) {
+        if had_waiters && state.waiting.is_empty() && state.step == 1 {
+            let after_drain = now + state.step_decay_interval;
+            state.step_decay_at = Some(
+                state
+                    .step_decay_at
+                    .map_or(after_drain, |old| old.max(after_drain)),
+            );
         }
     }
 
@@ -552,7 +580,8 @@ impl AccountRuntime {
         let exponential = StdDuration::from_secs(1u64 << state.step);
         let base = retry_after.unwrap_or_default().max(exponential);
         let factor = jitter.clamp(0.8, 1.2);
-        let delay = base.mul_f64(factor);
+        // Jitter may shorten our exponential guess, never server advice.
+        let delay = base.mul_f64(factor).max(retry_after.unwrap_or_default());
         let candidate = now + delay;
         state.backoff_until = Some(
             state
@@ -582,8 +611,22 @@ impl AccountRuntime {
         self.admit_until(id, deadline).await
     }
 
+    /// Record the one allowed final send after initial pacing admission expires.
+    /// An expired retry or cancelled wait must not call this method.
+    pub fn record_forced_send(&self, id: &str) {
+        let mut states = self.pacing.lock().unwrap_or_else(|e| e.into_inner());
+        let state = Self::pacing_state(&mut states, id);
+        let now = Instant::now();
+        Self::decay_pacing(state, now);
+        if state.step > 0 || state.backoff_until.is_some() {
+            state.last_release = Some(now);
+            state.wake.notify_one();
+        }
+    }
+
     /// The request budget also bounds later retries. Normal releases stay FIFO;
-    /// a forced budget expiry bypasses pacing but still updates its release clock.
+    /// budget expiry returns Forced. Only initial admission may send once;
+    /// that actual dispatch must call record_forced_send. Retries stop on expiry.
     pub async fn admit_until(self: &Arc<Self>, id: &str, deadline: Instant) -> AdmissionGuard {
         let local_deadline =
             Instant::now() + StdDuration::from_secs(self.rate_hold_secs.load(Ordering::Relaxed));
@@ -608,8 +651,8 @@ impl AccountRuntime {
             if open || now >= waiter.deadline {
                 waiter
                     .forced
-                    .store(now >= waiter.deadline, Ordering::Release);
-                if pacing {
+                    .store(!open && now >= waiter.deadline, Ordering::Release);
+                if pacing && open {
                     state.last_release = Some(now);
                 }
                 true
@@ -637,6 +680,7 @@ impl AccountRuntime {
             drop(cancellation);
         }
         AdmissionGuard {
+            waited: !immediate,
             admission: if waiter.forced.load(Ordering::Acquire) {
                 Admission::Forced
             } else {
@@ -654,6 +698,7 @@ impl AccountRuntime {
                 let state = Self::pacing_state(&mut states, &id);
                 let now = Instant::now();
                 Self::decay_pacing(state, now);
+                let had_waiters = !state.waiting.is_empty();
                 while state
                     .waiting
                     .front()
@@ -661,6 +706,7 @@ impl AccountRuntime {
                 {
                     state.waiting.pop_front();
                 }
+                Self::finish_queue_transition(state, had_waiters, now);
                 let selected = state
                     .waiting
                     .iter()
@@ -684,7 +730,8 @@ impl AccountRuntime {
                 if now >= gate || now >= deadline {
                     let forced = now >= deadline;
                     state.waiting.remove(selected);
-                    if pacing {
+                    Self::finish_queue_transition(state, true, now);
+                    if pacing && !forced {
                         state.last_release = Some(now);
                     }
                     (Some(waiter), state.wake.clone(), forced)
@@ -1187,6 +1234,24 @@ impl AccountRuntime {
         Ok(views)
     }
 
+    pub(crate) async fn eligible_unknown_model(&self, id: &str) -> bool {
+        if !self.eligible(id, None).await {
+            return false;
+        }
+        let volatile = self
+            .volatile
+            .lock()
+            .ok()
+            .and_then(|map| map.get(id).cloned());
+        if matches!(volatile, Some(Health::Cooling { until, scope, .. }) if until > Utc::now() && scope.starts_with("model:"))
+        {
+            return false;
+        }
+        let store = self.store.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || store.load(&id).is_ok_and(|a| !matches!(a.health, Health::Cooling { until, scope, .. } if until > Utc::now() && scope.starts_with("model:")))).await.unwrap_or(false)
+    }
+
     pub async fn observe_headers(
         &self,
         id: &str,
@@ -1204,12 +1269,65 @@ impl AccountRuntime {
         headers: &HeaderMap,
         model: Option<&str>,
     ) -> QuotaObservation {
-        let Some(snapshot) = self.obs.observe_headers_snapshot(id, provider, headers) else {
+        self.observe_headers_inner(id, provider, headers, model, None)
+            .await
+    }
+
+    pub(crate) async fn observe_headers_asof(
+        &self,
+        id: &str,
+        provider: Provider,
+        headers: &HeaderMap,
+        model: Option<&str>,
+        evidence: (
+            &crate::bindings::BindingTable,
+            crate::bindings::UsageObservationAsOf,
+        ),
+    ) -> QuotaObservation {
+        self.observe_headers_inner(id, provider, headers, model, Some(evidence))
+            .await
+    }
+
+    async fn observe_headers_inner(
+        &self,
+        id: &str,
+        provider: Provider,
+        headers: &HeaderMap,
+        model: Option<&str>,
+        evidence: Option<(
+            &crate::bindings::BindingTable,
+            crate::bindings::UsageObservationAsOf,
+        )>,
+    ) -> QuotaObservation {
+        let Some((snapshot, reported)) = self.obs.observe_headers_reported(id, provider, headers)
+        else {
             return QuotaObservation::default();
         };
+        if let Some((bindings, asof)) = evidence {
+            bindings.note_usage_observation_asof_token(id, &reported, asof);
+        }
         let observed_at = snapshot["observed_at"].clone();
-        let _ = self.apply_quota_snapshot(id, snapshot, model).await;
-        QuotaObservation { observed_at }
+        let quota_until = self
+            .apply_quota_snapshot(id, snapshot, model)
+            .await
+            .ok()
+            .and_then(|account| match account.health {
+                Health::Cooling {
+                    reason: HealthReason::Quota,
+                    until,
+                    scope,
+                } if until > Utc::now()
+                    && (scope == "account"
+                        || model.is_some_and(|m| scope == format!("model:{m}"))) =>
+                {
+                    Some(until)
+                }
+                _ => None,
+            });
+        QuotaObservation {
+            observed_at,
+            quota_until,
+        }
     }
 
     pub async fn observe_codex_event(&self, id: &str, event: &Value) {
@@ -1222,12 +1340,40 @@ impl AccountRuntime {
         event: &Value,
         model: Option<&str>,
     ) {
+        self.observe_codex_event_inner(id, event, model, None).await;
+    }
+    pub(crate) async fn observe_codex_event_asof(
+        &self,
+        id: &str,
+        event: &Value,
+        model: Option<&str>,
+        evidence: (
+            &crate::bindings::BindingTable,
+            crate::bindings::UsageObservationAsOf,
+        ),
+    ) {
+        self.observe_codex_event_inner(id, event, model, Some(evidence))
+            .await;
+    }
+    async fn observe_codex_event_inner(
+        &self,
+        id: &str,
+        event: &Value,
+        model: Option<&str>,
+        evidence: Option<(
+            &crate::bindings::BindingTable,
+            crate::bindings::UsageObservationAsOf,
+        )>,
+    ) {
         if event["type"] != "codex.rate_limits" {
             return;
         }
-        let Some(snapshot) = self.obs.observe_codex_event_snapshot(id, event) else {
+        let Some((snapshot, reported)) = self.obs.observe_codex_event_reported(id, event) else {
             return;
         };
+        if let Some((bindings, asof)) = evidence {
+            bindings.note_usage_observation_asof_token(id, &reported, asof);
+        }
         let observed_at = snapshot["observed_at"].clone();
         let _ = self.apply_quota_snapshot(id, snapshot, model).await;
         let limits = event.get("rate_limits").unwrap_or(event);
@@ -1599,6 +1745,152 @@ mod r1_rate_tests {
     }
 
     #[test]
+    fn draining_an_upper_step_keeps_its_original_quiet_schedule() {
+        for removal in ["release", "deadline", "cancellation"] {
+            let f = Fixture::new();
+            let start = Instant::now();
+            two_windows(&f.runtime, start);
+            {
+                let mut states = f.runtime.pacing.lock().unwrap();
+                let state = states.get_mut(ID).unwrap();
+                let waiter = Arc::new(PacingWaiter {
+                    deadline: at(start, 60),
+                    forced: std::sync::atomic::AtomicBool::new(removal == "deadline"),
+                    notify: Notify::new(),
+                    cancelled: std::sync::atomic::AtomicBool::new(removal == "cancellation"),
+                });
+                state.waiting.push_back(waiter);
+                // Drain at8, between the window ending6 and quiet boundary10.
+                state.waiting.pop_front();
+                AccountRuntime::finish_queue_transition(state, true, at(start, 8));
+            }
+            assert_eq!(
+                f.runtime
+                    .pacing_snapshot_at(ID, at(start, 10) - StdDuration::from_nanos(1))
+                    .rate_step,
+                2,
+                "{removal}"
+            );
+            assert_eq!(
+                f.runtime.pacing_snapshot_at(ID, at(start, 10)).rate_step,
+                1,
+                "{removal}"
+            );
+            assert_eq!(
+                f.runtime.pacing_snapshot_at(ID, at(start, 14)).rate_step,
+                0,
+                "{removal}"
+            );
+            let g = Fixture::new();
+            two_windows(&g.runtime, start);
+            {
+                let mut states = g.runtime.pacing.lock().unwrap();
+                let state = states.get_mut(ID).unwrap();
+                AccountRuntime::finish_queue_transition(state, true, at(start, 8));
+            }
+            let next = g
+                .runtime
+                .observe_429_at(ID, at(start, 11), at(start, 11), None, 1.0);
+            assert_eq!(next.rate_step, 2, "{removal}");
+            assert_eq!(next.rate_backoff_until, Some(at(start, 15)), "{removal}");
+        }
+    }
+    #[tokio::test]
+    async fn actual_fifo_release_starts_the_last_quiet_interval_at_drain() {
+        let f = Fixture::new();
+        f.runtime.observe_429(ID, None);
+        let guards = futures_util::future::join_all((0..16).map(|_| f.runtime.admit(ID))).await;
+        let drained = f
+            .runtime
+            .pacing
+            .lock()
+            .unwrap()
+            .get(ID)
+            .unwrap()
+            .last_release
+            .unwrap();
+        tokio::time::sleep_until(tokio::time::Instant::from_std(
+            drained + StdDuration::from_millis(400),
+        ))
+        .await;
+        assert_eq!(
+            f.runtime.pacing_snapshot(ID).rate_step,
+            1,
+            "the FIFO drained between decay boundaries"
+        );
+        let _first = f.runtime.admit(ID).await;
+        let before = Instant::now();
+        let _next = f.runtime.admit(ID).await;
+        assert!(
+            before.elapsed() >= StdDuration::from_millis(180),
+            "post-drain admissions still need spacing"
+        );
+        let until = {
+            let states = f.runtime.pacing.lock().unwrap();
+            states.get(ID).unwrap().step_decay_at.unwrap()
+        };
+        tokio::time::sleep_until(tokio::time::Instant::from_std(
+            until + StdDuration::from_millis(30),
+        ))
+        .await;
+        assert_eq!(f.runtime.pacing_snapshot(ID).rate_step, 0);
+        drop(guards);
+    }
+    #[test]
+    fn a_queued_tail_keeps_a_full_quiet_interval_from_the_actual_drain() {
+        for removal in ["release", "deadline", "cancellation"] {
+            let f = Fixture::new();
+            let start = Instant::now();
+            f.runtime.observe_429_at(ID, start, start, None, 1.0);
+            let waiter = Arc::new(PacingWaiter {
+                deadline: at(start, 60),
+                forced: std::sync::atomic::AtomicBool::new(false),
+                notify: Notify::new(),
+                cancelled: std::sync::atomic::AtomicBool::new(false),
+            });
+            f.runtime
+                .pacing
+                .lock()
+                .unwrap()
+                .get_mut(ID)
+                .unwrap()
+                .waiting
+                .push_back(waiter);
+            assert_eq!(f.runtime.pacing_snapshot_at(ID, at(start, 4)).rate_step, 1);
+            let drained = at(start, 5) + StdDuration::from_millis(750);
+            {
+                let mut states = f.runtime.pacing.lock().unwrap();
+                let state = states.get_mut(ID).unwrap();
+                let waiter = state.waiting.pop_front().unwrap();
+                if removal == "cancellation" {
+                    waiter.cancelled.store(true, Ordering::Release);
+                }
+                if removal == "deadline" {
+                    waiter.forced.store(true, Ordering::Release);
+                }
+                AccountRuntime::finish_queue_transition(state, true, drained);
+            }
+            assert_eq!(
+                f.runtime.pacing_snapshot_at(ID, at(start, 6)).rate_step,
+                1,
+                "{removal}"
+            );
+            let until = drained + StdDuration::from_secs(2);
+            assert_eq!(
+                f.runtime
+                    .pacing_snapshot_at(ID, until - StdDuration::from_nanos(1))
+                    .rate_step,
+                1,
+                "{removal}"
+            );
+            assert_eq!(
+                f.runtime.pacing_snapshot_at(ID, until).rate_step,
+                0,
+                "{removal}"
+            );
+        }
+    }
+    #[test]
     fn r1_step_decays_at_full_quiet_backoff_boundaries_not_sixty_seconds() {
         let f = Fixture::new();
         let start = Instant::now();
@@ -1795,7 +2087,10 @@ mod r1_rate_tests {
             .await
             .expect("retry renewed the total request budget");
         assert!(forced.forced());
-        assert!(last_release(&f.runtime).unwrap() >= deadline);
+        assert!(
+            last_release(&f.runtime).unwrap() < deadline,
+            "an unsent timeout cannot consume a release slot"
+        );
         block(&f.runtime);
         let mut expired = Box::pin(f.runtime.admit_until(ID, deadline));
         let Poll::Ready(final_admission) = poll!(expired.as_mut()) else {
@@ -1809,14 +2104,63 @@ mod r1_rate_tests {
     async fn r1_forced_admission_updates_shared_clock_before_next_normal_release() {
         let f = Fixture::new();
         block(&f.runtime);
+        let forced = f.runtime.admit_until(ID, Instant::now()).await;
+        assert!(forced.forced());
+        assert!(
+            last_release(&f.runtime).is_none(),
+            "unsent expiry is not dispatch"
+        );
+        let before = Instant::now();
+        f.runtime.record_forced_send(ID);
+        let stamp = last_release(&f.runtime).expect("actual forced send must update shared clock");
+        assert!(stamp >= before && stamp <= Instant::now());
+        open_backoff(&f.runtime);
+        let interval = f.runtime.pacing_snapshot(ID).rate_release_interval;
+        assert!(
+            !f.runtime
+                .admit_at(ID, stamp + interval - StdDuration::from_nanos(1))
+        );
+        assert!(f.runtime.admit_at(ID, stamp + interval));
+    }
+
+    #[tokio::test]
+    async fn unsent_expired_waiter_does_not_spend_the_next_waiters_release_slot() {
+        let f = Fixture::new();
+        block(&f.runtime);
+        let mut expired = Box::pin(
+            f.runtime
+                .admit_until(ID, Instant::now() + StdDuration::from_millis(20)),
+        );
+        let mut next = Box::pin(
+            f.runtime
+                .admit_until(ID, Instant::now() + StdDuration::from_secs(10)),
+        );
+        assert!(poll!(expired.as_mut()).is_pending());
+        assert!(poll!(next.as_mut()).is_pending());
+        assert!(expired.await.forced());
+        assert!(
+            last_release(&f.runtime).is_none(),
+            "an unsent timeout consumed a release slot"
+        );
+        open_backoff(&f.runtime);
+        assert!(!next.await.forced());
+        assert!(last_release(&f.runtime).is_some());
+    }
+    #[tokio::test]
+    async fn open_gate_after_old_rate_deadline_is_a_normal_release_with_shared_clock() {
+        let f = Fixture::new();
+        block(&f.runtime);
         open_backoff(&f.runtime);
         let before = Instant::now();
         let forced = f
             .runtime
             .admit_until(ID, before - StdDuration::from_millis(1))
             .await;
-        assert!(forced.forced());
-        let stamp = last_release(&f.runtime).expect("forced release did not update the clock");
+        assert!(
+            !forced.forced(),
+            "an open gate does not spend an expired pacing wait budget"
+        );
+        let stamp = last_release(&f.runtime).expect("normal release did not update the clock");
         assert!(stamp >= before && stamp <= Instant::now());
         let interval = f.runtime.pacing_snapshot(ID).rate_release_interval;
         assert!(
@@ -1877,8 +2221,10 @@ mod r1_rate_tests {
             .await
             .expect("earlier tail failed to wake the head's release-loop sleep");
         assert!(tail_guard.forced());
-        let forced_stamp = last_release(&f.runtime).unwrap();
-        assert!(forced_stamp >= deadline);
+        assert!(
+            last_release(&f.runtime).is_none(),
+            "unsent tail expiry must not consume the head's release slot"
+        );
         assert!(
             poll!(head.as_mut()).is_pending(),
             "head bypassed the still-closed gate"
@@ -1889,12 +2235,7 @@ mod r1_rate_tests {
             .await
             .unwrap();
         assert!(!head_guard.forced());
-        assert!(
-            last_release(&f.runtime)
-                .unwrap()
-                .duration_since(forced_stamp)
-                >= MIN_RELEASE
-        );
+        assert!(last_release(&f.runtime).unwrap() >= deadline);
         assert!(queue_deadlines(&f.runtime).is_empty());
     }
 
@@ -2223,12 +2564,14 @@ mod r5_view_tests {
                     &paid,
                     &QuotaObservation {
                         observed_at: obs.quota_snapshot(&id).unwrap()["observed_at"].clone(),
+                        ..Default::default()
                     },
                 )
                 .await;
             assert_eq!(runtime.views().await.unwrap()[0]["credits_in_use"], true);
             let revision = QuotaObservation {
                 observed_at: obs.quota_snapshot(&id).unwrap()["observed_at"].clone(),
+                ..Default::default()
             };
             let mut pending = std::pin::pin!(runtime.credit_headers(&id, &paid, &revision));
             {
@@ -2272,6 +2615,7 @@ mod r5_view_tests {
                         &paid,
                         &QuotaObservation {
                             observed_at: obs.quota_snapshot(&id).unwrap()["observed_at"].clone(),
+                            ..Default::default()
                         },
                     )
                     .await;

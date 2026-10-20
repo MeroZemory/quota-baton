@@ -63,12 +63,12 @@ pub(in crate::relay) struct CurrentCompletion {
     first_message: bool,
     model: Option<String>,
     response_id: Option<String>,
-    last_create: Option<Message>,
+    last_create: Option<(Message, Reservation)>,
     rate: Arc<RateBudget>,
 }
 
 impl CurrentCompletion {
-    fn new(context: &Context) -> Self {
+    async fn new(context: &Context) -> Option<Self> {
         let mut completion = Completion::new(
             context.observability.clone(),
             &Method::GET,
@@ -84,7 +84,9 @@ impl CurrentCompletion {
             completion.binding = Some(
                 relay
                     .bindings
-                    .begin_request(context.session.key.as_deref(), &context.account),
+                    .begin_request_async(context.session.key.as_deref(), &context.account)
+                    .await
+                    .ok()?,
             );
         }
         completion.record.transport = "ws".into();
@@ -101,7 +103,7 @@ impl CurrentCompletion {
             .dashboard_request
             .as_ref()
             .map(|guard| guard.pacing_source());
-        Self {
+        Some(Self {
             completion,
             committed: false,
             first_message: true,
@@ -109,7 +111,7 @@ impl CurrentCompletion {
             response_id: None,
             last_create: None,
             rate,
-        }
+        })
     }
 
     fn upstream(&mut self, event: Option<&Value>) -> Option<&'static str> {
@@ -136,6 +138,7 @@ impl CurrentCompletion {
             }
         } else if kind.is_some_and(|kind| kind.starts_with("response.")) {
             self.committed = true;
+            self.last_create = None;
         }
         match kind {
             Some("response.completed" | "response.done") => Some("ok"),
@@ -152,13 +155,18 @@ struct RateBudget {
     max_retries: u32,
     state: Mutex<RateState>,
     dashboard: Mutex<Option<crate::dashboard::runtime::PacingSource>>,
+    committed: std::sync::atomic::AtomicBool,
+    commit_changed: tokio::sync::Notify,
 }
 
 struct RateState {
     initial_sent: bool,
+    usage_asof: Option<crate::bindings::UsageObservationAsOf>,
     sent_at: std::time::Instant,
     retries: u32,
     forced: bool,
+    /// A cancelled admission is not a send; its redial still owns one attempt.
+    forced_sent: bool,
     waited: Duration,
     waiting_since: Option<std::time::Instant>,
 }
@@ -177,22 +185,38 @@ impl RateBudget {
         let now = std::time::Instant::now();
         Self {
             dashboard: Mutex::new(None),
+            committed: std::sync::atomic::AtomicBool::new(false),
+            commit_changed: tokio::sync::Notify::new(),
             deadline: now + hold,
             max_retries,
             state: Mutex::new(RateState {
                 initial_sent: false,
+                usage_asof: None,
                 sent_at: now,
                 retries: 0,
                 forced: false,
+                forced_sent: false,
                 waited: Duration::ZERO,
                 waiting_since: None,
             }),
         }
     }
 
+    fn is_committed(&self) -> bool {
+        self.committed.load(Ordering::Acquire)
+    }
+    fn commit(&self) {
+        self.committed.store(true, Ordering::Release);
+        self.commit_changed.notify_waiters();
+    }
     fn can_retry(&self) -> bool {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        !state.forced && state.retries < self.max_retries
+        !self.is_committed() && !state.forced_sent && state.retries < self.max_retries
+    }
+    fn can_send(&self) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.forced |= std::time::Instant::now() >= self.deadline;
+        !self.is_committed() && !state.forced_sent
     }
 
     fn initial_sent(&self) -> bool {
@@ -206,12 +230,32 @@ impl RateBudget {
         self: &Arc<Self>,
         runtime: Option<&Arc<crate::account_runtime::AccountRuntime>>,
         account: &str,
-    ) {
+    ) -> bool {
+        let committed = self.commit_changed.notified();
+        tokio::pin!(committed);
+        committed.as_mut().enable();
+        if self.is_committed() {
+            return false;
+        }
         if let Some(runtime) = runtime {
             let wait = RateWait::new(self.clone());
-            let admission = runtime.admit_until(account, self.deadline).await;
+            let admission = tokio::select! {
+                admission = runtime.admit_until(account, self.deadline) => admission,
+                _ = committed => return false,
+            };
             self.state.lock().unwrap_or_else(|e| e.into_inner()).forced |= admission.forced();
             drop(wait);
+        }
+        self.can_send()
+    }
+
+    fn note_usage_send(&self, context: &Context) {
+        if let Some(relay) = &context.relay {
+            let asof = relay.bindings.begin_usage_observation_for(&context.account);
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            // Until a response is attributed, the earliest attempt is the only
+            // safe lower bound for a delayed, unlabelled rate-limit event.
+            state.usage_asof.get_or_insert(asof);
         }
     }
 
@@ -220,6 +264,19 @@ impl RateBudget {
         state.initial_sent = true;
         state.sent_at = std::time::Instant::now();
         state.forced |= state.sent_at >= self.deadline;
+        state.forced_sent |= state.forced;
+    }
+
+    fn record_forced_send(
+        &self,
+        runtime: Option<&Arc<crate::account_runtime::AccountRuntime>>,
+        account: &str,
+    ) {
+        if self.state.lock().unwrap_or_else(|e| e.into_inner()).forced
+            && let Some(runtime) = runtime
+        {
+            runtime.record_forced_send(account);
+        }
     }
 
     fn sent(&self) {
@@ -229,6 +286,7 @@ impl RateBudget {
         state.retries += 1;
         // Also terminal when a runtime-free fixture reaches the deadline.
         state.forced |= state.sent_at >= self.deadline;
+        state.forced_sent |= state.forced;
     }
 }
 
@@ -266,6 +324,7 @@ impl Drop for RateWait {
 
 impl CurrentCompletion {
     fn finish(mut self, outcome: &str) {
+        self.rate.commit();
         self.completion.record.outcome = outcome.into();
     }
 }
@@ -336,7 +395,7 @@ fn response_completion(
     if matches!(kind, Some("response.created" | "error" | "response.failed"))
         && let Some((&id, _)) = current
             .iter()
-            .find(|(_, active)| active.rate.initial_sent() && !active.committed)
+            .find(|(_, active)| active.rate.initial_sent() && active.response_id.is_none())
     {
         return Some(id);
     }
@@ -526,25 +585,12 @@ fn event_affects_account(event: &Value, account: &str) -> bool {
 
 fn parsed(text: &str) -> Option<Value> {
     (text.len() <= PARSE_LIMIT)
-        .then(|| serde_json::from_str(text).ok())
+        .then(|| crate::json_unique::from_slice(text.as_bytes()).ok())
         .flatten()
 }
 
 fn response_create(text: &str) -> bool {
-    if text.len() <= PARSE_LIMIT {
-        return parsed(text).is_some_and(|value| value["type"] == "response.create");
-    }
-    // 큰 입력은 Codex의 선두 type 필드만 검사하고 입력 본문을 파싱하지 않는다.
-    let prefix = &text.as_bytes()[..text.len().min(256)];
-    let mut remaining = prefix;
-    for token in [b"{".as_slice(), b"\"type\"", b":", b"\"response.create\""] {
-        remaining = remaining.trim_ascii_start();
-        let Some(rest) = remaining.strip_prefix(token) else {
-            return false;
-        };
-        remaining = rest;
-    }
-    matches!(remaining.trim_ascii_start().first(), Some(b',' | b'}'))
+    super::super::wire_metadata::Metadata::parse(text.as_bytes()).is_some_and(|m| m.create())
 }
 
 fn count_type(counts: &mut BTreeMap<String, u64>, event: &Value) {
@@ -598,14 +644,9 @@ fn ws_retry_after(event: &Value) -> Option<Duration> {
 
 fn has_previous_response_id(message: &Message) -> bool {
     let Message::Text(text) = message else {
-        return false;
+        return true;
     };
-    if text.len() <= PARSE_LIMIT {
-        return parsed(text)
-            .and_then(|value| value.get("previous_response_id").cloned())
-            .is_some_and(|value| !value.is_null());
-    }
-    text[..text.len().min(PARSE_LIMIT)].contains("\"previous_response_id\"")
+    super::super::wire_metadata::Metadata::parse(text.as_bytes()).is_none_or(|m| m.continuation())
 }
 
 struct Delivered {
@@ -618,7 +659,9 @@ struct Delivered {
 struct PendingRateResend {
     request: u64,
     message: Message,
+    reservation: Reservation,
     rate: Arc<RateBudget>,
+    model: Option<String>,
 }
 
 struct PendingInitial {
@@ -679,6 +722,95 @@ where
     })
 }
 
+/// Classification is an observer, never an authorization boundary. Unknown
+/// and large client data still belongs to this socket's pinned account.
+fn guarded_upstream_write<S>(
+    context: Arc<Context>,
+    sink: S,
+    message: Message,
+    reservation: Reservation,
+    delivered: Delivered,
+    model: Option<String>,
+) -> Write<S>
+where
+    S: Sink<Message> + Send + Unpin + 'static,
+    S::Error: Send,
+{
+    if matches!(message, Message::Text(_) | Message::Binary(_))
+        && let Some(relay) = &context.relay
+    {
+        relay
+            .bindings
+            .unknown_request_cost(context.session.key.as_deref());
+    }
+    Box::pin(async move {
+        let rate = Arc::new(RateBudget::new(&context));
+        if matches!(message, Message::Text(_) | Message::Binary(_)) {
+            if !rate.admit(context.runtime.as_ref(), &context.account).await {
+                return (
+                    sink,
+                    false,
+                    Delivered {
+                        bytes: 0,
+                        terminal: Some("rate_wait_timeout"),
+                        ..delivered
+                    },
+                );
+            }
+            if let Some(runtime) = &context.runtime
+                && model.is_none()
+                && !runtime.eligible_unknown_model(&context.account).await
+            {
+                return (
+                    sink,
+                    false,
+                    Delivered {
+                        bytes: 0,
+                        terminal: Some("routing_policy_blocked"),
+                        ..delivered
+                    },
+                );
+            }
+        }
+        if matches!(message, Message::Text(_) | Message::Binary(_))
+            && let (Some(relay), Some(_)) = (&context.relay, &context.runtime)
+            && !relay
+                .dispatch_data_allowed(
+                    context.session.key.as_deref(),
+                    &context.account,
+                    model.as_deref(),
+                )
+                .await
+        {
+            return (
+                sink,
+                false,
+                Delivered {
+                    bytes: 0,
+                    terminal: Some("routing_policy_blocked"),
+                    ..delivered
+                },
+            );
+        }
+        if matches!(message, Message::Text(_) | Message::Binary(_)) && !rate.can_send() {
+            return (
+                sink,
+                false,
+                Delivered {
+                    bytes: 0,
+                    terminal: Some("rate_wait_timeout"),
+                    ..delivered
+                },
+            );
+        }
+        if matches!(message, Message::Text(_) | Message::Binary(_)) {
+            rate.initial_dispatch();
+            rate.record_forced_send(context.runtime.as_ref(), &context.account);
+        }
+        write(sink, message, reservation, delivered).await
+    })
+}
+
 fn flush<S, M>(mut sink: S) -> Write<S>
 where
     S: Sink<M> + Send + Unpin + 'static,
@@ -706,27 +838,92 @@ type RateRedial = BoxFuture<
             Write<SplitSink<UpstreamSocket, Message>>,
             SplitStream<UpstreamSocket>,
         ),
-        (),
+        &'static str,
     >,
 >;
 
 fn redial_rate(context: Arc<Context>, pending: PendingRateResend) -> RateRedial {
     Box::pin(async move {
         if !pending.rate.can_retry() {
-            return Err(());
+            return Err("rate_wait_timeout");
         }
-        pending
+        if !pending
             .rate
             .admit(context.runtime.as_ref(), &context.account)
-            .await;
-        let socket = super::redial_same_account(&context).await?;
+            .await
+        {
+            return Err("rate_wait_timeout");
+        }
+        if let Some(relay) = &context.relay
+            && !relay
+                .dispatch_data_allowed(
+                    context.session.key.as_deref(),
+                    &context.account,
+                    pending.model.as_deref(),
+                )
+                .await
+        {
+            return Err("routing_policy_blocked");
+        }
+        // Pacing expiry authorizes one final send. The reconnect retains its
+        // own bounded dial timeout; an exhausted pacing budget is not a zero
+        // duration connect deadline.
+        let socket = super::redial_same_account(&context, pending.model.as_deref())
+            .await
+            .map_err(|_| "upstream_write_error")?;
         let (sink, read) = socket.split();
         let bytes = pending.message.len();
-        let reservation = context.budget.reserve_message(bytes);
+        let reservation = pending.reservation;
         // Count a retry only when its write is actually polled, after a dial.
         let rate = pending.rate;
         let write = Box::pin(async move {
+            if let (Some(relay), Some(_)) = (&context.relay, &context.runtime)
+                && !relay
+                    .dispatch_data_allowed(
+                        context.session.key.as_deref(),
+                        &context.account,
+                        pending.model.as_deref(),
+                    )
+                    .await
+            {
+                return (
+                    sink,
+                    false,
+                    Delivered {
+                        bytes: 0,
+                        request: Some(pending.request),
+                        terminal: Some("routing_policy_blocked"),
+                        completed: false,
+                    },
+                );
+            }
+            if rate.is_committed() {
+                return (
+                    sink,
+                    true,
+                    Delivered {
+                        bytes: 0,
+                        request: Some(pending.request),
+                        terminal: None,
+                        completed: false,
+                    },
+                );
+            }
+            if !rate.can_send() {
+                return (
+                    sink,
+                    false,
+                    Delivered {
+                        bytes: 0,
+                        request: Some(pending.request),
+                        terminal: Some("rate_wait_timeout"),
+                        completed: false,
+                    },
+                );
+            }
+            rate.note_usage_send(&context);
             rate.sent();
+            rate.record_forced_send(context.runtime.as_ref(), &context.account);
             write(
                 sink,
                 pending.message,
@@ -860,7 +1057,17 @@ async fn run_with_read_timeout(
                     continue;
                 }
                 if !eligible {
-                    ending = Some((Some(CloseFrame { code: 1000.into(), reason: "".into() }), "account_ineligible"));
+                    let forced = pending.rate.state.lock().unwrap_or_else(|e| e.into_inner()).forced;
+                    let eligible_now = match &context.runtime {
+                        Some(runtime) => runtime.eligible(&context.account, model.as_deref()).await,
+                        None => true,
+                    };
+                    let expired = forced && eligible_now;
+                    let reason = if expired { "rate_wait_timeout" } else { "account_ineligible" };
+                    if let Some(active) = current.get_mut(&pending.request) {
+                        active.completion.record.outcome = reason.into();
+                    }
+                    ending = Some((Some(CloseFrame { code: (if expired { 1012 } else { 1000 }).into(), reason: "".into() }), reason));
                     end_deadline = Instant::now() + CLOSE_TIMEOUT;
                     continue;
                 }
@@ -871,8 +1078,9 @@ async fn run_with_read_timeout(
                 rate_redial = None;
                 match result {
                     Ok((write, read)) => { upstream_read = read; to_upstream = Some(write); }
-                    Err(()) => {
-                        ending = Some((None, "upstream_write_error"));
+                    Err(reason) => {
+                        for active in current.values_mut() { active.completion.record.outcome = reason.into(); }
+                        ending = Some((Some(CloseFrame { code: (if reason == "rate_wait_timeout" {1012} else {1000}).into(), reason: "".into() }), reason));
                         end_deadline = Instant::now() + CLOSE_TIMEOUT;
                     }
                 }
@@ -920,8 +1128,21 @@ async fn run_with_read_timeout(
                     initial_ready = false;
                     let sink = upstream_sink.take().expect("initial admission retains upstream sink");
                     let bytes = pending.message.len();
+                    let context = context.clone();
+                    let dispatch_model = model.clone();
+                    let dispatch_receipt = current.get(&pending.request).and_then(|active| active.completion.binding.as_ref()).map(|binding| binding.receipt());
                     to_upstream = Some(Box::pin(async move {
+                        if let (Some(relay), Some(_)) = (&context.relay, &context.runtime)
+                            && !relay.dispatch_data_allowed(context.session.key.as_deref(), &context.account, dispatch_model.as_deref()).await {
+                            return (sink, false, Delivered { bytes: 0, request: Some(pending.request), terminal: Some("routing_policy_blocked"), completed: false });
+                        }
+                        if !pending.rate.can_send() {
+                            return (sink, false, Delivered {bytes:0,request:Some(pending.request),terminal:Some("rate_wait_timeout"),completed:false});
+                        }
+                        if let Some(receipt) = dispatch_receipt { receipt.dispatched(); }
+                        pending.rate.note_usage_send(&context);
                         pending.rate.initial_dispatch();
+                        pending.rate.record_forced_send(context.runtime.as_ref(), &context.account);
                         write(sink, pending.message, pending.reservation, Delivered {
                             bytes, request: Some(pending.request), terminal: None, completed: false,
                         }).await
@@ -929,12 +1150,16 @@ async fn run_with_read_timeout(
                 }
                 to_upstream.as_mut().unwrap().await
             }, if to_upstream.is_some() || (initial_ready && ending.is_none()) => {
-                let (sink, success, _) = result;
+                let (sink, success, delivered) = result;
                 upstream_sink = Some(sink);
                 to_upstream = None;
                 if success { last_activity = Instant::now(); }
                 if success {
                     pending_rate_redial = None;
+                } else if ending.is_none() && let Some(reason) = delivered.terminal {
+                    if let Some(active) = delivered.request.and_then(|id| current.get_mut(&id)) { active.completion.record.outcome = reason.into(); }
+                    ending = Some((Some(CloseFrame {code: (if reason == "rate_wait_timeout" {1012} else {1000}).into(), reason:"".into()}), reason));
+                    end_deadline = Instant::now() + CLOSE_TIMEOUT;
                 } else if ending.is_none()
                     && let Some(pending) = pending_rate_redial.take()
                     && !has_previous_response_id(&pending.message)
@@ -993,33 +1218,40 @@ async fn run_with_read_timeout(
                 last_activity = Instant::now();
                 match message {
                     Some(Ok(message)) => {
+                        let bytes = message.len();
+                        let reservation = reservation.unwrap_or_else(|| context.budget.reserve_message(bytes));
                         let mut request = current.keys().next().copied();
                         if let Message::Text(text) = &message && response_create(text.as_str()) {
                             draining |= context.relay.as_ref().is_some_and(|relay| relay.is_draining());
                             if draining { continue; }
-                            model = parsed(text.as_str()).and_then(|value| value.get("model").and_then(Value::as_str).map(str::to_owned));
+                            model = super::super::wire_metadata::Metadata::parse(text.as_bytes()).and_then(|meta| meta.model());
                             if let Some(runtime) = &context.runtime && !runtime.eligible(&context.account, model.as_deref()).await {
                                 ending = Some((Some(CloseFrame { code: 1000.into(), reason: "".into() }), "account_ineligible"));
                                 end_deadline = Instant::now() + CLOSE_TIMEOUT;
                                 continue;
                             }
-                            let mut active = CurrentCompletion::new(&context);
+                            let Some(mut active) = CurrentCompletion::new(&context).await else {
+                                ending=Some((Some(CloseFrame {code:1001.into(),reason:"".into()}),"routing_unavailable"));
+                                end_deadline=Instant::now()+CLOSE_TIMEOUT;
+                                continue;
+                            };
                             active.model = model.clone();
                             active.completion.record.model = model.clone();
                             request = Some(next_request);
                             current.insert(next_request, active);
                             if let Some(active) = current.get_mut(&next_request) {
-                                active.last_create = Some(message.clone());
+                                active.last_create = Some((message.clone(), reservation.clone()));
                             }
                             next_request += 1;
                         }
-                        let bytes = message.len();
                         // 라이브러리가 예약한 로컬 pong을 반대쪽 전달 완료와 독립적으로 flush한다.
                         if matches!(&message, Message::Ping(_)) && to_client.is_none() {
                             to_client = Some(flush(client_sink.take().unwrap()));
                         }
                         if response_create(if let Message::Text(text) = &message { text.as_str() } else { "" }) && let Some(relay) = &context.relay {
-                            relay.bindings.request_bytes(context.session.key.as_deref(), bytes as u64);
+                            let continuation=has_previous_response_id(&message);
+                            if continuation {relay.bindings.unknown_request_cost(context.session.key.as_deref());}
+                            else {relay.bindings.request_bytes(context.session.key.as_deref(), bytes as u64);}
                         }
                         if let Some(active) = request.and_then(|id| current.get_mut(&id)) { active.completion.input_bytes.fetch_add(bytes as u64, Ordering::Relaxed); }
                         if let Message::Close(frame) = &message {
@@ -1032,22 +1264,22 @@ async fn run_with_read_timeout(
                         // Transfer the deferred slot's reservation into the
                         // write. Re-admitting its already charged bytes could
                         // deadlock when the slot itself fills the budget.
-                        let reservation = reservation.unwrap_or_else(|| context.budget.reserve_message(bytes));
                         if let Some(rate) = initial_rate {
                             let request = request.expect("response.create has completion");
                             pending_initial = Some(PendingInitial { request, message, reservation, rate: rate.clone() });
                             let context = context.clone();
                             let model = model.clone();
                             initial_admission = Some(Box::pin(async move {
-                                rate.admit(context.runtime.as_ref(), &context.account).await;
+                                if !rate.admit(context.runtime.as_ref(), &context.account).await { return false; }
                                 match &context.runtime {
-                                    Some(runtime) => runtime.eligible(&context.account, model.as_deref()).await,
+                                    Some(runtime) => if model.is_some() { runtime.eligible(&context.account, model.as_deref()).await } else { runtime.eligible_unknown_model(&context.account).await },
                                     None => true,
                                 }
                             }));
                         } else {
-                            to_upstream = Some(write(upstream_sink.take().unwrap(), message, reservation,
-                                Delivered { bytes, request, terminal: None, completed: false }));
+                            let fallback_model = if let Message::Text(text) = &message { super::super::wire_metadata::Metadata::parse(text.as_bytes()).and_then(|meta| meta.model()) } else { None };
+                            to_upstream = Some(guarded_upstream_write(context.clone(), upstream_sink.take().unwrap(), message, reservation,
+                                Delivered { bytes, request, terminal: None, completed: false }, fallback_model));
                         }
                     }
                     _ => { ending = Some((None, "client_eof")); end_deadline = Instant::now() + CLOSE_TIMEOUT; }
@@ -1068,7 +1300,14 @@ async fn run_with_read_timeout(
                         if let Some(event) = event.as_ref() {
                             if let Some(runtime) = &context.runtime {
                                 let active_model = request.and_then(|id| current.get(&id)).and_then(|active| active.model.as_deref());
-                                runtime.observe_codex_event_for_model(&context.account, event, active_model).await;
+                                if let Some(relay) = &context.relay {
+                                    let asof = request.and_then(|id| current.get(&id))
+                                        .and_then(|active| active.rate.state.lock().unwrap_or_else(|e| e.into_inner()).usage_asof)
+                                        .unwrap_or(crate::bindings::UsageObservationAsOf {sequence:0,placed_count:0});
+                                    runtime.observe_codex_event_asof(&context.account, event, active_model, (&relay.bindings, asof)).await;
+                                } else {
+                                    runtime.observe_codex_event_for_model(&context.account, event, active_model).await;
+                                }
                             } else {
                                 context.observability.observe_codex_event(&context.account, event);
                             }
@@ -1096,6 +1335,7 @@ async fn run_with_read_timeout(
                                             std::time::Instant::now,
                                             |active| active.rate.state.lock().unwrap_or_else(|e| e.into_inner()).sent_at,
                                         );
+                                        if let Some(relay)=&context.relay {relay.bindings.note_rate(&context.account,chrono::Utc::now());}
                                         runtime.observe_429_at(&context.account, sent_at, std::time::Instant::now(), ws_retry_after(event), 1.0);
                                     }
                                     if ws_rate_advice(event) && let Some(active) = request.and_then(|id| current.get_mut(&id)) {
@@ -1134,23 +1374,41 @@ async fn run_with_read_timeout(
                                                 active.last_create.clone()
                                             }
                                         });
-                                    if let Some(message) = resend
+                                    if let Some((message, reservation)) = resend
                                         && let Some(sink) = upstream_sink.take()
                                     {
                                         let rate = current[&request.expect("active rate request")].rate.clone();
                                         pending_rate_redial = Some(PendingRateResend {
                                             request: request.expect("active rate request"),
                                             message: message.clone(),
+                                            reservation: reservation.clone(),
                                             rate: rate.clone(),
+                                            model: current[&request.expect("active rate request")].model.clone(),
                                         });
                                         let runtime = context.runtime.clone();
+                                        let relay = context.relay.clone();
+                                        let key = context.session.key.clone();
+                                        let retry_model = current[&request.expect("active rate request")].model.clone();
                                         let account = context.account.clone();
-                                        let budget = context.budget.clone();
                                         let bytes = message.len();
-                                        let reservation = budget.reserve_message(bytes);
+                                        let retry_context = context.clone();
                                         to_upstream = Some(Box::pin(async move {
-                                            rate.admit(runtime.as_ref(), &account).await;
+                                            if !rate.admit(runtime.as_ref(), &account).await {
+                                                if rate.is_committed() { return (sink,true,Delivered {bytes:0,request,terminal:None,completed:false}); }
+                                                return (sink, false, Delivered {bytes:0, request, terminal:Some("rate_wait_timeout"), completed:false});
+                                            }
+                                            if let (Some(relay), Some(_)) = (&relay, &runtime)
+                                                && !relay.dispatch_data_allowed(key.as_deref(), &account, retry_model.as_deref()).await {
+                                                if rate.is_committed() { return (sink,true,Delivered {bytes:0,request,terminal:None,completed:false}); }
+                                                return (sink, false, Delivered {bytes:0, request, terminal:Some("routing_policy_blocked"), completed:false});
+                                            }
+                                            if rate.is_committed() { return (sink,true,Delivered {bytes:0,request,terminal:None,completed:false}); }
+                                            if !rate.can_send() {
+                                                return (sink, false, Delivered {bytes:0,request,terminal:Some("rate_wait_timeout"),completed:false});
+                                            }
+                                            rate.note_usage_send(&retry_context);
                                             rate.sent();
+                                            rate.record_forced_send(runtime.as_ref(), &account);
                                             write(
                                                 sink,
                                                 message,
@@ -1190,7 +1448,16 @@ async fn run_with_read_timeout(
                             end_deadline = Instant::now() + CLOSE_TIMEOUT;
                             continue;
                         }
+                        let observed_kind = event.as_ref().and_then(|e|e.get("type")).and_then(Value::as_str);
+                        let benign_control = matches!(observed_kind,Some("metadata"|"codex.rate_limits"));
+                        let classified = observed_kind.is_some_and(|kind|kind=="error" || kind.starts_with("response."));
+                        // Attribution and replay authority are independent. An unknown ID
+                        // must not finish another turn, but its publication must stop replay.
+                        if !benign_control && (!classified || request.is_none()) && matches!(message, Message::Text(_) | Message::Binary(_)) {
+                            for active in current.values_mut() { if active.rate.initial_sent() { active.committed = true; active.last_create = None; active.rate.commit(); } }
+                        }
                         let terminal = request.and_then(|id| current.get_mut(&id)).and_then(|active| active.upstream(event.as_ref()));
+                        if let Some(active)=request.and_then(|id|current.get_mut(&id)) && (active.committed || terminal.is_some()) { active.last_create = None; active.rate.commit(); }
                         terminal_pending = terminal.is_some();
                         let completed = event.as_ref().is_some_and(|event| event["type"] == "response.completed");
                         if let Message::Close(frame) = &message {

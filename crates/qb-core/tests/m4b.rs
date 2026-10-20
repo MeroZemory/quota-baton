@@ -1,4 +1,6 @@
 //! C7/C8 regressions through loopback HTTP and the runtime admin router.
+#[path = "support/routing_http.rs"]
+mod routing_http;
 use axum::http::{HeaderMap, StatusCode};
 use chrono::{Duration as ChronoDuration, Utc};
 use qb_core::{
@@ -42,6 +44,50 @@ impl Harness {
     }
 
     async fn with_hold(provider: Provider, reset_hold_secs: u64) -> Self {
+        Self::with_limits(provider, reset_hold_secs, 300, 60).await
+    }
+    async fn with_limits(
+        provider: Provider,
+        reset_hold_secs: u64,
+        request_timeout_secs: u64,
+        rate_hold_secs: u64,
+    ) -> Self {
+        Self::with_limits_and_config(
+            provider,
+            reset_hold_secs,
+            request_timeout_secs,
+            rate_hold_secs,
+            |_| {},
+        )
+        .await
+    }
+
+    async fn with_limits_and_config(
+        provider: Provider,
+        reset_hold_secs: u64,
+        request_timeout_secs: u64,
+        rate_hold_secs: u64,
+        configure: impl FnOnce(&mut Config),
+    ) -> Self {
+        Self::with_initial_usage(
+            provider,
+            reset_hold_secs,
+            request_timeout_secs,
+            rate_hold_secs,
+            configure,
+            true,
+        )
+        .await
+    }
+
+    async fn with_initial_usage(
+        provider: Provider,
+        reset_hold_secs: u64,
+        request_timeout_secs: u64,
+        rate_hold_secs: u64,
+        configure: impl FnOnce(&mut Config),
+        seed_usage: bool,
+    ) -> Self {
         // Waiting behind other bounded cases is separate from the HTTP deadline.
         let serial = tokio::time::timeout(Duration::from_secs(120), SERIAL.lock())
             .await
@@ -89,10 +135,13 @@ impl Harness {
             .unwrap();
         let mut config = Config::default();
         config.routing.reset_hold_secs = reset_hold_secs;
+        config.routing.request_timeout_secs = request_timeout_secs;
+        config.routing.rate_hold_secs = rate_hold_secs;
         config.server.data_port = 0;
         config.server.admin_port = 0;
         config.upstream.anthropic_base = fake.url.clone();
         config.upstream.codex_base = fake.url.clone();
+        configure(&mut config);
         let obs = Arc::new(Observability::new(&home, None).unwrap());
         let state = Arc::new(
             RelayState::new(
@@ -135,12 +184,14 @@ impl Harness {
             _root: root,
             _serial: serial,
         };
-        for id in harness.ids() {
-            harness
-                .state
-                .accounts
-                .observe_headers(&id, provider, &usage(provider, 10))
-                .await;
+        if seed_usage {
+            for id in harness.ids() {
+                harness
+                    .state
+                    .accounts
+                    .observe_headers(&id, provider, &usage(provider, 10))
+                    .await;
+            }
         }
         harness
     }
@@ -564,7 +615,14 @@ async fn sticky_http_above_gate_keeps_binding_but_new_session_uses_other_account
 
 #[tokio::test]
 async fn projected_credit_limit_only_spreads_placement_and_never_cools_warm_binding() {
-    let h = Harness::new(Provider::Codex).await;
+    let h = Harness::with_limits_and_config(Provider::Codex, 60, 300, 60, |config| {
+        // Isolate reservation projection: only the ten pending requests should
+        // raise observed 89% to 99%. Keep D20 charge/cap from deciding this
+        // three-session proof; their defaults have separate anti-herding tests.
+        config.routing.placement_allowance_pct = 0.0;
+        config.routing.weak_evidence_new_sessions = 3;
+    })
+    .await;
     let headers = [("session-id", "projected-credit-limit")];
     let first = h.turn("/v1/responses", &headers, RAW).await;
     let other = h.ids().into_iter().find(|id| id != &first).unwrap();
@@ -622,6 +680,80 @@ async fn projected_credit_limit_only_spreads_placement_and_never_cools_warm_bind
     assert_eq!(h.store.load(&first).unwrap().health, Health::Ready);
     assert!(h.store.load(&first).unwrap().quota_cooling.is_none());
     h.counts(&[(&first, 2), (&other, 1)]).await;
+}
+
+#[tokio::test]
+async fn r8_unobserved_burst_spreads_actual_relay_credentials_and_ledgers_placement_evidence() {
+    for provider in [Provider::Claude, Provider::Codex] {
+        let h = Harness::with_initial_usage(provider, 60, 300, 60, |_| {}, false).await;
+        let ids = h.ids();
+        let mut counts = [0_u64; 2];
+        let path = if provider == Provider::Claude {
+            "/v1/messages"
+        } else {
+            "/v1/responses"
+        };
+        let session_header = if provider == Provider::Claude {
+            "x-claude-code-session-id"
+        } else {
+            "session-id"
+        };
+        for n in 0..10 {
+            let session = format!("r8-unobserved-{n}");
+            let id = h.turn(path, &[(session_header, &session)], RAW).await;
+            let index = ids.iter().position(|candidate| candidate == &id).unwrap();
+            counts[index] += 1;
+            assert!(counts[0].abs_diff(counts[1]) <= 1);
+            let account = h.store.load(&id).unwrap();
+            let tokens = h.store.tokens(&account).unwrap();
+            let requests = h.fake.state.requests();
+            assert_eq!(requests.len(), n + 1);
+            assert_eq!(
+                requests[n].headers["authorization"],
+                format!("Bearer {}", tokens.access_token.as_str())
+            );
+            assert_eq!(requests[n].body.as_ref(), RAW.as_bytes());
+            // The stored affinity must agree with the actual credential sent.
+            assert_eq!(
+                h.state
+                    .bindings
+                    .current(Some(&format!("{}:{session}", provider.as_str()))),
+                Some(id)
+            );
+        }
+        assert_eq!(counts, [5, 5]);
+        let key = format!("{}:r8-unobserved-0", provider.as_str());
+        let first = h.state.bindings.current(Some(&key)).unwrap();
+        assert_eq!(
+            h.turn(path, &[(session_header, "r8-unobserved-0")], RAW)
+                .await,
+            first
+        );
+        assert_eq!(h.fake.state.requests().len(), 11);
+        h.counts(&[(&ids[0], 5), (&ids[1], 5)]).await;
+        let rows = h.ledger();
+        let placements: Vec<_> = rows
+            .iter()
+            .filter(|row| row["event"] == "placement")
+            .collect();
+        assert_eq!(placements.len(), 10);
+        assert!(
+            placements
+                .iter()
+                .all(|row| row["evidence"] == "weak" && row["charge"] == 2.0)
+        );
+        assert!(
+            placements[..2]
+                .iter()
+                .all(|row| row["capped"] == false && row["placed_since_obs"] == 0)
+        );
+        assert!(placements[2..].iter().all(|row| row["capped"] == true));
+        for id in ids {
+            let account = h.store.load(&id).unwrap();
+            assert_eq!(account.health, Health::Ready);
+            assert!(account.quota_cooling.is_none());
+        }
+    }
 }
 
 #[tokio::test]
@@ -783,9 +915,16 @@ async fn quota_reset_hold_waits_two_seconds_and_keeps_http_binding() {
     let first = h.turn("/v1/responses", &headers, RAW).await;
     h.store
         .update_metadata(&first, |account| {
+            let now = Utc::now();
+            let reset = now + ChronoDuration::seconds(2);
+            account.quota_cooling = Some(QuotaCooling {
+                window: "5h".into(),
+                reset_at: reset,
+                started_at: now,
+            });
             account.health = Health::Cooling {
                 reason: HealthReason::Quota,
-                until: Utc::now() + ChronoDuration::seconds(2),
+                until: reset,
                 scope: "account".into(),
             }
         })
@@ -850,9 +989,16 @@ async fn rn1_successful_reset_hold_then_payment_failover_is_forced() {
     let first = h.turn("/v1/responses", &headers, RAW).await;
     h.store
         .update_metadata(&first, |a| {
+            let now = Utc::now();
+            let reset = now + ChronoDuration::seconds(2);
+            a.quota_cooling = Some(QuotaCooling {
+                window: "5h".into(),
+                reset_at: reset,
+                started_at: now,
+            });
             a.health = Health::Cooling {
                 reason: HealthReason::Quota,
-                until: Utc::now() + ChronoDuration::seconds(2),
+                until: reset,
                 scope: "account".into(),
             };
         })

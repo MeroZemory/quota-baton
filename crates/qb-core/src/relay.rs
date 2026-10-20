@@ -7,6 +7,7 @@ mod outcome;
 mod response;
 mod upload;
 mod websocket;
+mod wire_metadata;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -58,10 +59,10 @@ pub struct RelayState {
     pub quota: Arc<crate::quota::UsagePoller>,
     pub bindings: Arc<crate::bindings::BindingTable>,
     burst: Mutex<crate::burst::BurstTracker>,
-    reset_hold_secs: u64,
     rate_hold_secs: u64,
     rate_hold_max_retries: u32,
     ws_upgrade_hold_secs: u64,
+    request_timeout_secs: u64,
     pub inflight_requests: Arc<AtomicU64>,
     store: Arc<AccountStore>,
     client: reqwest::Client,
@@ -94,6 +95,30 @@ pub struct RelayState {
 }
 
 impl RelayState {
+    pub fn routing_view(&self) -> serde_json::Value {
+        let mut view = self.bindings.routing_view();
+        let accounts = self.store.list().unwrap_or_default();
+        view["forecast_shadow"] = serde_json::Value::Array(accounts.iter().map(|a| {
+            serde_json::json!({"account":a.id,"forecast":self.observability.forecast_view(&a.id,
+                self.bindings.active_sessions(&a.id, chrono::Utc::now()), self.accounts.inflight_count(&a.id))})
+        }).collect());
+        view
+    }
+    async fn prepare_project(
+        &self,
+        session: &session::Session,
+        hint: Option<&crate::routing::ProjectHint>,
+    ) -> Result<(), ()> {
+        let Some(project) = hint.and_then(|hint| hint.0.clone()) else {
+            return Ok(());
+        };
+        let key = session.key.clone().ok_or(())?;
+        let table = self.bindings.clone();
+        tokio::task::spawn_blocking(move || table.associate_project(&key, &project))
+            .await
+            .map_err(|_| ())?
+            .map_err(|_| ())
+    }
     #[cfg(all(feature = "testkit", debug_assertions))]
     pub fn validate_takeover_test_inputs(
         home: &std::path::Path,
@@ -361,6 +386,14 @@ impl RelayState {
         websocket: bool,
         model: Option<&str>,
     ) -> Response {
+        if completion.policy_blocked {
+            return native_error(
+                StatusCode::CONFLICT,
+                provider,
+                "routing_policy_blocked",
+                "자동 계정 전환이 꺼져 있거나 이동 예산이 소진되었습니다. 계정 상태와 세션 정책을 확인해 주세요.",
+            );
+        }
         if !completion.usage_prepolled {
             completion.usage_prepolled = true;
             self.quota.before_unavailable(provider).await;
@@ -423,6 +456,9 @@ impl RelayState {
         // The lease is held and account expiry/reconciliation precedes affinity restore.
         store.list()?;
         let bindings = crate::bindings::BindingTable::new(store.home(), config.routing.clone())?;
+        bindings.policies.attach_observability(&observability);
+        quota.set_bindings(&bindings);
+        observability.configure_forecast(config.routing.forecast_shadow);
         observability.dashboard().attach(&bindings, config);
         for (id, settings) in &config.accounts {
             bindings.set_account_threshold(id, settings.spread_threshold);
@@ -431,10 +467,10 @@ impl RelayState {
             accounts,
             quota,
             bindings,
-            reset_hold_secs: config.routing.reset_hold_secs,
             rate_hold_secs: config.routing.rate_hold_secs,
             rate_hold_max_retries: config.routing.rate_hold_max_retries,
             ws_upgrade_hold_secs: config.routing.ws_upgrade_hold_secs,
+            request_timeout_secs: config.routing.request_timeout_secs,
             burst: Mutex::new(crate::burst::BurstTracker::new(
                 config.tray.burst_new_sessions,
             )),
@@ -595,7 +631,20 @@ impl RelayState {
                         && !runtime.blocked_in_memory(&a.id)
                         && store.tokens(a).is_ok_and(|t| !t.access_token.is_empty())
                 })
-                .map(|account| {
+                .map(|mut account| {
+                    if account.quota_cooling.is_none()
+                        && let Some(reset) = runtime.observed_quota_reset(&account)
+                    {
+                        account.quota_cooling = Some(crate::accounts::QuotaCooling {
+                            window: "observed".into(),
+                            reset_at: reset,
+                            started_at: chrono::Utc::now(),
+                        });
+                    }
+                    obs.forecast_load(
+                        &account.id,
+                        bindings.active_sessions(&account.id, chrono::Utc::now()),
+                    );
                     let pacing = runtime.pacing_snapshot(&account.id);
                     bindings.set_pacing(
                         &account.id,
@@ -628,9 +677,22 @@ impl RelayState {
         // Cooling/disabled accounts must not supply phantom rebalance room.
         // Keep them in ordinary selection so near-reset holds still work.
         candidates.retain(|candidate| candidate.account.eligible_at(None, now));
-        let (active, threshold, groups_hit, marked) =
-            self.bindings
-                .note_client_rate(provider, account, key, &candidates, now);
+        let table = self.bindings.clone();
+        let owned_account = account.to_owned();
+        let owned_key = key.map(str::to_owned);
+        let (active, threshold, groups_hit, marked) = tokio::task::spawn_blocking(move || {
+            table.note_client_rate(
+                provider,
+                &owned_account,
+                owned_key.as_deref(),
+                &candidates,
+                now,
+            )
+        })
+        .await
+        .unwrap_or_default();
+        self.observability
+            .record_unknown_cost_skips(self.bindings.take_unknown_cost_skips());
         if marked > 0 || (groups_hit >= 3 && self.bindings.overload_report_due(account, now)) {
             self.observability
                 .record_overload(account, active, threshold, groups_hit, marked);
@@ -645,6 +707,11 @@ impl RelayState {
         model: Option<&str>,
         tried: &BTreeSet<String>,
     ) -> Result<Option<Account>, ()> {
+        if key.is_none()
+            && self.bindings.policies.plan(None).settings.mode == crate::routing::Mode::Strict
+        {
+            return Ok(None);
+        }
         let candidates = self.candidates(provider, key, model, tried).await?;
         let pinned = self.pins.get(provider, key);
         match self.bindings.preview(
@@ -664,6 +731,69 @@ impl RelayState {
         }
     }
 
+    /// Recheck after every await that can outlive a policy/account edit. An
+    /// admitted auth probe owns its slot, so do not reject its own probe flag.
+    async fn dispatch_allowed(&self, key: Option<&str>, id: &str, model: Option<&str>) -> bool {
+        self.dispatch_checked(key, id, model, false).await
+    }
+    async fn dispatch_data_allowed(
+        &self,
+        key: Option<&str>,
+        id: &str,
+        model: Option<&str>,
+    ) -> bool {
+        self.dispatch_checked(key, id, model, true).await
+    }
+    async fn dispatch_checked(
+        &self,
+        key: Option<&str>,
+        id: &str,
+        model: Option<&str>,
+        data: bool,
+    ) -> bool {
+        if self.accounts.blocked_in_memory(id) {
+            return false;
+        }
+        let store = self.store.clone();
+        let obs = self.observability.clone();
+        let bindings = self.bindings.clone();
+        let owned_id = id.to_owned();
+        let owned_model = model.map(str::to_owned);
+        let owned_key = key.map(str::to_owned);
+        let eligible = tokio::task::spawn_blocking(move || {
+            if !store.takeover_fenced(&owned_id).is_ok_and(|fenced| !fenced) {
+                return false;
+            }
+            let Ok(account) = store.load(&owned_id) else {
+                return false;
+            };
+            if data && owned_model.is_none() && matches!(&account.health, Health::Cooling {until, scope, ..} if *until>chrono::Utc::now() && scope.starts_with("model:")) { return false; }
+            if account.drain && !bindings.existing_placement(owned_key.as_deref(), &owned_id) {
+                return false;
+            }
+            bindings.account_dispatch_eligible(
+                &crate::bindings::Candidate {
+                    quota: obs.quota_snapshot(&owned_id),
+                    account,
+                    inflight: 0,
+                },
+                owned_model.as_deref(),
+            )
+        })
+        .await
+        .unwrap_or(false);
+        // Last synchronous check: policy publication is immutable and never
+        // waits for the disk writer. No await separates it from the caller.
+        eligible
+            && !self.accounts.blocked_in_memory(id)
+            && self.bindings.policies.permits_dispatch(key, id)
+            && key.is_none_or(|key| {
+                self.bindings
+                    .current(Some(key))
+                    .is_none_or(|current| current == id)
+            })
+    }
+
     async fn select_request(
         &self,
         provider: Provider,
@@ -672,6 +802,12 @@ impl RelayState {
         model: Option<&str>,
         tried: &BTreeSet<String>,
     ) -> Result<Option<Account>, ()> {
+        if session.key.is_none()
+            && self.bindings.policies.plan(None).settings.mode == crate::routing::Mode::Strict
+        {
+            completion.policy_blocked = true;
+            return Ok(None);
+        }
         // Post-commit/nonreplayable quota errors cannot retry the old body.
         // On its next request, resolve C7 before publishing any context.
         let prior = self.bindings.current(session.key.as_deref());
@@ -711,21 +847,48 @@ impl RelayState {
                 .candidates(provider, session.key.as_deref(), model, &excluded)
                 .await?;
             let pinned = self.pins.get(provider, session.key.as_deref());
-            let bytes = completion
-                .input_bytes
-                .load(std::sync::atomic::Ordering::Relaxed);
-            let choice = self.bindings.choose_with_hold(
-                provider,
-                session.key.as_deref(),
-                session.parent.as_deref(),
-                model,
-                &candidates,
-                pinned.as_deref(),
-                bytes,
-                !completion.reset_hold_used,
-                completion.reset_hold_timed_out,
-            );
+            let bytes = completion.selection_cost.unwrap_or(0);
+            // Strict anchors/moves are durable before dispatch. Disk I/O must
+            // not block a Tokio reactor thread while holding the table gate.
+            let table = self.bindings.clone();
+            let key = session.key.clone();
+            let parent = session.parent.clone();
+            let owned_model = model.map(str::to_owned);
+            let choices = candidates.clone();
+            let hold_allowed = !completion.reset_hold_used;
+            let hold_timed_out = completion.reset_hold_timed_out;
+            let choice = tokio::task::spawn_blocking(move || {
+                table.choose_with_hold(
+                    provider,
+                    key.as_deref(),
+                    parent.as_deref(),
+                    owned_model.as_deref(),
+                    &choices,
+                    pinned.as_deref(),
+                    bytes,
+                    hold_allowed,
+                    hold_timed_out,
+                )
+            })
+            .await
+            .map_err(|_| ())?;
             match choice {
+                crate::bindings::Decision::Blocked => {
+                    completion.policy_blocked = true;
+                    return Ok(None);
+                }
+                crate::bindings::Decision::None
+                    if self
+                        .bindings
+                        .policies
+                        .plan(session.key.as_deref())
+                        .settings
+                        .mode
+                        == crate::routing::Mode::Strict =>
+                {
+                    completion.policy_blocked = true;
+                    return Ok(None);
+                }
                 crate::bindings::Decision::Selected {
                     account,
                     lease,
@@ -753,6 +916,9 @@ impl RelayState {
                             } else if let Some(count) = excess {
                                 self.observability.remember_burst(count);
                             }
+                        }
+                        if event.is_placement {
+                            self.observability.record_placement(&event);
                         }
                         self.observability.record_group_move(
                             &event.key,
@@ -811,10 +977,47 @@ impl RelayState {
                     held_account = self.bindings.current(session.key.as_deref());
                     let wait = (until - chrono::Utc::now()).to_std().unwrap_or_default();
                     completion.reset_hold_used = true;
-                    tokio::time::sleep(wait.min(Duration::from_secs(self.reset_hold_secs))).await;
-                    // This flag is request-local; a later turn may hold again.
-                    completion.reset_hold_timed_out = true;
+                    if !reset_fits_transport(completion, wait) {
+                        // A reset beyond this transport's remaining budget is
+                        // not a viable hold. Re-select without waiting; strict
+                        // still cannot choose another account.
+                        continue;
+                    }
+                    // Convert wall time once; policy/account edits interrupt
+                    // the monotonic wait. A later request has its own budget.
+                    completion.reset_hold_timed_out = self
+                        .wait_reset(session.key.as_deref(), held_account.as_deref(), wait)
+                        .await;
                 }
+            }
+        }
+    }
+
+    async fn wait_reset(&self, key: Option<&str>, id: Option<&str>, wait: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + wait;
+        let mut events = self.accounts.subscribe();
+        loop {
+            let changed = self.bindings.policies.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let plan = self.bindings.policies.plan(key);
+            if self.is_draining()
+                || plan.settings.reset_wait_secs == 0
+                || deadline.saturating_duration_since(tokio::time::Instant::now())
+                    > Duration::from_secs(plan.settings.reset_wait_secs)
+                || id.is_some_and(|id| !self.bindings.policies.permits_dispatch(key, id))
+            {
+                return false;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => return true,
+                _ = &mut changed => return false,
+                _ = self.drain_start_notify.notified() => return false,
+                event = events.recv() => match event {
+                    Ok(event) if id.is_some_and(|id| event["data"]["id"] == id) => return false,
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
+                    Err(_) => return false,
+                },
             }
         }
     }
@@ -844,18 +1047,24 @@ impl RelayState {
         let reset = match &account.health {
             Health::Cooling {
                 reason: HealthReason::Quota,
-                until,
                 scope,
+                ..
             } if account.user_state == UserState::Active
                 && (scope == "account"
                     || scope
                         .strip_prefix("model:")
                         .is_some_and(|m| model == Some(m))) =>
             {
-                account
+                let Some(reset) = account
                     .quota_cooling
                     .as_ref()
-                    .map_or(*until, |q| q.reset_at)
+                    .map(|q| q.reset_at)
+                    .or_else(|| self.accounts.observed_quota_reset(&account))
+                else {
+                    tracing::debug!(account = %id, reason = "no_observed_reset_evidence", "reset hold skipped");
+                    return Ok(false);
+                };
+                reset
             }
             _ => {
                 tracing::debug!(account = %id, reason = "account_not_active_quota_cooling", "reset hold skipped");
@@ -866,28 +1075,61 @@ impl RelayState {
             tracing::debug!(account = %id, reason = "reset_elapsed", "reset hold skipped");
             return Ok(false);
         };
-        if wait > Duration::from_secs(self.reset_hold_secs) {
+        let reset_budget = self
+            .bindings
+            .policies
+            .plan(session.key.as_deref())
+            .settings
+            .reset_wait_secs;
+        if wait > Duration::from_secs(reset_budget) {
             tracing::debug!(account = %id, reason = "reset_beyond_hold_bound", wait_ms = wait.as_millis() as u64, "reset hold skipped");
+            return Ok(false);
+        }
+        if !reset_fits_transport(completion, wait) {
+            completion.reset_hold_used = true;
+            tracing::debug!(account = %id, reason = "reset_beyond_transport_budget", "reset hold skipped");
             return Ok(false);
         }
         completion.end_attempt();
         completion.reset_hold_used = true;
         completion.failover("reset_hold_retry");
-        tokio::time::sleep(wait).await;
+        if !self
+            .wait_reset(session.key.as_deref(), Some(id), wait)
+            .await
+        {
+            tracing::debug!(account = %id, reason = "reset_hold_interrupted", "reset hold skipped");
+            return Ok(false);
+        }
         let store = self.store.clone();
         let account_id = id.to_owned();
         let account = tokio::task::spawn_blocking(move || store.load(&account_id))
             .await
             .map_err(|_| ())?
             .map_err(|_| ())?;
-        if !account.eligible(model) {
+        if !account.eligible(model)
+            || !self
+                .dispatch_allowed(session.key.as_deref(), id, model)
+                .await
+        {
             completion.reset_hold_timed_out = true;
             tracing::debug!(account = %id, reason = "account_still_ineligible_after_reset", "reset hold skipped");
             return Ok(false);
         }
-        completion.binding = Some(self.bindings.begin_request(session.key.as_deref(), id));
+        completion.binding = Some(
+            self.bindings
+                .begin_request_async(session.key.as_deref(), id)
+                .await
+                .map_err(|_| ())?,
+        );
         Ok(true)
     }
+}
+
+fn reset_fits_transport(completion: &Completion, wait: Duration) -> bool {
+    completion.record.transport != "ws"
+        || completion
+            .precommit_deadline
+            .is_none_or(|deadline| wait < deadline.saturating_duration_since(Instant::now()))
 }
 
 fn upstream_client() -> anyhow::Result<reqwest::Client> {
@@ -1106,6 +1348,14 @@ async fn handover_http(state: Arc<RelayState>, request: Request) -> Response {
     let path = parts.uri.path_and_query().map_or("/", |path| path.as_str());
     let url = format!("http://127.0.0.1:{}{path}", state.handover_port);
     let mut headers = parts.headers;
+    if let Some(project) = parts
+        .extensions
+        .get::<crate::routing::ProjectHint>()
+        .and_then(|hint| hint.0.as_deref())
+        && let Ok(value) = HeaderValue::from_str(project)
+    {
+        headers.insert(crate::routing::PROJECT_HEADER, value);
+    }
     for name in [
         "connection",
         "transfer-encoding",
@@ -1137,7 +1387,99 @@ async fn handover_http(state: Arc<RelayState>, request: Request) -> Response {
     }
 }
 
+#[derive(Clone, Copy)]
+struct RequestDeadline(Instant);
+fn routing_input_cost(headers: &HeaderMap, prefix: &[u8], provider: Provider) -> Option<u64> {
+    if provider == Provider::Codex
+        && wire_metadata::Metadata::parse(prefix).is_none_or(|meta| meta.continuation())
+    {
+        return None;
+    }
+    if headers
+        .get("content-encoding")
+        .is_some_and(|v| !v.as_bytes().eq_ignore_ascii_case(b"identity"))
+    {
+        return None;
+    }
+    headers.get("content-length")?.to_str().ok()?.parse().ok()
+}
+#[derive(Clone)]
+struct CommitSignal(tokio::sync::watch::Sender<bool>);
+async fn precommit_timeout<T>(
+    duration: Duration,
+    mut committed: tokio::sync::watch::Receiver<bool>,
+    work: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::pin!(work);
+    let deadline = tokio::time::Instant::now() + duration;
+    let mut closed = false;
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut work => return Some(result),
+            _ = tokio::time::sleep_until(deadline) => {
+                return if *committed.borrow() { Some(work.await) } else { None };
+            }
+            result = committed.changed(), if !closed => {
+                if result.is_err() { closed = true; }
+                else if *committed.borrow() { return Some(work.await); }
+            }
+        }
+    }
+}
 async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Response {
+    let provider = if request.uri().path().starts_with("/v1/messages") {
+        Provider::Claude
+    } else {
+        Provider::Codex
+    };
+    let ws = request.method() == Method::GET
+        && request.uri().path() == "/v1/responses"
+        && request
+            .headers()
+            .get("upgrade")
+            .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"));
+    let timeout = Duration::from_secs(if ws {
+        state.ws_upgrade_hold_secs
+    } else {
+        state.request_timeout_secs
+    });
+    request
+        .extensions_mut()
+        .insert(RequestDeadline(Instant::now() + timeout));
+    let (commit, committed) = tokio::sync::watch::channel(false);
+    request.extensions_mut().insert(CommitSignal(commit));
+    precommit_timeout(timeout, committed, relay_inner(state, request))
+        .await
+        .unwrap_or_else(|| {
+            native_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                provider,
+                "request_timeout",
+                "계정 선택·대기·재시도의 전체 시간 한도를 초과했습니다.",
+            )
+        })
+}
+
+async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
+    let project = match crate::routing::take_project(request.headers_mut()) {
+        Ok(project) => project,
+        Err(_) => {
+            return native_error(
+                StatusCode::BAD_REQUEST,
+                if request.uri().path().contains("responses") {
+                    Provider::Codex
+                } else {
+                    Provider::Claude
+                },
+                "invalid_request_error",
+                "프로젝트 식별자가 올바르지 않습니다.",
+            );
+        }
+    };
+    request
+        .extensions_mut()
+        .insert(crate::routing::ProjectHint(project));
     let launcher_label = crate::dashboard::labels::take_launcher_label(request.headers_mut());
     request
         .extensions_mut()
@@ -1184,6 +1526,7 @@ async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Re
         provider,
         &parts.headers,
     );
+    completion.precommit_deadline = parts.extensions.get::<RequestDeadline>().map(|d| d.0);
     completion.track(state.inflight_requests.clone());
     completion.runtime = Some(state.accounts.clone());
     let Some((_, upstream_path)) = routed else {
@@ -1234,6 +1577,28 @@ async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Re
         session_body = handle.metadata();
     }
     let session = session::classify(provider, path, &parts.headers, &session_body);
+    // input_bytes may be only the first streaming chunk, not full context.
+    completion.selection_cost = routing_input_cost(&parts.headers, &upload.prefix, provider);
+    if let Some(bytes) = completion.selection_cost {
+        state.bindings.request_bytes(session.key.as_deref(), bytes);
+    } else {
+        state.bindings.unknown_request_cost(session.key.as_deref());
+    }
+    if state
+        .prepare_project(
+            &session,
+            parts.extensions.get::<crate::routing::ProjectHint>(),
+        )
+        .await
+        .is_err()
+    {
+        return native_error(
+            StatusCode::CONFLICT,
+            provider,
+            "routing_project_conflict",
+            "등록된 프로젝트와 루트 세션 연결을 확인해 주세요.",
+        );
+    }
     completion.dashboard_label = launcher_label.or(completion.dashboard_label.take());
     completion.session(&session);
     let mut tried = BTreeSet::new();
@@ -1302,10 +1667,24 @@ async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Re
         }
     };
     completion.record.account = Some(account.id.clone());
+    if completion.selection_cost.is_none() {
+        state.bindings.unknown_request_cost(session.key.as_deref());
+    }
     // Phase-0 forced replay bypasses affinity, but still participates in the
     // authoritative placement reservation count.
     if completion.binding.is_none() {
-        completion.binding = Some(state.bindings.begin_request(None, &account.id));
+        completion.binding = match state.bindings.begin_request_async(None, &account.id).await {
+            Ok(lease) => Some(lease),
+            Err(_) => {
+                return failure(
+                    &mut completion,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    provider,
+                    "routing_policy_blocked",
+                    "요청 예약을 확정하지 못했습니다.",
+                );
+            }
+        };
     }
     tried.insert(account.id.clone());
     #[cfg(all(feature = "phase0", debug_assertions))]
@@ -1355,8 +1734,8 @@ async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Re
     let mut network_retry = false;
     let mut token_retry = false;
     let mut rate_retries = 0_u32;
-    let rate_hold_started = Instant::now();
-    let rate_hold_deadline = rate_hold_started + Duration::from_secs(state.rate_hold_secs);
+    let mut rate_retry_queued = false;
+    let mut rate_hold_deadline: Option<Instant> = None;
     let mut rate_relay_retry_after = None;
     let mut rate_relayed = false;
     let mut permission_denials = 0;
@@ -1410,12 +1789,43 @@ async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Re
         completion.dashboard_begin();
         let dashboard_pacing = completion.dashboard_pacing();
         let admission_started = Instant::now();
-        let admission = state
-            .accounts
-            .admit_until(&account.id, rate_hold_deadline)
-            .await;
+        let admission_deadline = rate_hold_deadline
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(state.rate_hold_secs));
+        let admission = if rate_hold_deadline.is_some_and(|at| Instant::now() >= at) {
+            None
+        } else {
+            Some(
+                state
+                    .accounts
+                    .admit_until(&account.id, admission_deadline)
+                    .await,
+            )
+        };
+        if admission.as_ref().is_some_and(|a| a.waited()) {
+            rate_hold_deadline.get_or_insert(admission_deadline);
+        }
         drop(dashboard_pacing);
         completion.rate_wait(admission_started.elapsed().as_millis() as u64);
+        let mut forced_send = admission.as_ref().is_none_or(|a| a.forced())
+            || rate_hold_deadline.is_some_and(|at| Instant::now() >= at);
+        if !state
+            .dispatch_allowed(
+                session.key.as_deref(),
+                &account.id,
+                request_model.as_deref(),
+            )
+            .await
+        {
+            completion.policy_blocked = !state
+                .bindings
+                .policies
+                .permits_dispatch(session.key.as_deref(), &account.id);
+            let response = state
+                .unavailable(&mut completion, provider, false, request_model.as_deref())
+                .await;
+            completion.outcome(response.status().as_u16(), "dispatch_revoked");
+            return response;
+        }
         let upstream_headers =
             match headers::upstream(&parts.headers, &account, &tokens.access_token) {
                 Ok(headers) => headers,
@@ -1429,7 +1839,30 @@ async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Re
                     );
                 }
             };
+        if completion
+            .precommit_deadline
+            .is_some_and(|at| Instant::now() >= at)
+        {
+            return failure(
+                &mut completion,
+                StatusCode::GATEWAY_TIMEOUT,
+                provider,
+                "request_timeout",
+                "전송 전 전체 시간 한도를 초과했습니다.",
+            );
+        }
+        forced_send |= rate_hold_deadline.is_some_and(|at| Instant::now() >= at);
+        if forced_send {
+            state.accounts.record_forced_send(&account.id);
+        }
+        if std::mem::take(&mut rate_retry_queued) {
+            completion.rate_retry();
+        }
+        if let Some(binding) = &completion.binding {
+            binding.dispatched();
+        }
         completion.attempt(&account.id);
+        let observation_asof = state.bindings.begin_usage_observation_for(&account.id);
         let sent_at = Instant::now();
         let send = state
             .client
@@ -1470,11 +1903,12 @@ async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Re
         let credit_observation = if status.is_success() || status == StatusCode::TOO_MANY_REQUESTS {
             state
                 .accounts
-                .observe_headers_for_model(
+                .observe_headers_asof(
                     &account.id,
                     provider,
                     &response_headers,
                     request_model.as_deref(),
+                    (&state.bindings, observation_asof),
                 )
                 .await
         } else {
@@ -1511,6 +1945,9 @@ async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Re
             );
         }
         let before_commit = !status.is_success() || held.decision == CommitDecision::FirstError;
+        if !before_commit && let Some(commit) = parts.extensions.get::<CommitSignal>() {
+            commit.0.send_replace(true);
+        }
         if state.is_draining() {
             // Once admission closes the old owner only finishes byte relay.
             // In particular a delayed 401 cannot refresh or change health.
@@ -1527,13 +1964,19 @@ async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Re
                 && status.is_success()
                 && state.accounts.probe_success(&account.id).await.is_err()
             {
-                return failure(
-                    &mut completion,
-                    StatusCode::BAD_GATEWAY,
-                    provider,
-                    "store_error",
-                    "Could not persist account probe result",
-                );
+                let mut blocked = account.clone();
+                blocked.health = crate::accounts::Health::Cooling {
+                    reason: crate::accounts::HealthReason::StoreError,
+                    until: chrono::Utc::now() + chrono::Duration::seconds(60),
+                    scope: "account".into(),
+                };
+                state.accounts.emit_account(&blocked);
+                state
+                    .observability
+                    .record_health(&account.id, &account.health, &blocked.health);
+                state
+                    .observability
+                    .core_warning(&account.id, "probe_store_failed_after_commit");
             }
             break (status, response_headers, held);
         }
@@ -1544,6 +1987,7 @@ async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Re
             &held.prefix,
             request_model.as_deref(),
         );
+        decision.reconcile_quota(&credit_observation);
         completion.record.upstream_error_code = hold::error_code(&response_headers, &held.prefix);
         if let Some(model) = decision.model.take() {
             request_model = Some(model);
@@ -1647,8 +2091,11 @@ async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Re
                 }
             }
         } else if decision.kind == outcome::Kind::Rate {
+            let rate_deadline = *rate_hold_deadline
+                .get_or_insert_with(|| Instant::now() + Duration::from_secs(state.rate_hold_secs));
+            state.bindings.note_rate(&account.id, chrono::Utc::now());
             let retry_after = outcome::header_seconds(&response_headers, "retry-after")
-                .map(|seconds| Duration::from_secs(seconds.min(60) as u64));
+                .map(|seconds| Duration::from_secs(seconds as u64));
             let pacing = state.accounts.observe_429_at(
                 &account.id,
                 sent_at,
@@ -1664,12 +2111,12 @@ async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Re
             }
             if let Some(copy) = retained.as_ref()
                 && rate_retries < state.rate_hold_max_retries
-                && !admission.forced()
-                && Instant::now() < rate_hold_deadline
+                && !forced_send
+                && Instant::now() < rate_deadline
                 && let Some(body) = copy.retry_body().await
             {
                 rate_retries += 1;
-                completion.rate_retry();
+                rate_retry_queued = true;
                 body_to_send = body;
                 // The next shared admission owns all rate delay. Its
                 // absolute deadline is unchanged across same-account retries.
@@ -1873,6 +2320,13 @@ async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Re
                     .expect("retained body completed")
                     .retry_body();
             }
+            Ok(None) if completion.policy_blocked => {
+                let response = state
+                    .unavailable(&mut completion, provider, false, request_model.as_deref())
+                    .await;
+                completion.outcome(response.status().as_u16(), "routing_policy_blocked");
+                return response;
+            }
             Ok(None)
                 if matches!(
                     decision.kind,
@@ -1952,6 +2406,42 @@ async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Re
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn precommit_timeout_never_replaces_a_committed_response_during_cleanup() {
+        let (commit, observed) = tokio::sync::watch::channel(false);
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let ready = entered.clone();
+        let task = tokio::spawn(super::precommit_timeout(
+            std::time::Duration::from_millis(30),
+            observed,
+            async move {
+                commit.send_replace(true);
+                ready.notify_one();
+                wait.await.unwrap();
+                "original-200-stream"
+            },
+        ));
+        entered.notified().await;
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert!(
+            !task.is_finished(),
+            "commit must disable the precommit deadline, not return504"
+        );
+        release.send(()).unwrap();
+        assert_eq!(task.await.unwrap(), Some("original-200-stream"));
+        let (_sender, observed) = tokio::sync::watch::channel(false);
+        assert_eq!(
+            super::precommit_timeout(
+                std::time::Duration::from_millis(10),
+                observed,
+                std::future::pending::<()>()
+            )
+            .await,
+            None
+        );
+    }
+
     use super::*;
 
     #[test]

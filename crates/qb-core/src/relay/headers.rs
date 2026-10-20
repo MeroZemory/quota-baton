@@ -20,6 +20,7 @@ pub(super) fn filtered(headers: &HeaderMap, request: bool) -> HeaderMap {
     let mut result = HeaderMap::new();
     for (name, value) in headers {
         if name.as_str() == crate::dashboard::labels::LABEL_HEADER
+            || name.as_str() == crate::routing::PROJECT_HEADER
             || per_hop(name.as_str())
             || connection
                 .iter()

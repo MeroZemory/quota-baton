@@ -11,22 +11,25 @@ use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
 const CAPACITY: usize = 20_000;
+#[cfg(test)]
+#[path = "bindings/routing_safety_tests.rs"]
+mod routing_safety_tests;
 
 #[cfg(test)]
 mod r7_snapshot_tests {
     use super::*;
     #[test]
-    fn r7_legacy_binding_snapshot_preserves_unknown_metadata_and_c7_pin_activity() {
+    fn r7_legacy_binding_snapshot_preserves_metadata_without_counting_idle_pin_as_activity() {
         let root = tempfile::tempdir().unwrap();
         fs::create_dir(root.path().join("state")).unwrap();
         let now = Utc::now();
@@ -41,7 +44,10 @@ mod r7_snapshot_tests {
         assert!(before[0].restored);
         let pin = table.pin(Some(key));
         let pinned = table.dashboard_snapshot(now);
-        assert!(pinned[0].active);
+        assert!(
+            !pinned[0].active,
+            "an idle socket protects affinity, not load"
+        );
         assert_eq!(
             pinned.iter().filter(|row| row.active).count(),
             table.active_sessions("cx-123abc", now)
@@ -59,6 +65,7 @@ pub struct Candidate {
 }
 #[derive(Debug)]
 pub enum Decision {
+    Blocked,
     Selected {
         account: String,
         lease: BindingLease,
@@ -84,12 +91,236 @@ pub struct MoveEvent {
     pub bytes: u64,
     pub keys: usize,
     pub debug_pin: bool,
+    pub evidence: PlacementEvidence,
+    pub placement_charge_pct: f64,
+    pub capped: bool,
+    pub placed_since_obs: usize,
+    pub is_placement: bool,
 }
+/// Evidence at selection time, before this placement adds its charge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlacementEvidence {
+    Fresh,
+    Weak,
+}
+
+/// A pending placement-driven poll. Reading deadlines does not consume them.
+#[derive(Clone, Debug)]
+pub struct PlacementPoll {
+    pub account: String,
+    pub placement_at: DateTime<Utc>,
+    pub placement_seq: u64,
+    pub due_at: DateTime<Utc>,
+}
+
+/// Capture under the binding lock just before sending. Cumulative placement
+/// count makes arbitrarily delayed observations exact without retaining history.
+#[derive(Clone, Copy, Debug)]
+pub struct UsageObservationAsOf {
+    pub sequence: u64,
+    pub placed_count: u64,
+}
+#[derive(Clone)]
+struct PlacementWindow {
+    value: Value,
+    asof: Option<UsageObservationAsOf>,
+    reported_sequence: u64,
+    unresolved_equal_charge: bool,
+}
+// Timer metadata only. Exact charge/cap counts use cumulative counters above.
+// Coalescing retains the earliest time, so partial acknowledgments can make a
+// poll early but never postpone it past the oldest remaining placement's due time.
+const PLACEMENT_POLL_DEADLINES: usize = 64;
+#[derive(Clone)]
+struct PlacementPollDeadline {
+    at: DateTime<Utc>,
+    through: u64,
+}
+#[derive(Clone, Default)]
+struct PlacementState {
+    latest: Option<u64>,
+    latest_at: Option<DateTime<Utc>>,
+    total: u64,
+    poll_deadlines: Vec<PlacementPollDeadline>,
+    windows: BTreeMap<String, PlacementWindow>,
+    window_set_sequence: Option<u64>,
+}
+impl PlacementState {
+    fn observe(&mut self, snapshot: &Value) {
+        // A cached/merged candidate must not resurrect a window removed by a
+        // complete source-stamped poll. Subsequent updates need a send token.
+        if self.window_set_sequence.is_some() {
+            return;
+        }
+        if let Some(windows) = snapshot["windows"].as_array() {
+            for w in windows {
+                if !placement_account_window(w) {
+                    continue;
+                }
+                let name = w["name"].as_str().expect("gating window");
+                self.windows
+                    .entry(name.to_owned())
+                    .or_insert_with(|| PlacementWindow {
+                        value: w.clone(),
+                        asof: date(&w["observed_at"]).map(|_| UsageObservationAsOf {
+                            sequence: 0,
+                            placed_count: 0,
+                        }),
+                        reported_sequence: 0,
+                        unresolved_equal_charge: false,
+                    });
+            }
+        }
+    }
+    fn observe_asof(&mut self, snapshot: &Value, asof: UsageObservationAsOf) {
+        self.observe_asof_set(snapshot, asof, false);
+    }
+    fn observe_complete_asof(&mut self, snapshot: &Value, asof: UsageObservationAsOf) {
+        self.observe_asof_set(snapshot, asof, true);
+    }
+    fn observe_asof_set(&mut self, snapshot: &Value, asof: UsageObservationAsOf, complete: bool) {
+        let Some(windows) = snapshot["windows"].as_array() else {
+            return;
+        };
+        let equal_placement = self.latest == Some(asof.sequence) && self.total > 0;
+        if complete
+            && self
+                .window_set_sequence
+                .is_none_or(|sequence| asof.sequence >= sequence)
+        {
+            let reported: BTreeSet<_> = windows
+                .iter()
+                .filter(|window| placement_account_window(window))
+                .filter_map(|window| window["name"].as_str())
+                .collect();
+            self.windows.retain(|name, window| {
+                reported.contains(name.as_str()) || window.reported_sequence > asof.sequence
+            });
+            self.window_set_sequence = Some(asof.sequence);
+        }
+        for w in windows {
+            if !placement_account_window(w) {
+                continue;
+            }
+            let name = w["name"].as_str().expect("account window");
+            if self
+                .window_set_sequence
+                .is_some_and(|sequence| asof.sequence < sequence)
+                && !self.windows.contains_key(name)
+            {
+                continue;
+            }
+            let window = self
+                .windows
+                .entry(name.to_owned())
+                .or_insert_with(|| PlacementWindow {
+                    value: w.clone(),
+                    asof: None,
+                    reported_sequence: asof.sequence,
+                    unresolved_equal_charge: false,
+                });
+            window.reported_sequence = window.reported_sequence.max(asof.sequence);
+            if date(&w["observed_at"]).is_some()
+                && window.asof.is_none_or(|old| asof.sequence >= old.sequence)
+            {
+                window.value = w.clone();
+                if window.asof.is_none_or(|old| asof.sequence > old.sequence) {
+                    // Equality leaves this window's charge unresolved even
+                    // after another placement changes the account's latest seq.
+                    // Replays of the same proof retain its original count/flag.
+                    window.unresolved_equal_charge = equal_placement;
+                    window.asof = Some(asof);
+                }
+            }
+        }
+        let oldest_asof = if self.windows.is_empty()
+            || self.windows.values().any(|window| window.asof.is_none())
+        {
+            0
+        } else {
+            self.windows
+                .values()
+                .filter_map(|window| window.asof.map(|token| token.sequence))
+                .min()
+                .unwrap_or(0)
+        };
+        // Equality does not acknowledge a placement. A partially covered
+        // coalesced deadline retains its original earliest time.
+        self.poll_deadlines
+            .retain(|deadline| deadline.through >= oldest_asof);
+    }
+    fn oldest_count(&self) -> u64 {
+        if self.windows.is_empty() || self.windows.values().any(|w| w.asof.is_none()) {
+            return 0;
+        }
+        self.windows
+            .values()
+            .filter_map(|w| w.asof.map(|at| at.placed_count))
+            .min()
+            .unwrap_or(0)
+            .min(self.total)
+    }
+    fn weak(&self, now: DateTime<Utc>) -> bool {
+        self.windows.is_empty()
+            || self.windows.values().any(|w| {
+                w.asof.is_none()
+                    || self
+                        .latest
+                        .is_some_and(|placed| w.asof.is_none_or(|at| at.sequence < placed))
+                    || date(&w.value["reset_at"]).is_some_and(|reset| {
+                        reset <= now && date(&w.value["observed_at"]).is_none_or(|at| at < reset)
+                    })
+            })
+    }
+    fn count(&self) -> usize {
+        usize::try_from(self.total - self.oldest_count()).unwrap_or(usize::MAX)
+    }
+    fn charge_count(&self, name: &str) -> usize {
+        let window = self.windows.get(name);
+        let asof = window.and_then(|w| w.asof);
+        let covered = asof.map_or(0, |at| at.placed_count.min(self.total));
+        // Equal is not newer: cap count excludes the equal placement while its
+        // charge remains. Real send tokens are distinct from placement events.
+        let equal = window.is_some_and(|w| w.unresolved_equal_charge);
+        usize::try_from((self.total - covered).saturating_add(u64::from(equal)))
+            .unwrap_or(usize::MAX)
+    }
+    fn placed(&mut self, now: DateTime<Utc>, seq: u64) {
+        self.total = self
+            .total
+            .checked_add(1)
+            .expect("placement count exhausted");
+        self.latest = Some(seq);
+        self.latest_at = Some(now);
+        if let Some(last) = self.poll_deadlines.last_mut()
+            && last.at == now
+        {
+            last.through = seq;
+        } else {
+            self.poll_deadlines.push(PlacementPollDeadline {
+                at: now,
+                through: seq,
+            });
+        }
+        if self.poll_deadlines.len() > PLACEMENT_POLL_DEADLINES {
+            let first = self.poll_deadlines.remove(0);
+            self.poll_deadlines[0].at = self.poll_deadlines[0].at.min(first.at);
+        }
+    }
+    fn poll_started(&mut self, asof: u64) {
+        self.poll_deadlines
+            .retain(|deadline| deadline.through > asof);
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Binding {
     key: String,
     account: String,
     last_used: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    accepted: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     first_seen_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -110,6 +341,12 @@ struct Group {
     account: String,
     last_used: DateTime<Utc>,
 }
+#[derive(Clone)]
+struct OverloadMark {
+    expires: DateTime<Utc>,
+    from: String,
+    target: String,
+}
 #[derive(Clone, Default)]
 struct AccountIndex {
     count: usize,
@@ -124,10 +361,16 @@ struct Data {
     pending: BTreeMap<String, usize>,
     traffic: BTreeMap<String, DateTime<Utc>>,
     sticky: BTreeMap<String, String>,
+    accepted_unbound: BTreeSet<String>,
+    epochs: BTreeMap<String, Arc<()>>,
+    snapshot_weight: usize,
     after_move: BTreeSet<String>,
     rate_hits: BTreeMap<String, BTreeMap<String, DateTime<Utc>>>,
-    overload_marks: BTreeMap<String, DateTime<Utc>>,
+    overload_marks: BTreeMap<String, OverloadMark>,
+    successes: BTreeMap<String, DateTime<Utc>>,
+    placements: BTreeMap<String, PlacementState>,
     last_request_bytes: BTreeMap<String, u64>,
+    unknown_cost: BTreeSet<String>,
     mark_history: BTreeMap<String, Vec<DateTime<Utc>>>,
     pacing: BTreeMap<String, bool>,
     overload_reported: BTreeMap<String, DateTime<Utc>>,
@@ -144,12 +387,16 @@ impl Data {
     }
 }
 pub struct BindingTable {
+    pub policies: crate::routing::PolicyStore,
     path: PathBuf,
     config: RoutingConfig,
     thresholds: Mutex<BTreeMap<String, usize>>,
     data: Mutex<Data>,
     writer: Mutex<()>,
+    mutations: Mutex<()>,
     writes_stopped: AtomicBool,
+    unknown_cost_skips: AtomicUsize,
+    usage_sequence: AtomicU64,
 }
 
 /// A reservation belongs to the actual upstream account, even after a forced
@@ -158,6 +405,8 @@ pub struct BindingLease {
     table: Arc<BindingTable>,
     group: Option<String>,
     account: String,
+    epoch_key: String,
+    epoch: Arc<()>,
     pub after_move: bool,
     defer: bool,
 }
@@ -170,9 +419,67 @@ impl std::fmt::Debug for BindingLease {
     }
 }
 impl BindingLease {
+    /// Final admission is separate from attempt/ledger accounting.
+    pub fn receipt(&self) -> DispatchReceipt {
+        DispatchReceipt {
+            table: self.table.clone(),
+            group: self.group.clone(),
+            account: self.account.clone(),
+            epoch_key: self.epoch_key.clone(),
+            epoch: self.epoch.clone(),
+        }
+    }
+    pub fn dispatched(&self) {
+        self.receipt().dispatched();
+    }
+    pub fn successful(&self) {
+        self.table.note_success(&self.account, Utc::now());
+    }
     /// Upgrade handshakes have no cache usage. Carry this marker to response.create.
     pub fn defer_after_move(&mut self) {
         self.defer = true;
+    }
+}
+#[derive(Clone)]
+pub struct DispatchReceipt {
+    table: Arc<BindingTable>,
+    group: Option<String>,
+    account: String,
+    epoch_key: String,
+    epoch: Arc<()>,
+}
+impl DispatchReceipt {
+    pub fn dispatched(&self) {
+        let mut d = self.table.data.lock().unwrap_or_else(|e| e.into_inner());
+        if !d
+            .epochs
+            .get(&self.epoch_key)
+            .is_some_and(|epoch| Arc::ptr_eq(epoch, &self.epoch))
+        {
+            return;
+        }
+        let Some(group) = &self.group else {
+            if d.sticky.values().any(|id| id == &self.account) {
+                d.accepted_unbound.insert(self.account.clone());
+            }
+            return;
+        };
+        let Some(entry) = d.groups.get(group).filter(|g| g.account == self.account) else {
+            return;
+        };
+        let keys = entry.keys.clone();
+        let mut changed = false;
+        for key in keys {
+            if let Some(binding) = d.bindings.get_mut(&key)
+                && binding.accepted == Some(false)
+            {
+                binding.accepted = Some(true);
+                changed = true;
+            }
+        }
+        if changed {
+            d.changed();
+        }
     }
 }
 impl Drop for BindingLease {
@@ -271,10 +578,24 @@ fn touch_group(d: &mut Data, g: &str, now: DateTime<Utc>) {
         d.changed();
     }
 }
+fn binding_bound(key: &str, account: &str) -> usize {
+    // Exact escaped identifier lengths plus a conservative fixed metadata budget.
+    serde_json::to_string(key)
+        .expect("JSON string")
+        .len()
+        .saturating_add(serde_json::to_string(account).expect("JSON string").len())
+        .saturating_add(384)
+}
+
 fn rebuild_indexes(d: &mut Data) {
     d.groups.clear();
     d.lru.clear();
     d.accounts.clear();
+    d.snapshot_weight = d
+        .bindings
+        .values()
+        .map(|b| binding_bound(&b.key, &b.account))
+        .fold(0usize, usize::saturating_add);
     let mut groups = BTreeMap::<String, Group>::new();
     for b in d.bindings.values() {
         let entry = groups
@@ -297,16 +618,90 @@ fn snapshot(d: &Data) -> Snapshot {
         bindings: d.bindings.values().cloned().collect(),
     }
 }
+const SNAPSHOT_MAX_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) fn read_binding_snapshot(path: &Path) -> std::io::Result<Vec<u8>> {
+    let invalid = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid binding snapshot trust or size",
+        )
+    };
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > SNAPSHOT_MAX_BYTES
+    {
+        return Err(invalid());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err(invalid());
+        }
+        crate::local_secrets::restrict(path).map_err(std::io::Error::other)?;
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x00200000);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let actual = file.metadata()?;
+    if !actual.is_file() || actual.len() > SNAPSHOT_MAX_BYTES {
+        return Err(invalid());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if actual.file_attributes() & 0x400 != 0 {
+            return Err(invalid());
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if actual.uid() != unsafe { libc::geteuid() } || actual.mode() & 0o077 != 0 {
+            return Err(invalid());
+        }
+    }
+    let mut bytes = Vec::new();
+    file.take(SNAPSHOT_MAX_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > SNAPSHOT_MAX_BYTES {
+        return Err(invalid());
+    }
+    Ok(bytes)
+}
+#[derive(Debug, thiserror::Error)]
+#[error("existing binding snapshot exceeds restore capacity; original retained")]
+struct SnapshotCapacity;
+#[cfg(test)]
 fn decode(value: Value) -> Result<Data> {
+    decode_scoped(value, false)
+}
+fn decode_scoped(value: Value, strict: bool) -> Result<Data> {
     let state: Snapshot = serde_json::from_value(value)?;
     if state.schema != 1 {
         bail!("unsupported binding schema");
+    }
+    if state.bindings.len() > CAPACITY * 2 {
+        return Err(SnapshotCapacity.into());
     }
     let mut d = Data::default();
     let mut groups = BTreeMap::new();
     let mut inconsistent = BTreeSet::new();
     for b in state.bindings {
-        if b.key.is_empty() || b.account.is_empty() || d.bindings.contains_key(&b.key) {
+        if b.key.is_empty()
+            || crate::observability::safe_identifier(&b.account).is_none()
+            || d.bindings.contains_key(&b.key)
+        {
             bail!("invalid binding");
         }
         let g = group(&b.key).to_owned();
@@ -318,6 +713,9 @@ fn decode(value: Value) -> Result<Data> {
         d.bindings.insert(b.key.clone(), b);
     }
     if !inconsistent.is_empty() {
+        if strict {
+            bail!("strict binding group has conflicting accounts");
+        }
         tracing::warn!(
             groups = inconsistent.len(),
             "Dropping inconsistent binding groups"
@@ -327,20 +725,101 @@ fn decode(value: Value) -> Result<Data> {
         d.changed();
     }
     rebuild_indexes(&mut d);
+    d.unknown_cost = d.groups.keys().cloned().collect();
+    if d.snapshot_weight as u64 + 64 > SNAPSHOT_MAX_BYTES {
+        return Err(SnapshotCapacity.into());
+    }
     Ok(d)
 }
 impl BindingTable {
+    fn accepted_in(d: &Data, key: Option<&str>, id: &str) -> bool {
+        if key.is_none() {
+            return d.accepted_unbound.contains(id) && d.sticky.values().any(|sticky| sticky == id);
+        }
+        key.and_then(|key| d.groups.get(group(key)))
+            .is_some_and(|g| {
+                g.account == id
+                    && g.keys
+                        .iter()
+                        .any(|k| d.bindings.get(k).is_some_and(|b| b.accepted != Some(false)))
+            })
+    }
+    pub(crate) fn existing_placement(&self, key: Option<&str>, id: &str) -> bool {
+        Self::accepted_in(
+            &self.data.lock().unwrap_or_else(|e| e.into_inner()),
+            key,
+            id,
+        )
+    }
+    pub fn associate_project(&self, key: &str, project: &str) -> Result<()> {
+        let _mutation = self.mutations.lock().unwrap_or_else(|e| e.into_inner());
+        let anchor = self
+            .data
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .groups
+            .get(group(key))
+            .map(|g| g.account.clone());
+        self.policies
+            .associate_with_anchor(key, project, anchor.as_deref())
+    }
+    pub fn routing_view(&self) -> Value {
+        let d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        let mut view = self.policies.list();
+        view["observed_sessions"]=serde_json::to_value(d.groups.iter().map(|(key,g)|serde_json::json!({"id":crate::routing::session_id(key),"account":g.account,"policy":self.policies.plan(Some(key))})).collect::<Vec<_>>()).unwrap_or_default();
+        view
+    }
+    pub fn set_routing_session(
+        &self,
+        id: &str,
+        settings: Option<crate::routing::Settings>,
+        project: Option<&str>,
+        inherit: bool,
+    ) -> Result<()> {
+        let _mutation = self.mutations.lock().unwrap_or_else(|e| e.into_inner());
+        let d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        let binding = d
+            .groups
+            .iter()
+            .find(|(key, _)| crate::routing::session_id(key) == id)
+            .map(|(key, g)| (key.clone(), g.account.clone()));
+        drop(d);
+        self.policies.edit_session_for_key(
+            id,
+            settings,
+            project,
+            binding.as_ref().map(|(_, a)| a.as_str()),
+            inherit,
+            binding.as_ref().map(|(k, _)| k.as_str()),
+        )
+    }
     pub fn new(home: &Path, config: RoutingConfig) -> Result<Arc<Self>> {
         config.validate()?;
         let path = home.join("state/bindings.json");
         fs::create_dir_all(path.parent().context("binding state directory")?)?;
-        let data = match fs::read(&path) {
-            Ok(bytes) => match serde_json::from_slice(&bytes)
+        let policies = crate::routing::PolicyStore::new(
+            home,
+            crate::routing::Settings {
+                mode: config.mode,
+                reset_wait_secs: config.reset_hold_secs,
+            },
+        )?
+        .with_limits(config.churn.clone())?;
+        let data = match read_binding_snapshot(&path) {
+            Ok(bytes) => match crate::json_unique::from_slice(&bytes)
                 .map_err(anyhow::Error::from)
-                .and_then(decode)
+                .and_then(|value| decode_scoped(value, policies.requires_strict_recovery()))
             {
                 Ok(data) => data,
-                Err(_) => {
+                Err(error) => {
+                    if error.downcast_ref::<SnapshotCapacity>().is_some() {
+                        return Err(error);
+                    }
+                    if policies.requires_strict_recovery() {
+                        return Err(error.context(
+                            "strict binding recovery failed; original snapshot retained",
+                        ));
+                    }
                     let quarantine = path.with_file_name(format!(
                         "bindings.json.corrupt-{}-{:08x}",
                         Utc::now().timestamp_millis(),
@@ -354,13 +833,24 @@ impl BindingTable {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Data::default(),
             Err(e) => return Err(e.into()),
         };
+        // Validate/capture before constructing an auto-flushing table. A failed
+        // legacy alias recovery must not prune or overwrite the source on Drop.
+        policies.capture_strict_anchors(
+            data.groups
+                .iter()
+                .map(|(key, g)| (key.as_str(), g.account.as_str())),
+        )?;
         let table = Arc::new(Self {
+            policies,
             path,
             config,
             thresholds: Mutex::new(BTreeMap::new()),
             data: Mutex::new(data),
             writer: Mutex::new(()),
+            mutations: Mutex::new(()),
             writes_stopped: AtomicBool::new(false),
+            unknown_cost_skips: AtomicUsize::new(0),
+            usage_sequence: AtomicU64::new(0),
         });
         table.prune(
             &mut table.data.lock().unwrap_or_else(|e| e.into_inner()),
@@ -391,9 +881,20 @@ impl BindingTable {
             }
             if let Some(entry) = unindex_group(d, &g) {
                 for key in entry.keys {
-                    d.bindings.remove(&key);
+                    if let Some(binding) = d.bindings.remove(&key) {
+                        d.snapshot_weight = d
+                            .snapshot_weight
+                            .saturating_sub(binding_bound(&binding.key, &binding.account));
+                    }
                 }
                 d.after_move.remove(&g);
+                d.overload_marks.remove(&g);
+                d.last_request_bytes.remove(&g);
+                d.unknown_cost.remove(&g);
+                d.epochs.remove(&g);
+                for hits in d.rate_hits.values_mut() {
+                    hits.remove(&g);
+                }
                 d.changed();
             }
         }
@@ -423,7 +924,7 @@ impl BindingTable {
             last_used_at: entry.last_used,
             active: entry.last_used
                 >= now - chrono::Duration::seconds(self.config.active_window_secs as i64)
-                || protected(d, g),
+                || d.active.contains_key(g),
             marked_for_move: d.overload_marks.contains_key(g),
             client_kind: metadata.and_then(|b| b.client_kind),
             restored: metadata.is_none_or(|b| !b.observed_here),
@@ -522,9 +1023,7 @@ impl BindingTable {
         account
             .recent
             .iter()
-            .filter(|(last, group)| {
-                *last >= cutoff || d.active.contains_key(group) || d.pins.contains_key(group)
-            })
+            .filter(|(last, group)| *last >= cutoff || d.active.contains_key(group))
             .count()
     }
 
@@ -559,51 +1058,83 @@ impl BindingTable {
         now: DateTime<Utc>,
     ) -> (usize, usize, usize, usize) {
         let Some(key) = key else { return (0, 0, 0, 0) };
+        let _mutation = self.mutations.lock().unwrap_or_else(|e| e.into_inner());
         let group = group(key).to_owned();
         let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
         let cutoff = now - chrono::Duration::seconds(self.config.overload_window_secs as i64);
+        let bound: BTreeSet<_> = d
+            .groups
+            .iter()
+            .filter(|(_, g)| g.account == account)
+            .map(|(k, _)| k.clone())
+            .collect();
         let hit_count = {
             let hits = d.rate_hits.entry(account.to_owned()).or_default();
-            hits.retain(|_, at| *at >= cutoff);
-            hits.insert(group, now);
+            hits.retain(|key, at| *at >= cutoff && bound.contains(key));
+            if bound.contains(&group) {
+                hits.insert(group, now);
+            }
             hits.len()
         };
         let active = self.active_sessions_in(&d, account, now);
         let threshold = self.spread_threshold_for(account);
-        let target = candidates
+        let mut targets: Vec<_> = candidates
             .iter()
             .filter(|c| {
                 c.account.id != account
                     && c.account.provider == provider
-                    && !c.account.drain
-                    && effective_account(c, &d, &self.config, None, now).eligible_at(None, now)
-                    && metrics(c, &d, &self.config, now).gate
+                    && self.rebalance_target_base(&d, account, c, None, now)
             })
-            .map(|c| {
-                (
-                    c.account.id.clone(),
-                    self.active_sessions_in(&d, &c.account.id, now),
-                    self.spread_threshold_for(&c.account.id),
-                )
-            })
-            .filter(|(_, active, threshold)| active < threshold)
-            .min_by_key(|(_, active, _)| *active);
-        let Some((_target, target_active, _)) = target else {
+            .map(|c| (c, metrics(c, &d, &self.config, now)))
+            .collect();
+        prefer_non_pacing(&mut targets, &d);
+        targets.retain(|(c, _)| !placement_capped(c, &d, &self.config, now));
+        let anchor = targets.iter().filter_map(|(_, m)| m.weekly).min();
+        targets.sort_by(|(a, x), (b, y)| compare_gated(a, x, b, y, anchor));
+        let Some((choice, _)) = targets.first() else {
             return (active, threshold, hit_count, 0);
         };
+        let target = choice.account.id.clone();
+        let target_active =
+            self.active_sessions_in(&d, &target, now) + self.reserved_in(&d, &target, None, now);
+        let target_threshold = self.spread_threshold_for(&target);
         if hit_count < 3 || active <= threshold || active.saturating_sub(target_active) < 2 {
             return (active, threshold, hit_count, 0);
         }
-        d.overload_marks.retain(|_, expires| *expires > now);
+        d.overload_marks.retain(|_, mark| mark.expires > now);
         let history = d.mark_history.entry(account.to_owned()).or_default();
         history.retain(|at| *at > cutoff);
         let already = history.len();
         let budget = 2usize.saturating_sub(already);
         let imbalance_budget = active.saturating_sub(target_active).saturating_sub(2) / 2;
+        let (evidence, placements) = placement_evidence(choice, &d, now);
+        let confidence_budget = if evidence == PlacementEvidence::Weak {
+            self.config
+                .weak_evidence_new_sessions
+                .saturating_sub(placements.saturating_add(self.reserved_in(&d, &target, None, now)))
+        } else {
+            usize::MAX
+        };
         let excess = active
             .saturating_sub(threshold)
             .min(budget)
-            .min(imbalance_budget);
+            .min(imbalance_budget)
+            .min(target_threshold.saturating_sub(target_active))
+            .min(confidence_budget);
+        let skipped = d
+            .groups
+            .iter()
+            .filter(|(g, entry)| {
+                entry.account == account
+                    && !d.active.contains_key(*g)
+                    && !d.overload_marks.contains_key(*g)
+                    && entry.last_used
+                        >= now - chrono::Duration::seconds(self.config.active_window_secs as i64)
+                    && d.unknown_cost.contains(*g)
+            })
+            .count();
+        self.unknown_cost_skips
+            .fetch_add(skipped, Ordering::Relaxed);
         let mut victims: Vec<_> = d
             .groups
             .iter()
@@ -611,11 +1142,18 @@ impl BindingTable {
                 entry.account == account
                     && !d.active.contains_key(*g)
                     && !d.overload_marks.contains_key(*g)
+                    && entry.last_used
+                        >= now - chrono::Duration::seconds(self.config.active_window_secs as i64)
+                    && !d.unknown_cost.contains(*g)
+                    && d.last_request_bytes.get(*g).is_some_and(|bytes| {
+                        *bytes > 0 && *bytes <= self.config.churn.max_move_bytes
+                    })
+                    && self.policies.discretionary_allowed(g, Some(&target), now)
             })
             .map(|(g, entry)| {
                 (
                     g.clone(),
-                    d.last_request_bytes.get(g).copied().unwrap_or(0),
+                    d.last_request_bytes.get(g).copied().unwrap_or(u64::MAX),
                     entry.last_used,
                 )
             })
@@ -628,7 +1166,12 @@ impl BindingTable {
         for victim in &victims {
             d.overload_marks.insert(
                 victim.clone(),
-                now + chrono::Duration::seconds(self.config.overload_window_secs as i64),
+                OverloadMark {
+                    expires: now
+                        + chrono::Duration::seconds(self.config.overload_window_secs as i64),
+                    from: account.to_owned(),
+                    target: target.clone(),
+                },
             );
         }
         d.mark_history
@@ -642,18 +1185,65 @@ impl BindingTable {
         let g = group(key);
         d.overload_marks
             .get(g)
-            .is_some_and(|expires| *expires > now)
+            .is_some_and(|mark| mark.expires > now)
     }
     pub fn overload_marked(&self, key: Option<&str>, now: DateTime<Utc>) -> bool {
-        key.and_then(|key| {
-            self.data
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .overload_marks
-                .get(group(key))
-                .copied()
+        let d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        key.is_some_and(|key| {
+            !d.active.contains_key(group(key)) && self.has_overload_mark(&d, key, now)
         })
-        .is_some_and(|expires| expires > now)
+    }
+    fn reserved_in(&self, d: &Data, id: &str, except: Option<&str>, now: DateTime<Utc>) -> usize {
+        d.overload_marks
+            .iter()
+            .filter(|(g, mark)| {
+                Some(g.as_str()) != except && mark.target == id && mark.expires > now
+            })
+            .count()
+    }
+    fn rebalance_target_waiting(
+        &self,
+        d: &Data,
+        source: &str,
+        c: &Candidate,
+        except: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> bool {
+        let m = metrics(c, d, &self.config, now);
+        let target = self.active_sessions_in(d, &c.account.id, now)
+            + self.reserved_in(d, &c.account.id, except, now);
+        let source_count = self.active_sessions_in(d, source, now);
+        let require_balance =
+            except.is_none_or(|g| d.overload_marks.get(g).is_some_and(|m| m.expires > now));
+        !c.account.drain
+            && effective_account(c, d, &self.config, None, now).eligible_at(None, now)
+            && m.gate
+            && !m.unknown
+            && (m.weekly.is_some() || m.five.is_some())
+            && target < self.spread_threshold_for(&c.account.id)
+            && (!require_balance || target.saturating_add(2) <= source_count)
+    }
+    fn rebalance_target_base(
+        &self,
+        d: &Data,
+        source: &str,
+        c: &Candidate,
+        except: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> bool {
+        // Pacing remains the ordinary C7 preference, not a hard move veto.
+        self.rebalance_target_waiting(d, source, c, except, now)
+    }
+    fn rebalance_target(
+        &self,
+        d: &Data,
+        source: &str,
+        c: &Candidate,
+        except: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> bool {
+        self.rebalance_target_base(d, source, c, except, now)
+            && !placement_capped(c, d, &self.config, now)
     }
     pub fn overload_report_due(&self, account: &str, now: DateTime<Utc>) -> bool {
         let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
@@ -673,13 +1263,162 @@ impl BindingTable {
             .insert(id.to_owned(), pacing);
     }
     pub fn request_bytes(&self, key: Option<&str>, bytes: u64) {
-        if let Some(key) = key {
-            self.data
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .last_request_bytes
-                .insert(group(key).to_owned(), bytes);
+        if bytes == 0 {
+            return;
         }
+        if let Some(key) = key {
+            let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+            if d.groups.contains_key(group(key)) {
+                // Only a complete root input establishes group-wide cost.
+                if key == group(key) {
+                    d.unknown_cost.remove(group(key));
+                }
+                if d.unknown_cost.contains(group(key)) {
+                    return;
+                }
+                let entry = d
+                    .last_request_bytes
+                    .entry(group(key).to_owned())
+                    .or_default();
+                *entry = (*entry).max(bytes);
+            }
+        }
+    }
+    pub fn unknown_request_cost(&self, key: Option<&str>) {
+        if let Some(key) = key {
+            let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+            if d.groups.contains_key(group(key)) {
+                d.unknown_cost.insert(group(key).to_owned());
+            }
+        }
+    }
+    pub fn note_success(&self, id: &str, now: DateTime<Utc>) {
+        self.data
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .successes
+            .insert(id.to_owned(), now);
+    }
+    /// Compatibility hook: rate observations no longer impose destination quiet.
+    pub fn note_rate(&self, _id: &str, _now: DateTime<Utc>) {}
+    /// Capture immediately before an upstream request/event-producing send.
+    /// Tokens and placements share one process-local monotonic sequence.
+    pub fn begin_usage_observation(&self) -> u64 {
+        self.usage_sequence
+            .fetch_add(1, Ordering::Relaxed)
+            .checked_add(1)
+            .expect("usage sequence exhausted")
+    }
+    /// Exact typed token. The lock makes token/count capture atomic with placement.
+    pub fn begin_usage_observation_for(&self, id: &str) -> UsageObservationAsOf {
+        let mut data = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        let sequence = self.begin_usage_observation();
+        let placed_count = data.placements.entry(id.to_owned()).or_default().total;
+        UsageObservationAsOf {
+            sequence,
+            placed_count,
+        }
+    }
+    /// Only newly reported fields; never pass borrowed merged windows.
+    pub fn note_usage_observation_asof_token(
+        &self,
+        id: &str,
+        snapshot: &Value,
+        asof: UsageObservationAsOf,
+    ) {
+        self.data
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .placements
+            .entry(id.to_owned())
+            .or_default()
+            .observe_asof(snapshot, asof);
+    }
+    /// A complete poll replaces older window names while preserving reports
+    /// newer than its send token. Headers/events remain partial through note_*.
+    pub fn replace_usage_windows_asof_token(
+        &self,
+        id: &str,
+        snapshot: &Value,
+        asof: UsageObservationAsOf,
+    ) {
+        self.data
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .placements
+            .entry(id.to_owned())
+            .or_default()
+            .observe_complete_asof(snapshot, asof);
+    }
+    /// Compatibility only: old sequence-only callers remain conservative for
+    /// late observations. Production senders should use the exact typed API.
+    pub fn note_usage_observation_asof(&self, id: &str, snapshot: &Value, sequence: u64) {
+        let mut data = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        let state = data.placements.entry(id.to_owned()).or_default();
+        let placed_count = if state.latest.is_none_or(|latest| sequence >= latest) {
+            state.total
+        } else {
+            0
+        };
+        state.observe_asof(
+            snapshot,
+            UsageObservationAsOf {
+                sequence,
+                placed_count,
+            },
+        );
+    }
+    pub fn note_placement_poll_started(&self, id: &str, asof: u64) {
+        if let Some(state) = self
+            .data
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .placements
+            .get_mut(id)
+        {
+            state.poll_started(asof);
+        }
+    }
+    /// Reconcile a merged candidate without inventing send-time provenance.
+    pub fn note_usage_observation(&self, id: &str, snapshot: &Value) {
+        self.data
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .placements
+            .entry(id.to_owned())
+            .or_default()
+            .observe(snapshot);
+    }
+    /// One descriptor per account; later placements never postpone the oldest.
+    pub fn due_placement_polls(&self, now: DateTime<Utc>) -> Vec<PlacementPoll> {
+        self.data
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .placements
+            .iter()
+            .filter_map(|(id, state)| {
+                placement_poll(id, state, now, None, self.config.placement_poll_after_secs)
+            })
+            .collect()
+    }
+    /// Bounded per-account timer lookup; never scans other accounts.
+    pub fn due_placement_poll(
+        &self,
+        id: &str,
+        now: DateTime<Utc>,
+        polled_through: Option<u64>,
+    ) -> Option<PlacementPoll> {
+        let data = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        placement_poll(
+            id,
+            data.placements.get(id)?,
+            now,
+            polled_through,
+            self.config.placement_poll_after_secs,
+        )
+    }
+    pub fn take_unknown_cost_skips(&self) -> usize {
+        self.unknown_cost_skips.swap(0, Ordering::Relaxed)
     }
     pub fn pending_count(&self, id: &str) -> usize {
         self.data
@@ -725,11 +1464,32 @@ impl BindingTable {
         }
     }
     pub fn begin_request(self: &Arc<Self>, key: Option<&str>, account: &str) -> BindingLease {
+        let _mutation = self.mutations.lock().unwrap_or_else(|e| e.into_inner());
         self.reserve(
             &mut self.data.lock().unwrap_or_else(|e| e.into_inner()),
             key,
             account,
         )
+    }
+    pub(crate) fn account_dispatch_eligible(
+        &self,
+        candidate: &Candidate,
+        model: Option<&str>,
+    ) -> bool {
+        let data = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        effective_account(candidate, &data, &self.config, model, Utc::now()).eligible(model)
+    }
+    pub async fn begin_request_async(
+        self: &Arc<Self>,
+        key: Option<&str>,
+        account: &str,
+    ) -> Result<BindingLease> {
+        let table = self.clone();
+        let key = key.map(str::to_owned);
+        let account = account.to_owned();
+        tokio::task::spawn_blocking(move || table.begin_request(key.as_deref(), &account))
+            .await
+            .context("routing reservation worker")
     }
     fn reserve(self: &Arc<Self>, d: &mut Data, key: Option<&str>, account: &str) -> BindingLease {
         *d.pending.entry(account.into()).or_default() += 1;
@@ -742,7 +1502,22 @@ impl BindingTable {
         } else {
             false
         };
+        let epoch_key = g.clone().unwrap_or_else(|| format!("unbound:{account}"));
+        let known_placement = g.as_ref().map_or_else(
+            || d.sticky.values().any(|id| id == account),
+            |g| d.groups.contains_key(g),
+        );
+        let epoch = if known_placement {
+            d.epochs
+                .entry(epoch_key.clone())
+                .or_insert_with(|| Arc::new(()))
+                .clone()
+        } else {
+            Arc::new(())
+        };
         BindingLease {
+            epoch_key,
+            epoch,
             table: self.clone(),
             group: g,
             account: account.into(),
@@ -812,9 +1587,57 @@ impl BindingTable {
         hold_allowed: bool,
         hold_timed_out: bool,
     ) -> Decision {
+        self.choose_with_hold_at(
+            provider,
+            key,
+            parent,
+            model,
+            candidates,
+            pinned,
+            request_bytes,
+            hold_allowed,
+            hold_timed_out,
+            Utc::now(),
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn choose_with_hold_at(
+        self: &Arc<Self>,
+        provider: Provider,
+        key: Option<&str>,
+        parent: Option<&str>,
+        model: Option<&str>,
+        candidates: &[Candidate],
+        pinned: Option<&str>,
+        request_bytes: u64,
+        hold_allowed: bool,
+        hold_timed_out: bool,
+        now: DateTime<Utc>,
+    ) -> Decision {
+        let _mutation = self.mutations.lock().unwrap_or_else(|e| e.into_inner());
         let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
-        let now = Utc::now();
+        for c in candidates {
+            if let Some(snapshot) = &c.quota {
+                d.placements
+                    .entry(c.account.id.clone())
+                    .or_default()
+                    .observe(snapshot);
+            }
+        }
         self.prune(&mut d, now);
+        // Current positive full-input evidence must constrain the choice,
+        // rather than being recorded after approving a move. A handshake's
+        // zero bytes never creates known full-context cost.
+        if let Some(key) = key.filter(|_| request_bytes > 0)
+            && d.groups.contains_key(group(key))
+            && !d.unknown_cost.contains(group(key))
+        {
+            let known = d
+                .last_request_bytes
+                .entry(group(key).to_owned())
+                .or_default();
+            *known = (*known).max(request_bytes);
+        }
         let (choice, reason) = self.select(
             &d,
             provider,
@@ -831,9 +1654,60 @@ impl BindingTable {
             PreviewDecision::None => return Decision::None,
             PreviewDecision::Selected { account } => account,
         };
+        if let Some(key) = key {
+            let mut extra = BTreeSet::new();
+            if !d.bindings.contains_key(key) {
+                extra.insert(key);
+            }
+            if let Some(parent) =
+                parent.filter(|p| group(p) == group(key) && !d.bindings.contains_key(*p))
+            {
+                extra.insert(parent);
+            }
+            let mut weight = d.snapshot_weight;
+            if let Some(entry) = d.groups.get(group(key))
+                && entry.account != account
+            {
+                for key in &entry.keys {
+                    weight = weight
+                        .saturating_sub(binding_bound(key, &entry.account))
+                        .saturating_add(binding_bound(key, &account));
+                }
+            }
+            weight = extra.iter().fold(weight, |n, key| {
+                n.saturating_add(binding_bound(key, &account))
+            });
+            if d.bindings.len().saturating_add(extra.len()) > CAPACITY * 2
+                || weight as u64 + 64 > SNAPSHOT_MAX_BYTES
+            {
+                tracing::warn!(
+                    code = "binding_capacity",
+                    "New binding refused at the restore-safe snapshot bound"
+                );
+                return Decision::Blocked;
+            }
+        }
+        let previous = key
+            .and_then(|key| d.groups.get(group(key)))
+            .map(|g| g.account.clone());
+        drop(d);
+        if self
+            .policies
+            .dispatch(key, &account, previous.as_deref(), reason, now)
+            .is_err()
+        {
+            tracing::warn!(
+                code = "routing_policy_blocked",
+                "Routing intent could not authorize dispatch"
+            );
+            return Decision::Blocked;
+        }
+        let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
         let mut moves = Vec::new();
         if let Some(k) = key {
             let g = group(k);
+            let accepted = Self::accepted_in(&d, Some(k), &account);
+            let selected_reason = reason;
             let reason = if hold_timed_out {
                 "reset_hold_timeout"
             } else {
@@ -851,14 +1725,47 @@ impl BindingTable {
                 keys.insert(p.into());
             }
             if from.as_deref() != Some(&account) {
+                let candidate = candidates
+                    .iter()
+                    .find(|c| c.account.id == account)
+                    .expect("selection came from candidates");
+                let (evidence, placed_since_obs) = placement_evidence(candidate, &d, now);
+                let capped = evidence == PlacementEvidence::Weak
+                    && placed_since_obs >= self.config.weak_evidence_new_sessions;
+                // C5 recovery is a placement; step-1 debug pins and step-2
+                // inheritance remain exempt even when the account changes.
+                let is_placement =
+                    selected_reason != "inherited" && pinned != Some(account.as_str());
+                if is_placement {
+                    let seq = self.begin_usage_observation();
+                    d.placements
+                        .entry(account.clone())
+                        .or_default()
+                        .placed(now, seq);
+                }
+                d.epochs.remove(g);
                 moves.push(MoveEvent {
                     key: g.to_owned(),
                     from: from.clone(),
                     to: account.clone(),
-                    reason: if from.is_none() { "new" } else { reason }.into(),
+                    reason: if from.is_none() && selected_reason == "new" {
+                        "new"
+                    } else {
+                        reason
+                    }
+                    .into(),
                     bytes: request_bytes,
                     keys: keys.len(),
                     debug_pin: pinned == Some(account.as_str()),
+                    evidence,
+                    placement_charge_pct: if is_placement {
+                        self.config.placement_allowance_pct
+                    } else {
+                        0.0
+                    },
+                    capped,
+                    placed_since_obs,
+                    is_placement,
                 });
                 if from.is_some() {
                     d.after_move.insert(g.into());
@@ -866,12 +1773,19 @@ impl BindingTable {
             }
             for k in &keys {
                 let previous = d.bindings.get(k).cloned();
+                if let Some(previous) = &previous {
+                    d.snapshot_weight = d
+                        .snapshot_weight
+                        .saturating_sub(binding_bound(&previous.key, &previous.account));
+                }
+                d.snapshot_weight = d.snapshot_weight.saturating_add(binding_bound(k, &account));
                 d.bindings.insert(
                     k.clone(),
                     Binding {
                         key: k.clone(),
                         account: account.clone(),
                         last_used,
+                        accepted: Some(accepted),
                         first_seen_at: previous.as_ref().map_or(Some(now), |b| b.first_seen_at),
                         bound_since: if from.as_deref() != Some(account.as_str()) {
                             Some(now)
@@ -892,11 +1806,22 @@ impl BindingTable {
                     last_used,
                 },
             );
-            d.last_request_bytes.insert(g.to_owned(), request_bytes);
-            d.overload_marks.remove(g);
+            if k != g && !d.last_request_bytes.contains_key(g) {
+                d.unknown_cost.insert(g.to_owned());
+            }
+            if request_bytes > 0 && !d.unknown_cost.contains(g) {
+                let known = d.last_request_bytes.entry(g.to_owned()).or_default();
+                *known = (*known).max(request_bytes);
+            }
+            if selected_reason != "mark_wait" {
+                d.overload_marks.remove(g);
+            }
             d.changed();
-        } else {
-            d.sticky.insert(provider.as_str().into(), account.clone());
+        } else if let Some(old) = d.sticky.insert(provider.as_str().into(), account.clone())
+            && old != account
+        {
+            d.accepted_unbound.remove(&old);
+            d.epochs.remove(&format!("unbound:{old}"));
         }
         let lease = self.reserve(&mut d, key, &account);
         self.prune(&mut d, now);
@@ -950,12 +1875,24 @@ impl BindingTable {
         now: DateTime<Utc>,
         hold_allowed: bool,
     ) -> (PreviewDecision, &'static str) {
+        let plan = self.policies.plan(key);
+        let strict_anchor = plan.anchor.clone().or_else(|| {
+            key.and_then(|k| self.retained_binding(d, k, now))
+                .map(|b| b.account.clone())
+        });
         let entries: Vec<_> = candidates
             .iter()
             .filter(|c| c.account.provider == provider)
+            .filter(|c| {
+                plan.settings.mode != crate::routing::Mode::Strict
+                    || strict_anchor
+                        .as_ref()
+                        .is_none_or(|anchor| anchor == &c.account.id)
+            })
             .map(|c| {
-                let eligible =
-                    effective_account(c, d, &self.config, model, now).eligible_at(model, now);
+                let eligible = effective_account(c, d, &self.config, model, now)
+                    .eligible_at(model, now)
+                    && (!c.account.drain || Self::accepted_in(d, key, &c.account.id));
                 (c, eligible)
             })
             .collect();
@@ -966,7 +1903,22 @@ impl BindingTable {
         {
             return (PreviewDecision::Selected { account: id.into() }, "forced");
         }
-        let bound = key.and_then(|k| self.retained_binding(d, k, now)).cloned();
+        let mut bound = key.and_then(|k| self.retained_binding(d, k, now)).cloned();
+        // A synchronously saved anchor wins over an older write-behind binding.
+        if let (Some(anchor), Some(key)) = (&plan.anchor, key) {
+            let b = bound.get_or_insert_with(|| Binding {
+                key: key.to_owned(),
+                account: anchor.clone(),
+                last_used: now,
+                accepted: None,
+                first_seen_at: None,
+                bound_since: None,
+                client_kind: None,
+                observed_here: false,
+            });
+            b.account = anchor.clone();
+        }
+        let bound_account = bound.as_ref().map(|b| b.account.clone());
         let mut reason = "new";
         if let Some(b) = bound {
             reason = "forced";
@@ -978,20 +1930,17 @@ impl BindingTable {
                         until,
                         scope,
                     } = &c.account.health
+                    && let Some(quota) = &c.account.quota_cooling
                     && *until > now
                     && (scope == "account"
                         || scope
                             .strip_prefix("model:")
                             .is_some_and(|m| model == Some(m)))
                 {
-                    let reset = c
-                        .account
-                        .quota_cooling
-                        .as_ref()
-                        .map_or(*until, |q| q.reset_at);
+                    let reset = quota.reset_at;
                     if reset > now
                         && (reset - now).to_std().is_ok_and(|wait| {
-                            wait <= Duration::from_secs(self.config.reset_hold_secs)
+                            wait <= Duration::from_secs(plan.settings.reset_wait_secs)
                         })
                     {
                         return (PreviewDecision::Hold { until: reset }, reason);
@@ -1009,16 +1958,90 @@ impl BindingTable {
                         "reset hold skipped"
                     );
                 }
+                if *eligible && plan.settings.mode != crate::routing::Mode::Rebalance {
+                    return (
+                        PreviewDecision::Selected {
+                            account: b.account.clone(),
+                        },
+                        if self.has_overload_mark(d, &b.key, now) {
+                            "mark_wait"
+                        } else {
+                            "forced"
+                        },
+                    );
+                }
+                if *eligible && d.active.contains_key(group(&b.key)) {
+                    return (
+                        PreviewDecision::Selected {
+                            account: b.account.clone(),
+                        },
+                        if self.has_overload_mark(d, &b.key, now) {
+                            "mark_wait"
+                        } else {
+                            "forced"
+                        },
+                    );
+                }
                 let marked = self.has_overload_mark(d, &b.key, now);
                 if marked && *eligible {
-                    let room_elsewhere = entries.iter().any(|(candidate, eligible)| {
-                        candidate.account.id != b.account
-                            && *eligible
-                            && !candidate.account.drain
-                            && metrics(candidate, d, &self.config, now).gate
-                            && self.active_sessions_in(d, &candidate.account.id, now)
-                                < self.spread_threshold_for(&candidate.account.id)
-                    });
+                    let known_cost = !d.unknown_cost.contains(group(&b.key))
+                        && d.last_request_bytes
+                            .get(group(&b.key))
+                            .is_some_and(|n| *n > 0 && *n <= self.config.churn.max_move_bytes);
+                    let room_elsewhere = known_cost
+                        && entries.iter().any(|(candidate, eligible)| {
+                            candidate.account.id != b.account
+                                && *eligible
+                                && d.overload_marks
+                                    .get(group(&b.key))
+                                    .is_some_and(|mark| mark.from == b.account)
+                                && self.rebalance_target(
+                                    d,
+                                    &b.account,
+                                    candidate,
+                                    Some(group(&b.key)),
+                                    now,
+                                )
+                                && self.policies.discretionary_allowed(
+                                    &b.key,
+                                    Some(&candidate.account.id),
+                                    now,
+                                )
+                        });
+                    // Any discretionary veto waits on the existing mark. In
+                    // particular, fresh/uncapped targets must not erase a mark
+                    // while group, revisit, pool or cost guards are active.
+                    let guard_waiting = !known_cost
+                        || !self.policies.discretionary_allowed(&b.key, None, now)
+                        || entries.iter().any(|(candidate, eligible)| {
+                            *eligible
+                                && candidate.account.id != b.account
+                                && self.rebalance_target_waiting(
+                                    d,
+                                    &b.account,
+                                    candidate,
+                                    Some(group(&b.key)),
+                                    now,
+                                )
+                                && (placement_capped(candidate, d, &self.config, now)
+                                    || !self.policies.discretionary_allowed(
+                                        &b.key,
+                                        Some(&candidate.account.id),
+                                        now,
+                                    ))
+                        });
+                    if !room_elsewhere
+                        && guard_waiting
+                        && self.active_sessions_in(d, &b.account, now)
+                            > self.spread_threshold_for(&b.account)
+                    {
+                        return (
+                            PreviewDecision::Selected {
+                                account: b.account.clone(),
+                            },
+                            "mark_wait",
+                        );
+                    }
                     if !room_elsewhere
                         || self.active_sessions_in(d, &b.account, now)
                             <= self.spread_threshold_for(&b.account)
@@ -1044,9 +2067,14 @@ impl BindingTable {
                     let cold =
                         !protected(d, g) && idle(now, last) >= self.config.rebalance_idle_secs;
                     if !cold
+                        || !self.policies.discretionary_allowed(&b.key, None, now)
+                        || d.unknown_cost.contains(group(&b.key))
+                        || d.last_request_bytes.get(group(&b.key)).is_none_or(|bytes| {
+                            *bytes == 0 || *bytes > self.config.churn.max_move_bytes
+                        })
                         || (!at_capacity
                             && !c.account.drain
-                            && metrics(c, d, &self.config, now).gate)
+                            && metrics_without_placement_charge(c, d, &self.config, now).gate)
                     {
                         return (
                             PreviewDecision::Selected {
@@ -1067,7 +2095,7 @@ impl BindingTable {
                     PreviewDecision::Selected {
                         account: p.account.clone(),
                     },
-                    reason,
+                    "inherited",
                 );
             }
         } else if key.is_none()
@@ -1088,6 +2116,21 @@ impl BindingTable {
             .filter(|(c, eligible)| !c.account.drain && *eligible)
             .map(|(c, _)| (c, metrics(c, d, &self.config, now)))
             .collect();
+        let eligible: Vec<_> = eligible
+            .into_iter()
+            .filter(|(c, _)| {
+                if !matches!(reason, "overload" | "cold_rebalance") {
+                    return true;
+                }
+                bound_account.as_ref().is_some_and(|source| {
+                    source != &c.account.id
+                        && self.rebalance_target_base(d, source, c, key.map(group), now)
+                }) && key.is_some_and(|key| {
+                    self.policies
+                        .discretionary_allowed(key, Some(&c.account.id), now)
+                })
+            })
+            .collect();
         let has_gate = eligible.iter().any(|(_, m)| m.gate);
         let pool: Vec<_> = eligible
             .iter()
@@ -1095,6 +2138,7 @@ impl BindingTable {
             .collect();
         let has_room = pool.iter().any(|(c, _)| {
             self.active_sessions_in(d, &c.account.id, now)
+                + self.reserved_in(d, &c.account.id, key.map(group), now)
                 < self.spread_threshold_for(&c.account.id)
         });
         let mut partition: Vec<_> = pool
@@ -1102,18 +2146,66 @@ impl BindingTable {
             .filter(|(c, _)| {
                 !has_room
                     || self.active_sessions_in(d, &c.account.id, now)
+                        + self.reserved_in(d, &c.account.id, key.map(group), now)
                         < self.spread_threshold_for(&c.account.id)
             })
             .collect();
         if reason == "overload" {
             partition.retain(|(c, m)| {
                 m.gate
-                    && self.active_sessions_in(d, &c.account.id, now)
-                        < self.spread_threshold_for(&c.account.id)
+                    && key
+                        .and_then(|key| d.overload_marks.get(group(key)))
+                        .is_some_and(|mark| {
+                            mark.from != c.account.id
+                                && self.rebalance_target_base(d, &mark.from, c, key.map(group), now)
+                                && key.is_some_and(|key| {
+                                    self.policies.discretionary_allowed(
+                                        key,
+                                        Some(&c.account.id),
+                                        now,
+                                    )
+                                })
+                        })
             });
         }
+        if reason == "cold_rebalance" {
+            partition.retain(|(c, _)| {
+                bound_account.as_ref().is_some_and(|source| {
+                    source != &c.account.id
+                        && self.rebalance_target_base(d, source, c, key.map(group), now)
+                }) && key.is_some_and(|key| {
+                    self.policies
+                        .discretionary_allowed(key, Some(&c.account.id), now)
+                })
+            });
+        }
+        if matches!(reason, "overload" | "cold_rebalance") {
+            // A discretionary move cannot bypass a capped, non-pacing target
+            // by reviving a pacing alternative. Resolve room, pacing, then cap.
+            if partition
+                .iter()
+                .any(|(c, _)| !d.pacing.get(&c.account.id).copied().unwrap_or(false))
+            {
+                partition.retain(|(c, _)| !d.pacing.get(&c.account.id).copied().unwrap_or(false));
+            }
+            partition.retain(|(c, _)| !placement_capped(c, d, &self.config, now));
+        }
+        if partition.is_empty()
+            && matches!(reason, "cold_rebalance" | "overload")
+            && let Some(account) = bound_account
+        {
+            return (
+                PreviewDecision::Selected { account },
+                if reason == "overload" {
+                    "mark_wait"
+                } else {
+                    "forced"
+                },
+            );
+        }
         let ratio = |c: &Candidate| {
-            self.active_sessions_in(d, &c.account.id, now) as f64
+            (self.active_sessions_in(d, &c.account.id, now)
+                + self.reserved_in(d, &c.account.id, key.map(group), now)) as f64
                 / self.spread_threshold_for(&c.account.id) as f64
         };
         let min_ratio = partition
@@ -1123,44 +2215,37 @@ impl BindingTable {
         if !has_room && let Some(minimum) = min_ratio {
             partition.retain(|(c, _)| ratio(c) == minimum);
         }
-        let non_pacing = partition
+        // Step 4: form the gate-passing set before any pacing/cap ordering.
+        // A lower-count or uncapped failing account must never displace it.
+        let mut gated: Vec<_> = partition
             .iter()
-            .any(|(c, _)| !d.pacing.get(&c.account.id).copied().unwrap_or(false));
-        if non_pacing {
-            partition.retain(|(c, _)| !d.pacing.get(&c.account.id).copied().unwrap_or(false));
-        }
-        let mut gated: Vec<_> = partition.iter().filter(|(_, m)| m.gate).collect();
-        // Anchor the first reset cohort; pairwise approximate comparisons are
-        // non-transitive and cannot be used as a sorting comparator.
-        let anchor = gated
-            .iter()
-            .filter(|(_, m)| !m.unknown)
-            .filter_map(|(_, m)| m.weekly)
-            .min();
-        gated.sort_by(|(a, x), (b, y)| {
-            let cohort = |t: Option<DateTime<Utc>>| match (anchor, t) {
-                (Some(start), Some(t)) if (t - start).num_seconds() <= 10800 => (0, None),
-                (_, Some(t)) => (1, Some(t)),
-                (_, None) => (2, None),
-            };
-            x.unknown
-                .cmp(&y.unknown)
-                .then_with(|| cohort(x.weekly).cmp(&cohort(y.weekly)))
-                .then_with(|| x.five.is_none().cmp(&y.five.is_none()))
-                .then_with(|| x.five.cmp(&y.five))
-                .then_with(|| x.usage.total_cmp(&y.usage))
-                .then_with(|| a.account.id.cmp(&b.account.id))
-        });
-        let chosen = gated.first().map(|(c, _)| *c).or_else(|| {
-            partition
+            .filter(|entry| entry.1.gate)
+            .map(|entry| (entry.0, &entry.1))
+            .collect();
+        let chosen = if !gated.is_empty() {
+            prefer_pacing_and_evidence(&mut gated, d, &self.config, now);
+            // Approximate reset cohorts require one fixed anchor.
+            let anchor = gated
+                .iter()
+                .filter(|(_, m)| !m.unknown)
+                .filter_map(|(_, m)| m.weekly)
+                .min();
+            gated.sort_by(|(a, x), (b, y)| compare_gated(a, x, b, y, anchor));
+            gated.first().map(|(candidate, _)| *candidate)
+        } else {
+            // Step 5: only when this set has no passing gate, apply its own
+            // pacing/cap ordering and then choose the most headroom.
+            let mut fallback: Vec<_> = partition.iter().map(|entry| (entry.0, &entry.1)).collect();
+            prefer_pacing_and_evidence(&mut fallback, d, &self.config, now);
+            fallback
                 .iter()
                 .min_by(|(a, x), (b, y)| {
                     x.usage
                         .total_cmp(&y.usage)
                         .then_with(|| a.account.id.cmp(&b.account.id))
                 })
-                .map(|(c, _)| *c)
-        });
+                .map(|(candidate, _)| *candidate)
+        };
         (
             chosen.map_or(PreviewDecision::None, |c| PreviewDecision::Selected {
                 account: c.account.id.clone(),
@@ -1174,17 +2259,28 @@ impl BindingTable {
     }
     /// Takeover only: reject import while any request or socket owns the table.
     pub fn import(&self, value: Value) -> Result<()> {
-        let mut next = decode(value)?;
-        let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        let _mutation = self.mutations.lock().unwrap_or_else(|e| e.into_inner());
+        let d = self.data.lock().unwrap_or_else(|e| e.into_inner());
         if !d.active.is_empty() || !d.pins.is_empty() || !d.pending.is_empty() {
             bail!("cannot import active binding table");
         }
+        drop(d);
+        self.policies.begin_recovery();
+        self.policies.reload()?;
+        let mut next = decode_scoped(value, self.policies.requires_strict_recovery())?;
+        self.policies.capture_strict_anchors(
+            next.groups
+                .iter()
+                .map(|(key, g)| (key.as_str(), g.account.as_str())),
+        )?;
+        let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
         self.prune(&mut next, Utc::now());
         // Import must advance the existing table's revision, rather than use
         // the decoded default: a flush may already own an older snapshot.
         next.revision = d.revision;
         next.changed();
         *d = next;
+        self.policies.finish_recovery();
         Ok(())
     }
     pub fn flush(&self) -> Result<()> {
@@ -1193,7 +2289,10 @@ impl BindingTable {
     /// Finish the last snapshot under the writer lock, then retire this
     /// process as a state-file writer while its streams finish in memory.
     pub fn freeze(&self) -> Result<()> {
-        self.flush_with_mode(atomic_write, true)
+        let _mutation = self.mutations.lock().unwrap_or_else(|e| e.into_inner());
+        self.flush_with_mode(atomic_write, true)?;
+        self.policies.freeze();
+        Ok(())
     }
     fn flush_with(&self, write: impl FnOnce(&Path, &[u8]) -> std::io::Result<()>) -> Result<()> {
         self.flush_with_mode(write, false)
@@ -1220,7 +2319,21 @@ impl BindingTable {
             }
             (snapshot(&d), d.revision)
         };
-        write(&self.path, &serde_json::to_vec(&state)?)?;
+        if state.bindings.len() > CAPACITY * 2
+            || state
+                .bindings
+                .iter()
+                .map(|b| binding_bound(&b.key, &b.account))
+                .fold(64usize, usize::saturating_add) as u64
+                > SNAPSHOT_MAX_BYTES
+        {
+            bail!("binding snapshot cannot be restored within its bounds");
+        }
+        let bytes = serde_json::to_vec(&state)?;
+        if bytes.len() as u64 > SNAPSHOT_MAX_BYTES {
+            bail!("binding snapshot byte cap exceeded");
+        }
+        write(&self.path, &bytes)?;
         let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
         if d.revision == revision {
             d.dirty = false;
@@ -1248,6 +2361,27 @@ struct Metrics {
     five: Option<DateTime<Utc>>,
     usage: f64,
 }
+fn compare_gated(
+    a: &Candidate,
+    x: &Metrics,
+    b: &Candidate,
+    y: &Metrics,
+    anchor: Option<DateTime<Utc>>,
+) -> std::cmp::Ordering {
+    let cohort = |t: Option<DateTime<Utc>>| match (anchor, t) {
+        (Some(start), Some(t)) if (t - start).num_seconds() <= 10800 => (0, None),
+        (_, Some(t)) => (1, Some(t)),
+        (_, None) => (2, None),
+    };
+    x.unknown
+        .cmp(&y.unknown)
+        .then_with(|| cohort(x.weekly).cmp(&cohort(y.weekly)))
+        .then_with(|| x.five.is_none().cmp(&y.five.is_none()))
+        .then_with(|| x.five.cmp(&y.five))
+        .then_with(|| x.usage.total_cmp(&y.usage))
+        .then_with(|| a.account.id.cmp(&b.account.id))
+}
+
 fn date(v: &Value) -> Option<DateTime<Utc>> {
     v.as_str()
         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
@@ -1310,6 +2444,110 @@ fn account_window(provider: Provider, w: &Value) -> Option<bool> {
         _ => None,
     }
 }
+// C9 names Codex primary/secondary windows by their actual duration, including
+// free-plan 43200m and non-minute poll durations. Track their evidence/cost;
+// account_window applies C7's provider-specific duration slots for selection.
+fn placement_account_window(w: &Value) -> bool {
+    let Some(name) = w["name"].as_str() else {
+        return false;
+    };
+    if matches!(name, "primary" | "secondary") {
+        return true;
+    }
+    if name.len() < 2
+        || name.len() > 21
+        || !matches!(name.as_bytes().last(), Some(b's' | b'm' | b'h' | b'd'))
+    {
+        return false;
+    }
+    let digits = &name[..name.len() - 1];
+    digits.bytes().all(|byte| byte.is_ascii_digit())
+        && digits.parse::<u64>().is_ok_and(|duration| duration > 0)
+}
+fn placement_poll(
+    id: &str,
+    state: &PlacementState,
+    now: DateTime<Utc>,
+    through: Option<u64>,
+    after_secs: u64,
+) -> Option<PlacementPoll> {
+    let sequence = state.latest?;
+    if through.is_some_and(|at| sequence <= at) {
+        return None;
+    }
+    let delay = chrono::Duration::from_std(Duration::from_secs(after_secs)).ok()?;
+    let due_at = state
+        .poll_deadlines
+        .iter()
+        .filter(|deadline| through.is_none_or(|at| deadline.through > at))
+        .filter_map(|deadline| deadline.at.checked_add_signed(delay))
+        .min()?;
+    (due_at <= now).then(|| PlacementPoll {
+        account: id.to_owned(),
+        placement_at: state.latest_at.expect("placement has time"),
+        placement_seq: sequence,
+        due_at,
+    })
+}
+fn prefer_non_pacing<T>(pool: &mut Vec<(&Candidate, T)>, d: &Data) {
+    let non_pacing = pool
+        .iter()
+        .any(|(c, _)| !d.pacing.get(&c.account.id).copied().unwrap_or(false));
+    if non_pacing {
+        pool.retain(|(c, _)| !d.pacing.get(&c.account.id).copied().unwrap_or(false));
+    }
+}
+// Call separately for the step-4 gate-passing set or step-5 fallback set,
+// after that step's room/ratio partition. This helper never admits a candidate.
+fn prefer_pacing_and_evidence(
+    pool: &mut Vec<(&Candidate, &Metrics)>,
+    d: &Data,
+    cfg: &RoutingConfig,
+    now: DateTime<Utc>,
+) {
+    prefer_non_pacing(pool, d);
+    if pool.iter().any(|(c, _)| !placement_capped(c, d, cfg, now)) {
+        pool.retain(|(c, _)| !placement_capped(c, d, cfg, now));
+    } else if let Some(minimum) = pool
+        .iter()
+        .map(|(c, _)| placement_evidence(c, d, now).1)
+        .min()
+    {
+        pool.retain(|(c, _)| placement_evidence(c, d, now).1 == minimum);
+    }
+}
+fn placement_capped(c: &Candidate, d: &Data, cfg: &RoutingConfig, now: DateTime<Utc>) -> bool {
+    let (evidence, count) = placement_evidence(c, d, now);
+    evidence == PlacementEvidence::Weak && count >= cfg.weak_evidence_new_sessions
+}
+fn placement_state(c: &Candidate, d: &Data) -> PlacementState {
+    let mut state = d.placements.get(&c.account.id).cloned().unwrap_or_default();
+    if let Some(snapshot) = &c.quota {
+        state.observe(snapshot);
+    }
+    state
+}
+fn placement_evidence(c: &Candidate, d: &Data, now: DateTime<Utc>) -> (PlacementEvidence, usize) {
+    let state = placement_state(c, d);
+    (
+        if state.weak(now) {
+            PlacementEvidence::Weak
+        } else {
+            PlacementEvidence::Fresh
+        },
+        state.count(),
+    )
+}
+fn metrics_without_placement_charge(
+    c: &Candidate,
+    d: &Data,
+    cfg: &RoutingConfig,
+    now: DateTime<Utc>,
+) -> Metrics {
+    let mut config = cfg.clone();
+    config.placement_allowance_pct = 0.0;
+    metrics(c, d, &config, now)
+}
 fn metrics(c: &Candidate, d: &Data, cfg: &RoutingConfig, now: DateTime<Utc>) -> Metrics {
     let mut m = Metrics {
         gate: true,
@@ -1329,6 +2567,7 @@ fn metrics(c: &Candidate, d: &Data, cfg: &RoutingConfig, now: DateTime<Utc>) -> 
         .copied()
         .unwrap_or(0)
         .max(c.inflight);
+    let state = placement_state(c, d);
     let mut seen = false;
     let mut slot_usage = [None::<f64>; 2];
     for w in windows {
@@ -1339,18 +2578,20 @@ fn metrics(c: &Candidate, d: &Data, cfg: &RoutingConfig, now: DateTime<Utc>) -> 
         let reset = date(&w["reset_at"]);
         let expired = reset.is_some_and(|r| r <= now);
         let reset = reset.filter(|r| *r > now);
+        let charge = cfg.placement_allowance_pct
+            * state.charge_count(w["name"].as_str().expect("gating window")) as f64;
         let usage = if expired {
-            Some(cfg.inflight_allowance_pct * pending as f64)
+            Some(cfg.inflight_allowance_pct * pending as f64 + charge)
         } else if stale_window(c, d, w, now) {
             None
         } else {
             w["used_pct"]
                 .as_f64()
                 .filter(|n| n.is_finite() && *n >= 0.0)
-                .map(|n| n + cfg.inflight_allowance_pct * pending as f64)
+                .map(|n| n + cfg.inflight_allowance_pct * pending as f64 + charge)
         };
-        // C7: every window gates independently, but the highest projected
-        // usage supplies its slot's reset key. Unknown/stale still sorts last.
+        // Gate every window; the highest projected usage (including D20
+        // charges) supplies its slot's reset key. Unknown still sorts last.
         let projected = usage.unwrap_or(f64::INFINITY);
         let slot = if weekly { &mut m.weekly } else { &mut m.five };
         let previous = &mut slot_usage[usize::from(weekly)];
@@ -1358,8 +2599,6 @@ fn metrics(c: &Candidate, d: &Data, cfg: &RoutingConfig, now: DateTime<Utc>) -> 
             *previous = Some(projected);
             *slot = reset;
         } else if *previous == Some(projected) {
-            // Equal usage retains the earlier started reset, independent of
-            // input order; unstarted windows stay last on a reset tie-break.
             *slot = match (*slot, reset) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
@@ -1391,10 +2630,19 @@ fn metrics(c: &Candidate, d: &Data, cfg: &RoutingConfig, now: DateTime<Utc>) -> 
     }
     m
 }
-fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension(format!("{:032x}.tmp", rand::random::<u128>()));
     let result = (|| {
-        let mut file = OpenOptions::new().create_new(true).write(true).open(&tmp)?;
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
+        #[cfg(windows)]
+        crate::local_secrets::restrict(&tmp).map_err(std::io::Error::other)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
@@ -1402,7 +2650,9 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         {
             use std::os::windows::ffi::OsStrExt;
             use windows::{
-                Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MoveFileExW},
+                Win32::Storage::FileSystem::{
+                    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+                },
                 core::PCWSTR,
             };
             let src: Vec<u16> = tmp.as_os_str().encode_wide().chain(Some(0)).collect();
@@ -1411,14 +2661,19 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
                 MoveFileExW(
                     PCWSTR(src.as_ptr()),
                     PCWSTR(dst.as_ptr()),
-                    MOVEFILE_REPLACE_EXISTING,
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
                 )
             }
             .map_err(std::io::Error::other)
         }
         #[cfg(not(windows))]
         {
-            fs::rename(&tmp, path)
+            fs::rename(&tmp, path)?;
+            fs::File::open(
+                path.parent()
+                    .ok_or_else(|| std::io::Error::other("missing state directory"))?,
+            )?
+            .sync_all()
         }
     })();
     if result.is_err() {
@@ -1434,7 +2689,7 @@ mod tests {
     use chrono::Duration as Delta;
     use serde_json::json;
 
-    fn candidate(id: &str, used: f64, weekly_hours: i64, five_hours: i64) -> Candidate {
+    pub(super) fn candidate(id: &str, used: f64, weekly_hours: i64, five_hours: i64) -> Candidate {
         let now = Utc::now();
         Candidate {
             account: Account {
@@ -1463,14 +2718,14 @@ mod tests {
                 generation: 0,
                 token_meta: TokenMeta::default(),
             },
-            quota: Some(json!({"windows":[
+            quota: Some(json!({"observed_at":now,"windows":[
                 {"name":"5h","used_pct":used,"reset_at":now+Delta::hours(five_hours),"observed_at":now},
                 {"name":"7d","used_pct":used,"reset_at":now+Delta::hours(weekly_hours),"observed_at":now}
             ]})),
             inflight: 0,
         }
     }
-    fn fixture_dir() -> tempfile::TempDir {
+    pub(super) fn fixture_dir() -> tempfile::TempDir {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
@@ -1483,10 +2738,48 @@ mod tests {
             .tempdir_in(root)
             .unwrap()
     }
+    fn strict_root_policy(home: &Path, key: &str) -> crate::routing::PolicyStore {
+        let store = crate::routing::PolicyStore::new(
+            home,
+            crate::routing::Settings {
+                mode: crate::routing::Mode::Rebalance,
+                reset_wait_secs: 60,
+            },
+        )
+        .unwrap();
+        store
+            .set_session(
+                &crate::routing::session_id(key),
+                Some(crate::routing::Settings {
+                    mode: crate::routing::Mode::Strict,
+                    reset_wait_secs: 0,
+                }),
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(store.requires_strict_recovery());
+        assert_eq!(
+            store.plan(Some(key)).settings.mode,
+            crate::routing::Mode::Strict
+        );
+        store
+    }
     fn table() -> (tempfile::TempDir, Arc<BindingTable>) {
         let dir = fixture_dir();
         let t = BindingTable::new(dir.path(), RoutingConfig::default()).unwrap();
         (dir, t)
+    }
+    /// These older cases isolate cold placement/drain mechanics. Churn defaults
+    /// are exercised separately with clocks and actual alternating failures.
+    fn cold_table() -> (tempfile::TempDir, Arc<BindingTable>) {
+        let dir = fixture_dir();
+        let mut config = RoutingConfig::default();
+        config.churn.dwell_secs = 0;
+        config.churn.revisit_secs = 0;
+        config.churn.max_group_moves = 16;
+        let table = BindingTable::new(dir.path(), config).unwrap();
+        (dir, table)
     }
     fn choose(
         t: &Arc<BindingTable>,
@@ -1498,7 +2791,10 @@ mod tests {
                 account,
                 lease,
                 moves,
-            } => (account, lease, moves),
+            } => {
+                lease.dispatched();
+                (account, lease, moves)
+            }
             other => panic!("{other:?}"),
         }
     }
@@ -1538,7 +2834,14 @@ mod tests {
     }
     #[test]
     fn reservation_uses_max_not_sum_and_burst_spreads() {
-        let (_dir, t) = table();
+        let dir = fixture_dir();
+        // Isolate max(runtime reservations, relay inflight): D20's separate
+        // placement charge must not obscure the 89 + 1 = 90 assertion.
+        let config = RoutingConfig {
+            placement_allowance_pct: 0.0,
+            ..RoutingConfig::default()
+        };
+        let t = BindingTable::new(dir.path(), config).unwrap();
         let mut cs = vec![candidate("a", 89.0, 8, 1), candidate("b", 10.0, 30, 2)];
         let (id, lease, _) = choose(&t, Some("claude:one"), &cs);
         assert_eq!(id, "a");
@@ -1600,12 +2903,466 @@ mod tests {
         assert_eq!(preview(&t, &[a, b]), "b");
     }
     #[test]
+    fn unbound_selection_without_dispatch_does_not_create_drain_privilege() {
+        let (_dir, t) = table();
+        let mut a = candidate("a", 10.0, 8, 1);
+        let b = candidate("b", 5.0, 30, 2);
+        let pending = t.choose(Provider::Claude, None, None, None, &[a.clone()], None, 42);
+        assert!(!t.existing_placement(None, "a"));
+        a.account.drain = true;
+        assert_eq!(choose(&t, None, &[a, b]).0, "b");
+        if let Decision::Selected { lease, .. } = &pending {
+            lease.dispatched();
+        }
+        assert!(
+            !t.existing_placement(None, "a"),
+            "a stale admission cannot warm the successor"
+        );
+        assert!(t.existing_placement(None, "b"));
+    }
+    #[test]
+    fn aba_old_receipt_cannot_warm_a_new_placement_for_root_or_unbound() {
+        for key in [Some("claude:aba"), None] {
+            let (_dir, t) = table();
+            let cs = [candidate("a", 10.0, 8, 1), candidate("b", 10.0, 30, 2)];
+            let choose_raw =
+                |id| match t.choose(Provider::Claude, key, None, None, &cs, Some(id), 42) {
+                    Decision::Selected { lease, .. } => lease,
+                    other => panic!("{other:?}"),
+                };
+            let old_a = choose_raw("a");
+            let b = choose_raw("b");
+            let new_a = choose_raw("a");
+            old_a.dispatched();
+            b.dispatched();
+            assert!(
+                !t.existing_placement(key, "a"),
+                "old A→B→A receipt authorized new A"
+            );
+            new_a.dispatched();
+            assert!(t.existing_placement(key, "a"));
+        }
+    }
+    #[test]
+    fn oversized_binding_file_is_refused_before_legacy_anchor_capture() {
+        let dir = fixture_dir();
+        fs::create_dir_all(dir.path().join("state")).unwrap();
+        let file = fs::File::create(dir.path().join("state/bindings.json")).unwrap();
+        file.set_len(SNAPSHOT_MAX_BYTES + 1).unwrap();
+        drop(file);
+        assert!(BindingTable::new(dir.path(), RoutingConfig::default()).is_err());
+    }
+    #[test]
+    fn strict_corrupt_snapshot_is_retained_and_cannot_be_reinterpreted_as_first_placement() {
+        for raw in [b"{".as_slice(), br#"{"schema":99,"bindings":[]}"#,
+            br#"{"schema":1,"bindings":[{"key":"codex:old","account":"cx-a","last_used":"2026-10-20T00:00:00Z"},{"key":"codex:old","account":"cx-b","last_used":"2026-10-20T00:00:00Z"}]}"#] {
+            let dir = fixture_dir();
+            let policy = strict_root_policy(dir.path(), "codex:old");
+            let policy_path = dir.path().join("state/routing-policies.json");
+            let policy_bytes = fs::read(&policy_path).unwrap();
+            let path = dir.path().join("state/bindings.json");
+            fs::write(&path, raw).unwrap();
+            crate::local_secrets::restrict(&path).unwrap();
+            let cfg = RoutingConfig::default();
+            cfg.validate().unwrap();
+            assert_eq!(cfg.mode, crate::routing::Mode::Rebalance);
+            for _ in 0..2 {
+                let Err(error) = BindingTable::new(dir.path(), cfg.clone()) else {
+                    panic!("strict corrupt binding must refuse startup");
+                };
+                assert!(error.to_string().contains("strict binding recovery failed"), "{error:#}");
+                assert_eq!(fs::read(&path).unwrap(), raw, "refusal must retain corrupt binding evidence");
+                assert_eq!(fs::read(&policy_path).unwrap(), policy_bytes);
+                assert_eq!(policy.plan(Some("codex:old")).anchor, None,
+                    "corruption cannot be reinterpreted as strict first placement");
+            }
+        }
+    }
+    #[test]
+    fn pinned_child_capacity_refuses_growth_and_freeze_round_trips_within_reader_bounds() {
+        let (_dir, t) = table();
+        let pin = t.pin(Some("claude:bounded"));
+        {
+            let mut d = t.data.lock().unwrap();
+            let mut weight = 64usize;
+            for i in 0..CAPACITY * 2 {
+                let key = format!("claude:bounded:agent:{}{i}", "x".repeat(1024));
+                let next = binding_bound(&key, "a");
+                if weight + next > SNAPSHOT_MAX_BYTES as usize {
+                    break;
+                }
+                weight += next;
+                d.bindings.insert(
+                    key.clone(),
+                    Binding {
+                        key,
+                        account: "a".into(),
+                        last_used: Utc::now(),
+                        accepted: None,
+                        first_seen_at: None,
+                        bound_since: None,
+                        client_kind: None,
+                        observed_here: false,
+                    },
+                );
+            }
+            rebuild_indexes(&mut d);
+            d.changed();
+        }
+        let before = t.count();
+        assert!(before < CAPACITY);
+        let key = format!("claude:bounded:agent:{}", "y".repeat(2048));
+        assert!(matches!(
+            t.choose(
+                Provider::Claude,
+                Some(&key),
+                None,
+                None,
+                &[candidate("a", 10.0, 8, 1)],
+                None,
+                42
+            ),
+            Decision::Blocked
+        ));
+        assert_eq!(t.count(), before);
+        t.freeze().unwrap();
+        assert!(fs::metadata(&t.path).unwrap().len() <= SNAPSHOT_MAX_BYTES);
+        let restored = BindingTable::new(
+            t.path.parent().unwrap().parent().unwrap(),
+            RoutingConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(restored.count(), before);
+        drop(pin);
+    }
+    #[test]
+    fn unknown_reservations_cannot_accumulate_placement_epochs() {
+        let (_dir, t) = table();
+        for n in 0..=CAPACITY {
+            drop(t.begin_request(Some(&format!("claude:unknown-{n}")), "a"));
+        }
+        assert!(t.data.lock().unwrap().epochs.is_empty());
+    }
+    #[test]
+    fn strict_group_conflict_refuses_start_and_import_without_losing_the_current_state() {
+        // Both timings are explicit root policies under global rebalance.
+        for strict_before_binding in [true, false] {
+            let dir = fixture_dir();
+            let cfg = RoutingConfig::default();
+            cfg.validate().unwrap();
+            if strict_before_binding {
+                strict_root_policy(dir.path(), "claude:conflict");
+            }
+            let t = BindingTable::new(dir.path(), cfg.clone()).unwrap();
+            let (_, lease, _) = choose(&t, Some("claude:conflict"), &[candidate("a", 10.0, 8, 1)]);
+            if !strict_before_binding {
+                t.set_routing_session(
+                    &crate::routing::session_id("claude:conflict"),
+                    Some(crate::routing::Settings {
+                        mode: crate::routing::Mode::Strict,
+                        reset_wait_secs: 0,
+                    }),
+                    None,
+                    false,
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                t.policies.plan(Some("claude:conflict")).settings.mode,
+                crate::routing::Mode::Strict
+            );
+            assert!(t.policies.requires_strict_recovery());
+            drop(lease);
+            assert!(t.data.lock().unwrap().active.is_empty());
+            let before = t.export().unwrap();
+            let conflict = json!({"schema":1,"bindings":[
+                {"key":"claude:conflict","account":"a","last_used":Utc::now()},
+                {"key":"claude:conflict:agent:x","account":"b","last_used":Utc::now()}]});
+            let error = t.import(conflict.clone()).unwrap_err();
+            assert!(
+                error.to_string().contains("strict binding group"),
+                "{error:#}"
+            );
+            assert_eq!(t.export().unwrap(), before);
+            t.freeze().unwrap();
+            let bytes = serde_json::to_vec(&conflict).unwrap();
+            fs::write(&t.path, &bytes).unwrap();
+            crate::local_secrets::restrict(&t.path).unwrap();
+            let policy_path = dir.path().join("state/routing-policies.json");
+            let policy_bytes = fs::read(&policy_path).unwrap();
+            for _ in 0..2 {
+                let Err(error) = BindingTable::new(dir.path(), cfg.clone()) else {
+                    panic!("conflicting strict binding group must refuse startup");
+                };
+                assert!(
+                    format!("{error:#}").contains("strict binding group"),
+                    "{error:#}"
+                );
+                assert_eq!(fs::read(&t.path).unwrap(), bytes);
+                assert_eq!(fs::read(&policy_path).unwrap(), policy_bytes);
+            }
+        }
+    }
+    #[test]
+    fn strict_duplicate_object_field_is_refused_while_private_non_strict_corruption_is_quarantined()
+    {
+        for strict in [false, true] {
+            let dir = fixture_dir();
+            fs::create_dir_all(dir.path().join("state")).unwrap();
+            let path = dir.path().join("state/bindings.json");
+            let raw=br#"{"schema":1,"bindings":[{"key":"codex:old","account":"cx-a","account":"cx-b","last_used":"2026-10-20T00:00:00Z"}]}"#;
+            fs::write(&path, raw).unwrap();
+            crate::local_secrets::restrict(&path).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+            let cfg = RoutingConfig::default();
+            cfg.validate().unwrap();
+            if strict {
+                strict_root_policy(dir.path(), "codex:old");
+            }
+            let result = BindingTable::new(dir.path(), cfg);
+            if strict {
+                let Err(error) = result else {
+                    panic!("duplicate binding field must refuse strict recovery");
+                };
+                assert!(
+                    error.to_string().contains("strict binding recovery failed"),
+                    "{error:#}"
+                );
+                assert!(format!("{error:#}").contains("duplicate"), "{error:#}");
+                assert_eq!(fs::read(&path).unwrap(), raw);
+            } else {
+                assert_eq!(result.unwrap().count(), 0);
+                assert!(
+                    !path.exists(),
+                    "non-strict contrast never reached JSON quarantine"
+                );
+                let quarantined: Vec<_> = fs::read_dir(dir.path().join("state"))
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .filter(|path| {
+                        path.file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .starts_with("bindings.json.corrupt-")
+                    })
+                    .collect();
+                assert_eq!(quarantined.len(), 1);
+                assert_eq!(fs::read(&quarantined[0]).unwrap(), raw);
+            }
+        }
+    }
+    #[test]
+    fn legacy_twenty_thousand_normal_eighty_byte_keys_remain_readable() {
+        let dir = fixture_dir();
+        fs::create_dir_all(dir.path().join("state")).unwrap();
+        let now = Utc::now();
+        let bindings: Vec<_> = (0..CAPACITY)
+            .map(|n| json!({"key":format!("codex:{n:074}"),"account":"cx-account","last_used":now}))
+            .collect();
+        let bytes = serde_json::to_vec(&json!({"schema":1,"bindings":bindings})).unwrap();
+        assert!((bytes.len() as u64) < SNAPSHOT_MAX_BYTES);
+        let path = dir.path().join("state/bindings.json");
+        fs::write(&path, bytes).unwrap();
+        crate::local_secrets::restrict(&path).unwrap();
+        let t = BindingTable::new(dir.path(), RoutingConfig::default()).unwrap();
+        assert_eq!(t.count(), CAPACITY);
+        let original = fs::read(&path).unwrap();
+        drop(t.begin_request(Some(&format!("codex:{:074}", 0)), "cx-account"));
+        assert!(t.data.lock().unwrap().dirty);
+        t.freeze().unwrap();
+        assert_ne!(
+            fs::read(&path).unwrap(),
+            original,
+            "freeze never exercised the writer"
+        );
+        assert_eq!(
+            BindingTable::new(dir.path(), RoutingConfig::default())
+                .unwrap()
+                .count(),
+            CAPACITY
+        );
+    }
+    #[test]
+    fn legacy_policy_alias_conflict_refuses_start_and_idle_import_before_pruning() {
+        for schema in [1, 2] {
+            let dir = fixture_dir();
+            let t = BindingTable::new(dir.path(), RoutingConfig::default()).unwrap();
+            let id = crate::routing::session_id("codex:alias");
+            let mut policy = json!({"schema":schema,"revision":1,"projects":{},"sessions":{id:{"project":null,"baseline":{"mode":"rebalance","reset_wait_secs":60},"explicit":{"mode":"strict","reset_wait_secs":0},"anchor":null,"movements":[]}}});
+            if schema == 2 {
+                policy["legacy_codex_roots"] = json!([]);
+                let child = crate::routing::session_id("codex:alias:agent:x");
+                policy["sessions"][child] = json!({"project":null,
+                    "baseline":{"mode":"rebalance","reset_wait_secs":60},
+                    "explicit":{"mode":"strict","reset_wait_secs":0},
+                    "anchor":null,"movements":[]});
+            }
+            let policy_path = dir.path().join("state/routing-policies.json");
+            let policy_bytes = serde_json::to_vec(&policy).unwrap();
+            fs::write(&policy_path, &policy_bytes).unwrap();
+            crate::local_secrets::restrict(&policy_path).unwrap();
+            let value = json!({"schema":1,"bindings":[{"key":"codex:alias","account":"a","last_used":"2020-01-01T00:00:00Z"},{"key":"codex:alias:agent:x","account":"b","last_used":"2020-01-01T00:00:00Z"}]});
+            let bytes = serde_json::to_vec(&value).unwrap();
+            fs::write(&t.path, &bytes).unwrap();
+            crate::local_secrets::restrict(&t.path).unwrap();
+            if schema == 1 {
+                let before = t.export().unwrap();
+                for _ in 0..2 {
+                    let error = t.import(value.clone()).unwrap_err();
+                    assert!(error.to_string().contains("strict policy alias"), "{error}");
+                    assert_eq!(t.export().unwrap(), before);
+                    assert_eq!(fs::read(&t.path).unwrap(), bytes);
+                    assert_eq!(fs::read(&policy_path).unwrap(), policy_bytes);
+                }
+                for _ in 0..2 {
+                    assert!(BindingTable::new(dir.path(), RoutingConfig::default()).is_err());
+                    assert_eq!(fs::read(&t.path).unwrap(), bytes);
+                    assert_eq!(fs::read(&policy_path).unwrap(), policy_bytes);
+                }
+            } else {
+                let cfg = RoutingConfig::default();
+                cfg.validate().unwrap();
+                let restored = BindingTable::new(dir.path(), cfg).unwrap();
+                assert_eq!(
+                    restored
+                        .policies
+                        .plan(Some("codex:alias"))
+                        .anchor
+                        .as_deref(),
+                    Some("a")
+                );
+                assert_eq!(
+                    restored
+                        .policies
+                        .plan(Some("codex:alias:agent:x"))
+                        .anchor
+                        .as_deref(),
+                    Some("b")
+                );
+                assert!(!restored.policies.permits_dispatch(Some("codex:alias"), "b"));
+                assert!(
+                    restored
+                        .policies
+                        .permits_dispatch(Some("codex:alias:agent:x"), "b")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_recovered_account_never_reaches_policy_writer() {
+        for bad in [
+            "bad/account",
+            "bad:account",
+            "sk-secret",
+            "",
+            &"x".repeat(101),
+        ] {
+            let (dir, t) = table();
+            t.policies
+                .set_session(
+                    &crate::routing::session_id("codex:invalid-account"),
+                    Some(crate::routing::Settings {
+                        mode: crate::routing::Mode::Strict,
+                        reset_wait_secs: 0,
+                    }),
+                    None,
+                    None,
+                )
+                .unwrap();
+            assert!(t.policies.requires_strict_recovery());
+            t.flush().unwrap();
+            let before = t.export().unwrap();
+            let path = dir.path().join("state/routing-policies.json");
+            let existed = fs::read(&path).ok();
+            let value = json!({"schema":1,"bindings":[{"key":"codex:invalid-account","account":bad,"last_used":Utc::now()}]});
+            let error = t.import(value.clone()).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("invalid binding"),
+                "{error:#}"
+            );
+            assert_eq!(t.export().unwrap(), before);
+            assert_eq!(fs::read(&path).ok(), existed);
+            fs::write(&t.path, serde_json::to_vec(&value).unwrap()).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&t.path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            let config = RoutingConfig::default();
+            config.validate().unwrap();
+            let Err(error) = BindingTable::new(dir.path(), config) else {
+                panic!("invalid strict recovered account must refuse startup");
+            };
+            assert!(
+                format!("{error:#}").contains("invalid binding"),
+                "{error:#}"
+            );
+            assert_eq!(fs::read(&path).ok(), existed);
+            assert_eq!(
+                crate::json_unique::from_slice(&fs::read(&t.path).unwrap()).unwrap(),
+                value
+            );
+        }
+    }
+    #[test]
+    fn idle_import_validates_the_latest_disk_strict_policy_and_preserves_the_old_table() {
+        let (dir, t) = table();
+        let (_, lease, _) = choose(&t, Some("claude:disk-newer"), &[candidate("a", 10.0, 8, 1)]);
+        drop(lease);
+        t.flush().unwrap();
+        let before = t.export().unwrap();
+        let original = fs::read(&t.path).unwrap();
+        let latest =
+            crate::routing::PolicyStore::new(dir.path(), crate::routing::Settings::default())
+                .unwrap();
+        latest
+            .set_session(
+                &crate::routing::session_id("claude:disk-newer"),
+                Some(crate::routing::Settings {
+                    mode: crate::routing::Mode::Strict,
+                    reset_wait_secs: 0,
+                }),
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            t.policies.plan(Some("claude:disk-newer")).settings.mode,
+            crate::routing::Mode::Rebalance
+        );
+        let policy_path = dir.path().join("state/routing-policies.json");
+        let policy_bytes = fs::read(&policy_path).unwrap();
+        let value = json!({"schema":1,"bindings":[{"key":"claude:disk-newer","account":"a","last_used":Utc::now()},{"key":"claude:disk-newer:agent:x","account":"b","last_used":Utc::now()}]});
+        let error = t.import(value).unwrap_err();
+        assert!(
+            error.to_string().contains("strict binding group"),
+            "{error}"
+        );
+        assert_eq!(t.export().unwrap(), before);
+        assert_eq!(fs::read(&t.path).unwrap(), original);
+        assert_eq!(fs::read(policy_path).unwrap(), policy_bytes);
+        assert_eq!(
+            t.policies.plan(Some("claude:disk-newer")).settings.mode,
+            crate::routing::Mode::Strict
+        );
+    }
+    #[test]
     fn warm_binding_and_unbound_stay_despite_thresholds_and_drain() {
         let (_dir, t) = table();
         let mut a = candidate("a", 10.0, 8, 1);
         let b = candidate("b", 5.0, 30, 2);
         drop(choose(&t, Some("claude:s"), &[a.clone(), b.clone()]));
-        drop(choose(&t, None, &[a.clone(), b.clone()]));
+        // Establish sticky A explicitly; D20 may otherwise place this first
+        // unbound request on fresh B after the bound session charged A.
+        assert_eq!(choose(&t, None, std::slice::from_ref(&a)).0, "a");
         a.account.drain = true;
         for w in a.quota.as_mut().unwrap()["windows"].as_array_mut().unwrap() {
             w["used_pct"] = json!(99);
@@ -1615,7 +3372,7 @@ mod tests {
     }
     #[test]
     fn cold_stays_when_gate_passes_and_moves_only_when_gate_fails() {
-        let (_dir, t) = table();
+        let (_dir, t) = cold_table();
         let mut a = candidate("a", 10.0, 30, 2);
         let b = candidate("b", 5.0, 8, 1);
         drop(choose(&t, Some("claude:s"), &[a.clone()]));
@@ -1642,6 +3399,11 @@ mod tests {
             until,
             scope: "account".into(),
         };
+        a.account.quota_cooling = Some(crate::accounts::QuotaCooling {
+            window: "5h".into(),
+            reset_at: until,
+            started_at: Utc::now(),
+        });
         assert!(
             matches!(t.choose(Provider::Claude, Some("claude:s"), None, None, &[a.clone(), b.clone()], None, 1), Decision::Hold { until: u } if u == until)
         );
@@ -1668,6 +3430,7 @@ mod tests {
             until: Utc::now() + Delta::seconds(120),
             scope: "account".into(),
         };
+        a.account.quota_cooling.as_mut().unwrap().reset_at = Utc::now() + Delta::seconds(120);
         assert_eq!(choose(&t, Some("claude:far"), &[a, b]).0, "b");
     }
     #[test]
@@ -1714,6 +3477,7 @@ mod tests {
                     Binding {
                         key,
                         account: "a".into(),
+                        accepted: None,
                         last_used: Utc::now(),
                         first_seen_at: None,
                         bound_since: None,
@@ -1953,7 +3717,14 @@ mod tests {
 
     #[test]
     fn projected_credit_usage_preserves_affinity_and_remains_eligible_for_fallback() {
-        let (_dir, t) = table();
+        let dir = fixture_dir();
+        // This legacy proof isolates projected 98 + inflight 1 = 99 from D20's
+        // placement allowance; default charge/health behavior has separate tests.
+        let config = RoutingConfig {
+            placement_allowance_pct: 0.0,
+            ..RoutingConfig::default()
+        };
+        let t = BindingTable::new(dir.path(), config).unwrap();
         let mut a = codex_candidate("a", 98.0);
         let b = codex_candidate("b", 99.0);
         // Establish both bound and unbound sticky placement below the limit.
@@ -1975,6 +3746,13 @@ mod tests {
             None,
             0,
         ));
+        // Fresh post-placement evidence keeps the confidence cap from choosing
+        // B before these in-flight-only fallback and affinity assertions.
+        let asof = t.begin_usage_observation_for("a");
+        let observed = Utc::now();
+        a.quota.as_mut().unwrap()["observed_at"] = json!(observed);
+        observe_at(&mut a, observed);
+        t.note_usage_observation_asof_token("a", a.quota.as_ref().unwrap(), asof);
         let reservation = t.begin_request(Some("codex:s"), "a");
         assert_eq!(t.pending_count("a"), 1);
         a.inflight = 1;
@@ -2148,7 +3926,7 @@ mod tests {
 
     #[test]
     fn drained_binding_stays_warm_but_rebalances_cold_even_below_gate() {
-        let (_dir, t) = table();
+        let (_dir, t) = cold_table();
         let mut a = candidate("a", 10.0, 8, 1);
         let b = candidate("b", 10.0, 30, 2);
         drop(choose(&t, Some("claude:s"), std::slice::from_ref(&a)));
@@ -2176,6 +3954,11 @@ mod tests {
         for w in a.quota.as_mut().unwrap()["windows"].as_array_mut().unwrap() {
             w["used_pct"] = json!(91);
         }
+        // The new group on B above used its confidence allowance. This case
+        // tests drain/cold behavior with an available destination, rather than
+        // the separate D20 cap-wait rule, so refresh B after that placement.
+        let asof = t.begin_usage_observation_for("b");
+        t.note_usage_observation_asof_token("b", b.quota.as_ref().unwrap(), asof);
         let (account, _, moves) = choose(&t, Some("claude:s"), &[a, b]);
         assert_eq!(account, "b");
         assert_eq!(moves[0].reason, "cold_rebalance");
@@ -2195,6 +3978,7 @@ mod tests {
                     Binding {
                         key,
                         account: "a".into(),
+                        accepted: None,
                         last_used: now,
                         first_seen_at: None,
                         bound_since: None,
@@ -2453,6 +4237,33 @@ mod tests {
     }
 
     #[test]
+    fn round2_codex_free_43200m_at_91_fails_weekly_gate_with_d20_charge_preserved() {
+        let now = Utc::now();
+        let cfg = RoutingConfig::default();
+        let mut c = codex_candidate("cx-free", 0.0);
+        c.quota = Some(json!({"windows":[{
+            "name":"43200m","used_pct":91,"reset_at":now+Delta::days(20),"observed_at":now
+        }]}));
+        let m = metrics(&c, &Data::default(), &cfg, now);
+        assert!(!m.gate && !m.unknown);
+        assert_eq!(m.weekly, Some(now + Delta::days(20)));
+        assert_eq!(m.usage, 91.0);
+        c.quota.as_mut().unwrap()["windows"][0]["used_pct"] = json!(89);
+        let mut d = Data::default();
+        let mut state = PlacementState::default();
+        state.observe(c.quota.as_ref().unwrap());
+        state.placed(now, 1);
+        d.placements.insert(c.account.id.clone(), state);
+        let m = metrics(&c, &d, &cfg, now);
+        assert!(!m.gate && !m.unknown);
+        assert_eq!(
+            m.usage, 91.0,
+            "D20 charge participates in the new weekly slot"
+        );
+        assert!(metrics_without_placement_charge(&c, &d, &cfg, now).gate);
+    }
+
+    #[test]
     fn codex_nonstandard_windows_keep_unknown_stale_and_past_reset_rules() {
         let now = Utc::now();
         let cfg = RoutingConfig::default();
@@ -2526,6 +4337,11 @@ mod tests {
             until,
             scope: "account".into(),
         };
+        a.account.quota_cooling = Some(crate::accounts::QuotaCooling {
+            window: "5h".into(),
+            reset_at: until,
+            started_at: Utc::now(),
+        });
         assert!(matches!(
             t.choose_with_hold(
                 Provider::Claude,
@@ -2662,7 +4478,7 @@ mod tests {
 
     #[test]
     fn pinned_socket_keeps_cold_binding_even_when_gate_fails() {
-        let (_dir, t) = table();
+        let (_dir, t) = cold_table();
         let mut a = candidate("a", 10.0, 30, 2);
         let b = candidate("b", 5.0, 8, 1);
         drop(choose(&t, Some("claude:s"), std::slice::from_ref(&a)));

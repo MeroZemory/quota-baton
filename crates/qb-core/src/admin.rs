@@ -205,6 +205,10 @@ pub fn runtime_routes_with_adoption_probe(
 
 fn runtime_router(state: RuntimeAdmin) -> Router {
     Router::new()
+        .route(
+            "/admin/v1/routing",
+            axum::routing::get(routing_view).post(routing_update),
+        )
         .route("/admin/v1/sessions", axum::routing::get(dashboard_sessions))
         .route(
             "/admin/v1/sessions/{id}",
@@ -226,6 +230,61 @@ fn runtime_router(state: RuntimeAdmin) -> Router {
         .route("/admin/v1/lifecycle/drain", post(lifecycle_drain))
         .route("/admin/v1/lifecycle/shutdown", post(lifecycle_shutdown))
         .with_state(state)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum RoutingUpdate {
+    Project {
+        id: Option<String>,
+        name: String,
+        settings: crate::routing::Settings,
+    },
+    Session {
+        id: String,
+        settings: Option<crate::routing::Settings>,
+        project: Option<String>,
+        #[serde(default)]
+        inherit: bool,
+    },
+}
+async fn routing_view(State(state): State<RuntimeAdmin>) -> Response {
+    let relay = state.relay.clone();
+    match tokio::task::spawn_blocking(move || relay.routing_view()).await {
+        Ok(value) => Json(value).into_response(),
+        Err(_) => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "계정 전환 정책을 조회하지 못했습니다.",
+        ),
+    }
+}
+async fn routing_update(
+    State(state): State<RuntimeAdmin>,
+    request: Result<Json<RoutingUpdate>, JsonRejection>,
+) -> Response {
+    if state.relay.is_draining() {
+        return error(
+            StatusCode::CONFLICT,
+            "코어 인계 중에는 정책을 변경할 수 없습니다.",
+        );
+    }
+    let Ok(Json(request)) = request else {
+        return error(StatusCode::BAD_REQUEST, "정책 요청이 올바르지 않습니다.");
+    };
+    let table = state.relay.bindings.clone();
+    let result=tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
+        match request {
+            RoutingUpdate::Project{id,name,settings}=>Ok(serde_json::json!({"id":table.policies.put_project(id.as_deref(),crate::routing::Project{name,settings})?})),
+            RoutingUpdate::Session{id,settings,project,inherit}=>{table.set_routing_session(&id,settings,project.as_deref(),inherit)?;Ok(serde_json::json!({"updated":true}))},
+        }
+    }).await;
+    match result {
+        Ok(Ok(value)) => Json(value).into_response(),
+        _ => error(
+            StatusCode::BAD_REQUEST,
+            "정책을 저장하지 못했습니다. 식별자·대기 시간·저장소를 확인해 주세요.",
+        ),
+    }
 }
 
 #[derive(Default, serde::Deserialize)]
