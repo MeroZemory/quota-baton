@@ -18,7 +18,9 @@ use tokio::{
 };
 use windows::Win32::{
     Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, HWND, LPARAM, WPARAM},
-    System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+    System::Threading::{
+        CREATE_NO_WINDOW, GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    },
     UI::WindowsAndMessaging::PostMessageW,
 };
 
@@ -350,7 +352,7 @@ fn spawn_core() -> std::io::Result<Child> {
         .unwrap_or_else(|| "quota-baton".into());
     Command::new(binary)
         .arg("serve")
-        .creation_flags(0x0800_0000)
+        .creation_flags(CREATE_NO_WINDOW.0)
         .spawn()
 }
 /// Missing credentials alone do not establish an outage. Only a bounded TCP

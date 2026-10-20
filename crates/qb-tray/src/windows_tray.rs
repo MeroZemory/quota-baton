@@ -18,6 +18,7 @@ use std::{
     cell::RefCell,
     ffi::c_void,
     mem::size_of,
+    os::windows::process::CommandExt,
     path::PathBuf,
     process::Command,
     rc::Rc,
@@ -46,7 +47,7 @@ use windows::{
                 MONITORINFO, MonitorFromRect, MonitorFromWindow, PAINTSTRUCT,
             },
         },
-        System::LibraryLoader::GetModuleHandleW,
+        System::{LibraryLoader::GetModuleHandleW, Threading::CREATE_NO_WINDOW},
         UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent},
         UI::{
             HiDpi::{
@@ -1729,6 +1730,7 @@ fn activate_hit(hwnd: HWND, target: HitTarget) {
                 submit_job(async move {
                     if std::env::var_os("QB_TRAY_TEST_NO_CLIPBOARD").is_none() {
                         let _ = Command::new("powershell.exe")
+                            .creation_flags(CREATE_NO_WINDOW.0)
                             .args(["-NoProfile", "-Command", "Set-Clipboard -Value $args[0]"])
                             .arg(url)
                             .spawn();
