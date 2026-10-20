@@ -626,7 +626,16 @@ fn metric(w: &Window, a: &Account, now: DateTime<Utc>) -> WindowMetric {
         .used_pct
         .filter(|n| n.is_finite())
         .map(|n| n.round().clamp(0., 100.) as u8);
-    let reset = w.reset_at.as_deref().and_then(timestamp);
+    let reset = if quota(a) {
+        a.quota_cooling
+            .as_ref()
+            .filter(|q| q.window == w.name)
+            .and_then(|q| q.reset_at.as_deref())
+            .and_then(timestamp)
+            .or_else(|| w.reset_at.as_deref().and_then(timestamp))
+    } else {
+        w.reset_at.as_deref().and_then(timestamp)
+    };
     let scoped = account_window(w);
     let scope = a.health.scope.as_deref().unwrap_or("");
     WindowMetric {
@@ -1539,6 +1548,25 @@ mod tests {
             .unwrap();
         assert_eq!(w.raw.name, "5h");
         assert_eq!(w.reset, timestamp("2026-10-20T01:00:00Z"));
+        let row = &codex(&v).rows[0];
+        let usage = row.usage.as_ref().unwrap();
+        let first = &usage.lines[0].window;
+        assert_eq!(first.reset, w.reset);
+        assert_eq!(first.reset_text, w.reset_text);
+        assert!(
+            row.accessible_name
+                .contains(first.reset_text.as_deref().unwrap())
+        );
+        assert!(
+            usage
+                .tooltip
+                .contains(&local_time(w.reset.unwrap(), now(), true))
+        );
+        assert_eq!(usage.lines[1].window.raw.name, "7d");
+        assert_eq!(
+            usage.lines[1].window.reset,
+            timestamp("2026-10-22T00:00:00Z")
+        );
         a["quota_cooling"]["window"] = json!("7d_oi");
         let v = view(vec![a], 0);
         assert!(codex(&v).rows[0].usage.as_ref().unwrap().binding.is_none());

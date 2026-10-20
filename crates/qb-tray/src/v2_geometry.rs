@@ -1878,7 +1878,19 @@ mod tests {
     }
     #[test]
     fn cap_scroll_only_list_and_clip_hitboxes() {
-        let v = view((0..12).map(|i| account(&format!("a{i:02}"))).collect(), 12);
+        let v = view(
+            (0..9)
+                .map(|i| {
+                    let mut a = account(&format!("a{i:02}"));
+                    a["windows"] = json!([
+                        {"name":"5h","used_pct":25,"reset_at":"2099-01-01T00:00:00Z"},
+                        {"name":"7d","used_pct":75,"reset_at":"2099-01-02T00:00:00Z"}
+                    ]);
+                    a
+                })
+                .collect(),
+            9,
+        );
         let a = Scene::build(&v, Presentation::default(), 400.);
         let b = Scene::build(
             &v,
@@ -1918,7 +1930,14 @@ mod tests {
             400.,
         );
         assert_eq!(last.offset, last.max_offset);
-        assert!(last.row("a11").unwrap().rect.bottom <= last.list.bottom);
+        let row = last.row("a08").unwrap();
+        assert!(row.rect.bottom <= last.list.bottom);
+        assert_eq!(row.usage_lines.len(), 2);
+        assert!(inside(row.usage_lines[1].bar, last.list));
+        assert_eq!(
+            last.hit_test(20., row.rect.top + 10.),
+            Some(&Target::Row("a08".into()))
+        );
     }
     #[test]
     fn section_disclosure_hint_disabled44_and_manual_override() {
