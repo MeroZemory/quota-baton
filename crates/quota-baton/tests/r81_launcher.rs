@@ -50,6 +50,13 @@ fn r81_console_probe() {
         set_title("client owns this title");
     } else if mode == "cmd" {
         set_title(&std::env::var("ComSpec").unwrap());
+    } else if mode == "cmd-space" {
+        set_title(&format!("{} ", std::env::var("ComSpec").unwrap()));
+    } else if mode == "cmd-suffix" {
+        set_title(&format!(
+            "{} - node synthetic.js",
+            std::env::var("ComSpec").unwrap()
+        ));
     }
     fs::write(root.join("started"), "started").unwrap();
     fs::write(
@@ -61,6 +68,10 @@ fn r81_console_probe() {
         std::thread::sleep(Duration::from_millis(450));
         set_title("client owns this title");
         std::thread::sleep(Duration::from_millis(850));
+    } else if mode == "cmd-late" {
+        std::thread::sleep(Duration::from_millis(3400));
+        set_title(&format!("{} ", std::env::var("ComSpec").unwrap()));
+        std::thread::sleep(Duration::from_millis(1200));
     } else {
         std::thread::sleep(Duration::from_millis(650));
     }
@@ -130,7 +141,23 @@ fn r81_console_host() {
 fn r81_title_after_child_start_in_hidden_console() {
     let sandbox = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r81-tests");
     fs::create_dir_all(&sandbox).unwrap();
-    for mode in ["actual", "cmd", "own", "own-late"] {
+    for mode in [
+        "actual",
+        "cmd",
+        "own",
+        "own-late",
+        "cmd-space",
+        "cmd-suffix",
+        "cmd-late",
+        "actual-node",
+    ] {
+        if mode == "actual-node"
+            && std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                .all(|p| !p.is_absolute() || !p.join("node.exe").is_file())
+        {
+            println!("actual-node unavailable: no node.exe on test PATH");
+            continue;
+        }
         let root = tempfile::tempdir_in(&sandbox).unwrap();
         let root = root.path().canonicalize().unwrap();
         let root = PathBuf::from(root.to_string_lossy().trim_start_matches(r"\\?\"));
@@ -138,13 +165,22 @@ fn r81_title_after_child_start_in_hidden_console() {
         fs::create_dir_all(root.join("AppData/Roaming/npm")).unwrap();
         let exe = std::env::current_exe().unwrap();
         fs::write(root.join("AppData/Roaming/npm/codex.cmd"), format!(
-            "@echo off\r\n\"{}\" --ignored --exact r81_console_probe --nocapture %*\r\nexit /b %errorlevel%\r\n", exe.display())).unwrap();
+            "@echo off\r\necho shim>\"%QB_R81_FIXTURE%\\shim-ran\"\r\n\"{}\" --ignored --exact r81_console_probe --nocapture %*\r\nexit /b %errorlevel%\r\n", exe.display())).unwrap();
+        if mode == "actual-node" {
+            let script = root.join("AppData/Roaming/npm/node_modules/@openai/codex/bin/codex.js");
+            fs::create_dir_all(script.parent().unwrap()).unwrap();
+            fs::write(script, r#"const {spawnSync}=require('node:child_process');
+const result=spawnSync(process.env.QB_R81_PROBE,['--ignored','--exact','r81_console_probe','--nocapture',...process.argv.slice(2)],{stdio:'inherit'});
+process.exit(result.status ?? 1);
+"#).unwrap();
+        }
         let mut env: Vec<(String, String)> = ["SystemRoot", "ComSpec", "PATH", "TEMP", "TMP"]
             .into_iter()
             .filter_map(|key| std::env::var(key).ok().map(|v| (key.into(), v)))
             .collect();
         env.push(("QB_R81_FIXTURE".into(), root.to_string_lossy().into_owned()));
         env.push(("QB_R81_TITLE_MODE".into(), mode.into()));
+        env.push(("QB_R81_PROBE".into(), exe.to_string_lossy().into_owned()));
         env.sort_by_key(|(k, _)| k.to_ascii_lowercase());
         let environment: Vec<u16> = env
             .into_iter()
@@ -189,6 +225,11 @@ fn r81_title_after_child_start_in_hidden_console() {
             assert_eq!(wait, WAIT_OBJECT_0, "hidden host timed out");
         }
         assert!(root.join("started").exists(), "child never started");
+        assert_eq!(
+            root.join("shim-ran").exists(),
+            mode != "actual-node",
+            "node resolution must bypass the npm cmd shim"
+        );
         for (name, expected) in [
             ("child-codepage.json", [65001, 65001]),
             ("restored-codepage.json", [949, 949]),
