@@ -439,7 +439,7 @@ Some outcomes never count toward the trigger, because they are not account conce
 
 **Moving.** At a marked group's next request boundary:
 - Move if the mark is unexpired, `active(A) > spread_threshold(A)` still holds, and an eligible account with room passes the gate. Then skip step 1, run steps 3–6 restricted to accounts with room, and bind the whole group there (C7 "Moves").
-- Otherwise clear the mark and stay on A.
+- If the only targets with room are capped (D20), stay on A and keep the mark. Otherwise clear the mark and stay on A.
 - Log the move when it executes: `binding_move` with reason `overload`, the request bytes, and the next turn's cache result.
 
 **What never moves.**
@@ -520,7 +520,7 @@ Polling rules (architecture §8):
 - A poll answered with 401 is handled exactly like a data-plane 401 (C6 rows 4 and 5, including the linked-account rule in C5).
 - **Linked accounts at startup and before each poll:** if the CPA file shows a newer `last_refresh` than the stored token, reload it first. The quota watcher ignored 2,704 such 401s and stayed blind for days (R8 I-07).
 - Every candidate is polled immediately before C6 row 14 or row 15 is answered.
-- The minimum interval per account is 5 minutes.
+- The minimum interval per account is 5 minutes. A D20 placement-evidence poll has its own budget of one per account per 5 minutes and may run inside the regular interval; it follows the same backoff and the exclusions below.
 - Polls never run for `needs_relogin` or `disabled` accounts.
 
 Inspecting compressed responses:
