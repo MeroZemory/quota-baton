@@ -1,0 +1,245 @@
+#![cfg(windows)]
+
+use std::{fs, path::PathBuf, process::Command, time::Duration};
+use windows::{
+    Win32::{
+        Foundation::{CloseHandle, WAIT_OBJECT_0},
+        System::Threading::{
+            CREATE_NEW_CONSOLE, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, PROCESS_INFORMATION,
+            STARTF_USESHOWWINDOW, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+        },
+    },
+    core::{PCWSTR, PWSTR},
+};
+
+#[path = "../src/launcher_script.rs"]
+mod launcher_script;
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetConsoleTitleW(buffer: *mut u16, size: u32) -> u32;
+    fn SetConsoleTitleW(title: *const u16) -> i32;
+    fn GetConsoleCP() -> u32;
+    fn GetConsoleOutputCP() -> u32;
+    fn SetConsoleCP(cp: u32) -> i32;
+    fn SetConsoleOutputCP(cp: u32) -> i32;
+}
+fn title() -> String {
+    let mut b = vec![0; 32768];
+    let n = unsafe { GetConsoleTitleW(b.as_mut_ptr(), b.len() as u32) };
+    String::from_utf16_lossy(&b[..n as usize])
+}
+fn set_title(s: &str) {
+    let s: Vec<_> = s.encode_utf16().chain(Some(0)).collect();
+    assert_ne!(unsafe { SetConsoleTitleW(s.as_ptr()) }, 0);
+}
+
+// Helpers run only in the test's separate hidden console, never the user's tab.
+#[test]
+#[ignore = "invoked by r81_title_after_child_start_in_hidden_console"]
+fn r81_console_probe() {
+    let root = PathBuf::from(std::env::var_os("QB_R81_FIXTURE").unwrap());
+    let mode = std::env::var("QB_R81_TITLE_MODE").unwrap();
+    fs::write(root.join("initial-title"), title()).unwrap();
+    fs::write(
+        root.join("args.json"),
+        serde_json::to_vec(&std::env::args().collect::<Vec<_>>()).unwrap(),
+    )
+    .unwrap();
+    if mode == "own" {
+        set_title("client owns this title");
+    } else if mode == "cmd" {
+        set_title(&std::env::var("ComSpec").unwrap());
+    }
+    fs::write(root.join("started"), "started").unwrap();
+    fs::write(
+        root.join("child-codepage.json"),
+        serde_json::to_vec(&unsafe { [GetConsoleCP(), GetConsoleOutputCP()] }).unwrap(),
+    )
+    .unwrap();
+    if mode == "own-late" {
+        std::thread::sleep(Duration::from_millis(450));
+        set_title("client owns this title");
+        std::thread::sleep(Duration::from_millis(850));
+    } else {
+        std::thread::sleep(Duration::from_millis(650));
+    }
+    fs::write(root.join("title"), title()).unwrap();
+    fs::write(
+        root.join("home"),
+        std::env::var_os("CODEX_HOME")
+            .unwrap()
+            .to_string_lossy()
+            .as_bytes(),
+    )
+    .unwrap();
+    fs::write(
+        root.join("label"),
+        std::env::var("SYNTHETIC_LABEL").unwrap(),
+    )
+    .unwrap();
+    std::process::exit(37);
+}
+
+#[test]
+#[ignore = "invoked by r81_title_after_child_start_in_hidden_console"]
+fn r81_console_host() {
+    let root = PathBuf::from(std::env::var_os("QB_R81_FIXTURE").unwrap());
+    unsafe {
+        assert_ne!(SetConsoleCP(949), 0);
+        assert_ne!(SetConsoleOutputCP(949), 0);
+    }
+    let launcher = root.join("codex-qb.cmd");
+    fs::write(
+        &launcher,
+        launcher_script::codex_launcher_bytes(std::path::Path::new(env!(
+            "CARGO_BIN_EXE_quota-baton"
+        ))),
+    )
+    .unwrap();
+    let mut child = Command::new(&launcher);
+    for value in [
+        "two words",
+        "한글 ! ^ & (x)",
+        "100% literal",
+        "%QB_R81_LITERAL%",
+        "ends\\",
+        "quoted\"value",
+    ] {
+        child.arg("--skip").arg(value);
+    }
+    let status = child
+        .current_dir(root.join("한글 project"))
+        .env("USERPROFILE", root.join("profile"))
+        .env("APPDATA", root.join("AppData/Roaming"))
+        .env("SYNTHETIC_LABEL", "retained-label")
+        .env("QB_R81_LITERAL", "must-not-expand")
+        // Deliberately invalid: launch-client must never open a core home.
+        .env("QB_HOME", root.join("nonexistent-home"))
+        .status()
+        .unwrap();
+    fs::write(root.join("status"), status.code().unwrap().to_string()).unwrap();
+    fs::write(
+        root.join("restored-codepage.json"),
+        serde_json::to_vec(&unsafe { [GetConsoleCP(), GetConsoleOutputCP()] }).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn r81_title_after_child_start_in_hidden_console() {
+    let sandbox = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r81-tests");
+    fs::create_dir_all(&sandbox).unwrap();
+    for mode in ["actual", "cmd", "own", "own-late"] {
+        let root = tempfile::tempdir_in(&sandbox).unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let root = PathBuf::from(root.to_string_lossy().trim_start_matches(r"\\?\"));
+        fs::create_dir(root.join("한글 project")).unwrap();
+        fs::create_dir_all(root.join("AppData/Roaming/npm")).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        fs::write(root.join("AppData/Roaming/npm/codex.cmd"), format!(
+            "@echo off\r\n\"{}\" --ignored --exact r81_console_probe --nocapture %*\r\nexit /b %errorlevel%\r\n", exe.display())).unwrap();
+        let mut env: Vec<(String, String)> = ["SystemRoot", "ComSpec", "PATH", "TEMP", "TMP"]
+            .into_iter()
+            .filter_map(|key| std::env::var(key).ok().map(|v| (key.into(), v)))
+            .collect();
+        env.push(("QB_R81_FIXTURE".into(), root.to_string_lossy().into_owned()));
+        env.push(("QB_R81_TITLE_MODE".into(), mode.into()));
+        env.sort_by_key(|(k, _)| k.to_ascii_lowercase());
+        let environment: Vec<u16> = env
+            .into_iter()
+            .flat_map(|(k, v)| format!("{k}={v}\0").encode_utf16().collect::<Vec<_>>())
+            .chain(Some(0))
+            .collect();
+        let app: Vec<_> = exe.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut command: Vec<_> = format!(
+            "\"{}\" --ignored --exact r81_console_host --nocapture",
+            exe.display()
+        )
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+        let startup = STARTUPINFOW {
+            cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+            dwFlags: STARTF_USESHOWWINDOW,
+            wShowWindow: 0,
+            ..Default::default()
+        };
+        let mut process = PROCESS_INFORMATION::default();
+        unsafe {
+            CreateProcessW(
+                PCWSTR(app.as_ptr()),
+                Some(PWSTR(command.as_mut_ptr())),
+                None,
+                None,
+                false,
+                CREATE_NEW_CONSOLE | CREATE_UNICODE_ENVIRONMENT,
+                Some(environment.as_ptr().cast()),
+                None,
+                &startup,
+                &mut process,
+            )
+            .unwrap();
+            let wait = WaitForSingleObject(process.hProcess, 20000);
+            if wait != WAIT_OBJECT_0 {
+                let _ = TerminateProcess(process.hProcess, 1);
+            }
+            CloseHandle(process.hThread).unwrap();
+            CloseHandle(process.hProcess).unwrap();
+            assert_eq!(wait, WAIT_OBJECT_0, "hidden host timed out");
+        }
+        assert!(root.join("started").exists(), "child never started");
+        for (name, expected) in [
+            ("child-codepage.json", [65001, 65001]),
+            ("restored-codepage.json", [949, 949]),
+        ] {
+            let actual: [u32; 2] =
+                serde_json::from_slice(&fs::read(root.join(name)).unwrap()).unwrap();
+            assert_eq!(actual, expected, "{name}");
+        }
+        assert_eq!(fs::read_to_string(root.join("status")).unwrap(), "37");
+        assert_eq!(
+            fs::read_to_string(root.join("title")).unwrap(),
+            if mode.starts_with("own") {
+                "client owns this title"
+            } else {
+                "codex-qb · 한글 project"
+            }
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("home")).unwrap(),
+            root.join("profile/.codex-acct/qb")
+                .to_string_lossy()
+                .replace('/', "\\")
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("label")).unwrap(),
+            "retained-label"
+        );
+        let args: Vec<String> =
+            serde_json::from_slice(&fs::read(root.join("args.json")).unwrap()).unwrap();
+        assert_eq!(
+            &args[5..],
+            [
+                "--skip",
+                "two words",
+                "--skip",
+                "한글 ! ^ & (x)",
+                "--skip",
+                "100% literal",
+                "--skip",
+                "%QB_R81_LITERAL%",
+                "--skip",
+                "ends\\",
+                "--skip",
+                "quoted\"value"
+            ]
+        );
+        assert!(!root.join("nonexistent-home").exists());
+        println!(
+            "{mode}: generated launcher, post-start title, 12 forwarded arguments, exit 37, CODEX_HOME, label and 949/65001/restored949 verified"
+        );
+    }
+}
+
+use std::os::windows::ffi::OsStrExt;
