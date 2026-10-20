@@ -9,7 +9,7 @@ use crate::{
     observability::Observability,
     relay::credentials::TokenGates,
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use std::{
     collections::BTreeMap,
     sync::{
@@ -33,11 +33,14 @@ pub enum PollError {
 #[derive(Default)]
 struct Clock {
     next: Option<Instant>,
+    failure_until: Option<Instant>,
     last: Option<Instant>,
     failures: u32,
     running: bool,
     disabled_until: Option<Instant>,
     profile: profile::ProfileClock,
+    placement_last: Option<Instant>,
+    placement_polled_through: Option<u64>,
 }
 
 pub struct UsagePoller {
@@ -48,11 +51,13 @@ pub struct UsagePoller {
     tokens: Mutex<TokenGates>,
     bases: [String; 2],
     min_interval: u64,
+    placement_min_interval: u64,
     clocks: Mutex<BTreeMap<String, Clock>>,
     tray_until: Mutex<Option<Instant>>,
     event_streams: AtomicUsize,
     semaphore: Semaphore,
     profile_semaphore: Semaphore,
+    bindings: Mutex<Option<Weak<crate::bindings::BindingTable>>>,
 }
 
 pub(crate) struct EventGuard(Weak<UsagePoller>);
@@ -70,6 +75,7 @@ struct Reservation<'a> {
     succeeded: bool,
     unsupported: bool,
     started: bool,
+    placement: bool,
 }
 impl Drop for Reservation<'_> {
     fn drop(&mut self) {
@@ -89,7 +95,11 @@ impl Drop for Reservation<'_> {
             clock.failures,
             rand::random::<f64>(),
         );
-        clock.next = Some(Instant::now() + Duration::from_secs_f64(delay));
+        let next = Instant::now() + Duration::from_secs_f64(delay);
+        clock.failure_until = (!self.succeeded).then_some(next);
+        if !self.placement {
+            clock.next = Some(next);
+        }
         if self.unsupported {
             clock.disabled_until = Some(Instant::now() + Duration::from_secs(6 * 3600));
         }
@@ -130,12 +140,41 @@ impl UsagePoller {
                     .into(),
             ],
             min_interval: config.quota.poll_min_interval_secs.max(1),
+            placement_min_interval: config.routing.placement_poll_min_interval_secs,
             clocks: Mutex::default(),
             tray_until: Mutex::default(),
             event_streams: AtomicUsize::new(0),
             semaphore: Semaphore::new(2),
             profile_semaphore: Semaphore::new(1),
+            bindings: Mutex::new(None),
         })
+    }
+    pub(crate) fn set_bindings(&self, bindings: &Arc<crate::bindings::BindingTable>) {
+        *self.bindings.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(bindings));
+    }
+    fn binding_table(&self) -> Option<Arc<crate::bindings::BindingTable>> {
+        self.bindings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(Weak::upgrade)
+    }
+    fn placement_due(&self, id: &str, now: DateTime<Utc>) -> Option<u64> {
+        let table = self.binding_table()?;
+        // This is the merged per-window snapshot used by AccountRuntime too.
+        // A fresh outer timestamp cannot acknowledge a stale/missing window.
+        if let Some(snapshot) = self.obs.quota_snapshot(id) {
+            table.note_usage_observation(id, &snapshot);
+        }
+        let through = self
+            .clocks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .and_then(|clock| clock.placement_polled_through);
+        table
+            .due_placement_poll(id, now, through)
+            .map(|due| due.placement_seq)
     }
     #[cfg(debug_assertions)]
     pub(crate) fn set_tokens(&self, tokens: TokenGates) {
@@ -160,10 +199,42 @@ impl UsagePoller {
         EventGuard(Arc::downgrade(self))
     }
     fn reserve(&self, id: &str) -> Result<Reservation<'_>, PollError> {
-        let now = Instant::now();
+        self.reserve_reason(id, false)
+    }
+    fn reserve_reason(&self, id: &str, placement: bool) -> Result<Reservation<'_>, PollError> {
+        self.reserve_reason_at(id, placement, Instant::now())
+    }
+    fn reserve_reason_at(
+        &self,
+        id: &str,
+        placement: bool,
+        now: Instant,
+    ) -> Result<Reservation<'_>, PollError> {
         let mut clocks = self.clocks.lock().unwrap_or_else(|e| e.into_inner());
         let clock = clocks.entry(id.into()).or_default();
-        let next = clock.next.into_iter().chain(clock.disabled_until).max();
+        if placement && let Some(last) = clock.placement_last {
+            let interval = Duration::from_secs(self.placement_min_interval);
+            let elapsed = now.saturating_duration_since(last);
+            if elapsed < interval {
+                return Err(PollError::TooSoon {
+                    retry_after: interval.saturating_sub(elapsed).as_secs().saturating_add(1),
+                });
+            }
+        }
+        let next = if placement {
+            clock
+                .disabled_until
+                .into_iter()
+                .chain(clock.failure_until)
+                .max()
+        } else {
+            clock
+                .next
+                .into_iter()
+                .chain(clock.failure_until)
+                .chain(clock.disabled_until)
+                .max()
+        };
         if clock.running || next.is_some_and(|next| next > now) {
             return Err(PollError::TooSoon {
                 retry_after: next.map_or(self.min_interval, |next| {
@@ -180,6 +251,7 @@ impl UsagePoller {
             succeeded: false,
             unsupported: false,
             started: false,
+            placement,
         })
     }
     async fn load(&self, id: &str) -> Result<Account, PollError> {
@@ -282,6 +354,9 @@ impl UsagePoller {
     }
 
     pub async fn poll(&self, id: &str) -> Result<Account, PollError> {
+        self.poll_reason(id, None).await
+    }
+    async fn poll_reason(&self, id: &str, placement: Option<u64>) -> Result<Account, PollError> {
         let account = self.load(id).await?;
         if account.user_state == UserState::Disabled
             || (matches!(account.health, Health::NeedsRelogin { .. })
@@ -296,7 +371,11 @@ impl UsagePoller {
         if !base.starts_with("http://127.0.0.1:") {
             return Err(PollError::Unavailable);
         }
-        let mut reservation = self.reserve(id)?;
+        let mut reservation = if placement.is_some() {
+            self.reserve_reason(id, true)?
+        } else {
+            self.reserve(id)?
+        };
         let _permit = self
             .semaphore
             .acquire()
@@ -332,6 +411,19 @@ impl UsagePoller {
             .runtime
             .begin_probe(&account)
             .map_err(|_| PollError::Unavailable)?;
+        if placement.is_some() && self.placement_due(id, Utc::now()).is_none() {
+            // Headers arriving while semaphore/token gates were queued cancel it.
+            return Err(PollError::Excluded);
+        }
+        if let Some(through) = placement {
+            let mut clocks = self.clocks.lock().unwrap_or_else(|e| e.into_inner());
+            let clock = clocks.get_mut(id).expect("reserved clock");
+            clock.placement_last = Some(Instant::now());
+            clock.placement_polled_through = Some(through);
+        }
+        if placement.is_some() {
+            self.obs.record_placement_poll(id);
+        }
         reservation.started = true;
         self.clocks
             .lock()
@@ -340,6 +432,16 @@ impl UsagePoller {
             .expect("reserved clock")
             .last = Some(Instant::now());
         for attempt in 0..2 {
+            let observation_table = self.binding_table();
+            let observation_asof = observation_table
+                .as_ref()
+                .map(|table| table.begin_usage_observation_for(id));
+            if attempt == 0
+                && placement.is_some()
+                && let (Some(table), Some(asof)) = (&observation_table, observation_asof)
+            {
+                table.note_placement_poll_started(id, asof.sequence);
+            }
             let path = if account.provider == Provider::Codex {
                 "/backend-api/wham/usage"
             } else {
@@ -404,6 +506,13 @@ impl UsagePoller {
                 return Err(PollError::Unavailable);
             };
             let replace_windows = parse::is_complete_snapshot(account.provider, &body);
+            if let (Some(table), Some(asof)) = (&observation_table, observation_asof) {
+                if replace_windows {
+                    table.replace_usage_windows_asof_token(id, &snapshot, asof);
+                } else {
+                    table.note_usage_observation_asof_token(id, &snapshot, asof);
+                }
+            }
             let snapshot = self
                 .obs
                 .observe_poll(id, snapshot, replace_windows)
@@ -474,11 +583,20 @@ impl UsagePoller {
         }
         let mut pending = futures_util::stream::FuturesUnordered::new();
         for account in accounts {
+            let placement = self.placement_due(&account.id, Utc::now());
             let usage = self.scheduled(&account);
             let profile = self.profile_due(&account);
-            if usage || profile {
+            if usage || placement.is_some() || profile {
                 pending.push(async move {
-                    if usage {
+                    if placement.is_some() {
+                        if matches!(
+                            self.poll_reason(&account.id, placement).await,
+                            Err(PollError::TooSoon { .. })
+                        ) && usage
+                        {
+                            let _ = self.poll(&account.id).await;
+                        }
+                    } else if usage {
                         let _ = self.poll(&account.id).await;
                     }
                     if profile {
@@ -729,16 +847,23 @@ mod tests {
             let clock = &clocks[&f.ids[0]];
             assert!(!clock.running);
             assert_eq!(clock.failures, 1);
+            assert_eq!(clock.failure_until, clock.next);
             let delay = clock.next.unwrap().duration_since(Instant::now()).as_secs();
             assert!((539..=660).contains(&delay));
         }
-        poller
-            .clocks
-            .lock()
-            .unwrap()
-            .get_mut(&f.ids[0])
-            .unwrap()
-            .next = None;
+        assert!(matches!(
+            poller.reserve(&f.ids[0]),
+            Err(PollError::TooSoon { .. })
+        ));
+        {
+            // Regular minimum and shared failure backoff are independent clocks.
+            // Expire both explicitly instead of waiting for their real deadline.
+            let expired = Instant::now() - Duration::from_secs(1);
+            let mut clocks = poller.clocks.lock().unwrap();
+            let clock = clocks.get_mut(&f.ids[0]).unwrap();
+            clock.next = Some(expired);
+            clock.failure_until = Some(expired);
+        }
         f.fake.state.push(Fixture::usage());
         poller.poll(&f.ids[0]).await.unwrap();
         assert!(matches!(
@@ -800,6 +925,216 @@ mod tests {
         }
         f.relay.quota.tick().await;
         assert_eq!(f.fake.state.requests().len(), 5);
+    }
+    #[tokio::test]
+    async fn d20_placement_reservation_bypasses_minimum_but_not_throttle_or_running() {
+        let f = Fixture::new(1).await;
+        let poller = &f.relay.quota;
+        let id = &f.ids[0];
+        let now = Instant::now();
+        poller.clocks.lock().unwrap().insert(
+            id.clone(),
+            Clock {
+                next: Some(now + Duration::from_secs(3600)),
+                ..Clock::default()
+            },
+        );
+        assert!(matches!(poller.reserve(id), Err(PollError::TooSoon { .. })));
+        let reservation = poller.reserve_reason_at(id, true, now).unwrap();
+        assert!(matches!(
+            poller.reserve_reason_at(id, true, now),
+            Err(PollError::TooSoon { .. })
+        ));
+        drop(reservation);
+        poller
+            .clocks
+            .lock()
+            .unwrap()
+            .get_mut(id)
+            .unwrap()
+            .placement_last = Some(now - Duration::from_secs(299));
+        assert!(matches!(
+            poller.reserve_reason_at(id, true, now),
+            Err(PollError::TooSoon { .. })
+        ));
+        poller
+            .clocks
+            .lock()
+            .unwrap()
+            .get_mut(id)
+            .unwrap()
+            .placement_last = Some(now - Duration::from_secs(300));
+        drop(poller.reserve_reason_at(id, true, now).unwrap());
+        let mut clocks = poller.clocks.lock().unwrap();
+        let clock = clocks.get_mut(id).unwrap();
+        clock.failures = 1;
+        clock.failure_until = Some(now + Duration::from_secs(300));
+        drop(clocks);
+        assert!(matches!(
+            poller.reserve_reason_at(id, true, now),
+            Err(PollError::TooSoon { .. })
+        ));
+        assert!(
+            f.fake.state.requests().is_empty(),
+            "reservation checks never send"
+        );
+    }
+    #[tokio::test]
+    async fn d20_scheduler_reconciles_partial_headers_and_deduplicates_by_watermark() {
+        let f = Fixture::new(1).await;
+        let poller = &f.relay.quota;
+        let table = &f.relay.bindings;
+        poller.set_bindings(table);
+        let now = Utc::now();
+        let placed = now - chrono::Duration::seconds(121);
+        let snapshot = json!({"source":"headers","observed_at":placed - chrono::Duration::seconds(1),
+            "windows":[
+                {"name":"primary","used_pct":0.,"reset_at":now + chrono::Duration::hours(1),
+                 "observed_at":placed - chrono::Duration::seconds(1)},
+                {"name":"secondary","used_pct":0.,"reset_at":now + chrono::Duration::hours(24),
+                 "observed_at":placed - chrono::Duration::seconds(1)}]});
+        let candidate = crate::bindings::Candidate {
+            account: f.account(0),
+            quota: Some(snapshot.clone()),
+            inflight: 0,
+        };
+        let decision = table.choose_with_hold_at(
+            Provider::Codex,
+            Some("codex:poll-evidence"),
+            None,
+            None,
+            &[candidate],
+            None,
+            10,
+            true,
+            false,
+            placed,
+        );
+        assert!(matches!(
+            decision,
+            crate::bindings::Decision::Selected { .. }
+        ));
+        drop(decision);
+        assert!(poller.placement_due(&f.ids[0], now).is_some());
+        let placed_seq = poller.placement_due(&f.ids[0], now).unwrap();
+        let asof = table.begin_usage_observation();
+        let mut partial = snapshot.clone();
+        partial["observed_at"] = json!(now);
+        partial["windows"][0]["observed_at"] = json!(now);
+        table.note_usage_observation_asof(
+            &f.ids[0],
+            &json!({"windows":[partial["windows"][0].clone()]}),
+            asof,
+        );
+        poller.obs.observe_poll(&f.ids[0], partial, true).unwrap();
+        assert_eq!(
+            poller.placement_due(&f.ids[0], now),
+            Some(placed_seq),
+            "weekly evidence remains old"
+        );
+        poller
+            .clocks
+            .lock()
+            .unwrap()
+            .entry(f.ids[0].clone())
+            .or_default()
+            .placement_polled_through = Some(placed_seq);
+        assert!(
+            poller.placement_due(&f.ids[0], now).is_none(),
+            "one trigger per placement batch"
+        );
+        let mut fresh = snapshot;
+        fresh["observed_at"] = json!(now + chrono::Duration::seconds(1));
+        for w in fresh["windows"].as_array_mut().unwrap() {
+            w["observed_at"] = json!(now + chrono::Duration::seconds(1));
+        }
+        table.note_usage_observation_asof(&f.ids[0], &fresh, asof);
+        poller.obs.observe_poll(&f.ids[0], fresh, true).unwrap();
+        assert!(poller.placement_due(&f.ids[0], now).is_none());
+        assert!(
+            table.due_placement_polls(now).is_empty(),
+            "fresh windows retire both charges"
+        );
+        assert!(
+            f.fake.state.requests().is_empty(),
+            "synthetic time/evidence only"
+        );
+    }
+    #[tokio::test]
+    async fn d20_placement_success_does_not_spend_regular_poll_budget() {
+        let f = Fixture::new(1).await;
+        let poller = &f.relay.quota;
+        let id = &f.ids[0];
+        let now = Instant::now();
+        let regular_next = now + Duration::from_secs(3600);
+        poller.clocks.lock().unwrap().insert(
+            id.clone(),
+            Clock {
+                next: Some(regular_next),
+                ..Clock::default()
+            },
+        );
+        let mut reservation = poller.reserve_reason_at(id, true, now).unwrap();
+        reservation.started = true;
+        reservation.succeeded = true;
+        drop(reservation);
+        assert_eq!(poller.clocks.lock().unwrap()[id].next, Some(regular_next));
+        assert!(f.fake.state.requests().is_empty());
+    }
+    #[tokio::test]
+    async fn r8_refused_placement_poll_does_not_skip_due_regular_tick() {
+        let f = Fixture::new(1).await;
+        let poller = &f.relay.quota;
+        poller.set_bindings(&f.relay.bindings);
+        let id = &f.ids[0];
+        let placed = Utc::now() - chrono::Duration::seconds(121);
+        let candidate = crate::bindings::Candidate {
+            account: f.account(0),
+            quota: None,
+            inflight: 0,
+        };
+        drop(f.relay.bindings.choose_with_hold_at(
+            Provider::Codex,
+            Some("codex:refused-placement-poll"),
+            None,
+            None,
+            &[candidate],
+            None,
+            10,
+            true,
+            false,
+            placed,
+        ));
+        assert!(poller.placement_due(id, Utc::now()).is_some());
+        poller.clocks.lock().unwrap().insert(
+            id.clone(),
+            Clock {
+                placement_last: Some(Instant::now()),
+                ..Clock::default()
+            },
+        );
+        assert!(poller.scheduled(&f.account(0)));
+        assert!(matches!(
+            poller.reserve_reason(id, true),
+            Err(PollError::TooSoon { .. })
+        ));
+        f.fake.state.push(Fixture::usage());
+        poller.tick().await;
+        let requests = f.fake.state.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "regular usage poll must run in this very tick"
+        );
+        assert_eq!(requests[0].method, "GET");
+        let clocks = poller.clocks.lock().unwrap();
+        let clock = &clocks[id];
+        assert!(clock.last.is_some());
+        assert!(clock.next.is_some());
+        assert!(
+            clock.placement_polled_through.is_none(),
+            "refused placement poll spends no placement trigger"
+        );
     }
     include!("quota/profile_tests.rs");
 }

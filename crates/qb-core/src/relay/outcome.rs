@@ -24,6 +24,18 @@ pub(super) struct Decision {
     pub quota_reset: Option<DateTime<Utc>>,
 }
 impl Decision {
+    // Header observations have already passed the account-aware C5 reducer.
+    // In particular, a paid-credit permission can keep a 100% account ready.
+    // Do not reinterpret that evidence using an account-free header heuristic.
+    pub fn reconcile_quota(&mut self, observation: &crate::account_runtime::QuotaObservation) {
+        if self.kind == Kind::Rate
+            && let Some(until) = observation.quota_until
+        {
+            self.kind = Kind::Quota;
+            self.signal = None; // C5 has durably applied the causal cooling already.
+            self.quota_reset = Some(until);
+        }
+    }
     pub fn failover(&self) -> bool {
         !matches!(self.kind, Kind::Relay | Kind::Rate)
     }
@@ -219,7 +231,9 @@ pub(super) fn classify(
             .filter(|reset| *reset > now)
             .max()
             .unwrap_or(
-                now + Duration::seconds(header_seconds(headers, "retry-after").unwrap_or(300)),
+                now + Duration::seconds(
+                    header_seconds_at(headers, "retry-after", now).unwrap_or(300),
+                ),
             );
         decision.signal = cooling(HealthReason::Quota, until, scope);
     } else if !matches!(
@@ -300,6 +314,10 @@ pub(super) fn classify(
 }
 
 pub(super) fn header_seconds(h: &HeaderMap, name: &str) -> Option<i64> {
+    header_seconds_at(h, name, Utc::now())
+}
+
+fn header_seconds_at(h: &HeaderMap, name: &str, now: DateTime<Utc>) -> Option<i64> {
     let value = h.get(name)?.to_str().ok()?;
     if let Ok(number) = value.parse::<f64>() {
         return number
@@ -309,13 +327,18 @@ pub(super) fn header_seconds(h: &HeaderMap, name: &str) -> Option<i64> {
             .map(|n| n.ceil().min(31_536_000.0) as i64);
     }
     if name == "retry-after" {
-        return DateTime::parse_from_rfc2822(value).ok().map(|date| {
-            (date.with_timezone(&Utc) - Utc::now())
-                .num_seconds()
-                .clamp(0, 31_536_000)
-        });
+        return DateTime::parse_from_rfc2822(value)
+            .ok()
+            .map(|date| advice_seconds_until(date.with_timezone(&Utc), now));
     }
     None
+}
+
+fn advice_seconds_until(date: DateTime<Utc>, now: DateTime<Utc>) -> i64 {
+    let remaining = date - now;
+    let whole = remaining.num_seconds();
+    let rounded = whole.saturating_add(i64::from(remaining > Duration::seconds(whole)));
+    rounded.clamp(0, 31_536_000)
 }
 
 fn header_timestamp(h: &HeaderMap, name: &str) -> Option<DateTime<Utc>> {
@@ -345,6 +368,66 @@ pub(super) fn error_value(raw: &[u8]) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn quota_fallback_uses_one_wall_clock_sample_across_a_second_boundary() {
+        let base = DateTime::parse_from_rfc3339("2026-10-20T00:00:00.900Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let later = DateTime::parse_from_rfc3339("2026-10-20T00:00:01.050Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let advice = DateTime::parse_from_rfc3339("2026-10-20T00:02:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "retry-after",
+            "Tue, 20 Oct 2026 00:02:00 GMT".parse().unwrap(),
+        );
+        // The former mixed-sample calculation ends100ms before server advice.
+        assert!(
+            base + Duration::seconds(header_seconds_at(&headers, "retry-after", later).unwrap())
+                < advice
+        );
+        let until =
+            base + Duration::seconds(header_seconds_at(&headers, "retry-after", base).unwrap());
+        assert!(until >= advice);
+        assert!(until - advice < Duration::seconds(1));
+    }
+
+    #[test]
+    fn http_date_advice_rounds_up_fractional_seconds_and_keeps_the_existing_cap() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-20T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        for (millis, expected) in [
+            (-1500, 0),
+            (0, 0),
+            (1, 1),
+            (999, 1),
+            (1000, 1),
+            (1001, 2),
+            (119999, 120),
+            (120000, 120),
+        ] {
+            assert_eq!(
+                super::advice_seconds_until(now + chrono::Duration::milliseconds(millis), now),
+                expected
+            );
+        }
+        assert_eq!(
+            super::advice_seconds_until(now + chrono::Duration::days(366), now),
+            31_536_000
+        );
+        assert_eq!(
+            super::advice_seconds_until(
+                now + chrono::Duration::seconds(1) + chrono::Duration::nanoseconds(1),
+                now
+            ),
+            2
+        );
+    }
+
     use super::*;
 
     #[test]

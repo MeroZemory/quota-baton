@@ -158,8 +158,17 @@ impl ScriptedState {
         if bucket.1 <= limiter.limit {
             Some(ScriptedResponse::json(StatusCode::OK, "{\"ok\":true}"))
         } else {
-            if let Some(count) = limiter.round_429.lock().unwrap().last_mut() {
-                *count += 1;
+            let mut rounds = limiter.round_429.lock().unwrap();
+            // Synthetic concurrent rounds retain their tag across real retries.
+            let tagged = headers
+                .get("user-agent")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("qb-storm-round/"))
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|n| *n < rounds.len());
+            let index = tagged.or_else(|| rounds.len().checked_sub(1));
+            if let Some(index) = index {
+                rounds[index] += 1;
             }
             Some(ScriptedResponse::json(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -259,6 +268,29 @@ impl Drop for FakeUpstream {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn overlapping_limiter_rounds_charge_the_originating_request_tag() {
+        let server = super::ScriptedUpstream::start().await.unwrap();
+        server
+            .state
+            .enable_window_limiter(1, std::time::Duration::from_secs(60));
+        for _ in 0..3 {
+            server.state.begin_limiter_round();
+        }
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for (round, status) in [(2, 200), (0, 429), (2, 429)] {
+            let response = client
+                .post(&server.url)
+                .bearer_auth("synthetic-round-token")
+                .header("user-agent", format!("qb-storm-round/{round}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), status);
+        }
+        assert_eq!(server.state.limiter_round_429_counts(), vec![1, 0, 1]);
+    }
+
     #[tokio::test]
     async fn limiter_start_batch_classifies_after_all_arrivals_and_only_gates_once() {
         let server = super::ScriptedUpstream::start().await.unwrap();

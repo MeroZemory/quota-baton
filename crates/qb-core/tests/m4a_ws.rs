@@ -1,4 +1,6 @@
 use axum::http::{HeaderMap, StatusCode};
+#[path = "support/routing_ws.rs"]
+mod routing_ws;
 use chrono::{Duration as ChronoDuration, Utc};
 use futures_util::{SinkExt, StreamExt};
 use qb_core::{
@@ -60,6 +62,28 @@ impl Harness {
         fail_first: bool,
         rate: Option<(u64, u32)>,
     ) -> Self {
+        Self::new_with_options(count, owned, fail_first, rate, None).await
+    }
+    async fn new_with_deadlines(http: u64, ws: u64) -> Self {
+        Self::new_with_options(1, false, false, None, Some((http, ws))).await
+    }
+    async fn new_with_options(
+        count: usize,
+        owned: bool,
+        fail_first: bool,
+        rate: Option<(u64, u32)>,
+        deadlines: Option<(u64, u64)>,
+    ) -> Self {
+        Self::new_with_budget_options(count, owned, fail_first, rate, deadlines, None).await
+    }
+    async fn new_with_budget_options(
+        count: usize,
+        owned: bool,
+        fail_first: bool,
+        rate: Option<(u64, u32)>,
+        deadlines: Option<(u64, u64)>,
+        budget: Option<u64>,
+    ) -> Self {
         let serial = SERIAL.lock().await;
         let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/m4a-ws-tests");
         fs::create_dir_all(&base).unwrap();
@@ -110,10 +134,17 @@ impl Harness {
         config.server.data_port = 0;
         config.server.admin_port = 0;
         config.websocket.idle_close_secs = 60;
+        if let Some(budget) = budget {
+            config.guard.inflight_budget_mib = budget;
+        }
         if let Some((hold, retries)) = rate {
             config.routing.rate_hold_secs = hold;
             config.routing.ws_upgrade_hold_secs = hold;
             config.routing.rate_hold_max_retries = retries;
+        }
+        if let Some((http, ws)) = deadlines {
+            config.routing.request_timeout_secs = http;
+            config.routing.ws_upgrade_hold_secs = ws;
         }
         let mut retry_proxy = None;
         config.upstream.codex_base = if fail_first {
@@ -273,6 +304,29 @@ async fn c6_row_13_upgrade_quota_health_before_second_account() {
         .unwrap();
     assert_eq!(upgrade["attempts"], 2);
     assert_eq!(upgrade["attempt_details"][0]["failover_reason"], "quota");
+}
+
+#[tokio::test]
+async fn upgrade_full_meter_without_limit_marker_fails_over_as_quota() {
+    let h = Harness::new(2).await;
+    let mut headers = HeaderMap::new();
+    for (key, value) in [
+        ("x-codex-primary-used-percent", "100"),
+        ("x-codex-primary-window-minutes", "300"),
+        ("x-codex-primary-reset-after-seconds", "3600"),
+    ] {
+        headers.insert(key, value.parse().unwrap());
+    }
+    h.fake
+        .state
+        .push_handshake(StatusCode::TOO_MANY_REQUESTS, "{}", headers);
+    let (mut client, account) = h.connect().await;
+    assert_eq!(account, h.ids[1]);
+    assert_eq!(h.fake.state.requests().len(), 2);
+    assert!(matches!(h.store.load(&h.ids[0]).unwrap().health,
+        Health::Cooling { reason: HealthReason::Quota, until, .. }
+        if (until - Utc::now()).num_seconds().abs_diff(3600) <= 2));
+    client.close(None).await.unwrap();
 }
 
 #[tokio::test]
@@ -467,6 +521,13 @@ async fn c6_3_ws_rate_frame_without_advice_closes_1012_same_account() {
     let (mut client, account) = h.connect().await;
     create(&mut client, "fixture-model").await;
     assert_close(receive(&mut client).await, 1012);
+    let pacing = h.state.accounts.pacing_snapshot(&account);
+    let wait = pacing
+        .rate_backoff_until
+        .unwrap()
+        .saturating_duration_since(std::time::Instant::now())
+        + pacing.rate_release_interval;
+    tokio::time::sleep(wait).await;
     let (mut reconnect, same_account) = h.connect().await;
     assert_eq!(same_account, account);
     assert_eq!(same_account, h.ids[0]);
@@ -2012,7 +2073,7 @@ async fn r1_ws_rate_wait_defers_one_charged_text_or_binary_and_preserves_bytes()
         Message::Text("  {\"type\":\"future.unknown\",\"opaque\":\"untouched\"} \n".into()),
         Message::Binary(vec![0, 255, 128, 13, 10, 0, 42].into()),
     ] {
-        let h = Harness::new_with_rate_options(1, false, false, Some((1, 5))).await;
+        let h = Harness::new_with_rate_options(1, false, false, Some((5, 5))).await;
         h.fake.state.push_reply([Message::Text(
             r#"{"type":"error","status":429,"error":{"code":"rate_limit_exceeded"}}"#.into(),
         )]);
@@ -2158,7 +2219,7 @@ async fn r1_create_first_and_persistent_second_gate_after_other_connection_429()
     for previous_turn in [false, true] {
         // The other connection uses its one allowed retry, returns the native
         // HTTP 429, and leaves the existing socket's shared gate closed.
-        let h = Harness::new_with_rate_options(1, false, false, Some((1, 1))).await;
+        let h = Harness::new_with_rate_options(1, false, false, Some((5, 1))).await;
         let done = Message::Text(r#"{"type":"response.completed"}"#.into());
         let (mut client, account) = h.connect().await;
         if previous_turn {
@@ -2188,7 +2249,7 @@ async fn r1_create_first_and_persistent_second_gate_after_other_connection_429()
         );
         assert_eq!(h.fake.state.messages().len(), before);
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(2), receive(&mut client))
+            tokio::time::timeout(Duration::from_secs(6), receive(&mut client))
                 .await
                 .unwrap(),
             done

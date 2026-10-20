@@ -176,12 +176,20 @@ impl Default for ServerConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct RoutingConfig {
+    pub mode: crate::routing::Mode,
+    pub churn: crate::routing::ChurnLimits,
     pub gate_5h_pct: f64,
     pub gate_weekly_pct: f64,
     pub gate_weekly_near_reset_pct: f64,
     pub near_reset_secs: u64,
     pub inflight_allowance_pct: f64,
+    pub placement_allowance_pct: f64,
+    pub weak_evidence_new_sessions: usize,
+    pub placement_poll_after_secs: u64,
+    pub placement_poll_min_interval_secs: u64,
     pub reset_hold_secs: u64,
+    pub request_timeout_secs: u64,
+    pub forecast_shadow: bool,
     pub rate_hold_secs: u64,
     pub rate_hold_max_retries: u32,
     pub ws_upgrade_hold_secs: u64,
@@ -194,12 +202,20 @@ pub struct RoutingConfig {
 impl Default for RoutingConfig {
     fn default() -> Self {
         Self {
+            mode: crate::routing::Mode::Rebalance,
+            churn: crate::routing::ChurnLimits::default(),
             gate_5h_pct: 90.0,
             gate_weekly_pct: 90.0,
             gate_weekly_near_reset_pct: 98.0,
             near_reset_secs: 18000,
             inflight_allowance_pct: 1.0,
+            placement_allowance_pct: 2.0,
+            weak_evidence_new_sessions: 1,
+            placement_poll_after_secs: 120,
+            placement_poll_min_interval_secs: 300,
             reset_hold_secs: 60,
+            request_timeout_secs: 300,
+            forecast_shadow: false,
             rate_hold_secs: 60,
             rate_hold_max_retries: 3,
             ws_upgrade_hold_secs: 10,
@@ -214,12 +230,39 @@ impl Default for RoutingConfig {
 
 impl RoutingConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
+        self.churn.validate()?;
+        anyhow::ensure!(
+            self.mode != crate::routing::Mode::Strict,
+            "global routing mode cannot be strict; set a project or root policy"
+        );
+        anyhow::ensure!(
+            (1..=1000).contains(&self.weak_evidence_new_sessions),
+            "weak evidence allowance must be 1..1000"
+        );
+        anyhow::ensure!(
+            self.placement_poll_after_secs > 0 && self.placement_poll_min_interval_secs > 0,
+            "placement polling intervals must be positive"
+        );
+        anyhow::ensure!(
+            (1..=600).contains(&self.request_timeout_secs),
+            "routing request timeout must be 1..600 seconds"
+        );
+        anyhow::ensure!(
+            (1..=600).contains(&self.rate_hold_secs)
+                && (1..=14).contains(&self.ws_upgrade_hold_secs),
+            "rate hold must be 1..600 seconds; WebSocket upgrade must be below 15 seconds"
+        );
+        anyhow::ensure!(
+            self.reset_hold_secs <= 120,
+            "routing reset hold cannot exceed 120 seconds"
+        );
         anyhow::ensure!(
             [
                 self.gate_5h_pct,
                 self.gate_weekly_pct,
                 self.gate_weekly_near_reset_pct,
-                self.inflight_allowance_pct
+                self.inflight_allowance_pct,
+                self.placement_allowance_pct
             ]
             .into_iter()
             .all(|value| value.is_finite() && (0.0..=100.0).contains(&value)),
@@ -330,12 +373,24 @@ impl Config {
             Err(error) => return Err(error.into()),
         };
         // 파싱 오류에 설정 원문이 포함되지 않도록 외부 오류는 고정 문구로 제한한다.
-        let value: toml::Value =
+        let mut value: toml::Value =
             toml::from_str(&text).map_err(|_| anyhow::anyhow!("invalid config.toml"))?;
-        let config: Self = value
+        for key in clamp_numeric_bounds(&mut value) {
+            config_warning("config_value_clamped", &key);
+        }
+        let mut config: Self = value
             .clone()
             .try_into()
             .map_err(|_| anyhow::anyhow!("invalid config.toml types"))?;
+        if config.routing.gate_weekly_near_reset_pct < config.routing.gate_weekly_pct {
+            config.routing.gate_weekly_near_reset_pct = config.routing.gate_weekly_pct;
+            config_warning("config_value_clamped", "routing.gate_weekly_near_reset_pct");
+        }
+        if config.websocket.idle_close_secs >= config.routing.rebalance_idle_secs {
+            config.routing.rebalance_idle_secs = config.routing.rebalance_idle_secs.max(2);
+            config.websocket.idle_close_secs = config.routing.rebalance_idle_secs - 1;
+            config_warning("config_value_clamped", "websocket.idle_close_secs");
+        }
         config.upstream.validate()?;
         config.websocket.validate()?;
         config.routing.validate()?;
@@ -347,13 +402,275 @@ impl Config {
         let known = toml::Value::try_from(Self::default())?;
         warn_unknown(&value, &known, "");
         if let Some(accounts) = value.get("accounts").and_then(toml::Value::as_table) {
-            let known = toml::Value::try_from(AccountConfig::default())?;
+            let known = toml::Value::try_from(AccountConfig {
+                spread_threshold: Some(1),
+                ..AccountConfig::default()
+            })?;
             for account in accounts.values() {
                 warn_unknown(account, &known, "accounts.<id>.");
             }
         }
         Ok(config)
     }
+}
+
+fn config_warning(code: &'static str, path: &str) {
+    let message = if code == "unknown_config_key" {
+        "Unknown configuration key"
+    } else {
+        "Configuration adjusted"
+    };
+    if tracing::dispatcher::has_been_set() {
+        tracing::warn!(event = "core_warning", code, config_key = path, "{message}");
+    } else {
+        eprintln!("WARN core_warning {code}: {message}: {path}");
+    }
+}
+
+#[cfg(test)]
+mod r8_bounds_tests {
+    use super::*;
+
+    #[test]
+    fn startup_clamps_numeric_bounds_and_ignores_unknown_nested_keys_without_rewriting() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/config-clamp-tests");
+        fs::create_dir_all(&root).unwrap();
+        let home = tempfile::tempdir_in(root).unwrap();
+        let text = r#"
+future_root = "synthetic"
+[routing]
+rate_hold_secs = 0
+ws_upgrade_hold_secs = 15
+request_timeout_secs = 9999
+reset_hold_secs = -10
+weak_evidence_new_sessions = 0
+placement_poll_after_secs = -1
+placement_poll_min_interval_secs = 0
+rate_hold_max_retries = 0
+gate_5h_pct = -5
+gate_weekly_pct = 120
+gate_weekly_near_reset_pct = 0
+inflight_allowance_pct = inf
+placement_allowance_pct = nan
+future_option = 42
+[routing.churn]
+target_success_secs = 0
+target_quiet_secs = 0
+future_nested = "synthetic"
+dwell_secs = -1
+revisit_secs = 90000
+window_secs = 0
+max_group_moves = 0
+max_pool_moves = 99
+max_move_bytes = 0
+[quota]
+poll_min_interval_secs = 0
+future = true
+[websocket]
+idle_close_secs = 99999
+max_message_size_mib = 0
+future = true
+"#;
+        fs::write(home.path().join("config.toml"), text).unwrap();
+        let config = Config::load(home.path()).unwrap();
+        assert_eq!(config.routing.rate_hold_secs, 1);
+        assert_eq!(config.routing.ws_upgrade_hold_secs, 14);
+        assert_eq!(config.routing.request_timeout_secs, 600);
+        assert_eq!(config.routing.reset_hold_secs, 0);
+        assert_eq!(config.routing.weak_evidence_new_sessions, 1);
+        assert_eq!(config.routing.placement_poll_after_secs, 1);
+        assert_eq!(config.routing.placement_poll_min_interval_secs, 1);
+        assert_eq!(config.routing.rate_hold_max_retries, 1);
+        assert_eq!(config.routing.gate_5h_pct, 0.0);
+        assert_eq!(config.routing.gate_weekly_pct, 100.0);
+        assert_eq!(config.routing.gate_weekly_near_reset_pct, 100.0);
+        assert_eq!(config.routing.inflight_allowance_pct, 100.0);
+        assert_eq!(config.routing.placement_allowance_pct, 2.0);
+        assert_eq!(config.routing.churn.dwell_secs, 0);
+        assert_eq!(config.routing.churn.revisit_secs, 86400);
+        assert_eq!(config.routing.churn.window_secs, 1);
+        assert_eq!(config.routing.churn.max_group_moves, 1);
+        assert_eq!(config.routing.churn.max_pool_moves, 32);
+        assert_eq!(config.routing.churn.max_move_bytes, 1);
+        assert_eq!(config.quota.poll_min_interval_secs, 1);
+        assert_eq!(
+            config.websocket.idle_close_secs,
+            config.routing.rebalance_idle_secs - 1
+        );
+        assert_eq!(config.websocket.max_message_size_mib, 1);
+        config.routing.validate().unwrap();
+        assert_eq!(
+            fs::read_to_string(home.path().join("config.toml")).unwrap(),
+            text
+        );
+        let mut parsed: toml::Value = toml::from_str(text).unwrap();
+        let warnings = clamp_numeric_bounds(&mut parsed);
+        assert!(warnings.iter().any(|k| k == "routing.rate_hold_secs"));
+        assert!(warnings.iter().any(|k| k == "routing.churn.max_pool_moves"));
+        assert!(warnings.iter().all(|k| !k.contains("synthetic")));
+    }
+    #[test]
+    fn valid_numeric_bounds_are_unchanged() {
+        let mut values = toml::Value::try_from(Config::default()).unwrap();
+        let original = values.clone();
+        assert!(clamp_numeric_bounds(&mut values).is_empty());
+        assert_eq!(values, original);
+    }
+    #[test]
+    fn account_thresholds_and_extreme_intervals_clamp_before_unsigned_deserialization() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/config-clamp-tests");
+        fs::create_dir_all(&root).unwrap();
+        let home = tempfile::tempdir_in(root).unwrap();
+        let text = "[routing]\nactive_window_secs = 9223372036854775807\noverload_window_secs = 9223372036854775807\n[accounts.\"cl-a\"]\nspread_threshold = -1\n[accounts.\"cl-b\"]\nspread_threshold = 0\n[accounts.\"cl-c\"]\nspread_threshold = 7\n";
+        fs::write(home.path().join("config.toml"), text).unwrap();
+        let config = Config::load(home.path()).unwrap();
+        assert_eq!(config.accounts["cl-a"].spread_threshold, Some(1));
+        assert_eq!(config.accounts["cl-b"].spread_threshold, Some(1));
+        assert_eq!(config.accounts["cl-c"].spread_threshold, Some(7));
+        assert_eq!(config.routing.active_window_secs, u64::from(u32::MAX));
+        assert_eq!(config.routing.overload_window_secs, u64::from(u32::MAX));
+        let delta = chrono::Duration::seconds(config.routing.active_window_secs as i64);
+        assert!(chrono::Utc::now().checked_sub_signed(delta).is_some());
+        assert!(
+            std::time::Instant::now()
+                .checked_add(std::time::Duration::from_secs(
+                    config.routing.overload_window_secs
+                ))
+                .is_some()
+        );
+        let mut parsed = toml::from_str(text).unwrap();
+        let warnings = clamp_numeric_bounds(&mut parsed);
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|k| *k == "accounts.<id>.spread_threshold")
+                .count(),
+            2
+        );
+        assert_eq!(
+            fs::read_to_string(home.path().join("config.toml")).unwrap(),
+            text
+        );
+    }
+    #[test]
+    fn unsigned_schema_bounds_clamp_ports_guards_and_tray_without_rewriting() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/config-clamp-tests");
+        fs::create_dir_all(&root).unwrap();
+        let home = tempfile::tempdir_in(root).unwrap();
+        let text = "[server]\ndata_port=-1\nadmin_port=99999\ndrain_timeout_secs=-1\n[guard]\nretain_max_per_request_mib=-1\ninflight_budget_mib=-1\nmemory_hard_limit_mib=-1\n[tray]\nburst_new_sessions=-1\n";
+        fs::write(home.path().join("config.toml"), text).unwrap();
+        let config = Config::load(home.path()).unwrap();
+        assert_eq!(config.server.data_port, 0);
+        assert_eq!(config.server.admin_port, u16::MAX);
+        assert_eq!(config.server.drain_timeout_secs, 0);
+        assert_eq!(config.guard.retain_max_per_request_mib, 0);
+        assert_eq!(config.guard.inflight_budget_mib, 0);
+        assert_eq!(config.guard.memory_hard_limit_mib, 0);
+        assert_eq!(config.tray.burst_new_sessions, 0);
+        assert_eq!(
+            fs::read_to_string(home.path().join("config.toml")).unwrap(),
+            text
+        );
+    }
+}
+
+// Normalize numbers before deserializing unsigned fields: negative TOML integers
+// are out of bounds too. Never include a value or the config text in a warning.
+fn clamp_numeric_bounds(value: &mut toml::Value) -> Vec<String> {
+    // Keep configured timer arithmetic representable on Windows Instant and
+    // Chrono alike (u32 seconds is over 136 years, far beyond operational use).
+    const MAX_INTERVAL: i64 = u32::MAX as i64;
+    fn field<'a>(value: &'a mut toml::Value, path: &str) -> Option<&'a mut toml::Value> {
+        let mut field = value;
+        for part in path.split('.') {
+            field = field.get_mut(part)?;
+        }
+        Some(field)
+    }
+    let mut changed = Vec::new();
+    for (path, min, max) in [
+        ("server.data_port", 0, u16::MAX as i64),
+        ("server.admin_port", 0, u16::MAX as i64),
+        ("server.drain_timeout_secs", 0, MAX_INTERVAL),
+        ("guard.retain_max_per_request_mib", 0, i64::MAX),
+        ("guard.inflight_budget_mib", 0, i64::MAX),
+        ("guard.memory_hard_limit_mib", 0, i64::MAX),
+        ("tray.burst_new_sessions", 0, u32::MAX as i64),
+        ("routing.weak_evidence_new_sessions", 1, 1000),
+        ("routing.placement_poll_after_secs", 1, MAX_INTERVAL),
+        ("routing.placement_poll_min_interval_secs", 1, MAX_INTERVAL),
+        ("routing.request_timeout_secs", 1, 600),
+        ("routing.rate_hold_secs", 1, 600),
+        ("routing.ws_upgrade_hold_secs", 1, 14),
+        ("routing.reset_hold_secs", 0, 120),
+        ("routing.rate_hold_max_retries", 1, u32::MAX as i64),
+        ("routing.rebalance_idle_secs", 1, MAX_INTERVAL),
+        ("routing.session_binding_max_secs", 1, MAX_INTERVAL),
+        ("routing.spread_threshold", 1, i64::MAX),
+        ("routing.active_window_secs", 1, MAX_INTERVAL),
+        ("routing.overload_window_secs", 1, MAX_INTERVAL),
+        ("routing.near_reset_secs", 0, MAX_INTERVAL),
+        ("routing.churn.dwell_secs", 0, 86400),
+        ("routing.churn.revisit_secs", 0, 86400),
+        ("routing.churn.window_secs", 1, 86400),
+        ("routing.churn.max_group_moves", 1, 16),
+        ("routing.churn.max_pool_moves", 1, 32),
+        ("routing.churn.max_move_bytes", 1, 64 * 1024 * 1024),
+        ("quota.poll_min_interval_secs", 1, 3600),
+        ("websocket.idle_close_secs", 1, MAX_INTERVAL),
+        ("websocket.max_message_size_mib", 1, i64::MAX),
+    ] {
+        if let Some(v) = field(value, path)
+            && let Some(n) = v.as_integer()
+        {
+            let clamped = n.clamp(min, max);
+            if clamped != n {
+                *v = toml::Value::Integer(clamped);
+                changed.push(path.to_owned());
+            }
+        }
+    }
+    if let Some(accounts) = value
+        .get_mut("accounts")
+        .and_then(toml::Value::as_table_mut)
+    {
+        for (_, account) in accounts.iter_mut() {
+            if let Some(v) = account.get_mut("spread_threshold")
+                && v.as_integer().is_some_and(|n| n < 1)
+            {
+                *v = toml::Value::Integer(1);
+                changed.push("accounts.<id>.spread_threshold".into());
+            }
+        }
+    }
+    for path in [
+        "routing.gate_5h_pct",
+        "routing.gate_weekly_pct",
+        "routing.gate_weekly_near_reset_pct",
+        "routing.inflight_allowance_pct",
+        "routing.placement_allowance_pct",
+    ] {
+        if let Some(v) = field(value, path)
+            && let Some(n) = v.as_float().or_else(|| v.as_integer().map(|n| n as f64))
+        {
+            let fallback = match path {
+                "routing.inflight_allowance_pct" => 1.0,
+                "routing.placement_allowance_pct" => 2.0,
+                "routing.gate_weekly_near_reset_pct" => 98.0,
+                _ => 90.0,
+            };
+            let clamped = if n.is_nan() {
+                fallback
+            } else {
+                n.clamp(0.0, 100.0)
+            };
+            if clamped != n {
+                *v = toml::Value::Float(clamped);
+                changed.push(path.to_owned());
+            }
+        }
+    }
+    changed
 }
 
 fn warn_unknown(value: &toml::Value, known: &toml::Value, prefix: &str) {
@@ -366,11 +683,7 @@ fn warn_unknown(value: &toml::Value, known: &toml::Value, prefix: &str) {
             match known.get(key) {
                 Some(known) => warn_unknown(value, known, &format!("{path}.")),
                 None => {
-                    if tracing::dispatcher::has_been_set() {
-                        tracing::warn!(config_key = %path, "Unknown configuration key");
-                    } else {
-                        eprintln!("WARN Unknown configuration key: {path}");
-                    }
+                    config_warning("unknown_config_key", &path);
                 }
             }
         }
@@ -470,5 +783,31 @@ mod tray_v2_theme_tests {
                 .theme,
             TrayTheme::Light
         );
+    }
+}
+
+#[cfg(test)]
+mod r8_routing_config_tests {
+    use super::*;
+    #[test]
+    fn routing_unknown_future_key_is_compatible_but_global_strict_is_rejected() {
+        let config: Config = toml::from_str("[routing]\nfuture_option = 42\n").unwrap();
+        assert_eq!(config.routing.mode, crate::routing::Mode::Rebalance);
+        config.routing.validate().unwrap();
+        let mut strict = config.routing;
+        strict.mode = crate::routing::Mode::Strict;
+        assert!(strict.validate().is_err());
+    }
+    #[test]
+    fn anti_herding_defaults_and_bounds() {
+        let mut config = RoutingConfig::default();
+        assert_eq!(config.placement_allowance_pct, 2.0);
+        assert_eq!(config.weak_evidence_new_sessions, 1);
+        config.validate().unwrap();
+        config.placement_allowance_pct = f64::NAN;
+        assert!(config.validate().is_err());
+        config.placement_allowance_pct = 2.0;
+        config.weak_evidence_new_sessions = 0;
+        assert!(config.validate().is_err());
     }
 }

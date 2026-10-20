@@ -950,8 +950,8 @@ async fn close_code_and_reason_are_mirrored_both_ways() {
     }
 }
 
-#[test]
-fn c6_row_13a_only_response_events_commit_the_current_request() {
+#[tokio::test]
+async fn c6_row_13a_only_response_events_commit_the_current_request() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/pump-tests");
     std::fs::create_dir_all(&root).unwrap();
     let home = tempfile::tempdir_in(root).unwrap();
@@ -972,7 +972,7 @@ fn c6_row_13a_only_response_events_commit_the_current_request() {
         capture_ticket: None,
         connection: "fixture".into(),
     };
-    let mut current = CurrentCompletion::new(&context);
+    let mut current = CurrentCompletion::new(&context).await.unwrap();
     for event in [
         None,
         Some(serde_json::json!({"type":"metadata"})),
@@ -1214,7 +1214,7 @@ async fn r1_create_unsent_completion_keeps_guard_but_ledgers_zero_attempts() {
         capture_ticket: None,
         connection: "queued-fixture".into(),
     };
-    let active = CurrentCompletion::new(&context);
+    let active = CurrentCompletion::new(&context).await.unwrap();
     assert_eq!(relay.accounts.inflight_count("fake-account"), 1);
     let rate = active.rate.clone();
     let wait = RateWait::new(rate.clone());
@@ -1256,8 +1256,8 @@ fn r1_ws_retry_advice_is_a_sidecopy() {
     assert_eq!(event, original);
 }
 
-#[test]
-fn r1_ws_completion_outlives_context_and_snapshots_both_wait_drop_orders() {
+#[tokio::test]
+async fn r1_ws_completion_outlives_context_and_snapshots_both_wait_drop_orders() {
     for explicit_finish in [false, true] {
         for wait_dropped_first in [false, true] {
             let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/pump-tests");
@@ -1281,7 +1281,7 @@ fn r1_ws_completion_outlives_context_and_snapshots_both_wait_drop_orders() {
                 capture_ticket: None,
                 connection: "fixture".into(),
             };
-            let active = CurrentCompletion::new(&context);
+            let active = CurrentCompletion::new(&context).await.unwrap();
             let rate = active.rate.clone();
             rate.sent(); // one actual resend, followed by an unsent wait
             let wait = RateWait::new(rate.clone());

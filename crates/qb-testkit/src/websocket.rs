@@ -45,6 +45,7 @@ struct HandshakeFailure {
 }
 
 struct Inner {
+    keep_old_connections: bool,
     requests: Vec<RecordedRequest>,
     messages: Vec<Message>,
     events: Vec<ConnectionEvent>,
@@ -63,6 +64,7 @@ pub struct WebSocketState(Arc<Mutex<Inner>>);
 impl Default for WebSocketState {
     fn default() -> Self {
         Self(Arc::new(Mutex::new(Inner {
+            keep_old_connections: false,
             requests: Vec::new(),
             messages: Vec::new(),
             events: Vec::new(),
@@ -78,6 +80,10 @@ impl Default for WebSocketState {
 }
 
 impl WebSocketState {
+    /// Retain previous fake sockets for actual overlapping-connection races.
+    pub fn keep_old_connections(&self) {
+        self.0.lock().unwrap().keep_old_connections = true;
+    }
     /// 다음 핸드셰이크를 지정한 HTTP 응답으로 거절한다.
     pub fn push_handshake(&self, status: StatusCode, body: impl Into<String>, headers: HeaderMap) {
         self.push_handshake_delayed(status, body, headers, Duration::ZERO);
@@ -134,6 +140,17 @@ impl WebSocketState {
         sender
             .send(message)
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "fake WebSocket closed"))
+    }
+
+    /// Capture this synthetic connection for overlap/backpressure tests.
+    pub fn sender(&self) -> io::Result<mpsc::UnboundedSender<Message>> {
+        self.0
+            .lock()
+            .unwrap()
+            .active
+            .as_ref()
+            .map(|(_, sender)| sender.clone())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no active fake WebSocket"))
     }
 
     /// 다음 성공한 연결이 열리면 순서대로 보낸다.
@@ -251,16 +268,17 @@ async fn serve_socket(stream: tokio::net::TcpStream, state: WebSocketState) {
         return;
     };
     let (sender, mut receiver) = mpsc::unbounded_channel();
-    let id = {
+    let (id, _sender_keepalive) = {
         let mut inner = state.0.lock().unwrap();
         inner.next_id += 1;
         let id = inner.next_id;
         for message in inner.queued.drain(..) {
             let _ = sender.send(message);
         }
+        let keepalive = inner.keep_old_connections.then(|| sender.clone());
         inner.active = Some((id, sender));
         inner.events.push(ConnectionEvent::Opened(id));
-        id
+        (id, keepalive)
     };
     loop {
         let result = tokio::select! {
