@@ -39,11 +39,6 @@ D17 review MF5는 wiring.json이 CPA 작업을 소유하면 retire가 그 작업
 
 비차단 질문이다. C9의 `43200m`(30일)·양수 초 단위 창은 D20 근거 갱신·배정량 해제·poll 추적에서 처리한다. 기존 C7 gate와 초기화 정렬은 5h/7d 및 primary/secondary 별칭 규칙을 유지했다. 월간 창에 주간 90/98% 기준을 새로 적용하거나 정렬 순서를 발명하지 않았다. 기존 기준을 명시적으로 유지할지, 비표준 길이 창의 gate·정렬 슬롯을 별도로 정할지 관문에서 확인한다. 실프로필은 조회하지 않았다.
 
-## R9 milestone gate (2026-10-21)
-
-- Addendum 2 says to remove an imported thread's own source names, and also never remove fork ancestors. If root A is still an ancestor of an unmoved source thread B, deleting A's source rollout breaks B. Current implementation takes the reversible conservative path: refuse moving A, retain its original files/rows, explain in Korean to move descendants first or use `--keep-source`; bulk sorts descendants before ancestors. Please confirm this interpretation at the R9 gate. This does not block implementing or verifying the rest.
-
-
 ## R9 Addendum 3 feasibility (gate question, 2026-10-21)
 
 Independent Sol source/native investigation: `.sandbox/research/R9-panel-feasibility.md`. Native Codex 0.163 falls back to rollout filenames when its thread row is absent and recreates the row. Thus keeping source S as a fork-ancestor link (G6) while removing its row does not make raw `codex` in the old home fail closed (G7); it can resume S and become a second row owner (G1). Process-held Codex locks also disappear when the importer is killed, so exposed links in two homes are writable before journal recovery (G3). Both have synthetic native counterexamples; no real home was touched.

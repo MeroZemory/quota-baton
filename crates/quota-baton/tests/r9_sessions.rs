@@ -534,7 +534,12 @@ fn r9_ancestor_resume_uses_child_journal_provenance_outside_known_homes() {
     assert!(f.sentinel.exists());
     fs::remove_file(&f.sentinel).unwrap();
     let writer = fs::OpenOptions::new().append(true).open(&ancestor).unwrap();
-    assert_refused(&f, &f.resume(A), "다른 곳에서 실행 중");
+    let refusal = f.resume(A);
+    assert_refused(&f, &refusal, "다른 곳에서 실행 중");
+    let diagnostic = String::from_utf8_lossy(&refusal.stderr);
+    assert!(diagnostic.contains("app-server-daemon/daemon.pid"));
+    assert!(diagnostic.contains("해당 PID"));
+    assert!(diagnostic.contains("다른 대화를 제공하지 않는"));
     drop(writer);
 
     // Preserve the old linked file as a prefix; only source's active physical

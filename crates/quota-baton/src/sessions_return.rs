@@ -238,6 +238,37 @@ fn probes(record: &Return) -> (Vec<PathBuf>, Vec<PathBuf>) {
     (record.homes.clone(), names)
 }
 
+fn check_record_destination_inventory(record: &Return) -> Result<()> {
+    // Q supplies the intended physical segments before retirement. During
+    // recovery its rows/names may be gone, so use only the verified intended
+    // target names, never arbitrary same-ID destination alternatives.
+    let source_names = record.phase < Phase::Retiring;
+    let home = if source_names {
+        &record.source
+    } else {
+        &record.target
+    };
+    let catalog = discovery::catalog(home)?;
+    let files = record
+        .names
+        .iter()
+        .map(|name| {
+            let path = if source_names {
+                &name.source
+            } else {
+                &name.target
+            };
+            catalog
+                .rollouts
+                .values()
+                .find(|file| &file.path == path)
+                .cloned()
+                .context("돌려보내기 기록 조각을 확인할 수 없습니다")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    super::check_destination_inventory(&record.source, &record.target, &files)
+}
+
 fn plan(store: &Store, id: &str, to: Option<&Path>, map_path: &Path) -> Result<Return> {
     let journal = store.load()?;
     let own = journal.imports.get(id);
@@ -269,6 +300,7 @@ fn plan(store: &Store, id: &str, to: Option<&Path>, map_path: &Path) -> Result<R
             .is_none_or(|provider| provider == "openai")),
         "openai 공급자의 대화만 돌려보낼 수 있습니다"
     );
+    super::check_destination_inventory(&store.target, &target, &files)?;
     let ids = files
         .iter()
         .map(|file| file.thread.clone())
@@ -427,6 +459,7 @@ fn execute(
     hook: &mut dyn FnMut(&str) -> Result<()>,
 ) -> Result<()> {
     check_names(record)?;
+    check_record_destination_inventory(record)?;
     if record.phase < Phase::Retiring {
         db::verify(&record.source_database)?;
     }
@@ -470,6 +503,7 @@ fn execute(
         db::verify(&record.source_database)?;
         db::verify(&record.database)?;
         check_names(record)?;
+        check_record_destination_inventory(record)?;
         if source_has_dependents(&discovery::catalog(&record.source)?, &record.id)? {
             for name in &mut record.names {
                 if name.thread == record.id {
@@ -569,6 +603,7 @@ fn run_using(
     let (homes, names) = probes(&record);
     let read_guards = guard::probe_all(&homes, &record.ids, &names)?;
     check_names(&record)?;
+    check_record_destination_inventory(&record)?;
     preview(&record)?;
     let manual = format!(
         "quota-baton sessions return {id} --to \"{}\"",
@@ -596,6 +631,7 @@ fn run_using(
         );
     }
     check_names(&record)?;
+    check_record_destination_inventory(&record)?;
     if record.phase < Phase::Retiring {
         db::verify(&record.source_database)?;
     }
@@ -972,6 +1008,108 @@ mod tests {
             assert!(db::thread_path(&f.store.target, ID)?.is_some());
             assert!(f.roots[0].exists());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn return_refuses_archived_or_alternate_destination_versions_without_rows_before_mutation()
+    -> Result<()> {
+        use std::io::Write;
+        for paginated in [false, true] {
+            for archived in [false, true] {
+                let f = Fixture::new(false, paginated)?;
+                // In the paginated case ID is the prefix, not the active head
+                // SEGMENT. Comparing only the destination's head misses it.
+                let incoming = write_rollout(&f.account, ID, ID, None, None)?;
+                let directory = f.account.join(if archived {
+                    "archived_sessions/2024/01/01"
+                } else {
+                    "sessions/2024/01/01"
+                });
+                fs::create_dir_all(&directory)?;
+                let conflict = directory.join(format!("rollout-2024-01-01T00-00-00-{ID}.jsonl"));
+                fs::rename(incoming, &conflict)?;
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(&conflict)?
+                    .write_all(
+                        b"{\"type\":\"event_msg\",\"payload\":\"DIFFERENT_SYNTHETIC_CONTENT\"}\n",
+                    )?;
+                let original_conflict = fs::read(&conflict)?;
+                let original_import = fs::read(f.store.path())?;
+                let original_map = fs::read(&f.store.map_path)?;
+                let original_state = fs::read(f.store.target.join("state_5.sqlite"))?;
+                let original_goals = fs::read(f.store.target.join("goals_1.sqlite"))?;
+                assert!(!f.account.join("state_5.sqlite").exists());
+
+                let error = f
+                    .run(&mut |_| Ok(()))
+                    .err()
+                    .context("conflicting destination accepted")?;
+                assert!(
+                    error
+                        .downcast_ref::<super::super::InventoryConflict>()
+                        .is_some()
+                );
+                assert!(fs::read(f.store.path())? == original_import);
+                assert!(fs::read(&f.store.map_path)? == original_map);
+                assert!(fs::read(f.store.target.join("state_5.sqlite"))? == original_state);
+                assert!(fs::read(f.store.target.join("goals_1.sqlite"))? == original_goals);
+                assert!(fs::read(&conflict)? == original_conflict);
+                assert!(fs::read(f.account.join("session_index.jsonl"))? == f.original_index);
+                assert!(!journal_path(&f.store, ID).exists());
+                assert!(!f.account.join("state_5.sqlite").exists());
+                assert!(!f.account.join("goals_1.sqlite").exists());
+                assert!(!f.store.home.join("journal/sessions-import.lock").exists());
+                assert!(!f.store.target.join("thread-writer-locks").exists());
+                assert!(!f.account.join("thread-writer-locks").exists());
+                for path in &f.roots {
+                    let relative = path.strip_prefix(f.store.target.join("sessions"))?;
+                    assert!(path.exists());
+                    assert!(!f.account.join("sessions").join(relative).exists());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn return_inventory_accepts_exact_intended_hardlinks_for_each_paginated_segment() -> Result<()>
+    {
+        let f = Fixture::new(false, true)?;
+        for source in &f.roots {
+            let relative = source.strip_prefix(f.store.target.join("sessions"))?;
+            let target = f.account.join("sessions").join(relative);
+            fs::create_dir_all(target.parent().context("segment parent")?)?;
+            fs::hard_link(source, target)?;
+        }
+        assert!(!f.account.join("state_5.sqlite").exists());
+        f.run(&mut |_| Ok(()))?;
+        f.check_complete(false)?;
+        Ok(())
+    }
+
+    #[test]
+    fn return_inventory_refuses_equal_content_hardlink_at_an_extra_archived_name() -> Result<()> {
+        let f = Fixture::new(false, false)?;
+        let directory = f.account.join("archived_sessions/2024/01/01");
+        fs::create_dir_all(&directory)?;
+        let alias = directory.join(format!("rollout-2024-01-01T00-00-00-{ID}.jsonl"));
+        fs::hard_link(&f.roots[0], &alias)?;
+        let identity = guard::identity(&alias)?;
+        let error = f
+            .run(&mut |_| Ok(()))
+            .err()
+            .context("extra destination alias accepted")?;
+        assert!(
+            error
+                .downcast_ref::<super::super::InventoryConflict>()
+                .is_some()
+        );
+        assert!(guard::identity(&alias)? == identity);
+        assert!(f.roots[0].exists());
+        assert!(!f.account.join("state_5.sqlite").exists());
+        assert!(!journal_path(&f.store, ID).exists());
         Ok(())
     }
 }

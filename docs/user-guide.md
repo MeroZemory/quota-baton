@@ -328,6 +328,8 @@ quota-baton.exe sessions return <UUID>
 quota-baton.exe sessions return <UUID> --to <HOME>
 ```
 
+TUI를 닫은 뒤에도 잠금이 남을 수 있습니다. 해당 홈의 `app-server-daemon/daemon.pid`에서 PID를 확인하세요. 다른 대화를 제공하지 않는 데몬만 그 PID로 종료한 뒤 다시 시도하세요. qb는 데몬을 자동으로 종료하지 않습니다.
+
 현재 기록과 목표 상태를 돌려보냅니다. 옛 가져오기 스냅샷으로 덮지 않습니다. 계획 뒤 `move`를 입력해야 하며, core가 꺼져 있어도 됩니다. herdr의 세션 홈도 같은 작업 기록에 따라 갱신합니다. 중간에 끊기면 같은 명령으로 기록된 작업을 완료합니다.
 
 가져오기를 해제할 때도 먼저 미리 봅니다.
