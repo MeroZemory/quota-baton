@@ -223,6 +223,8 @@ quota-baton routing session <식별자> --project <프로젝트-ID> --inherit
 
 기본 설정을 바꾸는 `default` 모드는 전용 명령으로 충분히 써 본 뒤에만 고려하십시오.
 
+**Codex 대화 기록은 따로 저장됩니다.** `codex-qb`는 전용 폴더 `~/.codex-acct/qb`를 쓰므로, 기존 `codex`나 `codex-mz` 같은 계정별 명령으로 나눈 대화는 `codex-qb resume`으로 바로 열리지 않습니다. qb 쪽에서 이어가려면 세션을 옮겨야 합니다. `claude-qb`는 기존 `claude`와 대화 기록 폴더를 같이 쓰므로 `claude-qb --resume <ID>`로 바로 이어갈 수 있습니다.
+
 전환 전에는 항상 dry-run을 실행합니다.
 
 ```powershell
