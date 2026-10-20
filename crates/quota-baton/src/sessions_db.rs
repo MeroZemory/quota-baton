@@ -1205,6 +1205,7 @@ fn prepare_with_operational_rebase<'a>(
                     let mut values = row.values.clone();
                     if after_resume && remove && !is_goal && row.owned {
                         for name in [
+                            "created_at",
                             "updated_at",
                             "tokens_used",
                             "created_at_ms",
@@ -2172,7 +2173,7 @@ mod tests {
         apply(&planned)?;
         let state = Connection::open(target.join(STATE))?;
         state.execute(
-            "UPDATE threads SET updated_at=77,tokens_used=88,created_at_ms=999,
+            "UPDATE threads SET created_at=42,updated_at=77,tokens_used=88,created_at_ms=999,
             updated_at_ms=77000,recency_at=77,recency_at_ms=77000 WHERE id=?1",
             [&ids[0]],
         )?;
@@ -2198,7 +2199,6 @@ mod tests {
             "UPDATE threads SET rollout_path='sessions/wrong.jsonl' WHERE id=?1",
             "UPDATE threads SET model_provider='qb' WHERE id=?1",
             "UPDATE threads SET title='changed title' WHERE id=?1",
-            "UPDATE threads SET created_at=42 WHERE id=?1",
             "UPDATE threads SET future_blob=X'AB' WHERE id=?1",
             "UPDATE threads SET id='different-id' WHERE id=?1",
         ] {
