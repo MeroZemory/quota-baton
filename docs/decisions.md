@@ -366,20 +366,46 @@ The design was independently reviewed (`.sandbox/reviews/D17-review.md`); all si
 **1. Routing policies.** Keep the `impl/cache-routing` surface: `strict` / `recover` / `rebalance` per project and per root session, plus the admin API and the CLI. This supersedes the D11 §4 rule that drain is the only manual placement setting. The default is `rebalance`. A user who sets no policy MUST get exactly the D15/C7.1 behaviour, including the review fixes below.
 
 **2. Anti-herding.** The problem: usage observations lag behind placements. An account that was just added, just reset or just observed low looks emptiest, so a burst of new sessions all land on it before any observation shows their cost.
-- **Placement charge.** Each new session placed on an account adds `placement_allowance_pct` (default 2 points) to that account's projected usage on every gating window. This applies to new placements and to rebalance moves. The charge stays until an observation of that window newer than the placement arrives, from a response header or a poll; the observation then already includes the session's cost. The charge is placement-only, like the in-flight allowance (C7): it never cools an account and never moves a bound session.
+- **Placement.** A placement is one of two things:
+  - a new session group bound by C7 steps 3–6;
+  - a group moved onto the account by C7.1 or by the cold-point rule.
+
+  Steps 1–2, restored bindings and in-place retries are not placements.
+- **As-of time.** An observation's as-of time depends on its source:
+  - for response headers and WebSocket rate-limit events, the send time of the request that produced it;
+  - for a poll, the time the poll started.
+
+  An observation is newer than a placement when its as-of time is after the placement in the account's monotonic sequence. The same instant is not newer.
+- **Placement charge.** Each placement adds `placement_allowance_pct` (default 2 points) to that account's projected usage on every gating window. It adds on top of the in-flight allowance.
+  - The charge for a window stays until an observation of that window newer than the placement arrives. A response to a request sent before the placement never clears it.
+  - The charge is used only for placement, like the in-flight allowance (C7). It never cools an account and never moves a bound session. The cold-point gate check (C7) uses projected usage without the charge.
 - **Confidence cap.** An account's usage evidence is **weak** when any gating window has:
   - no observation yet;
   - an observation older than the account's latest placement (an account that has just been used);
   - or a passed `reset_at` with no new observation.
 
-  An account with weak evidence accepts at most `weak_evidence_new_sessions` (default 1) new or moved session group until a fresh observation arrives. Only after that does it compete on its numbers again.
-  - If every candidate is weak, place round-robin by the fewest sessions placed since their last observation, then by the C7 order.
-  - A cap is never a refusal (the C7 rule that a full account is never a refusal applies).
-- **Fresh evidence soon.** After a placement on a weak account, if no usage header has updated it within 120 s, run one usage poll for that account. This poll is exempt from `poll_min_interval_secs`, at most once per account per 5 min. Polls stay read-only GETs with honest headers (C9, C10).
-- **Ledger.** `placement` records carry `evidence: fresh|weak` and the charge applied, so herding can be measured.
+  An account is **capped** when two things hold:
+  - its evidence is weak;
+  - `placed_since_obs` is at least `weak_evidence_new_sessions` (default 1). `placed_since_obs` counts the placements newer than the oldest observation among the account's gating windows. While a window has no observation, every placement counts.
+
+  Where the cap acts:
+  - It applies in C7 step 4 (both branches), in step 5 and in the C7.1 move.
+  - It applies after the room partition and the pacing skip. Room (C7.1) is decided before the cap.
+  - Uncapped candidates come first, in the C7 order. When every candidate in the set is capped, order them by the fewest `placed_since_obs`, then by the C7 order.
+  - A capped account is never a refusal.
+- **Fresh evidence soon.** 120 s after any placement, check whether every gating window of the account has an observation newer than that placement. If not, run one usage poll for that account.
+  - This poll has its own budget: one per account per 5 min, independent of `poll_min_interval_secs`.
+  - It respects the poll backoff and the C9 exclusions.
+  - Polls stay read-only GETs with honest headers (C9, C10).
+- **Ledger.** `placement` records carry `evidence: fresh|weak`, `capped`, `placed_since_obs` and the charge applied. The triggered poll logs `poll{reason: placement_evidence}`. Together they measure herding and the poll cost.
+- **Config keys** (C12): `placement_allowance_pct = 2`, `weak_evidence_new_sessions = 1`, `placement_poll_after_secs = 120`, `placement_poll_min_interval_secs = 300`. The counters, `last_placement_at` and the poll budget live in memory, like the C7.1 marks, and are not exported on takeover.
+- **Limits** (from the review `.sandbox/reviews/D20-anti-herding-check-fable.md`):
+  - The charge reorders only accounts that are tied on both resets. It mainly matters at the gate.
+  - A busy account that is first in the C7 order refreshes its evidence on every response, so it keeps taking sessions up to `spread_threshold`. That is D11 plus D15, and D20 does not change it.
+  - The cap bounds a burst: within one observation cycle no account is more than one placement ahead of another.
 
 **3. Review fixes the design owner decided (no user input needed).** References are to `.sandbox/reviews/cache-routing-review-fable-2026-10-20.md` §2.
-- **M5, D15 cure for idle targets.** Drop the requirement of a committed success within 300 s. A rebalance target needs eligibility, the gate, room, and C7 non-stale observations. A target with weak evidence takes at most one moved group (§2) until it is observed.
+- **M5, D15 cure for idle targets.** Drop the requirement of a committed success within 300 s. A rebalance target needs eligibility, the gate, room, and C7 non-stale observations. A target with weak evidence takes at most one moved group (§2) until it is observed. If every target with room is capped, the group stays and keeps its mark.
 - **M6, rate-hold expiry.** Keep D14 and C6.3: when the 60 s rate hold expires, send once. A locally synthesized 429 is not adopted (C7: projections never synthesize a 429). Local hold expiries do not count toward the C7.1 overload trigger.
 - **Churn guards.** The dwell, revisit, group, provider and cost guards are kept as defaults for **discretionary** moves only (rebalance and cold point). Forced moves (C5 ineligibility) are never blocked or budgeted (M3).
 - **Availability.** Policy-file failures deny dispatch only to `strict` sessions (M1, M2).
