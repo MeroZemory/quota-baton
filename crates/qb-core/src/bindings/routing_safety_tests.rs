@@ -582,6 +582,59 @@ fn d20_partial_observation_and_equal_sequence_preserve_window_charge() {
 }
 
 #[test]
+fn d20_equal_sequence_charge_survives_next_placement_and_same_proof_replay() {
+    let (_root, t, cs, now) = placement_fixture();
+    place_at(&t, "claude:equal-first", &cs[..1], now);
+    let first = t.data.lock().unwrap().placements["cl-a"].latest.unwrap();
+    assert_eq!(first, 1);
+    t.note_usage_observation_asof("cl-a", cs[0].quota.as_ref().unwrap(), first);
+    assert_eq!(
+        metrics(&cs[0], &t.data.lock().unwrap(), &t.config, now).usage,
+        2.
+    );
+
+    place_at(&t, "claude:equal-second", &cs[..1], now);
+    {
+        let data = t.data.lock().unwrap();
+        assert_eq!(data.placements["cl-a"].latest, Some(2));
+        assert_eq!(
+            data.placements["cl-a"].count(),
+            1,
+            "cap count excludes the equal first placement"
+        );
+        assert_eq!(data.placements["cl-a"].charge_count("5h"), 2);
+        assert_eq!(data.placements["cl-a"].charge_count("7d"), 2);
+        assert_eq!(
+            metrics(&cs[0], &data, &t.config, now).usage,
+            4.,
+            "both placements remain charged because sequence 1 covers neither strictly"
+        );
+    }
+    t.note_usage_observation_asof("cl-a", cs[0].quota.as_ref().unwrap(), first);
+    assert_eq!(
+        metrics(&cs[0], &t.data.lock().unwrap(), &t.config, now).usage,
+        4.,
+        "replaying the old proof cannot lose its equality state or change its captured count"
+    );
+
+    let newer = t.begin_usage_observation_for("cl-a");
+    assert!(newer.sequence > 2);
+    let short_only =
+        serde_json::json!({"windows":[cs[0].quota.as_ref().unwrap()["windows"][0].clone()]});
+    t.note_usage_observation_asof_token("cl-a", &short_only, newer);
+    {
+        let data = t.data.lock().unwrap();
+        assert_eq!(data.placements["cl-a"].charge_count("5h"), 0);
+        assert_eq!(data.placements["cl-a"].charge_count("7d"), 2);
+        assert_eq!(metrics(&cs[0], &data, &t.config, now).usage, 4.);
+    }
+    t.note_usage_observation_asof_token("cl-a", cs[0].quota.as_ref().unwrap(), newer);
+    let data = t.data.lock().unwrap();
+    assert_eq!(data.placements["cl-a"].charge_count("7d"), 0);
+    assert_eq!(metrics(&cs[0], &data, &t.config, now).usage, 0.);
+}
+
+#[test]
 fn d20_room_and_pacing_precede_the_cap() {
     let (_root, t, mut cs, now) = placement_fixture();
     place_at(&t, "claude:a", &cs[..1], now);
@@ -669,6 +722,63 @@ fn d20_charge_cannot_cool_or_trigger_a_cold_point_move() {
     let (account, moves) = decide_at(&t, "claude:bound", &cs, now);
     assert_eq!(account, "cl-a");
     assert!(moves.is_empty());
+}
+
+#[test]
+fn d20_cold_move_waits_without_charge_until_every_target_window_is_newer() {
+    let (_root, t, mut cs, now) = placement_fixture();
+    let source_key = "claude:cold-source";
+    place_at(&t, source_key, &cs[..1], now);
+    place_at(&t, "claude:target-seed", &cs[1..], now);
+    cs[0].account.drain = true;
+    let make_source_cold = || {
+        let mut data = t.data.lock().unwrap();
+        data.bindings.get_mut(source_key).unwrap().last_used =
+            now - chrono::Duration::seconds(3601);
+        rebuild_indexes(&mut data);
+    };
+    {
+        let data = t.data.lock().unwrap();
+        assert!(t.rebalance_target_base(&data, "cl-a", &cs[1], Some(source_key), now));
+        assert!(placement_capped(&cs[1], &data, &t.config, now));
+        assert_eq!(data.placements["cl-b"].total, 1);
+    }
+    for partial in [false, true] {
+        if partial {
+            let asof = t.begin_usage_observation_for("cl-b");
+            let short_only = serde_json::json!({"windows":[cs[1].quota.as_ref().unwrap()["windows"][0].clone()]});
+            t.note_usage_observation_asof_token("cl-b", &short_only, asof);
+        }
+        make_source_cold();
+        let sequence = t.usage_sequence.load(Ordering::Relaxed);
+        let (account, moves) = decide_at(&t, source_key, &cs, now);
+        assert_eq!(
+            account, "cl-a",
+            "capped target cannot receive a cold move, partial={partial}"
+        );
+        assert!(moves.is_empty());
+        assert_eq!(
+            t.usage_sequence.load(Ordering::Relaxed),
+            sequence,
+            "staying on the source is not a placement"
+        );
+        let data = t.data.lock().unwrap();
+        assert_eq!(data.placements["cl-a"].total, 1);
+        assert_eq!(
+            data.placements["cl-b"].total, 1,
+            "blocked cold moves add no charge"
+        );
+        assert_eq!(data.placements["cl-b"].charge_count("7d"), 1);
+    }
+    fresh_observation(&t, &mut cs[1..], now);
+    make_source_cold();
+    let (account, moves) = decide_at(&t, source_key, &cs, now);
+    assert_eq!(account, "cl-b");
+    assert_eq!(moves.len(), 1);
+    assert_eq!(moves[0].reason, "cold_rebalance");
+    assert!(moves[0].is_placement);
+    assert_eq!(moves[0].placement_charge_pct, 2.);
+    assert_eq!(t.data.lock().unwrap().placements["cl-b"].total, 2);
 }
 
 #[test]
@@ -1235,7 +1345,7 @@ fn d20_capped_mark_survives_default_target_quiet_without_authorizing_move() {
     };
     assert_eq!(cfg.churn.target_quiet_secs, 120);
     let t = BindingTable::new(root.path(), cfg).unwrap();
-    let cs = vec![
+    let mut cs = vec![
         candidate("cl-aaaaaa", 10., 8, 1),
         candidate("cl-bbbbbb", 10., 30, 2),
     ];
@@ -1253,6 +1363,8 @@ fn d20_capped_mark_survives_default_target_quiet_without_authorizing_move() {
         .collect();
     assert_eq!(place(&t, &keys[0], &cs, 100), cs[1].account.id);
     let now = Utc::now();
+    t.note_rate(&cs[1].account.id, now);
+    t.set_pacing(&cs[1].account.id, false);
     assert!(placement_capped(
         &cs[1],
         &t.data.lock().unwrap(),
@@ -1268,13 +1380,34 @@ fn d20_capped_mark_survives_default_target_quiet_without_authorizing_move() {
         t.policies.discretionary_allowed(&keys[1], None, now),
         "group/common guards permit retaining this other marked group"
     );
-    assert_eq!(
-        place(&t, &keys[1], &cs, 100),
-        cs[0].account.id,
-        "confidence/quiet must not authorize a second move"
-    );
-    assert!(
-        t.overload_marked(Some(&keys[1]), Utc::now()),
-        "destination quiet must not erase a mark waiting for uncapped evidence"
-    );
+    {
+        let data = t.data.lock().unwrap();
+        assert!(t.rebalance_target_waiting(&data, &cs[0].account.id, &cs[1], Some(&keys[1]), now));
+        assert!(
+            !t.rebalance_target_base(&data, &cs[0].account.id, &cs[1], Some(&keys[1]), now),
+            "pacing is over but note_rate still imposes the actual-move quiet guard"
+        );
+    }
+    for boundary in [
+        now + chrono::Duration::seconds(1),
+        now + chrono::Duration::seconds(121),
+    ] {
+        let (account, moves) = decide_at(&t, &keys[1], &cs, boundary);
+        assert_eq!(
+            account, cs[0].account.id,
+            "confidence/quiet cannot authorize a second move"
+        );
+        assert!(moves.is_empty());
+        assert!(
+            t.overload_marked(Some(&keys[1]), boundary),
+            "retain the capped mark before and after rate quiet expires"
+        );
+    }
+    let ready = now + chrono::Duration::seconds(122);
+    fresh_observation(&t, &mut cs[1..], ready);
+    let (account, moves) = decide_at(&t, &keys[1], &cs, ready);
+    assert_eq!(account, cs[1].account.id);
+    assert_eq!(moves.len(), 1);
+    assert_eq!(moves[0].reason, "overload");
+    assert!(!t.overload_marked(Some(&keys[1]), ready));
 }

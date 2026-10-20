@@ -662,6 +662,80 @@ async fn projected_credit_limit_only_spreads_placement_and_never_cools_warm_bind
 }
 
 #[tokio::test]
+async fn r8_unobserved_burst_spreads_actual_relay_credentials_and_ledgers_placement_evidence() {
+    for provider in [Provider::Claude, Provider::Codex] {
+        let h = Harness::new(provider).await;
+        let ids = h.ids();
+        let mut counts = [0_u64; 2];
+        let path = if provider == Provider::Claude {
+            "/v1/messages"
+        } else {
+            "/v1/responses"
+        };
+        let session_header = if provider == Provider::Claude {
+            "x-claude-code-session-id"
+        } else {
+            "session-id"
+        };
+        for n in 0..10 {
+            let session = format!("r8-unobserved-{n}");
+            let id = h.turn(path, &[(session_header, &session)], RAW).await;
+            let index = ids.iter().position(|candidate| candidate == &id).unwrap();
+            counts[index] += 1;
+            assert!(counts[0].abs_diff(counts[1]) <= 1);
+            let account = h.store.load(&id).unwrap();
+            let tokens = h.store.tokens(&account).unwrap();
+            let requests = h.fake.state.requests();
+            assert_eq!(requests.len(), n + 1);
+            assert_eq!(
+                requests[n].headers["authorization"],
+                format!("Bearer {}", tokens.access_token.as_str())
+            );
+            assert_eq!(requests[n].body.as_ref(), RAW.as_bytes());
+            // The stored affinity must agree with the actual credential sent.
+            assert_eq!(
+                h.state
+                    .bindings
+                    .current(Some(&format!("{}:{session}", provider.as_str()))),
+                Some(id)
+            );
+        }
+        assert_eq!(counts, [5, 5]);
+        let key = format!("{}:r8-unobserved-0", provider.as_str());
+        let first = h.state.bindings.current(Some(&key)).unwrap();
+        assert_eq!(
+            h.turn(path, &[(session_header, "r8-unobserved-0")], RAW)
+                .await,
+            first
+        );
+        assert_eq!(h.fake.state.requests().len(), 11);
+        h.counts(&[(&ids[0], 5), (&ids[1], 5)]).await;
+        let rows = h.ledger();
+        let placements: Vec<_> = rows
+            .iter()
+            .filter(|row| row["event"] == "placement")
+            .collect();
+        assert_eq!(placements.len(), 10);
+        assert!(
+            placements
+                .iter()
+                .all(|row| row["evidence"] == "weak" && row["charge"] == 2.0)
+        );
+        assert!(
+            placements[..2]
+                .iter()
+                .all(|row| row["capped"] == false && row["placed_since_obs"] == 0)
+        );
+        assert!(placements[2..].iter().all(|row| row["capped"] == true));
+        for id in ids {
+            let account = h.store.load(&id).unwrap();
+            assert_eq!(account.health, Health::Ready);
+            assert!(account.quota_cooling.is_none());
+        }
+    }
+}
+
+#[tokio::test]
 async fn drain_blocks_new_placements_and_preserves_existing_http_binding() {
     let h = Harness::new(Provider::Codex).await;
     let first = h
