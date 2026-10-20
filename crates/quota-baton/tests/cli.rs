@@ -1538,7 +1538,7 @@ async fn serve_and_status_use_isolated_home() {
     assert!(status.contains("코어: 실행 중"));
     assert!(status.contains("계정 ID"));
     assert!(
-        !status.contains("5시간 사용률"),
+        !status.contains("5시간 남음"),
         "empty state has no invented quota windows"
     );
     let key = std::fs::read_to_string(home.path().join("client.key")).unwrap();
@@ -1927,8 +1927,8 @@ fn offline_status_and_actions_use_synthetic_metadata_and_quota() {
         "대기 중",
         "할당량 소진",
         "합성 계정",
-        "37.5%",
-        "91.0%",
+        "62.5%",
+        "9%",
         "2030-01-01T05:00:00Z",
         "2030-01-07T00:00:00Z",
     ] {
@@ -2170,7 +2170,8 @@ fn online_status_piped_and_file_stdout_are_utf8_with_expired_windows_and_probe_p
          "health":{"kind":"ready"}, "windows":[{"name":"5h", "used_pct":12.0}]},
         {"id":"cx-invalid-reset", "provider":"codex", "user_state":"active",
          "health":{"kind":"cooling", "reason":"auth", "until":"2099-01-01T00:00:00Z"},
-         "windows":[{"name":"7d", "used_pct":25.0, "reset_at":"invalid"}]}
+         "windows":[{"name":"7d", "used_pct":25.0, "reset_at":"invalid"},
+                    {"name":"43200m", "used_pct":2.0, "reset_at":"2099-02-01T00:00:00Z"}]}
     ]});
     let server = std::thread::spawn(move || {
         let deadline = std::time::Instant::now() + MOCK_SERVER_TIMEOUT;
@@ -2188,11 +2189,11 @@ fn online_status_piped_and_file_stdout_are_utf8_with_expired_windows_and_probe_p
         "코어: 실행 중\n",
         "claude: 사용 가능 0 · 대기 [] · 사용 불가 0\n",
         "codex: 사용 가능 2 · 대기 [인증 오류 1] · 사용 불가 1\n",
-        "계정 ID\t제공자\t라벨\t사용 상태\t계정 상태\t5시간 사용률\t5시간 초기화\t7일 사용률\t7일 초기화\t상태 이유\t대기 종료\n",
-        "cx-expired-five\tcodex\t합성 🧪\t활성\t인증 확인 대기\t리셋됨\t2000-01-01T09:00:00.123+09:00\t37.5%\t2099-01-07T00:00:00Z\t-\t-\n",
-        "cx-expired-seven\tcodex\t합성 계정\t활성\t준비됨\t91.0%\t2099-01-01T05:00:00Z\t리셋됨\t2000-01-07T00:00:00Z\t-\t-\n",
-        "cx-missing-reset\tcodex\t-\t활성\t준비됨\t12.0%\t-\t-\t-\t-\t-\n",
-        "cx-invalid-reset\tcodex\t-\t활성\t대기 중\t-\t-\t25.0%\tinvalid\t인증 오류\t2099-01-01T00:00:00Z\n",
+        "계정 ID\t제공자\t라벨\t사용 상태\t계정 상태\t5시간 남음\t5시간 초기화\t7일 남음\t7일 초기화\t30일 남음\t30일 초기화\t상태 이유\t대기 종료\n",
+        "cx-expired-five\tcodex\t합성 🧪\t활성\t인증 확인 대기\t리셋됨\t2000-01-01T09:00:00.123+09:00\t62.5%\t2099-01-07T00:00:00Z\t-\t-\t-\t-\n",
+        "cx-expired-seven\tcodex\t합성 계정\t활성\t준비됨\t9%\t2099-01-01T05:00:00Z\t리셋됨\t2000-01-07T00:00:00Z\t-\t-\t-\t-\n",
+        "cx-missing-reset\tcodex\t-\t활성\t준비됨\t88%\t-\t-\t-\t-\t-\t-\t-\n",
+        "cx-invalid-reset\tcodex\t-\t활성\t대기 중\t-\t-\t75%\tinvalid\t98%\t2099-02-01T00:00:00Z\t인증 오류\t2099-01-01T00:00:00Z\n",
     );
     let piped = command(home.path()).arg("status").bounded_output().unwrap();
     let output_path = home.path().join("status.stdout");
