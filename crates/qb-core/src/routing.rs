@@ -1039,6 +1039,25 @@ impl PolicyStore {
         }
         let mut next = (*state).clone();
         let result = f(&mut next)?;
+        // A volatile ring may already have evicted live guard evidence. When
+        // its history becomes explicit intent, persist that summary with it.
+        // Merely moving a default root beside other durable intent does not
+        // promote the summary or cause a policy write.
+        if let Some(until) = state.history_overflow_until
+            && next.sessions.iter().any(|(id, session)| {
+                session.durable(&self.defaults)
+                    && !session.movements.is_empty()
+                    && state
+                        .sessions
+                        .get(id)
+                        .is_some_and(|previous| !previous.durable(&self.defaults))
+            })
+        {
+            next.durable_overflow_until = Some(
+                next.durable_overflow_until
+                    .map_or(until, |previous| previous.max(until)),
+            );
+        }
         let mut published_intent = None;
         if next.sessions.len() > MAX_SESSIONS || next.projects.len() > MAX_PROJECTS {
             bail!("routing policy capacity reached");
@@ -3902,6 +3921,128 @@ mod tests {
                 )
                 .unwrap();
             assert!(store.permits_dispatch(Some(key), "cx-forced-after-restart"));
+        }
+    }
+
+    #[test]
+    fn final_policy_promotion_persists_preexisting_volatile_eviction_guard() {
+        for project_policy in [false, true] {
+            for revisit in [true, false] {
+                let home = home();
+                let limits = ChurnLimits {
+                    revisit_secs: if revisit { 3600 } else { 0 },
+                    target_quiet_secs: 120,
+                    ..ChurnLimits::default()
+                };
+                let store = PolicyStore::new(home.path(), Settings::default())
+                    .unwrap()
+                    .with_limits(limits.clone())
+                    .unwrap();
+                let key = "codex:promoted-ring";
+                let mut previous = "cx-original".to_owned();
+                for n in 0..33 {
+                    let target = format!("cx-ring-{n}");
+                    store
+                        .dispatch(Some(key), &target, Some(&previous), "forced", clock())
+                        .unwrap();
+                    previous = target;
+                }
+                let deadline =
+                    clock() + chrono::Duration::seconds(if revisit { 3600 } else { 120 });
+                assert_eq!(store.snapshot().history_overflow_until, Some(deadline));
+                assert!(store.snapshot().durable_overflow_until.is_none());
+                assert!(!store.path.exists());
+                assert!(!fence_path(&store.path).exists());
+                if project_policy {
+                    let project = store
+                        .put_project(
+                            None,
+                            Project {
+                                name: "promotion".into(),
+                                settings: settings(Mode::Rebalance),
+                            },
+                        )
+                        .unwrap();
+                    // Unrelated durable project creation must not persist the
+                    // default root or its still-volatile eviction summary.
+                    let loaded = load(&store.path).unwrap().unwrap();
+                    assert!(loaded.sessions.is_empty());
+                    assert!(loaded.durable_overflow_until.is_none());
+                    let before = fs::read(&store.path).unwrap();
+                    let before_fence = fs::read(fence_path(&store.path)).unwrap();
+                    store
+                        .dispatch(
+                            Some("codex:other-default"),
+                            "cx-other",
+                            Some("cx-before"),
+                            "forced",
+                            clock(),
+                        )
+                        .unwrap();
+                    assert_eq!(fs::read(&store.path).unwrap(), before);
+                    assert_eq!(fs::read(fence_path(&store.path)).unwrap(), before_fence);
+                    store
+                        .edit_session(
+                            &session_id(key),
+                            None,
+                            Some(&project),
+                            Some("cx-ring-32"),
+                            true,
+                        )
+                        .unwrap();
+                } else {
+                    store
+                        .set_session(
+                            &session_id(key),
+                            Some(settings(Mode::Rebalance)),
+                            None,
+                            Some("cx-ring-32"),
+                        )
+                        .unwrap();
+                }
+                assert_eq!(
+                    load(&store.path).unwrap().unwrap().durable_overflow_until,
+                    Some(deadline)
+                );
+                drop(store);
+                let store = PolicyStore::new(home.path(), Settings::default())
+                    .unwrap()
+                    .with_limits(limits)
+                    .unwrap();
+                let (group, target) = if revisit {
+                    (key, "cx-original")
+                } else {
+                    ("codex:other-group", "cx-ring-0")
+                };
+                assert_eq!(store.snapshot().history_overflow_until, Some(deadline));
+                assert!(!store.discretionary_allowed(
+                    group,
+                    Some(target),
+                    clock() + chrono::Duration::seconds(1)
+                ));
+                assert!(!store.discretionary_allowed(
+                    group,
+                    Some(target),
+                    deadline - chrono::Duration::seconds(1)
+                ));
+                assert!(
+                    store
+                        .dispatch(Some(group), target, Some("cx-ring-32"), "overload", clock())
+                        .is_err()
+                );
+                // Guard preservation must not turn into a forced-move cap.
+                store
+                    .dispatch(
+                        Some(key),
+                        "cx-forced-after-promotion",
+                        Some("cx-ring-32"),
+                        "forced",
+                        clock(),
+                    )
+                    .unwrap();
+                assert!(store.permits_dispatch(Some(key), "cx-forced-after-promotion"));
+                assert!(store.discretionary_allowed(group, Some(target), deadline));
+            }
         }
     }
 }
