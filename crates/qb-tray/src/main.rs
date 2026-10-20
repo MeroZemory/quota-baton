@@ -67,7 +67,21 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(windows)]
 fn run() -> anyhow::Result<()> {
-    let args = Args::parse();
+    let args = match Args::try_parse() {
+        Ok(args) => args,
+        Err(error)
+            if matches!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) =>
+        {
+            error.print()?;
+            return Ok(());
+        }
+        // Parser diagnostics can echo secret arguments. Discard them and let
+        // main persist only the fixed startup-failure diagnostic.
+        Err(_) => anyhow::bail!("invalid tray arguments"),
+    };
     anyhow::ensure!(
         !args.open_flyout_live || cfg!(debug_assertions),
         "--open-flyout-live is debug-only"

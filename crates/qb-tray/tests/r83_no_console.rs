@@ -44,3 +44,63 @@ fn console_free_startup_failure_reaches_file_log_without_fixture_contents() {
     assert!(!logs.contains("SYNTHETIC-SECRET"));
     assert!(!String::from_utf8_lossy(&output.stderr).contains("SYNTHETIC-SECRET"));
 }
+
+fn assert_argument_failure_is_logged(args: &[&str]) {
+    let sandbox = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r83-tests");
+    fs::create_dir_all(&sandbox).unwrap();
+    let home = tempfile::tempdir_in(sandbox).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_quota-baton-tray"))
+        .args(args)
+        .env("QB_HOME", home.path())
+        .env("QB_LOG", "info")
+        .creation_flags(CREATE_NO_WINDOW.0)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("tray_startup_failed"));
+    let logs = fs::read_dir(home.path().join("logs"))
+        .unwrap()
+        .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+        .collect::<String>();
+    assert!(logs.contains("tray_startup_failed"));
+    for arg in args {
+        assert!(!logs.contains(arg));
+        assert!(!stderr.contains(arg));
+    }
+}
+
+#[test]
+fn console_free_unknown_flag_reaches_safe_startup_log() {
+    assert_argument_failure_is_logged(&["--unknown-option"]);
+}
+
+#[test]
+fn console_free_missing_value_reaches_safe_startup_log() {
+    assert_argument_failure_is_logged(&["--render-png"]);
+}
+
+#[test]
+fn console_free_parser_failure_never_exposes_secret_arguments() {
+    assert_argument_failure_is_logged(&["--theme", "SYNTHETIC-SECRET-MUST-NOT-BE-LOGGED"]);
+    assert_argument_failure_is_logged(&["--SYNTHETIC-SECRET-MUST-NOT-BE-LOGGED"]);
+}
+
+#[test]
+fn console_free_help_exits_successfully_without_startup_failure() {
+    let sandbox = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r83-tests");
+    fs::create_dir_all(&sandbox).unwrap();
+    let home = tempfile::tempdir_in(sandbox).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_quota-baton-tray"))
+        .arg("--help")
+        .env("QB_HOME", home.path())
+        .env("QB_LOG", "info")
+        .creation_flags(CREATE_NO_WINDOW.0)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Usage:"));
+    assert!(output.stderr.is_empty());
+    assert!(!home.path().join("logs").exists());
+}
