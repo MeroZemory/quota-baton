@@ -543,3 +543,30 @@ User: "이동은 강제로 시키는 게 아니라 터미널로 사람이 실수
   It then asks the user to **type `move`**. Any other input cancels and changes nothing. The launcher may also offer `share` (the `--keep-source` mode), with its warning.
 - **No terminal, no move.** Without an interactive terminal it refuses and prints the manual command. It never moves silently.
 - **Manual and bulk commands follow the same rule.** `quota-baton sessions import ... --apply` and the return command ask for the same typed word. A bulk run shows one table and one typed confirmation for the whole batch. `--yes` skips the prompt for scripted use only; the launcher never passes it.
+
+### D21 panel 2: guarantees against raw native Codex runs (2026-10-21)
+
+**Question.** The R9 feasibility study (`.sandbox/research/R9-panel-feasibility.md`) found two counterexamples with the real Codex 0.163 binary:
+1. A moved root S whose source name is kept for a child T is resumed by raw `codex resume S` in the source home. Codex rebuilds S's row and appends to the shared file.
+2. If the importer is killed while both homes have public names, its locks are released and raw resumes succeed in both homes.
+
+**Panel.** Sheet and answers are in `.sandbox/reviews/d21-raw-scope/`. Opus max ran via claude-qb and Astra max via codex-qb. In round 1 they disagreed: Opus chose an amended C, Astra chose A with staging as defence. Per the user's rule, each was sent the other's answer in its own session. In round 2 they **converged**: Astra adopted refusal of moves with descendants, and Opus adopted Astra's precise contract and boundaries.
+
+**Decision (consensus).**
+- **Staging protocol.**
+  - Link into a non-discoverable staging path in Q (Codex discovers only `sessions/` and `archived_sessions/`).
+  - Verify. Then remove **every** discoverable alias of S in the source home: the names first, the rows second. Then publish S into Q. Ancestors are published before S, and the multiplexer map is updated at the commit point.
+  - Before removing a name, open the file through it with sharing denied and delete it through that handle. A sharing violation means another process holds the file, so wait or refuse.
+  - Never remove a file's last name. Refuse when the hardlink count exceeds the names found in the source home, Q and staging.
+- **Descendants block the move by default.** Find descendants (forks and history-base children, transitively) by reading rollout headers, not sqlite rows, and refuse in Korean if any exist. Moving a whole family is deferred; it needs its own protocol and its own decision. Late forks are tested. If one cannot be excluded, it must fail closed and `qb doctor` must report it.
+- **A Q-side ancestor alias that already exists is refused.** S may already have a discoverable name in Q because it is an ancestor of an earlier move. The move is then refused with an explanation, and no exception is made.
+- **Contract wording.**
+  - **G1** holds at successful completion and at completed recovery.
+  - **G3** holds continuously, including the interval between a crash and recovery. While a journal is open, every managed entry point refuses its ids or runs recovery first, even after the OS locks are released.
+  - Recovery after the commit point only rolls forward; rollback and undo go through staging.
+  - If recovery finds conflicting rows, appends the journal did not record, or unknown names, it keeps the evidence, makes no destructive change and does not report success.
+- **G7** is reworded to: a resume of a moved id in the old home leaves the moved rollout and rows unchanged. Auxiliary files created by native startup are allowed, and a plain raw startup need not fail.
+- **Managed enforcement must cover every resume path:** explicit resume, `--last`, the session picker, automatic resume and the per-home daemon. If ancestor-only ids cannot be blocked on one of these paths, refuse the affected moves.
+- **Raw-native claims are evidence-bound.** For moved threads, qb claims protection against raw native runs only for scenarios that pass the protection tests on the pinned Codex version (Opus R1–R3b and R10–R12 in `answer-opus-r2.md`). Counterexamples 1 and 2 must pass as **protection** tests. The raw resume of a Q-side ancestor, and the stale-path case if R3b fails, are documented boundaries reproduced as **boundary** tests.
+- **Version gate.** Moves are disabled on a native Codex version that has not passed the suite.
+- **`qb doctor`.** It detects rows in the wrong home, staging files with no journal, unreferenced Q ancestors and descendants that were missed. It recognises intentional ancestor aliases, so completed moves are not flagged.
