@@ -1,8 +1,8 @@
 # Tray flyout v2: layout and behaviour spec
 
-This tracked copy records the approved R5 design and its later explicit user decisions. Reference mockups are retained by the design session under `.sandbox/design/tray-v2/`.
+This is the single normative tray presentation and interaction spec, recording the approved R5 design and its later explicit user decisions. Reference mockups are retained by the design session under `.sandbox/design/tray-v2/`.
 
-This spec replaces `.sandbox/design/tray/SPEC.md` for the account list, header, footer, menus, theme and notifications. The **delete confirmation (old §8)** and the **login panel (old §9)** are unchanged except that they use the v2 tokens. The intent and the keep/change/remove decisions are in `INTENT.md` (Korean).
+This spec supersedes the untracked design mockups and the old tray layout in architecture §10. Delete confirmation and login geometry are recorded here in §18. Behaviour and credit entitlement are owned by contract C5; mockups are reference material only.
 
 All sizes are DIPs at 100 % scale; multiply by the monitor scale. Coordinates are relative to the flyout's top-left (0,0). The width is 360.
 - **Mockup URL.** `mockup.html?state=<name>&theme=light|dark` reproduces each PNG. The states are overview, relogin, exhausted, credits, menu, empty, quit, settings and tooltip. Add `&debug=1` to outline the boxes. With no parameters the page shows a gallery.
@@ -78,7 +78,7 @@ The light theme is the default. The dark theme applies only on opt-in. Contrast 
 - **red**: the user must act
 - **amber**: money is being spent, or a bar is low
 - **grey**: waiting or off; nothing to do
-- **green** (summary dot only): the provider works on subscription quota
+- **green**: subscription quota is healthy (the summary dot, and a usage bar with ≥ 30 % remaining; user 2026-10-19)
 
 ## 4. Window
 
@@ -214,7 +214,7 @@ Overview fixture heights:
 
 ### 6.4 Credits line (Codex only)
 
-- **When.** Shown when C5 credit entitlement is available (unlimited, or a positive balance/has_credits with no explicit absence). It sits 6 below the bar (or below line 1 if there is no usage line). Height 16, or 24 when it carries a button. 12/16. The text is trimmed with an ellipsis before the button.
+- **When.** Shown when credits are available per contract C5. It sits 6 below the bar (or below line 1 if there is no usage line). Height 16, or 24 when it carries a button. 12/16. The text is trimmed with an ellipsis before the button.
 - **Amount.** `floor(balance)` with thousands separators ("19,395"). Unlimited shows "무제한". If the balance is unknown but `has_credits` is true, show "있음". The tooltip shows the exact value. The enable confirmation also covers accounts without a credits line: explicit absence shows "없음", missing evidence shows "확인 전". A contradictory old positive balance never overrides explicit absence.
 
 | Situation | Text | Colour | Button (standard, right-aligned to 344) |
