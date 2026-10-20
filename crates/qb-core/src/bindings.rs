@@ -1083,10 +1083,12 @@ impl BindingTable {
             .filter(|c| {
                 c.account.id != account
                     && c.account.provider == provider
-                    && self.rebalance_target(&d, account, c, None, now)
+                    && self.rebalance_target_base(&d, account, c, None, now)
             })
             .map(|c| (c, metrics(c, &d, &self.config, now)))
             .collect();
+        prefer_non_pacing(&mut targets, &d);
+        targets.retain(|(c, _)| !placement_capped(c, &d, &self.config, now));
         let anchor = targets.iter().filter_map(|(_, m)| m.weekly).min();
         targets.sort_by(|(a, x), (b, y)| compare_gated(a, x, b, y, anchor));
         let Some((choice, _)) = targets.first() else {
@@ -2155,7 +2157,7 @@ impl BindingTable {
                         .and_then(|key| d.overload_marks.get(group(key)))
                         .is_some_and(|mark| {
                             mark.from != c.account.id
-                                && self.rebalance_target(d, &mark.from, c, key.map(group), now)
+                                && self.rebalance_target_base(d, &mark.from, c, key.map(group), now)
                                 && key.is_some_and(|key| {
                                     self.policies.discretionary_allowed(
                                         key,
@@ -2170,12 +2172,23 @@ impl BindingTable {
             partition.retain(|(c, _)| {
                 bound_account.as_ref().is_some_and(|source| {
                     source != &c.account.id
-                        && self.rebalance_target(d, source, c, key.map(group), now)
+                        && self.rebalance_target_base(d, source, c, key.map(group), now)
                 }) && key.is_some_and(|key| {
                     self.policies
                         .discretionary_allowed(key, Some(&c.account.id), now)
                 })
             });
+        }
+        if matches!(reason, "overload" | "cold_rebalance") {
+            // A discretionary move cannot bypass a capped, non-pacing target
+            // by reviving a pacing alternative. Resolve room, pacing, then cap.
+            if partition
+                .iter()
+                .any(|(c, _)| !d.pacing.get(&c.account.id).copied().unwrap_or(false))
+            {
+                partition.retain(|(c, _)| !d.pacing.get(&c.account.id).copied().unwrap_or(false));
+            }
+            partition.retain(|(c, _)| !placement_capped(c, d, &self.config, now));
         }
         if partition.is_empty()
             && matches!(reason, "cold_rebalance" | "overload")
@@ -2476,6 +2489,14 @@ fn placement_poll(
         due_at,
     })
 }
+fn prefer_non_pacing<T>(pool: &mut Vec<(&Candidate, T)>, d: &Data) {
+    let non_pacing = pool
+        .iter()
+        .any(|(c, _)| !d.pacing.get(&c.account.id).copied().unwrap_or(false));
+    if non_pacing {
+        pool.retain(|(c, _)| !d.pacing.get(&c.account.id).copied().unwrap_or(false));
+    }
+}
 // Call separately for the step-4 gate-passing set or step-5 fallback set,
 // after that step's room/ratio partition. This helper never admits a candidate.
 fn prefer_pacing_and_evidence(
@@ -2484,12 +2505,7 @@ fn prefer_pacing_and_evidence(
     cfg: &RoutingConfig,
     now: DateTime<Utc>,
 ) {
-    let non_pacing = pool
-        .iter()
-        .any(|(c, _)| !d.pacing.get(&c.account.id).copied().unwrap_or(false));
-    if non_pacing {
-        pool.retain(|(c, _)| !d.pacing.get(&c.account.id).copied().unwrap_or(false));
-    }
+    prefer_non_pacing(pool, d);
     if pool.iter().any(|(c, _)| !placement_capped(c, d, cfg, now)) {
         pool.retain(|(c, _)| !placement_capped(c, d, cfg, now));
     } else if let Some(minimum) = pool
