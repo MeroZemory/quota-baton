@@ -194,7 +194,17 @@ process.exit(result.status ?? 1);
             env.retain(|(key, _)| !key.eq_ignore_ascii_case("PATH"));
             env.push(("PATH".into(), path.to_string_lossy().into_owned()));
         }
-        env.push(("PATHEXT".into(), ".COM;.EXE;.BAT;.CMD".into()));
+        // This mode explicitly tests the resolved .exe, even if the machine's
+        // Node directory also contains a .com wrapper. Other modes test fallback.
+        env.push((
+            "PATHEXT".into(),
+            if mode == "actual-node" {
+                ".EXE;.COM;.BAT;.CMD"
+            } else {
+                ".COM;.EXE;.BAT;.CMD"
+            }
+            .into(),
+        ));
         env.push(("QB_R81_FIXTURE".into(), root.to_string_lossy().into_owned()));
         env.push(("QB_R81_TITLE_MODE".into(), mode.into()));
         env.push(("QB_R81_PROBE".into(), exe.to_string_lossy().into_owned()));
