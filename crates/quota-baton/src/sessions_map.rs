@@ -209,7 +209,16 @@ fn save_backup(plan: &MapPlan) -> Result<()> {
     if !check_backup(plan)? {
         let bytes = serde_json::to_vec(&plan.change).map_err(|_| anyhow!(BACKUP))?;
         let protected = crate::cutover::protect(&bytes).map_err(|_| anyhow!(BACKUP))?;
-        crate::cutover::atomic_bytes(&backup_path(plan)?, protected.as_bytes())
+        let backup = backup_path(plan)?;
+        let parent = backup.parent().ok_or_else(|| anyhow!(BACKUP))?;
+        fs::create_dir_all(parent).map_err(|_| anyhow!(BACKUP))?;
+        // The handle-based publisher uses a native Windows rename API. Give
+        // it the extended canonical namespace even when APPDATA/QB_HOME came
+        // from ordinary DOS paths; UUID+hash backup names can exceed MAX_PATH.
+        let destination = fs::canonicalize(parent)
+            .map_err(|_| anyhow!(BACKUP))?
+            .join(backup.file_name().ok_or_else(|| anyhow!(BACKUP))?);
+        crate::cutover::atomic_bytes(&destination, protected.as_bytes())
             .map_err(|_| anyhow!(BACKUP))?;
         ensure!(check_backup(plan)?, "{BACKUP}");
     }
@@ -666,6 +675,26 @@ mod tests {
             .open(&staged)?;
         before()?;
         rename_file(&file, path, 3)
+    }
+
+    #[test]
+    fn existing_map_accepts_nonverbatim_windows_paths() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let mut f = Fixture::new();
+        let normal = |p: &Path| -> PathBuf {
+            let w = p.as_os_str().encode_wide().collect::<Vec<_>>();
+            assert!(p.to_string_lossy().starts_with(r"\\?\"));
+            std::ffi::OsString::from_wide(&w[4..]).into()
+        };
+        f.path = normal(&f.path);
+        f.backup = normal(&f.backup).join("synthetic-nested-backup-directory".repeat(3));
+        f.destination = normal(&f.destination);
+        f.write(&f.original());
+        let p = f.plan();
+        apply(&p).unwrap();
+        verify(&p).unwrap();
+        restore(&p).unwrap();
+        assert_eq!(f.value(), f.original());
     }
 
     #[test]
