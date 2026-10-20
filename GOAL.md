@@ -61,7 +61,8 @@ Implement quota-baton exactly as specified, milestone by milestone, until M8 is 
 | R8.2 | merged (20cb486, ff; m4a_ws 89/0) |
 | R8.3 | merged (67fb1ed; tray PE subsystem 2); installed 10-21 03:01, a normally started tray has no console (no conhost child) |
 | R8.4 | merged (`922a1f1`; scoped gate 256 pass, 7 explicit live tests excluded; strict qb-tray clippy and fmt, actual light/dark overview/exhausted HWND captures; Sol max closeout PASS). Report: `.sandbox/reports/R8.4.md` |
-| R9 | merged (`11851c2`; D21 panel 2). Full gate: default 1606/0/14, full 1688/0/24, standalone core 568/0/0, strict default/full clippy. Native: 6 protection cases plus raw-Q-ancestor boundary reproduced; existing picker/idle daemon unobserved and explicitly outside proven protection. Independent Sol MAX closeout approved. Report: `.sandbox/reports/R9.md`. Design review before install; no real migration performed |
+| R9 | merged (dev 11851c2). Merge review INSTALL-AFTER-FIXES → R9.1 before install |
+| R9.1 | R9 review fixes: version gate covers moves only, a crash never blocks codex-qb (aborted-source-kept, --resolve-map), .zst header inventory plus a real read-only dry run, and the should-fixes; brief `R9.1-review-fixes.md`; do this before continuing R10 |
 | R10 | dashboard v2 + chip-limit colour in the dashboard and tray (user-approved, O1=A); O2 duplicate quota_reached; O3 default labels; after R9; brief `R10-dashboard-v2.md` |
 | R11 | launch-scoped account and per-account model catalog (D22, resolves O13: /daybreak through codex-qb); after R10; brief `R11-launch-account.md` |
 | R8.1 | merged (round 2 39345fd, dev 6dbbfae); installed and verified live: the herdr pane title shows `codex-qb · quota-baton` from 1 s to 19 s, and a codex-qb exec request returned ok |
