@@ -2512,11 +2512,11 @@ fn restore_secret_json(
     Ok(())
 }
 
-fn protect(input: &[u8]) -> Result<String> {
+pub(crate) fn protect(input: &[u8]) -> Result<String> {
     transform(input, true).map(|bytes| STANDARD.encode(bytes))
 }
 
-fn unprotect(encoded: &str) -> Result<Vec<u8>> {
+pub(crate) fn unprotect(encoded: &str) -> Result<Vec<u8>> {
     let bytes = STANDARD
         .decode(encoded)
         .context("암호화된 journal 값이 올바르지 않습니다")?;
@@ -2649,7 +2649,7 @@ fn discard_owned_scratch(file: &fs::File) -> std::io::Result<()> {
     Ok(())
 }
 
-fn atomic_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn atomic_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     atomic_bytes_with_counter(path, bytes, &SEQUENCE)
 }
