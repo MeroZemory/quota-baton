@@ -149,7 +149,7 @@ The user delegated this decision to independent reviewers. Three models answered
    - **Lower-affinity heuristic:** after at least 1 h idle (this does not establish cache expiry on every account), but only if the current account fails the gate (D15 adds: or is at its spread threshold). V2 confirmed Codex's objection: the tested move kept that conversation working but did not reuse its earlier hidden reasoning, so a move that is not needed is avoided.
    - **Overload (added by D15):** a bounded rebalance at a request boundary when an account is concentrated and another has room.
 3. **Rejected:** restoring immediately when a preferred account recovers (unanimous), and moving warm sessions early to use expiring weekly quota (unanimous). New-session placement serves that goal without a cache cost.
-4. **No priority list.** The only manual placement setting is per-account **drain** (no new sessions; existing sessions stay). `allow_credits` stays off by default.
+4. **No priority list.** Per-account **drain** rejects new sessions while existing sessions stay. D20 supersedes the old drain-only restriction with project/root `strict`, `recover` and default `rebalance` policies. `allow_credits` remains separate and off by default.
 5. **Tuning from data:** the ledger records moves, the weekly quota left unused at each reset, and forced moves per gate crossing.
 6. **Caution:** the 88 % post-switch Codex cache figure may reflect shared prefixes rather than true cross-account sharing. Codex rules are not relaxed before a clean test.
 
@@ -361,6 +361,7 @@ The design was independently reviewed (`.sandbox/reviews/D17-review.md`); all si
 
 **Follow-ups.** Record `quota_credit_releasable` in AccountView and the account file format (C11, C12).
 
+<a id="d20"></a>
 ## D20. Routing policies kept, default rebalance; no herding onto accounts with weak usage evidence — Accepted (user direction, 2026-10-20)
 
 **User direction (quoted).** "기본값은 분산허용입니다 (사용량예측기능이 이미 있다면 분산허용이 올바릅니다). 다만 사용한지 얼마안된계정, 막 사용한계정의 사용량예측이 제대로안될 때 사용량이 적다는이유로 한계정에 여러세션이 몰리는문제를 회피하는 분명한 방법을 적용해주세요."

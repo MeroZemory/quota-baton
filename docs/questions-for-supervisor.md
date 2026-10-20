@@ -33,3 +33,8 @@ D17 review MF5는 wiring.json이 CPA 작업을 소유하면 retire가 그 작업
 대안: 비활성 작업이면 모든 token/file 변경 전에 복원을 거절하고 사용자가 별도 활성화하도록 안내한다. 다만 retire journal이 full unwire를 막으므로 사용자에게 복구 절차를 명시해야 한다.
 
 근거: `.sandbox/reviews/D17-review.md` MF4/MF5/SF5와 Part B의 task ownership/start 순서. [Microsoft Schtasks 설명](https://learn.microsoft.com/en-us/windows/win32/taskschd/schtasks)은 비활성 작업이 실행되지 않는다고 설명한다. 실제 작업을 조회하거나 실행하지 않았다.
+
+
+## R8: 월간 등 비표준 길이 창의 gate·정렬
+
+비차단 질문이다. C9의 `43200m`(30일)·양수 초 단위 창은 D20 근거 갱신·배정량 해제·poll 추적에서 처리한다. 기존 C7 gate와 초기화 정렬은 5h/7d 및 primary/secondary 별칭 규칙을 유지했다. 월간 창에 주간 90/98% 기준을 새로 적용하거나 정렬 순서를 발명하지 않았다. 기존 기준을 명시적으로 유지할지, 비표준 길이 창의 gate·정렬 슬롯을 별도로 정할지 관문에서 확인한다. 실프로필은 조회하지 않았다.
