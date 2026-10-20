@@ -570,3 +570,39 @@ User: "이동은 강제로 시키는 게 아니라 터미널로 사람이 실수
 - **Raw-native claims are evidence-bound.** For moved threads, qb claims protection against raw native runs only for scenarios that pass the protection tests on the pinned Codex version (Opus R1–R3b and R10–R12 in `answer-opus-r2.md`). Counterexamples 1 and 2 must pass as **protection** tests. The raw resume of a Q-side ancestor, and the stale-path case if R3b fails, are documented boundaries reproduced as **boundary** tests.
 - **Version gate.** Moves are disabled on a native Codex version that has not passed the suite.
 - **`qb doctor`.** It detects rows in the wrong home, staging files with no journal, unreferenced Q ancestors and descendants that were missed. It recognises intentional ancestor aliases, so completed moves are not flagged.
+
+## D22. The account is chosen at codex-qb launch, and the model catalog is that account's (resolves O13) — Accepted (user direction plus panel, 2026-10-21)
+
+**User direction (quoted).**
+- "1번으로하면 모델 변경시 계정변경으로 캐시가 깨질수있지 않나".
+- "애초에 codex-qb 실행 시 계정이 결정되고 그 계정에따라 models이 보일순 없는건가".
+- From the dashboard design tab: "세션 시작할 때 원하는 계정으로 시작가능하게 … 모델을 지정해서 시작하면 그 모델을 지원하는 최적계정으로 연결".
+
+**Trigger.** `/daybreak` in codex-qb reported "not available for this account". Codex enables it only when its model catalog contains a daybreak model (`tui/src/chatwidget/slash_dispatch.rs:192-204`). qb passed `/models` through one account, acct-d, which lacks it.
+
+**Panel.** Files are in `.sandbox/reviews/o13-launch-account/`. Opus max (via claude-qb) and Astra max (via codex-qb) each answered twice, after exchanging answers.
+- Opus held A′: a union catalog with (session, model) bindings and affinity.
+- Astra held B: a launch-scoped account.
+
+Both agreed on these points:
+- one authoritative binding store;
+- `/models` never places or moves anything;
+- entitlement maps;
+- an explanation before an avoidable unsupported-model request;
+- initial placement uses the **effective** startup model;
+- concurrency tests.
+
+The disagreement narrowed to two facts, which settle it:
+1. **B's catalog isolation holds.** Codex's model cache is keyed by a provider/auth identity that **includes the catalog URL** (`model-provider/src/models_identity_tests.rs` `cache_identity_tracks_catalog_url`, `models-manager/src/cache.rs`). A per-launch base URL therefore never shows another launch's cached catalog. This was Opus's main objection to B, and Opus said B is acceptable if isolation holds.
+2. **Cross-account hops are not free.** Evidence V2 (D10, 2026-10-13): encrypted reasoning items made on one account are silently ignored on another, so a move drops earlier hidden reasoning. Opus's own condition was G10, "no stripping, and portability holds". That fails, so his rule falls back to `consent`, which behaves like B. It also matches the user's account-first priority.
+
+**Decision: B, with Opus's corrections.**
+- **Launch token.** `codex-qb` obtains a launch token from qb and passes `-c openai_base_url=http://127.0.0.1:<port>/l/<token>/v1`. The token is a routing handle: local client-key authentication still applies, the token is unpredictable, it is redacted from logs, and it expires when idle. The launcher also passes a per-launch `model_catalog_url` if `openai_base_url` alone does not change the cache identity. The source test proves this for `model_catalog_url`, and `cache_identity_tracks_provider_routing…` suggests the base URL counts as well. Release gate: Astra's alternation test (launch on A, then B, then A again, with warm caches and concurrent launches) checks the picker contents and `/daybreak` with the real 0.163 binary.
+- **Placement at launch.** Among usable accounts that support the effective startup model (`-m`, else the configured default), choose with the normal C7 and D20 rules. `--account <name>` is a preference inside that set. On `resume <id>`, the existing binding wins.
+- **Catalog.** `/models` through a token returns the catalog of the account the session is bound to. qb keeps per-account entitlement maps, refreshed periodically and on "model not supported" responses.
+- **Model switches.** Advertised models always route to the bound account. A manually entered model the account lacks gets a clear explanation without an upstream request. Account shopping is never triggered implicitly.
+- **Forced moves** (account unusable). Move by current-model compatibility, preferring destinations that support the whole advertised catalog. A later pick that the new account lacks gets the same explanation. Never break a working session to keep the menu accurate.
+- **Resume with an explicit `-m` the binding lacks.** It is not refused outright: qb explains, and `--account <name>` or `--move-for-model` is the user's explicit consent to move the session.
+- **Unknown or expired tokens** fail explicitly only where the token is needed: `/models` and placing a new session. Requests that carry a bound session key route by the binding.
+- **Gap logging.** Every placement and move made for a model choice is logged and shown in the panel.
+- **Not chosen:** a union catalog, and routing each request by model.
