@@ -335,16 +335,14 @@ async fn upgrade_inner(
                 u64::try_from(admission_started.elapsed().as_millis()).unwrap_or(u64::MAX),
             );
             let forced = admission.forced();
-            if forced {
-                if let Some(response) = last_rate_error.take() {
-                    completion.relayed_rate_429();
-                    return response;
-                }
-                completion.outcome(429, "rate_wait_timeout");
+            if forced && let Some(response) = last_rate_error.take() {
+                completion.relayed_rate_429();
+                // This is the retained actual upstream 429, not the local
+                // expiration itself. It remains C7.1 client-visible pressure.
                 state
                     .note_client_rate(Provider::Codex, &account.id, session.key.as_deref())
                     .await;
-                return state.rate_wait_response(Provider::Codex, &account.id);
+                return response;
             }
             drop(last_rate_error.take());
             if !state
@@ -388,6 +386,10 @@ async fn upgrade_inner(
                 binding.dispatched();
             }
             completion.attempt(&account.id);
+            if forced {
+                state.accounts.record_forced_send(&account.id);
+            }
+            let observation_asof = state.bindings.begin_usage_observation_for(&account.id);
             let sent_at = std::time::Instant::now();
             let result = tokio::time::timeout(
                 Duration::from_secs(300),
@@ -411,7 +413,13 @@ async fn upgrade_inner(
             {
                 state
                     .accounts
-                    .observe_headers(&account.id, Provider::Codex, response.headers())
+                    .observe_headers_asof(
+                        &account.id,
+                        Provider::Codex,
+                        response.headers(),
+                        None,
+                        (&state.bindings, observation_asof),
+                    )
                     .await
             } else {
                 Default::default()

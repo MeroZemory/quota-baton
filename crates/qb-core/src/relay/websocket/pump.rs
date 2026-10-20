@@ -161,6 +161,7 @@ struct RateBudget {
 
 struct RateState {
     initial_sent: bool,
+    usage_asof: Option<crate::bindings::UsageObservationAsOf>,
     sent_at: std::time::Instant,
     retries: u32,
     forced: bool,
@@ -188,6 +189,7 @@ impl RateBudget {
             max_retries,
             state: Mutex::new(RateState {
                 initial_sent: false,
+                usage_asof: None,
                 sent_at: now,
                 retries: 0,
                 forced: false,
@@ -214,7 +216,7 @@ impl RateBudget {
     fn can_send(&self) -> bool {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.forced |= std::time::Instant::now() >= self.deadline;
-        !self.is_committed() && !state.forced
+        !self.is_committed() && (!state.initial_sent || !state.forced)
     }
 
     fn initial_sent(&self) -> bool {
@@ -244,7 +246,17 @@ impl RateBudget {
             self.state.lock().unwrap_or_else(|e| e.into_inner()).forced |= admission.forced();
             drop(wait);
         }
-        !self.is_committed() && !self.state.lock().unwrap_or_else(|e| e.into_inner()).forced
+        self.can_send()
+    }
+
+    fn note_usage_send(&self, context: &Context) {
+        if let Some(relay) = &context.relay {
+            let asof = relay.bindings.begin_usage_observation_for(&context.account);
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            // Until a response is attributed, the earliest attempt is the only
+            // safe lower bound for a delayed, unlabelled rate-limit event.
+            state.usage_asof.get_or_insert(asof);
+        }
     }
 
     fn initial_dispatch(&self) {
@@ -252,6 +264,18 @@ impl RateBudget {
         state.initial_sent = true;
         state.sent_at = std::time::Instant::now();
         state.forced |= state.sent_at >= self.deadline;
+    }
+
+    fn record_forced_send(
+        &self,
+        runtime: Option<&Arc<crate::account_runtime::AccountRuntime>>,
+        account: &str,
+    ) {
+        if self.state.lock().unwrap_or_else(|e| e.into_inner()).forced
+            && let Some(runtime) = runtime
+        {
+            runtime.record_forced_send(account);
+        }
     }
 
     fn sent(&self) {
@@ -777,6 +801,10 @@ where
                 },
             );
         }
+        if matches!(message, Message::Text(_) | Message::Binary(_)) {
+            rate.initial_dispatch();
+            rate.record_forced_send(context.runtime.as_ref(), &context.account);
+        }
         write(sink, message, reservation, delivered).await
     })
 }
@@ -896,6 +924,7 @@ fn redial_rate(context: Arc<Context>, pending: PendingRateResend) -> RateRedial 
                     },
                 );
             }
+            rate.note_usage_send(&context);
             rate.sent();
             write(
                 sink,
@@ -1036,12 +1065,11 @@ async fn run_with_read_timeout(
                         None => true,
                     };
                     let expired = forced && eligible_now;
-                    if expired { note_client_rate(&context).await; }
                     let reason = if expired { "rate_wait_timeout" } else { "account_ineligible" };
                     if let Some(active) = current.get_mut(&pending.request) {
                         active.completion.record.outcome = reason.into();
                     }
-                    ending = Some((Some(CloseFrame { code: (if expired { 1013 } else { 1000 }).into(), reason: "".into() }), reason));
+                    ending = Some((Some(CloseFrame { code: (if expired { 1012 } else { 1000 }).into(), reason: "".into() }), reason));
                     end_deadline = Instant::now() + CLOSE_TIMEOUT;
                     continue;
                 }
@@ -1054,7 +1082,7 @@ async fn run_with_read_timeout(
                     Ok((write, read)) => { upstream_read = read; to_upstream = Some(write); }
                     Err(reason) => {
                         for active in current.values_mut() { active.completion.record.outcome = reason.into(); }
-                        ending = Some((Some(CloseFrame { code: (if reason == "rate_wait_timeout" {1013} else {1000}).into(), reason: "".into() }), reason));
+                        ending = Some((Some(CloseFrame { code: (if reason == "rate_wait_timeout" {1012} else {1000}).into(), reason: "".into() }), reason));
                         end_deadline = Instant::now() + CLOSE_TIMEOUT;
                     }
                 }
@@ -1114,7 +1142,9 @@ async fn run_with_read_timeout(
                             return (sink, false, Delivered {bytes:0,request:Some(pending.request),terminal:Some("rate_wait_timeout"),completed:false});
                         }
                         if let Some(receipt) = dispatch_receipt { receipt.dispatched(); }
+                        pending.rate.note_usage_send(&context);
                         pending.rate.initial_dispatch();
+                        pending.rate.record_forced_send(context.runtime.as_ref(), &context.account);
                         write(sink, pending.message, pending.reservation, Delivered {
                             bytes, request: Some(pending.request), terminal: None, completed: false,
                         }).await
@@ -1130,7 +1160,7 @@ async fn run_with_read_timeout(
                     pending_rate_redial = None;
                 } else if ending.is_none() && let Some(reason) = delivered.terminal {
                     if let Some(active) = delivered.request.and_then(|id| current.get_mut(&id)) { active.completion.record.outcome = reason.into(); }
-                    ending = Some((Some(CloseFrame {code: (if reason == "rate_wait_timeout" {1013} else {1000}).into(), reason:"".into()}), reason));
+                    ending = Some((Some(CloseFrame {code: (if reason == "rate_wait_timeout" {1012} else {1000}).into(), reason:"".into()}), reason));
                     end_deadline = Instant::now() + CLOSE_TIMEOUT;
                 } else if ending.is_none()
                     && let Some(pending) = pending_rate_redial.take()
@@ -1272,7 +1302,14 @@ async fn run_with_read_timeout(
                         if let Some(event) = event.as_ref() {
                             if let Some(runtime) = &context.runtime {
                                 let active_model = request.and_then(|id| current.get(&id)).and_then(|active| active.model.as_deref());
-                                runtime.observe_codex_event_for_model(&context.account, event, active_model).await;
+                                if let Some(relay) = &context.relay {
+                                    let asof = request.and_then(|id| current.get(&id))
+                                        .and_then(|active| active.rate.state.lock().unwrap_or_else(|e| e.into_inner()).usage_asof)
+                                        .unwrap_or(crate::bindings::UsageObservationAsOf {sequence:0,placed_count:0});
+                                    runtime.observe_codex_event_asof(&context.account, event, active_model, (&relay.bindings, asof)).await;
+                                } else {
+                                    runtime.observe_codex_event_for_model(&context.account, event, active_model).await;
+                                }
                             } else {
                                 context.observability.observe_codex_event(&context.account, event);
                             }
@@ -1356,6 +1393,7 @@ async fn run_with_read_timeout(
                                         let retry_model = current[&request.expect("active rate request")].model.clone();
                                         let account = context.account.clone();
                                         let bytes = message.len();
+                                        let retry_context = context.clone();
                                         to_upstream = Some(Box::pin(async move {
                                             if !rate.admit(runtime.as_ref(), &account).await {
                                                 if rate.is_committed() { return (sink,true,Delivered {bytes:0,request,terminal:None,completed:false}); }
@@ -1370,6 +1408,7 @@ async fn run_with_read_timeout(
                                             if !rate.can_send() {
                                                 return (sink, false, Delivered {bytes:0,request,terminal:Some("rate_wait_timeout"),completed:false});
                                             }
+                                            rate.note_usage_send(&retry_context);
                                             rate.sent();
                                             write(
                                                 sink,

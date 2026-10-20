@@ -1861,7 +1861,7 @@ async fn r1_ws_open_and_redial_expiry_never_forces_another_send() {
             tokio::time::timeout(Duration::from_millis(1800), receive(&mut client))
                 .await
                 .unwrap(),
-            1013,
+            1012,
         );
         assert!(
             started.elapsed() >= Duration::from_millis(900),
@@ -2271,7 +2271,7 @@ async fn r1_create_first_and_persistent_second_gate_after_other_connection_429()
 }
 
 #[tokio::test]
-async fn r1_create_wait_expiry_closes_without_any_forced_wire_send() {
+async fn r1_create_forced_initial_rate_is_final_without_an_extra_send() {
     let h = Harness::new_with_rate_options(1, false, false, Some((1, 5))).await;
     let (mut client, account) = h.connect().await;
     h.state
@@ -2285,14 +2285,14 @@ async fn r1_create_wait_expiry_closes_without_any_forced_wire_send() {
         tokio::time::timeout(Duration::from_secs(2), receive(&mut client))
             .await
             .unwrap(),
-        1013,
+        1012,
     );
     // Finish the native close exchange before asking for the final ledger row.
     let _ = client.flush().await;
     let row = r1_create_record(&h, "forced-initial").await;
-    assert_eq!(row["attempts"], 0);
+    assert_eq!(row["attempts"], 1);
     assert_eq!(row["rate_retries"], 0);
-    assert_eq!(row["outcome"], "rate_wait_timeout");
+    assert_eq!(row["outcome"], "rate_hold_relayed_429");
     assert!(row["rate_wait_ms"].as_u64().unwrap() >= 800);
     assert_eq!(
         h.fake
@@ -2301,7 +2301,7 @@ async fn r1_create_wait_expiry_closes_without_any_forced_wire_send() {
             .iter()
             .filter(|m| matches!(m, Message::Text(_)))
             .count(),
-        0
+        1
     );
     assert_eq!(h.store.load(&account).unwrap().health, Health::Ready);
 }

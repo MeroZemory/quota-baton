@@ -174,7 +174,7 @@ impl Default for ServerConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct RoutingConfig {
     pub mode: crate::routing::Mode,
     pub churn: crate::routing::ChurnLimits,
@@ -183,6 +183,10 @@ pub struct RoutingConfig {
     pub gate_weekly_near_reset_pct: f64,
     pub near_reset_secs: u64,
     pub inflight_allowance_pct: f64,
+    pub placement_allowance_pct: f64,
+    pub weak_evidence_new_sessions: usize,
+    pub placement_poll_after_secs: u64,
+    pub placement_poll_min_interval_secs: u64,
     pub reset_hold_secs: u64,
     pub request_timeout_secs: u64,
     pub forecast_shadow: bool,
@@ -205,6 +209,10 @@ impl Default for RoutingConfig {
             gate_weekly_near_reset_pct: 98.0,
             near_reset_secs: 18000,
             inflight_allowance_pct: 1.0,
+            placement_allowance_pct: 2.0,
+            weak_evidence_new_sessions: 1,
+            placement_poll_after_secs: 120,
+            placement_poll_min_interval_secs: 300,
             reset_hold_secs: 60,
             request_timeout_secs: 300,
             forecast_shadow: false,
@@ -224,6 +232,18 @@ impl RoutingConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         self.churn.validate()?;
         anyhow::ensure!(
+            self.mode != crate::routing::Mode::Strict,
+            "global routing mode cannot be strict; set a project or root policy"
+        );
+        anyhow::ensure!(
+            (1..=1000).contains(&self.weak_evidence_new_sessions),
+            "weak evidence allowance must be 1..1000"
+        );
+        anyhow::ensure!(
+            self.placement_poll_after_secs > 0 && self.placement_poll_min_interval_secs > 0,
+            "placement polling intervals must be positive"
+        );
+        anyhow::ensure!(
             (1..=600).contains(&self.request_timeout_secs),
             "routing request timeout must be 1..600 seconds"
         );
@@ -241,7 +261,8 @@ impl RoutingConfig {
                 self.gate_5h_pct,
                 self.gate_weekly_pct,
                 self.gate_weekly_near_reset_pct,
-                self.inflight_allowance_pct
+                self.inflight_allowance_pct,
+                self.placement_allowance_pct
             ]
             .into_iter()
             .all(|value| value.is_finite() && (0.0..=100.0).contains(&value)),
@@ -492,5 +513,31 @@ mod tray_v2_theme_tests {
                 .theme,
             TrayTheme::Light
         );
+    }
+}
+
+#[cfg(test)]
+mod r8_routing_config_tests {
+    use super::*;
+    #[test]
+    fn routing_unknown_future_key_is_compatible_but_global_strict_is_rejected() {
+        let config: Config = toml::from_str("[routing]\nfuture_option = 42\n").unwrap();
+        assert_eq!(config.routing.mode, crate::routing::Mode::Rebalance);
+        config.routing.validate().unwrap();
+        let mut strict = config.routing;
+        strict.mode = crate::routing::Mode::Strict;
+        assert!(strict.validate().is_err());
+    }
+    #[test]
+    fn anti_herding_defaults_and_bounds() {
+        let mut config = RoutingConfig::default();
+        assert_eq!(config.placement_allowance_pct, 2.0);
+        assert_eq!(config.weak_evidence_new_sessions, 1);
+        config.validate().unwrap();
+        config.placement_allowance_pct = f64::NAN;
+        assert!(config.validate().is_err());
+        config.placement_allowance_pct = 2.0;
+        config.weak_evidence_new_sessions = 0;
+        assert!(config.validate().is_err());
     }
 }

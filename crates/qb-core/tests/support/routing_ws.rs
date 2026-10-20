@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test]
-async fn local_upgrade_rate_wait_expiry_has_typed_json_and_advice_without_a_dial() {
+async fn whole_upgrade_deadline_during_rate_wait_returns_504_without_a_dial() {
     let h = Harness::new_with_rate_options(1, false, false, Some((1, 3))).await;
     h.state
         .accounts
@@ -9,22 +9,17 @@ async fn local_upgrade_rate_wait_expiry_has_typed_json_and_advice_without_a_dial
     let Error::Http(response) = connect_async(h.request()).await.unwrap_err() else {
         panic!("expected local HTTP error");
     };
-    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-    assert!(
-        response.headers()["retry-after"]
-            .to_str()
-            .unwrap()
-            .parse::<u64>()
-            .unwrap()
-            >= 28
-    );
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert!(!response.headers().contains_key("retry-after"));
     let json: Value = serde_json::from_slice(response.body().as_ref().unwrap()).unwrap();
-    assert_eq!(json["error"]["type"], "rate_wait_timeout");
+    assert_eq!(json["error"]["type"], "request_timeout");
     assert!(h.fake.state.requests().is_empty());
     assert!(
         h.ledger()
             .iter()
-            .any(|row| row["outcome"] == "rate_wait_timeout" && row["attempts"] == 0)
+            .any(|row| row["outcome"] == "request_timeout"
+                && row["status"] == 504
+                && row["attempts"] == 0)
     );
 }
 
@@ -283,15 +278,32 @@ async fn large_field_reordered_create_obeys_model_cooling_and_rate_wait() {
             r#"{{"input":"{}","model":"blocked","type":"response.create"}}"#,
             "x".repeat(1024 * 1024 + 128)
         );
-        client.send(Message::Text(large.into())).await.unwrap();
-        assert_close(
-            receive(&mut client).await,
-            if cooling { 1000 } else { 1013 },
-        );
-        assert!(
-            h.fake.state.messages().is_empty(),
-            "large create bypassed final model/pacing admission"
-        );
+        h.fake.state.set_echo(true);
+        let began = std::time::Instant::now();
+        client
+            .send(Message::Text(large.clone().into()))
+            .await
+            .unwrap();
+        if cooling {
+            assert_close(receive(&mut client).await, 1000);
+            assert!(
+                h.fake.state.messages().is_empty(),
+                "model-cooled create reached upstream"
+            );
+        } else {
+            assert_eq!(
+                receive(&mut client).await,
+                Message::Text(large.clone().into())
+            );
+            assert!(began.elapsed() >= Duration::from_millis(900));
+            let messages = h.fake.state.messages();
+            assert_eq!(
+                messages,
+                vec![Message::Text(large.into())],
+                "initial expiry must send the exact large create once"
+            );
+            let _ = client.close(None).await;
+        }
         assert_eq!(h.fake.state.requests().len(), 1);
         assert_credential(&h, 0, &a);
     }

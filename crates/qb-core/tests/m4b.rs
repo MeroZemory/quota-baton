@@ -52,6 +52,23 @@ impl Harness {
         request_timeout_secs: u64,
         rate_hold_secs: u64,
     ) -> Self {
+        Self::with_limits_and_config(
+            provider,
+            reset_hold_secs,
+            request_timeout_secs,
+            rate_hold_secs,
+            |_| {},
+        )
+        .await
+    }
+
+    async fn with_limits_and_config(
+        provider: Provider,
+        reset_hold_secs: u64,
+        request_timeout_secs: u64,
+        rate_hold_secs: u64,
+        configure: impl FnOnce(&mut Config),
+    ) -> Self {
         // Waiting behind other bounded cases is separate from the HTTP deadline.
         let serial = tokio::time::timeout(Duration::from_secs(120), SERIAL.lock())
             .await
@@ -105,6 +122,7 @@ impl Harness {
         config.server.admin_port = 0;
         config.upstream.anthropic_base = fake.url.clone();
         config.upstream.codex_base = fake.url.clone();
+        configure(&mut config);
         let obs = Arc::new(Observability::new(&home, None).unwrap());
         let state = Arc::new(
             RelayState::new(
@@ -576,7 +594,14 @@ async fn sticky_http_above_gate_keeps_binding_but_new_session_uses_other_account
 
 #[tokio::test]
 async fn projected_credit_limit_only_spreads_placement_and_never_cools_warm_binding() {
-    let h = Harness::new(Provider::Codex).await;
+    let h = Harness::with_limits_and_config(Provider::Codex, 60, 300, 60, |config| {
+        // Isolate reservation projection: only the ten pending requests should
+        // raise observed 89% to 99%. Keep D20 charge/cap from deciding this
+        // three-session proof; their defaults have separate anti-herding tests.
+        config.routing.placement_allowance_pct = 0.0;
+        config.routing.weak_evidence_new_sessions = 3;
+    })
+    .await;
     let headers = [("session-id", "projected-credit-limit")];
     let first = h.turn("/v1/responses", &headers, RAW).await;
     let other = h.ids().into_iter().find(|id| id != &first).unwrap();

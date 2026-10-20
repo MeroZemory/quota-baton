@@ -463,8 +463,20 @@ impl Observability {
         provider: Provider,
         headers: &HeaderMap,
     ) -> Option<serde_json::Value> {
+        self.observe_headers_reported(account_id, provider, headers)
+            .map(|(merged, _)| merged)
+    }
+
+    pub(crate) fn observe_headers_reported(
+        &self,
+        account_id: &str,
+        provider: Provider,
+        headers: &HeaderMap,
+    ) -> Option<(serde_json::Value, serde_json::Value)> {
         let snapshot = snapshot(provider, headers, Utc::now())?;
-        self.remember(account_id, &snapshot, true)
+        let reported = serde_json::to_value(&snapshot).ok()?;
+        let merged = self.remember(account_id, &snapshot, true)?;
+        Some((merged, reported))
     }
 
     pub(crate) fn observe_poll(
@@ -502,6 +514,15 @@ impl Observability {
         account_id: &str,
         event: &serde_json::Value,
     ) -> Option<serde_json::Value> {
+        self.observe_codex_event_reported(account_id, event)
+            .map(|(merged, _)| merged)
+    }
+
+    pub(crate) fn observe_codex_event_reported(
+        &self,
+        account_id: &str,
+        event: &serde_json::Value,
+    ) -> Option<(serde_json::Value, serde_json::Value)> {
         if event.get("type").and_then(serde_json::Value::as_str) != Some("codex.rate_limits") {
             return None;
         }
@@ -554,9 +575,36 @@ impl Observability {
         }
         if let Some(mut snapshot) = snapshot(Provider::Codex, &headers, Utc::now()) {
             snapshot.source = "codex.rate_limits".into();
-            return self.remember(account_id, &snapshot, true);
+            let reported = serde_json::to_value(&snapshot).ok()?;
+            let merged = self.remember(account_id, &snapshot, true)?;
+            return Some((merged, reported));
         }
         None
+    }
+
+    pub fn record_placement(&self, event: &crate::bindings::MoveEvent) {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(event.key.as_bytes());
+        let session: String = digest[..6].iter().map(|b| format!("{b:02x}")).collect();
+        self.enqueue(Command::Ledger(serde_json::json!({
+            "ts":Utc::now().to_rfc3339(), "event":"placement", "session":session,
+            "account":event.to, "evidence":event.evidence, "capped":event.capped,
+            "placed_since_obs":event.placed_since_obs, "charge":event.placement_charge_pct
+        })));
+    }
+    pub fn record_unknown_cost_skips(&self, count: usize) {
+        if count > 0 {
+            self.enqueue(Command::Ledger(serde_json::json!({
+                "ts":Utc::now().to_rfc3339(), "event":"victim_skipped_unknown_cost",
+                "count":count
+            })));
+        }
+    }
+    pub fn record_placement_poll(&self, account: &str) {
+        self.enqueue(Command::Ledger(serde_json::json!({
+            "ts":Utc::now().to_rfc3339(), "event":"poll", "account":account,
+            "reason":"placement_evidence"
+        })));
     }
 
     pub fn record_ws_connection(
