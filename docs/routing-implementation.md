@@ -1,5 +1,7 @@
 # 계정 전환 보완 구현 기록
 
+현재 상태: 구현·독립 검수 지적 처리·전체 관문 완료. 검증 코드 `0734099`: 기본 workspace 1,302개, 전체 기능 workspace 1,331개, standalone core 899개 통과. 아래 단위 기록은 각 당시의 결과이며, 당시의 실패·대기 표기는 최종 상태가 아니다.
+
 사용자 지시(2026-10-20): 설계 보완안을 원자적으로 커밋하고 구현, codex-ax Sol max 독립 검수, 테스트까지 진행한다. 기존 실프로필·설치·이전 프록시 종료 보류는 유지한다.
 
 기준: `b70dade` 설계 보완, 그 이전 작업은 `1f260cb`까지 dev에 커밋되어 있다. 기존 작업 트리는 clean이었다. 별도 worktree는 만들지 않는다.
@@ -8,14 +10,14 @@
 
 1. [x] 영속 루트 정책(strict/recover/rebalance), 프로젝트 기본값/상속, 관리 API·CLI. 기본값은 현행 rebalance/60초를 유지한다. 추가 크레딧 권한은 바꾸지 않는다.
 2. [x] 그룹 체류·재방문/이동 예산, 대상 신뢰·예약·실행 시 재검사, unknown 비용·idle pin 등 관측 정확성.
-3. [x] 요청 전체 deadline과 dispatch 권한 재검사, reset 근거·epoch·취소, rate 대기 만료 군집 방지.
-4. [x] bounded 계정/window 소비 예측 shadow. 미지원 window·불확실·reset/부하 변경은 fallback. 실제 배정 변경은 기본적으로 끈다.
-5. [x] HTTP·WS·재시작·takeover·적대적 왕복/동시 배정 합성 회귀. UI/CLI와 문서의 설정 의미 일치.
-6. [ ] 독립 `codex-ax` gpt-6.1-sol max 실제 구현 검수와 수정. 마지막 전체 gate를 한 번 실행하고 fingerprint/report 기록.
+3. [x] HTTP 전송 전·WS 연결 deadline과 dispatch 권한 재검사, reset 근거·epoch·취소, rate 대기 만료 군집 방지.
+4. [x] bounded 계정/window 소비 예측 shadow. 미지원 window·불확실·reset/부하 변경은 fallback. 실제 배정에는 반영하지 않는다.
+5. [x] HTTP·WS·재시작·takeover·적대적 왕복/동시 배정 합성 회귀. 관리 API·CLI와 문서의 설정 의미 일치.
+6. [x] 독립 `codex-ax` gpt-6.1-sol max 실제 구현 검수와 수정. 마지막 전체 gate를 한 번 실행하고 fingerprint/report 기록.
 
 수치가 미결정인 새 정책은 현재 기본값을 유지하거나 명시적 opt-in으로 제공한다. 예측의 효과를 측정 없이 확정하지 않는다. 단위별 commit, focused 테스트; 마지막 gate에서 전체 matrix를 순차 실행한다. Cargo는 default target, incremental=0, debug profile override 없음, 8GiB cap을 지킨다.
 
-이 문서는 현재 진행 목록이다. 완료하지 않은 단위를 완료로 보고하지 않는다. 설계 세션 <pane>에는 보내지 않는다.
+이 문서는 완료 목록과 단위별 검증 이력이다. 설계 세션 <pane>에는 보내지 않는다.
 
 ## 단위 검증 기록
 
@@ -42,3 +44,5 @@
 - 여섯 번째 Sol max 검수(`5a99574`)의 strict 충돌 그룹 폐기, 미등록 response ID 출력 공개, 저장 JSON 중복 key의 last-wins를 보완했다. 손상 파싱 fixture는 owner-only 전제와 non-strict 대조군을 확인한다. 실제 80바이트 key/10바이트 계정의 20,000-entry legacy 파일도 freeze·재시작한다. 새 상한에 맞지 않는 기존 파일은 corrupt로 격리하지 않고 보존하며 시작을 거절한다.
 
 - 일곱 번째 Sol max 검수(`e239d5c`, packet 당시 HEAD 해시 별도 고정)의 legacy Codex 유효 정책 ID 충돌과 import reload 순서를 보완했다. 복원 충돌은 auto-flush 객체 생성 전에 거절해 실패 경로의 Drop도 원본을 바꾸지 않는다. import 검증은 lease가 없는 상태에서 정확한 오류 원인을 검사하며, 20,000-entry freeze 회귀는 dirty 변경·출력 바이트 변경을 확인한다.
+
+- 최종 코드 `073409978e06de61b7cc5254c9d71d40a141238f`: 기본/전체 기능 workspace tests, 코어 단독 tests, 기본/전체 strict clippy, fmt와 기본 product build 모두 통과. 정확한 명령·종료 코드·합계와 검수 지적 처리 내역은 `.sandbox/reports/cache-routing-implementation.md`에 기록했다. 이 문서 종료 커밋은 검증 코드 이후의 문서 변경만 포함한다.
