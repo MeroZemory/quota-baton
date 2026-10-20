@@ -18,6 +18,11 @@ use std::{
 const MAX_SESSIONS: usize = 20_000;
 const MAX_PROJECTS: usize = 1024;
 const MAX_FILE: u64 = 16 * 1024 * 1024;
+const MAX_FORCED_HISTORY: usize = 32;
+
+fn pool_id(account: &str) -> &str {
+    account.split('-').next().unwrap_or(account)
+}
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -123,6 +128,11 @@ struct SessionPolicy {
     movements: Vec<Movement>,
 }
 impl SessionPolicy {
+    fn durable(&self, defaults: &Settings) -> bool {
+        self.explicit.is_some()
+            || self.project.is_some()
+            || (self.anchor.is_some() && self.settings(defaults).mode == Mode::Strict)
+    }
     fn settings<'a>(&'a self, defaults: &'a Settings) -> &'a Settings {
         self.explicit.as_ref().unwrap_or(if self.project.is_some() {
             &self.baseline
@@ -152,6 +162,8 @@ struct State {
     arrivals: BTreeMap<String, DateTime<Utc>>,
     #[serde(skip)]
     frozen: bool,
+    #[serde(skip)]
+    history_overflow_until: Option<DateTime<Utc>>,
 }
 impl Default for State {
     fn default() -> Self {
@@ -164,6 +176,7 @@ impl Default for State {
             pool_moves: BTreeMap::new(),
             arrivals: BTreeMap::new(),
             frozen: false,
+            history_overflow_until: None,
         }
     }
 }
@@ -207,14 +220,7 @@ impl State {
                 .or_insert(movement.at);
             if movement.discretionary {
                 self.pool_moves
-                    .entry(
-                        movement
-                            .to
-                            .split('-')
-                            .next()
-                            .unwrap_or(&movement.to)
-                            .to_owned(),
-                    )
+                    .entry(pool_id(&movement.to).to_owned())
                     .or_default()
                     .push(movement.at);
             }
@@ -242,6 +248,11 @@ pub struct PolicyStore {
     writer: Mutex<()>,
     file_seen: AtomicBool,
     recovery_blocked: AtomicBool,
+    lifecycle_recovery: AtomicBool,
+    persistence_failed: AtomicBool,
+    recovery_intent: Mutex<State>,
+    durable_generation: Mutex<Option<(u64, String)>>,
+    warnings: Mutex<WarningState>,
     pub(crate) changed: tokio::sync::Notify,
 }
 
@@ -390,7 +401,13 @@ fn validate_state(state: &State) -> Result<()> {
     }
     for (id, session) in &state.sessions {
         if !valid_id(id, 64)
-            || session.movements.len() > 32
+            || session.movements.iter().filter(|m| m.discretionary).count() > 32
+            || session
+                .movements
+                .iter()
+                .filter(|m| !m.discretionary)
+                .count()
+                > MAX_FORCED_HISTORY
             || session
                 .project
                 .as_ref()
@@ -432,12 +449,29 @@ fn validate_state(state: &State) -> Result<()> {
     Ok(())
 }
 
+#[derive(Default)]
+struct WarningState {
+    pending: Vec<PolicyWarning>,
+    sink: Option<std::sync::Weak<crate::observability::Observability>>,
+    seen: BTreeSet<&'static str>,
+}
+
+/// Bounded, content-free warnings drained by BindingTable's observability owner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PolicyWarning {
+    pub code: &'static str,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PolicyFence {
     schema: u32,
     revision: u64,
     digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    strict: Option<State>,
+    #[serde(default)]
+    pending: bool,
 }
 fn fence_path(path: &Path) -> PathBuf {
     path.with_file_name("routing-policies.fence.json")
@@ -445,55 +479,437 @@ fn fence_path(path: &Path) -> PathBuf {
 fn policy_digest(state: &State) -> Result<String> {
     Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(state)?)))
 }
-fn write_fence(path: &Path, state: &State) -> Result<()> {
+fn strict_intent(state: &State, defaults: &Settings) -> State {
+    let mut strict = State {
+        projects: state
+            .projects
+            .iter()
+            .filter(|(_, p)| p.settings.mode == Mode::Strict)
+            .map(|(id, p)| {
+                (
+                    id.clone(),
+                    Project {
+                        name: "strict".into(),
+                        settings: p.settings.clone(),
+                    },
+                )
+            })
+            .collect(),
+        ..State::default()
+    };
+    let legacy_strict = state.legacy_codex_roots.iter().any(|id| {
+        state
+            .sessions
+            .get(id)
+            .is_some_and(|session| session.settings(defaults).mode == Mode::Strict)
+    });
+    for (id, session) in &state.sessions {
+        let mode = session.settings(defaults).mode;
+        if mode == Mode::Strict
+            || ((legacy_strict || defaults.mode == Mode::Strict) && session.durable(defaults))
+        {
+            strict.sessions.insert(
+                id.clone(),
+                SessionPolicy {
+                    project: None,
+                    baseline: session.settings(defaults).clone(),
+                    explicit: Some(session.settings(defaults).clone()),
+                    anchor: if mode == Mode::Strict {
+                        session.anchor.clone()
+                    } else {
+                        None
+                    },
+                    movements: Vec::new(),
+                },
+            );
+            if mode == Mode::Strict && state.legacy_codex_roots.contains(id) {
+                strict.legacy_codex_roots.insert(id.clone());
+            }
+        }
+    }
+    strict
+}
+fn merge_intent(into: &mut State, other: State) {
+    // Old known anchors win on an incomplete edit; every affected root is blocked.
+    for (id, session) in other.sessions {
+        match into.sessions.entry(id) {
+            std::collections::btree_map::Entry::Occupied(mut entry)
+                if entry
+                    .get()
+                    .explicit
+                    .as_ref()
+                    .is_none_or(|s| s.mode != Mode::Strict)
+                    && session
+                        .explicit
+                        .as_ref()
+                        .is_some_and(|s| s.mode == Mode::Strict) =>
+            {
+                entry.insert(session);
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(session);
+            }
+            _ => {}
+        }
+    }
+    for (id, project) in other.projects {
+        into.projects.entry(id).or_insert(project);
+    }
+    into.legacy_codex_roots.extend(other.legacy_codex_roots);
+}
+fn has_intent(state: &State) -> bool {
+    state.sessions.values().any(|session| {
+        session
+            .explicit
+            .as_ref()
+            .is_some_and(|s| s.mode == Mode::Strict)
+    }) || !state.projects.is_empty()
+}
+fn has_durable_rows(state: &State) -> bool {
+    !state.sessions.is_empty() || !state.projects.is_empty()
+}
+fn durable_state(state: &State, defaults: &Settings) -> State {
+    let mut durable = state.clone();
+    durable.sessions.retain(|_, s| s.durable(defaults));
+    durable
+        .legacy_codex_roots
+        .retain(|id| durable.sessions.contains_key(id));
+    durable
+}
+fn write_fence_with_intent(path: &Path, state: &State, strict: State) -> Result<()> {
+    write_intent_fence(path, state, strict, false)
+}
+fn write_pending_fence(path: &Path, state: &State, strict: State) -> Result<()> {
+    write_intent_fence(path, state, strict, true)
+}
+fn write_intent_fence(path: &Path, state: &State, strict: State, pending: bool) -> Result<()> {
+    validate_state(&strict)?;
     let fence = PolicyFence {
-        schema: 1,
+        schema: 2,
         revision: state.revision,
         digest: policy_digest(state)?,
+        strict: Some(strict),
+        pending,
     };
-    crate::bindings::atomic_write(&fence_path(path), &serde_json::to_vec(&fence)?)?;
+    let bytes = serde_json::to_vec(&fence)?;
+    if bytes.len() as u64 > MAX_FILE {
+        bail!("routing policy fence exceeds cap");
+    }
+    crate::bindings::atomic_write(&fence_path(path), &bytes)?;
     Ok(())
 }
-fn load_fenced(path: &Path) -> Result<Option<State>> {
-    let loaded = load(path)?;
+#[cfg(test)]
+fn write_fence(path: &Path, state: &State) -> Result<()> {
+    write_fence_with_intent(path, state, strict_intent(state, &Settings::default()))
+}
+fn read_fence(path: &Path) -> Result<Option<PolicyFence>> {
     match crate::bindings::read_binding_snapshot(&fence_path(path)) {
         Ok(bytes) => {
-            if bytes.len() > 1024 {
+            if bytes.len() as u64 > MAX_FILE {
                 bail!("routing policy fence exceeds cap");
             }
             let fence: PolicyFence =
                 serde_json::from_value(crate::json_unique::from_slice(&bytes)?)?;
-            let state = loaded.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("routing policy file disappeared; durable fence retained")
-            })?;
-            if fence.schema != 1
-                || fence.revision != state.revision
-                || fence.digest != policy_digest(state)?
+            if !matches!(fence.schema, 1 | 2)
+                || !valid_id(&fence.digest, 64)
+                || (fence.schema == 2 && fence.strict.is_none())
             {
-                bail!("routing policy generation does not match durable fence");
+                bail!("invalid routing policy fence");
             }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            // One-time adoption of pre-fence files. A fresh home has no fence
-            // until its first intent write. Removing BOTH files is outside
-            // protection against partial loss/rollback of an owned state file.
-            if let Some(state) = &loaded {
-                write_fence(path, state)?;
+            if let Some(strict) = &fence.strict {
+                validate_state(strict)?;
+                if strict.sessions.values().any(|s| {
+                    s.explicit.is_none()
+                        || (s.explicit.as_ref().is_some_and(|v| v.mode != Mode::Strict)
+                            && s.anchor.is_some())
+                        || s.project.is_some()
+                        || !s.movements.is_empty()
+                }) || strict
+                    .projects
+                    .values()
+                    .any(|p| p.settings.mode != Mode::Strict)
+                {
+                    bail!("invalid strict intent witness");
+                }
             }
+            Ok(Some(fence))
         }
-        Err(error) => return Err(error.into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
     }
-    Ok(loaded)
+}
+// Best-effort positive evidence only. Unparseable legacy bytes cannot establish
+// absence of strict intent; that pre-witness limitation is recorded at the gate.
+fn legacy_strict_evidence(path: &Path, defaults: &Settings) -> State {
+    let mut strict = State::default();
+    let Ok(bytes) = crate::bindings::read_binding_snapshot(path) else {
+        return strict;
+    };
+    if bytes.len() as u64 > MAX_FILE {
+        return strict;
+    }
+    let Ok(value) = crate::json_unique::from_slice(&bytes) else {
+        return strict;
+    };
+    if let Some(projects) = value.get("projects").and_then(|v| v.as_object()) {
+        for (id, value) in projects.iter().take(MAX_PROJECTS) {
+            if valid_project(id)
+                && value.pointer("/settings/mode").and_then(|v| v.as_str()) == Some("strict")
+            {
+                strict.projects.insert(
+                    id.clone(),
+                    Project {
+                        name: "recovered-strict".into(),
+                        settings: Settings {
+                            mode: Mode::Strict,
+                            ..Settings::default()
+                        },
+                    },
+                );
+            }
+        }
+    }
+    if let Some(sessions) = value.get("sessions").and_then(|v| v.as_object()) {
+        for (id, value) in sessions.iter().take(MAX_SESSIONS) {
+            let explicit = value.get("explicit").filter(|v| !v.is_null());
+            let project = value.get("project").and_then(|v| v.as_str());
+            // Project association freezes the session baseline. Current project
+            // settings cannot change the mode of an already-associated root.
+            let effective = explicit.or_else(|| project.and_then(|_| value.get("baseline")));
+            let mode = effective
+                .and_then(|v| v.get("mode"))
+                .and_then(|v| v.as_str());
+            let settings = match mode {
+                Some("strict") => Some(Settings {
+                    mode: Mode::Strict,
+                    ..Settings::default()
+                }),
+                Some("recover" | "rebalance") => effective
+                    .and_then(|v| serde_json::from_value::<Settings>(v.clone()).ok())
+                    .filter(|v| v.validate().is_ok()),
+                None if explicit.is_none()
+                    && project.is_none()
+                    && defaults.mode == Mode::Strict =>
+                {
+                    Some(defaults.clone())
+                }
+                _ => None,
+            };
+            if !valid_id(id, 64) {
+                continue;
+            }
+            if let Some(settings) = settings {
+                let anchor = value
+                    .get("anchor")
+                    .and_then(|v| v.as_str())
+                    .filter(|a| crate::observability::safe_identifier(a).is_some())
+                    .map(str::to_owned);
+                strict.sessions.insert(
+                    id.clone(),
+                    SessionPolicy {
+                        project: None,
+                        baseline: settings.clone(),
+                        explicit: Some(settings.clone()),
+                        anchor: if settings.mode == Mode::Strict {
+                            anchor
+                        } else {
+                            None
+                        },
+                        movements: Vec::new(),
+                    },
+                );
+            }
+        }
+    }
+    if value.get("schema").and_then(|v| v.as_u64()) == Some(1) {
+        strict.legacy_codex_roots.extend(
+            strict
+                .sessions
+                .iter()
+                .filter(|(_, session)| {
+                    session
+                        .explicit
+                        .as_ref()
+                        .is_some_and(|settings| settings.mode == Mode::Strict)
+                })
+                .map(|(id, _)| id.clone()),
+        );
+    } else if let Some(aliases) = value.get("legacy_codex_roots").and_then(|v| v.as_array()) {
+        for alias in aliases.iter().take(MAX_SESSIONS).filter_map(|v| v.as_str()) {
+            if strict.sessions.get(alias).is_some_and(|session| {
+                session
+                    .explicit
+                    .as_ref()
+                    .is_some_and(|settings| settings.mode == Mode::Strict)
+            }) {
+                strict.legacy_codex_roots.insert(alias.to_owned());
+            }
+        }
+    }
+    strict
+}
+struct Recovery {
+    state: State,
+    blocked: bool,
+    degraded: bool,
+    seen: bool,
+    warning: Option<&'static str>,
+}
+fn recover_policy(
+    path: &Path,
+    defaults: &Settings,
+    known: Option<&State>,
+    witness: Option<&State>,
+    generation: Option<&(u64, String)>,
+) -> Recovery {
+    // Read both independently: a bad policy must not hide a good strict witness.
+    let loaded = load(path);
+    let fence = read_fence(path);
+    let salvage = if loaded.is_err() {
+        legacy_strict_evidence(path, defaults)
+    } else {
+        State::default()
+    };
+    let mut strict = known
+        .map(|s| strict_intent(s, defaults))
+        .unwrap_or_default();
+    merge_intent(&mut strict, salvage);
+    if let Some(witness) = witness {
+        merge_intent(&mut strict, witness.clone());
+    }
+    if let Ok(Some(state)) = &loaded {
+        merge_intent(&mut strict, strict_intent(state, defaults));
+    }
+    if let Ok(Some(fence)) = &fence
+        && let Some(witness) = &fence.strict
+    {
+        merge_intent(&mut strict, witness.clone());
+    }
+    let adopt = matches!(&fence, Ok(None)) || matches!(&fence, Ok(Some(f)) if f.schema == 1);
+    let checked = (|| -> Result<Option<State>> {
+        let state = loaded?;
+        if let Some(fence) = fence? {
+            let state = state
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("routing policy missing"))?;
+            if fence.revision != state.revision || fence.digest != policy_digest(state)? {
+                bail!("routing policy generation mismatch");
+            }
+            if fence.pending {
+                bail!("routing policy transaction incomplete");
+            }
+            // A union witness from an interrupted transaction may be wider.
+            // Even matching generations cannot release those pending locks.
+            if let Some(witness) = fence.strict
+                && policy_digest(&strict_intent(&witness, defaults))?
+                    != policy_digest(&strict_intent(state, defaults))?
+            {
+                bail!("routing strict witness reconciliation incomplete");
+            }
+        }
+        if let (Some((revision, digest)), Some(next)) = (generation, state.as_ref()) {
+            let next = durable_state(next, defaults);
+            if next.revision < *revision
+                || (next.revision == *revision && policy_digest(&next)? != *digest)
+            {
+                bail!("routing policy revision rollback refused");
+            }
+        }
+        if state.is_none() && known.is_some_and(|s| has_durable_rows(&durable_state(s, defaults))) {
+            bail!("routing policy disappeared");
+        }
+        if let Some(state) = &state {
+            let durable = durable_state(state, defaults);
+            if adopt && has_durable_rows(&durable) {
+                // Also upgrades schema-1 digest-only fences and pre-fence files.
+                write_fence_with_intent(path, state, strict_intent(state, defaults))?;
+            }
+        }
+        Ok(state)
+    })();
+    match checked {
+        Ok(state) => Recovery {
+            seen: state.is_some(),
+            state: state.unwrap_or_default(),
+            blocked: false,
+            degraded: false,
+            warning: None,
+        },
+        Err(_) => {
+            strict.revision = known.map_or(0, |state| state.revision);
+            let blocked = defaults.mode == Mode::Strict || has_intent(&strict);
+            if !blocked {
+                // Rename evidence, never replace/delete it. Failure disables writes,
+                // but cannot deny unrelated non-strict traffic.
+                let suffix = format!(
+                    "corrupt-{}-{:016x}",
+                    Utc::now().timestamp_millis(),
+                    rand::random::<u64>()
+                );
+                for original in [path.to_path_buf(), fence_path(path)] {
+                    if fs::symlink_metadata(&original).is_ok() {
+                        let name = original
+                            .file_name()
+                            .expect("policy filename")
+                            .to_string_lossy();
+                        if fs::rename(
+                            &original,
+                            original.with_file_name(format!("{name}.{suffix}")),
+                        )
+                        .is_err()
+                        {
+                            return Recovery {
+                                state: strict,
+                                blocked: false,
+                                degraded: true,
+                                seen: false,
+                                warning: Some("routing_policy_quarantine_failed"),
+                            };
+                        }
+                    }
+                }
+            }
+            Recovery {
+                state: strict,
+                blocked,
+                degraded: true,
+                seen: blocked,
+                warning: Some(if blocked {
+                    "routing_policy_strict_recovery_required"
+                } else {
+                    "routing_policy_quarantined"
+                }),
+            }
+        }
+    }
 }
 
 impl PolicyStore {
     pub fn new(home: &Path, defaults: Settings) -> Result<Self> {
         defaults.validate()?;
         let path = home.join("state/routing-policies.json");
-        fs::create_dir_all(path.parent().expect("policy parent"))?;
-        let loaded = load_fenced(&path)?;
-        let file_seen = loaded.is_some();
-        let state = loaded.unwrap_or_default();
+        let directory_failed = fs::create_dir_all(path.parent().expect("policy parent")).is_err();
+        let recovered = recover_policy(&path, &defaults, None, None, None);
+        let file_seen = recovered.seen;
+        let intent = strict_intent(&recovered.state, &defaults);
+        let generation = if !recovered.degraded && recovered.seen {
+            Some((
+                recovered.state.revision,
+                policy_digest(&durable_state(&recovered.state, &defaults))?,
+            ))
+        } else {
+            None
+        };
+        let state = recovered.state;
+        let mut warnings = Vec::new();
+        if let Some(code) = recovered.warning {
+            warnings.push(PolicyWarning { code });
+        }
+        if directory_failed {
+            warnings.push(PolicyWarning {
+                code: "routing_policy_directory_failed",
+            });
+        }
         Ok(Self {
             path,
             defaults,
@@ -501,7 +917,16 @@ impl PolicyStore {
             state: Mutex::new(Arc::new(state)),
             writer: Mutex::new(()),
             file_seen: AtomicBool::new(file_seen),
-            recovery_blocked: AtomicBool::new(false),
+            recovery_blocked: AtomicBool::new(recovered.blocked),
+            lifecycle_recovery: AtomicBool::new(false),
+            persistence_failed: AtomicBool::new(recovered.degraded || directory_failed),
+            recovery_intent: Mutex::new(intent),
+            durable_generation: Mutex::new(generation),
+            warnings: Mutex::new(WarningState {
+                seen: warnings.iter().map(|w| w.code).collect(),
+                pending: warnings,
+                sink: None,
+            }),
             changed: tokio::sync::Notify::new(),
         })
     }
@@ -513,7 +938,58 @@ impl PolicyStore {
     pub fn limits(&self) -> &ChurnLimits {
         &self.limits
     }
+    /// The integration owner drains startup warnings after attaching observability,
+    /// and drains subsequent warnings after routing operations. No raw file data.
+    pub fn take_warnings(&self) -> Vec<PolicyWarning> {
+        std::mem::take(
+            &mut self
+                .warnings
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pending,
+        )
+    }
+    pub fn attach_observability(&self, observability: &Arc<crate::observability::Observability>) {
+        let pending = {
+            let mut state = self.warnings.lock().unwrap_or_else(|e| e.into_inner());
+            state.sink = Some(Arc::downgrade(observability));
+            std::mem::take(&mut state.pending)
+        };
+        for warning in pending {
+            observability.core_warning("routing", warning.code);
+        }
+    }
+    pub fn emit_pending_warnings(&self, observability: &crate::observability::Observability) {
+        for warning in self.take_warnings() {
+            observability.core_warning("routing", warning.code);
+        }
+    }
+    fn warn(&self, code: &'static str) {
+        let sink = {
+            let mut state = self.warnings.lock().unwrap_or_else(|e| e.into_inner());
+            // Codes come from a fixed set. Report each once per store lifetime,
+            // rather than flooding SSE/ledger during a persistent disk failure.
+            if !state.seen.insert(code) {
+                return;
+            }
+            let sink = state.sink.as_ref().and_then(std::sync::Weak::upgrade);
+            if sink.is_none() {
+                state.pending.push(PolicyWarning { code });
+            }
+            sink
+        };
+        if let Some(sink) = sink {
+            sink.core_warning("routing", code);
+        }
+    }
     fn update<T>(&self, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
+        self.update_inner(false, f)
+    }
+    fn update_inner<T>(
+        &self,
+        volatile_on_failure: bool,
+        f: impl FnOnce(&mut State) -> Result<T>,
+    ) -> Result<T> {
         let _writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let state = self.snapshot();
         if state.frozen {
@@ -526,23 +1002,68 @@ impl PolicyStore {
         }
         next.reindex();
         validate_state(&next)?;
-        next.revision = next.revision.wrapping_add(1);
-        let bytes = serde_json::to_vec(&next)?;
-        if bytes.len() as u64 > MAX_FILE {
-            bail!("routing policy file exceeds cap");
+        let before = durable_state(&state, &self.defaults);
+        let mut durable = durable_state(&next, &self.defaults);
+        // Volatile movement history never advances the durable generation.
+        durable.revision = before.revision;
+        if policy_digest(&before)? != policy_digest(&durable)? {
+            next.revision = state
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("routing revision exhausted"))?;
+            durable.revision = next.revision;
+            let mut union = strict_intent(&before, &self.defaults);
+            merge_intent(&mut union, strict_intent(&durable, &self.defaults));
+            merge_intent(
+                &mut union,
+                self.recovery_intent
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
+            );
+            let write = (|| -> Result<()> {
+                if self.persistence_failed.load(Ordering::Acquire) {
+                    bail!("routing persistence requires recovery");
+                }
+                let bytes = serde_json::to_vec(&durable)?;
+                if bytes.len() as u64 > MAX_FILE {
+                    bail!("routing policy file exceeds cap");
+                }
+                write_pending_fence(&self.path, &durable, union.clone())?;
+                crate::bindings::atomic_write(&self.path, &bytes)?;
+                write_fence_with_intent(
+                    &self.path,
+                    &durable,
+                    strict_intent(&durable, &self.defaults),
+                )?;
+                Ok(())
+            })();
+            if let Err(error) = write {
+                self.persistence_failed.store(true, Ordering::Release);
+                self.recovery_blocked.store(true, Ordering::Release);
+                *self
+                    .recovery_intent
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = union;
+                self.warn("routing_policy_write_failed");
+                self.changed.notify_waiters();
+                if !volatile_on_failure {
+                    return Err(error);
+                }
+                next.revision = state.revision;
+            } else {
+                self.file_seen.store(true, Ordering::Release);
+                *self
+                    .durable_generation
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) =
+                    Some((durable.revision, policy_digest(&durable)?));
+                *self
+                    .recovery_intent
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = strict_intent(&durable, &self.defaults);
+            }
         }
-        if let Err(error) = write_fence(&self.path, &next)
-            .and_then(|()| crate::bindings::atomic_write(&self.path, &bytes).map_err(Into::into))
-        {
-            // Replace may have succeeded before a durability failure. Do not
-            // keep authorizing from an older in-memory revision afterwards.
-            let mut retired = (*state).clone();
-            retired.frozen = true;
-            *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(retired);
-            self.changed.notify_waiters();
-            return Err(error);
-        }
-        self.file_seen.store(true, Ordering::Release);
         next.reindex();
         *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(next);
         self.changed.notify_waiters();
@@ -556,6 +1077,12 @@ impl PolicyStore {
     }
     pub(crate) fn requires_strict_recovery(&self) -> bool {
         self.defaults.mode == Mode::Strict
+            || has_intent(
+                &self
+                    .recovery_intent
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            )
             || self
                 .snapshot()
                 .sessions
@@ -568,31 +1095,83 @@ impl PolicyStore {
         if state.frozen {
             bail!("routing policy writer retired");
         }
-        let loaded = load_fenced(&self.path)?;
-        if loaded.is_none() && self.file_seen.load(Ordering::Acquire) {
-            bail!("routing policy file disappeared; existing intent retained");
+        let generation = self
+            .durable_generation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let witness = self
+            .recovery_intent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let recovered = recover_policy(
+            &self.path,
+            &self.defaults,
+            Some(&state),
+            Some(&witness),
+            generation.as_ref(),
+        );
+        if let Some(code) = recovered.warning {
+            self.warn(code);
         }
-        if loaded.is_some() {
-            self.file_seen.store(true, Ordering::Release);
+        self.recovery_blocked
+            .store(recovered.blocked, Ordering::Release);
+        self.persistence_failed
+            .store(recovered.degraded, Ordering::Release);
+        self.file_seen.store(recovered.seen, Ordering::Release);
+        let intent = strict_intent(&recovered.state, &self.defaults);
+        *self
+            .recovery_intent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = intent;
+        let mut next = recovered.state;
+        if !recovered.degraded {
+            *self
+                .durable_generation
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some((
+                next.revision,
+                policy_digest(&durable_state(&next, &self.defaults))?,
+            ));
         }
-        let next = loaded.unwrap_or_default();
-        if next.revision < state.revision
-            || (next.revision == state.revision && policy_digest(&next)? != policy_digest(&state)?)
-        {
-            bail!("routing policy revision rollback refused");
+        // In-memory implicit histories can be newer than legacy disk histories.
+        for (id, session) in &state.sessions {
+            if !session.durable(&self.defaults)
+                && next
+                    .sessions
+                    .get(id)
+                    .is_none_or(|disk| !disk.durable(&self.defaults))
+            {
+                next.sessions.insert(id.clone(), session.clone());
+            }
         }
+        next.history_overflow_until =
+            match (next.history_overflow_until, state.history_overflow_until) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
+        next.reindex();
         *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(next);
+        self.changed.notify_waiters();
+        if recovered.blocked {
+            bail!("routing strict recovery required");
+        }
         Ok(())
     }
-    /// Import recovery blocks every dispatch until validation and anchor capture finish.
-    /// On failure it remains blocked; only a successful recovery or restart clears it.
+    /// Import recovery blocks strict dispatch until validation and anchor capture finish.
+    /// Unrelated non-strict sessions continue serving.
     pub(crate) fn begin_recovery(&self) {
-        self.recovery_blocked.store(true, Ordering::Release);
+        self.lifecycle_recovery.store(true, Ordering::Release);
         self.changed.notify_waiters();
     }
     pub(crate) fn finish_recovery(&self) {
-        self.recovery_blocked.store(false, Ordering::Release);
+        self.lifecycle_recovery.store(false, Ordering::Release);
         self.changed.notify_waiters();
+    }
+    fn strict_dispatch_blocked(&self) -> bool {
+        self.recovery_blocked.load(Ordering::Acquire)
+            || self.lifecycle_recovery.load(Ordering::Acquire)
     }
     fn snapshot(&self) -> Arc<State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -602,6 +1181,10 @@ impl PolicyStore {
         &self,
         bindings: impl IntoIterator<Item = (&'a str, &'a str)>,
     ) -> Result<()> {
+        if self.persistence_failed.load(Ordering::Acquire) {
+            self.warn("routing_policy_strict_recovery_required");
+            return Ok(());
+        }
         let state = self.snapshot();
         let mut missing = BTreeMap::<String, String>::new();
         for (key, account) in bindings {
@@ -639,17 +1222,26 @@ impl PolicyStore {
     /// A queued request cannot use an obsolete account after policy changes.
     pub fn permits_dispatch(&self, key: Option<&str>, account: &str) -> bool {
         let state = self.snapshot();
-        if state.frozen || self.recovery_blocked.load(Ordering::Acquire) {
+        if state.frozen {
             return false;
         }
         let Some(key) = key else {
             return self.defaults.mode != Mode::Strict;
         };
-        let plan = self.resolve(&state, &state.policy_id(key));
-        plan.settings.mode != Mode::Strict || plan.anchor.as_deref() == Some(account)
+        let plan = self.plan(Some(key));
+        plan.settings.mode != Mode::Strict
+            || (!self.strict_dispatch_blocked() && plan.anchor.as_deref() == Some(account))
     }
     fn resolve(&self, state: &State, id: &str) -> Plan {
-        let session = state.sessions.get(id);
+        let witness = self
+            .recovery_intent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let session = if self.recovery_blocked.load(Ordering::Acquire) {
+            witness.sessions.get(id).or_else(|| state.sessions.get(id))
+        } else {
+            state.sessions.get(id)
+        };
         Plan {
             settings: session.map_or_else(
                 || self.defaults.clone(),
@@ -671,7 +1263,26 @@ impl PolicyStore {
     }
     pub fn plan(&self, key: Option<&str>) -> Plan {
         let state = self.snapshot();
-        self.resolve(&state, &key.map(|k| state.policy_id(k)).unwrap_or_default())
+        let id = key
+            .map(|key| {
+                let current = state.policy_id(key);
+                let witness = self
+                    .recovery_intent
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if self.recovery_blocked.load(Ordering::Acquire) {
+                    let guarded = witness.policy_id(key);
+                    if witness.sessions.contains_key(&guarded) {
+                        guarded
+                    } else {
+                        current
+                    }
+                } else {
+                    current
+                }
+            })
+            .unwrap_or_default();
+        self.resolve(&state, &id)
     }
     pub fn list(&self) -> serde_json::Value {
         let state = self.snapshot();
@@ -801,6 +1412,16 @@ impl PolicyStore {
         project: &str,
         anchor: Option<&str>,
     ) -> Result<()> {
+        if self.recovery_blocked.load(Ordering::Acquire)
+            && self
+                .recovery_intent
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .projects
+                .contains_key(project)
+        {
+            bail!("strict project recovery incomplete");
+        }
         let id = self.snapshot().policy_id(key);
         {
             let state = self.snapshot();
@@ -851,14 +1472,14 @@ impl PolicyStore {
         now: DateTime<Utc>,
     ) -> bool {
         let state = self.snapshot();
-        let prefix = if key.starts_with("claude:") {
-            "cl"
-        } else {
-            "cx"
-        };
-        let pool_moves = state
-            .pool_moves
-            .get(prefix)
+        if state
+            .history_overflow_until
+            .is_some_and(|until| now < until)
+        {
+            return false;
+        }
+        let pool_moves = target
+            .and_then(|account| state.pool_moves.get(pool_id(account)))
             .into_iter()
             .flatten()
             .filter(|at| (now - **at).num_seconds() < self.limits.window_secs as i64)
@@ -879,7 +1500,9 @@ impl PolicyStore {
             && session
                 .movements
                 .iter()
-                .filter(|m| (now - m.at).num_seconds() < self.limits.window_secs as i64)
+                .filter(|m| {
+                    m.discretionary && (now - m.at).num_seconds() < self.limits.window_secs as i64
+                })
                 .count()
                 < self.limits.max_group_moves
             && !session.movements.iter().any(|m| {
@@ -890,7 +1513,8 @@ impl PolicyStore {
                     })
             })
     }
-    /// Persist before a strict first dispatch or any account change. No partial memory commit.
+    /// Persist explicit intent before strict dispatch. Default movement guards are volatile.
+    /// Non-strict movement remains available when persistence fails.
     pub fn dispatch(
         &self,
         key: Option<&str>,
@@ -899,7 +1523,11 @@ impl PolicyStore {
         reason: &str,
         now: DateTime<Utc>,
     ) -> Result<()> {
-        if self.recovery_blocked.load(Ordering::Acquire) {
+        if self.snapshot().frozen {
+            bail!("routing policy writer retired");
+        }
+        let plan = self.plan(key);
+        if plan.settings.mode == Mode::Strict && self.strict_dispatch_blocked() {
             bail!("routing policy recovery incomplete");
         }
         let Some(key) = key else {
@@ -930,9 +1558,81 @@ impl PolicyStore {
                 return Ok(());
             }
         }
-        self.update(|state| {
+        if !discretionary
+            && plan.settings.mode != Mode::Strict
+            && self.persistence_failed.load(Ordering::Acquire)
+        {
+            let _writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+            let state = self.snapshot();
+            if state.frozen {
+                bail!("routing policy writer retired");
+            }
+            if state.sessions.len() > MAX_SESSIONS || state.projects.len() > MAX_PROJECTS {
+                if self.plan(Some(key)).settings.mode == Mode::Strict {
+                    bail!("routing policy recovery incomplete");
+                }
+                let mut next = (*state).clone();
+                let until = now
+                    + chrono::Duration::seconds(
+                        self.limits.revisit_secs.max(self.limits.target_quiet_secs) as i64,
+                    );
+                next.history_overflow_until = Some(
+                    next.history_overflow_until
+                        .map_or(until, |old| old.max(until)),
+                );
+                *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(next);
+                self.warn("routing_forced_history_overflow");
+                self.changed.notify_waiters();
+                // Metadata only: no rows added, no evidence pruned or persisted.
+                // BindingTable emits the successful forced MoveEvent as usual.
+                return Ok(());
+            }
+        }
+        self.update_inner(plan.settings.mode != Mode::Strict, |state| {
+            if discretionary
+                && state
+                    .history_overflow_until
+                    .is_some_and(|until| now < until)
+            {
+                bail!("routing volatile history overflow guard");
+            }
+            if !state.sessions.contains_key(&id) && state.sessions.len() >= MAX_SESSIONS {
+                let forced_horizon = self.limits.revisit_secs.max(self.limits.target_quiet_secs);
+                let discretionary_horizon = 86400_u64
+                    .max(self.limits.window_secs)
+                    .max(self.limits.dwell_secs)
+                    .max(self.limits.revisit_secs)
+                    .max(self.limits.target_quiet_secs);
+                state.sessions.retain(|root, session| {
+                    session.durable(&self.defaults)
+                        || session.settings(&self.defaults).mode == Mode::Strict
+                        || state.legacy_codex_roots.contains(root)
+                        || session.movements.iter().any(|movement| {
+                            let horizon = if movement.discretionary {
+                                discretionary_horizon
+                            } else {
+                                forced_horizon
+                            };
+                            (now - movement.at).num_seconds() < horizon as i64
+                        })
+                });
+                if state.sessions.len() >= MAX_SESSIONS
+                    && !discretionary
+                    && plan.settings.mode != Mode::Strict
+                {
+                    let until = now + chrono::Duration::seconds(forced_horizon as i64);
+                    state.history_overflow_until = Some(
+                        state
+                            .history_overflow_until
+                            .map_or(until, |old| old.max(until)),
+                    );
+                    self.warn("routing_forced_history_overflow");
+                    // BindingTable still records its successful MoveEvent/ledger.
+                    return Ok(());
+                }
+            }
             if discretionary {
-                let prefix = account.split('-').next().unwrap_or(account);
+                let prefix = pool_id(account);
                 // The immutable index de-duplicates inherited legacy history.
                 let pool_moves = state
                     .pool_moves
@@ -956,6 +1656,7 @@ impl PolicyStore {
                     bail!("routing destination inflow budget exhausted");
                 }
             }
+            let mut evicted_forced_until: Option<DateTime<Utc>> = None;
             let entry = state.sessions.entry(id).or_insert_with(|| SessionPolicy {
                 project: None,
                 baseline: self.defaults.clone(),
@@ -991,7 +1692,10 @@ impl PolicyStore {
                     .iter()
                     .filter(|m| (now - m.at).num_seconds() < self.limits.window_secs as i64)
                     .collect();
-                if recent.len() >= self.limits.max_group_moves {
+                if discretionary
+                    && recent.iter().filter(|m| m.discretionary).count()
+                        >= self.limits.max_group_moves
+                {
                     bail!("routing movement budget exhausted");
                 }
                 entry.movements.push(Movement {
@@ -1001,11 +1705,40 @@ impl PolicyStore {
                     at: now,
                     discretionary,
                 });
-                if entry.movements.len() > 32 {
+                if discretionary && entry.movements.iter().filter(|m| m.discretionary).count() > 32
+                {
                     bail!("routing history capacity reached");
+                }
+                if !discretionary {
+                    while entry.movements.iter().filter(|m| !m.discretionary).count()
+                        > MAX_FORCED_HISTORY
+                    {
+                        let index = entry
+                            .movements
+                            .iter()
+                            .position(|m| !m.discretionary)
+                            .expect("forced history overflow");
+                        let evicted = entry.movements.remove(index);
+                        let until = evicted.at
+                            + chrono::Duration::seconds(
+                                self.limits.revisit_secs.max(self.limits.target_quiet_secs) as i64,
+                            );
+                        if now < until {
+                            evicted_forced_until =
+                                Some(evicted_forced_until.map_or(until, |old| old.max(until)));
+                        }
+                    }
                 }
             }
             entry.anchor = Some(account.to_owned());
+            if let Some(until) = evicted_forced_until {
+                state.history_overflow_until = Some(
+                    state
+                        .history_overflow_until
+                        .map_or(until, |old| old.max(until)),
+                );
+                self.warn("routing_forced_history_overflow");
+            }
             Ok(())
         })
     }
@@ -1015,9 +1748,7 @@ impl PolicyStore {
 mod tests {
     use super::*;
     fn home() -> tempfile::TempDir {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/routing-tests");
-        fs::create_dir_all(&path).unwrap();
-        tempfile::tempdir_in(path).unwrap()
+        tempfile::tempdir().unwrap()
     }
     fn settings(mode: Mode) -> Settings {
         Settings {
@@ -1153,9 +1884,12 @@ mod tests {
         bad["sessions"][session_id("codex:other2")]["movements"][0]["id"] = id;
         bad["sessions"][session_id("codex:other2")]["movements"][0]["from"] = "cx-conflict".into();
         fs::write(&store.path, serde_json::to_vec(&bad).unwrap()).unwrap();
+        store.reload().unwrap();
         assert!(
-            store.reload().is_err(),
-            "conflicting movement IDs were allowed to erase pool history"
+            store
+                .take_warnings()
+                .iter()
+                .any(|w| w.code == "routing_policy_quarantined")
         );
     }
     #[test]
@@ -1244,6 +1978,15 @@ mod tests {
         let home = home();
         let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
         let now = Utc::now();
+        // Explicit policy makes this group's discretionary history durable.
+        store
+            .set_session(
+                &session_id("codex:moving"),
+                Some(settings(Mode::Rebalance)),
+                None,
+                Some("cx-a"),
+            )
+            .unwrap();
         store
             .dispatch(Some("codex:moving"), "cx-b", Some("cx-a"), "overload", now)
             .unwrap();
@@ -1262,28 +2005,31 @@ mod tests {
             Some("cx-c"),
             now + chrono::Duration::seconds(1801)
         ));
-        store
-            .dispatch(Some("codex:moving"), "cx-c", Some("cx-b"), "forced", now)
-            .unwrap();
-        store
-            .dispatch(Some("codex:moving"), "cx-d", Some("cx-c"), "forced", now)
-            .unwrap();
-        assert!(
+        for (from, to) in [
+            ("cx-b", "cx-c"),
+            ("cx-c", "cx-d"),
+            ("cx-d", "cx-e"),
+            ("cx-e", "cx-f"),
+        ] {
             store
-                .dispatch(Some("codex:moving"), "cx-e", Some("cx-d"), "forced", now)
-                .is_err()
-        );
+                .dispatch(Some("codex:moving"), to, Some(from), "forced", now)
+                .unwrap();
+        }
         drop(store);
         let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
         assert_eq!(
             store.plan(Some("codex:moving")).anchor.as_deref(),
-            Some("cx-d")
+            Some("cx-f")
         );
+        let snapshot = store.snapshot();
+        let moves = &snapshot.sessions[&session_id("codex:moving")].movements;
+        assert_eq!(moves.iter().filter(|m| !m.discretionary).count(), 4);
+        assert_eq!(snapshot.pool_moves["cx"].len(), 1);
         assert!(!store.discretionary_allowed("codex:moving", None, now));
     }
 
     #[test]
-    fn durable_fence_refuses_missing_rolled_back_and_same_revision_changed_intent() {
+    fn durable_fence_blocks_only_strict_on_missing_rollback_and_same_revision_changes() {
         let home = home();
         let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
         store
@@ -1326,7 +2072,11 @@ mod tests {
             }
             assert!(store.reload().is_err());
             for _ in 0..2 {
-                assert!(PolicyStore::new(home.path(), Settings::default()).is_err());
+                assert!(
+                    !PolicyStore::new(home.path(), Settings::default())
+                        .unwrap()
+                        .permits_dispatch(Some("codex:fenced"), "cx-a")
+                );
             }
             assert_eq!(store.plan(Some("codex:fenced")).settings.mode, Mode::Strict);
             assert_eq!(fs::read(fence_path(&store.path)).unwrap(), latest_fence);
@@ -1335,7 +2085,7 @@ mod tests {
         // While alive, even a coordinated rollback of both files is rejected.
         fs::write(&store.path, &old).unwrap();
         fs::write(fence_path(&store.path), old_fence).unwrap();
-        assert!(store.reload().unwrap_err().to_string().contains("rollback"));
+        assert!(store.reload().is_err());
         fs::write(&store.path, &latest).unwrap();
         fs::write(fence_path(&store.path), latest_fence).unwrap();
         store.reload().unwrap();
@@ -1355,7 +2105,7 @@ mod tests {
         assert!(PolicyStore::new(home.path(), Settings::default()).is_ok());
     }
     #[test]
-    fn interrupted_fence_before_policy_replace_refuses_start_and_keeps_evidence() {
+    fn interrupted_fence_before_policy_replace_blocks_strict_and_keeps_evidence() {
         let home = home();
         let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
         store
@@ -1371,7 +2121,9 @@ mod tests {
         pending.revision += 1;
         write_fence(&store.path, &pending).unwrap();
         for _ in 0..2 {
-            assert!(PolicyStore::new(home.path(), Settings::default()).is_err());
+            let restarted = PolicyStore::new(home.path(), Settings::default()).unwrap();
+            assert!(!restarted.permits_dispatch(Some("codex:crash"), "cx-a"));
+            assert!(restarted.permits_dispatch(Some("codex:unrelated"), "cx-b"));
         }
         assert_eq!(fs::read(&store.path).unwrap(), original);
     }
@@ -1426,12 +2178,23 @@ mod tests {
         assert!(store.reload().is_err());
     }
     #[test]
-    fn corrupt_policy_refuses_startup_instead_of_forgetting_strict_intent() {
+    fn corrupt_legacy_without_known_strict_evidence_quarantines_and_serves_defaults() {
         let home = home();
         fs::create_dir_all(home.path().join("state")).unwrap();
-        fs::write(home.path().join("state/routing-policies.json"), b"not-json").unwrap();
-        assert!(PolicyStore::new(home.path(), Settings::default()).is_err());
+        let path = home.path().join("state/routing-policies.json");
+        fs::write(&path, b"not-json").unwrap();
+        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        assert!(store.permits_dispatch(Some("codex:unrelated"), "cx-a"));
+        assert!(!path.exists());
+        assert_eq!(store.take_warnings()[0].code, "routing_policy_quarantined");
+        let files: Vec<_> = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|f| f.unwrap().path())
+            .collect();
+        assert_eq!(files.len(), 1);
+        assert_eq!(fs::read(&files[0]).unwrap(), b"not-json");
     }
+
     #[test]
     fn indexed_policy_checks_remain_bounded_at_maximum_session_capacity() {
         let home = home();
@@ -1552,7 +2315,7 @@ mod tests {
         );
     }
     #[test]
-    fn implicit_history_follows_current_global_defaults_after_restart() {
+    fn implicit_history_is_volatile_and_survives_in_process_reload() {
         let home = home();
         let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
         store
@@ -1564,13 +2327,20 @@ mod tests {
                 Utc::now(),
             )
             .unwrap();
+        assert!(!store.path.exists());
+        assert!(!fence_path(&store.path).exists());
+        store.reload().unwrap();
+        assert_eq!(
+            store.snapshot().sessions[&session_id("codex:global")]
+                .movements
+                .len(),
+            1
+        );
         drop(store);
-        let store = PolicyStore::new(home.path(), settings(Mode::Strict)).unwrap();
-        assert_eq!(store.plan(Some("codex:global")).source, "global");
-        assert_eq!(store.plan(Some("codex:global")).settings.mode, Mode::Strict);
-        assert!(!store.permits_dispatch(Some("codex:global"), "cx-a"));
-        assert!(store.permits_dispatch(Some("codex:global"), "cx-b"));
+        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        assert!(store.snapshot().sessions.is_empty());
     }
+
     #[test]
     fn project_assignment_does_not_clear_explicit_policy_without_inherit() {
         let home = home();
@@ -1630,35 +2400,52 @@ mod tests {
             bad["sessions"][&id].as_object_mut().unwrap().remove(field);
             fs::write(&store.path, serde_json::to_vec(&bad).unwrap()).unwrap();
             assert!(
-                PolicyStore::new(home.path(), Settings::default()).is_err(),
+                !PolicyStore::new(home.path(), Settings::default())
+                    .unwrap()
+                    .permits_dispatch(Some("codex:schema"), "cx-a"),
                 "missing {field}"
             );
         }
         let mut bad = original.clone();
         bad["sessions"][&id]["explict"] = bad["sessions"][&id]["explicit"].clone();
         fs::write(&store.path, serde_json::to_vec(&bad).unwrap()).unwrap();
-        assert!(PolicyStore::new(home.path(), Settings::default()).is_err());
+        assert!(
+            !PolicyStore::new(home.path(), Settings::default())
+                .unwrap()
+                .permits_dispatch(Some("codex:schema"), "cx-a")
+        );
         let mut bad = original;
         bad["sessions"][&id]["baseline"]
             .as_object_mut()
             .unwrap()
             .remove("mode");
         fs::write(&store.path, serde_json::to_vec(&bad).unwrap()).unwrap();
-        assert!(PolicyStore::new(home.path(), Settings::default()).is_err());
+        assert!(
+            !PolicyStore::new(home.path(), Settings::default())
+                .unwrap()
+                .permits_dispatch(Some("codex:schema"), "cx-a")
+        );
     }
     #[test]
-    fn policy_load_rejects_nonregular_and_oversized_files() {
-        let home = home();
-        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
-        fs::create_dir(&store.path).unwrap();
-        assert!(PolicyStore::new(home.path(), Settings::default()).is_err());
-        fs::remove_dir(&store.path).unwrap();
-        fs::File::create(&store.path)
-            .unwrap()
-            .set_len(MAX_FILE + 1)
-            .unwrap();
-        assert!(PolicyStore::new(home.path(), Settings::default()).is_err());
+    fn policy_load_quarantines_nonregular_and_oversized_files_without_default_denial() {
+        for directory in [true, false] {
+            let home = home();
+            let path = home.path().join("state/routing-policies.json");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            if directory {
+                fs::create_dir(&path).unwrap();
+            } else {
+                fs::File::create(&path)
+                    .unwrap()
+                    .set_len(MAX_FILE + 1)
+                    .unwrap();
+            }
+            let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+            assert!(store.permits_dispatch(Some("codex:default"), "cx-a"));
+            assert!(!store.take_warnings().is_empty());
+        }
     }
+
     #[test]
     fn slow_policy_writer_does_not_block_policy_readers() {
         let home = home();
@@ -1709,6 +2496,1003 @@ mod tests {
             }
             .validate()
             .is_err()
+        );
+    }
+    fn clock() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-10-20T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn r8_default_history_guards_survive_reload_without_policy_writes() {
+        let home = home();
+        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        store
+            .dispatch(
+                Some("codex:volatile"),
+                "cx-b",
+                Some("cx-a"),
+                "overload",
+                clock(),
+            )
+            .unwrap();
+        assert!(!store.discretionary_allowed("codex:volatile", Some("cx-c"), clock()));
+        assert_eq!(store.snapshot().pool_moves["cx"].len(), 1);
+        assert!(!store.path.exists());
+        assert!(!fence_path(&store.path).exists());
+        store.reload().unwrap();
+        assert!(!store.discretionary_allowed("codex:volatile", Some("cx-c"), clock()));
+        assert_eq!(store.snapshot().pool_moves["cx"].len(), 1);
+        assert!(!store.path.exists());
+    }
+
+    #[test]
+    fn r8_io_failure_blocks_only_strict_and_freeze_blocks_everyone() {
+        let home = home();
+        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        store
+            .set_session(
+                &session_id("codex:strict"),
+                Some(settings(Mode::Strict)),
+                None,
+                Some("cx-a"),
+            )
+            .unwrap();
+        store
+            .set_session(
+                &session_id("codex:recover"),
+                Some(settings(Mode::Recover)),
+                None,
+                Some("cx-a"),
+            )
+            .unwrap();
+        fs::remove_file(&store.path).unwrap();
+        fs::create_dir(&store.path).unwrap();
+        assert!(
+            store
+                .put_project(
+                    None,
+                    Project {
+                        name: "failure".into(),
+                        settings: Settings::default()
+                    }
+                )
+                .is_err()
+        );
+        assert!(!store.permits_dispatch(Some("codex:strict"), "cx-a"));
+        assert!(store.permits_dispatch(Some("codex:recover"), "cx-a"));
+        assert!(store.permits_dispatch(None, "cx-a"));
+        store
+            .dispatch(
+                Some("codex:recover"),
+                "cx-b",
+                Some("cx-a"),
+                "forced",
+                clock(),
+            )
+            .unwrap();
+        store
+            .dispatch(
+                Some("codex:default"),
+                "cx-b",
+                Some("cx-a"),
+                "forced",
+                clock(),
+            )
+            .unwrap();
+        assert_eq!(
+            store.plan(Some("codex:recover")).anchor.as_deref(),
+            Some("cx-b")
+        );
+        assert!(store.list()["projects"].as_object().unwrap().is_empty());
+        assert!(
+            store
+                .take_warnings()
+                .iter()
+                .any(|w| w.code == "routing_policy_write_failed")
+        );
+        store.freeze();
+        assert!(!store.permits_dispatch(Some("codex:default"), "cx-b"));
+        assert!(
+            store
+                .dispatch(
+                    Some("codex:default"),
+                    "cx-c",
+                    Some("cx-b"),
+                    "forced",
+                    clock()
+                )
+                .is_err()
+        );
+        assert!(!store.permits_dispatch(None, "cx-a"));
+    }
+
+    #[test]
+    fn r8_corrupt_policy_uses_witness_for_selective_recovery_and_aliases() {
+        let home = home();
+        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        let project = store
+            .put_project(
+                None,
+                Project {
+                    name: "strict".into(),
+                    settings: settings(Mode::Strict),
+                },
+            )
+            .unwrap();
+        store.associate("claude:strict-root", &project).unwrap();
+        store
+            .set_session(
+                &session_id("codex:legacy"),
+                Some(settings(Mode::Strict)),
+                None,
+                Some("cx-a"),
+            )
+            .unwrap();
+        store
+            .update(|state| {
+                state.legacy_codex_roots.insert(session_id("codex:legacy"));
+                Ok(())
+            })
+            .unwrap();
+        let fence = fs::read(fence_path(&store.path)).unwrap();
+        fs::write(&store.path, b"broken-json").unwrap();
+        for _ in 0..2 {
+            let restarted = PolicyStore::new(home.path(), Settings::default()).unwrap();
+            assert!(!restarted.permits_dispatch(Some("claude:strict-root:agent:child"), "cl-a"));
+            assert!(!restarted.permits_dispatch(Some("codex:legacy:agent:child"), "cx-a"));
+            assert!(restarted.permits_dispatch(Some("codex:unrelated"), "cx-a"));
+            assert!(restarted.permits_dispatch(None, "cx-a"));
+            assert!(
+                restarted
+                    .associate("codex:new-project-root", &project)
+                    .is_err()
+            );
+            assert!(
+                restarted
+                    .dispatch(Some("claude:strict-root"), "cl-a", None, "first", clock())
+                    .is_err()
+            );
+        }
+        assert_eq!(fs::read(&store.path).unwrap(), b"broken-json");
+        assert_eq!(fs::read(fence_path(&store.path)).unwrap(), fence);
+    }
+
+    #[test]
+    fn r8_pending_strict_creation_and_removal_keep_union_witness() {
+        for removal in [false, true] {
+            let home = home();
+            let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+            store
+                .set_session(
+                    &session_id("codex:pending"),
+                    Some(settings(if removal { Mode::Strict } else { Mode::Recover })),
+                    None,
+                    Some("cx-a"),
+                )
+                .unwrap();
+            let previous = (*store.snapshot()).clone();
+            let mut next = previous.clone();
+            next.revision += 1;
+            next.sessions
+                .get_mut(&session_id("codex:pending"))
+                .unwrap()
+                .explicit = Some(settings(if removal { Mode::Recover } else { Mode::Strict }));
+            let mut union = strict_intent(&previous, &Settings::default());
+            merge_intent(&mut union, strict_intent(&next, &Settings::default()));
+            write_pending_fence(&store.path, &next, union).unwrap();
+            // Test both crash boundaries: before and after policy replacement.
+            for replace_policy in [false, true] {
+                if replace_policy {
+                    crate::bindings::atomic_write(&store.path, &serde_json::to_vec(&next).unwrap())
+                        .unwrap();
+                }
+                let restarted = PolicyStore::new(home.path(), Settings::default()).unwrap();
+                assert!(!restarted.permits_dispatch(Some("codex:pending"), "cx-a"));
+                assert!(restarted.permits_dispatch(Some("codex:unrelated"), "cx-b"));
+            }
+        }
+    }
+
+    #[test]
+    fn r8_forced_ring_never_consumes_discretionary_budgets() {
+        let home = home();
+        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        store
+            .dispatch(
+                Some("codex:ring"),
+                "cx-b",
+                Some("cx-a"),
+                "overload",
+                clock(),
+            )
+            .unwrap();
+        let mut previous = "cx-b".to_owned();
+        for n in 0..80 {
+            let target = format!("cx-forced-{n}");
+            store
+                .dispatch(
+                    Some("codex:ring"),
+                    &target,
+                    Some(&previous),
+                    "forced",
+                    clock(),
+                )
+                .unwrap();
+            previous = target;
+        }
+        let state = store.snapshot();
+        let movements = &state.sessions[&session_id("codex:ring")].movements;
+        assert_eq!(
+            movements.iter().filter(|m| !m.discretionary).count(),
+            MAX_FORCED_HISTORY
+        );
+        assert_eq!(movements.iter().filter(|m| m.discretionary).count(), 1);
+        assert_eq!(state.pool_moves["cx"].len(), 1);
+        assert!(!store.discretionary_allowed("codex:ring", Some("cx-new"), clock()));
+        assert!(!store.discretionary_allowed("codex:other", Some("cx-new"), clock()));
+        assert!(!store.path.exists());
+    }
+
+    #[test]
+    fn r8_pool_budget_uses_account_id_not_session_prefix() {
+        let home = home();
+        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        for n in 0..4 {
+            // Intentionally different from the session's usual provider prefix.
+            store
+                .dispatch(
+                    Some(&format!("claude:pool-{n}")),
+                    &format!("cx-target-{n}"),
+                    Some("cx-source"),
+                    "overload",
+                    clock(),
+                )
+                .unwrap();
+        }
+        assert!(!store.discretionary_allowed("claude:next", Some("cx-unused"), clock()));
+        assert!(store.discretionary_allowed("codex:next", Some("cl-unused"), clock()));
+        assert!(store.discretionary_allowed("claude:next", None, clock()));
+        store.reload().unwrap();
+        assert!(!store.discretionary_allowed("claude:next", Some("cx-unused"), clock()));
+    }
+
+    #[test]
+    fn r8_failed_strict_first_placement_never_authorizes_send() {
+        let home = home();
+        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        store
+            .set_session(
+                &session_id("codex:first"),
+                Some(settings(Mode::Strict)),
+                None,
+                None,
+            )
+            .unwrap();
+        fs::remove_file(&store.path).unwrap();
+        fs::create_dir(&store.path).unwrap();
+        assert!(
+            store
+                .dispatch(Some("codex:first"), "cx-a", None, "first", clock())
+                .is_err()
+        );
+        assert!(!store.permits_dispatch(Some("codex:first"), "cx-a"));
+        assert!(store.permits_dispatch(Some("codex:default"), "cx-a"));
+        assert!(store.plan(Some("codex:first")).anchor.is_none());
+    }
+
+    #[test]
+    fn r8_legacy_digest_only_corruption_does_not_block_unprovable_strict_intent() {
+        let home = home();
+        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        store
+            .set_session(
+                &session_id("codex:old"),
+                Some(settings(Mode::Strict)),
+                None,
+                Some("cx-a"),
+            )
+            .unwrap();
+        let mut fence: serde_json::Value =
+            serde_json::from_slice(&fs::read(fence_path(&store.path)).unwrap()).unwrap();
+        fence["schema"] = 1.into();
+        fence.as_object_mut().unwrap().remove("strict");
+        fence.as_object_mut().unwrap().remove("pending");
+        crate::bindings::atomic_write(
+            &fence_path(&store.path),
+            &serde_json::to_vec(&fence).unwrap(),
+        )
+        .unwrap();
+        fs::write(&store.path, b"unparseable legacy data").unwrap();
+        let restarted = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        assert!(restarted.permits_dispatch(Some("codex:unrelated"), "cx-a"));
+        assert_eq!(
+            restarted.plan(Some("codex:old")).settings.mode,
+            Mode::Rebalance
+        );
+        assert!(
+            restarted
+                .take_warnings()
+                .iter()
+                .any(|w| w.code == "routing_policy_quarantined")
+        );
+        assert_eq!(fs::read_dir(home.path().join("state")).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn r8_legacy_positive_strict_evidence_survives_invalid_unrelated_fields() {
+        let home = home();
+        let path = home.path().join("state/routing-policies.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let value = serde_json::json!({"schema":1,"revision":3,"projects":{},"sessions":{
+            session_id("codex:known"): {"explicit":{"mode":"strict"},"anchor":"cx-a"},
+            session_id("codex:broken"): {"unrelated":"invalid"}
+        }});
+        crate::bindings::atomic_write(&path, &serde_json::to_vec(&value).unwrap()).unwrap();
+        let restarted = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        assert!(!restarted.permits_dispatch(Some("codex:known:agent:child"), "cx-a"));
+        assert!(restarted.permits_dispatch(Some("codex:unrelated"), "cx-a"));
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn r8_witness_rejects_over_capacity_without_unrelated_denial() {
+        let home = home();
+        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        let mut witness = State::default();
+        for n in 0..=MAX_PROJECTS {
+            witness.projects.insert(
+                format!("{n:032x}"),
+                Project {
+                    name: "strict".into(),
+                    settings: settings(Mode::Strict),
+                },
+            );
+        }
+        assert!(write_pending_fence(&store.path, &State::default(), witness).is_err());
+        assert!(!fence_path(&store.path).exists());
+        assert!(store.permits_dispatch(Some("codex:default"), "cx-a"));
+    }
+    #[test]
+    fn sol1_lifecycle_import_captures_anchor_before_releasing_strict_block() {
+        let home = home();
+        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        store
+            .set_session(
+                &session_id("codex:import"),
+                Some(settings(Mode::Strict)),
+                None,
+                None,
+            )
+            .unwrap();
+        store.begin_recovery();
+        // Import calls reload between begin_recovery and anchor capture.
+        store.reload().unwrap();
+        assert!(!store.permits_dispatch(Some("codex:import"), "cx-a"));
+        assert!(store.permits_dispatch(Some("codex:other"), "cx-a"));
+        store
+            .capture_strict_anchors([("codex:import", "cx-a")])
+            .unwrap();
+        assert_eq!(
+            store.plan(Some("codex:import")).anchor.as_deref(),
+            Some("cx-a")
+        );
+        assert!(!store.permits_dispatch(Some("codex:import"), "cx-a"));
+        store.finish_recovery();
+        assert!(store.permits_dispatch(Some("codex:import"), "cx-a"));
+        assert!(
+            store
+                .dispatch(Some("codex:import"), "cx-b", None, "first", clock())
+                .is_err()
+        );
+        let restarted = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        assert!(restarted.permits_dispatch(Some("codex:import"), "cx-a"));
+        assert!(!restarted.permits_dispatch(Some("codex:import"), "cx-b"));
+    }
+
+    #[test]
+    fn sol2_legacy_negative_exception_survives_policy_or_fence_corruption() {
+        for corrupt_policy in [false, true] {
+            let home = home();
+            let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+            let parent = "codex:legacy-exception";
+            let child = "codex:legacy-exception:agent:independent";
+            store
+                .set_session(
+                    &session_id(parent),
+                    Some(settings(Mode::Strict)),
+                    None,
+                    Some("cx-a"),
+                )
+                .unwrap();
+            store
+                .set_session(
+                    &session_id(child),
+                    Some(settings(Mode::Rebalance)),
+                    None,
+                    Some("cx-b"),
+                )
+                .unwrap();
+            store
+                .update(|state| {
+                    state.legacy_codex_roots.insert(session_id(parent));
+                    Ok(())
+                })
+                .unwrap();
+            let fence = read_fence(&store.path).unwrap().unwrap();
+            let witness = fence.strict.unwrap();
+            assert_eq!(
+                witness.sessions[&session_id(child)]
+                    .explicit
+                    .as_ref()
+                    .unwrap()
+                    .mode,
+                Mode::Rebalance
+            );
+            assert!(witness.sessions[&session_id(child)].anchor.is_none());
+            assert!(witness.sessions[&session_id(child)].movements.is_empty());
+            let broken = if corrupt_policy {
+                store.path.clone()
+            } else {
+                fence_path(&store.path)
+            };
+            fs::write(&broken, b"broken").unwrap();
+            assert!(store.reload().is_err());
+            assert!(!store.permits_dispatch(Some(parent), "cx-a"));
+            assert!(
+                !store.permits_dispatch(Some("codex:legacy-exception:agent:inherited"), "cx-a")
+            );
+            assert!(store.permits_dispatch(Some(child), "cx-b"));
+            store
+                .dispatch(Some(child), "cx-c", Some("cx-b"), "forced", clock())
+                .unwrap();
+            for _ in 0..2 {
+                let restarted = PolicyStore::new(home.path(), Settings::default()).unwrap();
+                assert!(!restarted.permits_dispatch(Some(parent), "cx-a"));
+                assert!(restarted.permits_dispatch(Some(child), "cx-b"));
+                assert!(restarted.permits_dispatch(Some("codex:unrelated"), "cx-b"));
+            }
+        }
+    }
+
+    #[test]
+    fn sol2_volatile_child_cannot_shadow_recovered_strict_alias() {
+        let home = home();
+        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        store
+            .set_session(
+                &session_id("codex:aliased"),
+                Some(settings(Mode::Strict)),
+                None,
+                Some("cx-a"),
+            )
+            .unwrap();
+        store
+            .update(|state| {
+                state.legacy_codex_roots.insert(session_id("codex:aliased"));
+                Ok(())
+            })
+            .unwrap();
+        // Pre-existing volatile history is not an explicit alias exception.
+        let mut state = (*store.snapshot()).clone();
+        state.sessions.insert(
+            session_id("codex:aliased:agent:child"),
+            SessionPolicy {
+                project: None,
+                baseline: Settings::default(),
+                explicit: None,
+                anchor: Some("cx-b".into()),
+                movements: Vec::new(),
+            },
+        );
+        *store.state.lock().unwrap() = Arc::new(state);
+        fs::write(&store.path, b"broken").unwrap();
+        assert!(store.reload().is_err());
+        assert_eq!(
+            store.plan(Some("codex:aliased:agent:child")).settings.mode,
+            Mode::Strict
+        );
+        assert!(!store.permits_dispatch(Some("codex:aliased:agent:child"), "cx-b"));
+    }
+
+    #[test]
+    fn sol3_reload_keeps_newer_volatile_history_over_legacy_disk_row() {
+        let home = home();
+        let path = home.path().join("state/routing-policies.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut legacy = State::default();
+        legacy.revision = 7;
+        legacy.sessions.insert(
+            session_id("codex:legacy-history"),
+            SessionPolicy {
+                project: None,
+                baseline: Settings::default(),
+                explicit: None,
+                anchor: Some("cx-a".into()),
+                movements: Vec::new(),
+            },
+        );
+        let original = serde_json::to_vec(&legacy).unwrap();
+        crate::bindings::atomic_write(&path, &original).unwrap();
+        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        store
+            .dispatch(
+                Some("codex:legacy-history"),
+                "cx-b",
+                Some("cx-a"),
+                "overload",
+                clock(),
+            )
+            .unwrap();
+        store.reload().unwrap();
+        assert_eq!(
+            store.plan(Some("codex:legacy-history")).anchor.as_deref(),
+            Some("cx-b")
+        );
+        assert_eq!(
+            store.snapshot().sessions[&session_id("codex:legacy-history")]
+                .movements
+                .len(),
+            1
+        );
+        assert_eq!(store.snapshot().pool_moves["cx"].len(), 1);
+        assert!(!store.discretionary_allowed("codex:legacy-history", Some("cx-c"), clock()));
+        assert!(!store.discretionary_allowed(
+            "codex:legacy-history",
+            Some("cx-a"),
+            clock() + chrono::Duration::seconds(1801)
+        ));
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(!fence_path(&path).exists());
+    }
+
+    #[test]
+    fn sol4_committed_witness_matches_durable_projection_with_global_strict() {
+        let home = home();
+        let store = PolicyStore::new(home.path(), settings(Mode::Strict)).unwrap();
+        store
+            .set_session(&session_id("codex:phantom"), None, None, None)
+            .unwrap();
+        assert!(!store.path.exists());
+        store
+            .put_project(
+                None,
+                Project {
+                    name: "explicit".into(),
+                    settings: settings(Mode::Recover),
+                },
+            )
+            .unwrap();
+        let loaded = load(&store.path).unwrap().unwrap();
+        let fence = read_fence(&store.path).unwrap().unwrap();
+        assert_eq!(
+            policy_digest(&fence.strict.unwrap()).unwrap(),
+            policy_digest(&strict_intent(&loaded, &settings(Mode::Strict))).unwrap()
+        );
+        assert!(!fence.pending);
+        store.reload().unwrap();
+        store
+            .dispatch(Some("codex:phantom"), "cx-a", None, "first", clock())
+            .unwrap();
+        assert!(store.permits_dispatch(Some("codex:phantom"), "cx-a"));
+        let restarted = PolicyStore::new(home.path(), settings(Mode::Strict)).unwrap();
+        assert!(restarted.permits_dispatch(Some("codex:phantom"), "cx-a"));
+        restarted
+            .dispatch(Some("codex:another"), "cx-b", None, "first", clock())
+            .unwrap();
+    }
+
+    fn capacity_state(explicit: bool, expired: bool) -> State {
+        let mut state = State::default();
+        let at = clock() - chrono::Duration::seconds(if expired { 86401 } else { 0 });
+        for n in 0..MAX_SESSIONS {
+            state.sessions.insert(
+                format!("{n:064x}"),
+                SessionPolicy {
+                    project: None,
+                    baseline: Settings::default(),
+                    explicit: explicit.then(Settings::default),
+                    anchor: Some("cx-b".into()),
+                    movements: vec![Movement {
+                        id: Some(format!("{n:032x}")),
+                        from: "cx-a".into(),
+                        to: "cx-b".into(),
+                        at,
+                        discretionary: false,
+                    }],
+                },
+            );
+        }
+        state.reindex();
+        state
+    }
+
+    #[test]
+    fn sol5_full_expired_volatile_history_prunes_and_records_new_forced_move() {
+        let home = home();
+        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        let mut state = capacity_state(false, true);
+        // A live discretionary guard must survive the capacity sweep.
+        let protected = state.sessions.get_mut(&format!("{:064x}", 0)).unwrap();
+        protected.movements[0].at = clock();
+        protected.movements[0].discretionary = true;
+        *store.state.lock().unwrap() = Arc::new(state);
+        store
+            .dispatch(
+                Some("codex:capacity-new"),
+                "cx-c",
+                Some("cx-a"),
+                "forced",
+                clock(),
+            )
+            .unwrap();
+        let state = store.snapshot();
+        assert_eq!(state.sessions.len(), 2);
+        assert!(state.sessions.contains_key(&format!("{:064x}", 0)));
+        assert_eq!(
+            state.sessions[&session_id("codex:capacity-new")]
+                .movements
+                .len(),
+            1
+        );
+        assert_eq!(state.pool_moves["cx"].len(), 1);
+        assert!(state.history_overflow_until.is_none());
+        assert!(!store.path.exists());
+        assert!(!fence_path(&store.path).exists());
+    }
+
+    #[test]
+    fn sol5_full_live_volatile_history_falls_back_and_preserves_overflow_on_reload() {
+        let home = home();
+        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        *store.state.lock().unwrap() = Arc::new(capacity_state(false, false));
+        for n in 0..4 {
+            store
+                .dispatch(
+                    Some(&format!("codex:overflow-{n}")),
+                    "cx-c",
+                    Some("cx-a"),
+                    "forced",
+                    clock(),
+                )
+                .unwrap();
+        }
+        assert_eq!(store.snapshot().sessions.len(), MAX_SESSIONS);
+        assert!(store.permits_dispatch(Some("codex:overflow-0"), "cx-c"));
+        assert_eq!(
+            store
+                .take_warnings()
+                .iter()
+                .filter(|w| w.code == "routing_forced_history_overflow")
+                .count(),
+            1
+        );
+        assert!(!store.discretionary_allowed("codex:next", Some("cx-unused"), clock()));
+        assert!(
+            store
+                .dispatch(
+                    Some("codex:next"),
+                    "cx-unused",
+                    Some("cx-a"),
+                    "overload",
+                    clock()
+                )
+                .is_err()
+        );
+        let deadline = store.snapshot().history_overflow_until.unwrap();
+        store.reload().unwrap();
+        assert_eq!(store.snapshot().history_overflow_until, Some(deadline));
+        assert!(!store.discretionary_allowed(
+            "codex:next",
+            Some("cx-unused"),
+            deadline - chrono::Duration::seconds(1)
+        ));
+        assert!(store.discretionary_allowed("codex:next", Some("cx-unused"), deadline));
+        assert!(!store.path.exists());
+        assert!(!fence_path(&store.path).exists());
+    }
+
+    #[test]
+    fn sol5_full_durable_intent_never_blocks_distinct_default_forced_move() {
+        let home = home();
+        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        let state = capacity_state(true, false);
+        let bytes = serde_json::to_vec(&state).unwrap();
+        // One fixture write, no 20,000-update/fsync loop.
+        crate::bindings::atomic_write(&store.path, &bytes).unwrap();
+        write_fence(&store.path, &state).unwrap();
+        *store.state.lock().unwrap() = Arc::new(state);
+        for n in 0..4 {
+            store
+                .dispatch(
+                    Some(&format!("codex:durable-overflow-{n}")),
+                    "cx-c",
+                    Some("cx-a"),
+                    "forced",
+                    clock(),
+                )
+                .unwrap();
+        }
+        assert_eq!(store.snapshot().sessions.len(), MAX_SESSIONS);
+        assert!(
+            store
+                .snapshot()
+                .sessions
+                .values()
+                .all(|s| s.explicit.is_some())
+        );
+        assert!(store.snapshot().history_overflow_until.is_some());
+        assert_eq!(fs::read(&store.path).unwrap(), bytes);
+        store.reload().unwrap();
+        assert_eq!(store.snapshot().sessions.len(), MAX_SESSIONS);
+        assert!(store.snapshot().history_overflow_until.is_some());
+    }
+    #[test]
+    fn close1_global_strict_keeps_explicit_recover_exception_on_corruption() {
+        let home = home();
+        let store = PolicyStore::new(home.path(), settings(Mode::Strict)).unwrap();
+        store
+            .set_session(
+                &session_id("codex:recover-exception"),
+                Some(settings(Mode::Recover)),
+                None,
+                Some("cx-r"),
+            )
+            .unwrap();
+        store
+            .set_session(
+                &session_id("codex:actual-strict"),
+                Some(settings(Mode::Strict)),
+                None,
+                Some("cx-s"),
+            )
+            .unwrap();
+        fs::write(&store.path, b"broken").unwrap();
+        assert!(store.reload().is_err());
+        assert_eq!(
+            store.plan(Some("codex:recover-exception")).settings.mode,
+            Mode::Recover
+        );
+        assert!(store.permits_dispatch(Some("codex:recover-exception"), "cx-r"));
+        assert!(!store.permits_dispatch(Some("codex:actual-strict"), "cx-s"));
+        assert!(!store.permits_dispatch(Some("codex:unknown-strict"), "cx-s"));
+        let restarted = PolicyStore::new(home.path(), settings(Mode::Strict)).unwrap();
+        assert_eq!(
+            restarted
+                .plan(Some("codex:recover-exception"))
+                .settings
+                .mode,
+            Mode::Recover
+        );
+        assert!(restarted.permits_dispatch(Some("codex:recover-exception"), "cx-r"));
+        assert!(!restarted.permits_dispatch(Some("codex:actual-strict"), "cx-s"));
+    }
+
+    #[test]
+    fn close2_salvage_keeps_valid_legacy_child_exception_with_unrelated_invalid_row() {
+        let home = home();
+        let path = home.path().join("state/routing-policies.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let value = serde_json::json!({"schema":1,"revision":4,"projects":{},"sessions":{
+            session_id("codex:salvage-parent"): {"project":null,"baseline":Settings::default(),"explicit":settings(Mode::Strict),"anchor":"cx-a","movements":[]},
+            session_id("codex:salvage-parent:agent:exception"): {"project":null,"baseline":Settings::default(),"explicit":settings(Mode::Recover),"anchor":"cx-b","movements":[]},
+            session_id("codex:invalid"): {"unrelated":"invalid"}
+        }});
+        crate::bindings::atomic_write(&path, &serde_json::to_vec(&value).unwrap()).unwrap();
+        for _ in 0..2 {
+            let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+            assert!(!store.permits_dispatch(Some("codex:salvage-parent"), "cx-a"));
+            assert!(!store.permits_dispatch(Some("codex:salvage-parent:agent:inherited"), "cx-a"));
+            assert_eq!(
+                store
+                    .plan(Some("codex:salvage-parent:agent:exception"))
+                    .settings
+                    .mode,
+                Mode::Recover
+            );
+            assert!(store.permits_dispatch(Some("codex:salvage-parent:agent:exception"), "cx-b"));
+        }
+        assert!(path.exists());
+        assert!(!fence_path(&path).exists());
+    }
+
+    #[test]
+    fn close3_salvage_uses_frozen_baseline_not_current_project_mode() {
+        for baseline_mode in [Mode::Rebalance, Mode::Strict] {
+            let home = home();
+            let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+            let project = store
+                .put_project(
+                    None,
+                    Project {
+                        name: "baseline".into(),
+                        settings: settings(baseline_mode),
+                    },
+                )
+                .unwrap();
+            store
+                .associate_with_anchor("codex:baseline-root", &project, Some("cx-a"))
+                .unwrap();
+            let current_mode = if baseline_mode == Mode::Strict {
+                Mode::Rebalance
+            } else {
+                Mode::Strict
+            };
+            store
+                .put_project(
+                    Some(&project),
+                    Project {
+                        name: "changed".into(),
+                        settings: settings(current_mode),
+                    },
+                )
+                .unwrap();
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&fs::read(&store.path).unwrap()).unwrap();
+            value["sessions"][session_id("codex:invalid")] =
+                serde_json::json!({"unrelated":"invalid"});
+            fs::write(&store.path, serde_json::to_vec(&value).unwrap()).unwrap();
+            // Exercise salvage itself, without a valid witness masking its result.
+            fs::remove_file(fence_path(&store.path)).unwrap();
+            let restarted = PolicyStore::new(home.path(), Settings::default()).unwrap();
+            assert_eq!(
+                restarted.plan(Some("codex:baseline-root")).settings.mode,
+                baseline_mode
+            );
+            assert_eq!(
+                restarted.permits_dispatch(Some("codex:baseline-root"), "cx-a"),
+                baseline_mode != Mode::Strict
+            );
+            assert!(restarted.permits_dispatch(Some("codex:unrelated"), "cx-a"));
+        }
+    }
+
+    #[test]
+    fn close4_forced_ring_eviction_preserves_live_revisit_and_arrival_guards() {
+        for revisit in [true, false] {
+            let home = home();
+            let limits = ChurnLimits {
+                revisit_secs: if revisit { 3600 } else { 0 },
+                target_quiet_secs: 120,
+                ..ChurnLimits::default()
+            };
+            let store = PolicyStore::new(home.path(), Settings::default())
+                .unwrap()
+                .with_limits(limits)
+                .unwrap();
+            let mut from = "cx-original".to_owned();
+            for n in 0..33 {
+                let to = format!("cx-ring-{n}");
+                store
+                    .dispatch(
+                        Some("codex:evict-ring"),
+                        &to,
+                        Some(&from),
+                        "forced",
+                        clock(),
+                    )
+                    .unwrap();
+                from = to;
+            }
+            assert_eq!(
+                store.snapshot().sessions[&session_id("codex:evict-ring")]
+                    .movements
+                    .len(),
+                MAX_FORCED_HISTORY
+            );
+            let target = if revisit { "cx-original" } else { "cx-ring-0" };
+            let key = if revisit {
+                "codex:evict-ring"
+            } else {
+                "codex:other-root"
+            };
+            let deadline = clock() + chrono::Duration::seconds(if revisit { 3600 } else { 120 });
+            assert_eq!(store.snapshot().history_overflow_until, Some(deadline));
+            assert!(!store.discretionary_allowed(key, Some(target), clock()));
+            assert!(
+                store
+                    .dispatch(Some(key), target, Some("cx-ring-32"), "overload", clock())
+                    .is_err()
+            );
+            store.reload().unwrap();
+            assert!(!store.discretionary_allowed(
+                key,
+                Some(target),
+                deadline - chrono::Duration::seconds(1)
+            ));
+            assert!(store.discretionary_allowed(key, Some(target), deadline));
+            // No discretionary budget was charged, and another forced move still succeeds.
+            assert!(store.snapshot().pool_moves.is_empty());
+            store
+                .dispatch(
+                    Some("codex:evict-ring"),
+                    "cx-forced-again",
+                    Some("cx-ring-32"),
+                    "forced",
+                    clock(),
+                )
+                .unwrap();
+            assert!(!store.path.exists());
+        }
+    }
+
+    #[test]
+    fn close5_oversized_two_file_recovery_keeps_both_strict_sets_and_allows_forced() {
+        let home = home();
+        let path = home.path().join("state/routing-policies.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut old = capacity_state(true, false);
+        for session in old.sessions.values_mut() {
+            session.explicit = Some(settings(Mode::Strict));
+        }
+        let removed = session_id("codex:old-strict-generation");
+        let old_row = old.sessions.remove(&format!("{:064x}", 0)).unwrap();
+        old.sessions.insert(removed.clone(), old_row);
+        write_fence(&path, &old).unwrap();
+        let added = session_id("codex:new-strict-generation");
+        let mut new = old.clone();
+        let row = new.sessions.remove(&removed).unwrap();
+        new.sessions.insert(added.clone(), row);
+        new.revision = 1;
+        validate_state(&old).unwrap();
+        validate_state(&new).unwrap();
+        let bytes = serde_json::to_vec(&new).unwrap();
+        crate::bindings::atomic_write(&path, &bytes).unwrap();
+        let fence = fs::read(fence_path(&path)).unwrap();
+        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        assert_eq!(store.snapshot().sessions.len(), MAX_SESSIONS + 1);
+        assert!(!store.permits_dispatch(Some("codex:new-strict-generation"), "cx-b"));
+        assert!(!store.permits_dispatch(Some("codex:old-strict-generation"), "cx-b"));
+        assert_eq!(
+            store.resolve(&store.snapshot(), &removed).settings.mode,
+            Mode::Strict
+        );
+        assert!(store.recovery_blocked.load(Ordering::Acquire));
+        for n in 0..4 {
+            store
+                .dispatch(
+                    Some(&format!("codex:oversize-default-{n}")),
+                    "cx-c",
+                    Some("cx-a"),
+                    "forced",
+                    clock(),
+                )
+                .unwrap();
+        }
+        let state = store.snapshot();
+        assert_eq!(state.sessions.len(), MAX_SESSIONS + 1);
+        assert!(state.sessions.contains_key(&removed));
+        assert!(state.sessions.contains_key(&added));
+        assert!(!store.permits_dispatch(Some("codex:old-strict-generation"), "cx-b"));
+        assert!(!store.permits_dispatch(Some("codex:new-strict-generation"), "cx-b"));
+        assert_eq!(
+            state.history_overflow_until,
+            Some(clock() + chrono::Duration::seconds(3600))
+        );
+        assert!(store.permits_dispatch(Some("codex:oversize-default-0"), "cx-c"));
+        assert!(!store.discretionary_allowed("codex:oversize-default-0", Some("cx-c"), clock()));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(fs::read(fence_path(&path)).unwrap(), fence);
+        assert_eq!(
+            store
+                .take_warnings()
+                .iter()
+                .filter(|w| w.code == "routing_forced_history_overflow")
+                .count(),
+            1
+        );
+        store.freeze();
+        assert!(
+            store
+                .dispatch(
+                    Some("codex:oversize-default-0"),
+                    "cx-d",
+                    Some("cx-c"),
+                    "forced",
+                    clock()
+                )
+                .is_err()
         );
     }
 }
