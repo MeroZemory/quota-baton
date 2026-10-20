@@ -3,8 +3,10 @@
 //! Persist MapPlan in the held operation journal BEFORE apply/restore. This is
 //! not a transaction with the session databases. Backups are encrypted deltas,
 //! never snapshots of unrelated entries, and remain available after recovery.
-//! Read handles deny in-place writers; noncooperating atomic rename writers
-//! still require caller exclusion (POSIX publication is not compare-and-swap).
+//! Existing maps are compared and updated under a TxF writer transaction, not
+//! replaced after a racy pathname check. Unsupported TxF fails without fallback.
+//! New maps use atomic no-replace publication. Neither operation loses a map
+//! that an external writer published before our exclusive update began.
 
 use anyhow::{Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
@@ -19,6 +21,8 @@ use std::{
 const FORMAT: &str = "herdr 세션 홈 파일 형식을 확인할 수 없습니다";
 const CONFLICT: &str = "herdr 세션 홈 연결이 변경되어 작업을 중단했습니다";
 const BACKUP: &str = "herdr 세션 홈 백업을 확인할 수 없습니다";
+#[cfg(windows)]
+const TRANSACTION: &str = "herdr 세션 홈 파일을 안전한 트랜잭션으로 저장하지 못했습니다";
 const LIMIT: u64 = 4 * 1024 * 1024;
 
 // No Debug: plans contain home paths. Only the selected UUID is journaled.
@@ -42,7 +46,8 @@ struct Document {
     value: Value,
     bytes: Option<Vec<u8>>,
     identity: Option<crate::sessions_guard::FileIdentity>,
-    // Keep the read handle open through publication/deletion.
+    // Retain until deletion or acquisition of a transactional writer. The
+    // latter rechecks this snapshot while holding actual filesystem exclusion.
     _file: Option<File>,
 }
 
@@ -220,26 +225,66 @@ fn unchanged(plan: &MapPlan, original: &Document) -> Result<()> {
     Ok(())
 }
 
-// Like the former sessions::atomic_index (6b57b2d), use POSIX replacement so
-// deny-write/read handles can stay open on the old map until verification ends.
-// The callback checks identity and bytes immediately before the final rename.
+// Low-level handle rename; production publication below always passes flags 0.
 #[cfg(windows)]
-fn publish(
-    path: &Path,
-    bytes: &[u8],
-    replace_existing: bool,
-    before_publish: impl FnOnce() -> Result<()>,
-) -> Result<()> {
+fn rename_file(file: &File, path: &Path, flags: u32) -> Result<()> {
+    use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
+    use windows::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{FILE_RENAME_INFO, FileRenameInfoEx, SetFileInformationByHandle},
+    };
+    let name = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    let name_bytes = name.len().checked_mul(2).ok_or_else(|| anyhow!(FORMAT))?;
+    let length = u32::try_from(name_bytes)?;
+    let offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+    let size = offset
+        .checked_add(name_bytes)
+        .and_then(|size| size.checked_add(2))
+        .ok_or_else(|| anyhow!(FORMAT))?;
+    let buffer_size = u32::try_from(size)?;
+    let mut buffer = vec![
+        std::mem::MaybeUninit::<FILE_RENAME_INFO>::zeroed();
+        size.div_ceil(std::mem::size_of::<FILE_RENAME_INFO>())
+    ];
+    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    // SAFETY: aligned, zeroed storage covers the header and complete UTF-16
+    // name. Only our create_new scratch handle is renamed, never reopened.
+    unsafe {
+        (*info).Anonymous.Flags = flags;
+        (*info).RootDirectory = HANDLE::default();
+        (*info).FileNameLength = length;
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            info.cast::<u8>().add(offset).cast::<u16>(),
+            name.len(),
+        );
+    }
+    // SAFETY: file still owns the scratch handle with DELETE access and
+    // the initialized rename buffer remains alive for the entire call.
+    unsafe {
+        SetFileInformationByHandle(
+            HANDLE(file.as_raw_handle()),
+            FileRenameInfoEx,
+            info.cast(),
+            buffer_size,
+        )
+    }
+    .map_err(|_| anyhow!("herdr 세션 홈 파일을 원자적으로 저장하지 못했습니다"))?;
+    Ok(())
+}
+
+// Publish a missing map only; never replace an existing destination.
+#[cfg(windows)]
+fn publish(path: &Path, bytes: &[u8], before_publish: impl FnOnce() -> Result<()>) -> Result<()> {
     use std::{
         io::Write,
-        os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle},
+        os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
         sync::atomic::{AtomicU64, Ordering},
     };
     use windows::Win32::{
         Foundation::{GENERIC_WRITE, HANDLE},
         Storage::FileSystem::{
-            DELETE, FILE_DISPOSITION_INFO, FILE_RENAME_INFO, FileDispositionInfo, FileRenameInfoEx,
-            SetFileInformationByHandle,
+            DELETE, FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
         },
     };
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -272,44 +317,8 @@ fn publish(
             .map_err(|_| anyhow!("herdr 세션 홈 임시 파일을 쓰지 못했습니다"))?;
         file.sync_all()
             .map_err(|_| anyhow!("herdr 세션 홈 임시 파일을 저장하지 못했습니다"))?;
-        let name = path.as_os_str().encode_wide().collect::<Vec<_>>();
-        let name_bytes = name.len().checked_mul(2).ok_or_else(|| anyhow!(FORMAT))?;
-        let length = u32::try_from(name_bytes)?;
-        let offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
-        let size = offset
-            .checked_add(name_bytes)
-            .and_then(|size| size.checked_add(2))
-            .ok_or_else(|| anyhow!(FORMAT))?;
-        let buffer_size = u32::try_from(size)?;
-        let mut buffer = vec![
-            std::mem::MaybeUninit::<FILE_RENAME_INFO>::zeroed();
-            size.div_ceil(std::mem::size_of::<FILE_RENAME_INFO>())
-        ];
-        let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-        // SAFETY: aligned, zeroed storage covers the header and complete UTF-16
-        // name. Only our create_new scratch handle is renamed, never reopened.
-        unsafe {
-            (*info).Anonymous.Flags = if replace_existing { 3 } else { 0 }; // New maps never replace a racing creator.
-            (*info).RootDirectory = HANDLE::default();
-            (*info).FileNameLength = length;
-            std::ptr::copy_nonoverlapping(
-                name.as_ptr(),
-                info.cast::<u8>().add(offset).cast::<u16>(),
-                name.len(),
-            );
-        }
         before_publish()?;
-        // SAFETY: file still owns the scratch handle with DELETE access and
-        // the initialized rename buffer remains alive for the entire call.
-        unsafe {
-            SetFileInformationByHandle(
-                HANDLE(file.as_raw_handle()),
-                FileRenameInfoEx,
-                info.cast(),
-                buffer_size,
-            )
-        }
-        .map_err(|_| anyhow!("herdr 세션 홈 파일을 원자적으로 저장하지 못했습니다"))?;
+        rename_file(&file, path, 0)?;
         Ok(())
     })();
     if result.is_err() {
@@ -330,20 +339,147 @@ fn publish(
 }
 
 #[cfg(not(windows))]
-fn publish(_: &Path, _: &[u8], _: bool, _: impl FnOnce() -> Result<()>) -> Result<()> {
+fn publish(_: &Path, _: &[u8], _: impl FnOnce() -> Result<()>) -> Result<()> {
     Err(anyhow!("herdr 세션 홈 변경은 Windows에서만 지원됩니다"))
 }
 
-fn write(plan: &MapPlan, original: &Document, value: &Value) -> Result<()> {
+// A deny-delete handle cannot protect an ordinary replacement by its own
+// holder. Instead TxF supplies exclusion AND atomic multi-sector visibility.
+// https://learn.microsoft.com/en-us/windows/win32/fileio/txf-basic-concepts
+// No normal write/replace fallback is safe if this filesystem lacks TxF.
+#[cfg(windows)]
+fn update_existing(
+    path: &Path,
+    original: &mut Document,
+    bytes: &[u8],
+    before_commit: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    use std::{
+        io::{Seek, SeekFrom, Write},
+        os::windows::{ffi::OsStrExt, io::FromRawHandle},
+    };
+    use windows::{
+        Win32::{
+            Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE},
+            Storage::FileSystem::{
+                CommitTransaction, CreateFileTransactedW, CreateTransaction,
+                FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, OPEN_EXISTING, RollbackTransaction,
+            },
+        },
+        core::PCWSTR,
+    };
+
+    struct Transaction {
+        handle: HANDLE,
+        committed: bool,
+    }
+    impl Drop for Transaction {
+        fn drop(&mut self) {
+            // SAFETY: this object exclusively owns the valid KTM handle. Any
+            // transacted File has been closed before this destructor runs.
+            unsafe {
+                if !self.committed {
+                    let _ = RollbackTransaction(self.handle);
+                }
+                let _ = CloseHandle(self.handle);
+            }
+        }
+    }
+
+    explicit(path)?;
+    // Release only our deny-write reader. A race in this gap is detected by
+    // the ID + byte comparison INSIDE the transaction, before any modification.
+    drop(original._file.take());
+    // SAFETY: optional pointers are null, reserved fields are zero; bounded
+    // five-second timeout. Existing windows features already expose KTM APIs.
+    let handle = unsafe {
+        CreateTransaction(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+            5_000,
+            PCWSTR::null(),
+        )
+    }
+    .map_err(|_| anyhow!(TRANSACTION))?;
+    let mut transaction = Transaction {
+        handle,
+        committed: false,
+    };
+    let name = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    // SAFETY: NUL-terminated name lives through the call. OPEN_EXISTING never
+    // creates/truncates. A writer locks against external modifications until
+    // commit/rollback, including after the file handle is closed below.
+    let handle = unsafe {
+        CreateFileTransactedW(
+            PCWSTR(name.as_ptr()),
+            GENERIC_READ.0 | GENERIC_WRITE.0,
+            FILE_SHARE_READ,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+            transaction.handle,
+            None,
+            None,
+        )
+    }
+    .map_err(|_| anyhow!(TRANSACTION))?;
+    // SAFETY: successful CreateFileTransactedW transfers one owned handle.
+    let mut file = unsafe { File::from_raw_handle(handle.0) };
+    ensure!(
+        Some(handle_identity(&file)?) == original.identity,
+        "{CONFLICT}"
+    );
+    let mut current = Vec::new();
+    Read::by_ref(&mut file)
+        .take(LIMIT + 1)
+        .read_to_end(&mut current)
+        .map_err(|_| anyhow!(TRANSACTION))?;
+    ensure!(
+        original.bytes.as_deref() == Some(current.as_slice()),
+        "{CONFLICT}"
+    );
+    file.seek(SeekFrom::Start(0))
+        .and_then(|_| file.write_all(bytes))
+        .and_then(|_| file.set_len(bytes.len() as u64))
+        .and_then(|_| file.sync_all())
+        .map_err(|_| anyhow!(TRANSACTION))?;
+    // TxF requires closing file handles before commit. The transaction still
+    // owns the filesystem lock: this is the crucial post-check race boundary.
+    drop(file);
+    before_commit()?;
+    // SAFETY: the live transaction exclusively owns the validated update.
+    unsafe { CommitTransaction(transaction.handle) }.map_err(|_| anyhow!(TRANSACTION))?;
+    transaction.committed = true;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn update_existing(
+    _: &Path,
+    _: &mut Document,
+    _: &[u8],
+    _: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    Err(anyhow!("herdr 세션 홈 변경은 Windows에서만 지원됩니다"))
+}
+
+fn write(plan: &MapPlan, original: &mut Document, value: &Value) -> Result<()> {
     let mut bytes = serde_json::to_vec_pretty(value).map_err(|_| anyhow!(FORMAT))?;
     bytes.push(b'\n');
     unchanged(plan, original)?;
-    publish(
-        &plan.change.path,
-        &bytes,
-        original.identity.is_some(),
-        || unchanged(plan, original),
-    )?;
+    if original.identity.is_some() {
+        update_existing(&plan.change.path, original, &bytes, || Ok(()))?;
+    } else {
+        publish(&plan.change.path, &bytes, || unchanged(plan, original))?;
+    }
     let current = read(&plan.change.path)?;
     ensure!(current.value == *value, "{CONFLICT}");
     Ok(())
@@ -378,9 +514,11 @@ pub(crate) fn plan(path: &Path, id: &str, destination: &Path, backupdir: &Path) 
 /// Requires a persisted caller journal intent. Durable encrypted backup always
 /// precedes publication. Replaying after either write is safe; a changed target
 /// UUID is refused. Unrelated changes completed before this call are preserved.
+/// Updating an existing map requires available local TxF support; otherwise
+/// this returns an error without attempting an unprotected map write.
 pub(crate) fn apply(plan: &MapPlan) -> Result<()> {
     validate(plan)?;
-    let document = read(&plan.change.path)?;
+    let mut document = read(&plan.change.path)?;
     ensure!(
         plan.change.map_was_missing || document.bytes.is_some(),
         "{CONFLICT}"
@@ -398,7 +536,7 @@ pub(crate) fn apply(plan: &MapPlan) -> Result<()> {
             plan.change.id.clone(),
             Value::String(plan.change.after.clone()),
         );
-        write(plan, &document, &value)?;
+        write(plan, &mut document, &value)?;
     }
     verify(plan)
 }
@@ -408,7 +546,7 @@ pub(crate) fn apply(plan: &MapPlan) -> Result<()> {
 /// nothing except our generated empty sessions object remains.
 pub(crate) fn restore(plan: &MapPlan) -> Result<()> {
     validate(plan)?;
-    let document = read(&plan.change.path)?;
+    let mut document = read(&plan.change.path)?;
     ensure!(
         plan.change.map_was_missing || document.bytes.is_some(),
         "{CONFLICT}"
@@ -434,7 +572,7 @@ pub(crate) fn restore(plan: &MapPlan) -> Result<()> {
             document.identity.ok_or_else(|| anyhow!(CONFLICT))?,
         )?;
     } else {
-        write(plan, &document, &value)?;
+        write(plan, &mut document, &value)?;
     }
     let restored = read(&plan.change.path)?;
     ensure!(
@@ -508,6 +646,26 @@ mod tests {
         fn original(&self) -> Value {
             json!({"sessions": {A: self.original_home, B: "SYNTHETIC_UNRELATED_PRIVATE_HOME"}, "future": {"keep": [1, true]}})
         }
+    }
+
+    // An independent noncooperating application, not a production safety bypass.
+    fn publish_foreign(
+        path: &Path,
+        bytes: &[u8],
+        before: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::DELETE;
+        let scratch = tempfile::tempdir_in(path.parent().unwrap())?;
+        let staged = scratch.path().join("foreign.json");
+        publish(&staged, bytes, || Ok(()))?;
+        let file = OpenOptions::new()
+            .read(true)
+            .access_mode(DELETE.0)
+            .share_mode(0)
+            .open(&staged)?;
+        before()?;
+        rename_file(&file, path, 3)
     }
 
     #[test]
@@ -701,64 +859,147 @@ mod tests {
         let f = Fixture::new();
         f.write(&f.original());
         let plan = f.plan();
-        let snapshot = read(&f.path).unwrap();
+        let mut snapshot = read(&f.path).unwrap();
         let mut proposed = snapshot.value.clone();
         proposed["sessions"][A] = json!(plan.change.after);
         let mut concurrent = snapshot.value.clone();
         concurrent["sessions"][B] = json!("concurrent-other-home");
-        publish(
+        publish_foreign(
             &f.path,
             &serde_json::to_vec(&concurrent).unwrap(),
-            true,
             || Ok(()),
         )
         .unwrap();
-        assert!(write(&plan, &snapshot, &proposed).is_err());
+        // Call the protected publisher directly, bypassing write's advisory
+        // precheck: the comparison under transaction must detect replacement.
+        let error = update_existing(
+            &f.path,
+            &mut snapshot,
+            &serde_json::to_vec(&proposed).unwrap(),
+            || panic!("changed snapshot must never reach commit"),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), CONFLICT);
         assert_eq!(f.value(), concurrent);
         assert!(!f.backup.exists());
     }
 
     #[test]
-    fn late_publication_check_preserves_unrelated_update_and_cleans_owned_scratch() {
+    fn transaction_excludes_foreign_replace_after_final_check_through_commit_or_rollback() {
+        for abort in [false, true] {
+            let f = Fixture::new();
+            let original = f.original();
+            f.write(&original);
+            let plan = f.plan();
+            let mut snapshot = read(&f.path).unwrap();
+            let mut proposed = snapshot.value.clone();
+            proposed["sessions"][A] = json!(plan.change.after);
+            proposed["future"]["multi_sector"] = json!("synthetic".repeat(2048));
+            let mut concurrent = snapshot.value.clone();
+            concurrent["sessions"][B] = json!("late-concurrent-other-home");
+            concurrent["future"]["new"] = json!("preserve");
+            let mut reached = false;
+            let result = update_existing(
+                &f.path,
+                &mut snapshot,
+                &serde_json::to_vec(&proposed).unwrap(),
+                || {
+                    reached = true;
+                    // AFTER the final snapshot comparison and after closing the
+                    // transacted file, immediately BEFORE commit. No extra path
+                    // precheck can mask a successful competing atomic replacement.
+                    assert!(
+                        publish_foreign(&f.path, &serde_json::to_vec(&concurrent).unwrap(), || Ok(
+                            ()
+                        ),)
+                        .is_err(),
+                        "TxF must exclude a foreign POSIX replacement"
+                    );
+                    // Neither staged bytes nor a partially written JSON are visible.
+                    assert_eq!(f.value(), original);
+                    if abort {
+                        Err(anyhow!("synthetic precommit interruption"))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert!(
+                reached,
+                "synthetic NTFS must support the protected publisher"
+            );
+            if abort {
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    "synthetic precommit interruption"
+                );
+                assert_eq!(f.value(), original);
+            } else {
+                result.unwrap();
+                assert_eq!(f.value(), proposed);
+            }
+            // Rollback/commit released exclusion; a foreign writer can now publish.
+            // Its committed B update must survive our stale retry, not be overwritten.
+            publish_foreign(
+                &f.path,
+                &serde_json::to_vec(&concurrent).unwrap(),
+                || Ok(()),
+            )
+            .unwrap();
+            assert!(
+                update_existing(
+                    &f.path,
+                    &mut snapshot,
+                    &serde_json::to_vec(&proposed).unwrap(),
+                    || Ok(())
+                )
+                .is_err()
+            );
+            assert_eq!(f.value(), concurrent);
+            assert_eq!(fs::read_dir(f.path.parent().unwrap()).unwrap().count(), 1);
+            assert!(!f.backup.exists());
+        }
+    }
+
+    #[test]
+    fn transaction_compares_bytes_even_when_file_identity_is_unchanged() {
         let f = Fixture::new();
         f.write(&f.original());
-        let plan = f.plan();
-        let snapshot = read(&f.path).unwrap();
-        let mut proposed = snapshot.value.clone();
-        proposed["sessions"][A] = json!(plan.change.after);
-        let mut concurrent = snapshot.value.clone();
-        concurrent["sessions"][B] = json!("late-concurrent-other-home");
-        concurrent["future"]["new"] = json!("preserve");
-        let files = || {
-            let mut names = fs::read_dir(f.path.parent().unwrap())
-                .unwrap()
-                .map(|entry| entry.unwrap().file_name())
-                .collect::<Vec<_>>();
-            names.sort();
-            names
-        };
-        let before = files();
-        let error = publish(
-            &f.path,
-            &serde_json::to_vec(&proposed).unwrap(),
-            true,
-            || {
-                // The outer scratch is already flushed, but its final rename has
-                // not happened. Model an external POSIX writer at that boundary.
-                publish(
-                    &f.path,
-                    &serde_json::to_vec(&concurrent).unwrap(),
-                    true,
-                    || Ok(()),
-                )?;
-                unchanged(&plan, &snapshot)
-            },
-        )
+        let mut snapshot = read(&f.path).unwrap();
+        let mut foreign = snapshot.value.clone();
+        foreign["sessions"][B] = json!("in-place-foreign-update");
+        drop(snapshot._file.take());
+        f.write(&foreign);
+        assert_eq!(
+            Some(crate::sessions_guard::identity(&f.path).unwrap()),
+            snapshot.identity
+        );
+        let error = update_existing(&f.path, &mut snapshot, b"{}", || {
+            panic!("changed bytes must refuse")
+        })
         .unwrap_err();
         assert_eq!(error.to_string(), CONFLICT);
-        assert_eq!(f.value(), concurrent);
-        assert_eq!(files(), before);
-        assert!(!f.backup.exists());
+        assert_eq!(f.value(), foreign);
+    }
+
+    #[test]
+    fn unavailable_transaction_writer_never_falls_back_to_replace() {
+        let f = Fixture::new();
+        f.write(&f.original());
+        let original = f.value();
+        let mut snapshot = read(&f.path).unwrap();
+        // Our independent deny-write reader makes a TxF writer unavailable,
+        // just as unsupported TxF must fail before any map modification.
+        let blocker = read(&f.path).unwrap();
+        assert!(
+            update_existing(&f.path, &mut snapshot, b"{}", || panic!(
+                "writer unavailable"
+            ))
+            .is_err()
+        );
+        assert_eq!(f.value(), original);
+        drop(blocker);
+        assert_eq!(fs::read_dir(f.path.parent().unwrap()).unwrap().count(), 1);
     }
 
     #[test]
@@ -766,7 +1007,7 @@ mod tests {
         let f = Fixture::new();
         fs::create_dir_all(f.path.parent().unwrap()).unwrap();
         let foreign = json!({"sessions":{B:"foreign-home"},"future":"preserve"});
-        let result = publish(&f.path, b"{\"sessions\":{}}", false, || {
+        let result = publish(&f.path, b"{\"sessions\":{}}", || {
             fs::write(&f.path, serde_json::to_vec(&foreign).unwrap())?;
             Ok(())
         });
