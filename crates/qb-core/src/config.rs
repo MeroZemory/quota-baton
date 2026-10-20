@@ -402,7 +402,10 @@ impl Config {
         let known = toml::Value::try_from(Self::default())?;
         warn_unknown(&value, &known, "");
         if let Some(accounts) = value.get("accounts").and_then(toml::Value::as_table) {
-            let known = toml::Value::try_from(AccountConfig::default())?;
+            let known = toml::Value::try_from(AccountConfig {
+                spread_threshold: Some(1),
+                ..AccountConfig::default()
+            })?;
             for account in accounts.values() {
                 warn_unknown(account, &known, "accounts.<id>.");
             }
@@ -513,11 +516,50 @@ future = true
         assert!(clamp_numeric_bounds(&mut values).is_empty());
         assert_eq!(values, original);
     }
+    #[test]
+    fn account_thresholds_and_extreme_intervals_clamp_before_unsigned_deserialization() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/config-clamp-tests");
+        fs::create_dir_all(&root).unwrap();
+        let home = tempfile::tempdir_in(root).unwrap();
+        let text = "[routing]\nactive_window_secs = 9223372036854775807\noverload_window_secs = 9223372036854775807\n[accounts.\"cl-a\"]\nspread_threshold = -1\n[accounts.\"cl-b\"]\nspread_threshold = 0\n[accounts.\"cl-c\"]\nspread_threshold = 7\n";
+        fs::write(home.path().join("config.toml"), text).unwrap();
+        let config = Config::load(home.path()).unwrap();
+        assert_eq!(config.accounts["cl-a"].spread_threshold, Some(1));
+        assert_eq!(config.accounts["cl-b"].spread_threshold, Some(1));
+        assert_eq!(config.accounts["cl-c"].spread_threshold, Some(7));
+        assert_eq!(config.routing.active_window_secs, u64::from(u32::MAX));
+        assert_eq!(config.routing.overload_window_secs, u64::from(u32::MAX));
+        let delta = chrono::Duration::seconds(config.routing.active_window_secs as i64);
+        assert!(chrono::Utc::now().checked_sub_signed(delta).is_some());
+        assert!(
+            std::time::Instant::now()
+                .checked_add(std::time::Duration::from_secs(
+                    config.routing.overload_window_secs
+                ))
+                .is_some()
+        );
+        let mut parsed = toml::from_str(text).unwrap();
+        let warnings = clamp_numeric_bounds(&mut parsed);
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|k| *k == "accounts.<id>.spread_threshold")
+                .count(),
+            2
+        );
+        assert_eq!(
+            fs::read_to_string(home.path().join("config.toml")).unwrap(),
+            text
+        );
+    }
 }
 
 // Normalize numbers before deserializing unsigned fields: negative TOML integers
 // are out of bounds too. Never include a value or the config text in a warning.
 fn clamp_numeric_bounds(value: &mut toml::Value) -> Vec<String> {
+    // Keep configured timer arithmetic representable on Windows Instant and
+    // Chrono alike (u32 seconds is over 136 years, far beyond operational use).
+    const MAX_INTERVAL: i64 = u32::MAX as i64;
     fn field<'a>(value: &'a mut toml::Value, path: &str) -> Option<&'a mut toml::Value> {
         let mut field = value;
         for part in path.split('.') {
@@ -528,19 +570,19 @@ fn clamp_numeric_bounds(value: &mut toml::Value) -> Vec<String> {
     let mut changed = Vec::new();
     for (path, min, max) in [
         ("routing.weak_evidence_new_sessions", 1, 1000),
-        ("routing.placement_poll_after_secs", 1, i64::MAX),
-        ("routing.placement_poll_min_interval_secs", 1, i64::MAX),
+        ("routing.placement_poll_after_secs", 1, MAX_INTERVAL),
+        ("routing.placement_poll_min_interval_secs", 1, MAX_INTERVAL),
         ("routing.request_timeout_secs", 1, 600),
         ("routing.rate_hold_secs", 1, 600),
         ("routing.ws_upgrade_hold_secs", 1, 14),
         ("routing.reset_hold_secs", 0, 120),
         ("routing.rate_hold_max_retries", 1, u32::MAX as i64),
-        ("routing.rebalance_idle_secs", 1, i64::MAX),
-        ("routing.session_binding_max_secs", 1, i64::MAX),
+        ("routing.rebalance_idle_secs", 1, MAX_INTERVAL),
+        ("routing.session_binding_max_secs", 1, MAX_INTERVAL),
         ("routing.spread_threshold", 1, i64::MAX),
-        ("routing.active_window_secs", 1, i64::MAX),
-        ("routing.overload_window_secs", 1, i64::MAX),
-        ("routing.near_reset_secs", 0, i64::MAX),
+        ("routing.active_window_secs", 1, MAX_INTERVAL),
+        ("routing.overload_window_secs", 1, MAX_INTERVAL),
+        ("routing.near_reset_secs", 0, MAX_INTERVAL),
         ("routing.churn.dwell_secs", 0, 86400),
         ("routing.churn.revisit_secs", 0, 86400),
         ("routing.churn.window_secs", 1, 86400),
@@ -548,7 +590,7 @@ fn clamp_numeric_bounds(value: &mut toml::Value) -> Vec<String> {
         ("routing.churn.max_pool_moves", 1, 32),
         ("routing.churn.max_move_bytes", 1, 64 * 1024 * 1024),
         ("quota.poll_min_interval_secs", 1, 3600),
-        ("websocket.idle_close_secs", 1, i64::MAX),
+        ("websocket.idle_close_secs", 1, MAX_INTERVAL),
         ("websocket.max_message_size_mib", 1, i64::MAX),
     ] {
         if let Some(v) = field(value, path)
@@ -558,6 +600,19 @@ fn clamp_numeric_bounds(value: &mut toml::Value) -> Vec<String> {
             if clamped != n {
                 *v = toml::Value::Integer(clamped);
                 changed.push(path.to_owned());
+            }
+        }
+    }
+    if let Some(accounts) = value
+        .get_mut("accounts")
+        .and_then(toml::Value::as_table_mut)
+    {
+        for (_, account) in accounts.iter_mut() {
+            if let Some(v) = account.get_mut("spread_threshold")
+                && v.as_integer().is_some_and(|n| n < 1)
+            {
+                *v = toml::Value::Integer(1);
+                changed.push("accounts.<id>.spread_threshold".into());
             }
         }
     }

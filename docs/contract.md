@@ -628,6 +628,8 @@ All keys are optional. The defaults are shown. Numeric values outside their docu
 
 Routing bounds: `request_timeout_secs` and `rate_hold_secs` are 1–600; `ws_upgrade_hold_secs` is 1–14; `reset_hold_secs` is 0–120; `weak_evidence_new_sessions` is 1–1000. Percentages are 0–100; non-finite values clamp to an endpoint, with NaN falling back to that field's default. The near-reset weekly percentage cannot be lower than the ordinary weekly percentage. Polling, retry, binding, spreading and activity intervals/counts have a minimum of 1; `near_reset_secs` may be 0. Under `[routing.churn]`, dwell/revisit are 0–86400 seconds, the window is 1–86400 seconds, group moves are 1–16, pool moves 1–32 and retained move bytes 1–67108864. `quota.poll_min_interval_secs` is 1–3600. WebSocket idle time and message size must be positive; idle time is clamped below the rebalance idle interval. The original configuration file is never rewritten by these corrections. Invalid types and unsafe upstream endpoints still refuse startup; global `strict` remains invalid (D20 §3).
 
+An account's optional `spread_threshold` has the same minimum of 1 as the global threshold. Unspecified account thresholds continue to inherit the global value. Routing and WebSocket timer intervals without a tighter bound above are capped at 4294967295 seconds (over 136 years) so Windows and Chrono deadline arithmetic remains representable.
+
 ```toml
 [server]
 data_port = 10200            # 10100 after cutover
