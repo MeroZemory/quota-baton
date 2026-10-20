@@ -494,3 +494,36 @@ These come from the R8 B/C merge review (`.sandbox/reviews/R8-BC-merge-review-20
 **Why.** After the move only one home can open the session. This closes the cross-home double-writer gap described in the concurrency findings, without changing the user's existing homes. The journal still allows `unimport`, which re-links the source name and restores its rows while the file exists.
 
 **Two-way sharing** remains available with `--keep-source`, together with the warnings above.
+
+### D21 panel: move is the default, confirmed (independent panel, 2026-10-21)
+
+**Mandate.** The user asked the design session to decide between move and share through independent review by Opus max and Astra max (gpt-6-astra, max). The user then challenged the argument that sharing relies on a promise never to open a session twice: Codex's own lock could enforce that if every home shared one lock directory.
+
+**Evidence.** All files are in `.sandbox/reviews/d21-move-vs-share/`:
+- `sheet.md` is the blind sheet.
+- `answer-opus.md` and `answer-astra.md` are the round-1 answers. `answer-opus.md` also contains the revision after the shared-lock input. `answer-astra-r2.md` is Astra's round 2.
+- `lock-experiment.md` is the real Codex 0.163 run with two temp homes and one hardlinked rollout:
+  - With separate lock directories, **both homes opened the session**, giving two live writers.
+  - With both homes' `thread-writer-locks` junctioned to one directory, the **second open was refused** by Codex itself ("This conversation is open in another app").
+  - A first run was invalid, because the herdr codex shim overrides `CODEX_HOME` from its session map. Experiments must call the native binary.
+
+**Outcome.** Both panelists chose **A, move**, in both rounds. Both accepted the user's point: a shared lock directory makes concurrent opens safe, and the "user promise" objection is withdrawn. The deciding reason changed to **sequential consistency**, which no lock provides:
+- **Backtrack splits the hardlink.** A backtrack in one home replaces that home's rollout. A later launch from another home then resumes the obsolete file, and the lock is free by then.
+- **Separate databases go stale.** Goal and thread rows live in per-home databases. Q cannot share the state database (provider id, D21), and qb never sees launches from the account homes.
+- **No shared meaning for archive and delete.** These operations act on one home's names only.
+
+Moving keeps a single authoritative home. The shared lock directory is useful only as **optional hardening during the move's commit window**. It is not adopted now: it changes the user's existing homes, and Codex's per-home managed app-server daemons hold the lock directory open.
+
+**Guarantees R9 must meet.** These merge Opus G1–G11 and Astra's seven acceptance criteria:
+1. **Single owner.** After any operation or recovery, exactly one home holds the session's rows. Any other name is a fork-ancestor link with no row.
+2. **Inventory first.** Check every known home (the default home, `.codex-acct/*`, Orca) for the id. Refuse conflicting versions: different file ids with different content, or different goal state. List the homes in the refusal. Never pick by timestamp, and never merge.
+3. **Never nameless.** Link before unlink. A journal rolls forward or back after a crash at any step. At every interruption point, at most one ordinarily writable location exists.
+4. **Exclusion through commit.** Probe first (a deny-write open, then the lock probe in every home). Then hold Codex's thread lock in the source home and in Q until commit.
+5. **Verify, then remove.** Before removing the source, all of these must hold: the same file id, the target row pointing at the target path, the goal row matching, no divergence and no writer. If any fails, abort with the source untouched.
+6. **Ancestors kept.** A rollout other threads fork from keeps its name in the source home.
+7. **Stale paths fail closed.** After a move, resuming in the old home modifies nothing.
+8. **Return.** The return command moves Q's **current** rollout and goal state back to an account home under the same rules, and writes nothing from an old snapshot. It works with the proxy stopped.
+9. **Bulk.** Each session moves atomically. Live and divergent sessions are skipped and listed. A re-run recognises sessions already committed and sessions still pending.
+10. **Safe databases.** Use transactions with a busy timeout. Never replace a database file. Only append to `session_index`. Run `integrity_check` in tests.
+11. **Auto-resume follows ownership.** The herdr session map (`%APPDATA%\herdr\session-homes.json`) is updated under the same journal and points at Q after a move. An interrupted move never resumes a fresh session.
+12. **Disk.** Hardlinks only. A move that cannot hardlink is refused.
