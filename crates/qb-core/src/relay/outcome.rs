@@ -321,13 +321,18 @@ pub(super) fn header_seconds(h: &HeaderMap, name: &str) -> Option<i64> {
             .map(|n| n.ceil().min(31_536_000.0) as i64);
     }
     if name == "retry-after" {
-        return DateTime::parse_from_rfc2822(value).ok().map(|date| {
-            (date.with_timezone(&Utc) - Utc::now())
-                .num_seconds()
-                .clamp(0, 31_536_000)
-        });
+        return DateTime::parse_from_rfc2822(value)
+            .ok()
+            .map(|date| advice_seconds_until(date.with_timezone(&Utc), Utc::now()));
     }
     None
+}
+
+fn advice_seconds_until(date: DateTime<Utc>, now: DateTime<Utc>) -> i64 {
+    let remaining = date - now;
+    let whole = remaining.num_seconds();
+    let rounded = whole.saturating_add(i64::from(remaining > Duration::seconds(whole)));
+    rounded.clamp(0, 31_536_000)
 }
 
 fn header_timestamp(h: &HeaderMap, name: &str) -> Option<DateTime<Utc>> {
@@ -357,6 +362,39 @@ pub(super) fn error_value(raw: &[u8]) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn http_date_advice_rounds_up_fractional_seconds_and_keeps_the_existing_cap() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-20T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        for (millis, expected) in [
+            (-1500, 0),
+            (0, 0),
+            (1, 1),
+            (999, 1),
+            (1000, 1),
+            (1001, 2),
+            (119999, 120),
+            (120000, 120),
+        ] {
+            assert_eq!(
+                super::advice_seconds_until(now + chrono::Duration::milliseconds(millis), now),
+                expected
+            );
+        }
+        assert_eq!(
+            super::advice_seconds_until(now + chrono::Duration::days(366), now),
+            31_536_000
+        );
+        assert_eq!(
+            super::advice_seconds_until(
+                now + chrono::Duration::seconds(1) + chrono::Duration::nanoseconds(1),
+                now
+            ),
+            2
+        );
+    }
+
     use super::*;
 
     #[test]
