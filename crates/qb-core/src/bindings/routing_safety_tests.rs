@@ -1607,3 +1607,149 @@ fn round2_any_discretionary_guard_veto_keeps_mark_on_healthy_source() {
         }
     }
 }
+
+#[test]
+fn round2_discretionary_moves_apply_pacing_before_cap_and_keep_overload_mark() {
+    for cold in [false, true] {
+        for all_pacing in [false, true] {
+            let root = fixture_dir();
+            let t = BindingTable::new(
+                root.path(),
+                RoutingConfig {
+                    spread_threshold: 4,
+                    ..RoutingConfig::default()
+                },
+            )
+            .unwrap();
+            let now = Utc::now();
+            let mut cs = vec![
+                candidate("cl-a", 10., 8, 1),
+                candidate("cl-b", 10., 30, 2),
+                candidate("cl-c", 10., 40, 3),
+            ];
+            observed_at(&mut cs, now);
+            for n in 0..10 {
+                place_at(&t, &format!("claude:source{n}"), &cs[..1], now);
+            }
+            let key = if cold {
+                "claude:source0".to_owned()
+            } else {
+                let mut marks = 0;
+                for n in 0..3 {
+                    marks += t
+                        .note_client_rate(
+                            Provider::Claude,
+                            "cl-a",
+                            Some(&format!("claude:source{n}")),
+                            &cs,
+                            now,
+                        )
+                        .3;
+                }
+                assert_eq!(marks, 2);
+                t.data
+                    .lock()
+                    .unwrap()
+                    .overload_marks
+                    .keys()
+                    .next()
+                    .unwrap()
+                    .clone()
+            };
+            place_at(&t, "claude:seed-b", &cs[1..2], now);
+            t.set_pacing("cl-b", all_pacing);
+            t.set_pacing("cl-c", true);
+            if cold {
+                let mut data = t.data.lock().unwrap();
+                data.bindings.get_mut(&key).unwrap().last_used =
+                    now - chrono::Duration::seconds(t.config.rebalance_idle_secs as i64 + 1);
+                rebuild_indexes(&mut data);
+            }
+            {
+                let data = t.data.lock().unwrap();
+                for c in &cs[1..] {
+                    assert!(
+                        t.rebalance_target_base(&data, "cl-a", c, Some(&key), now),
+                        "both destinations pass eligibility/gate/room before pacing/cap"
+                    );
+                }
+                assert!(placement_capped(&cs[1], &data, &t.config, now));
+                assert!(!placement_capped(&cs[2], &data, &t.config, now));
+            }
+            let sequence = t.usage_sequence.load(Ordering::Relaxed);
+            let (account, moves) = decide_at(&t, &key, &cs, now);
+            if all_pacing {
+                assert_eq!(account, "cl-c", "equal pacing leaves uncapped C available");
+                assert_eq!(moves.len(), 1);
+                assert_eq!(
+                    moves[0].reason,
+                    if cold { "cold_rebalance" } else { "overload" }
+                );
+                assert!(moves[0].is_placement);
+                assert_eq!(moves[0].placement_charge_pct, 2.);
+                assert_eq!(t.usage_sequence.load(Ordering::Relaxed), sequence + 1);
+                assert_eq!(t.data.lock().unwrap().placements["cl-c"].total, 1);
+                assert!(!t.overload_marked(Some(&key), now));
+            } else {
+                assert_eq!(account, "cl-a", "C must not bypass preferred but capped B");
+                assert!(moves.is_empty());
+                assert_eq!(t.usage_sequence.load(Ordering::Relaxed), sequence);
+                assert_eq!(t.data.lock().unwrap().placements["cl-c"].total, 0);
+                assert_eq!(t.overload_marked(Some(&key), now), !cold);
+            }
+            assert_eq!(t.data.lock().unwrap().placements["cl-b"].total, 1);
+        }
+    }
+}
+
+#[test]
+fn round2_mark_target_reservations_apply_pacing_before_cap() {
+    let root = fixture_dir();
+    let t = BindingTable::new(
+        root.path(),
+        RoutingConfig {
+            spread_threshold: 4,
+            ..RoutingConfig::default()
+        },
+    )
+    .unwrap();
+    let now = Utc::now();
+    let mut cs = vec![
+        candidate("cl-a", 10., 8, 1),
+        candidate("cl-b", 10., 30, 2),
+        candidate("cl-c", 10., 40, 3),
+    ];
+    observed_at(&mut cs, now);
+    for n in 0..10 {
+        place_at(&t, &format!("claude:source{n}"), &cs[..1], now);
+    }
+    place_at(&t, "claude:seed-b", &cs[1..2], now);
+    t.set_pacing("cl-c", true);
+    for n in 0..3 {
+        assert_eq!(
+            t.note_client_rate(
+                Provider::Claude,
+                "cl-a",
+                Some(&format!("claude:source{n}")),
+                &cs,
+                now
+            )
+            .3,
+            0,
+            "preferred capped B prevents reservations on pacing C"
+        );
+    }
+    assert!(t.data.lock().unwrap().overload_marks.is_empty());
+    t.set_pacing("cl-b", true);
+    assert_eq!(
+        t.note_client_rate(Provider::Claude, "cl-a", Some("claude:source0"), &cs, now)
+            .3,
+        2
+    );
+    let data = t.data.lock().unwrap();
+    assert!(
+        data.overload_marks
+            .values()
+            .all(|mark| mark.target == "cl-c")
+    );
+}
