@@ -323,6 +323,63 @@ fn r9_auto_resume_moves_then_unimport_restores_source_names_and_rows() {
 }
 
 #[test]
+fn r9_resume_uuid_with_trailing_help_does_not_import() {
+    assert_resume_without_import(&["resume", A, "--help"]);
+}
+
+#[test]
+fn r9_resume_last_with_uuid_prompt_does_not_import() {
+    assert_resume_without_import(&["resume", "--last", A]);
+}
+
+#[test]
+fn r9_resume_uuid_prompt_with_trailing_last_does_not_import() {
+    assert_resume_without_import(&["resume", A, "--last"]);
+}
+
+fn assert_resume_without_import(args: &[&str]) {
+    let f = Fixture::new();
+    let source = f.add(A, false, "openai");
+    let original = fs::read(&source).unwrap();
+    let original_state = fs::read(f.source.join("state_5.sqlite")).unwrap();
+    let target = f.target.join("sessions").join(source.file_name().unwrap());
+
+    let out = f.launch(args);
+    assert_success(&out);
+    assert!(f.sentinel.exists(), "stub did not launch for {args:?}");
+    assert!(source.exists(), "source removed for {args:?}");
+    assert!(fs::read(&source).unwrap() == original);
+    assert_eq!(thread_path(&f.source, A), Some(source));
+    assert!(fs::read(f.source.join("state_5.sqlite")).unwrap() == original_state);
+    assert!(!f.qb.join("journal/sessions-import.json").exists());
+    assert!(!target.exists());
+    // Do not use thread_path on an absent target DB: its test helper opens
+    // SQLite with CREATE, which would itself mutate this no-import fixture.
+    assert!(!f.target.join("state_5.sqlite").exists());
+    assert!(!f.target.join("goals_1.sqlite").exists());
+    assert!(!f.target.join("session_index.jsonl").exists());
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("기존 대화를 qb로"));
+}
+
+#[test]
+fn r9_last_as_config_value_does_not_suppress_explicit_resume_import() {
+    let f = Fixture::new();
+    let source = f.add(A, false, "openai");
+    let original = fs::read(&source).unwrap();
+    let target = f.target.join("sessions").join(source.file_name().unwrap());
+
+    // The stub accepts these arguments without parsing Codex configuration;
+    // this checks the launch hook's option-value boundary, not config validity.
+    let out = f.launch(&["--config", "--last", "resume", A]);
+    assert_success(&out);
+    assert!(f.sentinel.exists());
+    assert!(f.qb.join("journal/sessions-import.json").exists());
+    assert!(target.exists());
+    assert!(fs::read(&target).unwrap() == original);
+    assert_eq!(thread_path(&f.target, A), Some(target));
+}
+
+#[test]
 fn r9_keep_source_every_resume_grammar_refuses_source_writer_before_launch() {
     let f = Fixture::new();
     let source = f.add(A, false, "openai");
