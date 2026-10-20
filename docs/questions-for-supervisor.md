@@ -42,3 +42,10 @@ D17 review MF5는 wiring.json이 CPA 작업을 소유하면 retire가 그 작업
 ## R9 milestone gate (2026-10-21)
 
 - Addendum 2 says to remove an imported thread's own source names, and also never remove fork ancestors. If root A is still an ancestor of an unmoved source thread B, deleting A's source rollout breaks B. Current implementation takes the reversible conservative path: refuse moving A, retain its original files/rows, explain in Korean to move descendants first or use `--keep-source`; bulk sorts descendants before ancestors. Please confirm this interpretation at the R9 gate. This does not block implementing or verifying the rest.
+
+
+## R9 Addendum 3 feasibility (gate question, 2026-10-21)
+
+Independent Sol source/native investigation: `.sandbox/research/R9-panel-feasibility.md`. Native Codex 0.163 falls back to rollout filenames when its thread row is absent and recreates the row. Thus keeping source S as a fork-ancestor link (G6) while removing its row does not make raw `codex` in the old home fail closed (G7); it can resume S and become a second row owner (G1). Process-held Codex locks also disappear when the importer is killed, so exposed links in two homes are writable before journal recovery (G3). Both have synthetic native counterexamples; no real home was touched.
+
+Implementation continues on typed confirmation, inventory, current-state return, map journaling and tests. Before merge, please rule whether G1/G3/G7 cover only qb-mediated launches/recovery, or whether raw native guarantees require additional upstream/launcher authority (outside currently approved means). Recommendation: do not claim raw native guarantees; retain raw counterexamples as evidence and explicitly scope ownership enforcement, or approve a stronger mechanism before merge. This is queued until the milestone gate, while independent implementation remains.
