@@ -5,6 +5,12 @@ use std::path::Path;
 const NAME: &str = "x-quota-baton-label";
 const MAX_HEADERS: usize = 64 * 1024;
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum Client {
+    Claude,
+    Codex,
+}
+
 /// Encoding is deliberately ASCII: Node's header APIs reject raw Hangul/emoji.
 pub fn folder_value(cwd: &Path) -> Option<String> {
     let folder: String = cwd
@@ -52,14 +58,28 @@ pub fn merge_headers(existing: &str, value: &str) -> Option<String> {
 /// Keep the dedicated settings file unchanged and out of per-launch scratch.
 /// Client settings can override this environment; the core's filename lookup
 /// remains the fallback when no launcher header reaches it.
-pub fn run(program: &Path, settings: &Path, args: &[std::ffi::OsString]) -> std::io::Result<i32> {
-    if !program.is_absolute() || !settings.is_absolute() {
+pub fn run(
+    client: Client,
+    program: &Path,
+    settings: Option<&Path>,
+    args: &[std::ffi::OsString],
+) -> std::io::Result<i32> {
+    if !program.is_absolute()
+        || settings.is_some_and(|p| !p.is_absolute())
+        || matches!(client, Client::Claude) && settings.is_none()
+        || matches!(client, Client::Codex) && settings.is_some()
+    {
         return Err(std::io::ErrorKind::InvalidInput.into());
     }
     let mut child = std::process::Command::new(program);
-    child.arg("--settings").arg(settings).args(args);
+    if let Some(settings) = settings {
+        child.arg("--settings").arg(settings);
+    }
+    child.args(args);
     let headers = std::env::var_os("ANTHROPIC_CUSTOM_HEADERS");
-    if let Some(value) = folder_value(&std::env::current_dir()?) {
+    if matches!(client, Client::Claude)
+        && let Some(value) = folder_value(&std::env::current_dir()?)
+    {
         let existing = headers
             .as_deref()
             .map(std::ffi::OsStr::to_str)
@@ -70,7 +90,108 @@ pub fn run(program: &Path, settings: &Path, args: &[std::ffi::OsString]) -> std:
     }
     // Rust applies its batch-specific escaping for .cmd/.bat. Do not change
     // this into an interpolated `cmd /c` string or CALL reparse.
-    Ok(child.status()?.code().unwrap_or(1))
+    #[cfg(windows)]
+    let title = matches!(client, Client::Codex)
+        .then(|| ConsoleTitle::new(program))
+        .transpose()?;
+    let mut child = child.spawn()?;
+    #[cfg(windows)]
+    let repair = title.map(ConsoleTitle::watch);
+    let status = child.wait();
+    #[cfg(windows)]
+    if let Some((stop, worker)) = repair {
+        let _ = stop.send(());
+        let _ = worker.join();
+    }
+    Ok(status?.code().unwrap_or(1))
+}
+
+#[cfg(windows)]
+struct ConsoleTitle {
+    desired: String,
+    cmd_titles: Vec<String>,
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn SetConsoleTitleW(title: *const u16) -> i32;
+    fn GetConsoleTitleW(title: *mut u16, size: u32) -> u32;
+}
+
+#[cfg(windows)]
+fn console_title() -> String {
+    let mut buffer = vec![0u16; 32768];
+    let n = unsafe { GetConsoleTitleW(buffer.as_mut_ptr(), buffer.len() as u32) };
+    String::from_utf16_lossy(&buffer[..n as usize])
+}
+
+#[cfg(windows)]
+fn set_console_title(title: &str) {
+    let title: Vec<_> = title.encode_utf16().chain(Some(0)).collect();
+    // A redirected/non-console invocation has no title; that is not a launch failure.
+    unsafe {
+        SetConsoleTitleW(title.as_ptr());
+    }
+}
+
+#[cfg(windows)]
+impl ConsoleTitle {
+    fn new(program: &Path) -> std::io::Result<Self> {
+        let cwd = std::env::current_dir()?;
+        let folder: String = cwd
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect();
+        let desired = format!("codex-qb · {folder}");
+        set_console_title(&desired);
+        // Exact known shell/program titles only: never fight a client's own title.
+        let mut cmd_titles = vec![program.to_string_lossy().into_owned()];
+        if let Some(root) = std::env::var_os("SystemRoot") {
+            cmd_titles.push(
+                Path::new(&root)
+                    .join("System32/cmd.exe")
+                    .to_string_lossy()
+                    .replace('/', "\\"),
+            );
+        }
+        if let Some(cmd) = std::env::var_os("ComSpec") {
+            cmd_titles.push(cmd.to_string_lossy().into_owned());
+        }
+        Ok(Self {
+            desired,
+            cmd_titles,
+        })
+    }
+
+    fn watch(self) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            // Absolute offsets from spawn: 0.3s, 1s, 3s, then stop permanently.
+            for delay in [300, 700, 2000] {
+                if !matches!(
+                    stopped.recv_timeout(std::time::Duration::from_millis(delay)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    break;
+                }
+                let current = console_title();
+                if self
+                    .cmd_titles
+                    .iter()
+                    .any(|title| current.eq_ignore_ascii_case(title))
+                {
+                    set_console_title(&self.desired);
+                } else if current != self.desired {
+                    break;
+                }
+            }
+        });
+        (stop, worker)
+    }
 }
 
 #[cfg(test)]

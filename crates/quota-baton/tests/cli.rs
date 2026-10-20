@@ -915,7 +915,11 @@ async fn r3_wire_dedicated_apply_with_both_providers_and_unwire_preserves_sessio
         let launcher_text = std::fs::read_to_string(&launcher).unwrap();
         assert!(launcher_text.starts_with("@echo off\r\nsetlocal DisableDelayedExpansion\r\n"));
         assert!(launcher_text.contains("set \"CODEX_HOME=%USERPROFILE%\\.codex-acct\\qb\"\r\n"));
-        assert!(launcher_text.contains("/s /c ^\"\"%APPDATA%\\npm\\codex.cmd\" %*^\"\r\n"));
+        assert!(launcher_text.contains(
+            "launch-client --client codex --command \"%APPDATA%\\npm\\codex.cmd\" -- %*\r\n"
+        ));
+        assert!(!launcher_text.contains("--settings"));
+        assert!(!launcher_text.contains("/s /c"));
         assert!(
             launcher_text.ends_with("chcp %QB_CODEPAGE% >nul\r\nendlocal & exit /b %QB_EXIT%\r\n")
         );
