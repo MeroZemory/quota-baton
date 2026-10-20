@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
+
 mod client;
 #[cfg(windows)]
 mod dashboard_persistence;
@@ -47,7 +49,24 @@ struct Args {
 mod windows_tray;
 
 #[cfg(windows)]
-fn main() -> anyhow::Result<()> {
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(_) => {
+            // A GUI process has no stderr console. Persist a stable diagnostic,
+            // never a parser error, request payload, or credential-bearing path.
+            if let Ok(home) = qb_core::home()
+                && let Ok(_logs) = qb_core::logging::init(&home)
+            {
+                tracing::error!(code = "tray_startup_failed", "트레이 실행에 실패했습니다");
+            }
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(windows)]
+fn run() -> anyhow::Result<()> {
     let args = Args::parse();
     anyhow::ensure!(
         !args.open_flyout_live || cfg!(debug_assertions),

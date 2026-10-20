@@ -14,6 +14,12 @@ cargo build --release --workspace
 
 `quota-baton.exe`는 코어와 CLI입니다. `quota-baton-tray.exe`는 트레이 프로그램입니다.
 
+### 업그레이드 후 실행
+
+새 바이너리로 교체한 뒤 `quota-baton-tray.exe`를 실행합니다. 트레이는 별도의 콘솔 창 없이 알림 영역에 표시됩니다. 트레이에서 시작하거나 자동으로 다시 시작한 코어도 창 없이 실행됩니다. 터미널에서 직접 실행하는 `quota-baton.exe`의 CLI 출력은 그대로 사용할 수 있습니다.
+
+트레이 시작에 실패하면 데이터 폴더의 `logs`에서 `tray_startup_failed` 기록을 확인합니다.
+
 처음 실행할 때는 코어를 시작합니다.
 
 ```powershell
