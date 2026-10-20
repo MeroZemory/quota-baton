@@ -71,7 +71,7 @@ pub fn run(
     {
         return Err(std::io::ErrorKind::InvalidInput.into());
     }
-    let mut child = std::process::Command::new(program);
+    let mut child = client_command(client, program);
     if let Some(settings) = settings {
         child.arg("--settings").arg(settings);
     }
@@ -94,9 +94,17 @@ pub fn run(
     let title = matches!(client, Client::Codex)
         .then(|| ConsoleTitle::new(program))
         .transpose()?;
+    #[cfg(windows)]
+    let needs_title_repair = child.get_program() == program.as_os_str()
+        && program
+            .extension()
+            .and_then(|s| s.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"));
     let mut child = child.spawn()?;
     #[cfg(windows)]
-    let repair = title.map(ConsoleTitle::watch);
+    let repair = title
+        .filter(|_| needs_title_repair)
+        .map(ConsoleTitle::watch);
     let status = child.wait();
     #[cfg(windows)]
     if let Some((stop, worker)) = repair {
@@ -104,6 +112,42 @@ pub fn run(
         let _ = worker.join();
     }
     Ok(status?.code().unwrap_or(1))
+}
+
+fn client_command(client: Client, program: &Path) -> std::process::Command {
+    if matches!(client, Client::Codex)
+        && let Some((node, script)) = resolve_codex_node(program)
+    {
+        let mut command = std::process::Command::new(node);
+        command.arg(script);
+        return command;
+    }
+    std::process::Command::new(program)
+}
+
+fn resolve_codex_node(program: &Path) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    if !program
+        .file_name()?
+        .to_str()?
+        .eq_ignore_ascii_case("codex.cmd")
+    {
+        return None;
+    }
+    let npm = program.parent()?;
+    let script = npm.join("node_modules/@openai/codex/bin/codex.js");
+    if !script.is_file() {
+        return None;
+    }
+    let local = npm.join("node.exe");
+    let node = if local.is_file() {
+        local
+    } else {
+        std::env::split_paths(&std::env::var_os("PATH")?)
+            .filter(|dir| dir.is_absolute())
+            .map(|dir| dir.join("node.exe"))
+            .find(|path| path.is_file())?
+    };
+    Some((node, script))
 }
 
 #[cfg(windows)]
@@ -170,8 +214,12 @@ impl ConsoleTitle {
     fn watch(self) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
         let (stop, stopped) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
-            // Absolute offsets from spawn: 0.3s, 1s, 3s, then stop permanently.
-            for delay in [300, 700, 2000] {
+            // Bound fallback repair to the first twenty seconds. Exit promptly
+            // with the child, and stop permanently at a client's own title.
+            for delay in std::iter::once(300)
+                .chain(std::iter::once(700))
+                .chain(std::iter::repeat_n(1000, 19))
+            {
                 if !matches!(
                     stopped.recv_timeout(std::time::Duration::from_millis(delay)),
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout)
@@ -179,11 +227,7 @@ impl ConsoleTitle {
                     break;
                 }
                 let current = console_title();
-                if self
-                    .cmd_titles
-                    .iter()
-                    .any(|title| current.eq_ignore_ascii_case(title))
-                {
+                if is_cmd_title(&current, &self.cmd_titles) {
                     set_console_title(&self.desired);
                 } else if current != self.desired {
                     break;
@@ -194,9 +238,61 @@ impl ConsoleTitle {
     }
 }
 
+#[cfg(windows)]
+fn is_cmd_title(current: &str, cmd_titles: &[String]) -> bool {
+    let current = current.trim().to_ascii_lowercase();
+    cmd_titles.iter().any(|title| {
+        let title = title.trim().to_ascii_lowercase();
+        current == title
+            || current
+                .strip_prefix(&title)
+                .is_some_and(|rest| rest.starts_with(" - "))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn r81_node_resolution_uses_npm_script_and_sibling_node_without_a_shell() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r81-resolution");
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = tempfile::tempdir_in(root).unwrap();
+        let shim = dir.path().join("codex.cmd");
+        std::fs::write(&shim, "synthetic shim, never executed").unwrap();
+        assert!(resolve_codex_node(&shim).is_none());
+        let script = dir.path().join("node_modules/@openai/codex/bin/codex.js");
+        std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+        std::fs::write(&script, "// synthetic").unwrap();
+        let node = dir.path().join("node.exe");
+        std::fs::write(&node, "synthetic placeholder, never executed").unwrap();
+        assert_eq!(
+            resolve_codex_node(&shim),
+            Some((node.clone(), script.clone()))
+        );
+        let command = client_command(Client::Codex, &shim);
+        assert_eq!(command.get_program(), node);
+        assert_eq!(command.get_args().collect::<Vec<_>>(), [script.as_os_str()]);
+        assert_eq!(client_command(Client::Claude, &shim).get_program(), shim);
+    }
+    #[cfg(windows)]
+    #[test]
+    fn r81_known_cmd_title_trims_space_and_matches_command_suffix_only() {
+        let cmds = vec![r"C:\Windows\System32\cmd.exe".into()];
+        for title in [
+            r"C:\WINDOWS\system32\cmd.exe ",
+            r" C:\Windows\System32\cmd.exe - node script ",
+        ] {
+            assert!(is_cmd_title(title, &cmds));
+        }
+        for title in [
+            "client owns this title",
+            r"C:\Windows\System32\cmd.exe.other",
+            r"prefix C:\Windows\System32\cmd.exe",
+        ] {
+            assert!(!is_cmd_title(title, &cmds));
+        }
+    }
     #[test]
     fn unicode_basename_is_ascii_and_round_trips_without_path() {
         let value = folder_value(Path::new(r"C:\synthetic\한글 & 테스트 ! ^ % 🐬")).unwrap();
