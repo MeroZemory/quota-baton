@@ -65,10 +65,6 @@ Implement quota-baton exactly as specified, milestone by milestone, until M8 is 
 - No client impersonation crates or code (D3).
 - Do not restart a Claude session that the user stopped.
 
-## Design/review session paused (user, 2026-10-19)
+## Design/review session resumed (2026-10-20)
 
-The user paused the design/review session (<pane>) to save Claude usage. Until it resumes:
-- Work autonomously on rows whose brief and spec are user-approved (R5 with the green bar change, R3.2, R6, R7). Verify per rule 4 and merge into dev yourself when the full gate passes; record the fingerprint in the report.
-- Do not do anything that needs review or the user: R2 Part B (retire-cpa/restore-cpa on the real profile), any change to the user's live configs or the real install, and new design questions. Those wait.
-- Do not send questions or reports to <pane>. Put non-blocking questions in `docs/questions-for-supervisor.md`. If everything left needs review or a user decision, stop and leave a resume note.
-
+The user lifted the pause. The design session reviews the merges made during the pause (R5, R3.2, R6, R7, credits logic, docs/tray-v2.md) and the unmerged `impl/cache-routing`. Do not merge `impl/cache-routing` until that review lands. R2 Part B stays held until the design session says go.
