@@ -259,7 +259,7 @@ Rate limits are therefore absorbed on the same account. An individual rate limit
 3. **The error frame carries retry advice.** Relay it as is, immediately. Codex retries after the advised delay.
 4. **Otherwise.** Do not relay the frame. Close the client socket with 1012, with **no** reconnect exclusion. Codex treats the close as retryable and reconnects with the full input. The binding is unchanged, so the reconnect goes back to the same account, and admission paces its upgrade (at most `ws_upgrade_hold_secs`). Relaying the frame would end the turn at once (F3).
 
-If the upstream socket closes while a resend is pending, close the client socket with the same code. A pending create/resend whose pacing budget expires closes with 1012 without changing accounts; the Codex reconnect behaviour is documented in architecture §9 and D14 review F5. A local expiry is not an upstream client-visible rate observation.
+If the upstream socket closes while a resend is pending, close the client socket with the same code. A pending resend/redial whose pacing budget expires closes with 1012 without changing accounts; an initial create follows the send-once admission rule above. The Codex reconnect behaviour is documented in architecture §9 and D14 review F5. A local expiry is not an upstream client-visible rate observation.
 
 Phase 0 item **V8** observes the genuine `wss://chatgpt.com` rate-limit shape. It records which of these occur:
 - a handshake 429
