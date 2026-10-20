@@ -9,8 +9,8 @@ macro_rules! println_utf8 {
 mod accounts_cli;
 mod cutover;
 mod launcher_label;
-mod routing_cli;
 mod launcher_script;
+mod routing_cli;
 mod wire_readiness;
 
 fn print_stdout(args: std::fmt::Arguments<'_>) -> std::io::Result<()> {

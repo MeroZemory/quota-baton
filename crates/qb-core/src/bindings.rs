@@ -1730,9 +1730,10 @@ impl BindingTable {
                 let (evidence, placed_since_obs) = placement_evidence(candidate, &d, now);
                 let capped = evidence == PlacementEvidence::Weak
                     && placed_since_obs >= self.config.weak_evidence_new_sessions;
-                // Every actual relocation, including C5 recovery, places the
-                // group on its new account. Inheritance/reuse are unchanged.
-                let is_placement = selected_reason != "inherited";
+                // C5 recovery is a placement; step-1 debug pins and step-2
+                // inheritance remain exempt even when the account changes.
+                let is_placement =
+                    selected_reason != "inherited" && pinned != Some(account.as_str());
                 if is_placement {
                     let seq = self.begin_usage_observation();
                     d.placements
@@ -2431,8 +2432,8 @@ fn account_window(provider: Provider, w: &Value) -> Option<bool> {
     }
 }
 // C9 names Codex primary/secondary windows by their actual duration, including
-// free-plan 43200m and non-minute poll durations. Track their evidence/cost
-// without inventing a new C7 gate threshold or reset-order slot.
+// free-plan 43200m and non-minute poll durations. Track their evidence/cost;
+// account_window applies C7's provider-specific duration slots for selection.
 fn placement_account_window(w: &Value) -> bool {
     let Some(name) = w["name"].as_str() else {
         return false;

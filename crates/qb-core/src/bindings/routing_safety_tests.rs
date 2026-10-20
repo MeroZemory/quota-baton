@@ -783,6 +783,61 @@ fn d20_cold_move_waits_without_charge_until_every_target_window_is_newer() {
 }
 
 #[test]
+fn round2_debug_pin_is_exempt_but_new_and_unmatched_pin_recovery_take_charge() {
+    let (_root, t, mut cs, now) = placement_fixture();
+    let new = place_at(&t, "claude:normal", &cs[..1], now);
+    assert!(new.is_placement);
+    assert_eq!(new.placement_charge_pct, 2.);
+    let before_pin = t.usage_sequence.load(Ordering::Relaxed);
+    let pinned_choice = |key: &str, cs: &[Candidate]| match t.choose_with_hold_at(
+        Provider::Claude,
+        Some(key),
+        None,
+        None,
+        cs,
+        Some("cl-b"),
+        100,
+        true,
+        false,
+        now,
+    ) {
+        Decision::Selected {
+            account,
+            lease,
+            mut moves,
+        } => {
+            lease.dispatched();
+            drop(lease);
+            assert_eq!(moves.len(), 1);
+            (account, moves.remove(0))
+        }
+        other => panic!("expected selection: {other:?}"),
+    };
+    // Cover both a pinned first binding and a pin overriding an existing one.
+    for key in ["claude:pinned-new", "claude:normal"] {
+        let (account, event) = pinned_choice(key, &cs);
+        assert_eq!(account, "cl-b");
+        assert!(event.debug_pin);
+        assert!(!event.is_placement);
+        assert_eq!(event.placement_charge_pct, 0.);
+        assert_eq!(t.usage_sequence.load(Ordering::Relaxed), before_pin);
+        let data = t.data.lock().unwrap();
+        assert_eq!(data.placements["cl-a"].total, 1);
+        assert_eq!(data.placements["cl-b"].total, 0);
+    }
+    // A pin naming an ineligible candidate must not exempt real C5 recovery.
+    cs[1].account.user_state = UserState::Paused;
+    let (account, event) = pinned_choice("claude:normal", &cs);
+    assert_eq!(account, "cl-a");
+    assert_eq!(event.reason, "forced");
+    assert!(!event.debug_pin);
+    assert!(event.is_placement);
+    assert_eq!(event.placement_charge_pct, 2.);
+    assert_eq!(t.usage_sequence.load(Ordering::Relaxed), before_pin + 1);
+    assert_eq!(t.data.lock().unwrap().placements["cl-a"].total, 2);
+}
+
+#[test]
 fn d20_forced_move_adds_placement_but_inheritance_and_reuse_do_not() {
     let (_root, t, mut cs, now) = placement_fixture();
     place_at(&t, "claude:root", &cs[..1], now);
