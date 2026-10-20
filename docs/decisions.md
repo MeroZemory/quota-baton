@@ -457,10 +457,22 @@ These come from the R8 B/C merge review (`.sandbox/reviews/R8-BC-merge-review-20
 - **Manual and bulk import.** `quota-baton sessions import` supports both, with a dry run by default, a journal and `unimport`.
 - **Provider check.** A thread whose provider is not `openai` is refused.
 
-**Open risk, under study.** One session reachable from two homes must not run in both at once. Two things are not yet confirmed from the source (`.sandbox/research/codex-session-concurrency.md`):
-- whether Codex locks a running session;
-- whether any Codex path rewrites a rollout by rename, which would silently break the hardlink.
+**Concurrency findings** (`.sandbox/research/codex-session-concurrency.md`, read from the Codex 0.162.1 source; the 0.163 binary contains the same lock names and error string):
+- **The lock is a file inside the home.** Codex refuses a second writer only within one home: it holds an OS lock on `<home>/thread-writer-locks/<id>.lock`. A second resume in the same home gets "already has an active writer" and drops to a read-only view. The rollout file itself is never locked; it is opened with full sharing.
+- **No guard across homes.** Two processes in different homes that share a hardlinked rollout both append silently. Their line counters collide, and Codex drops the losing writer's turns from history without any warning. **One writer at a time is therefore a hard rule.**
+- **Some paths split the hardlink.** Each writes a new file or renames one in one home only, so the homes diverge:
+  - revert/backtrack (on by default);
+  - cold compression to `.zst`;
+  - `migrate-rollouts`;
+  - archive and delete.
 
-R9 must follow that study's findings.
+**Rules that follow (R9).**
+- **Before every import and every `codex-qb resume`, check that no process is writing the session.**
+  - **Rollout probe:** open the rollout for read with write sharing denied. A sharing violation means a live writer. This works through hardlinks.
+  - **Lock probe:** try Codex's thread lock in every home where the thread exists.
+  - Command lines and recent writes are hints only.
+- **Before reusing an imported session, run a divergence check.** Both names must have the same file id, both homes' `rollout_path` filenames must match, and no `.zst` file may exist beside the rollout. On divergence, refuse and explain; never merge files.
+- **What to link and what not to.** Link every file of a paginated thread. Never hardlink sqlite files or `session_index`. Do not copy `thread_history_1` rows; the target rebuilds them.
+- **Remaining gap.** Opening a qb session from an old command while qb is running it is not caught by qb. That is the old command's own launch, which qb does not wrap. Possible fix: point every home's `thread-writer-locks` at one shared directory, so Codex's own guard covers all homes. That changes the user's existing homes, so it needs a synthetic test first and then the user's approval.
 
 **Do not revisit without new evidence.** The shared-home options above were rejected on source evidence (Codex 0.163). Re-open them only if a Codex release lets resume keep a thread's provider, or adds a per-process auth override for the TUI.
