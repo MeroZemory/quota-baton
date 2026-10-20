@@ -216,7 +216,7 @@ quota-baton routing session <식별자> --project <프로젝트-ID> --inherit
 
 **권장: 기존 환경은 그대로 두고 `codex-qb`·`claude-qb` 전용 명령을 추가해서 씁니다.** `wire --codex-mode dedicated --claude-mode dedicated`가 이 방식입니다. 전용 명령으로 시작한 세션만 quota-baton을 거치고, 기존 `codex`·`claude`와 계정별 명령, 설정 파일은 바뀌지 않습니다.
 
-- quota-baton 코어가 꺼지거나 업데이트 중이거나 오류가 나면 전용 명령 쪽 세션은 요청을 보내지 못합니다. 이때 기존 명령으로 바로 작업을 이어갈 수 있습니다.
+- quota-baton 코어가 꺼지거나 업데이트 중이거나 오류가 나면 전용 명령 쪽 세션은 요청을 보내지 못합니다. 이때 기존 명령을 쓸 수 있습니다. 다만 qb로 옮긴 Codex 대화는 먼저 아래의 `sessions return`으로 돌려보내야 합니다.
 - 같은 작업을 두 명령으로 실행해 보면, 문제가 계정이나 서비스에 있는지 quota-baton에 있는지 가를 수 있습니다.
 - `unwire --apply`는 전용 파일만 지우므로 되돌리기가 간단합니다.
 - 이미 실행 중인 세션과 herdr 자동 재개는 영향을 받지 않습니다.
@@ -271,7 +271,7 @@ quota-baton.exe wire --claude-mode none
 
 각 provider의 `dedicated`는 별도 연결 설정을, `default`는 기존 기본 설정을 바꿉니다. `none`은 해당 provider를 연결하지 않습니다. 두 모드를 따로 고를 수 있습니다. Claude에서 `default`를 명시하면 기존 `settings.json`의 `ANTHROPIC_BASE_URL`과 인증 값을 바꾸고 나머지 설정은 유지합니다.
 
-기존 `.codex-acct` 홈은 덮어쓰지 않습니다. herdr 창에서 `codex-qb` 세션을 재시작 후 이어 열려면 그 세션 ID를 `session-homes.json`에 `~/.codex-acct/qb`로 등록해야 합니다. 이 파일은 자동으로 수정하지 않습니다.
+기존 `.codex-acct` 홈은 덮어쓰지 않습니다. `wire`만으로 herdr의 기존 `session-homes.json` 항목을 바꾸지는 않습니다. 아래의 대화 이동과 돌려보내기는 해당 대화의 홈 항목도 작업 기록에 따라 갱신합니다.
 
 전환을 되돌릴 때도 먼저 미리 봅니다.
 
@@ -286,7 +286,7 @@ quota-baton.exe unwire --apply
 
 ### 기존 Codex 대화 가져오기
 
-먼저 `wire --codex-mode dedicated --apply`로 Codex 전용 명령을 준비합니다. 아래의 `<HOME>`은 기존 Codex 홈 폴더입니다. `<UUID>`는 대화 ID입니다.
+먼저 `wire --codex-mode dedicated --apply`로 Codex 전용 명령을 준비합니다. 현재 관리 실행과 이동은 **Codex CLI 0.163.0**만 지원합니다. 실행기는 설치된 버전을 확인하고 `--no-daemon`을 붙입니다. 관리 명령에서 daemon이나 app-server를 직접 시작하는 방식은 거절합니다. 이 버전 제한이 다른 버전의 안전성을 보장하지는 않습니다. 아래의 `<HOME>`은 기존 Codex 홈 폴더입니다. `<UUID>`는 대화 ID입니다.
 
 ```powershell
 quota-baton.exe sessions import --from <HOME> --list
@@ -298,9 +298,13 @@ quota-baton.exe sessions import --from <HOME> --all --apply
 
 `--list`는 가져올 대화 목록을 보여 줍니다. 가져오기는 기본적으로 미리보기만 합니다. 결과를 확인한 뒤 `--apply`를 붙입니다. `--all`은 여러 대화에 같은 이동 절차를 적용합니다. 결과는 이동(`moved`), 실행 중 건너뜀(`skipped-live`), 분기 건너뜀(`skipped-diverged`), 실패(`failed`) 개수로 보여 줍니다.
 
-ID를 알면 `codex-qb resume <UUID>`로 이어갈 수 있습니다. qb에 없는 대화는 기본 홈, 계정별 홈, Orca 홈에서 찾아 계획을 보여 줍니다. 원본 홈, 크기, 목표 상태와 남길 조상을 확인한 뒤 `move` 또는 `share`를 직접 입력합니다. 다른 입력은 취소합니다. 터미널이 없으면 이동을 거절하고 수동 명령을 안내합니다. ID 없이 여는 선택 화면은 그대로입니다.
+ID를 알면 `codex-qb resume <UUID>`로 이어갈 수 있습니다. qb에 없는 대화는 기본 홈, 계정별 홈, Orca 홈에서 찾아 계획을 보여 줍니다. 원본 홈, 크기와 목표 상태를 확인한 뒤 `move` 또는 `share`를 직접 입력합니다. 다른 입력은 취소합니다. 터미널이 없으면 이동을 거절하고 수동 명령을 안내합니다. ID 없이 여는 선택 화면과 `--last`도 관리 실행 검사를 통과해야 합니다. 미완료 이동 작업이 있으면 UUID 지정 여부와 관계없이 모든 관리 실행을 거절합니다.
 
-**기본 동작은 이동입니다. 대화 기록 파일은 복사하지 않습니다.** 하드링크로 같은 파일을 qb에 연결합니다. 파일 ID와 qb의 대화·목표 항목, 기록의 분기 여부를 검증합니다. 검증을 통과한 뒤 선택한 대화 자체의 원본 파일 이름과 대화·목표 항목을 제거합니다. 분기 부모나 조상 대화는 제거하지 않습니다. 원본 `session_index`도 바꾸지 않습니다. 각 단계는 작업 기록에 남깁니다. 조상 파일 이름을 남겨야 해도 선택한 대화의 항목은 qb가 소유합니다. 다른 볼륨으로는 옮길 수 없습니다. 원래 홈에서 옮긴 대화를 직접 다시 열지 마세요. 돌아갈 때는 아래의 `sessions return`을 사용하세요.
+**기본 동작은 이동입니다. 대화 기록 파일은 복사하지 않습니다.** 먼저 qb 홈의 `.quota-baton/staging/`에 하드링크를 만들고 파일 ID, 내용과 대화·목표 항목을 검증합니다. 이 폴더는 Codex의 대화 검색 대상이 아닙니다. 이어서 선택한 대화의 모든 원본 파일 이름을 제거하고, 원본 대화·목표 항목을 제거한 뒤, qb의 `sessions/`에 공개하고 대상 항목과 herdr 홈 연결을 반영합니다. 같은 파일을 가리키는 보관 폴더 등의 별칭도 원본 이름에 포함합니다. 파일의 마지막 이름은 제거하지 않으며, 파악하지 못한 하드링크가 있으면 거절합니다. 원본 `session_index`는 바꾸지 않고 대상 인덱스에는 필요한 항목만 덧붙입니다. 각 단계는 보호된 작업 기록에 남깁니다. 다른 볼륨으로는 옮길 수 없습니다. 원래 홈에서 옮긴 대화를 직접 다시 열지 마세요. 돌아갈 때는 아래의 `sessions return`을 사용하세요.
+
+현재 이동 엔진은 자식·후손 대화가 있는 대화와, 분기 부모나 조상 기록이 필요한 대화를 거절합니다. 후손은 SQLite 항목이 없어도 기록 헤더의 분기·이전 기록 연결을 따라 끝까지 검사합니다. 대상에 이미 같은 ID의 이름이 조상 별칭 등으로 남아 있어도 거절합니다. 조상 이름을 양쪽에 남기는 예외나 대화 가족 전체 이동은 제공하지 않습니다.
+
+검사한 홈에 압축된 대화(`.zst`)가 있으면 이동을 거절합니다. 현재는 그 기록과의 후손 관계를 확인할 수 없기 때문입니다. qb 홈에 이런 기록이 있으면 소유권을 확인할 수 없어 관리 실행도 거절합니다. `quota-baton doctor`가 해당 경로를 보여 줍니다. 기록을 자동으로 풀거나 지우지는 않습니다.
 
 수동 명령과 일괄 명령도 계획 뒤 확인을 받습니다. `--apply`만으로 조용히 옮기지 않습니다. 스크립트는 `--yes`로 확인을 생략할 수 있습니다. `codex-qb`는 이 옵션을 쓰지 않습니다. 이동을 명시하려면 `--move`, 원본을 남기려면 `--keep-source`를 지정합니다. 두 옵션은 함께 쓸 수 없습니다.
 
@@ -308,13 +312,13 @@ ID를 알면 `codex-qb resume <UUID>`로 이어갈 수 있습니다. qb에 없�
 quota-baton.exe sessions import --from <HOME> <UUID> --keep-source --apply
 ```
 
-이 옵션은 양쪽에 같은 파일의 하드링크를 남깁니다. `codex-mz resume <UUID>`로도 이어갈 수 있습니다. 어느 쪽에서 이어 써도 양쪽에 보입니다. **같은 대화를 두 홈에서 동시에 실행하지 마세요.** 먼저 한쪽을 종료한 뒤 다른 쪽에서 여세요. 실행할 때도 이 경고를 보여 줍니다.
+이 옵션은 양쪽에 같은 파일의 하드링크를 남깁니다. `codex-mz resume <UUID>`로도 이어갈 수 있습니다. 기록 파일에 덧붙인 내용은 양쪽에 보이지만, 각 홈의 대화·목표 데이터베이스는 별개이므로 그 상태까지 동기화되지는 않습니다. **같은 대화를 두 홈에서 동시에 실행하지 마세요.** 먼저 한쪽을 종료한 뒤 다른 쪽에서 여세요. 실행할 때도 이 경고를 보여 줍니다.
 
 모든 알려진 홈을 먼저 검사합니다. 같은 ID의 내용이나 목표 상태가 다르면 홈 목록을 보여 주고 거절합니다. 시간만 보고 더 새 파일을 고르거나 내용을 합치지 않습니다. 같은 내용의 사본은 계획에 표시합니다. 이동은 그 사본의 항목도 정리해 한 소유자로 모읍니다. 공유 모드에서 같은 사본을 정리하려면 `--clean-stale`을 명시하세요.
 
 ```powershell
-quota-baton.exe sessions import --from <HOME> <UUID> --clean-stale
-quota-baton.exe sessions import --from <HOME> <UUID> --clean-stale --apply
+quota-baton.exe sessions import --from <HOME> <UUID> --keep-source --clean-stale
+quota-baton.exe sessions import --from <HOME> <UUID> --keep-source --clean-stale --apply
 ```
 
 정리할 이름과 크기는 작업 기록에 남깁니다. 다른 대화가 참조하는 이름과 실행 중인 파일은 지우지 않습니다. 내용이 다른 파일을 `--clean-stale`로 강제로 지우지 않습니다.
@@ -330,7 +334,7 @@ quota-baton.exe sessions return <UUID> --to <HOME>
 
 TUI를 닫은 뒤에도 잠금이 남을 수 있습니다. 해당 홈의 `app-server-daemon/daemon.pid`에서 PID를 확인하세요. 다른 대화를 제공하지 않는 데몬만 그 PID로 종료한 뒤 다시 시도하세요. qb는 데몬을 자동으로 종료하지 않습니다.
 
-현재 기록과 목표 상태를 돌려보냅니다. 옛 가져오기 스냅샷으로 덮지 않습니다. 계획 뒤 `move`를 입력해야 하며, core가 꺼져 있어도 됩니다. herdr의 세션 홈도 같은 작업 기록에 따라 갱신합니다. 중간에 끊기면 같은 명령으로 기록된 작업을 완료합니다.
+현재 기록과 목표 상태를 돌려보냅니다. 옛 가져오기 스냅샷으로 덮지 않습니다. 계획 뒤 `move`를 입력해야 하며, core가 꺼져 있어도 됩니다. 가져오기와 같은 비공개 staging 절차와 후손·조상 의존성 제한을 적용합니다. herdr의 세션 홈도 같은 작업 기록에 따라 갱신합니다. 중간에 끊기면 아래의 `sessions recover`로 복구합니다.
 
 가져오기를 해제할 때도 먼저 미리 봅니다.
 
@@ -340,7 +344,18 @@ quota-baton.exe sessions unimport <UUID> --apply
 quota-baton.exe sessions unimport <UUID> --apply --force
 ```
 
-`unimport`는 작업 기록에 따라 이동으로 제거한 원본 파일 이름과 대화·목표 항목을 복원합니다. 그 뒤 qb에 추가한 연결과 항목을 제거합니다. `--keep-source`로 가져왔다면 남겨 둔 원본은 유지합니다. 가져온 뒤 기록이 바뀌었다면 기본적으로 해제를 거절합니다. 변경 내용을 확인한 뒤에만 `--force`를 붙이세요.
+새 staging 방식으로 이동한 대화의 `unimport --apply`는 현재 qb 기록과 대화·목표 상태를 원래 홈으로 돌려보냅니다. 옛 스냅샷을 복원하지 않으며, `return`과 같은 계획·확인·검증을 거칩니다. 미리보기만 하려면 `--apply`를 생략합니다. `--force`로 후손·조상 의존성이나 충돌 검사를 건너뛸 수 없습니다. `--keep-source` 및 이전 방식의 가져오기는 기존 해제 절차를 사용합니다. 공유 원본은 유지하고 qb에 추가한 연결과 소유 항목을 제거하며, 변경된 기록은 기본적으로 거절합니다. 이 경우에만 변경 내용을 확인한 뒤 `--force` 사용을 검토하세요.
+
+중단된 이동과 남은 항목은 다음 명령으로 확인하고 복구합니다.
+
+```powershell
+quota-baton.exe doctor
+quota-baton.exe sessions recover <UUID>
+```
+
+`doctor`는 읽기 전용입니다. 잘못된 홈의 항목, 작업 기록 없는 staging 파일, 참조되지 않는 qb 조상 이름과 놓친 후손을 한국어 코드·ID·경로로 보고합니다. 정상적으로 참조되는 조상 별칭은 오류로 취급하지 않습니다. 이동 결정 전의 복구는 검증된 원본으로 되돌리고, 결정 뒤에는 대상 공개를 완료합니다. 현재 내용이나 항목이 기록과 충돌하면 증거를 보존하고 거절합니다. 미완료 작업 기록이 남아 있는 동안에는 명시적 UUID 재개, `--last`, 선택 화면과 자동 재개를 포함한 모든 관리 진입 경로가 차단됩니다. 잠금이 풀렸다는 이유만으로 재개하지 않습니다.
+
+이 검사는 qb의 관리 실행 경로에 적용됩니다. 원래 `codex`를 직접 실행하는 경우의 보호 주장은 고정된 0.163.0의 실제 native 시험에서 통과한 시나리오에만 한정합니다. 특히 qb의 조상 전용 ID 재개와 오래된 선택 화면·경로의 안전성은 실제 시험 근거 없이 보장하지 않습니다. 합성 시험이나 버전 일치만으로 모든 직접 실행이 안전하다고 판단하지 마세요.
 
 자세한 조건은 [D21 대화 하드링크 가져오기](decisions.md#d21-codex-qb-keeps-a-separate-codex-home-existing-sessions-are-brought-in-by-hardlink-import-automatically-on-resume--accepted-user-direction-2026-10-21)를 따릅니다.
 

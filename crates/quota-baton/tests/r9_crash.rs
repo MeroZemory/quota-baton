@@ -1,15 +1,14 @@
 //! Actual CLI process termination/recovery in project-local synthetic homes.
-//! These tests prove the recovered state has no data loss. They do NOT prove
-//! G3's single-writable-location guarantee during the interrupted commit window.
+//! D21 panel 2: continuous public-home exclusion, hardlink reachability,
+//! durable managed admission, directional recovery, and conflict preservation.
 #![cfg(all(windows, feature = "testkit", debug_assertions))]
 
-use base64::{Engine, engine::general_purpose::STANDARD};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::{
     ffi::OsString,
     fs,
-    io::{self, Read},
+    io::{self, Read, Write},
     net::{SocketAddr, TcpListener},
     os::windows::process::CommandExt,
     path::{Path, PathBuf},
@@ -23,14 +22,17 @@ const ROOT: &str = "11111111-1111-1111-1111-111111111111";
 const SEGMENT_A: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 const SEGMENT_B: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
 const OTHER: &str = "22222222-2222-2222-2222-222222222222";
+const CHILD: &str = "33333333-3333-3333-3333-333333333333";
+const GRANDCHILD: &str = "44444444-4444-4444-4444-444444444444";
 const BODY: &str = "SYNTHETIC_R9_CRASH_BODY";
 const OLD_OBJECTIVE: &str = "SYNTHETIC_R9_OLD_OBJECTIVE";
 const CURRENT_OBJECTIVE: &str = "SYNTHETIC_R9_CURRENT_OBJECTIVE";
 const OTHER_OBJECTIVE: &str = "SYNTHETIC_R9_OTHER_OBJECTIVE";
+const CURRENT_MARKER: &str = "SYNTHETIC_R9_CURRENT_ROLLOUT";
 const COMMAND_DEADLINE: Duration = Duration::from_secs(20);
 const REAP_DEADLINE: Duration = Duration::from_secs(5);
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct Goal {
     objective: String,
     status: String,
@@ -110,55 +112,89 @@ fn goal(home: &Path, id: &str) -> Option<Goal> {
     .unwrap()
 }
 
-fn import_journal(qb: &Path) -> Value {
-    use windows::Win32::{
-        Foundation::{HLOCAL, LocalFree},
-        Security::Cryptography::{
-            CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptUnprotectData,
-        },
-    };
-    // Decode only this fixture's protected journal. Keep product journal privacy
-    // intact; no plaintext inspection command or real account data is involved.
-    let envelope: Value =
-        serde_json::from_slice(&fs::read(qb.join("journal/sessions-import.json")).unwrap())
-            .unwrap();
-    assert_eq!(envelope["schema"], 1);
-    let mut input = STANDARD
-        .decode(envelope["payload"].as_str().unwrap())
-        .unwrap();
-    let data = CRYPT_INTEGER_BLOB {
-        cbData: u32::try_from(input.len()).unwrap(),
-        pbData: input.as_mut_ptr(),
-    };
-    let mut entropy = b"quota-baton/v1/wiring-journal".to_vec();
-    let entropy = CRYPT_INTEGER_BLOB {
-        cbData: u32::try_from(entropy.len()).unwrap(),
-        pbData: entropy.as_mut_ptr(),
-    };
-    let mut output = CRYPT_INTEGER_BLOB::default();
-    // SAFETY: input and entropy remain alive for the synchronous DPAPI call;
-    // output receives a Windows allocation that is copied and LocalFree'd below.
-    unsafe {
-        CryptUnprotectData(
-            &data,
-            None,
-            Some(&entropy),
-            None,
-            None,
-            CRYPTPROTECT_UI_FORBIDDEN,
-            &mut output,
-        )
-    }
+fn move_journal(qb: &Path) -> Value {
+    let bytes = fs::read(
+        qb.join("journal/session-moves")
+            .join(format!("{ROOT}.json")),
+    )
     .unwrap();
-    assert!(output.cbData > 0 && !output.pbData.is_null());
-    // SAFETY: successful DPAPI output covers cbData initialized bytes.
-    let bytes =
-        unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
-    // SAFETY: this is the allocation returned by DPAPI, no longer borrowed.
-    unsafe {
-        let _ = LocalFree(Some(HLOCAL(output.pbData.cast())));
+    // Inspect only envelope metadata, never decrypt private journal snapshots.
+    let envelope: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(envelope["schema"], 2);
+    assert!(envelope["open"].is_boolean());
+    assert!(
+        envelope["payload"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+    let text = String::from_utf8(bytes).unwrap();
+    for private in [
+        BODY,
+        OLD_OBJECTIVE,
+        CURRENT_OBJECTIVE,
+        OTHER_OBJECTIVE,
+        CURRENT_MARKER,
+    ] {
+        assert!(
+            !text.contains(private),
+            "journal exposed private fixture contents"
+        );
     }
-    serde_json::from_slice(&bytes).unwrap()
+    envelope
+}
+
+fn physical_id(path: &Path) -> (u32, u64) {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle},
+    };
+    let file = fs::File::open(path).unwrap();
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: file owns the live handle and information is writable output.
+    unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut information) }.unwrap();
+    (
+        information.dwVolumeSerialNumber,
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+    )
+}
+
+fn root_names(directory: &Path) -> Vec<PathBuf> {
+    let mut pending = vec![directory.to_path_buf()];
+    let mut names = Vec::new();
+    while let Some(dir) = pending.pop() {
+        if !dir.exists() {
+            continue;
+        }
+        for entry in fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let kind = entry.file_type().unwrap();
+            assert!(!kind.is_symlink(), "unexpected fixture symlink");
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if kind.is_file() && entry.path().extension().is_some_and(|ext| ext == "jsonl") {
+                let file = fs::File::open(entry.path()).unwrap();
+                let mut first = String::new();
+                std::io::BufRead::read_line(&mut std::io::BufReader::new(file), &mut first)
+                    .unwrap();
+                if serde_json::from_str::<Value>(&first)
+                    .ok()
+                    .is_some_and(|v| v["type"] == "session_meta" && v["payload"]["id"] == ROOT)
+                {
+                    names.push(entry.path());
+                }
+            }
+        }
+    }
+    names.sort();
+    names
+}
+
+fn public_names(home: &Path) -> Vec<PathBuf> {
+    ["sessions", "archived_sessions"]
+        .iter()
+        .flat_map(|top| root_names(&home.join(top)))
+        .collect()
 }
 
 struct Process {
@@ -180,7 +216,13 @@ impl Process {
         }
         let out = text(&self.stdout);
         let err = text(&self.stderr);
-        for private in [BODY, OLD_OBJECTIVE, CURRENT_OBJECTIVE, OTHER_OBJECTIVE] {
+        for private in [
+            BODY,
+            OLD_OBJECTIVE,
+            CURRENT_OBJECTIVE,
+            OTHER_OBJECTIVE,
+            CURRENT_MARKER,
+        ] {
             assert!(
                 !out.contains(private) && !err.contains(private),
                 "CLI printed synthetic private content"
@@ -225,7 +267,7 @@ impl Process {
         assert!(!status.success(), "terminated child unexpectedly succeeded");
     }
 
-    fn success(mut self) {
+    fn finish(mut self, success: bool) -> String {
         let status = match self.wait_until(Instant::now() + COMMAND_DEADLINE) {
             Some(status) => status,
             None => {
@@ -234,11 +276,19 @@ impl Process {
             }
         };
         assert!(
-            status.success(),
-            "CLI failed ({status}): {}",
+            status.success() == success,
+            "unexpected CLI status ({status}): {}",
             self.diagnostics()
         );
-        let _ = self.diagnostics();
+        self.diagnostics()
+    }
+
+    fn success(self) {
+        let _ = self.finish(true);
+    }
+
+    fn failure(self) -> String {
+        self.finish(false)
     }
 }
 
@@ -277,6 +327,7 @@ struct Fixture {
     original_map: Value,
     segments: [PathBuf; 2],
     contents: [Vec<u8>; 2],
+    identities: [(u32, u64); 2],
     other: PathBuf,
     other_contents: Vec<u8>,
     original_index: Vec<u8>,
@@ -305,9 +356,22 @@ impl Fixture {
             &qb.join("journal"),
             map_path.parent().unwrap(),
             &root.path().join("logs"),
+            &appdata.join("npm"),
+            &user.join("AppData/Local"),
+            &root.path().join("temp"),
         ] {
             fs::create_dir_all(dir).unwrap();
         }
+        fs::write(
+            appdata.join("npm/codex.cmd"),
+            b"@echo off\r\necho codex-cli 0.163.0\r\n",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("client.cmd"),
+            b"@echo off\r\nif \"%~1\"==\"--version\" (echo codex-cli 0.163.0& exit /b 0)\r\necho synthetic-launch>\"%QB_PANEL2_SENTINEL%\"\r\nexit /b 0\r\n",
+        )
+        .unwrap();
         fs::write(
             qb.join("journal/wiring.json"),
             serde_json::to_vec(
@@ -349,6 +413,7 @@ impl Fixture {
         let original_map = json!({"sessions": {ROOT: source, OTHER: source}, "future": {"preserve": [true, "synthetic"]}});
         fs::write(&map_path, serde_json::to_vec(&original_map).unwrap()).unwrap();
         let contents = [fs::read(&a).unwrap(), fs::read(&b).unwrap()];
+        let identities = [physical_id(&a), physical_id(&b)];
         let other_contents = fs::read(&other).unwrap();
         Self {
             root,
@@ -361,6 +426,7 @@ impl Fixture {
             original_map,
             segments: [a, b],
             contents,
+            identities,
             other,
             other_contents,
             original_index,
@@ -375,19 +441,18 @@ impl Fixture {
             "--from".into(),
             self.source.as_os_str().to_owned(),
             ROOT.into(),
-            "--move".into(),
             "--apply".into(),
             "--yes".into(),
         ]
     }
 
-    fn rollback_args(&self) -> Vec<OsString> {
+    fn unimport_args(&self) -> Vec<OsString> {
         vec![
             "sessions".into(),
             "unimport".into(),
             ROOT.into(),
             "--apply".into(),
-            "--force".into(),
+            "--yes".into(),
         ]
     }
 
@@ -407,17 +472,39 @@ impl Fixture {
         let stdout = self.root.path().join(format!("logs/{serial}.stdout.log"));
         let stderr = self.root.path().join(format!("logs/{serial}.stderr.log"));
         let mut command = Command::new(env!("CARGO_BIN_EXE_quota-baton"));
+        command.env_clear();
+        for key in [
+            "SystemRoot",
+            "WINDIR",
+            "PATH",
+            "PATHEXT",
+            "COMSPEC",
+            "NUMBER_OF_PROCESSORS",
+            "PROCESSOR_ARCHITECTURE",
+        ] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
         command
             .args(args)
             .env("QB_HOME", &self.qb)
             .env("USERPROFILE", &self.user)
             .env("HOME", &self.user)
             .env("APPDATA", &self.appdata)
+            .env("LOCALAPPDATA", self.user.join("AppData/Local"))
+            .env("TEMP", self.root.path().join("temp"))
+            .env("TMP", self.root.path().join("temp"))
+            .env("NO_PROXY", "*")
+            .env("HTTP_PROXY", "")
+            .env("HTTPS_PROXY", "")
+            .env("ALL_PROXY", "")
+            .env("QB_PANEL2_SENTINEL", self.root.path().join("launched.txt"))
             .env("CODEX_HOME", &self.target)
             .env_remove("QB_R9_CHECKPOINT")
             .env_remove("QB_R9_CHECKPOINT_NOTIFY")
             .current_dir(self.root.path())
-            .creation_flags(0x08000000)
+            .creation_flags(0x08000000 | 0x00004000)
             .stdin(Stdio::null())
             .stdout(fs::File::create(&stdout).unwrap())
             .stderr(fs::File::create(&stderr).unwrap());
@@ -495,8 +582,10 @@ impl Fixture {
             label.as_bytes(),
             "wrong checkpoint notification"
         );
+        self.assert_namespace();
         while_parked();
         process.kill_and_reap();
+        self.assert_namespace();
         let _ = process.diagnostics();
     }
 
@@ -504,73 +593,253 @@ impl Fixture {
         self.target.join(source.strip_prefix(&self.source).unwrap())
     }
 
-    fn import_and_change_current_goal(&self) {
+    fn recover_args(&self) -> Vec<OsString> {
+        vec!["sessions".into(), "recover".into(), ROOT.into()]
+    }
+
+    fn launch_args(&self, args: &[&str]) -> Vec<OsString> {
+        let mut result = vec![
+            "launch-client".into(),
+            "--client".into(),
+            "codex".into(),
+            "--command".into(),
+            self.root.path().join("client.cmd").into_os_string(),
+            "--".into(),
+        ];
+        result.extend(args.iter().map(|arg| OsString::from(*arg)));
+        result
+    }
+
+    fn assert_namespace(&self) {
+        let homes = [&self.source, &self.target]
+            .iter()
+            .filter(|home| !public_names(home).is_empty())
+            .count();
+        assert!(
+            homes <= 1,
+            "root is discoverable in both homes, including after process death"
+        );
+        let all = root_names(self.root.path());
+        for identity in self.identities {
+            assert!(
+                all.iter().any(|path| physical_id(path) == identity),
+                "lost the last hardlink of a physical rollout, including private staging"
+            );
+        }
+    }
+
+    fn assert_boundary_state(&self, label: &str, reverse: bool) {
+        self.assert_namespace();
+        let (from, to) = if reverse {
+            (&self.target, &self.source)
+        } else {
+            (&self.source, &self.target)
+        };
+        let source_count = public_names(from).len();
+        let target_count = public_names(to).len();
+        match label {
+            "stage:prepared" | "stage:staged" => {
+                assert!(source_count >= 2);
+                assert_eq!(target_count, 0);
+            }
+            "stage:source_name_removed" => {
+                assert_eq!(source_count, 1, "exercise partial multi-page retirement");
+                assert_eq!(target_count, 0);
+            }
+            "stage:source_names_removed" | "stage:source_rows_removed" | "stage:decided" => {
+                assert_eq!(source_count, 0);
+                assert_eq!(target_count, 0);
+            }
+            "stage:published" => {
+                assert_eq!(source_count, 0);
+                assert_eq!(
+                    target_count, 1,
+                    "exercise partial multi-physical publication"
+                );
+            }
+            "stage:target_rows" | "stage:map_committed" | "stage:committed" => {
+                assert_eq!(source_count, 0);
+                assert_eq!(target_count, 2);
+            }
+            _ => panic!("unknown acceptance boundary"),
+        }
+    }
+
+    fn assert_managed_admission(&self) {
+        if move_journal(&self.qb)["open"] == false {
+            return;
+        }
+        let before = self.protected_state();
+        for args in [
+            vec!["resume", ROOT],
+            vec!["resume", "--last"],
+            vec!["resume"],
+            vec![],
+            vec!["app-server"],
+        ] {
+            let sentinel = self.root.path().join("launched.txt");
+            assert!(!sentinel.exists());
+            let diagnostic = self.spawn(&self.launch_args(&args), None).failure();
+            assert!(
+                diagnostic.contains("recover")
+                    || diagnostic.contains("복구")
+                    || diagnostic.contains("이동"),
+                "managed admission failed for an unrelated reason"
+            );
+            assert!(
+                !sentinel.exists(),
+                "managed path started a client with an open journal"
+            );
+            assert!(
+                self.protected_state() == before,
+                "managed refusal changed protected session state"
+            );
+        }
+    }
+
+    fn assert_launcher_control(&self) {
+        self.run(&self.launch_args(&["--help"]));
+        let sentinel = self.root.path().join("launched.txt");
+        assert!(sentinel.exists(), "client marker control did not launch");
+        fs::remove_file(sentinel).unwrap();
+    }
+
+    fn protected_state(&self) -> ProtectedState {
+        let names = root_names(self.root.path())
+            .into_iter()
+            .map(|path| {
+                let identity = physical_id(&path);
+                let bytes = fs::read(&path).unwrap();
+                (path, identity, bytes)
+            })
+            .collect();
+        ProtectedState {
+            rows: [
+                thread_row(&self.source, ROOT),
+                thread_row(&self.target, ROOT),
+                thread_row(&self.source, OTHER),
+                thread_row(&self.target, OTHER),
+            ],
+            goals: [
+                goal(&self.source, ROOT),
+                goal(&self.target, ROOT),
+                goal(&self.source, OTHER),
+                goal(&self.target, OTHER),
+            ],
+            names,
+            map: fs::read(&self.map_path).unwrap(),
+            indices: [
+                fs::read(self.source.join("session_index.jsonl")).ok(),
+                fs::read(self.target.join("session_index.jsonl")).ok(),
+            ],
+            other: fs::read(&self.other).unwrap(),
+        }
+    }
+
+    fn import_and_change_current_goal(&self) -> [Vec<u8>; 2] {
         self.run(&self.import_args());
         assert!(self.segments.iter().all(|path| !path.exists()));
         assert!(thread_row(&self.source, ROOT).is_none());
-        assert_eq!(goal(&self.source, ROOT), None);
+        assert!(goal(&self.source, ROOT).is_none());
         let db = Connection::open(self.target.join("goals_1.sqlite")).unwrap();
         db.busy_timeout(Duration::from_secs(2)).unwrap();
         let current = current_goal();
         assert_eq!(db.execute("UPDATE thread_goals SET objective=?1,status=?2,updated_at_ms=?3 WHERE thread_id=?4", params![current.objective, current.status, current.updated_at_ms, ROOT]).unwrap(), 1);
         drop(db);
-        assert_eq!(goal(&self.target, ROOT), Some(current_goal()));
-        let map: Value = serde_json::from_slice(&fs::read(&self.map_path).unwrap()).unwrap();
-        assert_eq!(
-            Path::new(map["sessions"][ROOT].as_str().unwrap()),
-            self.target.as_path()
-        );
+        let path = self.q_name(&self.segments[1]);
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"event_msg","payload":{"type":"user_message","message":CURRENT_MARKER}})
+        )
+        .unwrap();
+        file.set_times(
+            fs::FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(300)),
+        )
+        .unwrap();
+        drop(file);
+        assert!(goal(&self.target, ROOT) == Some(current_goal()));
+        self.assert_namespace();
+        [
+            fs::read(self.q_name(&self.segments[0])).unwrap(),
+            fs::read(path).unwrap(),
+        ]
     }
 
-    fn assert_recovered(&self, expected_goal: Goal, other_archived: i64) {
-        for (source, original) in self.segments.iter().zip(&self.contents) {
-            assert_eq!(
-                fs::read(source).unwrap(),
-                *original,
-                "lost rollout segment after recovery"
+    fn assert_owner(
+        &self,
+        target_owns: bool,
+        expected_goal: Goal,
+        other_archived: i64,
+        contents: &[Vec<u8>; 2],
+    ) {
+        self.assert_namespace();
+        let (owner, empty) = if target_owns {
+            (&self.target, &self.source)
+        } else {
+            (&self.source, &self.target)
+        };
+        let names = public_names(owner);
+        assert_eq!(names.len(), 2);
+        assert!(public_names(empty).is_empty());
+        for (index, identity) in self.identities.iter().enumerate() {
+            let name = names
+                .iter()
+                .find(|path| physical_id(path) == *identity)
+                .expect("physical rollout missing from owning home");
+            assert!(
+                fs::read(name).unwrap() == contents[index],
+                "recovery lost or rewound rollout contents"
             );
-            assert!(!self.q_name(source).exists());
         }
-        assert_eq!(
-            thread_row(&self.source, ROOT),
-            Some((
-                self.segments[1].to_str().unwrap().into(),
-                "openai".into(),
-                0
-            ))
+        let (path, provider, archived) = thread_row(owner, ROOT).expect("owning row absent");
+        assert_eq!(physical_id(Path::new(&path)), self.identities[1]);
+        assert_eq!(provider, "openai");
+        assert_eq!(archived, 0);
+        assert!(goal(owner, ROOT) == Some(expected_goal));
+        assert!(thread_row(empty, ROOT).is_none());
+        assert!(goal(empty, ROOT).is_none());
+        let other = thread_row(&self.source, OTHER).unwrap();
+        assert_eq!(physical_id(Path::new(&other.0)), physical_id(&self.other));
+        assert_eq!(other.1, "openai");
+        assert_eq!(other.2, other_archived);
+        assert!(
+            goal(&self.source, OTHER)
+                == Some(Goal {
+                    objective: OTHER_OBJECTIVE.into(),
+                    status: "paused".into(),
+                    updated_at_ms: 23
+                })
         );
-        assert_eq!(goal(&self.source, ROOT), Some(expected_goal));
-        assert_eq!(thread_row(&self.target, ROOT), None);
-        assert_eq!(goal(&self.target, ROOT), None);
-        assert_eq!(
-            thread_row(&self.source, OTHER),
-            Some((
-                self.other.to_str().unwrap().into(),
-                "openai".into(),
-                other_archived
-            ))
-        );
-        assert_eq!(
-            goal(&self.source, OTHER),
-            Some(Goal {
-                objective: OTHER_OBJECTIVE.into(),
-                status: "paused".into(),
-                updated_at_ms: 23
-            })
-        );
-        assert_eq!(fs::read(&self.other).unwrap(), self.other_contents);
+        assert!(fs::read(&self.other).unwrap() == self.other_contents);
         assert!(
             fs::read(self.source.join("session_index.jsonl"))
                 .unwrap()
                 .starts_with(&self.original_index),
             "append-only source index was rewritten"
         );
+        let mut expected_map = self.original_map.clone();
         let map: Value = serde_json::from_slice(&fs::read(&self.map_path).unwrap()).unwrap();
-        assert_eq!(map, self.original_map);
-        let journal = import_journal(&self.qb);
-        assert!(!journal["imports"].as_object().unwrap().contains_key(ROOT));
+        assert_eq!(
+            fs::canonicalize(Path::new(map["sessions"][ROOT].as_str().unwrap())).unwrap(),
+            fs::canonicalize(owner).unwrap()
+        );
+        expected_map["sessions"][ROOT] = map["sessions"][ROOT].clone();
+        assert!(map == expected_map, "unrelated map fields were changed");
+        assert_eq!(move_journal(&self.qb)["open"], false);
         assert_integrity(self.root.path());
     }
+}
+
+#[derive(PartialEq, Eq)]
+struct ProtectedState {
+    rows: [Option<(String, String, i64)>; 4],
+    goals: [Option<Goal>; 4],
+    names: Vec<(PathBuf, (u32, u64), Vec<u8>)>,
+    map: Vec<u8>,
+    indices: [Option<Vec<u8>>; 2],
+    other: Vec<u8>,
 }
 
 fn write_rollout(home: &Path, id: &str, physical: &str, base: Option<&str>) -> PathBuf {
@@ -597,6 +866,23 @@ fn write_rollout(home: &Path, id: &str, physical: &str, base: Option<&str>) -> P
         .unwrap()
         .set_times(fs::FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(300)))
         .unwrap();
+    path
+}
+
+fn write_descendant(home: &Path, id: &str, parent: &str) -> PathBuf {
+    let path = write_rollout(home, id, id, None);
+    let physical_parent = if parent == ROOT { SEGMENT_B } else { parent };
+    let header = json!({"type":"session_meta","payload":{"id":id,"model_provider":"openai",
+        "forked_from_id":parent,"history_base":{"thread_id":physical_parent,"end_ordinal_exclusive":1,"end_byte_offset":0}}});
+    fs::write(
+        &path,
+        format!(
+            "{header}\n{}\n",
+            json!({"type":"event_msg","payload":{"type":"user_message","message":BODY}})
+        ),
+    )
+    .unwrap();
+    age(&path);
     path
 }
 
@@ -635,106 +921,344 @@ fn assert_integrity(root: &Path) {
     assert!(checked >= 2, "no source databases checked");
 }
 
+fn post_decision(label: &str) -> bool {
+    matches!(
+        label,
+        "stage:decided"
+            | "stage:published"
+            | "stage:target_rows"
+            | "stage:map_committed"
+            | "stage:committed"
+    )
+}
+
+fn unix_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap()
+}
+
+fn imported_goal(fixture: &Fixture, planned_between: (i64, i64)) -> Goal {
+    let timestamp = goal(&fixture.target, ROOT)
+        .expect("imported goal is absent")
+        .updated_at_ms;
+    // Import pauses the goal and stamps it when the original plan is made.
+    // Recovery must replay that timestamp, not retain 17 or generate a new one.
+    assert!((planned_between.0..=planned_between.1).contains(&timestamp));
+    assert!(timestamp > original_goal().updated_at_ms);
+    Goal {
+        status: "paused".into(),
+        updated_at_ms: timestamp,
+        ..original_goal()
+    }
+}
+
 fn recover_import_after_kill(label: &str) {
     let fixture = Fixture::new();
-    fixture.kill_at(&fixture.import_args(), label, || {});
-    if label == "source_name_removed" {
-        assert_eq!(
-            fixture.segments.iter().filter(|path| path.exists()).count(),
-            1,
-            "must exercise partial two-segment retirement"
+    fixture.assert_launcher_control();
+    let planned_after = unix_millis();
+    fixture.kill_at(&fixture.import_args(), label, || {
+        fixture.assert_boundary_state(label, false)
+    });
+    let planned_before = unix_millis();
+    fixture.assert_managed_admission();
+    let mut expected = None;
+    for _ in 0..2 {
+        fixture.run(&fixture.recover_args());
+        let expected_goal = expected.get_or_insert_with(|| {
+            if post_decision(label) {
+                imported_goal(&fixture, (planned_after, planned_before))
+            } else {
+                original_goal()
+            }
+        });
+        fixture.assert_owner(
+            post_decision(label),
+            expected_goal.clone(),
+            0,
+            &fixture.contents,
         );
     }
-    fixture.run(&fixture.rollback_args());
-    fixture.assert_recovered(original_goal(), 0);
 }
 
-fn recover_return_after_kill(label: &str) {
+fn recover_reverse_after_kill(label: &str, undo: bool) {
     let fixture = Fixture::new();
-    fixture.import_and_change_current_goal();
-    fixture.kill_at(&fixture.return_args(), label, || {});
-    if label == "return:source-name-removed" {
-        assert_eq!(
-            fixture
-                .segments
-                .iter()
-                .filter(|path| fixture.q_name(path).exists())
-                .count(),
-            1,
-            "must exercise partial Q retirement"
+    let contents = fixture.import_and_change_current_goal();
+    let args = if undo {
+        fixture.unimport_args()
+    } else {
+        fixture.return_args()
+    };
+    fixture.kill_at(&args, label, || fixture.assert_boundary_state(label, true));
+    fixture.assert_managed_admission();
+    for _ in 0..2 {
+        fixture.run(&fixture.recover_args());
+        fixture.assert_owner(!post_decision(label), current_goal(), 0, &contents);
+    }
+}
+
+macro_rules! crash_case {
+    ($name:ident, $kind:ident, $label:literal) => {
+        #[test]
+        fn $name() { crash_case!(@run $kind, $label); }
+    };
+    (@run import, $label:literal) => { recover_import_after_kill($label) };
+    (@run return_current, $label:literal) => { recover_reverse_after_kill($label, false) };
+    (@run undo_current, $label:literal) => { recover_reverse_after_kill($label, true) };
+}
+
+// Every mutation boundary of move, current-state return, and current-state undo.
+// Multiple pages in one home count as ONE discoverable home, not dual ownership.
+crash_case!(
+    import_recovery_after_prepared_kill,
+    import,
+    "stage:prepared"
+);
+crash_case!(import_recovery_after_staged_kill, import, "stage:staged");
+crash_case!(
+    import_recovery_after_source_name_removed_kill,
+    import,
+    "stage:source_name_removed"
+);
+crash_case!(
+    import_recovery_after_source_names_removed_kill,
+    import,
+    "stage:source_names_removed"
+);
+crash_case!(
+    import_recovery_after_source_rows_removed_kill,
+    import,
+    "stage:source_rows_removed"
+);
+crash_case!(import_recovery_after_decided_kill, import, "stage:decided");
+crash_case!(
+    import_recovery_after_published_kill,
+    import,
+    "stage:published"
+);
+crash_case!(
+    import_recovery_after_target_rows_kill,
+    import,
+    "stage:target_rows"
+);
+crash_case!(
+    import_recovery_after_map_committed_kill,
+    import,
+    "stage:map_committed"
+);
+crash_case!(
+    import_recovery_after_committed_kill,
+    import,
+    "stage:committed"
+);
+crash_case!(
+    return_current_recovery_after_prepared_kill,
+    return_current,
+    "stage:prepared"
+);
+crash_case!(
+    return_current_recovery_after_staged_kill,
+    return_current,
+    "stage:staged"
+);
+crash_case!(
+    return_current_recovery_after_source_name_removed_kill,
+    return_current,
+    "stage:source_name_removed"
+);
+crash_case!(
+    return_current_recovery_after_source_names_removed_kill,
+    return_current,
+    "stage:source_names_removed"
+);
+crash_case!(
+    return_current_recovery_after_source_rows_removed_kill,
+    return_current,
+    "stage:source_rows_removed"
+);
+crash_case!(
+    return_current_recovery_after_decided_kill,
+    return_current,
+    "stage:decided"
+);
+crash_case!(
+    return_current_recovery_after_published_kill,
+    return_current,
+    "stage:published"
+);
+crash_case!(
+    return_current_recovery_after_target_rows_kill,
+    return_current,
+    "stage:target_rows"
+);
+crash_case!(
+    return_current_recovery_after_map_committed_kill,
+    return_current,
+    "stage:map_committed"
+);
+crash_case!(
+    return_current_recovery_after_committed_kill,
+    return_current,
+    "stage:committed"
+);
+crash_case!(
+    undo_current_recovery_after_prepared_kill,
+    undo_current,
+    "stage:prepared"
+);
+crash_case!(
+    undo_current_recovery_after_staged_kill,
+    undo_current,
+    "stage:staged"
+);
+crash_case!(
+    undo_current_recovery_after_source_name_removed_kill,
+    undo_current,
+    "stage:source_name_removed"
+);
+crash_case!(
+    undo_current_recovery_after_source_names_removed_kill,
+    undo_current,
+    "stage:source_names_removed"
+);
+crash_case!(
+    undo_current_recovery_after_source_rows_removed_kill,
+    undo_current,
+    "stage:source_rows_removed"
+);
+crash_case!(
+    undo_current_recovery_after_decided_kill,
+    undo_current,
+    "stage:decided"
+);
+crash_case!(
+    undo_current_recovery_after_published_kill,
+    undo_current,
+    "stage:published"
+);
+crash_case!(
+    undo_current_recovery_after_target_rows_kill,
+    undo_current,
+    "stage:target_rows"
+);
+crash_case!(
+    undo_current_recovery_after_map_committed_kill,
+    undo_current,
+    "stage:map_committed"
+);
+crash_case!(
+    undo_current_recovery_after_committed_kill,
+    undo_current,
+    "stage:committed"
+);
+
+fn recovery_is_interruptible(first: &str, during: &str) {
+    let fixture = Fixture::new();
+    let planned_after = unix_millis();
+    fixture.kill_at(&fixture.import_args(), first, || {});
+    let planned_before = unix_millis();
+    fixture.kill_at(&fixture.recover_args(), during, || {});
+    fixture.assert_managed_admission();
+    let mut expected = None;
+    for _ in 0..2 {
+        fixture.run(&fixture.recover_args());
+        let expected_goal = expected.get_or_insert_with(|| {
+            if post_decision(first) {
+                imported_goal(&fixture, (planned_after, planned_before))
+            } else {
+                original_goal()
+            }
+        });
+        fixture.assert_owner(
+            post_decision(first),
+            expected_goal.clone(),
+            0,
+            &fixture.contents,
         );
     }
-    fixture.run(&fixture.return_args());
-    fixture.assert_recovered(current_goal(), 0);
-    fixture.run(&fixture.return_args()); // Completed-return replay is a no-op.
-    fixture.assert_recovered(current_goal(), 0);
 }
 
-macro_rules! import_recovery {
-    ($name:ident, $label:literal) => {
-        #[test]
-        fn $name() {
-            recover_import_after_kill($label);
-        }
-    };
+#[test]
+fn rollback_recovery_survives_kill_after_first_restored_name() {
+    recovery_is_interruptible("stage:source_rows_removed", "stage:rollback_name_restored");
+}
+#[test]
+fn rollback_recovery_survives_kill_after_rollback_complete() {
+    recovery_is_interruptible("stage:source_rows_removed", "stage:rollback_complete");
+}
+#[test]
+fn forward_recovery_survives_kill_after_first_publication() {
+    recovery_is_interruptible("stage:decided", "stage:published");
+}
+#[test]
+fn forward_recovery_survives_kill_after_target_rows() {
+    recovery_is_interruptible("stage:decided", "stage:target_rows");
+}
+#[test]
+fn forward_recovery_survives_kill_after_map_commit() {
+    recovery_is_interruptible("stage:decided", "stage:map_committed");
+}
+#[test]
+fn forward_recovery_survives_kill_after_commit() {
+    recovery_is_interruptible("stage:decided", "stage:committed");
 }
 
-macro_rules! return_recovery {
-    ($name:ident, $label:literal) => {
-        #[test]
-        fn $name() {
-            recover_return_after_kill($label);
-        }
-    };
+#[test]
+fn undo_rollback_recovery_can_be_killed_and_preserves_current_state() {
+    let fixture = Fixture::new();
+    let contents = fixture.import_and_change_current_goal();
+    fixture.kill_at(&fixture.unimport_args(), "stage:source_rows_removed", || {});
+    fixture.kill_at(
+        &fixture.recover_args(),
+        "stage:rollback_name_restored",
+        || {},
+    );
+    fixture.assert_managed_admission();
+    for _ in 0..2 {
+        fixture.run(&fixture.recover_args());
+        fixture.assert_owner(true, current_goal(), 0, &contents);
+    }
 }
 
-import_recovery!(import_recovery_after_prepared_kill, "prepared");
-import_recovery!(import_recovery_after_linked_kill, "linked");
-import_recovery!(import_recovery_after_target_rows_kill, "target_rows");
-import_recovery!(import_recovery_after_index_appended_kill, "index_appended");
-import_recovery!(import_recovery_after_verified_kill, "verified");
-import_recovery!(import_recovery_after_retiring_kill, "retiring");
-import_recovery!(
-    import_recovery_after_source_rows_removed_kill,
-    "source_rows_removed"
-);
-import_recovery!(
-    import_recovery_after_first_source_name_removed_kill,
-    "source_name_removed"
-);
-import_recovery!(import_recovery_after_source_retired_kill, "source_retired");
-import_recovery!(
-    import_recovery_after_aliases_retired_kill,
-    "aliases_retired"
-);
-import_recovery!(import_recovery_after_map_committed_kill, "map_committed");
-import_recovery!(import_recovery_after_committed_kill, "committed");
+#[test]
+fn undo_forward_recovery_can_be_killed_and_preserves_current_state() {
+    let fixture = Fixture::new();
+    let contents = fixture.import_and_change_current_goal();
+    fixture.kill_at(&fixture.unimport_args(), "stage:decided", || {});
+    fixture.kill_at(&fixture.recover_args(), "stage:published", || {});
+    for _ in 0..2 {
+        fixture.run(&fixture.recover_args());
+        fixture.assert_owner(false, current_goal(), 0, &contents);
+    }
+}
 
-return_recovery!(return_recovery_after_prepared_kill, "return:prepared");
-return_recovery!(return_recovery_after_linked_kill, "return:linked");
-return_recovery!(return_recovery_after_rows_kill, "return:rows");
-return_recovery!(return_recovery_after_verified_kill, "return:verified");
-return_recovery!(return_recovery_after_mapped_kill, "return:mapped");
-return_recovery!(return_recovery_after_retiring_kill, "return:retiring");
-return_recovery!(
-    return_recovery_after_source_rows_removed_kill,
-    "return:source-rows-removed"
-);
-return_recovery!(
-    return_recovery_after_first_source_name_removed_kill,
-    "return:source-name-removed"
-);
-return_recovery!(return_recovery_after_retired_kill, "return:retired");
-return_recovery!(
-    return_recovery_after_import_removed_kill,
-    "return:import-removed"
-);
-return_recovery!(return_recovery_after_committed_kill, "return:committed");
+#[test]
+fn completed_return_command_replay_preserves_current_bytes_and_goal() {
+    let fixture = Fixture::new();
+    let contents = fixture.import_and_change_current_goal();
+    for _ in 0..2 {
+        fixture.run(&fixture.return_args());
+        fixture.assert_owner(false, current_goal(), 0, &contents);
+    }
+}
+
+#[test]
+fn completed_unimport_command_replay_preserves_current_bytes_and_goal() {
+    let fixture = Fixture::new();
+    let contents = fixture.import_and_change_current_goal();
+    for _ in 0..2 {
+        fixture.run(&fixture.unimport_args());
+        fixture.assert_owner(false, current_goal(), 0, &contents);
+    }
+}
 
 #[test]
 fn rollback_recovery_preserves_unrelated_sqlite_commit_made_during_import() {
     let fixture = Fixture::new();
-    fixture.kill_at(&fixture.import_args(), "verified", || {
+    fixture.kill_at(&fixture.import_args(), "stage:staged", || {
         let mut db = Connection::open(fixture.source.join("state_5.sqlite")).unwrap();
         db.busy_timeout(Duration::from_secs(2)).unwrap();
         let transaction = db
@@ -748,6 +1272,270 @@ fn rollback_recovery_preserves_unrelated_sqlite_commit_made_during_import() {
         );
         transaction.commit().unwrap();
     });
-    fixture.run(&fixture.rollback_args());
-    fixture.assert_recovered(original_goal(), 1);
+    for _ in 0..2 {
+        fixture.run(&fixture.recover_args());
+        fixture.assert_owner(false, original_goal(), 1, &fixture.contents);
+    }
+}
+
+#[test]
+fn all_public_aliases_retire_before_any_target_publication() {
+    let fixture = Fixture::new();
+    let alias = fixture
+        .source
+        .join("archived_sessions/alias")
+        .join(fixture.segments[0].file_name().unwrap());
+    fs::create_dir_all(alias.parent().unwrap()).unwrap();
+    fs::hard_link(&fixture.segments[0], &alias).unwrap();
+    assert_eq!(public_names(&fixture.source).len(), 3);
+    fixture.kill_at(&fixture.import_args(), "stage:source_names_removed", || {
+        assert!(public_names(&fixture.source).is_empty());
+        assert!(public_names(&fixture.target).is_empty());
+        assert!(!alias.exists());
+    });
+    for _ in 0..2 {
+        fixture.run(&fixture.recover_args());
+    }
+    assert_eq!(public_names(&fixture.source).len(), 3);
+    assert!(public_names(&fixture.target).is_empty());
+    assert_eq!(physical_id(&alias), fixture.identities[0]);
+    assert!(thread_row(&fixture.source, ROOT).is_some());
+    assert!(goal(&fixture.source, ROOT) == Some(original_goal()));
+    assert_eq!(move_journal(&fixture.qb)["open"], false);
+    assert_integrity(fixture.root.path());
+}
+
+fn assert_refusal_unchanged(fixture: &Fixture, args: &[OsString]) {
+    let before = fixture.protected_state();
+    let diagnostic = fixture.spawn(args, None).failure();
+    assert!(
+        diagnostic
+            .chars()
+            .any(|c| ('\u{ac00}'..='\u{d7af}').contains(&c)),
+        "refusal needs a Korean explanation"
+    );
+    assert!(
+        fixture.protected_state() == before,
+        "refused move changed protected evidence"
+    );
+    assert_integrity(fixture.root.path());
+}
+
+#[test]
+fn counterexample_1_header_only_child_and_grandchild_protect_root_by_refusal() {
+    let fixture = Fixture::new();
+    let child = write_descendant(&fixture.source, CHILD, ROOT);
+    let grandchild = write_descendant(&fixture.source, GRANDCHILD, CHILD);
+    assert!(thread_row(&fixture.source, CHILD).is_none());
+    assert!(thread_row(&fixture.source, GRANDCHILD).is_none());
+    let child_bytes = fs::read(&child).unwrap();
+    let grandchild_bytes = fs::read(&grandchild).unwrap();
+    assert_refusal_unchanged(&fixture, &fixture.import_args());
+    fixture.assert_namespace();
+    assert!(fs::read(child).unwrap() == child_bytes);
+    assert!(fs::read(grandchild).unwrap() == grandchild_bytes);
+    assert!(
+        !fixture
+            .qb
+            .join("journal/session-moves")
+            .join(format!("{ROOT}.json"))
+            .exists()
+    );
+}
+
+#[test]
+fn preexisting_q_ancestor_alias_is_refused_without_exception() {
+    let fixture = Fixture::new();
+    let alias = fixture.q_name(&fixture.segments[0]);
+    fs::create_dir_all(alias.parent().unwrap()).unwrap();
+    fs::hard_link(&fixture.segments[0], alias).unwrap();
+    assert!(thread_row(&fixture.target, ROOT).is_none());
+    assert_eq!(public_names(&fixture.source).len(), 2);
+    assert_eq!(public_names(&fixture.target).len(), 1);
+    assert_refusal_unchanged(&fixture, &fixture.import_args());
+}
+
+#[test]
+fn unfenceable_fork_ancestor_causes_refusal_before_mutation() {
+    let fixture = Fixture::new();
+    let ancestor = write_rollout(&fixture.source, CHILD, CHILD, None);
+    let mut records: Vec<Value> = fixture.contents[1]
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect();
+    records[0]["payload"]["forked_from_id"] = CHILD.into();
+    records[0]["payload"]["history_base"] =
+        json!({"thread_id":CHILD,"end_ordinal_exclusive":1,"end_byte_offset":0});
+    let bytes = records
+        .iter()
+        .map(|record| format!("{record}\n"))
+        .collect::<String>();
+    fs::write(&fixture.segments[1], bytes).unwrap();
+    age(&fixture.segments[1]);
+    assert!(ancestor.exists());
+    assert_refusal_unchanged(&fixture, &fixture.import_args());
+}
+
+#[test]
+fn unknown_hardlink_is_refused_and_not_deleted() {
+    let fixture = Fixture::new();
+    let unknown = fixture.root.path().join("unknown-name.jsonl");
+    fs::hard_link(&fixture.segments[0], &unknown).unwrap();
+    assert_refusal_unchanged(&fixture, &fixture.import_args());
+    assert_eq!(physical_id(&unknown), fixture.identities[0]);
+}
+
+#[test]
+fn open_native_style_handle_forces_refusal_and_safe_predecision_recovery() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let fixture = Fixture::new();
+    let handle = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1)
+        .open(&fixture.segments[1])
+        .unwrap();
+    let _ = fixture.spawn(&fixture.import_args(), None).failure();
+    assert!(fixture.segments[1].exists(), "held name was unlinked");
+    assert!(fs::read(&fixture.segments[1]).unwrap() == fixture.contents[1]);
+    assert!(
+        public_names(&fixture.target).is_empty(),
+        "published despite a held source handle"
+    );
+    fixture.assert_namespace();
+    drop(handle);
+    let path = fixture
+        .qb
+        .join("journal/session-moves")
+        .join(format!("{ROOT}.json"));
+    if path.exists() {
+        for _ in 0..2 {
+            fixture.run(&fixture.recover_args());
+        }
+        fixture.assert_owner(false, original_goal(), 0, &fixture.contents);
+    } else {
+        assert!(fixture.segments.iter().all(|path| path.exists()));
+        assert!(thread_row(&fixture.source, ROOT).is_some());
+        assert!(goal(&fixture.source, ROOT) == Some(original_goal()));
+        assert_integrity(fixture.root.path());
+    }
+}
+
+#[test]
+fn late_header_child_is_preserved_while_predecision_recovery_restores_root() {
+    let fixture = Fixture::new();
+    fixture.kill_at(&fixture.import_args(), "stage:source_names_removed", || {
+        write_descendant(&fixture.source, CHILD, ROOT);
+    });
+    for _ in 0..2 {
+        fixture.run(&fixture.recover_args());
+    }
+    fixture.assert_owner(false, original_goal(), 0, &fixture.contents);
+    assert!(thread_row(&fixture.source, CHILD).is_none());
+    assert_refusal_unchanged(&fixture, &fixture.import_args());
+}
+
+fn append_conflict(label: &str) {
+    let fixture = Fixture::new();
+    fixture.kill_at(&fixture.import_args(), label, || {});
+    let name = root_names(fixture.root.path())
+        .into_iter()
+        .find(|path| physical_id(path) == fixture.identities[1])
+        .unwrap();
+    let mut file = fs::OpenOptions::new().append(true).open(&name).unwrap();
+    writeln!(
+        file,
+        "{}",
+        json!({"type":"event_msg","payload":{"type":"user_message","message":CURRENT_MARKER}})
+    )
+    .unwrap();
+    drop(file);
+    for _ in 0..2 {
+        assert_refusal_unchanged(&fixture, &fixture.recover_args());
+        fixture.assert_namespace();
+        assert_eq!(move_journal(&fixture.qb)["open"], true);
+    }
+}
+#[test]
+fn unrecorded_append_before_decision_is_preserved_with_refusal() {
+    append_conflict("stage:staged");
+}
+#[test]
+fn unrecorded_append_after_decision_is_preserved_with_refusal() {
+    append_conflict("stage:published");
+}
+
+#[test]
+fn conflicting_target_row_is_preserved_and_recovery_stays_open() {
+    let fixture = Fixture::new();
+    fixture.kill_at(&fixture.import_args(), "stage:target_rows", || {});
+    let db = Connection::open(fixture.target.join("state_5.sqlite")).unwrap();
+    assert_eq!(
+        db.execute("UPDATE threads SET archived=1 WHERE id=?1", [ROOT])
+            .unwrap(),
+        1
+    );
+    drop(db);
+    for _ in 0..2 {
+        assert_refusal_unchanged(&fixture, &fixture.recover_args());
+    }
+    assert_eq!(thread_row(&fixture.target, ROOT).unwrap().2, 1);
+    assert_eq!(move_journal(&fixture.qb)["open"], true);
+}
+
+#[test]
+fn conflicting_source_row_is_preserved_without_destructive_rollback() {
+    let fixture = Fixture::new();
+    fixture.kill_at(&fixture.import_args(), "stage:source_names_removed", || {});
+    let db = Connection::open(fixture.source.join("state_5.sqlite")).unwrap();
+    assert_eq!(
+        db.execute("UPDATE threads SET archived=1 WHERE id=?1", [ROOT])
+            .unwrap(),
+        1
+    );
+    drop(db);
+    for _ in 0..2 {
+        let before = fixture.protected_state();
+        let _ = fixture.spawn(&fixture.recover_args(), None).failure();
+        let after = fixture.protected_state();
+        assert!(before.rows == after.rows && before.goals == after.goals);
+        assert!(
+            before.map == after.map
+                && before.indices == after.indices
+                && before.other == after.other
+        );
+        // Restoring an additional source hardlink is non-destructive. Every
+        // existing evidence name, identity and byte must survive unchanged.
+        assert!(before.names.iter().all(|name| after.names.contains(name)));
+        assert_eq!(move_journal(&fixture.qb)["open"], true);
+        assert_integrity(fixture.root.path());
+    }
+    fixture.assert_namespace();
+}
+
+#[test]
+fn unsupported_native_version_never_opens_a_move() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.appdata.join("npm/codex.cmd"),
+        b"@echo off\r\necho codex-cli 99.0.0\r\n",
+    )
+    .unwrap();
+    assert_refusal_unchanged(&fixture, &fixture.import_args());
+    assert!(
+        !fixture
+            .qb
+            .join("journal/session-moves")
+            .join(format!("{ROOT}.json"))
+            .exists()
+    );
+}
+
+fn age(path: &Path) {
+    fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(300)))
+        .unwrap();
 }

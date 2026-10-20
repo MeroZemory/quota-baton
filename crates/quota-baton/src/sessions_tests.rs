@@ -148,6 +148,25 @@ impl Fixture {
     }
 }
 
+fn source_snapshot(home: &Path) -> [Vec<u8>; 3] {
+    ["state_5.sqlite", "goals_1.sqlite", "session_index.jsonl"]
+        .map(|name| fs::read(home.join(name)).unwrap())
+}
+
+fn assert_no_move_journal(f: &Fixture, id: &str) {
+    assert!(!f.store.path().exists());
+    assert!(
+        !f.store
+            .home
+            .join("journal/session-moves")
+            .join(format!("{id}.json"))
+            .exists()
+    );
+    assert!(!f.store.target.join("state_5.sqlite").exists());
+    assert!(!f.store.target.join("goals_1.sqlite").exists());
+    assert!(!f.store.target.join("sessions").exists());
+}
+
 #[test]
 fn r9_three_level_dry_run_apply_idempotent_and_unimport() {
     let f = Fixture::new();
@@ -430,13 +449,15 @@ fn r9_unimport_transfers_current_borrowed_ancestor_goal_without_deleting_it() {
 }
 
 #[test]
-fn r9_move_verifies_then_removes_only_root_and_unimport_restores_exact_source() {
+fn r9_move_refuses_unfenceable_fork_ancestor_without_changing_source() {
     let f = Fixture::new();
     let parent = f.add(A, None, true, "active");
     let child = f.add(B, Some(A), false, "usage_limited");
-    let index = fs::read(f.source.join("session_index.jsonl")).unwrap();
+    let parent_bytes = fs::read(&parent).unwrap();
+    let child_bytes = fs::read(&child).unwrap();
+    let before = source_snapshot(&f.source);
     let catalog = discovery::catalog(&f.source).unwrap();
-    import_one(
+    let error = import_one(
         &f.store,
         &catalog,
         B,
@@ -448,44 +469,22 @@ fn r9_move_verifies_then_removes_only_root_and_unimport_restores_exact_source() 
             clean_stale: false,
         },
     )
-    .unwrap();
-    let record = f.store.load().unwrap().imports[B].clone();
-    assert!(record.move_done && record.complete);
-    assert!(parent.exists() && !child.exists());
-    let source = Connection::open(f.source.join("state_5.sqlite")).unwrap();
+    .unwrap_err();
     assert_eq!(
-        source
-            .query_row("SELECT count(*) FROM threads WHERE id=?1", [A], |r| r
-                .get::<_, u64>(0))
-            .unwrap(),
-        1
+        error.to_string(),
+        "조상 전용 대화의 모든 관리 재개 경로를 차단할 수 없어 이 대화의 이동을 거절합니다"
     );
-    assert_eq!(
-        source
-            .query_row("SELECT count(*) FROM threads WHERE id=?1", [B], |r| r
-                .get::<_, u64>(0))
-            .unwrap(),
-        0
+    assert!(parent.exists() && child.exists());
+    assert!(fs::read(parent).unwrap() == parent_bytes);
+    assert!(fs::read(child).unwrap() == child_bytes);
+    assert!(
+        source_snapshot(&f.source) == before,
+        "refusal changed thread/goal rows or the source index"
     );
-    drop(source);
-    assert_eq!(
-        fs::read(f.source.join("session_index.jsonl")).unwrap(),
-        index
-    );
-    verify_links(&record, false).unwrap();
-    unimport(&f.store, B, true, false).unwrap();
-    assert!(child.exists() && parent.exists());
-    let goals = Connection::open(f.source.join("goals_1.sqlite")).unwrap();
-    assert_eq!(
-        goals
-            .query_row(
-                "SELECT status FROM thread_goals WHERE thread_id=?1",
-                [B],
-                |r| r.get::<_, String>(0)
-            )
-            .unwrap(),
-        "usage_limited"
-    );
+    assert_eq!(db::threads(&f.source).unwrap().len(), 2);
+    assert!(db::thread_path(&f.source, A).unwrap().is_some());
+    assert!(db::thread_path(&f.source, B).unwrap().is_some());
+    assert_no_move_journal(&f, B);
 }
 
 #[test]
@@ -587,30 +586,43 @@ fn r9_stale_copy_requires_explicit_cleanup_and_unimport_restores_it() {
 }
 
 #[test]
-fn r9_bulk_leaf_first_moves_chain_then_restores_each_root() {
+fn r9_bulk_move_refuses_dependency_chain_even_in_leaf_first_order() {
     let f = Fixture::new();
     let parent = f.add(A, None, false, "active");
     let child = f.add(B, Some(A), false, "usage_limited");
     let leaf = f.add(C, Some(B), false, "complete");
+    let contents = [&parent, &child, &leaf].map(|path| fs::read(path).unwrap());
+    let before = source_snapshot(&f.source);
     let catalog = discovery::catalog(&f.source).unwrap();
-    let options = || ImportOptions {
-        apply: true,
-        skip_existing: false,
-        announce: false,
-        keep_source: false,
-        clean_stale: false,
-    };
     for id in [C, B, A] {
-        import_one(&f.store, &catalog, id, options()).unwrap();
-    }
-    assert!(!parent.exists() && !child.exists() && !leaf.exists());
-    for entry in f.store.load().unwrap().imports.values() {
-        verify_links(entry, false).unwrap();
-    }
-    for id in [A, B, C] {
-        unimport(&f.store, id, true, false).unwrap();
+        let error = import_one(
+            &f.store,
+            &catalog,
+            id,
+            ImportOptions {
+                apply: true,
+                skip_existing: false,
+                announce: false,
+                keep_source: false,
+                clean_stale: false,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            if id == A {
+                "이 대화에서 갈라진 대화가 있습니다. 가족 이동을 지원하기 전에는 옮길 수 없습니다"
+            } else {
+                "조상 전용 대화의 모든 관리 재개 경로를 차단할 수 없어 이 대화의 이동을 거절합니다"
+            }
+        );
+        assert_no_move_journal(&f, id);
     }
     assert!(parent.exists() && child.exists() && leaf.exists());
+    for (path, bytes) in [&parent, &child, &leaf].iter().zip(contents) {
+        assert!(fs::read(path).unwrap() == bytes);
+    }
+    assert!(source_snapshot(&f.source) == before);
     assert_eq!(db::threads(&f.source).unwrap().len(), 3);
     assert!(db::threads(&f.store.target).unwrap().is_empty());
 }
@@ -659,7 +671,7 @@ fn r9_move_interrupted_after_journal_rows_or_unlinks_restores_from_journal() {
 }
 
 #[test]
-fn r9_stale_cleanup_never_removes_an_unmoved_fork_ancestor() {
+fn r9_stale_cleanup_refuses_move_with_an_unmoved_fork_descendant() {
     let mut f = Fixture::new();
     let old = Fixture::new();
     let current = f.add(A, None, false, "active");
@@ -672,8 +684,11 @@ fn r9_stale_cleanup_never_removes_an_unmoved_fork_ancestor() {
         .set_times(fs::FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(600)))
         .unwrap();
     f.store.search_homes = vec![old.source.clone()];
+    let before = source_snapshot(&f.source);
+    let old_before = source_snapshot(&old.source);
+    let contents = [&current, &stale, &child].map(|path| fs::read(path).unwrap());
     let catalog = discovery::catalog(&f.source).unwrap();
-    import_one(
+    let error = import_one(
         &f.store,
         &catalog,
         A,
@@ -685,19 +700,32 @@ fn r9_stale_cleanup_never_removes_an_unmoved_fork_ancestor() {
             clean_stale: true,
         },
     )
-    .unwrap();
-    assert!(!current.exists() && stale.exists() && child.exists());
-    assert!(f.store.load().unwrap().imports[A].complete);
-    assert_eq!(db::threads(&old.source).unwrap().len(), 1);
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "이 대화에서 갈라진 대화가 있습니다. 가족 이동을 지원하기 전에는 옮길 수 없습니다"
+    );
+    assert!(current.exists() && stale.exists() && child.exists());
+    for (path, bytes) in [&current, &stale, &child].iter().zip(contents) {
+        assert!(fs::read(path).unwrap() == bytes);
+    }
+    assert!(source_snapshot(&f.source) == before);
+    assert!(source_snapshot(&old.source) == old_before);
+    assert_eq!(db::threads(&f.source).unwrap().len(), 1);
+    assert_eq!(db::threads(&old.source).unwrap().len(), 2);
+    assert_no_move_journal(&f, A);
 }
 
 #[test]
-fn r9_move_refreshes_dependencies_and_retains_late_child_ancestor_name() {
+fn r9_move_refreshes_dependencies_and_refuses_late_child() {
     let f = Fixture::new();
     let parent = f.add(A, None, false, "active");
     let cached = discovery::catalog(&f.source).unwrap();
     let child = f.add(B, Some(A), false, "active");
-    import_one(
+    let before = source_snapshot(&f.source);
+    let parent_bytes = fs::read(&parent).unwrap();
+    let child_bytes = fs::read(&child).unwrap();
+    let error = import_one(
         &f.store,
         &cached,
         A,
@@ -709,19 +737,21 @@ fn r9_move_refreshes_dependencies_and_retains_late_child_ancestor_name() {
             clean_stale: false,
         },
     )
-    .unwrap();
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "이 대화에서 갈라진 대화가 있습니다. 가족 이동을 지원하기 전에는 옮길 수 없습니다"
+    );
     assert!(parent.exists() && child.exists());
-    assert!(db::thread_path(&f.source, A).unwrap().is_none());
+    assert!(fs::read(parent).unwrap() == parent_bytes);
+    assert!(fs::read(child).unwrap() == child_bytes);
+    assert!(source_snapshot(&f.source) == before);
+    assert!(db::thread_path(&f.source, A).unwrap().is_some());
     assert!(db::thread_path(&f.source, B).unwrap().is_some());
-    assert!(db::thread_path(&f.store.target, A).unwrap().is_some());
+    assert!(db::thread_path(&f.store.target, A).unwrap().is_none());
     assert!(db::thread_path(&f.store.target, B).unwrap().is_none());
     assert!(discovery::catalog(&f.source).unwrap().chain(B).is_ok());
-    assert!(
-        f.store.load().unwrap().imports[A]
-            .files
-            .iter()
-            .all(|link| link.retained_ancestor)
-    );
+    assert_no_move_journal(&f, A);
 }
 
 #[test]
@@ -878,7 +908,7 @@ fn r9_inventory_refuses_different_content_or_goal_without_timestamp_selection() 
 }
 
 #[test]
-fn r9_move_retires_identical_inventory_copies_and_restores_them_on_unimport() {
+fn r9_move_consolidates_inventory_copies_and_returns_only_current_owner() {
     let mut f = Fixture::new();
     let other = Fixture::new();
     let original = f.add(A, None, false, "active");
@@ -902,10 +932,53 @@ fn r9_move_retires_identical_inventory_copies_and_restores_them_on_unimport() {
     assert!(db::threads(&f.source).unwrap().is_empty());
     assert!(db::threads(&other.source).unwrap().is_empty());
     assert_eq!(db::threads(&f.store.target).unwrap().len(), 1);
-    unimport(&f.store, A, true, false).unwrap();
-    assert!(original.exists() && peer.exists());
-    assert_eq!(db::threads(&f.source).unwrap().len(), 1);
-    assert_eq!(db::threads(&other.source).unwrap().len(), 1);
+    let current_path = db::thread_path(&f.store.target, A).unwrap().unwrap();
+    let current_identity = guard::identity(&current_path).unwrap();
+    OpenOptions::new()
+        .append(true)
+        .open(&current_path)
+        .unwrap()
+        .write_all(b"{\"type\":\"synthetic_current_state\"}\n")
+        .unwrap();
+    File::options()
+        .write(true)
+        .open(&current_path)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(300)))
+        .unwrap();
+    let current = fs::read(&current_path).unwrap();
+    {
+        let goals = Connection::open(f.store.target.join("goals_1.sqlite")).unwrap();
+        assert_eq!(
+            goals
+                .execute(
+                    "UPDATE thread_goals SET status='complete',updated_at_ms=7 WHERE thread_id=?1",
+                    [A]
+                )
+                .unwrap(),
+            1
+        );
+    }
+    // Staged unimport/return is a reverse CURRENT move. It does not resurrect
+    // every pre-consolidation owner or restore its old goal snapshot.
+    for _ in 0..2 {
+        staged::return_current(&f.store, A, None, true, true).unwrap();
+        assert!(original.exists() && !peer.exists());
+        assert!(fs::read(&original).unwrap() == current);
+        assert_eq!(guard::identity(&original).unwrap(), current_identity);
+        assert_eq!(db::threads(&f.source).unwrap().len(), 1);
+        assert!(db::threads(&other.source).unwrap().is_empty());
+        assert!(db::threads(&f.store.target).unwrap().is_empty());
+        let goals = Connection::open(f.source.join("goals_1.sqlite")).unwrap();
+        let state = goals
+            .query_row(
+                "SELECT status,updated_at_ms FROM thread_goals WHERE thread_id=?1",
+                [A],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("complete".into(), 7));
+    }
 }
 
 #[test]

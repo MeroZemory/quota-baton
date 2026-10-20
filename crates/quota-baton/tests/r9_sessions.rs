@@ -32,16 +32,23 @@ impl Fixture {
         let source = user.join(".codex");
         let target = user.join(".codex-acct/qb");
         let qb = root.path().join("qb");
-        for dir in [&source, &target, &qb.join("journal")] {
+        for dir in [
+            &source,
+            &target,
+            &qb.join("journal"),
+            &user.join("AppData/Roaming/npm"),
+            &user.join("AppData/Local"),
+            &root.path().join("temp"),
+        ] {
             fs::create_dir_all(dir).unwrap();
         }
         fs::write(qb.join("journal/wiring.json"),serde_json::to_vec(&serde_json::json!({"schema":3,"mode":"dedicated","install_completed":true,"home":target})).unwrap()).unwrap();
         let sentinel = root.path().join("launched.txt");
-        let stub = root.path().join("stub.cmd");
+        let stub = user.join("AppData/Roaming/npm/codex.cmd");
         fs::write(
             &stub,
             format!(
-                "@echo off\r\necho synthetic-launch>\"{}\"\r\nexit /b 0\r\n",
+                "@echo off\r\nif \"%~1\"==\"--version\" (echo codex-cli 0.163.0& exit /b 0)\r\necho synthetic-launch>\"{}\"\r\nexit /b 0\r\n",
                 sentinel.display()
             ),
         )
@@ -105,6 +112,9 @@ impl Fixture {
             .env("QB_HOME", &self.qb)
             .env("USERPROFILE", &self.user)
             .env("APPDATA", self.user.join("AppData/Roaming"))
+            .env("LOCALAPPDATA", self.user.join("AppData/Local"))
+            .env("TEMP", self._root.path().join("temp"))
+            .env("TMP", self._root.path().join("temp"))
             .env("HOME", &self.user)
             .env("CODEX_HOME", &self.target)
             .current_dir(self._root.path())
@@ -174,6 +184,7 @@ impl Fixture {
             "unimport".as_ref(),
             id.as_ref(),
             "--apply".as_ref(),
+            "--yes".as_ref(),
         ])
     }
 }
@@ -263,6 +274,11 @@ fn r9_cli_dry_default_bulk_skips_recent_and_existing_and_never_prints_body() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(!f.qb.join("journal/sessions-import.json").exists());
+    assert!(
+        !f.qb
+            .join(format!("journal/session-moves/{A}.json"))
+            .exists()
+    );
     assert!(source.exists());
     assert!(!f.target.join("sessions").exists());
     let out = f.cli(&[
@@ -326,6 +342,11 @@ fn r9_no_tty_resume_needs_manual_import_then_reuses_and_unimports() {
         original_goals
     );
     assert!(!f.qb.join("journal/sessions-import.json").exists());
+    assert!(
+        !f.qb
+            .join(format!("journal/session-moves/{A}.json"))
+            .exists()
+    );
     assert!(!f.target.join("state_5.sqlite").exists());
     assert!(!f.target.join("goals_1.sqlite").exists());
     assert!(!f.target.join("sessions").exists());
@@ -354,7 +375,8 @@ fn r9_no_tty_resume_needs_manual_import_then_reuses_and_unimports() {
     assert!(!f.sentinel.exists());
     assert_eq!(fs::read(&source).unwrap(), original);
     assert_eq!(thread_path(&f.source, A), Some(source));
-    assert_eq!(goal_status(&f.source, A).as_deref(), Some("active"));
+    // Reverse the current Q state; do not reactivate an old import snapshot.
+    assert_eq!(goal_status(&f.source, A).as_deref(), Some("paused"));
     assert!(!target.exists());
     assert!(thread_path(&f.target, A).is_none());
     assert_eq!(goal_status(&f.target, A), None);
@@ -381,6 +403,11 @@ fn r9_no_tty_import_apply_without_yes_preserves_source_and_has_no_journal() {
         original_state
     );
     assert!(!f.qb.join("journal/sessions-import.json").exists());
+    assert!(
+        !f.qb
+            .join(format!("journal/session-moves/{A}.json"))
+            .exists()
+    );
     assert!(!f.target.join("sessions").exists());
     assert!(!f.target.join("state_5.sqlite").exists());
     assert!(!f.target.join("goals_1.sqlite").exists());
@@ -417,6 +444,11 @@ fn assert_resume_without_import(args: &[&str]) {
     assert_eq!(thread_path(&f.source, A), Some(source));
     assert!(fs::read(f.source.join("state_5.sqlite")).unwrap() == original_state);
     assert!(!f.qb.join("journal/sessions-import.json").exists());
+    assert!(
+        !f.qb
+            .join(format!("journal/session-moves/{A}.json"))
+            .exists()
+    );
     assert!(!target.exists());
     // Do not use thread_path on an absent target DB: its test helper opens
     // SQLite with CREATE, which would itself mutate this no-import fixture.
@@ -427,21 +459,26 @@ fn assert_resume_without_import(args: &[&str]) {
 }
 
 #[test]
-fn r9_last_as_config_value_does_not_suppress_resume_confirmation() {
+fn r9_last_as_model_value_does_not_suppress_resume_confirmation() {
     let f = Fixture::new();
     let source = f.add(A, false, "openai");
     let original = fs::read(&source).unwrap();
     let target = f.target.join("sessions").join(source.file_name().unwrap());
 
-    // The stub accepts these arguments without parsing Codex configuration;
-    // this checks the launch hook's option-value boundary, not config validity.
-    let refused = f.launch(&["--config", "--last", "resume", A]);
+    // Use an admitted value-taking option. Arbitrary --config overrides are
+    // deliberately rejected by panel 2 before the resume hook is reached.
+    let refused = f.launch(&["--model", "--last", "resume", A]);
     assert_confirmation_refused(&f, &refused);
     assert_eq!(fs::read(&source).unwrap(), original);
     assert!(!f.qb.join("journal/sessions-import.json").exists());
+    assert!(
+        !f.qb
+            .join(format!("journal/session-moves/{A}.json"))
+            .exists()
+    );
     assert!(!target.exists());
-    assert_success(&f.import(A, true));
-    let reused = f.launch(&["--config", "--last", "resume", A]);
+    assert_success(&f.import_options(A, true, &["--keep-source"]));
+    let reused = f.launch(&["--model", "--last", "resume", A]);
     assert_success(&reused);
     assert!(f.sentinel.exists());
     assert!(f.qb.join("journal/sessions-import.json").exists());
@@ -501,6 +538,53 @@ fn r9_keep_source_every_resume_grammar_refuses_source_writer_before_launch() {
     }
 }
 #[test]
+fn r9_compressed_only_rowless_target_refuses_all_managed_picker_launches() {
+    let grammars: &[&[&str]] = &[&[], &["resume"], &["resume", "--last"]];
+    for args in grammars {
+        let f = Fixture::new();
+        // Prove wiring, version admission, and this grammar reach the client
+        // before introducing the compressed-only target inventory.
+        assert_success(&f.launch(args));
+        assert!(
+            f.sentinel.exists(),
+            "client control did not launch: {args:?}"
+        );
+        fs::remove_file(&f.sentinel).unwrap();
+
+        let compressed = f
+            .target
+            .join("sessions")
+            .join(format!("rollout-2026-10-21T00-00-00-{B}.jsonl.zst"));
+        fs::create_dir_all(compressed.parent().unwrap()).unwrap();
+        let meta = serde_json::json!({
+            "type":"session_meta",
+            "payload":{
+                "id":B,"model_provider":"openai","forked_from_id":A,
+                "history_base":{
+                    "thread_id":A,"end_ordinal_exclusive":1,"end_byte_offset":1
+                }
+            }
+        });
+        let body = format!("{meta}\n");
+        let encoded = zstd::stream::encode_all(body.as_bytes(), 1).unwrap();
+        assert_eq!(
+            zstd::stream::decode_all(encoded.as_slice()).unwrap(),
+            body.as_bytes()
+        );
+        fs::write(&compressed, &encoded).unwrap();
+        assert!(!f.target.join("state_5.sqlite").exists());
+
+        assert_refused(
+            &f,
+            &f.launch(args),
+            "압축된 대화의 소유권을 확인할 수 없어 관리 실행을 거절합니다",
+        );
+        assert_eq!(fs::read(&compressed).unwrap(), encoded);
+        assert!(!f.target.join("state_5.sqlite").exists());
+    }
+}
+
+#[test]
 fn r9_auto_resume_diverged_or_compressed_records_never_launch() {
     let f = Fixture::new();
     let source = f.add(A, false, "openai");
@@ -514,7 +598,11 @@ fn r9_auto_resume_diverged_or_compressed_records_never_launch() {
     fs::remove_file(&target).unwrap();
     fs::write(&target, b"unrelated synthetic").unwrap();
     let out = f.resume(A);
-    assert_refused(&f, &out, "분기");
+    assert_refused(
+        &f,
+        &out,
+        "대화 소유권과 목록이 다릅니다. doctor로 확인하세요",
+    );
 }
 
 #[test]
@@ -632,6 +720,11 @@ fn r9_explicit_move_succeeds_and_conflicts_with_keep_source_without_journal() {
     let diagnostic = String::from_utf8_lossy(&conflict.stderr);
     assert!(diagnostic.contains("--move") && diagnostic.contains("--keep-source"));
     assert!(!f.qb.join("journal/sessions-import.json").exists());
+    assert!(
+        !f.qb
+            .join(format!("journal/session-moves/{A}.json"))
+            .exists()
+    );
     assert!(!f.target.join("state_5.sqlite").exists());
     assert!(!target.exists());
     assert_eq!(fs::read(&source).unwrap(), original);
@@ -645,7 +738,10 @@ fn r9_explicit_move_succeeds_and_conflicts_with_keep_source_without_journal() {
     assert_eq!(fs::read(&target).unwrap(), original);
     assert!(thread_path(&f.source, A).is_none());
     assert_eq!(thread_path(&f.target, A), Some(target));
-    assert!(f.qb.join("journal/sessions-import.json").exists());
+    assert!(
+        f.qb.join(format!("journal/session-moves/{A}.json"))
+            .exists()
+    );
     assert!(!f.sentinel.exists());
 }
 
@@ -655,6 +751,11 @@ fn r9_cli_live_unknown_provider_and_missing_wiring_refuse() {
     let source = f.add(A, false, "other");
     assert!(!f.import(A, true).status.success());
     assert!(!f.qb.join("journal/sessions-import.json").exists());
+    assert!(
+        !f.qb
+            .join(format!("journal/session-moves/{A}.json"))
+            .exists()
+    );
     fs::OpenOptions::new()
         .append(true)
         .open(source)
