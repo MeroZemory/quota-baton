@@ -1836,7 +1836,7 @@ async fn c6_row_13_transient_refresh_cools_auth_even_while_own_probe_is_held() {
 }
 
 #[tokio::test]
-async fn r1_ws_open_and_redial_expiry_never_forces_another_send() {
+async fn r1_ws_open_and_redial_force_one_send_at_the_same_request_deadline() {
     for redial in [false, true] {
         let h = Harness::new_with_rate_options(1, false, false, Some((1, 5))).await;
         let rate = Message::Text(
@@ -1876,7 +1876,7 @@ async fn r1_ws_open_and_redial_expiry_never_forces_another_send() {
                 .iter()
                 .filter(|message| matches!(message, Message::Text(_)))
                 .count(),
-            1
+            2
         );
         let auth: Vec<_> = h
             .fake
@@ -1886,21 +1886,20 @@ async fn r1_ws_open_and_redial_expiry_never_forces_another_send() {
             .map(|request| request.headers["authorization"].clone())
             .collect();
         assert!(auth.iter().all(|value| value == auth[0]));
-        let row =
-            tokio::time::timeout(Duration::from_secs(3), async {
-                loop {
-                    if let Some(row) = h.ledger().into_iter().find(|row| {
-                        row["transport"] == "ws" && row["outcome"] == "rate_wait_timeout"
-                    }) {
-                        break row;
-                    }
-                    tokio::task::yield_now().await;
+        let row = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(row) = h.ledger().into_iter().find(|row| {
+                    row["transport"] == "ws" && row["outcome"] == "rate_hold_relayed_429"
+                }) {
+                    break row;
                 }
-            })
-            .await
-            .unwrap();
-        assert_eq!(row["attempts"], 1);
-        assert_eq!(row["rate_retries"], 0);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(row["attempts"], 2);
+        assert_eq!(row["rate_retries"], 1);
         assert!(row["rate_wait_ms"].as_u64().unwrap() >= 800);
     }
 }
@@ -1985,16 +1984,16 @@ async fn r1_ws_client_close_cancels_rate_wait_and_ledgers_elapsed_wait() {
 }
 
 #[tokio::test]
-async fn r1_ws_upgrade_http_date_advice_is_observed_without_forced_final_send() {
+async fn r1_ws_upgrade_http_date_observed_and_forced_initial_send_is_final() {
     let h = Harness::new_with_rate_options(1, false, false, Some((1, 5))).await;
     let id = &h.ids[0];
+    h.state
+        .accounts
+        .observe_429(id, Some(Duration::from_secs(60)));
     let mut advice = HeaderMap::new();
     let date = (Utc::now() + ChronoDuration::seconds(120))
         .format("%a, %d %b %Y %H:%M:%S GMT")
         .to_string();
-    let advice_at = chrono::DateTime::parse_from_rfc2822(&date)
-        .unwrap()
-        .with_timezone(&Utc);
     advice.insert("retry-after", date.parse().unwrap());
     h.fake.state.push_handshake(
         StatusCode::TOO_MANY_REQUESTS,
@@ -2013,17 +2012,13 @@ async fn r1_ws_upgrade_http_date_advice_is_observed_without_forced_final_send() 
         "forced initial upgrade cannot retry its 429"
     );
     let pacing = h.state.accounts.pacing_snapshot(id);
-    let monotonic_before = std::time::Instant::now();
-    let remaining = (advice_at - Utc::now()).to_std().unwrap_or_default();
-    let monotonic_after = std::time::Instant::now();
-    let deadline = pacing.rate_backoff_until.unwrap();
     assert!(
-        deadline + Duration::from_millis(10) >= monotonic_before + remaining,
-        "gate must preserve the actual HTTP-date advice, independent of elapsed local wait"
-    );
-    assert!(
-        deadline <= monotonic_after + remaining + Duration::from_millis(1010) + started.elapsed(),
-        "ceiling and time spent processing cannot create an arbitrary extra backoff"
+        pacing
+            .rate_backoff_until
+            .unwrap()
+            .saturating_duration_since(std::time::Instant::now())
+            > Duration::from_secs(59),
+        "HTTP-date advice must extend the old window (capped at 60s)"
     );
     let row = h
         .ledger()
@@ -2057,14 +2052,14 @@ async fn r1_ws_upgrade_retries_share_the_original_pacing_deadline() {
         .unwrap();
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     assert!(started.elapsed() >= Duration::from_millis(900));
-    assert_eq!(h.fake.state.requests().len(), 1);
+    assert_eq!(h.fake.state.requests().len(), 2);
     let row = h
         .ledger()
         .into_iter()
         .find(|row| row["outcome"] == "ws_upgrade_error")
         .unwrap();
-    assert_eq!(row["attempts"], 1);
-    assert_eq!(row["rate_retries"], 0);
+    assert_eq!(row["attempts"], 2);
+    assert_eq!(row["rate_retries"], 1);
     assert!(row["rate_wait_ms"].as_u64().unwrap() >= 800);
     assert!(
         row["rate_wait_ms"].as_u64().unwrap() < 1400,

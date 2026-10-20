@@ -256,12 +256,11 @@ async fn upgrade_inner(
     let mut last_error = None;
     // One pacing deadline for the entire upgrade, including retries and
     // account selection. C7 reset-hold and token/network budgets stay separate.
-    // Leave a small envelope for relaying a terminal wait result before the
-    // overall connect deadline cancels the future.
+    // Leave a small envelope for the hold's final forced attempt before the
+    // independent overall connect deadline cancels the future.
     let upgrade_deadline = deadline
         .checked_sub(Duration::from_millis(100))
         .unwrap_or(deadline);
-    let mut last_rate_error: Option<Response> = None;
     let mut quota_source: Option<String> = None;
     let (upstream, upstream_headers, account, tokens) = 'accounts: loop {
         if tried.len() == 4 {
@@ -334,17 +333,7 @@ async fn upgrade_inner(
             completion.rate_wait(
                 u64::try_from(admission_started.elapsed().as_millis()).unwrap_or(u64::MAX),
             );
-            let forced = admission.forced();
-            if forced && let Some(response) = last_rate_error.take() {
-                completion.relayed_rate_429();
-                // This is the retained actual upstream 429, not the local
-                // expiration itself. It remains C7.1 client-visible pressure.
-                state
-                    .note_client_rate(Provider::Codex, &account.id, session.key.as_deref())
-                    .await;
-                return response;
-            }
-            drop(last_rate_error.take());
+            let mut forced = admission.forced() || std::time::Instant::now() >= upgrade_deadline;
             if !state
                 .dispatch_allowed(session.key.as_deref(), &account.id, None)
                 .await
@@ -371,7 +360,7 @@ async fn upgrade_inner(
                 HeaderValue::from_str(&key).expect("generated key"),
             );
             completion.record.account = Some(account.id.clone());
-            if std::time::Instant::now() >= upgrade_deadline {
+            if std::time::Instant::now() >= deadline {
                 return native_error(
                     StatusCode::GATEWAY_TIMEOUT,
                     Provider::Codex,
@@ -379,6 +368,7 @@ async fn upgrade_inner(
                     "WebSocket 연결 시간 한도를 초과했습니다.",
                 );
             }
+            forced |= std::time::Instant::now() >= upgrade_deadline;
             if std::mem::take(&mut rate_retry_queued) {
                 completion.rate_retry();
             }
@@ -517,13 +507,6 @@ async fn upgrade_inner(
                 {
                     rate_retries += 1;
                     rate_retry_queued = true;
-                    let mut response = error.into_response();
-                    if !response.headers().contains_key("retry-after") {
-                        response
-                            .headers_mut()
-                            .insert("retry-after", HeaderValue::from_static("1"));
-                    }
-                    last_rate_error = Some(response);
                     continue;
                 }
                 state

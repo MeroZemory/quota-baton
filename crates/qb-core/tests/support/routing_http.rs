@@ -390,7 +390,7 @@ async fn simultaneous_initial_rate_expiry_sends_once_each_and_relays_actual_429(
 }
 
 #[tokio::test]
-async fn rate_expiry_returns_original_upstream_429_without_final_forced_retry() {
+async fn rate_expiry_sends_once_and_returns_final_actual_upstream_429() {
     let h = Harness::with_limits(Provider::Codex, 60, 5, 1).await;
     let mut rate = ScriptedResponse::json(
         StatusCode::TOO_MANY_REQUESTS,
@@ -398,12 +398,16 @@ async fn rate_expiry_returns_original_upstream_429_without_final_forced_retry() 
     );
     rate.headers.insert("retry-after", "3".parse().unwrap());
     h.fake.state.push(rate);
+    h.fake.state.push(ScriptedResponse::json(
+        StatusCode::TOO_MANY_REQUESTS,
+        r#"{"error":{"type":"rate_limit_error","message":"synthetic-rate-final"}}"#,
+    ));
     let reply = h
         .send("/v1/responses", &[("session-id", "original-429")], RAW)
         .await;
     assert_eq!(reply.0, 429);
-    assert!(String::from_utf8_lossy(&reply.2).contains("synthetic-rate-original"));
-    assert_eq!(h.fake.state.requests().len(), 1);
+    assert!(String::from_utf8_lossy(&reply.2).contains("synthetic-rate-final"));
+    assert_eq!(h.fake.state.requests().len(), 2);
 }
 
 fn assert_credential(h: &Harness, index: usize, id: &str) {
