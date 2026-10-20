@@ -10,6 +10,7 @@ mod accounts_cli;
 mod cutover;
 mod launcher_label;
 mod routing_cli;
+mod launcher_script;
 mod wire_readiness;
 
 fn print_stdout(args: std::fmt::Arguments<'_>) -> std::io::Result<()> {
@@ -49,10 +50,12 @@ enum Command {
     /// Internal child launch; no core config or credentials are loaded.
     #[command(hide = true)]
     LaunchClient {
+        #[arg(long, value_enum, default_value = "claude")]
+        client: launcher_label::Client,
         #[arg(long)]
         command: std::path::PathBuf,
         #[arg(long)]
-        settings: std::path::PathBuf,
+        settings: Option<std::path::PathBuf>,
         #[arg(last = true, allow_hyphen_values = true)]
         args: Vec<std::ffi::OsString>,
     },
@@ -346,12 +349,18 @@ async fn check_wire_preconditions(
 async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     if let Command::LaunchClient {
+        client,
         command,
         settings,
         args,
     } = &cli.command
     {
-        std::process::exit(launcher_label::run(command, settings, args)?);
+        std::process::exit(launcher_label::run(
+            *client,
+            command,
+            settings.as_deref(),
+            args,
+        )?);
     }
     let home = qb_core::home()?;
     match cli.command {
