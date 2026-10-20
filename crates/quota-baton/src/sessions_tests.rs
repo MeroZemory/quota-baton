@@ -907,3 +907,80 @@ fn r9_move_retires_identical_inventory_copies_and_restores_them_on_unimport() {
     assert_eq!(db::threads(&f.source).unwrap().len(), 1);
     assert_eq!(db::threads(&other.source).unwrap().len(), 1);
 }
+
+#[test]
+fn r9_return_index_appends_current_name_over_old_home_hint() {
+    let f = Fixture::new();
+    f.add(A, None, false, "active");
+    let old = format!(
+        "{}\n",
+        serde_json::json!({"id":A,"thread_name":"old-home-name","updated_at":"2026-10-20T00:00:00Z"})
+    );
+    fs::write(f.store.target.join("session_index.jsonl"), old.as_bytes()).unwrap();
+    let current = serde_json::json!({"id":A,"thread_name":"current-owner-name","updated_at":"2026-10-21T00:00:00Z"});
+    // The exact current JSON also occurred before the stale latest hint.
+    fs::write(
+        f.store.target.join("session_index.jsonl"),
+        format!("{current}\n{old}"),
+    )
+    .unwrap();
+    fs::write(f.source.join("session_index.jsonl"), format!("{current}\n")).unwrap();
+    let plan = db::plan_return(&f.source, &f.store.target, &[A.into()]).unwrap();
+    let append = index_plan(&f.store.target, &plan).unwrap();
+    assert_eq!(append.len(), 1);
+    update_index(&f.store.target, &append, false).unwrap();
+    let bytes = fs::read_to_string(f.store.target.join("session_index.jsonl")).unwrap();
+    assert!(bytes.starts_with(&format!("{current}\n{old}")));
+    assert_eq!(bytes.lines().count(), 3);
+    let newest: serde_json::Value = serde_json::from_str(bytes.lines().last().unwrap()).unwrap();
+    assert_eq!(newest, current);
+    assert!(index_plan(&f.store.target, &plan).unwrap().is_empty());
+    update_index(&f.store.target, &append, false).unwrap();
+    assert_eq!(
+        fs::read_to_string(f.store.target.join("session_index.jsonl")).unwrap(),
+        bytes
+    );
+}
+
+#[test]
+fn r9_import_refuses_destination_without_row_at_other_or_archived_path() {
+    for archived in [false, true] {
+        let f = Fixture::new();
+        let source = f.add(A, None, false, "active");
+        let extra = f
+            .store
+            .target
+            .join(if archived {
+                "archived_sessions"
+            } else {
+                "sessions/other"
+            })
+            .join(source.file_name().unwrap());
+        fs::create_dir_all(extra.parent().unwrap()).unwrap();
+        let mut body = fs::read(&source).unwrap();
+        body.extend_from_slice(b"{\"type\":\"synthetic_divergence\"}\n");
+        fs::write(&extra, &body).unwrap();
+        for apply in [false, true] {
+            let catalog = discovery::catalog(&f.source).unwrap();
+            let error = import_one(
+                &f.store,
+                &catalog,
+                A,
+                ImportOptions {
+                    apply,
+                    skip_existing: false,
+                    announce: false,
+                    keep_source: false,
+                    clean_stale: false,
+                },
+            )
+            .unwrap_err();
+            assert!(error.downcast_ref::<InventoryConflict>().is_some());
+            assert!(source.exists());
+            assert_eq!(fs::read(&extra).unwrap(), body);
+            assert!(!f.store.path().exists());
+            assert!(!f.store.target.join("state_5.sqlite").exists());
+            assert!(!f.store.target.join("sessions/2026/10/21").exists());
+        }
+    }
+}

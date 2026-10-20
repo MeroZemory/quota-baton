@@ -6,7 +6,9 @@ pub(crate) fn friendly_error(error: &anyhow::Error) -> Option<String> {
         return Some(conflict.to_string());
     }
     if let Some(live) = error.downcast_ref::<guard::LiveWriter>() {
-        return Some(live.to_string());
+        return Some(format!(
+            "{live}\n먼저 해당 홈의 대화를 종료하세요. 종료 후에도 잠겨 있으면 그 홈의 app-server-daemon/daemon.pid에서 PID를 확인하세요. 다른 대화를 제공하지 않는 데몬만 해당 PID로 종료한 뒤 다시 시도하세요. qb는 데몬을 자동 종료하지 않습니다."
+        ));
     }
     const FIXED: &[&str] = &[
         "전용 Codex 홈 연결이 없습니다. 먼저 wire를 실행하세요",
@@ -494,6 +496,38 @@ fn stale_plan(store: &Store, catalog: &discovery::Catalog, id: &str) -> Result<V
     Ok(result)
 }
 
+fn check_destination_inventory(
+    source: &Path,
+    target: &Path,
+    files: &[discovery::Rollout],
+) -> Result<()> {
+    let destination = discovery::catalog(target)?;
+    let threads: BTreeSet<_> = files.iter().map(|file| &file.thread).collect();
+    for item in destination
+        .rollouts
+        .values()
+        .filter(|item| threads.contains(&item.thread))
+    {
+        // Only the exact hardlink we would reuse is harmless. An extra name,
+        // even without a threads row, would leave an ambiguous physical id.
+        let candidate = files.iter().find(|file| {
+            file.physical == item.physical
+                && item.path == target.join("sessions").join(&file.relative)
+        });
+        let compatible = match candidate {
+            Some(file) => guard::identity(&file.path)? == guard::identity(&item.path)?,
+            None => false,
+        };
+        if !compatible {
+            return Err(InventoryConflict {
+                homes: vec![source.to_owned(), target.to_owned()],
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
+
 fn clean_stale_copies(copies: &[StaleCopy], journal_home: &Path) -> Result<()> {
     for copy in copies {
         for name in &copy.names {
@@ -568,15 +602,18 @@ fn index_plan(target: &Path, database: &db::DbPlan) -> Result<Vec<String>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(_) => bail!("대화 인덱스를 읽을 수 없습니다"),
     };
-    let present: BTreeSet<_> = current
+    let present: BTreeMap<_, _> = current
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter_map(|v| v["id"].as_str().map(str::to_owned))
+        .filter_map(|v| {
+            let id = v["id"].as_str()?.to_owned();
+            Some((id, v))
+        })
         .collect();
     let mut result = Vec::new();
     for thread in &database.threads {
-        if !present.contains(&thread.id)
-            && let Some(entry) = &thread.latest_index_entry
+        if let Some(entry) = &thread.latest_index_entry
+            && present.get(&thread.id) != Some(entry)
         {
             result.push(serde_json::to_string(entry)?);
         }
@@ -612,11 +649,20 @@ fn update_index(target: &Path, entries: &[String], remove: bool) -> Result<()> {
     if !current.is_empty() && !current.ends_with('\n') {
         file.write_all(b"\n")?;
     }
+    let mut latest: BTreeMap<String, serde_json::Value> = current
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|value| Some((value["id"].as_str()?.to_owned(), value)))
+        .collect();
     for entry in entries {
-        if !current.lines().any(|line| line == entry) {
+        let value: serde_json::Value = serde_json::from_str(entry)?;
+        let id = value["id"]
+            .as_str()
+            .context("대화 인덱스 ID가 없습니다")?
+            .to_owned();
+        if latest.get(&id) != Some(&value) {
             file.write_all(format!("{entry}\n").as_bytes())?;
-            current.push_str(entry);
-            current.push('\n');
+            latest.insert(id, value);
         }
     }
     file.sync_all()?;
@@ -955,6 +1001,7 @@ fn import_one_using(
     };
     let retain_ancestor =
         !keep_source && source_has_dependents(&discovery::catalog(&catalog.home)?, id)?;
+    check_destination_inventory(&catalog.home, &store.target, &files)?;
     let stale = stale_plan(store, catalog, id)?;
     if announce {
         preview(id, &files, &store.target)?;
