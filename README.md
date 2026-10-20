@@ -21,6 +21,8 @@ quota-baton.exe wire --codex-mode dedicated --claude-mode dedicated --apply  # �
 - **되돌리기가 간단합니다.** `quota-baton.exe unwire --apply`는 quota-baton이 만든 전용 파일만 지웁니다. 기존 설정은 처음부터 바뀌지 않았으므로 따로 복구할 것이 없습니다.
 - **실행 중인 세션에 영향을 주지 않습니다.** 이미 열려 있는 세션, herdr 자동 재개, 다른 도구가 부르는 `codex`·`claude` 명령은 하나도 바뀌지 않습니다.
 
+**대화 기록에 관한 주의 (Codex):** 지금의 `codex-qb`는 전용 폴더 `~/.codex-acct/qb`를 씁니다. 그래서 `codex-qb`로 나눈 대화와 기존 `codex`(또는 `codex-mz` 같은 계정별 명령)로 나눈 대화는 **따로 저장됩니다.** 기존 명령으로 하던 대화는 `codex-qb resume`으로 바로 열리지 않으며, qb 쪽에서 이어가려면 세션을 옮겨야 합니다. Claude는 다릅니다. `claude-qb`는 기존 `claude`와 대화 기록 폴더를 같이 쓰므로 `claude-qb --resume <ID>`로 기존 대화를 그대로 이어갈 수 있습니다. Codex도 같은 폴더를 함께 쓰는 방식을 검토하고 있습니다.
+
 기본 설정 자체를 quota-baton으로 바꾸는 `--codex-mode default`, `--claude-mode default`는 전용 명령으로 충분히 써 본 뒤에만 고려하십시오. 자세한 설명은 [사용자 안내서의 클라이언트 설정 전환](docs/user-guide.md#클라이언트-설정-전환)에 있습니다.
 
 ## Development
