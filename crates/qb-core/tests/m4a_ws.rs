@@ -521,13 +521,6 @@ async fn c6_3_ws_rate_frame_without_advice_closes_1012_same_account() {
     let (mut client, account) = h.connect().await;
     create(&mut client, "fixture-model").await;
     assert_close(receive(&mut client).await, 1012);
-    let pacing = h.state.accounts.pacing_snapshot(&account);
-    let wait = pacing
-        .rate_backoff_until
-        .unwrap()
-        .saturating_duration_since(std::time::Instant::now())
-        + pacing.rate_release_interval;
-    tokio::time::sleep(wait).await;
     let (mut reconnect, same_account) = h.connect().await;
     assert_eq!(same_account, account);
     assert_eq!(same_account, h.ids[0]);
@@ -2073,7 +2066,7 @@ async fn r1_ws_rate_wait_defers_one_charged_text_or_binary_and_preserves_bytes()
         Message::Text("  {\"type\":\"future.unknown\",\"opaque\":\"untouched\"} \n".into()),
         Message::Binary(vec![0, 255, 128, 13, 10, 0, 42].into()),
     ] {
-        let h = Harness::new_with_rate_options(1, false, false, Some((5, 5))).await;
+        let h = Harness::new_with_rate_options(1, false, false, Some((1, 5))).await;
         h.fake.state.push_reply([Message::Text(
             r#"{"type":"error","status":429,"error":{"code":"rate_limit_exceeded"}}"#.into(),
         )]);
@@ -2219,7 +2212,7 @@ async fn r1_create_first_and_persistent_second_gate_after_other_connection_429()
     for previous_turn in [false, true] {
         // The other connection uses its one allowed retry, returns the native
         // HTTP 429, and leaves the existing socket's shared gate closed.
-        let h = Harness::new_with_rate_options(1, false, false, Some((5, 1))).await;
+        let h = Harness::new_with_rate_options(1, false, false, Some((1, 1))).await;
         let done = Message::Text(r#"{"type":"response.completed"}"#.into());
         let (mut client, account) = h.connect().await;
         if previous_turn {
@@ -2249,7 +2242,7 @@ async fn r1_create_first_and_persistent_second_gate_after_other_connection_429()
         );
         assert_eq!(h.fake.state.messages().len(), before);
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(6), receive(&mut client))
+            tokio::time::timeout(Duration::from_secs(2), receive(&mut client))
                 .await
                 .unwrap(),
             done
