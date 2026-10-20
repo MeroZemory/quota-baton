@@ -46,10 +46,22 @@ fn r81_console_probe() {
         serde_json::to_vec(&std::env::args().collect::<Vec<_>>()).unwrap(),
     )
     .unwrap();
-    if mode == "own" {
+    if mode == "own-script" {
+        set_title(&format!(
+            "{}\\npm\\codex.cmd - my-session",
+            std::env::var("APPDATA").unwrap()
+        ));
+    } else if mode == "own" {
         set_title("client owns this title");
     } else if mode == "cmd" {
         set_title(&std::env::var("ComSpec").unwrap());
+    } else if mode == "cmd-space" {
+        set_title(&format!("{} ", std::env::var("ComSpec").unwrap()));
+    } else if mode == "cmd-suffix" {
+        set_title(&format!(
+            "{} - node synthetic.js",
+            std::env::var("ComSpec").unwrap()
+        ));
     }
     fs::write(root.join("started"), "started").unwrap();
     fs::write(
@@ -61,6 +73,10 @@ fn r81_console_probe() {
         std::thread::sleep(Duration::from_millis(450));
         set_title("client owns this title");
         std::thread::sleep(Duration::from_millis(850));
+    } else if mode == "cmd-late" {
+        std::thread::sleep(Duration::from_millis(3400));
+        set_title(&format!("{} ", std::env::var("ComSpec").unwrap()));
+        std::thread::sleep(Duration::from_millis(1200));
     } else {
         std::thread::sleep(Duration::from_millis(650));
     }
@@ -111,7 +127,12 @@ fn r81_console_host() {
     let status = child
         .current_dir(root.join("한글 project"))
         .env("USERPROFILE", root.join("profile"))
-        .env("APPDATA", root.join("AppData/Roaming"))
+        .env(
+            "APPDATA",
+            root.join("AppData/Roaming")
+                .to_string_lossy()
+                .replace('/', "\\"),
+        )
         .env("SYNTHETIC_LABEL", "retained-label")
         .env("QB_R81_LITERAL", "must-not-expand")
         // Deliberately invalid: launch-client must never open a core home.
@@ -130,7 +151,23 @@ fn r81_console_host() {
 fn r81_title_after_child_start_in_hidden_console() {
     let sandbox = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r81-tests");
     fs::create_dir_all(&sandbox).unwrap();
-    for mode in ["actual", "cmd", "own", "own-late"] {
+    for mode in [
+        "actual",
+        "cmd",
+        "own",
+        "own-late",
+        "cmd-space",
+        "cmd-suffix",
+        "cmd-late",
+        "actual-node",
+        "own-script",
+    ] {
+        let node_dir = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .find(|p| p.is_absolute() && p.join("node.exe").is_file());
+        if mode == "actual-node" && node_dir.is_none() {
+            println!("actual-node unavailable: no node.exe on test PATH");
+            continue;
+        }
         let root = tempfile::tempdir_in(&sandbox).unwrap();
         let root = root.path().canonicalize().unwrap();
         let root = PathBuf::from(root.to_string_lossy().trim_start_matches(r"\\?\"));
@@ -138,13 +175,39 @@ fn r81_title_after_child_start_in_hidden_console() {
         fs::create_dir_all(root.join("AppData/Roaming/npm")).unwrap();
         let exe = std::env::current_exe().unwrap();
         fs::write(root.join("AppData/Roaming/npm/codex.cmd"), format!(
-            "@echo off\r\n\"{}\" --ignored --exact r81_console_probe --nocapture %*\r\nexit /b %errorlevel%\r\n", exe.display())).unwrap();
+            "@echo off\r\necho shim>\"%QB_R81_FIXTURE%\\shim-ran\"\r\n\"{}\" --ignored --exact r81_console_probe --nocapture %*\r\nexit /b %errorlevel%\r\n", exe.display())).unwrap();
+        if mode == "actual-node" {
+            let script = root.join("AppData/Roaming/npm/node_modules/@openai/codex/bin/codex.js");
+            fs::create_dir_all(script.parent().unwrap()).unwrap();
+            fs::write(script, r#"const {spawnSync}=require('node:child_process');
+const result=spawnSync(process.env.QB_R81_PROBE,['--ignored','--exact','r81_console_probe','--nocapture',...process.argv.slice(2)],{stdio:'inherit'});
+process.exit(result.status ?? 1);
+"#).unwrap();
+        }
         let mut env: Vec<(String, String)> = ["SystemRoot", "ComSpec", "PATH", "TEMP", "TMP"]
             .into_iter()
             .filter_map(|key| std::env::var(key).ok().map(|v| (key.into(), v)))
             .collect();
+        if mode == "actual-node" {
+            let system = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32");
+            let path = std::env::join_paths([node_dir.as_ref().unwrap(), &system]).unwrap();
+            env.retain(|(key, _)| !key.eq_ignore_ascii_case("PATH"));
+            env.push(("PATH".into(), path.to_string_lossy().into_owned()));
+        }
+        // This mode explicitly tests the resolved .exe, even if the machine's
+        // Node directory also contains a .com wrapper. Other modes test fallback.
+        env.push((
+            "PATHEXT".into(),
+            if mode == "actual-node" {
+                ".EXE;.COM;.BAT;.CMD"
+            } else {
+                ".COM;.EXE;.BAT;.CMD"
+            }
+            .into(),
+        ));
         env.push(("QB_R81_FIXTURE".into(), root.to_string_lossy().into_owned()));
         env.push(("QB_R81_TITLE_MODE".into(), mode.into()));
+        env.push(("QB_R81_PROBE".into(), exe.to_string_lossy().into_owned()));
         env.sort_by_key(|(k, _)| k.to_ascii_lowercase());
         let environment: Vec<u16> = env
             .into_iter()
@@ -189,6 +252,11 @@ fn r81_title_after_child_start_in_hidden_console() {
             assert_eq!(wait, WAIT_OBJECT_0, "hidden host timed out");
         }
         assert!(root.join("started").exists(), "child never started");
+        assert_eq!(
+            root.join("shim-ran").exists(),
+            mode != "actual-node",
+            "node resolution must bypass the npm cmd shim"
+        );
         for (name, expected) in [
             ("child-codepage.json", [65001, 65001]),
             ("restored-codepage.json", [949, 949]),
@@ -200,10 +268,17 @@ fn r81_title_after_child_start_in_hidden_console() {
         assert_eq!(fs::read_to_string(root.join("status")).unwrap(), "37");
         assert_eq!(
             fs::read_to_string(root.join("title")).unwrap(),
-            if mode.starts_with("own") {
-                "client owns this title"
+            if mode == "own-script" {
+                format!(
+                    "{}\\npm\\codex.cmd - my-session",
+                    root.join("AppData/Roaming")
+                        .to_string_lossy()
+                        .replace('/', "\\")
+                )
+            } else if mode.starts_with("own") {
+                "client owns this title".to_owned()
             } else {
-                "codex-qb · 한글 project"
+                "codex-qb · 한글 project".to_owned()
             }
         );
         assert_eq!(
