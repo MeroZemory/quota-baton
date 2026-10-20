@@ -244,7 +244,19 @@ impl Store {
         threads: &[String],
         initial: &[PathBuf],
     ) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+        self.probes_with_recorded_homes(source, threads, initial, &[])
+    }
+    fn probes_with_recorded_homes(
+        &self,
+        source: &Path,
+        threads: &[String],
+        initial: &[PathBuf],
+        recorded: &[PathBuf],
+    ) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
         let mut homes = vec![source.to_owned(), self.target.clone()];
+        // Recovery may have removed active rows before moving paginated names.
+        // Their complete probe inventory comes from the encrypted journal.
+        homes.extend_from_slice(recorded);
         let mut names = initial.to_vec();
         for home in &self.search_homes {
             let canonical = fs::canonicalize(home)?;
@@ -343,7 +355,7 @@ fn stale_plan(store: &Store, catalog: &discovery::Catalog, id: &str) -> Result<V
     Ok(result)
 }
 
-fn clean_stale_copies(copies: &[StaleCopy]) -> Result<()> {
+fn clean_stale_copies(copies: &[StaleCopy], journal_home: &Path) -> Result<()> {
     for copy in copies {
         for name in &copy.names {
             ensure!(
@@ -358,7 +370,14 @@ fn clean_stale_copies(copies: &[StaleCopy]) -> Result<()> {
             if let Some(parent) = name.backup.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::rename(&name.original, &name.backup).map_err(|_| {
+            guard::rename_verified(
+                &copy.home,
+                &name.original,
+                journal_home,
+                &name.backup,
+                name.identity,
+            )
+            .map_err(|_| {
                 anyhow::anyhow!(
                     "오래된 기록을 journal에 보존하지 못했습니다. 복사하거나 덮어쓰지 않았습니다"
                 )
@@ -368,7 +387,7 @@ fn clean_stale_copies(copies: &[StaleCopy]) -> Result<()> {
     Ok(())
 }
 
-fn restore_stale_copies(copies: &[StaleCopy]) -> Result<()> {
+fn restore_stale_copies(copies: &[StaleCopy], journal_home: &Path) -> Result<()> {
     for copy in copies {
         for name in &copy.names {
             if name.original.exists() {
@@ -384,7 +403,13 @@ fn restore_stale_copies(copies: &[StaleCopy]) -> Result<()> {
                 if let Some(parent) = name.original.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                fs::rename(&name.backup, &name.original)?;
+                guard::rename_verified(
+                    journal_home,
+                    &name.backup,
+                    &copy.home,
+                    &name.original,
+                    name.identity,
+                )?;
             }
         }
         let plan: db::DbPlan = serde_json::from_slice(&crate::cutover::unprotect(&copy.database)?)?;
@@ -812,6 +837,12 @@ fn import_one_using(
     let names: Vec<_> = files.iter().map(|f| f.path.clone()).collect();
     let (homes, names) = store.probes(&catalog.home, &threads, &names)?;
     let _guards = guard::probe_all(&homes, &threads, &names)?;
+    if !keep_source {
+        ensure!(
+            !source_has_dependents(&discovery::catalog(&catalog.home)?, id)?,
+            "다른 원본 대화가 이 기록을 사용합니다. 자식 대화를 먼저 옮기거나 --keep-source를 사용하세요"
+        );
+    }
     let stale = stale_plan(store, catalog, id)?;
     if clean_stale {
         for copy in &stale {
@@ -963,12 +994,12 @@ fn import_one_using(
         }
         db::remove_exact(&source)?;
         for link in record.files.iter().filter(|l| l.thread == id) {
-            fs::remove_file(&link.source)?;
+            guard::remove_verified(&record.source_home, &link.source, link.identity)?;
         }
         journal.imports.get_mut(id).unwrap().move_done = true;
         store.save(&journal)?;
     }
-    clean_stale_copies(&record.stale)?;
+    clean_stale_copies(&record.stale, &store.home)?;
     journal.imports.get_mut(id).unwrap().complete = true;
     store.save(&journal)?;
     if announce && keep_source {
@@ -1003,7 +1034,13 @@ fn unimport(store: &Store, id: &str, apply: bool, force: bool) -> Result<()> {
             );
         }
     }
-    let (mut homes, names) = store.probes(&entry.source_home, &entry.threads, &names)?;
+    let recorded = entry
+        .stale
+        .iter()
+        .map(|c| c.home.clone())
+        .collect::<Vec<_>>();
+    let (mut homes, names) =
+        store.probes_with_recorded_homes(&entry.source_home, &entry.threads, &names, &recorded)?;
     homes.extend(entry.stale.iter().map(|c| c.home.clone()));
     homes.push(store.home.clone());
     homes.sort();
@@ -1068,7 +1105,7 @@ fn unimport(store: &Store, id: &str, apply: bool, force: bool) -> Result<()> {
             serde_json::from_slice(&crate::cutover::unprotect(&entry.source_database)?)?;
         db::apply(&source)?;
     }
-    restore_stale_copies(&entry.stale)?;
+    restore_stale_copies(&entry.stale, &store.home)?;
     let mut database: db::DbPlan =
         serde_json::from_slice(&crate::cutover::unprotect(&entry.database)?)
             .map_err(|_| anyhow::anyhow!("가져오기 메타데이터를 읽을 수 없습니다"))?;
@@ -1143,7 +1180,7 @@ fn unimport(store: &Store, id: &str, apply: bool, force: bool) -> Result<()> {
     update_index(&store.target, &remove_index, true)?;
     for link in &entry.files {
         if link.owned && !retained.contains(&link.target) && link.target.exists() {
-            fs::remove_file(&link.target)?;
+            guard::remove_verified(&entry.target_home, &link.target, link.identity)?;
         }
     }
     journal.imports.remove(id);
@@ -1155,6 +1192,9 @@ fn resume_uuid(args: &[OsString]) -> Result<Option<String>> {
     let mut resume = false;
     let mut literal = false;
     let mut exec = false;
+    let mut requested = None;
+    let mut positional_seen = false;
+    let mut last = false;
     while let Some(arg) = args.get(index).and_then(|v| v.to_str()) {
         index += 1;
         if !literal && arg == "--" {
@@ -1205,6 +1245,10 @@ fn resume_uuid(args: &[OsString]) -> Result<Option<String>> {
                 }
                 continue;
             }
+            if name == "--last" {
+                last = true;
+                continue;
+            }
             if arg.len() > 2
                 && ["-c", "-m", "-p", "-s", "-C", "-a", "-i", "-o"]
                     .iter()
@@ -1247,11 +1291,28 @@ fn resume_uuid(args: &[OsString]) -> Result<Option<String>> {
                 "exec" | "e" if !exec => exec = true,
                 _ => return Ok(None),
             }
-        } else {
-            return Ok(discovery::valid_id(arg).then(|| arg.to_ascii_lowercase()));
+        } else if !positional_seen {
+            positional_seen = true;
+            requested = discovery::valid_id(arg).then(|| arg.to_ascii_lowercase());
         }
     }
-    Ok(None)
+    Ok(if last { None } else { requested })
+}
+
+fn resume_entry<'a>(journal: &'a Journal, id: &str) -> Result<Option<&'a Import>> {
+    ensure!(
+        !journal
+            .imports
+            .values()
+            .any(|entry| !entry.complete && entry.threads.iter().any(|t| t == id)),
+        "대화 가져오기가 완료되지 않았습니다"
+    );
+    Ok(journal.imports.get(id).or_else(|| {
+        journal
+            .imports
+            .values()
+            .find(|entry| entry.threads.iter().any(|t| t == id))
+    }))
 }
 
 pub(crate) fn before_codex_resume(args: &[OsString]) -> Result<()> {
@@ -1261,11 +1322,7 @@ pub(crate) fn before_codex_resume(args: &[OsString]) -> Result<()> {
     let id = id.as_str();
     let store = Store::open(&qb_core::home()?)?;
     let journal = store.load()?;
-    if let Some(entry) = journal
-        .imports
-        .values()
-        .find(|entry| entry.threads.iter().any(|t| t == id))
-    {
+    if let Some(entry) = resume_entry(&journal, id)? {
         ensure!(entry.complete, "대화 가져오기가 완료되지 않았습니다");
         let names = entry
             .files

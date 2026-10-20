@@ -1,8 +1,8 @@
-//! Read-only import/resume guards for Codex's per-home writer protocol.
+//! Import/resume guards and identity-bound cleanup for Codex's writer protocol.
 //!
 //! See Codex `rollout/src/writer_lock.rs`: coordination precedes thread locks.
 //! Keep `Guards` alive through publication/launch preparation. Dropping it closes
-//! all handles; no source file is created, changed, unlocked by name, or removed.
+//! all guard handles without creating, changing, or removing source files.
 //! These guards cannot protect a session after they are dropped, reserve absent
 //! lock files, or make an unwrapped Codex launch in another home cooperate.
 
@@ -76,9 +76,13 @@ mod platform {
     use windows::Win32::{
         Foundation::HANDLE,
         Storage::FileSystem::{
-            BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
+            BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY,
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_FLAG_DELETE,
+            FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX,
+            FILE_DISPOSITION_INFO_EX_FLAGS, FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfoEx,
+            FileRenameInfoEx, GetFileInformationByHandle, SetFileInformationByHandle,
         },
     };
 
@@ -260,6 +264,147 @@ mod platform {
         file_identity(&file)
     }
 
+    // Deliberately no Debug: the file handle and directory pins are private.
+    // Parent visibility permits a deterministic test of replacement after open.
+    pub(super) struct VerifiedRemoval {
+        file: File,
+        _pins: Vec<File>,
+    }
+
+    impl VerifiedRemoval {
+        pub(super) fn remove(self) -> Result<()> {
+            let disposition = FILE_DISPOSITION_INFO_EX {
+                Flags: FILE_DISPOSITION_INFO_EX_FLAGS(
+                    FILE_DISPOSITION_FLAG_DELETE.0 | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS.0,
+                ),
+            };
+            // SAFETY: self owns a live, identity-checked file handle with DELETE
+            // access. The initialized fixed-size buffer lives through this call.
+            // POSIX unlink removes this handle's link while probe/read handles
+            // stay open. It never resolves the caller's pathname a second time.
+            unsafe {
+                SetFileInformationByHandle(
+                    HANDLE(self.file.as_raw_handle()),
+                    FileDispositionInfoEx,
+                    std::ptr::from_ref(&disposition).cast(),
+                    std::mem::size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+                )
+            }
+            .map_err(|error| anyhow!("검증한 세션 파일 삭제 실패 (OS 코드 {})", error.code().0))?;
+            Ok(())
+        }
+
+        pub(super) fn rename(self, root_to: &Path, target: &Path) -> Result<()> {
+            let root_to = absolute(root_to)?;
+            let target = absolute(target)?;
+            let parent = target
+                .parent()
+                .ok_or_else(|| anyhow!("대상 폴더가 없습니다"))?;
+            let (_parent_pins, parent_exists) = pin_path(&root_to, parent)?;
+            if !parent_exists {
+                // Do not open a destination through an unchecked missing suffix
+                // that another process could create as a reparse directory.
+                bail!("대상 폴더가 없습니다");
+            }
+            let (_target_pins, _) = pin_path(&root_to, &target)?;
+            let name = target.as_os_str().encode_wide().collect::<Vec<_>>();
+            let name_bytes = name
+                .len()
+                .checked_mul(2)
+                .ok_or_else(|| anyhow!("대상 경로가 너무 깁니다"))?;
+            let length = u32::try_from(name_bytes)?;
+            let offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+            let size = offset
+                .checked_add(name_bytes)
+                .and_then(|size| size.checked_add(2))
+                .ok_or_else(|| anyhow!("대상 경로가 너무 깁니다"))?;
+            let buffer_size = u32::try_from(size)?;
+            // FILE_RENAME_INFO ends in a flexible UTF-16 array. Allocate an
+            // aligned, zeroed buffer large enough for the complete destination.
+            let mut buffer = vec![
+                std::mem::MaybeUninit::<FILE_RENAME_INFO>::zeroed();
+                size.div_ceil(std::mem::size_of::<FILE_RENAME_INFO>())
+            ];
+            let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+            // SAFETY: buffer has FILE_RENAME_INFO alignment and enough bytes
+            // for all fields and the UTF-16 name. self and both sets of directory
+            // pins live through the call. No source pathname is re-resolved.
+            unsafe {
+                (*info).Anonymous.Flags = 0; // NO REPLACE: collision is an atomic failure.
+                (*info).RootDirectory = HANDLE::default();
+                (*info).FileNameLength = length;
+                std::ptr::copy_nonoverlapping(
+                    name.as_ptr(),
+                    info.cast::<u8>().add(offset).cast::<u16>(),
+                    name.len(),
+                );
+                SetFileInformationByHandle(
+                    HANDLE(self.file.as_raw_handle()),
+                    FileRenameInfoEx,
+                    info.cast(),
+                    buffer_size,
+                )
+            }
+            .map_err(|error| anyhow!("검증한 세션 파일 이동 실패 (OS 코드 {})", error.code().0))?;
+            Ok(())
+        }
+    }
+
+    pub(super) fn verified_removal(
+        root: &Path,
+        path: &Path,
+        expected: FileIdentity,
+    ) -> Result<VerifiedRemoval> {
+        let root = absolute(root)?;
+        let path = absolute(path)?;
+        let (pins, exists) = pin_path(&root, &path)?;
+        if !exists {
+            bail!("세션 파일이 없습니다");
+        }
+        let file = options()
+            .access_mode(DELETE.0 | FILE_READ_ATTRIBUTES.0)
+            .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_DELETE.0)
+            .open(&path)
+            .map_err(|error| {
+                if matches!(error.raw_os_error(), Some(32 | 33)) {
+                    live(&root)
+                } else {
+                    inspection_error(error)
+                }
+            })?;
+        let info = information(&file)?;
+        if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0 {
+            bail!("rollout은 일반 파일이어야 합니다");
+        }
+        if file_identity(&file)? != expected {
+            bail!("대상 파일 소유권이 달라 되돌릴 수 없습니다");
+        }
+        Ok(VerifiedRemoval { file, _pins: pins })
+    }
+
+    /// Remove only the opened name of the expected file, never a replacement.
+    /// Caller retains coordination/thread guards and decides journal ownership;
+    /// this primitive does not infer whether a matching hardlink is borrowed.
+    /// Ancestors remain pinned through the identity check and handle-bound unlink.
+    /// Requires Windows/FS support for POSIX FileDispositionInfoEx; no path-based
+    /// or readonly-attribute-overriding fallback. A missing name is an error.
+    pub(crate) fn remove_verified(root: &Path, path: &Path, expected: FileIdentity) -> Result<()> {
+        verified_removal(root, path, expected)?.remove()
+    }
+
+    /// Rename the expected source object with both roots pinned. Destination
+    /// collisions fail atomically; no replacement, directory creation, or
+    /// cross-volume copy fallback. Caller retains writer guards and journals it.
+    pub(crate) fn rename_verified(
+        root_from: &Path,
+        path: &Path,
+        root_to: &Path,
+        target: &Path,
+        expected: FileIdentity,
+    ) -> Result<()> {
+        verified_removal(root_from, path, expected)?.rename(root_to, target)
+    }
+
     struct PendingLock {
         identity: FileIdentity,
         file: File,
@@ -414,7 +559,9 @@ mod platform {
 }
 
 #[cfg(windows)]
-pub(crate) use platform::{identity, probe_all, probe_cleanup, safe_path};
+pub(crate) use platform::{
+    identity, probe_all, probe_cleanup, remove_verified, rename_verified, safe_path,
+};
 
 #[cfg(not(windows))]
 mod platform {
@@ -425,6 +572,18 @@ mod platform {
     }
     pub(crate) fn identity(_: &Path) -> Result<FileIdentity> {
         anyhow::bail!("세션 파일 식별은 Windows에서만 지원됩니다")
+    }
+    pub(crate) fn remove_verified(_: &Path, _: &Path, _: FileIdentity) -> Result<()> {
+        anyhow::bail!("검증한 세션 파일 삭제는 Windows에서만 지원됩니다")
+    }
+    pub(crate) fn rename_verified(
+        _: &Path,
+        _: &Path,
+        _: &Path,
+        _: &Path,
+        _: FileIdentity,
+    ) -> Result<()> {
+        anyhow::bail!("검증한 세션 파일 이동은 Windows에서만 지원됩니다")
     }
     pub(crate) fn probe_all(_: &[PathBuf], _: &[String], _: &[PathBuf]) -> Result<Guards> {
         anyhow::bail!("세션 잠금 검사는 Windows에서만 지원됩니다")
@@ -438,7 +597,9 @@ mod platform {
     }
 }
 #[cfg(not(windows))]
-pub(crate) use platform::{identity, probe_all, probe_cleanup, safe_path};
+pub(crate) use platform::{
+    identity, probe_all, probe_cleanup, remove_verified, rename_verified, safe_path,
+};
 
 #[cfg(all(test, windows))]
 mod tests {
@@ -570,6 +731,229 @@ mod tests {
         fs::remove_file(&link).unwrap();
         fs::write(&link, []).unwrap();
         assert_ne!(before, identity(&link).unwrap());
+    }
+
+    #[test]
+    fn verified_unlink_refuses_leaf_replaced_after_probe() {
+        let temp = fixture();
+        let home = home(temp.path(), "home");
+        let path = home.join("sessions/owned.jsonl");
+        let parked = home.join("sessions/parked.jsonl");
+        fs::write(&path, b"synthetic original").unwrap();
+        let expected = identity(&path).unwrap();
+        let guards = probe_cleanup(
+            std::slice::from_ref(&home),
+            &[ID.into()],
+            std::slice::from_ref(&path),
+        )
+        .unwrap();
+        fs::rename(&path, &parked).unwrap();
+        fs::write(&path, b"synthetic replacement").unwrap();
+        assert!(remove_verified(&home, &path, expected).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"synthetic replacement");
+        assert_eq!(fs::read(&parked).unwrap(), b"synthetic original");
+        assert_eq!(identity(&parked).unwrap(), expected);
+        drop(guards);
+    }
+
+    #[test]
+    fn verified_unlink_removes_own_name_and_preserves_borrowed_hardlink() {
+        let temp = fixture();
+        let home = home(temp.path(), "home");
+        let owned = home.join("sessions/owned.jsonl");
+        let borrowed = home.join("sessions/borrowed.jsonl");
+        fs::write(&owned, b"synthetic shared object").unwrap();
+        fs::hard_link(&owned, &borrowed).unwrap();
+        let expected = identity(&owned).unwrap();
+        let guards = probe_cleanup(
+            std::slice::from_ref(&home),
+            &[ID.into()],
+            &[owned.clone(), borrowed.clone()],
+        )
+        .unwrap();
+        remove_verified(&home, &owned, expected).unwrap();
+        assert!(!owned.exists());
+        assert_eq!(identity(&borrowed).unwrap(), expected);
+        assert_eq!(fs::read(&borrowed).unwrap(), b"synthetic shared object");
+        assert!(OpenOptions::new().append(true).open(&borrowed).is_err());
+        drop(guards);
+        assert!(OpenOptions::new().append(true).open(&borrowed).is_ok());
+
+        // Also cover a final owned link with a read probe still open, without
+        // authorizing removal of the borrowed name above.
+        let single = home.join("sessions/single-owned.jsonl");
+        fs::write(&single, b"synthetic sole owned link").unwrap();
+        let single_id = identity(&single).unwrap();
+        let guards = probe_cleanup(
+            std::slice::from_ref(&home),
+            &[ID.into()],
+            std::slice::from_ref(&single),
+        )
+        .unwrap();
+        remove_verified(&home, &single, single_id).unwrap();
+        assert!(!single.exists());
+        assert_eq!(identity(&borrowed).unwrap(), expected);
+        drop(guards);
+    }
+
+    #[test]
+    fn verified_unlink_stays_bound_after_open_and_keeps_ancestors_pinned() {
+        let temp = fixture();
+        let home = home(temp.path(), "home");
+        let path = home.join("sessions/owned.jsonl");
+        let parked = home.join("sessions/parked.jsonl");
+        let borrowed = home.join("sessions/borrowed.jsonl");
+        fs::write(&path, b"synthetic original").unwrap();
+        fs::hard_link(&path, &borrowed).unwrap();
+        let expected = identity(&path).unwrap();
+        let removal = platform::verified_removal(&home, &path, expected).unwrap();
+        assert!(fs::rename(home.join("sessions"), home.join("renamed-sessions")).is_err());
+        fs::rename(&path, &parked).unwrap();
+        fs::write(&path, b"synthetic replacement after open").unwrap();
+        removal.remove().unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"synthetic replacement after open"
+        );
+        assert_eq!(identity(&borrowed).unwrap(), expected);
+        assert_eq!(fs::read(&borrowed).unwrap(), b"synthetic original");
+    }
+
+    #[test]
+    fn verified_unlink_refuses_writer_through_hardlink() {
+        let temp = fixture();
+        let home = home(temp.path(), "home");
+        let path = home.join("sessions/owned.jsonl");
+        let alias = home.join("sessions/writer.jsonl");
+        fs::write(&path, b"synthetic original").unwrap();
+        fs::hard_link(&path, &alias).unwrap();
+        let expected = identity(&path).unwrap();
+        let writer = OpenOptions::new().append(true).open(&alias).unwrap();
+        let error = remove_verified(&home, &path, expected).unwrap_err();
+        assert!(error.downcast_ref::<LiveWriter>().is_some());
+        assert_eq!(fs::read(&path).unwrap(), b"synthetic original");
+        assert_eq!(identity(&alias).unwrap(), expected);
+        drop(writer);
+    }
+
+    #[test]
+    fn verified_rename_roundtrip_preserves_identity_and_borrowed_link_under_probes() {
+        let temp = fixture();
+        let source_home = home(temp.path(), "source");
+        let backup_home = home(temp.path(), "backup");
+        let source = source_home.join("sessions/owned.jsonl");
+        let borrowed = source_home.join("sessions/borrowed.jsonl");
+        let backup = backup_home.join("sessions/백업 name.jsonl");
+        fs::write(&source, b"synthetic original").unwrap();
+        fs::hard_link(&source, &borrowed).unwrap();
+        let expected = identity(&source).unwrap();
+        let guards = probe_cleanup(
+            &[source_home.clone(), backup_home.clone()],
+            &[ID.into()],
+            &[source.clone(), borrowed.clone()],
+        )
+        .unwrap();
+        rename_verified(&source_home, &source, &backup_home, &backup, expected).unwrap();
+        assert!(!source.exists());
+        assert_eq!(identity(&backup).unwrap(), expected);
+        assert_eq!(identity(&borrowed).unwrap(), expected);
+        assert!(OpenOptions::new().append(true).open(&backup).is_err());
+        rename_verified(&backup_home, &backup, &source_home, &source, expected).unwrap();
+        assert!(!backup.exists());
+        assert_eq!(identity(&source).unwrap(), expected);
+        assert_eq!(fs::read(&borrowed).unwrap(), b"synthetic original");
+        drop(guards);
+    }
+
+    #[test]
+    fn verified_rename_refuses_replaced_source_and_destination_collision() {
+        let temp = fixture();
+        let home = home(temp.path(), "home");
+        let source = home.join("sessions/owned.jsonl");
+        let parked = home.join("sessions/parked.jsonl");
+        let target = home.join("sessions/backup.jsonl");
+        fs::write(&source, b"synthetic original").unwrap();
+        let expected = identity(&source).unwrap();
+        fs::rename(&source, &parked).unwrap();
+        fs::write(&source, b"synthetic source replacement").unwrap();
+        assert!(rename_verified(&home, &source, &home, &target, expected).is_err());
+        assert_eq!(fs::read(&source).unwrap(), b"synthetic source replacement");
+        assert!(!target.exists());
+
+        // Insert a destination after opening/verifying the original source.
+        // The OS must reject collision without overwriting either object.
+        let operation = platform::verified_removal(&home, &parked, expected).unwrap();
+        fs::write(&target, b"synthetic destination replacement").unwrap();
+        let destination_id = identity(&target).unwrap();
+        assert!(operation.rename(&home, &target).is_err());
+        assert_eq!(identity(&target).unwrap(), destination_id);
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            b"synthetic destination replacement"
+        );
+        assert_eq!(identity(&parked).unwrap(), expected);
+        assert_eq!(fs::read(&parked).unwrap(), b"synthetic original");
+    }
+
+    #[test]
+    fn verified_rename_stays_bound_when_source_name_changes_after_open() {
+        let temp = fixture();
+        let home = home(temp.path(), "home");
+        let source = home.join("sessions/owned.jsonl");
+        let parked = home.join("sessions/parked.jsonl");
+        let target = home.join("sessions/backup.jsonl");
+        fs::write(&source, b"synthetic original").unwrap();
+        let expected = identity(&source).unwrap();
+        let operation = platform::verified_removal(&home, &source, expected).unwrap();
+        fs::rename(&source, &parked).unwrap();
+        fs::write(&source, b"synthetic replacement after open").unwrap();
+        operation.rename(&home, &target).unwrap();
+        assert_eq!(identity(&target).unwrap(), expected);
+        assert_eq!(fs::read(&target).unwrap(), b"synthetic original");
+        assert_eq!(
+            fs::read(&source).unwrap(),
+            b"synthetic replacement after open"
+        );
+    }
+
+    #[test]
+    fn verified_rename_refuses_writer_escape_and_missing_destination_parent() {
+        let temp = fixture();
+        let home = home(temp.path(), "home");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let source = home.join("sessions/owned.jsonl");
+        let target = home.join("sessions/backup.jsonl");
+        fs::write(&source, b"synthetic original").unwrap();
+        let expected = identity(&source).unwrap();
+        let writer = OpenOptions::new().append(true).open(&source).unwrap();
+        let error = rename_verified(&home, &source, &home, &target, expected).unwrap_err();
+        assert!(error.downcast_ref::<LiveWriter>().is_some());
+        drop(writer);
+        assert!(
+            rename_verified(
+                &home,
+                &source,
+                &home,
+                &outside.join("backup.jsonl"),
+                expected
+            )
+            .is_err()
+        );
+        assert!(
+            rename_verified(
+                &home,
+                &source,
+                &home,
+                &home.join("missing/backup.jsonl"),
+                expected
+            )
+            .is_err()
+        );
+        assert!(!home.join("missing").exists());
+        assert_eq!(identity(&source).unwrap(), expected);
+        assert_eq!(fs::read(&source).unwrap(), b"synthetic original");
+        assert!(!target.exists());
     }
 
     #[test]
@@ -712,6 +1096,23 @@ mod tests {
         assert!(safe_path(&alias, &alias.join("missing.jsonl")).is_err());
         assert!(identity(&alias.join("missing.jsonl")).is_err());
         assert!(probe_cleanup(std::slice::from_ref(&alias), &[ID.into()], &[]).is_err());
+        let protected = outside.join("sessions/protected.jsonl");
+        fs::write(&protected, b"synthetic outside root").unwrap();
+        let expected = identity(&protected).unwrap();
+        assert!(remove_verified(&root, &protected, expected).is_err());
+        assert!(remove_verified(&root, &alias.join("sessions/protected.jsonl"), expected).is_err());
+        assert_eq!(fs::read(&protected).unwrap(), b"synthetic outside root");
+        assert!(
+            rename_verified(
+                &outside,
+                &protected,
+                &root,
+                &alias.join("sessions/backup.jsonl"),
+                expected
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&protected).unwrap(), b"synthetic outside root");
         assert!(probe_all(&[alias], &[ID.into()], &[]).is_err());
     }
 

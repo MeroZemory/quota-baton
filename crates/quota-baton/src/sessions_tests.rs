@@ -26,6 +26,8 @@ fn r9_resume_uuid_parses_global_resume_options_values_and_separator() {
         vec!["-m", "model", "--no-daemon", "resume", "--all", A],
         vec!["--config", "x=\"resume\"", "resume", "--", A],
         vec!["exec", "--json", "resume", A],
+        vec!["--config", "--last", "resume", A],
+        vec!["resume", "--", A, "--last"],
     ] {
         assert_eq!(
             resume_uuid(&args.iter().map(OsString::from).collect::<Vec<_>>())
@@ -39,6 +41,10 @@ fn r9_resume_uuid_parses_global_resume_options_values_and_separator() {
         vec!["resume", "--last"],
         vec!["--config", A, "resume"],
         vec!["--help", "resume", A],
+        vec!["resume", A, "--help"],
+        vec!["resume", "--last", A],
+        vec!["resume", A, "--last"],
+        vec!["exec", "resume", A, "--last"],
         vec!["exec", "a prompt containing resume"],
     ] {
         assert!(
@@ -675,4 +681,103 @@ fn r9_stale_cleanup_never_removes_an_unmoved_fork_ancestor() {
     assert!(current.exists() && stale.exists() && child.exists());
     assert!(f.store.load().unwrap().imports.is_empty());
     assert_eq!(db::threads(&old.source).unwrap().len(), 2);
+}
+
+#[test]
+fn r9_move_refreshes_dependencies_after_initial_catalog_capture() {
+    let f = Fixture::new();
+    let parent = f.add(A, None, false, "active");
+    let cached = discovery::catalog(&f.source).unwrap();
+    let child = f.add(B, Some(A), false, "active");
+    let error = import_one(
+        &f.store,
+        &cached,
+        A,
+        ImportOptions {
+            apply: true,
+            skip_existing: false,
+            announce: false,
+            keep_source: false,
+            clean_stale: false,
+        },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("자식 대화를 먼저"));
+    assert!(parent.exists() && child.exists());
+    assert!(f.store.load().unwrap().imports.is_empty());
+}
+
+#[test]
+fn r9_pending_root_is_never_shadowed_by_completed_child_provenance() {
+    let f = Fixture::new();
+    f.add(C, None, false, "active");
+    f.add(A, Some(C), false, "active");
+    f.import(A, true).unwrap();
+    f.import(C, true).unwrap();
+    let mut journal = f.store.load().unwrap();
+    assert_eq!(resume_entry(&journal, C).unwrap().unwrap().root, C);
+    journal.imports.get_mut(C).unwrap().complete = false;
+    journal.imports.get_mut(C).unwrap().move_started = true;
+    f.store.save(&journal).unwrap();
+    assert!(resume_entry(&f.store.load().unwrap(), C).is_err());
+    assert!(resume_entry(&f.store.load().unwrap(), A).is_ok());
+}
+
+#[test]
+fn r9_paginated_stale_rows_deleted_before_rename_recover_from_journal() {
+    let mut f = Fixture::new();
+    let old = Fixture::new();
+    f.add(A, None, false, "active");
+    let first = old.add(A, None, false, "complete");
+    let second = first
+        .parent()
+        .unwrap()
+        .join(format!("rollout-2026-10-21T00-00-00-{B}.jsonl"));
+    let mut meta: serde_json::Value = serde_json::from_slice(&fs::read(&first).unwrap()).unwrap();
+    meta["payload"]["history_base"] =
+        serde_json::json!({"thread_id":A,"end_ordinal_exclusive":5,"end_byte_offset":100});
+    fs::write(&second, format!("{meta}\n")).unwrap();
+    for file in [&first, &second] {
+        File::options()
+            .write(true)
+            .open(file)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(600)),
+            )
+            .unwrap();
+    }
+    let db = Connection::open(old.source.join("state_5.sqlite")).unwrap();
+    db.execute(
+        "UPDATE threads SET rollout_path=?1 WHERE id=?2",
+        rusqlite::params![second.to_str().unwrap(), A],
+    )
+    .unwrap();
+    drop(db);
+    f.store.search_homes = vec![old.source.clone()];
+    let catalog = discovery::catalog(&f.source).unwrap();
+    let stale = stale_plan(&f.store, &catalog, A).unwrap();
+    assert_eq!(stale[0].names.len(), 2);
+    f.import(A, true).unwrap();
+    let mut journal = f.store.load().unwrap();
+    let entry = journal.imports.get_mut(A).unwrap();
+    entry.complete = false;
+    entry.stale = stale;
+    let snapshot: db::DbPlan =
+        serde_json::from_slice(&crate::cutover::unprotect(&entry.stale[0].database).unwrap())
+            .unwrap();
+    f.store.save(&journal).unwrap();
+    db::remove_exact(&snapshot).unwrap();
+    assert!(discovery::catalog(&old.source).unwrap().chain(A).is_err());
+    unimport(&f.store, A, true, false).unwrap();
+    assert!(first.exists() && second.exists());
+    assert_eq!(
+        discovery::catalog(&old.source)
+            .unwrap()
+            .chain(A)
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(f.store.load().unwrap().imports.is_empty());
 }
