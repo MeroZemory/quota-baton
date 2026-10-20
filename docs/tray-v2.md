@@ -198,7 +198,11 @@ Overview fixture heights:
   - **Codex**: `free` → Free, `plus` → Plus, `pro` → Pro, `team` → Team, `business` → Business, `enterprise` → Enterprise.
   - Anything else, or null: hidden.
 
-**Usage line** (16 high, 6 below line 1):
+**Usage lines: one per account window (user, 2026-10-21).** Every account-scoped window with a known value gets its own usage line and bar, so a reset time is never shown without the window it belongs to. Claude and Codex Plus/Pro accounts show two lines, `5시간` then `주간`. A Codex Free account shows one line, `30일`. Lines are ordered from the shortest window to the longest. The user's reason: a lone "7시 초기화" next to an account that had just had its weekly reset read as a weekly reset.
+
+The rules below describe one usage line and apply to each line. Each additional line adds 26 DIP to the row (16 line + 4 gap + 4 bar + 2 spacing). The "binding window" choice now only decides which window drives the row's chip and the colour of the summary dot. Every window is always shown.
+
+**Usage line** (16 high, 6 below line 1, or below the previous bar):
 - **Left**: the window label ("5시간", "주간", or "N분" / "N일" for `<n>m` windows) in secondary, 4 gap, then **"N% 남음"** in 600 text.
 - **Right**: "<time> 초기화" in secondary (time format in §14). If `reset_at` has passed, show "초기화됨".
 - **Remaining.** `remaining = clamp(100 − round(used_pct), 0, 100)`. It is always expressed as remaining; **never print a bare used percentage.**
@@ -356,7 +360,7 @@ A toggle shows "변경 중…" in place of its label while its PATCH is pending 
 | Hover target | Tooltip text |
 |---|---|
 | Summary line | `Claude 계정 4개 · 켜짐 2개 · 지금 사용 가능 0개.` + (unavailable) `가장 빠른 초기화: acct-alpha 10/19(월) 14:00. 그때까지 새 요청은 오류로 끝납니다.` / (available) `acct-alpha가 대화 2개를 처리 중입니다.` |
-| Usage line or bar | Line 1: `**주간 사용량**: 62% 사용, **38% 남음**`. Line 2 (secondary): `10/22(목) 15:22에 초기화됩니다.` Line 3: the other account window, `5시간: 41% 사용, 59% 남음 · 내일 01:40 초기화`. Last line (secondary): `막대는 남은 양입니다. 남은 양이 가장 적은 창을 보여 줍니다. HH:MM 기준.` |
+| Usage line or bar | Line 1: `**주간 사용량**: 62% 사용, **38% 남음**`. Line 2 (secondary): `10/22(목) 15:22에 초기화됩니다.` Last line (secondary): `막대는 남은 양입니다. HH:MM 기준.` (Each window's line has its own tooltip.) |
 | Chip 사용 중 | `이 계정에서 최근 5분 안에 요청한 대화 N개 · 연결된 대화 M개` |
 | Chip 한도 도달 | `<window> 한도에 도달했습니다. <time>에 초기화되면 다시 사용합니다.` |
 | Chip 크레딧 사용 중 | `구독 한도에 도달해 유료 크레딧으로 처리하고 있습니다.` |
