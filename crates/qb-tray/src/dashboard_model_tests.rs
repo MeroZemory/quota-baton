@@ -560,3 +560,530 @@ fn r7_empty_states_are_distinct_and_day_boundary_explicit() {
     c.day_end = c.day_start + chrono::Duration::hours(23);
     assert_eq!(c.day_end.signed_duration_since(c.day_start).num_hours(), 23);
 }
+
+fn r10_quota(seq: u64, minutes_ago: i64) -> ActivityEvent {
+    ActivityEvent {
+        seq,
+        ts: Some(clock().utc() - chrono::Duration::minutes(minutes_ago)),
+        kind: "quota_reached".into(),
+        provider: "claude".into(),
+        account: Some("cl-a".into()),
+        notable: true,
+        data: ActivityData {
+            window: Some("5h".into()),
+            reset_at: Some(clock().utc() + chrono::Duration::hours(1)),
+            moved_groups: Some(0),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+fn r10_fold(events: &[ActivityEvent]) -> Vec<EventRow> {
+    folded_events(
+        &events.iter().collect::<Vec<_>>(),
+        &snapshot().accounts,
+        &clock(),
+    )
+}
+fn r10_accounts(accounts: serde_json::Value) -> DashboardSnapshot {
+    DashboardSnapshot::new(
+        v2::project(
+            &serde_json::json!({"accounts":accounts}).to_string(),
+            clock().utc().into(),
+        )
+        .unwrap(),
+    )
+}
+fn r10_fact<'a>(detail: &'a DetailView, key: &str) -> &'a str {
+    &detail.facts.iter().find(|(k, _)| k == key).unwrap().1
+}
+
+#[test]
+fn r10_limit_tag_names_known_windows_and_never_leaves_empty_title_slot() {
+    let accounts = snapshot().accounts;
+    for (window, label) in [("5h", "5시간"), ("7d", "주간"), ("43200m", "30일")] {
+        let mut e = r10_quota(1, 1);
+        e.data.window = Some(window.into());
+        for moves in [0, 2] {
+            e.data.moved_groups = Some(moves);
+            let row = event_row(&e, &accounts, &clock()).unwrap();
+            assert_eq!(row.tag, "한도 도달");
+            assert_eq!(row.tone, v2::Tone::Limit);
+            assert!(row.title.ends_with(&format!(" · {label} 한도 도달")));
+        }
+    }
+    for window in [None, Some("".into()), Some("  ".into())] {
+        let mut e = r10_quota(1, 1);
+        e.data.window = window;
+        let row = event_row(&e, &accounts, &clock()).unwrap();
+        assert!(row.title.ends_with(" · 한도 도달"));
+        assert!(!row.title.contains("·  "));
+        assert_eq!(row.title.matches('·').count(), 1);
+    }
+    let mut e = r10_quota(1, 1);
+    e.data.no_eligible = true;
+    assert_eq!(event_row(&e, &accounts, &clock()).unwrap().tag, "정보");
+    e.data.actionable = true;
+    assert_eq!(
+        event_row(&e, &accounts, &clock()).unwrap().tone,
+        v2::Tone::Bad
+    );
+}
+
+#[test]
+fn r10_repeats_keep_newest_and_show_three_local_times_then_overflow() {
+    let events: Vec<_> = (0..6).map(|i| r10_quota(i + 1, 6 - i as i64)).collect();
+    let rows = r10_fold(&events);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].seq, 6);
+    let times: Vec<_> = [2, 3, 4]
+        .iter()
+        .map(|m| clock().time(Some(clock().utc() - chrono::Duration::minutes(*m))))
+        .collect();
+    assert!(
+        rows[0]
+            .body
+            .ends_with(&format!("같은 알림 5번 더 · {} 외 2번", times.join(", ")))
+    );
+    assert!(!rows[0].body.contains(&clock().time(events[0].ts)));
+}
+
+#[test]
+fn r10_folding_requires_every_key_known_equal_no_moves_and_eligible() {
+    let old = r10_quota(1, 2);
+    for case in 0..15 {
+        let mut new = r10_quota(2, 1);
+        match case {
+            0 => new.provider = "codex".into(),
+            1 => new.provider.clear(),
+            2 => new.account = Some("cl-b".into()),
+            3 => new.account = None,
+            4 => new.account = Some("".into()),
+            5 => new.data.window = Some("7d".into()),
+            6 => new.data.window = None,
+            7 => new.data.window = Some(" ".into()),
+            8 => new.data.reset_at = new.data.reset_at.map(|t| t + chrono::Duration::seconds(1)),
+            9 => new.data.reset_at = None,
+            10 => new.data.moved_groups = Some(1),
+            11 => new.data.moved_groups = None,
+            12 => new.data.no_eligible = true,
+            13 => new.kind = "move".into(),
+            _ => new.data.actionable = true, // Actionability alone is not a folding veto.
+        }
+        let rows = r10_fold(&[old.clone(), new.clone()]);
+        assert_eq!(rows.len(), if case == 14 { 1 } else { 2 }, "case {case}");
+        // Every veto applies equally to the older member of the pair.
+        let mut changed_old = new;
+        changed_old.seq = 1;
+        changed_old.ts = old.ts;
+        assert_eq!(
+            r10_fold(&[changed_old, r10_quota(2, 1)]).len(),
+            if case == 14 { 1 } else { 2 },
+            "older case {case}"
+        );
+    }
+    for kind in ["move", "quota_reset", "credits_started"] {
+        let mut a = old.clone();
+        a.kind = kind.into();
+        let mut b = a.clone();
+        b.seq += 1;
+        assert_eq!(r10_fold(&[a, b]).len(), 2);
+    }
+}
+
+#[test]
+fn r10_resets_break_all_windows_only_for_same_provider_account_including_ties() {
+    for same_time in [false, true] {
+        let mut old = r10_quota(1, 3);
+        let mut reset = r10_quota(2, 2);
+        reset.kind = "quota_reset".into();
+        reset.data.window = Some("7d".into());
+        let new = r10_quota(3, 1);
+        if same_time {
+            old.ts = new.ts;
+            reset.ts = new.ts;
+        }
+        assert_eq!(
+            r10_fold(&[new.clone(), old.clone(), reset.clone()]).len(),
+            3
+        );
+        reset.account = Some("cl-b".into());
+        assert_eq!(
+            r10_fold(&[old.clone(), reset.clone(), new.clone()]).len(),
+            2
+        );
+        reset.account = old.account.clone();
+        reset.provider = "codex".into();
+        assert_eq!(
+            r10_fold(&[old.clone(), reset.clone(), new.clone()]).len(),
+            2
+        );
+        reset.provider = old.provider.clone();
+        reset.ts = Some(clock().utc());
+        reset.seq = 4;
+        if !same_time {
+            assert_eq!(
+                r10_fold(&[old.clone(), reset.clone(), new.clone()]).len(),
+                2
+            );
+        }
+        reset.ts = None;
+        assert_eq!(r10_fold(&[old, reset, new]).len(), 2); // Unknown reset is a barrier, not a dated row.
+    }
+}
+
+#[test]
+fn r10_feed_and_tab_fold_before_limits_and_keep_nonnotable_reset_barriers() {
+    let mut data = snapshot();
+    data.activity = (0..6).map(|i| r10_quota(i + 1, 6 - i as i64)).collect();
+    let view = project(&data, &mut DashboardState::default(), &clock());
+    assert_eq!(view.events.len(), 1);
+    assert_eq!(view.recent.len(), 1);
+    assert_eq!(view.events[0].seq, view.recent[0].seq);
+    assert_eq!(view.events[0].body, view.recent[0].body);
+    let mut reset = r10_quota(20, 3);
+    reset.kind = "quota_reset".into();
+    reset.notable = false;
+    data.activity.push(reset);
+    let view = project(&data, &mut DashboardState::default(), &clock());
+    assert_eq!(view.recent.len(), 2);
+    assert_eq!(
+        view.events
+            .iter()
+            .filter(|e| e.kind == "quota_reached")
+            .count(),
+        2
+    );
+    let mut future = r10_quota(21, -1);
+    future.data.moved_groups = Some(2);
+    let mut unknown = r10_quota(22, 1);
+    unknown.ts = None;
+    data.activity.extend([future, unknown]);
+    let view = project(&data, &mut DashboardState::default(), &clock());
+    assert!(!view.events.iter().chain(&view.recent).any(|e| e.seq >= 21));
+}
+
+#[test]
+fn r10_headers_detail_and_tiles_share_all_windows_including_exhausted_and_unknown() {
+    let data = r10_accounts(serde_json::json!([
+        {"id":"free","provider":"codex","user_state":"active","health":{"kind":"ready"},"windows":[{"name":"43200m","used_pct":100},{"name":"7d_oi","used_pct":50}]},
+        {"id":"unknown","provider":"claude","user_state":"active","health":{"kind":"ready"},"windows":[{"name":"5h"}]}
+    ]));
+    let view = project(&data, &mut DashboardState::default(), &clock());
+    for group in &view.groups {
+        let tile = view.usage.iter().find(|t| t.id == group.id).unwrap();
+        assert_eq!(
+            tile.windows
+                .iter()
+                .map(|w| (&w.label, w.remaining_pct))
+                .collect::<Vec<_>>(),
+            group
+                .windows
+                .iter()
+                .map(|w| (&w.label, w.remaining_pct))
+                .collect::<Vec<_>>()
+        );
+        let detail = detail_view(
+            &SessionDetail {
+                session: Session {
+                    account: group.id.clone(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            &data.accounts,
+            &clock(),
+            false,
+        );
+        if group.id == "free" {
+            assert_eq!(group.windows.len(), 1);
+            assert_eq!(r10_fact(&detail, "남은 양"), "30일 0%");
+        } else {
+            assert!(group.windows.is_empty());
+            assert_eq!(r10_fact(&detail, "남은 양"), "사용량 확인 전");
+        }
+    }
+    let data = snapshot();
+    let detail = detail_view(
+        &SessionDetail {
+            session: data.sessions.sessions[0].clone(),
+            ..Default::default()
+        },
+        &data.accounts,
+        &clock(),
+        false,
+    );
+    assert_eq!(r10_fact(&detail, "남은 양"), "5시간 34% · 주간 88%");
+    assert!(!r10_fact(&detail, "계정").contains('%'));
+}
+
+#[test]
+fn r10_relogin_stale_windows_have_observation_time_and_paused_metadata() {
+    let data = r10_accounts(serde_json::json!([
+        {"id":"login","provider":"claude","user_state":"active","health":{"kind":"needs_relogin"},"observed_at":"2026-10-19T05:00:00Z","windows":[{"name":"5h","used_pct":10},{"name":"7d","used_pct":20}]},
+        {"id":"paused","provider":"codex","user_state":"paused","health":{"kind":"ready"},"windows":[{"name":"5h","used_pct":100}]}
+    ]));
+    let view = project(&data, &mut DashboardState::default(), &clock());
+    let login = view.groups.iter().find(|g| g.id == "login").unwrap();
+    assert!(!login.relogin_reason.is_empty());
+    assert!(!login.paused);
+    let tile = view.usage.iter().find(|t| t.id == "login").unwrap();
+    assert!(tile.unconfirmed);
+    assert_eq!(tile.last_observed, Some(at("2026-10-19T05:00:00Z")));
+    let detail = detail_view(
+        &SessionDetail {
+            session: Session {
+                account: "login".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        &data.accounts,
+        &clock(),
+        false,
+    );
+    assert_eq!(
+        r10_fact(&detail, "남은 양"),
+        "확인 불가 · 14:00 기준 5시간 90% · 주간 80%"
+    );
+    let paused = view.groups.iter().find(|g| g.id == "paused").unwrap();
+    assert!(paused.paused);
+    assert_eq!(paused.windows[0].remaining_pct, 0);
+    assert!(view.usage.iter().find(|t| t.id == "paused").unwrap().paused);
+    assert!(paused.no_sessions.ends_with("새 세션을 배정하지 않습니다"));
+}
+
+#[test]
+fn r10_usage_observation_metadata_ignores_future_unknown_and_sorts_windows() {
+    let mut data = snapshot();
+    let history = data
+        .usage
+        .accounts
+        .iter_mut()
+        .find(|h| h.id == "cx-a")
+        .unwrap();
+    history.windows.reverse();
+    history.windows[0]
+        .points
+        .push((clock().utc() + chrono::Duration::seconds(1), Some(20.)));
+    history.windows[0].points.push((clock().utc(), None));
+    let tiles = usage_tiles(&data, &clock());
+    let tile = tiles.iter().find(|t| t.id == "cx-a").unwrap();
+    assert_eq!(tile.series[0].name, "5시간");
+    assert_eq!(tile.series[1].name, "주간");
+    assert_eq!(tile.last_observed, Some(clock().utc()));
+    assert_eq!(tile.series[1].points.last().unwrap().1, None);
+    let unknown = r10_accounts(serde_json::json!([
+        {"id":"bad","provider":"codex","user_state":"active","health":{"kind":"needs_relogin"},"observed_at":"not-a-time"},
+        {"id":"future","provider":"codex","user_state":"active","health":{"kind":"ready"},"observed_at":"2030-01-01T00:00:00Z"}
+    ]));
+    assert!(
+        usage_tiles(&unknown, &clock())
+            .iter()
+            .all(|t| t.last_observed.is_none())
+    );
+}
+
+#[test]
+fn r10_detail_status_chip_separates_request_activity_from_account_assignment() {
+    let data = snapshot();
+    let mut detail = SessionDetail {
+        session: data.sessions.sessions[0].clone(),
+        ..Default::default()
+    };
+    let view = detail_view(&detail, &data.accounts, &clock(), false);
+    assert_eq!(view.status, "요청 중 0:42");
+    assert_eq!(view.status_tone, v2::Tone::Use);
+    assert!(view.account_status.ends_with("에서 처리 중"));
+    detail.session.inflight = Inflight::default();
+    for (known, active, text) in [
+        (true, true, "5분 안에 활동"),
+        (true, false, "쉬는 중"),
+        (false, false, "요청 상태 확인 전"),
+    ] {
+        detail.session.inflight_known = known;
+        detail.session.active = active;
+        let view = detail_view(&detail, &data.accounts, &clock(), false);
+        assert_eq!(view.status, text);
+        assert_eq!(view.status_tone, v2::Tone::Off);
+        assert!(view.account_status.ends_with("에 배정됨"));
+    }
+}
+
+#[test]
+fn r10_final_failures_survive_failover_and_today_counts_respect_boundaries_and_partial_data() {
+    let data = snapshot();
+    let mut detail = SessionDetail {
+        session: data.sessions.sessions[0].clone(),
+        ..Default::default()
+    };
+    for result in [
+        "upstream_error",
+        "network_error",
+        "relayed_rate429",
+        "relayed_rate_429",
+        "client_drop",
+        "ok",
+        "rate_hold_ok",
+        "inflight",
+    ] {
+        detail.recent_requests.push(RequestSummary {
+            ts: Some(clock().utc()),
+            outcome: result.into(),
+            failover: Some(Failover {
+                from: "cl-a".into(),
+                to: "cl-b".into(),
+            }),
+            ..Default::default()
+        });
+    }
+    let view = detail_view(&detail, &data.accounts, &clock(), false);
+    assert_eq!(
+        view.requests.iter().filter(|r| r.contains("실패")).count(),
+        4
+    );
+    assert_eq!(r10_fact(&view, "오늘 요청"), "100건 · 실패 4건");
+    for time in [
+        None,
+        Some(clock().day_start - chrono::Duration::seconds(1)),
+        Some(clock().utc() + chrono::Duration::seconds(1)),
+    ] {
+        detail.recent_requests.push(RequestSummary {
+            ts: time,
+            outcome: "upstream_error".into(),
+            ..Default::default()
+        });
+    }
+    assert_eq!(
+        r10_fact(
+            &detail_view(&detail, &data.accounts, &clock(), false),
+            "오늘 요청"
+        ),
+        "100건 · 실패 4건"
+    );
+    detail.session.failures_today = Some(9);
+    assert_eq!(
+        r10_fact(
+            &detail_view(&detail, &data.accounts, &clock(), false),
+            "오늘 요청"
+        ),
+        "100건 · 실패 9건"
+    );
+    detail.session.counters_complete = false;
+    assert_eq!(
+        r10_fact(
+            &detail_view(&detail, &data.accounts, &clock(), false),
+            "오늘 요청"
+        ),
+        "— · 실패 최소 9건 · 이전 실행 기록 확인 전"
+    );
+    detail.session.counters_complete = true;
+    detail.session.failures_today = None;
+    assert_eq!(
+        r10_fact(
+            &detail_view(&detail, &data.accounts, &clock(), false),
+            "오늘 요청"
+        ),
+        "100건 · 실패 최소 4건"
+    );
+}
+
+#[test]
+fn r10_empty_group_ready_reason_and_client_sort_are_explicit() {
+    let data = r10_accounts(serde_json::json!([
+        {"id":"cl-a","provider":"claude","user_state":"active","health":{"kind":"ready"}},
+        {"id":"cl-login","provider":"claude","user_state":"active","health":{"kind":"needs_relogin"}},
+        {"id":"cl-quota","provider":"claude","user_state":"active","health":{"kind":"cooling","reason":"quota","scope":"account"},"windows":[{"name":"5h","used_pct":100}]}
+    ]));
+    let view = project(&data, &mut DashboardState::default(), &clock());
+    assert_eq!(view.session_count, 0);
+    assert_eq!(view.active_count, 0);
+    assert_eq!(view.inflight_count, 0);
+    assert!(
+        view.groups
+            .iter()
+            .find(|g| g.id == "cl-a")
+            .unwrap()
+            .no_sessions
+            .ends_with("새 세션 배정 가능")
+    );
+    assert!(
+        view.groups
+            .iter()
+            .find(|g| g.id == "cl-login")
+            .unwrap()
+            .no_sessions
+            .ends_with("새 세션을 배정하지 않습니다")
+    );
+    assert!(
+        view.groups
+            .iter()
+            .find(|g| g.id == "cl-quota")
+            .unwrap()
+            .no_sessions
+            .ends_with("새 세션을 배정하지 않습니다")
+    );
+    let original = snapshot();
+    let mut a = session_row(
+        &original.sessions.sessions[0],
+        &original.accounts,
+        &clock(),
+        None,
+    );
+    let mut b = a.clone();
+    a.client = "Zulu".into();
+    b.client = "alpha".into();
+    assert!(compare_rows(&a, &b, SortKey::Client, false).is_gt());
+    assert!(compare_rows(&a, &b, SortKey::Client, true).is_lt());
+    a.client = "ALPHA".into();
+    a.short_id = "000001".into();
+    b.short_id = "000002".into();
+    assert!(compare_rows(&a, &b, SortKey::Client, false).is_lt());
+}
+
+#[test]
+fn r10_unknown_event_times_do_not_fold_and_reset_outside_pair_does_not_split() {
+    let old = r10_quota(1, 3);
+    let new = r10_quota(3, 1);
+    for minutes in [0, 4] {
+        let mut reset = r10_quota(2, minutes);
+        reset.kind = "quota_reset".into();
+        let rows = r10_fold(&[old.clone(), reset, new.clone()]);
+        assert_eq!(rows.iter().filter(|r| r.kind == "quota_reached").count(), 1);
+    }
+    let mut unknown = new.clone();
+    unknown.ts = None;
+    let rows = r10_fold(&[old, unknown]);
+    assert_eq!(rows.len(), 1);
+    assert!(!rows[0].body.contains("같은 알림"));
+    let mut data = snapshot();
+    data.activity = vec![r10_quota(1, 2), new];
+    data.activity[1].notable = false;
+    let view = project(&data, &mut DashboardState::default(), &clock());
+    assert_eq!(view.recent.len(), 1);
+    assert_eq!(view.recent[0].seq, 1);
+}
+
+#[test]
+fn r10_relogin_unknown_observation_time_never_claims_a_known_timestamp() {
+    let data = r10_accounts(serde_json::json!([
+        {"id":"login","provider":"claude","user_state":"active","health":{"kind":"needs_relogin"},"windows":[{"name":"5h","used_pct":10}]}
+    ]));
+    let detail = detail_view(
+        &SessionDetail {
+            session: Session {
+                account: "login".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        &data.accounts,
+        &clock(),
+        false,
+    );
+    assert_eq!(
+        r10_fact(&detail, "남은 양"),
+        "확인 불가 · 기준 시각 확인 전 5시간 90%"
+    );
+    assert_eq!(usage_tiles(&data, &clock())[0].last_observed, None);
+}

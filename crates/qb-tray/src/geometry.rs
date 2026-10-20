@@ -2,6 +2,9 @@
 use crate::{Rect, dashboard_history as history, dashboard_model as m, state::*, v2};
 use chrono::{DateTime, Utc};
 use std::collections::{BTreeMap, BTreeSet};
+#[path = "dashboard_usage_geometry.rs"]
+mod usage_geometry;
+use usage_geometry::usage;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Target {
@@ -17,6 +20,7 @@ pub enum Target {
     Group(String),
     Session(String),
     CloseDetail,
+    DetailSurface,
     EventFilter(EventFilter),
     EventDays(u8),
     EventDaysMenu,
@@ -40,6 +44,7 @@ pub enum Role {
     Row,
     Text,
     Chart,
+    Group,
 }
 #[derive(Clone, Copy, Debug)]
 pub enum Color {
@@ -47,6 +52,7 @@ pub enum Color {
     Surface,
     Footer,
     Border,
+    GroupBorder,
     Text,
     Secondary,
     Accent,
@@ -58,6 +64,9 @@ pub enum Color {
     BarOk,
     BarLow,
     BarCritical,
+    BarPaused,
+    PipOutline,
+    Verdict(v2::Tone),
     Series7d,
     ChipBg(v2::Tone),
     ChipFg(v2::Tone),
@@ -248,8 +257,36 @@ struct Builder<'a> {
     metrics: &'a Metrics,
     clip: Rect,
     scope: String,
+    enabled: bool,
 }
 impl Builder<'_> {
+    fn target(
+        &mut self,
+        r: Rect,
+        label: &str,
+        target: Target,
+        role: Role,
+        selected: bool,
+        parent: Option<String>,
+    ) {
+        if let Some(hit) = intersection(r, self.clip) {
+            let index = self.semantic(
+                format!("{}:control:{target:?}", self.scope),
+                parent,
+                role,
+                label.into(),
+                hit,
+                Some(target.clone()),
+            );
+            self.scene.accessibility[index].selected = selected;
+            self.scene.targets.push(HitTarget {
+                rect: hit,
+                target,
+                enabled: true,
+                tooltip: None,
+            });
+        }
+    }
     fn tooltip(&mut self, r: Rect, text: String) {
         if let Some(rect) = intersection(r, self.clip) {
             self.scene.tooltips.push(TooltipRegion { rect, text });
@@ -445,6 +482,9 @@ impl Builder<'_> {
         tip: Option<String>,
     ) {
         let accent = matches!(&target, Target::OpenTrayAccount(_) | Target::OpenTrayAdd);
+        if !self.enabled {
+            self.scene.draw.push(Draw::Alpha(0.5));
+        }
         if let Some(hit) = intersection(r, self.clip) {
             let idx = self.semantic(
                 format!("{}:control:{target:?}", self.scope),
@@ -511,6 +551,9 @@ impl Builder<'_> {
             },
             false,
         );
+        if !self.enabled {
+            self.scene.draw.push(Draw::Alpha(1.));
+        }
     }
     fn card(&mut self, r: Rect) {
         self.fill(r, Color::Surface, 8.);
@@ -580,104 +623,32 @@ impl Scene {
             metrics,
             clip: outer,
             scope: "dashboard".into(),
+            enabled: view.connection.core_ok,
         };
         b.fill(outer, Color::Page, 0.);
         b.fill(rect(0., 0., w, 48.), Color::Surface, 0.);
         b.line([0., 47.5], [w, 47.5], Color::Border, 1., None);
-        for (i, (tab, label)) in [
-            (Tab::Overview, "개요"),
-            (Tab::Events, "기록"),
-            (Tab::Usage, "사용량"),
-        ]
-        .iter()
-        .enumerate()
-        {
-            let r = rect(20. + i as f32 * 72., 12., 68., 36.);
-            b.control(
-                r,
-                label,
-                Target::Tab(*tab),
-                Role::Tab,
-                state.tab == *tab,
-                None,
-            );
-            if state.tab == *tab {
-                b.fill(rect(r.left + 12., 45., 44., 3.), Color::Accent, 0.);
-            }
-        }
-        if view.todo > 0 {
-            b.text(
-                rect(242., 15., 88., 20.),
-                format!("할 일 {}", view.todo),
-                12.,
-                true,
-                Color::Bad,
-                false,
-            );
-        }
-        if view.connection.core_ok {
-            let right = w - 20.;
-            b.semantic(
-                "header:counts".into(),
-                None,
-                Role::Text,
-                format!(
-                    "세션 {}개, 활성 {}개, 요청 중 {}개{}",
-                    view.session_count,
-                    view.active_count,
-                    view.inflight_text(),
-                    if view.truncated {
-                        " · 일부 세션만 표시"
-                    } else {
-                        ""
-                    }
-                ),
-                rect(right - 380., 16., 380., 20.),
-                None,
-            );
-            b.text(
-                rect(right - 380., 16., 380., 20.),
-                format!(
-                    "세션 {}개    활성 {}개    요청 중 {}개",
-                    view.session_count,
-                    view.active_count,
-                    view.inflight_text()
-                ),
-                12.,
-                false,
-                Color::Secondary,
-                false,
-            );
-            let summary_space = (right - 400. - 330.).max(0.);
-            for (i, s) in view.summaries.iter().take(2).enumerate() {
-                let sw = summary_space / 2.;
-                let r = rect(330. + i as f32 * sw, 14., (sw - 12.).max(0.), 24.);
-                b.text(r, s.clone(), 12., false, Color::Text, false);
-                b.semantic(format!("summary:{i}"), None, Role::Text, s.clone(), r, None);
-            }
-        } else {
-            b.text(
-                rect(w - 330., 15., 310., 22.),
-                "코어에 연결할 수 없습니다",
-                13.,
-                true,
-                Color::Bad,
-                false,
-            );
-        }
+        app_header(&mut b, view, state, w);
         let mut top = 64.;
         if !view.connection.core_ok {
-            b.fill(rect(20., 64., w - 40., 28.), Color::Select, 4.);
+            b.fill(
+                rect(20., 64., w - 40., 28.),
+                Color::ChipBg(v2::Tone::Bad),
+                4.,
+            );
             b.text(
                 rect(32., 68., w - 64., 20.),
-                format!("{}초 후 다시 연결합니다", view.connection.retry_seconds),
+                format!(
+                    "{}초 후 다시 연결합니다 · 아래는 {}의 마지막 값입니다",
+                    view.connection.retry_seconds,
+                    view.clock.now.format("%H:%M:%S")
+                ),
                 12.,
                 false,
-                Color::Secondary,
+                Color::Bad,
                 false,
             );
             top += 40.;
-            b.scene.draw.push(Draw::Alpha(0.5));
         }
         let body = rect(20., top, w - 40., (h - top - 20.).max(0.));
         if view.empty == m::EmptyState::NoAccounts {
@@ -721,6 +692,16 @@ impl Scene {
         if let Some(popup) = state.popup {
             dropdown(&mut b, popup);
         }
+        if !view.connection.core_ok {
+            for target in &mut b.scene.targets {
+                target.enabled = false;
+            }
+            for node in &mut b.scene.accessibility {
+                if node.target.is_some() {
+                    node.enabled = false;
+                }
+            }
+        }
         b.scene
     }
     /// Table offset that reveals this row. Native rebuilds before publishing UIA bounds.
@@ -762,6 +743,7 @@ impl Scene {
         let mut order = Vec::new();
         for h in &self.targets {
             if h.enabled
+                && h.target != Target::DetailSurface
                 && (!self.modal || matches!(h.target, Target::Range(_) | Target::EventDays(_)))
                 && !order.contains(&&h.target)
             {
@@ -807,6 +789,189 @@ impl Scene {
     }
 }
 
+fn app_header(b: &mut Builder<'_>, v: &m::DashboardView, state: &DashboardState, w: f32) {
+    let mut x = 20.;
+    for (tab, label) in [
+        (Tab::Overview, "개요"),
+        (Tab::Events, "기록"),
+        (Tab::Usage, "사용량"),
+    ] {
+        let tw = if tab == Tab::Events && v.todo > 0 {
+            100.
+        } else {
+            72.
+        };
+        let r = rect(x, 8., tw, 40.);
+        b.target(
+            r,
+            label,
+            Target::Tab(tab),
+            Role::Tab,
+            state.tab == tab,
+            None,
+        );
+        b.text(
+            rect(x + 12., 19., 48., 20.),
+            label,
+            13.,
+            state.tab == tab,
+            Color::Text,
+            false,
+        );
+        if tab == Tab::Events && v.todo > 0 {
+            b.text(
+                rect(x + 48., 19., 52., 20.),
+                format!("할 일 {}", v.todo),
+                12.,
+                true,
+                Color::Bad,
+                false,
+            );
+        }
+        if state.tab == tab {
+            b.fill(rect(x + 12., 45., tw - 24., 3.), Color::Accent, 0.);
+        }
+        x += tw;
+    }
+    if !v.connection.core_ok {
+        b.text(
+            rect((w - 330.).max(x + 16.), 16., 310., 22.),
+            "코어에 연결할 수 없습니다",
+            13.,
+            true,
+            Color::Bad,
+            false,
+        );
+        return;
+    }
+    let counts = format!(
+        "세션 {}개    활성 {}개    요청 중 {}개",
+        v.session_count,
+        v.active_count,
+        v.inflight_text()
+    );
+    let cw = if w >= 1180. {
+        b.measured_width(&counts, 12., false)
+    } else {
+        0.
+    };
+    let right = w - 20. - if cw > 0. { cw + 16. } else { 0. };
+    if cw > 0. {
+        let r = rect(w - 20. - cw, 17., cw, 20.);
+        b.text(r, counts.clone(), 12., false, Color::Secondary, false);
+        b.semantic("header:counts".into(), None, Role::Text, counts, r, None);
+    } else {
+        let index = b.semantic(
+            "header:counts".into(),
+            None,
+            Role::Text,
+            counts,
+            rect(0., 0., 0., 0.),
+            None,
+        );
+        b.scene.accessibility[index].hidden = true;
+    }
+    let parts: Vec<_> = v
+        .provider_summaries
+        .iter()
+        .take(2)
+        .map(|summary| {
+            let provider_w = b.measured_width(&summary.provider_label, 12., true);
+            let verdict_w = b.measured_width(summary.verdict.text(), 12., false);
+            let todo = if summary.todo > 0 {
+                format!(" · 할 일 {}", summary.todo)
+            } else {
+                String::new()
+            };
+            let todo_w = if todo.is_empty() {
+                0.
+            } else {
+                b.measured_width(&todo, 12., true)
+            };
+            let detail_w = if summary.detail.is_empty() {
+                0.
+            } else {
+                b.measured_width(&summary.detail, 12., false) + 6.
+            };
+            (provider_w, verdict_w, todo, todo_w, detail_w)
+        })
+        .collect();
+    let separators = parts.len().saturating_sub(1) as f32 * 25.;
+    let fixed = parts
+        .iter()
+        .map(|(p, verdict, _, todo, _)| 16. + p + 6. + verdict + todo)
+        .sum::<f32>()
+        + separators;
+    let mut room = (right - 300. - fixed).max(0.);
+    let details: Vec<_> = parts
+        .iter()
+        .map(|part| {
+            let width = part.4.min(room);
+            room -= width;
+            width
+        })
+        .collect();
+    let mut sx = (right - fixed - details.iter().sum::<f32>()).max(300.);
+    for (i, (summary, (provider_w, verdict_w, todo, todo_w, _))) in
+        v.provider_summaries.iter().zip(parts).enumerate()
+    {
+        let left = sx;
+        b.fill(rect(sx, 20., 8., 8.), Color::Verdict(summary.tone), 4.);
+        sx += 16.;
+        b.text(
+            rect(sx, 16., provider_w, 20.),
+            summary.provider_label.clone(),
+            12.,
+            true,
+            Color::Text,
+            false,
+        );
+        sx += provider_w + 6.;
+        b.text(
+            rect(sx, 16., verdict_w, 20.),
+            summary.verdict.text(),
+            12.,
+            false,
+            Color::Text,
+            false,
+        );
+        sx += verdict_w;
+        if details[i] > 0. {
+            b.text(
+                rect(sx + 6., 16., (details[i] - 6.).max(0.), 20.),
+                summary.detail.clone(),
+                12.,
+                false,
+                Color::Secondary,
+                false,
+            );
+            sx += details[i];
+        }
+        if todo_w > 0. {
+            b.text(
+                rect(sx, 16., todo_w, 20.),
+                todo,
+                12.,
+                true,
+                Color::Bad,
+                false,
+            );
+            sx += todo_w;
+        }
+        b.semantic(
+            format!("summary:{i}"),
+            None,
+            Role::Text,
+            summary.accessible_name.clone(),
+            rect(left, 12., sx - left, 24.),
+            None,
+        );
+        if i + 1 < v.provider_summaries.len().min(2) {
+            b.line([sx + 12., 12.], [sx + 12., 36.], Color::Border, 1., None);
+            sx += 25.;
+        }
+    }
+}
 fn dropdown(b: &mut Builder<'_>, popup: Popup) {
     let anchor_target = match popup {
         Popup::Range => Target::RangeMenu,
@@ -866,15 +1031,14 @@ fn dropdown(b: &mut Builder<'_>, popup: Popup) {
 fn overview(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, body: Rect) {
     let narrow = width(body) < 1140.;
     let (table, side) = if narrow {
-        let th = (height(body) * 0.6).min(height(body) - 156.).max(120.);
         (
-            rect(body.left, body.top, width(body), th),
             rect(
                 body.left,
-                body.top + th + 16.,
+                body.top,
                 width(body),
-                height(body) - th - 16.,
+                (height(body) - 56.).max(0.),
             ),
+            rect(body.left, body.bottom - 44., width(body), 44.),
         )
     } else {
         (
@@ -883,10 +1047,105 @@ fn overview(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, body:
         )
     };
     sessions(b, v, s, table);
-    if let Some(d) = &v.detail {
+    if narrow {
+        recent_strip(b, v, side);
+        if let Some(d) = &v.detail {
+            let overlay = rect(
+                body.right - 360.,
+                body.top + 16.,
+                360.,
+                (height(body) - 16.).max(0.),
+            );
+            b.scene.draw.push(Draw::Alpha(0.03));
+            for spread in 1..=8 {
+                let spread = spread as f32;
+                b.fill(
+                    rect(
+                        overlay.left - spread,
+                        overlay.top + 8. - spread,
+                        width(overlay) + 2. * spread,
+                        height(overlay) + 2. * spread,
+                    ),
+                    Color::Text,
+                    8. + spread,
+                );
+            }
+            b.scene.draw.push(Draw::Alpha(1.));
+            detail(b, v, s, overlay, d);
+        }
+    } else if let Some(d) = &v.detail {
         detail(b, v, s, side, d);
     } else {
         recent(b, v, s, side);
+    }
+}
+fn recent_strip(b: &mut Builder<'_>, v: &m::DashboardView, r: Rect) {
+    b.card(r);
+    b.text(
+        rect(r.left + 16., r.top + 12., 58., 20.),
+        "최근 일",
+        13.,
+        true,
+        Color::Text,
+        false,
+    );
+    let link = rect(r.right - 130., r.top + 8., 114., 28.);
+    b.target(
+        link,
+        "기록 모두 보기",
+        Target::AllEvents,
+        Role::Button,
+        false,
+        None,
+    );
+    b.text(
+        rect(link.left, link.top + 5., width(link), 18.),
+        "기록 모두 보기 ›",
+        12.,
+        false,
+        Color::Accent,
+        false,
+    );
+    if let Some(event) = v.recent.first() {
+        let tag_w = b.measured_width(&event.tag, 12., true) + 16.;
+        chip(
+            b,
+            &event.tag,
+            event.tone,
+            rect(r.left + 82., r.top + 12., tag_w, 20.),
+            4.,
+        );
+        let x = r.left + 82. + tag_w + 12.;
+        b.text(
+            rect(x, r.top + 13., (link.left - x - 66.).max(0.), 18.),
+            format!("{} · {}", event.title, event.body),
+            12.,
+            false,
+            Color::Text,
+            false,
+        );
+        b.text(
+            rect(link.left - 58., r.top + 13., 48., 18.),
+            event.time.clone(),
+            12.,
+            false,
+            Color::Secondary,
+            false,
+        );
+    } else {
+        b.text(
+            rect(
+                r.left + 82.,
+                r.top + 13.,
+                (link.left - r.left - 98.).max(0.),
+                18.,
+            ),
+            v.event_empty.clone(),
+            12.,
+            false,
+            Color::Secondary,
+            false,
+        );
     }
 }
 fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card: Rect) {
@@ -899,17 +1158,18 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
         card,
         None,
     );
-    let mut x = card.left + 12.;
-    let y = card.top + 8.;
+    let y = card.top + 12.;
     b.text(
-        rect(x, y + 6., 42., 22.),
+        rect(card.left + 16., y + 5., 42., 20.),
         "세션",
         14.,
         true,
         Color::Text,
         false,
     );
-    x += 48.;
+    let start = card.left + 64.;
+    let segment = rect(start, y, 192., 28.);
+    b.stroke(segment, Color::Border, 1., 4.);
     for (i, (filter, label)) in [
         (ProviderFilter::All, "전체"),
         (ProviderFilter::Claude, "Claude"),
@@ -918,51 +1178,103 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
     .iter()
     .enumerate()
     {
+        let r = rect(start + i as f32 * 64., y, 64., 28.);
+        let selected = s.provider == *filter;
+        if selected {
+            b.fill(rect(r.left + 1., r.top + 1., 62., 26.), Color::Select, 0.);
+        }
+        if i > 0 {
+            b.line([r.left, r.top], [r.left, r.bottom], Color::Border, 1., None);
+        }
         let text = format!("{label} {}", v.provider_counts[i]);
-        b.control(
-            rect(x, y, 76., 28.),
+        b.target(
+            r,
             &text,
             Target::Provider(*filter),
             Role::Button,
-            s.provider == *filter,
+            selected,
             None,
         );
-        x += 78.;
+        b.center_text(
+            rect(r.left + 2., r.top + 5., 60., 18.),
+            text,
+            12.,
+            false,
+            if selected { Color::Accent } else { Color::Text },
+            false,
+        );
     }
-    x += 8.;
     b.control(
-        rect(x, y, 106., 28.),
+        rect(start + 204., y, 96., 28.),
         s.range.label(),
         Target::RangeMenu,
         Role::ComboBox,
         false,
         None,
     );
-    x += 116.;
-    b.control(
-        rect(x, y, 136., 28.),
-        if s.grouped {
-            "☑ 계정별로 묶기"
-        } else {
-            "☐ 계정별로 묶기"
-        },
+    let check = rect(start + 312., y, 134., 28.);
+    b.target(
+        check,
+        "계정별로 묶기",
         Target::ToggleGrouping,
         Role::Checkbox,
         s.grouped,
         None,
     );
-    let search_w = (card.right - 12. - (x + 148.)).clamp(64., 200.);
-    b.control(
-        rect(card.right - search_w - 12., y, search_w, 28.),
+    let box_rect = rect(check.left, check.top + 6., 16., 16.);
+    if s.grouped {
+        b.fill(box_rect, Color::Accent, 2.);
+        b.text_face(
+            rect(box_rect.left + 1., box_rect.top + 1., 14., 14.),
+            "\u{e73e}",
+            12.,
+            false,
+            Color::OnAccent,
+            false,
+            Face::Icon,
+            TextAlign::Center,
+        );
+    } else {
+        b.stroke(box_rect, Color::Secondary, 1., 2.);
+    }
+    b.text(
+        rect(check.left + 24., y + 5., 110., 18.),
+        "계정별로 묶기",
+        12.,
+        false,
+        Color::Text,
+        false,
+    );
+    let search_w = (card.right - 16. - check.right - 12.).clamp(100., 220.);
+    let search = rect(card.right - search_w - 16., y, search_w, 28.);
+    b.fill(search, Color::Surface, 4.);
+    b.stroke(search, Color::Border, 1., 4.);
+    b.target(search, "세션 검색", Target::Search, Role::Edit, false, None);
+    b.text(
+        rect(search.left + 30., y + 5., search_w - 38., 18.),
         if s.search.is_empty() {
-            "검색"
+            "폴더, 세션 번호, 계정 검색"
         } else {
             &s.search
         },
-        Target::Search,
-        Role::Edit,
+        12.,
         false,
-        None,
+        if s.search.is_empty() {
+            Color::Secondary
+        } else {
+            Color::Text
+        },
+        false,
+    );
+    b.text_face(
+        rect(search.left + 8., y + 6., 14., 16.),
+        "\u{e721}",
+        12.,
+        false,
+        Color::Secondary,
+        false,
+        Face::Icon,
+        TextAlign::Leading,
     );
     if let Some(node) = b
         .scene
@@ -976,13 +1288,13 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
     let no_sessions = matches!(v.empty, m::EmptyState::NoSessions(_));
     let header = rect(
         card.left + 1.,
-        card.top + 48.,
+        card.top + 52.,
         width(card) - 2.,
         if no_sessions { 0. } else { 32. },
     );
     b.fill(header, Color::Footer, 0.);
-    let columns = columns(width(card) - 28., !s.grouped);
-    let mut cx = card.left + 12.;
+    let columns = columns(width(card) - 50., !s.grouped);
+    let mut cx = card.left + 25.;
     if !no_sessions {
         for (key, label, cw) in &columns {
             if s.grouped {
@@ -1020,7 +1332,63 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
     }
     let foot = rect(card.left + 1., card.bottom - 32., width(card) - 2., 31.);
     b.fill(foot, Color::Footer, 0.);
-    b.text(rect(foot.left+12.,foot.top+8.,width(foot)-24.,18.),format!("● 요청 중  ◯ 5분 안에 활동  ● 쉬는 중 · 활성 세션 = 요청 중 + 5분 안에 활동 · {} 기준 · {}{}",v.clock.now.format("%H:%M:%S"),if v.connection.stream_ok{"바뀌면 바로 반영"}else{"다시 연결 중"},if v.truncated{" · 최근 2,000개까지 표시"}else{""}),12.,false,if v.connection.stream_ok{Color::Secondary}else{Color::Warn},false);
+    let mut fx = foot.left + 12.;
+    for (kind, label) in [(0, "요청 중"), (1, "5분 안에 활동"), (2, "쉬는 중")] {
+        let dot = rect(fx, foot.top + 13., 7., 7.);
+        match kind {
+            0 => {
+                b.fill(rect(fx - 3., foot.top + 10., 13., 13.), Color::Select, 7.);
+                b.fill(dot, Color::Accent, 4.);
+            }
+            1 => b.stroke(dot, Color::Accent, 2., 4.),
+            _ => b.fill(dot, Color::Secondary, 4.),
+        }
+        let label_width = b.measured_width(label, 12., false);
+        b.text(
+            rect(fx + 13., foot.top + 8., label_width, 18.),
+            label,
+            12.,
+            false,
+            Color::Secondary,
+            false,
+        );
+        fx += label_width + 28.;
+    }
+    let time = format!(
+        "{} 기준 · {}{}",
+        v.clock.now.format("%H:%M:%S"),
+        if v.connection.stream_ok {
+            "바뀌면 바로 반영"
+        } else {
+            "다시 연결 중"
+        },
+        if v.truncated {
+            " · 최근 2,000개"
+        } else {
+            ""
+        }
+    );
+    let tw = b.measured_width(&time, 12., false);
+    b.text(
+        rect(foot.right - 12. - tw, foot.top + 8., tw, 18.),
+        time,
+        12.,
+        false,
+        if v.connection.stream_ok {
+            Color::Secondary
+        } else {
+            Color::Warn
+        },
+        false,
+    );
+    b.text(
+        rect(fx, foot.top + 8., (foot.right - 24. - tw - fx).max(0.), 18.),
+        "활성 세션 = 요청 중 + 5분 안에 활동",
+        12.,
+        false,
+        Color::Secondary,
+        false,
+    );
     let viewport = rect(
         card.left + 1.,
         header.bottom,
@@ -1067,24 +1435,24 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
         120.
     } else if s.grouped {
         let mut provider = "";
-        let mut total = 0.;
+        let mut total = 4.;
         for g in &v.groups {
             if provider != g.provider {
-                total += 26.;
+                total += if provider.is_empty() { 24. } else { 28. };
                 provider = &g.provider;
             }
-            total += 34.;
+            total += group_header_height(g, width(viewport) - 22.) + 2. + 10.;
             if !g.collapsed {
                 total += if g.rows.is_empty() {
-                    30.
+                    32.
                 } else {
-                    g.rows.len() as f32 * 34.
+                    g.rows.len() as f32 * 35.
                 };
             }
         }
-        total
+        total + 12.
     } else {
-        v.flat.len() as f32 * 34.
+        v.flat.len() as f32 * 35. + 8.
     };
     let (old, offset) = b.begin_region(ScrollRegion::Table, viewport, content, s.table_offset);
     let mut ry = viewport.top - offset;
@@ -1199,60 +1567,171 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
         _ => {
             if s.grouped {
                 let mut provider = "";
+                let mut pinned = None;
+                ry += 4.;
                 for group in &v.groups {
                     if provider != group.provider {
+                        let ph = if provider.is_empty() { 24. } else { 28. };
                         b.text(
-                            rect(viewport.left + 12., ry + 5., width(viewport) - 24., 20.),
+                            rect(
+                                viewport.left + 12.,
+                                ry + ph - 18.,
+                                width(viewport) - 24.,
+                                16.,
+                            ),
                             v2::provider_label(&group.provider),
                             12.,
                             true,
                             Color::Secondary,
                             false,
                         );
-                        ry += 26.;
+                        ry += ph;
                         provider = &group.provider;
                     }
-                    let header_height =
-                        (34. + group.windows.len().saturating_sub(1) as f32 * 26.).max(34.);
+                    let header_height = group_header_height(group, width(viewport) - 22.);
+                    let rows_height = if group.collapsed {
+                        0.
+                    } else if group.rows.is_empty() {
+                        32.
+                    } else {
+                        group.rows.len() as f32 * 35.
+                    };
+                    let box_rect = rect(
+                        viewport.left + 11.,
+                        ry,
+                        width(viewport) - 22.,
+                        header_height + rows_height + 2.,
+                    );
+                    let description = format!(
+                        "{} 계정, {}, {}, 활성 세션 {} / {}{}, {}",
+                        group.name,
+                        group.plan,
+                        group.chip,
+                        group.active,
+                        group.threshold.unwrap_or(5),
+                        if group.active > group.threshold.unwrap_or(5) {
+                            format!(
+                                ", 기준보다 {}개 많음",
+                                group.active - group.threshold.unwrap_or(5)
+                            )
+                        } else {
+                            String::new()
+                        },
+                        group
+                            .windows
+                            .iter()
+                            .map(|w| format!("{} {} {}", w.label, w.remaining, w.reset))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    b.semantic(
+                        format!("group:{}", group.id),
+                        Some("sessions:table".into()),
+                        Role::Group,
+                        description,
+                        box_rect,
+                        None,
+                    );
+                    b.fill(box_rect, Color::Surface, 6.);
+                    b.stroke(box_rect, Color::GroupBorder, 1., 6.);
                     group_header(
                         b,
                         group,
-                        rect(viewport.left, ry, width(viewport), header_height),
+                        rect(
+                            box_rect.left + 1.,
+                            ry + 1.,
+                            width(box_rect) - 2.,
+                            header_height,
+                        ),
+                        false,
                     );
-                    ry += header_height;
+                    if !group.collapsed {
+                        b.line(
+                            [box_rect.left, ry + header_height + 1.],
+                            [box_rect.right, ry + header_height + 1.],
+                            Color::Border,
+                            1.,
+                            None,
+                        );
+                    }
+                    if box_rect.top < viewport.top
+                        && box_rect.bottom > viewport.top
+                        && !group.collapsed
+                    {
+                        pinned = Some((
+                            group,
+                            rect(
+                                box_rect.left + 1.,
+                                viewport.top.min(box_rect.bottom - header_height),
+                                width(box_rect) - 2.,
+                                header_height,
+                            ),
+                        ));
+                    }
+                    ry += header_height + 1.;
                     if !group.collapsed {
                         if group.rows.is_empty() {
                             b.text(
-                                rect(viewport.left + 44., ry + 7., width(viewport) - 56., 20.),
+                                rect(box_rect.left + 32., ry + 8., width(box_rect) - 44., 16.),
                                 group.no_sessions.clone(),
                                 12.,
                                 false,
                                 Color::Secondary,
                                 false,
                             );
-                            ry += 30.;
                         } else {
-                            for row in &group.rows {
+                            for (index, row) in group.rows.iter().enumerate() {
                                 session(
                                     b,
                                     row,
-                                    rect(viewport.left, ry, width(viewport), 34.),
+                                    rect(box_rect.left + 1., ry, width(box_rect) - 2., 35.),
                                     &columns,
+                                    Some(format!("group:{}", group.id)),
                                 );
-                                ry += 34.;
+                                if index + 1 < group.rows.len() {
+                                    b.line(
+                                        [box_rect.left + 1., ry + 34.5],
+                                        [box_rect.right - 1., ry + 34.5],
+                                        Color::Border,
+                                        1.,
+                                        None,
+                                    );
+                                }
+                                ry += 35.;
                             }
                         }
                     }
+                    ry = box_rect.bottom + 10.;
+                }
+                if let Some((group, pinned_rect)) = pinned {
+                    b.scene.draw.push(Draw::Alpha(0.02));
+                    for spread in 1..=4 {
+                        let spread = spread as f32;
+                        b.fill(
+                            rect(
+                                pinned_rect.left - spread * 0.5,
+                                pinned_rect.top + 2.,
+                                width(pinned_rect) + spread,
+                                height(pinned_rect) + spread,
+                            ),
+                            Color::Text,
+                            6. + spread,
+                        );
+                    }
+                    b.scene.draw.push(Draw::Alpha(1.));
+                    group_header(b, group, pinned_rect, true);
+                    b.stroke(pinned_rect, Color::GroupBorder, 1., 6.);
                 }
             } else {
                 for row in &v.flat {
                     session(
                         b,
                         row,
-                        rect(viewport.left, ry, width(viewport), 34.),
+                        rect(viewport.left + 11., ry, width(viewport) - 22., 35.),
                         &columns,
+                        None,
                     );
-                    ry += 34.;
+                    ry += 35.;
                 }
             }
         }
@@ -1260,194 +1739,313 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
     b.end_region(old);
 }
 pub fn columns(available: f32, flat: bool) -> Vec<(SortKey, &'static str, f32)> {
-    let mut cols = vec![(SortKey::Status, "", 16.), (SortKey::Session, "세션", 268.)];
+    let mut cols = vec![(SortKey::Status, "", 20.), (SortKey::Session, "세션", 188.)];
     if flat {
         cols.push((SortKey::Account, "계정", 160.));
     }
     cols.extend([
-        (SortKey::Model, "모델", 136.),
-        (SortKey::Start, "시작", 76.),
-        (SortKey::LastActivity, "마지막 활동", 112.),
-        (SortKey::Requests, "오늘 요청", 80.),
+        (SortKey::Client, "클라이언트 · 번호", 172.),
+        (SortKey::Model, "모델", 116.),
+        (SortKey::Start, "시작", 64.),
+        (SortKey::LastActivity, "마지막 활동", 96.),
+        (SortKey::Requests, "오늘 요청", 64.),
     ]);
     let used = cols.iter().map(|c| c.2).sum::<f32>();
     if available - used >= 96. {
         cols.push((SortKey::Memo, "메모", available - used));
     } else {
+        if let Some(column) = cols.iter_mut().find(|column| column.0 == SortKey::Session) {
+            column.2 = (column.2 - (used - available).max(0.)).clamp(160., 188.);
+        }
         for key in [SortKey::Start, SortKey::Model] {
             if cols.iter().map(|c| c.2).sum::<f32>() <= available {
                 break;
             }
             cols.retain(|c| c.0 != key);
         }
+        let used = cols.iter().map(|c| c.2).sum::<f32>();
+        if let Some(col) = cols.iter_mut().find(|c| c.0 == SortKey::Session) {
+            col.2 = (col.2 + available - used).clamp(160., 188.);
+        }
+        // The native minimum window never needs this fallback. Keep callers
+        // below that width contained without shrinking the session id column.
+        let overflow = (cols.iter().map(|c| c.2).sum::<f32>() - available).max(0.);
+        if let Some(col) = cols.iter_mut().find(|c| c.0 == SortKey::Account) {
+            col.2 = (col.2 - overflow).max(80.);
+        }
     }
     cols
 }
-fn group_header(b: &mut Builder<'_>, g: &m::AccountGroup, r: Rect) {
-    b.fill(r, Color::Footer, 0.);
-    let label = format!(
-        "{} {} · {} · {}",
-        if g.collapsed { "›" } else { "⌄" },
-        g.name,
-        g.plan,
-        g.chip
-    );
-    b.control(
-        rect(r.left + 8., r.top + 1., (width(r) - 500.).max(184.), 32.),
-        &label,
-        Target::Group(g.id.clone()),
+fn group_header_height(g: &m::AccountGroup, available: f32) -> f32 {
+    let slots = ((available - 40. + 24.) / 320.).floor().max(1.) as usize;
+    60. + g.windows.len().max(1).div_ceil(slots).saturating_sub(1) as f32 * 24.
+}
+fn chip(b: &mut Builder<'_>, text: &str, tone: v2::Tone, r: Rect, radius: f32) {
+    if text.is_empty() {
+        return;
+    }
+    b.fill(r, Color::ChipBg(tone), radius);
+    b.center_text(r, text, 12., true, Color::ChipFg(tone), false);
+}
+fn usage_bar(b: &mut Builder<'_>, r: Rect, remaining: u8, paused: bool) {
+    b.fill(r, Color::Track, 2.);
+    if remaining == 0 && !paused {
+        b.line(
+            [r.left, (r.top + r.bottom) / 2.],
+            [r.right, (r.top + r.bottom) / 2.],
+            Color::ChipBg(v2::Tone::Limit),
+            height(r),
+            Some([4., 3.]),
+        );
+    } else if remaining > 0 {
+        b.fill(
+            rect(
+                r.left,
+                r.top,
+                width(r) * f32::from(remaining) / 100.,
+                height(r),
+            ),
+            if paused {
+                Color::BarPaused
+            } else {
+                bar_color(remaining)
+            },
+            2.,
+        );
+    }
+}
+fn group_header(b: &mut Builder<'_>, g: &m::AccountGroup, r: Rect, sticky: bool) {
+    b.fill(r, Color::Footer, 6.);
+    let prior_scope = b.scope.clone();
+    if sticky {
+        b.scope = format!("sticky:{}", g.id);
+    }
+    let target = Target::Group(g.id.clone());
+    b.target(
+        r,
+        &format!("{} 계정 접기/펼치기", g.name),
+        target.clone(),
         Role::Button,
         false,
-        None,
+        Some(format!("group:{}", g.id)),
     );
     if let Some(node) = b
         .scene
         .accessibility
         .last_mut()
-        .filter(|n| n.target.as_ref() == Some(&Target::Group(g.id.clone())))
+        .filter(|n| n.target.as_ref() == Some(&target))
     {
         node.expanded = Some(!g.collapsed);
-        node.parent = Some("sessions:table".into());
     }
-    let lx = (r.right - 490.).max(r.left + 210.);
-    let threshold = g
-        .threshold
-        .map(|n| n.to_string())
-        .unwrap_or_else(m::unknown);
-    let load = format!(
-        "활성 세션 {} / {}{}",
-        g.active,
-        threshold,
-        if g.threshold.is_some_and(|t| g.active > t) {
-            " · 기준 넘음"
-        } else {
-            ""
-        }
+    b.text_face(
+        rect(r.left + 12., r.top + 15., 20., 16.),
+        if g.collapsed { "\u{e76c}" } else { "\u{e70d}" },
+        10.,
+        false,
+        Color::Secondary,
+        false,
+        Face::Icon,
+        TextAlign::Leading,
     );
+    let threshold = g.threshold.unwrap_or(5).max(1);
+    let pip_count = threshold.min(20);
+    let over = g.active.saturating_sub(threshold);
+    let over_width = if over > 0 {
+        b.measured_width(&format!("기준보다 {over}개 많음"), 12., false) + 8.
+    } else {
+        0.
+    };
+    let extra_width = if over > 0 { 30. } else { 0. };
+    let load_width = 64. + pip_count as f32 * 11. + extra_width + 42. + over_width;
+    let load_left = r.right - 12. - load_width;
+    let button_width = if g.relogin { 146. } else { 0. };
+    let content_right = load_left - if g.relogin { button_width + 24. } else { 12. };
+    let chip_width = if g.chip.is_empty() {
+        0.
+    } else {
+        b.measured_width(&g.chip, 12., true) + 16.
+    };
+    let plan_width = b.measured_width(&g.plan, 12., false);
+    let prefix = if sticky {
+        format!("{} · ", v2::provider_label(&g.provider))
+    } else {
+        String::new()
+    };
+    let prefix_width = if sticky {
+        b.measured_width(&prefix, 12., false) + 6.
+    } else {
+        0.
+    };
+    let name_left = r.left + 32. + prefix_width;
+    if sticky {
+        b.text(
+            rect(r.left + 32., r.top + 11., prefix_width, 18.),
+            prefix,
+            12.,
+            false,
+            Color::Secondary,
+            false,
+        );
+    }
+    let name_width = b
+        .measured_width(&g.name, 13., true)
+        .min((content_right - name_left - plan_width - chip_width - 20.).max(0.));
     b.text(
-        rect(lx, r.top + 7., 210., 20.),
-        load.clone(),
-        12.,
+        rect(name_left, r.top + 11., name_width, 18.),
+        g.name.clone(),
+        13.,
         true,
         Color::Text,
         false,
     );
-    let pips = g.threshold.unwrap_or(0).max(g.active).min(20);
-    for i in 0..pips {
-        let pr = rect(lx + i as f32 * 10., r.top + 26., 8., 5.);
-        if i < g.active {
-            b.fill(
-                pr,
-                if g.threshold.is_some_and(|t| i >= t) {
-                    Color::Accent
-                } else {
-                    Color::BarOk
-                },
-                2.,
-            );
-        } else {
-            b.stroke(pr, Color::Accent, 1., 2.);
-        }
-    }
-    let tip = format!(
-        "활성 세션 {}개 / 기준 {}개. 기준을 넘으면 새 세션은 여유 있는 다른 계정에 먼저 배정합니다. 연결된 세션 {}개.",
-        g.active, threshold, g.bound
+    let plan_left = name_left + name_width + 6.;
+    b.text(
+        rect(plan_left, r.top + 12., plan_width, 16.),
+        g.plan.clone(),
+        12.,
+        false,
+        Color::Secondary,
+        false,
     );
-    b.tooltip(rect(lx, r.top, 210., 34.), tip.clone());
-    b.semantic(
-        format!("load:{}", g.id),
-        None,
-        Role::Text,
-        tip,
-        rect(lx, r.top, 210., 34.),
-        None,
+    chip(
+        b,
+        &g.chip,
+        g.tone,
+        rect(plan_left + plan_width + 8., r.top + 10., chip_width, 20.),
+        10.,
     );
-    let right = rect(r.right - 270., r.top, 258., 34.);
     if g.relogin {
         b.control(
-            rect(right.left, right.top + 2., width(right), 30.),
+            rect(
+                load_left - button_width - 12.,
+                r.top + 8.,
+                button_width,
+                24.,
+            ),
             "트레이에서 다시 로그인",
             Target::OpenTrayAccount(g.id.clone()),
             Role::Button,
             false,
             None,
         );
-    } else if g.windows.is_empty() {
+    }
+    b.text(
+        rect(load_left, r.top + 12., 64., 16.),
+        "활성 세션",
+        12.,
+        false,
+        Color::Secondary,
+        false,
+    );
+    let pip_left = load_left + 64.;
+    for i in 0..pip_count {
+        let pr = rect(pip_left + i as f32 * 11., r.top + 16., 8., 8.);
+        if i < g.active {
+            b.fill(pr, Color::Accent, 2.);
+        } else {
+            b.stroke(pr, Color::PipOutline, 1., 2.);
+        }
+    }
+    let mut count_left = pip_left + pip_count as f32 * 11. + 8.;
+    if over > 0 {
         b.text(
-            rect(right.left, right.top + 3., width(right), 18.),
-            g.remaining.clone(),
+            rect(count_left - 6., r.top + 12., 30., 16.),
+            format!("+{over}"),
             12.,
             true,
-            Color::Text,
+            Color::Accent,
             false,
         );
+        count_left += 30.;
+    }
+    b.text(
+        rect(count_left, r.top + 12., 42., 16.),
+        format!("{} / {threshold}", g.active),
+        12.,
+        true,
+        Color::Text,
+        false,
+    );
+    if over > 0 {
         b.text(
-            rect(right.left, right.top + 19., width(right) - 60., 16.),
-            g.reset.clone(),
+            rect(count_left + 42., r.top + 12., over_width, 16.),
+            format!("기준보다 {over}개 많음"),
             12.,
             false,
             Color::Secondary,
             false,
         );
-        if let Some(p) = g.remaining_pct {
-            let bar = rect(right.right - 48., right.top + 24., 48., 4.);
-            b.fill(bar, Color::Track, 2.);
-            b.fill(
-                rect(bar.left, bar.top, 48. * p as f32 / 100., 4.),
-                bar_color(p),
-                2.,
-            );
-        }
+    }
+    b.tooltip(rect(load_left, r.top + 8., load_width, 24.), format!("활성 세션 {}개 / 기준 {}개. 기준을 넘으면 새 세션은 여유 있는 다른 계정에 먼저 배정합니다. 연결된 세션 {}개.", g.active, threshold, g.bound));
+    if g.relogin {
+        b.text(
+            rect(r.left + 32., r.top + 36., width(r) - 44., 16.),
+            g.relogin_reason.clone(),
+            12.,
+            false,
+            Color::Secondary,
+            false,
+        );
+    } else if g.windows.is_empty() {
+        b.text(
+            rect(r.left + 32., r.top + 36., 112., 16.),
+            "사용량 확인 전",
+            12.,
+            false,
+            Color::Secondary,
+            false,
+        );
+        b.fill(rect(r.left + 152., r.top + 42., 64., 4.), Color::Track, 2.);
     } else {
+        let slots = ((width(r) - 40. + 24.) / 320.).floor().max(1.) as usize;
         for (index, window) in g.windows.iter().enumerate() {
-            let top = right.top + 2. + index as f32 * 26.;
-            let reset_width = b.measured_width(&window.reset, 12., false);
-            let label = format!("{} {}", window.label, window.remaining);
+            let x = r.left + 32. + (index % slots) as f32 * 320.;
+            let y = r.top + 36. + (index / slots) as f32 * 24.;
             b.text(
-                rect(
-                    right.left,
-                    top,
-                    (width(right) - reset_width - 8.).max(0.),
-                    16.,
-                ),
-                label.clone(),
+                rect(x, y, 40., 16.),
+                window.label.clone(),
+                12.,
+                false,
+                Color::Secondary,
+                false,
+            );
+            b.text(
+                rect(x + 40., y, 66., 16.),
+                window.remaining.clone(),
                 12.,
                 true,
                 Color::Text,
                 false,
             );
-            if !window.reset.is_empty() {
-                b.text(
-                    rect(right.right - reset_width, top, reset_width, 16.),
-                    window.reset.clone(),
-                    12.,
-                    false,
-                    Color::Secondary,
-                    false,
-                );
-            }
-            let bar = rect(right.left, top + 19., width(right), 4.);
-            b.fill(bar, Color::Track, 2.);
-            b.fill(
-                rect(
-                    bar.left,
-                    bar.top,
-                    width(bar) * f32::from(window.remaining_pct) / 100.,
-                    4.,
-                ),
-                bar_color(window.remaining_pct),
-                2.,
+            usage_bar(
+                b,
+                rect(x + 106., y + 6., 64., 4.),
+                window.remaining_pct,
+                g.paused,
+            );
+            b.text(
+                rect(x + 178., y, 118., 16.),
+                window.reset.clone(),
+                12.,
+                false,
+                Color::Secondary,
+                false,
             );
             b.semantic(
-                format!("usage:{}:{index}", g.id),
-                Some("sessions:table".into()),
+                if sticky {
+                    format!("sticky:usage:{}:{index}", g.id)
+                } else {
+                    format!("usage:{}:{index}", g.id)
+                },
+                Some(format!("group:{}", g.id)),
                 Role::Text,
-                format!("{label} · {}", window.reset),
-                rect(right.left, top, width(right), 23.),
+                format!("{} {} · {}", window.label, window.remaining, window.reset),
+                rect(x, y, 296., 16.),
                 None,
             );
         }
     }
+    b.scope = prior_scope;
 }
 fn bar_color(p: u8) -> Color {
     if p >= 30 {
@@ -1458,7 +2056,13 @@ fn bar_color(p: u8) -> Color {
         Color::BarCritical
     }
 }
-fn session(b: &mut Builder<'_>, row: &m::SessionRow, r: Rect, columns: &[(SortKey, &str, f32)]) {
+fn session(
+    b: &mut Builder<'_>,
+    row: &m::SessionRow,
+    r: Rect,
+    columns: &[(SortKey, &str, f32)],
+    parent: Option<String>,
+) {
     b.scene.session_rows.push(SessionGeometry {
         id: row.id.clone(),
         rect: r,
@@ -1475,7 +2079,7 @@ fn session(b: &mut Builder<'_>, row: &m::SessionRow, r: Rect, columns: &[(SortKe
     }
     let idx = b.semantic(
         key.clone(),
-        Some("sessions:table".into()),
+        parent.or_else(|| Some("sessions:table".into())),
         Role::Row,
         format!(
             "{}, {} · {}, 계정 {}, 모델 {}, {}, 오늘 요청 {}",
@@ -1512,16 +2116,28 @@ fn session(b: &mut Builder<'_>, row: &m::SessionRow, r: Rect, columns: &[(SortKe
             }
             SortKey::Session => {
                 b.text(
-                    rect(cr.left, cr.top, (*cw - 110.).max(80.), 20.),
+                    cr,
                     row.label.clone(),
                     13.,
-                    true,
+                    row.label_source.contains("사용자") || !row.label.contains(" 세션 "),
                     Color::Text,
                     false,
                 );
+            }
+            SortKey::Client => {
+                let id_text = format!(" · {}", row.short_id);
+                let id_width = b.measured_width(&id_text, 12., false);
                 b.text(
-                    rect(cr.left + (*cw - 106.), cr.top, 106., 20.),
-                    format!("{} · {}", row.client, row.short_id),
+                    rect(cr.left, cr.top, (*cw - id_width).max(0.), 20.),
+                    row.client.clone(),
+                    12.,
+                    false,
+                    Color::Secondary,
+                    false,
+                );
+                b.text(
+                    rect(cr.right - id_width, cr.top, id_width, 20.),
+                    id_text,
                     12.,
                     false,
                     Color::Secondary,
@@ -1553,13 +2169,6 @@ fn session(b: &mut Builder<'_>, row: &m::SessionRow, r: Rect, columns: &[(SortKe
         }
         x += *cw;
     }
-    b.line(
-        [r.left, r.bottom - 0.5],
-        [r.right, r.bottom - 0.5],
-        Color::Border,
-        1.,
-        None,
-    );
 }
 fn recent(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card: Rect) {
     b.card(card);
@@ -1621,16 +2230,8 @@ fn recent(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card: R
 fn event_card(b: &mut Builder<'_>, e: &m::EventRow, r: Rect, recent: bool) {
     let old_scope = std::mem::replace(&mut b.scope, format!("event:{}", e.seq));
     let x = r.left + 16.;
-    let tag = rect(x, r.top + 12., 96., 20.);
-    b.fill(tag, Color::ChipBg(e.tone), 4.);
-    b.text(
-        rect(tag.left + 6., tag.top + 2., 84., 18.),
-        e.tag.clone(),
-        11.,
-        true,
-        Color::ChipFg(e.tone),
-        false,
-    );
+    let tag_width = b.measured_width(&e.tag, 12., true) + 16.;
+    chip(b, &e.tag, e.tone, rect(x, r.top + 12., tag_width, 20.), 4.);
     b.text(
         rect(r.right - 96., r.top + 14., 80., 18.),
         e.time.clone(),
@@ -1697,6 +2298,12 @@ fn detail(
     d: &m::DetailView,
 ) {
     b.card(card);
+    b.scene.targets.push(HitTarget {
+        rect: card,
+        target: Target::DetailSurface,
+        enabled: true,
+        tooltip: None,
+    });
     let header = if d.raw_prefix.is_some() { 146. } else { 124. };
     b.text(
         rect(card.left + 16., card.top + 16., width(card) - 64., 28.),
@@ -1732,18 +2339,32 @@ fn detail(
             false,
         );
     }
-    b.text(
+    let chip_width = b.measured_width(&d.status, 12., true) + 16.;
+    let status_y = card.top + header - 36.;
+    chip(
+        b,
+        &d.status,
+        d.status_tone,
         rect(
             card.left + 16.,
-            card.top + header - 44.,
-            width(card) - 32.,
-            40.,
+            status_y,
+            chip_width.min(width(card) - 32.),
+            20.,
         ),
-        d.status.clone(),
+        10.,
+    );
+    b.text(
+        rect(
+            card.left + 24. + chip_width,
+            status_y + 2.,
+            (width(card) - 40. - chip_width).max(0.),
+            18.,
+        ),
+        d.account_status.clone(),
         12.,
         false,
-        Color::Accent,
-        true,
+        Color::Secondary,
+        false,
     );
     let viewport = rect(
         card.left + 1.,
@@ -1869,6 +2490,37 @@ fn detail(
     let _ = v;
     b.end_region(old);
 }
+fn event_refs(e: &m::EventRow) -> Vec<(Target, String)> {
+    let mut refs = Vec::new();
+    if let Some(id) = &e.account {
+        refs.push((
+            Target::AccountLink(id.clone()),
+            format!(
+                "계정 {} ›",
+                e.account_label.as_deref().unwrap_or("이름 없음")
+            ),
+        ));
+    }
+    if let Some(id) = &e.session {
+        refs.push((
+            Target::SessionLink(id.clone()),
+            format!(
+                "세션 {} ›",
+                e.session_label
+                    .as_deref()
+                    .unwrap_or_else(|| id.get(..6).unwrap_or(id))
+            ),
+        ));
+    }
+    refs
+}
+fn event_refs_width(b: &mut Builder<'_>, e: &m::EventRow) -> f32 {
+    let refs = event_refs(e);
+    refs.iter()
+        .map(|(_, label)| b.measured_width(label, 12., false).min(240.))
+        .sum::<f32>()
+        + refs.len().saturating_sub(1) as f32 * 16.
+}
 fn events(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card: Rect) {
     b.card(card);
     let mut x = card.left + 12.;
@@ -1961,15 +2613,15 @@ fn events(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card: R
     {
         node.value = Some(s.event_search.clone());
     }
-    let middle = (width(card) - 32. - 64. - 96. - 260. - 36.).max(100.);
     let heights: Vec<_> = v
         .events
         .iter()
         .map(|e| {
+            let middle = (width(card) - 32. - 56. - 92. - 36. - event_refs_width(b, e)).max(100.);
             (b.measured_height(&e.body, middle, 12., false)
-                + 52.
+                + 50.
                 + if e.relogin { 36. } else { 0. })
-            .max(92.)
+            .max(70.)
         })
         .collect();
     let mut previous = "";
@@ -2022,17 +2674,12 @@ fn events(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card: R
             Color::Text,
             false,
         );
-        let tag = rect(time_x + 76., y + 12., 96., 20.);
-        b.fill(tag, Color::ChipBg(e.tone), 4.);
-        b.text(
-            rect(tag.left + 6., tag.top + 2., 84., 18.),
-            e.tag.clone(),
-            11.,
-            true,
-            Color::ChipFg(e.tone),
-            false,
-        );
-        let tx = tag.right + 12.;
+        let tag_width = b.measured_width(&e.tag, 12., true) + 16.;
+        let tag = rect(time_x + 68., y + 12., tag_width, 20.);
+        chip(b, &e.tag, e.tone, tag, 4.);
+        let tx = time_x + 56. + 12. + 92. + 12.;
+        let refs_width = event_refs_width(b, e);
+        let middle = (viewport.right - 16. - refs_width - 12. - tx).max(100.);
         b.text(
             rect(tx, y + 10., middle, 24.),
             e.title.clone(),
@@ -2054,26 +2701,20 @@ fn events(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card: R
             Color::Secondary,
             true,
         );
-        let refs = viewport.right - 276.;
-        if let Some(id) = &e.session {
-            b.control(
-                rect(refs, y + 8., 260., 28.),
-                &format!("세션 {} ›", e.session_label.as_deref().unwrap_or(&id[..6])),
-                Target::SessionLink(id.clone()),
-                Role::Button,
+        let mut refs = viewport.right - 16. - refs_width;
+        for (target, label) in event_refs(e) {
+            let width = b.measured_width(&label, 12., false).min(240.);
+            let r = rect(refs, y + 10., width, 24.);
+            b.target(r, &label, target, Role::Button, false, None);
+            b.text(
+                rect(r.left, r.top + 2., width, 20.),
+                label,
+                12.,
                 false,
-                None,
-            );
-        }
-        if let Some(id) = &e.account {
-            b.control(
-                rect(refs, y + 42., 260., 28.),
-                "계정 보기 ›",
-                Target::AccountLink(id.clone()),
-                Role::Button,
+                Color::Accent,
                 false,
-                None,
             );
+            refs += width + 16.;
         }
         if e.relogin
             && let Some(id) = &e.account
@@ -2107,449 +2748,6 @@ fn events(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card: R
     }
     b.end_region(old);
 }
-fn usage(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card: Rect) {
-    b.card(card);
-    b.text(
-        rect(card.left + 16., card.top + 14., 120., 24.),
-        "오늘 사용량",
-        14.,
-        true,
-        Color::Text,
-        false,
-    );
-    b.text(
-        rect(card.left + 144., card.top + 16., 300., 20.),
-        format!(
-            "남은 양 · 00:00–24:00 · {}",
-            v.clock.day_label(v.clock.utc())
-        ),
-        12.,
-        false,
-        Color::Secondary,
-        false,
-    );
-    b.text(
-        rect(card.right - 520., card.top + 16., 504., 20.),
-        "━ 5시간 남은 양  ┄ 주간 남은 양  ⋮ 초기화  ▧ 크레딧으로 처리",
-        12.,
-        false,
-        Color::Secondary,
-        false,
-    );
-    let viewport = rect(
-        card.left + 12.,
-        card.top + 52.,
-        width(card) - 24.,
-        height(card) - 64.,
-    );
-    let columns = if width(card) < 1140. { 2 } else { 3 };
-    let tw = (width(viewport) - (columns - 1) as f32 * 12.) / columns as f32;
-    let rows = v.usage.len().div_ceil(columns);
-    let content = rows as f32 * 292.;
-    let (old, offset) = b.begin_region(ScrollRegion::Usage, viewport, content, s.usage_offset);
-    let available_nodes = history::SCENE_NODE_BUDGET.saturating_sub(b.scene.accessibility.len());
-    for (i, tile) in v.usage.iter().enumerate() {
-        let r = rect(
-            viewport.left + (i % columns) as f32 * (tw + 12.),
-            viewport.top + (i / columns) as f32 * 292. - offset,
-            tw,
-            280.,
-        );
-        let table = history::project(
-            tile,
-            history::row_limit(tile.series.len(), v.usage.len(), available_nodes),
-        );
-        let draw_start = b.scene.draw.len();
-        usage_tile(b, v, tile, r, &table);
-        // Retain bounded offscreen semantics, but do not paint invisible history lines.
-        if intersection(r, b.clip).is_none() {
-            b.scene.draw.truncate(draw_start);
-        }
-    }
-    if v.usage.is_empty() {
-        b.text(
-            rect(
-                viewport.left + 24.,
-                viewport.top + 24.,
-                width(viewport) - 48.,
-                40.,
-            ),
-            "사용량 확인 전",
-            14.,
-            false,
-            Color::Secondary,
-            false,
-        );
-    }
-    b.end_region(old);
-}
-fn usage_tile(
-    b: &mut Builder<'_>,
-    v: &m::DashboardView,
-    t: &m::UsageTile,
-    r: Rect,
-    table: &history::Table,
-) {
-    b.card(r);
-    b.text(
-        rect(r.left + 12., r.top + 10., 70., 18.),
-        v2::provider_label(&t.provider),
-        12.,
-        false,
-        Color::Secondary,
-        false,
-    );
-    b.text(
-        rect(r.left + 12., r.top + 32., width(r) - 130., 24.),
-        format!("{} · {}", t.name, t.plan),
-        13.,
-        true,
-        Color::Text,
-        false,
-    );
-    b.text(
-        rect(r.right - 110., r.top + 34., 98., 20.),
-        t.chip.clone(),
-        12.,
-        true,
-        Color::ChipFg(t.tone),
-        false,
-    );
-    b.text(
-        rect(r.left + 12., r.top + 64., width(r) - 24., 20.),
-        format!(
-            "지금 {}",
-            if t.series.is_empty() {
-                "사용량 확인 전".into()
-            } else {
-                t.series
-                    .iter()
-                    .map(|s| {
-                        format!(
-                            "{} {} 남음",
-                            s.name,
-                            s.remaining
-                                .map(|p| format!("{p}%"))
-                                .unwrap_or_else(m::unknown)
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" · ")
-            }
-        ),
-        12.,
-        false,
-        Color::Text,
-        false,
-    );
-    let future_labels: BTreeSet<_> = t
-        .series
-        .iter()
-        .flat_map(|series| {
-            series
-                .future_resets
-                .iter()
-                .map(|at| v.clock.time(Some(*at)))
-        })
-        .collect();
-    let annotation_space = if future_labels.is_empty() { 0. } else { 20. };
-    let plot = rect(
-        r.left + 40.,
-        r.top + 102. + annotation_space,
-        width(r) - 64.,
-        130. - annotation_space,
-    );
-    if !future_labels.is_empty() {
-        b.text(
-            rect(plot.left, r.top + 86., width(plot), 16.),
-            format!(
-                "{} 초기화",
-                future_labels.into_iter().collect::<Vec<_>>().join(" · ")
-            ),
-            11.,
-            false,
-            Color::Secondary,
-            false,
-        );
-    }
-    let from = v.clock.day_start;
-    let to = v.clock.day_end;
-    let total = to.signed_duration_since(from).num_milliseconds().max(1) as f64;
-    let x = |at: DateTime<Utc>| {
-        plot.left
-            + (at.signed_duration_since(from).num_milliseconds() as f64 / total).clamp(0., 1.)
-                as f32
-                * width(plot)
-    };
-    let y = |pct: f64| plot.bottom - (pct.clamp(0., 100.) as f32 / 100.) * height(plot);
-    for (start, end) in &t.credits_spans {
-        b.fill(
-            rect(x(*start), plot.top, x(*end) - x(*start), height(plot)),
-            Color::ChipBg(v2::Tone::Warn),
-            0.,
-        );
-    }
-    for p in [0, 50, 100] {
-        let yy = y(p as f64);
-        b.line([plot.left, yy], [plot.right, yy], Color::Border, 1., None);
-        b.text(
-            rect(r.left + 4., yy - 7., 32., 16.),
-            format!("{p}%"),
-            11.,
-            false,
-            Color::Secondary,
-            false,
-        );
-    }
-    for hour in [0, 6, 12, 18, 24] {
-        let xx = plot.left + width(plot) * hour as f32 / 24.;
-        b.text(
-            rect(xx - 10., plot.bottom + 8., 36., 16.),
-            format!("{hour}:00"),
-            11.,
-            false,
-            Color::Secondary,
-            false,
-        );
-    }
-    let nowx = x(v.clock.utc());
-    b.line([nowx, plot.top], [nowx, plot.bottom], Color::Text, 1., None);
-    b.text(
-        rect(
-            (nowx - 12.).clamp(plot.left, plot.right - 26.),
-            plot.top - 18.,
-            28.,
-            18.,
-        ),
-        "지금",
-        11.,
-        true,
-        Color::Text,
-        false,
-    );
-    let mut end_labels: Vec<Rect> = Vec::new();
-    for (series_index, series) in t.series.iter().enumerate() {
-        let color = if series.name == "주간" || series.name == "7d" || series_index > 0 {
-            Color::Series7d
-        } else {
-            Color::BarOk
-        };
-        let dash = if series.name == "주간" || series.name == "7d" || series_index > 0 {
-            Some([5., 3.])
-        } else {
-            None
-        };
-        let mut previous: Option<(DateTime<Utc>, f64)> = None;
-        let resets: BTreeSet<_> = series.resets.iter().copied().collect();
-        for (at, pct) in &series.points {
-            if let Some(pct) = pct {
-                if let Some((pa, pp)) = previous {
-                    if resets.contains(at) {
-                        b.line([x(pa), y(pp)], [x(*at), y(pp)], color, 2., dash);
-                        b.line([x(*at), y(pp)], [x(*at), y(*pct)], color, 2., dash);
-                    } else {
-                        b.line([x(pa), y(pp)], [x(*at), y(*pct)], color, 2., dash);
-                    }
-                }
-                previous = Some((*at, *pct));
-            } else {
-                previous = None;
-            }
-        }
-        for reset in &series.resets {
-            b.line(
-                [x(*reset), plot.top],
-                [x(*reset), plot.bottom],
-                Color::Secondary,
-                1.,
-                Some([1., 3.]),
-            );
-        }
-        for reset in &series.future_resets {
-            b.line(
-                [x(*reset), plot.top],
-                [x(*reset), plot.bottom],
-                Color::Secondary,
-                1.,
-                Some([1., 3.]),
-            );
-        }
-        if let Some((at, Some(pct))) = series.points.last() {
-            let left = (x(*at) - 32.).clamp(plot.left, plot.right - 40.);
-            let preferred = (y(*pct) - 18.).clamp(plot.top + 2., plot.bottom - 18.);
-            let end_rect = std::iter::once(preferred)
-                .chain(
-                    (0..=((height(plot) - 20.) / 20.) as usize)
-                        .map(|row| plot.top + 2. + row as f32 * 20.),
-                )
-                .map(|top| rect(left, top, 40., 18.))
-                .find(|r| {
-                    end_labels
-                        .iter()
-                        .all(|old| intersection(*old, *r).is_none())
-                })
-                .unwrap_or(rect(left, preferred, 40., 18.));
-            end_labels.push(end_rect);
-            b.text(
-                end_rect,
-                format!("{}%", pct.round() as u8),
-                11.,
-                series_index == 0,
-                color,
-                false,
-            );
-        }
-    }
-    if t.unconfirmed || t.truncated || !table.complete {
-        let note = if table.rows.len() < table.total_rows {
-            format!(
-                "접근성 표: 대표 {}/{}행 · 일부만 표시{}",
-                table.rows.len(),
-                table.total_rows,
-                if t.unconfirmed {
-                    " · 이후 확인 못 함"
-                } else {
-                    ""
-                }
-            )
-        } else {
-            match (t.unconfirmed, t.truncated) {
-                (true, true) => "이후 확인 못 함 · 일부 관측만 표시",
-                (true, false) => "이후 확인 못 함",
-                _ => "일부 관측만 표시",
-            }
-            .into()
-        };
-        b.semantic(
-            format!("chart:{}:notice", t.id),
-            None,
-            Role::Text,
-            note.clone(),
-            rect(r.left + 12., r.bottom - 24., width(r) - 24., 18.),
-            None,
-        );
-        b.text(
-            rect(r.left + 12., r.bottom - 24., width(r) - 24., 18.),
-            note,
-            12.,
-            false,
-            Color::Bad,
-            false,
-        );
-    }
-    if let Some(hit) = intersection(plot, b.clip) {
-        b.scene.targets.push(HitTarget {
-            rect: hit,
-            target: Target::Chart(t.id.clone()),
-            enabled: true,
-            tooltip: None,
-        });
-    }
-    let chartkey = format!("chart:{}", t.id);
-    b.semantic(
-        chartkey.clone(),
-        None,
-        Role::Chart,
-        format!("{} 오늘 남은 양", t.name),
-        plot,
-        Some(Target::Chart(t.id.clone())),
-    );
-    let tablekey = format!("{chartkey}:table");
-    let index = b.semantic(
-        tablekey.clone(),
-        Some(chartkey.clone()),
-        Role::Table,
-        if table.complete {
-            "시각과 남은 양".into()
-        } else {
-            format!(
-                "시각과 남은 양 · 일부 기록 · 대표 {}/{}행",
-                table.rows.len(),
-                table.total_rows
-            )
-        },
-        plot,
-        None,
-    );
-    b.scene.accessibility[index].hidden = true;
-    b.scene.accessibility[index].value = Some(
-        if table.complete {
-            "complete"
-        } else {
-            "incomplete"
-        }
-        .into(),
-    );
-    let headers = std::iter::once("시각".to_string())
-        .chain(t.series.iter().map(|s| format!("{} 남은 양", s.name)));
-    for (i, name) in headers.enumerate() {
-        let idx = b.semantic(
-            format!("{tablekey}:header:{i}"),
-            Some(tablekey.clone()),
-            Role::ColumnHeader,
-            name,
-            plot,
-            None,
-        );
-        b.scene.accessibility[idx].hidden = true;
-    }
-    for row in &table.rows {
-        let at = row.at;
-        let values: Vec<_> = t
-            .series
-            .iter()
-            .zip(&row.values)
-            .map(|(series, value)| {
-                format!(
-                    "{} {} 남음",
-                    series.name,
-                    value
-                        .map(|n| format!("{}%", n.round() as u8))
-                        .unwrap_or_else(m::unknown)
-                )
-            })
-            .collect();
-        let rowkey = format!(
-            "{tablekey}:{}:{}",
-            at.timestamp(),
-            at.timestamp_subsec_nanos()
-        );
-        let idx = b.semantic(
-            rowkey.clone(),
-            Some(tablekey.clone()),
-            Role::Row,
-            format!("{} · {}", v.clock.stamp(Some(at)), values.join(" · ")),
-            plot,
-            None,
-        );
-        b.scene.accessibility[idx].hidden = true;
-        for (i, value) in std::iter::once(v.clock.stamp(Some(at)))
-            .chain(values)
-            .enumerate()
-        {
-            let idx = b.semantic(
-                format!("{rowkey}:cell:{i}"),
-                Some(rowkey.clone()),
-                Role::Text,
-                value,
-                plot,
-                None,
-            );
-            b.scene.accessibility[idx].hidden = true;
-        }
-    }
-    b.scene.charts.push(ChartData {
-        id: t.id.clone(),
-        rect: plot,
-        from,
-        to,
-        now: v.clock.utc(),
-        series: t.series.clone(),
-        unconfirmed: t.unconfirmed,
-        offset: *v.clock.now.offset(),
-    });
-}
-
 #[cfg(test)]
 #[path = "dashboard_geometry_tests.rs"]
 mod tests;

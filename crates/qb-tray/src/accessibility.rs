@@ -48,6 +48,7 @@ pub enum Kind {
     ColumnHeader,
     DataRow,
     Chart,
+    Group,
 }
 
 #[derive(Clone, Debug)]
@@ -499,6 +500,7 @@ impl Node {
                 Some(Kind::ColumnHeader) => UIA_HeaderItemControlTypeId.0,
                 Some(Kind::DataRow) => UIA_DataItemControlTypeId.0,
                 Some(Kind::Chart) => UIA_CustomControlTypeId.0,
+                Some(Kind::Group) => UIA_GroupControlTypeId.0,
             }),
             UIA_AutomationIdPropertyId => string_variant(
                 match element {

@@ -22,6 +22,7 @@ pub struct Interaction {
     pub hover: Option<Target>,
     pub pressed: Option<Target>,
     pub focus: Option<Target>,
+    pub keyboard_focus: bool,
     pub pointer: Option<[f32; 2]>,
     pub tooltip_ready: bool,
 }
@@ -64,6 +65,7 @@ pub fn color(p: Palette, c: Color) -> Rgb {
         Color::Surface => p.surface,
         Color::Footer => p.footer,
         Color::Border => Rgb::hex(if p.dark { 0x333333 } else { 0xe3e3e3 }),
+        Color::GroupBorder => Rgb::hex(if p.dark { 0x3d3d3d } else { 0xd6d9dd }),
         Color::Text => p.text,
         Color::Secondary => p.secondary,
         Color::Accent => p.accent,
@@ -75,6 +77,9 @@ pub fn color(p: Palette, c: Color) -> Rgb {
         Color::BarOk => p.bars[0],
         Color::BarLow => p.bars[1],
         Color::BarCritical => p.bars[2],
+        Color::BarPaused => p.bars[3],
+        Color::PipOutline => Rgb::hex(0x9db8d6),
+        Color::Verdict(tone) => p.tone(tone),
         Color::Series7d => Rgb::hex(if p.dark { 0xb5b5b5 } else { 0x50555b }),
         Color::ChipBg(tone) => p.chip(tone).0,
         Color::ChipFg(tone) => p.chip(tone).1,
@@ -260,6 +265,9 @@ impl Renderer {
                 }
             }
             for hit in &scene.targets {
+                if !hit.enabled || hit.target == Target::DetailSurface {
+                    continue;
+                }
                 if interaction.hover.as_ref() == Some(&hit.target)
                     || interaction.pressed.as_ref() == Some(&hit.target)
                 {
@@ -279,9 +287,17 @@ impl Renderer {
                         4.,
                     )?;
                 }
-                if interaction.focus.as_ref() == Some(&hit.target) {
+                if interaction.keyboard_focus && interaction.focus.as_ref() == Some(&hit.target) {
                     self.shared
                         .stroke(target, hit.rect, p.focus_outer, 2., 4., 1.)?;
+                    let inner = rect(
+                        hit.rect.left + 1.,
+                        hit.rect.top + 1.,
+                        (width(hit.rect) - 2.).max(0.),
+                        (height(hit.rect) - 2.).max(0.),
+                    );
+                    self.shared
+                        .stroke(target, inner, p.focus_inner, 1., 3., 1.)?;
                 }
             }
             if let (Some(Target::Chart(id)), Some(pointer)) =

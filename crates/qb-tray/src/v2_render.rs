@@ -912,13 +912,31 @@ impl Renderer {
                         self.text(target, reset_rect, reset, s, p.secondary, alpha)?;
                     }
                     self.fill(target, boxes.bar, p.track, alpha, 2.)?;
+                    if line.bar_tone == v2::BarTone::Limit {
+                        let mut x = boxes.bar.left;
+                        while x < boxes.bar.right {
+                            self.fill(
+                                target,
+                                Rect {
+                                    left: x,
+                                    right: (x + 4.).min(boxes.bar.right),
+                                    ..boxes.bar
+                                },
+                                p.chip(v2::Tone::Limit).0,
+                                alpha,
+                                0.,
+                            )?;
+                            x += 7.;
+                        }
+                    }
                     if let Some(fill) = boxes.fill {
-                        let color = p.bars[match line.bar_tone {
-                            v2::BarTone::Ok => 0,
-                            v2::BarTone::Low => 1,
-                            v2::BarTone::Critical => 2,
-                            v2::BarTone::Paused => 3,
-                        }];
+                        let color = match line.bar_tone {
+                            v2::BarTone::Ok => p.bars[0],
+                            v2::BarTone::Low => p.bars[1],
+                            v2::BarTone::Critical => p.bars[2],
+                            v2::BarTone::Paused => p.bars[3],
+                            v2::BarTone::Limit => p.chip(v2::Tone::Limit).0,
+                        };
                         self.fill(target, fill, color, alpha, 2.)?;
                     }
                 }
