@@ -165,6 +165,8 @@ struct RateState {
     sent_at: std::time::Instant,
     retries: u32,
     forced: bool,
+    /// A cancelled admission is not a send; its redial still owns one attempt.
+    forced_sent: bool,
     waited: Duration,
     waiting_since: Option<std::time::Instant>,
 }
@@ -193,6 +195,7 @@ impl RateBudget {
                 sent_at: now,
                 retries: 0,
                 forced: false,
+                forced_sent: false,
                 waited: Duration::ZERO,
                 waiting_since: None,
             }),
@@ -208,15 +211,12 @@ impl RateBudget {
     }
     fn can_retry(&self) -> bool {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        !self.is_committed()
-            && !state.forced
-            && state.retries < self.max_retries
-            && std::time::Instant::now() < self.deadline
+        !self.is_committed() && !state.forced_sent && state.retries < self.max_retries
     }
     fn can_send(&self) -> bool {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.forced |= std::time::Instant::now() >= self.deadline;
-        !self.is_committed() && (!state.initial_sent || !state.forced)
+        !self.is_committed() && !state.forced_sent
     }
 
     fn initial_sent(&self) -> bool {
@@ -264,6 +264,7 @@ impl RateBudget {
         state.initial_sent = true;
         state.sent_at = std::time::Instant::now();
         state.forced |= state.sent_at >= self.deadline;
+        state.forced_sent |= state.forced;
     }
 
     fn record_forced_send(
@@ -285,6 +286,7 @@ impl RateBudget {
         state.retries += 1;
         // Also terminal when a runtime-free fixture reaches the deadline.
         state.forced |= state.sent_at >= self.deadline;
+        state.forced_sent |= state.forced;
     }
 }
 
@@ -863,17 +865,12 @@ fn redial_rate(context: Arc<Context>, pending: PendingRateResend) -> RateRedial 
         {
             return Err("routing_policy_blocked");
         }
-        let remaining = pending
-            .rate
-            .deadline
-            .saturating_duration_since(std::time::Instant::now());
-        let socket = tokio::time::timeout(
-            remaining,
-            super::redial_same_account(&context, pending.model.as_deref()),
-        )
-        .await
-        .map_err(|_| "rate_wait_timeout")?
-        .map_err(|_| "upstream_write_error")?;
+        // Pacing expiry authorizes one final send. The reconnect retains its
+        // own bounded dial timeout; an exhausted pacing budget is not a zero
+        // duration connect deadline.
+        let socket = super::redial_same_account(&context, pending.model.as_deref())
+            .await
+            .map_err(|_| "upstream_write_error")?;
         let (sink, read) = socket.split();
         let bytes = pending.message.len();
         let reservation = pending.reservation;
@@ -926,6 +923,7 @@ fn redial_rate(context: Arc<Context>, pending: PendingRateResend) -> RateRedial 
             }
             rate.note_usage_send(&context);
             rate.sent();
+            rate.record_forced_send(context.runtime.as_ref(), &context.account);
             write(
                 sink,
                 pending.message,
@@ -1410,6 +1408,7 @@ async fn run_with_read_timeout(
                                             }
                                             rate.note_usage_send(&retry_context);
                                             rate.sent();
+                                            rate.record_forced_send(runtime.as_ref(), &account);
                                             write(
                                                 sink,
                                                 message,

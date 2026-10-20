@@ -1740,7 +1740,6 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
     let mut rate_relayed = false;
     let mut permission_denials = 0;
     let mut probe = state.claim_probe(&mut account).await;
-    let mut last_rate_response = None;
     let (status, response_headers, held) = loop {
         if !account.eligible(request_model.as_deref()) {
             let next = state
@@ -1809,16 +1808,6 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
         completion.rate_wait(admission_started.elapsed().as_millis() as u64);
         let mut forced_send = admission.as_ref().is_none_or(|a| a.forced())
             || rate_hold_deadline.is_some_and(|at| Instant::now() >= at);
-        if forced_send && let Some(previous) = last_rate_response.take() {
-            // A retry deadline returns the actual upstream 429. Only an
-            // initial admission expiry permits one send with no further rate retry.
-            rate_relayed = true;
-            state
-                .note_client_rate(provider, &account.id, session.key.as_deref())
-                .await;
-            completion.relayed_rate_429();
-            break previous;
-        }
         if !state
             .dispatch_allowed(
                 session.key.as_deref(),
@@ -1863,18 +1852,9 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
             );
         }
         forced_send |= rate_hold_deadline.is_some_and(|at| Instant::now() >= at);
-        if forced_send && let Some(previous) = last_rate_response.take() {
-            rate_relayed = true;
-            state
-                .note_client_rate(provider, &account.id, session.key.as_deref())
-                .await;
-            completion.relayed_rate_429();
-            break previous;
-        }
         if forced_send {
             state.accounts.record_forced_send(&account.id);
         }
-        drop(last_rate_response.take());
         if std::mem::take(&mut rate_retry_queued) {
             completion.rate_retry();
         }
@@ -2138,7 +2118,6 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
                 rate_retries += 1;
                 rate_retry_queued = true;
                 body_to_send = body;
-                last_rate_response = Some((status, response_headers, held));
                 // The next shared admission owns all rate delay. Its
                 // absolute deadline is unchanged across same-account retries.
                 continue;

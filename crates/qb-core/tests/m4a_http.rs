@@ -2481,13 +2481,18 @@ async fn r1_http_total_hold_case(initial_budget_exhausted: bool) {
         "total hold reset between admission and retry"
     );
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(headers["x-quota-baton-account"], account);
     assert_eq!(headers["retry-after"], "30");
+    assert_eq!(headers["x-quota-baton-account"], account);
     assert_eq!(
-        body, first_body,
-        "expiry must relay the actual upstream 429"
+        body,
+        if initial_budget_exhausted {
+            first_body
+        } else {
+            final_body
+        }
     );
-    let expected_attempts = 1;
+
+    let expected_attempts = if initial_budget_exhausted { 1 } else { 2 };
     let requests = h.fake.state.requests();
     assert_eq!(requests.len(), expected_attempts);
     let first_send_wait = requests[0].received_at.saturating_duration_since(started);
@@ -2496,7 +2501,11 @@ async fn r1_http_total_hold_case(initial_budget_exhausted: bool) {
     } else {
         assert!(
             (Duration::from_millis(450)..=Duration::from_millis(900)).contains(&first_send_wait),
-            "initial wait must spend the original budget"
+            "initial admission must consume the seeded ~600ms before the first attempt"
+        );
+        assert!(
+            requests[1].received_at.saturating_duration_since(started)
+                >= Duration::from_millis(900)
         );
     }
     for request in &requests {
@@ -2519,7 +2528,7 @@ async fn r1_http_total_hold_case(initial_budget_exhausted: bool) {
     assert_eq!(rows.len(), 1, "exactly one completed HTTP request");
     let row = &rows[0];
     assert_eq!(row["attempts"], expected_attempts as u64);
-    assert_eq!(row["rate_retries"], 0);
+    assert_eq!(row["rate_retries"], (expected_attempts - 1) as u64);
     assert_eq!(row["relayed_rate_429s"], 1);
     assert_eq!(row["retained_copy"], true);
     assert_eq!(row["account"], account);
@@ -2548,6 +2557,97 @@ async fn r1_http_total_hold_absolute_deadline_includes_initial_admission_and_ret
 #[tokio::test]
 async fn r1_http_total_hold_initial_admission_expiry_forces_one_send_without_retry() {
     r1_http_total_hold_case(true).await;
+}
+
+#[tokio::test]
+async fn r8_round2_http_retry_expiry_sends_final_attempt_and_relays_its_429() {
+    for provider in [Provider::Claude, Provider::Codex] {
+        let routing = RoutingConfig {
+            rate_hold_secs: 1,
+            rate_hold_max_retries: 5,
+            ..RoutingConfig::default()
+        };
+        let h = Harness::new_with_routing(provider, 1, 384, 1024, routing).await;
+        let account = h.ids()[0].clone();
+        let first_body =
+            r#"{"error":{"type":"rate_limit_error","message":"synthetic first rate"}}"#;
+        let final_body =
+            r#"{"error":{"type":"rate_limit_error","message":"synthetic final forced rate"}}"#;
+        for body in [first_body, final_body] {
+            let mut rate = ScriptedResponse::json(StatusCode::TOO_MANY_REQUESTS, body);
+            rate.headers.insert("retry-after", "30".parse().unwrap());
+            h.fake.state.push(rate);
+        }
+        h.fake.state.push(ok()); // A forbidden third RATE send would consume this.
+        let (path, session_header) = if provider == Provider::Claude {
+            ("/v1/messages", "x-claude-code-session-id")
+        } else {
+            ("/v1/responses", "session-id")
+        };
+        let raw =
+            " {\"model\":\"synthetic-model\",\"messages\":[],\"input\":\"conversation-marker\"}\n";
+        let began = Instant::now();
+        let (status, headers, body) = tokio::time::timeout(Duration::from_secs(2), async {
+            let response = reqwest::Client::new()
+                .post(format!("http://{}{path}", h.servers.data_addr))
+                .bearer_auth("synthetic-client")
+                .header(session_header, "round2-final-retry")
+                .body(raw.to_owned())
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let headers = response.headers().clone();
+            let body = response.text().await.unwrap();
+            (status, headers, body)
+        })
+        .await
+        .expect("retry must use the original one-second hold");
+        assert!(began.elapsed() >= Duration::from_millis(900));
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(headers["x-quota-baton-account"], account);
+        assert_eq!(headers["retry-after"], "30");
+        assert_eq!(
+            body, final_body,
+            "relay the final forced attempt, not its predecessor"
+        );
+        let requests = h.fake.state.requests();
+        assert_eq!(
+            requests.len(),
+            2,
+            "a forced attempt cannot schedule another RATE retry"
+        );
+        assert!(
+            requests[1].received_at.saturating_duration_since(began) >= Duration::from_millis(900)
+        );
+        for request in &requests {
+            assert_eq!(request.body.as_ref(), raw.as_bytes());
+            assert_eq!(
+                request.headers["authorization"],
+                requests[0].headers["authorization"]
+            );
+            assert_eq!(request.headers[session_header], "round2-final-retry");
+        }
+        assert_eq!(
+            h.state
+                .bindings
+                .current(Some(&format!("{}:round2-final-retry", provider.as_str()))),
+            Some(account.clone())
+        );
+        assert_eq!(h.store.load(&account).unwrap().health, Health::Ready);
+        let rows: Vec<_> = h
+            .ledger()
+            .into_iter()
+            .filter(|row| row.get("req").is_some())
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["account"], account);
+        assert_eq!(rows[0]["attempts"], 2);
+        assert_eq!(rows[0]["rate_retries"], 1);
+        assert_eq!(rows[0]["relayed_rate_429s"], 1);
+        assert_eq!(rows[0]["outcome"], "rate_hold_relayed_429");
+        assert!(rows[0]["rate_wait_ms"].as_u64().unwrap() >= 900);
+    }
 }
 
 #[tokio::test]
