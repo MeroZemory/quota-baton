@@ -253,28 +253,15 @@ fn config_bytes(paths: &CutoverPaths, port: u16) -> Result<Vec<u8>> {
     dedicated_codex_title_bytes(text.as_bytes())
 }
 
-fn launcher() -> Vec<u8> {
-    // CALL reparses percent/carets. Protect only the child command's outer
-    // quotes from this parser, retaining the forwarded argument quotes.
-    concat!(
-        "@echo off\r\n",
-        "setlocal DisableDelayedExpansion\r\n",
-        "rem quota-baton dedicated Codex home\r\n",
-        "set \"ERRORLEVEL=\"\r\n",
-        "for /f \"tokens=2 delims=:\" %%P in ('chcp') do set \"QB_CODEPAGE=%%P\"\r\n",
-        "chcp 65001 >nul\r\n",
-        "for %%I in (.) do set \"QB_LAUNCHER_FOLDER=%%~nxI\"\r\n",
-        "setlocal EnableDelayedExpansion\r\n",
-        "title codex-qb · !QB_LAUNCHER_FOLDER!\r\n",
-        "endlocal\r\n",
-        "set \"CODEX_HOME=%USERPROFILE%\\.codex-acct\\qb\"\r\n",
-        "\"%SystemRoot%\\System32\\cmd.exe\" /d /v:off /s /c ^\"\"%APPDATA%\\npm\\codex.cmd\" %*^\"\r\n",
-        "set \"QB_EXIT=%errorlevel%\"\r\n",
-        "chcp %QB_CODEPAGE% >nul\r\n",
-        "endlocal & exit /b %QB_EXIT%\r\n",
-    )
-    .as_bytes()
-    .to_vec()
+fn launcher() -> Result<Vec<u8>> {
+    launcher_with_helper(&std::env::current_exe()?)
+}
+
+fn launcher_with_helper(helper: &Path) -> Result<Vec<u8>> {
+    if !safe_command_path(helper) {
+        bail!("quota-baton 실행 파일 경로를 확인해 주세요");
+    }
+    Ok(crate::launcher_script::codex_launcher_bytes(helper))
 }
 
 // Collect credentials by key, then redact their known values everywhere they recur.
@@ -1679,7 +1666,7 @@ fn upgrade_completed(
         } else if e.path.file_name().is_some_and(|n| n == "settings.json") {
             dedicated_claude_title_bytes(&before)?
         } else if e.path == m.npm.join("codex-qb.cmd") {
-            launcher()
+            launcher()?
         } else {
             claude_launcher(
                 &m.command
@@ -2219,7 +2206,7 @@ pub(super) fn wire(
             paths.npm_dir.join("codex-qb.cmd"),
             Kind::File,
             None,
-            Some(&launcher()),
+            Some(&launcher()?),
             apply,
         )?);
         for e in &entries {
@@ -2843,8 +2830,39 @@ mod tests {
     }
 
     #[test]
+    fn r81_codex_launcher_validates_helper_and_preserves_dispatch_quoting() {
+        let helper = Path::new(r"C:\synthetic bin (x)\quota-baton.exe");
+        let script = String::from_utf8(launcher_with_helper(helper).unwrap()).unwrap();
+        assert!(script.contains(&format!(
+            "\"{}\" launch-client --client codex --command \"%APPDATA%\\npm\\codex.cmd\" -- %*\r\n",
+            helper.display()
+        )));
+        assert!(!script.contains("--settings"));
+        assert!(!script.contains("/s /c"));
+        assert!(!script.contains("call "));
+        for helper in [
+            "relative.exe",
+            r"C:\safe\..\quota-baton.exe",
+            r"C:\bad%name\qb.exe",
+            r"C:\bad!name\qb.exe",
+            r"C:\bad^name\qb.exe",
+            r"C:\bad&name\qb.exe",
+            r"C:\bad|name\qb.exe",
+            r"C:\bad<name\qb.exe",
+            r"C:\bad>name\qb.exe",
+            r#"C:\bad"name\qb.exe"#,
+            concat!(r"C:\bad", "\n", r"name\qb.exe"),
+        ] {
+            assert!(
+                launcher_with_helper(Path::new(helper)).is_err(),
+                "accepted {helper:?}"
+            );
+        }
+    }
+
+    #[test]
     fn r32_launcher_bytes_scope_delayed_expansion_and_capture_exit_before_restore() {
-        let codex = String::from_utf8(launcher()).unwrap();
+        let codex = String::from_utf8(launcher().unwrap()).unwrap();
         let claude =
             String::from_utf8(claude_launcher(Path::new(r"C:\synthetic bin\claude.cmd")).unwrap())
                 .unwrap();
@@ -2855,12 +2873,27 @@ mod tests {
             assert!(script.contains(&format!(
                 "setlocal EnableDelayedExpansion\r\ntitle {client}-qb · !QB_LAUNCHER_FOLDER!\r\nendlocal\r\n"
             )));
-            let dispatch = script
-                .find("\"%SystemRoot%\\System32\\cmd.exe\" /d /v:off /s /c ^\"\"")
-                .unwrap();
+            let dispatch = if client == "codex" {
+                assert!(!script.contains("/s /c"));
+                script
+                    .find(&format!(
+                        "\"{}\" launch-client --client codex",
+                        std::env::current_exe().unwrap().display()
+                    ))
+                    .unwrap()
+            } else {
+                script
+                    .find("\"%SystemRoot%\\System32\\cmd.exe\" /d /v:off /s /c ^\"\"")
+                    .unwrap()
+            };
             assert!(script.find("chcp 65001 >nul").unwrap() < script.find("title ").unwrap());
             assert!(script.find("endlocal\r\n").unwrap() < dispatch);
-            assert!(script[dispatch..].contains(" %*^\"\r\nset \"QB_EXIT=%errorlevel%\"\r\nchcp %QB_CODEPAGE% >nul\r\nendlocal & exit /b %QB_EXIT%\r\n"));
+            let forwarded = if client == "codex" {
+                " %*\r\n"
+            } else {
+                " %*^\"\r\n"
+            };
+            assert!(script[dispatch..].contains(&format!("{forwarded}set \"QB_EXIT=%errorlevel%\"\r\nchcp %QB_CODEPAGE% >nul\r\nendlocal & exit /b %QB_EXIT%\r\n")));
             assert!(
                 script
                     .as_bytes()
@@ -2869,6 +2902,10 @@ mod tests {
             );
         }
         assert!(codex.contains("set \"CODEX_HOME=%USERPROFILE%\\.codex-acct\\qb\"\r\n"));
+        assert!(codex.contains(
+            "launch-client --client codex --command \"%APPDATA%\\npm\\codex.cmd\" -- %*"
+        ));
+        assert!(!codex.contains("--settings"));
         assert!(claude.contains("launch-client --command"));
         assert!(claude.contains("--settings \"%USERPROFILE%\\.claude-qb\\settings.json\" -- %*"));
         // Opt-in coordinator fixture: exercise the actual generated payloads in
@@ -2883,7 +2920,11 @@ mod tests {
             let canonical = out.canonicalize().unwrap();
             assert!(canonical.starts_with(project.canonicalize().unwrap()));
             assert!(canonical.components().any(|c| c.as_os_str() == ".sandbox"));
-            fs::write(out.join("codex-qb.cmd"), launcher()).unwrap();
+            fs::write(
+                out.join("codex-qb.cmd"),
+                launcher_with_helper(&project.join("target/debug/quota-baton.exe")).unwrap(),
+            )
+            .unwrap();
             fs::write(
                 out.join("claude-qb.cmd"),
                 claude_launcher_with_helper(
@@ -3167,10 +3208,12 @@ trusted_hash = "synthetic-hook-hash"
             doc["hooks"]["state"][key.as_str()]["trusted_hash"].as_str(),
             Some("synthetic-hook-hash")
         );
-        let launcher = String::from_utf8(launcher()).unwrap();
+        let launcher = String::from_utf8(launcher().unwrap()).unwrap();
         assert!(launcher.starts_with("@echo off\r\nsetlocal DisableDelayedExpansion\r\nrem "));
         assert!(launcher.contains("set \"CODEX_HOME=%USERPROFILE%\\.codex-acct\\qb\"\r\n"));
-        assert!(launcher.contains("/s /c ^\"\"%APPDATA%\\npm\\codex.cmd\" %*^\"\r\n"));
+        assert!(launcher.contains(
+            "launch-client --client codex --command \"%APPDATA%\\npm\\codex.cmd\" -- %*\r\n"
+        ));
         assert!(launcher.ends_with("chcp %QB_CODEPAGE% >nul\r\nendlocal & exit /b %QB_EXIT%\r\n"));
         assert!(normal_path(&p.codex_qb_home).contains(".codex-acct"));
     }
@@ -4602,6 +4645,30 @@ trusted_hash = "synthetic-hook-hash"
 
     // R3.2 candidate tests: SYNTHETIC, UNRUN. Merge the helper/launcher worker
     // first. Tests call only fixture paths; they never launch the wrappers.
+    fn r81_old_r32_codex_launcher() -> Vec<u8> {
+        // CALL reparses percent/carets. Protect only the child command's outer
+        // quotes from this parser, retaining the forwarded argument quotes.
+        concat!(
+            "@echo off\r\n",
+            "setlocal DisableDelayedExpansion\r\n",
+            "rem quota-baton dedicated Codex home\r\n",
+            "set \"ERRORLEVEL=\"\r\n",
+            "for /f \"tokens=2 delims=:\" %%P in ('chcp') do set \"QB_CODEPAGE=%%P\"\r\n",
+            "chcp 65001 >nul\r\n",
+            "for %%I in (.) do set \"QB_LAUNCHER_FOLDER=%%~nxI\"\r\n",
+            "setlocal EnableDelayedExpansion\r\n",
+            "title codex-qb · !QB_LAUNCHER_FOLDER!\r\n",
+            "endlocal\r\n",
+            "set \"CODEX_HOME=%USERPROFILE%\\.codex-acct\\qb\"\r\n",
+            "\"%SystemRoot%\\System32\\cmd.exe\" /d /v:off /s /c ^\"\"%APPDATA%\\npm\\codex.cmd\" %*^\"\r\n",
+            "set \"QB_EXIT=%errorlevel%\"\r\n",
+            "chcp %QB_CODEPAGE% >nul\r\n",
+            "endlocal & exit /b %QB_EXIT%\r\n",
+        )
+        .as_bytes()
+        .to_vec()
+    }
+
     fn r32_old_install(p: &CutoverPaths) {
         claude_run(p, true, CodexMode::Dedicated, Some(ClaudeMode::Dedicated)).unwrap();
         let config = p.codex_qb_home.join("config.toml");
@@ -4864,6 +4931,96 @@ trusted_hash = "synthetic-hook-hash"
             assert_eq!(fs::read(p.journal()).unwrap(), journal);
             assert_eq!(r32_owned(&p), owned);
         }
+    }
+
+    #[test]
+    fn r81_upgrade_exact_r32_codex_launcher_is_atomic_idempotent_and_unwires_owned_objects() {
+        let (_dir, p) = fixture();
+        r32_run(&p, true, false).unwrap();
+        let path = p.npm_dir.join("codex-qb.cmd");
+        let old_bytes = r81_old_r32_codex_launcher();
+        assert!(!String::from_utf8_lossy(&old_bytes).contains("launch-client"));
+        fs::write(&path, &old_bytes).unwrap();
+        let mut m = manifest(&p);
+        let entry = m.entries.iter_mut().find(|e| e.path == path).unwrap();
+        entry.hash = hash_bytes(&old_bytes);
+        entry.payload = Some(protect(&old_bytes).unwrap());
+        entry.identity = Some(identity(&path).unwrap());
+        atomic_json(&p.journal(), &m).unwrap();
+        let sources = snapshot(&p);
+        let before = r32_owned(&p);
+        let journal = fs::read(p.journal()).unwrap();
+        let dry = r32_run(&p, false, false).unwrap();
+        assert_eq!(dry.changed, vec![path.display().to_string()]);
+        assert!(output(&dry).contains("launch-client --client codex"));
+        assert_eq!(fs::read(p.journal()).unwrap(), journal);
+        assert_eq!(r32_owned(&p), before);
+
+        let applied = r32_run(&p, true, false).unwrap();
+        assert_eq!(applied.changed, vec![path.display().to_string()]);
+        assert_eq!(fs::read(&path).unwrap(), launcher().unwrap());
+        let upgraded = manifest(&p);
+        for old in &m.entries {
+            let new = upgraded
+                .entries
+                .iter()
+                .find(|e| e.path == old.path)
+                .unwrap();
+            if old.path == path {
+                assert_eq!(new.identity, Some(identity(&path).unwrap()));
+                assert_eq!(new.hash, hash_file(&path).unwrap());
+                assert!(new.upgrade.is_none());
+            } else {
+                assert_eq!(
+                    serde_json::to_value(new).unwrap(),
+                    serde_json::to_value(old).unwrap()
+                );
+            }
+        }
+        for (name, bytes, id) in &before {
+            if *name != path {
+                assert_eq!(fs::read(name).unwrap(), *bytes);
+                assert_eq!(identity(name).unwrap(), *id);
+            }
+        }
+        let journal = fs::read(p.journal()).unwrap();
+        assert!(r32_run(&p, true, false).unwrap().changed.is_empty());
+        assert_eq!(fs::read(p.journal()).unwrap(), journal);
+
+        // Force never adopts a same-bytes replacement as launcher ownership.
+        let held = path.with_extension("owned-held");
+        fs::rename(&path, &held).unwrap();
+        let bytes = fs::read(&held).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        let replacement_id = identity(&path).unwrap();
+        assert_ne!(replacement_id, identity(&held).unwrap());
+        for force in [false, true] {
+            assert!(super::unwire(&p, true, force).is_err());
+            // Unwire journals progress per entry; other owned objects may
+            // already be removed. The refused launcher must retain its original
+            // ownership record so restoring it permits recovery below.
+            let recovery = manifest(&p);
+            validate_manifest(&p, &recovery).unwrap();
+            let recorded = recovery.entries.iter().find(|e| e.path == path).unwrap();
+            let owned = upgraded.entries.iter().find(|e| e.path == path).unwrap();
+            assert_eq!(
+                serde_json::to_value(recorded).unwrap(),
+                serde_json::to_value(owned).unwrap()
+            );
+            assert_eq!(identity(&held).ok(), owned.identity);
+            assert_eq!(identity(&path).unwrap(), replacement_id);
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+        fs::remove_file(&path).unwrap();
+        fs::rename(&held, &path).unwrap();
+        let unknown = p.npm_dir.join("unowned-r81.txt");
+        fs::write(&unknown, "keep unknown").unwrap();
+        super::unwire(&p, true, false).unwrap();
+        assert!(!path.exists());
+        assert!(!p.npm_dir.join("claude-qb.cmd").exists());
+        assert!(!p.journal().exists());
+        assert_eq!(fs::read_to_string(unknown).unwrap(), "keep unknown");
+        assert_eq!(snapshot(&p), sources);
     }
 
     #[test]
