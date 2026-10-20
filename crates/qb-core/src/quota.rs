@@ -589,7 +589,13 @@ impl UsagePoller {
             if usage || placement.is_some() || profile {
                 pending.push(async move {
                     if placement.is_some() {
-                        let _ = self.poll_reason(&account.id, placement).await;
+                        if matches!(
+                            self.poll_reason(&account.id, placement).await,
+                            Err(PollError::TooSoon { .. })
+                        ) && usage
+                        {
+                            let _ = self.poll(&account.id).await;
+                        }
                     } else if usage {
                         let _ = self.poll(&account.id).await;
                     }
@@ -1074,6 +1080,61 @@ mod tests {
         drop(reservation);
         assert_eq!(poller.clocks.lock().unwrap()[id].next, Some(regular_next));
         assert!(f.fake.state.requests().is_empty());
+    }
+    #[tokio::test]
+    async fn r8_refused_placement_poll_does_not_skip_due_regular_tick() {
+        let f = Fixture::new(1).await;
+        let poller = &f.relay.quota;
+        poller.set_bindings(&f.relay.bindings);
+        let id = &f.ids[0];
+        let placed = Utc::now() - chrono::Duration::seconds(121);
+        let candidate = crate::bindings::Candidate {
+            account: f.account(0),
+            quota: None,
+            inflight: 0,
+        };
+        drop(f.relay.bindings.choose_with_hold_at(
+            Provider::Codex,
+            Some("codex:refused-placement-poll"),
+            None,
+            None,
+            &[candidate],
+            None,
+            10,
+            true,
+            false,
+            placed,
+        ));
+        assert!(poller.placement_due(id, Utc::now()).is_some());
+        poller.clocks.lock().unwrap().insert(
+            id.clone(),
+            Clock {
+                placement_last: Some(Instant::now()),
+                ..Clock::default()
+            },
+        );
+        assert!(poller.scheduled(&f.account(0)));
+        assert!(matches!(
+            poller.reserve_reason(id, true),
+            Err(PollError::TooSoon { .. })
+        ));
+        f.fake.state.push(Fixture::usage());
+        poller.tick().await;
+        let requests = f.fake.state.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "regular usage poll must run in this very tick"
+        );
+        assert_eq!(requests[0].method, "GET");
+        let clocks = poller.clocks.lock().unwrap();
+        let clock = &clocks[id];
+        assert!(clock.last.is_some());
+        assert!(clock.next.is_some());
+        assert!(
+            clock.placement_polled_through.is_none(),
+            "refused placement poll spends no placement trigger"
+        );
     }
     include!("quota/profile_tests.rs");
 }
