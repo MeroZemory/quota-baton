@@ -11,6 +11,80 @@ static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 const EMAIL: &str = "synthetic@example.invalid";
 
+#[test]
+fn r10_import_omits_default_labels_and_preserves_real_organization_and_reimport_label() {
+    for provider in ["claude", "codex"] {
+        for organization in [
+            None,
+            Some(EMAIL.to_owned()),
+            Some(format!("{EMAIL}'s Organization")),
+            Some("Synthetic Research".into()),
+            Some("Synthetic@example.invalid's Organization".into()),
+        ] {
+            isolated(|store, cpa, _| {
+                let mut value = fixture(provider, Some("synthetic-user"), 1);
+                value["organization_name"] = json!(organization);
+                write(cpa, "account.json", &value);
+                import::run(store, cpa, &[], false).unwrap();
+                let account = store.list().unwrap().remove(0);
+                let expected = if provider == "claude" {
+                    organization
+                        .as_deref()
+                        .filter(|name| *name != EMAIL && *name != format!("{EMAIL}'s Organization"))
+                        .unwrap_or_default()
+                } else {
+                    ""
+                };
+                assert_eq!(account.label, expected);
+                let mut newer = fixture(provider, Some("synthetic-user"), 3);
+                newer["organization_name"] = json!("Different organization");
+                write(cpa, "account.json", &newer);
+                // Preserve stored labels verbatim, including user values that happen
+                // to match a generated default. Display handling is separate.
+                for label in [
+                    account.label.clone(),
+                    "My custom label".into(),
+                    EMAIL.into(),
+                    format!("{EMAIL}'s Organization"),
+                ] {
+                    store
+                        .update_metadata(&account.id, |a| a.label = label.clone())
+                        .unwrap();
+                    import::run(store, cpa, &[], false).unwrap();
+                    assert_eq!(store.load(&account.id).unwrap().label, label);
+                }
+            });
+        }
+    }
+}
+
+#[cfg(feature = "testkit")]
+#[test]
+fn r10_adopt_preserves_unset_organization_and_custom_labels() {
+    use qb_core::accounts::adopt::{self, AdoptRequest, ProbeState};
+    for provider in ["claude", "codex"] {
+        for label in ["", "Synthetic Research", "My custom label"] {
+            isolated(|store, cpa, _| {
+                let account = imported(store, cpa, provider, Some("synthetic-user"));
+                let account = store
+                    .update_metadata(&account.id, |a| a.label = label.into())
+                    .unwrap();
+                adopt::run_with_probe(
+                    store,
+                    &account.id,
+                    AdoptRequest {
+                        from: Default::default(),
+                        expected_generation: account.generation,
+                    },
+                    || ProbeState::Stopped,
+                )
+                .unwrap();
+                assert_eq!(store.load(&account.id).unwrap().label, label);
+            });
+        }
+    }
+}
+
 fn isolated(test: impl FnOnce(&AccountStore, &Path, &Path)) {
     let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/m1b2-import-tests");

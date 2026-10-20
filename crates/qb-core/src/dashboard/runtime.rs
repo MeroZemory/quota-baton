@@ -616,13 +616,23 @@ impl Runtime {
     }
     pub fn health(&self, id: &str, from: &crate::accounts::Health, to: &crate::accounts::Health) {
         use crate::accounts::{Health, HealthReason};
+        let now = Utc::now();
         let kind = match to {
             Health::NeedsRelogin { .. } => ActivityKind::NeedsRelogin,
             Health::Cooling {
                 reason: HealthReason::Quota,
                 scope,
                 ..
-            } if !scope.starts_with("model:") => ActivityKind::QuotaReached,
+            } if !scope.starts_with("model:") => {
+                // Extending a still-active account cooldown is the same episode.
+                // Health persistence and the raw health_changed ledger remain independent.
+                if matches!(from, Health::Cooling { reason: HealthReason::Quota, scope, until }
+                    if !scope.starts_with("model:") && *until > now)
+                {
+                    return;
+                }
+                ActivityKind::QuotaReached
+            }
             Health::Cooling {
                 reason: HealthReason::LinkStale,
                 ..
@@ -649,7 +659,7 @@ impl Runtime {
             _ => (None, None),
         };
         self.activity(ActivityInput {
-            ts: Utc::now(),
+            ts: now,
             kind,
             provider: if id.starts_with("cl-") {
                 Provider::Claude
@@ -851,6 +861,117 @@ pub fn request_outcome(outcome: &str) -> RequestOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn r10_quota_activity_suppresses_only_continuous_account_cooling() {
+        use crate::accounts::{Health, HealthReason};
+        let now = Utc::now();
+        let quota = |scope: &str, until| Health::Cooling {
+            reason: HealthReason::Quota,
+            scope: scope.into(),
+            until,
+        };
+        let deadline = now + chrono::Duration::hours(2);
+        let account = quota("account", deadline);
+        let extended = quota("account", deadline + chrono::Duration::milliseconds(1));
+        let relogin = Health::NeedsRelogin {
+            reason: "synthetic".into(),
+            since: now,
+        };
+        for (from, to, expected) in [
+            (
+                Health::Ready,
+                account.clone(),
+                Some(ActivityKind::QuotaReached),
+            ),
+            (account.clone(), account.clone(), None),
+            (account.clone(), extended, None),
+            (
+                quota("model:synthetic", deadline),
+                account.clone(),
+                Some(ActivityKind::QuotaReached),
+            ),
+            (
+                quota("account", now - chrono::Duration::seconds(1)),
+                account.clone(),
+                Some(ActivityKind::QuotaReached),
+            ),
+            (
+                account.clone(),
+                Health::Ready,
+                Some(ActivityKind::QuotaReset),
+            ),
+            (
+                account.clone(),
+                relogin.clone(),
+                Some(ActivityKind::NeedsRelogin),
+            ),
+            (relogin, account.clone(), Some(ActivityKind::QuotaReached)),
+            (
+                Health::Cooling {
+                    reason: HealthReason::LinkStale,
+                    scope: "account".into(),
+                    until: deadline,
+                },
+                account.clone(),
+                Some(ActivityKind::QuotaReached),
+            ),
+            (account, quota("model:synthetic", deadline), None),
+        ] {
+            let runtime = Runtime::new();
+            runtime.health("cx-123abc", &from, &to);
+            let kinds: Vec<_> = runtime
+                .activity_page(None, 100, 1)
+                .unwrap()
+                .events
+                .into_iter()
+                .map(|e| e.kind)
+                .collect();
+            assert_eq!(
+                kinds,
+                expected.into_iter().collect::<Vec<_>>(),
+                "{from:?} -> {to:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn r10_quota_activity_preserves_same_reset_reentry_after_ready_or_relogin() {
+        use crate::accounts::{Health, HealthReason};
+        let now = Utc::now();
+        let quota = Health::Cooling {
+            reason: HealthReason::Quota,
+            scope: "account".into(),
+            until: now + chrono::Duration::hours(2),
+        };
+        for middle in [
+            Health::Ready,
+            Health::NeedsRelogin {
+                reason: "synthetic".into(),
+                since: now,
+            },
+        ] {
+            let runtime = Runtime::new();
+            runtime.health("cx-123abc", &Health::Ready, &quota);
+            runtime.health("cx-123abc", &quota, &middle);
+            runtime.health("cx-123abc", &middle, &quota);
+            let events = runtime.activity_page(None, 100, 1).unwrap().events;
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| e.kind == ActivityKind::QuotaReached)
+                    .count(),
+                2
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| e.kind == ActivityKind::QuotaReset)
+                    .count(),
+                usize::from(middle == Health::Ready)
+            );
+        }
+    }
+
     #[test]
     fn r7_stale_empty_snapshot_cannot_remove_ensured_row_before_request_start() {
         let home = tempfile::tempdir().unwrap();

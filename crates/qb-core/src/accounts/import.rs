@@ -139,7 +139,11 @@ pub(crate) fn read(path: &Path, dir: &Path) -> Result<Candidate, ReadError> {
                     organization_uuid: file.organization_uuid.filter(|s| !s.is_empty()),
                     email: file.email.clone(),
                 },
-                file.organization_name.unwrap_or_else(|| file.email.clone()),
+                file.organization_name
+                    .filter(|name| {
+                        name != &file.email && name != &format!("{}'s Organization", file.email)
+                    })
+                    .unwrap_or_default(),
                 None,
             )
         }
@@ -154,7 +158,7 @@ pub(crate) fn read(path: &Path, dir: &Path) -> Result<Candidate, ReadError> {
                     account_id: id,
                     email: file.email.clone(),
                 },
-                file.email.clone(),
+                String::new(),
                 file.plan_type,
             )
         }

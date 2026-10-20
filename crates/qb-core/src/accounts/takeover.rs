@@ -622,7 +622,7 @@ fn finish_prepare(
             schema: 1,
             id: profile.identity.id(),
             provider: request.provider,
-            label: profile.email.clone(),
+            label: String::new(),
             email: profile.email.clone(),
             plan: profile.plan.clone(),
             identity: profile.identity,
