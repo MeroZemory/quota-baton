@@ -46,7 +46,12 @@ fn r81_console_probe() {
         serde_json::to_vec(&std::env::args().collect::<Vec<_>>()).unwrap(),
     )
     .unwrap();
-    if mode == "own" {
+    if mode == "own-script" {
+        set_title(&format!(
+            "{}\\npm\\codex.cmd - my-session",
+            std::env::var("APPDATA").unwrap()
+        ));
+    } else if mode == "own" {
         set_title("client owns this title");
     } else if mode == "cmd" {
         set_title(&std::env::var("ComSpec").unwrap());
@@ -122,7 +127,12 @@ fn r81_console_host() {
     let status = child
         .current_dir(root.join("한글 project"))
         .env("USERPROFILE", root.join("profile"))
-        .env("APPDATA", root.join("AppData/Roaming"))
+        .env(
+            "APPDATA",
+            root.join("AppData/Roaming")
+                .to_string_lossy()
+                .replace('/', "\\"),
+        )
         .env("SYNTHETIC_LABEL", "retained-label")
         .env("QB_R81_LITERAL", "must-not-expand")
         // Deliberately invalid: launch-client must never open a core home.
@@ -150,11 +160,11 @@ fn r81_title_after_child_start_in_hidden_console() {
         "cmd-suffix",
         "cmd-late",
         "actual-node",
+        "own-script",
     ] {
-        if mode == "actual-node"
-            && std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-                .all(|p| !p.is_absolute() || !p.join("node.exe").is_file())
-        {
+        let node_dir = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .find(|p| p.is_absolute() && p.join("node.exe").is_file());
+        if mode == "actual-node" && node_dir.is_none() {
             println!("actual-node unavailable: no node.exe on test PATH");
             continue;
         }
@@ -178,6 +188,13 @@ process.exit(result.status ?? 1);
             .into_iter()
             .filter_map(|key| std::env::var(key).ok().map(|v| (key.into(), v)))
             .collect();
+        if mode == "actual-node" {
+            let system = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32");
+            let path = std::env::join_paths([node_dir.as_ref().unwrap(), &system]).unwrap();
+            env.retain(|(key, _)| !key.eq_ignore_ascii_case("PATH"));
+            env.push(("PATH".into(), path.to_string_lossy().into_owned()));
+        }
+        env.push(("PATHEXT".into(), ".COM;.EXE;.BAT;.CMD".into()));
         env.push(("QB_R81_FIXTURE".into(), root.to_string_lossy().into_owned()));
         env.push(("QB_R81_TITLE_MODE".into(), mode.into()));
         env.push(("QB_R81_PROBE".into(), exe.to_string_lossy().into_owned()));
@@ -241,10 +258,17 @@ process.exit(result.status ?? 1);
         assert_eq!(fs::read_to_string(root.join("status")).unwrap(), "37");
         assert_eq!(
             fs::read_to_string(root.join("title")).unwrap(),
-            if mode.starts_with("own") {
-                "client owns this title"
+            if mode == "own-script" {
+                format!(
+                    "{}\\npm\\codex.cmd - my-session",
+                    root.join("AppData/Roaming")
+                        .to_string_lossy()
+                        .replace('/', "\\")
+                )
+            } else if mode.starts_with("own") {
+                "client owns this title".to_owned()
             } else {
-                "codex-qb · 한글 project"
+                "codex-qb · 한글 project".to_owned()
             }
         );
         assert_eq!(
