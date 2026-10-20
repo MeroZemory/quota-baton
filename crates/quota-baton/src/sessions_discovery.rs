@@ -198,7 +198,7 @@ pub(crate) fn catalog(home: &Path) -> Result<Catalog> {
 }
 
 impl Catalog {
-    fn active(&self, id: &str) -> Result<&Rollout> {
+    pub(crate) fn active(&self, id: &str) -> Result<&Rollout> {
         let choices = self
             .threads
             .get(id)

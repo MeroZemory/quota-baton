@@ -1,0 +1,508 @@
+//! Product CLI acceptance; only project-local synthetic homes and client stub.
+#![cfg(windows)]
+use rusqlite::{Connection, OptionalExtension};
+use std::{
+    fs,
+    io::Write,
+    os::windows::process::CommandExt,
+    path::{Path, PathBuf},
+    process::{Command, Output},
+    time::{Duration, Instant, SystemTime},
+};
+const A: &str = "11111111-1111-1111-1111-111111111111";
+const B: &str = "22222222-2222-2222-2222-222222222222";
+const C: &str = "33333333-3333-3333-3333-333333333333";
+const D: &str = "44444444-4444-4444-4444-444444444444";
+const PRIVATE_BODY: &str = "SYNTHETIC_PRIVATE_SESSION_BODY";
+struct Fixture {
+    _root: tempfile::TempDir,
+    user: PathBuf,
+    source: PathBuf,
+    target: PathBuf,
+    qb: PathBuf,
+    stub: PathBuf,
+    sentinel: PathBuf,
+}
+impl Fixture {
+    fn new() -> Self {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r9-cli-tests");
+        fs::create_dir_all(&base).unwrap();
+        let root = tempfile::tempdir_in(fs::canonicalize(base).unwrap()).unwrap();
+        let user = root.path().join("user");
+        let source = user.join(".codex");
+        let target = user.join(".codex-acct/qb");
+        let qb = root.path().join("qb");
+        for dir in [&source, &target, &qb.join("journal")] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::write(qb.join("journal/wiring.json"),serde_json::to_vec(&serde_json::json!({"schema":3,"mode":"dedicated","install_completed":true,"home":target})).unwrap()).unwrap();
+        let sentinel = root.path().join("launched.txt");
+        let stub = root.path().join("stub.cmd");
+        fs::write(
+            &stub,
+            format!(
+                "@echo off\r\necho synthetic-launch>\"{}\"\r\nexit /b 0\r\n",
+                sentinel.display()
+            ),
+        )
+        .unwrap();
+        let db = Connection::open(source.join("state_5.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY,rollout_path TEXT NOT NULL,model_provider TEXT NOT NULL,archived INTEGER DEFAULT 0);").unwrap();
+        Self {
+            _root: root,
+            user,
+            source,
+            target,
+            qb,
+            stub,
+            sentinel,
+        }
+    }
+    fn add(&self, id: &str, recent: bool, provider: &str) -> PathBuf {
+        self.add_with_parent(id, recent, provider, None)
+    }
+    fn add_with_parent(
+        &self,
+        id: &str,
+        recent: bool,
+        provider: &str,
+        parent: Option<&str>,
+    ) -> PathBuf {
+        let path = self
+            .source
+            .join("sessions")
+            .join(format!("rollout-2026-10-21T00-00-00-{id}.jsonl"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut meta = serde_json::json!({"type":"session_meta","payload":{"id":id,"model_provider":provider}});
+        if let Some(parent) = parent {
+            meta["payload"]["forked_from_id"] = parent.into();
+            meta["payload"]["history_base"] = serde_json::json!({"thread_id":parent,"end_ordinal_exclusive":5,"end_byte_offset":100});
+        }
+        fs::write(&path, format!("{meta}\n{}\n", serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":PRIVATE_BODY}}))).unwrap();
+        if !recent {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(
+                    fs::FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(300)),
+                )
+                .unwrap();
+        }
+        let db = Connection::open(self.source.join("state_5.sqlite")).unwrap();
+        db.execute(
+            "INSERT INTO threads VALUES(?1,?2,?3,0)",
+            rusqlite::params![id, path.to_str().unwrap(), provider],
+        )
+        .unwrap();
+        path
+    }
+    fn cli(&self, args: &[&std::ffi::OsStr]) -> Output {
+        let stdout = self._root.path().join("stdout.txt");
+        let stderr = self._root.path().join("stderr.txt");
+        let mut child = Command::new(env!("CARGO_BIN_EXE_quota-baton"))
+            .args(args)
+            .env("QB_HOME", &self.qb)
+            .env("USERPROFILE", &self.user)
+            .env("HOME", &self.user)
+            .env("CODEX_HOME", &self.target)
+            .current_dir(self._root.path())
+            .creation_flags(0x08000000)
+            .stdout(fs::File::create(&stdout).unwrap())
+            .stderr(fs::File::create(&stderr).unwrap())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("synthetic CLI exceeded15s");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let output = Output {
+            status,
+            stdout: fs::read(stdout).unwrap(),
+            stderr: fs::read(stderr).unwrap(),
+        };
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(PRIVATE_BODY));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(PRIVATE_BODY));
+        output
+    }
+    fn import(&self, id: &str, apply: bool) -> Output {
+        self.import_options(id, apply, &[])
+    }
+    fn import_options(&self, id: &str, apply: bool, options: &[&str]) -> Output {
+        let mut args = vec![
+            std::ffi::OsStr::new("sessions"),
+            "import".as_ref(),
+            "--from".as_ref(),
+            self.source.as_os_str(),
+            id.as_ref(),
+        ];
+        if apply {
+            args.push("--apply".as_ref());
+        }
+        args.extend(options.iter().map(std::ffi::OsStr::new));
+        self.cli(&args)
+    }
+    fn resume(&self, id: &str) -> Output {
+        self.launch(&["resume", id])
+    }
+    fn launch(&self, client_args: &[&str]) -> Output {
+        let mut args = vec![
+            "launch-client".as_ref(),
+            "--client".as_ref(),
+            "codex".as_ref(),
+            "--command".as_ref(),
+            self.stub.as_os_str(),
+            "--".as_ref(),
+        ];
+        args.extend(client_args.iter().map(std::ffi::OsStr::new));
+        self.cli(&args)
+    }
+    fn unimport(&self, id: &str) -> Output {
+        self.cli(&[
+            "sessions".as_ref(),
+            "unimport".as_ref(),
+            id.as_ref(),
+            "--apply".as_ref(),
+        ])
+    }
+}
+
+fn assert_success(output: &Output) {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn assert_refused(fixture: &Fixture, output: &Output, reason: &str) {
+    assert!(!output.status.success());
+    assert!(!fixture.sentinel.exists());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(reason),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn thread_path(home: &Path, id: &str) -> Option<PathBuf> {
+    Connection::open(home.join("state_5.sqlite"))
+        .unwrap()
+        .query_row(
+            "SELECT rollout_path FROM threads WHERE id=?1",
+            [id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .unwrap()
+        .map(PathBuf::from)
+}
+
+fn goal_status(home: &Path, id: &str) -> Option<String> {
+    Connection::open(home.join("goals_1.sqlite"))
+        .unwrap()
+        .query_row(
+            "SELECT status FROM thread_goals WHERE thread_id=?1",
+            [id],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap()
+}
+
+fn assert_counts(output: &Output, counts: [u64; 5]) {
+    assert_success(output);
+    let text = String::from_utf8_lossy(&output.stdout);
+    let row = text
+        .lines()
+        .find(|line| line.starts_with("개수 |"))
+        .unwrap_or_else(|| panic!("missing bulk counts: {text}"));
+    let actual: Vec<u64> = row
+        .split('|')
+        .skip(1)
+        .map(|value| value.trim().parse().unwrap())
+        .collect();
+    assert_eq!(actual, counts, "{text}");
+    assert!(text.contains("이미 가져옴 | 실행 중 건너뜀 | 분기 건너뜀 | 실패"));
+}
+#[test]
+fn r9_cli_dry_default_bulk_skips_recent_and_existing_and_never_prints_body() {
+    let f = Fixture::new();
+    let source = f.add(A, false, "openai");
+    f.add(B, true, "openai");
+    let out = f.import(A, false);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!f.qb.join("journal/sessions-import.json").exists());
+    assert!(source.exists());
+    assert!(!f.target.join("sessions").exists());
+    let out = f.cli(&[
+        "sessions".as_ref(),
+        "import".as_ref(),
+        "--from".as_ref(),
+        f.source.as_os_str(),
+        "--all".as_ref(),
+        "--keep-source".as_ref(),
+        "--apply".as_ref(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_counts(&out, [1, 0, 1, 0, 0]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("결과 | 공유 |"));
+    assert!(source.exists());
+    let target = f.target.join("sessions").join(source.file_name().unwrap());
+    assert!(target.exists());
+    let out = f.cli(&[
+        "sessions".as_ref(),
+        "import".as_ref(),
+        "--from".as_ref(),
+        f.source.as_os_str(),
+        "--all".as_ref(),
+        "--keep-source".as_ref(),
+        "--apply".as_ref(),
+    ]);
+    assert_counts(&out, [0, 1, 1, 0, 0]);
+}
+#[test]
+fn r9_auto_resume_moves_then_unimport_restores_source_names_and_rows() {
+    let f = Fixture::new();
+    let source = f.add(A, false, "openai");
+    let original = fs::read(&source).unwrap();
+    {
+        let goals = Connection::open(f.source.join("goals_1.sqlite")).unwrap();
+        goals.execute_batch("CREATE TABLE thread_goals(thread_id TEXT PRIMARY KEY,objective TEXT NOT NULL,status TEXT NOT NULL,updated_at_ms INTEGER NOT NULL);").unwrap();
+        goals
+            .execute(
+                "INSERT INTO thread_goals VALUES (?1,'synthetic objective','active',0)",
+                [A],
+            )
+            .unwrap();
+    }
+    let out = f.resume(A);
+    assert_success(&out);
+    assert!(f.sentinel.exists());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("기존 대화를 qb로 옮겼습니다"));
+    let target = f.target.join("sessions").join(source.file_name().unwrap());
+    assert!(!source.exists());
+    assert_eq!(fs::read(&target).unwrap(), original);
+    assert!(thread_path(&f.source, A).is_none());
+    assert_eq!(thread_path(&f.target, A), Some(target.clone()));
+    assert_eq!(goal_status(&f.source, A), None);
+    assert_eq!(goal_status(&f.target, A).as_deref(), Some("paused"));
+    fs::remove_file(&f.sentinel).unwrap();
+    let reused = f.resume(A);
+    assert_success(&reused);
+    assert!(f.sentinel.exists());
+    assert!(!source.exists());
+    assert!(!String::from_utf8_lossy(&reused.stdout).contains("기존 대화를 qb로"));
+    assert!(thread_path(&f.source, A).is_none());
+    assert_eq!(thread_path(&f.target, A), Some(target.clone()));
+    fs::remove_file(&f.sentinel).unwrap();
+    assert_success(&f.unimport(A));
+    assert!(!f.sentinel.exists());
+    assert_eq!(fs::read(&source).unwrap(), original);
+    assert_eq!(thread_path(&f.source, A), Some(source));
+    assert_eq!(goal_status(&f.source, A).as_deref(), Some("active"));
+    assert!(!target.exists());
+    assert!(thread_path(&f.target, A).is_none());
+    assert_eq!(goal_status(&f.target, A), None);
+}
+
+#[test]
+fn r9_keep_source_every_resume_grammar_refuses_source_writer_before_launch() {
+    let f = Fixture::new();
+    let source = f.add(A, false, "openai");
+    assert_success(&f.import_options(A, true, &["--keep-source"]));
+    assert!(source.exists());
+    assert!(!f.sentinel.exists());
+    let writer = fs::OpenOptions::new().append(true).open(&source).unwrap();
+    let grammars: &[&[&str]] = &[
+        &["resume", A],
+        &["resume", "--all", A],
+        &["-m", "synthetic-model", "resume", "--all", A],
+        &["resume", "--", A],
+    ];
+    for args in grammars {
+        assert_refused(&f, &f.launch(args), "다른 곳에서 실행 중");
+    }
+    drop(writer);
+    for args in grammars {
+        let out = f.launch(args);
+        assert_success(&out);
+        assert!(f.sentinel.exists());
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("기존 대화를 qb로"));
+        fs::remove_file(&f.sentinel).unwrap();
+    }
+}
+#[test]
+fn r9_auto_resume_diverged_or_compressed_records_never_launch() {
+    let f = Fixture::new();
+    let source = f.add(A, false, "openai");
+    assert_success(&f.import_options(A, true, &["--keep-source"]));
+    let compressed = source.with_extension("jsonl.zst");
+    fs::write(&compressed, b"synthetic compressed marker").unwrap();
+    let out = f.resume(A);
+    assert_refused(&f, &out, "압축");
+    fs::remove_file(compressed).unwrap();
+    let target = f.target.join("sessions").join(source.file_name().unwrap());
+    fs::remove_file(&target).unwrap();
+    fs::write(&target, b"unrelated synthetic").unwrap();
+    let out = f.resume(A);
+    assert_refused(&f, &out, "분기");
+}
+
+#[test]
+fn r9_ancestor_resume_uses_child_journal_provenance_outside_known_homes() {
+    let mut f = Fixture::new();
+    let manual_home = f._root.path().join("manual-source");
+    fs::rename(&f.source, &manual_home).unwrap();
+    f.source = manual_home;
+    let ancestor = f.add(A, false, "openai");
+    let child = f.add_with_parent(B, false, "openai", Some(A));
+    assert_success(&f.import_options(B, true, &["--keep-source"]));
+    assert!(ancestor.exists() && child.exists());
+    assert!(thread_path(&f.target, A).is_some());
+    // A was installed only as B's ancestor, never as a separate import. The
+    // journaled manual home is outside automatic discovery's search roots.
+    assert_success(&f.resume(A));
+    assert!(f.sentinel.exists());
+    fs::remove_file(&f.sentinel).unwrap();
+    let writer = fs::OpenOptions::new().append(true).open(&ancestor).unwrap();
+    assert_refused(&f, &f.resume(A), "다른 곳에서 실행 중");
+    drop(writer);
+
+    // Preserve the old linked file as a prefix; only source's active physical
+    // filename changes. Identity checks on the saved names alone cannot catch it.
+    let replacement = f
+        .source
+        .join("sessions")
+        .join(format!("rollout-2026-10-21T00-00-00-{C}.jsonl"));
+    fs::write(&replacement, fs::read(&ancestor).unwrap()).unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&replacement)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(300)))
+        .unwrap();
+    {
+        let db = Connection::open(f.source.join("state_5.sqlite")).unwrap();
+        db.execute(
+            "UPDATE threads SET rollout_path=?1 WHERE id=?2",
+            rusqlite::params![replacement.to_str().unwrap(), A],
+        )
+        .unwrap();
+    }
+    assert_refused(&f, &f.resume(A), "분기");
+    assert_eq!(
+        fs::read(&ancestor).unwrap(),
+        fs::read(&replacement).unwrap()
+    );
+}
+
+#[test]
+fn r9_bulk_move_reports_moved_live_diverged_and_failed_separately() {
+    let f = Fixture::new();
+    let moved = f.add(A, false, "openai");
+    let live = f.add(B, false, "openai");
+    let diverged = f.add(C, false, "openai");
+    let unsupported = f.add(D, false, "other");
+    let conflicting = f
+        .target
+        .join("sessions")
+        .join(diverged.file_name().unwrap());
+    fs::create_dir_all(conflicting.parent().unwrap()).unwrap();
+    // Same valid metadata and bytes, but a separate file rather than a hardlink.
+    fs::write(&conflicting, fs::read(&diverged).unwrap()).unwrap();
+    let writer = fs::OpenOptions::new().append(true).open(&live).unwrap();
+    let out = f.cli(&[
+        "sessions".as_ref(),
+        "import".as_ref(),
+        "--from".as_ref(),
+        f.source.as_os_str(),
+        "--all".as_ref(),
+        "--apply".as_ref(),
+    ]);
+    assert_counts(&out, [1, 0, 1, 1, 1]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("결과 | 이동 |"));
+    assert!(text.contains(&format!("{B}: 실행 중/최근 사용으로 건너뜀")));
+    assert!(text.contains(&format!("{C}: 기록 분기로 건너뜀")));
+    assert!(text.contains(&format!("{D}: 실패")));
+    assert!(!moved.exists());
+    assert!(
+        f.target
+            .join("sessions")
+            .join(moved.file_name().unwrap())
+            .exists()
+    );
+    assert!(thread_path(&f.source, A).is_none());
+    for id in [B, C, D] {
+        assert!(thread_path(&f.source, id).is_some());
+        assert!(thread_path(&f.target, id).is_none());
+    }
+    assert!(live.exists() && diverged.exists() && unsupported.exists());
+    assert_eq!(
+        fs::read(&conflicting).unwrap(),
+        fs::read(&diverged).unwrap()
+    );
+    assert!(!f.sentinel.exists());
+    drop(writer);
+}
+
+#[test]
+fn r9_explicit_move_succeeds_and_conflicts_with_keep_source_without_journal() {
+    let f = Fixture::new();
+    let source = f.add(A, false, "openai");
+    let original = fs::read(&source).unwrap();
+    let target = f.target.join("sessions").join(source.file_name().unwrap());
+    let conflict = f.import_options(A, true, &["--move", "--keep-source"]);
+    assert_eq!(conflict.status.code(), Some(2));
+    let diagnostic = String::from_utf8_lossy(&conflict.stderr);
+    assert!(diagnostic.contains("--move") && diagnostic.contains("--keep-source"));
+    assert!(!f.qb.join("journal/sessions-import.json").exists());
+    assert!(!f.target.join("state_5.sqlite").exists());
+    assert!(!target.exists());
+    assert_eq!(fs::read(&source).unwrap(), original);
+    assert_eq!(thread_path(&f.source, A), Some(source.clone()));
+    assert!(!f.sentinel.exists());
+
+    let moved = f.import_options(A, true, &["--move"]);
+    assert_success(&moved);
+    assert!(String::from_utf8_lossy(&moved.stdout).contains("결과 | 이동 |"));
+    assert!(!source.exists());
+    assert_eq!(fs::read(&target).unwrap(), original);
+    assert!(thread_path(&f.source, A).is_none());
+    assert_eq!(thread_path(&f.target, A), Some(target));
+    assert!(f.qb.join("journal/sessions-import.json").exists());
+    assert!(!f.sentinel.exists());
+}
+
+#[test]
+fn r9_cli_live_unknown_provider_and_missing_wiring_refuse() {
+    let f = Fixture::new();
+    let source = f.add(A, false, "other");
+    assert!(!f.import(A, true).status.success());
+    assert!(!f.qb.join("journal/sessions-import.json").exists());
+    fs::OpenOptions::new()
+        .append(true)
+        .open(source)
+        .unwrap()
+        .write_all(b"{}\n")
+        .unwrap();
+    fs::remove_file(f.qb.join("journal/wiring.json")).unwrap();
+    assert!(!f.import(A, true).status.success());
+}

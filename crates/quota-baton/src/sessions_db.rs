@@ -14,7 +14,10 @@
 //! Ownership means absent at planning time under that lock, not merely equal.
 //! Each DB commits atomically; a failure between DB commits is recovered by
 //! replaying or removing the saved plan. Empty created DBs/schemas are retained.
-//! Fresh schemas deliberately contain no migrations ledger or global tables.
+//! Fresh databases retain the source's versioned schema and migration ledger,
+//! but never unrelated user rows. Rollback retains these shared schema objects.
+//! Official triggers are checked against migrations/0025_thread_timestamps_millis.sql
+//! and migrations/0039_threads_recency_at.sql, not trusted by name alone.
 
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::types::{ToSql, ToSqlOutput, ValueRef};
@@ -27,6 +30,69 @@ use std::path::{Component, Path, PathBuf};
 
 const STATE: &str = "state_5.sqlite";
 const GOALS: &str = "goals_1.sqlite";
+
+// Exact official bodies from Codex state migrations 0025 and 0039 above.
+// SQLite omits the final semicolon in sqlite_schema; whitespace is normalized.
+const OFFICIAL_TRIGGERS: [(&str, &str); 5] = [
+    (
+        "threads_created_at_ms_after_insert",
+        "CREATE TRIGGER threads_created_at_ms_after_insert
+AFTER INSERT ON threads
+WHEN NEW.created_at_ms IS NULL
+BEGIN
+    UPDATE threads
+    SET created_at_ms = NEW.created_at * 1000
+    WHERE id = NEW.id;
+END",
+    ),
+    (
+        "threads_updated_at_ms_after_insert",
+        "CREATE TRIGGER threads_updated_at_ms_after_insert
+AFTER INSERT ON threads
+WHEN NEW.updated_at_ms IS NULL
+BEGIN
+    UPDATE threads
+    SET updated_at_ms = NEW.updated_at * 1000
+    WHERE id = NEW.id;
+END",
+    ),
+    (
+        "threads_created_at_ms_after_update",
+        "CREATE TRIGGER threads_created_at_ms_after_update
+AFTER UPDATE OF created_at ON threads
+WHEN NEW.created_at != OLD.created_at
+ AND NEW.created_at_ms IS OLD.created_at_ms
+BEGIN
+    UPDATE threads
+    SET created_at_ms = NEW.created_at * 1000
+    WHERE id = NEW.id;
+END",
+    ),
+    (
+        "threads_updated_at_ms_after_update",
+        "CREATE TRIGGER threads_updated_at_ms_after_update
+AFTER UPDATE OF updated_at ON threads
+WHEN NEW.updated_at != OLD.updated_at
+ AND NEW.updated_at_ms IS OLD.updated_at_ms
+BEGIN
+    UPDATE threads
+    SET updated_at_ms = NEW.updated_at * 1000
+    WHERE id = NEW.id;
+END",
+    ),
+    (
+        "threads_recency_at_after_insert",
+        "CREATE TRIGGER threads_recency_at_after_insert
+AFTER INSERT ON threads
+WHEN NEW.recency_at_ms = 0
+BEGIN
+    UPDATE threads
+    SET recency_at = NEW.updated_at,
+        recency_at_ms = COALESCE(NEW.updated_at_ms, NEW.updated_at * 1000)
+    WHERE id = NEW.id;
+END",
+    ),
+];
 
 // Codex state/migrations/0001_threads.sql. Used only for explicit synthesis in
 // rollout-only homes; callers must supply the required verified metadata.
@@ -89,7 +155,8 @@ impl ToSql for DbValue {
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RowSnapshot {
     pub(crate) values: BTreeMap<String, DbValue>,
-    /// False for an identical row already present when planning.
+    /// False for an identical destination row already present when planning.
+    /// Source snapshots explicitly own their selected rows for move/restore.
     pub(crate) owned: bool,
 }
 
@@ -140,7 +207,30 @@ pub(crate) struct DbPlan {
     pub(crate) goals_path: PathBuf,
     pub(crate) threads_schema: Option<TableSchema>,
     pub(crate) goals_schema: Option<TableSchema>,
+    #[serde(default)]
+    pub(crate) state_bootstrap: Option<BootstrapPlan>,
+    #[serde(default)]
+    pub(crate) goals_bootstrap: Option<BootstrapPlan>,
+    /// Exact same-home move/restore snapshot, never a transformed import plan.
+    #[serde(default)]
+    pub(crate) is_source_snapshot: bool,
     pub(crate) threads: Vec<ThreadPlan>,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct SchemaObject {
+    pub(crate) kind: String,
+    pub(crate) name: String,
+    pub(crate) table: String,
+    pub(crate) ddl: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct BootstrapPlan {
+    pub(crate) objects: Vec<SchemaObject>,
+    pub(crate) migrations_schema: TableSchema,
+    /// Only successfully applied _sqlx_migrations rows, never application rows.
+    pub(crate) migrations: Vec<RowSnapshot>,
 }
 
 fn readonly(path: &Path) -> Result<Option<Connection>> {
@@ -210,6 +300,163 @@ fn schema(db: &Connection, table: &str) -> Result<Option<TableSchema>> {
         indexes,
         columns: columns(db, table)?,
     }))
+}
+
+fn normalized_sql(sql: &str) -> String {
+    sql.trim()
+        .trim_end_matches(';')
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn schema_objects(db: &Connection) -> Result<Vec<SchemaObject>> {
+    let mut statement = db.prepare(
+        "SELECT type, name, tbl_name, sql FROM sqlite_schema
+         WHERE sql IS NOT NULL AND name NOT GLOB 'sqlite_*'
+         ORDER BY CASE type WHEN 'table' THEN 0 WHEN 'index' THEN 1 ELSE 2 END, name",
+    )?;
+    let objects = statement
+        .query_map([], |row| {
+            Ok(SchemaObject {
+                kind: row.get(0)?,
+                name: row.get(1)?,
+                table: row.get(2)?,
+                ddl: row.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(objects)
+}
+
+fn validate_trigger(object: &SchemaObject) -> Result<()> {
+    ensure!(
+        object.kind == "trigger"
+            && object.table == "threads"
+            && OFFICIAL_TRIGGERS
+                .iter()
+                .any(|(name, ddl)| *name == object.name
+                    && normalized_sql(ddl) == normalized_sql(&object.ddl)),
+        "unsupported SQLite trigger; refusing indirect writes"
+    );
+    Ok(())
+}
+
+fn validate_triggers(db: &Connection) -> Result<()> {
+    for object in schema_objects(db)?
+        .iter()
+        .filter(|object| object.kind == "trigger")
+    {
+        validate_trigger(object)?;
+    }
+    Ok(())
+}
+
+fn migration_rows(db: &Connection) -> Result<Vec<RowSnapshot>> {
+    if schema(db, "_sqlx_migrations")?.is_none() {
+        return Ok(Vec::new());
+    }
+    let mut statement =
+        db.prepare("SELECT version, success FROM _sqlx_migrations ORDER BY version")?;
+    let versions = statement
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut rows = Vec::new();
+    for (version, success) in versions {
+        ensure!(
+            success == 1,
+            "SQLite migration ledger contains an unsuccessful migration"
+        );
+        rows.push(
+            selected_row(db, "_sqlx_migrations", "version", &version.to_string())?
+                .context("migration snapshot disappeared")?,
+        );
+    }
+    Ok(rows)
+}
+
+fn bootstrap_snapshot(db: &Connection) -> Result<Option<BootstrapPlan>> {
+    // Even unversioned sources must not carry arbitrary executable triggers.
+    validate_triggers(db)?;
+    let migrations = migration_rows(db)?;
+    if migrations.is_empty() {
+        return Ok(None);
+    }
+    let objects = schema_objects(db)?;
+    ensure!(
+        objects.iter().all(
+            |object| matches!(object.kind.as_str(), "table" | "index" | "trigger")
+                && !object
+                    .ddl
+                    .to_ascii_uppercase()
+                    .starts_with("CREATE VIRTUAL")
+        ),
+        "unsupported versioned SQLite schema object"
+    );
+    Ok(Some(BootstrapPlan {
+        objects,
+        migrations,
+        migrations_schema: schema(db, "_sqlx_migrations")?.context("missing migrations schema")?,
+    }))
+}
+
+/// Repair only an uninitialized database whose existing objects are an exact
+/// subset of the source schema. A nonempty ledger belongs to an initialized
+/// destination and is never replaced or extended by this adapter.
+fn bootstrap(db: &Connection, snapshot: &BootstrapPlan) -> Result<()> {
+    validate_triggers(db)?;
+    if !migration_rows(db)?.is_empty() {
+        return Ok(());
+    }
+    for object in &snapshot.objects {
+        if object.kind == "trigger" {
+            validate_trigger(object)?;
+        }
+    }
+    let existing = schema_objects(db)?;
+    for object in &existing {
+        ensure!(
+            snapshot
+                .objects
+                .iter()
+                .any(|source| source.kind == object.kind
+                    && source.name == object.name
+                    && source.table == object.table
+                    && normalized_sql(&source.ddl) == normalized_sql(&object.ddl)),
+            "uninitialized destination has incompatible schema objects"
+        );
+    }
+    // Tables, then indexes, then allowlisted triggers. The caller's IMMEDIATE
+    // transaction includes all schema, ledger and selected row writes.
+    for kind in ["table", "index", "trigger"] {
+        for object in snapshot.objects.iter().filter(|object| object.kind == kind) {
+            if !existing
+                .iter()
+                .any(|current| current.kind == object.kind && current.name == object.name)
+            {
+                db.execute(&object.ddl, [])?;
+            }
+        }
+    }
+    ensure!(
+        columns(db, "_sqlx_migrations")? == snapshot.migrations_schema.columns,
+        "incompatible migration ledger columns"
+    );
+    for row in &snapshot.migrations {
+        ensure!(
+            row.values.get("success") == Some(&DbValue::Integer(1)),
+            "invalid migration snapshot"
+        );
+        insert_row(db, "_sqlx_migrations", &snapshot.migrations_schema, row)?;
+    }
+    ensure!(
+        migration_rows(db)?
+            .iter()
+            .map(|row| &row.values)
+            .eq(snapshot.migrations.iter().map(|row| &row.values)),
+        "destination coerced migration metadata"
+    );
+    Ok(())
 }
 
 fn selected_row(db: &Connection, table: &str, key: &str, id: &str) -> Result<Option<RowSnapshot>> {
@@ -456,6 +703,24 @@ pub(crate) fn plan(source_home: &Path, target_home: &Path, ids: &[String]) -> Re
         .map(|db| schema(db, "thread_goals"))
         .transpose()?
         .flatten();
+    let state_bootstrap = state
+        .as_ref()
+        .map(bootstrap_snapshot)
+        .transpose()?
+        .flatten();
+    let goals_bootstrap = goals
+        .as_ref()
+        .map(bootstrap_snapshot)
+        .transpose()?
+        .flatten();
+    let state_triggers = state
+        .as_ref()
+        .map(schema_objects)
+        .transpose()?
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|object| object.kind == "trigger")
+        .collect::<Vec<_>>();
     let ids = ids.iter().cloned().collect::<BTreeSet<_>>();
     let mut index = latest_index(source_home, &ids)?;
     let mut selected = Vec::new();
@@ -494,6 +759,7 @@ pub(crate) fn plan(source_home: &Path, target_home: &Path, ids: &[String]) -> Re
                 "id",
                 &id,
                 row,
+                &state_triggers,
             )?;
             set_ownership(target_state.as_ref(), "threads", "id", &id, row)?;
         }
@@ -524,6 +790,7 @@ pub(crate) fn plan(source_home: &Path, target_home: &Path, ids: &[String]) -> Re
                 "thread_id",
                 &id,
                 row,
+                &[],
             )?;
             // A second fork can share an already imported ancestor. A timestamp
             // refresh alone must not turn that identical logical goal into a
@@ -571,8 +838,137 @@ pub(crate) fn plan(source_home: &Path, target_home: &Path, ids: &[String]) -> Re
         goals_path: target_home.join(GOALS),
         threads_schema,
         goals_schema,
+        state_bootstrap,
+        goals_bootstrap,
+        is_source_snapshot: false,
         threads: selected,
     })
+}
+
+/// Capture only explicitly selected ROOT ids, without traversing fork ancestry.
+/// Persist/encrypt this entire plan before deleting any source rows or names.
+/// `remove_exact` deletes these original rows; `apply` restores their exact
+/// values, including archived state, paths, active status and original times.
+/// No index file is read or written. Caller holds source/destination guards
+/// through destination verification and source removal, and restores names
+/// before restoring source rows on unimport.
+pub(crate) fn source_snapshot(home: &Path, root_ids: &[String]) -> Result<DbPlan> {
+    ensure!(home.is_absolute(), "metadata home must be absolute");
+    let state = readonly(&home.join(STATE))?;
+    let goals = readonly(&home.join(GOALS))?;
+    let threads_schema = state
+        .as_ref()
+        .map(|db| schema(db, "threads"))
+        .transpose()?
+        .flatten();
+    let goals_schema = goals
+        .as_ref()
+        .map(|db| schema(db, "thread_goals"))
+        .transpose()?
+        .flatten();
+    let state_bootstrap = state
+        .as_ref()
+        .map(bootstrap_snapshot)
+        .transpose()?
+        .flatten();
+    let goals_bootstrap = goals
+        .as_ref()
+        .map(bootstrap_snapshot)
+        .transpose()?
+        .flatten();
+    let mut selected = Vec::new();
+    for id in root_ids.iter().cloned().collect::<BTreeSet<_>>() {
+        let mut thread = state
+            .as_ref()
+            .map(|db| selected_row(db, "threads", "id", &id))
+            .transpose()?
+            .flatten();
+        let mut goal = goals
+            .as_ref()
+            .map(|db| selected_row(db, "thread_goals", "thread_id", &id))
+            .transpose()?
+            .flatten();
+        let source = thread.as_ref().map(thread_info).transpose()?;
+        let source_goal_status = goal
+            .as_ref()
+            .map(|row| field(row, "status").map(str::to_owned))
+            .transpose()?;
+        if let Some(row) = &mut thread {
+            row.owned = true;
+        }
+        if let Some(row) = &mut goal {
+            row.owned = true;
+        }
+        selected.push(ThreadPlan {
+            id,
+            source,
+            thread,
+            goal,
+            source_goal_status,
+            latest_index_entry: None,
+        });
+    }
+    Ok(DbPlan {
+        source_home: home.to_owned(),
+        target_home: home.to_owned(),
+        state_path: home.join(STATE),
+        goals_path: home.join(GOALS),
+        threads_schema,
+        goals_schema,
+        state_bootstrap,
+        goals_bootstrap,
+        is_source_snapshot: true,
+        threads: selected,
+    })
+}
+
+/// Read-only post-apply verification before a move deletes its source. A thread
+/// row must exactly match the full snapshot at its planned path/provider, and
+/// its optional goal must match (or remain absent). Includes borrowed rows;
+/// verification does not change ownership or reuse removal's borrowed-row skip.
+pub(crate) fn verify(plan: &DbPlan) -> Result<()> {
+    ensure!(
+        plan.state_path == plan.target_home.join(STATE)
+            && plan.goals_path == plan.target_home.join(GOALS),
+        "invalid metadata plan paths"
+    );
+    let state = readonly(&plan.state_path)?;
+    let goals = readonly(&plan.goals_path)?;
+    for thread in &plan.threads {
+        let expected = thread
+            .thread
+            .as_ref()
+            .context("cannot verify destination without planned thread metadata")?;
+        let actual = state
+            .as_ref()
+            .map(|db| selected_row(db, "threads", "id", &thread.id))
+            .transpose()?
+            .flatten()
+            .context("destination thread row is missing")?;
+        ensure!(
+            field(&actual, "rollout_path")? == field(expected, "rollout_path")?
+                && field(&actual, "model_provider")? == field(expected, "model_provider")?,
+            "destination thread path or provider differs for {}",
+            thread.id
+        );
+        ensure!(
+            actual.values == expected.values,
+            "destination thread metadata differs for {}",
+            thread.id
+        );
+        let actual_goal = goals
+            .as_ref()
+            .map(|db| selected_row(db, "thread_goals", "thread_id", &thread.id))
+            .transpose()?
+            .flatten();
+        ensure!(
+            actual_goal.as_ref().map(|row| &row.values)
+                == thread.goal.as_ref().map(|row| &row.values),
+            "destination goal differs for {}",
+            thread.id
+        );
+    }
+    Ok(())
 }
 
 /// For a rollout-only home, the filesystem planner can supply metadata it has
@@ -585,6 +981,10 @@ pub(crate) fn add_synthetic_thread(
     source: &ThreadInfo,
     mut fields: BTreeMap<String, DbValue>,
 ) -> Result<()> {
+    ensure!(
+        !plan.is_source_snapshot,
+        "cannot synthesize rows into an exact source snapshot"
+    );
     ensure!(
         source.model_provider == "openai",
         "unsupported model provider for {}",
@@ -637,6 +1037,21 @@ pub(crate) fn add_synthetic_thread(
     let db = Connection::open_in_memory()?;
     db.execute_batch("PRAGMA foreign_keys=OFF")?;
     db.execute(&expected.ddl, [])?;
+    let synthesis_objects = if let Some(target) = &target {
+        schema_objects(target)?
+    } else {
+        plan.state_bootstrap
+            .as_ref()
+            .map(|snapshot| snapshot.objects.clone())
+            .unwrap_or_default()
+    };
+    for object in synthesis_objects
+        .iter()
+        .filter(|object| object.kind == "trigger")
+    {
+        validate_trigger(object)?;
+        db.execute(&object.ddl, [])?;
+    }
     let names = fields
         .keys()
         .map(|name| quoted(name))
@@ -667,15 +1082,7 @@ fn validate_schema(db: &Connection, table: &str, expected: &TableSchema) -> Resu
         columns(db, table)? == expected.columns,
         "incompatible destination {table} columns"
     );
-    let triggers: i64 = db.query_row(
-        "SELECT count(*) FROM sqlite_schema WHERE type='trigger' AND tbl_name=?1",
-        [table],
-        |row| row.get(0),
-    )?;
-    ensure!(
-        triggers == 0,
-        "destination {table} has triggers; refusing indirect writes"
-    );
+    validate_triggers(db)?;
     Ok(())
 }
 
@@ -688,18 +1095,34 @@ struct Pending<'a> {
 }
 
 fn prepare<'a>(plan: &'a DbPlan, remove: bool) -> Result<Vec<Pending<'a>>> {
+    prepare_with_operational_rebase(plan, remove, false)
+}
+
+fn prepare_with_operational_rebase<'a>(
+    plan: &'a DbPlan,
+    remove: bool,
+    after_resume: bool,
+) -> Result<Vec<Pending<'a>>> {
     ensure!(
         plan.state_path == plan.target_home.join(STATE)
             && plan.goals_path == plan.target_home.join(GOALS),
         "invalid metadata plan paths"
     );
-    if plan.target_home.try_exists()? && plan.source_home.try_exists()? {
+    if plan.is_source_snapshot {
+        ensure!(
+            plan.source_home == plan.target_home,
+            "source snapshot homes differ"
+        );
+    } else if plan.target_home.try_exists()? && plan.source_home.try_exists()? {
         ensure!(
             plan.source_home.canonicalize()? != plan.target_home.canonicalize()?,
             "source and target homes coincide"
         );
     }
     let mut pending = Vec::new();
+    if plan.threads.is_empty() {
+        return Ok(pending);
+    }
     for (path, table, key, expected, is_goal) in [
         (
             &plan.state_path,
@@ -725,10 +1148,16 @@ fn prepare<'a>(plan: &'a DbPlan, remove: bool) -> Result<Vec<Pending<'a>>> {
                 } else {
                     thread.thread.as_ref()
                 };
-                row.map(|row| (thread.id.as_str(), row))
+                row.filter(|row| !remove || row.owned)
+                    .map(|row| (thread.id.as_str(), row))
             })
             .collect::<Vec<_>>();
-        if rows.is_empty() {
+        let snapshot = if is_goal {
+            plan.goals_bootstrap.as_ref()
+        } else {
+            plan.state_bootstrap.as_ref()
+        };
+        if rows.is_empty() && (remove || snapshot.is_none()) {
             continue;
         }
         let expected = expected.context("row plan lacks source schema")?;
@@ -749,6 +1178,10 @@ fn prepare<'a>(plan: &'a DbPlan, remove: bool) -> Result<Vec<Pending<'a>>> {
         // Preserve foreign-key columns without cloning referenced global tables;
         // disable cascades so exact-row removal cannot delete unrelated metadata.
         db.execute_batch("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE")?;
+        validate_triggers(&db)?;
+        if !remove && let Some(snapshot) = snapshot {
+            bootstrap(&db, snapshot)?;
+        }
         if schema(&db, table)?.is_none() {
             if remove {
                 continue;
@@ -764,14 +1197,53 @@ fn prepare<'a>(plan: &'a DbPlan, remove: bool) -> Result<Vec<Pending<'a>>> {
             ensure!(field(row, key)? == *id, "row plan identity mismatch");
             let current = selected_row(&db, table, key, id)?;
             match current {
-                Some(current) => ensure!(
-                    current.values == row.values,
-                    "destination {table} row changed for {id}"
-                ),
-                None => ensure!(
-                    row.owned,
-                    "unowned destination {table} row disappeared for {id}"
-                ),
+                Some(current) => {
+                    // Rebase only the comparison snapshot while both database
+                    // write transactions are held. Never rewrite the journal or
+                    // relax identity, rollout path, provider, goals or unknown
+                    // fields. Borrowed rows were excluded above for removal.
+                    let mut values = row.values.clone();
+                    if after_resume && remove && !is_goal && row.owned {
+                        for name in [
+                            "updated_at",
+                            "tokens_used",
+                            "created_at_ms",
+                            "updated_at_ms",
+                            "recency_at",
+                            "recency_at_ms",
+                        ] {
+                            if values.contains_key(name)
+                                && let Some(value) = current.values.get(name)
+                            {
+                                ensure!(
+                                    matches!(value, DbValue::Integer(_))
+                                        || (matches!(name, "created_at_ms" | "updated_at_ms")
+                                            && *value == DbValue::Null),
+                                    "invalid operational metadata for {id}"
+                                );
+                                values.insert(name.to_owned(), value.clone());
+                            }
+                        }
+                    }
+                    ensure!(
+                        current.values == values,
+                        "destination {table} row changed for {id}"
+                    );
+                }
+                None => {
+                    ensure!(
+                        row.owned,
+                        "unowned destination {table} row disappeared for {id}"
+                    );
+                    if after_resume && remove && !is_goal {
+                        let replacement: bool = db.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM threads WHERE rollout_path=?1 AND id<>?2)",
+                            (field(row, "rollout_path")?, *id),
+                            |row| row.get(0),
+                        )?;
+                        ensure!(!replacement, "destination thread identity changed for {id}");
+                    }
+                }
             }
         }
         pending.push(Pending {
@@ -788,6 +1260,28 @@ fn prepare<'a>(plan: &'a DbPlan, remove: bool) -> Result<Vec<Pending<'a>>> {
 pub(crate) fn apply(plan: &DbPlan) -> Result<()> {
     let pending = prepare(plan, false)?;
     for item in &pending {
+        // Exact source restoration must not let the official INSERT triggers
+        // rewrite an original legacy NULL/zero timestamp. Suspend only the
+        // allowlisted triggers, in this same transaction, and restore their
+        // original definitions before commit. Failed inserts roll back DDL too.
+        let mut restore_triggers = Vec::new();
+        if plan.is_source_snapshot {
+            let mut has_missing = false;
+            for (id, _) in &item.rows {
+                has_missing |= selected_row(&item.db, item.table, item.key, id)?.is_none();
+            }
+            if has_missing {
+                restore_triggers = schema_objects(&item.db)?
+                    .into_iter()
+                    .filter(|object| object.kind == "trigger")
+                    .collect();
+                for trigger in &restore_triggers {
+                    validate_trigger(trigger)?;
+                    item.db
+                        .execute(&format!("DROP TRIGGER {}", quoted(&trigger.name)), [])?;
+                }
+            }
+        }
         for (id, row) in &item.rows {
             if selected_row(&item.db, item.table, item.key, id)?.is_some() {
                 continue;
@@ -800,6 +1294,9 @@ pub(crate) fn apply(plan: &DbPlan) -> Result<()> {
                 inserted.values == row.values,
                 "destination coerced imported metadata for {id}"
             );
+        }
+        for trigger in &restore_triggers {
+            item.db.execute(&trigger.ddl, [])?;
         }
     }
     for item in pending {
@@ -839,23 +1336,32 @@ fn recompute_generated(
     key: &str,
     id: &str,
     row: &mut RowSnapshot,
+    triggers: &[SchemaObject],
 ) -> Result<()> {
-    if schema.columns.values().all(|writable| *writable) {
+    if schema.columns.values().all(|writable| *writable) && triggers.is_empty() {
         return Ok(());
     }
     let db = Connection::open_in_memory()?;
     db.execute_batch("PRAGMA foreign_keys=OFF")?;
     db.execute(&schema.ddl, [])?;
+    for trigger in triggers {
+        validate_trigger(trigger)?;
+        db.execute(&trigger.ddl, [])?;
+    }
     insert_row(&db, table, schema, row)?;
     let computed = selected_row(&db, table, key, id)?.context("generated row missing")?;
     row.values = computed.values;
     Ok(())
 }
 
-/// Validate *all* selected rows before removing any. Missing rows are harmless
-/// for crash recovery; matching pre-existing (unowned) rows are never deleted.
+/// Validate all owned rows before removing any. Missing owned rows are harmless
+/// for crash recovery. Borrowed rows are neither inspected nor deleted: another
+/// import owns their current snapshots and may legitimately have changed them.
 pub(crate) fn remove_exact(plan: &DbPlan) -> Result<()> {
-    let pending = prepare(plan, true)?;
+    remove_prepared(prepare(plan, true)?)
+}
+
+fn remove_prepared(pending: Vec<Pending<'_>>) -> Result<()> {
     for item in &pending {
         for (id, row) in &item.rows {
             if row.owned {
@@ -878,6 +1384,21 @@ pub(crate) fn remove_exact(plan: &DbPlan) -> Result<()> {
 
 pub(crate) fn rollback(plan: &DbPlan) -> Result<()> {
     remove_exact(plan)
+}
+
+/// Force permits only Codex's known operational thread time/token changes.
+/// Every owned row in both databases is validated under IMMEDIATE transactions
+/// before any deletion. Goals remain exact; borrowed rows remain untouched.
+/// The original encrypted plan is not rebased or modified by this operation.
+pub(crate) fn rollback_after_resume(plan: &DbPlan, force: bool) -> Result<()> {
+    if !force {
+        return rollback(plan);
+    }
+    ensure!(
+        !plan.is_source_snapshot,
+        "forced rollback requires a destination import plan"
+    );
+    remove_prepared(prepare_with_operational_rebase(plan, true, true)?)
 }
 
 #[cfg(test)]
@@ -910,8 +1431,7 @@ mod tests {
              ALTER TABLE threads ADD COLUMN project_id TEXT REFERENCES projects(id);
              CREATE INDEX future_index ON threads(future_text) WHERE archived=0;
              CREATE TABLE thread_history(thread_id TEXT, content TEXT);
-             CREATE TABLE audit(id TEXT);
-             CREATE TRIGGER source_only AFTER INSERT ON threads BEGIN INSERT INTO audit VALUES (NEW.id); END;"
+             CREATE TABLE audit(id TEXT);"
         )?;
         let goals = Connection::open(source.join(GOALS))?;
         goals.execute_batch(
@@ -1238,6 +1758,545 @@ mod tests {
             mapped_path(&canonical_home, &target, &rollout)?,
             target.join("sessions/2026/rollout-existing.jsonl")
         );
+        Ok(())
+    }
+
+    fn add_ledger(db: &Connection, versions: &[i64]) -> Result<()> {
+        db.execute_batch(
+            "CREATE TABLE _sqlx_migrations (
+            version BIGINT PRIMARY KEY,
+            description TEXT NOT NULL,
+            installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            success BOOLEAN NOT NULL,
+            checksum BLOB NOT NULL,
+            execution_time BIGINT NOT NULL
+        )",
+        )?;
+        for version in versions {
+            db.execute("INSERT INTO _sqlx_migrations VALUES (?1,'synthetic migration','2026-10-21 00:00:00',1,X'00FF1020',17)", [version])?;
+        }
+        Ok(())
+    }
+
+    fn versioned_fixture(source: &Path) -> Result<Vec<String>> {
+        let ids = fixture(source, &["active", "complete"])?;
+        let db = Connection::open(source.join(STATE))?;
+        db.execute_batch("PRAGMA foreign_keys=OFF;
+            ALTER TABLE threads ADD COLUMN created_at_ms INTEGER;
+            ALTER TABLE threads ADD COLUMN updated_at_ms INTEGER;
+            ALTER TABLE threads ADD COLUMN recency_at INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE threads ADD COLUMN recency_at_ms INTEGER NOT NULL DEFAULT 0;
+            UPDATE threads SET created_at_ms=1000, updated_at_ms=2000, recency_at=2, recency_at_ms=2000;
+            CREATE TABLE projects(id TEXT PRIMARY KEY, value TEXT);
+            INSERT INTO projects VALUES('uncopied-project','unrelated project');
+            CREATE TABLE thread_dynamic_tools(id INTEGER PRIMARY KEY AUTOINCREMENT, thread_id TEXT, value BLOB);
+            INSERT INTO thread_dynamic_tools(thread_id,value) VALUES('thread-0', X'01');
+            CREATE INDEX dynamic_thread ON thread_dynamic_tools(thread_id);")?;
+        for (_, ddl) in OFFICIAL_TRIGGERS {
+            db.execute(ddl, [])?;
+        }
+        add_ledger(&db, &[1, 25, 39])?;
+        let goals = Connection::open(source.join(GOALS))?;
+        add_ledger(&goals, &[1, 2])?;
+        goals.execute("INSERT INTO unrelated VALUES('unrelated user row')", [])?;
+        Ok(ids)
+    }
+
+    #[test]
+    fn versioned_bootstrap_prevents_first_migration_collision_and_keeps_only_selected_data()
+    -> Result<()> {
+        let (_temp, source, target) = homes()?;
+        let ids = versioned_fixture(&source)?;
+        let planned = plan(&source, &target, &ids[..1])?;
+        assert_eq!(
+            planned
+                .state_bootstrap
+                .as_ref()
+                .context("bootstrap")?
+                .migrations
+                .len(),
+            3
+        );
+        let planned: DbPlan = serde_json::from_slice(&serde_json::to_vec(&planned)?)?;
+        apply(&planned)?;
+        apply(&planned)?;
+        let db = Connection::open(target.join(STATE))?;
+        let applied: i64 = db.query_row(
+            "SELECT count(*) FROM _sqlx_migrations WHERE version=1 AND success=1",
+            [],
+            |row| row.get(0),
+        )?;
+        // Model SQLx's first migration gate: without this ledger row the same
+        // CREATE TABLE statement fails with 'table threads already exists'.
+        if applied == 0 {
+            db.execute(MINIMUM_THREADS_DDL, [])?;
+        }
+        assert_eq!(applied, 1);
+        let source_db = readonly(&source.join(STATE))?.context("source DB")?;
+        assert!(schema_objects(&db)? == schema_objects(&source_db)?);
+        assert!(
+            migration_rows(&db)?
+                .iter()
+                .map(|r| &r.values)
+                .eq(migration_rows(&source_db)?.iter().map(|r| &r.values))
+        );
+        assert_eq!(threads(&target)?.len(), 1);
+        for table in [
+            "projects",
+            "thread_dynamic_tools",
+            "thread_history",
+            "audit",
+        ] {
+            let count: i64 = db.query_row(
+                &format!("SELECT count(*) FROM {}", quoted(table)),
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(count, 0);
+        }
+        let target_goals = Connection::open(target.join(GOALS))?;
+        let unrelated: i64 =
+            target_goals.query_row("SELECT count(*) FROM unrelated", [], |row| row.get(0))?;
+        assert_eq!(unrelated, 0);
+        drop(source_db);
+        drop(target_goals);
+        drop(db);
+        remove_exact(&planned)?;
+        let db = Connection::open(target.join(STATE))?;
+        assert_eq!(migration_rows(&db)?.len(), 3);
+        assert!(schema(&db, "thread_dynamic_tools")?.is_some());
+        assert!(threads(&target)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn bootstrap_repairs_qb_partial_schema_with_empty_sqlx_ledger() -> Result<()> {
+        let (_temp, source, target) = homes()?;
+        let ids = versioned_fixture(&source)?;
+        let planned = plan(&source, &target, &ids[..1])?;
+        std::fs::create_dir(&target)?;
+        let db = Connection::open(target.join(STATE))?;
+        db.execute_batch("PRAGMA foreign_keys=OFF")?;
+        let threads_schema = planned.threads_schema.as_ref().context("threads schema")?;
+        db.execute(&threads_schema.ddl, [])?;
+        for ddl in &threads_schema.indexes {
+            db.execute(ddl, [])?;
+        }
+        add_ledger(&db, &[])?;
+        insert_row(
+            &db,
+            "threads",
+            threads_schema,
+            planned.threads[0].thread.as_ref().context("thread")?,
+        )?;
+        drop(db);
+        apply(&planned)?;
+        let db = Connection::open(target.join(STATE))?;
+        assert_eq!(migration_rows(&db)?.len(), 3);
+        validate_triggers(&db)?;
+        assert_eq!(
+            schema_objects(&db)?
+                .iter()
+                .filter(|o| o.kind == "trigger")
+                .count(),
+            5
+        );
+        assert_eq!(threads(&target)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn initialized_official_triggers_are_accepted_but_modified_bodies_are_refused() -> Result<()> {
+        let (_temp, source, target) = homes()?;
+        let ids = versioned_fixture(&source)?;
+        let first = plan(&source, &target, &ids[..1])?;
+        apply(&first)?;
+        let second = plan(&source, &target, &ids[1..])?;
+        apply(&second)?;
+        assert_eq!(threads(&target)?.len(), 2);
+        let db = Connection::open(target.join(STATE))?;
+        db.execute_batch(
+            "DROP TRIGGER threads_created_at_ms_after_insert;
+            CREATE TRIGGER threads_created_at_ms_after_insert AFTER INSERT ON threads
+            BEGIN DELETE FROM projects; END;",
+        )?;
+        assert!(apply(&second).is_err());
+        assert!(remove_exact(&second).is_err());
+        assert!(plan(&target, &source, &ids).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn arbitrary_source_triggers_are_refused_even_without_a_ledger() -> Result<()> {
+        let (_temp, source, target) = homes()?;
+        let ids = fixture(&source, &["paused"])?;
+        let db = Connection::open(source.join(STATE))?;
+        db.execute_batch("CREATE TRIGGER source_only AFTER INSERT ON threads BEGIN INSERT INTO audit VALUES(NEW.id); END;")?;
+        assert!(plan(&source, &target, &ids).is_err());
+        assert!(!target.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn bootstrap_conflicts_rollback_schema_and_never_adopt_unversioned_tables() -> Result<()> {
+        let (_temp, source, target) = homes()?;
+        let ids = versioned_fixture(&source)?;
+        let planned = plan(&source, &target, &ids[..1])?;
+        std::fs::create_dir(&target)?;
+        let db = Connection::open(target.join(STATE))?;
+        db.execute("CREATE TABLE unknown_user_data(value TEXT)", [])?;
+        assert!(apply(&planned).is_err());
+        assert!(schema(&db, "threads")?.is_none());
+        db.execute("DROP TABLE unknown_user_data", [])?;
+        // A deliberately changed planned snapshot fails after bootstrap creates
+        // the schema, which must still roll back within the same transaction.
+        let mut invalid = planned.clone();
+        invalid.threads[0].thread.as_mut().context("thread")?.owned = false;
+        assert!(apply(&invalid).is_err());
+        assert!(schema(&db, "threads")?.is_none());
+        assert!(schema(&db, "_sqlx_migrations")?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn changed_borrowed_ancestor_does_not_block_child_removal() -> Result<()> {
+        let (_temp, source, target) = homes()?;
+        let ids = fixture(&source, &["active", "complete"])?;
+        let mut successor = plan(&source, &target, &ids[..1])?;
+        apply(&successor)?;
+        let child = plan(&source, &target, &ids)?;
+        apply(&child)?;
+        verify(&child)?;
+        assert!(
+            !child.threads[0]
+                .thread
+                .as_ref()
+                .context("borrowed thread")?
+                .owned
+        );
+        assert!(
+            !child.threads[0]
+                .goal
+                .as_ref()
+                .context("borrowed goal")?
+                .owned
+        );
+        let state = Connection::open(target.join(STATE))?;
+        let goals = Connection::open(target.join(GOALS))?;
+        state.execute(
+            "UPDATE threads SET title='ancestor changed' WHERE id=?1",
+            [&ids[0]],
+        )?;
+        // Verification includes a borrowed row's non-path metadata, even
+        // though child removal deliberately ignores that borrowed snapshot.
+        assert!(verify(&child).is_err());
+        goals.execute(
+            "UPDATE thread_goals SET updated_at_ms=456,tokens_used=9 WHERE thread_id=?1",
+            [&ids[0]],
+        )?;
+        // The surviving journal owns the current snapshots; child removal must
+        // neither replace those snapshots nor insist on its stale borrowed copy.
+        let mut current_thread =
+            selected_row(&state, "threads", "id", &ids[0])?.context("current thread")?;
+        let mut current_goal =
+            selected_row(&goals, "thread_goals", "thread_id", &ids[0])?.context("current goal")?;
+        current_thread.owned = true;
+        current_goal.owned = true;
+        successor.threads[0].thread = Some(current_thread.clone());
+        successor.threads[0].goal = Some(current_goal.clone());
+        remove_exact(&child)?;
+        assert!(thread_path(&target, &ids[1])?.is_none());
+        assert!(
+            selected_row(&state, "threads", "id", &ids[0])?
+                .context("retained thread")?
+                .values
+                == current_thread.values
+        );
+        assert!(
+            selected_row(&goals, "thread_goals", "thread_id", &ids[0])?
+                .context("retained goal")?
+                .values
+                == current_goal.values
+        );
+        remove_exact(&successor)?;
+        assert!(threads(&target)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn move_snapshot_removes_only_explicit_roots_and_restores_original_rows() -> Result<()> {
+        let (_temp, source, target) = homes()?;
+        let ids = fixture(&source, &["active", "complete"])?;
+        let source_index = std::fs::read(source.join("session_index.jsonl"))?;
+        let snapshot = source_snapshot(&source, &ids[..1])?;
+        let snapshot: DbPlan = serde_json::from_slice(&serde_json::to_vec(&snapshot)?)?;
+        assert!(snapshot.is_source_snapshot);
+        assert_eq!(snapshot.source_home, snapshot.target_home);
+        assert_eq!(snapshot.threads.len(), 1);
+        assert!(snapshot.threads[0].latest_index_entry.is_none());
+        let root = snapshot.threads[0].thread.as_ref().context("root")?;
+        let goal = snapshot.threads[0].goal.as_ref().context("goal")?;
+        assert!(root.owned && goal.owned);
+        assert!(root.values["archived"] == DbValue::Integer(1));
+        assert_eq!(field(goal, "status")?, "active");
+        assert!(goal.values["updated_at_ms"] == DbValue::Integer(2));
+        let destination = plan(&source, &target, &ids)?;
+        apply(&destination)?;
+        verify(&destination)?;
+        remove_exact(&snapshot)?;
+        remove_exact(&snapshot)?;
+        assert!(thread_path(&source, &ids[0])?.is_none());
+        assert!(thread_path(&source, &ids[1])?.is_some());
+        let goals = readonly(&source.join(GOALS))?.context("source goals")?;
+        assert!(selected_row(&goals, "thread_goals", "thread_id", &ids[0])?.is_none());
+        assert!(selected_row(&goals, "thread_goals", "thread_id", &ids[1])?.is_some());
+        drop(goals);
+        apply(&snapshot)?;
+        apply(&snapshot)?;
+        verify(&snapshot)?;
+        let state = readonly(&source.join(STATE))?.context("source state")?;
+        let goals = readonly(&source.join(GOALS))?.context("source goals")?;
+        assert!(
+            selected_row(&state, "threads", "id", &ids[0])?
+                .context("restored root")?
+                .values
+                == root.values
+        );
+        assert!(
+            selected_row(&goals, "thread_goals", "thread_id", &ids[0])?
+                .context("restored goal")?
+                .values
+                == goal.values
+        );
+        assert!(std::fs::read(source.join("session_index.jsonl"))? == source_index);
+        // A normal import must never acquire source-write authority merely by
+        // constructing a reverse plan with identical home paths.
+        let mut invalid = snapshot.clone();
+        invalid.is_source_snapshot = false;
+        assert!(remove_exact(&invalid).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn source_snapshot_refuses_changed_owned_rows_before_deleting_anything() -> Result<()> {
+        let (_temp, source, _target) = homes()?;
+        let ids = fixture(&source, &["active", "complete"])?;
+        let snapshot = source_snapshot(&source, &ids)?;
+        let goals = Connection::open(source.join(GOALS))?;
+        goals.execute(
+            "UPDATE thread_goals SET tokens_used=17 WHERE thread_id=?1",
+            [&ids[1]],
+        )?;
+        assert!(remove_exact(&snapshot).is_err());
+        assert_eq!(threads(&source)?.len(), 2);
+        assert!(apply(&snapshot).is_err());
+        let changed =
+            selected_row(&goals, "thread_goals", "thread_id", &ids[1])?.context("changed goal")?;
+        assert!(changed.values["tokens_used"] == DbValue::Integer(17));
+        Ok(())
+    }
+
+    #[test]
+    fn destination_verify_failure_leaves_source_rows_intact() -> Result<()> {
+        let (_temp, source, target) = homes()?;
+        // This test deletes a row through a normal SQLite connection. Use a
+        // versioned source so bootstrap supplies the referenced projects schema;
+        // the legacy fixture deliberately has a dangling project-table reference.
+        let ids = versioned_fixture(&source)?;
+        let destination = plan(&source, &target, &ids[..1])?;
+        apply(&destination)?;
+        verify(&destination)?;
+        let goals = Connection::open(target.join(GOALS))?;
+        goals.execute("UPDATE thread_goals SET tokens_used=1", [])?;
+        assert!(verify(&destination).is_err());
+        assert!(thread_path(&source, &ids[0])?.is_some());
+        goals.execute("UPDATE thread_goals SET tokens_used=0", [])?;
+        verify(&destination)?;
+        let state = Connection::open(target.join(STATE))?;
+        let projects: i64 =
+            state.query_row("SELECT count(*) FROM projects", [], |row| row.get(0))?;
+        assert_eq!(projects, 0);
+        state.execute("UPDATE threads SET rollout_path='sessions/wrong.jsonl'", [])?;
+        assert!(verify(&destination).is_err());
+        assert!(thread_path(&source, &ids[0])?.is_some());
+        state.execute("DELETE FROM threads", [])?;
+        assert!(verify(&destination).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn source_restore_preserves_legacy_null_times_and_official_trigger_schema() -> Result<()> {
+        let (_temp, source, _target) = homes()?;
+        let ids = versioned_fixture(&source)?;
+        let state = Connection::open(source.join(STATE))?;
+        state.execute("UPDATE threads SET created_at_ms=NULL,updated_at_ms=NULL,recency_at=0,recency_at_ms=0 WHERE id=?1", [&ids[0]])?;
+        let original_schema = schema_objects(&state)?;
+        let snapshot = source_snapshot(&source, &ids[..1])?;
+        let expected = snapshot.threads[0]
+            .thread
+            .as_ref()
+            .context("original thread")?;
+        assert!(expected.values["created_at_ms"] == DbValue::Null);
+        assert!(expected.values["recency_at_ms"] == DbValue::Integer(0));
+        remove_exact(&snapshot)?;
+        apply(&snapshot)?;
+        let restored = selected_row(&state, "threads", "id", &ids[0])?.context("restored row")?;
+        assert!(restored.values == expected.values);
+        assert!(schema_objects(&state)? == original_schema);
+        validate_triggers(&state)?;
+        Ok(())
+    }
+
+    #[test]
+    fn source_snapshot_without_rows_does_not_read_index_or_create_databases() -> Result<()> {
+        let (_temp, source, _target) = homes()?;
+        let index = b"not JSON; snapshot must never open this file";
+        std::fs::write(source.join("session_index.jsonl"), index)?;
+        let snapshot = source_snapshot(&source, &["rollout-only-root".into()])?;
+        assert!(snapshot.threads[0].thread.is_none());
+        assert!(snapshot.threads[0].goal.is_none());
+        remove_exact(&snapshot)?;
+        apply(&snapshot)?;
+        assert!(!source.join(STATE).exists());
+        assert!(!source.join(GOALS).exists());
+        assert!(std::fs::read(source.join("session_index.jsonl"))? == index);
+        Ok(())
+    }
+
+    #[test]
+    fn forced_rollback_allows_only_owned_operational_thread_changes() -> Result<()> {
+        let (_temp, source, target) = homes()?;
+        let ids = versioned_fixture(&source)?;
+        let planned = plan(&source, &target, &ids)?;
+        let journal = serde_json::to_vec(&planned)?;
+        apply(&planned)?;
+        let state = Connection::open(target.join(STATE))?;
+        state.execute(
+            "UPDATE threads SET updated_at=77,tokens_used=88,created_at_ms=999,
+            updated_at_ms=77000,recency_at=77,recency_at_ms=77000 WHERE id=?1",
+            [&ids[0]],
+        )?;
+        assert!(rollback(&planned).is_err());
+        assert!(rollback_after_resume(&planned, false).is_err());
+        assert_eq!(threads(&target)?.len(), 2);
+        rollback_after_resume(&planned, true)?;
+        rollback_after_resume(&planned, true)?;
+        assert!(threads(&target)?.is_empty());
+        let goals = Connection::open(target.join(GOALS))?;
+        let count: i64 =
+            goals.query_row("SELECT count(*) FROM thread_goals", [], |row| row.get(0))?;
+        assert_eq!(count, 0);
+        assert_eq!(threads(&source)?.len(), 2);
+        assert!(serde_json::to_vec(&planned)? == journal);
+        Ok(())
+    }
+
+    #[test]
+    fn forced_rollback_refuses_owned_identity_path_provider_and_other_semantic_changes()
+    -> Result<()> {
+        for change in [
+            "UPDATE threads SET rollout_path='sessions/wrong.jsonl' WHERE id=?1",
+            "UPDATE threads SET model_provider='qb' WHERE id=?1",
+            "UPDATE threads SET title='changed title' WHERE id=?1",
+            "UPDATE threads SET created_at=42 WHERE id=?1",
+            "UPDATE threads SET future_blob=X'AB' WHERE id=?1",
+            "UPDATE threads SET id='different-id' WHERE id=?1",
+        ] {
+            let (_temp, source, target) = homes()?;
+            let ids = versioned_fixture(&source)?;
+            let planned = plan(&source, &target, &ids)?;
+            apply(&planned)?;
+            let state = Connection::open(target.join(STATE))?;
+            state.execute(
+                "UPDATE threads SET updated_at=77,tokens_used=88 WHERE id=?1",
+                [&ids[0]],
+            )?;
+            state.execute(change, [&ids[1]])?;
+            assert!(rollback_after_resume(&planned, true).is_err());
+            assert_eq!(threads(&target)?.len(), 2);
+            let goals = Connection::open(target.join(GOALS))?;
+            let count: i64 =
+                goals.query_row("SELECT count(*) FROM thread_goals", [], |row| row.get(0))?;
+            assert_eq!(count, 2);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn forced_rollback_keeps_goal_rows_exact_and_validates_both_dbs_before_delete() -> Result<()> {
+        for change in [
+            "UPDATE thread_goals SET status='paused' WHERE thread_id=?1",
+            "UPDATE thread_goals SET objective='changed objective' WHERE thread_id=?1",
+            "UPDATE thread_goals SET updated_at_ms=updated_at_ms+1 WHERE thread_id=?1",
+            "UPDATE thread_goals SET tokens_used=9 WHERE thread_id=?1",
+        ] {
+            let (_temp, source, target) = homes()?;
+            let ids = versioned_fixture(&source)?;
+            let planned = plan(&source, &target, &ids)?;
+            apply(&planned)?;
+            let state = Connection::open(target.join(STATE))?;
+            state.execute(
+                "UPDATE threads SET updated_at=77,tokens_used=88 WHERE id=?1",
+                [&ids[0]],
+            )?;
+            let goals = Connection::open(target.join(GOALS))?;
+            goals.execute(change, [&ids[1]])?;
+            assert!(rollback_after_resume(&planned, true).is_err());
+            assert_eq!(threads(&target)?.len(), 2);
+            let count: i64 =
+                goals.query_row("SELECT count(*) FROM thread_goals", [], |row| row.get(0))?;
+            assert_eq!(count, 2);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn forced_rollback_does_not_rebase_validate_or_delete_borrowed_rows() -> Result<()> {
+        let (_temp, source, target) = homes()?;
+        let ids = versioned_fixture(&source)?;
+        let ancestor = plan(&source, &target, &ids[..1])?;
+        apply(&ancestor)?;
+        let child = plan(&source, &target, &ids)?;
+        apply(&child)?;
+        assert!(
+            !child.threads[0]
+                .thread
+                .as_ref()
+                .context("borrowed thread")?
+                .owned
+        );
+        assert!(
+            !child.threads[0]
+                .goal
+                .as_ref()
+                .context("borrowed goal")?
+                .owned
+        );
+        let state = Connection::open(target.join(STATE))?;
+        state.execute("UPDATE threads SET updated_at=77,tokens_used=88", [])?;
+        let goals = Connection::open(target.join(GOALS))?;
+        goals.execute(
+            "UPDATE thread_goals SET objective='surviving ancestor goal' WHERE thread_id=?1",
+            [&ids[0]],
+        )?;
+        let current_thread =
+            selected_row(&state, "threads", "id", &ids[0])?.context("current ancestor")?;
+        let current_goal =
+            selected_row(&goals, "thread_goals", "thread_id", &ids[0])?.context("current goal")?;
+        rollback_after_resume(&child, true)?;
+        assert!(
+            selected_row(&state, "threads", "id", &ids[0])?
+                .context("surviving ancestor")?
+                .values
+                == current_thread.values
+        );
+        assert!(
+            selected_row(&goals, "thread_goals", "thread_id", &ids[0])?
+                .context("surviving goal")?
+                .values
+                == current_goal.values
+        );
+        assert!(thread_path(&target, &ids[1])?.is_none());
         Ok(())
     }
 }

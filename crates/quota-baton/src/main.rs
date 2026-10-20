@@ -182,6 +182,9 @@ async fn main() {
 }
 
 fn friendly_error(error: &anyhow::Error) -> String {
+    if let Some(message) = sessions::friendly_error(error) {
+        return message;
+    }
     // Only exact fixed diagnostics may pass through; parser/transport chains
     // and appended file contents must stay behind the generic safe error.
     const WIRE_DIAGNOSTICS: &[&str] = &[
