@@ -208,6 +208,15 @@ quota-baton routing session <식별자> --project <프로젝트-ID> --inherit
 
 ## 클라이언트 설정 전환
 
+**권장: 기존 환경은 그대로 두고 `codex-qb`·`claude-qb` 전용 명령을 추가해서 씁니다.** `wire --codex-mode dedicated --claude-mode dedicated`가 이 방식입니다. 전용 명령으로 시작한 세션만 quota-baton을 거치고, 기존 `codex`·`claude`와 계정별 명령, 설정 파일은 바뀌지 않습니다.
+
+- quota-baton 코어가 꺼지거나 업데이트 중이거나 오류가 나면 전용 명령 쪽 세션은 요청을 보내지 못합니다. 이때 기존 명령으로 바로 작업을 이어갈 수 있습니다.
+- 같은 작업을 두 명령으로 실행해 보면, 문제가 계정이나 서비스에 있는지 quota-baton에 있는지 가를 수 있습니다.
+- `unwire --apply`는 전용 파일만 지우므로 되돌리기가 간단합니다.
+- 이미 실행 중인 세션과 herdr 자동 재개는 영향을 받지 않습니다.
+
+기본 설정을 바꾸는 `default` 모드는 전용 명령으로 충분히 써 본 뒤에만 고려하십시오.
+
 전환 전에는 항상 dry-run을 실행합니다.
 
 ```powershell
