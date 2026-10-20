@@ -337,7 +337,7 @@ fn account_absence_stays_distinct_from_missing_routes() {
 fn status_discovers_free_monthly_and_mixed_plan_windows() {
     assert_eq!(status_window_label("5h"), "5시간");
     assert_eq!(status_window_label("7d"), "7일");
-    assert_eq!(status_window_label("43200m"), "43200m (30일)");
+    assert_eq!(status_window_label("43200m"), "30일");
     let windows = status_window_names(&[
         json!({"windows":[{"name":"43200m", "used_pct":42.0}]}),
         json!({"windows":[{"name":"5h"},{"name":"7d"},{"name":"43200m"}]}),
@@ -350,7 +350,32 @@ fn status_discovers_free_monthly_and_mixed_plan_windows() {
             &json!({"name":"43200m","used_pct":42.0}),
             std::time::SystemTime::now()
         ),
-        "42.0%"
+        "58%"
+    );
+}
+
+#[test]
+fn r8_status_remaining_values_preserve_used_snapshot_and_reset_marker() {
+    let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000_000);
+    for (used, expected) in [
+        (0.0, "100%"),
+        (2.0, "98%"),
+        (37.5, "62.5%"),
+        (100.0, "0%"),
+        (105.0, "0%"),
+        (-5.0, "100%"),
+    ] {
+        let snapshot = json!({"name":"5h", "used_pct":used});
+        assert_eq!(percentage(&snapshot, now), expected);
+        assert_eq!(snapshot["used_pct"], used, "JSON remains a used percentage");
+    }
+    assert_eq!(percentage(&json!({}), now), "-");
+    assert_eq!(
+        percentage(
+            &json!({"used_pct":100.0, "reset_at":"2000-01-01T00:00:00Z"}),
+            now
+        ),
+        "리셋됨"
     );
 }
 

@@ -993,7 +993,7 @@ pub async fn status(home: &Path, config: &Config) -> anyhow::Result<()> {
         .iter()
         .map(|name| {
             format!(
-                "{} 사용률\t{} 초기화",
+                "{} 남음\t{} 초기화",
                 status_window_label(name),
                 status_window_label(name)
             )
@@ -1051,7 +1051,7 @@ fn status_window_label(name: &str) -> String {
     match name {
         "5h" => "5시간".into(),
         "7d" => "7일".into(),
-        "43200m" => "43200m (30일)".into(),
+        "43200m" => "30일".into(),
         _ => cell(&serde_json::json!(name)),
     }
 }
@@ -1084,7 +1084,10 @@ fn percentage(window: &serde_json::Value, now: std::time::SystemTime) -> String 
     }
     window["used_pct"]
         .as_f64()
-        .map(|value| format!("{value:.1}%"))
+        .map(|value| {
+            let remaining = format!("{:.1}", (100.0 - value).clamp(0.0, 100.0));
+            format!("{}%", remaining.trim_end_matches(".0"))
+        })
         .unwrap_or_else(|| "-".into())
 }
 
