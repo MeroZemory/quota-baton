@@ -153,6 +153,7 @@ pub enum Tone {
     Off,
     Ok,
     Secondary,
+    Limit,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Group {
@@ -279,6 +280,7 @@ pub enum BarTone {
     Low,
     Critical,
     Paused,
+    Limit,
 }
 #[derive(Debug, Clone)]
 pub struct WindowMetric {
@@ -483,7 +485,13 @@ fn nonempty(s: Option<&str>) -> Option<&str> {
     s.filter(|s| !s.trim().is_empty())
 }
 fn account_name(a: &Account, accounts: &[&Account]) -> String {
-    if let Some(label) = nonempty(a.label.as_deref()) {
+    if let Some(label) = nonempty(a.label.as_deref()).filter(|label| {
+        // Older imports stored these exact generated defaults as labels.
+        // Any other value, including a real organisation name, is user-visible.
+        !a.email
+            .as_deref()
+            .is_some_and(|email| *label == email || *label == format!("{email}'s Organization"))
+    }) {
         return clean(label);
     }
     let Some(email) = nonempty(a.email.as_deref()) else {
@@ -571,7 +579,7 @@ fn state_style(s: DisplayState) -> (Group, Option<Chip>) {
         Permission => (Group::NeedsAction, "접근 거부", Tone::Bad),
         Credits => (Group::InUse, "크레딧 사용 중", Tone::Warn),
         Paused => (Group::Paused, "일시정지", Tone::Off),
-        Quota => (Group::Waiting, "한도 도달", Tone::Off),
+        Quota => (Group::Waiting, "한도 도달", Tone::Limit),
         Auth => (Group::Waiting, "인증 확인 대기", Tone::Off),
         InUse => (Group::InUse, "사용 중", Tone::Use),
         Drain => (Group::Ready, "새 대화 안 받음", Tone::Off),
@@ -668,6 +676,7 @@ fn bar_tone(a: &Account, remaining: Option<u8>) -> BarTone {
         BarTone::Paused
     } else {
         match remaining {
+            Some(0) => BarTone::Limit,
             Some(30..=100) | None => BarTone::Ok,
             Some(10..=29) => BarTone::Low,
             Some(_) => BarTone::Critical,
@@ -1516,6 +1525,26 @@ mod tests {
         assert_eq!(codex(&v).rows[0].name, "이름 없는 계정");
     }
     #[test]
+    fn generated_email_labels_are_unset_but_real_organisation_and_custom_names_stay() {
+        for label in ["same@one.test", "same@one.test's Organization"] {
+            let mut a = base("one");
+            a["email"] = json!("same@one.test");
+            a["label"] = json!(label);
+            let projected = view(vec![a.clone()], 1);
+            assert_eq!(codex(&projected).rows[0].name, "same");
+            let mut b = base("two");
+            b["email"] = json!("same@two.test");
+            let projected = view(vec![a, b], 1);
+            assert_eq!(codex(&projected).rows[0].name, "same@one.test");
+        }
+        for label in ["My team", "same@one.test's Organization Custom"] {
+            let mut a = base("one");
+            a["email"] = json!("same@one.test");
+            a["label"] = json!(label);
+            assert_eq!(codex(&view(vec![a], 1)).rows[0].name, label);
+        }
+    }
+    #[test]
     fn every_known_account_window_is_displayed_but_binding_still_uses_limit() {
         let mut a = base("a");
         a["windows"] = json!([
@@ -1635,7 +1664,7 @@ mod tests {
             (70.6, 29, BarTone::Low),
             (90., 10, BarTone::Low),
             (90.5, 9, BarTone::Critical),
-            (140., 0, BarTone::Critical),
+            (140., 0, BarTone::Limit),
         ] {
             let mut a = base("a");
             a["windows"] = json!([window("5h", used, "2026-10-22T00:00:00Z")]);
@@ -1709,7 +1738,7 @@ mod tests {
                 4,
                 true,
                 DisplayState::Quota,
-                Some(Tone::Off),
+                Some(Tone::Limit),
             ),
             (
                 "active",

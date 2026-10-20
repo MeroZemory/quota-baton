@@ -85,7 +85,7 @@ fn r7_keyboard_reveal_uses_full_row_geometry_and_rebuilds_visible_semantics() {
         .iter()
         .find(|n| n.key == format!("session:{id}"))
         .unwrap();
-    assert_eq!(height(node.rect), 34.);
+    assert_eq!(height(node.rect), 35.);
     assert_eq!(scene.reveal_session(&id), Some(offset));
     assert_eq!(scene.reveal_session("missing"), None);
     assert!(
@@ -142,7 +142,7 @@ fn r7_default_and_narrow_scenes_keep_all_hits_inside_client_and_same_semantic_re
     }
 }
 #[test]
-fn r7_table_and_side_stack_below_1180_and_scroll_independently() {
+fn r10_narrow_recent_strip_preserves_list_height_and_wide_side_scroll() {
     for (size, stacked) in [([1320., 960.], false), ([1024., 640.], true)] {
         let mut state = DashboardState {
             table_offset: 1e6,
@@ -156,15 +156,25 @@ fn r7_table_and_side_stack_below_1180_and_scroll_independently() {
             .iter()
             .find(|r| r.region == ScrollRegion::Table)
             .unwrap();
-        let side = scene
-            .content
-            .iter()
-            .find(|r| r.region == ScrollRegion::Side)
-            .unwrap();
         if stacked {
-            assert!(side.viewport.top >= table.viewport.bottom);
-            assert!(height(table.viewport) <= size[1] * 0.6);
+            assert!(!scene.content.iter().any(|r| r.region == ScrollRegion::Side));
+            let link = scene
+                .targets
+                .iter()
+                .find(|h| h.target == Target::AllEvents)
+                .unwrap();
+            assert!(link.rect.top > table.viewport.bottom);
+            assert!(
+                height(table.viewport) / 35. >= 10.,
+                "the 640 DIP window must retain ten full session rows"
+            );
+            assert_eq!(height(link.rect), 28.);
         } else {
+            let side = scene
+                .content
+                .iter()
+                .find(|r| r.region == ScrollRegion::Side)
+                .unwrap();
             assert!(side.viewport.left > table.viewport.right);
         }
         for r in &scene.content {
@@ -233,7 +243,7 @@ fn r7_event_toolbar_measures_full_counts_and_wraps_without_overlapping_controls(
     {
         metrics.widths.insert(
             measure.key(),
-            if measure.text.starts_with("계정 전환") || measure.text.starts_with("속도 조절")
+            if measure.text.starts_with("한도·계정 전환") || measure.text.starts_with("속도 조절")
             {
                 110.
             } else {
@@ -651,4 +661,146 @@ fn r7_detail_prefix_stays_only_in_selected_panel_and_close_is_targeted() {
         .join("\n");
     assert!(text.contains("abcdefgh"));
     assert!(!text.contains("private-rest"));
+}
+
+#[test]
+fn r10_account_boxes_gap_group_children_and_header_height_are_shared_geometry() {
+    let mut state = DashboardState::default();
+    let v = view(&mut state);
+    let scene = Scene::build(&v, &state, [1320., 960.], &Metrics::default());
+    for group in &v.groups {
+        let key = format!("group:{}", group.id);
+        let node = scene.accessibility.iter().find(|n| n.key == key).unwrap();
+        assert_eq!(node.role, Role::Group);
+        assert!(node.name.contains(&group.name));
+        for row in &group.rows {
+            let child = scene
+                .accessibility
+                .iter()
+                .find(|n| n.key == format!("session:{}", row.id))
+                .unwrap();
+            assert_eq!(child.parent.as_deref(), Some(key.as_str()));
+        }
+    }
+    let boxes: Vec<_> = scene
+        .draw
+        .iter()
+        .filter_map(|draw| match draw {
+            Draw::Stroke {
+                rect,
+                color: Color::GroupBorder,
+                radius,
+                ..
+            } if *radius == 6. => Some(*rect),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(boxes.len(), v.groups.len());
+    for (index, pair) in boxes.windows(2).enumerate() {
+        let gap = if v.groups[index].provider == v.groups[index + 1].provider {
+            10.
+        } else {
+            38.
+        };
+        assert_eq!(pair[1].top - pair[0].bottom, gap);
+    }
+    for group in &v.groups {
+        assert_eq!(group_header_height(group, 900.), 60.);
+    }
+}
+#[test]
+fn r10_zero_window_dash_has_neutral_limit_color_unless_paused() {
+    let mut state = DashboardState::default();
+    let mut v = view(&mut state);
+    v.groups.truncate(1);
+    v.groups[0].windows[0].remaining_pct = 0;
+    for paused in [false, true] {
+        v.groups[0].paused = paused;
+        let scene = Scene::build(&v, &state, [1320., 960.], &Metrics::default());
+        let limit = scene
+            .draw
+            .iter()
+            .filter(|d| {
+                matches!(
+                    d,
+                    Draw::Line {
+                        color: Color::ChipBg(v2::Tone::Limit),
+                        dash: Some([4., 3.]),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(limit, usize::from(!paused));
+    }
+}
+#[test]
+fn r10_client_number_column_is_fixed_and_does_not_share_session_label_box() {
+    for flat in [false, true] {
+        for width in [640., 714., 900., 1100.] {
+            let cols = columns(width, flat);
+            assert_eq!(
+                cols.iter().find(|c| c.0 == SortKey::Client).unwrap().2,
+                172.
+            );
+            assert!(cols.iter().map(|c| c.2).sum::<f32>() <= width);
+        }
+    }
+    let mut state = DashboardState::default();
+    let v = view(&mut state);
+    let scene = Scene::build(&v, &state, [1320., 960.], &Metrics::default());
+    for row in &v.flat {
+        let suffix = format!(" · {}", row.short_id);
+        let labels: Vec<_> = scene
+            .draw
+            .iter()
+            .filter_map(|d| {
+                if let Draw::Text { rect, measure, .. } = d {
+                    Some((*rect, measure.text.as_str()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let id = labels.iter().find(|(_, text)| *text == suffix).unwrap().0;
+        assert!(width(id) > 0.);
+        assert!(
+            labels
+                .iter()
+                .any(|(r, text)| *text == row.label && r.right <= id.left)
+        );
+    }
+}
+#[test]
+fn r10_offline_keeps_data_text_full_contrast_and_disables_every_control() {
+    let mut state = DashboardState::default();
+    let mut v = view(&mut state);
+    v.connection.core_ok = false;
+    let scene = Scene::build(&v, &state, [1320., 960.], &Metrics::default());
+    assert!(scene.targets.iter().all(|h| !h.enabled));
+    assert!(
+        scene
+            .accessibility
+            .iter()
+            .filter(|n| n.target.is_some())
+            .all(|n| !n.enabled)
+    );
+    let mut alpha = 1.;
+    let names: std::collections::BTreeSet<_> = v.groups.iter().map(|g| g.name.as_str()).collect();
+    let mut checked = 0;
+    for draw in &scene.draw {
+        match draw {
+            Draw::Alpha(value) => alpha = *value,
+            Draw::Text {
+                measure,
+                color: Color::Text,
+                ..
+            } if names.contains(measure.text.as_str()) => {
+                assert_eq!(alpha, 1.);
+                checked += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(checked, v.groups.len());
 }

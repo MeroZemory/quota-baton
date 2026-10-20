@@ -23,7 +23,7 @@ pub struct Palette {
     pub track: Rgb,
     pub bars: [Rgb; 4],
     pub dots: [Rgb; 4],
-    pub chips: [(Rgb, Rgb); 4],
+    pub chips: [(Rgb, Rgb); 5],
     pub warning: Rgb,
     pub bad: Rgb,
     pub accent: Rgb,
@@ -58,6 +58,7 @@ impl Palette {
                     (c(0x3d2f14), c(0xe8b864)),
                     (c(0x432020), c(0xf08a80)),
                     (c(0x2e2e2e), c(0xb5b5b5)),
+                    (c(0xdadce0), c(0x1a1a1a)),
                 ],
                 warning: c(0xe8b864),
                 bad: c(0xf08a80),
@@ -89,6 +90,7 @@ impl Palette {
                     (c(0xfbf0dc), c(0x8a560a)),
                     (c(0xfcebe9), c(0xb42318)),
                     (c(0xeef0f2), c(0x50555b)),
+                    (c(0x3d4148), c(0xffffff)),
                 ],
                 warning: c(0x8a560a),
                 bad: c(0xb42318),
@@ -108,6 +110,7 @@ impl Palette {
             Tone::Use => 0,
             Tone::Warn => 1,
             Tone::Bad => 2,
+            Tone::Limit => 4,
             _ => 3,
         }]
     }
@@ -116,6 +119,7 @@ impl Palette {
             Tone::Use => self.accent,
             Tone::Warn => self.warning,
             Tone::Bad => self.bad,
+            Tone::Limit => self.chip(Tone::Limit).1,
             Tone::Off | Tone::Secondary => self.secondary,
             Tone::Ok => self.dots[0],
         }
@@ -133,6 +137,14 @@ mod tests {
         assert_eq!(dark.surface, Rgb::hex(0x202020));
         assert_eq!(light.bars[0], Rgb::hex(0x2e7d32));
         assert_eq!(dark.bars[0], Rgb::hex(0x5dbb63));
+        assert_eq!(
+            light.chip(Tone::Limit),
+            (Rgb::hex(0x3d4148), Rgb::hex(0xffffff))
+        );
+        assert_eq!(
+            dark.chip(Tone::Limit),
+            (Rgb::hex(0xdadce0), Rgb::hex(0x1a1a1a))
+        );
         for p in [light, dark] {
             assert_eq!(p.chip(Tone::Use).1, p.accent);
             assert_eq!(p.chip(Tone::Warn).1, p.warning);

@@ -398,6 +398,9 @@ pub struct AccountGroup {
     pub remaining_pct: Option<u8>,
     pub windows: Vec<AccountUsageWindow>,
     pub relogin: bool,
+    /// Shared tray reason; nonempty only for re-login, including linked accounts.
+    pub relogin_reason: String,
+    pub paused: bool,
     pub disabled: bool,
     pub collapsed: bool,
     pub no_sessions: String,
@@ -421,6 +424,7 @@ pub struct EventRow {
     pub title: String,
     pub body: String,
     pub account: Option<String>,
+    pub account_label: Option<String>,
     pub session: Option<String>,
     pub session_label: Option<String>,
     pub relogin: bool,
@@ -435,6 +439,9 @@ pub struct DetailView {
     pub subtitle: String,
     pub raw_prefix: Option<String>,
     pub status: String,
+    /// `status` is chip text; assignment/serving text is separate.
+    pub status_tone: v2::Tone,
+    pub account_status: String,
     pub facts: Vec<(String, String)>,
     pub timeline: Vec<String>,
     pub requests: Vec<String>,
@@ -456,6 +463,10 @@ pub struct UsageTile {
     pub plan: String,
     pub chip: String,
     pub tone: v2::Tone,
+    pub windows: Vec<AccountUsageWindow>,
+    /// Latest valid account/window timestamp or known history point, never a null/future point.
+    pub last_observed: Option<DateTime<Utc>>,
+    pub paused: bool,
     pub series: Vec<Series>,
     pub credits_spans: Vec<(DateTime<Utc>, DateTime<Utc>)>,
     pub unconfirmed: bool,
@@ -474,6 +485,7 @@ pub struct DashboardView {
     pub clock: Clock,
     pub connection: Connection,
     pub summaries: Vec<String>,
+    pub provider_summaries: Vec<v2::Summary>,
     pub todo: usize,
     pub session_count: usize,
     pub active_count: usize,
@@ -619,6 +631,103 @@ fn account_name(view: &v2::View, id: &str) -> String {
         .map(|r| folder(&r.name))
         .unwrap_or_else(|| "알 수 없는 계정".into())
 }
+fn account_windows(a: &v2::AccountRow) -> Vec<AccountUsageWindow> {
+    a.windows
+        .iter()
+        .filter(|w| w.account_scoped)
+        .filter_map(|w| {
+            w.remaining.map(|pct| AccountUsageWindow {
+                label: w.label.clone(),
+                remaining: format!("{pct}% 남음"),
+                reset: w.reset_text.clone().unwrap_or_default(),
+                remaining_pct: pct,
+            })
+        })
+        .collect()
+}
+fn observed_at(a: &v2::AccountRow, clock: &Clock) -> Option<DateTime<Utc>> {
+    a.raw
+        .observed_at
+        .iter()
+        .chain(
+            a.windows
+                .iter()
+                .filter(|w| w.account_scoped)
+                .filter_map(|w| w.raw.observed_at.as_ref()),
+        )
+        .filter_map(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| t.with_timezone(&Utc))
+        .filter(|t| *t <= clock.utc())
+        .max()
+}
+
+// Walk newest first. Resets clear every window for that provider/account.
+fn folded_events(source: &[&ActivityEvent], accounts: &v2::View, clock: &Clock) -> Vec<EventRow> {
+    let mut source = source.to_vec();
+    source.sort_by(|a, b| b.ts.cmp(&a.ts).then(b.seq.cmp(&a.seq)));
+    // A reset without a timestamp cannot be proven outside a candidate pair.
+    let uncertain_resets: Vec<_> = source
+        .iter()
+        .filter(|e| e.kind == "quota_reset" && e.ts.is_none())
+        .map(|e| (e.provider.clone(), e.account.clone()))
+        .collect();
+    let mut rows: Vec<EventRow> = vec![];
+    let mut seen = BTreeMap::new();
+    let mut repeats: BTreeMap<usize, Vec<DateTime<Utc>>> = BTreeMap::new();
+    for e in source {
+        if e.kind == "quota_reset" {
+            seen.retain(|(p, a, _, _), _| !(p == &e.provider && Some(a) == e.account.as_ref()));
+        }
+        let foldable = e.kind == "quota_reached"
+            && !e.data.no_eligible
+            && e.data.moved_groups == Some(0)
+            && !e.provider.trim().is_empty()
+            && e.account.as_deref().is_some_and(|a| !a.trim().is_empty())
+            && e.data
+                .window
+                .as_deref()
+                .is_some_and(|w| !w.trim().is_empty())
+            && e.data.reset_at.is_some()
+            && e.ts.is_some()
+            && !uncertain_resets.contains(&(e.provider.clone(), e.account.clone()));
+        if foldable {
+            let key = (
+                e.provider.clone(),
+                e.account.clone().unwrap(),
+                e.data.window.clone().unwrap(),
+                e.data.reset_at.unwrap(),
+            );
+            if let Some(&index) = seen.get(&key) {
+                repeats.entry(index).or_default().push(e.ts.unwrap());
+                continue;
+            }
+            seen.insert(key, rows.len());
+        }
+        if e.ts.is_some()
+            && let Some(row) = event_row(e, accounts, clock)
+        {
+            rows.push(row);
+        }
+    }
+    for (index, times) in repeats {
+        let clocks = times
+            .iter()
+            .take(3)
+            .map(|t| clock.time(Some(*t)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        rows[index]
+            .body
+            .push_str(&format!("\n같은 알림 {}번 더 · {clocks}", times.len()));
+        if times.len() > 3 {
+            rows[index]
+                .body
+                .push_str(&format!(" 외 {}번", times.len() - 3));
+        }
+    }
+    rows
+}
+
 fn session_row(
     s: &Session,
     accounts: &v2::View,
@@ -738,6 +847,11 @@ fn compare_rows(
     let cmp = match key {
         SortKey::Status => (a.inflight, a.active).cmp(&(b.inflight, b.active)),
         SortKey::Session => a.label.to_lowercase().cmp(&b.label.to_lowercase()),
+        SortKey::Client => a
+            .client
+            .to_lowercase()
+            .cmp(&b.client.to_lowercase())
+            .then(a.short_id.cmp(&b.short_id)),
         SortKey::Account => a.account.cmp(&b.account),
         SortKey::Model => a.model.cmp(&b.model),
         SortKey::Start => a.first_seen.cmp(&b.first_seen),
@@ -842,25 +956,19 @@ pub fn project(
             continue;
         }
         let remaining = a.usage.as_ref().and_then(|u| u.binding.as_ref());
-        let windows = a.usage.as_ref().map_or_else(Vec::new, |usage| {
-            usage
-                .lines
-                .iter()
-                .map(|line| AccountUsageWindow {
-                    label: line.window.label.clone(),
-                    remaining: format!("{}% 남음", line.window.remaining.unwrap_or_default()),
-                    reset: line.window.reset_text.clone().unwrap_or_default(),
-                    remaining_pct: line.window.remaining.unwrap_or_default(),
-                })
-                .collect()
-        });
-        let blocked =
-            a.raw.drain || a.raw.user_state != "active" || a.raw.health.kind == "needs_relogin";
+        let windows = account_windows(a);
+        let blocked = a.raw.drain
+            || a.raw.user_state != "active"
+            || matches!(a.group, v2::Group::NeedsAction | v2::Group::Waiting)
+            || a.raw.eligible_for_new_session == Some(false);
         let away = all
             .iter()
             .flat_map(|s| &s.moves_today)
             .filter(|m| {
-                m.from.as_deref() == Some(&a.raw.id) && m.at.is_some_and(|v| v >= clock.day_start)
+                m.from.as_deref() == Some(&a.raw.id)
+                    && m.at.is_some_and(|v| {
+                        v >= clock.day_start && v < clock.day_end && v <= clock.utc()
+                    })
             })
             .max_by_key(|m| m.at);
         let reason = if blocked {
@@ -872,7 +980,7 @@ pub fn project(
                 account_name(&snapshot.accounts, m.to.as_deref().unwrap_or(""))
             )
         } else {
-            String::new()
+            "새 세션 배정 가능".into()
         };
         groups.push(AccountGroup {
             id: a.raw.id.clone(),
@@ -894,6 +1002,14 @@ pub fn project(
             remaining_pct: remaining.and_then(|w| w.remaining),
             windows,
             relogin: a.raw.health.kind == "needs_relogin" && a.menu.show_relogin,
+            relogin_reason: if a.state == v2::DisplayState::Relogin {
+                a.reason
+                    .clone()
+                    .unwrap_or_else(|| "다시 로그인 필요".into())
+            } else {
+                String::new()
+            },
+            paused: a.raw.user_state == "paused",
             disabled: a.raw.user_state == "disabled",
             collapsed: state.collapsed.contains(&a.raw.id),
             no_sessions: if reason.is_empty() {
@@ -909,36 +1025,38 @@ pub fn project(
     groups.sort_by_key(|g| if g.provider == "claude" { 0 } else { 1 });
     let cutoff =
         clock.day_start - chrono::Duration::days(i64::from(state.event_days.saturating_sub(1)));
-    let mut events: Vec<_> = snapshot
+    let enriched: Vec<_> = snapshot
         .activity
         .iter()
-        .filter(|e| e.ts.is_some_and(|t| t >= cutoff && t <= clock.utc()))
-        .filter_map(|e| {
-            event_row(
-                &enriched_event(e, snapshot, &all),
-                &snapshot.accounts,
-                clock,
-            )
+        .filter(|e| {
+            e.ts.is_some_and(|t| t <= clock.utc()) || (e.kind == "quota_reset" && e.ts.is_none())
         })
+        .map(|e| enriched_event(e, snapshot, &all))
         .collect();
-    events.sort_by(|a, b| b.at.cmp(&a.at).then(b.seq.cmp(&a.seq)));
+    let mut events = folded_events(
+        &enriched
+            .iter()
+            .filter(|e| {
+                e.ts.is_some_and(|t| t >= cutoff) || (e.kind == "quota_reset" && e.ts.is_none())
+            })
+            .collect::<Vec<_>>(),
+        &snapshot.accounts,
+        clock,
+    );
     let event_counts = EventFilter::ALL
         .iter()
         .map(|f| (*f, events.iter().filter(|e| f.matches(e)).count()))
         .collect();
-    let mut recent: Vec<_> = snapshot
-        .activity
-        .iter()
-        .filter(|e| e.notable)
-        .filter_map(|e| {
-            event_row(
-                &enriched_event(e, snapshot, &all),
-                &snapshot.accounts,
-                clock,
-            )
-        })
-        .collect();
-    recent.sort_by(|a, b| b.at.cmp(&a.at).then(b.seq.cmp(&a.seq)));
+    // Non-notable resets must still break repeats in the feed.
+    let mut recent = folded_events(
+        &enriched
+            .iter()
+            .filter(|e| e.notable || e.kind == "quota_reset")
+            .collect::<Vec<_>>(),
+        &snapshot.accounts,
+        clock,
+    );
+    recent.retain(|e| e.notable);
     state
         .recent_freeze
         .apply(&mut recent, |r| r.seq.to_string());
@@ -981,6 +1099,8 @@ pub fn project(
                     subtitle: format!("세션 {id}"),
                     raw_prefix: None,
                     status: "세션 정보를 확인하고 있습니다.".into(),
+                    status_tone: v2::Tone::Off,
+                    account_status: String::new(),
                     facts: vec![],
                     timeline: vec![],
                     requests: vec![],
@@ -1007,6 +1127,7 @@ pub fn project(
             .iter()
             .map(|s| s.accessible_name.clone())
             .collect(),
+        provider_summaries: snapshot.accounts.summaries.clone(),
         todo: snapshot.accounts.summaries.iter().map(|s| s.todo).sum(),
         session_count: sessions.len(),
         active_count: sessions.iter().filter(|s| s.active).count(),
@@ -1089,7 +1210,7 @@ fn enriched_event(
                 .unwrap_or_else(|| id[..6].into())
         })
         .collect();
-    d.no_eligible = e.account.is_none() && e.kind == "quota_reached";
+    d.no_eligible |= e.account.is_none() && e.kind == "quota_reached";
     d.disabled_accounts = Some(
         account_rows(&snapshot.accounts)
             .iter()
@@ -1129,6 +1250,7 @@ fn event_row(e: &ActivityEvent, accounts: &v2::View, clock: &Clock) -> Option<Ev
     let win = d
         .window
         .as_deref()
+        .filter(|w| !w.trim().is_empty())
         .map(v2::window_label)
         .unwrap_or_default();
     let reset = clock.time(d.reset_at);
@@ -1168,10 +1290,17 @@ fn event_row(e: &ActivityEvent, accounts: &v2::View, clock: &Clock) -> Option<Ev
                 };
                 (format!("{p} 계정 모두 한도 도달"), body)
             } else {
-                tag = "계정 전환";
-                tone = v2::Tone::Use;
+                tag = "한도 도달";
+                tone = v2::Tone::Limit;
                 (
-                    format!("{p} {a} · {win} 한도 도달"),
+                    format!(
+                        "{p} {a} · {}한도 도달",
+                        if win.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{win} ")
+                        }
+                    ),
                     if d.moved_groups.unwrap_or(0) > 0 {
                         format!(
                             "연결된 세션 {}개를 {b}로 옮겨 이어서 처리합니다. {a}는 {reset}에 초기화됩니다.",
@@ -1418,6 +1547,7 @@ fn event_row(e: &ActivityEvent, accounts: &v2::View, clock: &Clock) -> Option<Ev
         title,
         body,
         account: e.account.clone(),
+        account_label: e.account.as_ref().map(|_| a),
         session: d.session.as_deref().and_then(hash),
         session_label: d.label.as_deref().map(folder),
         relogin,
@@ -1451,7 +1581,9 @@ fn decimal_spent(start: &serde_json::Number, stop: &serde_json::Number) -> Optio
     Some(v2::group_number(&(delta.max(0) / factor).to_string()))
 }
 pub fn outcome(r: &RequestSummary, accounts: &v2::View) -> String {
-    if let Some(f) = &r.failover {
+    if let Some(f) = &r.failover
+        && matches!(r.outcome.as_str(), "ok" | "rate_hold_ok")
+    {
         return format!(
             "성공 · {}에서 {}로 넘겨 처리",
             account_name(accounts, &f.from),
@@ -1483,20 +1615,44 @@ fn detail_view(d: &SessionDetail, accounts: &v2::View, clock: &Clock, expired: b
         .into_iter()
         .find(|a| a.raw.id == s.account);
     let account_text = account
-        .map(|a| {
-            format!(
-                "{} · {} · {}",
-                folder(&a.name),
-                a.plan.as_deref().unwrap_or("—"),
-                a.usage
-                    .as_ref()
-                    .map(|u| u.text.as_str())
-                    .unwrap_or("사용량 확인 전")
-            )
-        })
+        .map(|a| format!("{} · {}", folder(&a.name), a.plan.as_deref().unwrap_or("—")))
         .unwrap_or_else(unknown);
+    let remaining = account
+        .map(|a| {
+            let windows = account_windows(a);
+            let values = windows
+                .iter()
+                .map(|w| format!("{} {}%", w.label, w.remaining_pct))
+                .collect::<Vec<_>>()
+                .join(" · ");
+            if a.state == v2::DisplayState::Relogin {
+                if values.is_empty() {
+                    "확인 불가 · 사용량 확인 전".into()
+                } else {
+                    let observed = observed_at(a, clock)
+                        .map(|t| format!("{} 기준", clock.time(Some(t))))
+                        .unwrap_or_else(|| "기준 시각 확인 전".into());
+                    format!("확인 불가 · {observed} {values}")
+                }
+            } else if values.is_empty() {
+                "사용량 확인 전".into()
+            } else {
+                values
+            }
+        })
+        .unwrap_or_else(|| "사용량 확인 전".into());
+    let observed_failures = d
+        .recent_requests
+        .iter()
+        .filter(|r| {
+            r.ts.is_some_and(|t| t >= clock.day_start && t < clock.day_end && t <= clock.utc())
+                && outcome(r, accounts).starts_with("실패")
+        })
+        .count() as u64;
+    let known_failures = s.failures_today.unwrap_or(0).max(observed_failures);
     let mut facts = vec![
         ("계정".into(), account_text),
+        ("남은 양".into(), remaining),
         ("모델".into(), row.model),
         (
             "시작".into(),
@@ -1533,11 +1689,19 @@ fn detail_view(d: &SessionDetail, accounts: &v2::View, clock: &Clock, expired: b
         (
             "오늘 요청".into(),
             if s.counters_complete {
-                format!(
-                    "{}건 · 실패 {}건",
-                    count(s.requests_today),
-                    count(s.failures_today)
-                )
+                let failures = s
+                    .failures_today
+                    .map(|n| format!("{}건", count(Some(n.max(observed_failures)))))
+                    .unwrap_or_else(|| {
+                        if observed_failures > 0 {
+                            format!("최소 {observed_failures}건")
+                        } else {
+                            "—건".into()
+                        }
+                    });
+                format!("{}건 · 실패 {failures}", count(s.requests_today))
+            } else if known_failures > 0 {
+                format!("— · 실패 최소 {known_failures}건 · 이전 실행 기록 확인 전")
             } else {
                 "— · 실패 — · 이전 실행 기록 확인 전".into()
             },
@@ -1650,11 +1814,29 @@ fn detail_view(d: &SessionDetail, accounts: &v2::View, clock: &Clock, expired: b
             .as_deref()
             .map(|s| clean(s).chars().take(8).collect::<String>())
             .filter(|s| !s.is_empty()),
-        status: format!(
-            "{} · {}({})에서 처리 중",
-            row.activity,
+        status: if !s.inflight_known {
+            "요청 상태 확인 전".into()
+        } else if row.inflight {
+            row.activity
+        } else if s.active {
+            "5분 안에 활동".into()
+        } else {
+            "쉬는 중".into()
+        },
+        status_tone: if row.inflight {
+            v2::Tone::Use
+        } else {
+            v2::Tone::Off
+        },
+        account_status: format!(
+            "{}({}){}",
             account_name(accounts, &s.account),
-            v2::provider_label(&s.provider)
+            v2::provider_label(&s.provider),
+            if row.inflight {
+                "에서 처리 중"
+            } else {
+                "에 배정됨"
+            }
         ),
         facts,
         timeline,
@@ -1728,6 +1910,12 @@ fn usage_tiles(snapshot: &DashboardSnapshot, clock: &Clock) -> Vec<UsageTile> {
                     });
                 }
             }
+            series.sort_by_key(|s| {
+                a.windows
+                    .iter()
+                    .position(|w| w.account_scoped && w.label == s.name)
+                    .unwrap_or(usize::MAX)
+            });
             let credits_spans = history
                 .map(|h| {
                     h.credits_spans
@@ -1747,6 +1935,17 @@ fn usage_tiles(snapshot: &DashboardSnapshot, clock: &Clock) -> Vec<UsageTile> {
                 plan: a.plan.clone().unwrap_or_else(unknown),
                 chip: a.chip.as_ref().map(|c| c.text.clone()).unwrap_or_default(),
                 tone: a.chip.as_ref().map_or(v2::Tone::Off, |c| c.tone),
+                windows: account_windows(a),
+                last_observed: observed_at(a, clock)
+                    .into_iter()
+                    .chain(
+                        series
+                            .iter()
+                            .flat_map(|s| &s.points)
+                            .filter_map(|(t, p)| p.map(|_| *t)),
+                    )
+                    .max(),
+                paused: a.raw.user_state == "paused",
                 series,
                 credits_spans,
                 unconfirmed: a.raw.health.kind == "needs_relogin",

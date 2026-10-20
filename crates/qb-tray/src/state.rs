@@ -67,6 +67,7 @@ impl Range {
 pub enum SortKey {
     Status,
     Session,
+    Client,
     Account,
     Model,
     Start,
@@ -100,7 +101,7 @@ impl EventFilter {
         match self {
             Self::Notable => "중요한 일",
             Self::Tasks => "할 일",
-            Self::Moves => "계정 전환",
+            Self::Moves => "한도·계정 전환",
             Self::Pacing => "속도 조절",
             Self::Credits => "크레딧",
             Self::Tokens => "토큰·로그인",
@@ -376,6 +377,7 @@ impl DashboardState {
                 self.select(None);
                 vec![]
             }
+            Target::DetailSurface => vec![],
             Target::EventFilter(filter) => {
                 self.event_filter = *filter;
                 self.events_offset = 0.;

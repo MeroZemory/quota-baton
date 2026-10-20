@@ -380,7 +380,11 @@ fn activate_target(hwnd: HWND, target: Target, enter: bool) {
         {
             return;
         }
-        h.input.focus = Some(target.clone());
+        h.input.focus = if target == Target::CloseDetail {
+            h.state.selected.clone().map(Target::Session)
+        } else {
+            Some(target.clone())
+        };
         if enter && let Target::Session(id) = &target {
             window_logic::open_session(&mut h.state, id)
         } else {
@@ -689,6 +693,7 @@ fn decorate_editor(h: &Host, scene: &mut Scene) -> Result<()> {
     };
     let Some((index, rect, measure)) = scene.draw.iter().enumerate().find_map(|(i, draw)| {
         if let Draw::Text { rect, measure, .. } = draw
+            && measure.face != geometry::Face::Icon
             && geometry::contains(hit.rect, rect.left, rect.top)
         {
             return Some((i, *rect, measure.clone()));
@@ -842,6 +847,7 @@ fn publish_accessibility(h: &mut Host, frame: &mut Frame) {
             geometry::Role::Row => accessibility::Kind::DataRow,
             geometry::Role::Text => accessibility::Kind::Text,
             geometry::Role::Chart => accessibility::Kind::Chart,
+            geometry::Role::Group => accessibility::Kind::Group,
         };
         let interactive = !node.hidden
             && node.enabled
@@ -977,6 +983,9 @@ fn keyboard(hwnd: HWND, key: usize) -> bool {
     let Some(host) = current(hwnd) else {
         return false;
     };
+    if matches!(key, 0x09 | 0x25..=0x28) {
+        host.borrow_mut().input.keyboard_focus = true;
+    }
     let control = held(0x11);
     let shift = held(0x10);
     if key == 0x1b && window_logic::dismiss_popup(&mut host.borrow_mut().state) {
@@ -1138,7 +1147,11 @@ fn keyboard(hwnd: HWND, key: usize) -> bool {
     };
     if let Some(target) = action {
         if target == Target::CloseDetail {
-            let commands = host.borrow_mut().state.activate(&target);
+            let commands = {
+                let mut h = host.borrow_mut();
+                h.input.focus = h.state.selected.clone().map(Target::Session);
+                h.state.activate(&target)
+            };
             redraw(hwnd);
             dispatch(hwnd, commands);
         } else {
@@ -1498,6 +1511,9 @@ unsafe extern "system" fn wndproc(
             return LRESULT(0);
         }
         WM_LBUTTONDOWN => {
+            if let Some(host) = current(hwnd) {
+                host.borrow_mut().input.keyboard_focus = false;
+            }
             let target = current(hwnd).and_then(|h| {
                 let mut h = h.borrow_mut();
                 if !frame_valid(&h) {
