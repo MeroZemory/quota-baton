@@ -1050,7 +1050,7 @@ impl PolicyStore {
                     && state
                         .sessions
                         .get(id)
-                        .is_some_and(|previous| !previous.durable(&self.defaults))
+                        .is_none_or(|previous| !previous.durable(&self.defaults))
             })
         {
             next.durable_overflow_until = Some(
@@ -4041,6 +4041,140 @@ mod tests {
                     )
                     .unwrap();
                 assert!(store.permits_dispatch(Some(key), "cx-forced-after-promotion"));
+                assert!(store.discretionary_allowed(group, Some(target), deadline));
+            }
+        }
+    }
+
+    #[test]
+    fn final_legacy_history_copy_promotes_eviction_guard_for_new_exact_policy() {
+        for project_policy in [false, true] {
+            for revisit in [true, false] {
+                let home = home();
+                let path = home.path().join("state/routing-policies.json");
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                let legacy = session_id("codex:legacy-promotion");
+                let key = "codex:legacy-promotion:agent:new";
+                let exact = session_id(key);
+                let fixture = State {
+                    sessions: BTreeMap::from([(
+                        legacy.clone(),
+                        SessionPolicy {
+                            project: None,
+                            baseline: Settings::default(),
+                            explicit: None,
+                            anchor: Some("cx-original".into()),
+                            movements: Vec::new(),
+                        },
+                    )]),
+                    legacy_codex_roots: BTreeSet::from([legacy.clone()]),
+                    ..State::default()
+                };
+                let original = serde_json::to_vec(&fixture).unwrap();
+                crate::bindings::atomic_write(&path, &original).unwrap();
+                let limits = ChurnLimits {
+                    revisit_secs: if revisit { 3600 } else { 0 },
+                    target_quiet_secs: 120,
+                    ..ChurnLimits::default()
+                };
+                let store = PolicyStore::new(home.path(), Settings::default())
+                    .unwrap()
+                    .with_limits(limits.clone())
+                    .unwrap();
+                let mut previous = "cx-original".to_owned();
+                for n in 0..33 {
+                    let target = format!("cx-ring-{n}");
+                    store
+                        .dispatch(Some(key), &target, Some(&previous), "forced", clock())
+                        .unwrap();
+                    previous = target;
+                }
+                let deadline =
+                    clock() + chrono::Duration::seconds(if revisit { 3600 } else { 120 });
+                assert!(!store.snapshot().sessions.contains_key(&exact));
+                assert_eq!(
+                    store.snapshot().sessions[&legacy].movements.len(),
+                    MAX_FORCED_HISTORY
+                );
+                assert_eq!(store.snapshot().history_overflow_until, Some(deadline));
+                assert!(store.snapshot().durable_overflow_until.is_none());
+                // Existing legacy evidence is not rewritten by default moves.
+                assert_eq!(fs::read(&path).unwrap(), original);
+                assert!(!fence_path(&path).exists());
+                let project = if project_policy {
+                    Some(
+                        store
+                            .put_project(
+                                None,
+                                Project {
+                                    name: "legacy-promotion".into(),
+                                    settings: settings(Mode::Rebalance),
+                                },
+                            )
+                            .unwrap(),
+                    )
+                } else {
+                    None
+                };
+                if project_policy {
+                    let loaded = load(&path).unwrap().unwrap();
+                    assert!(loaded.sessions.is_empty());
+                    assert!(loaded.durable_overflow_until.is_none());
+                }
+                store
+                    .edit_session_for_key(
+                        &exact,
+                        if project_policy {
+                            None
+                        } else {
+                            Some(settings(Mode::Rebalance))
+                        },
+                        project.as_deref(),
+                        Some("cx-ring-32"),
+                        true,
+                        Some(key),
+                    )
+                    .unwrap();
+                let loaded = load(&path).unwrap().unwrap();
+                assert_eq!(loaded.durable_overflow_until, Some(deadline));
+                assert_eq!(loaded.sessions[&exact].movements.len(), MAX_FORCED_HISTORY);
+                assert!(!loaded.sessions.contains_key(&legacy));
+                drop(store);
+                let store = PolicyStore::new(home.path(), Settings::default())
+                    .unwrap()
+                    .with_limits(limits)
+                    .unwrap();
+                let (group, target) = if revisit {
+                    (key, "cx-original")
+                } else {
+                    ("codex:other-group", "cx-ring-0")
+                };
+                assert_eq!(store.snapshot().history_overflow_until, Some(deadline));
+                assert!(!store.discretionary_allowed(
+                    group,
+                    Some(target),
+                    clock() + chrono::Duration::seconds(1)
+                ));
+                assert!(!store.discretionary_allowed(
+                    group,
+                    Some(target),
+                    deadline - chrono::Duration::seconds(1)
+                ));
+                assert!(
+                    store
+                        .dispatch(Some(group), target, Some("cx-ring-32"), "overload", clock())
+                        .is_err()
+                );
+                store
+                    .dispatch(
+                        Some(key),
+                        "cx-forced-after-copy",
+                        Some("cx-ring-32"),
+                        "forced",
+                        clock(),
+                    )
+                    .unwrap();
+                assert!(store.permits_dispatch(Some(key), "cx-forced-after-copy"));
                 assert!(store.discretionary_allowed(group, Some(target), deadline));
             }
         }
