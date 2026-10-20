@@ -346,3 +346,15 @@ The design was independently reviewed (`.sandbox/reviews/D17-review.md`); all si
 - Orca has no service, scheduled task, Run key or startup entry, and was not running.
 - Its homes' `auth.json` were last refreshed when Orca was last used: 09-18, 09-30, 10-11 and 10-12.
 - Orca refreshes only while it (or a Codex CLI in that home) runs. A takeover while Orca is closed is therefore safe, provided Orca is not started on that home afterwards. The source rename guarantees this.
+
+## D19. Codex credit continuation: permission is not proof of funds — Accepted (design owner ratification, 2026-10-20)
+
+**Context.** During the design pause (10-19) the implementer rewrote the C5 and C7 credit rules. No brief or decision covered it, but it followed the user's R4 and tray v2 direction: "유료 크레딧 사용 허용" means a Codex account keeps serving from credits once its subscription window is spent. A Sol max independent review covered it (`.sandbox/reviews/credits-logic-20261019/sol-max-final.md`). The design owner reviewed it on 10-20 (`.sandbox/reviews/pause-merges-review-2026-10-20.md`, MUST-FIX 2) and ratifies it as written in C5 ("Codex credit entitlement and subscription observations") and C7 ("Unusable stays narrow").
+
+- **Permission and funds are separate.** `allow_credits` is the user's permission. Available credits need evidence: unlimited, `has_credits=true` or a positive balance, with no explicit absence. Alternatively, a successful paid response proves entitlement for the life of the process.
+- **No subscription-only cooling with permitted credits.** A permitted Codex account with credits available is not cooled only because a subscription window reached 100 %. An explicit upstream quota rejection, `limit_reached`, and auth or payment holds still apply.
+- **Real rejections are not undone by settings.** A hold caused by an actual upstream quota rejection is non-releasable (`quota_credit_releasable=false`). Turning credits on releases only holds that came from observations. This keeps a credit toggle from re-sending traffic into a real rejection.
+- **Display needs proof.** "유료 크레딧 사용 중" is shown only after a successful paid response, never from a poll or a capability flag. Proof is not restored after a restart.
+- **The 99 % preventive hold** applies only to credit-capable accounts with permission off.
+
+**Follow-ups.** Record `quota_credit_releasable` in AccountView and the account file format (C11, C12).
