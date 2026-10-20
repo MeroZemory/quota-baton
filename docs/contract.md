@@ -584,6 +584,7 @@ Base: `http://127.0.0.1:<admin_port>/admin/v1`. Every route requires `Authorizat
 - `pool_eligible` identifies membership in the C6.4 `pools.eligible` count; it is not a new-session placement promise. `quota_cooling` carries the persisted limiting-window evidence (C5), and `observed_at` is the usage snapshot's observation time, not the last admin read time.
 - `/state` also carries `pools: {<provider>: {eligible, cooling: {<reason>: n}, unavailable}}` (C6.4)
 - `token_expires_at`
+- `quota_credit_releasable` (boolean, missing means false; C5 observation-only hold provenance)
 
 Tokens are never included.
 
@@ -623,6 +624,9 @@ memory_hard_limit_mib = 1024
 theme = "light"                  # "light", "dark", "system"; tray-v2.md §1
 burst_new_sessions = 30           # per client per 10 minutes; toast on excess (R8 I-40)
 
+[dashboard]
+resolve_claude_project = true     # filename-only Claude project lookup; false disables it
+
 [websocket]
 idle_close_secs = 1800            # MUST be < routing.rebalance_idle_secs
 max_message_size_mib = 192        # both legs; max_frame_size is set to the same value (Codex sends single-frame messages)
@@ -652,10 +656,13 @@ DPAPI is called with the application entropy, the ASCII bytes `quota-baton/v1/ac
   "identity": { "...provider ids per C10..." },
   "user_state": "active",
   "health": { "kind": "ready" },
+  "quota_credit_releasable": false,
   "generation": 7,
   "token_meta": { "expires_at": "...", "last_refresh_at": "...", "refresh_uncertain": false },
   "secret_dpapi_b64": "..." }
 ```
+
+`quota_credit_releasable` defaults to false when missing (C5).
 
 The DPAPI blob decrypts to `{access_token, refresh_token, id_token?}`. Files are written atomically and generation-guarded (architecture §6), and only by the holder of the credential lease.
 
