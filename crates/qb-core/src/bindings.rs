@@ -369,7 +369,6 @@ struct Data {
     overload_marks: BTreeMap<String, OverloadMark>,
     successes: BTreeMap<String, DateTime<Utc>>,
     placements: BTreeMap<String, PlacementState>,
-    last_rate: BTreeMap<String, DateTime<Utc>>,
     last_request_bytes: BTreeMap<String, u64>,
     unknown_cost: BTreeSet<String>,
     mark_history: BTreeMap<String, Vec<DateTime<Utc>>>,
@@ -1182,9 +1181,9 @@ impl BindingTable {
 
     fn has_overload_mark(&self, d: &Data, key: &str, now: DateTime<Utc>) -> bool {
         let g = group(key);
-        d.overload_marks.get(g).is_some_and(|mark| {
-            mark.expires > now && self.policies.discretionary_allowed(key, None, now)
-        })
+        d.overload_marks
+            .get(g)
+            .is_some_and(|mark| mark.expires > now)
     }
     pub fn overload_marked(&self, key: Option<&str>, now: DateTime<Utc>) -> bool {
         let d = self.data.lock().unwrap_or_else(|e| e.into_inner());
@@ -1230,13 +1229,8 @@ impl BindingTable {
         except: Option<&str>,
         now: DateTime<Utc>,
     ) -> bool {
-        // Actual moves still require pacing and recent-rate quiet to end.
-        // A capped target may remain worth waiting for while either is active.
+        // Pacing remains the ordinary C7 preference, not a hard move veto.
         self.rebalance_target_waiting(d, source, c, except, now)
-            && !d.pacing.get(&c.account.id).copied().unwrap_or(false)
-            && d.last_rate.get(&c.account.id).is_none_or(|at| {
-                (now - *at).num_seconds() >= self.config.churn.target_quiet_secs as i64
-            })
     }
     fn rebalance_target(
         &self,
@@ -1303,13 +1297,8 @@ impl BindingTable {
             .successes
             .insert(id.to_owned(), now);
     }
-    pub fn note_rate(&self, id: &str, now: DateTime<Utc>) {
-        self.data
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .last_rate
-            .insert(id.to_owned(), now);
-    }
+    /// Compatibility hook: rate observations no longer impose destination quiet.
+    pub fn note_rate(&self, _id: &str, _now: DateTime<Utc>) {}
     /// Capture immediately before an upstream request/event-producing send.
     /// Tokens and placements share one process-local monotonic sequence.
     pub fn begin_usage_observation(&self) -> u64 {
@@ -1741,8 +1730,9 @@ impl BindingTable {
                 let (evidence, placed_since_obs) = placement_evidence(candidate, &d, now);
                 let capped = evidence == PlacementEvidence::Weak
                     && placed_since_obs >= self.config.weak_evidence_new_sessions;
-                let is_placement = (from.is_none() && selected_reason == "new")
-                    || (from.is_some() && matches!(selected_reason, "overload" | "cold_rebalance"));
+                // Every actual relocation, including C5 recovery, places the
+                // group on its new account. Inheritance/reuse are unchanged.
+                let is_placement = selected_reason != "inherited";
                 if is_placement {
                     let seq = self.begin_usage_observation();
                     d.placements
@@ -1820,7 +1810,7 @@ impl BindingTable {
                 let known = d.last_request_bytes.entry(g.to_owned()).or_default();
                 *known = (*known).max(request_bytes);
             }
-            if selected_reason != "capped_target" {
+            if selected_reason != "mark_wait" {
                 d.overload_marks.remove(g);
             }
             d.changed();
@@ -1970,7 +1960,11 @@ impl BindingTable {
                         PreviewDecision::Selected {
                             account: b.account.clone(),
                         },
-                        "forced",
+                        if self.has_overload_mark(d, &b.key, now) {
+                            "mark_wait"
+                        } else {
+                            "forced"
+                        },
                     );
                 }
                 if *eligible && d.active.contains_key(group(&b.key)) {
@@ -1978,11 +1972,14 @@ impl BindingTable {
                         PreviewDecision::Selected {
                             account: b.account.clone(),
                         },
-                        "forced",
+                        if self.has_overload_mark(d, &b.key, now) {
+                            "mark_wait"
+                        } else {
+                            "forced"
+                        },
                     );
                 }
-                let marked = self.has_overload_mark(d, &b.key, now)
-                    && plan.settings.mode == crate::routing::Mode::Rebalance;
+                let marked = self.has_overload_mark(d, &b.key, now);
                 if marked && *eligible {
                     let known_cost = !d.unknown_cost.contains(group(&b.key))
                         && d.last_request_bytes
@@ -2008,11 +2005,12 @@ impl BindingTable {
                                     now,
                                 )
                         });
-                    // Retention is not authorization to move. Destination quiet
-                    // or revisit vetoes must not erase a confidence-blocked mark;
-                    // room_elsewhere and actual dispatch still enforce them.
-                    let capped_room = known_cost
-                        && entries.iter().any(|(candidate, eligible)| {
+                    // Any discretionary veto waits on the existing mark. In
+                    // particular, fresh/uncapped targets must not erase a mark
+                    // while group, revisit, pool or cost guards are active.
+                    let guard_waiting = !known_cost
+                        || !self.policies.discretionary_allowed(&b.key, None, now)
+                        || entries.iter().any(|(candidate, eligible)| {
                             *eligible
                                 && candidate.account.id != b.account
                                 && self.rebalance_target_waiting(
@@ -2022,10 +2020,15 @@ impl BindingTable {
                                     Some(group(&b.key)),
                                     now,
                                 )
-                                && placement_capped(candidate, d, &self.config, now)
+                                && (placement_capped(candidate, d, &self.config, now)
+                                    || !self.policies.discretionary_allowed(
+                                        &b.key,
+                                        Some(&candidate.account.id),
+                                        now,
+                                    ))
                         });
                     if !room_elsewhere
-                        && capped_room
+                        && guard_waiting
                         && self.active_sessions_in(d, &b.account, now)
                             > self.spread_threshold_for(&b.account)
                     {
@@ -2033,7 +2036,7 @@ impl BindingTable {
                             PreviewDecision::Selected {
                                 account: b.account.clone(),
                             },
-                            "capped_target",
+                            "mark_wait",
                         );
                     }
                     if !room_elsewhere
@@ -2177,7 +2180,14 @@ impl BindingTable {
             && matches!(reason, "cold_rebalance" | "overload")
             && let Some(account) = bound_account
         {
-            return (PreviewDecision::Selected { account }, "forced");
+            return (
+                PreviewDecision::Selected { account },
+                if reason == "overload" {
+                    "mark_wait"
+                } else {
+                    "forced"
+                },
+            );
         }
         let ratio = |c: &Candidate| {
             (self.active_sessions_in(d, &c.account.id, now)
@@ -2405,10 +2415,18 @@ fn effective_account(
     }
     account
 }
-fn account_window(w: &Value) -> Option<bool> {
+fn account_window(provider: Provider, w: &Value) -> Option<bool> {
     match w["name"].as_str()? {
         "7d" | "secondary" => Some(true),
         "5h" | "primary" => Some(false),
+        name if provider == Provider::Codex => {
+            let minutes = name.strip_suffix('m')?;
+            if minutes.is_empty() || !minutes.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let minutes = minutes.parse::<u64>().ok()?;
+            (minutes > 0).then_some(minutes > 1440)
+        }
         _ => None,
     }
 }
@@ -2534,19 +2552,15 @@ fn metrics(c: &Candidate, d: &Data, cfg: &RoutingConfig, now: DateTime<Utc>) -> 
         .max(c.inflight);
     let state = placement_state(c, d);
     let mut seen = false;
+    let mut slot_usage = [None::<f64>; 2];
     for w in windows {
-        let Some(weekly) = account_window(w) else {
+        let Some(weekly) = account_window(c.account.provider, w) else {
             continue;
         };
         seen = true;
         let reset = date(&w["reset_at"]);
         let expired = reset.is_some_and(|r| r <= now);
         let reset = reset.filter(|r| *r > now);
-        let slot = if weekly { &mut m.weekly } else { &mut m.five };
-        *slot = match (*slot, reset) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
         let charge = cfg.placement_allowance_pct
             * state.charge_count(w["name"].as_str().expect("gating window")) as f64;
         let usage = if expired {
@@ -2559,6 +2573,20 @@ fn metrics(c: &Candidate, d: &Data, cfg: &RoutingConfig, now: DateTime<Utc>) -> 
                 .filter(|n| n.is_finite() && *n >= 0.0)
                 .map(|n| n + cfg.inflight_allowance_pct * pending as f64 + charge)
         };
+        // Gate every window; the highest projected usage (including D20
+        // charges) supplies its slot's reset key. Unknown still sorts last.
+        let projected = usage.unwrap_or(f64::INFINITY);
+        let slot = if weekly { &mut m.weekly } else { &mut m.five };
+        let previous = &mut slot_usage[usize::from(weekly)];
+        if previous.is_none_or(|old| projected > old) {
+            *previous = Some(projected);
+            *slot = reset;
+        } else if *previous == Some(projected) {
+            *slot = match (*slot, reset) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+        }
         let Some(usage) = usage else {
             m.unknown = true;
             m.usage = f64::INFINITY;
@@ -2732,7 +2760,6 @@ mod tests {
         let mut config = RoutingConfig::default();
         config.churn.dwell_secs = 0;
         config.churn.revisit_secs = 0;
-        config.churn.target_quiet_secs = 0;
         config.churn.max_group_moves = 16;
         let table = BindingTable::new(dir.path(), config).unwrap();
         (dir, table)
@@ -4063,6 +4090,223 @@ mod tests {
         assert!(m.gate && m.unknown);
         c.quota.as_mut().unwrap()["windows"][1]["used_pct"] = json!(98);
         assert!(!metrics(&c, &Data::default(), &t.config, now).gate);
+    }
+
+    #[test]
+    fn codex_nonstandard_window_slots_gate_at_1440_minute_boundary() {
+        let now = Utc::now();
+        let cfg = RoutingConfig {
+            gate_5h_pct: 80.0,
+            gate_weekly_pct: 90.0,
+            ..RoutingConfig::default()
+        };
+        let mut c = codex_candidate("a", 0.0);
+        for (name, weekly) in [
+            ("60m", false),
+            ("1440m", false),
+            ("1441m", true),
+            ("43200m", true),
+        ] {
+            c.quota = Some(json!({"windows":[{
+                "name":name,"used_pct":85,"reset_at":now+Delta::hours(8),"observed_at":now
+            }]}));
+            let m = metrics(&c, &Data::default(), &cfg, now);
+            assert_eq!(m.gate, weekly, "{name}: slot-specific threshold");
+            assert!(!m.unknown);
+            assert_eq!(m.weekly.is_some(), weekly);
+            assert_eq!(m.five.is_some(), !weekly);
+            c.quota.as_mut().unwrap()["windows"][0]["used_pct"] =
+                json!(if weekly { 89 } else { 79 });
+            assert!(metrics(&c, &Data::default(), &cfg, now).gate);
+            c.inflight = 1;
+            assert!(
+                !metrics(&c, &Data::default(), &cfg, now).gate,
+                "{name}: projection reaching the threshold fails the gate"
+            );
+            c.inflight = 0;
+            c.quota.as_mut().unwrap()["windows"][0]["used_pct"] = json!(97);
+            c.quota.as_mut().unwrap()["windows"][0]["reset_at"] = json!(now + Delta::hours(4));
+            assert_eq!(
+                metrics(&c, &Data::default(), &cfg, now).gate,
+                weekly,
+                "{name}: only weekly slots get the near-reset threshold"
+            );
+            c.quota.as_mut().unwrap()["windows"][0]["used_pct"] = json!(98);
+            assert!(!metrics(&c, &Data::default(), &cfg, now).gate);
+        }
+        for name in ["0m", "-1m", "+60m", "1.5m", "60m_oi", "7d_oi", "unknown"] {
+            assert_eq!(
+                account_window(Provider::Codex, &json!({"name":name})),
+                None,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_same_slot_uses_highest_projected_window_for_ordering_but_all_gate() {
+        let (_dir, t) = table();
+        let now = Utc::now();
+        // Both short and weekly collisions must pick the high-usage reset,
+        // rather than the earliest reset of a less-used window in that slot.
+        for (canonical, extra, first_hours, higher_hours, competitor_hours) in
+            [("5h", "1440m", 1, 4, 2), ("7d", "43200m", 8, 30, 16)]
+        {
+            let mut a = codex_candidate("a", 0.0);
+            a.inflight = 1;
+            a.quota = Some(json!({"windows":[
+                {"name":canonical,"used_pct":10,"reset_at":now+Delta::hours(first_hours),"observed_at":now},
+                {"name":extra,"used_pct":80,"reset_at":now+Delta::hours(higher_hours),"observed_at":now}
+            ]}));
+            let mut b = codex_candidate("b", 0.0);
+            b.quota = Some(json!({"windows":[
+                {"name":extra,"used_pct":50,"reset_at":now+Delta::hours(competitor_hours),"observed_at":now}
+            ]}));
+            let d = Data::default();
+            let m = metrics(&a, &d, &t.config, now);
+            assert!(m.gate && !m.unknown);
+            assert_eq!(m.usage, 81.0);
+            assert_eq!(
+                if canonical == "7d" { m.weekly } else { m.five },
+                Some(now + Delta::hours(higher_hours))
+            );
+            let select = |cs: &[Candidate]| match t
+                .select(&d, Provider::Codex, None, None, None, cs, None, now, false)
+                .0
+            {
+                PreviewDecision::Selected { account } => account,
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(select(&[a.clone(), b.clone()]), "b");
+            a.quota.as_mut().unwrap()["windows"]
+                .as_array_mut()
+                .unwrap()
+                .reverse();
+            assert_eq!(select(&[b.clone(), a.clone()]), "b");
+            // Equal projected usage keeps a deterministic earlier-reset tie.
+            for w in a.quota.as_mut().unwrap()["windows"].as_array_mut().unwrap() {
+                w["used_pct"] = json!(80);
+            }
+            for _ in 0..2 {
+                let tied = metrics(&a, &d, &t.config, now);
+                assert_eq!(
+                    if canonical == "7d" {
+                        tied.weekly
+                    } else {
+                        tied.five
+                    },
+                    Some(now + Delta::hours(first_hours))
+                );
+                a.quota.as_mut().unwrap()["windows"]
+                    .as_array_mut()
+                    .unwrap()
+                    .reverse();
+            }
+            // A near-reset high-usage window may pass its own relaxed gate,
+            // while the less-used, far-reset window must still fail its gate.
+            if canonical == "7d" {
+                a.quota = Some(json!({"windows":[
+                    {"name":extra,"used_pct":96,"reset_at":now+Delta::hours(4),"observed_at":now},
+                    {"name":canonical,"used_pct":90,"reset_at":now+Delta::hours(30),"observed_at":now}
+                ]}));
+                let m = metrics(&a, &d, &t.config, now);
+                assert_eq!(m.weekly, Some(now + Delta::hours(4)));
+                assert!(
+                    !m.gate,
+                    "ordering representative cannot hide a failing window"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn round2_codex_free_43200m_at_91_fails_weekly_gate_with_d20_charge_preserved() {
+        let now = Utc::now();
+        let cfg = RoutingConfig::default();
+        let mut c = codex_candidate("cx-free", 0.0);
+        c.quota = Some(json!({"windows":[{
+            "name":"43200m","used_pct":91,"reset_at":now+Delta::days(20),"observed_at":now
+        }]}));
+        let m = metrics(&c, &Data::default(), &cfg, now);
+        assert!(!m.gate && !m.unknown);
+        assert_eq!(m.weekly, Some(now + Delta::days(20)));
+        assert_eq!(m.usage, 91.0);
+        c.quota.as_mut().unwrap()["windows"][0]["used_pct"] = json!(89);
+        let mut d = Data::default();
+        let mut state = PlacementState::default();
+        state.observe(c.quota.as_ref().unwrap());
+        state.placed(now, 1);
+        d.placements.insert(c.account.id.clone(), state);
+        let m = metrics(&c, &d, &cfg, now);
+        assert!(!m.gate && !m.unknown);
+        assert_eq!(
+            m.usage, 91.0,
+            "D20 charge participates in the new weekly slot"
+        );
+        assert!(metrics_without_placement_charge(&c, &d, &cfg, now).gate);
+    }
+
+    #[test]
+    fn codex_nonstandard_windows_keep_unknown_stale_and_past_reset_rules() {
+        let now = Utc::now();
+        let cfg = RoutingConfig::default();
+        let mut c = codex_candidate("a", 0.0);
+        for name in ["1440m", "43200m"] {
+            c.quota = Some(json!({"windows":[{
+                "name":name,"used_pct":null,"reset_at":now+Delta::hours(8),"observed_at":now
+            }]}));
+            let m = metrics(&c, &Data::default(), &cfg, now);
+            assert!(m.gate && m.unknown && m.usage.is_infinite());
+            c.quota.as_mut().unwrap()["windows"][0]["used_pct"] = json!(95);
+            c.quota.as_mut().unwrap()["windows"][0]["observed_at"] =
+                json!(now - Delta::seconds(901));
+            assert!(!metrics(&c, &Data::default(), &cfg, now).gate);
+            let mut d = Data::default();
+            d.traffic.insert(c.account.id.clone(), now);
+            let m = metrics(&c, &d, &cfg, now);
+            assert!(m.gate && m.unknown && m.usage.is_infinite());
+            // Exactly 900 seconds is still fresh, even after traffic.
+            c.quota.as_mut().unwrap()["windows"][0]["observed_at"] =
+                json!(now - Delta::seconds(900));
+            assert!(!metrics(&c, &d, &cfg, now).gate);
+            c.quota.as_mut().unwrap()["windows"][0]["reset_at"] = json!(now - Delta::seconds(1));
+            let m = metrics(&c, &d, &cfg, now);
+            assert!(m.gate && !m.unknown);
+            assert_eq!(m.usage, 0.0);
+            assert!(m.weekly.is_none() && m.five.is_none());
+        }
+    }
+
+    #[test]
+    fn claude_numeric_and_model_subbuckets_never_gate_or_order() {
+        let (_dir, t) = table();
+        let now = Utc::now();
+        let mut a = candidate("a", 10.0, 30, 2);
+        let expected = metrics(&a, &Data::default(), &t.config, now);
+        for name in [
+            "60m",
+            "1440m",
+            "1441m",
+            "43200m",
+            "7d_oi",
+            "7d_sonnet",
+            "43200m_oi",
+        ] {
+            a.quota.as_mut().unwrap()["windows"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({
+                    "name":name,"used_pct":100,"reset_at":now+Delta::minutes(1),"observed_at":now
+                }));
+        }
+        let m = metrics(&a, &Data::default(), &t.config, now);
+        assert!(m.gate && !m.unknown);
+        assert_eq!(m.usage, expected.usage);
+        assert_eq!(m.weekly, expected.weekly);
+        assert_eq!(m.five, expected.five);
+        // An ignored early-reset subbucket cannot beat B's real account reset.
+        let b = candidate("b", 20.0, 8, 3);
+        assert_eq!(preview(&t, &[a, b]), "b");
     }
 
     #[test]
