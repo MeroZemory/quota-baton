@@ -476,3 +476,21 @@ These come from the R8 B/C merge review (`.sandbox/reviews/R8-BC-merge-review-20
 - **Remaining gap.** Opening a qb session from an old command while qb is running it is not caught by qb. That is the old command's own launch, which qb does not wrap. Possible fix: point every home's `thread-writer-locks` at one shared directory, so Codex's own guard covers all homes. That changes the user's existing homes, so it needs a synthetic test first and then the user's approval.
 
 **Do not revisit without new evidence.** The shared-home options above were rejected on source evidence (Codex 0.163). Re-open them only if a Codex release lets resume keep a thread's provider, or adds a per-process auth override for the TUI.
+
+### D21 amendment: move, not share (user direction, 2026-10-21)
+
+**User direction.** The user asked: "codex-qb로 지정한 세션(codex꺼든 orca꺼든 codex-mz꺼든 codex-ax꺼든... 범용적으로) 재개하기 (재개하는 과정에서 처리 필요한 문제들 e.g. 마이그레이션 후 검사 후 문제없으면 기존것 삭제 등. 일괄 처리)". The day's manual migrations removed the source copy once the session opened in its new home, and the user confirmed that is the wanted behaviour.
+
+**Change.** Import is a **move** by default:
+1. **Import.** Hardlink the rollout files and copy the rows, exactly as in D21.
+2. **Verify.** Run all of these checks:
+   - the target and source names share the same file id;
+   - the target thread row points at the target path;
+   - the goal row matches;
+   - the divergence check passes;
+   - no live writer exists.
+3. **Remove the source.** On success, remove the session's own rollout name or names from the source home, its `threads` row and its `thread_goals` row. Do not remove fork ancestors: other threads in the source home may still fork from them, and the extra links cost no space. Do not edit `session_index`, which is append-only.
+
+**Why.** After the move only one home can open the session. This closes the cross-home double-writer gap described in the concurrency findings, without changing the user's existing homes. The journal still allows `unimport`, which re-links the source name and restores its rows while the file exists.
+
+**Two-way sharing** remains available with `--keep-source`, together with the warnings above.
