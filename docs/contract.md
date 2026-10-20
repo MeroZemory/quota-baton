@@ -242,7 +242,7 @@ Rate limits are therefore absorbed on the same account. An individual rate limit
 - **While the account is pacing** (`rate_step` > 0, or a future `rate_backoff_until`), the gate is open when `now ≥ rate_backoff_until` and the previous release was at least `rate_release_interval` ago. Once `rate_step` has decayed to 0, spacing stops.
 - Waiting requests are released in arrival order, one per interval. One release task per account enforces the spacing.
 - While a request waits, its body is retained or back-pressured.
-- A request whose wait reaches `rate_hold_secs` (default 60) is not forcibly sent. Return its retained upstream 429 if available, otherwise a provider-shaped local 429 `rate_wait_timeout` with retry advice. This local terminal wait result is distinct from fail-fast before waiting and never creates quota cooling. Concurrent expiries must not become a burst of upstream sends.
+- A request whose initial admission wait reaches `rate_hold_secs` (default 60) is sent once on the same account. A forced send receives no further rate retry. If a retained upstream 429 already exists when the total rate budget expires, relay that last response. Local hold expiries never count toward the C7.1 overload trigger. Eligibility and strict policy are still rechecked before any send (D14, D20).
 
 **HTTP: retry in place.** This applies to a pre-commit rate 429 when the request has a retained copy.
 - Pass the admission gate again, then retry the same account from the retained copy.
@@ -259,7 +259,7 @@ Rate limits are therefore absorbed on the same account. An individual rate limit
 3. **The error frame carries retry advice.** Relay it as is, immediately. Codex retries after the advised delay.
 4. **Otherwise.** Do not relay the frame. Close the client socket with 1012, with **no** reconnect exclusion. Codex treats the close as retryable and reconnects with the full input. The binding is unchanged, so the reconnect goes back to the same account, and admission paces its upgrade (at most `ws_upgrade_hold_secs`). Relaying the frame would end the turn at once (F3).
 
-If the upstream socket closes while a resend is pending, close the client socket with the same code. A pending create/resend whose pacing budget expires closes with 1013 without a forced payload send; that terminal rule takes precedence over cases 1–2.
+If the upstream socket closes while a resend is pending, close the client socket with the same code. A pending create/resend whose pacing budget expires closes with 1012 without changing accounts; the Codex reconnect behaviour is documented in architecture §9 and D14 review F5. A local expiry is not an upstream client-visible rate observation.
 
 Phase 0 item **V8** observes the genuine `wss://chatgpt.com` rate-limit shape. It records which of these occur:
 - a handshake 429
@@ -318,13 +318,13 @@ The workaround was applied on the previous proxy side and verified there. This s
 
 ## C7. Selection policy
 
-These rules come from the P2 blind panel (`.sandbox/reviews/switch-policy-blind-panel.md`, [D11](decisions.md#d11)).
+These rules originate in D11, with session spreading in D15 and explicit routing and anti-herding in D20 (decisions.md).
 
 **Input:** the family, the request's session key with its optional parent key (C8), the model if known, and the accounts already tried.
 
 **Placement is serialized** per family, so a burst of new sessions sees each earlier decision.
 
-**Projected usage.** For each window it is the last observed `used_pct`, plus an in-flight allowance for each request in flight on that account (`inflight_allowance_pct`). Rules from the M4b review:
+**Projected usage.** For each window it is the last observed `used_pct`, plus an in-flight allowance for each request in flight (`inflight_allowance_pct`), plus outstanding placement charges (`placement_allowance_pct`, default 2 percentage points per new or moved group). Each window retains a charge until its own observation is strictly newer than the placement. Equal or older observations do not clear it. Rules from M4b and D20:
 - **Gating windows.** Only the account windows count for the gate and for ordering: `5h` and `7d` (Codex primary/secondary as named by C9). Sub-buckets such as `7d_oi` and other names never gate the account and never set the weekly ordering. They act only through model-scoped cooling (C5) (S1).
 - **Past reset.** A window whose `reset_at` has passed counts as 0 % used and unstarted until a new observation arrives (F2).
 - **Unknown or stale.** A window is stale when its observation is older than 15 min **and** the account has carried traffic newer than that observation.
@@ -332,6 +332,14 @@ These rules come from the P2 blind panel (`.sandbox/reviews/switch-policy-blind-
   - Traffic records older than the latest observation do not count.
   - Restored bindings do not count as traffic.
 - **Projection.** The in-flight projection is used only for placement. It never creates a cooling, for example the credits hold (S5). Coolings come only from observed values (C5).
+
+**Evidence and anti-herding (D20).** A placement is a new C7 steps 3–6 group or a C7.1/cold-point move. Bound reuse, step 2 recovery, restored bindings and same-account retries are not placements. Observations use request-send time for headers/WS events, or poll-start time for polls, in the account's monotonic sequence. Receipt time is not evidence age. Only a strictly later as-of observation clears a charge; the same instant does not.
+
+Evidence is weak when any gating window is unobserved, its observation precedes the latest placement, or its reset passed without a new observation. `placed_since_obs` counts placements newer than the oldest gating-window observation, or all placements while any window is unobserved. An account is capped only when weak and this count is at least `weak_evidence_new_sessions` (default 1).
+
+Apply the cap in both branches of step 4, in step 5 and in C7.1, after the room partition and pacing skip. Uncapped accounts come first in C7 order. When every candidate in that set is capped, use the fewest placements since observation, then C7 order. New-session placement never refuses merely because all accounts are capped. C7.1 instead retains the group and its unexpired mark when every target with room is capped. Placement charges never affect the cold-point gate check and never cool or move a bound eligible session.
+
+After any placement, wait `placement_poll_after_secs` (120) and check that every gating window has a newer observation. If not, issue one read-only GET poll using its own per-account `placement_poll_min_interval_secs` (300) budget, independent of the normal minimum, while respecting poll backoff and C9 exclusions. The ledger records `placement{evidence: fresh|weak, capped, placed_since_obs, charge}` and `poll{reason: placement_evidence}`.
 
 **The gate** (new-session placement):
 - every 5-hour window is projected below `gate_5h_pct` (default 90)
@@ -349,16 +357,16 @@ These rules come from the P2 blind panel (`.sandbox/reviews/switch-policy-blind-
 2. Else, if the parent key is bound to account P, P is eligible and P has not been tried, bind the session to P and use it.
 3. Else, let `E` be the eligible accounts that have not been tried, and let `G` be the accounts in `E` that pass the gate.
 4. Partition `G` into `G_room` (the accounts with room, C7.1: `active < spread_threshold`) and the rest.
-   - If `G_room` is non-empty, apply the C6.3 pacing skip within it and order it by:
+   - If `G_room` is non-empty, apply the C6.3 pacing skip and then the D20 uncapped/round-robin preference within it; order the remaining candidates by:
      1. the soonest weekly `reset_at`. Resets within 3 h of each other count as tied.
      2. among tied accounts, the soonest 5-hour `reset_at`, with unstarted windows last
      3. the lower projected usage on the binding window
      4. account id
 
      Take the first account.
-   - If `G_room` is empty but `G` is not, order `G` by `active / spread_threshold` ascending, then by the pacing skip, then by 1–4 above, and take the first.
+   - If `G_room` is empty but `G` is not, order `G` by `active / spread_threshold` ascending, then by the pacing skip, then the D20 uncapped/round-robin preference, then by 1–4 above, and take the first.
    - A full account is never a refusal.
-5. If `G` is empty but `E` is not, apply the same partition to `E`. Take an account with room and the most headroom on its binding window. If no account has room, take the lowest `active / spread_threshold`, with ties going to the most headroom. This is the 2B fallback.
+5. If `G` is empty but `E` is not, apply the same room partition to `E`, then the C6.3 pacing skip and D20 uncapped/round-robin preference. Take the most headroom within that set. If no account has room, first take the lowest `active / spread_threshold`, then apply pacing and D20 preferences, then headroom. This is the 2B fallback.
 6. Bind the session, and the parent if it was unbound, to the chosen account.
 7. If `E` is empty, apply C6 row 14 or row 15.
 
@@ -370,7 +378,7 @@ These rules come from the P2 blind panel (`.sandbox/reviews/switch-policy-blind-
 Overload, 5xx, short rate limits and network errors retry in place (C6).
 
 Further rules:
-- **Usage gates never move a session.** Gates and usage MUST NOT move a bound session. A bound session moves only in three cases, and then only at a request boundary:
+- **Usage gates never move a session.** Placement charges are also excluded from the cold-point gate check. Gates and usage MUST NOT move a bound session. A bound session moves only in three cases, and then only at a request boundary:
   - its account fails the eligibility test in C5
   - it is cold and the cold-point rule applies
   - it is marked by the overload rebalance (C7.1)
@@ -432,14 +440,15 @@ Some outcomes never count toward the trigger, because they are not account conce
 
 **Marking.** When A is overloaded, victims are chosen among the groups bound to A.
 - **Order:** smallest last request bytes first, since that is the cost of the uncached re-send; ties go to the longest idle time.
-- **Skipped:** any group with a request or a WebSocket response in flight.
+- **Skipped:** any group with a request or a WebSocket response in flight, or unknown full-input cost. Restored and continuation-only input has unknown cost until full input is known; `victim_skipped_unknown_cost` measures this exemption.
 - **How many:** at most `min(active(A) − spread_threshold(A), 2 − marks already made for A in this window)`. Marking stops as soon as `active(A) − active(B) < 2` would hold after the move.
-- **The mark** is `{from: A, expires: now + overload_window_secs}`. It is held in memory with the bindings and is not exported on takeover.
+- **The mark** is `{from: A, target: reserved B, expires: now + overload_window_secs}`. Its reservation counts against destination room until execution, replacement or expiry. It is held in memory with the bindings and is not exported on takeover.
 - **Idle pinned socket:** if the marked group's pinned socket is idle, close the client socket with 1000, as in C6 row 13c. The reconnect's upgrade is then the group's next request boundary.
 - **Ledger:** log `overload_detected {account, active, threshold, groups_hit, marked}`. When conditions 1 and 2 hold but no account has room, log it once per window too, so that "well spread, no move" is visible.
 
 **Moving.** At a marked group's next request boundary:
 - Move if the mark is unexpired, `active(A) > spread_threshold(A)` still holds, and an eligible account with room passes the gate. Then skip step 1, run steps 3–6 restricted to accounts with room, and bind the whole group there (C7 "Moves").
+- The marked target is a capacity reservation, not a constraint. At execution, reselect among currently eligible accounts with room, using C7 order and destination-specific guards; a disabled or cooling reserved target cannot prevent moving to another eligible one.
 - If the only targets with room are capped (D20), stay on A and keep the mark. Otherwise clear the mark and stay on A.
 - Log the move when it executes: `binding_move` with reason `overload`, the request bytes, and the next turn's cache result.
 
@@ -449,7 +458,7 @@ Some outcomes never count toward the trigger, because they are not account conce
 - Anything when no account has room. The sessions are then well spread, and a 429 only paces.
 - A running stream, an in-flight request, or a WebSocket with a response in flight.
 
-**Local rebalance constraints.** Rebalance never takes a target over its threshold, and a move never leaves the target more loaded than the source. These constraints do not by themselves bound repeated A→B→A moves across changing load and successive requests. Additional persisted group/pool limits are specified in C7.2 and the [routing design supplement](account-routing-design.md#4-계정-왕복과-이동-비용).
+**Discretionary movement guards (D20).** Rebalance and cold-point moves require dwell 1,800 seconds, revisit 3,600 seconds, at most 3 discretionary group moves and 4 discretionary provider moves per 600 seconds, destination quiet 120 seconds, and known full input at most 8 MiB. A target needs eligibility, the C7 gate, room, and non-stale quota evidence; no recent successful request is required. Weak targets accept one moved group until observed; all-capped move destinations retain the mark rather than invoking the new-session fallback. A move cannot take the target above its threshold or leave it more loaded than the source. Forced C5 moves are recorded but never blocked by or charged to these guards, including the retained-history cap. Account ID determines the provider movement pool.
 
 **Speed.** The cure is deliberately slow: at most 2 moves per account per window. Placement is the main lever.
 
@@ -465,13 +474,13 @@ Some outcomes never count toward the trigger, because they are not account conce
 
 ### C7.2 Explicit root-session routing intent
 
-`routing.mode` defaults to `rebalance` (existing C7/D15 behaviour). `recover` keeps an eligible bound account and permits only recovery from ineligibility. `strict` does not automatically change its local account ID and requires a classified root identity. It may refresh/reconnect that account, but pause, quota, auth, payment and credit restrictions still prevent dispatch. An unavailable locked account returns a provider-shaped HTTP 409 `routing_policy_blocked`; it must not trigger selection of a different account. Exhausted group movement budgets or failure to durably authorize a move use the same explicit local block.
+`routing.mode` defaults to `rebalance` (existing C7/D15 behaviour). `recover` keeps an eligible bound account and permits only recovery from ineligibility. `strict` does not automatically change its local account ID and requires a classified root identity. It may refresh/reconnect that account, but pause, quota, auth, payment and credit restrictions still prevent dispatch. An unavailable locked account returns a provider-shaped HTTP 409 `routing_policy_blocked`; it must not trigger selection of a different account. Discretionary movement guards retain a healthy current account; forced C5 recovery is never refused by those budgets. Strict authority alone fails closed on policy persistence failures.
 
 The authenticated routing admin API registers opaque projects and applies root-session overrides. Effective settings are global defaults → explicitly associated project baseline → explicit root override. Children inherit the root. A project edit affects new associations; existing baselines stay until explicitly edited. Display labels never select policy. Session handles are full SHA-256 hashes of canonical C8 root keys, separate from the short dashboard display IDs.
 
-Explicit intent, anchor and movement history are atomically persisted in `state/routing-policies.json` before a strict first dispatch or account move. Corrupt intent refuses startup rather than silently forgetting a lock. The file is bounded to 16MiB, 20,000 root records, 1,024 projects and 32 retained movement entries per root. Capacity/write failure fails closed. Takeover retires the old writer and reloads durable intent after lease handover. Normal binding LRU/write-behind cannot erase the lock.
+Only explicit project/session intent and strict anchors require durable policy writes. Default routing history remains in memory. Policy files are bounded to 16 MiB, 20,000 roots and 1,024 projects. A policy write, recovery or startup failure blocks dispatch only for affected strict sessions, including a strict first placement. Non-strict sessions continue on eligible accounts, quarantine damaged evidence and raise `core_warning`. Normal binding LRU eviction cannot erase a strict anchor. Takeover retires the old writer before handover.
 
-`reset_wait_secs` is a root/project setting in 0–120 seconds; omitted global intent retains `routing.reset_hold_secs` (60). It is separate from paid-credit permission. New defaults do not silently change existing explicit baselines. `routing.churn` bounds discretionary moves: dwell 1,800 s, revisit 3,600 s, group/pool window 600 s, at most 3 group moves and 4 discretionary provider moves per window, target quiet 120 s, recent success within 300 s, and known full-input cost at most 8 MiB. These are configurable local safeguards, not provider limits. Movement reservations count against new-placement room. A healthy current account keeps serving when discretionary movement is forbidden; an exhausted recovery budget fails closed. Targets need fresh per-window observations and recent actual success, and must remain eligible, non-draining and non-pacing at execution. Unknown restored/full-input cost suppresses discretionary movement. Idle socket pins protect bindings but do not count as active demand.
+`reset_wait_secs` is a root/project setting in 0–120 seconds; global defaults retain `routing.reset_hold_secs` (60). It is separate from credit permission. Global `routing.mode = strict` is rejected: strict requires a classified root policy. Churn safeguards in C7.1 govern discretionary movement only; inability to satisfy them retains a healthy bound account. Unknown full-input cost suppresses discretionary movement. Idle socket pins protect bindings without counting as active demand.
 
 Associating a project preserves an explicit root override unless `inherit: true` / CLI `--inherit` is supplied. A history-only root follows current global defaults. Startup captures strict anchors before pruning legacy bindings. Serving rechecks current intent and account eligibility after pacing/reset waits, including WS create/reconnect. Readers use immutable intent snapshots; disk writers never hold the binding/read lock across I/O. Forecast and total-deadline work remain staged until their tests and final gate pass.
 
@@ -615,6 +624,13 @@ data_port = 10200            # 10100 after cutover
 admin_port = 10201
 
 [routing]
+mode = "rebalance"                # recover also allowed; strict is per project/root only
+request_timeout_secs = 300
+forecast_shadow = false
+placement_allowance_pct = 2.0     # D20 charge per new or moved group
+weak_evidence_new_sessions = 1
+placement_poll_after_secs = 120
+placement_poll_min_interval_secs = 300
 gate_5h_pct = 90
 gate_weekly_pct = 90
 gate_weekly_near_reset_pct = 98     # applies within near_reset_secs of the weekly reset
@@ -629,6 +645,15 @@ active_window_secs = 300            # C7.1: a group counts as active for this lo
 overload_window_secs = 600          # C7.1: overload trigger window, mark budget (2 per account) and mark expiry
 rebalance_idle_secs = 3600          # cold point; >= the longest prompt-cache TTL in use
 session_binding_max_secs = 604800
+
+[routing.churn]
+dwell_secs = 1800
+revisit_secs = 3600
+window_secs = 600
+max_group_moves = 3
+max_pool_moves = 4
+target_quiet_secs = 120
+max_move_bytes = 8388608
 
 [guard]
 retain_max_per_request_mib = 64   # larger bodies are forwarded without retention (no failover)
@@ -722,30 +747,3 @@ The tray writes `state/ui.json` atomically with schema and geometry only: positi
 ## C13. Acceptance
 
 See [architecture §16.3](architecture.md#163-acceptance-criteria) (A1–A5). Every row of C5 and C6 MUST have a `qb-testkit` test before M4a/M4b are accepted.
-
-### Routing wait and forecast supplement (cache-routing implementation)
-
-`routing.request_timeout_secs` (1–600, default 300) bounds the whole HTTP pre-commit path: input preparation, selection/reset hold, token refresh waiting, pacing, dial and retries. It does not cut off an already committed stream. WS upgrade uses its own overall `ws_upgrade_hold_secs` envelope (1–14, default 10); pacing leaves 100 ms to return a terminal result within it. Account/policy edits interrupt reset waits, and current authority is checked at actual dispatch, including open-socket resends and redials with the pending request's model. A request owns at most one reset hold; later requests have independent budgets. A generic cooling expiry is not evidence of a provider reset: the hold requires persisted causal quota metadata or a current structured reset observation. Wall reset times are converted once per wait to a monotonic deadline.
-
-`rate_hold_secs` is bounded to 1–600 seconds. Rate wait expiry is terminal, not a send permit. HTTP returns the retained upstream 429 when available, otherwise a provider-shaped local 429 `rate_wait_timeout`. An unsent open-WS create/resend ends with 1013 on wait expiry; no payload is forcibly sent and no quota cooling is synthesized. Retry-After advice is never shortened by the local wait cap or negative jitter. C6.3 defines this terminal wait behaviour. Genuine network/token retry budgets remain independent, and there is no post-commit replay.
-
-Policy schema 2 records conservative aliases for schema-1 Codex `:agent:` hashes. Legacy locks survive independent-root correction and takeover; only an explicit override changes that intent. Discretionary budgets include all recent group moves, while pool budgets count discretionary provider moves. Cost/unknown state is rechecked before choice and after marks. The shared atomic writer uses owner-only files and durable replace; an uncertain policy-write failure retires that process's policy writer and rejects further dispatch until restart rather than serving an older revision.
-
-`routing.forecast_shadow` defaults false. If enabled, at most 1,024 account/window series hold 32 numeric observations each; only canonical 5h/7d/30d account windows are supported. Freshness is 300 s, minimum five observations over 120 s, and reset scenarios require a horizon at most 900 s and no longer than the observed span. Reset, rollback, plan/model/load changes invalidate history. In-flight/unattributed new demand prevents capacity certification. Bands are uncalibrated empirical scenarios (half the minimum recent rate to twice the maximum plus quantization margin), never a probability guarantee. A separate 120 s boundary comparison counts observed coverage only when the next sample arrives within 15 s of the boundary. They are exposed only in authenticated diagnostics, never used to relax gates, cool accounts, move existing groups or refuse work. No session-level percent attribution is claimed; external traffic is included. Existing 90/98% placement gates stay in force until future calibrated acceptance.
-
-The HTTP rate-wait budget starts on its first actual pacing wait or observed rate failure, not on an unrelated slow token/network retry. An open gate does not reject a request because an unused rate-wait deadline elapsed. Local unsent HTTP/WS-upgrade expiries expose `rate_wait_timeout` with `Retry-After`; their client-visible pressure is counted for overload placement without manufacturing quota cooling. For a generic 429, an accepted header observation that C5 actually persisted as applicable quota cooling is classified as quota recovery, using its causal deadline. A full meter with permitted, available paid credits is not alone a reason to change that classification.
-
-Project association and the current root anchor are persisted under the same binding mutation gate. Project-only edits preserve inherited legacy explicit locks; empty edits are rejected. All WS client data writes, including unclassified large messages, must pass current dispatch authority. Fresh placements and moves are not warm until their final dispatch admission is recorded; a drained destination rejects an unaccepted placement. Only an already accepted placement may continue on its draining account. Restored groups and child-only observations retain unknown full-context cost until a complete root input is known. Streaming prefix byte counts never stand in for full-input size. Target reservation uses the same C7 reset/cohort ordering as final selection.
-
-Dispatch admission receipts identify a live placement epoch, not just its account ID: stale A→B→A completions cannot warm the new A placement. Ledger accounting never grants admission. Legacy alias copies preserve stable movement IDs so shared pool counts do not duplicate history, while separate real moves remain distinct. Pacing timeouts that send nothing consume no release slot. Full HTTP input-cost proof excludes `previous_response_id` continuations and incomplete/unclassified prefixes; unknown input stays conservative. WS create metadata is field-order independent and input trees are skipped without materializing them. All unclassified client data still crosses pacing/current-model authority, and any unclassified upstream data forwarded during a turn conservatively prevents later automatic replay.
-
-A strict legacy recovery cannot treat a malformed/schema-invalid/duplicate-key binding snapshot as a first placement. Startup refuses while retaining the failed snapshot, so a repeated start cannot bypass the refusal by quarantine. Ordinary non-strict disposable binding recovery retains its existing quarantine behaviour. Binding additions, writes and imports share a 40,000-key hard ceiling and a conservative 16MiB restore-size bound; active/pinned groups are preserved by refusing unsafe growth. The normal 20,000-key LRU remains the soft capacity.
-
-Only explicitly recognized WS control events (`metadata`, `codex.rate_limits`) stay pre-commit. Unclassified application data, including small JSON objects/arrays/strings and unknown types, conservatively commits sent turns. Publication or terminal delivery cancels queued retries, and each retry/redial checks shared cancellation immediately before writing. Model-unknown WS data dispatch checks model-scoped cooling in the same latest account read as other eligibility; upgrade handshake eligibility remains separate.
-
-Persisted routing and binding JSON reject duplicate object keys recursively before schema migration; duplicate fields/map IDs cannot use last-key-wins to replace a lock. Strict recovery and takeover import also reject inconsistent root/child account groups before any group is discarded; a rejected import preserves the prior in-memory table. Unregistered response IDs cannot authorize replay: published application data commits sent turns conservatively without falsely completing them. Restore bounds use exact escaped identifier lengths, preserve ordinary 20,000-entry legacy snapshots, and retain an over-capacity legacy file rather than quarantining it as corrupt.
-
-Strict anchor recovery groups evidence by its effective policy ID, including schema-1 Codex aliases. Conflicting accounts for an unanchored strict policy refuse recovery before construction of an auto-flushing table. Schema-2 independent Codex keys retain independent anchors. Idle takeover import reloads the latest policy before decoding/capturing the incoming bindings under its mutation gate; conflicts leave the previous table and source files intact.
-
-
-Routing intent persistence keeps an owner-only `routing-policies.fence.json` containing the canonical state revision and digest. Intent writes persist the next fence before replacing the policy. A missing policy or mismatched generation refuses startup/reload and preserves evidence; a failed import remains dispatch-blocked until successful recovery. Pre-fence policy files are adopted once. A crash between the two writes fails closed rather than accepting the older policy. Reload also refuses revision regression or different content at the same revision. This protects partial file loss/rollback; an owner who deletes or rewinds both files is outside this integrity boundary. Takeover import executes on a blocking worker before listeners start.
