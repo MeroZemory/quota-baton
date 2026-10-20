@@ -427,3 +427,40 @@ These come from the R8 B/C merge review (`.sandbox/reviews/R8-BC-merge-review-20
 - **Forced moves are placements.** A group moved off an ineligible account (C5) is a placement on its new account. It takes the charge, and target choice applies the cap. The cap is never a refusal, so a forced move always proceeds when any eligible account exists.
 - **Polls.** When the placement-poll budget refuses a poll, the regular poll schedule still runs.
 - **Config bounds.** A value outside its bounds logs a `core_warning` and is clamped. It never refuses startup. Unknown keys are ignored with a warning, in every table.
+
+## D21. codex-qb keeps a separate Codex home; existing sessions are brought in by hardlink import, automatically on resume — Accepted (user direction, 2026-10-21)
+
+**User direction (quoted).** "기존폴더에서 찾아 자동으로 가져온뒤 여는 기능을 넣죠. 복사도 안하고요". Before that the user had asked whether codex-qb can share conversations with the normal `codex` at all.
+
+**Problem.** `codex-qb` runs Codex with `CODEX_HOME=~/.codex-acct/qb` (R3). That home holds the qb base URL and an API-key auth.json carrying the qb client key. Codex keeps settings, login, rollouts, thread state and goals in one home, so sessions started with `codex`, `codex-mz` and the like are invisible to `codex-qb`. `claude-qb` has no such problem: Claude Code accepts `--settings` per process, so it shares `~/.claude` (R3).
+
+**Options studied** (`.sandbox/research/codex-shared-home-qb.md`, a Codex 0.163 source read with file:line citations):
+
+1. **Shared home with a custom provider id (`qb`).**
+   - **How it would work.** The process uses `-c model_provider=qb` with `model_providers.qb.env_key` holding the client key. Auth works per process, and the home's auth.json stays untouched.
+   - **Rejected.** Codex records the active provider on a thread when it resumes it.
+     - **Provider flip.** A thread resumed once in codex-qb becomes provider `qb`. The normal `codex` then hides it from its picker and fails to resume it by UUID ("Model provider `qb` not found").
+     - **Split picker.** codex-qb's picker shows only threads whose provider is `qb`.
+   - **Other costs.** The approach also depends on Codex internals: the `name=="OpenAI"` behaviour switches, request compression and the picker filter. Those can change in any Codex release.
+2. **Shared home keeping the provider id `openai`.**
+   - **Rejected.** The TUI has no per-process API-key override (`CODEX_API_KEY` is honoured by `exec` only), and built-in provider ids cannot be redefined.
+   - **What it would cost.** It would mean sending the home's ChatGPT token to qb, routing ChatGPT-only request paths through qb, and changing qb's client-auth contract (C3, C11).
+3. **Separate home plus import (chosen).**
+   - **Why it works.** The qb home already uses the built-in `openai` provider, with `openai_base_url` and API-key auth. An imported thread therefore keeps provider `openai`.
+   - **Hardlinks, no copies.** The rollout files are hardlinked, so the import copies nothing and costs no disk space. Appends made in either home are visible in both.
+   - **Two-way.** The session can go back to `codex-mz resume <id>`.
+   - **Import contents.** Only the thread metadata rows and the goal row are copied into the qb home's databases (R9).
+
+**Decision.**
+- **No copies.** `codex-qb` keeps its separate home. Rollouts are never copied; they are hardlinked. A cross-volume source is refused rather than copied.
+- **Auto-import.** `codex-qb resume <uuid>` imports a thread that is missing from the qb home before it starts Codex. It searches `~/.codex`, `~/.codex-acct/*` and Orca homes, prints one Korean line naming the source home, and refuses a live session with the reason.
+- **Manual and bulk import.** `quota-baton sessions import` supports both, with a dry run by default, a journal and `unimport`.
+- **Provider check.** A thread whose provider is not `openai` is refused.
+
+**Open risk, under study.** One session reachable from two homes must not run in both at once. Two things are not yet confirmed from the source (`.sandbox/research/codex-session-concurrency.md`):
+- whether Codex locks a running session;
+- whether any Codex path rewrites a rollout by rename, which would silently break the hardlink.
+
+R9 must follow that study's findings.
+
+**Do not revisit without new evidence.** The shared-home options above were rejected on source evidence (Codex 0.163). Re-open them only if a Codex release lets resume keep a thread's provider, or adds a per-process auth override for the TUI.
