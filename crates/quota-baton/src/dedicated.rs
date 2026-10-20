@@ -1615,7 +1615,7 @@ fn upgrade_completed(
     m: &mut Manifest,
     apply: bool,
     force: bool,
-    command_updated: bool,
+    command_update: Option<CommandRecord>,
 ) -> Result<Report> {
     upgrade_directories(m)?;
     // Title upgrades do not reinstall the other objects, but still enforce
@@ -1712,11 +1712,12 @@ fn upgrade_completed(
             }
         }
     }
-    if command_updated {
+    if let Some(command) = command_update {
         report.summary.push(CLAUDE_UPDATED.into());
         if apply {
             // Persist only after every upgrade preflight succeeds, even when
             // all owned launcher/settings bytes are already current.
+            m.command = Some(command);
             atomic_json(&paths.journal(), m)?;
         }
     }
@@ -1959,9 +1960,6 @@ pub(super) fn wire(
             .transpose()?
             .flatten();
         let command_updated = command_update.is_some();
-        if let Some(command) = command_update {
-            old.command = Some(command);
-        }
         if !old.retained {
             if old
                 .entries
@@ -1975,7 +1973,7 @@ pub(super) fn wire(
                 if apply {
                     validate_resume_inputs(paths, &options, &old)?;
                 }
-                return upgrade_completed(paths, &mut old, apply, options.force, command_updated);
+                return upgrade_completed(paths, &mut old, apply, options.force, command_update);
             }
             let mut report = Report {
                 summary: vec!["요약: 기존 journal에서 연결을 재개합니다".into()],
@@ -1986,10 +1984,14 @@ pub(super) fn wire(
             }
             if apply {
                 validate_resume_inputs(paths, &options, &old)?;
-                if command_updated {
+                // Keep the old observation through all existing install checks
+                // and recovery writes. Failed/interrupted resumes must still
+                // detect the update and show its notice on the next retry.
+                install(paths, &mut old)?;
+                if let Some(command) = command_update {
+                    old.command = Some(command);
                     atomic_json(&paths.journal(), &old)?;
                 }
-                install(paths, &mut old)?;
             }
             report.warnings.extend(scratch_warnings(&old));
             return Ok(report);
@@ -4786,6 +4788,60 @@ trusted_hash = "synthetic-hook-hash"
                 assert!(r32_run(&p, apply, true).is_err(), "accepted {case}");
                 assert_eq!(fs::read(p.journal()).unwrap(), journal);
             }
+        }
+    }
+
+    #[test]
+    fn r8_claude_partial_resume_self_update_collision_preserves_journal() {
+        for force in [false, true] {
+            let (_dir, p) = fixture();
+            let home = claude_home(&p).unwrap();
+            INTERRUPT.with(|slot| *slot.borrow_mut() = Some((home.clone(), "after-publish")));
+            assert!(r32_run(&p, true, false).is_err());
+            assert_eq!(manifest(&p).install_completed, Some(false));
+            let original_id = identity(&home).unwrap();
+            let held = home.with_extension("original-held");
+            fs::rename(&home, &held).unwrap();
+            fs::create_dir(&home).unwrap();
+            let marker = home.join("unowned.txt");
+            fs::write(&marker, "preserve substitute").unwrap();
+            let substitute_id = identity(&home).unwrap();
+            assert_ne!(substitute_id, original_id);
+            let command = p.claude_command.as_ref().unwrap();
+            fs::write(command, "synthetic-updated-Claude-never-executed").unwrap();
+            let journal = fs::read(p.journal()).unwrap();
+            let before = resume_snapshot(&p);
+            let dry = r32_run(&p, false, force).unwrap();
+            assert!(output(&dry).contains(CLAUDE_UPDATED));
+            assert_eq!(fs::read(p.journal()).unwrap(), journal);
+            assert_eq!(resume_snapshot(&p), before);
+            assert!(r32_run(&p, true, force).is_err());
+            assert_eq!(fs::read(p.journal()).unwrap(), journal);
+            assert_eq!(resume_snapshot(&p), before);
+            assert_eq!(identity(&home).unwrap(), substitute_id);
+            assert_eq!(identity(&held).unwrap(), original_id);
+            assert_eq!(fs::read_to_string(&marker).unwrap(), "preserve substitute");
+            let substitute = home.with_extension("substitute-held");
+            fs::rename(&home, &substitute).unwrap();
+            fs::rename(&held, &home).unwrap();
+            let dry = r32_run(&p, false, force).unwrap();
+            assert!(output(&dry).contains(CLAUDE_UPDATED));
+            assert_eq!(fs::read(p.journal()).unwrap(), journal);
+            let resumed = r32_run(&p, true, force).unwrap();
+            assert!(output(&resumed).contains(CLAUDE_UPDATED));
+            let m = manifest(&p);
+            assert_eq!(m.install_completed, Some(true));
+            let record = m.command.as_ref().unwrap();
+            assert_eq!(record.hash, hash_file(command).unwrap());
+            assert_eq!(record.identity, identity(command).unwrap());
+            assert_eq!(identity(&home).unwrap(), original_id);
+            assert!(!output(&r32_run(&p, true, force).unwrap()).contains(CLAUDE_UPDATED));
+            super::unwire(&p, true, false).unwrap();
+            assert_eq!(identity(&substitute).unwrap(), substitute_id);
+            assert_eq!(
+                fs::read_to_string(substitute.join("unowned.txt")).unwrap(),
+                "preserve substitute"
+            );
         }
     }
 
