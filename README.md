@@ -3,6 +3,28 @@
 A local Windows proxy for subscription accounts used by Claude Code and Codex CLI.
 The implementation follows [the behavioural contract](docs/contract.md).
 
+## 권장 사용 방식: 기존 환경은 그대로 두고 전용 명령을 추가합니다
+
+quota-baton은 기존 `codex`·`claude` 설정을 바꾸지 않고 **전용 실행 명령**을 추가해서 쓰는 방식을 권장합니다.
+
+```powershell
+quota-baton.exe wire --codex-mode dedicated --claude-mode dedicated          # 미리보기
+quota-baton.exe wire --codex-mode dedicated --claude-mode dedicated --apply  # 적용
+```
+
+적용하면 `codex-qb`와 `claude-qb` 명령이 생깁니다. 이 두 명령으로 시작한 세션만 quota-baton을 거칩니다. 기존 `codex`, `claude`, 계정별 실행 명령(예: `codex-mz`)과 설정 파일은 그대로 남습니다.
+
+기존 환경을 그대로 두는 이유는 다음과 같습니다.
+
+- **프록시 장애에 대비할 수 있습니다.** quota-baton 코어가 꺼지거나, 업데이트 중이거나, 오류가 나면 그 경로를 쓰는 세션은 모두 요청을 보내지 못합니다. 기존 명령이 살아 있으면 바로 그 명령으로 작업을 이어갈 수 있습니다.
+- **문제의 원인을 가를 수 있습니다.** 같은 작업을 기존 명령과 `-qb` 명령으로 각각 실행해 보면, 문제가 계정이나 서비스에 있는지 quota-baton에 있는지 바로 확인할 수 있습니다.
+- **되돌리기가 간단합니다.** `quota-baton.exe unwire --apply`는 quota-baton이 만든 전용 파일만 지웁니다. 기존 설정은 처음부터 바뀌지 않았으므로 따로 복구할 것이 없습니다.
+- **실행 중인 세션에 영향을 주지 않습니다.** 이미 열려 있는 세션, herdr 자동 재개, 다른 도구가 부르는 `codex`·`claude` 명령은 하나도 바뀌지 않습니다.
+
+기본 설정 자체를 quota-baton으로 바꾸는 `--codex-mode default`, `--claude-mode default`는 전용 명령으로 충분히 써 본 뒤에만 고려하십시오. 자세한 설명은 [사용자 안내서의 클라이언트 설정 전환](docs/user-guide.md#클라이언트-설정-전환)에 있습니다.
+
+## Development
+
 Build and verify with Rust 1.93:
 
 ```powershell
