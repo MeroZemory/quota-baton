@@ -556,6 +556,7 @@ fn execute(
     Ok(())
 }
 
+#[cfg(not(test))]
 pub(super) fn run(store: &Store, id: &str, to: Option<&Path>, yes: bool) -> Result<()> {
     run_using(store, id, to, yes, &store.map_path, &mut |step| {
         super::checkpoint(store, id, &format!("return:{step}"))
@@ -884,7 +885,10 @@ mod tests {
                 }
                 Ok(())
             });
-            assert!(interrupted && result.is_err(), "missing checkpoint {point}");
+            assert!(
+                interrupted && result.is_err(),
+                "missing checkpoint {point}: {result:?}"
+            );
             if point != "committed" {
                 assert!(ensure_not_pending(&f.store, ID).is_err());
             }

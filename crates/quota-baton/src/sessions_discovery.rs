@@ -28,6 +28,10 @@ pub(crate) struct Rollout {
 pub(crate) struct Catalog {
     pub home: PathBuf,
     pub rollouts: BTreeMap<String, Rollout>,
+    pub aliases: Vec<Rollout>,
+    /// Compressed headers are not decoded by this metadata adapter. Their
+    /// presence prevents proving that the dependency inventory is complete.
+    pub compressed: Vec<PathBuf>,
     pub threads: BTreeMap<String, Vec<String>>,
 }
 
@@ -150,6 +154,8 @@ pub(crate) fn catalog(home: &Path) -> Result<Catalog> {
     let mut result = Catalog {
         home: home.clone(),
         rollouts: BTreeMap::new(),
+        aliases: Vec::new(),
+        compressed: Vec::new(),
         threads: BTreeMap::new(),
     };
     for top in ["sessions", "archived_sessions"] {
@@ -173,18 +179,32 @@ pub(crate) fn catalog(home: &Path) -> Result<Catalog> {
                     continue;
                 }
                 if path.extension().is_some_and(|s| s == "zst") {
+                    ensure!(
+                        result.compressed.len() < 100_000,
+                        "대화 파일이 너무 많습니다"
+                    );
+                    result.compressed.push(path);
                     continue;
                 }
                 let Some(physical) = physical_id(&path) else {
                     continue;
                 };
-                ensure!(result.rollouts.len() < 100_000, "대화 파일이 너무 많습니다");
+                ensure!(
+                    result.rollouts.len() + result.aliases.len() < 100_000,
+                    "대화 파일이 너무 많습니다"
+                );
                 let relative = path.strip_prefix(&base)?.to_owned();
                 let item = read_meta(&path, relative, physical.clone())?;
-                ensure!(
-                    !result.rollouts.contains_key(&physical),
-                    "같은 대화 기록 ID가 중복되어 있습니다"
-                );
+                if let Some(existing) = result.rollouts.get(&physical) {
+                    ensure!(
+                        crate::sessions_guard::identity(&existing.path)?
+                            == crate::sessions_guard::identity(&item.path)?
+                            && existing.thread == item.thread,
+                        "같은 대화 기록 ID가 중복되어 있습니다"
+                    );
+                    result.aliases.push(item);
+                    continue;
+                }
                 result
                     .threads
                     .entry(item.thread.clone())
@@ -198,6 +218,48 @@ pub(crate) fn catalog(home: &Path) -> Result<Catalog> {
 }
 
 impl Catalog {
+    /// Every discoverable name, including hardlink aliases of a physical segment.
+    pub(crate) fn all(&self) -> impl Iterator<Item = &Rollout> {
+        self.rollouts.values().chain(self.aliases.iter())
+    }
+
+    /// Header-only logical descendants, including children with no SQLite rows.
+    /// A history_base UUID identifies a physical segment, not a logical thread.
+    pub(crate) fn descendants(&self, id: &str) -> BTreeSet<String> {
+        let mut children: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        for item in self.all() {
+            let physical_parent = item
+                .history_base
+                .as_ref()
+                .and_then(|base| self.rollouts.get(base))
+                .map(|parent| parent.thread.as_str());
+            for parent in item
+                .forked_from
+                .as_deref()
+                .into_iter()
+                .chain(physical_parent)
+            {
+                if parent != item.thread {
+                    children.entry(parent).or_default().insert(&item.thread);
+                }
+            }
+        }
+        let root = id.to_ascii_lowercase();
+        let mut seen = BTreeSet::from([root.clone()]);
+        let mut pending = vec![root.clone()];
+        while let Some(parent) = pending.pop() {
+            if let Some(items) = children.get(parent.as_str()) {
+                for child in items {
+                    if seen.insert((*child).to_owned()) {
+                        pending.push((*child).to_owned());
+                    }
+                }
+            }
+        }
+        seen.remove(&root);
+        seen
+    }
+
     pub(crate) fn active(&self, id: &str) -> Result<&Rollout> {
         let choices = self
             .threads
@@ -211,9 +273,8 @@ impl Catalog {
             );
             let physical = physical_id(&path).context("대화 기록 경로 형식이 올바르지 않습니다")?;
             return self
-                .rollouts
-                .get(&physical)
-                .filter(|r| r.path == path && r.thread == id)
+                .all()
+                .find(|r| r.physical == physical && r.path == path && r.thread == id)
                 .context("대화 상태와 기록 경로가 다릅니다");
         }
         ensure!(
@@ -397,5 +458,63 @@ mod tests {
         for id in [A, B, C] {
             assert!(valid_id(id));
         }
+    }
+    #[cfg(windows)]
+    #[test]
+    fn hardlink_aliases_are_retained_and_database_can_select_an_alias() {
+        let home = home();
+        let original = write(home.path(), A, A, None, None, false);
+        let alias = home
+            .path()
+            .join("archived_sessions")
+            .join(original.file_name().unwrap());
+        fs::create_dir_all(alias.parent().unwrap()).unwrap();
+        fs::hard_link(&original, &alias).unwrap();
+        let found = catalog(home.path()).unwrap();
+        assert_eq!(found.rollouts.len(), 1);
+        assert_eq!(found.aliases.len(), 1);
+        assert_eq!(found.all().count(), 2);
+        assert_eq!(found.threads[A], [A]);
+        assert_eq!(found.chain(A).unwrap().len(), 1);
+        let selected = &found.aliases[0].path;
+        let db = rusqlite::Connection::open(home.path().join("state_5.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL);")
+            .unwrap();
+        db.execute(
+            "INSERT INTO threads VALUES(?1, ?2)",
+            rusqlite::params![A, selected.to_str().unwrap()],
+        )
+        .unwrap();
+        assert_eq!(
+            &catalog(home.path()).unwrap().active(A).unwrap().path,
+            selected
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn equal_bytes_with_different_file_identity_are_not_aliases() {
+        let home = home();
+        write(home.path(), A, A, None, None, false);
+        write(home.path(), A, A, None, None, true);
+        assert!(catalog(home.path()).is_err());
+    }
+
+    #[test]
+    fn descendants_follow_logical_forks_and_physical_bases_transitively_without_rows() {
+        let home = home();
+        write(home.path(), A, D, None, None, true);
+        write(home.path(), B, B, Some(D), None, false);
+        write(home.path(), C, C, None, Some(B), false);
+        let found = catalog(home.path()).unwrap();
+        assert_eq!(found.descendants(A), BTreeSet::from([B.into(), C.into()]));
+        assert_eq!(found.descendants(B), BTreeSet::from([C.into()]));
+        assert!(found.descendants(C).is_empty());
+        assert!(!home.path().join("state_5.sqlite").exists());
+        write(home.path(), A, D, None, Some(C), true);
+        assert_eq!(
+            catalog(home.path()).unwrap().descendants(A),
+            BTreeSet::from([B.into(), C.into()])
+        );
     }
 }

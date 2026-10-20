@@ -41,11 +41,12 @@ fn r81_console_probe() {
     let root = PathBuf::from(std::env::var_os("QB_R81_FIXTURE").unwrap());
     let mode = std::env::var("QB_R81_TITLE_MODE").unwrap();
     fs::write(root.join("initial-title"), title()).unwrap();
-    fs::write(
-        root.join("args.json"),
-        serde_json::to_vec(&std::env::args().collect::<Vec<_>>()).unwrap(),
-    )
-    .unwrap();
+    let mut args = std::env::args().collect::<Vec<_>>();
+    // The first separator belongs to this libtest transport. The remaining
+    // prefix is real managed admission: --no-daemon plus the free-form boundary.
+    assert_eq!(&args[5..8], ["--", "--no-daemon", "--"]);
+    drop(args.drain(5..8));
+    fs::write(root.join("args.json"), serde_json::to_vec(&args).unwrap()).unwrap();
     if mode == "own-script" {
         set_title(&format!(
             "{}\\npm\\codex.cmd - my-session",
@@ -114,6 +115,8 @@ fn r81_console_host() {
     )
     .unwrap();
     let mut child = Command::new(&launcher);
+    // Admit the existing quoting payload without making --skip a native option.
+    child.arg("--");
     for value in [
         "two words",
         "한글 ! ^ & (x)",
@@ -127,6 +130,8 @@ fn r81_console_host() {
     let status = child
         .current_dir(root.join("한글 project"))
         .env("USERPROFILE", root.join("profile"))
+        .env("HOME", root.join("profile"))
+        .env("CODEX_HOME", root.join("profile/.codex-acct/qb"))
         .env(
             "APPDATA",
             root.join("AppData/Roaming")
@@ -135,8 +140,8 @@ fn r81_console_host() {
         )
         .env("SYNTHETIC_LABEL", "retained-label")
         .env("QB_R81_LITERAL", "must-not-expand")
-        // Deliberately invalid: launch-client must never open a core home.
-        .env("QB_HOME", root.join("nonexistent-home"))
+        // Admission reads this synthetic dedicated wiring; no core is started.
+        .env("QB_HOME", root.join("qb"))
         .status()
         .unwrap();
     fs::write(root.join("status"), status.code().unwrap().to_string()).unwrap();
@@ -173,21 +178,39 @@ fn r81_title_after_child_start_in_hidden_console() {
         let root = PathBuf::from(root.to_string_lossy().trim_start_matches(r"\\?\"));
         fs::create_dir(root.join("한글 project")).unwrap();
         fs::create_dir_all(root.join("AppData/Roaming/npm")).unwrap();
+        fs::create_dir_all(root.join("profile/.codex-acct/qb")).unwrap();
+        fs::create_dir_all(root.join("profile/AppData/Local")).unwrap();
+        fs::create_dir_all(root.join("temp")).unwrap();
+        fs::create_dir_all(root.join("qb/journal")).unwrap();
+        fs::write(root.join("qb/journal/wiring.json"), serde_json::to_vec(
+            &serde_json::json!({"schema":3,"mode":"dedicated","install_completed":true,"home":root.join("profile/.codex-acct/qb")})
+        ).unwrap()).unwrap();
         let exe = std::env::current_exe().unwrap();
         fs::write(root.join("AppData/Roaming/npm/codex.cmd"), format!(
-            "@echo off\r\necho shim>\"%QB_R81_FIXTURE%\\shim-ran\"\r\n\"{}\" --ignored --exact r81_console_probe --nocapture %*\r\nexit /b %errorlevel%\r\n", exe.display())).unwrap();
+            "@echo off\r\nif \"%~1\"==\"--version\" (echo codex-cli 0.163.0& exit /b 0)\r\necho shim>\"%QB_R81_FIXTURE%\\shim-ran\"\r\n\"{}\" --ignored --exact r81_console_probe --nocapture -- %*\r\nexit /b %errorlevel%\r\n", exe.display())).unwrap();
         if mode == "actual-node" {
             let script = root.join("AppData/Roaming/npm/node_modules/@openai/codex/bin/codex.js");
             fs::create_dir_all(script.parent().unwrap()).unwrap();
             fs::write(script, r#"const {spawnSync}=require('node:child_process');
-const result=spawnSync(process.env.QB_R81_PROBE,['--ignored','--exact','r81_console_probe','--nocapture',...process.argv.slice(2)],{stdio:'inherit'});
+const args=process.argv.slice(2);
+if(args.length===1 && args[0]==='--version'){process.stdout.write('codex-cli 0.163.0\n');process.exit(0);}
+const result=spawnSync(process.env.QB_R81_PROBE,['--ignored','--exact','r81_console_probe','--nocapture','--',...args],{stdio:'inherit'});
 process.exit(result.status ?? 1);
 "#).unwrap();
         }
-        let mut env: Vec<(String, String)> = ["SystemRoot", "ComSpec", "PATH", "TEMP", "TMP"]
+        let mut env: Vec<(String, String)> = ["SystemRoot", "ComSpec", "PATH"]
             .into_iter()
             .filter_map(|key| std::env::var(key).ok().map(|v| (key.into(), v)))
             .collect();
+        for key in ["TEMP", "TMP"] {
+            env.push((key.into(), root.join("temp").to_string_lossy().into_owned()));
+        }
+        env.push((
+            "LOCALAPPDATA".into(),
+            root.join("profile/AppData/Local")
+                .to_string_lossy()
+                .into_owned(),
+        ));
         if mode == "actual-node" {
             let system = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32");
             let path = std::env::join_paths([node_dir.as_ref().unwrap(), &system]).unwrap();

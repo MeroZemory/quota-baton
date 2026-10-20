@@ -45,6 +45,20 @@ pub(crate) fn friendly_error(error: &anyhow::Error) -> Option<String> {
         "확인 안내를 출력하지 못했습니다.",
         "확인 입력을 읽지 못해 취소했습니다.",
         "중단된 돌려보내기가 있습니다. sessions return으로 먼저 완료하세요",
+        "이 대화에서 갈라진 대화가 있습니다. 가족 이동을 지원하기 전에는 옮길 수 없습니다",
+        "조상 전용 대화의 모든 관리 재개 경로를 차단할 수 없어 이 대화의 이동을 거절합니다",
+        "대상 홈에 이미 조상 또는 대화 이름이 있습니다. 이동을 거절합니다",
+        "발견하지 못한 하드링크가 있습니다. doctor로 확인하세요",
+        "이동 기록과 현재 상태가 다릅니다. 증거를 보존했습니다. doctor로 확인하세요",
+        "미완료 이동이 있습니다. sessions recover로 먼저 복구하세요",
+        "조상 전용 또는 고아 대화가 있어 관리 실행을 거절합니다. doctor로 확인하세요",
+        "이 대화는 다른 홈이 소유합니다. 원래 홈에서 재개하세요",
+        "대화 소유권과 목록이 다릅니다. doctor로 확인하세요",
+        "이동 중 갈라진 대화가 나타나 원본으로 되돌렸습니다",
+        "압축된 대화의 후손 관계를 확인할 수 없어 이동을 거절합니다. doctor로 확인하세요",
+        "하나의 파일에 서로 다른 물리 대화 ID가 있어 이동을 거절합니다",
+        "서로 다른 볼륨에는 하드링크로 대화를 옮길 수 없습니다",
+        "압축된 대화의 소유권을 확인할 수 없어 관리 실행을 거절합니다. doctor로 확인하세요",
     ];
     let message = error.to_string();
     FIXED.contains(&message.as_str()).then_some(message)
@@ -97,6 +111,8 @@ pub(crate) enum SessionsCommand {
         apply: bool,
         #[arg(long)]
         force: bool,
+        #[arg(long)]
+        yes: bool,
     },
     #[command(about = "qb의 현재 대화를 계정 홈으로 돌려보냅니다")]
     Return {
@@ -106,6 +122,8 @@ pub(crate) enum SessionsCommand {
         #[arg(long)]
         yes: bool,
     },
+    #[command(about = "중단된 대화 이동을 안전한 방향으로 복구합니다")]
+    Recover { id: String },
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -690,7 +708,7 @@ fn preview(id: &str, files: &[discovery::Rollout], target: &Path) -> Result<()> 
         }
     }
     crate::print_stdout(format_args!(
-        "move는 원본의 대화 항목을 제거합니다. 다른 대화가 참조하는 기록 이름은 남깁니다."
+        "move는 원본 이름과 대화 항목을 제거합니다. 다른 대화에 필요한 기록의 이동은 거절합니다."
     ))?;
     crate::print_stdout(format_args!("돌려보내기: quota-baton sessions return {id}"))?;
     crate::print_stdout(format_args!("계속하기: codex-qb resume {id}"))?;
@@ -925,8 +943,30 @@ pub(crate) fn run(home: &Path, command: SessionsCommand) -> Result<()> {
             ))?;
             Ok(())
         }
-        SessionsCommand::Unimport { id, apply, force } => unimport(&store, &id, apply, force),
-        SessionsCommand::Return { id, to, yes } => returning::run(&store, &id, to.as_deref(), yes),
+        SessionsCommand::Unimport {
+            id,
+            apply,
+            force,
+            yes,
+        } => {
+            if staged::recorded(&store, &id)? {
+                if staged::pending(&store)? {
+                    ensure!(
+                        apply,
+                        "미완료 이동은 sessions recover로 복구하세요. 미리보기에서는 변경하지 않습니다"
+                    );
+                    staged::recover(&store, &id)
+                } else {
+                    staged::return_current(&store, &id, None, yes, apply)
+                }
+            } else {
+                unimport(&store, &id, apply, force)
+            }
+        }
+        SessionsCommand::Return { id, to, yes } => {
+            staged::return_current(&store, &id, to.as_deref(), yes, true)
+        }
+        SessionsCommand::Recover { id } => staged::recover(&store, &id),
     }
 }
 
@@ -945,6 +985,9 @@ fn import_one(
     id: &str,
     options: ImportOptions,
 ) -> Result<bool> {
+    if !options.keep_source {
+        return staged::import(store, catalog, id, options);
+    }
     import_one_using(store, catalog, id, options, |a, b| fs::hard_link(a, b))
 }
 
@@ -1519,11 +1562,20 @@ fn resume_entry<'a>(journal: &'a Journal, id: &str) -> Result<Option<&'a Import>
 }
 
 pub(crate) fn before_codex_resume(args: &[OsString]) -> Result<()> {
+    admission_check(&qb_core::home()?)?;
     let Some(id) = resume_uuid(args)? else {
         return Ok(());
     };
     let id = id.as_str();
     let store = Store::open(&qb_core::home()?)?;
+    let previous_owner = staged::owner(&store, id)?;
+    if previous_owner.as_ref() == Some(&store.target) {
+        ensure!(
+            db::thread_path(&store.target, id)?.is_some(),
+            "대화 소유권과 목록이 다릅니다. doctor로 확인하세요"
+        );
+        return Ok(());
+    }
     returning::ensure_not_pending(&store, id)?;
     let journal = store.load()?;
     if let Some(entry) = resume_entry(&journal, id)?
@@ -1555,7 +1607,13 @@ pub(crate) fn before_codex_resume(args: &[OsString]) -> Result<()> {
         .map(PathBuf::from)
         .context("사용자 홈 경로가 없습니다")?;
     let mut matches = Vec::new();
-    for home in known_homes(&user) {
+    let mut candidates = known_homes(&user);
+    if let Some(owner) = previous_owner
+        && !candidates.contains(&owner)
+    {
+        candidates.push(owner);
+    }
+    for home in candidates {
         if fs::canonicalize(&home).ok().as_ref() == Some(&store.target) {
             continue;
         }
@@ -1636,5 +1694,94 @@ pub(crate) fn before_codex_resume(args: &[OsString]) -> Result<()> {
 #[path = "sessions_tests.rs"]
 mod tests;
 
+#[path = "sessions_return_compat.rs"]
+mod return_compat;
+#[cfg(test)]
 #[path = "sessions_return.rs"]
 mod returning;
+#[cfg(not(test))]
+use return_compat as returning;
+
+#[path = "sessions_doctor.rs"]
+mod doctor_impl;
+#[path = "sessions_move.rs"]
+mod staged;
+
+pub(crate) fn doctor(home: &Path) -> Result<()> {
+    doctor_impl::run(&Store::open(home)?)
+}
+
+pub(crate) fn admission_check(home: &Path) -> Result<()> {
+    let dir = home.join("journal/session-moves");
+    guard::safe_path(home, &dir)?;
+    if dir.exists() {
+        for entry in fs::read_dir(&dir)? {
+            let path = entry?.path();
+            guard::safe_path(home, &path)?;
+            ensure!(
+                fs::metadata(&path)?.len() < 64 * 1024 * 1024,
+                "이동 journal이 잘못되었습니다"
+            );
+            let value: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+            ensure!(
+                value["schema"] == 2 && value["open"].as_bool() == Some(false),
+                "미완료 이동이 있습니다. sessions recover로 먼저 복구하세요"
+            );
+        }
+    }
+    let journal = home.join("journal");
+    if journal.exists() {
+        for entry in fs::read_dir(&journal)? {
+            let path = entry?.path();
+            if let Some(name) = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_prefix("sessions-return-"))
+                .and_then(|n| n.strip_suffix(".json"))
+            {
+                let stub = Store {
+                    home: home.to_owned(),
+                    target: home.to_owned(),
+                    search_homes: Vec::new(),
+                    map_path: home.join("unused"),
+                };
+                return_compat::ensure_not_pending(&stub, name)?;
+            }
+        }
+    }
+    if !home.join("journal/wiring.json").exists() {
+        ensure!(
+            !home.join("journal/sessions-import.json").exists() && !dir.exists(),
+            "전용 Codex 홈 연결이 없습니다. 먼저 wire를 실행하세요"
+        );
+        return Ok(());
+    }
+    let store = Store::open(home)?;
+    ensure!(
+        !staged::pending(&store)?,
+        "미완료 이동이 있습니다. sessions recover로 먼저 복구하세요"
+    );
+    let legacy = store.load()?;
+    ensure!(
+        legacy.imports.values().all(|i| i.complete),
+        "대화 가져오기가 완료되지 않았습니다"
+    );
+    for id in legacy.imports.keys() {
+        returning::ensure_not_pending(&store, id)?;
+    }
+    let catalog = discovery::catalog(&store.target)
+        .map_err(|_| anyhow::anyhow!("대화 소유권과 목록이 다릅니다. doctor로 확인하세요"))?;
+    ensure!(
+        catalog.compressed.is_empty(),
+        "압축된 대화의 소유권을 확인할 수 없어 관리 실행을 거절합니다. doctor로 확인하세요"
+    );
+    let rows: BTreeSet<_> = db::threads(&store.target)?
+        .into_iter()
+        .map(|t| t.id)
+        .collect();
+    ensure!(
+        catalog.threads.keys().all(|id| rows.contains(id)),
+        "조상 전용 또는 고아 대화가 있어 관리 실행을 거절합니다. doctor로 확인하세요"
+    );
+    Ok(())
+}

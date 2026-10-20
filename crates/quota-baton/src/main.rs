@@ -12,6 +12,7 @@ mod launcher_label;
 mod launcher_script;
 mod routing_cli;
 mod sessions;
+mod sessions_admission;
 mod sessions_confirm;
 mod sessions_db;
 mod sessions_discovery;
@@ -48,6 +49,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    #[command(about = "대화 이동 기록과 홈의 상태를 검사합니다")]
+    Doctor,
     #[command(about = "기존 Codex 대화를 가져오거나 되돌립니다")]
     Sessions {
         #[command(subcommand)]
@@ -184,6 +187,9 @@ async fn main() {
 }
 
 fn friendly_error(error: &anyhow::Error) -> String {
+    if let Some(message) = sessions_admission::friendly_error(error) {
+        return message;
+    }
     if let Some(message) = sessions::friendly_error(error) {
         return message;
     }
@@ -369,18 +375,26 @@ async fn run() -> anyhow::Result<()> {
         args,
     } = &cli.command
     {
-        if matches!(client, launcher_label::Client::Codex) {
+        let (permit, child_args) = if matches!(client, launcher_label::Client::Codex) {
+            let home = qb_core::home()?;
+            sessions::admission_check(&home)?;
+            sessions_admission::preflight_launch(args, command)?;
             sessions::before_codex_resume(args)?;
-        }
-        std::process::exit(launcher_label::run(
-            *client,
-            command,
-            settings.as_deref(),
-            args,
-        )?);
+            let (permit, child_args) = sessions_admission::prepare_launch(args, command)?;
+            sessions::admission_check(&home)?;
+            (Some(permit), child_args)
+        } else {
+            (None, args.clone())
+        };
+        let status = launcher_label::run(*client, command, settings.as_deref(), &child_args);
+        // process::exit does not run destructors. The contained process tree
+        // has finished before we release admission on success or launch error.
+        drop(permit);
+        std::process::exit(status?);
     }
     let home = qb_core::home()?;
     match cli.command {
+        Command::Doctor => sessions::doctor(&home)?,
         Command::Sessions { command } => sessions::run(&home, command)?,
         Command::LaunchClient { .. } => {
             unreachable!("launcher handled before core home resolution")
