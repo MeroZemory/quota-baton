@@ -415,15 +415,15 @@ impl Config {
 }
 
 fn config_warning(code: &'static str, path: &str) {
-    if tracing::dispatcher::has_been_set() {
-        tracing::warn!(
-            event = "core_warning",
-            code,
-            config_key = path,
-            "Configuration adjusted"
-        );
+    let message = if code == "unknown_config_key" {
+        "Unknown configuration key"
     } else {
-        eprintln!("WARN core_warning {code}: {path}");
+        "Configuration adjusted"
+    };
+    if tracing::dispatcher::has_been_set() {
+        tracing::warn!(event = "core_warning", code, config_key = path, "{message}");
+    } else {
+        eprintln!("WARN core_warning {code}: {message}: {path}");
     }
 }
 
@@ -552,6 +552,26 @@ future = true
             text
         );
     }
+    #[test]
+    fn unsigned_schema_bounds_clamp_ports_guards_and_tray_without_rewriting() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/config-clamp-tests");
+        fs::create_dir_all(&root).unwrap();
+        let home = tempfile::tempdir_in(root).unwrap();
+        let text = "[server]\ndata_port=-1\nadmin_port=99999\ndrain_timeout_secs=-1\n[guard]\nretain_max_per_request_mib=-1\ninflight_budget_mib=-1\nmemory_hard_limit_mib=-1\n[tray]\nburst_new_sessions=-1\n";
+        fs::write(home.path().join("config.toml"), text).unwrap();
+        let config = Config::load(home.path()).unwrap();
+        assert_eq!(config.server.data_port, 0);
+        assert_eq!(config.server.admin_port, u16::MAX);
+        assert_eq!(config.server.drain_timeout_secs, 0);
+        assert_eq!(config.guard.retain_max_per_request_mib, 0);
+        assert_eq!(config.guard.inflight_budget_mib, 0);
+        assert_eq!(config.guard.memory_hard_limit_mib, 0);
+        assert_eq!(config.tray.burst_new_sessions, 0);
+        assert_eq!(
+            fs::read_to_string(home.path().join("config.toml")).unwrap(),
+            text
+        );
+    }
 }
 
 // Normalize numbers before deserializing unsigned fields: negative TOML integers
@@ -569,6 +589,13 @@ fn clamp_numeric_bounds(value: &mut toml::Value) -> Vec<String> {
     }
     let mut changed = Vec::new();
     for (path, min, max) in [
+        ("server.data_port", 0, u16::MAX as i64),
+        ("server.admin_port", 0, u16::MAX as i64),
+        ("server.drain_timeout_secs", 0, MAX_INTERVAL),
+        ("guard.retain_max_per_request_mib", 0, i64::MAX),
+        ("guard.inflight_budget_mib", 0, i64::MAX),
+        ("guard.memory_hard_limit_mib", 0, i64::MAX),
+        ("tray.burst_new_sessions", 0, u32::MAX as i64),
         ("routing.weak_evidence_new_sessions", 1, 1000),
         ("routing.placement_poll_after_secs", 1, MAX_INTERVAL),
         ("routing.placement_poll_min_interval_secs", 1, MAX_INTERVAL),

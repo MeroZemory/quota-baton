@@ -630,6 +630,8 @@ Routing bounds: `request_timeout_secs` and `rate_hold_secs` are 1–600; `ws_upg
 
 An account's optional `spread_threshold` has the same minimum of 1 as the global threshold. Unspecified account thresholds continue to inherit the global value. Routing and WebSocket timer intervals without a tighter bound above are capped at 4294967295 seconds (over 136 years) so Windows and Chrono deadline arithmetic remains representable.
 
+Port numbers are 0–65535 (0 retains the existing ephemeral-port behavior). Server drain time is 0–4294967295 seconds. Guard MiB fields retain their unsigned minimum of 0, and the tray burst count is 0–4294967295. These schema bounds are normalized before unsigned deserialization too. Unknown-key warnings retain the text `Unknown configuration key` and additionally carry the stable `unknown_config_key` code.
+
 ```toml
 [server]
 data_port = 10200            # 10100 after cutover
