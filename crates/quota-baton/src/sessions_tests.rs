@@ -78,6 +78,7 @@ impl Fixture {
         db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY,rollout_path TEXT NOT NULL,model_provider TEXT NOT NULL,archived INTEGER DEFAULT 0); CREATE INDEX idx_thread_provider ON threads(model_provider);").unwrap();
         let goals = Connection::open(source.join("goals_1.sqlite")).unwrap();
         goals.execute_batch("CREATE TABLE thread_goals(thread_id TEXT PRIMARY KEY,objective TEXT NOT NULL,status TEXT NOT NULL,updated_at_ms INTEGER NOT NULL);").unwrap();
+        let map_path = root.path().join("herdr/session-homes.json");
         Self {
             _root: root,
             source,
@@ -85,6 +86,7 @@ impl Fixture {
                 home,
                 target,
                 search_homes: Vec::new(),
+                map_path,
             },
         }
     }
@@ -356,16 +358,27 @@ fn r9_interrupted_after_first_link_can_unimport_and_retry() {
 }
 
 #[test]
-fn r9_unimport_failure_is_not_reusable_and_can_finish_after_index_writer_exits() {
+fn r9_unimport_metadata_failure_is_not_reusable_and_can_finish_after_repair() {
     let f = Fixture::new();
     f.add(A, None, false, "active");
     f.import(A, true).unwrap();
-    let index = f.store.target.join("session_index.jsonl");
-    let writer = OpenOptions::new().append(true).open(&index).unwrap();
+    let goals = Connection::open(f.store.target.join("goals_1.sqlite")).unwrap();
+    goals
+        .execute(
+            "UPDATE thread_goals SET objective='synthetic changed' WHERE thread_id=?1",
+            [A],
+        )
+        .unwrap();
     assert!(unimport(&f.store, A, true, false).is_err());
     assert!(!f.store.load().unwrap().imports[A].complete);
     assert!(f.import(A, true).is_err());
-    drop(writer);
+    goals
+        .execute(
+            "UPDATE thread_goals SET objective='SYNTHETIC PRIVATE OBJECTIVE' WHERE thread_id=?1",
+            [A],
+        )
+        .unwrap();
+    drop(goals);
     unimport(&f.store, A, true, false).unwrap();
     assert!(f.store.load().unwrap().imports.is_empty());
 }
@@ -517,7 +530,7 @@ fn r9_stale_copy_requires_explicit_cleanup_and_unimport_restores_it() {
     let mut f = Fixture::new();
     let old = Fixture::new();
     let current = f.add(A, None, false, "active");
-    let stale = old.add(A, None, false, "complete");
+    let stale = old.add(A, None, false, "active");
     File::options()
         .write(true)
         .open(&stale)
@@ -569,12 +582,12 @@ fn r9_stale_copy_requires_explicit_cleanup_and_unimport_restores_it() {
             |r| r.get::<_, String>(0)
         )
         .unwrap(),
-        "complete"
+        "active"
     );
 }
 
 #[test]
-fn r9_move_parent_refuses_until_children_moved_then_bulk_chain_restores() {
+fn r9_bulk_leaf_first_moves_chain_then_restores_each_root() {
     let f = Fixture::new();
     let parent = f.add(A, None, false, "active");
     let child = f.add(B, Some(A), false, "usage_limited");
@@ -587,10 +600,6 @@ fn r9_move_parent_refuses_until_children_moved_then_bulk_chain_restores() {
         keep_source: false,
         clean_stale: false,
     };
-    let error = import_one(&f.store, &catalog, A, options()).unwrap_err();
-    assert!(error.to_string().contains("자식 대화를 먼저"));
-    assert!(parent.exists() && child.exists() && leaf.exists());
-    assert!(f.store.load().unwrap().imports.is_empty());
     for id in [C, B, A] {
         import_one(&f.store, &catalog, id, options()).unwrap();
     }
@@ -654,7 +663,7 @@ fn r9_stale_cleanup_never_removes_an_unmoved_fork_ancestor() {
     let mut f = Fixture::new();
     let old = Fixture::new();
     let current = f.add(A, None, false, "active");
-    let stale = old.add(A, None, false, "complete");
+    let stale = old.add(A, None, false, "active");
     let child = old.add(B, Some(A), false, "active");
     File::options()
         .write(true)
@@ -664,7 +673,7 @@ fn r9_stale_cleanup_never_removes_an_unmoved_fork_ancestor() {
         .unwrap();
     f.store.search_homes = vec![old.source.clone()];
     let catalog = discovery::catalog(&f.source).unwrap();
-    let error = import_one(
+    import_one(
         &f.store,
         &catalog,
         A,
@@ -676,20 +685,19 @@ fn r9_stale_cleanup_never_removes_an_unmoved_fork_ancestor() {
             clean_stale: true,
         },
     )
-    .unwrap_err();
-    assert!(error.to_string().contains("--clean-stale 없이"));
-    assert!(current.exists() && stale.exists() && child.exists());
-    assert!(f.store.load().unwrap().imports.is_empty());
-    assert_eq!(db::threads(&old.source).unwrap().len(), 2);
+    .unwrap();
+    assert!(!current.exists() && stale.exists() && child.exists());
+    assert!(f.store.load().unwrap().imports[A].complete);
+    assert_eq!(db::threads(&old.source).unwrap().len(), 1);
 }
 
 #[test]
-fn r9_move_refreshes_dependencies_after_initial_catalog_capture() {
+fn r9_move_refreshes_dependencies_and_retains_late_child_ancestor_name() {
     let f = Fixture::new();
     let parent = f.add(A, None, false, "active");
     let cached = discovery::catalog(&f.source).unwrap();
     let child = f.add(B, Some(A), false, "active");
-    let error = import_one(
+    import_one(
         &f.store,
         &cached,
         A,
@@ -701,10 +709,19 @@ fn r9_move_refreshes_dependencies_after_initial_catalog_capture() {
             clean_stale: false,
         },
     )
-    .unwrap_err();
-    assert!(error.to_string().contains("자식 대화를 먼저"));
+    .unwrap();
     assert!(parent.exists() && child.exists());
-    assert!(f.store.load().unwrap().imports.is_empty());
+    assert!(db::thread_path(&f.source, A).unwrap().is_none());
+    assert!(db::thread_path(&f.source, B).unwrap().is_some());
+    assert!(db::thread_path(&f.store.target, A).unwrap().is_some());
+    assert!(db::thread_path(&f.store.target, B).unwrap().is_none());
+    assert!(discovery::catalog(&f.source).unwrap().chain(B).is_ok());
+    assert!(
+        f.store.load().unwrap().imports[A]
+            .files
+            .iter()
+            .all(|link| link.retained_ancestor)
+    );
 }
 
 #[test]
@@ -728,7 +745,7 @@ fn r9_paginated_stale_rows_deleted_before_rename_recover_from_journal() {
     let mut f = Fixture::new();
     let old = Fixture::new();
     f.add(A, None, false, "active");
-    let first = old.add(A, None, false, "complete");
+    let first = old.add(A, None, false, "active");
     let second = first
         .parent()
         .unwrap()
@@ -737,6 +754,29 @@ fn r9_paginated_stale_rows_deleted_before_rename_recover_from_journal() {
     meta["payload"]["history_base"] =
         serde_json::json!({"thread_id":A,"end_ordinal_exclusive":5,"end_byte_offset":100});
     fs::write(&second, format!("{meta}\n")).unwrap();
+    let current = discovery::catalog(&f.source)
+        .unwrap()
+        .active(A)
+        .unwrap()
+        .path
+        .clone();
+    let current_second = current.parent().unwrap().join(second.file_name().unwrap());
+    fs::write(&current_second, format!("{meta}\n")).unwrap();
+    File::options()
+        .write(true)
+        .open(&current_second)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(300)))
+        .unwrap();
+    let current_db = Connection::open(f.source.join("state_5.sqlite")).unwrap();
+    current_db
+        .execute(
+            "UPDATE threads SET rollout_path=?1 WHERE id=?2",
+            rusqlite::params![current_second.to_str().unwrap(), A],
+        )
+        .unwrap();
+    drop(current_db);
+
     for file in [&first, &second] {
         File::options()
             .write(true)
@@ -780,4 +820,90 @@ fn r9_paginated_stale_rows_deleted_before_rename_recover_from_journal() {
         2
     );
     assert!(f.store.load().unwrap().imports.is_empty());
+}
+
+#[test]
+fn r9_inventory_refuses_different_content_or_goal_without_timestamp_selection() {
+    for goal_conflict in [false, true] {
+        let mut f = Fixture::new();
+        let other = Fixture::new();
+        let original = f.add(A, None, false, "active");
+        let peer = other.add(
+            A,
+            None,
+            false,
+            if goal_conflict { "complete" } else { "active" },
+        );
+        if !goal_conflict {
+            OpenOptions::new()
+                .append(true)
+                .open(&peer)
+                .unwrap()
+                .write_all(b"{\"type\":\"synthetic_divergence\"}\n")
+                .unwrap();
+        }
+        File::options()
+            .write(true)
+            .open(&peer)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(600)),
+            )
+            .unwrap();
+        f.store.search_homes = vec![other.source.clone()];
+        let catalog = discovery::catalog(&f.source).unwrap();
+        let error = import_one(
+            &f.store,
+            &catalog,
+            A,
+            ImportOptions {
+                apply: true,
+                skip_existing: false,
+                announce: false,
+                keep_source: false,
+                clean_stale: true,
+            },
+        )
+        .unwrap_err();
+        assert!(error.downcast_ref::<InventoryConflict>().is_some());
+        let message = friendly_error(&error).unwrap();
+        assert!(
+            message.contains(&f.source.display().to_string())
+                && message.contains(&other.source.display().to_string())
+        );
+        assert!(!message.contains("SYNTHETIC PRIVATE"));
+        assert!(original.exists() && peer.exists());
+        assert!(f.store.load().unwrap().imports.is_empty());
+    }
+}
+
+#[test]
+fn r9_move_retires_identical_inventory_copies_and_restores_them_on_unimport() {
+    let mut f = Fixture::new();
+    let other = Fixture::new();
+    let original = f.add(A, None, false, "active");
+    let peer = other.add(A, None, false, "active");
+    f.store.search_homes = vec![other.source.clone()];
+    let catalog = discovery::catalog(&f.source).unwrap();
+    import_one(
+        &f.store,
+        &catalog,
+        A,
+        ImportOptions {
+            apply: true,
+            skip_existing: false,
+            announce: false,
+            keep_source: false,
+            clean_stale: false,
+        },
+    )
+    .unwrap();
+    assert!(!original.exists() && !peer.exists());
+    assert!(db::threads(&f.source).unwrap().is_empty());
+    assert!(db::threads(&other.source).unwrap().is_empty());
+    assert_eq!(db::threads(&f.store.target).unwrap().len(), 1);
+    unimport(&f.store, A, true, false).unwrap();
+    assert!(original.exists() && peer.exists());
+    assert_eq!(db::threads(&f.source).unwrap().len(), 1);
+    assert_eq!(db::threads(&other.source).unwrap().len(), 1);
 }

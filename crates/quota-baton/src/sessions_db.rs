@@ -27,9 +27,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 const STATE: &str = "state_5.sqlite";
 const GOALS: &str = "goals_1.sqlite";
+const DB_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
 
 // Exact official bodies from Codex state migrations 0025 and 0039 above.
 // SQLite omits the final semicolon in sqlite_schema; whitespace is normalized.
@@ -214,6 +216,10 @@ pub(crate) struct DbPlan {
     /// Exact same-home move/restore snapshot, never a transformed import plan.
     #[serde(default)]
     pub(crate) is_source_snapshot: bool,
+    /// Return copies current state verbatim, apart from the rollout path and
+    /// generated columns depending on it. Import-only normalization is disabled.
+    #[serde(default)]
+    pub(crate) preserve_current_state: bool,
     pub(crate) threads: Vec<ThreadPlan>,
 }
 
@@ -239,11 +245,42 @@ fn readonly(path: &Path) -> Result<Option<Connection>> {
     match path.try_exists()? {
         false => Ok(None),
         true => {
-            let db = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            let db = with_busy_timeout(Connection::open_with_flags(
+                &path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?)?;
             db.execute_batch("PRAGMA query_only=ON; BEGIN DEFERRED")?;
             Ok(Some(db))
         }
     }
+}
+
+fn with_busy_timeout(db: Connection) -> Result<Connection> {
+    db.busy_timeout(DB_BUSY_TIMEOUT)?;
+    Ok(db)
+}
+
+/// All homes must agree on the optional goal, excluding only updated_at_ms.
+/// Goal identity, creation time, status, objective, budgets, both usage counters
+/// and every unknown column remain exact. Missing-vs-present goals conflict.
+/// No goal values are emitted; callers retain the relevant writer guards when
+/// using this inventory decision to commit a move or return.
+pub(crate) fn compare_goal_state(homes: &[PathBuf], id: &str) -> Result<bool> {
+    let mut states = Vec::new();
+    for home in homes {
+        let db = readonly(&home.join(GOALS))?;
+        let row = db
+            .as_ref()
+            .map(|db| selected_row(db, "thread_goals", "thread_id", id))
+            .transpose()?
+            .flatten();
+        states.push(row.map(|row| {
+            let mut values = row.values;
+            values.remove("updated_at_ms");
+            values
+        }));
+    }
+    Ok(states.windows(2).all(|pair| pair[0] == pair[1]))
 }
 
 /// Convert only canonical Windows verbatim-disk prefixes for the local guard.
@@ -676,6 +713,27 @@ fn destination_file(path: &Path) -> Result<()> {
 }
 
 pub(crate) fn plan(source_home: &Path, target_home: &Path, ids: &[String]) -> Result<DbPlan> {
+    plan_with_mode(source_home, target_home, ids, false)
+}
+
+/// Read the authoritative home's CURRENT rows, never an old import snapshot.
+/// Preserve goal status, objective, counters and timestamps, and thread archive
+/// state. Map only rollout_path (and its generated dependents). Capture the
+/// root-only source_snapshot separately under the same guards before removal.
+pub(crate) fn plan_return(
+    source_home: &Path,
+    target_home: &Path,
+    ids: &[String],
+) -> Result<DbPlan> {
+    plan_with_mode(source_home, target_home, ids, true)
+}
+
+fn plan_with_mode(
+    source_home: &Path,
+    target_home: &Path,
+    ids: &[String],
+    preserve_current_state: bool,
+) -> Result<DbPlan> {
     ensure!(
         source_home.is_absolute() && target_home.is_absolute(),
         "metadata homes must be absolute"
@@ -752,14 +810,20 @@ pub(crate) fn plan(source_home: &Path, target_home: &Path, ids: &[String]) -> Re
                 row.values.contains_key("archived"),
                 "missing archived column"
             );
-            row.values.insert("archived".into(), DbValue::Integer(0));
+            if !preserve_current_state {
+                row.values.insert("archived".into(), DbValue::Integer(0));
+            }
             recompute_generated(
                 threads_schema.as_ref().context("missing threads schema")?,
                 "threads",
                 "id",
                 &id,
                 row,
-                &state_triggers,
+                if preserve_current_state {
+                    &[]
+                } else {
+                    &state_triggers
+                },
             )?;
             set_ownership(target_state.as_ref(), "threads", "id", &id, row)?;
         }
@@ -773,39 +837,41 @@ pub(crate) fn plan(source_home: &Path, target_home: &Path, ids: &[String]) -> Re
             .map(|row| field(row, "status").map(str::to_owned))
             .transpose()?;
         if let Some(row) = &mut goal {
-            if matches!(field(row, "status")?, "active" | "usage_limited") {
-                row.values.insert("status".into(), DbValue::text("paused"));
-            }
-            ensure!(
-                row.values.contains_key("updated_at_ms"),
-                "missing goal update timestamp"
-            );
-            row.values.insert(
-                "updated_at_ms".into(),
-                DbValue::Integer(chrono::Utc::now().timestamp_millis()),
-            );
-            recompute_generated(
-                goals_schema.as_ref().context("missing goals schema")?,
-                "thread_goals",
-                "thread_id",
-                &id,
-                row,
-                &[],
-            )?;
-            // A second fork can share an already imported ancestor. A timestamp
-            // refresh alone must not turn that identical logical goal into a
-            // collision or claim ownership of the first import's row.
-            if let Some(target) = &target_goals
-                && let Some(existing) = selected_row(target, "thread_goals", "thread_id", &id)?
-            {
-                let expected = goals_schema.as_ref().context("missing goals schema")?;
-                if expected
-                    .columns
-                    .iter()
-                    .filter(|(name, writable)| **writable && name.as_str() != "updated_at_ms")
-                    .all(|(name, _)| existing.values.get(name) == row.values.get(name))
+            if !preserve_current_state {
+                if matches!(field(row, "status")?, "active" | "usage_limited") {
+                    row.values.insert("status".into(), DbValue::text("paused"));
+                }
+                ensure!(
+                    row.values.contains_key("updated_at_ms"),
+                    "missing goal update timestamp"
+                );
+                row.values.insert(
+                    "updated_at_ms".into(),
+                    DbValue::Integer(chrono::Utc::now().timestamp_millis()),
+                );
+                recompute_generated(
+                    goals_schema.as_ref().context("missing goals schema")?,
+                    "thread_goals",
+                    "thread_id",
+                    &id,
+                    row,
+                    &[],
+                )?;
+                // A second fork can share an already imported ancestor. A timestamp
+                // refresh alone must not turn that identical logical goal into a
+                // collision or claim ownership of the first import's row.
+                if let Some(target) = &target_goals
+                    && let Some(existing) = selected_row(target, "thread_goals", "thread_id", &id)?
                 {
-                    row.values = existing.values;
+                    let expected = goals_schema.as_ref().context("missing goals schema")?;
+                    if expected
+                        .columns
+                        .iter()
+                        .filter(|(name, writable)| **writable && name.as_str() != "updated_at_ms")
+                        .all(|(name, _)| existing.values.get(name) == row.values.get(name))
+                    {
+                        row.values = existing.values;
+                    }
                 }
             }
             set_ownership(target_goals.as_ref(), "thread_goals", "thread_id", &id, row)?;
@@ -841,6 +907,7 @@ pub(crate) fn plan(source_home: &Path, target_home: &Path, ids: &[String]) -> Re
         state_bootstrap,
         goals_bootstrap,
         is_source_snapshot: false,
+        preserve_current_state,
         threads: selected,
     })
 }
@@ -918,6 +985,7 @@ pub(crate) fn source_snapshot(home: &Path, root_ids: &[String]) -> Result<DbPlan
         state_bootstrap,
         goals_bootstrap,
         is_source_snapshot: true,
+        preserve_current_state: false,
         threads: selected,
     })
 }
@@ -1011,7 +1079,7 @@ pub(crate) fn add_synthetic_thread(
         {
             Some(schema) => schema,
             None => {
-                let db = Connection::open_in_memory()?;
+                let db = with_busy_timeout(Connection::open_in_memory()?)?;
                 db.execute(MINIMUM_THREADS_DDL, [])?;
                 schema(&db, "threads")?.context("missing synthetic schema")?
             }
@@ -1034,7 +1102,7 @@ pub(crate) fn add_synthetic_thread(
             .all(|name| expected.columns.get(name) == Some(&true)),
         "unknown or generated synthetic field"
     );
-    let db = Connection::open_in_memory()?;
+    let db = with_busy_timeout(Connection::open_in_memory()?)?;
     db.execute_batch("PRAGMA foreign_keys=OFF")?;
     db.execute(&expected.ddl, [])?;
     let synthesis_objects = if let Some(target) = &target {
@@ -1174,7 +1242,7 @@ fn prepare_with_operational_rebase<'a>(
             } else {
                 OpenFlags::SQLITE_OPEN_CREATE
             };
-        let db = Connection::open_with_flags(local_path(path), flags)?;
+        let db = with_busy_timeout(Connection::open_with_flags(local_path(path), flags)?)?;
         // Preserve foreign-key columns without cloning referenced global tables;
         // disable cascades so exact-row removal cannot delete unrelated metadata.
         db.execute_batch("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE")?;
@@ -1261,12 +1329,12 @@ fn prepare_with_operational_rebase<'a>(
 pub(crate) fn apply(plan: &DbPlan) -> Result<()> {
     let pending = prepare(plan, false)?;
     for item in &pending {
-        // Exact source restoration must not let the official INSERT triggers
-        // rewrite an original legacy NULL/zero timestamp. Suspend only the
-        // allowlisted triggers, in this same transaction, and restore their
+        // Exact restoration and current-state return must not let official
+        // INSERT triggers rewrite a captured legacy NULL/zero timestamp.
+        // Suspend only the allowlisted triggers in this transaction, restoring their
         // original definitions before commit. Failed inserts roll back DDL too.
         let mut restore_triggers = Vec::new();
-        if plan.is_source_snapshot {
+        if plan.is_source_snapshot || plan.preserve_current_state {
             let mut has_missing = false;
             for (id, _) in &item.rows {
                 has_missing |= selected_row(&item.db, item.table, item.key, id)?.is_none();
@@ -1342,7 +1410,7 @@ fn recompute_generated(
     if schema.columns.values().all(|writable| *writable) && triggers.is_empty() {
         return Ok(());
     }
-    let db = Connection::open_in_memory()?;
+    let db = with_busy_timeout(Connection::open_in_memory()?)?;
     db.execute_batch("PRAGMA foreign_keys=OFF")?;
     db.execute(&schema.ddl, [])?;
     for trigger in triggers {
@@ -2297,6 +2365,194 @@ mod tests {
                 == current_goal.values
         );
         assert!(thread_path(&target, &ids[1])?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn goal_inventory_ignores_only_update_time_and_compares_all_semantic_fields() -> Result<()> {
+        let (_temp, source, target) = homes()?;
+        let ids = fixture(&source, &["active"])?;
+        let current = plan_return(&source, &target, &ids)?;
+        apply(&current)?;
+        let homes = vec![source.clone(), target.clone()];
+        assert!(compare_goal_state(&homes, &ids[0])?);
+        let target_goals = Connection::open(target.join(GOALS))?;
+        target_goals.execute("UPDATE thread_goals SET updated_at_ms=987654321", [])?;
+        assert!(compare_goal_state(&homes, &ids[0])?);
+        for change in [
+            "UPDATE thread_goals SET status='paused' WHERE thread_id=?1",
+            "UPDATE thread_goals SET objective='different synthetic objective' WHERE thread_id=?1",
+            "UPDATE thread_goals SET goal_id='another-goal' WHERE thread_id=?1",
+            "UPDATE thread_goals SET token_budget=1000 WHERE thread_id=?1",
+            "UPDATE thread_goals SET tokens_used=99 WHERE thread_id=?1",
+            "UPDATE thread_goals SET time_used_seconds=33 WHERE thread_id=?1",
+            "UPDATE thread_goals SET created_at_ms=42 WHERE thread_id=?1",
+            "UPDATE thread_goals SET future_goal=X'0304' WHERE thread_id=?1",
+        ] {
+            target_goals.execute(change, [&ids[0]])?;
+            assert!(!compare_goal_state(&homes, &ids[0])?);
+            target_goals.execute("DELETE FROM thread_goals WHERE thread_id=?1", [&ids[0]])?;
+            insert_row(
+                &target_goals,
+                "thread_goals",
+                current.goals_schema.as_ref().context("goal schema")?,
+                current.threads[0].goal.as_ref().context("goal snapshot")?,
+            )?;
+            assert!(compare_goal_state(&homes, &ids[0])?);
+        }
+        target_goals.execute("DELETE FROM thread_goals WHERE thread_id=?1", [&ids[0]])?;
+        assert!(!compare_goal_state(&homes, &ids[0])?);
+        assert!(compare_goal_state(&homes, "absent-id")?);
+        assert!(compare_goal_state(&[], &ids[0])?);
+        Ok(())
+    }
+
+    #[test]
+    fn goal_inventory_missing_home_is_read_only_and_differs_from_present_goal() -> Result<()> {
+        let (_temp, source, target) = homes()?;
+        let ids = fixture(&source, &["active"])?;
+        assert!(compare_goal_state(std::slice::from_ref(&target), &ids[0])?);
+        assert!(!compare_goal_state(&[source, target.clone()], &ids[0])?);
+        assert!(!target.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn return_moves_current_goal_and_thread_state_without_restoring_old_snapshots() -> Result<()> {
+        let (_temp, account, qb) = homes()?;
+        let ids = versioned_fixture(&account)?;
+        let old_source = source_snapshot(&account, &ids[..1])?;
+        let imported = plan(&account, &qb, &ids[..1])?;
+        apply(&imported)?;
+        verify(&imported)?;
+        remove_exact(&old_source)?;
+        let qb_state = Connection::open(qb.join(STATE))?;
+        qb_state.execute(
+            "UPDATE threads SET updated_at=88,tokens_used=450,created_at_ms=NULL,
+            updated_at_ms=NULL,recency_at=0,recency_at_ms=0,archived=1 WHERE id=?1",
+            [&ids[0]],
+        )?;
+        let qb_goals = Connection::open(qb.join(GOALS))?;
+        qb_goals.execute("UPDATE thread_goals SET objective='current synthetic objective',status='usage_limited',
+            tokens_used=123,token_budget=1000,time_used_seconds=45,updated_at_ms=9876543 WHERE thread_id=?1", [&ids[0]])?;
+        let current_source = source_snapshot(&qb, &ids[..1])?;
+        let returned = plan_return(&qb, &account, &ids[..1])?;
+        let returned: DbPlan = serde_json::from_slice(&serde_json::to_vec(&returned)?)?;
+        assert!(returned.preserve_current_state);
+        let current_thread = current_source.threads[0]
+            .thread
+            .as_ref()
+            .context("current thread")?;
+        let returned_thread = returned.threads[0]
+            .thread
+            .as_ref()
+            .context("return thread")?;
+        for (name, value) in &current_thread.values {
+            if !matches!(name.as_str(), "rollout_path" | "future_derived") {
+                assert!(returned_thread.values.get(name) == Some(value));
+            }
+        }
+        assert!(returned_thread.values["archived"] == DbValue::Integer(1));
+        assert!(returned_thread.values["created_at_ms"] == DbValue::Null);
+        let current_goal = current_source.threads[0]
+            .goal
+            .as_ref()
+            .context("current goal")?;
+        assert!(
+            returned.threads[0]
+                .goal
+                .as_ref()
+                .context("return goal")?
+                .values
+                == current_goal.values
+        );
+        assert_eq!(field(current_goal, "status")?, "usage_limited");
+        assert_eq!(
+            field(current_goal, "objective")?,
+            "current synthetic objective"
+        );
+        assert!(current_goal.values["tokens_used"] == DbValue::Integer(123));
+        assert!(current_goal.values["updated_at_ms"] == DbValue::Integer(9876543));
+        apply(&returned)?;
+        verify(&returned)?;
+        remove_exact(&current_source)?;
+        assert!(thread_path(&qb, &ids[0])?.is_none());
+        assert!(thread_path(&account, &ids[0])?.is_some());
+        assert!(thread_path(&account, &ids[1])?.is_some());
+        let account_goals = readonly(&account.join(GOALS))?.context("returned goals")?;
+        assert!(
+            selected_row(&account_goals, "thread_goals", "thread_id", &ids[0])?
+                .context("returned goal")?
+                .values
+                == current_goal.values
+        );
+        for home in [&account, &qb] {
+            for filename in [STATE, GOALS] {
+                let db = readonly(&home.join(filename))?.context("integrity database")?;
+                let integrity: String =
+                    db.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+                assert_eq!(integrity, "ok");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn adapter_read_write_and_memory_connections_have_explicit_two_second_timeout() -> Result<()> {
+        fn check(db: &Connection) -> Result<()> {
+            let timeout: i64 = db.query_row("PRAGMA busy_timeout", [], |row| row.get(0))?;
+            assert_eq!(timeout, 2000);
+            Ok(())
+        }
+        let (_temp, source, target) = homes()?;
+        let ids = versioned_fixture(&source)?;
+        let planned = plan(&source, &target, &ids)?;
+        for name in [STATE, GOALS] {
+            check(&readonly(&source.join(name))?.context("source database")?)?;
+        }
+        let pending = prepare(&planned, false)?;
+        assert_eq!(pending.len(), 2);
+        for item in &pending {
+            check(&item.db)?;
+        }
+        drop(pending);
+        apply(&planned)?;
+        let pending = prepare(&planned, true)?;
+        for item in &pending {
+            check(&item.db)?;
+        }
+        drop(pending);
+        check(&with_busy_timeout(Connection::open_in_memory()?)?)?;
+        Ok(())
+    }
+
+    #[test]
+    fn adapter_waits_for_busy_writer_then_times_out_without_deleting_rows() -> Result<()> {
+        let (_temp, source, target) = homes()?;
+        let ids = versioned_fixture(&source)?;
+        let planned = plan(&source, &target, &ids)?;
+        apply(&planned)?;
+        let writer = Connection::open(target.join(STATE))?;
+        writer.execute_batch("BEGIN IMMEDIATE")?;
+        let started = std::time::Instant::now();
+        let error = remove_exact(&planned)
+            .err()
+            .context("competing writer did not cause timeout")?;
+        let elapsed = started.elapsed();
+        let sqlite = error
+            .downcast_ref::<rusqlite::Error>()
+            .context("expected SQLite busy error")?;
+        assert_eq!(
+            sqlite.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy)
+        );
+        assert!(elapsed >= Duration::from_millis(1500));
+        assert!(elapsed < Duration::from_secs(10));
+        writer.execute_batch("ROLLBACK")?;
+        verify(&planned)?;
+        assert_eq!(threads(&target)?.len(), 2);
+        remove_exact(&planned)?;
+        assert!(threads(&target)?.is_empty());
         Ok(())
     }
 }

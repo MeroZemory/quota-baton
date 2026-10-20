@@ -104,10 +104,12 @@ impl Fixture {
             .args(args)
             .env("QB_HOME", &self.qb)
             .env("USERPROFILE", &self.user)
+            .env("APPDATA", self.user.join("AppData/Roaming"))
             .env("HOME", &self.user)
             .env("CODEX_HOME", &self.target)
             .current_dir(self._root.path())
             .creation_flags(0x08000000)
+            .stdin(std::process::Stdio::null())
             .stdout(fs::File::create(&stdout).unwrap())
             .stderr(fs::File::create(&stderr).unwrap())
             .spawn()
@@ -146,6 +148,7 @@ impl Fixture {
         ];
         if apply {
             args.push("--apply".as_ref());
+            args.push("--yes".as_ref());
         }
         args.extend(options.iter().map(std::ffi::OsStr::new));
         self.cli(&args)
@@ -190,6 +193,21 @@ fn assert_refused(fixture: &Fixture, output: &Output, reason: &str) {
         String::from_utf8_lossy(&output.stderr).contains(reason),
         "{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn assert_confirmation_refused(fixture: &Fixture, output: &Output) {
+    assert!(!output.status.success());
+    assert!(!fixture.sentinel.exists());
+    let diagnostic = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(diagnostic.contains("터미널"), "{diagnostic}");
+    assert!(
+        diagnostic.contains("quota-baton sessions import"),
+        "{diagnostic}"
     );
 }
 
@@ -255,6 +273,7 @@ fn r9_cli_dry_default_bulk_skips_recent_and_existing_and_never_prints_body() {
         "--all".as_ref(),
         "--keep-source".as_ref(),
         "--apply".as_ref(),
+        "--yes".as_ref(),
     ]);
     assert!(
         out.status.success(),
@@ -274,11 +293,12 @@ fn r9_cli_dry_default_bulk_skips_recent_and_existing_and_never_prints_body() {
         "--all".as_ref(),
         "--keep-source".as_ref(),
         "--apply".as_ref(),
+        "--yes".as_ref(),
     ]);
     assert_counts(&out, [0, 1, 1, 0, 0]);
 }
 #[test]
-fn r9_auto_resume_moves_then_unimport_restores_source_names_and_rows() {
+fn r9_no_tty_resume_needs_manual_import_then_reuses_and_unimports() {
     let f = Fixture::new();
     let source = f.add(A, false, "openai");
     let original = fs::read(&source).unwrap();
@@ -292,10 +312,28 @@ fn r9_auto_resume_moves_then_unimport_restores_source_names_and_rows() {
             )
             .unwrap();
     }
-    let out = f.resume(A);
-    assert_success(&out);
-    assert!(f.sentinel.exists());
-    assert!(String::from_utf8_lossy(&out.stdout).contains("기존 대화를 qb로 옮겼습니다"));
+    let original_state = fs::read(f.source.join("state_5.sqlite")).unwrap();
+    let original_goals = fs::read(f.source.join("goals_1.sqlite")).unwrap();
+    let refused = f.resume(A);
+    assert_confirmation_refused(&f, &refused);
+    assert_eq!(fs::read(&source).unwrap(), original);
+    assert_eq!(
+        fs::read(f.source.join("state_5.sqlite")).unwrap(),
+        original_state
+    );
+    assert_eq!(
+        fs::read(f.source.join("goals_1.sqlite")).unwrap(),
+        original_goals
+    );
+    assert!(!f.qb.join("journal/sessions-import.json").exists());
+    assert!(!f.target.join("state_5.sqlite").exists());
+    assert!(!f.target.join("goals_1.sqlite").exists());
+    assert!(!f.target.join("sessions").exists());
+
+    let imported = f.import(A, true);
+    assert_success(&imported);
+    assert!(!String::from_utf8_lossy(&imported.stdout).contains("입력하세요"));
+    assert!(!f.sentinel.exists());
     let target = f.target.join("sessions").join(source.file_name().unwrap());
     assert!(!source.exists());
     assert_eq!(fs::read(&target).unwrap(), original);
@@ -303,12 +341,12 @@ fn r9_auto_resume_moves_then_unimport_restores_source_names_and_rows() {
     assert_eq!(thread_path(&f.target, A), Some(target.clone()));
     assert_eq!(goal_status(&f.source, A), None);
     assert_eq!(goal_status(&f.target, A).as_deref(), Some("paused"));
-    fs::remove_file(&f.sentinel).unwrap();
     let reused = f.resume(A);
     assert_success(&reused);
     assert!(f.sentinel.exists());
     assert!(!source.exists());
     assert!(!String::from_utf8_lossy(&reused.stdout).contains("기존 대화를 qb로"));
+    assert!(!String::from_utf8_lossy(&reused.stdout).contains("입력하세요"));
     assert!(thread_path(&f.source, A).is_none());
     assert_eq!(thread_path(&f.target, A), Some(target.clone()));
     fs::remove_file(&f.sentinel).unwrap();
@@ -320,6 +358,33 @@ fn r9_auto_resume_moves_then_unimport_restores_source_names_and_rows() {
     assert!(!target.exists());
     assert!(thread_path(&f.target, A).is_none());
     assert_eq!(goal_status(&f.target, A), None);
+}
+
+#[test]
+fn r9_no_tty_import_apply_without_yes_preserves_source_and_has_no_journal() {
+    let f = Fixture::new();
+    let source = f.add(A, false, "openai");
+    let original = fs::read(&source).unwrap();
+    let original_state = fs::read(f.source.join("state_5.sqlite")).unwrap();
+    let out = f.cli(&[
+        "sessions".as_ref(),
+        "import".as_ref(),
+        "--from".as_ref(),
+        f.source.as_os_str(),
+        A.as_ref(),
+        "--apply".as_ref(),
+    ]);
+    assert_confirmation_refused(&f, &out);
+    assert_eq!(fs::read(&source).unwrap(), original);
+    assert_eq!(
+        fs::read(f.source.join("state_5.sqlite")).unwrap(),
+        original_state
+    );
+    assert!(!f.qb.join("journal/sessions-import.json").exists());
+    assert!(!f.target.join("sessions").exists());
+    assert!(!f.target.join("state_5.sqlite").exists());
+    assert!(!f.target.join("goals_1.sqlite").exists());
+    assert!(!f.target.join("session_index.jsonl").exists());
 }
 
 #[test]
@@ -362,7 +427,7 @@ fn assert_resume_without_import(args: &[&str]) {
 }
 
 #[test]
-fn r9_last_as_config_value_does_not_suppress_explicit_resume_import() {
+fn r9_last_as_config_value_does_not_suppress_resume_confirmation() {
     let f = Fixture::new();
     let source = f.add(A, false, "openai");
     let original = fs::read(&source).unwrap();
@@ -370,13 +435,43 @@ fn r9_last_as_config_value_does_not_suppress_explicit_resume_import() {
 
     // The stub accepts these arguments without parsing Codex configuration;
     // this checks the launch hook's option-value boundary, not config validity.
-    let out = f.launch(&["--config", "--last", "resume", A]);
-    assert_success(&out);
+    let refused = f.launch(&["--config", "--last", "resume", A]);
+    assert_confirmation_refused(&f, &refused);
+    assert_eq!(fs::read(&source).unwrap(), original);
+    assert!(!f.qb.join("journal/sessions-import.json").exists());
+    assert!(!target.exists());
+    assert_success(&f.import(A, true));
+    let reused = f.launch(&["--config", "--last", "resume", A]);
+    assert_success(&reused);
     assert!(f.sentinel.exists());
     assert!(f.qb.join("journal/sessions-import.json").exists());
     assert!(target.exists());
     assert!(fs::read(&target).unwrap() == original);
     assert_eq!(thread_path(&f.target, A), Some(target));
+}
+
+#[test]
+fn r9_yes_keep_source_shares_without_a_prompt() {
+    let f = Fixture::new();
+    let source = f.add(A, false, "openai");
+    let original = fs::read(&source).unwrap();
+    let original_state = fs::read(f.source.join("state_5.sqlite")).unwrap();
+    let out = f.import_options(A, true, &["--keep-source"]);
+    assert_success(&out);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("결과 | 공유 |"));
+    assert!(!text.contains("입력하세요"));
+    assert!(!f.sentinel.exists());
+    let target = f.target.join("sessions").join(source.file_name().unwrap());
+    assert_eq!(fs::read(&source).unwrap(), original);
+    assert_eq!(fs::read(&target).unwrap(), original);
+    assert_eq!(
+        fs::read(f.source.join("state_5.sqlite")).unwrap(),
+        original_state
+    );
+    assert_eq!(thread_path(&f.source, A), Some(source));
+    assert_eq!(thread_path(&f.target, A), Some(target));
+    assert!(f.qb.join("journal/sessions-import.json").exists());
 }
 
 #[test]
@@ -492,6 +587,7 @@ fn r9_bulk_move_reports_moved_live_diverged_and_failed_separately() {
         f.source.as_os_str(),
         "--all".as_ref(),
         "--apply".as_ref(),
+        "--yes".as_ref(),
     ]);
     assert_counts(&out, [1, 0, 1, 1, 1]);
     let text = String::from_utf8_lossy(&out.stdout);

@@ -411,13 +411,32 @@ mod platform {
         home: PathBuf,
     }
 
-    fn pending(home: &Path, path: &Path, pins: &mut Vec<File>) -> Result<Option<PendingLock>> {
+    fn pending(
+        home: &Path,
+        path: &Path,
+        pins: &mut Vec<File>,
+        create: bool,
+    ) -> Result<Option<PendingLock>> {
         let (ancestors, exists) = pin_path(home, path)?;
         pins.extend(ancestors);
-        if !exists {
+        if !exists && !create {
             return Ok(None);
         }
-        let file = match options().read(true).write(true).open(path) {
+        if create {
+            let parent = path
+                .parent()
+                .ok_or_else(|| anyhow!("Codex 잠금 폴더가 없습니다"))?;
+            std::fs::create_dir_all(parent)?;
+            let (checked, _) = pin_path(home, path)?;
+            pins.extend(checked);
+        }
+        let file = match options()
+            .read(true)
+            .write(true)
+            .create(create)
+            .truncate(false)
+            .open(path)
+        {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) if matches!(error.raw_os_error(), Some(32 | 33)) => return Err(live(home)),
@@ -462,7 +481,7 @@ mod platform {
         ids: &[String],
         rollouts: &[PathBuf],
     ) -> Result<Guards> {
-        probe(homes, ids, rollouts, false)
+        probe(homes, ids, rollouts, false, false)
     }
 
     /// Unlink-only recovery: retain all writer/path/share checks, but leave any
@@ -473,7 +492,26 @@ mod platform {
         ids: &[String],
         plain_rollouts: &[PathBuf],
     ) -> Result<Guards> {
-        probe(homes, ids, plain_rollouts, true)
+        probe(homes, ids, plain_rollouts, true, false)
+    }
+
+    /// Applying operations reserve even absent per-home Codex locks. Existing
+    /// rollouts are pinned against writers first; all coordination locks are
+    /// acquired before creating/taking thread locks, and retained through commit.
+    pub(crate) fn reserve_commit(
+        homes: &[PathBuf],
+        ids: &[String],
+        rollouts: &[PathBuf],
+    ) -> Result<Guards> {
+        probe(homes, ids, rollouts, false, true)
+    }
+
+    pub(crate) fn reserve_cleanup(
+        homes: &[PathBuf],
+        ids: &[String],
+        rollouts: &[PathBuf],
+    ) -> Result<Guards> {
+        probe(homes, ids, rollouts, true, true)
     }
 
     fn probe(
@@ -481,6 +519,7 @@ mod platform {
         ids: &[String],
         rollouts: &[PathBuf],
         allow_compressed_sibling: bool,
+        reserve: bool,
     ) -> Result<Guards> {
         if ids.iter().any(|id| {
             id.is_empty()
@@ -499,24 +538,6 @@ mod platform {
             .iter()
             .map(|home| absolute(home))
             .collect::<Result<Vec<_>>>()?;
-        let mut locks = Vec::new();
-        for home in &homes {
-            let path = home.join("thread-writer-locks/.coordination.lock");
-            if let Some(lock) = pending(home, &path, &mut guards._ancestors)? {
-                locks.push(lock);
-            }
-        }
-        guards._coordination = take_locks(locks)?;
-        let mut locks = Vec::new();
-        for home in &homes {
-            for id in ids {
-                let path = home.join("thread-writer-locks").join(format!("{id}.lock"));
-                if let Some(lock) = pending(home, &path, &mut guards._ancestors)? {
-                    locks.push(lock);
-                }
-            }
-        }
-        guards._threads = take_locks(locks)?;
         for path in rollouts {
             let path = absolute(path)?;
             let home = homes
@@ -554,13 +575,32 @@ mod platform {
             }
             guards._rollouts.push(file);
         }
+        let mut locks = Vec::new();
+        for home in &homes {
+            let path = home.join("thread-writer-locks/.coordination.lock");
+            if let Some(lock) = pending(home, &path, &mut guards._ancestors, reserve)? {
+                locks.push(lock);
+            }
+        }
+        guards._coordination = take_locks(locks)?;
+        let mut locks = Vec::new();
+        for home in &homes {
+            for id in ids {
+                let path = home.join("thread-writer-locks").join(format!("{id}.lock"));
+                if let Some(lock) = pending(home, &path, &mut guards._ancestors, reserve)? {
+                    locks.push(lock);
+                }
+            }
+        }
+        guards._threads = take_locks(locks)?;
         Ok(guards)
     }
 }
 
 #[cfg(windows)]
 pub(crate) use platform::{
-    identity, probe_all, probe_cleanup, remove_verified, rename_verified, safe_path,
+    identity, probe_all, probe_cleanup, remove_verified, rename_verified, reserve_cleanup,
+    reserve_commit, safe_path,
 };
 
 #[cfg(not(windows))]
@@ -588,6 +628,20 @@ mod platform {
     pub(crate) fn probe_all(_: &[PathBuf], _: &[String], _: &[PathBuf]) -> Result<Guards> {
         anyhow::bail!("세션 잠금 검사는 Windows에서만 지원됩니다")
     }
+    pub(crate) fn reserve_commit(
+        homes: &[PathBuf],
+        ids: &[String],
+        rollouts: &[PathBuf],
+    ) -> Result<Guards> {
+        probe_all(homes, ids, rollouts)
+    }
+    pub(crate) fn reserve_cleanup(
+        homes: &[PathBuf],
+        ids: &[String],
+        rollouts: &[PathBuf],
+    ) -> Result<Guards> {
+        probe_all(homes, ids, rollouts)
+    }
     pub(crate) fn probe_cleanup(
         homes: &[PathBuf],
         ids: &[String],
@@ -598,7 +652,8 @@ mod platform {
 }
 #[cfg(not(windows))]
 pub(crate) use platform::{
-    identity, probe_all, probe_cleanup, remove_verified, rename_verified, safe_path,
+    identity, probe_all, probe_cleanup, remove_verified, rename_verified, reserve_cleanup,
+    reserve_commit, safe_path,
 };
 
 #[cfg(all(test, windows))]
@@ -1037,6 +1092,29 @@ mod tests {
         assert!(OpenOptions::new().append(true).open(&source).is_err());
         assert_eq!(fs::read(&source).unwrap(), b"synthetic\n");
         drop(guards);
+    }
+
+    #[test]
+    fn commit_reserves_missing_source_and_target_thread_locks_until_drop() {
+        let temp = fixture();
+        let source = home(temp.path(), "source");
+        let target = home(temp.path(), "target");
+        let rollout = source.join("sessions/rollout.jsonl");
+        fs::write(&rollout, b"synthetic").unwrap();
+        let homes = vec![source.clone(), target.clone()];
+        let ids = vec![ID.to_string()];
+        let held = reserve_commit(&homes, &ids, std::slice::from_ref(&rollout)).unwrap();
+        for home in &homes {
+            assert!(home.join("thread-writer-locks/.coordination.lock").exists());
+            assert!(
+                home.join("thread-writer-locks")
+                    .join(format!("{ID}.lock"))
+                    .exists()
+            );
+        }
+        assert!(probe_all(&homes, &ids, std::slice::from_ref(&rollout)).is_err());
+        drop(held);
+        assert!(probe_all(&homes, &ids, std::slice::from_ref(&rollout)).is_ok());
     }
 
     #[test]

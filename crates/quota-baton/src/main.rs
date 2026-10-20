@@ -12,9 +12,11 @@ mod launcher_label;
 mod launcher_script;
 mod routing_cli;
 mod sessions;
+mod sessions_confirm;
 mod sessions_db;
 mod sessions_discovery;
 mod sessions_guard;
+mod sessions_map;
 mod wire_readiness;
 
 fn print_stdout(args: std::fmt::Arguments<'_>) -> std::io::Result<()> {
