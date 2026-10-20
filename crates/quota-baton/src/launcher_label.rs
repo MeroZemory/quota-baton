@@ -142,18 +142,60 @@ fn resolve_codex_node(program: &Path) -> Option<(std::path::PathBuf, std::path::
     let node = if local.is_file() {
         local
     } else {
-        std::env::split_paths(&std::env::var_os("PATH")?)
-            .filter(|dir| dir.is_absolute())
-            .map(|dir| dir.join("node.exe"))
-            .find(|path| path.is_file())?
+        unambiguous_path_node(
+            &std::env::var_os("PATH")?,
+            &std::env::current_dir().ok()?,
+            &std::env::var_os("PATHEXT")?,
+        )?
     };
     Some((node, script))
+}
+
+// cmd also searches the current directory and accepts relative PATH entries.
+// If those could affect resolution, preserve npm's own lookup via the fallback.
+fn unambiguous_path_node(
+    path: &std::ffi::OsStr,
+    cwd: &Path,
+    pathext: &std::ffi::OsStr,
+) -> Option<std::path::PathBuf> {
+    // npm removes ;.JS; from PATHEXT before invoking `node`.
+    let pathext = pathext.to_str()?.replace(";.JS;", ";");
+    let extensions: Vec<_> = pathext.split(';').map(str::to_ascii_lowercase).collect();
+    if extensions.is_empty()
+        || extensions.iter().any(|ext| {
+            !ext.starts_with('.') || !ext[1..].bytes().all(|b| b.is_ascii_alphanumeric())
+        })
+    {
+        return None;
+    }
+    let has_candidate = |dir: &Path| {
+        dir.join("node").is_file()
+            || extensions
+                .iter()
+                .any(|ext| dir.join(format!("node{ext}")).is_file())
+    };
+    if has_candidate(cwd) {
+        return None;
+    }
+    for dir in std::env::split_paths(path) {
+        if !dir.is_absolute() || dir.join("node").is_file() {
+            return None;
+        }
+        for extension in &extensions {
+            let candidate = dir.join(format!("node{extension}"));
+            if candidate.is_file() {
+                return (extension == ".exe").then_some(candidate);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(windows)]
 struct ConsoleTitle {
     desired: String,
     cmd_titles: Vec<String>,
+    program_title: String,
 }
 
 #[cfg(windows)]
@@ -193,7 +235,8 @@ impl ConsoleTitle {
         let desired = format!("codex-qb · {folder}");
         set_console_title(&desired);
         // Exact known shell/program titles only: never fight a client's own title.
-        let mut cmd_titles = vec![program.to_string_lossy().into_owned()];
+        let program_title = program.to_string_lossy().into_owned();
+        let mut cmd_titles = Vec::new();
         if let Some(root) = std::env::var_os("SystemRoot") {
             cmd_titles.push(
                 Path::new(&root)
@@ -208,6 +251,7 @@ impl ConsoleTitle {
         Ok(Self {
             desired,
             cmd_titles,
+            program_title,
         })
     }
 
@@ -227,7 +271,11 @@ impl ConsoleTitle {
                     break;
                 }
                 let current = console_title();
-                if is_cmd_title(&current, &self.cmd_titles) {
+                if current
+                    .trim()
+                    .eq_ignore_ascii_case(self.program_title.trim())
+                    || is_cmd_title(&current, &self.cmd_titles)
+                {
                     set_console_title(&self.desired);
                 } else if current != self.desired {
                     break;
@@ -253,6 +301,38 @@ fn is_cmd_title(current: &str, cmd_titles: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn r81_ambiguous_relative_or_current_directory_node_uses_shim_fallback() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r81-path-resolution");
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = tempfile::tempdir_in(root).unwrap();
+        let cwd = dir.path().join("cwd");
+        let absolute = dir.path().join("node-b");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&absolute).unwrap();
+        std::fs::write(absolute.join("node.exe"), "synthetic, never executed").unwrap();
+        let path = std::env::join_paths([Path::new("node-a"), absolute.as_path()]).unwrap();
+        assert!(
+            unambiguous_path_node(&path, &cwd, std::ffi::OsStr::new(".COM;.EXE;.BAT;.CMD"))
+                .is_none()
+        );
+        let path = std::env::join_paths([absolute.as_path()]).unwrap();
+        assert_eq!(
+            unambiguous_path_node(&path, &cwd, std::ffi::OsStr::new(".COM;.EXE;.BAT;.CMD")),
+            Some(absolute.join("node.exe"))
+        );
+        std::fs::write(cwd.join("node.cmd"), "synthetic wrapper, never executed").unwrap();
+        assert!(
+            unambiguous_path_node(&path, &cwd, std::ffi::OsStr::new(".COM;.EXE;.BAT;.CMD"))
+                .is_none()
+        );
+        std::fs::remove_file(cwd.join("node.cmd")).unwrap();
+        std::fs::write(cwd.join("node.exe"), "synthetic, never executed").unwrap();
+        assert!(
+            unambiguous_path_node(&path, &cwd, std::ffi::OsStr::new(".COM;.EXE;.BAT;.CMD"))
+                .is_none()
+        );
+    }
     #[test]
     fn r81_node_resolution_uses_npm_script_and_sibling_node_without_a_shell() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r81-resolution");
