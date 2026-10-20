@@ -36,6 +36,29 @@ pub(crate) fn compressed_sibling(path: &Path) -> bool {
     }
 }
 
+/// Safe to recognize by type at the CLI boundary; Debug never reveals home.
+pub(crate) struct LiveWriter {
+    home: PathBuf,
+}
+
+impl std::fmt::Debug for LiveWriter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("LiveWriter")
+    }
+}
+
+impl std::fmt::Display for LiveWriter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "이 대화는 다른 곳에서 실행 중입니다 ({})",
+            self.home.display()
+        )
+    }
+}
+
+impl std::error::Error for LiveWriter {}
+
 #[cfg(windows)]
 mod platform {
     use super::*;
@@ -74,7 +97,9 @@ mod platform {
     }
 
     fn live(home: &Path) -> anyhow::Error {
-        anyhow!("이 대화는 다른 곳에서 실행 중입니다 ({})", home.display())
+        anyhow!(LiveWriter {
+            home: home.to_path_buf()
+        })
     }
 
     fn information(file: &File) -> Result<BY_HANDLE_FILE_INFORMATION> {
@@ -292,6 +317,26 @@ mod platform {
         ids: &[String],
         rollouts: &[PathBuf],
     ) -> Result<Guards> {
+        probe(homes, ids, rollouts, false)
+    }
+
+    /// Unlink-only recovery: retain all writer/path/share checks, but leave any
+    /// compressed sibling untouched. Inputs must still be plain rollout names.
+    /// Caller must verify identities/ownership before deleting journaled links.
+    pub(crate) fn probe_cleanup(
+        homes: &[PathBuf],
+        ids: &[String],
+        plain_rollouts: &[PathBuf],
+    ) -> Result<Guards> {
+        probe(homes, ids, plain_rollouts, true)
+    }
+
+    fn probe(
+        homes: &[PathBuf],
+        ids: &[String],
+        rollouts: &[PathBuf],
+        allow_compressed_sibling: bool,
+    ) -> Result<Guards> {
         if ids.iter().any(|id| {
             id.is_empty()
                 || id.len() > 128
@@ -339,7 +384,10 @@ mod platform {
             if !exists {
                 bail!("rollout 파일이 없습니다");
             }
-            if compressed_sibling(&path) {
+            let compressed_input = path
+                .extension()
+                .is_some_and(|ext| ext.as_encoded_bytes().eq_ignore_ascii_case(b"zst"));
+            if compressed_input || (!allow_compressed_sibling && compressed_sibling(&path)) {
                 bail!(
                     "압축된 rollout 또는 .zst 형제가 있습니다. sessions unimport 후 다시 가져오세요"
                 );
@@ -366,7 +414,7 @@ mod platform {
 }
 
 #[cfg(windows)]
-pub(crate) use platform::{identity, probe_all, safe_path};
+pub(crate) use platform::{identity, probe_all, probe_cleanup, safe_path};
 
 #[cfg(not(windows))]
 mod platform {
@@ -381,9 +429,16 @@ mod platform {
     pub(crate) fn probe_all(_: &[PathBuf], _: &[String], _: &[PathBuf]) -> Result<Guards> {
         anyhow::bail!("세션 잠금 검사는 Windows에서만 지원됩니다")
     }
+    pub(crate) fn probe_cleanup(
+        homes: &[PathBuf],
+        ids: &[String],
+        plain_rollouts: &[PathBuf],
+    ) -> Result<Guards> {
+        probe_all(homes, ids, plain_rollouts)
+    }
 }
 #[cfg(not(windows))]
-pub(crate) use platform::{identity, probe_all, safe_path};
+pub(crate) use platform::{identity, probe_all, probe_cleanup, safe_path};
 
 #[cfg(all(test, windows))]
 mod tests {
@@ -425,6 +480,10 @@ mod tests {
             Ok(_) => panic!("writer must be refused"),
             Err(error) => error,
         };
+        let live_writer = error
+            .downcast_ref::<LiveWriter>()
+            .expect("typed live writer error");
+        assert_eq!(format!("{live_writer:?}"), "LiveWriter");
         let expected_home = match home.components().next() {
             Some(std::path::Component::Prefix(prefix))
                 if matches!(prefix.kind(), std::path::Prefix::VerbatimDisk(_)) =>
@@ -458,6 +517,10 @@ mod tests {
             lock.try_lock().unwrap();
             assert_live(
                 probe_all(std::slice::from_ref(&home), &[ID.into()], &[]),
+                &home,
+            );
+            assert_live(
+                probe_cleanup(std::slice::from_ref(&home), &[ID.into()], &[]),
                 &home,
             );
             drop(lock);
@@ -625,6 +688,7 @@ mod tests {
         assert!(safe_path(&root, &root.join("sessions/file.jsonl:stream")).is_err());
         assert!(safe_path(&root, &root.join("sessions. /file.jsonl")).is_err());
         assert!(probe_all(std::slice::from_ref(&root), &["../escape".into()], &[]).is_err());
+        assert!(probe_cleanup(std::slice::from_ref(&root), &["../escape".into()], &[]).is_err());
         let alias = root.join("alias");
         // Local NTFS junctions need no symlink privilege. Both arguments are
         // fixed-name children of this project-local synthetic fixture. mklink
@@ -647,7 +711,67 @@ mod tests {
         assert!(safe_path(&root, &alias.join("missing.jsonl")).is_err());
         assert!(safe_path(&alias, &alias.join("missing.jsonl")).is_err());
         assert!(identity(&alias.join("missing.jsonl")).is_err());
+        assert!(probe_cleanup(std::slice::from_ref(&alias), &[ID.into()], &[]).is_err());
         assert!(probe_all(&[alias], &[ID.into()], &[]).is_err());
+    }
+
+    #[test]
+    fn cleanup_allows_compressed_sibling_but_refuses_compressed_input_and_writer() {
+        let temp = fixture();
+        let home = home(temp.path(), "home");
+        let rollout = home.join("sessions/test.jsonl");
+        let link = home.join("sessions/link.jsonl");
+        let compressed = home.join("sessions/test.jsonl.zst");
+        fs::write(&rollout, b"synthetic\n").unwrap();
+        fs::write(&compressed, b"synthetic compressed sibling").unwrap();
+        fs::hard_link(&rollout, &link).unwrap();
+        let before = identity(&rollout).unwrap();
+        assert!(
+            probe_all(
+                std::slice::from_ref(&home),
+                &[ID.into()],
+                std::slice::from_ref(&rollout)
+            )
+            .is_err()
+        );
+        let guards = probe_cleanup(
+            std::slice::from_ref(&home),
+            &[ID.into()],
+            std::slice::from_ref(&rollout),
+        )
+        .unwrap();
+        assert!(OpenOptions::new().append(true).open(&link).is_err());
+        fs::remove_file(&link).unwrap();
+        assert_eq!(
+            fs::read(&compressed).unwrap(),
+            b"synthetic compressed sibling"
+        );
+        assert_eq!(identity(&rollout).unwrap(), before);
+        drop(guards);
+        assert!(
+            probe_cleanup(
+                std::slice::from_ref(&home),
+                &[ID.into()],
+                std::slice::from_ref(&compressed)
+            )
+            .is_err()
+        );
+        fs::hard_link(&rollout, &link).unwrap();
+        let writer = OpenOptions::new().append(true).open(&link).unwrap();
+        assert_live(
+            probe_cleanup(
+                std::slice::from_ref(&home),
+                &[ID.into()],
+                std::slice::from_ref(&rollout),
+            ),
+            &home,
+        );
+        drop(writer);
+        assert_eq!(fs::read(&rollout).unwrap(), b"synthetic\n");
+        assert_eq!(
+            fs::read(&compressed).unwrap(),
+            b"synthetic compressed sibling"
+        );
     }
 
     #[test]

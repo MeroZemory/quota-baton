@@ -223,7 +223,7 @@ quota-baton routing session <식별자> --project <프로젝트-ID> --inherit
 
 기본 설정을 바꾸는 `default` 모드는 전용 명령으로 충분히 써 본 뒤에만 고려하십시오.
 
-**Codex 대화 기록은 따로 저장됩니다.** `codex-qb`는 전용 폴더 `~/.codex-acct/qb`를 쓰므로, 기존 `codex`나 `codex-mz` 같은 계정별 명령으로 나눈 대화는 `codex-qb resume`으로 바로 열리지 않습니다. qb 쪽에서 이어가려면 세션을 옮겨야 합니다. `claude-qb`는 기존 `claude`와 대화 기록 폴더를 같이 쓰므로 `claude-qb --resume <ID>`로 바로 이어갈 수 있습니다.
+**Codex는 전용 대화 폴더를 씁니다.** `codex-qb`는 `~/.codex-acct/qb`를 씁니다. `codex-qb resume <UUID>`는 qb에 없는 대화를 기존 홈에서 찾아 옮깁니다. 자세한 방법은 [기존 Codex 대화 가져오기](#기존-codex-대화-가져오기)를 참고하세요. `claude-qb`는 기존 `claude`와 대화 기록 폴더를 같이 쓰므로 `claude-qb --resume <ID>`로 바로 이어갈 수 있습니다.
 
 전환 전에는 항상 dry-run을 실행합니다.
 
@@ -283,6 +283,55 @@ quota-baton.exe unwire --apply
 별도 홈의 세션 기록(`~/.codex-acct/qb/sessions`)은 되돌린 뒤에도 남습니다. `unwire`는 직접 만든 파일과 연결만 변경 여부를 확인해 제거합니다.
 
 사용자가 수정한 파일은 자동으로 덮어쓰지 않습니다. 변경 내용을 확인하고 force가 필요한 경우에만 별도 승인을 사용합니다. 전환은 [C11 관리 API](contract.md#c11-admin-api)와 [C12 저장 형식](contract.md#c12-persistence-formats)에 맞춰 journal과 함께 처리됩니다.
+
+### 기존 Codex 대화 가져오기
+
+먼저 `wire --codex-mode dedicated --apply`로 Codex 전용 명령을 준비합니다. 아래의 `<HOME>`은 기존 Codex 홈 폴더입니다. `<UUID>`는 대화 ID입니다.
+
+```powershell
+quota-baton.exe sessions import --from <HOME> --list
+quota-baton.exe sessions import --from <HOME> <UUID>
+quota-baton.exe sessions import --from <HOME> <UUID> --apply
+quota-baton.exe sessions import --from <HOME> --all
+quota-baton.exe sessions import --from <HOME> --all --apply
+```
+
+`--list`는 가져올 대화 목록을 보여 줍니다. 가져오기는 기본적으로 미리보기만 합니다. 결과를 확인한 뒤 `--apply`를 붙입니다. `--all`은 여러 대화에 같은 이동 절차를 적용합니다. 결과는 이동(`moved`), 실행 중 건너뜀(`skipped-live`), 분기 건너뜀(`skipped-diverged`), 실패(`failed`) 개수로 보여 줍니다.
+
+ID를 알면 `codex-qb resume <UUID>`로 이어갈 수 있습니다. qb에 없는 대화는 기본 Codex 홈, 계정별 홈, Orca 홈에서 찾아 자동으로 옮깁니다. ID 없이 여는 `codex-qb resume`의 선택 화면은 그대로입니다.
+
+**기본 동작은 이동입니다. 대화 기록 파일은 복사하지 않습니다.** 하드링크로 같은 파일을 qb에 연결합니다. 파일 ID와 qb의 대화·목표 항목, 기록의 분기 여부를 검증합니다. 검증을 통과한 뒤 선택한 대화 자체의 원본 파일 이름과 대화·목표 항목을 제거합니다. 분기 부모나 조상 대화는 제거하지 않습니다. 원본 `session_index`도 바꾸지 않습니다. 각 단계는 작업 기록에 남깁니다. 다른 볼륨으로는 옮길 수 없습니다.
+
+이동을 명시하려면 `--move`를 지정합니다. 원본 홈에서도 계속 열려면 `--keep-source`를 지정합니다. 두 옵션은 함께 쓸 수 없습니다.
+
+```powershell
+quota-baton.exe sessions import --from <HOME> <UUID> --keep-source --apply
+```
+
+이 옵션은 양쪽에 같은 파일의 하드링크를 남깁니다. `codex-mz resume <UUID>`로도 이어갈 수 있습니다. 어느 쪽에서 이어 써도 양쪽에 보입니다. **같은 대화를 두 홈에서 동시에 실행하지 마세요.** 먼저 한쪽을 종료한 뒤 다른 쪽에서 여세요. 실행할 때도 이 경고를 보여 줍니다.
+
+다른 홈에 같은 ID의 더 오래된 별도 파일이 있으면 미리보기에 표시합니다. 하드링크가 아닌 이 파일은 자동으로 지우지 않습니다. 확인한 뒤 `--clean-stale`을 지정해야 정리합니다.
+
+```powershell
+quota-baton.exe sessions import --from <HOME> <UUID> --clean-stale
+quota-baton.exe sessions import --from <HOME> <UUID> --clean-stale --apply
+```
+
+오래된 파일의 정리도 파일 크기와 함께 작업 기록에 남깁니다. 실행 중인 대화의 파일은 이 옵션으로도 지우지 않습니다.
+
+실행 중인 대화는 거절합니다. 기록이 최근 120초 안에 바뀌었어도 거절합니다. 대화를 종료한 뒤 120초가 지나면 다시 시도하세요. 원본과 qb 기록이 서로 다른 파일로 갈라졌거나 압축된 기록이 있으면 이어 열기를 거절합니다. 이때는 가져오기를 해제한 뒤 다시 가져오세요. 기록을 자동으로 합치지 않습니다.
+
+가져오기를 해제할 때도 먼저 미리 봅니다.
+
+```powershell
+quota-baton.exe sessions unimport <UUID>
+quota-baton.exe sessions unimport <UUID> --apply
+quota-baton.exe sessions unimport <UUID> --apply --force
+```
+
+`unimport`는 작업 기록에 따라 이동으로 제거한 원본 파일 이름과 대화·목표 항목을 복원합니다. 그 뒤 qb에 추가한 연결과 항목을 제거합니다. `--keep-source`로 가져왔다면 남겨 둔 원본은 유지합니다. 가져온 뒤 기록이 바뀌었다면 기본적으로 해제를 거절합니다. 변경 내용을 확인한 뒤에만 `--force`를 붙이세요.
+
+자세한 조건은 [D21 대화 하드링크 가져오기](decisions.md#d21-codex-qb-keeps-a-separate-codex-home-existing-sessions-are-brought-in-by-hardlink-import-automatically-on-resume--accepted-user-direction-2026-10-21)를 따릅니다.
 
 ## 문제 해결
 

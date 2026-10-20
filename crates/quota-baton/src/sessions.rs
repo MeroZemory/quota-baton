@@ -1,5 +1,44 @@
 //! Journaled Codex session imports. No rollout contents appear in diagnostics.
 use crate::{sessions_db as db, sessions_discovery as discovery, sessions_guard as guard};
+
+pub(crate) fn friendly_error(error: &anyhow::Error) -> Option<String> {
+    if let Some(live) = error.downcast_ref::<guard::LiveWriter>() {
+        return Some(live.to_string());
+    }
+    const FIXED: &[&str] = &[
+        "전용 Codex 홈 연결이 없습니다. 먼저 wire를 실행하세요",
+        "전용 Codex 홈 연결을 먼저 완료하세요",
+        "전용 Codex 홈이 없습니다",
+        "대화 ID는 UUID여야 합니다",
+        "원본에서 대화를 찾지 못했습니다",
+        "최근에 사용한 대화입니다. 먼저 대화를 종료하고 120초 후 다시 시도하세요",
+        "openai 제공자의 대화만 가져올 수 있습니다",
+        "대화 기록이 분기되었습니다. sessions unimport 후 다시 가져오세요",
+        "활성 대화 기록이 분기되었습니다. sessions unimport 후 다시 가져오세요",
+        "압축된 대화 기록이 있습니다. sessions unimport 후 다시 가져오세요",
+        "대화 제공자가 변경되었습니다. sessions unimport 후 다시 가져오세요",
+        "가져온 뒤 대화 기록이 변경되었습니다. 확인 후 --force를 사용하세요",
+        "가져온 뒤 기록이 변경되었습니다. 확인 후 --force를 사용하세요",
+        "대상 파일 소유권이 달라 되돌릴 수 없습니다",
+        "하드링크를 만들 수 없습니다. 같은 드라이브의 홈을 사용하세요. 기록은 복사하지 않았습니다",
+        "중단된 가져오기가 있습니다. sessions unimport로 되돌린 뒤 다시 시도하세요",
+        "다른 대화 가져오기 작업이 실행 중입니다",
+        "다른 작업이 대화 인덱스를 사용 중입니다",
+        "기존 홈에서 대화를 찾지 못했습니다. sessions import --from으로 원본을 지정하세요",
+        "여러 홈의 대화 기록이 분기되었습니다. 원본을 직접 지정하세요",
+        "대화 가져오기가 완료되지 않았습니다",
+        "가져온 대화가 아닙니다",
+        "기록에서 필요한 대화 메타데이터를 복구하지 못했습니다",
+        "재개 옵션의 값이 없습니다",
+        "재개 옵션을 확인할 수 없습니다. 지원되는 옵션과 UUID를 사용하세요",
+        "다른 원본 대화가 이 기록을 사용합니다. 자식 대화를 먼저 옮기거나 --keep-source를 사용하세요",
+        "압축된 rollout 또는 .zst 형제가 있습니다. sessions unimport 후 다시 가져오세요",
+        "가져온 대화의 메타데이터가 없습니다",
+        "오래된 기록을 다른 대화가 사용합니다. --clean-stale 없이 다시 시도하세요",
+    ];
+    let message = error.to_string();
+    FIXED.contains(&message.as_str()).then_some(message)
+}
 use anyhow::{Context, Result, bail, ensure};
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
@@ -12,6 +51,9 @@ use std::{
     time::SystemTime,
 };
 
+// D21 panel is reviewing this one default; both flows remain explicit internally.
+const DEFAULT_KEEP_SOURCE: bool = false;
+
 #[derive(Subcommand)]
 pub(crate) enum SessionsCommand {
     #[command(
@@ -22,13 +64,19 @@ pub(crate) enum SessionsCommand {
         #[arg(long)]
         from: PathBuf,
         #[arg(conflicts_with_all=["all", "list"])]
-        id: Option<String>,
+        id: Vec<String>,
         #[arg(long, conflicts_with = "list")]
         all: bool,
         #[arg(long)]
         list: bool,
         #[arg(long, conflicts_with = "list")]
         apply: bool,
+        #[arg(long, conflicts_with = "list")]
+        keep_source: bool,
+        #[arg(long = "move", conflicts_with_all = ["list", "keep_source"])]
+        move_source: bool,
+        #[arg(long, conflicts_with = "list")]
+        clean_stale: bool,
     },
     #[command(about = "가져온 대화의 연결만 되돌립니다")]
     Unimport {
@@ -47,6 +95,8 @@ struct Link {
     identity: guard::FileIdentity,
     length: u64,
     owned: bool,
+    thread: String,
+    moved: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Import {
@@ -57,6 +107,25 @@ struct Import {
     database: String,
     index: Vec<String>,
     complete: bool,
+    root: String,
+    keep_source: bool,
+    move_started: bool,
+    move_done: bool,
+    source_database: String,
+    stale: Vec<StaleCopy>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct StaleName {
+    original: PathBuf,
+    backup: PathBuf,
+    identity: guard::FileIdentity,
+    bytes: u64,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct StaleCopy {
+    home: PathBuf,
+    names: Vec<StaleName>,
+    database: String,
 }
 #[derive(Default, Serialize, Deserialize)]
 struct Journal {
@@ -139,6 +208,12 @@ impl Store {
                 guard::safe_path(&self.target.join("sessions"), &link.target)?;
                 guard::safe_path(&entry.source_home, &link.source)?;
             }
+            for stale in &entry.stale {
+                for name in &stale.names {
+                    guard::safe_path(&stale.home, &name.original)?;
+                    guard::safe_path(&self.home.join("journal/sessions-stale"), &name.backup)?;
+                }
+            }
         }
         Ok(journal)
     }
@@ -194,6 +269,128 @@ impl Store {
         names.dedup();
         Ok((homes, names))
     }
+}
+
+fn source_has_dependents(catalog: &discovery::Catalog, id: &str) -> Result<bool> {
+    let own = catalog
+        .threads
+        .get(id)
+        .context("원본에서 대화를 찾지 못했습니다")?;
+    Ok(catalog.rollouts.values().any(|f| {
+        f.thread != id
+            && f.path.exists()
+            && (f.forked_from.as_deref() == Some(id)
+                || f.history_base
+                    .as_ref()
+                    .is_some_and(|base| own.contains(base)))
+    }))
+}
+
+fn stale_plan(store: &Store, catalog: &discovery::Catalog, id: &str) -> Result<Vec<StaleCopy>> {
+    let active = catalog.active(id)?;
+    let current = guard::identity(&active.path)?;
+    let at = fs::metadata(&active.path)?.modified()?;
+    let mut result = Vec::new();
+    for home in &store.search_homes {
+        let home = fs::canonicalize(home)?;
+        if home == catalog.home || home == store.target {
+            continue;
+        }
+        let other = discovery::catalog(&home)?;
+        if !other.threads.contains_key(id) {
+            continue;
+        }
+        let head = other.active(id)?;
+        if guard::identity(&head.path)? == current {
+            continue;
+        }
+        ensure!(
+            fs::metadata(&head.path)?.modified()? < at,
+            "여러 홈의 대화 기록이 분기되었습니다. 원본을 직접 지정하세요"
+        );
+        let mut names = Vec::new();
+        for physical in &other.threads[id] {
+            let item = &other.rollouts[physical];
+            let directory = store
+                .home
+                .join("journal/sessions-stale")
+                .join(id)
+                .join(format!("{}-{}", result.len(), names.len()));
+            let backup =
+                directory.join(item.path.file_name().context("기록 파일 이름이 없습니다")?);
+            guard::safe_path(&store.home, &backup)?;
+            ensure!(
+                !backup.exists(),
+                "오래된 대화의 보존 위치가 이미 사용 중입니다"
+            );
+            names.push(StaleName {
+                original: item.path.clone(),
+                backup,
+                identity: guard::identity(&item.path)?,
+                bytes: item.bytes,
+            });
+        }
+        let database = crate::cutover::protect(&serde_json::to_vec(&db::source_snapshot(
+            &home,
+            &[id.into()],
+        )?)?)?;
+        result.push(StaleCopy {
+            home,
+            names,
+            database,
+        });
+    }
+    Ok(result)
+}
+
+fn clean_stale_copies(copies: &[StaleCopy]) -> Result<()> {
+    for copy in copies {
+        for name in &copy.names {
+            ensure!(
+                guard::identity(&name.original)? == name.identity
+                    && fs::metadata(&name.original)?.len() == name.bytes,
+                "오래된 대화 기록이 정리 전에 변경되었습니다"
+            );
+        }
+        let plan: db::DbPlan = serde_json::from_slice(&crate::cutover::unprotect(&copy.database)?)?;
+        db::remove_exact(&plan)?;
+        for name in &copy.names {
+            if let Some(parent) = name.backup.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::rename(&name.original, &name.backup).map_err(|_| {
+                anyhow::anyhow!(
+                    "오래된 기록을 journal에 보존하지 못했습니다. 복사하거나 덮어쓰지 않았습니다"
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn restore_stale_copies(copies: &[StaleCopy]) -> Result<()> {
+    for copy in copies {
+        for name in &copy.names {
+            if name.original.exists() {
+                ensure!(
+                    guard::identity(&name.original)? == name.identity,
+                    "원본 위치에 다른 기록이 있어 복구하지 못했습니다"
+                );
+            } else {
+                ensure!(
+                    guard::identity(&name.backup)? == name.identity,
+                    "보존된 오래된 기록이 변경되었습니다"
+                );
+                if let Some(parent) = name.original.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::rename(&name.backup, &name.original)?;
+            }
+        }
+        let plan: db::DbPlan = serde_json::from_slice(&crate::cutover::unprotect(&copy.database)?)?;
+        db::apply(&plan)?;
+    }
+    Ok(())
 }
 
 fn index_plan(target: &Path, database: &db::DbPlan) -> Result<Vec<String>> {
@@ -365,7 +562,11 @@ fn verify_links(entry: &Import, growth: bool) -> Result<()> {
     for link in &entry.files {
         guard::safe_path(&entry.source_home, &link.source)?;
         guard::safe_path(&entry.target_home, &link.target)?;
-        let source = guard::identity(&link.source)?;
+        let source = if link.moved && !link.source.exists() {
+            link.identity
+        } else {
+            guard::identity(&link.source)?
+        };
         ensure!(
             source == link.identity && guard::identity(&link.target)? == source,
             "대화 기록이 분기되었습니다. sessions unimport 후 다시 가져오세요"
@@ -388,8 +589,19 @@ fn verify_links(entry: &Import, growth: bool) -> Result<()> {
             "대화 제공자가 변경되었습니다. sessions unimport 후 다시 가져오세요"
         );
         let source = db::thread_path(&entry.source_home, id)?;
-        let target = db::thread_path(&entry.target_home, id)?;
-        if let (Some(source), Some(target)) = (source, target) {
+        let target = db::thread_path(&entry.target_home, id)?
+            .context("가져온 대화의 메타데이터가 없습니다")?;
+        guard::safe_path(&entry.target_home, &target)?;
+        let expected = entry
+            .files
+            .iter()
+            .find(|l| l.thread == *id && l.target.file_name() == target.file_name())
+            .context("활성 대화 기록이 분기되었습니다. sessions unimport 후 다시 가져오세요")?;
+        ensure!(
+            fs::canonicalize(&target)? == fs::canonicalize(&expected.target)?,
+            "활성 대화 기록이 분기되었습니다. sessions unimport 후 다시 가져오세요"
+        );
+        if let Some(source) = source {
             ensure!(
                 source.file_name() == target.file_name(),
                 "활성 대화 기록이 분기되었습니다. sessions unimport 후 다시 가져오세요"
@@ -433,11 +645,15 @@ pub(crate) fn run(home: &Path, command: SessionsCommand) -> Result<()> {
             all,
             list,
             apply,
+            keep_source,
+            move_source,
+            clean_stale,
         } => {
             ensure!(
-                id.is_some() || all || list,
+                !id.is_empty() || all || list,
                 "대화 ID, --all 또는 --list를 지정하세요"
             );
+            let keep_source = !move_source && (keep_source || DEFAULT_KEEP_SOURCE);
             let catalog = discovery::catalog(&from)?;
             if list {
                 let providers = db::threads(&catalog.home)?
@@ -456,35 +672,69 @@ pub(crate) fn run(home: &Path, command: SessionsCommand) -> Result<()> {
                 }
                 return Ok(());
             }
-            let ids = if all {
+            let mut ids: Vec<String> = if all {
                 catalog.threads.keys().cloned().collect()
             } else {
-                vec![id.unwrap().to_ascii_lowercase()]
+                id.into_iter().map(|s| s.to_ascii_lowercase()).collect()
             };
+            ids.sort_by_key(|id| {
+                std::cmp::Reverse(catalog.chain(id).map(|c| c.len()).unwrap_or(0))
+            });
+            let bulk = all || ids.len() > 1;
             let mut imported = 0;
             let mut skipped = 0;
+            let mut live = 0;
+            let mut diverged = 0;
+            let mut failed = 0;
             for id in ids {
-                match import_one(&store, &catalog, &id, apply, all, true) {
+                match import_one(
+                    &store,
+                    &catalog,
+                    &id,
+                    ImportOptions {
+                        apply,
+                        skip_existing: all,
+                        announce: true,
+                        keep_source,
+                        clean_stale,
+                    },
+                ) {
                     Ok(true) => imported += 1,
                     Ok(false) => skipped += 1,
-                    Err(error) if all => {
-                        skipped += 1;
-                        // Internal failures may include sqlite contents. Never echo them.
-                        let _ = error;
-                        crate::print_stdout(format_args!(
-                            "{id}: 건너뜀 (사용 중이거나 가져오기 조건을 만족하지 않습니다)"
-                        ))?;
+                    Err(error) if bulk => {
+                        let message = error.to_string();
+                        let outcome = if error.downcast_ref::<guard::LiveWriter>().is_some()
+                            || message
+                                == "최근에 사용한 대화입니다. 먼저 대화를 종료하고 120초 후 다시 시도하세요"
+                        {
+                            live += 1;
+                            "실행 중/최근 사용으로 건너뜀"
+                        } else if message.contains("분기")
+                            || message == "대상에 다른 대화 기록이 있습니다"
+                        {
+                            diverged += 1;
+                            "기록 분기로 건너뜀"
+                        } else {
+                            failed += 1;
+                            "실패 (원본과 journal을 확인하세요)"
+                        };
+                        crate::print_stdout(format_args!("{id}: {outcome}"))?;
                     }
                     Err(error) => return Err(error),
                 }
             }
             crate::print_stdout(format_args!(
-                "{} {imported}개 · 건너뜀 {skipped}개",
-                if apply {
-                    "가져옴"
+                "결과 | {} | 이미 가져옴 | 실행 중 건너뜀 | 분기 건너뜀 | 실패",
+                if !apply {
+                    "처리 예정"
+                } else if keep_source {
+                    "공유"
                 } else {
-                    "가져올 대화"
+                    "이동"
                 }
+            ))?;
+            crate::print_stdout(format_args!(
+                "개수 | {imported} | {skipped} | {live} | {diverged} | {failed}"
             ))?;
             Ok(())
         }
@@ -492,34 +742,38 @@ pub(crate) fn run(home: &Path, command: SessionsCommand) -> Result<()> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ImportOptions {
+    apply: bool,
+    skip_existing: bool,
+    announce: bool,
+    keep_source: bool,
+    clean_stale: bool,
+}
+
 fn import_one(
     store: &Store,
     catalog: &discovery::Catalog,
     id: &str,
-    apply: bool,
-    skip_existing: bool,
-    announce: bool,
+    options: ImportOptions,
 ) -> Result<bool> {
-    import_one_using(
-        store,
-        catalog,
-        id,
-        apply,
-        skip_existing,
-        announce,
-        |a, b| fs::hard_link(a, b),
-    )
+    import_one_using(store, catalog, id, options, |a, b| fs::hard_link(a, b))
 }
 
 fn import_one_using(
     store: &Store,
     catalog: &discovery::Catalog,
     id: &str,
-    apply: bool,
-    skip_existing: bool,
-    announce: bool,
+    options: ImportOptions,
     linker: impl Fn(&Path, &Path) -> std::io::Result<()>,
 ) -> Result<bool> {
+    let ImportOptions {
+        apply,
+        skip_existing,
+        announce,
+        keep_source,
+        clean_stale,
+    } = options;
     let _lock = if apply { Some(store.lock()?) } else { None };
     let mut journal = store.load()?;
     if let Some(entry) = journal.imports.get(id) {
@@ -542,6 +796,12 @@ fn import_one_using(
     }
     let files = catalog.chain(id)?;
     ensure!(catalog.home != store.target, "원본과 대상 홈이 같습니다");
+    if !keep_source {
+        ensure!(
+            !source_has_dependents(catalog, id)?,
+            "다른 원본 대화가 이 기록을 사용합니다. 자식 대화를 먼저 옮기거나 --keep-source를 사용하세요"
+        );
+    }
     discovery::refuse_recent(&files, SystemTime::now())?;
     let threads: Vec<_> = files
         .iter()
@@ -552,8 +812,30 @@ fn import_one_using(
     let names: Vec<_> = files.iter().map(|f| f.path.clone()).collect();
     let (homes, names) = store.probes(&catalog.home, &threads, &names)?;
     let _guards = guard::probe_all(&homes, &threads, &names)?;
+    let stale = stale_plan(store, catalog, id)?;
+    if clean_stale {
+        for copy in &stale {
+            ensure!(
+                !source_has_dependents(&discovery::catalog(&copy.home)?, id)?,
+                "오래된 기록을 다른 대화가 사용합니다. --clean-stale 없이 다시 시도하세요"
+            );
+        }
+    }
     if announce {
         preview(id, &files, &store.target)?;
+        for copy in &stale {
+            let bytes: u64 = copy.names.iter().map(|n| n.bytes).sum();
+            crate::print_stdout(format_args!(
+                "오래된 별도 기록: {} · {}개 · {bytes}바이트 · {}",
+                copy.home.display(),
+                copy.names.len(),
+                if clean_stale {
+                    "정리 후 journal에서 복구 가능"
+                } else {
+                    "유지 (--clean-stale로만 정리)"
+                }
+            ))?;
+        }
     }
     let mut database = db::plan(&catalog.home, &store.target, &threads)?;
     for id in &threads {
@@ -618,6 +900,8 @@ fn import_one_using(
             identity,
             length: file.bytes,
             owned,
+            thread: file.thread.clone(),
+            moved: false,
         });
     }
     let index = index_plan(&store.target, &database)?;
@@ -629,6 +913,15 @@ fn import_one_using(
         database: crate::cutover::protect(&serde_json::to_vec(&database)?)?,
         index,
         complete: false,
+        root: id.into(),
+        keep_source,
+        move_started: false,
+        move_done: false,
+        source_database: crate::cutover::protect(&serde_json::to_vec(&db::source_snapshot(
+            &catalog.home,
+            &[id.into()],
+        )?)?)?,
+        stale: if clean_stale { stale } else { Vec::new() },
     };
     journal.imports.insert(id.into(), record.clone());
     store.save(&journal)?;
@@ -643,9 +936,42 @@ fn import_one_using(
     }
     db::apply(&database)?;
     update_index(&store.target, &record.index, false)?;
+    verify_links(&record, false)?;
+    db::verify(&database)?;
+    if !keep_source {
+        journal.imports.get_mut(id).unwrap().move_started = true;
+        for removed in record.files.iter().filter(|l| l.thread == id) {
+            for entry in journal.imports.values_mut() {
+                for alias in &mut entry.files {
+                    if alias.source == removed.source && alias.identity == removed.identity {
+                        alias.moved = true;
+                    }
+                }
+            }
+        }
+        store.save(&journal)?;
+        let source: db::DbPlan =
+            serde_json::from_slice(&crate::cutover::unprotect(&record.source_database)?)?;
+        // Verify completed while all writer guards remain held, then remove only
+        // this thread's own names/rows. Shared fork ancestors remain untouched.
+        for link in record.files.iter().filter(|l| l.thread == id) {
+            ensure!(
+                guard::identity(&link.source)? == link.identity
+                    && guard::identity(&link.target)? == link.identity,
+                "이동 검증 중 대화 기록이 변경되었습니다"
+            );
+        }
+        db::remove_exact(&source)?;
+        for link in record.files.iter().filter(|l| l.thread == id) {
+            fs::remove_file(&link.source)?;
+        }
+        journal.imports.get_mut(id).unwrap().move_done = true;
+        store.save(&journal)?;
+    }
+    clean_stale_copies(&record.stale)?;
     journal.imports.get_mut(id).unwrap().complete = true;
     store.save(&journal)?;
-    if announce {
+    if announce && keep_source {
         crate::print_stdout(format_args!(
             "주의: 두 홈의 대화 기록은 같은 파일입니다. 양쪽에서 동시에 실행하면 기록이 손상될 수 있습니다."
         ))?;
@@ -662,14 +988,27 @@ fn unimport(store: &Store, id: &str, apply: bool, force: bool) -> Result<()> {
         .get(id)
         .context("가져온 대화가 아닙니다")?
         .clone();
-    let names: Vec<_> = entry
+    let mut names: Vec<_> = entry
         .files
         .iter()
         .flat_map(|f| [f.source.clone(), f.target.clone()])
         .filter(|p| p.exists())
         .collect();
-    let (homes, names) = store.probes(&entry.source_home, &entry.threads, &names)?;
-    let _guards = guard::probe_all(&homes, &entry.threads, &names)?;
+    for copy in &entry.stale {
+        for name in &copy.names {
+            names.extend(
+                [name.original.clone(), name.backup.clone()]
+                    .into_iter()
+                    .filter(|p| p.exists()),
+            );
+        }
+    }
+    let (mut homes, names) = store.probes(&entry.source_home, &entry.threads, &names)?;
+    homes.extend(entry.stale.iter().map(|c| c.home.clone()));
+    homes.push(store.home.clone());
+    homes.sort();
+    homes.dedup();
+    let _guards = guard::probe_cleanup(&homes, &entry.threads, &names)?;
     for link in &entry.files {
         if link.target.exists() {
             ensure!(
@@ -691,6 +1030,45 @@ fn unimport(store: &Store, id: &str, apply: bool, force: bool) -> Result<()> {
     if !apply {
         return Ok(());
     }
+    journal.imports.get_mut(id).unwrap().complete = false;
+    store.save(&journal)?;
+    if entry.move_started {
+        // Restore original names/rows first. A crash is retryable and never leaves
+        // this half-unimport advertised as a usable completed import.
+        for link in entry
+            .files
+            .iter()
+            .filter(|l| l.moved || l.thread == entry.root)
+        {
+            if link.source.exists() {
+                ensure!(
+                    guard::identity(&link.source)? == link.identity,
+                    "원본 위치에 다른 기록이 있어 복구하지 못했습니다"
+                );
+            } else {
+                ensure!(
+                    guard::identity(&link.target)? == link.identity,
+                    "이동한 기록을 복구할 수 없습니다"
+                );
+                if let Some(parent) = link.source.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                guard::safe_path(&entry.source_home, &link.source)?;
+                fs::hard_link(&link.target, &link.source)?;
+            }
+            for other in journal.imports.values_mut() {
+                for alias in &mut other.files {
+                    if alias.source == link.source && alias.identity == link.identity {
+                        alias.moved = false;
+                    }
+                }
+            }
+        }
+        let source: db::DbPlan =
+            serde_json::from_slice(&crate::cutover::unprotect(&entry.source_database)?)?;
+        db::apply(&source)?;
+    }
+    restore_stale_copies(&entry.stale)?;
     let mut database: db::DbPlan =
         serde_json::from_slice(&crate::cutover::unprotect(&entry.database)?)
             .map_err(|_| anyhow::anyhow!("가져오기 메타데이터를 읽을 수 없습니다"))?;
@@ -753,8 +1131,9 @@ fn unimport(store: &Store, id: &str, apply: bool, force: bool) -> Result<()> {
             }
         }
     }
+    journal.imports.get_mut(id).unwrap().complete = false;
     store.save(&journal)?;
-    db::rollback(&database)?;
+    db::rollback_after_resume(&database, force)?;
     let remove_index = entry
         .index
         .iter()
@@ -771,29 +1150,132 @@ fn unimport(store: &Store, id: &str, apply: bool, force: bool) -> Result<()> {
     store.save(&journal)
 }
 
-pub(crate) fn before_codex_resume(args: &[OsString]) -> Result<()> {
-    if args.first().and_then(|s| s.to_str()) != Some("resume") {
-        return Ok(());
+fn resume_uuid(args: &[OsString]) -> Result<Option<String>> {
+    let mut index = 0;
+    let mut resume = false;
+    let mut literal = false;
+    let mut exec = false;
+    while let Some(arg) = args.get(index).and_then(|v| v.to_str()) {
+        index += 1;
+        if !literal && arg == "--" {
+            if !resume {
+                return Ok(None);
+            }
+            literal = true;
+            continue;
+        }
+        if !literal && matches!(arg, "--help" | "-h" | "--version" | "-V") {
+            return Ok(None);
+        }
+        if !literal && arg.starts_with('-') {
+            let (name, inline) = arg
+                .split_once('=')
+                .map_or((arg, false), |(name, _)| (name, true));
+            let valued = matches!(
+                name,
+                "--config"
+                    | "-c"
+                    | "--model"
+                    | "-m"
+                    | "--profile"
+                    | "-p"
+                    | "--sandbox"
+                    | "-s"
+                    | "--cd"
+                    | "-C"
+                    | "--ask-for-approval"
+                    | "-a"
+                    | "--image"
+                    | "-i"
+                    | "--enable"
+                    | "--disable"
+                    | "--add-dir"
+                    | "--remote"
+                    | "--remote-auth-token-env"
+                    | "--local-provider"
+                    | "--output-last-message"
+                    | "-o"
+                    | "--output-schema"
+                    | "--color"
+            );
+            if valued {
+                if !inline {
+                    ensure!(index < args.len(), "재개 옵션의 값이 없습니다");
+                    index += 1;
+                }
+                continue;
+            }
+            if arg.len() > 2
+                && ["-c", "-m", "-p", "-s", "-C", "-a", "-i", "-o"]
+                    .iter()
+                    .any(|p| arg.starts_with(p))
+            {
+                continue;
+            }
+            if matches!(
+                name,
+                "--all"
+                    | "--last"
+                    | "--include-non-interactive"
+                    | "--search"
+                    | "--no-alt-screen"
+                    | "--no-daemon"
+                    | "--strict-config"
+                    | "--oss"
+                    | "--approve-for-me"
+                    | "--dangerously-bypass-approvals-and-sandbox"
+                    | "--dangerously-bypass-hook-trust"
+                    | "--skip-git-repo-check"
+                    | "--json"
+                    | "--ephemeral"
+                    | "--full-auto"
+            ) {
+                continue;
+            }
+            if args.iter().any(|v| v == "resume")
+                && args
+                    .iter()
+                    .any(|v| v.to_str().is_some_and(discovery::valid_id))
+            {
+                bail!("재개 옵션을 확인할 수 없습니다. 지원되는 옵션과 UUID를 사용하세요");
+            }
+            return Ok(None);
+        }
+        if !resume {
+            match arg {
+                "resume" => resume = true,
+                "exec" | "e" if !exec => exec = true,
+                _ => return Ok(None),
+            }
+        } else {
+            return Ok(discovery::valid_id(arg).then(|| arg.to_ascii_lowercase()));
+        }
     }
-    let Some(id) = args
-        .get(1)
-        .and_then(|s| s.to_str())
-        .filter(|s| discovery::valid_id(s))
-    else {
+    Ok(None)
+}
+
+pub(crate) fn before_codex_resume(args: &[OsString]) -> Result<()> {
+    let Some(id) = resume_uuid(args)? else {
         return Ok(());
     };
+    let id = id.as_str();
     let store = Store::open(&qb_core::home()?)?;
     let journal = store.load()?;
-    if let Some(entry) = journal.imports.get(id) {
+    if let Some(entry) = journal
+        .imports
+        .values()
+        .find(|entry| entry.threads.iter().any(|t| t == id))
+    {
         ensure!(entry.complete, "대화 가져오기가 완료되지 않았습니다");
-        verify_links(entry, false)?;
         let names = entry
             .files
             .iter()
             .flat_map(|f| [f.source.clone(), f.target.clone()])
+            .filter(|p| p.exists())
             .collect::<Vec<_>>();
         let (homes, names) = store.probes(&entry.source_home, &entry.threads, &names)?;
         let _guards = guard::probe_all(&homes, &entry.threads, &names)?;
+        verify_links(entry, false)?;
         return Ok(());
     }
     if db::thread_path(&store.target, id)?.is_some() {
@@ -837,9 +1319,25 @@ pub(crate) fn before_codex_resume(args: &[OsString]) -> Result<()> {
             "여러 홈의 대화 기록이 분기되었습니다. 원본을 직접 지정하세요"
         );
     }
-    import_one(&store, &matches[0], id, true, false, false)?;
+    import_one(
+        &store,
+        &matches[0],
+        id,
+        ImportOptions {
+            apply: true,
+            skip_existing: false,
+            announce: false,
+            keep_source: DEFAULT_KEEP_SOURCE,
+            clean_stale: false,
+        },
+    )?;
+    let action = if DEFAULT_KEEP_SOURCE {
+        "연결했습니다"
+    } else {
+        "옮겼습니다"
+    };
     crate::print_stdout(format_args!(
-        "기존 대화를 qb로 가져왔습니다 ({}) · 두 홈에서 동시에 열지 마세요",
+        "기존 대화를 qb로 {action} ({} → qb)",
         matches[0].home.display()
     ))?;
     Ok(())
