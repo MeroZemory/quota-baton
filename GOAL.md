@@ -58,7 +58,7 @@ Implement quota-baton exactly as specified, milestone by milestone, until M8 is 
 | R6 | merged (`2245050`; full gate: default 1,056, full 1,085, standalone core 363; strict clippy and native Codex/Claude inspect/cancel/new/replace passed). Report: `.sandbox/reports/R6.md`. D18 takeover preserves ids, protects one-use refresh recovery, and keeps 30-day windows visible |
 | R7 | merged (`4bbe855`; full gate: default 1,176, full 1,205, standalone core 410; strict clippy and actual spawned-core dashboard captures/actions passed). Report: `.sandbox/reports/R7.md`. Separate dashboard, shared SSE, bounded session/activity/usage views and memory-only labels; no real profile/install changes |
 | R8 | review fixes + cache-routing conformance + anti-herding (D19, D20); Part A from dev, Parts B/C on impl/cache-routing rebased; brief `R8-review-fixes-and-anti-herding.md` |
-| R8.1 | round 1 merged (3cdaf5f), live recheck FAILED (title stays `C:\WINDOWS\system32\cmd.exe ` with a trailing space); round 2 in the brief `R8.1-codex-qb-title.md` |
+| R8.1 | merged (round 2 39345fd, dev 6dbbfae); installed and verified live: the herdr pane title shows `codex-qb · quota-baton` from 1 s to 19 s, and a codex-qb exec request returned ok |
 
 ## Hard boundaries (never)
 
