@@ -1212,8 +1212,14 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
                         ry += 26.;
                         provider = &group.provider;
                     }
-                    group_header(b, group, rect(viewport.left, ry, width(viewport), 34.));
-                    ry += 34.;
+                    let header_height =
+                        (34. + group.windows.len().saturating_sub(1) as f32 * 26.).max(34.);
+                    group_header(
+                        b,
+                        group,
+                        rect(viewport.left, ry, width(viewport), header_height),
+                    );
+                    ry += header_height;
                     if !group.collapsed {
                         if group.rows.is_empty() {
                             b.text(
@@ -1366,7 +1372,7 @@ fn group_header(b: &mut Builder<'_>, g: &m::AccountGroup, r: Rect) {
             false,
             None,
         );
-    } else {
+    } else if g.windows.is_empty() {
         b.text(
             rect(right.left, right.top + 3., width(right), 18.),
             g.remaining.clone(),
@@ -1389,6 +1395,47 @@ fn group_header(b: &mut Builder<'_>, g: &m::AccountGroup, r: Rect) {
             b.fill(
                 rect(bar.left, bar.top, 48. * p as f32 / 100., 4.),
                 bar_color(p),
+                2.,
+            );
+        }
+    } else {
+        for (index, window) in g.windows.iter().enumerate() {
+            let top = right.top + 2. + index as f32 * 26.;
+            let reset_width = window.reset.chars().count() as f32 * 6.5;
+            let label = format!("{} {}", window.label, window.remaining);
+            b.text(
+                rect(
+                    right.left,
+                    top,
+                    (width(right) - reset_width - 8.).max(0.),
+                    16.,
+                ),
+                label,
+                12.,
+                true,
+                Color::Text,
+                false,
+            );
+            if !window.reset.is_empty() {
+                b.text(
+                    rect(right.right - reset_width, top, reset_width, 16.),
+                    window.reset.clone(),
+                    12.,
+                    false,
+                    Color::Secondary,
+                    false,
+                );
+            }
+            let bar = rect(right.left, top + 19., width(right), 4.);
+            b.fill(bar, Color::Track, 2.);
+            b.fill(
+                rect(
+                    bar.left,
+                    bar.top,
+                    width(bar) * f32::from(window.remaining_pct) / 100.,
+                    4.,
+                ),
+                bar_color(window.remaining_pct),
                 2.,
             );
         }

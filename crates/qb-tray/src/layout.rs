@@ -2063,22 +2063,23 @@ mod tests {
         assert_eq!(row_height(&rows[3]), 92.0);
         assert_eq!(row_height(&rows[4]), 116.0);
         assert_eq!(row_height(&rows[5]), 92.0);
-        // V2: header105 + provider sections216/289 + list padding8 + footer48.
+        // V2: header105 + provider sections294/289 + list padding8 + footer48.
+        // The first section gained three account-window lines (26 DIP each).
         // Expanding both disclosures adds two44-DIP rows.
-        assert_eq!(native_render::content_height(&rows, false), 666.0);
-        assert_eq!(native_render::content_height(&rows, true), 754.0);
+        assert_eq!(native_render::content_height(&rows, false), 744.0);
+        assert_eq!(native_render::content_height(&rows, true), 832.0);
         let mut pacing = rows.clone();
         pacing[3].health_tone = Tone::Warning;
         pacing[3].health_chip = "속도 조절 중 · 10초".into();
         // A translated compatibility chip cannot fabricate core pacing evidence.
-        assert_eq!(native_render::content_height(&pacing, false), 666.0);
+        assert_eq!(native_render::content_height(&pacing, false), 744.0);
         let mut source: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
         source["accounts"][3]["pacing"] = serde_json::json!({
             "backoff_until":"2099-01-01T00:00:00Z", "waiting":1
         });
         let pacing = parse_state(&source.to_string()).unwrap();
         // A real pacing reason adds eight DIPs of gap and a16-DIP line.
-        assert_eq!(native_render::content_height(&pacing, false), 690.0);
+        assert_eq!(native_render::content_height(&pacing, false), 768.0);
     }
 
     #[test]

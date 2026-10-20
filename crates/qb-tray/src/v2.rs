@@ -294,9 +294,14 @@ pub struct WindowMetric {
 #[derive(Debug, Clone)]
 pub struct Usage {
     pub binding: Option<WindowMetric>,
+    pub lines: Vec<UsageLine>,
     pub text: String,
-    pub bar_tone: BarTone,
     pub tooltip: String,
+}
+#[derive(Debug, Clone)]
+pub struct UsageLine {
+    pub window: WindowMetric,
+    pub bar_tone: BarTone,
 }
 #[derive(Debug, Clone)]
 pub struct CreditsLine {
@@ -598,8 +603,8 @@ pub fn account_window(w: &Window) -> bool {
 }
 pub fn window_label(name: &str) -> String {
     match name {
-        "5h" => "5시간".into(),
-        "7d" => "주간".into(),
+        "5h" | "primary" => "5시간".into(),
+        "7d" | "secondary" => "주간".into(),
         "7d_oi" => "모델 주간 (7d_oi)".into(),
         "seven_day_opus" => "Opus 주간".into(),
         "seven_day_sonnet" => "Sonnet 주간".into(),
@@ -636,6 +641,28 @@ fn metric(w: &Window, a: &Account, now: DateTime<Utc>) -> WindowMetric {
             && a.health.kind == "cooling"
             && scope != "account"
             && (scope == w.name || scope.strip_prefix("model:") == Some(w.name.as_str())),
+    }
+}
+fn window_minutes(name: &str) -> Option<u64> {
+    match name {
+        "5h" | "primary" => Some(300),
+        "7d" | "secondary" => Some(10_080),
+        _ => name
+            .strip_suffix('m')?
+            .parse::<u64>()
+            .ok()
+            .filter(|n| *n > 0),
+    }
+}
+fn bar_tone(a: &Account, remaining: Option<u8>) -> BarTone {
+    if a.user_state == "paused" {
+        BarTone::Paused
+    } else {
+        match remaining {
+            Some(30..=100) | None => BarTone::Ok,
+            Some(10..=29) => BarTone::Low,
+            Some(_) => BarTone::Critical,
+        }
     }
 }
 fn binding(a: &Account, windows: &[WindowMetric], now: DateTime<Utc>) -> Option<WindowMetric> {
@@ -681,11 +708,7 @@ fn project_row(a: &Account, name: String, now: DateTime<Utc>) -> AccountRow {
     windows.sort_by_key(|w| {
         (
             !w.account_scoped,
-            match w.raw.name.as_str() {
-                "5h" => 0,
-                "7d" => 1,
-                _ => 2,
-            },
+            window_minutes(&w.raw.name).unwrap_or(u64::MAX),
             w.raw.name.clone(),
         )
     });
@@ -693,26 +716,21 @@ fn project_row(a: &Account, name: String, now: DateTime<Utc>) -> AccountRow {
         None
     } else {
         let chosen = binding(a, &windows, now);
-        let remaining = chosen.as_ref().and_then(|w| w.remaining);
-        let text = chosen
-            .as_ref()
-            .and_then(|w| w.remaining.map(|n| format!("{} {n}% 남음", w.label)))
-            .unwrap_or_else(|| "사용량 확인 전".into());
-        let bar_tone = if a.user_state == "paused" {
-            BarTone::Paused
-        } else {
-            match remaining {
-                Some(30..=100) => BarTone::Ok,
-                Some(10..=29) => BarTone::Low,
-                Some(_) => BarTone::Critical,
-                None => BarTone::Ok,
-            }
-        };
+        let text = "사용량 확인 전".into();
+        let lines = windows
+            .iter()
+            .filter(|w| w.account_scoped && w.used.is_some())
+            .cloned()
+            .map(|window| UsageLine {
+                bar_tone: bar_tone(a, window.remaining),
+                window,
+            })
+            .collect();
         let tooltip = usage_tooltip(chosen.as_ref(), &windows, a.observed_at.as_deref(), now);
         Some(Usage {
             binding: chosen,
+            lines,
             text,
-            bar_tone,
             tooltip,
         })
     };
@@ -1024,15 +1042,34 @@ fn finish_row(row: &mut AccountRow, summary: &Summary, serving: Option<&str>, no
         Drain => Some("이미 연결된 대화만 계속 처리합니다.".into()),
         _ => None,
     };
+    let usage_accessibility = row.usage.as_ref().map(|usage| {
+        if usage.lines.is_empty() {
+            usage.text.clone()
+        } else {
+            usage
+                .lines
+                .iter()
+                .map(|line| {
+                    format!(
+                        "{} {}% 남음{}",
+                        line.window.label,
+                        line.window.remaining.unwrap_or_default(),
+                        line.window
+                            .reset_text
+                            .as_ref()
+                            .map(|reset| format!(", {reset}"))
+                            .unwrap_or_default()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    });
     row.accessible_name = [
         Some(row.name.clone()),
         row.plan.clone(),
         row.chip.as_ref().map(|c| c.text.clone()),
-        row.usage.as_ref().map(|u| u.text.clone()),
-        row.usage
-            .as_ref()
-            .and_then(|u| u.binding.as_ref())
-            .and_then(|w| w.reset_text.clone()),
+        usage_accessibility,
     ]
     .into_iter()
     .flatten()
@@ -1305,7 +1342,7 @@ fn usage_tooltip(
         .map(|t| format!(" {} 기준.", t.with_timezone(&Local).format("%H:%M")))
         .unwrap_or_else(|| " 기준 시각 확인 전.".into());
     lines.push(format!(
-        "막대는 남은 양입니다. 남은 양이 가장 적은 창을 보여 줍니다.{observed}"
+        "각 막대는 해당 사용량 창의 남은 양입니다.{observed}"
     ));
     lines.join("\n")
 }
@@ -1470,7 +1507,7 @@ mod tests {
         assert_eq!(codex(&v).rows[0].name, "이름 없는 계정");
     }
     #[test]
-    fn binding_remaining_tie_and_model_exclusion() {
+    fn every_known_account_window_is_displayed_but_binding_still_uses_limit() {
         let mut a = base("a");
         a["windows"] = json!([
             window("5h", 62.0, "2026-10-19T00:00:00Z"),
@@ -1481,7 +1518,13 @@ mod tests {
         let v = view(vec![a.clone()], 1);
         let u = codex(&v).rows[0].usage.as_ref().unwrap();
         assert_eq!(u.binding.as_ref().unwrap().raw.name, "7d");
-        assert_eq!(u.text, "주간 38% 남음");
+        assert_eq!(
+            u.lines
+                .iter()
+                .map(|l| l.window.raw.name.as_str())
+                .collect::<Vec<_>>(),
+            ["5h", "7d"]
+        );
         assert!(u.tooltip.contains("62% 사용, 38% 남음"));
         assert!(u.tooltip.contains("Opus 주간"));
         a["health"] = json!({"kind":"cooling","reason":"quota","scope":"account"});
@@ -1499,6 +1542,38 @@ mod tests {
         a["quota_cooling"]["window"] = json!("7d_oi");
         let v = view(vec![a], 0);
         assert!(codex(&v).rows[0].usage.as_ref().unwrap().binding.is_none());
+    }
+    #[test]
+    fn account_windows_render_in_duration_order_and_free_has_one_thirty_day_line() {
+        let mut claude = base("claude");
+        claude["provider"] = json!("claude");
+        claude["windows"] = json!([
+            window("7d", 25., "2026-10-26T00:00:00Z"),
+            window("5h", 75., "2026-10-21T20:00:00Z")
+        ]);
+        let mut plus = base("plus");
+        plus["windows"] = claude["windows"].clone();
+        let mut free = base("free");
+        free["plan"] = json!("free");
+        free["windows"] = json!([window("43200m", 40., "2026-11-20T00:00:00Z")]);
+        let v = view(vec![claude, plus, free], 3);
+        for row in [&v.sections[0].rows[0], &codex(&v).rows[1]] {
+            let usage = row.usage.as_ref().unwrap();
+            assert_eq!(
+                usage
+                    .lines
+                    .iter()
+                    .map(|l| l.window.label.as_str())
+                    .collect::<Vec<_>>(),
+                ["5시간", "주간"]
+            );
+            assert_eq!(usage.binding.as_ref().unwrap().raw.name, "5h");
+        }
+        let free = codex(&v).rows.iter().find(|r| r.raw.id == "free").unwrap();
+        let usage = free.usage.as_ref().unwrap();
+        assert_eq!(usage.lines.len(), 1);
+        assert_eq!(usage.lines[0].window.label, "30일");
+        assert_eq!(usage.binding.as_ref().unwrap().raw.name, "43200m");
     }
     #[test]
     fn unknown_meter_and_authoritative_missing_meter() {
@@ -1539,7 +1614,7 @@ mod tests {
             let v = view(vec![a], 1);
             let u = codex(&v).rows[0].usage.as_ref().unwrap();
             assert_eq!(u.binding.as_ref().unwrap().remaining, Some(remaining));
-            assert_eq!(u.bar_tone, tone);
+            assert_eq!(u.lines[0].bar_tone, tone);
         }
         assert_eq!(window_label("10080m"), "7일");
         assert_eq!(window_label("300m"), "300분");
@@ -1819,6 +1894,7 @@ mod tests {
         let mut a = base("a");
         a["user_state"] = json!("disabled");
         a["health"] = json!({"kind":"needs_relogin"});
+        a["windows"] = json!([window("5h", 40., "2026-10-21T20:00:00Z")]);
         let v = view(vec![a.clone()], 0);
         let s = codex(&v);
         assert_eq!(summary(&v).verdict, Verdict::Off);
@@ -1835,7 +1911,7 @@ mod tests {
         a["health"] = json!({"kind":"ready"});
         let v = view(vec![a], 0);
         assert_eq!(
-            codex(&v).rows[0].usage.as_ref().unwrap().bar_tone,
+            codex(&v).rows[0].usage.as_ref().unwrap().lines[0].bar_tone,
             BarTone::Paused
         );
     }
