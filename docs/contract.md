@@ -326,6 +326,11 @@ These rules originate in D11, with session spreading in D15 and explicit routing
 
 **Projected usage.** For each window it is the last observed `used_pct`, plus an in-flight allowance for each request in flight (`inflight_allowance_pct`), plus outstanding placement charges (`placement_allowance_pct`, default 2 percentage points per new or moved group). Each window retains a charge until its own observation is strictly newer than the placement. Equal or older observations do not clear it. Rules from M4b and D20:
 - **Gating windows.** Only the account windows count for the gate and for ordering: `5h` and `7d` (Codex primary/secondary as named by C9). Sub-buckets such as `7d_oi` and other names never gate the account and never set the weekly ordering. They act only through model-scoped cooling (C5) (S1).
+- **Non-standard Codex windows (design owner, 2026-10-20).** A Codex primary or secondary window with another length (`<n>m`, C9; e.g. the Free plan's single `43200m`) is an account window. It gates and orders in a slot chosen by its length:
+  - `n` ≤ 1440 takes the 5-hour slot: `gate_5h_pct` and the 5-hour ordering key.
+  - `n` > 1440 takes the weekly slot: `gate_weekly_pct`, the near-reset rule and the weekly ordering key.
+  - When a slot holds two windows, both gate, and the ordering key uses the window with the higher projected usage.
+  - Unknown, stale and past-reset rules apply unchanged.
 - **Past reset.** A window whose `reset_at` has passed counts as 0 % used and unstarted until a new observation arrives (F2).
 - **Unknown or stale.** A window is stale when its observation is older than 15 min **and** the account has carried traffic newer than that observation.
   - Unknown or stale usage **sorts last** in ordering but **does not fail the gate**: it is not known to be over (F1).
