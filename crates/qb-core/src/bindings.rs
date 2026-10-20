@@ -126,6 +126,7 @@ struct PlacementWindow {
     value: Value,
     asof: Option<UsageObservationAsOf>,
     reported_sequence: u64,
+    unresolved_equal_charge: bool,
 }
 // Timer metadata only. Exact charge/cap counts use cumulative counters above.
 // Coalescing retains the earliest time, so partial acknowledgments can make a
@@ -167,6 +168,7 @@ impl PlacementState {
                             placed_count: 0,
                         }),
                         reported_sequence: 0,
+                        unresolved_equal_charge: false,
                     });
             }
         }
@@ -181,6 +183,7 @@ impl PlacementState {
         let Some(windows) = snapshot["windows"].as_array() else {
             return;
         };
+        let equal_placement = self.latest == Some(asof.sequence) && self.total > 0;
         if complete
             && self
                 .window_set_sequence
@@ -215,13 +218,20 @@ impl PlacementState {
                     value: w.clone(),
                     asof: None,
                     reported_sequence: asof.sequence,
+                    unresolved_equal_charge: false,
                 });
             window.reported_sequence = window.reported_sequence.max(asof.sequence);
             if date(&w["observed_at"]).is_some()
                 && window.asof.is_none_or(|old| asof.sequence >= old.sequence)
             {
                 window.value = w.clone();
-                window.asof = Some(asof);
+                if window.asof.is_none_or(|old| asof.sequence > old.sequence) {
+                    // Equality leaves this window's charge unresolved even
+                    // after another placement changes the account's latest seq.
+                    // Replays of the same proof retain its original count/flag.
+                    window.unresolved_equal_charge = equal_placement;
+                    window.asof = Some(asof);
+                }
             }
         }
         let oldest_asof = if self.windows.is_empty()
@@ -267,11 +277,12 @@ impl PlacementState {
         usize::try_from(self.total - self.oldest_count()).unwrap_or(usize::MAX)
     }
     fn charge_count(&self, name: &str) -> usize {
-        let asof = self.windows.get(name).and_then(|w| w.asof);
+        let window = self.windows.get(name);
+        let asof = window.and_then(|w| w.asof);
         let covered = asof.map_or(0, |at| at.placed_count.min(self.total));
         // Equal is not newer: cap count excludes the equal placement while its
         // charge remains. Real send tokens are distinct from placement events.
-        let equal = asof.is_some_and(|at| self.latest == Some(at.sequence) && self.total > 0);
+        let equal = window.is_some_and(|w| w.unresolved_equal_charge);
         usize::try_from((self.total - covered).saturating_add(u64::from(equal)))
             .unwrap_or(usize::MAX)
     }
@@ -1189,7 +1200,7 @@ impl BindingTable {
             })
             .count()
     }
-    fn rebalance_target_base(
+    fn rebalance_target_waiting(
         &self,
         d: &Data,
         source: &str,
@@ -1208,12 +1219,24 @@ impl BindingTable {
             && m.gate
             && !m.unknown
             && (m.weekly.is_some() || m.five.is_some())
+            && target < self.spread_threshold_for(&c.account.id)
+            && (!require_balance || target.saturating_add(2) <= source_count)
+    }
+    fn rebalance_target_base(
+        &self,
+        d: &Data,
+        source: &str,
+        c: &Candidate,
+        except: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> bool {
+        // Actual moves still require pacing and recent-rate quiet to end.
+        // A capped target may remain worth waiting for while either is active.
+        self.rebalance_target_waiting(d, source, c, except, now)
             && !d.pacing.get(&c.account.id).copied().unwrap_or(false)
             && d.last_rate.get(&c.account.id).is_none_or(|at| {
                 (now - *at).num_seconds() >= self.config.churn.target_quiet_secs as i64
             })
-            && target < self.spread_threshold_for(&c.account.id)
-            && (!require_balance || target.saturating_add(2) <= source_count)
     }
     fn rebalance_target(
         &self,
@@ -1992,7 +2015,7 @@ impl BindingTable {
                         && entries.iter().any(|(candidate, eligible)| {
                             *eligible
                                 && candidate.account.id != b.account
-                                && self.rebalance_target_base(
+                                && self.rebalance_target_waiting(
                                     d,
                                     &b.account,
                                     candidate,
@@ -2143,7 +2166,7 @@ impl BindingTable {
             partition.retain(|(c, _)| {
                 bound_account.as_ref().is_some_and(|source| {
                     source != &c.account.id
-                        && self.rebalance_target_base(d, source, c, key.map(group), now)
+                        && self.rebalance_target(d, source, c, key.map(group), now)
                 }) && key.is_some_and(|key| {
                     self.policies
                         .discretionary_allowed(key, Some(&c.account.id), now)
