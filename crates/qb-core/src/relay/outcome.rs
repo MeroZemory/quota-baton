@@ -231,7 +231,9 @@ pub(super) fn classify(
             .filter(|reset| *reset > now)
             .max()
             .unwrap_or(
-                now + Duration::seconds(header_seconds(headers, "retry-after").unwrap_or(300)),
+                now + Duration::seconds(
+                    header_seconds_at(headers, "retry-after", now).unwrap_or(300),
+                ),
             );
         decision.signal = cooling(HealthReason::Quota, until, scope);
     } else if !matches!(
@@ -312,6 +314,10 @@ pub(super) fn classify(
 }
 
 pub(super) fn header_seconds(h: &HeaderMap, name: &str) -> Option<i64> {
+    header_seconds_at(h, name, Utc::now())
+}
+
+fn header_seconds_at(h: &HeaderMap, name: &str, now: DateTime<Utc>) -> Option<i64> {
     let value = h.get(name)?.to_str().ok()?;
     if let Ok(number) = value.parse::<f64>() {
         return number
@@ -323,7 +329,7 @@ pub(super) fn header_seconds(h: &HeaderMap, name: &str) -> Option<i64> {
     if name == "retry-after" {
         return DateTime::parse_from_rfc2822(value)
             .ok()
-            .map(|date| advice_seconds_until(date.with_timezone(&Utc), Utc::now()));
+            .map(|date| advice_seconds_until(date.with_timezone(&Utc), now));
     }
     None
 }
@@ -362,6 +368,33 @@ pub(super) fn error_value(raw: &[u8]) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn quota_fallback_uses_one_wall_clock_sample_across_a_second_boundary() {
+        let base = DateTime::parse_from_rfc3339("2026-10-20T00:00:00.900Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let later = DateTime::parse_from_rfc3339("2026-10-20T00:00:01.050Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let advice = DateTime::parse_from_rfc3339("2026-10-20T00:02:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "retry-after",
+            "Tue, 20 Oct 2026 00:02:00 GMT".parse().unwrap(),
+        );
+        // The former mixed-sample calculation ends100ms before server advice.
+        assert!(
+            base + Duration::seconds(header_seconds_at(&headers, "retry-after", later).unwrap())
+                < advice
+        );
+        let until =
+            base + Duration::seconds(header_seconds_at(&headers, "retry-after", base).unwrap());
+        assert!(until >= advice);
+        assert!(until - advice < Duration::seconds(1));
+    }
+
     #[test]
     fn http_date_advice_rounds_up_fractional_seconds_and_keeps_the_existing_cap() {
         let now = chrono::DateTime::parse_from_rfc3339("2026-10-20T00:00:00Z")
