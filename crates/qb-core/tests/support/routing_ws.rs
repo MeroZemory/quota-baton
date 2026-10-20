@@ -1,26 +1,93 @@
 use super::*;
 
 #[tokio::test]
-async fn whole_upgrade_deadline_during_rate_wait_returns_504_without_a_dial() {
+async fn upgrade_rate_hold_expiry_sends_once_before_the_overall_deadline() {
     let h = Harness::new_with_rate_options(1, false, false, Some((1, 3))).await;
+    let id = &h.ids[0];
     h.state
         .accounts
-        .observe_429(&h.ids[0], Some(Duration::from_secs(30)));
-    let Error::Http(response) = connect_async(h.request()).await.unwrap_err() else {
-        panic!("expected local HTTP error");
+        .observe_429(id, Some(Duration::from_secs(30)));
+    let began = std::time::Instant::now();
+    let (mut client, response) =
+        tokio::time::timeout(Duration::from_millis(1800), connect_async(h.request()))
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+    assert_eq!(response.headers()["x-quota-baton-account"], id.as_str());
+    assert!(
+        began.elapsed() >= Duration::from_millis(800),
+        "admission cannot skip the one-second hold's final-send boundary"
+    );
+    assert_eq!(h.fake.state.requests().len(), 1);
+    assert_credential(&h, 0, id);
+    assert_eq!(
+        h.fake.state.requests()[0].headers["session-id"],
+        "synthetic-ws-session"
+    );
+    let row = h
+        .ledger()
+        .into_iter()
+        .find(|row| row["outcome"] == "ws_upgrade")
+        .unwrap();
+    assert_eq!(row["status"], 101);
+    assert_eq!(row["account"], id.as_str());
+    assert_eq!(row["attempts"], 1);
+    assert_eq!(row["rate_retries"], 0);
+    assert_eq!(row["relayed_rate_429s"], 0);
+    assert!(row["rate_wait_ms"].as_u64().unwrap() >= 800);
+    assert_eq!(h.store.load(id).unwrap().health, Health::Ready);
+    let _ = client.close(None).await;
+}
+
+#[tokio::test]
+async fn slow_forced_upgrade_still_expires_at_the_original_overall_deadline() {
+    let h = Harness::new_with_rate_options(1, false, false, Some((1, 3))).await;
+    let id = &h.ids[0];
+    h.state
+        .accounts
+        .observe_429(id, Some(Duration::from_secs(30)));
+    h.fake.state.push_handshake_delayed(
+        StatusCode::BAD_REQUEST,
+        r#"{"error":{"type":"invalid_request_error","message":"synthetic delayed rejection"}}"#,
+        HeaderMap::new(),
+        Duration::from_secs(2),
+    );
+    let began = std::time::Instant::now();
+    let Error::Http(response) =
+        tokio::time::timeout(Duration::from_millis(1800), connect_async(h.request()))
+            .await
+            .expect("the forced dial must not renew the overall one-second envelope")
+            .unwrap_err()
+    else {
+        panic!("expected overall upgrade timeout");
     };
+    assert!(began.elapsed() >= Duration::from_millis(900));
+    assert!(began.elapsed() < Duration::from_millis(1800));
     assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
     assert!(!response.headers().contains_key("retry-after"));
     let json: Value = serde_json::from_slice(response.body().as_ref().unwrap()).unwrap();
     assert_eq!(json["error"]["type"], "request_timeout");
-    assert!(h.fake.state.requests().is_empty());
-    assert!(
-        h.ledger()
-            .iter()
-            .any(|row| row["outcome"] == "request_timeout"
-                && row["status"] == 504
-                && row["attempts"] == 0)
+    assert!(!json.to_string().contains("synthetic delayed rejection"));
+    assert_eq!(
+        h.fake.state.requests().len(),
+        1,
+        "expiry authorizes one dial, not retries or failover"
     );
+    assert_credential(&h, 0, id);
+    let row = h
+        .ledger()
+        .into_iter()
+        .find(|row| row["outcome"] == "request_timeout")
+        .unwrap();
+    assert_eq!(row["status"], 504);
+    assert_eq!(row["account"], id.as_str());
+    assert_eq!(row["attempts"], 1);
+    assert_eq!(row["rate_retries"], 0);
+    assert_eq!(row["relayed_rate_429s"], 0);
+    assert!(row["rate_wait_ms"].as_u64().unwrap() >= 800);
+    assert!(row["dur_ms"].as_u64().unwrap() < 1800);
+    assert_eq!(h.store.load(id).unwrap().health, Health::Ready);
 }
 
 #[tokio::test]
