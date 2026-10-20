@@ -33,15 +33,13 @@ pub enum Mode {
     Rebalance,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct ChurnLimits {
     pub dwell_secs: u64,
     pub revisit_secs: u64,
     pub window_secs: u64,
     pub max_group_moves: usize,
     pub max_pool_moves: usize,
-    pub target_quiet_secs: u64,
-    pub target_success_secs: u64,
     pub max_move_bytes: u64,
 }
 impl Default for ChurnLimits {
@@ -52,8 +50,6 @@ impl Default for ChurnLimits {
             window_secs: 600,
             max_group_moves: 3,
             max_pool_moves: 4,
-            target_quiet_secs: 120,
-            target_success_secs: 300,
             max_move_bytes: 8 * 1024 * 1024,
         }
     }
@@ -66,9 +62,6 @@ impl ChurnLimits {
             || self.window_secs > 86400
             || !(1..=16).contains(&self.max_group_moves)
             || !(1..=32).contains(&self.max_pool_moves)
-            || self.target_quiet_secs > 3600
-            || self.target_success_secs == 0
-            || self.target_success_secs > 900
             || self.max_move_bytes == 0
             || self.max_move_bytes > 64 * 1024 * 1024
         {
@@ -159,8 +152,6 @@ struct State {
     #[serde(skip)]
     pool_moves: BTreeMap<String, Vec<DateTime<Utc>>>,
     #[serde(skip)]
-    arrivals: BTreeMap<String, DateTime<Utc>>,
-    #[serde(skip)]
     frozen: bool,
     #[serde(skip)]
     history_overflow_until: Option<DateTime<Utc>>,
@@ -176,7 +167,6 @@ impl Default for State {
             sessions: BTreeMap::new(),
             legacy_codex_roots: BTreeSet::new(),
             pool_moves: BTreeMap::new(),
-            arrivals: BTreeMap::new(),
             frozen: false,
             history_overflow_until: None,
             durable_overflow_until: None,
@@ -205,7 +195,6 @@ impl State {
             );
         }
         self.pool_moves.clear();
-        self.arrivals.clear();
         for (root, session) in &mut self.sessions {
             for (index, movement) in session.movements.iter_mut().enumerate() {
                 if movement.id.is_none() {
@@ -223,10 +212,6 @@ impl State {
             if !seen.insert(movement.id.as_ref().expect("indexed movement identity")) {
                 continue;
             }
-            self.arrivals
-                .entry(movement.to.clone())
-                .and_modify(|at| *at = (*at).max(movement.at))
-                .or_insert(movement.at);
             if movement.discretionary {
                 self.pool_moves
                     .entry(pool_id(&movement.to).to_owned())
@@ -1578,13 +1563,7 @@ impl PolicyStore {
             .flatten()
             .filter(|at| (now - **at).num_seconds() < self.limits.window_secs as i64)
             .count();
-        if pool_moves >= self.limits.max_pool_moves
-            || target.is_some_and(|target| {
-                state.arrivals.get(target).is_some_and(|at| {
-                    (now - *at).num_seconds() < self.limits.target_quiet_secs as i64
-                })
-            })
-        {
+        if pool_moves >= self.limits.max_pool_moves {
             return false;
         }
         let Some(session) = state.sessions.get(&state.policy_id(key)) else {
@@ -1670,10 +1649,7 @@ impl PolicyStore {
                     bail!("routing policy recovery incomplete");
                 }
                 let mut next = (*state).clone();
-                let until = now
-                    + chrono::Duration::seconds(
-                        self.limits.revisit_secs.max(self.limits.target_quiet_secs) as i64,
-                    );
+                let until = now + chrono::Duration::seconds(self.limits.revisit_secs as i64);
                 next.history_overflow_until = Some(
                     next.history_overflow_until
                         .map_or(until, |old| old.max(until)),
@@ -1704,12 +1680,11 @@ impl PolicyStore {
                 bail!("routing volatile history overflow guard");
             }
             if !state.sessions.contains_key(&id) && state.sessions.len() >= MAX_SESSIONS {
-                let forced_horizon = self.limits.revisit_secs.max(self.limits.target_quiet_secs);
+                let forced_horizon = self.limits.revisit_secs;
                 let discretionary_horizon = 86400_u64
                     .max(self.limits.window_secs)
                     .max(self.limits.dwell_secs)
-                    .max(self.limits.revisit_secs)
-                    .max(self.limits.target_quiet_secs);
+                    .max(self.limits.revisit_secs);
                 state.sessions.retain(|root, session| {
                     session.durable(&self.defaults)
                         || session.settings(&self.defaults).mode == Mode::Strict
@@ -1750,17 +1725,6 @@ impl PolicyStore {
                     .count();
                 if pool_moves >= self.limits.max_pool_moves {
                     bail!("routing pool movement budget exhausted");
-                }
-                if state
-                    .sessions
-                    .values()
-                    .flat_map(|s| s.movements.iter())
-                    .any(|m| {
-                        m.to == account
-                            && (now - m.at).num_seconds() < self.limits.target_quiet_secs as i64
-                    })
-                {
-                    bail!("routing destination inflow budget exhausted");
                 }
             }
             let mut evicted_forced_until: Option<DateTime<Utc>> = None;
@@ -1826,10 +1790,8 @@ impl PolicyStore {
                             .position(|m| !m.discretionary)
                             .expect("forced history overflow");
                         let evicted = entry.movements.remove(index);
-                        let until = evicted.at
-                            + chrono::Duration::seconds(
-                                self.limits.revisit_secs.max(self.limits.target_quiet_secs) as i64,
-                            );
+                        let until =
+                            evicted.at + chrono::Duration::seconds(self.limits.revisit_secs as i64);
                         if now < until {
                             evicted_forced_until =
                                 Some(evicted_forced_until.map_or(until, |old| old.max(until)));
@@ -2088,6 +2050,68 @@ mod tests {
             .unwrap();
         assert_eq!(store.plan(Some("codex:new")).source, "session");
     }
+    #[test]
+    fn round2_churn_ignores_removed_and_unknown_keys() {
+        let limits: ChurnLimits = serde_json::from_value(serde_json::json!({
+            "target_quiet_secs": 120, "target_success_secs": 300,
+            "future_option": true, "max_pool_moves": 7
+        }))
+        .unwrap();
+        assert_eq!(limits.max_pool_moves, 7);
+        limits.validate().unwrap();
+        let value = serde_json::to_value(limits).unwrap();
+        assert!(value.get("target_quiet_secs").is_none());
+        assert!(value.get("target_success_secs").is_none());
+        assert!(value.get("future_option").is_none());
+    }
+
+    #[test]
+    fn round2_distinct_groups_can_arrive_without_destination_quiet() {
+        let home = home();
+        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        for n in 0..2 {
+            let key = format!("codex:arrival{n}");
+            assert!(store.discretionary_allowed(&key, Some("cx-b"), clock()));
+            store
+                .dispatch(Some(&key), "cx-b", Some("cx-a"), "overload", clock())
+                .unwrap();
+        }
+        assert_eq!(store.snapshot().pool_moves["cx"].len(), 2);
+        assert!(!store.path.exists());
+    }
+
+    #[test]
+    fn round2_zero_revisit_forced_ring_does_not_invent_arrival_guard() {
+        let home = home();
+        let store = PolicyStore::new(home.path(), Settings::default())
+            .unwrap()
+            .with_limits(ChurnLimits {
+                revisit_secs: 0,
+                ..ChurnLimits::default()
+            })
+            .unwrap();
+        let mut previous = "cx-original".to_owned();
+        for n in 0..33 {
+            let to = format!("cx-ring-{n}");
+            store
+                .dispatch(Some("codex:ring"), &to, Some(&previous), "forced", clock())
+                .unwrap();
+            previous = to;
+        }
+        assert!(store.snapshot().history_overflow_until.is_none());
+        assert!(store.discretionary_allowed("codex:other", Some("cx-ring-0"), clock()));
+        assert!(store.discretionary_allowed("codex:ring", Some("cx-original"), clock()));
+        store
+            .dispatch(
+                Some("codex:other"),
+                "cx-ring-0",
+                Some("cx-before"),
+                "overload",
+                clock(),
+            )
+            .unwrap();
+    }
+
     #[test]
     fn movement_budget_dwell_and_revisit_survive_restart() {
         let home = home();
@@ -3466,12 +3490,11 @@ mod tests {
     }
 
     #[test]
-    fn close4_forced_ring_eviction_preserves_live_revisit_and_arrival_guards() {
+    fn close4_forced_ring_eviction_preserves_live_revisit_guards() {
         for revisit in [true, false] {
             let home = home();
             let limits = ChurnLimits {
-                revisit_secs: if revisit { 3600 } else { 0 },
-                target_quiet_secs: 120,
+                revisit_secs: if revisit { 3600 } else { 120 },
                 ..ChurnLimits::default()
             };
             let store = PolicyStore::new(home.path(), Settings::default())
@@ -3498,12 +3521,8 @@ mod tests {
                     .len(),
                 MAX_FORCED_HISTORY
             );
-            let target = if revisit { "cx-original" } else { "cx-ring-0" };
-            let key = if revisit {
-                "codex:evict-ring"
-            } else {
-                "codex:other-root"
-            };
+            let target = "cx-original";
+            let key = "codex:evict-ring";
             let deadline = clock() + chrono::Duration::seconds(if revisit { 3600 } else { 120 });
             assert_eq!(store.snapshot().history_overflow_until, Some(deadline));
             assert!(!store.discretionary_allowed(key, Some(target), clock()));
@@ -3836,8 +3855,7 @@ mod tests {
         for revisit in [true, false] {
             let home = home();
             let limits = ChurnLimits {
-                revisit_secs: if revisit { 3600 } else { 0 },
-                target_quiet_secs: 120,
+                revisit_secs: if revisit { 3600 } else { 120 },
                 ..ChurnLimits::default()
             };
             let store = PolicyStore::new(home.path(), Settings::default())
@@ -3895,11 +3913,7 @@ mod tests {
                 .with_limits(limits)
                 .unwrap();
             assert_eq!(store.snapshot().history_overflow_until, Some(deadline));
-            let (group, target) = if revisit {
-                (key, "cx-original")
-            } else {
-                ("codex:other-group", "cx-ring-0")
-            };
+            let (group, target) = (key, "cx-original");
             assert!(!store.discretionary_allowed(
                 group,
                 Some(target),
@@ -3930,8 +3944,7 @@ mod tests {
             for revisit in [true, false] {
                 let home = home();
                 let limits = ChurnLimits {
-                    revisit_secs: if revisit { 3600 } else { 0 },
-                    target_quiet_secs: 120,
+                    revisit_secs: if revisit { 3600 } else { 120 },
                     ..ChurnLimits::default()
                 };
                 let store = PolicyStore::new(home.path(), Settings::default())
@@ -4009,11 +4022,7 @@ mod tests {
                     .unwrap()
                     .with_limits(limits)
                     .unwrap();
-                let (group, target) = if revisit {
-                    (key, "cx-original")
-                } else {
-                    ("codex:other-group", "cx-ring-0")
-                };
+                let (group, target) = (key, "cx-original");
                 assert_eq!(store.snapshot().history_overflow_until, Some(deadline));
                 assert!(!store.discretionary_allowed(
                     group,
@@ -4073,8 +4082,7 @@ mod tests {
                 let original = serde_json::to_vec(&fixture).unwrap();
                 crate::bindings::atomic_write(&path, &original).unwrap();
                 let limits = ChurnLimits {
-                    revisit_secs: if revisit { 3600 } else { 0 },
-                    target_quiet_secs: 120,
+                    revisit_secs: if revisit { 3600 } else { 120 },
                     ..ChurnLimits::default()
                 };
                 let store = PolicyStore::new(home.path(), Settings::default())
@@ -4144,11 +4152,7 @@ mod tests {
                     .unwrap()
                     .with_limits(limits)
                     .unwrap();
-                let (group, target) = if revisit {
-                    (key, "cx-original")
-                } else {
-                    ("codex:other-group", "cx-ring-0")
-                };
+                let (group, target) = (key, "cx-original");
                 assert_eq!(store.snapshot().history_overflow_until, Some(deadline));
                 assert!(!store.discretionary_allowed(
                     group,

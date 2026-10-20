@@ -79,11 +79,10 @@ fn drained_unaccepted_placement_never_becomes_warm_by_merely_retrying() {
 
 fn fixture() -> (tempfile::TempDir, Arc<BindingTable>, Vec<Candidate>) {
     let root = fixture_dir();
-    let mut cfg = RoutingConfig {
+    let cfg = RoutingConfig {
         spread_threshold: 2,
         ..RoutingConfig::default()
     };
-    cfg.churn.target_quiet_secs = 0;
     let t = BindingTable::new(root.path(), cfg).unwrap();
     let cs = vec![
         candidate("cl-aaaaaa", 10., 8, 1),
@@ -121,7 +120,7 @@ fn trigger(t: &BindingTable, id: &str, prefix: &str, cs: &[Candidate]) -> usize 
     marked
 }
 #[test]
-fn routing_idle_target_needs_c7_non_stale_usage_and_non_pacing_not_success() {
+fn routing_idle_target_needs_c7_non_stale_usage_not_success_or_quiet() {
     let (_root, t, mut cs) = fixture();
     let now = Utc::now();
     for w in cs[1].quota.as_mut().unwrap()["windows"]
@@ -131,11 +130,10 @@ fn routing_idle_target_needs_c7_non_stale_usage_and_non_pacing_not_success() {
         w["observed_at"] = serde_json::json!(now - chrono::Duration::seconds(899));
     }
     t.set_pacing(&cs[1].account.id, true);
-    assert_eq!(trigger(&t, &cs[0].account.id, "a", &cs[..2]), 0);
-    t.set_pacing(&cs[1].account.id, false);
+    t.note_rate(&cs[1].account.id, now);
     assert!(
         trigger(&t, &cs[0].account.id, "a", &cs[..2]) > 0,
-        "an idle target has no successful request in the last 300 seconds"
+        "fresh idle target needs no success or quiet period; pacing is a preference"
     );
 }
 #[test]
@@ -328,7 +326,10 @@ fn routing_mark_rechecks_unknown_and_current_oversized_input_before_moving() {
             t.config.churn.max_move_bytes + 1
         };
         assert_eq!(place(&t, &key, &cs[..2], bytes), cs[0].account.id);
-        assert!(!t.overload_marked(Some(&key), Utc::now()));
+        assert!(
+            t.overload_marked(Some(&key), Utc::now()),
+            "unknown/oversized cost veto keeps the unexpired mark"
+        );
     }
 }
 
@@ -782,16 +783,19 @@ fn d20_cold_move_waits_without_charge_until_every_target_window_is_newer() {
 }
 
 #[test]
-fn d20_forced_move_inheritance_and_reuse_do_not_add_placement_or_sequence() {
+fn d20_forced_move_adds_placement_but_inheritance_and_reuse_do_not() {
     let (_root, t, mut cs, now) = placement_fixture();
     place_at(&t, "claude:root", &cs[..1], now);
     let before = t.usage_sequence.load(Ordering::Relaxed);
     assert!(decide_at(&t, "claude:root", &cs, now).1.is_empty());
     cs[0].account.user_state = UserState::Paused;
     let event = place_at(&t, "claude:root", &cs, now);
-    assert!(!event.is_placement);
-    assert_eq!(event.placement_charge_pct, 0.);
-    assert_eq!(t.usage_sequence.load(Ordering::Relaxed), before);
+    assert!(event.is_placement);
+    assert_eq!(event.reason, "forced");
+    assert_eq!(event.placement_charge_pct, 2.);
+    let after_forced = t.usage_sequence.load(Ordering::Relaxed);
+    assert!(after_forced > before);
+    assert_eq!(t.data.lock().unwrap().placements[&event.to].total, 1);
     match t.choose_with_hold_at(
         Provider::Claude,
         Some("claude:child"),
@@ -809,7 +813,7 @@ fn d20_forced_move_inheritance_and_reuse_do_not_add_placement_or_sequence() {
         }
         other => panic!("{other:?}"),
     }
-    assert_eq!(t.usage_sequence.load(Ordering::Relaxed), before);
+    assert_eq!(t.usage_sequence.load(Ordering::Relaxed), after_forced);
 }
 
 #[test]
@@ -1039,9 +1043,9 @@ fn d20_positive_duration_account_windows_exclude_subbuckets_and_placeholders() {
         );
     }
     assert_eq!(
-        account_window(&serde_json::json!({"name":"43200m"})),
-        None,
-        "C7 gate/reset-order mapping is intentionally unchanged"
+        account_window(Provider::Codex, &serde_json::json!({"name":"43200m"})),
+        Some(true),
+        "C7 maps nonstandard Codex windows over one day to the weekly slot"
     );
 }
 
@@ -1337,22 +1341,28 @@ fn d20_all_gates_failed_uses_step_five_cap_order_then_headroom() {
 }
 
 #[test]
-fn d20_capped_mark_survives_default_target_quiet_without_authorizing_move() {
+fn round2_default_limits_move_both_marked_groups_with_fresh_target_in_first_window() {
     let root = fixture_dir();
-    let cfg = RoutingConfig {
-        spread_threshold: 2,
-        ..RoutingConfig::default()
-    };
-    assert_eq!(cfg.churn.target_quiet_secs, 120);
-    let t = BindingTable::new(root.path(), cfg).unwrap();
-    let mut cs = vec![
-        candidate("cl-aaaaaa", 10., 8, 1),
-        candidate("cl-bbbbbb", 10., 30, 2),
-    ];
-    for n in 0..6 {
-        place(&t, &format!("claude:a{n}"), &cs[..1], 100);
+    let t = BindingTable::new(root.path(), RoutingConfig::default()).unwrap();
+    let now = Utc::now();
+    let mut cs = vec![candidate("cl-a", 10., 8, 1), candidate("cl-b", 10., 30, 2)];
+    observed_at(&mut cs, now);
+    for n in 0..8 {
+        place_at(&t, &format!("claude:source{n}"), &cs[..1], now);
     }
-    assert_eq!(trigger(&t, &cs[0].account.id, "a", &cs), 2);
+    let mut marked = 0;
+    for n in 0..3 {
+        marked += t
+            .note_client_rate(
+                Provider::Claude,
+                "cl-a",
+                Some(&format!("claude:source{n}")),
+                &cs,
+                now,
+            )
+            .3;
+    }
+    assert_eq!(marked, 2);
     let keys: Vec<_> = t
         .data
         .lock()
@@ -1361,53 +1371,184 @@ fn d20_capped_mark_survives_default_target_quiet_without_authorizing_move() {
         .keys()
         .cloned()
         .collect();
-    assert_eq!(place(&t, &keys[0], &cs, 100), cs[1].account.id);
-    let now = Utc::now();
-    t.note_rate(&cs[1].account.id, now);
-    t.set_pacing(&cs[1].account.id, false);
+    let first = place_at(&t, &keys[0], &cs, now + chrono::Duration::seconds(1));
+    assert_eq!(first.to, "cl-b");
+    assert_eq!(first.reason, "overload");
     assert!(placement_capped(
         &cs[1],
         &t.data.lock().unwrap(),
         &t.config,
         now
     ));
-    assert!(
-        !t.policies
-            .discretionary_allowed(&keys[1], Some(&cs[1].account.id), now),
-        "the first move must activate default destination quiet"
-    );
-    assert!(
-        t.policies.discretionary_allowed(&keys[1], None, now),
-        "group/common guards permit retaining this other marked group"
-    );
-    {
-        let data = t.data.lock().unwrap();
-        assert!(t.rebalance_target_waiting(&data, &cs[0].account.id, &cs[1], Some(&keys[1]), now));
-        assert!(
-            !t.rebalance_target_base(&data, &cs[0].account.id, &cs[1], Some(&keys[1]), now),
-            "pacing is over but note_rate still imposes the actual-move quiet guard"
-        );
-    }
-    for boundary in [
-        now + chrono::Duration::seconds(1),
-        now + chrono::Duration::seconds(121),
-    ] {
-        let (account, moves) = decide_at(&t, &keys[1], &cs, boundary);
-        assert_eq!(
-            account, cs[0].account.id,
-            "confidence/quiet cannot authorize a second move"
-        );
-        assert!(moves.is_empty());
-        assert!(
-            t.overload_marked(Some(&keys[1]), boundary),
-            "retain the capped mark before and after rate quiet expires"
-        );
-    }
-    let ready = now + chrono::Duration::seconds(122);
+    // The second mark waits for evidence, not an arrival/rate quiet timer.
+    t.note_rate("cl-b", now + chrono::Duration::seconds(1));
+    t.set_pacing("cl-b", true);
+    let (account, moves) = decide_at(&t, &keys[1], &cs, now + chrono::Duration::seconds(2));
+    assert_eq!(account, "cl-a");
+    assert!(moves.is_empty());
+    assert!(t.overload_marked(Some(&keys[1]), now + chrono::Duration::seconds(2)));
+    let ready = now + chrono::Duration::seconds(3);
     fresh_observation(&t, &mut cs[1..], ready);
-    let (account, moves) = decide_at(&t, &keys[1], &cs, ready);
-    assert_eq!(account, cs[1].account.id);
-    assert_eq!(moves.len(), 1);
-    assert_eq!(moves[0].reason, "overload");
-    assert!(!t.overload_marked(Some(&keys[1]), ready));
+    let second = place_at(&t, &keys[1], &cs, ready);
+    assert_eq!(second.to, "cl-b");
+    assert_eq!(second.reason, "overload");
+    assert!(second.is_placement);
+    assert_eq!(second.placement_charge_pct, 2.);
+    assert!(t.data.lock().unwrap().overload_marks.is_empty());
+    assert_eq!(t.data.lock().unwrap().placements["cl-b"].total, 2);
+    assert_eq!(t.active_sessions("cl-a", ready), 6);
+    assert_eq!(t.active_sessions("cl-b", ready), 2);
+}
+
+#[test]
+fn round2_forced_burst_takes_charge_and_cap_but_never_refuses() {
+    for targets in [1usize, 2] {
+        let (_root, t, mut cs, now) = placement_fixture();
+        cs.push(candidate("cl-c", 30., 40, 3));
+        observed_at(&mut cs, now);
+        for n in 0..10 {
+            place_at(&t, &format!("claude:forced{n}"), &cs[..1], now);
+        }
+        cs[0].account.user_state = UserState::Paused;
+        let mut counts = [0usize; 2];
+        let before = t.usage_sequence.load(Ordering::Relaxed);
+        for n in 0..10 {
+            let at = now + chrono::Duration::seconds(n + 1);
+            let event = place_at(&t, &format!("claude:forced{n}"), &cs[..=targets], at);
+            assert_eq!(event.reason, "forced");
+            assert_eq!(event.from.as_deref(), Some("cl-a"));
+            assert!(event.is_placement);
+            assert_eq!(event.placement_charge_pct, 2.);
+            let index = if event.to == "cl-b" {
+                0
+            } else {
+                assert_eq!(event.to, "cl-c");
+                1
+            };
+            if n >= targets as i64 {
+                assert!(
+                    event.capped,
+                    "all-capped recovery still must select a target"
+                );
+            }
+            counts[index] += 1;
+            if targets == 2 {
+                assert!(
+                    counts[0].abs_diff(counts[1]) <= 1,
+                    "forced target choice must obey weak-evidence round-robin"
+                );
+            }
+        }
+        assert_eq!(counts, if targets == 2 { [5, 5] } else { [10, 0] });
+        assert_eq!(t.usage_sequence.load(Ordering::Relaxed), before + 10);
+        let data = t.data.lock().unwrap();
+        for (index, c) in cs[1..=targets].iter().enumerate() {
+            assert_eq!(data.placements[&c.account.id].total, counts[index] as u64);
+            assert_eq!(
+                data.placements[&c.account.id].charge_count("7d"),
+                counts[index]
+            );
+            assert_eq!(
+                metrics(c, &data, &t.config, now).usage,
+                30. + 2. * counts[index] as f64
+            );
+            assert_eq!(
+                effective_account(c, &data, &t.config, None, now).health,
+                Health::Ready
+            );
+        }
+    }
+}
+
+#[test]
+fn round2_any_discretionary_guard_veto_keeps_mark_on_healthy_source() {
+    for guard in [
+        "dwell", "revisit", "group", "pool", "cost", "unknown", "recover", "strict",
+    ] {
+        let root = fixture_dir();
+        let mut cfg = RoutingConfig {
+            spread_threshold: 2,
+            ..RoutingConfig::default()
+        };
+        // Isolate group budget from dwell, which would independently veto it.
+        if guard == "group" {
+            cfg.churn.dwell_secs = 0;
+            cfg.churn.max_group_moves = 1;
+        }
+        let t = BindingTable::new(root.path(), cfg).unwrap();
+        let now = Utc::now();
+        let cs = vec![candidate("cl-a", 10., 8, 1), candidate("cl-b", 10., 30, 2)];
+        for n in 0..6 {
+            place_at(&t, &format!("claude:guard{n}"), &cs[..1], now);
+        }
+        for n in 0..3 {
+            t.note_client_rate(
+                Provider::Claude,
+                "cl-a",
+                Some(&format!("claude:guard{n}")),
+                &cs,
+                now,
+            );
+        }
+        let key = t
+            .data
+            .lock()
+            .unwrap()
+            .overload_marks
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        match guard {
+            "dwell" | "group" => t
+                .policies
+                .dispatch(Some(&key), "cl-a", Some("cl-other"), "overload", now)
+                .unwrap(),
+            "revisit" => t
+                .policies
+                .dispatch(Some(&key), "cl-a", Some("cl-b"), "forced", now)
+                .unwrap(),
+            "pool" => {
+                for n in 0..4 {
+                    t.policies
+                        .dispatch(
+                            Some(&format!("claude:pool{n}")),
+                            &format!("cl-other{n}"),
+                            Some("cl-before"),
+                            "overload",
+                            now,
+                        )
+                        .unwrap();
+                }
+            }
+            "cost" => t.request_bytes(Some(&key), t.config.churn.max_move_bytes + 1),
+            "unknown" => t.unknown_request_cost(Some(&key)),
+            "recover" | "strict" => t
+                .policies
+                .set_session(
+                    &crate::routing::session_id(&key),
+                    Some(crate::routing::Settings {
+                        mode: if guard == "strict" {
+                            crate::routing::Mode::Strict
+                        } else {
+                            crate::routing::Mode::Recover
+                        },
+                        reset_wait_secs: 60,
+                    }),
+                    None,
+                    Some("cl-a"),
+                )
+                .unwrap(),
+            _ => unreachable!(),
+        }
+        let sequence = t.usage_sequence.load(Ordering::Relaxed);
+        for seconds in [1, 2] {
+            let at = now + chrono::Duration::seconds(seconds);
+            let (id, moves) = decide_at(&t, &key, &cs, at);
+            assert_eq!(id, "cl-a", "{guard}");
+            assert!(moves.is_empty(), "{guard}: veto is not a forced move");
+            assert!(t.overload_marked(Some(&key), at), "{guard}: preserve mark");
+            assert_eq!(t.usage_sequence.load(Ordering::Relaxed), sequence);
+        }
+    }
 }
