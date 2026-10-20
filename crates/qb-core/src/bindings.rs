@@ -3910,6 +3910,11 @@ mod tests {
         for w in a.quota.as_mut().unwrap()["windows"].as_array_mut().unwrap() {
             w["used_pct"] = json!(91);
         }
+        // The new group on B above used its confidence allowance. This case
+        // tests drain/cold behavior with an available destination, rather than
+        // the separate D20 cap-wait rule, so refresh B after that placement.
+        let asof = t.begin_usage_observation_for("b");
+        t.note_usage_observation_asof_token("b", b.quota.as_ref().unwrap(), asof);
         let (account, _, moves) = choose(&t, Some("claude:s"), &[a, b]);
         assert_eq!(account, "b");
         assert_eq!(moves[0].reason, "cold_rebalance");
