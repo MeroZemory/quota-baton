@@ -59,7 +59,7 @@ Implement quota-baton exactly as specified, milestone by milestone, until M8 is 
 | R7 | merged (`4bbe855`; full gate: default 1,176, full 1,205, standalone core 410; strict clippy and actual spawned-core dashboard captures/actions passed). Report: `.sandbox/reports/R7.md`. Separate dashboard, shared SSE, bounded session/activity/usage views and memory-only labels; no real profile/install changes |
 | R8 | merged (dev 269ac3b). Combined-tree test 1399/0/14 (`.sandbox/reports/merge-269ac3b/test.log`). Installed dev 20cb486 on 10-20 17:58; live codex-qb request ok, placement ledger shows evidence=fresh, charge=2 |
 | R8.2 | merged (20cb486, ff; m4a_ws 89/0) |
-| R8.3 | merged (67fb1ed; tray PE subsystem 2) |
+| R8.3 | merged (67fb1ed; tray PE subsystem 2); installed 10-21 03:01, a normally started tray has no console (no conhost child) |
 | R8.4 | show every account window (5h and weekly) in the tray and dashboard; user 10-21; brief `R8.4-all-windows.md` |
 | R9 | `quota-baton sessions import` (Codex session into the qb home, journaled, dry-run default); user-approved split, live relaunch stays ops; after R8.4; brief `R9-session-import.md` |
 | R8.1 | merged (round 2 39345fd, dev 6dbbfae); installed and verified live: the herdr pane title shows `codex-qb · quota-baton` from 1 s to 19 s, and a codex-qb exec request returned ok |
