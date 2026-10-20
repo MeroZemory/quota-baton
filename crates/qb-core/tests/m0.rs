@@ -62,15 +62,25 @@ fn config_defaults_partial_unknown_and_invalid() {
     assert_eq!(config.server.admin_port, 10201);
     assert!(config.accounts["cx_fake"].drain);
     assert!(!config.accounts["cx_fake"].allow_credits);
-    for invalid in [
-        "[server]\ndata_port = 'fake-secret-value'",
-        "[server]\ndata_port = 65536",
-        "[websocket]\nidle_close_secs = 3600",
-        "broken = [",
-    ] {
+    for invalid in ["[server]\ndata_port = 'fake-secret-value'", "broken = ["] {
         fs::write(home.path().join("config.toml"), invalid).unwrap();
         let error = Config::load(home.path()).unwrap_err().to_string();
         assert!(!error.contains("fake-secret-value"));
+    }
+    // D20 §4 replaces refusal for numeric bounds with warning + clamping.
+    // Invalid types/syntax above still refuse without echoing source values.
+    for (text, port, idle) in [
+        ("[server]\ndata_port = 65536", 65535, 1800),
+        ("[websocket]\nidle_close_secs = 3600", 10200, 3599),
+    ] {
+        fs::write(home.path().join("config.toml"), text).unwrap();
+        let config = Config::load(home.path()).unwrap();
+        assert_eq!(config.server.data_port, port);
+        assert_eq!(config.websocket.idle_close_secs, idle);
+        assert_eq!(
+            fs::read_to_string(home.path().join("config.toml")).unwrap(),
+            text
+        );
     }
 }
 
