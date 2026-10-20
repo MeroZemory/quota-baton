@@ -483,6 +483,55 @@ fn r84_dashboard_group_header_keeps_each_usage_window_and_binding_chip() {
     assert!(group.windows[0].reset.contains("초기화"));
     assert_eq!(group.windows[1].remaining, "88% 남음");
     assert_eq!(group.chip, "사용 중");
+    let scene = crate::geometry::Scene::build(
+        &view,
+        &DashboardState::default(),
+        [1280., 900.],
+        &crate::geometry::Metrics::default(),
+    );
+    for (index, window) in group.windows.iter().enumerate() {
+        let node = scene
+            .accessibility
+            .iter()
+            .find(|n| n.key == format!("usage:cl-a:{index}"))
+            .unwrap();
+        assert!(node.name.contains(&window.label));
+        assert!(node.name.contains(&window.remaining));
+        assert!(node.name.contains(&window.reset));
+    }
+}
+#[test]
+fn r84_dashboard_window_uses_authoritative_cooling_reset() {
+    let c = clock();
+    let accounts = v2::project(
+        &serde_json::json!({"accounts":[{
+            "id":"quota","provider":"claude","user_state":"active",
+            "health":{"kind":"cooling","reason":"quota","scope":"account"},
+            "quota_cooling":{"window":"5h","reset_at":"2026-10-20T01:00:00Z"},
+            "windows":[
+                {"name":"5h","used_pct":100,"reset_at":"2026-10-19T09:20:00Z"},
+                {"name":"7d","used_pct":12,"reset_at":"2026-10-26T01:00:00Z"}
+            ]
+        }]})
+        .to_string(),
+        c.utc().into(),
+    )
+    .unwrap();
+    let expected = accounts.sections[0].rows[0]
+        .usage
+        .as_ref()
+        .unwrap()
+        .binding
+        .as_ref()
+        .unwrap()
+        .reset_text
+        .clone()
+        .unwrap();
+    let data = DashboardSnapshot::new(accounts);
+    let view = project(&data, &mut DashboardState::default(), &c);
+    assert_eq!(view.groups[0].windows[0].reset, expected);
+    assert_eq!(view.groups[0].windows[1].remaining, "88% 남음");
+    assert_ne!(view.groups[0].windows[1].reset, expected);
 }
 #[test]
 fn r7_empty_states_are_distinct_and_day_boundary_explicit() {

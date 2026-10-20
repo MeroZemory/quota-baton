@@ -1401,7 +1401,7 @@ fn group_header(b: &mut Builder<'_>, g: &m::AccountGroup, r: Rect) {
     } else {
         for (index, window) in g.windows.iter().enumerate() {
             let top = right.top + 2. + index as f32 * 26.;
-            let reset_width = window.reset.chars().count() as f32 * 6.5;
+            let reset_width = b.measured_width(&window.reset, 12., false);
             let label = format!("{} {}", window.label, window.remaining);
             b.text(
                 rect(
@@ -1410,7 +1410,7 @@ fn group_header(b: &mut Builder<'_>, g: &m::AccountGroup, r: Rect) {
                     (width(right) - reset_width - 8.).max(0.),
                     16.,
                 ),
-                label,
+                label.clone(),
                 12.,
                 true,
                 Color::Text,
@@ -1437,6 +1437,14 @@ fn group_header(b: &mut Builder<'_>, g: &m::AccountGroup, r: Rect) {
                 ),
                 bar_color(window.remaining_pct),
                 2.,
+            );
+            b.semantic(
+                format!("usage:{}:{index}", g.id),
+                Some("sessions:table".into()),
+                Role::Text,
+                format!("{label} · {}", window.reset),
+                rect(right.left, top, width(right), 23.),
+                None,
             );
         }
     }
