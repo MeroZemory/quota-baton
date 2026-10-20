@@ -11,6 +11,10 @@ mod cutover;
 mod launcher_label;
 mod launcher_script;
 mod routing_cli;
+mod sessions;
+mod sessions_db;
+mod sessions_discovery;
+mod sessions_guard;
 mod wire_readiness;
 
 fn print_stdout(args: std::fmt::Arguments<'_>) -> std::io::Result<()> {
@@ -42,6 +46,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    #[command(about = "기존 Codex 대화를 가져오거나 되돌립니다")]
+    Sessions {
+        #[command(subcommand)]
+        command: sessions::SessionsCommand,
+    },
     #[command(about = "프로젝트·세션별 계정 전환을 설정합니다")]
     Routing {
         #[command(subcommand)]
@@ -355,6 +364,9 @@ async fn run() -> anyhow::Result<()> {
         args,
     } = &cli.command
     {
+        if matches!(client, launcher_label::Client::Codex) {
+            sessions::before_codex_resume(args)?;
+        }
         std::process::exit(launcher_label::run(
             *client,
             command,
@@ -364,6 +376,7 @@ async fn run() -> anyhow::Result<()> {
     }
     let home = qb_core::home()?;
     match cli.command {
+        Command::Sessions { command } => sessions::run(&home, command)?,
         Command::LaunchClient { .. } => {
             unreachable!("launcher handled before core home resolution")
         }

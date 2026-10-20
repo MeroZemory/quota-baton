@@ -13,6 +13,7 @@ chrono.workspace = true
 qb-core.workspace = true
 qb-proto.workspace = true
 reqwest.workspace = true
+rusqlite = { version = "=0.33.0", features = ["bundled"] }
 serde_json.workspace = true
 serde.workspace = true
 sha2.workspace = true
