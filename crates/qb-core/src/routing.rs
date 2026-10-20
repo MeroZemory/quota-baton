@@ -10,7 +10,7 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -164,6 +164,8 @@ struct State {
     frozen: bool,
     #[serde(skip)]
     history_overflow_until: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    durable_overflow_until: Option<DateTime<Utc>>,
 }
 impl Default for State {
     fn default() -> Self {
@@ -177,6 +179,7 @@ impl Default for State {
             arrivals: BTreeMap::new(),
             frozen: false,
             history_overflow_until: None,
+            durable_overflow_until: None,
         }
     }
 }
@@ -195,6 +198,12 @@ impl State {
         exact
     }
     fn reindex(&mut self) {
+        if let Some(until) = self.durable_overflow_until {
+            self.history_overflow_until = Some(
+                self.history_overflow_until
+                    .map_or(until, |old| old.max(until)),
+            );
+        }
         self.pool_moves.clear();
         self.arrivals.clear();
         for (root, session) in &mut self.sessions {
@@ -246,6 +255,11 @@ pub struct PolicyStore {
     limits: ChurnLimits,
     state: Mutex<Arc<State>>,
     writer: Mutex<()>,
+    /// Readers hold this only during in-memory authority lookup. Writers acquire
+    /// it only after I/O, and publish state, witness and blocking flags together.
+    publication: RwLock<()>,
+    #[cfg(test)]
+    publication_hook: Mutex<Option<Arc<PublicationHook>>>,
     file_seen: AtomicBool,
     recovery_blocked: AtomicBool,
     lifecycle_recovery: AtomicBool,
@@ -254,6 +268,12 @@ pub struct PolicyStore {
     durable_generation: Mutex<Option<(u64, String)>>,
     warnings: Mutex<WarningState>,
     pub(crate) changed: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+struct PublicationHook {
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
 }
 
 pub fn root(key: &str) -> &str {
@@ -574,6 +594,9 @@ fn durable_state(state: &State, defaults: &Settings) -> State {
     durable
         .legacy_codex_roots
         .retain(|id| durable.sessions.contains_key(id));
+    if !has_durable_rows(&durable) {
+        durable.durable_overflow_until = None;
+    }
     durable
 }
 fn write_fence_with_intent(path: &Path, state: &State, strict: State) -> Result<()> {
@@ -652,7 +675,7 @@ fn legacy_strict_evidence(path: &Path, defaults: &Settings) -> State {
         return strict;
     };
     if let Some(projects) = value.get("projects").and_then(|v| v.as_object()) {
-        for (id, value) in projects.iter().take(MAX_PROJECTS) {
+        for (id, value) in projects.iter() {
             if valid_project(id)
                 && value.pointer("/settings/mode").and_then(|v| v.as_str()) == Some("strict")
             {
@@ -670,7 +693,7 @@ fn legacy_strict_evidence(path: &Path, defaults: &Settings) -> State {
         }
     }
     if let Some(sessions) = value.get("sessions").and_then(|v| v.as_object()) {
-        for (id, value) in sessions.iter().take(MAX_SESSIONS) {
+        for (id, value) in sessions.iter() {
             let explicit = value.get("explicit").filter(|v| !v.is_null());
             let project = value.get("project").and_then(|v| v.as_str());
             // Project association freezes the session baseline. Current project
@@ -735,7 +758,7 @@ fn legacy_strict_evidence(path: &Path, defaults: &Settings) -> State {
                 .map(|(id, _)| id.clone()),
         );
     } else if let Some(aliases) = value.get("legacy_codex_roots").and_then(|v| v.as_array()) {
-        for alias in aliases.iter().take(MAX_SESSIONS).filter_map(|v| v.as_str()) {
+        for alias in aliases.iter().filter_map(|v| v.as_str()) {
             if strict.sessions.get(alias).is_some_and(|session| {
                 session
                     .explicit
@@ -916,6 +939,9 @@ impl PolicyStore {
             limits: ChurnLimits::default(),
             state: Mutex::new(Arc::new(state)),
             writer: Mutex::new(()),
+            publication: RwLock::new(()),
+            #[cfg(test)]
+            publication_hook: Mutex::new(None),
             file_seen: AtomicBool::new(file_seen),
             recovery_blocked: AtomicBool::new(recovered.blocked),
             lifecycle_recovery: AtomicBool::new(false),
@@ -982,6 +1008,22 @@ impl PolicyStore {
             sink.core_warning("routing", code);
         }
     }
+    #[cfg(test)]
+    fn pause_publication(&self) {
+        let hook = self
+            .publication_hook
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook.entered.send(()).unwrap();
+            hook.release
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .recv()
+                .unwrap();
+        }
+    }
     fn update<T>(&self, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
         self.update_inner(false, f)
     }
@@ -997,6 +1039,7 @@ impl PolicyStore {
         }
         let mut next = (*state).clone();
         let result = f(&mut next)?;
+        let mut published_intent = None;
         if next.sessions.len() > MAX_SESSIONS || next.projects.len() > MAX_PROJECTS {
             bail!("routing policy capacity reached");
         }
@@ -1039,33 +1082,48 @@ impl PolicyStore {
                 Ok(())
             })();
             if let Err(error) = write {
-                self.persistence_failed.store(true, Ordering::Release);
-                self.recovery_blocked.store(true, Ordering::Release);
-                *self
-                    .recovery_intent
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = union;
+                {
+                    let _publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
+                    self.persistence_failed.store(true, Ordering::Release);
+                    self.recovery_blocked.store(true, Ordering::Release);
+                    #[cfg(test)]
+                    self.pause_publication();
+                    *self
+                        .recovery_intent
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = union;
+                    if volatile_on_failure {
+                        next.revision = state.revision;
+                        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(next);
+                    }
+                }
                 self.warn("routing_policy_write_failed");
                 self.changed.notify_waiters();
-                if !volatile_on_failure {
-                    return Err(error);
-                }
-                next.revision = state.revision;
-            } else {
-                self.file_seen.store(true, Ordering::Release);
-                *self
-                    .durable_generation
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) =
-                    Some((durable.revision, policy_digest(&durable)?));
+                return if volatile_on_failure {
+                    Ok(result)
+                } else {
+                    Err(error)
+                };
+            }
+            self.file_seen.store(true, Ordering::Release);
+            *self
+                .durable_generation
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) =
+                Some((durable.revision, policy_digest(&durable)?));
+            published_intent = Some(strict_intent(&durable, &self.defaults));
+        }
+        next.reindex();
+        {
+            let _publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
+            if let Some(intent) = published_intent {
                 *self
                     .recovery_intent
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = strict_intent(&durable, &self.defaults);
+                    .unwrap_or_else(|e| e.into_inner()) = intent;
             }
+            *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(next);
         }
-        next.reindex();
-        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(next);
         self.changed.notify_waiters();
         Ok(result)
     }
@@ -1073,9 +1131,11 @@ impl PolicyStore {
         let _writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let mut next = (*self.snapshot()).clone();
         next.frozen = true;
+        let _publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
         *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(next);
     }
     pub(crate) fn requires_strict_recovery(&self) -> bool {
+        let _publication = self.publication.read().unwrap_or_else(|e| e.into_inner());
         self.defaults.mode == Mode::Strict
             || has_intent(
                 &self
@@ -1115,16 +1175,7 @@ impl PolicyStore {
         if let Some(code) = recovered.warning {
             self.warn(code);
         }
-        self.recovery_blocked
-            .store(recovered.blocked, Ordering::Release);
-        self.persistence_failed
-            .store(recovered.degraded, Ordering::Release);
-        self.file_seen.store(recovered.seen, Ordering::Release);
         let intent = strict_intent(&recovered.state, &self.defaults);
-        *self
-            .recovery_intent
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = intent;
         let mut next = recovered.state;
         if !recovered.degraded {
             *self
@@ -1152,7 +1203,21 @@ impl PolicyStore {
                 (a, b) => a.or(b),
             };
         next.reindex();
-        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(next);
+        {
+            let _publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
+            self.recovery_blocked
+                .store(recovered.blocked, Ordering::Release);
+            #[cfg(test)]
+            self.pause_publication();
+            self.persistence_failed
+                .store(recovered.degraded, Ordering::Release);
+            self.file_seen.store(recovered.seen, Ordering::Release);
+            *self
+                .recovery_intent
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = intent;
+            *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(next);
+        }
         self.changed.notify_waiters();
         if recovered.blocked {
             bail!("routing strict recovery required");
@@ -1162,10 +1227,12 @@ impl PolicyStore {
     /// Import recovery blocks strict dispatch until validation and anchor capture finish.
     /// Unrelated non-strict sessions continue serving.
     pub(crate) fn begin_recovery(&self) {
+        let _publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
         self.lifecycle_recovery.store(true, Ordering::Release);
         self.changed.notify_waiters();
     }
     pub(crate) fn finish_recovery(&self) {
+        let _publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
         self.lifecycle_recovery.store(false, Ordering::Release);
         self.changed.notify_waiters();
     }
@@ -1221,6 +1288,7 @@ impl PolicyStore {
     }
     /// A queued request cannot use an obsolete account after policy changes.
     pub fn permits_dispatch(&self, key: Option<&str>, account: &str) -> bool {
+        let _publication = self.publication.read().unwrap_or_else(|e| e.into_inner());
         let state = self.snapshot();
         if state.frozen {
             return false;
@@ -1228,7 +1296,7 @@ impl PolicyStore {
         let Some(key) = key else {
             return self.defaults.mode != Mode::Strict;
         };
-        let plan = self.plan(Some(key));
+        let plan = self.plan_published(Some(key));
         plan.settings.mode != Mode::Strict
             || (!self.strict_dispatch_blocked() && plan.anchor.as_deref() == Some(account))
     }
@@ -1262,6 +1330,11 @@ impl PolicyStore {
         }
     }
     pub fn plan(&self, key: Option<&str>) -> Plan {
+        let _publication = self.publication.read().unwrap_or_else(|e| e.into_inner());
+        self.plan_published(key)
+    }
+    // Caller holds publication read/write access; never reacquire it here.
+    fn plan_published(&self, key: Option<&str>) -> Plan {
         let state = self.snapshot();
         let id = key
             .map(|key| {
@@ -1285,6 +1358,7 @@ impl PolicyStore {
         self.resolve(&state, &id)
     }
     pub fn list(&self) -> serde_json::Value {
+        let _publication = self.publication.read().unwrap_or_else(|e| e.into_inner());
         let state = self.snapshot();
         serde_json::json!({"revision":state.revision,"defaults":self.defaults,"projects":state.projects,"sessions":state.sessions.keys().map(|id| (id.clone(), self.resolve(&state,id))).collect::<BTreeMap<_,_>>()})
     }
@@ -1471,6 +1545,7 @@ impl PolicyStore {
         target: Option<&str>,
         now: DateTime<Utc>,
     ) -> bool {
+        let _publication = self.publication.read().unwrap_or_else(|e| e.into_inner());
         let state = self.snapshot();
         if state
             .history_overflow_until
@@ -1536,11 +1611,15 @@ impl PolicyStore {
         let id = self.snapshot().policy_id(key);
         let discretionary = matches!(reason, "overload" | "cold_rebalance");
         {
+            let _publication = self.publication.read().unwrap_or_else(|e| e.into_inner());
             let state = self.snapshot();
             if state.frozen {
                 bail!("routing policy writer retired");
             }
-            let plan = self.resolve(&state, &id);
+            let plan = self.plan_published(Some(key));
+            if plan.settings.mode == Mode::Strict && self.strict_dispatch_blocked() {
+                bail!("routing policy recovery incomplete");
+            }
             let anchor = plan.anchor.as_deref().or(previous);
             if plan.settings.mode == Mode::Strict && anchor.is_some_and(|a| a != account) {
                 bail!("routing session is locked");
@@ -1580,7 +1659,10 @@ impl PolicyStore {
                     next.history_overflow_until
                         .map_or(until, |old| old.max(until)),
                 );
-                *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(next);
+                {
+                    let _publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
+                    *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(next);
+                }
                 self.warn("routing_forced_history_overflow");
                 self.changed.notify_waiters();
                 // Metadata only: no rows added, no evidence pruned or persisted.
@@ -1589,6 +1671,12 @@ impl PolicyStore {
             }
         }
         self.update_inner(plan.settings.mode != Mode::Strict, |state| {
+            let current = self.plan(Some(key));
+            if current.settings.mode == Mode::Strict
+                && (self.strict_dispatch_blocked() || plan.settings.mode != Mode::Strict)
+            {
+                bail!("routing strict authority changed before dispatch");
+            }
             if discretionary
                 && state
                     .history_overflow_until
@@ -1731,7 +1819,15 @@ impl PolicyStore {
                 }
             }
             entry.anchor = Some(account.to_owned());
+            let durable_eviction = entry.durable(&self.defaults);
             if let Some(until) = evicted_forced_until {
+                if durable_eviction {
+                    state.durable_overflow_until = Some(
+                        state
+                            .durable_overflow_until
+                            .map_or(until, |old| old.max(until)),
+                    );
+                }
                 state.history_overflow_until = Some(
                     state
                         .history_overflow_until
@@ -3001,8 +3097,10 @@ mod tests {
         let home = home();
         let path = home.path().join("state/routing-policies.json");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let mut legacy = State::default();
-        legacy.revision = 7;
+        let mut legacy = State {
+            revision: 7,
+            ..State::default()
+        };
         legacy.sessions.insert(
             session_id("codex:legacy-history"),
             SessionPolicy {
@@ -3494,5 +3592,316 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    fn publication_pause(
+        store: &PolicyStore,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        *store.publication_hook.lock().unwrap() = Some(Arc::new(PublicationHook {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        }));
+        (entered_rx, release_tx)
+    }
+
+    fn assert_publication_reader_blocked(
+        store: &Arc<PolicyStore>,
+        key: &'static str,
+        entered: std::sync::mpsc::Receiver<()>,
+        release: std::sync::mpsc::SyncSender<()>,
+    ) {
+        entered
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        // The writer hook is between flag and authority writes. This assertion
+        // proves that no reader can inspect the deliberately split internal state.
+        let gated = store.publication.try_read().is_err();
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let reader = store.clone();
+        let reader_start = start.clone();
+        let task = std::thread::spawn(move || {
+            reader_start.wait();
+            (
+                reader.plan(Some(key)).settings.mode,
+                reader.permits_dispatch(Some(key), "cx-wrong"),
+                reader.permits_dispatch(Some("codex:existing-nonstrict"), "cx-nonstrict"),
+            )
+        });
+        start.wait();
+        release.send(()).unwrap();
+        let (mode, wrong_allowed, nonstrict_allowed) = task.join().unwrap();
+        assert!(gated);
+        assert_eq!(mode, Mode::Strict);
+        assert!(!wrong_allowed);
+        assert!(nonstrict_allowed);
+        *store.publication_hook.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn integrated1_failed_new_strict_edit_publishes_authority_atomically() {
+        let home = home();
+        let store = Arc::new(PolicyStore::new(home.path(), Settings::default()).unwrap());
+        store
+            .set_session(
+                &session_id("codex:existing-nonstrict"),
+                Some(settings(Mode::Recover)),
+                None,
+                Some("cx-nonstrict"),
+            )
+            .unwrap();
+        fs::remove_file(&store.path).unwrap();
+        fs::create_dir(&store.path).unwrap();
+        assert!(store.permits_dispatch(Some("codex:existing-nonstrict"), "cx-nonstrict"));
+        let (entered, release) = publication_pause(&store);
+        let writer = store.clone();
+        let task = std::thread::spawn(move || {
+            writer.set_session(
+                &session_id("codex:new-strict-race"),
+                Some(settings(Mode::Strict)),
+                None,
+                Some("cx-right"),
+            )
+        });
+        assert_publication_reader_blocked(&store, "codex:new-strict-race", entered, release);
+        assert!(task.join().unwrap().is_err());
+        assert!(!store.permits_dispatch(Some("codex:new-strict-race"), "cx-wrong"));
+        assert!(
+            store
+                .dispatch(
+                    Some("codex:new-strict-race"),
+                    "cx-wrong",
+                    None,
+                    "first",
+                    clock()
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn integrated1_restored_strict_generation_never_exposes_previous_recover_plan() {
+        let home = home();
+        let store = Arc::new(PolicyStore::new(home.path(), Settings::default()).unwrap());
+        store
+            .set_session(
+                &session_id("codex:restored-strict-race"),
+                Some(settings(Mode::Recover)),
+                None,
+                Some("cx-right"),
+            )
+            .unwrap();
+        store
+            .set_session(
+                &session_id("codex:existing-nonstrict"),
+                Some(settings(Mode::Recover)),
+                None,
+                Some("cx-nonstrict"),
+            )
+            .unwrap();
+        fs::remove_file(&store.path).unwrap();
+        fs::create_dir(&store.path).unwrap();
+        assert!(
+            store
+                .set_session(
+                    &session_id("codex:restored-strict-race"),
+                    Some(settings(Mode::Strict)),
+                    None,
+                    Some("cx-right")
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store.snapshot().sessions[&session_id("codex:restored-strict-race")]
+                .explicit
+                .as_ref()
+                .unwrap()
+                .mode,
+            Mode::Recover
+        );
+        assert!(!store.permits_dispatch(Some("codex:restored-strict-race"), "cx-wrong"));
+        let mut restored = (*store.snapshot()).clone();
+        restored.revision += 1;
+        restored
+            .sessions
+            .get_mut(&session_id("codex:restored-strict-race"))
+            .unwrap()
+            .explicit = Some(settings(Mode::Strict));
+        fs::remove_dir(&store.path).unwrap();
+        crate::bindings::atomic_write(&store.path, &serde_json::to_vec(&restored).unwrap())
+            .unwrap();
+        write_fence(&store.path, &restored).unwrap();
+        let (entered, release) = publication_pause(&store);
+        let writer = store.clone();
+        let task = std::thread::spawn(move || writer.reload());
+        assert_publication_reader_blocked(&store, "codex:restored-strict-race", entered, release);
+        task.join().unwrap().unwrap();
+        assert!(store.permits_dispatch(Some("codex:restored-strict-race"), "cx-right"));
+        assert!(!store.permits_dispatch(Some("codex:restored-strict-race"), "cx-wrong"));
+    }
+
+    #[test]
+    fn integrated2_duplicate_or_invalid_alias_prefix_cannot_hide_later_strict_root() {
+        let home = home();
+        let path = home.path().join("state/routing-policies.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let a = session_id("codex:alias-a");
+        let b = session_id("codex:alias-b");
+        let row = serde_json::json!({"project":null,"baseline":Settings::default(),"explicit":settings(Mode::Strict),"anchor":"cx-right","movements":[]});
+        let mut aliases = vec![serde_json::Value::String(a.clone()); MAX_SESSIONS];
+        aliases.push(serde_json::Value::Null);
+        aliases.push("invalid".into());
+        aliases.push(b.clone().into());
+        let value = serde_json::json!({"schema":2,"revision":1,"projects":{},"sessions":{
+            a:row.clone(), b:row, session_id("codex:malformed"): {"invalid":"row"}
+        },"legacy_codex_roots":aliases});
+        let bytes = serde_json::to_vec(&value).unwrap();
+        assert!(bytes.len() as u64 <= MAX_FILE);
+        crate::bindings::atomic_write(&path, &bytes).unwrap();
+        for _ in 0..2 {
+            let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+            for root in [
+                "codex:alias-a",
+                "codex:alias-b",
+                "codex:alias-b:agent:child",
+            ] {
+                assert!(!store.permits_dispatch(Some(root), "cx-wrong"));
+                assert_eq!(store.plan(Some(root)).settings.mode, Mode::Strict);
+            }
+            assert!(store.permits_dispatch(Some("codex:unrelated"), "cx-right"));
+        }
+    }
+
+    #[test]
+    fn integrated2_invalid_map_prefix_cannot_hide_positive_strict_evidence() {
+        let home = home();
+        let path = home.path().join("state/routing-policies.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut projects = serde_json::Map::new();
+        for n in 0..MAX_PROJECTS {
+            projects.insert(format!("!invalid-{n:05}"), serde_json::Value::Null);
+        }
+        let project = "f".repeat(32);
+        projects.insert(
+            project.clone(),
+            serde_json::json!({"name":"strict","settings":settings(Mode::Strict)}),
+        );
+        let mut sessions = serde_json::Map::new();
+        for n in 0..MAX_SESSIONS {
+            sessions.insert(format!("!invalid-{n:05}"), serde_json::Value::Null);
+        }
+        let root = session_id("codex:late-strict");
+        sessions.insert(root.clone(), serde_json::json!({"project":null,"baseline":Settings::default(),"explicit":settings(Mode::Strict),"anchor":"cx-right","movements":[]}));
+        let bytes = serde_json::to_vec(&serde_json::json!({"schema":2,"revision":1,"projects":projects,"sessions":sessions,"legacy_codex_roots":[root]})).unwrap();
+        assert!(bytes.len() as u64 <= MAX_FILE);
+        crate::bindings::atomic_write(&path, &bytes).unwrap();
+        let store = PolicyStore::new(home.path(), Settings::default()).unwrap();
+        assert_eq!(
+            store
+                .plan(Some("codex:late-strict:agent:child"))
+                .settings
+                .mode,
+            Mode::Strict
+        );
+        assert!(!store.permits_dispatch(Some("codex:late-strict:agent:child"), "cx-right"));
+        assert!(store.associate("codex:late-project", &project).is_err());
+        assert!(store.permits_dispatch(Some("codex:unrelated"), "cx-right"));
+    }
+
+    #[test]
+    fn integrated3_durable_forced_eviction_guard_survives_restart_for_both_horizons() {
+        for revisit in [true, false] {
+            let home = home();
+            let limits = ChurnLimits {
+                revisit_secs: if revisit { 3600 } else { 0 },
+                target_quiet_secs: 120,
+                ..ChurnLimits::default()
+            };
+            let store = PolicyStore::new(home.path(), Settings::default())
+                .unwrap()
+                .with_limits(limits.clone())
+                .unwrap();
+            let key = "codex:durable-ring";
+            store
+                .set_session(
+                    &session_id(key),
+                    Some(settings(Mode::Rebalance)),
+                    None,
+                    Some("cx-original"),
+                )
+                .unwrap();
+            // Seed the first 32 durable moves in one update, then exercise the
+            // real 33rd-move eviction/write path without a 32-fsync fixture loop.
+            store
+                .update(|state| {
+                    let entry = state.sessions.get_mut(&session_id(key)).unwrap();
+                    for n in 0..MAX_FORCED_HISTORY {
+                        entry.movements.push(Movement {
+                            id: Some(format!("{n:032x}")),
+                            from: if n == 0 {
+                                "cx-original".into()
+                            } else {
+                                format!("cx-ring-{}", n - 1)
+                            },
+                            to: format!("cx-ring-{n}"),
+                            at: clock(),
+                            discretionary: false,
+                        });
+                    }
+                    entry.anchor = Some("cx-ring-31".into());
+                    Ok(())
+                })
+                .unwrap();
+            store
+                .dispatch(
+                    Some(key),
+                    "cx-ring-32",
+                    Some("cx-ring-31"),
+                    "forced",
+                    clock(),
+                )
+                .unwrap();
+            let deadline = clock() + chrono::Duration::seconds(if revisit { 3600 } else { 120 });
+            assert_eq!(
+                load(&store.path).unwrap().unwrap().durable_overflow_until,
+                Some(deadline)
+            );
+            drop(store);
+            let store = PolicyStore::new(home.path(), Settings::default())
+                .unwrap()
+                .with_limits(limits)
+                .unwrap();
+            assert_eq!(store.snapshot().history_overflow_until, Some(deadline));
+            let (group, target) = if revisit {
+                (key, "cx-original")
+            } else {
+                ("codex:other-group", "cx-ring-0")
+            };
+            assert!(!store.discretionary_allowed(
+                group,
+                Some(target),
+                deadline - chrono::Duration::seconds(1)
+            ));
+            assert!(
+                store
+                    .dispatch(Some(group), target, Some("cx-ring-32"), "overload", clock())
+                    .is_err()
+            );
+            assert!(store.discretionary_allowed(group, Some(target), deadline));
+            store
+                .dispatch(
+                    Some(key),
+                    "cx-forced-after-restart",
+                    Some("cx-ring-32"),
+                    "forced",
+                    clock(),
+                )
+                .unwrap();
+            assert!(store.permits_dispatch(Some(key), "cx-forced-after-restart"));
+        }
     }
 }
