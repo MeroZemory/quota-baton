@@ -527,3 +527,19 @@ Moving keeps a single authoritative home. The shared lock directory is useful on
 10. **Safe databases.** Use transactions with a busy timeout. Never replace a database file. Only append to `session_index`. Run `integrity_check` in tests.
 11. **Auto-resume follows ownership.** The herdr session map (`%APPDATA%\herdr\session-homes.json`) is updated under the same journal and points at Q after a move. An interrupted move never resumes a fresh session.
 12. **Disk.** Hardlinks only. A move that cannot hardlink is refused.
+
+### D21 amendment: a move needs a typed confirmation (user direction, 2026-10-21)
+
+User: "이동은 강제로 시키는 게 아니라 터미널로 사람이 실수 안 하게끔 입력받을거죠? (e.g. move라고 친다거나)".
+
+- **The resume launcher asks before it moves anything.** When `codex-qb resume <id>` finds the session only in another home, it shows what would happen, in Korean:
+  - the source home;
+  - the rollout size;
+  - the goal status;
+  - the fork ancestors that stay in the source home;
+  - that the session will be removed from the source home;
+  - the return command.
+
+  It then asks the user to **type `move`**. Any other input cancels and changes nothing. The launcher may also offer `share` (the `--keep-source` mode), with its warning.
+- **No terminal, no move.** Without an interactive terminal it refuses and prints the manual command. It never moves silently.
+- **Manual and bulk commands follow the same rule.** `quota-baton sessions import ... --apply` and the return command ask for the same typed word. A bulk run shows one table and one typed confirmation for the whole batch. `--yes` skips the prompt for scripted use only; the launcher never passes it.
