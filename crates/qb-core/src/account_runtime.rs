@@ -539,7 +539,7 @@ impl AccountRuntime {
     }
 
     fn finish_queue_transition(state: &mut PacingState, had_waiters: bool, now: Instant) {
-        if had_waiters && state.waiting.is_empty() && state.step > 0 {
+        if had_waiters && state.waiting.is_empty() && state.step == 1 {
             let after_drain = now + state.step_decay_interval;
             state.step_decay_at = Some(
                 state
@@ -1669,6 +1669,57 @@ mod r1_rate_tests {
         assert_eq!(second.rate_release_interval, StdDuration::from_millis(500));
     }
 
+    #[test]
+    fn draining_an_upper_step_keeps_its_original_quiet_schedule() {
+        for removal in ["release", "deadline", "cancellation"] {
+            let f = Fixture::new();
+            let start = Instant::now();
+            two_windows(&f.runtime, start);
+            {
+                let mut states = f.runtime.pacing.lock().unwrap();
+                let state = states.get_mut(ID).unwrap();
+                let waiter = Arc::new(PacingWaiter {
+                    deadline: at(start, 60),
+                    forced: std::sync::atomic::AtomicBool::new(removal == "deadline"),
+                    notify: Notify::new(),
+                    cancelled: std::sync::atomic::AtomicBool::new(removal == "cancellation"),
+                });
+                state.waiting.push_back(waiter);
+                // Drain at8, between the window ending6 and quiet boundary10.
+                state.waiting.pop_front();
+                AccountRuntime::finish_queue_transition(state, true, at(start, 8));
+            }
+            assert_eq!(
+                f.runtime
+                    .pacing_snapshot_at(ID, at(start, 10) - StdDuration::from_nanos(1))
+                    .rate_step,
+                2,
+                "{removal}"
+            );
+            assert_eq!(
+                f.runtime.pacing_snapshot_at(ID, at(start, 10)).rate_step,
+                1,
+                "{removal}"
+            );
+            assert_eq!(
+                f.runtime.pacing_snapshot_at(ID, at(start, 14)).rate_step,
+                0,
+                "{removal}"
+            );
+            let g = Fixture::new();
+            two_windows(&g.runtime, start);
+            {
+                let mut states = g.runtime.pacing.lock().unwrap();
+                let state = states.get_mut(ID).unwrap();
+                AccountRuntime::finish_queue_transition(state, true, at(start, 8));
+            }
+            let next = g
+                .runtime
+                .observe_429_at(ID, at(start, 11), at(start, 11), None, 1.0);
+            assert_eq!(next.rate_step, 2, "{removal}");
+            assert_eq!(next.rate_backoff_until, Some(at(start, 15)), "{removal}");
+        }
+    }
     #[tokio::test]
     async fn actual_fifo_release_starts_the_last_quiet_interval_at_drain() {
         let f = Fixture::new();
