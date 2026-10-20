@@ -7,8 +7,7 @@ use qb_core::{
 };
 use serde_json::json;
 
-// These table tests model successful target probes explicitly. Relay-level
-// counterparts obtain proof from real fake-upstream responses instead.
+// Fixtures record genuine client rate signals; idle targets need no prior success.
 trait FixtureRate {
     fn fixture_rate(
         &self,
@@ -28,9 +27,6 @@ impl FixtureRate for BindingTable {
         candidates: &[Candidate],
         now: chrono::DateTime<Utc>,
     ) -> (usize, usize, usize, usize) {
-        for c in candidates.iter().filter(|c| c.account.id != source) {
-            self.note_success(&c.account.id, now);
-        }
         self.note_rate(source, now);
         self.note_client_rate(provider, source, key, candidates, now)
     }
@@ -83,17 +79,13 @@ fn candidates(ids: &[&str]) -> Vec<Candidate> {
 }
 
 fn table() -> (tempfile::TempDir, std::sync::Arc<BindingTable>) {
-    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/m4d-tests");
-    std::fs::create_dir_all(&base).unwrap();
-    let root = tempfile::tempdir_in(base).unwrap();
+    let root = tempfile::tempdir().unwrap();
     let table = BindingTable::new(root.path(), RoutingConfig::default()).unwrap();
     (root, table)
 }
 
 fn table_with(config: RoutingConfig) -> (tempfile::TempDir, std::sync::Arc<BindingTable>) {
-    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/m4d-tests");
-    std::fs::create_dir_all(&base).unwrap();
-    let root = tempfile::tempdir_in(base).unwrap();
+    let root = tempfile::tempdir().unwrap();
     let table = BindingTable::new(root.path(), config).unwrap();
     (root, table)
 }
@@ -224,12 +216,12 @@ fn c7_1_rebalance_never_targets_disabled_or_cooling_account() {
             ids[0].account.user_state = UserState::Disabled;
         }
 
-        assert_eq!(choose(&table, "codex:g0", &ids, 10), source);
-        assert_eq!(table.current(Some("codex:g0")), Some(source.into()));
+        assert_eq!(choose(&table, "codex:g0", &ids, 10), target);
+        assert_eq!(table.current(Some("codex:g0")), Some(target.into()));
         assert!(!table.overload_marked(Some("codex:g0"), Utc::now()));
         assert_eq!(table.active_sessions("cx-a-ineligible", Utc::now()), 0);
-        assert_eq!(table.active_sessions(source, Utc::now()), 4);
-        assert_eq!(table.active_sessions(target, Utc::now()), 0);
+        assert_eq!(table.active_sessions(source, Utc::now()), 3);
+        assert_eq!(table.active_sessions(target, Utc::now()), 1);
     }
 }
 
@@ -476,10 +468,15 @@ fn c7_1_placement_all_full_uses_lowest_ratio_never_refuses() {
 #[test]
 fn c7_1_placement_per_account_threshold_override() {
     let (_root, table) = table();
-    let ids = candidates(&["cx-a", "cx-b"]);
     table.set_account_threshold("cx-a", Some(1));
     table.set_account_threshold("cx-b", Some(3));
     for n in 0..4 {
+        // This case isolates room; each turn includes fresh usage evidence.
+        let ids = candidates(&["cx-a", "cx-b"]);
+        let asof = table.begin_usage_observation();
+        for c in &ids {
+            table.note_usage_observation_asof(&c.account.id, c.quota.as_ref().unwrap(), asof);
+        }
         let _ = choose(&table, &format!("codex:g{n}"), &ids, 1);
     }
     assert_eq!(table.active_sessions("cx-a", Utc::now()), 1);

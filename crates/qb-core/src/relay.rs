@@ -95,30 +95,6 @@ pub struct RelayState {
 }
 
 impl RelayState {
-    fn rate_wait_response(&self, provider: Provider, id: &str) -> Response {
-        let remaining = self
-            .accounts
-            .pacing_snapshot(id)
-            .rate_backoff_until
-            .map(|at| at.saturating_duration_since(Instant::now()))
-            .unwrap_or(Duration::from_secs(1));
-        let seconds =
-            (remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0)).clamp(1, 31_536_000);
-        let mut response = native_error(
-            StatusCode::TOO_MANY_REQUESTS,
-            provider,
-            "rate_wait_timeout",
-            "요청 속도 제한의 대기 한도에 도달했습니다. 잠시 후 다시 요청해 주세요.",
-        );
-        response.headers_mut().insert(
-            "retry-after",
-            HeaderValue::from_str(&seconds.to_string()).expect("bounded retry advice"),
-        );
-        if let Ok(id) = HeaderValue::from_str(id) {
-            response.headers_mut().insert("x-quota-baton-account", id);
-        }
-        response
-    }
     pub fn routing_view(&self) -> serde_json::Value {
         let mut view = self.bindings.routing_view();
         let accounts = self.store.list().unwrap_or_default();
@@ -480,6 +456,8 @@ impl RelayState {
         // The lease is held and account expiry/reconciliation precedes affinity restore.
         store.list()?;
         let bindings = crate::bindings::BindingTable::new(store.home(), config.routing.clone())?;
+        bindings.policies.attach_observability(&observability);
+        quota.set_bindings(&bindings);
         observability.configure_forecast(config.routing.forecast_shadow);
         observability.dashboard().attach(&bindings, config);
         for (id, settings) in &config.accounts {
@@ -713,6 +691,8 @@ impl RelayState {
         })
         .await
         .unwrap_or_default();
+        self.observability
+            .record_unknown_cost_skips(self.bindings.take_unknown_cost_skips());
         if marked > 0 || (groups_hit >= 3 && self.bindings.overload_report_due(account, now)) {
             self.observability
                 .record_overload(account, active, threshold, groups_hit, marked);
@@ -936,6 +916,9 @@ impl RelayState {
                             } else if let Some(count) = excess {
                                 self.observability.remember_burst(count);
                             }
+                        }
+                        if event.is_placement {
+                            self.observability.record_placement(&event);
                         }
                         self.observability.record_group_move(
                             &event.key,
@@ -1824,22 +1807,17 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
         }
         drop(dashboard_pacing);
         completion.rate_wait(admission_started.elapsed().as_millis() as u64);
-        if admission.as_ref().is_none_or(|a| a.forced())
-            || rate_hold_deadline.is_some_and(|at| Instant::now() >= at)
-        {
-            if let Some(previous) = last_rate_response.take() {
-                rate_relayed = true;
-                state
-                    .note_client_rate(provider, &account.id, session.key.as_deref())
-                    .await;
-                completion.relayed_rate_429();
-                break previous;
-            }
-            completion.outcome(429, "rate_wait_timeout");
+        let mut forced_send = admission.as_ref().is_none_or(|a| a.forced())
+            || rate_hold_deadline.is_some_and(|at| Instant::now() >= at);
+        if forced_send && let Some(previous) = last_rate_response.take() {
+            // A retry deadline returns the actual upstream 429. Only an
+            // initial admission expiry permits one send with no further rate retry.
+            rate_relayed = true;
             state
                 .note_client_rate(provider, &account.id, session.key.as_deref())
                 .await;
-            return state.rate_wait_response(provider, &account.id);
+            completion.relayed_rate_429();
+            break previous;
         }
         if !state
             .dispatch_allowed(
@@ -1884,20 +1862,17 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
                 "전송 전 전체 시간 한도를 초과했습니다.",
             );
         }
-        if rate_hold_deadline.is_some_and(|at| Instant::now() >= at) {
-            if let Some(previous) = last_rate_response.take() {
-                rate_relayed = true;
-                state
-                    .note_client_rate(provider, &account.id, session.key.as_deref())
-                    .await;
-                completion.relayed_rate_429();
-                break previous;
-            }
-            completion.outcome(429, "rate_wait_timeout");
+        forced_send |= rate_hold_deadline.is_some_and(|at| Instant::now() >= at);
+        if forced_send && let Some(previous) = last_rate_response.take() {
+            rate_relayed = true;
             state
                 .note_client_rate(provider, &account.id, session.key.as_deref())
                 .await;
-            return state.rate_wait_response(provider, &account.id);
+            completion.relayed_rate_429();
+            break previous;
+        }
+        if forced_send {
+            state.accounts.record_forced_send(&account.id);
         }
         drop(last_rate_response.take());
         if std::mem::take(&mut rate_retry_queued) {
@@ -1907,6 +1882,7 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
             binding.dispatched();
         }
         completion.attempt(&account.id);
+        let observation_asof = state.bindings.begin_usage_observation_for(&account.id);
         let sent_at = Instant::now();
         let send = state
             .client
@@ -1947,11 +1923,12 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
         let credit_observation = if status.is_success() || status == StatusCode::TOO_MANY_REQUESTS {
             state
                 .accounts
-                .observe_headers_for_model(
+                .observe_headers_asof(
                     &account.id,
                     provider,
                     &response_headers,
                     request_model.as_deref(),
+                    (&state.bindings, observation_asof),
                 )
                 .await
         } else {
@@ -2154,7 +2131,7 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
             }
             if let Some(copy) = retained.as_ref()
                 && rate_retries < state.rate_hold_max_retries
-                && admission.as_ref().is_some_and(|a| !a.forced())
+                && !forced_send
                 && Instant::now() < rate_deadline
                 && let Some(body) = copy.retry_body().await
             {

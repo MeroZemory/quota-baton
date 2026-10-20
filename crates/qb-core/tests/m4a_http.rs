@@ -570,6 +570,13 @@ async fn c6_4_402_payment_failover_and_relay_when_none() {
 async fn c6_4_400_billing_error_is_row7_not_row9() {
     let h = Harness::new(Provider::Claude, 2, 384, 1024).await;
     let ids = h.ids();
+    // Both pre-existing groups must belong to A; new placements otherwise
+    // spread under D20 before this test exercises payment recovery.
+    h.state
+        .accounts
+        .change(&ids[1], Some(UserState::Paused), None, None, None)
+        .await
+        .unwrap();
     for session in ["billing", "untouched"] {
         c6_4_assert_served(
             h.send_with_session(Provider::Claude, session).await,
@@ -578,6 +585,11 @@ async fn c6_4_400_billing_error_is_row7_not_row9() {
         )
         .await;
     }
+    h.state
+        .accounts
+        .change(&ids[1], Some(UserState::Active), None, None, None)
+        .await
+        .unwrap();
     let writes = c6_4_health_writes(&h);
     let body = r#"{"type":"error","error":{"type":"billing_error","message":"Credit balance is too low"}}"#;
     h.fake
@@ -964,7 +976,7 @@ async fn c6_3_release_interval_adapts_after_429_window() {
 }
 
 #[tokio::test]
-async fn c6_3_admission_wait_exhausted_returns_local_429_without_a_send() {
+async fn c6_3_admission_wait_exhausted_sends_once() {
     let h = Harness::new(Provider::Claude, 1, 0, 1024).await;
     let id = h.ids()[0].clone();
     h.state.accounts.set_rate_hold_secs(1);
@@ -973,8 +985,129 @@ async fn c6_3_admission_wait_exhausted_returns_local_429_without_a_send() {
         .observe_429(&id, Some(Duration::from_secs(60)));
     h.fake.state.push(ok());
     let response = h.send(Provider::Claude, "{}").await;
-    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(h.fake.state.requests().len(), 0);
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(h.fake.state.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn r8_forced_initial_send_keeps_genuine_quota_recovery_independent() {
+    for provider in [Provider::Claude, Provider::Codex] {
+        let h = Harness::new_with_routing(
+            provider,
+            2,
+            384,
+            1024,
+            RoutingConfig {
+                rate_hold_secs: 1,
+                ..RoutingConfig::default()
+            },
+        )
+        .await;
+        let ids = h.ids();
+        let key = format!("{}:forced-quota", provider.as_str());
+        h.state
+            .bindings
+            .import(json!({"schema":1,"bindings":[{
+                "key":key,"account":ids[0],"last_used":Utc::now()
+            }]}))
+            .unwrap();
+        h.state
+            .accounts
+            .observe_429(&ids[0], Some(Duration::from_secs(30)));
+        h.fake.state.push(quota(Utc::now().timestamp() + 3600));
+        h.fake.state.push(ok());
+        let started = Instant::now();
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            h.send_with_session(provider, "forced-quota"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-quota-baton-account"], ids[1]);
+        response.bytes().await.unwrap();
+        let requests = h.fake.state.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].received_at.duration_since(started) >= Duration::from_millis(900));
+        for (request, id) in requests.iter().zip(&ids) {
+            let account = h.store.load(id).unwrap();
+            let tokens = h.store.tokens(&account).unwrap();
+            assert_eq!(
+                request.headers["authorization"],
+                format!("Bearer {}", tokens.access_token.as_str())
+            );
+            assert_eq!(request.body, "{}");
+        }
+        assert!(matches!(
+            h.store.load(&ids[0]).unwrap().health,
+            Health::Cooling {
+                reason: HealthReason::Quota,
+                ..
+            }
+        ));
+        assert_eq!(h.state.bindings.current(Some(&key)), Some(ids[1].clone()));
+        let rows = h.ledger();
+        let row = rows.iter().find(|row| row["attempts"] == 2).unwrap();
+        assert_eq!(row["attempt_details"][0]["failover_reason"], "quota");
+        assert_eq!(row["rate_retries"], 0);
+        assert_eq!(row["relayed_rate_429s"], 0);
+    }
+}
+
+#[tokio::test]
+async fn r8_forced_initial_send_keeps_current_token_retry_independent() {
+    let h = Harness::new_with_routing(
+        Provider::Codex,
+        1,
+        384,
+        1024,
+        RoutingConfig {
+            rate_hold_secs: 1,
+            ..RoutingConfig::default()
+        },
+    )
+    .await;
+    let id = h.ids().remove(0);
+    let mut account = h.store.load(&id).unwrap();
+    let old = h.store.tokens(&account).unwrap();
+    account.source = Source::Oauth;
+    h.store
+        .save(&account, &old, Some(account.generation))
+        .unwrap();
+    h.state
+        .accounts
+        .observe_429(&id, Some(Duration::from_secs(30)));
+    h.fake
+        .state
+        .push(ScriptedResponse::json(StatusCode::UNAUTHORIZED, "{}"));
+    h.fake.state.push(ScriptedResponse::json(StatusCode::OK, r#"{"access_token":"synthetic-r8-refreshed","refresh_token":"synthetic-r8-rotated","expires_in":3600}"#));
+    h.fake.state.push(ok());
+    let response = tokio::time::timeout(Duration::from_secs(5), h.send(Provider::Codex, "{}"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-quota-baton-account"], id);
+    response.bytes().await.unwrap();
+    let requests = h.fake.state.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[0].headers["authorization"],
+        format!("Bearer {}", old.access_token.as_str())
+    );
+    assert!(String::from_utf8_lossy(&requests[1].body).contains("refresh_token"));
+    assert_eq!(
+        requests[2].headers["authorization"],
+        "Bearer synthetic-r8-refreshed"
+    );
+    assert_eq!(
+        requests[0].headers["chatgpt-account-id"],
+        requests[2].headers["chatgpt-account-id"]
+    );
+    assert_eq!(h.store.load(&id).unwrap().health, Health::Ready);
+    let rows = h.ledger();
+    let row = rows.iter().find(|row| row["attempts"] == 2).unwrap();
+    assert_eq!(row["attempt_details"][0]["failover_reason"], "token_retry");
+    assert_eq!(row["rate_retries"], 0);
 }
 
 #[tokio::test]
@@ -2165,8 +2298,14 @@ async fn c6_row_5_transient_and_throttled_refresh_cools_auth_five_minutes_and_fa
         }
         h.fake.state.push(ok());
         let before = Utc::now();
-        // C7 keeps unbound traffic on its last account; each round deliberately
-        // starts a new binding to exercise the first account's refresh throttle.
+        // Restore an existing affinity to A in each independent scenario.
+        // Choosing a new session is subject to D20 and can legitimately select B.
+        h.state
+            .bindings
+            .import(json!({"schema":1,"bindings":[{
+                "key":format!("codex:refresh-round-{round}"),"account":id,"last_used":Utc::now()
+            }]}))
+            .unwrap();
         let response = reqwest::Client::new()
             .post(format!("http://{}/v1/responses", h.servers.data_addr))
             .bearer_auth("synthetic-client")
@@ -2343,26 +2482,18 @@ async fn r1_http_total_hold_case(initial_budget_exhausted: bool) {
     );
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(headers["x-quota-baton-account"], account);
-    if initial_budget_exhausted {
-        let advice = headers["retry-after"]
-            .to_str()
-            .unwrap()
-            .parse::<u64>()
-            .unwrap();
-        assert!((28..=30).contains(&advice));
-        assert_eq!(
-            serde_json::from_str::<Value>(&body).unwrap()["error"]["type"],
-            "rate_wait_timeout"
-        );
-    } else {
-        assert_eq!(headers["retry-after"], "30");
-        assert_eq!(body, first_body);
-    }
-    let expected_attempts = usize::from(!initial_budget_exhausted);
+    assert_eq!(headers["retry-after"], "30");
+    assert_eq!(
+        body, first_body,
+        "expiry must relay the actual upstream 429"
+    );
+    let expected_attempts = 1;
     let requests = h.fake.state.requests();
     assert_eq!(requests.len(), expected_attempts);
-    if !initial_budget_exhausted {
-        let first_send_wait = requests[0].received_at.saturating_duration_since(started);
+    let first_send_wait = requests[0].received_at.saturating_duration_since(started);
+    if initial_budget_exhausted {
+        assert!(first_send_wait >= Duration::from_millis(900));
+    } else {
         assert!(
             (Duration::from_millis(450)..=Duration::from_millis(900)).contains(&first_send_wait),
             "initial wait must spend the original budget"
@@ -2389,21 +2520,11 @@ async fn r1_http_total_hold_case(initial_budget_exhausted: bool) {
     let row = &rows[0];
     assert_eq!(row["attempts"], expected_attempts as u64);
     assert_eq!(row["rate_retries"], 0);
-    assert_eq!(
-        row["relayed_rate_429s"],
-        u64::from(!initial_budget_exhausted)
-    );
+    assert_eq!(row["relayed_rate_429s"], 1);
     assert_eq!(row["retained_copy"], true);
     assert_eq!(row["account"], account);
     assert_eq!(row["status"], 429);
-    assert_eq!(
-        row["outcome"],
-        if initial_budget_exhausted {
-            "rate_wait_timeout"
-        } else {
-            "rate_hold_relayed_429"
-        }
-    );
+    assert_eq!(row["outcome"], "rate_hold_relayed_429");
     let duration = row["dur_ms"].as_u64().unwrap();
     assert!((900..=1600).contains(&duration));
     let wait = row["rate_wait_ms"].as_u64().unwrap();
@@ -2425,7 +2546,7 @@ async fn r1_http_total_hold_absolute_deadline_includes_initial_admission_and_ret
 }
 
 #[tokio::test]
-async fn r1_http_total_hold_initial_admission_expiry_never_forces_a_send() {
+async fn r1_http_total_hold_initial_admission_expiry_forces_one_send_without_retry() {
     r1_http_total_hold_case(true).await;
 }
 

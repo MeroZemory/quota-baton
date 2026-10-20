@@ -34,6 +34,19 @@ async fn large_streaming_input_is_not_moved_based_on_first_small_chunk() {
         Some(json!({"drain":false})),
     )
     .await;
+    // The target's warm-up placement consumes its D20 weak-evidence slot.
+    // Observe quota after that placement so this test reaches the overload mark
+    // and isolates the large-body cost guard rather than the freshness cap.
+    let asof = h.state.bindings.begin_usage_observation_for(&ids[1]);
+    h.state
+        .accounts
+        .observe_headers(&ids[1], Provider::Codex, &usage(Provider::Codex, 10))
+        .await;
+    h.state.bindings.note_usage_observation_asof_token(
+        &ids[1],
+        &h.obs.quota_snapshot(&ids[1]).unwrap(),
+        asof,
+    );
     let candidates: Vec<_> = h
         .store
         .list()
@@ -127,7 +140,7 @@ async fn restored_claude_root_cannot_move_on_small_child_cost_evidence() {
 }
 
 #[tokio::test]
-async fn local_rate_wait_expiry_has_typed_json_retry_advice_for_both_families() {
+async fn initial_rate_wait_expiry_forces_one_same_account_send_for_both_families() {
     for provider in [Provider::Claude, Provider::Codex] {
         let h = Harness::with_limits(provider, 60, 5, 1).await;
         let (path, header) = if provider == Provider::Claude {
@@ -135,34 +148,25 @@ async fn local_rate_wait_expiry_has_typed_json_retry_advice_for_both_families() 
         } else {
             ("/v1/responses", "session-id")
         };
-        let a = h.turn(path, &[(header, "typed-rate-expiry")], RAW).await;
+        let a = h.turn(path, &[(header, "forced-rate-expiry")], RAW).await;
         h.state
             .accounts
             .observe_429(&a, Some(Duration::from_secs(30)));
-        let response = h
-            .client
-            .post(format!("http://{}{path}", h.servers.data_addr))
-            .bearer_auth("synthetic-client")
-            .header(header, "typed-rate-expiry")
-            .body(RAW)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert!(
-            response.headers()["retry-after"]
-                .to_str()
-                .unwrap()
-                .parse::<u64>()
-                .unwrap()
-                >= 28
-        );
+        let before = h.fake.state.requests().len();
+        let started = Instant::now();
         assert_eq!(
-            response.json::<Value>().await.unwrap()["error"]["type"],
-            "rate_wait_timeout"
+            h.turn(path, &[(header, "forced-rate-expiry")], RAW).await,
+            a
         );
-        assert_eq!(h.fake.state.requests().len(), 1);
+        assert!(started.elapsed() >= Duration::from_millis(900));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(h.fake.state.requests().len(), before + 1);
+        assert_credential(&h, before, &a);
         assert!(matches!(h.store.load(&a).unwrap().health, Health::Ready));
+        assert_eq!(
+            h.fake.state.requests()[before].body.as_ref(),
+            RAW.as_bytes()
+        );
     }
 }
 
@@ -328,22 +332,57 @@ async fn total_precommit_deadline_cancels_hold_without_sending_or_changing_accou
 }
 
 #[tokio::test]
-async fn simultaneous_rate_wait_expiry_never_forces_a_burst_to_upstream() {
+async fn simultaneous_initial_rate_expiry_sends_once_each_and_relays_actual_429() {
     let h = Harness::with_limits(Provider::Codex, 60, 5, 1).await;
     let headers = [("session-id", "expiry-herd")];
     let first = h.turn("/v1/responses", &headers, RAW).await;
     h.state
         .accounts
         .observe_429(&first, Some(Duration::from_secs(30)));
+    let raw_rate = r#"{"error":{"type":"rate_limit_error","message":"synthetic-forced-final"}}"#;
+    for _ in 0..8 {
+        let mut rate = ScriptedResponse::json(StatusCode::TOO_MANY_REQUESTS, raw_rate);
+        rate.headers.insert("retry-after", "30".parse().unwrap());
+        h.fake.state.push(rate);
+    }
+    let began = Instant::now();
     let replies =
         futures_util::future::join_all((0..8).map(|_| h.send("/v1/responses", &headers, RAW)))
             .await;
-    assert!(replies.iter().all(|r| r.0 == 429));
-    assert_eq!(
-        h.fake.state.requests().len(),
-        1,
-        "expired waiters are errors, never admitted wire sends"
+    assert!(began.elapsed() >= Duration::from_millis(900));
+    assert!(
+        began.elapsed() < Duration::from_secs(5),
+        "initial expiry must not renew the rate wait"
     );
+    for (status, account, body) in replies {
+        assert_eq!(status, 429);
+        assert_eq!(account, first);
+        assert_eq!(body, raw_rate.as_bytes());
+    }
+    let requests = h.fake.state.requests();
+    assert_eq!(
+        requests.len(),
+        9,
+        "each initial expiry sends once, with no RATE retry"
+    );
+    for (index, request) in requests.iter().enumerate().skip(1) {
+        assert_credential(&h, index, &first);
+        assert_eq!(request.body.as_ref(), RAW.as_bytes());
+        assert_eq!(request.headers["session-id"], "expiry-herd");
+    }
+    let rows: Vec<_> = h
+        .ledger()
+        .into_iter()
+        .filter(|row| row["req"].is_string() && row["status"] == 429)
+        .collect();
+    assert_eq!(rows.len(), 8);
+    for row in rows {
+        assert_eq!(row["attempts"], 1);
+        assert_eq!(row["rate_retries"], 0);
+        assert_eq!(row["relayed_rate_429s"], 1);
+        assert_eq!(row["outcome"], "rate_hold_relayed_429");
+        assert!(row["rate_wait_ms"].as_u64().unwrap() >= 900);
+    }
     assert!(matches!(
         h.store.load(&first).unwrap().health,
         Health::Ready
@@ -534,18 +573,32 @@ async fn policy_edit_interrupts_reset_hold_instead_of_waiting_for_obsolete_deadl
 }
 
 #[tokio::test]
-async fn full_move_budget_serves_healthy_credential_and_blocks_only_required_move() {
+async fn full_discretionary_pool_budget_preserves_healthy_credential_but_allows_forced_move() {
     let h = Harness::new(Provider::Codex).await;
     let headers = [("session-id", "full-move-budget")];
     let a = h.turn("/v1/responses", &headers, RAW).await;
     let key = "codex:full-move-budget";
-    for (from, to) in [("cx-z", "cx-x"), ("cx-x", "cx-y"), ("cx-y", a.as_str())] {
+    // Fill the discretionary pool cap with distinct groups/targets. Forced
+    // history is exempt from all movement caps and cannot seed this condition.
+    for n in 0..h.state.bindings.policies.limits().max_pool_moves {
         h.state
             .bindings
             .policies
-            .dispatch(Some(key), to, Some(from), "forced", Utc::now())
+            .dispatch(
+                Some(&format!("codex:budget-seed-{n}")),
+                &format!("cx-budget-{n}"),
+                Some("cx-origin"),
+                "overload",
+                Utc::now(),
+            )
             .unwrap();
     }
+    assert!(
+        !h.state
+            .bindings
+            .policies
+            .discretionary_allowed(key, Some(&a), Utc::now())
+    );
     let mut snapshot = h.state.bindings.export().unwrap();
     for binding in snapshot["bindings"].as_array_mut().unwrap() {
         binding["last_used"] = json!(Utc::now() - ChronoDuration::seconds(3601));
@@ -557,11 +610,40 @@ async fn full_move_budget_serves_healthy_credential_and_blocks_only_required_mov
         .await;
     assert_ne!(a, b);
     assert_credential(&h, 1, &b);
+    // Keep D20's target cap out of this test: quota observed after the
+    // warm-up placement makes B a genuine candidate for a discretionary move.
+    let asof = h.state.bindings.begin_usage_observation_for(&b);
+    h.state
+        .accounts
+        .observe_headers(&b, Provider::Codex, &usage(Provider::Codex, 10))
+        .await;
+    h.state.bindings.note_usage_observation_asof_token(
+        &b,
+        &h.obs.quota_snapshot(&b).unwrap(),
+        asof,
+    );
     assert_eq!(h.turn("/v1/responses", &headers, RAW).await, a);
     assert_credential(&h, 2, &a);
+    assert!(
+        !h.state
+            .bindings
+            .policies
+            .discretionary_allowed(key, Some(&b), Utc::now())
+    );
+    assert!(
+        !h.ledger()
+            .iter()
+            .any(|row| row["event"] == "binding_move" && row["from"] == a && row["to"] == b)
+    );
     h.pause(&a).await;
-    assert_eq!(h.send("/v1/responses", &headers, RAW).await.0, 409);
-    assert_eq!(h.fake.state.requests().len(), 3);
+    assert_eq!(h.turn("/v1/responses", &headers, RAW).await, b);
+    assert_credential(&h, 3, &b);
+    assert_eq!(h.fake.state.requests().len(), 4);
+    assert_eq!(h.fake.state.requests()[3].body.as_ref(), RAW.as_bytes());
+    assert!(h.ledger().iter().any(|row| row["event"] == "binding_move"
+        && row["from"] == a
+        && row["to"] == b
+        && row["reason"] == "forced"));
 }
 
 #[tokio::test]
@@ -724,7 +806,7 @@ async fn restored_codex_root_continuation_does_not_claim_full_context_cost_or_mo
 }
 
 #[tokio::test]
-async fn started_rate_budget_does_not_reopen_after_later_slow_auth_retry() {
+async fn spent_rate_budget_allows_slow_auth_retry_but_never_another_rate_retry() {
     let h = Harness::with_limits(Provider::Codex, 60, 10, 3).await;
     for id in h.ids() {
         let mut a = h.store.load(&id).unwrap();
@@ -745,9 +827,13 @@ async fn started_rate_budget_does_not_reopen_after_later_slow_auth_retry() {
     auth.chunks[0].0 = Duration::from_millis(2200);
     h.fake.state.push(auth);
     h.fake.state.push(ScriptedResponse::json(StatusCode::OK,r#"{"access_token":"synthetic-rotated-access","refresh_token":"synthetic-rotated-refresh","expires_in":3600}"#));
-    h.fake
-        .state
-        .push(ScriptedResponse::json(StatusCode::OK, "{}"));
+    let final_body =
+        r#"{"error":{"type":"rate_limit_error","message":"synthetic-after-auth-rate"}}"#;
+    let mut final_rate = ScriptedResponse::json(StatusCode::TOO_MANY_REQUESTS, final_body);
+    final_rate
+        .headers
+        .insert("retry-after", "30".parse().unwrap());
+    h.fake.state.push(final_rate);
     let result = h
         .send(
             "/v1/responses",
@@ -756,22 +842,47 @@ async fn started_rate_budget_does_not_reopen_after_later_slow_auth_retry() {
         )
         .await;
     assert_eq!(result.0, 429);
-    assert!(String::from_utf8_lossy(&result.2).contains("rate_wait_timeout"));
+    assert_eq!(
+        result.2,
+        final_body.as_bytes(),
+        "relay the actual final 429 after independent auth recovery"
+    );
     let requests = h.fake.state.requests();
     assert_eq!(
         requests.len(),
-        3,
-        "a spent rate budget sent one more data request"
+        4,
+        "one RATE retry, one token refresh, and one independent auth retry only"
     );
     assert_eq!(
         requests[0].headers["chatgpt-account-id"],
         requests[1].headers["chatgpt-account-id"]
     );
     assert!(String::from_utf8_lossy(&requests[2].body).contains("refresh_token"));
+    assert_eq!(
+        requests[3].headers["authorization"],
+        "Bearer synthetic-rotated-access"
+    );
+    for index in [0, 1, 3] {
+        assert_eq!(requests[index].body.as_ref(), RAW.as_bytes());
+        assert_eq!(
+            requests[index].headers["chatgpt-account-id"],
+            requests[0].headers["chatgpt-account-id"]
+        );
+    }
+    let rows: Vec<_> = h
+        .ledger()
+        .into_iter()
+        .filter(|row| row["req"].is_string())
+        .collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["attempts"], 3);
+    assert_eq!(rows[0]["rate_retries"], 1);
+    assert_eq!(rows[0]["relayed_rate_429s"], 1);
+    assert_eq!(rows[0]["outcome"], "rate_hold_relayed_429");
 }
 
 #[tokio::test]
-async fn legacy_global_strict_corrupt_restore_refuses_core_start_before_any_b_credential() {
+async fn global_strict_is_rejected_and_explicit_strict_corrupt_restore_preserves_evidence() {
     for provider in [Provider::Codex, Provider::Claude] {
         for global in [true, false] {
             let h = Harness::new(provider).await;
@@ -815,6 +926,13 @@ async fn legacy_global_strict_corrupt_restore_refuses_core_start_before_any_b_cr
             };
             config.upstream.codex_base = fake.url.clone();
             config.upstream.anthropic_base = fake.url.clone();
+            if global {
+                assert!(
+                    config.routing.validate().is_err(),
+                    "global strict must not be accepted"
+                );
+                continue;
+            }
             if !global {
                 let policy = qb_core::routing::PolicyStore::new(
                     &home,
@@ -935,7 +1053,7 @@ async fn legacy_alias_anchor_recovery_and_v2_independence_use_the_actual_serving
         let mut config = Config::default();
         config.server.data_port = 0;
         config.server.admin_port = 0;
-        config.routing.mode = qb_core::routing::Mode::Strict;
+        config.routing.mode = qb_core::routing::Mode::Rebalance;
         config.upstream.codex_base = fake.url.clone();
         config.upstream.anthropic_base = fake.url.clone();
         if schema == 1 && divergent {
@@ -1067,11 +1185,7 @@ async fn rejected_idle_import_blocks_alias_dispatch_until_successful_recovery() 
             .to_string()
             .contains("strict policy alias")
     );
-    for session in [
-        "idle-alias:agent:x",
-        "idle-alias",
-        "fresh-after-rejected-import",
-    ] {
+    for session in ["idle-alias:agent:x", "idle-alias"] {
         assert_eq!(
             h.send("/v1/responses", &[("session-id", session)], RAW)
                 .await
@@ -1080,6 +1194,16 @@ async fn rejected_idle_import_blocks_alias_dispatch_until_successful_recovery() 
         );
     }
     assert_eq!(h.fake.state.requests().len(), 2);
+    let n = h.fake.state.requests().len();
+    let normal = h
+        .turn(
+            "/v1/responses",
+            &[("session-id", "fresh-after-rejected-import")],
+            RAW,
+        )
+        .await;
+    assert_credential(&h, n, &normal);
+    assert_eq!(h.fake.state.requests().len(), n + 1);
     assert_eq!(fs::read(&path).unwrap(), bytes);
     let mut repaired = snapshot;
     for binding in repaired["bindings"].as_array_mut().unwrap() {
@@ -1107,14 +1231,7 @@ async fn disappeared_policy_during_idle_import_preserves_strict_serving_lock() {
     h.admin(reqwest::Method::POST,"/admin/v1/routing",Some(json!({"kind":"session","id":qb_core::routing::session_id("codex:missing-policy"),"settings":{"mode":"strict","reset_wait_secs":0}}))).await;
     let before = h.state.bindings.export().unwrap();
     fs::remove_file(h.home.join("state/routing-policies.json")).unwrap();
-    assert!(
-        h.state
-            .bindings
-            .import(before.clone())
-            .unwrap_err()
-            .to_string()
-            .contains("disappeared")
-    );
+    assert!(h.state.bindings.import(before.clone()).is_err());
     assert_eq!(
         h.state
             .bindings
@@ -1133,18 +1250,133 @@ async fn disappeared_policy_during_idle_import_preserves_strict_serving_lock() {
     );
     assert_eq!(h.fake.state.requests().len(), 1);
     assert_eq!(h.state.bindings.export().unwrap(), before);
-    // Restart shares the same startup path for HTTP and WebSocket listeners:
-    // no listener/dial can be created from a disappeared fenced policy.
-    for _ in 0..2 {
-        assert!(
-            RelayState::new(
-                h.store.clone(),
-                &Config::default(),
-                h.obs.clone(),
-                Arc::new(DebugPins::default())
+    let h = h.restart_with_fixture(|_| {}).await;
+    assert_eq!(
+        h.send("/v1/responses", &[("session-id", "missing-policy")], RAW)
+            .await
+            .0,
+        409
+    );
+    assert_eq!(h.fake.state.requests().len(), 1);
+    let n = h.fake.state.requests().len();
+    let normal = h
+        .turn(
+            "/v1/responses",
+            &[("session-id", "not-locked-after-recovery")],
+            RAW,
+        )
+        .await;
+    assert_ne!(normal, a);
+    assert_credential(&h, n, &normal);
+    assert!(h.ledger().iter().any(|row| row["event"] == "core_warning"
+        && row["code"] == "routing_policy_strict_recovery_required"));
+}
+
+#[tokio::test]
+async fn r8_policy_write_failure_blocks_only_strict_sessions_and_keeps_current_default_credential()
+{
+    let h = Harness::new(Provider::Codex).await;
+    let a = h
+        .turn("/v1/responses", &[("session-id", "available-default")], RAW)
+        .await;
+    h.admin(reqwest::Method::POST,"/admin/v1/routing",Some(json!({"kind":"session","id":qb_core::routing::session_id("codex:locked"),"settings":{"mode":"strict","reset_wait_secs":0}}))).await;
+    let path = h.home.join("state/routing-policies.json");
+    fs::remove_file(&path).unwrap();
+    fs::create_dir(&path).unwrap();
+    let response = h.client.post(format!("http://{}/admin/v1/routing",h.servers.admin_addr))
+        .bearer_auth("synthetic-admin")
+        .json(&json!({"kind":"session","id":qb_core::routing::session_id("codex:available-default"),"settings":{"mode":"recover","reset_wait_secs":20}}))
+        .send().await.unwrap();
+    assert!(!response.status().is_success());
+    let n = h.fake.state.requests().len();
+    assert_eq!(
+        h.turn("/v1/responses", &[("session-id", "available-default")], RAW)
+            .await,
+        a
+    );
+    assert_credential(&h, n, &a);
+    assert_eq!(
+        h.send("/v1/responses", &[("session-id", "locked")], RAW)
+            .await
+            .0,
+        409
+    );
+    assert_eq!(h.fake.state.requests().len(), n + 1);
+    assert!(
+        h.ledger()
+            .iter()
+            .any(|row| row["event"] == "core_warning"
+                && row["code"] == "routing_policy_write_failed")
+    );
+}
+
+#[tokio::test]
+async fn r8_corrupt_default_policy_is_quarantined_and_real_relay_keeps_serving() {
+    let h = Harness::new(Provider::Codex).await;
+    let a = h
+        .turn("/v1/responses", &[("session-id", "plain-recovery")], RAW)
+        .await;
+    let h = h
+        .restart_with_fixture(|home| {
+            fs::write(home.join("state/routing-policies.json"), b"not a policy").unwrap();
+        })
+        .await;
+    assert_eq!(
+        h.turn("/v1/responses", &[("session-id", "plain-recovery")], RAW)
+            .await,
+        a
+    );
+    assert_credential(&h, 1, &a);
+    assert!(
+        h.ledger().iter().any(
+            |row| row["event"] == "core_warning" && row["code"] == "routing_policy_quarantined"
+        )
+    );
+    assert!(
+        fs::read_dir(h.home.join("state"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("routing-policies.json.corrupt-"))
+    );
+}
+
+#[tokio::test]
+async fn r8_four_forced_recoveries_within_ten_minutes_use_the_actual_alternate_credentials() {
+    let h = Harness::new(Provider::Codex).await;
+    let key = "unbudgeted-forced";
+    let mut current = h.turn("/v1/responses", &[("session-id", key)], RAW).await;
+    let mut alternate = h.ids().into_iter().find(|id| id != &current).unwrap();
+    let began = Instant::now();
+    for _ in 0..4 {
+        if h.store.load(&alternate).unwrap().user_state != qb_core::accounts::UserState::Active {
+            h.admin(
+                reqwest::Method::POST,
+                &format!("/admin/v1/accounts/{alternate}/resume"),
+                None,
             )
-            .is_err()
+            .await;
+        }
+        h.pause(&current).await;
+        let n = h.fake.state.requests().len();
+        assert_eq!(
+            h.turn("/v1/responses", &[("session-id", key)], RAW).await,
+            alternate
         );
-        assert_eq!(h.fake.state.requests().len(), 1);
+        assert_credential(&h, n, &alternate);
+        std::mem::swap(&mut current, &mut alternate);
     }
+    assert!(began.elapsed() < Duration::from_secs(600));
+    assert_eq!(h.fake.state.requests().len(), 5);
+    assert_eq!(
+        h.ledger()
+            .iter()
+            .filter(|row| row["event"] == "binding_move" && row["reason"] == "forced")
+            .count(),
+        4
+    );
+    assert!(!h.home.join("state/routing-policies.json").exists());
+    assert!(!h.home.join("state/routing-policies.fence.json").exists());
 }

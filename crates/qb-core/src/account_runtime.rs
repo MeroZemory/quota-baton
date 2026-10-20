@@ -611,9 +611,22 @@ impl AccountRuntime {
         self.admit_until(id, deadline).await
     }
 
+    /// Record the one allowed final send after initial pacing admission expires.
+    /// An expired retry or cancelled wait must not call this method.
+    pub fn record_forced_send(&self, id: &str) {
+        let mut states = self.pacing.lock().unwrap_or_else(|e| e.into_inner());
+        let state = Self::pacing_state(&mut states, id);
+        let now = Instant::now();
+        Self::decay_pacing(state, now);
+        if state.step > 0 || state.backoff_until.is_some() {
+            state.last_release = Some(now);
+            state.wake.notify_one();
+        }
+    }
+
     /// The request budget also bounds later retries. Normal releases stay FIFO;
-    /// budget expiry returns Forced as a terminal wait result. Callers must
-    /// not interpret it as permission to send past the server's gate.
+    /// budget expiry returns Forced. Only initial admission may send once;
+    /// that actual dispatch must call record_forced_send. Retries stop on expiry.
     pub async fn admit_until(self: &Arc<Self>, id: &str, deadline: Instant) -> AdmissionGuard {
         let local_deadline =
             Instant::now() + StdDuration::from_secs(self.rate_hold_secs.load(Ordering::Relaxed));
@@ -1256,9 +1269,43 @@ impl AccountRuntime {
         headers: &HeaderMap,
         model: Option<&str>,
     ) -> QuotaObservation {
-        let Some(snapshot) = self.obs.observe_headers_snapshot(id, provider, headers) else {
+        self.observe_headers_inner(id, provider, headers, model, None)
+            .await
+    }
+
+    pub(crate) async fn observe_headers_asof(
+        &self,
+        id: &str,
+        provider: Provider,
+        headers: &HeaderMap,
+        model: Option<&str>,
+        evidence: (
+            &crate::bindings::BindingTable,
+            crate::bindings::UsageObservationAsOf,
+        ),
+    ) -> QuotaObservation {
+        self.observe_headers_inner(id, provider, headers, model, Some(evidence))
+            .await
+    }
+
+    async fn observe_headers_inner(
+        &self,
+        id: &str,
+        provider: Provider,
+        headers: &HeaderMap,
+        model: Option<&str>,
+        evidence: Option<(
+            &crate::bindings::BindingTable,
+            crate::bindings::UsageObservationAsOf,
+        )>,
+    ) -> QuotaObservation {
+        let Some((snapshot, reported)) = self.obs.observe_headers_reported(id, provider, headers)
+        else {
             return QuotaObservation::default();
         };
+        if let Some((bindings, asof)) = evidence {
+            bindings.note_usage_observation_asof_token(id, &reported, asof);
+        }
         let observed_at = snapshot["observed_at"].clone();
         let quota_until = self
             .apply_quota_snapshot(id, snapshot, model)
@@ -1293,12 +1340,40 @@ impl AccountRuntime {
         event: &Value,
         model: Option<&str>,
     ) {
+        self.observe_codex_event_inner(id, event, model, None).await;
+    }
+    pub(crate) async fn observe_codex_event_asof(
+        &self,
+        id: &str,
+        event: &Value,
+        model: Option<&str>,
+        evidence: (
+            &crate::bindings::BindingTable,
+            crate::bindings::UsageObservationAsOf,
+        ),
+    ) {
+        self.observe_codex_event_inner(id, event, model, Some(evidence))
+            .await;
+    }
+    async fn observe_codex_event_inner(
+        &self,
+        id: &str,
+        event: &Value,
+        model: Option<&str>,
+        evidence: Option<(
+            &crate::bindings::BindingTable,
+            crate::bindings::UsageObservationAsOf,
+        )>,
+    ) {
         if event["type"] != "codex.rate_limits" {
             return;
         }
-        let Some(snapshot) = self.obs.observe_codex_event_snapshot(id, event) else {
+        let Some((snapshot, reported)) = self.obs.observe_codex_event_reported(id, event) else {
             return;
         };
+        if let Some((bindings, asof)) = evidence {
+            bindings.note_usage_observation_asof_token(id, &reported, asof);
+        }
         let observed_at = snapshot["observed_at"].clone();
         let _ = self.apply_quota_snapshot(id, snapshot, model).await;
         let limits = event.get("rate_limits").unwrap_or(event);
@@ -2023,6 +2098,29 @@ mod r1_rate_tests {
         };
         assert!(final_admission.forced());
         assert!(queue_deadlines(&f.runtime).is_empty());
+    }
+
+    #[tokio::test]
+    async fn r1_forced_admission_updates_shared_clock_before_next_normal_release() {
+        let f = Fixture::new();
+        block(&f.runtime);
+        let forced = f.runtime.admit_until(ID, Instant::now()).await;
+        assert!(forced.forced());
+        assert!(
+            last_release(&f.runtime).is_none(),
+            "unsent expiry is not dispatch"
+        );
+        let before = Instant::now();
+        f.runtime.record_forced_send(ID);
+        let stamp = last_release(&f.runtime).expect("actual forced send must update shared clock");
+        assert!(stamp >= before && stamp <= Instant::now());
+        open_backoff(&f.runtime);
+        let interval = f.runtime.pacing_snapshot(ID).rate_release_interval;
+        assert!(
+            !f.runtime
+                .admit_at(ID, stamp + interval - StdDuration::from_nanos(1))
+        );
+        assert!(f.runtime.admit_at(ID, stamp + interval));
     }
 
     #[tokio::test]
