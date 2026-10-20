@@ -1992,6 +1992,9 @@ async fn r1_ws_upgrade_http_date_advice_is_observed_without_forced_final_send() 
     let date = (Utc::now() + ChronoDuration::seconds(120))
         .format("%a, %d %b %Y %H:%M:%S GMT")
         .to_string();
+    let advice_at = chrono::DateTime::parse_from_rfc2822(&date)
+        .unwrap()
+        .with_timezone(&Utc);
     advice.insert("retry-after", date.parse().unwrap());
     h.fake.state.push_handshake(
         StatusCode::TOO_MANY_REQUESTS,
@@ -2010,13 +2013,17 @@ async fn r1_ws_upgrade_http_date_advice_is_observed_without_forced_final_send() 
         "forced initial upgrade cannot retry its 429"
     );
     let pacing = h.state.accounts.pacing_snapshot(id);
+    let monotonic_before = std::time::Instant::now();
+    let remaining = (advice_at - Utc::now()).to_std().unwrap_or_default();
+    let monotonic_after = std::time::Instant::now();
+    let deadline = pacing.rate_backoff_until.unwrap();
     assert!(
-        pacing
-            .rate_backoff_until
-            .unwrap()
-            .saturating_duration_since(std::time::Instant::now())
-            > Duration::from_secs(118),
-        "HTTP-date advice must not be shortened to the local wait cap"
+        deadline + Duration::from_millis(10) >= monotonic_before + remaining,
+        "gate must preserve the actual HTTP-date advice, independent of elapsed local wait"
+    );
+    assert!(
+        deadline <= monotonic_after + remaining + Duration::from_millis(1010) + started.elapsed(),
+        "ceiling and time spent processing cannot create an arbitrary extra backoff"
     );
     let row = h
         .ledger()
