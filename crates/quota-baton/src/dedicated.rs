@@ -494,17 +494,25 @@ fn claude_launcher_with_helper(command: &Path, helper: &Path) -> Result<Vec<u8>>
     )
     .into_bytes())
 }
-fn check_command(record: &CommandRecord) -> Result<()> {
-    if !safe_command_path(&record.path)
-        || !record.path.is_file()
-        || reparse(&record.path)?
-        || identity(&record.path)? != record.identity
-        || hash_file(&record.path)? != record.hash
-    {
+const CLAUDE_UPDATED: &str = "Claude가 업데이트되었습니다 · 실행 경로는 그대로입니다";
+
+fn command_record(path: &Path) -> Result<CommandRecord> {
+    if !safe_command_path(path) || !path.is_file() || reparse(path)? {
         bail!("Claude 실행 파일이 변경되었습니다. 먼저 unwire를 실행하세요");
     }
-    ancestors_safe(&record.path)?;
-    Ok(())
+    ancestors_safe(path)?;
+    Ok(CommandRecord {
+        path: path.to_owned(),
+        hash: hash_file(path)?,
+        identity: identity(path)?,
+    })
+}
+
+fn refreshed_command(record: &CommandRecord) -> Result<Option<CommandRecord>> {
+    // The launcher binds to this safe path, not to a self-updater's bytes or ID.
+    // Command records are observations only; they never confer unwire ownership.
+    let current = command_record(&record.path)?;
+    Ok((current.hash != record.hash || current.identity != record.identity).then_some(current))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1607,6 +1615,7 @@ fn upgrade_completed(
     m: &mut Manifest,
     apply: bool,
     force: bool,
+    command_updated: bool,
 ) -> Result<Report> {
     upgrade_directories(m)?;
     // Title upgrades do not reinstall the other objects, but still enforce
@@ -1701,6 +1710,14 @@ fn upgrade_completed(
             if let Ok(json) = serde_json::from_slice::<Value>(strip_utf8_bom(&bytes)) {
                 json_strings(&json, &mut secrets);
             }
+        }
+    }
+    if command_updated {
+        report.summary.push(CLAUDE_UPDATED.into());
+        if apply {
+            // Persist only after every upgrade preflight succeeds, even when
+            // all owned launcher/settings bytes are already current.
+            atomic_json(&paths.journal(), m)?;
         }
     }
     if apply {
@@ -1935,8 +1952,15 @@ pub(super) fn wire(
         {
             bail!("Claude 실행 파일이 변경되었습니다. 먼저 unwire를 실행하세요");
         }
-        if let Some(command) = &old.command {
-            check_command(command)?;
+        let command_update = old
+            .command
+            .as_ref()
+            .map(refreshed_command)
+            .transpose()?
+            .flatten();
+        let command_updated = command_update.is_some();
+        if let Some(command) = command_update {
+            old.command = Some(command);
         }
         if !old.retained {
             if old
@@ -1951,14 +1975,20 @@ pub(super) fn wire(
                 if apply {
                     validate_resume_inputs(paths, &options, &old)?;
                 }
-                return upgrade_completed(paths, &mut old, apply, options.force);
+                return upgrade_completed(paths, &mut old, apply, options.force, command_updated);
             }
             let mut report = Report {
                 summary: vec!["요약: 기존 journal에서 연결을 재개합니다".into()],
                 ..Report::default()
             };
+            if command_updated {
+                report.summary.push(CLAUDE_UPDATED.into());
+            }
             if apply {
                 validate_resume_inputs(paths, &options, &old)?;
+                if command_updated {
+                    atomic_json(&paths.journal(), &old)?;
+                }
                 install(paths, &mut old)?;
             }
             report.warnings.extend(scratch_warnings(&old));
@@ -2037,12 +2067,7 @@ pub(super) fn wire(
         let command = paths.claude_command.as_ref().context(
             "PATH에서 안전한 Claude 실행 파일을 찾지 못했습니다. Claude 설치를 확인하세요",
         )?;
-        let record = CommandRecord {
-            path: command.clone(),
-            hash: hash_file(command)?,
-            identity: identity(command)?,
-        };
-        check_command(&record)?;
+        let record = command_record(command)?;
         let home = claude_home(paths)?;
         if exists(&home)?
             && !(retained_home
@@ -4319,7 +4344,7 @@ trusted_hash = "synthetic-hook-hash"
         fs::write(&p.client_key, "different-key").unwrap();
         assert!(claude_run(&p, true, CodexMode::None, None).is_err());
         fs::write(&p.client_key, KEY).unwrap();
-        fs::write(p.claude_command.as_ref().unwrap(), "changed-command").unwrap();
+        fs::remove_file(p.claude_command.as_ref().unwrap()).unwrap();
         assert!(claude_run(&p, true, CodexMode::None, None).is_err());
         let mut m = manifest(&p);
         let original = fs::read(p.journal()).unwrap();
@@ -4646,6 +4671,143 @@ trusted_hash = "synthetic-hook-hash"
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn r8_claude_same_path_self_update_refreshes_only_on_apply_and_unwires_exact_objects() {
+        for legacy in [false, true] {
+            for replace in [false, true] {
+                let (_dir, p) = fixture();
+                if legacy {
+                    r32_old_install(&p);
+                } else {
+                    r32_run(&p, true, false).unwrap();
+                }
+                let sources = snapshot(&p);
+                let old = manifest(&p);
+                let command = p.claude_command.as_ref().unwrap();
+                let old_id = identity(command).unwrap();
+                let held = command.with_extension("previous");
+                if replace {
+                    // Keep the old inode alive so replacement cannot reuse its ID.
+                    fs::rename(command, &held).unwrap();
+                }
+                fs::write(command, "synthetic-updated-Claude-never-executed").unwrap();
+                if replace {
+                    assert_ne!(identity(command).unwrap(), old_id);
+                } else {
+                    assert_eq!(identity(command).unwrap(), old_id);
+                }
+                let journal = fs::read(p.journal()).unwrap();
+                let owned = r32_owned(&p);
+                let dry = r32_run(&p, false, false).unwrap();
+                assert!(output(&dry).contains(CLAUDE_UPDATED));
+                assert_eq!(fs::read(p.journal()).unwrap(), journal);
+                assert_eq!(r32_owned(&p), owned);
+
+                let applied = r32_run(&p, true, false).unwrap();
+                assert!(output(&applied).contains(CLAUDE_UPDATED));
+                let updated = manifest(&p);
+                let record = updated.command.as_ref().unwrap();
+                assert_eq!(&record.path, command);
+                assert_eq!(record.hash, hash_file(command).unwrap());
+                assert_eq!(record.identity, identity(command).unwrap());
+                assert!(updated.entries.iter().all(|e| &e.path != command));
+                if !legacy {
+                    // A command-only refresh must not rewrite/adopt owned objects.
+                    assert!(applied.changed.is_empty());
+                    assert_eq!(r32_owned(&p), owned);
+                    assert_eq!(
+                        serde_json::to_value(&updated.entries).unwrap(),
+                        serde_json::to_value(&old.entries).unwrap()
+                    );
+                }
+                let refreshed = fs::read(p.journal()).unwrap();
+                let repeat = r32_run(&p, true, false).unwrap();
+                assert!(!output(&repeat).contains(CLAUDE_UPDATED));
+                assert!(repeat.changed.is_empty());
+                assert_eq!(fs::read(p.journal()).unwrap(), refreshed);
+
+                let unknown = claude_home(&p).unwrap().join("unowned.txt");
+                fs::write(&unknown, "preserve unknown").unwrap();
+                super::unwire(&p, true, false).unwrap();
+                for e in updated.entries.iter().filter(|e| e.kind != Kind::Directory) {
+                    assert!(
+                        !exists(&e.path).unwrap(),
+                        "{} survived unwire",
+                        e.path.display()
+                    );
+                }
+                assert_eq!(
+                    fs::read_to_string(command).unwrap(),
+                    "synthetic-updated-Claude-never-executed"
+                );
+                assert_eq!(identity(command).unwrap(), record.identity);
+                if replace {
+                    assert!(held.is_file());
+                }
+                assert_eq!(fs::read_to_string(unknown).unwrap(), "preserve unknown");
+                assert_eq!(snapshot(&p), sources);
+            }
+        }
+    }
+
+    #[test]
+    fn r8_claude_changed_resolved_path_missing_and_reparse_still_refuse() {
+        for case in ["changed-path", "missing", "reparse", "reparse-parent"] {
+            let (_dir, mut p) = fixture();
+            r32_run(&p, true, false).unwrap();
+            let command = p.claude_command.as_ref().unwrap().clone();
+            match case {
+                "changed-path" => {
+                    let other = p.npm_dir.join("other-claude.cmd");
+                    fs::copy(&command, &other).unwrap();
+                    // Simulate PATH resolution selecting a different safe file.
+                    p.claude_command = Some(other);
+                }
+                "missing" => fs::remove_file(&command).unwrap(),
+                "reparse" => {
+                    fs::remove_file(&command).unwrap();
+                    fs::create_dir(&command).unwrap();
+                    let target = p.qb_home.join("synthetic-target");
+                    fs::create_dir(&target).unwrap();
+                    junction(&command, &target).unwrap();
+                }
+                "reparse-parent" => {
+                    let saved = p.npm_dir.with_extension("saved");
+                    fs::rename(&p.npm_dir, &saved).unwrap();
+                    fs::create_dir(&p.npm_dir).unwrap();
+                    junction(&p.npm_dir, &saved).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let journal = fs::read(p.journal()).unwrap();
+            for apply in [false, true] {
+                assert!(r32_run(&p, apply, true).is_err(), "accepted {case}");
+                assert_eq!(fs::read(p.journal()).unwrap(), journal);
+            }
+        }
+    }
+
+    #[test]
+    fn r8_claude_self_update_does_not_refresh_journal_when_upgrade_preflight_refuses() {
+        let (_dir, p) = fixture();
+        r32_old_install(&p);
+        fs::write(p.claude_command.as_ref().unwrap(), "synthetic-update").unwrap();
+        let config = p.codex_qb_home.join("config.toml");
+        let mut doc = fs::read_to_string(&config)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        doc["openai_base_url"] = toml_edit::value("http://127.0.0.1:10291/v1");
+        fs::write(&config, doc.to_string()).unwrap();
+        let journal = fs::read(p.journal()).unwrap();
+        let owned = r32_owned(&p);
+        for apply in [false, true] {
+            assert!(r32_run(&p, apply, true).is_err());
+            assert_eq!(fs::read(p.journal()).unwrap(), journal);
+            assert_eq!(r32_owned(&p), owned);
+        }
     }
 
     #[test]
