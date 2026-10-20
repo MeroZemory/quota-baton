@@ -69,6 +69,25 @@ impl Harness {
         rate_hold_secs: u64,
         configure: impl FnOnce(&mut Config),
     ) -> Self {
+        Self::with_initial_usage(
+            provider,
+            reset_hold_secs,
+            request_timeout_secs,
+            rate_hold_secs,
+            configure,
+            true,
+        )
+        .await
+    }
+
+    async fn with_initial_usage(
+        provider: Provider,
+        reset_hold_secs: u64,
+        request_timeout_secs: u64,
+        rate_hold_secs: u64,
+        configure: impl FnOnce(&mut Config),
+        seed_usage: bool,
+    ) -> Self {
         // Waiting behind other bounded cases is separate from the HTTP deadline.
         let serial = tokio::time::timeout(Duration::from_secs(120), SERIAL.lock())
             .await
@@ -165,12 +184,14 @@ impl Harness {
             _root: root,
             _serial: serial,
         };
-        for id in harness.ids() {
-            harness
-                .state
-                .accounts
-                .observe_headers(&id, provider, &usage(provider, 10))
-                .await;
+        if seed_usage {
+            for id in harness.ids() {
+                harness
+                    .state
+                    .accounts
+                    .observe_headers(&id, provider, &usage(provider, 10))
+                    .await;
+            }
         }
         harness
     }
@@ -664,7 +685,7 @@ async fn projected_credit_limit_only_spreads_placement_and_never_cools_warm_bind
 #[tokio::test]
 async fn r8_unobserved_burst_spreads_actual_relay_credentials_and_ledgers_placement_evidence() {
     for provider in [Provider::Claude, Provider::Codex] {
-        let h = Harness::new(provider).await;
+        let h = Harness::with_initial_usage(provider, 60, 300, 60, |_| {}, false).await;
         let ids = h.ids();
         let mut counts = [0_u64; 2];
         let path = if provider == Provider::Claude {
