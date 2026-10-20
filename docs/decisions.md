@@ -358,3 +358,28 @@ The design was independently reviewed (`.sandbox/reviews/D17-review.md`); all si
 - **The 99 % preventive hold** applies only to credit-capable accounts with permission off.
 
 **Follow-ups.** Record `quota_credit_releasable` in AccountView and the account file format (C11, C12).
+
+## D20. Routing policies kept, default rebalance; no herding onto accounts with weak usage evidence — Accepted (user direction, 2026-10-20)
+
+**User direction (quoted).** "기본값은 분산허용입니다 (사용량예측기능이 이미 있다면 분산허용이 올바릅니다). 다만 사용한지 얼마안된계정, 막 사용한계정의 사용량예측이 제대로안될 때 사용량이 적다는이유로 한계정에 여러세션이 몰리는문제를 회피하는 분명한 방법을 적용해주세요."
+
+**1. Routing policies.** Keep the `impl/cache-routing` surface: `strict` / `recover` / `rebalance` per project and per root session, plus the admin API and the CLI. This supersedes the D11 §4 rule that drain is the only manual placement setting. The default is `rebalance`. A user who sets no policy MUST get exactly the D15/C7.1 behaviour, including the review fixes below.
+
+**2. Anti-herding.** The problem: usage observations lag behind placements. An account that was just added, just reset or just observed low looks emptiest, so a burst of new sessions all land on it before any observation shows their cost.
+- **Placement charge.** Each new session placed on an account adds `placement_allowance_pct` (default 2 points) to that account's projected usage on every gating window. This applies to new placements and to rebalance moves. The charge stays until an observation of that window newer than the placement arrives, from a response header or a poll; the observation then already includes the session's cost. The charge is placement-only, like the in-flight allowance (C7): it never cools an account and never moves a bound session.
+- **Confidence cap.** An account's usage evidence is **weak** when any gating window has:
+  - no observation yet;
+  - an observation older than the account's latest placement (an account that has just been used);
+  - or a passed `reset_at` with no new observation.
+
+  An account with weak evidence accepts at most `weak_evidence_new_sessions` (default 1) new or moved session group until a fresh observation arrives. Only after that does it compete on its numbers again.
+  - If every candidate is weak, place round-robin by the fewest sessions placed since their last observation, then by the C7 order.
+  - A cap is never a refusal (the C7 rule that a full account is never a refusal applies).
+- **Fresh evidence soon.** After a placement on a weak account, if no usage header has updated it within 120 s, run one usage poll for that account. This poll is exempt from `poll_min_interval_secs`, at most once per account per 5 min. Polls stay read-only GETs with honest headers (C9, C10).
+- **Ledger.** `placement` records carry `evidence: fresh|weak` and the charge applied, so herding can be measured.
+
+**3. Review fixes the design owner decided (no user input needed).** References are to `.sandbox/reviews/cache-routing-review-fable-2026-10-20.md` §2.
+- **M5, D15 cure for idle targets.** Drop the requirement of a committed success within 300 s. A rebalance target needs eligibility, the gate, room, and C7 non-stale observations. A target with weak evidence takes at most one moved group (§2) until it is observed.
+- **M6, rate-hold expiry.** Keep D14 and C6.3: when the 60 s rate hold expires, send once. A locally synthesized 429 is not adopted (C7: projections never synthesize a 429). Local hold expiries do not count toward the C7.1 overload trigger.
+- **Churn guards.** The dwell, revisit, group, provider and cost guards are kept as defaults for **discretionary** moves only (rebalance and cold point). Forced moves (C5 ineligibility) are never blocked or budgeted (M3).
+- **Availability.** Policy-file failures deny dispatch only to `strict` sessions (M1, M2).
