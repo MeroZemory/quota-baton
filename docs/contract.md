@@ -242,7 +242,7 @@ Rate limits are therefore absorbed on the same account. An individual rate limit
 - **While the account is pacing** (`rate_step` > 0, or a future `rate_backoff_until`), the gate is open when `now ≥ rate_backoff_until` and the previous release was at least `rate_release_interval` ago. Once `rate_step` has decayed to 0, spacing stops.
 - Waiting requests are released in arrival order, one per interval. One release task per account enforces the spacing.
 - While a request waits, its body is retained or back-pressured.
-- A request whose initial admission wait reaches `rate_hold_secs` (default 60) is sent once on the same account. A forced send receives no further rate retry. If a retained upstream 429 already exists when the total rate budget expires, relay that last response. Local hold expiries never count toward the C7.1 overload trigger. Eligibility and strict policy are still rechecked before any send (D14, D20).
+- A request whose wait reaches `rate_hold_secs` (default 60) is sent anyway, once. Its response is relayed as is, and C3 adds `retry-after` to a 429. The proxy never synthesizes a rate 429; answering with a synthesized 429 at once was the previous proxy's fail-fast failure. This send-once rule applies to initial admission, HTTP retries, and WebSocket resends or same-account redials. A forced send receives no further rate retry. Local hold expiries never count toward the C7.1 overload trigger. Eligibility and strict policy are still rechecked before any send (D14, D20 §4).
 
 **HTTP: retry in place.** This applies to a pre-commit rate 429 when the request has a retained copy.
 - Pass the admission gate again, then retry the same account from the retained copy.
@@ -251,7 +251,7 @@ Rate limits are therefore absorbed on the same account. An individual rate limit
 - After the last retry, relay the last 429 as is. Do the same at once when the request has no retained copy (C6 row 17).
 - During a storm, retained copies count against the in-flight budget (architecture §13). When it runs out, later requests have no retained copy, so their 429 is relayed.
 
-**WebSocket upgrade.** No hold on an upgrade lasts longer than `ws_upgrade_hold_secs` (default 10), because Codex's connect timeout is 15 s. This covers both the rate hold and the C7 reset hold. If the pacing ends later than that, answer the upgrade at once as if the hold had expired.
+**WebSocket upgrade.** No hold on an upgrade lasts longer than `ws_upgrade_hold_secs` (default 10), because Codex's connect timeout is 15 s. This covers both the rate hold and the C7 reset hold. If the pacing ends later than that, answer the upgrade at once as if the hold had expired. The overall envelope includes refresh and dial (D20 §4); the send-once expiry rule applies within it.
 
 **Open WebSocket, pre-commit rate error.** The proxy keeps the last `response.create` of each socket until commit. Codex sends nothing else on the socket before commit. This copy counts against the in-flight budget, like an HTTP retained copy. Take the first case that applies:
 1. **The upstream socket is still open.** Wait for the pacing delay, then resend the kept message on the same upstream socket. Do not relay the error frame. The pacing delays together stay within `rate_hold_secs`, with at most `rate_hold_max_retries` resends.
@@ -259,7 +259,7 @@ Rate limits are therefore absorbed on the same account. An individual rate limit
 3. **The error frame carries retry advice.** Relay it as is, immediately. Codex retries after the advised delay.
 4. **Otherwise.** Do not relay the frame. Close the client socket with 1012, with **no** reconnect exclusion. Codex treats the close as retryable and reconnects with the full input. The binding is unchanged, so the reconnect goes back to the same account, and admission paces its upgrade (at most `ws_upgrade_hold_secs`). Relaying the frame would end the turn at once (F3).
 
-If the upstream socket closes while a resend is pending, close the client socket with the same code. A pending resend/redial whose pacing budget expires closes with 1012 without changing accounts; an initial create follows the send-once admission rule above. The Codex reconnect behaviour is documented in architecture §9 and D14 review F5. A local expiry is not an upstream client-visible rate observation.
+If the upstream socket closes while a resend is pending, close the client socket with the same code. Pending resend and same-account redial admission waits follow the send-once rule above when their hold expires. The Codex reconnect behaviour for close 1012 is documented in architecture §9 and D14 review F5. A local expiry is not an upstream client-visible rate observation.
 
 Phase 0 item **V8** observes the genuine `wss://chatgpt.com` rate-limit shape. It records which of these occur:
 - a handshake 429
@@ -338,13 +338,13 @@ These rules originate in D11, with session spreading in D15 and explicit routing
   - Restored bindings do not count as traffic.
 - **Projection.** The in-flight projection is used only for placement. It never creates a cooling, for example the credits hold (S5). Coolings come only from observed values (C5).
 
-**Evidence and anti-herding (D20).** A placement is a new C7 steps 3–6 group or a C7.1/cold-point move. Bound reuse, step 2 recovery, restored bindings and same-account retries are not placements. Observations use request-send time for headers/WS events, or poll-start time for polls, in the account's monotonic sequence. Receipt time is not evidence age. Only a strictly later as-of observation clears a charge; the same instant does not.
+**Evidence and anti-herding (D20).** A placement is a new C7 steps 3–6 group, a C7.1/cold-point move, or a group moved off an ineligible account under C5. Forced C5 moves take the placement charge and apply the cap in target choice (D20 §4). Bound reuse, parent-binding reuse in step 2, restored bindings and same-account retries are not placements. Observations use request-send time for headers/WS events, or poll-start time for polls, in the account's monotonic sequence. Receipt time is not evidence age. Only a strictly later as-of observation clears a charge; the same instant does not.
 
 Evidence is weak when any gating window is unobserved, its observation precedes the latest placement, or its reset passed without a new observation. `placed_since_obs` counts placements newer than the oldest gating-window observation, or all placements while any window is unobserved. An account is capped only when weak and this count is at least `weak_evidence_new_sessions` (default 1).
 
-Apply the cap in both branches of step 4, in step 5 and in C7.1, after the room partition and pacing skip. Uncapped accounts come first in C7 order. When every candidate in that set is capped, use the fewest placements since observation, then C7 order. New-session placement never refuses merely because all accounts are capped. C7.1 instead retains the group and its unexpired mark when every target with room is capped. Placement charges never affect the cold-point gate check and never cool or move a bound eligible session.
+Apply the cap in both branches of step 4, in step 5 and in C7.1, after the room partition and pacing skip. Uncapped accounts come first in C7 order. When every candidate in that set is capped, use the fewest placements since observation, then C7 order. New-session and forced C5 placement never refuse merely because all accounts are capped; a cap cannot prevent a forced move when an eligible account exists. C7.1 instead retains the group and its unexpired mark when every target with room is capped. Placement charges never affect the cold-point gate check and never cool or move a bound eligible session.
 
-After any placement, wait `placement_poll_after_secs` (120) and check that every gating window has a newer observation. If not, issue one read-only GET poll using its own per-account `placement_poll_min_interval_secs` (300) budget, independent of the normal minimum, while respecting poll backoff and C9 exclusions. The ledger records `placement{evidence: fresh|weak, capped, placed_since_obs, charge}` and `poll{reason: placement_evidence}`.
+After any placement, wait `placement_poll_after_secs` (120) and check that every gating window has a newer observation. If not, issue one read-only GET poll using its own per-account `placement_poll_min_interval_secs` (300) budget, independent of the normal minimum, while respecting poll backoff and C9 exclusions. If this independent budget refuses a placement poll, the regular poll schedule still runs. The ledger records `placement{evidence: fresh|weak, capped, placed_since_obs, charge}` and `poll{reason: placement_evidence}`.
 
 **The gate** (new-session placement):
 - every 5-hour window is projected below `gate_5h_pct` (default 90)
@@ -389,8 +389,9 @@ Further rules:
   - it is marked by the overload rebalance (C7.1)
 - **`last_used`.** Every HTTP request and every relayed WebSocket `response.create` updates the binding's `last_used`, set to the end of the response. Idle time is measured over the whole session identity group, sub-agents included.
 - **Pinned sockets keep their binding.** A binding referenced by an open pinned WebSocket is never expired or evicted.
-- **Cold point** (staged 1B). A binding is cold when it has been idle (`now - last_used`) for at least `rebalance_idle_secs`, default 3600. That is never below the longest prompt-cache TTL in use for the provider. This is an operational idle threshold for considering a move, not proof that every provider cache has expired or that moving preserves reasoning.
+- **Cold point.** A binding is cold when it has been idle (`now - last_used`) for at least `rebalance_idle_secs`, default 3600. That is never below the longest prompt-cache TTL in use for the provider. This is an operational idle threshold for considering a move, not proof that every provider cache has expired or that moving preserves reasoning.
   - A cold session is re-placed (steps 3–6) **only if its current account fails the gate or has `active ≥ spread_threshold`** (C7.1). In the first case a forced move would probably come soon anyway; in the second the account is already full. Either way, moving at a cold boundary is cheaper than moving mid-session.
+  - A cold-point target must be eligible, pass the gate, have known non-stale quota and have room, including pending mark reservations. If no such target exists, the session stays (D20 §4).
   - Otherwise the binding stays, for up to `session_binding_max_secs` (default 7 days).
   - Why not re-place every cold session? In the tested V2 cases, moves completed with evidence consistent with earlier hidden reasoning being dropped (D10). Compatibility is not guaranteed outside that evidence. A move that is not needed is therefore not free.
   - `[websocket] idle_close_secs` MUST be smaller than `rebalance_idle_secs`.
@@ -454,7 +455,7 @@ Some outcomes never count toward the trigger, because they are not account conce
 **Moving.** At a marked group's next request boundary:
 - Move if the mark is unexpired, `active(A) > spread_threshold(A)` still holds, and an eligible account with room passes the gate. Then skip step 1, run steps 3–6 restricted to accounts with room, and bind the whole group there (C7 "Moves").
 - The marked target is a capacity reservation, not a constraint. At execution, reselect among currently eligible accounts with room, using C7 order and destination-specific guards; a disabled or cooling reserved target cannot prevent moving to another eligible one.
-- If the only targets with room are capped (D20), stay on A and keep the mark. Otherwise clear the mark and stay on A.
+- If the only targets with room are capped, or any remaining discretionary guard vetoes the move, stay on A and keep the unexpired mark while `active(A) > spread_threshold(A)` still holds (D20 §4). Otherwise clear the mark and stay on A. A guard veto never converts the move to a forced C5 move.
 - Log the move when it executes: `binding_move` with reason `overload`, the request bytes, and the next turn's cache result.
 
 **What never moves.**
@@ -463,7 +464,7 @@ Some outcomes never count toward the trigger, because they are not account conce
 - Anything when no account has room. The sessions are then well spread, and a 429 only paces.
 - A running stream, an in-flight request, or a WebSocket with a response in flight.
 
-**Discretionary movement guards (D20).** Rebalance and cold-point moves require dwell 1,800 seconds, revisit 3,600 seconds, at most 3 discretionary group moves and 4 discretionary provider moves per 600 seconds, destination quiet 120 seconds, and known full input at most 8 MiB. A target needs eligibility, the C7 gate, room, and non-stale quota evidence; no recent successful request is required. Weak targets accept one moved group until observed; all-capped move destinations retain the mark rather than invoking the new-session fallback. A move cannot take the target above its threshold or leave it more loaded than the source. Forced C5 moves are recorded but never blocked by or charged to these guards, including the retained-history cap. Account ID determines the provider movement pool.
+**Discretionary movement guards (D20).** Rebalance and cold-point moves require dwell 1,800 seconds, revisit 3,600 seconds, at most 3 discretionary group moves and 4 discretionary provider moves per 600 seconds, and known full input at most 8 MiB. Group and provider pool budgets count only discretionary moves. D20 §4 removes the destination-quiet guard. A target needs eligibility, the C7 gate, room, and non-stale quota evidence; no recent successful request is required. Weak targets accept one moved group until observed; all-capped move destinations retain the mark rather than invoking the new-session fallback. A move cannot take the target above its threshold or leave it more loaded than the source. Forced C5 moves are recorded but never blocked by or charged to these guards, including the retained-history cap. Account ID determines the provider movement pool.
 
 **Speed.** The cure is deliberately slow: at most 2 moves per account per window. Placement is the main lever.
 
@@ -487,7 +488,9 @@ Only explicit project/session intent and strict anchors require durable policy w
 
 `reset_wait_secs` is a root/project setting in 0–120 seconds; global defaults retain `routing.reset_hold_secs` (60). It is separate from credit permission. Global `routing.mode = strict` is rejected: strict requires a classified root policy. Churn safeguards in C7.1 govern discretionary movement only; inability to satisfy them retains a healthy bound account. Unknown full-input cost suppresses discretionary movement. Idle socket pins protect bindings without counting as active demand.
 
-Associating a project preserves an explicit root override unless `inherit: true` / CLI `--inherit` is supplied. A history-only root follows current global defaults. Startup captures strict anchors before pruning legacy bindings. Serving rechecks current intent and account eligibility after pacing/reset waits, including WS create/reconnect. Readers use immutable intent snapshots; disk writers never hold the binding/read lock across I/O. Forecast and total-deadline work remain staged until their tests and final gate pass.
+Associating a project preserves an explicit root override unless `inherit: true` / CLI `--inherit` is supplied. A history-only root follows current global defaults. Startup captures strict anchors before pruning legacy bindings. Serving rechecks current intent and account eligibility after pacing/reset waits, including WS create/reconnect. Readers use immutable intent snapshots; disk writers never hold the binding/read lock across I/O. Forecast remains observation-only. The pre-commit deadline and WebSocket upgrade envelope are active, as ratified by D20 §4.
+
+`routing.request_timeout_secs` (default 300 s) bounds the whole HTTP pre-commit path, including preparation, selection and holds, refresh, dial and retries. If it expires before response headers, return a provider-shaped HTTP 504. It never cuts off an already committed stream. The WebSocket upgrade has its own overall `ws_upgrade_hold_secs` envelope (default 10 s), including refresh and dial, below Codex's 15 s connect timeout (C6.3).
 
 ## C8. Session keys and the allowed body peek
 
@@ -621,7 +624,9 @@ Tokens are never included.
 
 ### `config.toml`
 
-All keys are optional. The defaults are shown.
+All keys are optional. The defaults are shown. Numeric values outside their documented bounds emit a `core_warning` and are clamped to the existing bounds; they do not refuse startup. Unknown keys are ignored with a warning in every table, including `[routing]` and `[routing.churn]` (D20 §4).
+
+Routing bounds: `request_timeout_secs` and `rate_hold_secs` are 1–600; `ws_upgrade_hold_secs` is 1–14; `reset_hold_secs` is 0–120; `weak_evidence_new_sessions` is 1–1000. Percentages are 0–100; non-finite values clamp to an endpoint, with NaN falling back to that field's default. The near-reset weekly percentage cannot be lower than the ordinary weekly percentage. Polling, retry, binding, spreading and activity intervals/counts have a minimum of 1; `near_reset_secs` may be 0. Under `[routing.churn]`, dwell/revisit are 0–86400 seconds, the window is 1–86400 seconds, group moves are 1–16, pool moves 1–32 and retained move bytes 1–67108864. `quota.poll_min_interval_secs` is 1–3600. WebSocket idle time and message size must be positive; idle time is clamped below the rebalance idle interval. The original configuration file is never rewritten by these corrections. Invalid types and unsafe upstream endpoints still refuse startup; global `strict` remains invalid (D20 §3).
 
 ```toml
 [server]
@@ -657,7 +662,6 @@ revisit_secs = 3600
 window_secs = 600
 max_group_moves = 3
 max_pool_moves = 4
-target_quiet_secs = 120
 max_move_bytes = 8388608
 
 [guard]
