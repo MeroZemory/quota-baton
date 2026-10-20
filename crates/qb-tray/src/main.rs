@@ -58,7 +58,7 @@ fn main() -> std::process::ExitCode {
             if let Ok(home) = qb_core::home()
                 && let Ok(_logs) = qb_core::logging::init(&home)
             {
-                tracing::error!(code = "tray_startup_failed", "트레이 실행에 실패했습니다");
+                tracing::error!(event = "tray_startup_failed", "트레이 실행에 실패했습니다");
             }
             std::process::ExitCode::FAILURE
         }
