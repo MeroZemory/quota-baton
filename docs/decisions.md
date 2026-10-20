@@ -409,3 +409,18 @@ The design was independently reviewed (`.sandbox/reviews/D17-review.md`); all si
 - **M6, rate-hold expiry.** Keep D14 and C6.3: when the 60 s rate hold expires, send once. A locally synthesized 429 is not adopted (C7: projections never synthesize a 429). Local hold expiries do not count toward the C7.1 overload trigger.
 - **Churn guards.** The dwell, revisit, group, provider and cost guards are kept as defaults for **discretionary** moves only (rebalance and cold point). Forced moves (C5 ineligibility) are never blocked or budgeted (M3).
 - **Availability.** Policy-file failures deny dispatch only to `strict` sessions (M1, M2).
+
+### D20 §4. Merge-review rulings (design owner, 2026-10-20)
+
+These come from the R8 B/C merge review (`.sandbox/reviews/R8-BC-merge-review-2026-10-20.md`).
+- **F1, rate-hold expiry everywhere.** "Send once" (D14, C6.3) applies to every hold that ends a request's wait: the initial admission, HTTP retries and WebSocket resends or redials. Restore the dev tests by name and body. C6.3 keeps its dev wording.
+- **F2, the destination-quiet guard is removed.** The D20 §2 cap does the same job better: a weak target takes one group until it is observed. A veto by any remaining discretionary guard keeps the overload mark and never converts it to a forced move.
+- **F4, deadlines ratified.**
+  - **The 300 s pre-commit deadline (504) is ratified.** It stays under Claude Code's 600 s client timeout, and it applies only before response headers.
+  - **The 10 s WebSocket envelope is ratified.** It includes refresh and dial, and stays under Codex's 15 s connect timeout.
+- **F6, narrowings ratified.**
+  - **Cold-point targets.** A cold-point move needs a target that passes the gate, has room and has known quota. The move is discretionary; when no such target exists, the session stays.
+  - **Room.** Pending mark reservations count against room.
+- **Forced moves are placements.** A group moved off an ineligible account (C5) is a placement on its new account. It takes the charge, and target choice applies the cap. The cap is never a refusal, so a forced move always proceeds when any eligible account exists.
+- **Polls.** When the placement-poll budget refuses a poll, the regular poll schedule still runs.
+- **Config bounds.** A value outside its bounds logs a `core_warning` and is clamped. It never refuses startup. Unknown keys are ignored with a warning, in every table.
