@@ -411,6 +411,7 @@ fn activity() -> Vec<ActivityEvent> {
             kind: kind.into(),
             provider: "codex".into(),
             account: Some("cx-support".into()),
+            account_to: None,
             notable: true,
             data: ActivityData {
                 window: Some("5h".into()),
