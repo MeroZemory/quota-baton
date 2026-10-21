@@ -3,6 +3,35 @@ use crate::dashboard_fixtures as fixtures;
 use fixtures::*;
 
 #[test]
+fn r10_flat_account_status_uses_the_shared_chip_but_omits_serving_chip() {
+    let data = snapshot();
+    let session = &data.sessions.sessions[0];
+    for (health, expected) in [
+        (serde_json::json!({"kind":"ready"}), None),
+        (
+            serde_json::json!({"kind":"needs_relogin"}),
+            Some(v2::Tone::Bad),
+        ),
+        (
+            serde_json::json!({"kind":"cooling","reason":"quota","scope":"account","until":"2026-10-19T09:20:00Z"}),
+            Some(v2::Tone::Limit),
+        ),
+    ] {
+        let accounts = v2::project(
+            &serde_json::json!({"accounts":[{"id":session.account,"provider":"claude",
+                "email":"synthetic@example.invalid","user_state":"active","source":"oauth",
+                "active_sessions":1,"health":health}]})
+            .to_string(),
+            clock().utc().into(),
+        )
+        .unwrap();
+        let row = session_row(session, &accounts, &clock(), None);
+        assert_eq!(row.account_provider, "Claude");
+        assert_eq!(row.account_chip.as_ref().map(|c| c.tone), expected);
+    }
+}
+
+#[test]
 fn r7_unknown_inflight_never_projects_idle_or_exact_zero() {
     let mut data = snapshot();
     let mut session:Session=serde_json::from_value(serde_json::json!({"id":"abcdef123456","provider":"codex","account":"cx-a","active":false,"inflight":{"requests":0,"ws_open":0},"inflight_known":false})).unwrap();
