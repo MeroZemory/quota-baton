@@ -9,7 +9,7 @@ This file names the verification for each unit and each row. The row list and th
 목표: 보이는 대시보드의 유휴 CPU와 조작 지연을 줄인다
 핵심 지표: 새 경로 출시 1/2 · R11은 HTTP 통합 저장, WS 경계 2건과 출시 관문 남음
 사용자 대기: 없음 (R2 Part B만 사용자 결정 대기)
-갱신: 2026-10-22 04:22 KST (브러시 검사 통과, 성능 목표 미달 경로 추가 수정)
+갱신: 2026-10-22 04:36 KST (release 라이브러리220통과, 실제 창·성능 수용 검증 중)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -78,6 +78,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-22 02:27 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R12.10 계측 단위, 출시 수 변화 없음 |
 | 2026-10-22 02:42 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R12.10 텍스트 캐시 단위 2a6f6db, 출시 수 변화 없음 |
 | 2026-10-22 03:02 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R12.10 실제 HWND 캐시 회귀 통과; 성능 관문 미완료 |
+| 2026-10-22 04:36 | 1/2 | 브러시 수명 단위 저장, 출시 수 변화 없음; 실제 HWND 회귀 통과, 성능 수용 미완료 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -122,6 +123,8 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-22 04:22 | R12.10 합성 HWND 유휴 CPU (30계정·40세션, 코어 하나 기준) | 0.052083 % | 2 % 미만 | 30초, 전체 성능 수용 실패 |
 | 2026-10-22 04:22 | R12.10 새 snapshot 전체 재작성 v5 (30회, 탭별10회) p95 | 68.772 ms | 50 ms 미만 | 브러시 재사용만으로 목표 충족하지 못함 |
 | 2026-10-22 04:22 | R12.10 브러시 픽셀·색·대상·해제 release 라이브러리 검사 | 215통과 / 0실패 | 실제 WIC 픽셀·경계 검사 | 대상 자원 해제 추가; HWND 바이너리 가시성 오류는 수정 후 별도 확인 |
+| 2026-10-22 04:36 | R12.10 줄바꿈 재사용 포함 release 라이브러리 | 220통과 / 0실패 | cached/uncached·범위·한글·대상 해제 검사 | prepared-text-stage/library.log; 실제 성능 수용과 별도 |
+| 2026-10-22 04:36 | R12.10 대상 해제 수정 후 실제 HWND 캐시 회귀 | 1통과 / 0실패 | 실제 창 동작·UIA·자정 회귀 | host-brush-clear-fixed; 최초 가시성 오류 수정 뒤 확인 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
