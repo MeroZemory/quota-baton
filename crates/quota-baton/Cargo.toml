@@ -21,6 +21,7 @@ toml_edit.workspace = true
 tokio.workspace = true
 windows = { workspace = true, features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_System_IO"] }
 zstd.workspace = true
+zeroize.workspace = true
 
 [build-dependencies]
 cc = "=1.8.0"

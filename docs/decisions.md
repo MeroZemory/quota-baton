@@ -354,7 +354,7 @@ The design was independently reviewed (`.sandbox/reviews/D17-review.md`); all si
 **Context.** During the design pause (10-19) the implementer rewrote the C5 and C7 credit rules. No brief or decision covered it, but it followed the user's R4 and tray v2 direction: "유료 크레딧 사용 허용" means a Codex account keeps serving from credits once its subscription window is spent. A Sol max independent review covered it (`.sandbox/reviews/credits-logic-20261019/sol-max-final.md`). The design owner reviewed it on 10-20 (`.sandbox/reviews/pause-merges-review-2026-10-20.md`, MUST-FIX 2) and ratifies it as written in C5 ("Codex credit entitlement and subscription observations") and C7 ("Unusable stays narrow").
 
 - **Permission and funds are separate.** `allow_credits` is the user's permission. Available credits need evidence: unlimited, `has_credits=true` or a positive balance, with no explicit absence. Alternatively, a successful paid response proves entitlement for the life of the process.
-- **No subscription-only cooling with permitted credits.** A permitted Codex account with credits available is not cooled only because a subscription window reached 100 %. An explicit upstream quota rejection, `limit_reached`, and auth or payment holds still apply.
+- **No subscription-only cooling with permitted credits.** A permitted Codex account with credits available is not cooled only because a subscription window reached 100 % or a usage snapshot reports `limit_reached=true`. The design owner corrected this snapshot-only rule after the 2026-10-21 outage (R12.9 Update 2, hotfix `77ba7f8`): the flag alone must not create a hard hold. An actual upstream request quota rejection, rejected status, and auth or payment holds still apply.
 - **Real rejections are not undone by settings.** A hold caused by an actual upstream quota rejection is non-releasable (`quota_credit_releasable=false`). Turning credits on releases only holds that came from observations. This keeps a credit toggle from re-sending traffic into a real rejection.
 - **Display needs proof.** "유료 크레딧 사용 중" is shown only after a successful paid response, never from a poll or a capability flag. Proof is not restored after a restart.
 - **The 99 % preventive hold** applies only to credit-capable accounts with permission off.
@@ -649,3 +649,19 @@ Built-in provider ids cannot be redefined. The tool POSTs to `<base>/images/gene
   - The full round trip account → Qi → account → Q → Qi → account, with a turn at each stop.
   - Header-strip capture tests.
   - An upgrade canary: on a Codex version change, the launcher checks that Qi still lists `image_gen__imagegen` and points to `codex-mz` if it does not.
+
+### D23 amendment: ship new Qi sessions first; probe the resume path (design owner, 2026-10-21)
+
+**R12 hit the D23 stop** (`.sandbox/reports/R12.md`, checkpoint impl/r12 d58e630). Resuming an existing thread in Qi with native Codex 0.163 rewrote the thread's database provider from `qb` back to `openai`, taking it from the rollout. The next request then carried no actor header and offered no image tool. No rollout was copied or rewritten.
+
+New Qi sessions passed a real built-in image generation and a local PNG edit through a spawned synthetic core.
+
+**Rulings.**
+1. **Ship new Qi sessions now.**
+   - `codex-qb --images` starts a **new** session in Qi with the image tool.
+   - `codex-qb --images resume <id>` and moving into Qi are **disabled**. They print, in Korean: "기존 대화는 이미지 모드로 옮길 수 없습니다. 새 이미지 세션을 여세요".
+   - This needs the full gate and the real-profile `launch-client --check`, then a merge. The design session installs it and runs one live generation.
+2. **Probe authorized**, bounded and synthetic. In temp homes, using the native binary against a fake upstream, test whether `codex -c model_provider=qb resume <id>` (and/or `-c model_providers.qb…` supplied on the command line) keeps provider `qb` for a resumed thread and exposes the image tool. Report the result.
+   - **If it works:** re-enable resume and move into Qi through the launcher, with that override, under all D21 guarantees.
+   - **If it does not:** existing sessions stay out of Qi.
+3. **Copying stays prohibited** (D21).
