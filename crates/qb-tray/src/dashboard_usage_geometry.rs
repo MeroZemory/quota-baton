@@ -215,44 +215,79 @@ fn usage_tile(
             left += reset_width + 16.;
         }
     }
-    let future_labels: BTreeSet<_> = t
+    let future_resets: BTreeSet<_> = t
         .series
         .iter()
-        .flat_map(|series| {
-            series
-                .future_resets
-                .iter()
-                .map(|at| v.clock.time(Some(*at)))
-        })
+        .flat_map(|series| series.future_resets.iter().copied())
         .collect();
-    let annotation_space = if future_labels.is_empty() { 0. } else { 20. };
+    let annotation_space = if future_resets.is_empty() { 0. } else { 20. };
     let notice_space = if t.truncated || !table.complete {
         20.
     } else {
         0.
     };
-    let plot = rect(
+    let mut plot = rect(
         r.left + 40.,
         r.top + 86. + annotation_space,
         width(r) - 64.,
         170. - annotation_space - notice_space,
     );
-    if !future_labels.is_empty() {
+    let from = v.clock.day_start;
+    let to = v.clock.day_end;
+    let total = to.signed_duration_since(from).num_milliseconds().max(1) as f64;
+    // Keep close reset captions in separate rows while retaining their own x anchor.
+    let mut caption_rights: Vec<f32> = Vec::new();
+    let mut captions = Vec::new();
+    let mut overflow = Vec::new();
+    for at in future_resets {
+        let label = format!("{} 초기화", v.clock.time(Some(at)));
+        let w = (b.measured_width(&label, 11., false) + 4.).min(width(plot));
+        let marker = plot.left
+            + (at.signed_duration_since(from).num_milliseconds() as f64 / total).clamp(0., 1.)
+                as f32
+                * width(plot);
+        let left = (marker - w / 2.).clamp(plot.left, plot.right - w);
+        let lane = caption_rights
+            .iter()
+            .position(|right| *right + 4. <= left)
+            .unwrap_or(caption_rights.len());
+        if lane >= 2 {
+            overflow.push(label);
+            continue;
+        }
+        if lane == caption_rights.len() {
+            caption_rights.push(left + w);
+        } else {
+            caption_rights[lane] = left + w;
+        }
+        captions.push((label, left, w, lane));
+    }
+    plot.top += caption_rights.len().saturating_sub(1) as f32 * 20.;
+    if !overflow.is_empty() {
+        // One bounded overflow row; all dashed markers remain in the plot.
+        plot.top += 20.;
+        let note = format!("초기화 {}개 더", overflow.len());
+        let bounds = rect(plot.left, r.top + 104., width(plot), 16.);
+        b.text(bounds, note.clone(), 11., false, Color::Secondary, false);
+        b.semantic(
+            format!("usage:{}:reset-overflow", t.id),
+            None,
+            Role::Text,
+            format!("{note}: {}", overflow.join(" · ")),
+            bounds,
+            None,
+        );
+    }
+    for (label, left, w, lane) in captions {
         b.text(
-            rect(plot.left, r.top + 64., width(plot), 16.),
-            format!(
-                "{} 초기화",
-                future_labels.into_iter().collect::<Vec<_>>().join(" · ")
-            ),
+            rect(left, r.top + 64. + lane as f32 * 20., w, 16.),
+            label,
             11.,
             false,
             Color::Secondary,
             false,
         );
     }
-    let from = v.clock.day_start;
-    let to = v.clock.day_end;
-    let total = to.signed_duration_since(from).num_milliseconds().max(1) as f64;
     let x = |at: DateTime<Utc>| {
         plot.left
             + (at.signed_duration_since(from).num_milliseconds() as f64 / total).clamp(0., 1.)

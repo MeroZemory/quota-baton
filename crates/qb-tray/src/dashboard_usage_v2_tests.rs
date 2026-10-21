@@ -560,3 +560,129 @@ fn r10_usage_tiles_share_row_height_at_wide_and_narrow_widths() {
         assert!(s.accessibility.len() <= history::SCENE_NODE_BUDGET);
     }
 }
+
+#[test]
+fn r101_crowded_resets_bound_captions_keep_markers_and_expose_overflow() {
+    let (v, mut t) = fixture();
+    for at_end in [false, true] {
+        let start = if at_end {
+            v.clock.day_end - Duration::minutes(12)
+        } else {
+            v.clock.utc() + Duration::hours(1)
+        };
+        let resets: Vec<_> = (0..40).map(|i| start + Duration::minutes(i)).collect();
+        t.series[0].future_resets = resets.clone();
+        t.series[1].future_resets.clear();
+        for tile_width in [406., 476.] {
+            let s = scene_at_width(&v, &t, tile_width);
+            let plot = s.charts[0].rect;
+            assert!(
+                height(plot) >= 90.,
+                "crowded captions must not consume the plot"
+            );
+            assert!(plot.top < plot.bottom && plot.bottom <= s.rect.bottom);
+            let overflow = s
+                .accessibility
+                .iter()
+                .find(|n| n.key.ends_with(":reset-overflow"))
+                .unwrap();
+            assert!(overflow.rect.bottom <= plot.top - 22.);
+            assert!(
+                overflow
+                    .name
+                    .contains(&v.clock.time(Some(*resets.last().unwrap())))
+            );
+            let captions: Vec<_> = s
+                .draw
+                .iter()
+                .filter_map(|d| match d {
+                    Draw::Text { rect, measure, .. }
+                        if measure.text.ends_with(" 초기화")
+                            && !measure.text.starts_with(" · ") =>
+                    {
+                        Some(*rect)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert!(captions.len() <= 2);
+            for r in captions {
+                assert!(r.bottom <= plot.top - 22. && r.left >= plot.left && r.right <= plot.right);
+            }
+            let markers: Vec<_> = s
+                .draw
+                .iter()
+                .filter_map(|d| match d {
+                    Draw::Line {
+                        from,
+                        to,
+                        dash: Some(dash),
+                        ..
+                    } if *dash == [1., 3.] && from[1] == plot.top && to[1] == plot.bottom => {
+                        Some(from[0])
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(markers.len(), resets.len());
+            for (marker, at) in markers.iter().zip(&resets) {
+                let fraction = (at
+                    .signed_duration_since(v.clock.day_start)
+                    .num_milliseconds() as f64
+                    / v.clock
+                        .day_end
+                        .signed_duration_since(v.clock.day_start)
+                        .num_milliseconds() as f64)
+                    .clamp(0., 1.);
+                let expected = plot.left + fraction as f32 * width(plot);
+                assert!((*marker - expected).abs() < 0.01);
+            }
+            if at_end {
+                assert_eq!(*markers.last().unwrap(), plot.right);
+            }
+        }
+    }
+}
+
+#[test]
+fn r101_each_reset_caption_tracks_its_own_dashed_marker() {
+    let (v, mut t) = fixture();
+    for close in [false, true] {
+        let resets = [
+            v.clock.day_start + Duration::hours(1),
+            v.clock.day_start + Duration::hours(23),
+        ];
+        let resets = if close {
+            [resets[0], resets[0] + Duration::minutes(1)]
+        } else {
+            resets
+        };
+        for (series, at) in t.series.iter_mut().zip(resets) {
+            series.future_resets = vec![at];
+        }
+        for tile_width in [406., 476.] {
+            let s = scene_at_width(&v, &t, tile_width);
+            let plot = s.charts[0].rect;
+            let first_label = text(&s, &format!("{} 초기화", v.clock.time(Some(resets[0])))).1;
+            let second_label = text(&s, &format!("{} 초기화", v.clock.time(Some(resets[1])))).1;
+            assert!(intersection(first_label, second_label).is_none());
+            for at in resets {
+                let (_, label, _) = text(&s, &format!("{} 초기화", v.clock.time(Some(at))));
+                let fraction = at
+                    .signed_duration_since(v.clock.day_start)
+                    .num_milliseconds() as f32
+                    / v.clock
+                        .day_end
+                        .signed_duration_since(v.clock.day_start)
+                        .num_milliseconds() as f32;
+                let marker = plot.left + width(plot) * fraction;
+                assert!(label.left <= marker && marker <= label.right);
+                assert!(label.left >= plot.left && label.right <= plot.right);
+                assert!(s.draw.iter().any(|draw| matches!(draw,
+                Draw::Line { from, to, dash: Some(_), .. }
+                    if (from[0] - marker).abs() < 0.01 && from[0] == to[0]
+                    && from[1] == plot.top && to[1] == plot.bottom)));
+            }
+        }
+    }
+}

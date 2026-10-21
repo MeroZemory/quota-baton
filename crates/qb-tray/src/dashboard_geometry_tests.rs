@@ -1463,6 +1463,15 @@ fn r10_client_number_column_is_fixed_and_does_not_share_session_label_box() {
             .collect();
         let id = labels.iter().find(|(_, text)| *text == suffix).unwrap().0;
         assert!(width(id) > 0.);
+        let client = labels
+            .iter()
+            .find(|(r, text)| *text == row.client && r.top == id.top)
+            .unwrap()
+            .0;
+        assert!(
+            (client.right - id.left).abs() < 0.01,
+            "number follows measured client width"
+        );
         let model = labels
             .iter()
             .find(|(r, text)| *text == row.model && r.top == id.top)
@@ -1511,4 +1520,83 @@ fn r10_offline_keeps_data_text_full_contrast_and_disables_every_control() {
         }
     }
     assert_eq!(checked, v.groups.len());
+}
+
+#[test]
+fn r101_client_number_stays_adjacent_for_long_clients_at_narrow_and_wide_sizes() {
+    for client in [
+        "Codex CLI",
+        "A very long custom client label that must be ellipsized",
+    ] {
+        let mut state = DashboardState::default();
+        let mut v = view(&mut state);
+        for row in &mut v.flat {
+            row.client = client.into();
+        }
+        for group in &mut v.groups {
+            for row in &mut group.rows {
+                row.client = client.into();
+            }
+        }
+        for size in [[1024., 640.], [1320., 960.]] {
+            let scene = Scene::build(&v, &state, size, &Metrics::default());
+            let labels: Vec<_> = scene
+                .draw
+                .iter()
+                .filter_map(|d| match d {
+                    Draw::Text { rect, measure, .. } => Some((*rect, measure.text.as_str())),
+                    _ => None,
+                })
+                .collect();
+            let mut checked = 0;
+            for row in &v.flat {
+                let suffix = format!(" · {}", row.short_id);
+                if let Some((id, _)) = labels.iter().find(|(_, text)| *text == suffix) {
+                    let (name, _) = labels
+                        .iter()
+                        .find(|(r, text)| *text == client && r.top == id.top)
+                        .unwrap();
+                    assert!((name.right - id.left).abs() < 0.01);
+                    assert!(width(*name) > 0. && width(*id) > 0.);
+                    assert!(id.right <= size[0]);
+                    checked += 1;
+                }
+            }
+            assert!(checked > 0);
+        }
+    }
+}
+
+#[test]
+fn r101_unknown_counter_notice_is_once_in_reserved_bottom_row() {
+    let mut state = DashboardState::default();
+    let mut data = fixtures::snapshot();
+    for s in &mut data.sessions.sessions {
+        s.counters_complete = false;
+    }
+    let v = m::project(&data, &mut state, &fixtures::clock());
+    assert!(v.counters_unknown);
+    for size in [[1024., 640.], [1320., 960.]] {
+        let scene = Scene::build(&v, &state, size, &Metrics::default());
+        let notices: Vec<_> = scene
+            .draw
+            .iter()
+            .filter_map(|draw| match draw {
+                Draw::Text { rect, measure, .. }
+                    if measure.text.contains("오늘 요청 수 확인 전") =>
+                {
+                    Some(*rect)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].bottom <= size[1]);
+        let table = scene
+            .content
+            .iter()
+            .find(|r| r.region == ScrollRegion::Table)
+            .unwrap();
+        assert!(notices[0].top >= table.viewport.bottom);
+    }
 }

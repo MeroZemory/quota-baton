@@ -1425,8 +1425,24 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
             cx += *cw;
         }
     }
-    let foot = rect(card.left + 1., card.bottom - 32., width(card) - 2., 31.);
+    let footer_height = if v.counters_unknown { 52. } else { 32. };
+    let foot = rect(
+        card.left + 1.,
+        card.bottom - footer_height,
+        width(card) - 2.,
+        footer_height - 1.,
+    );
     b.fill(foot, Color::Footer, 0.);
+    if v.counters_unknown {
+        b.text(
+            rect(foot.left + 12., foot.top + 30., width(foot) - 24., 18.),
+            "오늘 요청 수 확인 전 · 이전 실행의 집계는 확인할 수 없습니다.",
+            12.,
+            false,
+            Color::Secondary,
+            false,
+        );
+    }
     let mut fx = foot.left + 12.;
     for (kind, label) in [(0, "요청 중"), (1, "5분 안에 활동"), (2, "쉬는 중")] {
         let dot = rect(fx, foot.top + 13., 7., 7.);
@@ -2338,9 +2354,11 @@ fn session(
             SortKey::Client => {
                 let id_text = format!(" · {}", row.short_id);
                 let id_width = b.measured_width(&id_text, 12., false);
-                let id_right = cr.right - 8.;
+                let client_width = b
+                    .measured_width(&row.client, 12., false)
+                    .min((*cw - id_width - 8.).max(0.));
                 b.text(
-                    rect(cr.left, cr.top, (*cw - id_width - 8.).max(0.), 20.),
+                    rect(cr.left, cr.top, client_width, 20.),
                     row.client.clone(),
                     12.,
                     false,
@@ -2348,7 +2366,7 @@ fn session(
                     false,
                 );
                 b.text(
-                    rect(id_right - id_width, cr.top, id_width, 20.),
+                    rect(cr.left + client_width, cr.top, id_width, 20.),
                     id_text,
                     12.,
                     false,
