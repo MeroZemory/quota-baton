@@ -7,9 +7,9 @@ This file names the verification for each unit and each row. The row list and th
 <!-- status:begin -->
 현재 마일스톤: R11 (실행별 계정·모델 목록 마무리)
 목표: 대시보드 수정을 전달하고 R11을 마무리한다
-핵심 지표: 새 경로 출시 1/2 · R11 HTTP32·WS15 통과, native·최종 관문 남음
+핵심 지표: 새 경로 출시 1/2 · R11 HTTP32·WS15·clippy·빌드 통과, native·전체 관문 남음
 사용자 대기: 없음 (R2 Part B만 사용자 결정 대기)
-갱신: 2026-10-22 06:01 KST (R11 독립 검수·반례 확인 완료, 미출시)
+갱신: 2026-10-22 06:14 KST (R11 native 하네스 보완·전체 검사 병행, 미출시)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -89,6 +89,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-22 05:48 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R11 검수 보완 HTTP30 실행: 28통과·2 fixture 시각 비교 실패; 미출시 |
 | 2026-10-22 05:56 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R11 보완 HTTP32/32·실제 WS15/15 통과, native·최종 관문 미완료 |
 | 2026-10-22 06:01 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R11 수정 전 반례7/7 실패·소스 복원 확인; 최종 관문 미완료 |
+| 2026-10-22 06:09 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R11 strict clippy·제품 build 통과; native 설정 순서 fixture 보완, 미출시 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -153,6 +154,9 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-22 05:48 | R11 검수 보완 HTTP 회귀 | 28/30 통과 | 30/30 | 고정 입력7efebecd; 실패2건은 launch_anchors.last_used 비교, 수정·재실행 예정 |
 | 2026-10-22 05:56 | R11 검수 보완 HTTP/실제 WS 회귀 | 32/32 · 15/15 통과 | 모두 통과 | 고정 입력dda712bf; F1–F5·추가 경합·재개 모델·동의·프로브·legacy 포함 |
 | 2026-10-22 06:01 | R11 수정 전 반례 검출 | 7/7 예상 실패 확인 | 7/7 | F1/F3/F5·F4 초기 후보 반례, F2는 로컬 오류 대기 timeout; 현재 소스 지문 복원 |
+| 2026-10-22 06:09 | R11 strict core clippy / testkit 제품 build | exit0 / exit0 | 모두 exit0 | callback 타입 복잡도1건은 type alias로 수정; 입력9d09e0bb |
+| 2026-10-22 06:09 | R11 첫 native 설정 시도 | 0/5 완료 | 5/5 완료 | wire-before-serve 하네스 오류로6.8초 종료; job 정지·잔류 home0 확인 |
+| 2026-10-22 06:14 (초기 결과 소급 기록) | R11 최초 strict clippy | exit101 · 타입 복잡도1건 | exit0 | 행동 변경 없이56e0fde alias 수정 후35.8초 exit0; 실패 로그 보존 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
