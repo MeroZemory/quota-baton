@@ -293,13 +293,11 @@ fn plan(store: &Store, id: &str, to: Option<&Path>, map_path: &Path) -> Result<R
         }
     }
     discovery::refuse_recent(&files, SystemTime::now())?;
-    ensure!(
-        files.iter().all(|file| file
-            .provider
-            .as_deref()
-            .is_none_or(|provider| provider == "openai")),
-        "openai 공급자의 대화만 돌려보낼 수 있습니다"
-    );
+    for file in &files {
+        if let Some(provider) = &file.provider {
+            db::require_provider(provider)?;
+        }
+    }
     super::check_destination_inventory(&store.target, &target, &files)?;
     let ids = files
         .iter()

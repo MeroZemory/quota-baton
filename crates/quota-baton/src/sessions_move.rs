@@ -128,13 +128,13 @@ fn load(store: &Store, id: &str) -> Result<Option<Move>> {
             && m.homes.contains(&m.target),
         "{CONFLICT}"
     );
-    let stage_root = store.target.join(".quota-baton/staging").join(id);
+    let stage_root = store.staging_home()?.join(".quota-baton/staging").join(id);
     for file in &m.files {
         ensure!(
             file.stage.starts_with(&stage_root) && !file.sources.is_empty(),
             "{CONFLICT}"
         );
-        guard::safe_path(&store.target, &file.stage)?;
+        guard::safe_path(&store.staging_home()?, &file.stage)?;
         for name in &file.sources {
             let home = m
                 .homes
@@ -337,18 +337,26 @@ fn make_plan(
     let source = fs::canonicalize(source)?;
     let target = fs::canonicalize(target)?;
     ensure!(source != target, "원본과 대상 홈이 같습니다");
+    let managed = store.managed_homes()?;
+    let origin = if managed.contains(&source) && managed.contains(&target) {
+        load(store, id)?
+            .filter(|previous| !open(previous) && !managed.contains(&previous.origin))
+            .map(|previous| previous.origin)
+    } else {
+        None
+    }
+    .unwrap_or_else(|| origin.to_owned());
     let catalog = discovery::catalog(&source)?;
     let files = super::migration_files(&catalog, id)?;
     ensure!(
         files.iter().all(|f| f.thread == id),
         "조상 전용 대화의 모든 관리 재개 경로를 차단할 수 없어 이 대화의 이동을 거절합니다"
     );
-    ensure!(
-        files
-            .iter()
-            .all(|f| f.provider.as_deref().is_none_or(|p| p == "openai")),
-        "openai 제공자의 대화만 가져올 수 있습니다"
-    );
+    for file in &files {
+        if let Some(provider) = &file.provider {
+            db::require_provider(provider)?;
+        }
+    }
     discovery::refuse_recent(&files, SystemTime::now())?;
     descendants(&source, id)?;
     let dest = discovery::catalog(&target)?;
@@ -489,7 +497,7 @@ fn make_plan(
                 sources: vec![item.path.clone()],
                 physical: item.physical.clone(),
                 stage: store
-                    .target
+                    .staging_home()?
                     .join(".quota-baton/staging")
                     .join(id)
                     .join(&nonce)
@@ -531,7 +539,7 @@ fn make_plan(
             &db::ThreadInfo {
                 id: id.into(),
                 rollout_path: item.path.clone(),
-                model_provider: "openai".into(),
+                model_provider: item.provider.clone().context("대화 제공자가 없습니다")?,
             },
             fields,
         )?;
@@ -548,7 +556,7 @@ fn make_plan(
         id: id.into(),
         source,
         target,
-        origin: origin.to_owned(),
+        origin,
         homes,
         files: segments,
         source_db: snapshots,
@@ -618,7 +626,12 @@ fn rollback(store: &Store, m: &mut Move) -> Result<()> {
     }
     for f in &m.files {
         if f.stage.exists() {
-            guard::unlink_counted(&store.target, &f.stage, f.identity, known_links(f) as u32)?;
+            guard::unlink_counted(
+                &store.staging_home()?,
+                &f.stage,
+                f.identity,
+                known_links(f) as u32,
+            )?;
         }
     }
     m.phase = Phase::Aborted;
@@ -656,7 +669,7 @@ fn execute(store: &Store, m: &mut Move) -> Result<()> {
     if m.phase == Phase::Prepared {
         for f in &m.files {
             let _parent =
-                guard::prepare_parent(&store.target, f.stage.parent().context(CONFLICT)?)?;
+                guard::prepare_parent(&store.staging_home()?, f.stage.parent().context(CONFLICT)?)?;
             fs::hard_link(&f.sources[0], &f.stage)?;
             same(f, &f.stage)?;
             step(store, m, "staged")?;
@@ -752,7 +765,13 @@ fn execute(store: &Store, m: &mut Move) -> Result<()> {
             {
                 let parent = target.parent().context(CONFLICT)?;
                 let _parent = guard::prepare_parent(&m.target, parent)?;
-                guard::rename_verified(&store.target, &f.stage, &m.target, target, f.identity)?;
+                guard::rename_verified(
+                    &store.staging_home()?,
+                    &f.stage,
+                    &m.target,
+                    target,
+                    f.identity,
+                )?;
                 step(store, m, "published")?;
             }
         }
@@ -801,6 +820,7 @@ fn run_plan(store: &Store, mut m: Move) -> Result<()> {
         .flat_map(|f| f.sources.iter().cloned())
         .collect::<Vec<_>>();
     let _guards = guard::reserve_decoded_exclusive(&m.homes, std::slice::from_ref(&m.id), &names)?;
+    db::verify_destination_provider(&m.database)?;
     verify_files(&m)?;
     for home in &m.homes {
         if home != &m.target {
@@ -1001,7 +1021,12 @@ fn abort_legitimate_source_append(store: &Store, m: &mut Move) -> Result<bool> {
     }
     for f in &m.files {
         if f.stage.exists() {
-            guard::unlink_counted(&store.target, &f.stage, f.identity, known_links(f) as u32)?;
+            guard::unlink_counted(
+                &store.staging_home()?,
+                &f.stage,
+                f.identity,
+                known_links(f) as u32,
+            )?;
         }
     }
     m.phase = Phase::AbortedSourceKept;
@@ -1083,6 +1108,14 @@ pub(super) fn return_current(
             "미완료 이동이 있습니다. sessions recover로 먼저 복구하세요"
         );
         return recover(store, id);
+    }
+    if let Some(m) = &previous
+        && m.phase == Phase::Complete
+        && let Some(to) = to
+        && fs::canonicalize(to)? == m.target
+    {
+        ensure!(db::thread_path(&m.target, id)?.is_some(), "{CONFLICT}");
+        return Ok(());
     }
     let legacy = store.load()?;
     let origin = to
