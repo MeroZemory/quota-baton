@@ -43,6 +43,7 @@ use windows::Win32::{
             DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow,
             SetThreadDpiAwarenessContext,
         },
+        Input::KeyboardAndMouse::{GetKeyboardState, SetKeyboardState, VK_SHIFT},
         WindowsAndMessaging::*,
     },
 };
@@ -339,20 +340,24 @@ fn r10_dashboard_native() {
                 "real Bridge detail command required"
             );
             if state == 9 {
-                // Mouse selection sets focus to this row; keyboard navigation enables its ring.
+                // Focus order can change as navigation reveals rows. A forward/backward
+                // pair returns to this row without traversing a changing scroll viewport.
                 run.key(hwnd, 0x09);
-                // Walk native focus order to the selected row without mutating Host state.
-                let scene = run.scene();
-                let order: Vec<_> = scene.focus_order().into_iter().cloned().collect();
-                let row = Target::Session(fixture::SELECTED.into());
-                let at = order.iter().position(|t| t == &row).unwrap();
-                // One initial Tab above moved from selected row to the following control.
-                for _ in 1..order.len() {
-                    run.key(hwnd, 0x09);
+                let mut keys = [0u8; 256];
+                unsafe { GetKeyboardState(&mut keys).unwrap() };
+                struct RestoreKeys([u8; 256]);
+                impl Drop for RestoreKeys {
+                    fn drop(&mut self) {
+                        unsafe { SetKeyboardState(&self.0).unwrap() };
+                    }
                 }
-                run.actions.push(format!(
-                    "keyboard focus cycle returned to selected row, index {at}"
-                ));
+                let restore = RestoreKeys(keys);
+                keys[VK_SHIFT.0 as usize] |= 0x80;
+                unsafe { SetKeyboardState(&keys).unwrap() };
+                run.key(hwnd, 0x09);
+                drop(restore);
+                run.actions
+                    .push("Tab then Shift+Tab returned to selected row".into());
             }
         }
         4 => {
@@ -401,11 +406,17 @@ fn r10_dashboard_native() {
             "value":n.value,"expanded":n.expanded,"target":format!("{:?}",n.target)})
         })
         .collect();
+    // Freeze only this synthetic host's periodic timer after expensive WIC work.
+    // External UIA reads one completed fixture frame instead of racing clock repaints.
+    // Production clock behavior is unchanged; no system clock or global input is altered.
+    assert!(run.port.as_ref().unwrap().clock(fixture::clock()));
+    run.pump(80);
     unsafe {
+        KillTimer(Some(hwnd), 0x71).unwrap();
         let _ = InvalidateRect(Some(hwnd), None, false);
         let _ = UpdateWindow(hwnd);
     }
-    run.pump(120);
+    run.pump(40);
     let mut client = RECT::default();
     unsafe { GetClientRect(hwnd, &mut client).unwrap() };
     assert_eq!(
