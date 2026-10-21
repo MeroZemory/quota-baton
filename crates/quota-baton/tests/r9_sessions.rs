@@ -7,6 +7,10 @@ use std::{
     os::windows::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Output},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant, SystemTime},
 };
 const A: &str = "11111111-1111-1111-1111-111111111111";
@@ -14,6 +18,98 @@ const B: &str = "22222222-2222-2222-2222-222222222222";
 const C: &str = "33333333-3333-3333-3333-333333333333";
 const D: &str = "44444444-4444-4444-4444-444444444444";
 const PRIVATE_BODY: &str = "SYNTHETIC_PRIVATE_SESSION_BODY";
+
+// Exercise the real CLI's authenticated R11 issue/catalog path. Account/model
+// placement is tested by qb-core; these fixtures retain R9 migration ownership.
+struct LaunchCore {
+    _runtime: tokio::runtime::Runtime,
+    issued: Arc<AtomicUsize>,
+    catalogs: Arc<AtomicUsize>,
+    resumes: Arc<Mutex<Vec<Option<String>>>>,
+}
+impl LaunchCore {
+    fn new(home: &Path, codex_home: &Path) -> Self {
+        use axum::{
+            Json, Router,
+            http::HeaderMap,
+            routing::{get, post},
+        };
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(!matches!(port, 10100 | 10101));
+        let admin = URL_SAFE_NO_PAD.encode([1u8; 32]);
+        let client = URL_SAFE_NO_PAD.encode([2u8; 32]);
+        let handle = URL_SAFE_NO_PAD.encode([3u8; 32]);
+        fs::write(home.join("admin.token"), &admin).unwrap();
+        fs::write(home.join("client.key"), &client).unwrap();
+        fs::write(
+            home.join("config.toml"),
+            format!("[server]\ndata_port={port}\nadmin_port={port}\n"),
+        )
+        .unwrap();
+        fs::write(
+            codex_home.join("config.toml"),
+            // Each synthetic home has one cwd. Do not expand the surrounding
+            // implementation worktree's linked-worktree scope.
+            "model = \"synthetic-model\"\nmodel_provider = \"openai\"\n[features]\nworktrees = false\n",
+        )
+        .unwrap();
+        let issued = Arc::new(AtomicUsize::new(0));
+        let catalogs = Arc::new(AtomicUsize::new(0));
+        let issue_count = issued.clone();
+        let catalog_count = catalogs.clone();
+        let resumes = Arc::new(Mutex::new(Vec::new()));
+        let resume_ids = resumes.clone();
+        let base = format!("http://127.0.0.1:{port}/l/{handle}/v1");
+        let app = Router::new()
+            .route("/admin/v1/launches", post(move |headers: HeaderMap, Json(request): Json<serde_json::Value>| {
+                let (admin, base, count, resume_ids) = (admin.clone(), base.clone(), issue_count.clone(), resume_ids.clone());
+                async move {
+                    assert_eq!(headers.get("authorization").unwrap(), format!("Bearer {admin}").as_str());
+                    assert!(matches!(request["model"].as_str(), Some("synthetic-model" | "--last")));
+                    assert!(request["model_is_explicit"].is_boolean());
+                    assert_eq!(request["move_for_model"], false);
+                    resume_ids.lock().unwrap().push(request["resume_id"].as_str().map(str::to_owned));
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({"base_url":base,"catalog_url":format!("{base}/models"),
+                        "account":"synthetic-launch-account","model":request["model"]}))
+                }
+            }))
+            .route(&format!("/l/{handle}/v1/models"), get(move |headers: HeaderMap| {
+                let (client, count) = (client.clone(), catalog_count.clone());
+                async move {
+                    assert_eq!(headers.get("authorization").unwrap(), format!("Bearer {client}").as_str());
+                    assert_eq!(headers.get("accept-encoding").unwrap(), "identity");
+                    count.fetch_add(1, Ordering::SeqCst);
+                    ([ ("x-quota-baton-account", "synthetic-launch-account") ],
+                        Json(serde_json::json!({"models":[{"slug":"synthetic-model"},{"slug":"--last"}]})))
+                }
+            }));
+        runtime.spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        Self {
+            _runtime: runtime,
+            issued,
+            catalogs,
+            resumes,
+        }
+    }
+    fn counts(&self) -> (usize, usize) {
+        (
+            self.issued.load(Ordering::SeqCst),
+            self.catalogs.load(Ordering::SeqCst),
+        )
+    }
+}
 
 /// Run alone with `cargo test -p quota-baton --test r9_sessions
 /// r93_5300_rollout_preview_timing -- --ignored --nocapture`.
@@ -61,6 +157,8 @@ fn r93_5300_rollout_preview_timing() {
     println!("5300 rollouts / 3950 zstd: preview {elapsed:?}; read-only");
 }
 struct Fixture {
+    // Drop the serving runtime before deleting its synthetic home.
+    core: LaunchCore,
     _root: tempfile::TempDir,
     user: PathBuf,
     source: PathBuf,
@@ -94,14 +192,16 @@ impl Fixture {
         fs::write(
             &stub,
             format!(
-                "@echo off\r\nif \"%~1\"==\"--version\" (echo codex-cli 0.163.0& exit /b 0)\r\necho synthetic-launch>\"{}\"\r\nexit /b 0\r\n",
+                "@echo off\r\nif \"%~1\"==\"--version\" (echo codex-cli 0.163.0& exit /b 0)\r\necho %*>\"{}\"\r\nexit /b 0\r\n",
                 sentinel.display()
             ),
         )
         .unwrap();
         let db = Connection::open(source.join("state_5.sqlite")).unwrap();
         db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY,rollout_path TEXT NOT NULL,model_provider TEXT NOT NULL,archived INTEGER DEFAULT 0);").unwrap();
+        let core = LaunchCore::new(&qb, &target);
         Self {
+            core,
             _root: root,
             user,
             source,
@@ -146,6 +246,34 @@ impl Fixture {
         db.execute(
             "INSERT INTO threads VALUES(?1,?2,?3,0)",
             rusqlite::params![id, path.to_str().unwrap(), provider],
+        )
+        .unwrap();
+        path
+    }
+    fn target_resume(&self, id: &str) -> PathBuf {
+        let path = self
+            .target
+            .join("sessions")
+            .join(format!("rollout-2026-10-21T00-00-00-{id}.jsonl"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, format!("{}\n", serde_json::json!({"type":"session_meta","payload":{"id":id,"model_provider":"openai"}}))).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(300)),
+            )
+            .unwrap();
+        let db = Connection::open(self.target.join("state_5.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY,rollout_path TEXT NOT NULL,model_provider TEXT NOT NULL,archived INTEGER DEFAULT 0,source TEXT NOT NULL,cwd TEXT NOT NULL,preview TEXT NOT NULL,updated_at_ms INTEGER NOT NULL);").unwrap();
+        db.execute(
+            "INSERT INTO threads VALUES(?1,?2,'openai',0,'cli',?3,'synthetic target',1000)",
+            rusqlite::params![
+                id,
+                path.to_str().unwrap(),
+                self._root.path().to_str().unwrap()
+            ],
         )
         .unwrap();
         path
@@ -216,6 +344,7 @@ impl Fixture {
         self.launch(&["resume", id])
     }
     fn launch(&self, client_args: &[&str]) -> Output {
+        let before = self.core.counts();
         let mut args = vec![
             "launch-client".as_ref(),
             "--client".as_ref(),
@@ -225,7 +354,21 @@ impl Fixture {
             "--".as_ref(),
         ];
         args.extend(client_args.iter().map(std::ffi::OsStr::new));
-        self.cli(&args)
+        let output = self.cli(&args);
+        let passthrough = client_args
+            .iter()
+            .any(|arg| matches!(*arg, "--help" | "--version"));
+        let expected = if output.status.success() && !passthrough {
+            (before.0 + 1, before.1 + 1)
+        } else {
+            before
+        };
+        assert_eq!(
+            self.core.counts(),
+            expected,
+            "issuance/catalog must follow migration admission"
+        );
+        output
     }
     fn unimport(&self, id: &str) -> Output {
         self.cli(&[
@@ -550,10 +693,26 @@ fn assert_resume_without_import(args: &[&str]) {
     let original = fs::read(&source).unwrap();
     let original_state = fs::read(f.source.join("state_5.sqlite")).unwrap();
     let target = f.target.join("sessions").join(source.file_name().unwrap());
+    // --last chooses an existing target, never the UUID-shaped prompt in A's
+    // source home. An absent DB is a separate unresolved-selection boundary.
+    let selected = args.contains(&"--last").then(|| f.target_resume(B));
+    let target_state = fs::read(f.target.join("state_5.sqlite")).ok();
 
     let out = f.launch(args);
     assert_success(&out);
     assert!(f.sentinel.exists(), "stub did not launch for {args:?}");
+    if let Some(selected) = selected {
+        assert_eq!(
+            f.core.resumes.lock().unwrap().as_slice(),
+            &[Some(B.to_owned())]
+        );
+        let argv = fs::read_to_string(&f.sentinel).unwrap().replace('"', "");
+        assert!(
+            argv.trim().ends_with(&format!("resume {B} {A}")),
+            "selected ID and prompt must both reach the child"
+        );
+        assert!(selected.exists());
+    }
     assert!(source.exists(), "source removed for {args:?}");
     assert!(fs::read(&source).unwrap() == original);
     assert_eq!(thread_path(&f.source, A), Some(source));
@@ -567,7 +726,7 @@ fn assert_resume_without_import(args: &[&str]) {
     assert!(!target.exists());
     // Do not use thread_path on an absent target DB: its test helper opens
     // SQLite with CREATE, which would itself mutate this no-import fixture.
-    assert!(!f.target.join("state_5.sqlite").exists());
+    assert_eq!(fs::read(f.target.join("state_5.sqlite")).ok(), target_state);
     assert!(!f.target.join("goals_1.sqlite").exists());
     assert!(!f.target.join("session_index.jsonl").exists());
     assert!(!String::from_utf8_lossy(&out.stdout).contains("기존 대화를 qb로"));
@@ -653,17 +812,14 @@ fn r9_keep_source_every_resume_grammar_refuses_source_writer_before_launch() {
     }
 }
 #[test]
-fn r9_readable_compressed_only_rowless_target_allows_managed_picker_launches() {
+fn r9_readable_compressed_only_rowless_target_preserves_new_launch_and_selection_boundaries() {
     let grammars: &[&[&str]] = &[&[], &["resume"], &["resume", "--last"]];
     for args in grammars {
         let f = Fixture::new();
         // Prove wiring, version admission, and this grammar reach the client
         // before introducing the compressed-only target inventory.
-        assert_success(&f.launch(args));
-        assert!(
-            f.sentinel.exists(),
-            "client control did not launch: {args:?}"
-        );
+        assert_success(&f.launch(&[]));
+        assert!(f.sentinel.exists(), "new-launch control did not launch");
         fs::remove_file(&f.sentinel).unwrap();
 
         let compressed = f
@@ -690,8 +846,20 @@ fn r9_readable_compressed_only_rowless_target_allows_managed_picker_launches() {
         assert!(!f.target.join("state_5.sqlite").exists());
         let source_state = fs::read(f.source.join("state_5.sqlite")).unwrap();
 
-        assert_success(&f.launch(args));
-        assert!(f.sentinel.exists(), "client did not launch: {args:?}");
+        let out = f.launch(args);
+        if args.is_empty() {
+            assert_success(&out);
+            assert!(f.sentinel.exists(), "new client did not launch");
+        } else {
+            assert_refused(&f, &out, "codex-qb resume <UUID>");
+            let reason = if args.len() == 1 {
+                "대화 선택은 입력과 출력이 모두 터미널일 때만 가능합니다"
+            } else {
+                "이 재개 방식의 대화를 안전하게 선택하지 못했습니다"
+            };
+            assert!(String::from_utf8_lossy(&out.stderr).contains(reason));
+            assert!(!String::from_utf8_lossy(&out.stderr).contains("압축"));
+        }
         assert_eq!(fs::read(&compressed).unwrap(), encoded);
         assert_eq!(
             fs::read(f.source.join("state_5.sqlite")).unwrap(),
@@ -700,6 +868,33 @@ fn r9_readable_compressed_only_rowless_target_allows_managed_picker_launches() {
         assert!(!f.target.join("state_5.sqlite").exists());
         assert!(!f.target.join("goals_1.sqlite").exists());
         assert!(!f.target.join("session_index.jsonl").exists());
+        assert!(!f.qb.join("journal/sessions-import.json").exists());
+        assert!(!f.qb.join("journal/session-moves").exists());
+    }
+}
+
+#[test]
+fn r11_unresolved_last_never_imports_a_uuid_shaped_prompt() {
+    for args in [["resume", "--last", A], ["resume", A, "--last"]] {
+        let f = Fixture::new();
+        let source = f.add(A, false, "openai");
+        let source_bytes = fs::read(&source).unwrap();
+        let source_rows = fs::read(f.source.join("state_5.sqlite")).unwrap();
+        let out = f.launch(&args);
+        assert_refused(&f, &out, "codex-qb resume <UUID>");
+        assert!(
+            String::from_utf8_lossy(&out.stderr)
+                .contains("이 재개 방식의 대화를 안전하게 선택하지 못했습니다")
+        );
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("터미널일 때만"));
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        assert_eq!(
+            fs::read(f.source.join("state_5.sqlite")).unwrap(),
+            source_rows
+        );
+        for name in ["state_5.sqlite", "goals_1.sqlite", "session_index.jsonl"] {
+            assert!(!f.target.join(name).exists());
+        }
         assert!(!f.qb.join("journal/sessions-import.json").exists());
         assert!(!f.qb.join("journal/session-moves").exists());
     }

@@ -9,7 +9,7 @@ This file names the verification for each unit and each row. The row list and th
 목표: 대시보드 수정을 전달하고 R11을 마무리한다
 핵심 지표: 새 경로 출시 1/2 · R11 HTTP32·WS15·clippy·빌드 통과, native·전체 관문 남음
 사용자 대기: 없음 (R2 Part B만 사용자 결정 대기)
-갱신: 2026-10-22 06:20 KST (R11 workspace lint 보완 통과, native·전체 관문 미완료)
+갱신: 2026-10-22 07:07 KST (R11 실행·세션 fixture20/20, 전체 기능·native 검증 남음)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -92,6 +92,9 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-22 06:09 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R11 strict clippy·제품 build 통과; native 설정 순서 fixture 보완, 미출시 |
 | 2026-10-22 06:20 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R11 두 번째 native 실패0/5와 workspace lint4건 수정 기록; 미출시 |
 | 2026-10-22 06:24 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R11 native 하네스20/20 자체검사; 제품 native 수용과 별도 |
+| 2026-10-22 06:45 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R11 workspace default2127통과·14실패·17제외; 보완 중, 미출시 |
+| 2026-10-22 06:59 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R11 takeover9/9·reset2/2; launcher경계·native 미완료 |
+| 2026-10-22 07:07 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | 실행·세션 fixture20/20, 명시적 제외3; 독립 정적 검수 통과, R11 미출시 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -162,12 +165,17 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-22 06:20 | R11 두 번째 실제 native | 0/5 완료 | 5/5 완료 | A picker·Daybreak 표시 성공, 첫 WS 추론 실패; cleanup 정지true·잔류0 |
 | 2026-10-22 06:20 | R11 workspace default strict clippy | 최초exit101 → 수정 뒤exit0 | exit0 | 스타일4건5dc8a2f; 이전 실패 지문 보존, all-features·tests 진행 |
 | 2026-10-22 06:24 | R11 합성 WS 하네스 순수 검사 | 20/20 통과 | 전 검사 통과 | 실제 parser/handler/finish, 프로세스·네트워크 금지; 제품 실행 아님 |
+| 2026-10-22 06:45 | R11 workspace default 전체 실행 | 2127통과 / 14실패 / 17제외 | 전 검사 통과 | 입력a5fdf36b, 1324.9초; m4b1·title1·R9 9·takeover3 실패 모두 보존 |
+| 2026-10-22 06:59 | R11 reset-deadline·재요청 focused | 2/2 통과 | 2/2 | setup 뒤 실제남은시간·양수사전조건 유지 |
+| 2026-10-22 06:59 | R11 실제 두 코어 takeover 집중 | 처음8/9 → 보완9/9 | 9/9 | catalog와SSE script 분리; 모든 strict·401·refresh·lease 조건 유지 |
+| 2026-10-22 06:59 | R11 기존 launcher focused | title1통과·R9 15통과/3실패 | 모든 지원경로 통과 | UUID없는 선택의 DB·TTY 경계가 원인; 양성/경계 분리 후 재검증 |
+| 2026-10-22 06:59 | R11 세 번째 native | 0/5 완료 | 5/5 | warmup·일반 image viewing 도구의 과도한 거부 진단; cleanup정지true·잔류0 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 행동 |
 |---|---|---|---|
-| R11 실행별 계정 | 보완 HTTP32/32·WS15/15 통과 | native·최종 관문 통과 | A/B/A·동시 실행과 전체 검사; 독립 검수·반례7건 완료 |
+| R11 실행별 계정 | HTTP32·WS15 통과, 전체 기본14실패 | native·최종 관문 통과 | 실패 fixture focused 보완 후 나머지 기능조합·native; 실패 행 보존 |
 | 대시보드 지연 (R12.10) | 합성 실제 창 성능·최종 scoped gate 통과 | 실제 설치 확인 | 설계 세션이 설치하고 사용자 환경 확인 |
 | R13 소진 예측·아이콘·차트·캐시 보류 | 설계 완료, 병합 0/3 단위 | 3/3 단위 병합과 설치 | R11 뒤 B+B2+D, A, C+E 순서 |
 <!-- gaps:end -->
