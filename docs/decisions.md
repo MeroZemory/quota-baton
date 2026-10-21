@@ -606,3 +606,46 @@ The disagreement narrowed to two facts, which settle it:
 - **Unknown or expired tokens** fail explicitly only where the token is needed: `/models` and placing a new session. Requests that carry a bound session key route by the binding.
 - **Gap logging.** Every placement and move made for a model choice is logged and shown in the panel.
 - **Not chosen:** a union catalog, and routing each request by model.
+
+## D23. Image generation through qb: a separate image home Qi with a custom provider, and qb relays the images routes — Accepted (user direction plus panel, 2026-10-21)
+
+**User direction.** "codex-qb에는 이미지 도구가 없습니다 → 이건 우리가 빨리 지원하고 (모델 지정처럼 이미지젠 지정 시 지원하는 계정으로 잡아주도록)". Any imagegen model is fine (gpt-image-2).
+
+**Facts.** The evidence is in `.sandbox/research/codex-image-tool-qb.md` plus a live tool listing. Codex exposes `image_gen__imagegen` only when one of two conditions holds:
+- ChatGPT login together with `requires_openai_auth=true`;
+- a provider with `requires_openai_auth=false` and a non-empty `x-openai-actor-authorization` header.
+
+Built-in provider ids cannot be redefined. The tool POSTs to `<base>/images/generations|edits` with `gpt-image-2`, and qb relays neither route today.
+
+**Panel.** Files are in `.sandbox/reviews/qb-imagegen/`. Opus max (via claude-qb) and Astra max (via codex-qb) **agreed in round 1**: option C. Both rejected synthetic ChatGPT auth (B), because it forges plan claims and risks refresh calls against the irreplaceable account.
+
+**Decision.**
+- **The Qi home.** `codex-qb --images [resume <id>]` runs in a separate home Qi. `wire` generates Qi's config from Q's config plus one provider block, so the two cannot drift. The block (`model_provider="qb"`) contains:
+  - `base_url` set to qb;
+  - `env_key` set to the client key;
+  - `requires_openai_auth=false`;
+  - `http_headers.x-openai-actor-authorization="qb-local"`, a local compatibility sentinel, honestly described as such;
+  - `wire_api="responses"`, `supports_websockets`, `name="OpenAI"`, and remote compaction as in the shared-home study.
+- **The default Q stays on the built-in `openai` provider.** Ordinary sessions are unaffected.
+- **qb relays `/v1/images/generations` and `/v1/images/edits`** to the selected account's `…/backend-api/codex/images/*`.
+  - Bodies are relayed byte for byte (multipart included).
+  - `x-openai-actor-authorization` is stripped in every letter case and every duplicate, and the local client key never goes upstream. The sentinel never authorizes access to qb; the client key still does.
+  - Upstream authentication is the selected account's real token.
+- **Image account selection.**
+  - Only non-Free accounts that are not marked image-exhausted are eligible. The session's bound account is preferred.
+  - On an image 429 or quota error, that account is marked image-exhausted until its reset and each other eligible account is tried once.
+  - Image traffic never changes the session's binding for responses.
+  - Edits that reference a server-side image stay on the account that produced it.
+  - A 401 or 403 on an image route only marks the account image-incapable. It **never** deletes, rotates or force-refreshes a token (acct-d has one irreplaceable login).
+- **Provider-id round trip.**
+  - Moving a thread into Qi sets the copied row's provider to `qb`; moving it out sets the destination's provider (`openai`). The R9 mover gains a destination-provider rule, and an unknown provider aborts the move with the id named.
+  - Live test: verify on the real 0.163 binary whether resume reads the provider from rows only, or also from the rollout's session meta or turn context.
+  - **Rows only:** keep hardlinks.
+  - **Rollout too:** stop and return to the design session. Copying would reopen D21's "never copy", and that needs its own decision.
+- **Failure messages** distinguish no eligible image account, bound account unavailable, auth rejected, quota exhausted, endpoint unsupported, and transport errors. Each says whether it was generation or editing, and they are OpenAI-shaped so the Codex tool result shows them.
+- **Acceptance gates.**
+  - One real generation and one real edit through qb. They cost a little image quota, which is acceptable.
+  - The tool is listed in Qi.
+  - The full round trip account → Qi → account → Q → Qi → account, with a turn at each stop.
+  - Header-strip capture tests.
+  - An upgrade canary: on a Codex version change, the launcher checks that Qi still lists `image_gen__imagegen` and points to `codex-mz` if it does not.
