@@ -4,6 +4,19 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub(in crate::relay) type Admission = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+#[cfg(feature = "testkit")]
+type SelectionPause = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
+#[cfg(feature = "testkit")]
+type AdmissionPause = (
+    tokio::sync::oneshot::Sender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
+
 #[derive(Default)]
 struct AccountCapacity {
     reserved: usize,
@@ -21,9 +34,72 @@ impl AccountCapacity {
 /// Process-local upstream socket capacity, independent of account health and
 /// response.create pacing. A reservation covers pending dial through pump drop.
 #[derive(Default)]
-pub(in crate::relay) struct Capacity(Mutex<BTreeMap<String, AccountCapacity>>);
+pub(in crate::relay) struct Capacity(
+    Mutex<BTreeMap<String, AccountCapacity>>,
+    #[cfg(feature = "testkit")] Mutex<Option<SelectionPause>>,
+    #[cfg(feature = "testkit")] std::sync::atomic::AtomicUsize,
+    #[cfg(feature = "testkit")] Mutex<Option<AdmissionPause>>,
+);
 
 impl Capacity {
+    #[cfg(feature = "testkit")]
+    pub(in crate::relay) fn pause_admission(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (entered, observed) = tokio::sync::oneshot::channel();
+        let (resume, released) = std::sync::mpsc::channel();
+        *self.3.lock().unwrap_or_else(|e| e.into_inner()) = Some((entered, released));
+        (observed, resume)
+    }
+
+    #[cfg(feature = "testkit")]
+    pub(in crate::relay) fn before_admission(&self) {
+        let hook = self.3.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some((entered, released)) = hook {
+            let _ = entered.send(());
+            let _ = released.recv_timeout(Duration::from_secs(5));
+        }
+    }
+
+    #[cfg(feature = "testkit")]
+    pub(in crate::relay) fn pause_selection(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered, observed) = tokio::sync::oneshot::channel();
+        let (resume, released) = tokio::sync::oneshot::channel();
+        *self.1.lock().unwrap_or_else(|e| e.into_inner()) = Some((entered, released));
+        (observed, resume)
+    }
+
+    #[cfg(feature = "testkit")]
+    pub(in crate::relay) async fn before_selection(&self) {
+        let hook = self.1.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some((entered, released)) = hook {
+            let _ = entered.send(());
+            let _ = released.await;
+        }
+    }
+
+    #[cfg(feature = "testkit")]
+    pub(in crate::relay) fn reserved_for_test(&self, account: &str) -> usize {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(account)
+            .map_or(0, |state| state.reserved)
+    }
+
+    #[cfg(feature = "testkit")]
+    pub(in crate::relay) fn waits_for_test(&self) -> usize {
+        self.2.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub(super) fn capped(&self) -> BTreeSet<String> {
         self.0
             .lock()
@@ -50,14 +126,20 @@ impl Capacity {
     pub(super) fn stream_connection_limit(&self, account: &str) {
         let mut accounts = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let state = accounts.entry(account.into()).or_default();
-        // An in-stream rejection does not dispose of the established socket.
-        let observed = state.reserved.max(1);
+        // Keep the rejected socket occupied until it drops, but do not count
+        // it as evidence of usable upstream capacity.
+        let observed = state.reserved.saturating_sub(1).max(1);
         state.cap = Some(state.cap.map_or(observed, |cap| cap.min(observed)));
+        if state.reserved <= 1 {
+            state.retry_at = Some(Instant::now() + Duration::from_millis(250));
+        }
     }
 
     /// Poll only while inside the caller's existing upgrade envelope. Waiting
     /// requests retain no slot and create no unbounded account-local queue.
     pub(super) async fn wait_until(&self, deadline: Instant) -> bool {
+        #[cfg(feature = "testkit")]
+        self.2.fetch_add(1, std::sync::atomic::Ordering::Release);
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return false;
@@ -236,7 +318,10 @@ mod tests {
         capacity.stream_connection_limit("stream");
         assert!(capacity.reserve("stream").is_none());
         drop(live);
-        assert!(capacity.reserve("stream").is_some());
+        assert!(
+            capacity.reserve("stream").is_none(),
+            "external occupancy backs off even after close"
+        );
     }
 
     #[test]

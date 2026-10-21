@@ -20,6 +20,15 @@ use std::{
 };
 use tokio::{sync::Semaphore, time::Instant};
 
+#[cfg(test)]
+pub(crate) fn parse_snapshot_for_test(
+    provider: Provider,
+    body: &[u8],
+    now: DateTime<Utc>,
+) -> Option<serde_json::Value> {
+    parse::snapshot(provider, body, now)
+}
+
 const MAX_BODY: usize = 256 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -513,19 +522,20 @@ impl UsagePoller {
                     table.note_usage_observation_asof_token(id, &snapshot, asof);
                 }
             }
+            let reported = snapshot.clone();
             let snapshot = self
                 .obs
                 .observe_poll(id, snapshot, replace_windows)
                 .ok_or(PollError::Unavailable)?;
             if probe.is_some() {
                 self.runtime
-                    .probe_success(id)
+                    .poll_probe_success(id)
                     .await
                     .map_err(|_| PollError::Unavailable)?;
             }
             let account = self
                 .runtime
-                .apply_quota_snapshot(id, snapshot, None)
+                .apply_quota_snapshot_reported(id, snapshot, &reported, None)
                 .await
                 .map_err(|_| PollError::Unavailable)?;
             reservation.succeeded = true;
@@ -769,6 +779,39 @@ mod tests {
                 r#"{"rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":18000,"reset_after_seconds":3600}}}"#,
             )
         }
+    }
+
+    #[tokio::test]
+    async fn outage_usage_poll_success_does_not_complete_serving_probe() {
+        let f = Fixture::new(1).await;
+        let id = &f.ids[0];
+        f.relay
+            .quota
+            .store
+            .update_metadata(id, |a| {
+                a.health = Health::Cooling {
+                    reason: HealthReason::Quota,
+                    until: Utc::now() + chrono::Duration::hours(1),
+                    scope: "account".into(),
+                };
+            })
+            .unwrap();
+        f.relay.accounts.release_quota_hold(id).await.unwrap();
+        f.fake.state.push(ScriptedResponse::json(
+            reqwest::StatusCode::OK,
+            r#"{"plan_type":"pro"}"#,
+        ));
+        f.relay.quota.poll(id).await.unwrap();
+        let account = f.account(0);
+        let serving = f
+            .relay
+            .accounts
+            .begin_probe(&account)
+            .unwrap()
+            .expect("usage GET does not prove serving success");
+        assert!(f.relay.accounts.begin_probe(&account).is_err());
+        drop(serving);
+        assert!(f.relay.accounts.begin_probe(&account).unwrap().is_some());
     }
 
     #[test]

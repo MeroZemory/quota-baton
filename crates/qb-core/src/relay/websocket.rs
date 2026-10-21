@@ -73,6 +73,37 @@ fn clear_retried_token(relay: &Arc<RelayState>, account: &str, token: &str) {
         });
 }
 
+#[cfg(feature = "testkit")]
+impl RelayState {
+    pub fn ws_capacity_waits_for_test(&self) -> usize {
+        self.ws_capacity.waits_for_test()
+    }
+
+    pub fn ws_reserved_for_test(&self, account: &str) -> usize {
+        self.ws_capacity.reserved_for_test(account)
+    }
+
+    /// Pause the blocking selector under the mutation gate before admission.
+    pub fn pause_next_ws_admission(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.ws_capacity.pause_admission()
+    }
+
+    /// Pause one synthetic WS after candidate collection, before guarded selection.
+    pub fn pause_next_ws_selection(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.ws_capacity.pause_selection()
+    }
+}
+
 pub(super) type UpstreamSocket = WebSocketStream<reqwest::Upgraded>;
 pub(super) type ClientSocket = WebSocketStream<hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>>;
 
@@ -82,9 +113,10 @@ async fn redial_same_account(
 ) -> Result<UpstreamSocket, ()> {
     let relay = context.relay.as_ref().ok_or(())?;
     let (account, token) = context.credentials.as_ref().ok_or(())?;
-    if !relay
-        .dispatch_data_allowed(context.session.key.as_deref(), &account.id, model)
-        .await
+    if relay.is_draining()
+        || !relay
+            .dispatch_data_allowed(context.session.key.as_deref(), &account.id, model)
+            .await
     {
         return Err(());
     }
@@ -97,6 +129,9 @@ async fn redial_same_account(
         "sec-websocket-key",
         HeaderValue::from_str(&key).map_err(|_| ())?,
     );
+    if relay.is_draining() {
+        return Err(());
+    }
     let response = tokio::time::timeout(
         Duration::from_secs(15),
         relay
@@ -159,10 +194,13 @@ pub(super) async fn upgrade(state: Arc<RelayState>, request: Request) -> Respons
         });
     completion.precommit_deadline = Some(deadline);
     let timeout = deadline.saturating_duration_since(std::time::Instant::now());
-    let response = tokio::time::timeout(
-        timeout,
-        upgrade_inner(state, request, &mut completion, deadline),
-    )
+    let response = tokio::time::timeout(timeout, async {
+        tokio::select! {
+            biased;
+            _ = state.wait_for_drain_start() => handover_response(),
+            response = upgrade_inner(state.clone(), request, &mut completion, deadline) => response,
+        }
+    })
     .await
     .unwrap_or_else(|_| {
         native_error(
@@ -282,32 +320,79 @@ async fn upgrade_inner(
         // account; strict anchors stay anchored and wait for their slot.
         let capped = state.ws_capacity.capped();
         let excluded = tried.union(&capped).cloned().collect();
+        let reserved = Arc::new(std::sync::Mutex::new(None));
+        let admission_denied = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let admit = {
+            let state = state.clone();
+            // The blocking selector must not keep a cancelled upgrade alive.
+            // Only this live future owns the strong reservation container.
+            let owner = Arc::downgrade(&reserved);
+            let denied = admission_denied.clone();
+            Arc::new(move |account: &str| {
+                #[cfg(feature = "testkit")]
+                state.ws_capacity.before_admission();
+                if state.is_draining() || std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                let Some(reserved) = owner.upgrade() else {
+                    return false;
+                };
+                let permit = state.ws_capacity.reserve(account);
+                denied.store(permit.is_none(), Ordering::Release);
+                let allowed = permit.is_some();
+                *reserved.lock().unwrap_or_else(|e| e.into_inner()) = permit;
+                allowed
+            })
+        };
         completion.policy_blocked = false;
         let selected = state
-            .select_request(Provider::Codex, &session, completion, None, &excluded)
+            .select_request_admitted(
+                Provider::Codex,
+                &session,
+                completion,
+                None,
+                &excluded,
+                Some(admit),
+            )
             .await;
+        if state.is_draining() {
+            return handover_response();
+        }
         if let Some(id) = quota_source.take()
             && let Ok(next) = &selected
         {
             state.notice_quota(&id, next.as_ref(), None).await;
         }
+        if !matches!(selected, Ok(Some(_))) {
+            // Policy persistence may reject after admission. Never keep that
+            // unused permit while deciding whether another candidate can wait.
+            reserved.lock().unwrap_or_else(|e| e.into_inner()).take();
+        }
         let account = match selected {
             Ok(Some(account)) => account,
             Ok(None) => {
-                // Do not turn capacity exhaustion into quota/account failure.
-                // Check unexcluded candidates so unrelated unavailable accounts
-                // do not cause a wait merely because some other account is full.
-                if !capped.is_empty()
-                    && state
-                        .candidates(Provider::Codex, session.key.as_deref(), None, &tried)
-                        .await
-                        .is_ok_and(|candidates| {
-                            candidates.iter().any(|candidate| {
-                                capped.contains(&candidate.account.id)
-                                    && candidate.account.eligible_at(None, chrono::Utc::now())
-                            })
-                        })
+                let policy = state.bindings.policies.plan(session.key.as_deref());
+                if policy.settings.mode == crate::routing::Mode::Strict
+                    && (state.bindings.policies.strict_dispatch_blocked()
+                        || policy.anchor.as_deref().is_some_and(|anchor| {
+                            !state
+                                .bindings
+                                .policies
+                                .permits_dispatch(session.key.as_deref(), anchor)
+                        }))
                 {
+                    completion.policy_blocked = true;
+                    return state
+                        .unavailable(completion, Provider::Codex, true, None)
+                        .await;
+                }
+                // Preview the actual routing decision with only capacity
+                // exclusions removed. In particular, unrelated full accounts
+                // cannot mask an unavailable strict anchor or drain policy.
+                let capacity_blocked = admission_denied.load(Ordering::Acquire)
+                    || (!capped.is_empty()
+                        && capacity_candidate(&state, &session, &tried, &capped).await);
+                if capacity_blocked {
                     completion.end_attempt();
                     if state.ws_capacity.wait_until(deadline).await {
                         continue;
@@ -330,16 +415,11 @@ async fn upgrade_inner(
             }
             Err(_) => return network_failure(),
         };
-        // Selection awaits disk/routing work, so its snapshot is not a slot.
-        // Reserve atomically before refresh/dial and reselect if another
-        // upgrade took the final slot in the meantime.
-        let Some(capacity_permit) = state.ws_capacity.reserve(&account.id) else {
-            completion.end_attempt();
-            if state.ws_capacity.wait_until(deadline).await {
-                continue;
-            }
-            return capacity_timeout();
-        };
+        let capacity_permit = reserved
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .expect("selected WS account has an admitted slot");
         tried.insert(account.id.clone());
         let (mut account, mut tokens) = match state
             .tokens
@@ -382,6 +462,9 @@ async fn upgrade_inner(
                 return state
                     .unavailable(completion, Provider::Codex, true, None)
                     .await;
+            }
+            if state.is_draining() {
+                return handover_response();
             }
             let mut forwarded =
                 match headers::upstream(&parts.headers, &account, &tokens.access_token) {
@@ -822,6 +905,42 @@ async fn upgrade_inner(
             .headers_mut()
             .insert("x-quota-baton-account", value);
     }
+    response
+}
+
+async fn capacity_candidate(
+    state: &RelayState,
+    session: &session::Session,
+    tried: &BTreeSet<String>,
+    capped: &BTreeSet<String>,
+) -> bool {
+    if session.key.is_none()
+        && state.bindings.policies.plan(None).settings.mode == crate::routing::Mode::Strict
+    {
+        return false;
+    }
+    let Ok(candidates) = state
+        .candidates(Provider::Codex, session.key.as_deref(), None, tried)
+        .await
+    else {
+        return false;
+    };
+    matches!(state.bindings.preview(
+        Provider::Codex, session.key.as_deref(), session.parent.as_deref(), None,
+        &candidates, state.pins.get(Provider::Codex, session.key.as_deref()).as_deref(), 0,
+    ), crate::bindings::PreviewDecision::Selected { account } if capped.contains(&account))
+}
+
+fn handover_response() -> Response {
+    let mut response = native_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        Provider::Codex,
+        "server_error",
+        "quota-baton is handing over",
+    );
+    response
+        .headers_mut()
+        .insert("retry-after", HeaderValue::from_static("1"));
     response
 }
 

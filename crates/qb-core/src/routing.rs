@@ -1240,7 +1240,7 @@ impl PolicyStore {
         self.lifecycle_recovery.store(false, Ordering::Release);
         self.changed.notify_waiters();
     }
-    fn strict_dispatch_blocked(&self) -> bool {
+    pub(crate) fn strict_dispatch_blocked(&self) -> bool {
         self.recovery_blocked.load(Ordering::Acquire)
             || self.lifecycle_recovery.load(Ordering::Acquire)
     }

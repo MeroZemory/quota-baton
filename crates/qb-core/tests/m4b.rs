@@ -1475,6 +1475,39 @@ async fn outage_release_hold_requires_confirmation_and_preserves_credentials() {
 }
 
 #[tokio::test]
+async fn outage_release_does_not_authorize_paid_serving_without_credit_metadata() {
+    let h = Harness::with_hold(Provider::Codex, 0).await;
+    let ids = h.ids();
+    h.store
+        .update_metadata(&ids[1], |a| {
+            a.user_state = qb_core::accounts::UserState::Disabled;
+        })
+        .unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert("x-codex-active-limit", "credits".parse().unwrap());
+    h.state
+        .accounts
+        .observe_headers(&ids[0], Provider::Codex, &headers)
+        .await;
+    assert!(matches!(
+        h.store.load(&ids[0]).unwrap().health,
+        Health::Cooling { .. }
+    ));
+    assert!(h.state.accounts.release_quota_hold(&ids[0]).await.is_err());
+    let before = h.fake.state.requests().len();
+    let (status, _, _) = h
+        .send(
+            "/v1/responses",
+            &[("session_id", "synthetic-paid-denial")],
+            RAW,
+        )
+        .await;
+    assert_eq!(status, 429);
+    assert_eq!(h.fake.state.requests().len(), before);
+    assert!(!h.store.load(&ids[0]).unwrap().allow_credits);
+}
+
+#[tokio::test]
 async fn outage_real_quota_rejection_can_be_operator_probed() {
     let h = Harness::with_hold(Provider::Codex, 0).await;
     let ids = h.ids();
@@ -1503,6 +1536,11 @@ async fn outage_real_quota_rejection_can_be_operator_probed() {
         }
     ));
     assert!(!held.quota_credit_releasable);
+    // Cached numeric evidence must not immediately undo an explicit probe.
+    h.state
+        .accounts
+        .observe_headers(id, Provider::Codex, &usage(Provider::Codex, 100))
+        .await;
     h.admin(
         reqwest::Method::POST,
         &format!("/admin/v1/accounts/{id}/release-hold"),

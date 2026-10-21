@@ -36,6 +36,7 @@ struct Harness {
     servers: RunningServers,
     ids: Vec<String>,
     obs: Arc<Observability>,
+    pins: Arc<DebugPins>,
     home: PathBuf,
     _retry_proxy: Option<RetryProxy>,
 }
@@ -176,7 +177,7 @@ impl Harness {
         let obs = Arc::new(Observability::new(&home, None).unwrap());
         let pins = Arc::new(DebugPins::default());
         let state = Arc::new(
-            RelayState::new(store.clone(), &config, obs.clone(), pins)
+            RelayState::new(store.clone(), &config, obs.clone(), pins.clone())
                 .unwrap()
                 .with_token_endpoint(Provider::Codex, token_fake.url.clone()),
         );
@@ -201,6 +202,7 @@ impl Harness {
             servers,
             ids,
             obs,
+            pins,
             home,
             _retry_proxy: retry_proxy,
         }
@@ -682,6 +684,584 @@ async fn r12_9_capacity_wait_resumes_when_live_socket_drops() {
     assert_eq!(h.fake.state.requests().len(), 3);
     assert_eq!(h.store.load(&original).unwrap().health, Health::Ready);
     replacement.close(None).await.unwrap();
+}
+
+// All capacity evidence below comes from synthetic real WS upgrades/frames.
+async fn capacity_count(h: &Harness, account: &str, count: usize) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while h.state.ws_reserved_for_test(account) != count {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("socket reservation transition");
+}
+
+async fn capacity_wait_started(h: &Harness) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while h.state.ws_capacity_waits_for_test() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("actual upgrade entered capacity wait");
+}
+
+fn session_request(h: &Harness, session: &str) -> axum::http::Request<()> {
+    let mut request = h.request();
+    request
+        .headers_mut()
+        .insert("session-id", session.parse().unwrap());
+    request
+}
+
+async fn learn_one_socket_cap(h: &Harness, id: &str, session: &str) -> Client {
+    h.pins.set(Provider::Codex, None, id.into());
+    let (live, _) = connect_async(session_request(h, session)).await.unwrap();
+    let error = json!({"type":"error","status":400,"error":{
+        "code":"websocket_connection_limit_reached","message":"never-ledger-stream-body"
+    }})
+    .to_string();
+    h.fake.state.queue_send(Message::Text(error.clone().into()));
+    let (mut rejected, _) = connect_async(session_request(h, session)).await.unwrap();
+    assert_eq!(receive(&mut rejected).await, Message::Text(error.into()));
+    // Rejected sockets remain occupied until close, but are not usable capacity.
+    assert_eq!(h.state.ws_reserved_for_test(id), 2);
+    rejected.close(None).await.unwrap();
+    drop(rejected);
+    capacity_count(h, id, 1).await;
+    h.pins.clear();
+    live
+}
+
+#[tokio::test]
+async fn r12_9_losing_actual_upgrade_slot_race_preserves_binding_and_old_create() {
+    let h = Harness::new_with_options(2, false, false, None, Some((30, 2))).await;
+    h.fake.state.keep_old_connections();
+    let a = &h.ids[0];
+    let b = &h.ids[1];
+    let mut original = learn_one_socket_cap(&h, a, "synthetic-ws-session").await;
+    let mut b_live = learn_one_socket_cap(&h, b, "synthetic-b").await;
+    b_live.close(None).await.unwrap();
+    drop(b_live);
+    capacity_count(&h, b, 0).await;
+    let (collected, resume) = h.state.pause_next_ws_selection();
+    let request = h.request();
+    let losing = tokio::spawn(async move { connect_async(request).await });
+    tokio::time::timeout(Duration::from_secs(2), collected)
+        .await
+        .unwrap()
+        .unwrap();
+    // B was available in the losing upgrade's collected candidates. Another
+    // actual upgrade reserves its final slot before guarded selection resumes.
+    h.pins.set(Provider::Codex, None, b.clone());
+    let (mut winner, response) = connect_async(session_request(&h, "synthetic-winner"))
+        .await
+        .unwrap();
+    assert_eq!(response.headers()["x-quota-baton-account"], b.as_str());
+    h.pins.clear();
+    resume.send(()).unwrap();
+    let Error::Http(response) = tokio::time::timeout(Duration::from_secs(3), losing)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err()
+    else {
+        panic!("capacity timeout expected")
+    };
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(
+        h.state
+            .bindings
+            .current(Some("codex:synthetic-ws-session"))
+            .as_deref(),
+        Some(a.as_str())
+    );
+    let before = h.fake.state.requests().len();
+    h.fake.state.set_echo(true);
+    create(&mut original, "race-survivor").await;
+    let Message::Text(echo) = receive(&mut original).await else {
+        panic!("original socket create must survive")
+    };
+    assert_eq!(
+        serde_json::from_str::<Value>(&echo).unwrap()["model"],
+        "race-survivor"
+    );
+    assert_eq!(
+        h.fake.state.requests().len(),
+        before,
+        "loser must never dial"
+    );
+    original.close(None).await.unwrap();
+    winner.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn r12_9_strict_recovery_veto_precedes_capacity_wait() {
+    let h = Harness::new(1).await;
+    h.fake.state.keep_old_connections();
+    let mut original = learn_one_socket_cap(&h, &h.ids[0], "synthetic-ws-session").await;
+    routing_ws::strict(&h).await;
+    let path = h.home.join("state/routing-policies.json");
+    fs::remove_file(&path).unwrap();
+    fs::create_dir(&path).unwrap();
+    let table = h.state.bindings.clone();
+    tokio::task::spawn_blocking(move || {
+        assert!(
+            table
+                .policies
+                .put_project(
+                    None,
+                    qb_core::routing::Project {
+                        name: "synthetic-write-failure".into(),
+                        settings: qb_core::routing::Settings::default(),
+                    }
+                )
+                .is_err()
+        );
+    })
+    .await
+    .unwrap();
+    assert!(
+        !h.state
+            .bindings
+            .policies
+            .permits_dispatch(Some("codex:synthetic-ws-session"), &h.ids[0])
+    );
+    let before = h.fake.state.requests().len();
+    let (status, body) = tokio::time::timeout(Duration::from_secs(2), h.error())
+        .await
+        .expect("policy recovery veto must return before capacity expiry");
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["type"], "routing_policy_blocked");
+    assert_eq!(h.state.ws_capacity_waits_for_test(), 0);
+    assert_eq!(h.fake.state.requests().len(), before);
+    assert_eq!(h.state.ws_reserved_for_test(&h.ids[0]), 1);
+    let _ = original.close(None).await;
+}
+
+#[tokio::test]
+async fn r12_9_healthy_unanchored_strict_first_placement_waits_then_dispatches() {
+    let h = Harness::new(1).await;
+    h.fake.state.keep_old_connections();
+    let mut live = learn_one_socket_cap(&h, &h.ids[0], "synthetic-existing").await;
+    let table = h.state.bindings.clone();
+    tokio::task::spawn_blocking(move || {
+        table
+            .set_routing_session(
+                &qb_core::routing::session_id("codex:synthetic-ws-session"),
+                Some(qb_core::routing::Settings {
+                    mode: qb_core::routing::Mode::Strict,
+                    reset_wait_secs: 0,
+                }),
+                None,
+                false,
+            )
+            .unwrap();
+    })
+    .await
+    .unwrap();
+    assert!(
+        h.state
+            .bindings
+            .policies
+            .plan(Some("codex:synthetic-ws-session"))
+            .anchor
+            .is_none()
+    );
+    let before = h.fake.state.requests().len();
+    let request = h.request();
+    let pending = tokio::spawn(async move { connect_async(request).await });
+    capacity_wait_started(&h).await;
+    assert!(!pending.is_finished());
+    assert_eq!(h.fake.state.requests().len(), before);
+    live.close(None).await.unwrap();
+    drop(live);
+    let (mut placed, response) = tokio::time::timeout(Duration::from_secs(3), pending)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        response.headers()["x-quota-baton-account"],
+        h.ids[0].as_str()
+    );
+    assert_eq!(
+        h.state
+            .bindings
+            .policies
+            .plan(Some("codex:synthetic-ws-session"))
+            .anchor
+            .as_deref(),
+        Some(h.ids[0].as_str())
+    );
+    placed.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn r12_9_timed_out_blocking_admission_cannot_move_binding_or_break_old_create() {
+    let h = Harness::new_with_options(2, false, false, None, Some((30, 1))).await;
+    h.fake.state.keep_old_connections();
+    let a = &h.ids[0];
+    let b = &h.ids[1];
+    let mut original = learn_one_socket_cap(&h, a, "synthetic-ws-session").await;
+    let mut b_live = learn_one_socket_cap(&h, b, "synthetic-b").await;
+    b_live.close(None).await.unwrap();
+    drop(b_live);
+    capacity_count(&h, b, 0).await;
+    let (entered, resume) = h.state.pause_next_ws_admission();
+    let request = h.request();
+    let pending = tokio::spawn(async move { connect_async(request).await });
+    tokio::time::timeout(Duration::from_secs(2), entered)
+        .await
+        .unwrap()
+        .unwrap();
+    // The blocking selector now owns the mutation gate. Let the actual HTTP
+    // upgrade expire and drop its owner before allowing admission to proceed.
+    let waiting_since = std::time::Instant::now();
+    let Error::Http(response) = tokio::time::timeout(Duration::from_secs(2), pending)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err()
+    else {
+        panic!("upgrade expiry expected")
+    };
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert!(
+        waiting_since.elapsed() < Duration::from_secs(3),
+        "upgrade timeout must not wait for the five-second hook safety bound"
+    );
+    let before = h.fake.state.requests().len();
+    resume.send(()).unwrap();
+    // This gate acquisition cannot finish before the detached selector exits.
+    let barrier = h
+        .state
+        .bindings
+        .begin_request_async(Some("codex:synthetic-ws-session"), a)
+        .await
+        .unwrap();
+    drop(barrier);
+    assert_eq!(
+        h.state
+            .bindings
+            .current(Some("codex:synthetic-ws-session"))
+            .as_deref(),
+        Some(a.as_str())
+    );
+    assert_eq!(h.state.ws_reserved_for_test(b), 0);
+    h.fake.state.set_echo(true);
+    create(&mut original, "detached-admission-survivor").await;
+    let Message::Text(echo) = receive(&mut original).await else {
+        panic!("old socket must remain usable")
+    };
+    assert_eq!(
+        serde_json::from_str::<Value>(&echo).unwrap()["model"],
+        "detached-admission-survivor"
+    );
+    assert_eq!(
+        h.fake.state.requests().len(),
+        before,
+        "expired selector must never dial"
+    );
+    original.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn r12_9_unrelated_cap_cannot_mask_unavailable_strict_anchor() {
+    let h = Harness::new(2).await;
+    h.fake.state.keep_old_connections();
+    h.pins.set(Provider::Codex, None, h.ids[0].clone());
+    let (mut anchor, _) = h.connect().await;
+    h.pins.clear();
+    routing_ws::strict(&h).await;
+    let mut unrelated = learn_one_socket_cap(&h, &h.ids[1], "synthetic-unrelated").await;
+    h.state
+        .accounts
+        .change(&h.ids[0], Some(UserState::Paused), None, None, None)
+        .await
+        .unwrap();
+    let (status, body) = tokio::time::timeout(Duration::from_secs(2), h.error())
+        .await
+        .expect("strict policy failure must not wait for unrelated capacity");
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["type"], "routing_policy_blocked");
+    let _ = anchor.close(None).await;
+    unrelated.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn r12_9_healthy_strict_anchor_waits_for_own_slot_despite_free_other_account() {
+    let h = Harness::new(2).await;
+    h.fake.state.keep_old_connections();
+    let mut anchor = learn_one_socket_cap(&h, &h.ids[0], "synthetic-ws-session").await;
+    routing_ws::strict(&h).await;
+    let (collected, resume) = h.state.pause_next_ws_selection();
+    let request = h.request();
+    let pending = tokio::spawn(async move { connect_async(request).await });
+    collected.await.unwrap();
+    let before = h.fake.state.requests().len();
+    resume.send(()).unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), async {
+            while !pending.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_err(),
+        "strict capped anchor must wait"
+    );
+    assert_eq!(h.fake.state.requests().len(), before);
+    anchor.close(None).await.unwrap();
+    drop(anchor);
+    let (mut replacement, response) = tokio::time::timeout(Duration::from_secs(3), pending)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        response.headers()["x-quota-baton-account"],
+        h.ids[0].as_str()
+    );
+    replacement.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn r12_9_capacity_wait_and_predial_selection_cancel_on_drain() {
+    // Repeat at a capacity wait and while candidate selection is suspended.
+    for paused_selection in [false, true] {
+        let h = Harness::new(1).await;
+        h.fake.state.keep_old_connections();
+        let mut live = learn_one_socket_cap(&h, &h.ids[0], "synthetic-ws-session").await;
+        let (collected, resume) = h.state.pause_next_ws_selection();
+        let request = h.request();
+        let pending = tokio::spawn(async move { connect_async(request).await });
+        collected.await.unwrap();
+        let mut resume = Some(resume);
+        if !paused_selection {
+            resume.take().unwrap().send(()).unwrap();
+            capacity_wait_started(&h).await;
+        }
+        let before = h.fake.state.requests().len();
+        let state = h.state.clone();
+        let drain = tokio::spawn(async move { state.begin_drain().await });
+        h.state.wait_for_drain_start().await;
+        // Freeing the old slot during drain must not authorize another dial.
+        let _ = live.close(None).await;
+        let Error::Http(response) = tokio::time::timeout(Duration::from_secs(2), pending)
+            .await
+            .expect("drain cancels queued upgrade promptly")
+            .unwrap()
+            .unwrap_err()
+        else {
+            panic!("handover response expected")
+        };
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()["retry-after"], "1");
+        assert_eq!(h.fake.state.requests().len(), before);
+        drop(resume);
+        drain.await.unwrap().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn r12_9_reserved_predial_rate_wait_cancels_and_releases_slot_on_drain() {
+    let h = Harness::new(1).await;
+    h.state
+        .accounts
+        .observe_429(&h.ids[0], Some(Duration::from_secs(20)));
+    let request = h.request();
+    let pending = tokio::spawn(async move { connect_async(request).await });
+    capacity_count(&h, &h.ids[0], 1).await;
+    let state = h.state.clone();
+    let drain = tokio::spawn(async move { state.begin_drain().await });
+    let Error::Http(response) = tokio::time::timeout(Duration::from_secs(2), pending)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err()
+    else {
+        panic!("handover response expected")
+    };
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    capacity_count(&h, &h.ids[0], 0).await;
+    assert!(
+        h.fake.state.requests().is_empty(),
+        "cancelled admission must not dial"
+    );
+    drain.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn r12_9_capped_upgrade_cancels_while_drain_waits_for_detached_refresh() {
+    let h = Harness::new_with_owned(2, true).await;
+    h.fake.state.keep_old_connections();
+    let mut live = learn_one_socket_cap(&h, &h.ids[0], "synthetic-ws-session").await;
+    routing_ws::strict(&h).await;
+    h.pins.set(Provider::Codex, None, h.ids[1].clone());
+    h.fake.state.push_handshake(
+        StatusCode::UNAUTHORIZED,
+        r#"{"error":{"code":"token_expired"}}"#,
+        HeaderMap::new(),
+    );
+    let mut refresh_response = ScriptedResponse::json(
+        StatusCode::OK,
+        r#"{"access_token":"synthetic-after-drain","refresh_token":"synthetic-drain-rotation","expires_in":3600}"#,
+    );
+    refresh_response.chunks[0].0 = Duration::from_secs(3);
+    h.token_fake.state.push(refresh_response);
+    let refresh_request = session_request(&h, "synthetic-refresh-owner");
+    let refreshing = tokio::spawn(async move { connect_async(refresh_request).await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while h.token_fake.state.requests().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detached synthetic refresh started");
+    h.pins.clear();
+    let (collected, resume) = h.state.pause_next_ws_selection();
+    let request = h.request();
+    let queued = tokio::spawn(async move { connect_async(request).await });
+    collected.await.unwrap();
+    resume.send(()).unwrap();
+    capacity_wait_started(&h).await;
+    let state = h.state.clone();
+    let drain = tokio::spawn(async move { state.begin_drain().await });
+    h.state.wait_for_drain_start().await;
+    assert!(
+        !drain.is_finished(),
+        "refresh shutdown must still be pending"
+    );
+    let before = h.fake.state.requests().len();
+    let _ = live.close(None).await;
+    let Error::Http(response) = tokio::time::timeout(Duration::from_secs(1), queued)
+        .await
+        .expect("capacity waiter cancels before refresh finishes")
+        .unwrap()
+        .unwrap_err()
+    else {
+        panic!("handover response expected")
+    };
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        !drain.is_finished(),
+        "response does not wait for binding freeze"
+    );
+    tokio::time::timeout(Duration::from_secs(5), drain)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        h.fake.state.requests().len(),
+        before,
+        "free slot during refresh shutdown must not redial"
+    );
+    let Error::Http(response) = refreshing.await.unwrap().unwrap_err() else {
+        panic!("refresh owner also cancels")
+    };
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn r12_9_stream_rejection_close_spreads_and_records_connection_code() {
+    let h = Harness::new(2).await;
+    h.fake.state.keep_old_connections();
+    let mut live = learn_one_socket_cap(&h, &h.ids[0], "synthetic-ws-session").await;
+    let (mut next, destination) = h.connect().await;
+    assert_eq!(destination, h.ids[1]);
+    let rows = h.ledger();
+    let diagnostic = rows
+        .iter()
+        .find(|row| row["outcome"] == "ws_connection_error")
+        .unwrap();
+    assert_eq!(diagnostic["account"], h.ids[0]);
+    assert_eq!(diagnostic["upstream_status"], 400);
+    assert_eq!(
+        diagnostic["upstream_error_code"],
+        "websocket_connection_limit_reached"
+    );
+    assert!(diagnostic["session"].is_null());
+    assert!(
+        rows.iter()
+            .any(|row| row["event"] == "ws_open" && row["connection"] == diagnostic["req"])
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row.to_string().contains("never-ledger-stream-body"))
+    );
+    live.close(None).await.unwrap();
+    next.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn r12_9_unknown_response_error_is_sanitized_without_finishing_active_turn() {
+    let h = Harness::new(1).await;
+    let (mut client, _) = h.connect().await;
+    h.fake.state.push_reply([Message::Text(
+        json!({"type":"response.created","response":{"id":"known-response"}})
+            .to_string()
+            .into(),
+    )]);
+    create(&mut client, "fixture-model").await;
+    receive(&mut client).await;
+    for code in [
+        "websocket_connection_limit_reached",
+        "sk-never-ledger-secret",
+        "invalid code with spaces",
+    ] {
+        let event = json!({"type":"error","response_id":"unknown-response","status":400,
+            "error":{"code":code,"message":"never-ledger-unknown-body"}})
+        .to_string();
+        h.fake
+            .state
+            .send(Message::Text(event.clone().into()))
+            .unwrap();
+        assert_eq!(receive(&mut client).await, Message::Text(event.into()));
+    }
+    let rows = h.ledger();
+    let errors: Vec<_> = rows
+        .iter()
+        .filter(|row| row["outcome"] == "ws_connection_error")
+        .collect();
+    assert_eq!(errors.len(), 3);
+    assert_eq!(
+        errors[0]["upstream_error_code"],
+        "websocket_connection_limit_reached"
+    );
+    assert!(errors[1]["upstream_error_code"].is_null());
+    assert!(errors[2]["upstream_error_code"].is_null());
+    assert!(!rows.iter().any(|row| row["outcome"] == "upstream_error"));
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row.to_string().contains("never-ledger-unknown-body")
+                || row.to_string().contains("sk-never-ledger-secret"))
+    );
+    h.fake
+        .state
+        .send(Message::Text(
+            json!({"type":"response.completed","response":{"id":"known-response"}})
+                .to_string()
+                .into(),
+        ))
+        .unwrap();
+    receive(&mut client).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !h
+            .ledger()
+            .iter()
+            .any(|row| row["outcome"] == "ok" && row["model"] == "fixture-model")
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("known turn still completes normally");
+    client.close(None).await.unwrap();
 }
 
 #[tokio::test]
