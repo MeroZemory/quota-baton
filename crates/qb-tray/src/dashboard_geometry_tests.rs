@@ -46,13 +46,19 @@ fn r10_no_matching_search_is_centered_with_forty_dip_padding() {
             .find(|r| r.region == ScrollRegion::Table)
             .unwrap()
             .viewport;
-        let text = scene
+        let node = scene
             .accessibility
             .iter()
             .find(|n| n.key == "empty:search")
-            .unwrap()
-            .rect;
-        assert!(((text.top + text.bottom) - (viewport.top + viewport.bottom)).abs() < 1.);
+            .unwrap();
+        assert_eq!(node.role, Role::Text);
+        assert_eq!(node.parent.as_deref(), Some("sessions:table"));
+        assert_eq!(
+            node.name,
+            format!("“{}”와 맞는 세션이 없습니다", state.search)
+        );
+        let text = node.rect;
+        assert_eq!(text.top - viewport.top, 40.);
         assert_eq!(text.left - viewport.left, 40.);
         assert_eq!(viewport.right - text.right, 40.);
         assert!(text.top - viewport.top >= 40. && viewport.bottom - text.bottom >= 40.);
@@ -930,6 +936,282 @@ fn r7_measured_long_events_expand_content_and_all_text_uses_clip() {
     assert!(after.content_height > before.content_height);
     assert!(after.max_offset > 0.);
 }
+
+#[test]
+fn r10_folded_event_body_uses_its_draw_width_and_full_measured_height() {
+    for size in [[1024., 640.], [1179., 960.], [1180., 960.], [1320., 960.]] {
+        for long_refs in [false, true] {
+            for relogin in [false, true] {
+                let mut state = DashboardState {
+                    tab: Tab::Events,
+                    event_filter: EventFilter::All,
+                    ..Default::default()
+                };
+                let mut v = view(&mut state);
+                v.events.truncate(1);
+                let event = &mut v.events[0];
+                event.body = "한도에 도달했습니다.\n같은 알림 2번 더 · 04:52, 04:44".into();
+                event.account = Some("cl-a".into());
+                event.account_label = Some(if long_refs {
+                    "긴 계정 이름".repeat(32)
+                } else {
+                    "hello".into()
+                });
+                event.session = long_refs.then(|| "synthetic-session".into());
+                event.session_label = long_refs.then(|| "긴 세션 이름".repeat(32));
+                event.relogin = relogin;
+                let body = event.body.clone();
+                let key = format!("event:{}", event.seq);
+                let probe = Scene::build(&v, &state, size, &Metrics::default());
+                let (body_rect, body_measure) = probe
+                    .draw
+                    .iter()
+                    .find_map(|draw| match draw {
+                        Draw::Text { rect, measure, .. } if measure.text == body => {
+                            Some((*rect, measure))
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                let viewport = probe
+                    .content
+                    .iter()
+                    .find(|r| r.region == ScrollRegion::Events)
+                    .unwrap()
+                    .viewport;
+                // A row is 2 DIP narrower than its card. Assert against the
+                // actual drawn box, not another copy of the layout formula.
+                let body_probes: Vec<_> = probe
+                    .measurements
+                    .iter()
+                    .filter(|m| m.text == body && m.wrap)
+                    .collect();
+                assert!(body_probes.len() >= 2);
+                assert!(body_probes.iter().all(|m| m.width == width(body_rect)));
+                assert!(body_rect.left >= viewport.left && body_rect.right <= viewport.right);
+                assert!(body_measure.wrap && body_measure.line_height == 16.);
+                for measured_height in [32., 48., 128.] {
+                    let mut metrics = Metrics::default();
+                    metrics.heights.insert(body_measure.key(), measured_height);
+                    let scene = Scene::build(&v, &state, size, &metrics);
+                    let row = scene.accessibility.iter().find(|n| n.key == key).unwrap();
+                    let (allocated, measure) = scene
+                        .draw
+                        .iter()
+                        .find_map(|draw| match draw {
+                            Draw::Text { rect, measure, .. } if measure.text == body => {
+                                Some((*rect, measure))
+                            }
+                            _ => None,
+                        })
+                        .unwrap();
+                    assert_eq!(measure.key(), body_measure.key());
+                    assert_eq!(
+                        height(allocated),
+                        measured_height,
+                        "all measured lines, including the repeat summary, need space"
+                    );
+                    assert_eq!(
+                        height(row.rect),
+                        measured_height + 50. + if relogin { 36. } else { 0. }
+                    );
+                    assert!(
+                        allocated.bottom <= row.rect.bottom && allocated.bottom <= viewport.bottom
+                    );
+                    assert!(
+                        row.name.ends_with(&body),
+                        "full folded body stays in the semantic event"
+                    );
+                    assert!(measure.text.contains("\n같은 알림 2번 더 · 04:52, 04:44"));
+                    if relogin {
+                        let action = scene
+                            .targets
+                            .iter()
+                            .find(|h| h.target == Target::OpenTrayAccount("cl-a".into()))
+                            .unwrap();
+                        assert!(
+                            action.rect.top >= allocated.bottom
+                                && action.rect.bottom <= row.rect.bottom
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn r10_empty_guidance_wraps_four_inline_mono_chips_with_the_complete_sentences() {
+    let expected = "codex-qb나 claude-qb로 실행한 Codex·Claude가 요청을 보내면 여기에 바로 나타납니다. 그냥 codex나 claude로 실행하면 quota-baton을 거치지 않습니다.";
+    let commands = [
+        ("codex-qb", 130.25_f32),
+        ("claude-qb", 141.5),
+        ("codex", 90.75),
+        ("claude", 103.125),
+    ];
+    let expected_runs = [
+        "codex-qb",
+        "나",
+        "claude-qb",
+        "로",
+        "실행한",
+        "Codex·Claude가",
+        "요청을",
+        "보내면",
+        "여기에",
+        "바로",
+        "나타납니다.",
+        "그냥",
+        "codex",
+        "나",
+        "claude",
+        "로",
+        "실행하면",
+        "quota-baton을",
+        "거치지",
+        "않습니다.",
+    ];
+    let mut data = fixtures::snapshot();
+    data.sessions.sessions.clear();
+    let mut state = DashboardState::default();
+    let v = m::project(&data, &mut state, &fixtures::clock());
+    for size in [[1024., 640.], [1320., 960.]] {
+        let probe = Scene::build(&v, &state, size, &Metrics::default());
+        let mut metrics = Metrics::default();
+        // Deliberately distinct face metrics: a Text-face probe cannot satisfy
+        // these Mono widths. This is injected geometry data, not a font test.
+        for (command, natural) in commands {
+            let probes: Vec<_> = probe
+                .measurements
+                .iter()
+                .filter(|m| m.text == command && m.face == Face::Mono && m.width == 4096.)
+                .collect();
+            assert_eq!(probes.len(), 1, "each command needs a Mono width probe");
+            metrics.widths.insert(probes[0].key(), natural);
+            let mut wrong_face = (*probes[0]).clone();
+            wrong_face.face = Face::Text;
+            metrics.widths.insert(wrong_face.key(), 300.);
+        }
+        let scene = Scene::build(&v, &state, size, &metrics);
+        let help = scene
+            .accessibility
+            .iter()
+            .find(|n| n.key == "empty:sessions:help")
+            .unwrap();
+        assert_eq!(help.name, expected);
+        assert_eq!(help.role, Role::Text);
+        assert_eq!(help.parent.as_deref(), Some("empty:sessions"));
+        assert!(help.target.is_none());
+        assert_eq!(
+            scene
+                .accessibility
+                .iter()
+                .filter(|n| n.name == expected)
+                .count(),
+            1
+        );
+        assert!(
+            height(help.rect) >= 40.,
+            "narrow guidance must exercise wrapping"
+        );
+        let inside = |r: Rect| {
+            r.left >= help.rect.left - 0.01
+                && r.right <= help.rect.right + 0.01
+                && r.top >= help.rect.top - 0.01
+                && r.bottom <= help.rect.bottom + 0.01
+        };
+        let runs: Vec<_> = scene
+            .draw
+            .iter()
+            .filter_map(|draw| match draw {
+                Draw::Text { rect, measure, .. } if inside(*rect) => Some((*rect, measure)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            runs.iter()
+                .map(|(_, m)| m.text.as_str())
+                .collect::<Vec<_>>(),
+            expected_runs
+        );
+        let chips: Vec<_> = runs
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, m))| m.face == Face::Mono)
+            .collect();
+        assert_eq!(chips.len(), 4);
+        for ((index, (text_rect, measure)), (command, natural)) in chips.into_iter().zip(commands) {
+            assert_eq!(measure.text, command);
+            assert_eq!(measure.size, 12.);
+            let chip = scene
+                .draw
+                .iter()
+                .find_map(|draw| match draw {
+                    Draw::Stroke {
+                        rect,
+                        color: Color::Border,
+                        radius,
+                        ..
+                    } if *radius == 4.
+                        && rect.left + 7. == text_rect.left
+                        && rect.top + 2. == text_rect.top =>
+                    {
+                        Some(*rect)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert!(inside(chip));
+            assert_eq!(height(chip), 20.);
+            assert_eq!(width(chip), natural.ceil() + 14.);
+            assert!(scene.draw.iter().any(|draw| matches!(draw,Draw::Fill {rect,color:Color::Footer,radius} if *rect == chip && *radius == 4.)));
+            let (suffix, suffix_measure) = runs[index + 1];
+            assert!(matches!(suffix_measure.text.as_str(), "나" | "로"));
+            assert_eq!(
+                suffix.top, chip.top,
+                "command and Korean suffix stay on one line"
+            );
+            assert_eq!(
+                suffix.left, chip.right,
+                "command chip stays inside its sentence"
+            );
+            assert!(
+                !scene
+                    .targets
+                    .iter()
+                    .any(|h| intersection(h.rect, chip).is_some()),
+                "command examples are not actions"
+            );
+        }
+        let mut lines = std::collections::BTreeMap::<i32, (f32, f32)>::new();
+        for (r, m) in &runs {
+            let top = r.top - if m.face == Face::Mono { 2. } else { 0. };
+            let line = ((top - help.rect.top) / 20.).round() as i32;
+            let left = r.left - if m.face == Face::Mono { 7. } else { 0. };
+            let right = r.right + if m.face == Face::Mono { 7. } else { 0. };
+            let bounds = lines.entry(line).or_insert((left, right));
+            bounds.0 = bounds.0.min(left);
+            bounds.1 = bounds.1.max(right);
+        }
+        assert!(lines.len() >= 2);
+        assert_eq!(height(help.rect), lines.len() as f32 * 20.);
+        for (line, (left, right)) in lines {
+            assert!(line >= 0);
+            assert!(
+                ((left + right) - (help.rect.left + help.rect.right)).abs() < 0.1,
+                "each wrapped sentence line stays centered"
+            );
+        }
+        let recovery = scene
+            .targets
+            .iter()
+            .find(|h| h.target == Target::Today)
+            .unwrap();
+        assert_eq!(recovery.rect.top - help.rect.bottom, 16.);
+        assert_eq!(height(recovery.rect), 32.);
+    }
+}
+
 #[test]
 fn r7_no_sessions_block_is_centered_with_measured_text_and_no_column_header() {
     let mut data = fixtures::snapshot();
@@ -990,7 +1272,7 @@ fn r7_no_sessions_block_is_centered_with_measured_text_and_no_column_header() {
             })
             .collect::<Vec<_>>();
         assert!(centered.iter().any(|m| m.text.starts_with("최근 1시간")));
-        assert!(centered.iter().any(|m| m.text.starts_with("codex-qb나")));
+        assert!(help.name.starts_with("codex-qb나"));
         let mut leading = (*centered[0]).clone();
         leading.align = TextAlign::Leading;
         assert_ne!(leading.key(), centered[0].key());
