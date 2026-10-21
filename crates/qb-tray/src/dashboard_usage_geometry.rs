@@ -598,11 +598,20 @@ fn usage_tile(
     }
 }
 
-// §7: symmetric separation, then a common shift at either plot edge.
+// §7: symmetric separation projected into the plot's feasible bounds.
 fn end_label_positions(preferred: &[f32], plot: Rect) -> Vec<f32> {
     // Keep at least §7's 14 DIP separation and room for each 16 DIP backing.
     const GAP: f32 = 16.;
+    let lower = plot.top + 6.;
+    let upper = plot.bottom - 18.;
+    if preferred.is_empty() || upper < lower {
+        return Vec::new();
+    }
+    // Omit excess labels rather than overlap backings or leave the plot.
+    let capacity = (((upper - lower) / GAP).floor() as usize).saturating_add(1);
+    let preferred = &preferred[..preferred.len().min(capacity)];
     let mut positions = preferred.to_vec();
+    let upper_mean = upper - (positions.len() - 1) as f32 * GAP;
     // Pool colliding neighbours around their original mean (also handles >2 windows).
     let mut blocks: Vec<(usize, usize, f32)> = Vec::new();
     for (i, &y) in preferred.iter().enumerate() {
@@ -624,20 +633,10 @@ fn end_label_positions(preferred: &[f32], plot: Rect) -> Vec<f32> {
         }
     }
     for (start, count, mean) in blocks {
+        // A common interval preserves monotone means, hence GAP separation.
+        let mean = mean.clamp(lower, upper_mean);
         for (i, y) in positions.iter_mut().enumerate().skip(start).take(count) {
             *y = mean + i as f32 * GAP;
-        }
-    }
-    if let Some(&first) = positions.first() {
-        let shift = (plot.top + 6. - first).max(0.);
-        for y in &mut positions {
-            *y += shift;
-        }
-    }
-    if let Some(&last) = positions.last() {
-        let shift = (last - (plot.bottom - 18.)).max(0.);
-        for y in &mut positions {
-            *y -= shift;
         }
     }
     positions
