@@ -299,18 +299,42 @@ fn validate(snapshot: &Snapshot) -> Result<()> {
     if focus_count > 1 {
         return Err(Error::from_hresult(E_INVALIDARG));
     }
-    let parents: std::collections::HashMap<_, _> =
-        snapshot.elements.iter().map(|e| (e.id, e.parent)).collect();
+    let mut parents: std::collections::HashMap<_, _> = snapshot
+        .elements
+        .iter()
+        .map(|e| (e.id, (e.parent, None::<usize>)))
+        .collect();
     for e in &snapshot.elements {
-        let mut cursor = e.parent;
-        let mut seen = HashSet::from([e.id]);
-        while let Some(parent) = cursor {
-            if seen.len() > 64 || !seen.insert(parent) {
+        // Resolve each ancestor once. A fixed path avoids allocating a HashSet
+        // for every cell in a large chart's hidden accessibility table.
+        let mut path = [0; 65];
+        let mut len = 0;
+        let mut cursor = e.id;
+        let mut depth = loop {
+            let &(parent, depth) = parents
+                .get(&cursor)
+                .ok_or_else(|| Error::from_hresult(E_INVALIDARG))?;
+            if let Some(depth) = depth {
+                break depth;
+            }
+            if len == path.len() || path[..len].contains(&cursor) {
                 return Err(Error::from_hresult(E_INVALIDARG));
             }
-            cursor = *parents
-                .get(&parent)
-                .ok_or_else(|| Error::from_hresult(E_INVALIDARG))?;
+            if let Some(parent) = parent {
+                path[len] = cursor;
+                len += 1;
+                cursor = parent;
+            } else {
+                parents.get_mut(&cursor).unwrap().1 = Some(0);
+                break 0;
+            }
+        };
+        for id in path[..len].iter().rev() {
+            depth += 1;
+            if depth > 64 {
+                return Err(Error::from_hresult(E_INVALIDARG));
+            }
+            parents.get_mut(id).unwrap().1 = Some(depth);
         }
     }
     Ok(())
@@ -2429,6 +2453,43 @@ mod tests {
         assert!(owner.publish(cycle, 1).is_err());
         owner.publish(scene(), 1)?;
         Ok(())
+    }
+    #[test]
+    fn r1210_accessibility_parent_depth_limit_is_order_independent() {
+        let mut snapshot = scene();
+        snapshot.elements = (1..=65)
+            .map(|id| {
+                let mut element = pattern_element(id, Kind::Group, None, None, None, None);
+                element.parent = (id > 1).then_some(id - 1);
+                element
+            })
+            .collect();
+        assert!(validate(&snapshot).is_ok()); // Root plus 64 ancestors.
+        snapshot.elements.reverse();
+        assert!(validate(&snapshot).is_ok());
+        let mut too_deep = pattern_element(66, Kind::Text, None, None, None, None);
+        too_deep.parent = Some(65);
+        snapshot.elements.push(too_deep);
+        assert!(validate(&snapshot).is_err());
+        snapshot.elements.reverse();
+        assert!(validate(&snapshot).is_err());
+    }
+    #[test]
+    fn r1210_accessibility_shared_ancestors_do_not_hide_broken_components() {
+        let mut snapshot = scene();
+        snapshot.elements = (1..=10_000)
+            .map(|id| {
+                let mut element = pattern_element(id, Kind::Group, None, None, None, None);
+                element.parent = (id > 1).then_some(1);
+                element
+            })
+            .collect();
+        assert!(validate(&snapshot).is_ok());
+        snapshot.elements[5000].parent = Some(5002);
+        snapshot.elements[5001].parent = Some(5001);
+        assert!(validate(&snapshot).is_err());
+        snapshot.elements[5001].parent = Some(20_000);
+        assert!(validate(&snapshot).is_err());
     }
     #[test]
     fn dashboard_selected_tabs_and_search_value_have_cached_semantics() -> Result<()> {
