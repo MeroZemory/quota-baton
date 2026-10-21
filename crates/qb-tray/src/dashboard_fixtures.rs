@@ -27,6 +27,7 @@ pub fn snapshot() -> DashboardSnapshot {
     ]});
     let tray = v2::project(&accounts.to_string(), now.utc().into()).unwrap();
     let mut data = DashboardSnapshot::new(tray);
+    data.data_at = Some(now.utc());
     for i in 0..12u64 {
         let provider = if i < 6 { "claude" } else { "codex" };
         let account = if i < 4 {

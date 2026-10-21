@@ -32,13 +32,14 @@ use windows::{
         Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
         Graphics::{
             Direct2D::{
-                Common::D2D_SIZE_U, D2D1_FACTORY_TYPE_SINGLE_THREADED,
-                D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE,
-                D2D1_RENDER_TARGET_PROPERTIES, D2D1CreateFactory, ID2D1Factory,
-                ID2D1HwndRenderTarget,
+                Common::{D2D_SIZE_U, D2D1_ALPHA_MODE_IGNORE, D2D1_PIXEL_FORMAT},
+                D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_HWND_RENDER_TARGET_PROPERTIES,
+                D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES, D2D1CreateFactory,
+                ID2D1Factory, ID2D1HwndRenderTarget,
             },
+            Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
             Gdi::{
-                BeginPaint, ClientToScreen, EndPaint, GetMonitorInfoW, InvalidateRect,
+                BeginPaint, ClientToScreen, EndPaint, GetMonitorInfoW, HDC, InvalidateRect,
                 MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect, MonitorFromWindow,
                 PAINTSTRUCT, ScreenToClient,
             },
@@ -401,7 +402,7 @@ fn focus_edit(hwnd: HWND, target: Target) {
     let Some(host) = current(hwnd) else { return };
     {
         let mut h = host.borrow_mut();
-        if h.state.popup.is_some() {
+        if !h.snapshot.connection.core_ok || h.state.popup.is_some() {
             return;
         }
         let text = if target == Target::EventSearch {
@@ -427,6 +428,9 @@ fn finish_edit(hwnd: HWND) {
     }
 }
 fn sync_search(h: &mut Host) {
+    if !h.snapshot.connection.core_ok {
+        return;
+    }
     let displayed = h.edit.displayed();
     match h.editing {
         Some(Target::Search) => {
@@ -455,6 +459,13 @@ fn apply_mail(hwnd: HWND) {
         if let Some((snapshot, clock)) = mail.snapshot.take()
             && snapshot.revision >= h.snapshot.revision
         {
+            if !snapshot.connection.core_ok {
+                h.editing = None;
+                h.edit.composition.clear();
+                h.input.focus = None;
+                h.input.pressed = None;
+                h.state.popup = None;
+            }
             h.snapshot = snapshot;
             h.clock = clock;
             h.clock_at = Instant::now();
@@ -575,6 +586,42 @@ fn flush_geometry(hwnd: HWND, force: bool) {
             });
         }
     }
+}
+
+unsafe fn print_client(hwnd: HWND, dc: HDC) -> Result<()> {
+    if dc.is_invalid() {
+        return Err(invalid());
+    }
+    // Refresh the same frame used by hit-testing and UIA before Windows copies it.
+    unsafe { paint(hwnd) }?;
+    let host = current(hwnd).ok_or_else(invalid)?;
+    let h = host.borrow();
+    let frame = h.frame.as_ref().ok_or_else(invalid)?;
+    let (pixels, dpi) = unsafe { metrics(hwnd) }.ok_or_else(invalid)?;
+    let target = unsafe {
+        h.factory
+            .CreateDCRenderTarget(&D2D1_RENDER_TARGET_PROPERTIES {
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_IGNORE,
+                },
+                dpiX: dpi as f32,
+                dpiY: dpi as f32,
+                ..Default::default()
+            })
+    }?;
+    unsafe {
+        target.BindDC(
+            dc,
+            &RECT {
+                left: 0,
+                top: 0,
+                right: pixels[0] as i32,
+                bottom: pixels[1] as i32,
+            },
+        )?;
+    }
+    h.renderer.paint(&target, &frame.scene, &h.input)
 }
 
 unsafe fn paint(hwnd: HWND) -> Result<()> {
@@ -983,6 +1030,9 @@ fn keyboard(hwnd: HWND, key: usize) -> bool {
     let Some(host) = current(hwnd) else {
         return false;
     };
+    if !host.borrow().snapshot.connection.core_ok {
+        return true;
+    }
     if matches!(key, 0x09 | 0x25..=0x28) {
         host.borrow_mut().input.keyboard_focus = true;
     }
@@ -1081,6 +1131,7 @@ fn keyboard(hwnd: HWND, key: usize) -> bool {
                 &frame.as_ref().unwrap().scene,
                 input.focus.as_ref(),
                 key == 0x26,
+                true, // The snapshot connection guard above covers every keyboard path.
             )
             .map(|(focus, commands)| {
                 input.focus = Some(focus);
@@ -1208,7 +1259,11 @@ fn ime(hwnd: HWND, flags: isize) {
     let Some(host) = current(hwnd) else { return };
     let accepts_text = {
         let h = host.borrow();
-        window_logic::text_input_allowed(&h.state, h.editing.is_some())
+        window_logic::text_input_allowed(
+            &h.state,
+            h.editing.is_some(),
+            h.snapshot.connection.core_ok,
+        )
     };
     if !accepts_text {
         return;
@@ -1345,6 +1400,10 @@ unsafe extern "system" fn wndproc(
 ) -> LRESULT {
     match message {
         WM_ERASEBKGND => return LRESULT(1),
+        WM_PRINTCLIENT => {
+            let _ = unsafe { print_client(hwnd, HDC(wparam.0 as *mut c_void)) };
+            return LRESULT(0);
+        }
         WM_PAINT => {
             let _ = unsafe { paint(hwnd) };
             position_ime(hwnd);
@@ -1575,8 +1634,11 @@ unsafe extern "system" fn wndproc(
                 if h.state.popup.is_some() {
                     return LRESULT(0);
                 }
-                if window_logic::text_input_allowed(&h.state, h.editing.is_some())
-                    && wparam.0 >= 32
+                if window_logic::text_input_allowed(
+                    &h.state,
+                    h.editing.is_some(),
+                    h.snapshot.connection.core_ok,
+                ) && wparam.0 >= 32
                     && !held(0x11)
                 {
                     h.edit.utf16(wparam.0 as u16);
