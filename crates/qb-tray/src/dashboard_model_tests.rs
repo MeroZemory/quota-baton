@@ -3,6 +3,35 @@ use crate::dashboard_fixtures as fixtures;
 use fixtures::*;
 
 #[test]
+fn r10_retained_data_timestamp_does_not_follow_later_offline_or_polling_clocks() {
+    let mut data = snapshot();
+    data.data_at = None; // Exercise the explicitly unknown publication time first.
+    let mut state = DashboardState {
+        range: Range::All,
+        ..Default::default()
+    };
+    let initial = clock();
+    assert_eq!(project(&data, &mut state, &initial).data_at, None);
+    data.data_at = Some(initial.utc());
+    let retained_sessions = data.sessions.sessions.len();
+    for core_ok in [false, true] {
+        data.connection.core_ok = core_ok;
+        data.connection.stream_ok = false;
+        for seconds in [30, 90] {
+            let mut later = initial.clone();
+            later.now += chrono::Duration::seconds(seconds);
+            let view = project(&data, &mut state, &later);
+            assert_eq!(view.clock.utc(), later.utc());
+            assert_eq!(view.data_at, Some(initial.utc()));
+            assert_ne!(view.data_at, Some(view.clock.utc()));
+            assert_eq!(view.session_count, retained_sessions);
+            assert_eq!(view.connection.core_ok, core_ok);
+            assert!(!view.connection.stream_ok);
+        }
+    }
+}
+
+#[test]
 fn r10_flat_account_status_uses_the_shared_chip_but_omits_serving_chip() {
     let data = snapshot();
     let session = &data.sessions.sessions[0];

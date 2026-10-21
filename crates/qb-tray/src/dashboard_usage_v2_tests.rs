@@ -306,7 +306,7 @@ fn r10_usage_relogin_stops_at_observation_and_hatches_only_the_unknown_span() {
 }
 
 #[test]
-fn r10_usage_shortest_solid_weekly_dashed_and_paused_all_solid_gray() {
+fn r10_usage_paused_shortest_is_solid_gray_and_weekly_retains_dashes() {
     let (v, mut t) = fixture();
     let s = scene(&v, &t);
     let lines = series_lines(&s);
@@ -327,8 +327,17 @@ fn r10_usage_shortest_solid_weekly_dashed_and_paused_all_solid_gray() {
     assert!(
         lines
             .iter()
-            .all(|(_, _, c, d)| matches!(c, Color::BarPaused) && d.is_none())
+            .any(|(_, _, c, d)| matches!(c, Color::BarPaused) && d.is_none())
     );
+    assert!(
+        lines
+            .iter()
+            .any(|(_, _, c, d)| matches!(c, Color::Series7d) && **d == Some([5., 3.]))
+    );
+    assert!(lines.iter().all(|(_, _, c, d)| {
+        (matches!(c, Color::BarPaused) && d.is_none())
+            || (matches!(c, Color::Series7d) && **d == Some([5., 3.]))
+    }));
 }
 
 #[test]

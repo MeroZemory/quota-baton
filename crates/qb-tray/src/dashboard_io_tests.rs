@@ -2,6 +2,48 @@ use super::*;
 use std::sync::atomic::AtomicUsize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[test]
+fn r10_data_timestamp_advances_only_for_successful_data_publications() {
+    let now = chrono::DateTime::parse_from_rfc3339("2026-10-21T06:25:50+09:00").unwrap();
+    let first = model::Clock {
+        now,
+        day_start: now.with_timezone(&Utc) - chrono::Duration::hours(6),
+        day_end: now.with_timezone(&Utc) + chrono::Duration::hours(18),
+    };
+    let mut data = model::DashboardSnapshot::new(
+        qb_tray::v2::project(r#"{"accounts":[]}"#, first.utc().into()).unwrap(),
+    );
+    let mut later = first.clone();
+    later.now += chrono::Duration::seconds(30);
+    record_data_publication(&mut data, ALL, false, &first);
+    assert_eq!(data.data_at, None);
+    record_data_publication(&mut data, CLOCK, true, &first);
+    assert_eq!(data.data_at, None);
+    record_data_publication(&mut data, ALL, true, &first);
+    assert_eq!(data.data_at, Some(first.utc()));
+
+    for (dirty, ok) in [
+        (CLOCK, true),
+        (CLOCK, false),
+        (ALL | CLOCK, false),
+        (USAGE, false),
+        (DETAIL, true),
+    ] {
+        record_data_publication(&mut data, dirty, ok, &later);
+        assert_eq!(data.data_at, Some(first.utc()));
+    }
+    // A successful fallback poll is fresh even while the stream stays down.
+    data.connection.stream_ok = false;
+    record_data_publication(&mut data, ALL | DETAIL, true, &later);
+    assert_eq!(data.data_at, Some(later.utc()));
+    assert!(!data.connection.stream_ok);
+    for dirty in [STATE, SESSIONS, ACTIVITY, USAGE] {
+        later.now += chrono::Duration::seconds(5);
+        record_data_publication(&mut data, dirty, true, &later);
+        assert_eq!(data.data_at, Some(later.utc()));
+    }
+}
+
 struct Fake {
     client: AdminClient,
     hold: Arc<Notify>,

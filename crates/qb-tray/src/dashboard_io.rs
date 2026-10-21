@@ -31,6 +31,18 @@ const DETAIL: u8 = 16;
 const CLOCK: u8 = 32;
 const ALL: u8 = STATE | SESSIONS | ACTIVITY;
 
+fn record_data_publication(
+    data: &mut model::DashboardSnapshot,
+    dirty: u8,
+    ok: bool,
+    clock: &model::Clock,
+) {
+    // Failed batches can retain older fields; do not label them as fresh.
+    if ok && dirty & (ALL | USAGE) != 0 {
+        data.data_at = Some(clock.utc());
+    }
+}
+
 pub(super) enum Handoff {
     Account(String),
     Add,
@@ -473,6 +485,8 @@ impl Coordinator {
                 }
             }
             if self.current(&work) {
+                let clock = clock();
+                record_data_publication(&mut data, work.dirty, ok, &clock);
                 revision = revision.saturating_add(1);
                 data.revision = revision;
                 data.connection = model::Connection {
@@ -481,7 +495,7 @@ impl Coordinator {
                     retry_seconds: 5,
                 };
                 let data = Arc::new(data);
-                work.port.snapshot(data.clone(), clock());
+                work.port.snapshot(data.clone(), clock);
                 cached = Some(data);
             } else {
                 self.requeue_obsolete(&work);

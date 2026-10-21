@@ -316,18 +316,14 @@ fn usage_tile(
     let mut endpoints = Vec::new();
     for (series_index, series) in t.series.iter().enumerate() {
         let weekly = series.name == "주간" || series.name == "7d";
-        let color = if t.paused {
-            Color::BarPaused
-        } else if weekly {
+        let color = if weekly {
             Color::Series7d
+        } else if t.paused {
+            Color::BarPaused
         } else {
             Color::BarOk
         };
-        let dash = if weekly && !t.paused {
-            Some([5., 3.])
-        } else {
-            None
-        };
+        let dash = if weekly { Some([5., 3.]) } else { None };
         let mut previous: Option<(DateTime<Utc>, f64)> = None;
         let resets: BTreeSet<_> = series.resets.iter().copied().collect();
         for (at, pct) in &series.points {
