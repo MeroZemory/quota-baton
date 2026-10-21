@@ -36,14 +36,9 @@ Implement quota-baton exactly as specified, row by row, until every row of the m
     Then comes the plain-language result. Gate, mark, hash and test-count listings go into a collapsed `<details>` block at the end. When a milestone finishes, its report is updated to read as finished (never "running"). Follow `C:/_projects/research/methods/reporting/devlog-and-interim-report.md` for wording.
 8. **Follow every rule in `AGENTS.md`:** question routing, build hygiene, the retention of `.sandbox` artifacts, and no secret dumps.
 
-## Lanes and next ready nodes (re-planned 2026-10-21)
+## Lanes and next ready nodes
 
-| Lane | Items | Waits on | Next ready node while waiting |
-|---|---|---|---|
-| A: product | R12 (images, priority) → R11 (launch-scoped account, per-account aliases) | nothing (synthetic and loopback tests) | — |
-| B: held | R2 Part B (retire-cpa / restore-cpa) | the user's go (D9) | lane A |
-| C: live | install, real-profile checks, live move/return, live image test | the design session (it installs) | lane A |
-| D: background | long gates, native harness runs, independent reviews | one completion signal each | the next unit of lane A |
+The current plan, with lanes, owners and start commands, is the "Plan" section of `docs/milestones.md`. The design session owns it. Dashboard and tray polish is frozen until R12 (new-Qi images) and R11 ship.
 
 ## Milestone order (architecture §17)
 
