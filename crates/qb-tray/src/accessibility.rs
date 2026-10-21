@@ -782,7 +782,8 @@ impl Node {
         if matches!(action, SelectionAction::Add)
             && cache.snapshot.elements.iter().any(|other| {
                 other.id != element.id
-                    && other.parent == element.parent
+                    // Session selection spans presentation groups; tabs stay separate.
+                    && (element.kind != Kind::Tab || other.parent == element.parent)
                     && Patterns::of(Some(other)).selection_item
                     && (other.kind == Kind::Tab) == (element.kind == Kind::Tab)
                     && other.selected == Some(true)
@@ -1760,6 +1761,59 @@ mod tests {
         assert_eq!(
             &posts.messages()[5..],
             [(1, WM_UIA_INVOKE, 5, 2), (1, WM_UIA_INVOKE, 7, 2)]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn raw_add_to_selection_rejects_selected_sessions_across_groups() -> Result<()> {
+        let posts = PostCapture::new();
+        let owner = create_root_provider(1)?;
+        let mut snapshot = pattern_scene();
+        snapshot
+            .elements
+            .iter_mut()
+            .find(|e| e.id == 5)
+            .unwrap()
+            .parent = Some(14);
+        owner.publish(snapshot.clone(), 1)?;
+        let row = com_pattern::<ISelectionItemProvider>(
+            &com_element(&owner, 4)?,
+            UIA_SelectionItemPatternId,
+        )?;
+        let other = com_pattern::<ISelectionItemProvider>(
+            &com_element(&owner, 5)?,
+            UIA_SelectionItemPatternId,
+        )?;
+        unsafe {
+            assert_eq!(
+                (other.vtable().AddToSelection)(other.as_raw()),
+                uia_error(UIA_E_INVALIDOPERATION).code()
+            );
+            assert!(posts.messages().is_empty());
+            assert!(row.IsSelected()?.as_bool());
+            assert!(!other.IsSelected()?.as_bool());
+            // Select may still replace the selected session in another group.
+            (other.vtable().Select)(other.as_raw()).ok()?;
+        }
+        assert_eq!(posts.messages(), [(1, WM_UIA_INVOKE, 7, 1)]);
+
+        snapshot
+            .elements
+            .iter_mut()
+            .find(|e| e.id == 4)
+            .unwrap()
+            .selected = Some(false);
+        owner.publish(snapshot, 2)?;
+        let other = com_pattern::<ISelectionItemProvider>(
+            &com_element(&owner, 5)?,
+            UIA_SelectionItemPatternId,
+        )?;
+        // The selected tab is a separate domain and cannot block this addition.
+        unsafe { (other.vtable().AddToSelection)(other.as_raw()).ok()? };
+        assert_eq!(
+            posts.messages(),
+            [(1, WM_UIA_INVOKE, 7, 1), (1, WM_UIA_INVOKE, 7, 2)]
         );
         Ok(())
     }
