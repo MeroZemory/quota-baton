@@ -338,6 +338,8 @@ impl Default for Connection {
 }
 #[derive(Clone, Debug)]
 pub struct DashboardSnapshot {
+    /// Last successful dashboard data publication; independent of the UI clock.
+    pub data_at: Option<DateTime<Utc>>,
     pub accounts: v2::View,
     pub sessions: SessionsResponse,
     pub activity: Vec<ActivityEvent>,
@@ -349,6 +351,7 @@ pub struct DashboardSnapshot {
 impl DashboardSnapshot {
     pub fn new(accounts: v2::View) -> Self {
         Self {
+            data_at: None,
             accounts,
             sessions: Default::default(),
             activity: vec![],
@@ -485,6 +488,7 @@ pub enum EmptyState {
 pub struct DashboardView {
     pub revision: u64,
     pub clock: Clock,
+    pub data_at: Option<DateTime<Utc>>,
     pub connection: Connection,
     pub summaries: Vec<String>,
     pub provider_summaries: Vec<v2::Summary>,
@@ -1129,6 +1133,7 @@ pub fn project(
     DashboardView {
         revision: snapshot.revision,
         clock: clock.clone(),
+        data_at: snapshot.data_at,
         connection: snapshot.connection.clone(),
         summaries: snapshot
             .accounts
