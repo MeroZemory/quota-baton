@@ -11,14 +11,15 @@ use crate::{
     v2_colors::{Palette, Rgb},
     v2_render, v2_text,
 };
-#[cfg(any(debug_assertions, feature = "testkit"))]
-use std::{cell::Cell, time::Instant};
 use std::{
+    borrow::Cow,
     cell::RefCell,
     collections::{BTreeMap, BTreeSet, VecDeque},
     ops::{Deref, DerefMut},
     sync::Arc,
 };
+#[cfg(any(debug_assertions, feature = "testkit"))]
+use std::{cell::Cell, time::Instant};
 use windows::{
     Win32::Graphics::{
         Direct2D::{Common::D2D_RECT_F, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, ID2D1RenderTarget},
@@ -31,6 +32,7 @@ pub struct Renderer {
     shared: v2_render::Renderer,
     paint_text_proofs: RefCell<PaintTextProofs>,
     scene_metrics: RefCell<SceneMetricCache>,
+    wrapped_text: RefCell<WrappedTextCache>,
     #[cfg(test)]
     scene_builds: std::cell::Cell<usize>,
     #[cfg(any(debug_assertions, feature = "testkit"))]
@@ -412,6 +414,52 @@ impl PaintTextProofs {
     }
 }
 
+// Cache only prepared UTF-8, never native layouts or caller-visible mutable data.
+// Measure::key covers every input; fonts and fallback stay with this Renderer.
+const WRAPPED_TEXT_CAPACITY: usize = 4_096;
+const WRAPPED_TEXT_BYTES: usize = 1024 * 1024;
+const WRAPPED_TEXT_INPUT_LIMIT: usize = 16 * 1024;
+#[derive(Default)]
+struct WrappedTextCache {
+    entries: BTreeMap<String, String>,
+    order: VecDeque<String>,
+    // Actual retained string capacities: map key + FIFO key + wrapped value.
+    bytes: usize,
+    #[cfg(test)]
+    preparations: usize,
+}
+impl WrappedTextCache {
+    fn remember(&mut self, key: String, value: &str) {
+        if self.entries.contains_key(&key)
+            || key.len().saturating_mul(2).saturating_add(value.len()) > WRAPPED_TEXT_BYTES
+        {
+            return;
+        }
+        let order_key = key.clone();
+        let value = value.to_owned();
+        let bytes = key
+            .capacity()
+            .saturating_add(order_key.capacity())
+            .saturating_add(value.capacity());
+        // An oversized entry must not evict useful retained text.
+        if bytes > WRAPPED_TEXT_BYTES {
+            return;
+        }
+        while self.entries.len() >= WRAPPED_TEXT_CAPACITY || self.bytes + bytes > WRAPPED_TEXT_BYTES
+        {
+            let old = self.order.pop_front().expect("retained wrapped-text key");
+            let (key, value) = self
+                .entries
+                .remove_entry(&old)
+                .expect("retained wrapped text");
+            self.bytes -= old.capacity() + key.capacity() + value.capacity();
+        }
+        self.bytes += bytes;
+        self.order.push_back(order_key);
+        self.entries.insert(key, value);
+    }
+}
+
 // Keep measurements, never scene geometry, across full builds. The Text engine's
 // fonts live for this Renderer; Measure::key includes every measurement input.
 // FIFO eviction only causes a normal probe miss. Count BOTH retained key copies.
@@ -522,6 +570,7 @@ impl Renderer {
             shared: v2_render::Renderer::new(dark)?,
             paint_text_proofs: RefCell::default(),
             scene_metrics: RefCell::default(),
+            wrapped_text: RefCell::default(),
             #[cfg(test)]
             scene_builds: std::cell::Cell::new(0),
             #[cfg(any(debug_assertions, feature = "testkit"))]
@@ -594,7 +643,34 @@ impl Renderer {
             .rebuild(&previous.view, state, &previous.scene, region, metrics)
     }
 
-    fn wrapped(&self, measure: &Measure) -> Result<String> {
+    fn wrapped<'a>(&self, measure: &'a Measure) -> Result<Cow<'a, str>> {
+        if !measure.wrap {
+            return Ok(Cow::Borrowed(&measure.text));
+        }
+        // Nonfinite floats do not have a complete textual key (NaN payloads).
+        // Preserve their existing behavior, but do not retain their results.
+        let key = (measure.text.len() <= WRAPPED_TEXT_INPUT_LIMIT
+            && measure.size.is_finite()
+            && measure.line_height.is_finite()
+            && measure.width.is_finite())
+        .then(|| measure.key());
+        if let Some(key) = key.as_ref()
+            && let Some(value) = self.wrapped_text.borrow().entries.get(key)
+        {
+            return Ok(Cow::Owned(value.clone()));
+        }
+        #[cfg(test)]
+        {
+            self.wrapped_text.borrow_mut().preparations += 1;
+        }
+        let out = self.wrap_uncached(measure)?;
+        if let Some(key) = key {
+            self.wrapped_text.borrow_mut().remember(key, &out);
+        }
+        Ok(Cow::Owned(out))
+    }
+
+    fn wrap_uncached(&self, measure: &Measure) -> Result<String> {
         if !measure.wrap {
             return Ok(measure.text.clone());
         }
@@ -1240,6 +1316,194 @@ mod tests {
         assert_eq!(color(dark, Color::Page), Rgb::hex(0x1b1b1b));
         assert_eq!(color(light, Color::BarOk), light.bars[0]);
         assert_ne!(color(light, Color::Series7d), color(light, Color::BarOk));
+    }
+}
+
+#[cfg(test)]
+mod wrapped_text_tests {
+    use super::*;
+
+    fn request(text: &str) -> Measure {
+        Measure {
+            text: text.into(),
+            size: 13.,
+            line_height: 18.,
+            width: 90.,
+            bold: false,
+            wrap: true,
+            face: Face::Text,
+            align: TextAlign::Leading,
+        }
+    }
+
+    fn assert_bounds(cache: &WrappedTextCache) {
+        assert!(cache.entries.len() <= WRAPPED_TEXT_CAPACITY);
+        assert!(cache.bytes <= WRAPPED_TEXT_BYTES);
+        assert_eq!(cache.order.len(), cache.entries.len());
+        assert!(
+            cache
+                .order
+                .iter()
+                .all(|key| cache.entries.contains_key(key))
+        );
+        assert_eq!(
+            cache.bytes,
+            cache
+                .entries
+                .iter()
+                .map(|(k, v)| k.capacity() + v.capacity())
+                .sum::<usize>()
+                + cache.order.iter().map(String::capacity).sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn r1210_wrapped_text_no_wrap_borrows_original_bytes() -> Result<()> {
+        let renderer = Renderer::new(false)?;
+        let mut measure = request("한글 🙂 trailing  \n\n");
+        measure.wrap = false;
+        let wrapped = renderer.wrapped(&measure)?;
+        assert!(matches!(wrapped, Cow::Borrowed(_)));
+        assert_eq!(wrapped.as_ptr(), measure.text.as_ptr());
+        assert_eq!(wrapped.as_ref(), measure.text);
+        let cache = renderer.wrapped_text.borrow();
+        assert_eq!(cache.preparations, 0);
+        assert!(cache.entries.is_empty());
+        assert_bounds(&cache);
+        Ok(())
+    }
+
+    #[test]
+    fn r1210_wrapped_text_unicode_matches_uncached_and_keeps_results_immutable() -> Result<()> {
+        let renderer = Renderer::new(false)?;
+        for text in [
+            "short \n\n한글  \n".to_owned(),
+            "verylongunbrokenfoldername0123456789".repeat(4),
+            "긴경로이름한글문자열".repeat(6),
+            "🙂🔬🌏".repeat(12),
+        ] {
+            let measure = request(&text);
+            let expected = renderer.wrap_uncached(&measure)?;
+            assert_eq!(expected.replace('\n', ""), text.replace('\n', ""));
+            if !text.contains('\n') {
+                assert!(expected.contains('\n'), "long token must wrap");
+            }
+            let before = renderer.wrapped_text.borrow().preparations;
+            assert_eq!(renderer.wrapped(&measure)?.as_ref(), expected);
+            assert_eq!(renderer.wrapped_text.borrow().preparations, before + 1);
+            let mut hit = renderer.wrapped(&measure)?;
+            assert_eq!(hit.as_ref(), expected);
+            hit.to_mut().push_str(" caller mutation");
+            renderer.clear_target_resources();
+            assert_eq!(renderer.wrapped(&measure)?.as_ref(), expected);
+            assert_eq!(renderer.wrapped_text.borrow().preparations, before + 1);
+        }
+        assert_bounds(&renderer.wrapped_text.borrow());
+        Ok(())
+    }
+
+    #[test]
+    fn r1210_wrapped_text_complete_measure_key_keeps_styles_and_widths_separate() -> Result<()> {
+        let renderer = Renderer::new(false)?;
+        let base = request("긴단어longunbrokentoken0123456789");
+        let mut variants = vec![base.clone()];
+        let mut next = base.clone();
+        next.text.push('!');
+        variants.push(next);
+        let mut next = base.clone();
+        next.size += 1.;
+        variants.push(next);
+        let mut next = base.clone();
+        next.line_height += 1.;
+        variants.push(next);
+        let mut next = base.clone();
+        next.width += 1.;
+        variants.push(next);
+        let mut next = base.clone();
+        next.bold = true;
+        variants.push(next);
+        let mut next = base.clone();
+        next.face = Face::Mono;
+        variants.push(next);
+        let mut next = base.clone();
+        next.face = Face::Icon;
+        variants.push(next);
+        let mut next = base.clone();
+        next.align = TextAlign::Center;
+        variants.push(next);
+        for measure in &variants {
+            let expected = renderer.wrap_uncached(measure)?;
+            assert_eq!(renderer.wrapped(measure)?.as_ref(), expected);
+            assert_eq!(renderer.wrapped(measure)?.as_ref(), expected);
+        }
+        let cache = renderer.wrapped_text.borrow();
+        assert_eq!(cache.entries.len(), variants.len());
+        assert_eq!(cache.preparations, variants.len());
+        assert_bounds(&cache);
+        Ok(())
+    }
+
+    #[test]
+    fn r1210_wrapped_text_fifo_bounds_all_key_and_value_capacities() {
+        let mut cache = WrappedTextCache::default();
+        for i in 0..=WRAPPED_TEXT_CAPACITY {
+            cache.remember(format!("tiny-{i}"), "value");
+        }
+        assert_eq!(cache.entries.len(), WRAPPED_TEXT_CAPACITY);
+        assert!(!cache.entries.contains_key("tiny-0"));
+        assert_bounds(&cache);
+
+        let mut cache = WrappedTextCache::default();
+        let value = "wrapped".repeat(600);
+        for i in 0..180 {
+            cache.remember(format!("large-{i}-{}", "한".repeat(1024)), &value);
+            assert_bounds(&cache);
+        }
+        assert!(
+            cache.entries.len() < 180,
+            "byte bound must evict before entry bound"
+        );
+        let keys: Vec<_> = cache.entries.keys().cloned().collect();
+        let bytes = cache.bytes;
+        cache.remember(
+            "oversized-value".into(),
+            &"x".repeat(WRAPPED_TEXT_BYTES + 1),
+        );
+        let mut oversized_capacity = String::with_capacity(WRAPPED_TEXT_BYTES + 1);
+        oversized_capacity.push_str("small-key-with-oversized-allocation");
+        cache.remember(oversized_capacity, "small value");
+        assert!(cache.entries.keys().eq(keys.iter()));
+        assert_eq!(cache.bytes, bytes, "oversized inputs must not evict");
+        assert_bounds(&cache);
+    }
+
+    #[test]
+    fn r1210_wrapped_text_oversized_and_nonfinite_inputs_bypass_retention() -> Result<()> {
+        let renderer = Renderer::new(false)?;
+        let mut oversized = request(&"x".repeat(WRAPPED_TEXT_INPUT_LIMIT + 1));
+        oversized.width = 1_000_000.;
+        for measure in [
+            oversized,
+            Measure {
+                width: f32::INFINITY,
+                ..request("short")
+            },
+            Measure {
+                width: f32::NAN,
+                ..request("short")
+            },
+        ] {
+            let expected = renderer.wrap_uncached(&measure)?;
+            let before = renderer.wrapped_text.borrow().preparations;
+            for _ in 0..2 {
+                assert_eq!(renderer.wrapped(&measure)?.as_ref(), expected);
+            }
+            let cache = renderer.wrapped_text.borrow();
+            assert_eq!(cache.preparations, before + 2);
+            assert!(cache.entries.is_empty());
+            assert_bounds(&cache);
+        }
+        Ok(())
     }
 }
 

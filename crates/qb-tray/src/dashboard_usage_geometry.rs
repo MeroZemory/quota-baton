@@ -377,43 +377,48 @@ fn usage_tile(
             Color::BarOk
         };
         let dash = if weekly { Some([5., 3.]) } else { None };
-        let mut previous: Option<(DateTime<Utc>, f64)> = None;
-        let resets: BTreeSet<_> = series.resets.iter().copied().collect();
-        for (at, pct) in &series.points {
-            if !observed(*at) {
-                continue;
-            }
-            if let Some(pct) = pct {
-                if let Some((pa, pp)) = previous {
-                    if resets.contains(at) {
-                        b.line([x(pa), y(pp)], [x(*at), y(pp)], color, 2., dash);
-                        b.line([x(*at), y(pp)], [x(*at), y(*pct)], color, 2., dash);
-                    } else {
-                        b.line([x(pa), y(pp)], [x(*at), y(*pct)], color, 2., dash);
-                    }
+        // Offscreen tiles retain their chart data and accessibility table below,
+        // but usage() discards all their drawing commands. Do not allocate the
+        // per-point/reset strokes that would immediately be discarded.
+        if tile_clip.is_some() {
+            let mut previous: Option<(DateTime<Utc>, f64)> = None;
+            let resets: BTreeSet<_> = series.resets.iter().copied().collect();
+            for (at, pct) in &series.points {
+                if !observed(*at) {
+                    continue;
                 }
-                previous = Some((*at, *pct));
-            } else {
-                previous = None;
+                if let Some(pct) = pct {
+                    if let Some((pa, pp)) = previous {
+                        if resets.contains(at) {
+                            b.line([x(pa), y(pp)], [x(*at), y(pp)], color, 2., dash);
+                            b.line([x(*at), y(pp)], [x(*at), y(*pct)], color, 2., dash);
+                        } else {
+                            b.line([x(pa), y(pp)], [x(*at), y(*pct)], color, 2., dash);
+                        }
+                    }
+                    previous = Some((*at, *pct));
+                } else {
+                    previous = None;
+                }
             }
-        }
-        for reset in &series.resets {
-            b.line(
-                [x(*reset), plot.top],
-                [x(*reset), plot.bottom],
-                Color::Secondary,
-                1.,
-                Some([1., 3.]),
-            );
-        }
-        for reset in &series.future_resets {
-            b.line(
-                [x(*reset), plot.top],
-                [x(*reset), plot.bottom],
-                Color::Secondary,
-                1.,
-                Some([1., 3.]),
-            );
+            for reset in &series.resets {
+                b.line(
+                    [x(*reset), plot.top],
+                    [x(*reset), plot.bottom],
+                    Color::Secondary,
+                    1.,
+                    Some([1., 3.]),
+                );
+            }
+            for reset in &series.future_resets {
+                b.line(
+                    [x(*reset), plot.top],
+                    [x(*reset), plot.bottom],
+                    Color::Secondary,
+                    1.,
+                    Some([1., 3.]),
+                );
+            }
         }
         if let Some((at, Some(pct))) = series.points.iter().rev().find(|(at, _)| observed(*at))
             && !t.unconfirmed
