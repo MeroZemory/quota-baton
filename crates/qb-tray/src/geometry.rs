@@ -408,6 +408,9 @@ impl Builder<'_> {
         });
     }
     fn measured_width(&mut self, text: &str, size: f32, bold: bool) -> f32 {
+        self.measured_width_face(text, size, bold, Face::Text)
+    }
+    fn measured_width_face(&mut self, text: &str, size: f32, bold: bool, face: Face) -> f32 {
         let m = Measure {
             text: text.into(),
             size,
@@ -415,7 +418,7 @@ impl Builder<'_> {
             width: 4096.,
             bold,
             wrap: false,
-            face: Face::Text,
+            face,
             align: TextAlign::Leading,
         };
         let width = self
@@ -1187,6 +1190,53 @@ fn recent_strip(b: &mut Builder<'_>, v: &m::DashboardView, r: Rect) {
         );
     }
 }
+const EMPTY_SESSION_HELP: &str = "codex-qb나 claude-qb로 실행한 Codex·Claude가 요청을 보내면 여기에 바로 나타납니다. 그냥 codex나 claude로 실행하면 quota-baton을 거치지 않습니다.";
+
+struct EmptyHelpRun {
+    command: &'static str,
+    text: &'static str,
+    command_width: f32,
+    text_width: f32,
+}
+
+fn empty_help_lines(b: &mut Builder<'_>, available: f32, gap: f32) -> Vec<Vec<EmptyHelpRun>> {
+    let mut lines = vec![Vec::new()];
+    let mut line_width = 0.;
+    for token in EMPTY_SESSION_HELP.split_whitespace() {
+        let command = ["codex-qb", "claude-qb", "codex", "claude"]
+            .into_iter()
+            .find(|command| token.starts_with(*command))
+            .unwrap_or("");
+        let text = &token[command.len()..];
+        let command_width = if command.is_empty() {
+            0.
+        } else {
+            b.measured_width_face(command, 12., false, Face::Mono) + 14.
+        };
+        let text_width = if text.is_empty() {
+            0.
+        } else {
+            b.measured_width(text, 13., false)
+        };
+        let run_width = command_width + text_width;
+        if line_width > 0. && line_width + gap + run_width > available {
+            lines.push(Vec::new());
+            line_width = 0.;
+        }
+        if line_width > 0. {
+            line_width += gap;
+        }
+        line_width += run_width;
+        lines.last_mut().unwrap().push(EmptyHelpRun {
+            command,
+            text,
+            command_width,
+            text_width,
+        });
+    }
+    lines
+}
+
 fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card: Rect) {
     b.card(card);
     b.semantic(
@@ -1450,12 +1500,17 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
     } else {
         0.
     };
-    let explanation = "codex-qb나 claude-qb로 실행한 Codex·Claude가 요청을 보내면 여기에 바로 나타납니다. 그냥 codex나 claude로 실행하면 quota-baton을 거치지 않습니다.";
-    let empty_help_height = if no_sessions {
-        b.measured_height_aligned(explanation, empty_width, 13., false, TextAlign::Center)
+    let empty_help_gap = if no_sessions {
+        b.measured_width(" ", 13., false)
     } else {
         0.
     };
+    let empty_help_lines = if no_sessions {
+        empty_help_lines(b, empty_width, empty_help_gap)
+    } else {
+        Vec::new()
+    };
+    let empty_help_height = empty_help_lines.len() as f32 * 20.;
     let empty_last_height = if no_sessions {
         v.last_session
             .as_ref()
@@ -1471,8 +1526,7 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
         + 12.
         + empty_help_height
         + 16.
-        + 24.
-        + if empty_button { 44. } else { 0. }
+        + if empty_button { 32. } else { 0. }
         + if v.last_session.is_some() {
             16. + empty_last_height
         } else {
@@ -1539,40 +1593,53 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
                 true,
             );
             ry += empty_title_height + 12.;
-            b.center_text(
-                rect(left, ry, empty_width, empty_help_height),
-                explanation,
-                13.,
-                false,
-                Color::Secondary,
-                true,
-            );
             b.semantic(
                 "empty:sessions:help".into(),
                 Some("empty:sessions".into()),
                 Role::Text,
-                explanation.into(),
+                EMPTY_SESSION_HELP.into(),
                 rect(left, ry, empty_width, empty_help_height),
                 None,
             );
-            ry += empty_help_height + 16.;
-            for (i, command) in ["codex-qb", "claude-qb"].iter().enumerate() {
-                let r = rect(cx - 88. + i as f32 * 92., ry, 84., 24.);
-                b.fill(r, Color::Footer, 4.);
-                b.text_face(
-                    rect(r.left + 6., r.top + 3., width(r) - 12., 20.),
-                    *command,
-                    12.,
-                    false,
-                    Color::Text,
-                    false,
-                    Face::Mono,
-                    TextAlign::Center,
-                );
+            for line in empty_help_lines {
+                let line_width = line
+                    .iter()
+                    .map(|run| run.command_width + run.text_width)
+                    .sum::<f32>()
+                    + line.len().saturating_sub(1) as f32 * empty_help_gap;
+                let mut x = cx - line_width / 2.;
+                for run in line {
+                    if !run.command.is_empty() {
+                        let r = rect(x, ry, run.command_width, 20.);
+                        b.fill(r, Color::Footer, 4.);
+                        b.stroke(r, Color::Border, 1., 4.);
+                        b.text_face(
+                            rect(r.left + 7., r.top + 2., width(r) - 14., 16.),
+                            run.command,
+                            12.,
+                            false,
+                            Color::Text,
+                            false,
+                            Face::Mono,
+                            TextAlign::Leading,
+                        );
+                    }
+                    if !run.text.is_empty() {
+                        b.text(
+                            rect(x + run.command_width, ry, run.text_width, 20.),
+                            run.text,
+                            13.,
+                            false,
+                            Color::Secondary,
+                            false,
+                        );
+                    }
+                    x += run.command_width + run.text_width + empty_help_gap;
+                }
+                ry += 20.;
             }
-            ry += 24.;
+            ry += 16.;
             if empty_button {
-                ry += 12.;
                 b.control(
                     rect(cx - 75., ry, 150., 32.),
                     "오늘 전체 보기",
@@ -1603,7 +1670,7 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
                 .min((height(viewport) - 80.).max(20.));
             let message_rect = rect(
                 viewport.left + 40.,
-                viewport.top + (height(viewport) - message_height) / 2.,
+                viewport.top + 40.,
                 available,
                 message_height,
             );
@@ -2802,7 +2869,8 @@ fn events(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card: R
         .events
         .iter()
         .map(|e| {
-            let middle = (width(card) - 32. - 56. - 92. - 36. - event_refs_width(b, e)).max(100.);
+            let middle =
+                (width(viewport) - 32. - 56. - 92. - 36. - event_refs_width(b, e)).max(100.);
             (b.measured_height(&e.body, middle, 12., false)
                 + 50.
                 + if e.relogin { 36. } else { 0. })
@@ -2878,7 +2946,7 @@ fn events(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card: R
                 tx,
                 y + 38.,
                 middle,
-                (h - 52. - if e.relogin { 36. } else { 0. }).max(16.),
+                (h - 50. - if e.relogin { 36. } else { 0. }).max(16.),
             ),
             e.body.clone(),
             12.,
