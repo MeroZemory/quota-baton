@@ -7,7 +7,7 @@ pub const SELECTED: &str = "30f878000000";
 pub const EDGE_ACCOUNT: &str = "cl-mero";
 pub const NEXT_ACCOUNT: &str = "cl-hello";
 pub const OTHER_ROW: &str = "7c1e90000000";
-pub const LONG_ACCOUNT: &str = "아주 긴 합성 계정 이름 · 경계 너비에서 이름부터 줄이고 고정 필드와 다시 로그인 동작은 온전히 유지해야 하는 계정";
+pub const LONG_ACCOUNT: &str = "아주 긴 합성 계정 이름 · 경계 너비에서 이름부터 줄이고 고정 필드와 다시 로그인 동작은 온전히 유지하는 계정";
 
 /// Opt-in variants of existing states, never additional numbered states.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
