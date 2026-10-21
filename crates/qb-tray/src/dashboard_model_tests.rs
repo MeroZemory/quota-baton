@@ -1396,3 +1396,46 @@ fn r101_unknown_totals_hide_stats_but_keep_failure_lower_bound_and_active_wait()
             .contains("오늘 요청 수 확인 전")
     );
 }
+
+#[test]
+fn r11_model_choice_wire_reasons_preserve_initial_timeline_and_explicit_move_wording() {
+    let data = snapshot();
+    let c = clock();
+    let detail: SessionDetail = serde_json::from_value(serde_json::json!({
+        "id":"abcdef123456", "provider":"codex", "account":"cx-b",
+        "timeline":[
+            {"at":c.utc()-chrono::Duration::minutes(2), "kind":"placed",
+             "account":"cx-a", "from":null, "reason":"launch_model", "next_turn_cache":null},
+            {"at":c.utc()-chrono::Duration::minutes(1), "kind":"move",
+             "account":"cx-b", "from":"cx-a", "reason":"model_choice", "next_turn_cache":null}
+        ]
+    }))
+    .unwrap();
+    let view = detail_view(&detail, &data.accounts, &c, false);
+    assert_eq!(view.timeline.len(), 2);
+    assert!(view.timeline[0].contains("시작 모델에 맞춰 처음 배정"));
+    assert!(!view.timeline[0].contains("캐시"));
+    assert!(view.timeline[1].contains("선택한 모델에 맞춰 계정 전환"));
+    assert!(view.timeline.iter().all(|line| !line.contains("사용 불가")));
+
+    let activity: ActivityResponse = serde_json::from_value(serde_json::json!({
+        "events":[{"seq":1, "ts":c.utc(), "kind":"move", "provider":"codex",
+            "account":"cx-a", "account_to":"cx-b", "notable":true,
+            "data":{"session":"abcdef123456", "reason":"model_choice"}}],
+        "next_seq":1, "truncated":false
+    }))
+    .unwrap();
+    let event = &activity.events[0];
+    let row = event_row(event, &data.accounts, &c).unwrap();
+    assert_eq!(row.tag, "계정 전환");
+    assert_eq!(row.category, EventFilter::Moves);
+    assert!(row.body.contains("선택한 모델"));
+    assert!(!row.body.contains("쓸 수 없"));
+    assert!(!row.body.contains("사용 불가"));
+    assert!(row.notable);
+    for initial in ["new", "launch_model"] {
+        let mut first = event.clone();
+        first.data.reason = Some(initial.into());
+        assert!(event_row(&first, &data.accounts, &c).is_none());
+    }
+}

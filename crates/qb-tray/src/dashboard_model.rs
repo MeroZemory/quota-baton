@@ -1261,6 +1261,8 @@ pub fn reason(word: &str) -> &str {
         "cold_rebalance" => "오래 쉬어 다시 배치",
         "reset_hold_timeout" => "초기화를 기다렸지만 풀리지 않음",
         "new" => "처음 배정",
+        "launch_model" => "시작 모델에 맞춰 처음 배정",
+        "model_choice" => "선택한 모델에 맞춰 계정 전환",
         _ => "사용 불가",
     }
 }
@@ -1464,13 +1466,17 @@ fn event_row(e: &ActivityEvent, accounts: &v2::View, clock: &Clock) -> Option<Ev
             (format!("{p} {a} · {title}"), body)
         }
         "move" => {
-            if d.reason.as_deref() == Some("new") {
+            if matches!(d.reason.as_deref(), Some("new" | "launch_model")) {
                 return None;
             }
             tag = "계정 전환";
             tone = v2::Tone::Use;
             category = EventFilter::Moves;
             match d.reason.as_deref() {
+                Some("model_choice") => (
+                    format!("{p} · {name} 세션을 {b}로 옮김"),
+                    format!("선택한 모델을 지원하는 {b}로 계정을 전환했습니다."),
+                ),
                 Some("overload") => (
                     format!(
                         "{p} · 몰린 세션 {}개를 나눔",
@@ -1875,7 +1881,7 @@ fn detail_view(d: &SessionDetail, accounts: &v2::View, clock: &Clock, expired: b
                 } else {
                     ""
                 },
-                if p.kind == "placed" {
+                if p.kind == "placed" && p.reason.as_deref() != Some("launch_model") {
                     "처음 배정"
                 } else {
                     reason(p.reason.as_deref().unwrap_or(""))

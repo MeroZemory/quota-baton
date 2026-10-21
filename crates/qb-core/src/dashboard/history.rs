@@ -273,7 +273,12 @@ impl ActivityLog {
                         .is_some_and(|outcome| outcome != RequestOutcome::Ok)
                 });
         }
-        if input.kind == ActivityKind::Move && input.data.reason == Some(MoveReason::New) {
+        if input.kind == ActivityKind::Move
+            && input
+                .data
+                .reason
+                .is_some_and(MoveReason::is_initial_placement)
+        {
             return Ok(None);
         }
         input.notable = match input.kind {
@@ -1053,9 +1058,11 @@ mod tests {
         assert_eq!(folded.seq, quota.seq);
         assert_eq!(folded.data.moved_groups, 1);
         assert_eq!(log.events.len(), 1);
-        let mut new = input(ActivityKind::Move, at);
-        new.data.reason = Some(MoveReason::New);
-        assert!(log.push(new, at).unwrap().is_none());
+        for reason in [MoveReason::New, MoveReason::LaunchModel] {
+            let mut new = input(ActivityKind::Move, at);
+            new.data.reason = Some(reason);
+            assert!(log.push(new, at).unwrap().is_none());
+        }
         let mut late = input(ActivityKind::Move, at + Duration::seconds(6));
         late.data.reason = Some(MoveReason::Forced);
         late.data.session = Some(SessionId::from_key("codex:late"));
