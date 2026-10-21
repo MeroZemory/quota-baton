@@ -12,7 +12,8 @@ This file names the verification for each unit and each row. The row list and th
 갱신: 2026-10-22 02:04 KST (R11 단위 체크포인트 eb9da81, 긴급 성능 수정 시작)
 <!-- status:end -->
 
-The implementer updates this block at each gate; the design session also updates priority, approval and the core metric. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
+The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
+
 
 ## Unit check (closes a unit)
 
@@ -62,3 +63,30 @@ The implementer updates this block at each gate; the design session also updates
 ## Completion
 
 The goal stays open while any row in `GOAL.md` is open. Before marking it complete, compare the open rows there with this file. Completion follows the design session's gate judgment, and a row that needs installation closes when the design session has installed and verified it.
+
+## 진전 장부 (source of the "진전 한눈에" block)
+
+Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-interim-report.md` §3 item 1-1). `.sandbox/scripts/status_head.py` renders these tables, plus the done / in progress / remaining count from the `GOAL.md` milestone table, right under every report head. Append a row at every measurement, flat ones included; never edit old rows. When a metric's definition or denominator changes, start a new 계열 name.
+
+<!-- metric:begin -->
+| 측정 시각 (KST) | 계열 | 값 | 비고 |
+|---|---|---|---|
+| 2026-10-21 22:15 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 0/2 | 지표 도입 |
+| 2026-10-21 22:47 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R12 설치, codex-qb로 실제 이미지 생성 성공 |
+| 2026-10-21 23:14 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R12.1 설치, 변화 없음 |
+| 2026-10-22 01:02 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R12.9 설치, 변화 없음 |
+<!-- metric:end -->
+
+<!-- support:begin -->
+| 측정 시각 (KST) | 보조 지표 | 값 | 목표 | 비고 |
+|---|---|---|---|---|
+| 2026-10-22 01시대 (분 미기록) | 대시보드 유휴 CPU (코어 하나 기준, 창 열림) | 60.7 % | 2 % 미만 | 최소화 시 1.4 %; R12.10 전 측정 |
+<!-- support:end -->
+
+<!-- gaps:begin -->
+| 남은 차이 | 지금 | 넘어야 할 값 | 다음 행동 |
+|---|---|---|---|
+| R11 실행별 계정 | HTTP 통합 저장, WS 경계 2건과 출시 관문 남음 | 관문 통과와 설치 | R12.10 뒤 WS 경계 2건 마무리 후 관문 |
+| 대시보드 지연 (R12.10) | 유휴 CPU 60.7 %, 장면당 약 300 ms | 유휴 2 % 미만, 조작 p95 16 ms 미만 | 장면 단계별 시간 측정 후 다시 그리기 조건 제한 |
+| R13 소진 예측·아이콘·차트·캐시 보류 | 설계 완료, 구현 0/5 부분 | 5/5 부분 병합과 설치 | R11과 R12.10 뒤 시작 |
+<!-- gaps:end -->

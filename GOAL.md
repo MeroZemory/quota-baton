@@ -64,7 +64,11 @@ The current plan, with lanes, owners and start commands, is the "Plan" section o
 | R9.3 | merged and INSTALLED (5ce0afe). Live on the real profile: codex-qb resume preview 21 s and commit 8 s (before: 382 s and about 9 min); return prompt 6 s and commit 7 s; the map is written as C:/Users/... |
 | R10 | merged and INSTALLED (a35be74); live acceptance 13 pass / 3 partial, no must-fix |
 | R10.1 | merged and INSTALLED (dev 14938b4, 10-21) |
-| R12 | PRIORITY: image generation through qb (D23: Qi home with custom provider, codex-qb --images, qb images relay); do before finishing R11; brief `R12-images.md` |
+| R12 | merged and INSTALLED (dev 63805ac, 10-21 22:47): `codex-qb --images` and `--images exec` generate images live; image sessions notified |
+| R12.1 | merged and INSTALLED (c6a304e, 10-21 23:14): image canary stage diagnostics and retry, user `-c` passthrough |
+| R12.9 | merged and INSTALLED (c899b6a, 10-22 01:02): outage follow-ups (credit hold fix kept, WS capacity spreading, release-hold, Q-owned CPA resume) |
+| R12.10 | urgent: dashboard lag (idle CPU 60.7 %); brief `R12.10-dashboard-perf.md`; after the current R11 unit |
+| R13 | burn rate and projected exhaustion, dashboard icon, plain active count, rolling chart (D24), cache-lifetime hold (D25); brief `R13-burn-icon-hold.md`; after R11 and R12.10 |
 | R11 | launch-scoped account and per-account model catalog (D22, resolves O13: /daybreak through codex-qb); after R10; brief `R11-launch-account.md` |
 | R8.1 | merged (round 2 39345fd, dev 6dbbfae); installed and verified live: the herdr pane title shows `codex-qb · quota-baton` from 1 s to 19 s, and a codex-qb exec request returned ok |
 
