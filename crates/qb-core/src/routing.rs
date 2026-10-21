@@ -1028,7 +1028,9 @@ impl PolicyStore {
     ) -> Result<T> {
         let _writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(operation) = operation {
-            operation.check().map_err(|_| anyhow::anyhow!("launch admission cancelled"))?;
+            operation
+                .check()
+                .map_err(|_| anyhow::anyhow!("launch admission cancelled"))?;
         }
         let state = self.snapshot();
         if state.frozen {
@@ -1064,7 +1066,9 @@ impl PolicyStore {
         // Writer gate is held, f only changed a private clone. Cancellation
         // competes here before durable writes/publication; never after them.
         if let Some(operation) = operation {
-            operation.admit().map_err(|_| anyhow::anyhow!("launch admission cancelled"))?;
+            operation
+                .admit()
+                .map_err(|_| anyhow::anyhow!("launch admission cancelled"))?;
         }
         let before = durable_state(&state, &self.defaults);
         let mut durable = durable_state(&next, &self.defaults);
@@ -1691,8 +1695,12 @@ impl PolicyStore {
         let Some(key) = key else {
             if let Some(operation) = operation {
                 let _publication = self.publication.read().unwrap_or_else(|e| e.into_inner());
-                if self.snapshot().frozen { bail!("routing policy writer retired"); }
-                operation.admit().map_err(|_| anyhow::anyhow!("launch admission cancelled"))?;
+                if self.snapshot().frozen {
+                    bail!("routing policy writer retired");
+                }
+                operation
+                    .admit()
+                    .map_err(|_| anyhow::anyhow!("launch admission cancelled"))?;
             }
             return Ok(());
         };
@@ -1717,7 +1725,9 @@ impl PolicyStore {
                     || state.sessions.get(&id).is_some_and(|s| s.anchor.is_some()))
             {
                 if let Some(operation) = operation {
-                    operation.admit().map_err(|_| anyhow::anyhow!("launch admission cancelled"))?;
+                    operation
+                        .admit()
+                        .map_err(|_| anyhow::anyhow!("launch admission cancelled"))?;
                 }
                 return Ok(());
             }
@@ -1726,7 +1736,9 @@ impl PolicyStore {
                 && !state.sessions.contains_key(&id)
             {
                 if let Some(operation) = operation {
-                    operation.admit().map_err(|_| anyhow::anyhow!("launch admission cancelled"))?;
+                    operation
+                        .admit()
+                        .map_err(|_| anyhow::anyhow!("launch admission cancelled"))?;
                 }
                 return Ok(());
             }
@@ -1745,7 +1757,9 @@ impl PolicyStore {
                     bail!("routing policy recovery incomplete");
                 }
                 if let Some(operation) = operation {
-                    operation.admit().map_err(|_| anyhow::anyhow!("launch admission cancelled"))?;
+                    operation
+                        .admit()
+                        .map_err(|_| anyhow::anyhow!("launch admission cancelled"))?;
                 }
                 let mut next = (*state).clone();
                 let until = now + chrono::Duration::seconds(self.limits.revisit_secs as i64);
@@ -4617,19 +4631,29 @@ mod issue_operation_writer_tests {
             .join("../../.sandbox/r11-operation-tests");
         std::fs::create_dir_all(&root).unwrap();
         let dir = tempfile::tempdir_in(root).unwrap();
-        let store = Arc::new(PolicyStore::new(dir.path(), Settings {
-            mode: Mode::Strict, reset_wait_secs: 7,
-        }).unwrap());
+        let store = Arc::new(
+            PolicyStore::new(
+                dir.path(),
+                Settings {
+                    mode: Mode::Strict,
+                    reset_wait_secs: 7,
+                },
+            )
+            .unwrap(),
+        );
         let key = "codex:operation-cancel";
         store.capture_strict_anchors([(key, "cx-a")]).unwrap();
         let plan = store.plan(Some(key));
         let consent = crate::bindings::LaunchPolicyMove {
-            key: key.into(), previous: "cx-a".into(), account: "cx-b".into(),
-            expected_revision: plan.revision, at: chrono::Utc::now(),
+            key: key.into(),
+            previous: "cx-a".into(),
+            account: "cx-b".into(),
+            expected_revision: plan.revision,
+            at: chrono::Utc::now(),
         };
         let before = std::fs::read(&store.path).unwrap();
-        let operation = IssueOperation::new(tokio::time::Instant::now()
-            + std::time::Duration::from_secs(3600));
+        let operation =
+            IssueOperation::new(tokio::time::Instant::now() + std::time::Duration::from_secs(3600));
         let caller = operation.caller_guard();
         let ready = Arc::new(Barrier::new(2));
         let held = store.writer.lock().unwrap();
@@ -4640,8 +4664,12 @@ mod issue_operation_writer_tests {
             let ready = ready.clone();
             std::thread::spawn(move || {
                 ready.wait();
-                send.send(store.authorize_model_move_for_issue(&consent, Some(&operation)).is_err())
-                    .unwrap();
+                send.send(
+                    store
+                        .authorize_model_move_for_issue(&consent, Some(&operation))
+                        .is_err(),
+                )
+                .unwrap();
             })
         };
         ready.wait();
@@ -4660,18 +4688,33 @@ mod issue_operation_writer_tests {
             .join("../../.sandbox/r11-operation-tests");
         std::fs::create_dir_all(&root).unwrap();
         let dir = tempfile::tempdir_in(root).unwrap();
-        let store = PolicyStore::new(dir.path(), Settings {
-            mode: Mode::Strict, reset_wait_secs: 7,
-        }).unwrap();
+        let store = PolicyStore::new(
+            dir.path(),
+            Settings {
+                mode: Mode::Strict,
+                reset_wait_secs: 7,
+            },
+        )
+        .unwrap();
         let key = "codex:operation-recheck";
         store.capture_strict_anchors([(key, "cx-a")]).unwrap();
-        let operation = IssueOperation::new(tokio::time::Instant::now()
-            + std::time::Duration::from_secs(3600));
+        let operation =
+            IssueOperation::new(tokio::time::Instant::now() + std::time::Duration::from_secs(3600));
         let caller = operation.caller_guard();
         operation.admit().unwrap();
         drop(caller);
-        assert!(store.dispatch_for_issue(Some(key), "cx-b", Some("cx-a"),
-            "model_choice", chrono::Utc::now(), Some(&operation)).is_err());
+        assert!(
+            store
+                .dispatch_for_issue(
+                    Some(key),
+                    "cx-b",
+                    Some("cx-a"),
+                    "model_choice",
+                    chrono::Utc::now(),
+                    Some(&operation)
+                )
+                .is_err()
+        );
         assert_eq!(store.plan(Some(key)).anchor.as_deref(), Some("cx-a"));
     }
 }
