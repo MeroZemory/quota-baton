@@ -4,6 +4,145 @@ use qb_tray::{dashboard_model::*, v2};
 use serde_json::{Value, json};
 
 pub const SELECTED: &str = "30f878000000";
+pub const EDGE_ACCOUNT: &str = "cl-mero";
+pub const NEXT_ACCOUNT: &str = "cl-hello";
+pub const OTHER_ROW: &str = "7c1e90000000";
+pub const LONG_ACCOUNT: &str = "아주 긴 합성 계정 이름 · 경계 너비에서 이름부터 줄이고 고정 필드와 다시 로그인 동작은 온전히 유지해야 하는 계정";
+
+/// Opt-in variants of existing states, never additional numbered states.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EdgeCase {
+    Boundary1179,
+    Boundary1180,
+    ReloginOwned,
+    ReloginLinked,
+    Sticky,
+    Overlay,
+}
+impl EdgeCase {
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "boundary-1179" => Self::Boundary1179,
+            "boundary-1180" => Self::Boundary1180,
+            "relogin-owned" => Self::ReloginOwned,
+            "relogin-linked" => Self::ReloginLinked,
+            "sticky" => Self::Sticky,
+            "overlay" => Self::Overlay,
+            _ => panic!("unknown R10_EDGE_CASE"),
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Boundary1179 => "boundary-1179",
+            Self::Boundary1180 => "boundary-1180",
+            Self::ReloginOwned => "relogin-owned",
+            Self::ReloginLinked => "relogin-linked",
+            Self::Sticky => "sticky",
+            Self::Overlay => "overlay",
+        }
+    }
+    pub fn state(self) -> u8 {
+        match self {
+            Self::ReloginOwned | Self::ReloginLinked => 5,
+            Self::Overlay => 15,
+            _ => 2,
+        }
+    }
+    pub fn size(self) -> [f32; 2] {
+        match self {
+            Self::Boundary1179 => [1179., 960.],
+            Self::Boundary1180 => [1180., 960.],
+            Self::ReloginOwned | Self::ReloginLinked => [1320., 960.],
+            Self::Sticky => [1320., 640.],
+            Self::Overlay => [1024., 640.],
+        }
+    }
+}
+
+pub fn last_observed() -> DateTime<Utc> {
+    clock().utc() - Duration::hours(2)
+}
+
+/// Still real DTO projection: source ownership, retained windows and history are
+/// input data, not hand-edited DashboardView/Scene or a fabricated Host state.
+pub fn edge_snapshot(edge: EdgeCase) -> DashboardSnapshot {
+    let mut s = snapshot(edge.state());
+    if edge == EdgeCase::Overlay {
+        return s;
+    }
+    let mut rows = accounts(2);
+    rows.retain(|a| a["id"] == EDGE_ACCOUNT || a["id"] == NEXT_ACCOUNT);
+    let first = rows.iter_mut().find(|a| a["id"] == EDGE_ACCOUNT).unwrap();
+    first["health"] = json!({"kind":"needs_relogin"});
+    first["active_sessions"] = json!(0);
+    first["bound_sessions"] = json!(6);
+    first["windows"] = json!([
+        window("5h", 63, "2026-10-21T07:20:00+09:00"),
+        window("7d", 42, "2026-10-26T21:00:00+09:00")
+    ]);
+    first["observed_at"] = json!(last_observed());
+    for w in first["windows"].as_array_mut().unwrap() {
+        w["observed_at"] = json!(last_observed());
+    }
+    if matches!(edge, EdgeCase::Boundary1179 | EdgeCase::Boundary1180) {
+        first["label"] = json!(LONG_ACCOUNT);
+    }
+    if edge == EdgeCase::ReloginLinked {
+        first["source"] = json!({"kind":"cpa","mode":"linked"});
+    }
+    if matches!(edge, EdgeCase::ReloginOwned | EdgeCase::ReloginLinked) {
+        rows.retain(|a| a["id"] == EDGE_ACCOUNT);
+    }
+    s.accounts = v2::project(
+        &json!({"version":"R10-synthetic-edges","accounts":rows}).to_string(),
+        clock().utc().into(),
+    )
+    .unwrap();
+    s.sessions
+        .sessions
+        .retain(|row| s.accounts.raw.accounts.iter().any(|a| a.id == row.account));
+    if edge == EdgeCase::Sticky {
+        // Both groups must remain scrollable even after collapsing the first.
+        for (group, prefix) in [(EDGE_ACCOUNT, "e1"), (NEXT_ACCOUNT, "e2")] {
+            let sample = s
+                .sessions
+                .sessions
+                .iter()
+                .find(|r| r.account == group)
+                .unwrap()
+                .clone();
+            for i in 0..24 {
+                let mut row = sample.clone();
+                row.id = format!("{prefix}{i:010x}");
+                row.inflight = Inflight::default();
+                row.inflight.requests = Some(0);
+                s.sessions.sessions.push(row);
+            }
+        }
+    }
+    s.usage.accounts.retain(|a| a.id == EDGE_ACCOUNT);
+    let history = s
+        .usage
+        .accounts
+        .iter_mut()
+        .find(|a| a.id == EDGE_ACCOUNT)
+        .unwrap();
+    history.credits_spans.clear();
+    history.windows = [("5h", 37.), ("7d", 58.)]
+        .into_iter()
+        .map(|(name, used)| HistoryWindow {
+            name: name.into(),
+            points: vec![
+                (clock().day_start + Duration::minutes(10), Some(10.)),
+                (clock().day_start + Duration::hours(3), Some(20.)),
+                (last_observed(), Some(used)),
+            ],
+            resets: vec![],
+            truncated: false,
+        })
+        .collect();
+    s
+}
 pub fn clock() -> Clock {
     Clock {
         now: DateTime::parse_from_rfc3339("2026-10-21T06:25:50+09:00").unwrap(),
