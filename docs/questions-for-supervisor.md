@@ -44,3 +44,10 @@ D17 review MF5는 wiring.json이 CPA 작업을 소유하면 retire가 그 작업
 Independent Sol source/native investigation: `.sandbox/research/R9-panel-feasibility.md`. Native Codex 0.163 falls back to rollout filenames when its thread row is absent and recreates the row. Thus keeping source S as a fork-ancestor link (G6) while removing its row does not make raw `codex` in the old home fail closed (G7); it can resume S and become a second row owner (G1). Process-held Codex locks also disappear when the importer is killed, so exposed links in two homes are writable before journal recovery (G3). Both have synthetic native counterexamples; no real home was touched.
 
 Implementation continues on typed confirmation, inventory, current-state return, map journaling and tests. Before merge, please rule whether G1/G3/G7 cover only qb-mediated launches/recovery, or whether raw native guarantees require additional upstream/launcher authority (outside currently approved means). Recommendation: do not claim raw native guarantees; retain raw counterexamples as evidence and explicitly scope ownership enforcement, or approve a stronger mechanism before merge. This is queued until the milestone gate, while independent implementation remains.
+
+
+## R10: 폭에 들어가지 않는 세션 부하 기준 칸 수
+
+비차단 관문 질문입니다. 대시보드 v2 §3.3은 기준 T개만큼 칸을 그리도록 하지만 C7의 유효 기준은 i64::MAX까지입니다. 유한한 창에서 그 수를 모두 표시할 수 없습니다. 구현은 기본 5칸과 폭에 들어가는 21칸을 정확히 표시합니다. 들어가지 않는 경우에는 칸 수를 폭으로 제한하고 줄임표, 전체 N/T, 생략 수 접근성 설명을 유지합니다. 기준 수만큼 반복·할당하지 않습니다.
+
+추천: 이 한정된 표현을 극단값의 공식 예외로 승인합니다. 설정 상한을 새로 줄이거나 나머지 필드를 밀어내는 변경은 하지 않았습니다. literal T 규칙과의 편차 및 회귀 근거는 `.sandbox/reports/R10-evidence/pip-fallback.md`와 독립 검수 `R10-final-requirements-sol.md` D1에 기록했습니다. 전체 관문 보고에서 한 번만 확인하며 다른 구현·검증은 계속합니다.
