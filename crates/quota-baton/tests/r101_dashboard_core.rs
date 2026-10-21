@@ -1,5 +1,5 @@
 #![cfg(all(feature = "testkit", debug_assertions))]
-//! Proposal only: synthetic numeric-loopback upstream and isolated spawned core.
+//! Synthetic numeric-loopback upstream and isolated spawned core.
 use futures_util::{SinkExt, StreamExt};
 use qb_core::{
     accounts::{AccountStore, import},
@@ -112,12 +112,14 @@ async fn r101_spawned_core_ws_create_model_visible_while_inflight_and_updates_ne
                 core.try_wait().unwrap().is_none(),
                 "core exited before readiness"
             );
-            if client
-                .get(format!("http://127.0.0.1:{admin_port}/admin/v1/state"))
+            if let Ok(response) = client
+                .get(format!("http://127.0.0.1:{admin_port}/admin/v1/health"))
                 .bearer_auth(ADMIN)
                 .send()
                 .await
-                .is_ok_and(|r| r.status().is_success())
+                && response.status().is_success()
+                && let Ok(value) = response.json::<Value>().await
+                && value["pid"].as_u64() == core.id().map(u64::from)
             {
                 break;
             }
@@ -217,6 +219,62 @@ async fn r101_spawned_core_ws_create_model_visible_while_inflight_and_updates_ne
         .await
         .unwrap();
     }
+    // A later overlapping turn owns the displayed model even when its terminal
+    // event arrives before the older turn's terminal event.
+    for (response_id, model, count) in [
+        ("r101-overlap-a", "r101-overlap-model-a", 1),
+        ("r101-overlap-b", "r101-overlap-model-b", 2),
+    ] {
+        fake.state.push_reply([Message::Text(
+            json!({"type":"response.created","response":{"id":response_id,"status":"in_progress"}})
+                .to_string()
+                .into(),
+        )]);
+        socket
+            .send(Message::Text(
+                json!({"type":"response.create","model":model,"input":[]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Message::Text(text) = socket.next().await.unwrap().unwrap() {
+                    let event: Value = serde_json::from_str(&text).unwrap();
+                    if event["type"] == "response.created" && event["response"]["id"] == response_id
+                    {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let active = detail(&client, admin_port).await;
+        assert_eq!(active["model"], model);
+        assert_eq!(active["inflight"]["requests"], count);
+        assert_eq!(active["requests_today"], 3 + count);
+    }
+    for (response_id, remaining) in [("r101-overlap-b", 1), ("r101-overlap-a", 0)] {
+        fake.state.send(Message::Text(
+            json!({"type":"response.completed","response":{"id":response_id,"status":"completed"}})
+                .to_string().into(),
+        )).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let current = detail(&client, admin_port).await;
+                assert_eq!(current["model"], "r101-overlap-model-b");
+                if current["inflight"]["requests"] == remaining {
+                    assert_eq!(current["requests_today"], 5);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
     assert_eq!(
         fake.state
             .messages()
@@ -224,7 +282,7 @@ async fn r101_spawned_core_ws_create_model_visible_while_inflight_and_updates_ne
             .filter(|m| matches!(m, Message::Text(t)
         if serde_json::from_str::<Value>(t).unwrap()["type"] == "response.create"))
             .count(),
-        3
+        5
     );
     socket.close(None).await.unwrap();
     core.kill().await.unwrap();
