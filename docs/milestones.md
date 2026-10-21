@@ -9,7 +9,7 @@ This file names the verification for each unit and each row. The row list and th
 목표: 보이는 대시보드의 유휴 CPU와 조작 지연을 줄인다
 핵심 지표: 새 경로 출시 1/2 · R11은 HTTP 통합 저장, WS 경계 2건과 출시 관문 남음
 사용자 대기: 없음 (R2 Part B만 사용자 결정 대기)
-갱신: 2026-10-22 04:07 KST (e764773 관문 통과, 최종 성능 미달로 추가 수정 중)
+갱신: 2026-10-22 04:22 KST (브러시 검사 통과, 성능 목표 미달 경로 추가 수정)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -118,12 +118,16 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-22 04:07 | R12.10 새 snapshot 전체 재작성 v4 (30회, 탭별10회) p95 | 63.837 ms | 50 ms 미만 | final-v4 실패, 이전42.431 ms 통과만으로 병합하지 않음 |
 | 2026-10-22 04:07 | R12.10 qb-tray focused 관문 | 527통과 / 0실패 / 17명시제외 | fmt·strict clippy·tests·build 통과 | e764773; 이후 브러시 재사용 변경에는 재검증 필요 |
 | 2026-10-22 04:07 | R12.10 원본 v4 비교 재측정 | 첫 탭 입력 상관 검사 실패 | 같은 조건의 완전한 실행 | 미완료 수치 제외; v5는 탭 focus 사전조건 명시, 기준값 불변 |
+| 2026-10-22 04:22 | R12.10 동기 production paint v5 브러시 재사용 프레임 p95 (hover/scroll/tab) | 3.266 / 64.389 / 19.084 ms | 각16 ms 미만 | after-brush-v5 실패, focus 사전조건 명시; 각100회 보존 |
+| 2026-10-22 04:22 | R12.10 합성 HWND 유휴 CPU (30계정·40세션, 코어 하나 기준) | 0.052083 % | 2 % 미만 | 30초, 전체 성능 수용 실패 |
+| 2026-10-22 04:22 | R12.10 새 snapshot 전체 재작성 v5 (30회, 탭별10회) p95 | 68.772 ms | 50 ms 미만 | 브러시 재사용만으로 목표 충족하지 못함 |
+| 2026-10-22 04:22 | R12.10 브러시 픽셀·색·대상·해제 release 라이브러리 검사 | 215통과 / 0실패 | 실제 WIC 픽셀·경계 검사 | 대상 자원 해제 추가; HWND 바이너리 가시성 오류는 수정 후 별도 확인 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 행동 |
 |---|---|---|---|
 | R11 실행별 계정 | HTTP 통합 저장, WS 경계 2건과 출시 관문 남음 | 관문 통과와 설치 | R12.10 뒤 WS 경계 2건 마무리 후 관문 |
-| 대시보드 지연 (R12.10) | 마지막 조작 p95 1.9/24.2/31.4 ms, 전체63.8 ms | 조작16 ms, 전체50 ms 미만 | 렌더 대상별 브러시 재사용 후 같은 기준 재측정 |
+| 대시보드 지연 (R12.10) | 최근 조작 p95 3.3/64.4/19.1 ms, 전체68.8 ms | 조작16 ms, 전체50 ms 미만 | 실제 draw·UIA 비용을 줄이고 재측정 |
 | R13 소진 예측·아이콘·차트·캐시 보류 | 설계 완료, 구현 0/5 부분 | 5/5 부분 병합과 설치 | R11과 R12.10 뒤 시작 |
 <!-- gaps:end -->
