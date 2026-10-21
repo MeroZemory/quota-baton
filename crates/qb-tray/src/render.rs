@@ -1,4 +1,7 @@
-//! Shared v2 Direct2D/DirectWrite renderer adapter; no HWND, GDI, I/O or clock.
+//! Shared v2 Direct2D/DirectWrite renderer adapter; no HWND, GDI or I/O.
+//! Optional debug/testkit phase profiling is off by default.
+#[cfg(any(debug_assertions, feature = "testkit"))]
+use crate::v2_text::{PhaseTimer, phase_elapsed_ns};
 use crate::{
     dashboard_model::DashboardView,
     geometry::*,
@@ -6,6 +9,8 @@ use crate::{
     v2_colors::{Palette, Rgb},
     v2_render, v2_text,
 };
+#[cfg(any(debug_assertions, feature = "testkit"))]
+use std::{cell::Cell, time::Instant};
 use windows::{
     Win32::Graphics::{
         Direct2D::{Common::D2D_RECT_F, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, ID2D1RenderTarget},
@@ -16,6 +21,33 @@ use windows::{
 
 pub struct Renderer {
     shared: v2_render::Renderer,
+    #[cfg(any(debug_assertions, feature = "testkit"))]
+    phases: RendererPhaseCounters,
+}
+
+/// Per-renderer elapsed wall durations since reset, not process CPU time.
+/// Includes this renderer's text engine.
+/// Add separately owned editor Text stats at the Host boundary.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct PhaseStats {
+    /// Sum of every Scene::build pass, excluding text measurement between passes.
+    pub scene_geometry_us: u64,
+    pub text_measure_us: u64,
+    /// BeginDraw through clip cleanup, excluding measured text layout work.
+    pub draw_us: u64,
+    /// EndDraw elapsed wall duration; may include waits/vsync. Not display completion.
+    pub present_us: u64,
+    pub layout_creations: u64,
+    pub format_creations: u64,
+}
+
+#[cfg(any(debug_assertions, feature = "testkit"))]
+#[derive(Default)]
+struct RendererPhaseCounters {
+    enabled: Cell<bool>,
+    scene_geometry_ns: Cell<u64>,
+    draw_ns: Cell<u64>,
+    present_ns: Cell<u64>,
 }
 #[derive(Default)]
 pub struct Interaction {
@@ -89,8 +121,60 @@ impl Renderer {
     pub fn new(dark: bool) -> Result<Self> {
         Ok(Self {
             shared: v2_render::Renderer::new(dark)?,
+            #[cfg(any(debug_assertions, feature = "testkit"))]
+            phases: RendererPhaseCounters::default(),
         })
     }
+
+    /// Default off. Plain release builds ignore enabling and report zeros.
+    pub fn set_phase_stats_enabled(&self, enabled: bool) {
+        #[cfg(any(debug_assertions, feature = "testkit"))]
+        self.phases.enabled.set(enabled);
+        self.shared
+            .dashboard_text()
+            .set_phase_stats_enabled(enabled);
+    }
+
+    /// Clear totals while preserving whether profiling is enabled.
+    pub fn reset_phase_stats(&self) {
+        #[cfg(any(debug_assertions, feature = "testkit"))]
+        {
+            self.phases.scene_geometry_ns.set(0);
+            self.phases.draw_ns.set(0);
+            self.phases.present_ns.set(0);
+        }
+        self.shared.dashboard_text().reset_phase_stats();
+    }
+
+    pub fn phase_stats(&self) -> PhaseStats {
+        #[cfg(any(debug_assertions, feature = "testkit"))]
+        {
+            let text = self.shared.dashboard_text().phase_stats();
+            PhaseStats {
+                scene_geometry_us: self.phases.scene_geometry_ns.get() / 1_000,
+                text_measure_us: text.text_measure_us,
+                draw_us: self.phases.draw_ns.get() / 1_000,
+                present_us: self.phases.present_ns.get() / 1_000,
+                layout_creations: text.layout_creations,
+                format_creations: text.format_creations,
+            }
+        }
+        #[cfg(not(any(debug_assertions, feature = "testkit")))]
+        PhaseStats::default()
+    }
+
+    fn build_scene(
+        &self,
+        view: &DashboardView,
+        state: &DashboardState,
+        size: [f32; 2],
+        metrics: &Metrics,
+    ) -> Scene {
+        #[cfg(any(debug_assertions, feature = "testkit"))]
+        let _geometry = PhaseTimer::new(self.phases.enabled.get(), &self.phases.scene_geometry_ns);
+        Scene::build(view, state, size, metrics)
+    }
+
     fn wrapped(&self, measure: &Measure) -> Result<String> {
         if !measure.wrap {
             return Ok(measure.text.clone());
@@ -162,7 +246,7 @@ impl Renderer {
         // Probe collects exact width/font requests, then build with measured line
         // heights. Second probe covers content newly revealed by offset clamping.
         for _ in 0..3 {
-            let scene = Scene::build(view, state, size, &metrics);
+            let scene = self.build_scene(view, state, size, &metrics);
             let mut added = false;
             for measure in &scene.measurements {
                 if let std::collections::btree_map::Entry::Vacant(entry) =
@@ -189,7 +273,7 @@ impl Renderer {
                 return Ok(scene);
             }
         }
-        Ok(Scene::build(view, state, size, &metrics))
+        Ok(self.build_scene(view, state, size, &metrics))
     }
     pub fn paint(
         &self,
@@ -197,6 +281,10 @@ impl Renderer {
         scene: &Scene,
         interaction: &Interaction,
     ) -> Result<()> {
+        #[cfg(any(debug_assertions, feature = "testkit"))]
+        let draw_started = self.phases.enabled.get().then(Instant::now);
+        #[cfg(any(debug_assertions, feature = "testkit"))]
+        let text_before = self.shared.dashboard_text().phase_measure_ns();
         let p = self.shared.dashboard_palette();
         let mut clips = 0usize;
         let mut alpha = 1.;
@@ -359,7 +447,23 @@ impl Renderer {
             }
             clips -= 1;
         }
+        #[cfg(any(debug_assertions, feature = "testkit"))]
+        if let Some(started) = draw_started {
+            let text_ns = self
+                .shared
+                .dashboard_text()
+                .phase_measure_ns()
+                .saturating_sub(text_before);
+            let draw_ns = phase_elapsed_ns(started).saturating_sub(text_ns);
+            self.phases
+                .draw_ns
+                .set(self.phases.draw_ns.get().saturating_add(draw_ns));
+        }
+        #[cfg(any(debug_assertions, feature = "testkit"))]
+        let present = PhaseTimer::new(self.phases.enabled.get(), &self.phases.present_ns);
         let ended = unsafe { target.EndDraw(None, None) };
+        #[cfg(any(debug_assertions, feature = "testkit"))]
+        drop(present);
         result.and(ended)
     }
     fn tooltip(

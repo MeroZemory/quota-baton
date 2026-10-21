@@ -5,14 +5,14 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: R11 (실행별 계정 지정과 계정별 모델 목록, codex-rh 같은 계정 별칭)
-목표: codex-qb를 실행할 때 쓸 계정을 지정할 수 있게 하고, 계정별 별칭 명령을 제공한다
-핵심 지표: 새 경로 출시 1/2 (R12 이미지 출시 완료, R11 실행별 계정 진행 중) · 2026-10-22 01:04 KST
+현재 마일스톤: R12.10 (대시보드 지연 수정)
+목표: 보이는 대시보드의 유휴 CPU와 조작 지연을 줄인다
+핵심 지표: 새 경로 출시 1/2 · R11은 HTTP 통합 저장, WS 경계 2건과 출시 관문 남음
 사용자 대기: 없음 (R2 Part B만 사용자 결정 대기)
-갱신: 2026-10-22 01:04 KST (R12.9 dev c899b6a 설치 완료)
+갱신: 2026-10-22 02:04 KST (R11 단위 체크포인트 eb9da81, 긴급 성능 수정 시작)
 <!-- status:end -->
 
-Only the design session edits this block, when priority, approval or the core metric changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
+The implementer updates this block at each gate; the design session also updates priority, approval and the core metric. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
 
 ## Unit check (closes a unit)
 
