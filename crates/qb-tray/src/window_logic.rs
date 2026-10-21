@@ -19,7 +19,11 @@ pub fn wheel_scroll(
     else {
         return false;
     };
-    state.scroll(region.region, region.offset + delta, region.max_offset);
+    let next = (region.offset + delta).clamp(0., region.max_offset.max(0.));
+    if !next.is_finite() || next == region.offset {
+        return false;
+    }
+    state.scroll(region.region, next, region.max_offset);
     true
 }
 
@@ -406,3 +410,42 @@ impl Editor {
 #[cfg(test)]
 #[path = "window_logic_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod r1210_tests {
+    use super::*;
+    #[test]
+    fn clamped_wheel_does_not_request_a_scene_rebuild() {
+        use qb_tray::{dashboard_model as m, geometry as g, state::ScrollRegion};
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-22T12:00:00+09:00").unwrap();
+        let clock = m::Clock {
+            now,
+            day_start: now.with_timezone(&chrono::Utc) - chrono::Duration::hours(12),
+            day_end: now.with_timezone(&chrono::Utc) + chrono::Duration::hours(12),
+        };
+        let mut state = qb_tray::state::DashboardState::default();
+        let view = m::project(
+            &m::DashboardSnapshot::new(
+                qb_tray::v2::project("{}", std::time::SystemTime::UNIX_EPOCH).unwrap(),
+            ),
+            &mut state,
+            &clock,
+        );
+        let mut scene = g::Scene::build(&view, &state, [1320., 960.], &g::Metrics::default());
+        scene.content.push(g::Region {
+            region: ScrollRegion::Table,
+            viewport: g::rect(0., 0., 100., 100.),
+            content_height: 300.,
+            offset: 0.,
+            max_offset: 200.,
+        });
+        assert!(!wheel_scroll(&mut state, &scene, [50., 50.], -96.));
+        assert_eq!(state.table_offset, 0.);
+        assert!(wheel_scroll(&mut state, &scene, [50., 50.], 96.));
+        assert_eq!(state.table_offset, 96.);
+        scene.content.last_mut().unwrap().offset = 200.;
+        state.table_offset = 200.;
+        assert!(!wheel_scroll(&mut state, &scene, [50., 50.], 96.));
+        assert_eq!(state.table_offset, 200.);
+    }
+}

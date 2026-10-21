@@ -1,38 +1,41 @@
 //! DirectWrite text shared by native and WIC D2D targets.
-//! Layouts last one paint pass. The native text engine lasts one visible session
-//! and is released on hide; WIC uses one engine per render.
+//! Mutable layouts are independent; plain drawing and metrics use bounded caches.
+//! The native engine lasts one visible session; WIC uses one engine per render.
 #![cfg(target_os = "windows")]
 
+#[cfg(any(debug_assertions, feature = "testkit"))]
+use std::{cell::Cell, time::Instant};
+use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 use windows::{
     Win32::{
         Foundation::{E_FAIL, E_INVALIDARG},
         Graphics::{
             Direct2D::{
                 Common::{D2D_RECT_F, D2D1_COLOR_F},
-                D2D1_DRAW_TEXT_OPTIONS_NONE, ID2D1RenderTarget,
+                D2D1_DRAW_TEXT_OPTIONS_NONE, ID2D1RenderTarget, ID2D1SolidColorBrush,
             },
             DirectWrite::*,
         },
     },
-    core::{Error, PCWSTR, Result},
+    core::{Error, Interface, PCWSTR, Result},
 };
 use windows_numerics::Vector2;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Face {
     Text,
     Icon,
     Mono,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Align {
     Leading,
     Center,
     Trailing,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Wrap {
     SingleLine,
     KeepAll,
@@ -50,15 +53,241 @@ pub struct Style {
     pub wrap: Wrap,
 }
 
+const FORMAT_CACHE_CAPACITY: usize = 64;
+// Retain the measured cross-tab working set within the same text-byte budget.
+const LAYOUT_CACHE_CAPACITY: usize = 4_096;
+const LAYOUT_CACHE_LINE_LIMIT: usize = 8_192;
+const LAYOUT_CACHE_TEXT_LIMIT: usize = 1024 * 1024;
+const LAYOUT_CACHE_INPUT_LIMIT: usize = 16 * 1024;
+const LAYOUT_CACHE_ENTRY_LINE_LIMIT: usize = 256;
+const SOLID_BRUSH_CACHE_CAPACITY: usize = 128;
+
+#[derive(Default)]
+struct SolidBrushCache {
+    // Pin the actual target interface so its address cannot be recycled while
+    // its brushes remain cached. A different interface is conservatively cold.
+    target: Option<ID2D1RenderTarget>,
+    brushes: BTreeMap<[u32; 4], ID2D1SolidColorBrush>,
+    #[cfg(test)]
+    creations: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct StyleKey {
+    face: Face,
+    size: u32,
+    weight: i32,
+    line_height: u32,
+    align: Align,
+    wrap: Wrap,
+}
+
+impl From<Style> for StyleKey {
+    fn from(style: Style) -> Self {
+        Self {
+            face: style.face,
+            size: style.size.to_bits(),
+            weight: style.weight.0,
+            line_height: style.line_height.to_bits(),
+            align: style.align,
+            wrap: style.wrap,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct LayoutKey {
+    text: String,
+    style: StyleKey,
+    width: u32,
+    height: u32,
+}
+
+impl LayoutKey {
+    fn new(value: &str, width: f32, height: f32, style: Style) -> Self {
+        Self {
+            text: value.to_owned(),
+            style: style.into(),
+            width: width.to_bits(),
+            height: height.to_bits(),
+        }
+    }
+}
+
+struct Cached<T> {
+    value: T,
+    used: u64,
+}
+
+#[derive(Default)]
+struct TextCache {
+    formats: BTreeMap<StyleKey, Cached<IDWriteTextFormat>>,
+    // Only draw/measure can obtain these shared, immutable layouts.
+    layouts: BTreeMap<LayoutKey, Cached<Rc<Layout>>>,
+    clock: u64,
+    line_count: usize,
+    text_bytes: usize,
+}
+
+impl TextCache {
+    fn tick(&mut self) -> u64 {
+        self.clock = self.clock.saturating_add(1);
+        self.clock
+    }
+
+    fn format(&mut self, key: &StyleKey) -> Option<IDWriteTextFormat> {
+        let used = self.tick();
+        self.formats.get_mut(key).map(|entry| {
+            entry.used = used;
+            entry.value.clone()
+        })
+    }
+
+    fn retain_format(&mut self, key: StyleKey, format: IDWriteTextFormat) {
+        self.formats.remove(&key);
+        if self.formats.len() >= FORMAT_CACHE_CAPACITY {
+            let oldest = self
+                .formats
+                .iter()
+                .min_by_key(|(_, entry)| entry.used)
+                .map(|(key, _)| *key)
+                .expect("nonempty format cache");
+            self.formats.remove(&oldest);
+        }
+        let used = self.tick();
+        self.formats.insert(
+            key,
+            Cached {
+                value: format,
+                used,
+            },
+        );
+    }
+
+    fn layout(&mut self, key: &LayoutKey) -> Option<Rc<Layout>> {
+        let used = self.tick();
+        self.layouts.get_mut(key).map(|entry| {
+            entry.used = used;
+            Rc::clone(&entry.value)
+        })
+    }
+
+    fn remove_layout(&mut self, key: &LayoutKey) {
+        if let Some((key, entry)) = self.layouts.remove_entry(key) {
+            self.line_count -= entry.value.lines.len();
+            self.text_bytes -= retained_text_bytes(&key, &entry.value);
+        }
+    }
+
+    fn retain_layout(&mut self, key: LayoutKey, layout: Rc<Layout>) {
+        let lines = layout.lines.len();
+        let bytes = retained_text_bytes(&key, &layout);
+        if key.text.len() > LAYOUT_CACHE_INPUT_LIMIT
+            || lines > LAYOUT_CACHE_ENTRY_LINE_LIMIT
+            || bytes > LAYOUT_CACHE_TEXT_LIMIT
+        {
+            return;
+        }
+        self.remove_layout(&key);
+        while self.layouts.len() >= LAYOUT_CACHE_CAPACITY
+            || self.line_count + lines > LAYOUT_CACHE_LINE_LIMIT
+            || self.text_bytes + bytes > LAYOUT_CACHE_TEXT_LIMIT
+        {
+            let oldest = self
+                .layouts
+                .iter()
+                .min_by_key(|(_, entry)| entry.used)
+                .map(|(key, _)| key.clone())
+                .expect("nonempty layout cache");
+            self.remove_layout(&oldest);
+        }
+        let used = self.tick();
+        self.line_count += lines;
+        self.text_bytes += bytes;
+        self.layouts.insert(
+            key,
+            Cached {
+                value: layout,
+                used,
+            },
+        );
+    }
+}
+
+fn retained_text_bytes(key: &LayoutKey, layout: &Layout) -> usize {
+    layout
+        .lines
+        .iter()
+        .fold(key.text.capacity(), |bytes, line| {
+            bytes.saturating_add(line.text.capacity())
+        })
+}
+
 /// An isolated factory owned by its renderer, never a global shared font cache.
 pub struct Text {
     factory: IDWriteFactory,
     text_family: &'static str,
     icon_family: &'static str,
     mono_family: &'static str,
+    cache: RefCell<TextCache>,
+    solid_brushes: RefCell<SolidBrushCache>,
+    #[cfg(any(debug_assertions, feature = "testkit"))]
+    phases: TextPhaseCounters,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+/// Per-engine elapsed wall durations since reset, not process CPU time.
+/// Creation counts include failed COM attempts.
+/// Plain release builds expose the same API and return zero totals.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct TextPhaseStats {
+    /// Elapsed wall time in layout/measure/draw preparation, including cache lookup.
+    pub text_measure_us: u64,
+    pub layout_creations: u64,
+    pub format_creations: u64,
+}
+
+#[cfg(any(debug_assertions, feature = "testkit"))]
+#[derive(Default)]
+struct TextPhaseCounters {
+    enabled: Cell<bool>,
+    text_measure_ns: Cell<u64>,
+    layout_creations: Cell<u64>,
+    format_creations: Cell<u64>,
+}
+
+#[cfg(any(debug_assertions, feature = "testkit"))]
+pub(crate) fn phase_elapsed_ns(started: Instant) -> u64 {
+    started.elapsed().as_nanos().min(u64::MAX as u128) as u64
+}
+
+/// Includes early-error paths without reading the clock when disabled.
+#[cfg(any(debug_assertions, feature = "testkit"))]
+pub(crate) struct PhaseTimer<'a> {
+    started: Option<Instant>,
+    total: &'a Cell<u64>,
+}
+
+#[cfg(any(debug_assertions, feature = "testkit"))]
+impl<'a> PhaseTimer<'a> {
+    pub(crate) fn new(enabled: bool, total: &'a Cell<u64>) -> Self {
+        Self {
+            started: enabled.then(Instant::now),
+            total,
+        }
+    }
+}
+
+#[cfg(any(debug_assertions, feature = "testkit"))]
+impl Drop for PhaseTimer<'_> {
+    fn drop(&mut self) {
+        if let Some(started) = self.started {
+            self.total
+                .set(self.total.get().saturating_add(phase_elapsed_ns(started)));
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Metrics {
     /// Maximum untrimmed advance, including trailing spaces, of wrapped lines.
     pub natural_width: f32,
@@ -81,7 +310,8 @@ struct Line {
     text: String,
 }
 
-/// Owns shaped layouts, never the input string. Keep only for this paint pass.
+/// Independently mutable shaped layouts returned by Text::layout.
+/// Shared plain layouts stay private to Text's draw/measure cache.
 pub struct Layout {
     lines: Vec<Line>,
     pub metrics: Metrics,
@@ -100,7 +330,46 @@ impl Text {
             icon_family: choose_family(&collection, &["Segoe Fluent Icons", "Segoe MDL2 Assets"])?,
             mono_family: choose_family(&collection, &["Cascadia Mono", "Consolas"])?,
             factory,
+            cache: RefCell::new(TextCache::default()),
+            solid_brushes: RefCell::new(SolidBrushCache::default()),
+            #[cfg(any(debug_assertions, feature = "testkit"))]
+            phases: TextPhaseCounters::default(),
         })
+    }
+
+    /// Default off. Disabling retains totals; reset does not change this flag.
+    pub fn set_phase_stats_enabled(&self, enabled: bool) {
+        #[cfg(any(debug_assertions, feature = "testkit"))]
+        self.phases.enabled.set(enabled);
+        #[cfg(not(any(debug_assertions, feature = "testkit")))]
+        let _ = enabled;
+    }
+
+    pub fn reset_phase_stats(&self) {
+        #[cfg(any(debug_assertions, feature = "testkit"))]
+        {
+            self.phases.text_measure_ns.set(0);
+            self.phases.layout_creations.set(0);
+            self.phases.format_creations.set(0);
+        }
+    }
+
+    pub fn phase_stats(&self) -> TextPhaseStats {
+        #[cfg(any(debug_assertions, feature = "testkit"))]
+        {
+            TextPhaseStats {
+                text_measure_us: self.phases.text_measure_ns.get() / 1_000,
+                layout_creations: self.phases.layout_creations.get(),
+                format_creations: self.phases.format_creations.get(),
+            }
+        }
+        #[cfg(not(any(debug_assertions, feature = "testkit")))]
+        TextPhaseStats::default()
+    }
+
+    #[cfg(any(debug_assertions, feature = "testkit"))]
+    pub(crate) fn phase_measure_ns(&self) -> u64 {
+        self.phases.text_measure_ns.get()
     }
 
     pub fn families(&self) -> (&'static str, &'static str) {
@@ -108,6 +377,10 @@ impl Text {
     }
 
     fn format(&self, style: Style) -> Result<IDWriteTextFormat> {
+        let key = style.into();
+        if let Some(format) = self.cache.borrow_mut().format(&key) {
+            return Ok(format);
+        }
         let family = wide(match style.face {
             Face::Text => self.text_family,
             Face::Icon => self.icon_family,
@@ -116,6 +389,12 @@ impl Text {
         // No custom font collection/fallback: DirectWrite's system fallback
         // resolves Hangul (normally Malgun Gothic on Korean Windows).
         unsafe {
+            #[cfg(any(debug_assertions, feature = "testkit"))]
+            if self.phases.enabled.get() {
+                self.phases
+                    .format_creations
+                    .set(self.phases.format_creations.get().saturating_add(1));
+            }
             let format = self.factory.CreateTextFormat(
                 PCWSTR(family.as_ptr()),
                 None,
@@ -141,6 +420,7 @@ impl Text {
                 },
                 &sign,
             )?;
+            self.cache.borrow_mut().retain_format(key, format.clone());
             Ok(format)
         }
     }
@@ -155,6 +435,12 @@ impl Text {
         let utf16: Vec<u16> = value.encode_utf16().collect();
         let length = u32::try_from(utf16.len()).map_err(|_| Error::from_hresult(E_INVALIDARG))?;
         unsafe {
+            #[cfg(any(debug_assertions, feature = "testkit"))]
+            if self.phases.enabled.get() {
+                self.phases
+                    .layout_creations
+                    .set(self.phases.layout_creations.get().saturating_add(1));
+            }
             let layout = self
                 .factory
                 .CreateTextLayout(&utf16, format, width, height)?;
@@ -194,27 +480,13 @@ impl Text {
     /// opportunities; CRLF/CR/LF are explicit breaks. Long words stay intact
     /// in the wrapping algorithm and are ellipsized by DirectWrite when drawn.
     pub fn layout(&self, value: &str, bounds: D2D_RECT_F, style: Style) -> Result<Layout> {
-        let width = bounds.right - bounds.left;
-        let height = bounds.bottom - bounds.top;
-        if ![
-            bounds.left,
-            bounds.top,
-            bounds.right,
-            bounds.bottom,
-            width,
-            height,
-            style.size,
-            style.line_height,
-        ]
-        .iter()
-        .all(|v| v.is_finite())
-            || width <= 0.0
-            || height < 0.0
-            || style.size <= 0.0
-            || style.line_height <= 0.0
-        {
-            return Err(Error::from_hresult(E_INVALIDARG));
-        }
+        #[cfg(any(debug_assertions, feature = "testkit"))]
+        let _measurement = PhaseTimer::new(self.phases.enabled.get(), &self.phases.text_measure_ns);
+        self.build_layout(value, bounds, style)
+    }
+
+    fn build_layout(&self, value: &str, bounds: D2D_RECT_F, style: Style) -> Result<Layout> {
+        let (width, height) = dimensions(bounds, style)?;
         let format = self.format(style)?;
         let normalized = value.replace("\r\n", "\n").replace('\r', "\n");
         let mut strings = Vec::new();
@@ -297,7 +569,83 @@ impl Text {
         Ok(Layout { lines, metrics })
     }
 
-    /// Convenience for callers that do not need to keep the shaped layout.
+    // Build at a relative origin. Never expose shared COM layouts to emphasize.
+    fn cached_layout(&self, value: &str, bounds: D2D_RECT_F, style: Style) -> Result<Rc<Layout>> {
+        #[cfg(any(debug_assertions, feature = "testkit"))]
+        let _measurement = PhaseTimer::new(self.phases.enabled.get(), &self.phases.text_measure_ns);
+        let (width, height) = dimensions(bounds, style)?;
+        let relative = D2D_RECT_F {
+            left: 0.,
+            top: 0.,
+            right: width,
+            bottom: height,
+        };
+        // Oversized input still renders normally without retaining a key copy.
+        if value.len() > LAYOUT_CACHE_INPUT_LIMIT {
+            return self.build_layout(value, relative, style).map(Rc::new);
+        }
+        let key = LayoutKey::new(value, width, height, style);
+        if let Some(layout) = self.cache.borrow_mut().layout(&key) {
+            return Ok(layout);
+        }
+        // The lookup borrow is gone before shaping consults the format cache.
+        let layout = Rc::new(self.build_layout(value, relative, style)?);
+        self.cache
+            .borrow_mut()
+            .retain_layout(key, Rc::clone(&layout));
+        Ok(layout)
+    }
+
+    /// Cached plain metrics without exposing mutable shared DirectWrite objects.
+    pub fn measure(&self, value: &str, bounds: D2D_RECT_F, style: Style) -> Result<Metrics> {
+        Ok(self.cached_layout(value, bounds, style)?.metrics)
+    }
+
+    /// Release target-dependent resources before creating a replacement target.
+    /// Device-independent text caches and diagnostic creation counts are retained.
+    pub(crate) fn clear_target_resources(&self) {
+        let mut cache = self.solid_brushes.borrow_mut();
+        cache.brushes.clear();
+        cache.target = None;
+    }
+
+    /// Shared target-local brushes are immutable: callers must not change their
+    /// color, opacity or transform. A full cache bypasses retention.
+    pub(crate) fn solid_brush(
+        &self,
+        target: &ID2D1RenderTarget,
+        color: D2D1_COLOR_F,
+    ) -> Result<ID2D1SolidColorBrush> {
+        let mut cache = self.solid_brushes.borrow_mut();
+        if cache
+            .target
+            .as_ref()
+            .is_none_or(|old| old.as_raw() != target.as_raw())
+        {
+            cache.brushes.clear();
+            cache.target = Some(target.clone());
+        }
+        let key = [
+            color.r.to_bits(),
+            color.g.to_bits(),
+            color.b.to_bits(),
+            color.a.to_bits(),
+        ];
+        if let Some(brush) = cache.brushes.get(&key) {
+            return Ok(brush.clone());
+        }
+        #[cfg(test)]
+        {
+            cache.creations += 1;
+        }
+        let brush = unsafe { target.CreateSolidColorBrush(&color, None)? };
+        if cache.brushes.len() < SOLID_BRUSH_CACHE_CAPACITY {
+            cache.brushes.insert(key, brush.clone());
+        }
+        Ok(brush)
+    }
+
+    /// Draw a cached plain layout at the current bounds' origin.
     pub fn draw(
         &self,
         target: &ID2D1RenderTarget,
@@ -306,8 +654,16 @@ impl Text {
         style: Style,
         color: D2D1_COLOR_F,
     ) -> Result<Metrics> {
-        let layout = self.layout(value, bounds, style)?;
-        layout.draw(target, color)?;
+        let layout = self.cached_layout(value, bounds, style)?;
+        let brush = self.solid_brush(target, color)?;
+        layout.draw_with_brush_at(
+            target,
+            &brush,
+            Vector2 {
+                X: bounds.left,
+                Y: bounds.top,
+            },
+        );
         Ok(layout.metrics)
     }
 }
@@ -339,19 +695,71 @@ impl Layout {
     /// Caller owns BeginDraw/EndDraw and must propagate EndDraw's deferred D2D
     /// errors. Caller clips must also allow for reported ink overflow.
     pub fn draw(&self, target: &ID2D1RenderTarget, color: D2D1_COLOR_F) -> Result<()> {
+        self.draw_at(target, color, Vector2 { X: 0., Y: 0. })
+    }
+
+    fn draw_at(
+        &self,
+        target: &ID2D1RenderTarget,
+        color: D2D1_COLOR_F,
+        origin: Vector2,
+    ) -> Result<()> {
         let brush = unsafe { target.CreateSolidColorBrush(&color, None)? };
+        self.draw_with_brush_at(target, &brush, origin);
+        Ok(())
+    }
+
+    fn draw_with_brush_at(
+        &self,
+        target: &ID2D1RenderTarget,
+        brush: &ID2D1SolidColorBrush,
+        origin: Vector2,
+    ) {
         for line in &self.lines {
             unsafe {
                 target.DrawTextLayout(
-                    line.origin,
+                    line.at(origin),
                     &line.layout,
-                    &brush,
+                    brush,
                     D2D1_DRAW_TEXT_OPTIONS_NONE,
                 );
             }
         }
-        Ok(())
     }
+}
+
+impl Line {
+    fn at(&self, origin: Vector2) -> Vector2 {
+        Vector2 {
+            X: self.origin.X + origin.X,
+            Y: self.origin.Y + origin.Y,
+        }
+    }
+}
+
+fn dimensions(bounds: D2D_RECT_F, style: Style) -> Result<(f32, f32)> {
+    let width = bounds.right - bounds.left;
+    let height = bounds.bottom - bounds.top;
+    if ![
+        bounds.left,
+        bounds.top,
+        bounds.right,
+        bounds.bottom,
+        width,
+        height,
+        style.size,
+        style.line_height,
+    ]
+    .iter()
+    .all(|v| v.is_finite())
+        || width <= 0.0
+        || height < 0.0
+        || style.size <= 0.0
+        || style.line_height <= 0.0
+    {
+        return Err(Error::from_hresult(E_INVALIDARG));
+    }
+    Ok((width, height))
 }
 
 fn measure(layout: &IDWriteTextLayout) -> Result<DWRITE_TEXT_METRICS> {
@@ -387,6 +795,705 @@ fn choose_family(
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
     use super::*;
+    use crate::{v2_colors::Rgb, v2_render::Renderer};
+    use windows::Win32::{
+        Graphics::{
+            Direct2D::{
+                Common::{D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_PIXEL_FORMAT},
+                D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_RENDER_TARGET_PROPERTIES,
+                D2D1_ROUNDED_RECT, D2D1CreateFactory, ID2D1Factory,
+            },
+            Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
+            Imaging::{
+                CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICBitmap,
+                IWICImagingFactory, WICBitmapCacheOnLoad,
+            },
+        },
+        System::Com::{
+            CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+            CoUninitialize,
+        },
+    };
+
+    struct Com;
+    impl Com {
+        fn enter() -> Result<Self> {
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()? };
+            Ok(Self)
+        }
+    }
+    impl Drop for Com {
+        fn drop(&mut self) {
+            unsafe { CoUninitialize() };
+        }
+    }
+
+    struct BrushSurface {
+        target: ID2D1RenderTarget,
+        bitmap: IWICBitmap,
+    }
+    impl BrushSurface {
+        fn new() -> Result<Self> {
+            unsafe {
+                let wic: IWICImagingFactory =
+                    CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
+                let bitmap = wic.CreateBitmap(
+                    256,
+                    192,
+                    &GUID_WICPixelFormat32bppPBGRA,
+                    WICBitmapCacheOnLoad,
+                )?;
+                let factory: ID2D1Factory =
+                    D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
+                let target = factory.CreateWicBitmapRenderTarget(
+                    &bitmap,
+                    &D2D1_RENDER_TARGET_PROPERTIES {
+                        pixelFormat: D2D1_PIXEL_FORMAT {
+                            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                        },
+                        dpiX: 96.,
+                        dpiY: 96.,
+                        ..Default::default()
+                    },
+                )?;
+                Ok(Self { target, bitmap })
+            }
+        }
+
+        fn pixels(&self) -> Result<Vec<u8>> {
+            let mut pixels = vec![0; 256 * 192 * 4];
+            unsafe {
+                self.bitmap
+                    .CopyPixels(std::ptr::null(), 256 * 4, &mut pixels)?;
+            }
+            Ok(pixels)
+        }
+    }
+
+    fn brush_fixture(surface: &BrushSurface, renderer: &Renderer, cached: bool) -> Result<()> {
+        let target = &surface.target;
+        unsafe {
+            target.BeginDraw();
+            target.Clear(Some(&D2D1_COLOR_F {
+                r: 0.02,
+                g: 0.04,
+                b: 0.08,
+                a: 0.25,
+            }));
+        }
+        for repeat in 0..2 {
+            for (index, (rgb, alpha)) in [
+                (Rgb(14, 105, 241), 1.),
+                (Rgb(14, 105, 241), 0.25),
+                (Rgb(14, 105, 241), 0.),
+                (Rgb(241, 36, 82), 0.5),
+                (Rgb(14, 105, 241), 1.),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let y = 8. + index as f32 * 33. + repeat as f32 * 2.;
+                let box_ = crate::Rect {
+                    left: 8. + repeat as f32,
+                    top: y,
+                    right: 244.,
+                    bottom: y + 26.,
+                };
+                let bounds = D2D_RECT_F {
+                    left: box_.left,
+                    top: box_.top,
+                    right: box_.right,
+                    bottom: box_.bottom,
+                };
+                let label = D2D_RECT_F {
+                    left: box_.left + 8.,
+                    top: y + 2.,
+                    right: 232.,
+                    bottom: y + 24.,
+                };
+                let color = D2D1_COLOR_F {
+                    r: rgb.0 as f32 / 255.,
+                    g: rgb.1 as f32 / 255.,
+                    b: rgb.2 as f32 / 255.,
+                    a: alpha,
+                };
+                let from = Vector2 {
+                    X: box_.left,
+                    Y: y + 29.,
+                };
+                let to = Vector2 {
+                    X: box_.right,
+                    Y: y + 29.,
+                };
+                if cached {
+                    renderer.fill(target, box_, rgb, alpha, 3.)?;
+                    renderer.stroke(target, box_, rgb, 1.5, 3., alpha)?;
+                    renderer.dashboard_line(
+                        target,
+                        [from.X, from.Y],
+                        [to.X, to.Y],
+                        rgb,
+                        1.5,
+                        alpha,
+                    )?;
+                    renderer.dashboard_text().draw(
+                        target,
+                        "계정 상태 38%",
+                        label,
+                        style(Wrap::SingleLine),
+                        color,
+                    )?;
+                } else {
+                    let brush = unsafe { target.CreateSolidColorBrush(&color, None)? };
+                    let rounded = D2D1_ROUNDED_RECT {
+                        rect: bounds,
+                        radiusX: 3.,
+                        radiusY: 3.,
+                    };
+                    unsafe {
+                        target.FillRoundedRectangle(&rounded, &brush);
+                        target.DrawRoundedRectangle(&rounded, &brush, 1.5, None);
+                        target.DrawLine(from, to, &brush, 1.5, None);
+                    }
+                    renderer
+                        .dashboard_text()
+                        .layout("계정 상태 38%", label, style(Wrap::SingleLine))?
+                        .draw(target, color)?;
+                }
+            }
+        }
+        unsafe { target.EndDraw(None, None) }
+    }
+
+    #[test]
+    fn r1210_solid_brush_cached_draws_match_uncached_wic_pixels() -> Result<()> {
+        let _com = Com::enter()?;
+        let cached = Renderer::new(false)?;
+        let uncached = Renderer::new(false)?;
+        let surface = BrushSurface::new()?;
+        let reference = BrushSurface::new()?;
+        for _ in 0..3 {
+            brush_fixture(&surface, &cached, true)?;
+            brush_fixture(&reference, &uncached, false)?;
+            let pixels = surface.pixels()?;
+            assert_eq!(pixels, reference.pixels()?);
+            assert!(pixels.chunks_exact(4).any(|pixel| pixel[3] > 64));
+            assert!(
+                pixels
+                    .chunks_exact(4)
+                    .any(|pixel| pixel[3] > 0 && pixel[3] < 255)
+            );
+            assert_eq!(cached.dashboard_text().solid_brushes.borrow().creations, 4);
+        }
+        assert!(
+            uncached
+                .dashboard_text()
+                .solid_brushes
+                .borrow()
+                .brushes
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn r1210_solid_brush_exact_bits_and_full_cache_bypass_preserve_retained_brushes() -> Result<()>
+    {
+        let _com = Com::enter()?;
+        let text = Text::new()?;
+        let surface = BrushSurface::new()?;
+        let color = D2D1_COLOR_F {
+            r: 0.,
+            g: 0.25,
+            b: 0.75,
+            a: 0.5,
+        };
+        let first = text.solid_brush(&surface.target, color)?;
+        let hit = text.solid_brush(&surface.target, color)?;
+        assert_eq!(first.as_raw(), hit.as_raw());
+        let negative_zero = text.solid_brush(&surface.target, D2D1_COLOR_F { r: -0., ..color })?;
+        assert_ne!(first.as_raw(), negative_zero.as_raw());
+        for index in 1..SOLID_BRUSH_CACHE_CAPACITY - 1 {
+            text.solid_brush(
+                &surface.target,
+                D2D1_COLOR_F {
+                    r: index as f32 / SOLID_BRUSH_CACHE_CAPACITY as f32,
+                    ..color
+                },
+            )?;
+        }
+        assert_eq!(
+            text.solid_brushes.borrow().brushes.len(),
+            SOLID_BRUSH_CACHE_CAPACITY
+        );
+        assert_eq!(
+            text.solid_brushes.borrow().creations,
+            SOLID_BRUSH_CACHE_CAPACITY
+        );
+        let extra = D2D1_COLOR_F { g: 0.375, ..color };
+        let bypass = text.solid_brush(&surface.target, extra)?;
+        let bypass_again = text.solid_brush(&surface.target, extra)?;
+        assert_ne!(bypass.as_raw(), bypass_again.as_raw());
+        assert_eq!(
+            text.solid_brush(&surface.target, color)?.as_raw(),
+            first.as_raw()
+        );
+        assert_eq!(
+            text.solid_brushes.borrow().brushes.len(),
+            SOLID_BRUSH_CACHE_CAPACITY
+        );
+        assert_eq!(
+            text.solid_brushes.borrow().creations,
+            SOLID_BRUSH_CACHE_CAPACITY + 2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn r1210_solid_brush_clear_target_resources_releases_pin_and_repaints() -> Result<()> {
+        let _com = Com::enter()?;
+        let renderer = Renderer::new(false)?;
+        let surface = BrushSurface::new()?;
+        brush_fixture(&surface, &renderer, true)?;
+        let expected = surface.pixels()?;
+        let text = renderer.dashboard_text();
+        let creations = text.solid_brushes.borrow().creations;
+        assert_eq!(creations, 4);
+        assert!(text.solid_brushes.borrow().target.is_some());
+
+        renderer.clear_target_resources();
+        {
+            let cache = text.solid_brushes.borrow();
+            assert!(cache.brushes.is_empty());
+            assert!(cache.target.is_none());
+            assert_eq!(cache.creations, creations);
+        }
+        // Clearing an already empty domain must also preserve the counter.
+        renderer.clear_target_resources();
+        assert_eq!(text.solid_brushes.borrow().creations, creations);
+
+        // Repainting the same live target must recreate every previously cached
+        // color, then reuse those new brushes without changing the pixels.
+        for _ in 0..2 {
+            brush_fixture(&surface, &renderer, true)?;
+            assert_eq!(surface.pixels()?, expected);
+            let cache = text.solid_brushes.borrow();
+            assert_eq!(cache.brushes.len(), 4);
+            assert_eq!(cache.creations, creations + 4);
+            assert_eq!(
+                cache.target.as_ref().unwrap().as_raw(),
+                surface.target.as_raw()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn r1210_solid_brush_target_swap_clears_domain_and_pins_target() -> Result<()> {
+        let _com = Com::enter()?;
+        let text = Text::new()?;
+        let first_surface = BrushSurface::new()?;
+        let color = D2D1_COLOR_F {
+            r: 0.25,
+            g: 0.5,
+            b: 0.75,
+            a: 0.5,
+        };
+        let old_target = first_surface.target.as_raw();
+        let old_brush = text.solid_brush(&first_surface.target, color)?;
+        drop(first_surface);
+        let pinned = text.solid_brushes.borrow().target.as_ref().unwrap().clone();
+        assert_eq!(pinned.as_raw(), old_target);
+        let surface = BrushSurface::new()?;
+        assert_ne!(surface.target.as_raw(), old_target);
+        let brush = text.solid_brush(&surface.target, color)?;
+        assert_ne!(brush.as_raw(), old_brush.as_raw());
+        let alias = surface.target.clone();
+        assert_eq!(text.solid_brush(&alias, color)?.as_raw(), brush.as_raw());
+        assert_eq!(text.solid_brushes.borrow().brushes.len(), 1);
+        assert_eq!(text.solid_brushes.borrow().creations, 2);
+        unsafe {
+            surface.target.BeginDraw();
+            surface.target.Clear(None);
+            surface.target.FillRectangle(&rect(80., 24.), &brush);
+            surface.target.EndDraw(None, None)?;
+        }
+        assert!(surface.pixels()?.iter().any(|byte| *byte != 0));
+        let rebound = text.solid_brush(&pinned, color)?;
+        assert_ne!(rebound.as_raw(), old_brush.as_raw());
+        assert_eq!(text.solid_brushes.borrow().brushes.len(), 1);
+        assert_eq!(text.solid_brushes.borrow().creations, 3);
+        Ok(())
+    }
+
+    #[cfg(any(debug_assertions, feature = "testkit"))]
+    #[test]
+    fn r1210_phase_stats_count_actual_calls_and_preserve_enable_reset_semantics() -> Result<()> {
+        let text = Text::new()?;
+        text.layout("disabled", rect(240., 24.), style(Wrap::SingleLine))?;
+        assert_eq!(text.phase_stats(), TextPhaseStats::default());
+
+        text.set_phase_stats_enabled(true);
+        for value in ["enabled before reset", "enabled after reset"] {
+            text.reset_phase_stats();
+            assert_eq!(text.phase_stats(), TextPhaseStats::default());
+            text.layout(value, rect(240., 24.), style(Wrap::SingleLine))?;
+            let stats = text.phase_stats();
+            // Profiling reset preserves the format warmed while disabled.
+            assert_eq!(stats.format_creations, 0);
+            // Natural advance, line-height probe, and final shaped line.
+            assert_eq!(stats.layout_creations, 3);
+        }
+
+        text.reset_phase_stats();
+        text.layout(
+            "new style",
+            rect(240., 24.),
+            Style {
+                size: 14.,
+                ..style(Wrap::SingleLine)
+            },
+        )?;
+        assert_eq!(text.phase_stats().format_creations, 1);
+        assert_eq!(text.phase_stats().layout_creations, 3);
+
+        let before = text.phase_stats();
+        text.set_phase_stats_enabled(false);
+        text.layout("disabled again", rect(240., 24.), style(Wrap::SingleLine))?;
+        assert_eq!(text.phase_stats(), before);
+        text.reset_phase_stats();
+        text.layout(
+            "reset while disabled",
+            rect(240., 24.),
+            style(Wrap::SingleLine),
+        )?;
+        assert_eq!(text.phase_stats(), TextPhaseStats::default());
+
+        text.set_phase_stats_enabled(true);
+        assert!(
+            text.layout("invalid", rect(0., 24.), style(Wrap::SingleLine))
+                .is_err()
+        );
+        assert_eq!(text.phase_stats().format_creations, 0);
+        assert_eq!(text.phase_stats().layout_creations, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn r1210_plain_cache_reuses_shaping_and_translates_hangul_origins() -> Result<()> {
+        let text = Text::new()?;
+        text.set_phase_stats_enabled(true);
+        let value = "계정 상태 😀 38% 남음\n다음 줄";
+        for align in [Align::Leading, Align::Center, Align::Trailing] {
+            let s = Style {
+                align,
+                ..style(Wrap::KeepAll)
+            };
+            let initial = D2D_RECT_F {
+                left: 24.,
+                top: 18.,
+                right: 264.,
+                bottom: 66.,
+            };
+            let cached = text.cached_layout(value, initial, s)?;
+            let fresh = text.layout(value, initial, s)?;
+            assert_eq!(cached.metrics, fresh.metrics);
+            for origin in [Vector2 { X: 47., Y: 91. }, Vector2 { X: -24., Y: -96. }] {
+                let shifted = D2D_RECT_F {
+                    left: origin.X,
+                    top: origin.Y,
+                    right: origin.X + 240.,
+                    bottom: origin.Y + 48.,
+                };
+                text.reset_phase_stats();
+                let hit = text.cached_layout(value, shifted, s)?;
+                assert!(Rc::ptr_eq(&cached, &hit));
+                assert_eq!(text.measure(value, shifted, s)?, cached.metrics);
+                assert_eq!(text.phase_stats().format_creations, 0);
+                assert_eq!(text.phase_stats().layout_creations, 0);
+                let fresh = text.layout(value, shifted, s)?;
+                assert_eq!(hit.metrics, fresh.metrics);
+                for (line, fresh) in hit.lines.iter().zip(&fresh.lines) {
+                    let actual = line.at(origin);
+                    assert!((actual.X - fresh.origin.X).abs() < 0.001);
+                    assert!((actual.Y - fresh.origin.Y).abs() < 0.001);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn r1210_plain_cache_keys_all_style_fields_and_both_dimensions() -> Result<()> {
+        let text = Text::new()?;
+        let value = "계정 상태\n다음 줄\n셋째 줄";
+        let s = style(Wrap::KeepAll);
+        let bounds = rect(240., 48.);
+        let base = text.cached_layout(value, bounds, s)?;
+        for variant in [
+            Style {
+                face: Face::Mono,
+                ..s
+            },
+            Style {
+                face: Face::Icon,
+                ..s
+            },
+            Style { size: 14., ..s },
+            Style {
+                weight: DWRITE_FONT_WEIGHT_NORMAL,
+                ..s
+            },
+            Style {
+                line_height: 25.,
+                ..s
+            },
+            Style {
+                align: Align::Center,
+                ..s
+            },
+            Style {
+                align: Align::Trailing,
+                ..s
+            },
+            Style {
+                wrap: Wrap::SingleLine,
+                ..s
+            },
+        ] {
+            let changed = text.cached_layout(value, bounds, variant)?;
+            assert!(!Rc::ptr_eq(&base, &changed));
+            assert_eq!(
+                changed.metrics,
+                text.layout(value, bounds, variant)?.metrics
+            );
+        }
+        for bounds in [rect(241., 48.), rect(240., 24.), rect(240., 0.)] {
+            let changed = text.cached_layout(value, bounds, s)?;
+            assert!(!Rc::ptr_eq(&base, &changed));
+            assert_eq!(changed.metrics, text.layout(value, bounds, s)?.metrics);
+        }
+        assert_eq!(base.metrics.visible_lines, 2);
+        assert!(base.metrics.trimmed);
+        assert_eq!(text.measure(value, rect(240., 0.), s)?.visible_lines, 0);
+        let changed = text.cached_layout("different", bounds, s)?;
+        assert!(!Rc::ptr_eq(&base, &changed));
+        let entries = text.cache.borrow().layouts.len();
+        for invalid in [
+            rect(0., 48.),
+            rect(240., -1.),
+            D2D_RECT_F {
+                left: f32::NAN,
+                ..bounds
+            },
+        ] {
+            assert!(text.measure(value, invalid, s).is_err());
+        }
+        assert!(
+            text.measure(value, bounds, Style { size: 0., ..s })
+                .is_err()
+        );
+        assert!(
+            text.measure(
+                value,
+                bounds,
+                Style {
+                    line_height: f32::INFINITY,
+                    ..s
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(text.cache.borrow().layouts.len(), entries);
+        Ok(())
+    }
+
+    #[test]
+    fn r1210_mutable_emphasis_cannot_change_cached_or_other_private_layouts() -> Result<()> {
+        let text = Text::new()?;
+        let value = "계정 😀 38% 남음";
+        let s = Style {
+            weight: DWRITE_FONT_WEIGHT_NORMAL,
+            ..style(Wrap::SingleLine)
+        };
+        let bounds = rect(400., 24.);
+        let cached = text.cached_layout(value, bounds, s)?;
+        let mut private = text.layout(value, bounds, s)?;
+        private.emphasize(&["38% 남음"])?;
+        private.emphasize(&["계정"])?;
+        let fresh = text.layout(value, bounds, s)?;
+        let offset = "계정 😀 ".encode_utf16().count() as u32;
+        for position in [0, offset] {
+            for (layout, expected) in [
+                (&*cached, DWRITE_FONT_WEIGHT_NORMAL),
+                (&fresh, DWRITE_FONT_WEIGHT_NORMAL),
+                (&private, DWRITE_FONT_WEIGHT_SEMI_BOLD),
+            ] {
+                let mut actual = DWRITE_FONT_WEIGHT_NORMAL;
+                unsafe {
+                    layout.lines[0]
+                        .layout
+                        .GetFontWeight(position, &mut actual, None)?;
+                }
+                assert_eq!(actual, expected);
+            }
+        }
+        assert!(Rc::ptr_eq(&cached, &text.cached_layout(value, bounds, s)?));
+        Ok(())
+    }
+
+    #[cfg(any(debug_assertions, feature = "testkit"))]
+    #[test]
+    fn r1210_cross_tab_working_set_stays_warm_within_retention_bounds() -> Result<()> {
+        const ROWS_PER_TAB: usize = 600;
+        let text = Text::new()?;
+        text.set_phase_stats_enabled(true);
+        let styles = [
+            style(Wrap::KeepAll),
+            Style {
+                size: 12.,
+                weight: DWRITE_FONT_WEIGHT_NORMAL,
+                align: Align::Center,
+                ..style(Wrap::KeepAll)
+            },
+            Style {
+                face: Face::Mono,
+                align: Align::Trailing,
+                ..style(Wrap::KeepAll)
+            },
+        ];
+        // Geometry's full-height measurement and finite-height paint are
+        // separate keys. Keep metrics alone so no test-held Rc pins an entry.
+        let heights = [65536., 48.];
+        let mut tabs = Vec::new();
+        for (tab, style) in styles.iter().copied().enumerate() {
+            let width = 240. + tab as f32 * 32.;
+            let mut rows = Vec::new();
+            for row in 0..ROWS_PER_TAB {
+                let value = format!("계정 {tab}:{row:03} 😀\n상태");
+                let mut metrics = [Metrics::default(); 2];
+                for (index, height) in heights.iter().copied().enumerate() {
+                    metrics[index] = text.measure(&value, rect(width, height), style)?;
+                    assert_eq!(metrics[index].total_lines, 2);
+                    assert_eq!(metrics[index].visible_lines, 2);
+                    if row == 0 {
+                        assert_eq!(
+                            metrics[index],
+                            text.layout(&value, rect(width, height), style)?.metrics
+                        );
+                    }
+                }
+                rows.push((value, metrics));
+            }
+            tabs.push(rows);
+        }
+        assert!(text.phase_stats().layout_creations > 0);
+        assert!(text.phase_stats().format_creations > 0);
+
+        for tab in [0, 1, 2, 0, 2, 1] {
+            text.reset_phase_stats();
+            let width = 240. + tab as f32 * 32.;
+            for (value, expected) in &tabs[tab] {
+                for (index, height) in heights.iter().copied().enumerate() {
+                    // Moving the same geometry must not create another key.
+                    let shifted = D2D_RECT_F {
+                        left: 32.,
+                        top: -64.,
+                        right: 32. + width,
+                        bottom: -64. + height,
+                    };
+                    assert_eq!(text.measure(value, shifted, styles[tab])?, expected[index]);
+                }
+            }
+            let stats = text.phase_stats();
+            assert_eq!(stats.layout_creations, 0, "warm tab {tab}");
+            assert_eq!(stats.format_creations, 0, "warm tab {tab}");
+            let cache = text.cache.borrow();
+            assert_eq!(
+                cache.layouts.len(),
+                styles.len() * ROWS_PER_TAB * heights.len()
+            );
+            assert_eq!(cache.line_count, cache.layouts.len() * 2);
+            assert!(cache.layouts.len() <= LAYOUT_CACHE_CAPACITY);
+            assert!(cache.line_count <= LAYOUT_CACHE_LINE_LIMIT);
+            assert!(cache.text_bytes <= LAYOUT_CACHE_TEXT_LIMIT);
+            assert!(cache.formats.len() <= FORMAT_CACHE_CAPACITY);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn r1210_cache_retention_bounds_entries_lines_bytes_and_formats() -> Result<()> {
+        let text = Text::new()?;
+        let s = style(Wrap::SingleLine);
+        for index in 0..=FORMAT_CACHE_CAPACITY {
+            text.format(Style {
+                size: 10. + index as f32,
+                ..s
+            })?;
+        }
+        assert_eq!(text.cache.borrow().formats.len(), FORMAT_CACHE_CAPACITY);
+        let single = Rc::new(text.layout("x", rect(240., 24.), s)?);
+        let key = |value: &str| LayoutKey::new(value, 240., 24., s);
+        // Exercise retention policy without shaping thousands of fixture lines.
+        let mut cache = TextCache::default();
+        for index in 0..=LAYOUT_CACHE_CAPACITY {
+            cache.retain_layout(key(&format!("entry-{index}")), Rc::clone(&single));
+        }
+        assert_eq!(cache.layouts.len(), LAYOUT_CACHE_CAPACITY);
+        assert!(cache.layout(&key("entry-0")).is_none());
+        assert!(cache.layout(&key("entry-1")).is_some());
+        cache.retain_layout(key("extra"), Rc::clone(&single));
+        assert!(cache.layout(&key("entry-1")).is_some());
+        assert!(cache.layout(&key("entry-2")).is_none());
+
+        let body = (0..32).map(|_| "계정").collect::<Vec<_>>().join("\n");
+        let tall = Rc::new(text.layout(&body, rect(240., 32. * 24.), style(Wrap::KeepAll))?);
+        assert_eq!(tall.lines.len(), 32);
+        let mut cache = TextCache::default();
+        for index in 0..=LAYOUT_CACHE_LINE_LIMIT / tall.lines.len() {
+            cache.retain_layout(key(&format!("line-{index}")), Rc::clone(&tall));
+        }
+        assert_eq!(cache.line_count, LAYOUT_CACHE_LINE_LIMIT);
+        assert!(cache.layout(&key("line-0")).is_none());
+
+        let mut cache = TextCache::default();
+        for index in 0..=LAYOUT_CACHE_TEXT_LIMIT / LAYOUT_CACHE_INPUT_LIMIT {
+            let value = format!("{index:04}{}", "x".repeat(LAYOUT_CACHE_INPUT_LIMIT - 4));
+            cache.retain_layout(key(&value), Rc::clone(&single));
+        }
+        assert!(cache.layouts.len() < LAYOUT_CACHE_TEXT_LIMIT / LAYOUT_CACHE_INPUT_LIMIT);
+        assert!(cache.text_bytes <= LAYOUT_CACHE_TEXT_LIMIT);
+        assert_eq!(cache.line_count, cache.layouts.len());
+        assert_eq!(
+            cache.text_bytes,
+            cache
+                .layouts
+                .iter()
+                .map(|(key, entry)| retained_text_bytes(key, &entry.value))
+                .sum::<usize>()
+        );
+
+        let oversized = "x".repeat(LAYOUT_CACHE_INPUT_LIMIT + 1);
+        let before = text.cache.borrow().layouts.len();
+        assert_eq!(
+            text.measure(&oversized, rect(240., 24.), s)?,
+            text.layout(&oversized, rect(240., 24.), s)?.metrics
+        );
+        assert_eq!(text.cache.borrow().layouts.len(), before);
+        let many = (0..=LAYOUT_CACHE_ENTRY_LINE_LIMIT)
+            .map(|_| "계정")
+            .collect::<Vec<_>>()
+            .join("\n");
+        let bounds = rect(240., 24. * (LAYOUT_CACHE_ENTRY_LINE_LIMIT + 1) as f32);
+        assert_eq!(
+            text.measure(&many, bounds, style(Wrap::KeepAll))?,
+            text.layout(&many, bounds, style(Wrap::KeepAll))?.metrics
+        );
+        assert_eq!(text.cache.borrow().layouts.len(), before);
+        Ok(())
+    }
 
     fn style(wrap: Wrap) -> Style {
         Style {
