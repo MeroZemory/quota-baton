@@ -377,11 +377,11 @@ async fn run() -> anyhow::Result<()> {
     {
         let (permit, child_args) = if matches!(client, launcher_label::Client::Codex) {
             let home = qb_core::home()?;
-            sessions::admission_check(&home)?;
+            sessions::admission_check(&home, sessions::resume_uuid(args)?.as_deref())?;
             sessions_admission::preflight_launch(args, command)?;
             sessions::before_codex_resume(args)?;
             let (permit, child_args) = sessions_admission::prepare_launch(args, command)?;
-            sessions::admission_check(&home)?;
+            sessions::admission_check(&home, sessions::resume_uuid(args)?.as_deref())?;
             (Some(permit), child_args)
         } else {
             (None, args.clone())

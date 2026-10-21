@@ -34,6 +34,48 @@ fn set_title(s: &str) {
     assert_ne!(unsafe { SetConsoleTitleW(s.as_ptr()) }, 0);
 }
 
+const EXISTING_ID: &str = "11111111-1111-1111-1111-111111111111";
+
+fn native_args(mode: &str) -> Vec<&'static str> {
+    if mode == "fresh-empty" {
+        return vec![];
+    }
+    let mut args = if mode == "existing-resume" {
+        vec!["resume", EXISTING_ID]
+    } else {
+        vec!["fix X"]
+    };
+    args.extend([
+        "--profile",
+        "work",
+        "--oss",
+        "--enable",
+        "new_feature",
+        "-c",
+        "openai_base_url='http://synthetic.invalid/v1'",
+        "-c",
+        "model_catalog_url='http://synthetic.invalid/catalog'",
+        "-i",
+        "one.png",
+        "-i",
+        "two.png",
+        "--",
+        "--skip",
+        "two words",
+        "--skip",
+        "한글 ! ^ & (x)",
+        "--skip",
+        "100% literal",
+        "--skip",
+        "%QB_R81_LITERAL%",
+        "--skip",
+        "ends\\",
+        "--skip",
+        "quoted\"value",
+    ]);
+    args
+}
+
 // Helpers run only in the test's separate hidden console, never the user's tab.
 #[test]
 #[ignore = "invoked by r81_title_after_child_start_in_hidden_console"]
@@ -42,10 +84,9 @@ fn r81_console_probe() {
     let mode = std::env::var("QB_R81_TITLE_MODE").unwrap();
     fs::write(root.join("initial-title"), title()).unwrap();
     let mut args = std::env::args().collect::<Vec<_>>();
-    // The first separator belongs to this libtest transport. The remaining
-    // prefix is real managed admission: --no-daemon plus the free-form boundary.
-    assert_eq!(&args[5..8], ["--", "--no-daemon", "--"]);
-    drop(args.drain(5..8));
+    // Only libtest's transport separator is removed; all native args are recorded.
+    assert_eq!(args[5], "--");
+    args.remove(5);
     fs::write(root.join("args.json"), serde_json::to_vec(&args).unwrap()).unwrap();
     if mode == "own-script" {
         set_title(&format!(
@@ -115,18 +156,7 @@ fn r81_console_host() {
     )
     .unwrap();
     let mut child = Command::new(&launcher);
-    // Admit the existing quoting payload without making --skip a native option.
-    child.arg("--");
-    for value in [
-        "two words",
-        "한글 ! ^ & (x)",
-        "100% literal",
-        "%QB_R81_LITERAL%",
-        "ends\\",
-        "quoted\"value",
-    ] {
-        child.arg("--skip").arg(value);
-    }
+    child.args(native_args(&std::env::var("QB_R81_TITLE_MODE").unwrap()));
     let status = child
         .current_dir(root.join("한글 project"))
         .env("USERPROFILE", root.join("profile"))
@@ -158,6 +188,8 @@ fn r81_title_after_child_start_in_hidden_console() {
     fs::create_dir_all(&sandbox).unwrap();
     for mode in [
         "actual",
+        "fresh-empty",
+        "existing-resume",
         "cmd",
         "own",
         "own-late",
@@ -185,15 +217,32 @@ fn r81_title_after_child_start_in_hidden_console() {
         fs::write(root.join("qb/journal/wiring.json"), serde_json::to_vec(
             &serde_json::json!({"schema":3,"mode":"dedicated","install_completed":true,"home":root.join("profile/.codex-acct/qb")})
         ).unwrap()).unwrap();
+        if mode == "existing-resume" {
+            let home = root.join("profile/.codex-acct/qb");
+            let rollout = home
+                .join("sessions")
+                .join(format!("rollout-{EXISTING_ID}.jsonl"));
+            fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+            fs::write(&rollout, format!("{}\n", serde_json::json!({
+                "type":"session_meta", "payload":{"id":EXISTING_ID,"model_provider":"openai"}
+            }))).unwrap();
+            let db = rusqlite::Connection::open(home.join("state_5.sqlite")).unwrap();
+            db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY,rollout_path TEXT NOT NULL,model_provider TEXT NOT NULL,archived INTEGER DEFAULT 0);").unwrap();
+            db.execute(
+                "INSERT INTO threads VALUES(?1,?2,'openai',0)",
+                rusqlite::params![EXISTING_ID, rollout.to_str().unwrap()],
+            )
+            .unwrap();
+        }
         let exe = std::env::current_exe().unwrap();
         fs::write(root.join("AppData/Roaming/npm/codex.cmd"), format!(
-            "@echo off\r\nif \"%~1\"==\"--version\" (echo codex-cli 0.163.0& exit /b 0)\r\necho shim>\"%QB_R81_FIXTURE%\\shim-ran\"\r\n\"{}\" --ignored --exact r81_console_probe --nocapture -- %*\r\nexit /b %errorlevel%\r\n", exe.display())).unwrap();
+            "@echo off\r\nif \"%~1\"==\"--version\" (echo probe>\"%QB_R81_FIXTURE%\\version-probed\"& echo codex-cli 0.999.0& exit /b 0)\r\necho shim>\"%QB_R81_FIXTURE%\\shim-ran\"\r\n\"{}\" --ignored --exact r81_console_probe --nocapture -- %*\r\nexit /b %errorlevel%\r\n", exe.display())).unwrap();
         if mode == "actual-node" {
             let script = root.join("AppData/Roaming/npm/node_modules/@openai/codex/bin/codex.js");
             fs::create_dir_all(script.parent().unwrap()).unwrap();
             fs::write(script, r#"const {spawnSync}=require('node:child_process');
 const args=process.argv.slice(2);
-if(args.length===1 && args[0]==='--version'){process.stdout.write('codex-cli 0.163.0\n');process.exit(0);}
+if(args.length===1 && args[0]==='--version'){require('node:fs').writeFileSync(process.env.QB_R81_FIXTURE+'/version-probed','probe');process.stdout.write('codex-cli 0.999.0\n');process.exit(0);}
 const result=spawnSync(process.env.QB_R81_PROBE,['--ignored','--exact','r81_console_probe','--nocapture','--',...args],{stdio:'inherit'});
 process.exit(result.status ?? 1);
 "#).unwrap();
@@ -316,26 +365,14 @@ process.exit(result.status ?? 1);
         );
         let args: Vec<String> =
             serde_json::from_slice(&fs::read(root.join("args.json")).unwrap()).unwrap();
-        assert_eq!(
-            &args[5..],
-            [
-                "--skip",
-                "two words",
-                "--skip",
-                "한글 ! ^ & (x)",
-                "--skip",
-                "100% literal",
-                "--skip",
-                "%QB_R81_LITERAL%",
-                "--skip",
-                "ends\\",
-                "--skip",
-                "quoted\"value"
-            ]
+        assert_eq!(&args[5..], native_args(mode));
+        assert!(
+            !root.join("version-probed").exists(),
+            "ordinary launch probed version"
         );
         assert!(!root.join("nonexistent-home").exists());
         println!(
-            "{mode}: generated launcher, post-start title, 12 forwarded arguments, exit 37, CODEX_HOME, label and 949/65001/restored949 verified"
+            "{mode}: generated launcher, post-start title, exact forwarded arguments, no version probe, exit 37, CODEX_HOME, label and 949/65001/restored949 verified"
         );
     }
 }

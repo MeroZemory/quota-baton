@@ -5,10 +5,12 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     fs,
     io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
+    rc::Rc,
     time::{Duration, SystemTime},
 };
 
@@ -25,14 +27,69 @@ pub(crate) struct Rollout {
     pub metadata: BTreeMap<String, crate::sessions_db::DbValue>,
 }
 
+#[derive(Clone)]
 pub(crate) struct Catalog {
     pub home: PathBuf,
     pub rollouts: BTreeMap<String, Rollout>,
     pub aliases: Vec<Rollout>,
-    /// Compressed headers are not decoded by this metadata adapter. Their
-    /// presence prevents proving that the dependency inventory is complete.
+    /// All compressed names, including successfully decoded headers (counts only).
     pub compressed: Vec<PathBuf>,
+    pub unreadable: Vec<UnreadableRollout>,
     pub threads: BTreeMap<String, Vec<String>>,
+}
+
+/// No decoder errors or record contents are retained.
+#[derive(Clone)]
+pub(crate) struct UnreadableRollout {
+    pub path: PathBuf,
+    pub physical: Option<String>,
+    pub reason: &'static str,
+}
+
+const HEADER_LIMIT: u64 = 4 * 1024 * 1024;
+const COMPRESSED_LIMIT: u64 = 8 * 1024 * 1024;
+const CACHE_HOME_LIMIT: usize = 64;
+const CATALOG_NODE_LIMIT: usize = 100_000;
+
+#[derive(Clone, Default)]
+struct MetadataCache {
+    homes: BTreeMap<PathBuf, Rc<Catalog>>,
+    nodes: usize,
+}
+
+thread_local! {
+    static READ_ONLY_CACHE: RefCell<Option<MetadataCache>> = const { RefCell::new(None) };
+}
+
+/// Lexically scoped, thread-bound metadata snapshots. Drop nested guards in
+/// reverse creation order. Never hold this across a mutation or its preview.
+#[must_use = "retain the guard for the read-only invocation"]
+pub(crate) struct ReadOnlyCacheGuard {
+    previous: Option<MetadataCache>,
+    // Rc makes the guard !Send/!Sync, matching the thread-local cache.
+    _thread: std::marker::PhantomData<Rc<()>>,
+}
+
+/// Opt in only for a read-only invocation (e.g. import --apply=false/list).
+/// Nested scopes inherit snapshots, then roll back their additions on drop,
+/// including unwinding. The outermost drop returns to uncached discovery.
+/// Only successful catalogs are cached; rows and filesystem guards stay live.
+pub(crate) fn read_only_cache() -> ReadOnlyCacheGuard {
+    READ_ONLY_CACHE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        let previous = state.take();
+        *state = Some(previous.clone().unwrap_or_default());
+        ReadOnlyCacheGuard {
+            previous,
+            _thread: std::marker::PhantomData,
+        }
+    })
+}
+
+impl Drop for ReadOnlyCacheGuard {
+    fn drop(&mut self) {
+        READ_ONLY_CACHE.with(|slot| *slot.borrow_mut() = self.previous.take());
+    }
 }
 
 pub(crate) fn valid_id(id: &str) -> bool {
@@ -64,7 +121,11 @@ fn ordinary(path: &Path) -> Result<fs::Metadata> {
 }
 
 fn physical_id(path: &Path) -> Option<String> {
-    let name = path.file_name()?.to_str()?.strip_suffix(".jsonl")?;
+    let name = path.file_name()?.to_str()?;
+    let name = name
+        .strip_suffix(".zst")
+        .unwrap_or(name)
+        .strip_suffix(".jsonl")?;
     if !name.starts_with("rollout-") || name.len() < 36 {
         return None;
     }
@@ -76,11 +137,21 @@ fn read_meta(path: &Path, relative: PathBuf, physical: String) -> Result<Rollout
     let metadata = ordinary(path)?;
     ensure!(metadata.is_file(), "대화 기록이 일반 파일이 아닙니다");
     let file = fs::File::open(path)?;
+    let reader: Box<dyn Read> = if path.extension().is_some_and(|s| s == "zst") {
+        let mut decoder =
+            zstd::stream::read::Decoder::new(file.take(COMPRESSED_LIMIT))?.single_frame();
+        decoder.window_log_max(23)?;
+        Box::new(decoder)
+    } else {
+        Box::new(file)
+    };
     let mut line = String::new();
     // Only the first record can be session_meta. Never scan assistant/user text.
-    let count = BufReader::new(file.take(4 * 1024 * 1024 + 1)).read_line(&mut line)?;
+    // Capacity one prevents decoded read-ahead into the next record. Decoder
+    // input and window are bounded independently of the decoded header limit.
+    let count = BufReader::with_capacity(1, reader.take(HEADER_LIMIT + 1)).read_line(&mut line)?;
     ensure!(
-        count <= 4 * 1024 * 1024 && line.ends_with('\n'),
+        count as u64 <= HEADER_LIMIT && line.ends_with('\n'),
         "대화 메타데이터를 안전하게 읽을 수 없습니다"
     );
     let value: Value = serde_json::from_str(&line)
@@ -151,11 +222,48 @@ fn read_meta(path: &Path, relative: PathBuf, physical: String) -> Result<Rollout
 pub(crate) fn catalog(home: &Path) -> Result<Catalog> {
     ensure!(ordinary(home)?.is_dir(), "원본 홈이 폴더가 아닙니다");
     let home = fs::canonicalize(home)?;
+    if let Some(snapshot) = READ_ONLY_CACHE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .and_then(|cache| cache.homes.get(&home).cloned())
+    }) {
+        return Ok((*snapshot).clone());
+    }
+    let result = scan_catalog(home)?;
+    READ_ONLY_CACHE.with(|slot| -> Result<()> {
+        let mut state = slot.borrow_mut();
+        if let Some(cache) = state.as_mut() {
+            // Count every retained name/diagnostic, conservatively counting a
+            // compressed name again when it also has a header or failure.
+            let nodes = result.rollouts.len()
+                + result.aliases.len()
+                + result.compressed.len()
+                + result.unreadable.len();
+            ensure!(
+                cache.homes.len() < CACHE_HOME_LIMIT,
+                "읽기 전용 대화 캐시의 홈이 너무 많습니다"
+            );
+            ensure!(
+                nodes <= CATALOG_NODE_LIMIT.saturating_sub(cache.nodes),
+                "읽기 전용 대화 캐시의 파일이 너무 많습니다"
+            );
+            cache.nodes += nodes;
+            cache
+                .homes
+                .insert(result.home.clone(), Rc::new(result.clone()));
+        }
+        Ok(())
+    })?;
+    Ok(result)
+}
+
+fn scan_catalog(home: PathBuf) -> Result<Catalog> {
     let mut result = Catalog {
         home: home.clone(),
         rollouts: BTreeMap::new(),
         aliases: Vec::new(),
         compressed: Vec::new(),
+        unreadable: Vec::new(),
         threads: BTreeMap::new(),
     };
     for top in ["sessions", "archived_sessions"] {
@@ -178,29 +286,48 @@ pub(crate) fn catalog(home: &Path) -> Result<Catalog> {
                 if !kind.is_file() {
                     continue;
                 }
-                if path.extension().is_some_and(|s| s == "zst") {
+                let compressed = path.extension().is_some_and(|s| s == "zst");
+                if compressed {
                     ensure!(
-                        result.compressed.len() < 100_000,
+                        result.compressed.len() < CATALOG_NODE_LIMIT,
                         "대화 파일이 너무 많습니다"
                     );
-                    result.compressed.push(path);
-                    continue;
+                    result.compressed.push(path.clone());
                 }
                 let Some(physical) = physical_id(&path) else {
+                    if compressed {
+                        result.unreadable.push(UnreadableRollout {
+                            path,
+                            physical: None,
+                            reason: "압축 대화 파일 이름에서 ID를 확인할 수 없습니다",
+                        });
+                    }
                     continue;
                 };
                 ensure!(
-                    result.rollouts.len() + result.aliases.len() < 100_000,
+                    result.rollouts.len() + result.aliases.len() < CATALOG_NODE_LIMIT,
                     "대화 파일이 너무 많습니다"
                 );
                 let relative = path.strip_prefix(&base)?.to_owned();
-                let item = read_meta(&path, relative, physical.clone())?;
+                let item = match read_meta(&path, relative, physical.clone()) {
+                    Ok(item) => item,
+                    Err(_) if compressed => {
+                        result.unreadable.push(UnreadableRollout {
+                            path,
+                            physical: Some(physical),
+                            reason: "압축 대화 메타데이터를 안전하게 읽을 수 없습니다",
+                        });
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 if let Some(existing) = result.rollouts.get(&physical) {
                     ensure!(
                         crate::sessions_guard::identity(&existing.path)?
                             == crate::sessions_guard::identity(&item.path)?
                             && existing.thread == item.thread,
-                        "같은 대화 기록 ID가 중복되어 있습니다"
+                        "같은 대화 기록 ID가 서로 다른 파일에 중복되어 있습니다: {}",
+                        physical
                     );
                     result.aliases.push(item);
                     continue;
@@ -218,6 +345,48 @@ pub(crate) fn catalog(home: &Path) -> Result<Catalog> {
 }
 
 impl Catalog {
+    /// Expand known IDs through logical, physical, fork and history-base edges.
+    /// Callers seed this with moving IDs plus IDs established by rows/references;
+    /// for cross-home graphs, union and repeat across catalogs until stable.
+    pub(crate) fn related_ids(&self, ids: &BTreeSet<String>) -> BTreeSet<String> {
+        let mut edges: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        for item in self.all() {
+            for id in std::iter::once(item.physical.as_str())
+                .chain(item.forked_from.as_deref())
+                .chain(item.history_base.as_deref())
+            {
+                edges.entry(&item.thread).or_default().insert(id);
+                edges.entry(id).or_default().insert(&item.thread);
+            }
+        }
+        let mut found: BTreeSet<String> = ids.iter().map(|id| id.to_ascii_lowercase()).collect();
+        let mut pending: Vec<_> = found.iter().cloned().collect();
+        while let Some(id) = pending.pop() {
+            if let Some(neighbors) = edges.get(id.as_str()) {
+                for neighbor in neighbors {
+                    if found.insert((*neighbor).to_owned()) {
+                        pending.push((*neighbor).to_owned());
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    /// Refuse only unreadable names whose exact filename UUID is in the known
+    /// graph. Unknown IDs do not imply a relationship. No rows are read here.
+    pub(crate) fn ensure_readable_for(&self, ids: &BTreeSet<String>) -> Result<()> {
+        let related = self.related_ids(ids);
+        for item in &self.unreadable {
+            if let Some(id) = &item.physical
+                && related.contains(id)
+            {
+                bail!("{}: {}", item.reason, id);
+            }
+        }
+        Ok(())
+    }
+
     /// Every discoverable name, including hardlink aliases of a physical segment.
     pub(crate) fn all(&self) -> impl Iterator<Item = &Rollout> {
         self.rollouts.values().chain(self.aliases.iter())
@@ -288,6 +457,7 @@ impl Catalog {
 
     pub fn chain(&self, id: &str) -> Result<Vec<Rollout>> {
         ensure!(valid_id(id), "대화 ID는 UUID여야 합니다");
+        self.ensure_readable_for(&BTreeSet::from([id.to_owned()]))?;
         let mut done = BTreeSet::new();
         let mut visiting = BTreeSet::new();
         let mut result = Vec::new();
@@ -340,6 +510,10 @@ impl Catalog {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "sessions_compressed_tests.rs"]
+mod compressed_tests;
 
 pub(crate) fn refuse_recent(items: &[Rollout], now: SystemTime) -> Result<()> {
     for item in items {
@@ -516,5 +690,107 @@ mod tests {
             catalog(home.path()).unwrap().descendants(A),
             BTreeSet::from([B.into(), C.into()])
         );
+    }
+
+    #[test]
+    fn read_only_snapshot_is_stable_canonical_and_fresh_after_drop() {
+        let home = home();
+        let plain = write(home.path(), A, A, None, None, false);
+        let compressed = plain.with_extension("jsonl.zst");
+        fs::write(
+            &compressed,
+            zstd::stream::encode_all(fs::read(&plain).unwrap().as_slice(), 1).unwrap(),
+        )
+        .unwrap();
+        fs::remove_file(plain).unwrap();
+        let guard = read_only_cache();
+        let mut first = catalog(home.path()).unwrap();
+        assert_eq!(first.rollouts.len(), 1);
+        // Returned catalogs are independent of the stored snapshot.
+        first.rollouts.clear();
+        fs::write(&compressed, b"synthetic corrupt compressed header").unwrap();
+        write(home.path(), B, B, None, None, false);
+        let again = catalog(&home.path().join(".")).unwrap();
+        assert_eq!(again.rollouts.len(), 1);
+        assert!(again.unreadable.is_empty());
+        READ_ONLY_CACHE.with(|slot| assert_eq!(slot.borrow().as_ref().unwrap().homes.len(), 1));
+        drop(guard);
+        let fresh = catalog(home.path()).unwrap();
+        assert!(fresh.threads.contains_key(B));
+        assert!(!fresh.threads.contains_key(A));
+        assert_eq!(fresh.unreadable.len(), 1);
+        READ_ONLY_CACHE.with(|slot| assert!(slot.borrow().is_none()));
+        // Default-off calls observe every subsequent filesystem change.
+        write(home.path(), C, C, None, None, false);
+        assert!(catalog(home.path()).unwrap().threads.contains_key(C));
+    }
+
+    #[test]
+    fn nested_read_only_scope_inherits_then_rolls_back_added_snapshots() {
+        let first = home();
+        let second = home();
+        write(first.path(), A, A, None, None, false);
+        let outer = read_only_cache();
+        catalog(first.path()).unwrap();
+        write(first.path(), B, B, None, None, false);
+        {
+            let _inner = read_only_cache();
+            assert!(!catalog(first.path()).unwrap().threads.contains_key(B));
+            assert!(catalog(second.path()).unwrap().rollouts.is_empty());
+            write(second.path(), C, C, None, None, false);
+            assert!(catalog(second.path()).unwrap().rollouts.is_empty());
+        }
+        assert!(!catalog(first.path()).unwrap().threads.contains_key(B));
+        assert!(catalog(second.path()).unwrap().threads.contains_key(C));
+        drop(outer);
+        assert!(catalog(first.path()).unwrap().threads.contains_key(B));
+    }
+
+    #[test]
+    fn read_only_scope_unwinding_restores_outer_then_disables_cache() {
+        let first = home();
+        let second = home();
+        let outer = read_only_cache();
+        catalog(first.path()).unwrap();
+        let unwind = std::panic::catch_unwind(|| {
+            let _inner = read_only_cache();
+            catalog(second.path()).unwrap();
+            write(first.path(), A, A, None, None, false);
+            write(second.path(), B, B, None, None, false);
+            panic!("synthetic nested scope rollback");
+        });
+        assert!(unwind.is_err());
+        assert!(catalog(first.path()).unwrap().rollouts.is_empty());
+        assert!(catalog(second.path()).unwrap().threads.contains_key(B));
+        drop(outer);
+        let unwind = std::panic::catch_unwind(|| {
+            let _guard = read_only_cache();
+            catalog(first.path()).unwrap();
+            write(first.path(), C, C, None, None, false);
+            panic!("synthetic outer scope rollback");
+        });
+        assert!(unwind.is_err());
+        READ_ONLY_CACHE.with(|slot| assert!(slot.borrow().is_none()));
+        assert!(catalog(first.path()).unwrap().threads.contains_key(C));
+    }
+
+    #[test]
+    fn failed_scan_is_not_cached_and_capacity_refusal_does_not_poison_scope() {
+        let home = home();
+        let path = write(home.path(), A, A, None, None, false);
+        fs::write(&path, b"invalid first record\n").unwrap();
+        let _guard = read_only_cache();
+        assert!(catalog(home.path()).is_err());
+        READ_ONLY_CACHE.with(|slot| assert!(slot.borrow().as_ref().unwrap().homes.is_empty()));
+        write(home.path(), A, A, None, None, false);
+        READ_ONLY_CACHE.with(|slot| slot.borrow_mut().as_mut().unwrap().nodes = CATALOG_NODE_LIMIT);
+        assert!(catalog(home.path()).is_err());
+        READ_ONLY_CACHE.with(|slot| {
+            let mut state = slot.borrow_mut();
+            let cache = state.as_mut().unwrap();
+            assert!(cache.homes.is_empty());
+            cache.nodes = 0;
+        });
+        assert!(catalog(home.path()).unwrap().threads.contains_key(A));
     }
 }

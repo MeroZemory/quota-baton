@@ -34,6 +34,8 @@ enum Phase {
     Mapped,
     Complete,
     Aborted,
+    #[serde(rename = "aborted-source-kept")]
+    AbortedSourceKept,
 }
 #[derive(Serialize, Deserialize)]
 struct Segment {
@@ -80,7 +82,10 @@ fn path(store: &Store, id: &str) -> PathBuf {
         .join(format!("{id}.json"))
 }
 fn open(m: &Move) -> bool {
-    !matches!(m.phase, Phase::Complete | Phase::Aborted)
+    !matches!(
+        m.phase,
+        Phase::Complete | Phase::Aborted | Phase::AbortedSourceKept
+    )
 }
 fn save(store: &Store, m: &Move) -> Result<()> {
     let p = path(store, &m.id);
@@ -90,7 +95,9 @@ fn save(store: &Store, m: &Move) -> Result<()> {
         fs::canonicalize(p.parent().context(CONFLICT)?)?.join(p.file_name().context(CONFLICT)?);
     crate::cutover::atomic_bytes(
         &native,
-        &serde_json::to_vec(&serde_json::json!({"schema":2,"open":open(m),"payload":payload}))?,
+        &serde_json::to_vec(
+            &serde_json::json!({"schema":2,"open":open(m),"ids":std::iter::once(m.id.clone()).chain(m.files.iter().map(|f|f.physical.clone())).collect::<BTreeSet<_>>(),"payload":payload}),
+        )?,
     )
 }
 fn load(store: &Store, id: &str) -> Result<Option<Move>> {
@@ -239,10 +246,7 @@ fn verify_files(m: &Move) -> Result<()> {
 }
 fn descendants(home: &Path, id: &str) -> Result<()> {
     let c = discovery::catalog(home)?;
-    ensure!(
-        c.compressed.is_empty(),
-        "압축된 대화의 후손 관계를 확인할 수 없어 이동을 거절합니다. doctor로 확인하세요"
-    );
+    c.ensure_readable_for(&BTreeSet::from([id.to_owned()]))?;
     ensure!(
         c.descendants(id).is_empty(),
         "이 대화에서 갈라진 대화가 있습니다. 가족 이동을 지원하기 전에는 옮길 수 없습니다"
@@ -271,10 +275,7 @@ fn rows_compatible(expected: &db::DbPlan, partial: bool) -> Result<()> {
 }
 fn found_descendants(m: &Move, home: &Path) -> Result<bool> {
     let c = discovery::catalog(home)?;
-    ensure!(
-        c.compressed.is_empty(),
-        "압축된 대화의 후손 관계를 확인할 수 없어 이동을 거절합니다. doctor로 확인하세요"
-    );
+    c.ensure_readable_for(&BTreeSet::from([m.id.clone()]))?;
     let mut seen = BTreeSet::from([m.id.clone()]);
     loop {
         let before = seen.len();
@@ -351,10 +352,12 @@ fn make_plan(
     discovery::refuse_recent(&files, SystemTime::now())?;
     descendants(&source, id)?;
     let dest = discovery::catalog(&target)?;
-    ensure!(
-        dest.compressed.is_empty(),
-        "압축된 대화의 후손 관계를 확인할 수 없어 이동을 거절합니다. doctor로 확인하세요"
-    );
+    dest.ensure_readable_for(&BTreeSet::from([id.to_owned()]))?;
+    if dest.threads.contains_key(id) && !dest.descendants(id).is_empty() {
+        bail!(
+            "대상 qb 홈에 이 대화의 조상 별칭 또는 같은 대화 이름이 있습니다. 먼저 doctor로 확인하세요"
+        );
+    }
     if dest.threads.contains_key(id) {
         return Err(super::InventoryConflict {
             homes: vec![source.clone(), target.clone()],
@@ -366,6 +369,53 @@ fn make_plan(
         let h = fs::canonicalize(home)?;
         if !homes.contains(&h) {
             homes.push(h);
+        }
+    }
+    let inventory = homes
+        .iter()
+        .map(|home| discovery::catalog(home))
+        .collect::<Result<Vec<_>>>()?;
+    let mut related = BTreeSet::from([id.to_owned()]);
+    loop {
+        let before = related.len();
+        for catalog in &inventory {
+            related.extend(catalog.related_ids(&related));
+        }
+        if related.len() == before {
+            break;
+        }
+    }
+    for catalog in &inventory {
+        catalog.ensure_readable_for(&related)?;
+    }
+    // A compressed child's history_base may point at a physical segment in
+    // another home. Resolve that edge across the complete inventory, including
+    // rowless children in Q and peer homes, before any staging is planned.
+    let mut descendant_ids = BTreeSet::from([id.to_owned()]);
+    descendant_ids.extend(files.iter().map(|f| f.physical.clone()));
+    loop {
+        let before = descendant_ids.len();
+        for item in inventory.iter().flat_map(|c| c.all()) {
+            if descendant_ids.contains(&item.thread)
+                || item
+                    .forked_from
+                    .as_ref()
+                    .is_some_and(|p| descendant_ids.contains(p))
+                || item
+                    .history_base
+                    .as_ref()
+                    .is_some_and(|p| descendant_ids.contains(p))
+            {
+                ensure!(
+                    item.thread == id,
+                    "이 대화에서 갈라진 대화가 있습니다. 가족 이동을 지원하기 전에는 옮길 수 없습니다"
+                );
+                descendant_ids.insert(item.thread.clone());
+                descendant_ids.insert(item.physical.clone());
+            }
+        }
+        if descendant_ids.len() == before {
+            break;
         }
     }
     let nonce = format!(
@@ -380,10 +430,7 @@ fn make_plan(
             continue;
         }
         let other = discovery::catalog(home)?;
-        ensure!(
-            other.compressed.is_empty(),
-            "압축된 대화의 후손 관계를 확인할 수 없어 이동을 거절합니다. doctor로 확인하세요"
-        );
+        other.ensure_readable_for(&BTreeSet::from([id.to_owned()]))?;
         if !other.threads.contains_key(id) {
             let plan = db::source_snapshot(home, &[id.into()])?;
             ensure!(
@@ -578,6 +625,13 @@ fn rollback(store: &Store, m: &mut Move) -> Result<()> {
     step(store, m, "rollback_complete")?;
     Ok(())
 }
+fn apply_map(m: &Move) -> Result<()> {
+    if m.map.is_resolution() {
+        mapping::apply_resolution(&m.map)
+    } else {
+        mapping::apply(&m.map)
+    }
+}
 fn execute(store: &Store, m: &mut Move) -> Result<()> {
     verify_files(m)?;
     if m.phase >= Phase::Decided {
@@ -587,6 +641,9 @@ fn execute(store: &Store, m: &mut Move) -> Result<()> {
         }
     }
     target_rows_compatible(m)?;
+    if m.phase >= Phase::Decided {
+        apply_map(m)?;
+    }
     if m.phase < Phase::NamesGone {
         source_rows_present(m)?;
     } else if m.phase < Phase::Decided {
@@ -678,9 +735,15 @@ fn execute(store: &Store, m: &mut Move) -> Result<()> {
         }
         m.phase = Phase::Decided;
         save(store, m)?;
+        // The durable ownership decision precedes the map change, which must
+        // precede exposing any name or row in the destination home.
+        apply_map(m)?;
+        mapping::verify(&m.map)?;
         step(store, m, "decided")?;
     }
     if m.phase == Phase::Decided {
+        apply_map(m)?;
+        mapping::verify(&m.map)?;
         source_rows_absent(m)?;
         for f in &m.files {
             if let Some(target) = &f.target
@@ -707,7 +770,7 @@ fn execute(store: &Store, m: &mut Move) -> Result<()> {
         source_rows_absent(m)?;
         db::verify(&m.database)?;
         update_index(&m.target, &m.index, false)?;
-        mapping::apply(&m.map)?;
+        apply_map(m)?;
         mapping::verify(&m.map)?;
         m.phase = Phase::Mapped;
         save(store, m)?;
@@ -725,7 +788,7 @@ fn execute(store: &Store, m: &mut Move) -> Result<()> {
     Ok(())
 }
 fn run_plan(store: &Store, mut m: Move) -> Result<()> {
-    let _admission = admission::exclusive(&m.homes)?;
+    let _admission = admission::exclusive(&m.homes, &m.id)?;
     let _store = store.lock()?;
     ensure!(
         !pending(store)?,
@@ -736,7 +799,7 @@ fn run_plan(store: &Store, mut m: Move) -> Result<()> {
         .iter()
         .flat_map(|f| f.sources.iter().cloned())
         .collect::<Vec<_>>();
-    let _guards = guard::reserve_commit_exclusive(&m.homes, std::slice::from_ref(&m.id), &names)?;
+    let _guards = guard::reserve_decoded_exclusive(&m.homes, std::slice::from_ref(&m.id), &names)?;
     verify_files(&m)?;
     for home in &m.homes {
         if home != &m.target {
@@ -797,6 +860,13 @@ pub(super) fn import(
     )?;
     if o.announce {
         super::preview(id, &super::migration_files(catalog, id)?, &store.target)?;
+        for (thread, from, to) in db::summaries(&m.database) {
+            crate::print_stdout(format_args!(
+                "목표 {thread}: {} → {}",
+                super::goal_status(&from),
+                super::goal_status(&to)
+            ))?;
+        }
     }
     if o.apply {
         #[cfg(not(test))]
@@ -829,19 +899,32 @@ fn preserve_evidence(store: &Store, m: &Move) -> Result<()> {
         &serde_json::to_vec(&serde_json::json!({"schema":1,"payload":payload}))?,
     )
 }
+fn preserve_source_abort(store: &Store, m: &Move) -> Result<()> {
+    let observations = m.files.iter().map(|f| {
+        let current = f.sources.iter().find(|p| p.exists()).unwrap_or(&f.stage);
+        let metadata = fs::metadata(current).ok();
+        serde_json::json!({"physical":f.physical,"identity":guard::identity(current).ok(),"planned_bytes":f.bytes,"current_bytes":metadata.as_ref().map(fs::Metadata::len),"modified_unix_ms":metadata.and_then(|v|v.modified().ok()).and_then(|v|v.duration_since(UNIX_EPOCH).ok()).map(|v|v.as_millis())})
+    }).collect::<Vec<_>>();
+    let dir = store.home.join("journal/session-moves-evidence");
+    let _parent = guard::prepare_parent(&store.home, &dir)?;
+    let payload = crate::cutover::protect(&serde_json::to_vec(
+        &serde_json::json!({"schema":1,"outcome":"aborted-source-kept","id":m.id,"at_unix_ms":SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),"files":observations}),
+    )?)?;
+    crate::cutover::atomic_bytes(
+        &fs::canonicalize(&dir)?.join(format!("{}-aborted-source-kept.json", m.id)),
+        &serde_json::to_vec(&serde_json::json!({"schema":1,"payload":payload}))?,
+    )
+}
 fn abort_legitimate_source_append(store: &Store, m: &mut Move) -> Result<bool> {
-    // Before the first source-name removal the sole public owner may legitimately
-    // resume after a crash. Only verified append-only bytes accompanied by a
-    // native operational row advance qualify. Never replay the old row snapshot.
-    if m.phase > Phase::Staged
-        || m.files.iter().any(|f| {
-            f.target.as_ref().is_some_and(|p| p.exists()) || f.sources.iter().any(|p| !p.exists())
-        })
+    // No source rows are replayed over user changes. Before the decision an
+    // unchanged prefix plus appended bytes means the source kept ownership.
+    if m.phase >= Phase::Decided
+        || m.files
+            .iter()
+            .any(|f| f.target.as_ref().is_some_and(|p| p.exists()))
     {
         return Ok(false);
     }
-    // An append does not authorize clearing conflicting destination ownership.
-    // Check before deleting staging or closing the durable admission barrier.
     let destination = db::source_snapshot(&m.target, std::slice::from_ref(&m.id))?;
     ensure!(
         destination
@@ -850,83 +933,69 @@ fn abort_legitimate_source_append(store: &Store, m: &mut Move) -> Result<bool> {
             .all(|t| t.thread.is_none() && t.goal.is_none()),
         "{CONFLICT}"
     );
-    let mut advanced = false;
-    for snap in &m.source_db {
-        let now = db::source_snapshot(&snap.target_home, std::slice::from_ref(&m.id))?;
-        for (a, b) in now.threads.iter().zip(&snap.threads) {
-            if a.goal.as_ref().map(|r| &r.values) != b.goal.as_ref().map(|r| &r.values) {
-                return Ok(false);
-            }
-            match (&a.thread, &b.thread) {
-                (Some(current), Some(old)) => {
-                    if current.values.keys().ne(old.values.keys()) {
-                        return Ok(false);
-                    }
-                    for (key, value) in &current.values {
-                        if old.values.get(key) == Some(value) {
-                            continue;
-                        }
-                        if !matches!(
-                            key.as_str(),
-                            "created_at"
-                                | "updated_at"
-                                | "tokens_used"
-                                | "created_at_ms"
-                                | "updated_at_ms"
-                                | "recency_at"
-                                | "recency_at_ms"
-                        ) || !matches!(
-                            (value, old.values.get(key)),
-                            (db::DbValue::Integer(now), Some(db::DbValue::Integer(before))) if now > before
-                        ) {
-                            return Ok(false);
-                        }
-                        advanced = true;
-                    }
-                }
-                (None, None) => {}
-                _ => return Ok(false),
-            }
-        }
-    }
-    if !advanced {
-        return Ok(false);
-    }
+    let catalog = discovery::catalog(&m.target)?;
+    ensure!(!catalog.all().any(|f| f.thread == m.id), "{CONFLICT}");
+    let mut appended = false;
+    let mut source_public = false;
     for f in &m.files {
-        let p = &f.sources[0];
-        if guard::identity(p)? != f.identity
-            || fs::metadata(p)?.len() < f.bytes
-            || guard::hardlink_count(p)? as usize != known_links(f)
+        let candidate = f.sources.iter().find(|p| p.exists());
+        source_public |= candidate.is_some();
+        let candidate = candidate.unwrap_or(&f.stage);
+        let bytes = fs::metadata(candidate)?.len();
+        if guard::identity(candidate)? != f.identity
+            || bytes < f.bytes
+            || guard::hardlink_count(candidate)? as usize != known_links(f)
         {
             return Ok(false);
         }
-        let mut stream = File::open(p)?;
-        let mut h = Sha256::new();
-        let mut left = f.bytes;
+        let mut stream = File::open(candidate)?.take(f.bytes);
+        let mut digest = Sha256::new();
         let mut buffer = [0u8; 65536];
-        while left > 0 {
-            let wanted = (left as usize).min(buffer.len());
-            let count = stream.read(&mut buffer[..wanted])?;
-            if count == 0 {
-                return Ok(false);
+        loop {
+            let read = stream.read(&mut buffer)?;
+            if read == 0 {
+                break;
             }
-            h.update(&buffer[..count]);
-            left -= count as u64;
+            digest.update(&buffer[..read]);
         }
-        if format!("{:x}", h.finalize()) != f.sha256 {
+        if format!("{:x}", digest.finalize()) != f.sha256 {
             return Ok(false);
         }
-        let reader = std::io::BufReader::new(stream);
-        use std::io::BufRead;
-        for line in reader.lines() {
-            if serde_json::from_str::<serde_json::Value>(&line?).is_err() {
-                return Ok(false);
-            }
-        }
-        for name in &f.sources {
+        for name in f
+            .sources
+            .iter()
+            .chain(std::iter::once(&f.stage))
+            .filter(|p| p.exists())
+        {
             if guard::identity(name)? != f.identity {
                 return Ok(false);
             }
+        }
+        appended |= bytes > f.bytes;
+    }
+    if !appended || !source_public {
+        return Ok(false);
+    }
+    preserve_source_abort(store, m)?;
+    for f in &m.files {
+        for name in &f.sources {
+            if !name.exists() {
+                let origin = surviving(f)?;
+                let home = m
+                    .homes
+                    .iter()
+                    .find(|h| name.starts_with(h))
+                    .context(CONFLICT)?;
+                let _parent = guard::prepare_parent(home, name.parent().context(CONFLICT)?)?;
+                fs::hard_link(origin, name)?;
+                ensure!(guard::identity(name)? == f.identity, "{CONFLICT}");
+                step(store, m, "source_kept_name_restored")?;
+            }
+        }
+    }
+    if m.phase >= Phase::NamesGone {
+        for saved in &m.source_db {
+            db::restore_source_preserving_current(saved)?;
         }
     }
     for f in &m.files {
@@ -934,111 +1003,26 @@ fn abort_legitimate_source_append(store: &Store, m: &mut Move) -> Result<bool> {
             guard::unlink_counted(&store.target, &f.stage, f.identity, known_links(f) as u32)?;
         }
     }
-    m.phase = Phase::Aborted;
+    m.phase = Phase::AbortedSourceKept;
     save(store, m)?;
-    Ok(true)
-}
-fn adopt_legitimate_target_append(store: &Store, m: &mut Move) -> Result<bool> {
-    if m.phase < Phase::Decided
-        || m.files.iter().any(|f| {
-            f.sources.iter().any(|p| p.exists()) || f.target.as_ref().is_some_and(|p| !p.exists())
-        })
-    {
-        return Ok(false);
-    }
-    source_rows_absent(m)?;
-    for home in &m.homes {
-        ensure!(!found_descendants(m, home)?, "{CONFLICT}");
-    }
-    let current = db::source_snapshot(&m.target, std::slice::from_ref(&m.id))?;
-    let mut advanced = false;
-    for (now, old) in current.threads.iter().zip(&m.database.threads) {
-        if now.goal.as_ref().map(|r| &r.values) != old.goal.as_ref().map(|r| &r.values) {
-            return Ok(false);
-        }
-        let (Some(now), Some(old)) = (&now.thread, &old.thread) else {
-            return Ok(false);
-        };
-        if now.values.keys().ne(old.values.keys()) {
-            return Ok(false);
-        }
-        for (key, value) in &now.values {
-            if old.values.get(key) == Some(value) {
-                continue;
-            }
-            if !matches!(
-                key.as_str(),
-                "created_at"
-                    | "updated_at"
-                    | "tokens_used"
-                    | "created_at_ms"
-                    | "updated_at_ms"
-                    | "recency_at"
-                    | "recency_at_ms"
-            ) || !matches!(
-                (value, old.values.get(key)),
-                (db::DbValue::Integer(now), Some(db::DbValue::Integer(before))) if now > before
-            ) {
-                return Ok(false);
-            }
-            advanced = true;
-        }
-    }
-    if !advanced {
-        return Ok(false);
-    }
-    for f in &m.files {
-        let path = surviving(f)?;
-        if guard::identity(path)? != f.identity
-            || guard::hardlink_count(path)? as usize != known_links(f)
-            || fs::metadata(path)?.len() < f.bytes
-        {
-            return Ok(false);
-        }
-        if f.target.is_none() {
-            same(f, path)?;
-            continue;
-        }
-        let mut file = File::open(path)?;
-        let mut hash = Sha256::new();
-        let mut remaining = f.bytes;
-        let mut buffer = [0u8; 65536];
-        while remaining > 0 {
-            let wanted = (remaining as usize).min(buffer.len());
-            let n = file.read(&mut buffer[..wanted])?;
-            if n == 0 {
-                return Ok(false);
-            }
-            hash.update(&buffer[..n]);
-            remaining -= n as u64;
-        }
-        if format!("{:x}", hash.finalize()) != f.sha256 {
-            return Ok(false);
-        }
-        use std::io::BufRead;
-        for line in std::io::BufReader::new(file).lines() {
-            if serde_json::from_str::<serde_json::Value>(&line?).is_err() {
-                return Ok(false);
-            }
-        }
-    }
-    preserve_evidence(store, m)?;
-    for f in &mut m.files {
-        if let Some(path) = &f.target {
-            f.bytes = fs::metadata(path)?.len();
-            f.sha256 = hash(path)?;
-        }
-    }
-    m.database = current;
-    save(store, m)?;
+    step(store, m, "aborted-source-kept")?;
+    crate::print_stdout(format_args!(
+        "이동을 취소했습니다: 원래 위치에서 계속 사용되었습니다"
+    ))?;
     Ok(true)
 }
 pub(super) fn recover(store: &Store, id: &str) -> Result<()> {
+    recover_impl(store, id, false)
+}
+pub(super) fn recover_resolve(store: &Store, id: &str) -> Result<()> {
+    recover_impl(store, id, true)
+}
+fn recover_impl(store: &Store, id: &str, resolve_map: bool) -> Result<()> {
     let mut m = load(store, id)?.context("복구할 이동 기록이 없습니다")?;
     if !open(&m) {
         return Ok(());
     }
-    let _admission = admission::exclusive(&m.homes)?;
+    let _admission = admission::exclusive(&m.homes, &m.id)?;
     let _store = store.lock()?;
     let names = m
         .files
@@ -1052,13 +1036,24 @@ pub(super) fn recover(store: &Store, id: &str) -> Result<()> {
         .filter(|p| p.exists())
         .cloned()
         .collect::<Vec<_>>();
-    let _guards = guard::reserve_commit_exclusive(&m.homes, std::slice::from_ref(&m.id), &names)?;
+    let _guards = guard::reserve_decoded_exclusive(&m.homes, std::slice::from_ref(&m.id), &names)?;
     let result = (|| {
         if verify_files(&m).is_err() {
             if abort_legitimate_source_append(store, &mut m)? {
                 return Ok(());
             }
-            ensure!(adopt_legitimate_target_append(store, &mut m)?, "{CONFLICT}");
+            bail!("{CONFLICT}");
+        }
+        if resolve_map {
+            ensure!(
+                m.phase >= Phase::Decided,
+                "게시 결정 전에는 --resolve-map 없이 sessions recover를 실행하세요"
+            );
+            source_rows_absent(&m)?;
+            target_rows_compatible(&m)?;
+            preserve_evidence(store, &m)?;
+            m.map = mapping::replan_resolution(&m.map)?;
+            save(store, &m)?;
         }
         if m.phase < Phase::Decided {
             rollback(store, &mut m)
@@ -1078,6 +1073,8 @@ pub(super) fn return_current(
     yes: bool,
     apply: bool,
 ) -> Result<()> {
+    #[cfg(not(test))]
+    admission::verify_installed_version()?;
     let previous = load(store, id)?;
     if previous.as_ref().is_some_and(open) {
         ensure!(

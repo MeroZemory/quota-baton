@@ -674,20 +674,20 @@ fn assert_compressed_doctor(f: &Fixture, name: &Path) -> Result<()> {
     let before = tree(f.root.path(), true)?;
     let diagnostics = super::super::doctor_impl::check(&f.store)?;
     assert!(
-        diagnostics.iter().any(|diagnostic| {
+        !diagnostics.iter().any(|diagnostic| {
             diagnostic.code == "압축_대화_관계_미확인"
                 && diagnostic.id.is_none()
                 && diagnostic.paths.iter().any(|path| path == name)
         }),
-        "doctor omitted the compressed relationship and its path"
+        "doctor must not classify readable compressed metadata as unknown"
     );
     assert_eq!(tree(f.root.path(), true)?, before);
     Ok(())
 }
 
 #[test]
-fn compressed_rowless_children_refuse_planning_in_every_home_and_doctor_reports_paths() -> Result<()>
-{
+fn compressed_rowless_descendants_refuse_planning_without_unknown_metadata_diagnostics()
+-> Result<()> {
     for location in ["source", "target", "inventory"] {
         for top in ["sessions", "archived_sessions"] {
             for history_only in [false, true] {
@@ -719,12 +719,12 @@ fn admission_check_refuses_a_rowless_compressed_child_in_the_wired_q_home() -> R
             "home":f.store.target
         }))?,
     )?;
-    super::super::admission_check(&f.store.home)?;
+    super::super::admission_check(&f.store.home, None)?;
     compressed_child(&f.store.target, "sessions", false)?;
     no_rows(&f.store.target)?;
     assert!(!path(&f.store, ROOT).exists());
     let before = tree(f.root.path(), true)?;
-    assert!(super::super::admission_check(&f.store.home).is_err());
+    assert!(super::super::admission_check(&f.store.home, None).is_ok());
     assert_eq!(tree(f.root.path(), true)?, before);
     Ok(())
 }
@@ -818,10 +818,11 @@ fn an_ancestor_alias_in_q_refuses_without_touching_the_existing_family() -> Resu
     no_rows(&f.store.target)?;
     let before = tree(f.root.path(), true)?;
     let error = f.plan().err().context("ancestor alias was accepted")?;
-    let conflict = error
-        .downcast_ref::<super::super::InventoryConflict>()
-        .context("ancestor alias refusal must carry the inventory conflict type")?;
-    assert!(conflict.homes.contains(&f.source) && conflict.homes.contains(&f.store.target));
+    assert!(
+        error
+            .to_string()
+            .contains("대상 qb 홈에 이 대화의 조상 별칭")
+    );
     assert_eq!(tree(f.root.path(), true)?, before);
     assert_eq!(guard::identity(&alias)?, guard::identity(&f.original)?);
     assert!(child.exists() && !path(&f.store, ROOT).exists());
@@ -1307,8 +1308,17 @@ fn unrecorded_append_without_row_advance_never_claims_recovery_success() -> Resu
         append_bytes(name, APPEND)?;
         let appended = fs::read(name)?;
         assert!(appended.starts_with(&file.body) && appended.ends_with(APPEND));
-        assert_conflict_preserved(&f)?;
-        assert_eq!(fs::read(name)?, appended);
+        if load(&f.store, ROOT)?.context("interrupted move")?.phase < Phase::Decided
+            && file.names.iter().any(|n| n.exists())
+        {
+            recover(&f.store, ROOT)?;
+            let recovered = load(&f.store, ROOT)?.context("closed source-kept journal")?;
+            assert!(recovered.phase == Phase::AbortedSourceKept && !open(&recovered));
+            assert_eq!(fs::read(&f.original)?, appended);
+        } else {
+            assert_conflict_preserved(&f)?;
+            assert_eq!(fs::read(name)?, appended);
+        }
     }
     Ok(())
 }
@@ -1346,7 +1356,7 @@ fn native_source_append_and_only_allowed_integer_changes_abort_without_old_row_r
         let appended = fs::read(&f.original)?;
         recover_twice(&f)?;
         let m = load(&f.store, ROOT)?.context("source append abort")?;
-        assert!(m.phase == Phase::Aborted && !open(&m));
+        assert!(m.phase == Phase::AbortedSourceKept && !open(&m));
         assert!(!pending(&f.store)?);
         assert_eq!(owner(&f.store, ROOT)?, Some(f.source.clone()));
         assert!(
@@ -1367,11 +1377,11 @@ fn native_source_append_and_only_allowed_integer_changes_abort_without_old_row_r
 }
 
 #[test]
-fn source_append_with_changed_stable_fields_goal_type_prefix_links_or_identity_conflicts()
--> Result<()> {
+fn source_append_keeps_current_rows_but_refuses_prefix_identity_or_untracked_links() -> Result<()> {
     for change in [
         "title",
         "goal",
+        "goal_clear",
         "integer_type",
         "prefix",
         "tail",
@@ -1406,6 +1416,10 @@ fn source_append_with_changed_stable_fields_goal_type_prefix_links_or_identity_c
                     [ROOT],
                 )?;
             }
+            "goal_clear" => {
+                Connection::open(f.source.join("goals_1.sqlite"))?
+                    .execute("DELETE FROM thread_goals WHERE thread_id=?1", [ROOT])?;
+            }
             "integer_type" => {
                 state.execute(
                     "UPDATE threads SET tokens_used='SYNTHETIC noninteger' WHERE id=?1",
@@ -1430,8 +1444,27 @@ fn source_append_with_changed_stable_fields_goal_type_prefix_links_or_identity_c
             _ => unreachable!(),
         }
         drop(state);
-        assert_conflict_preserved(&f)?;
-        assert!(f.original.exists() && witness.files[0].stage.exists());
+        let current_rows = rows(&f.source)?;
+        let current_body = fs::read(&f.original)?;
+        if matches!(change, "prefix" | "link" | "identity") {
+            assert_conflict_preserved(&f)?;
+            assert!(witness.files[0].stage.exists());
+        } else {
+            recover_twice(&f)?;
+            let m = load(&f.store, ROOT)?.context("source kept journal")?;
+            assert!(m.phase == Phase::AbortedSourceKept && !open(&m));
+            assert!(!witness.files[0].stage.exists());
+            assert!(
+                f.store
+                    .home
+                    .join("journal/session-moves-evidence")
+                    .join(format!("{ROOT}-aborted-source-kept.json"))
+                    .exists()
+            );
+        }
+        assert!(rows(&f.source)? == current_rows);
+        assert_eq!(fs::read(&f.original)?, current_body);
+        assert!(f.original.exists());
         assert!(public_names(&f.store.target, ROOT)?.is_empty());
     }
     Ok(())
@@ -1452,7 +1485,7 @@ fn advance_target(f: &Fixture, m: &Move) -> Result<()> {
 }
 
 #[test]
-fn fully_published_native_target_append_preserves_current_rows_and_rolls_forward() -> Result<()> {
+fn fully_published_unrecorded_target_append_is_a_preserved_conflict() -> Result<()> {
     for label in ["published", "target_rows", "map_committed"] {
         let f = Fixture::new()?;
         let witness = interrupt(&f, label, 1)?;
@@ -1466,29 +1499,15 @@ fn fully_published_native_target_append_preserves_current_rows_and_rolls_forward
         append_bytes(target, APPEND)?;
         let body = fs::read(target)?;
         assert!(body.starts_with(&witness.files[0].body) && body.ends_with(APPEND));
-        recover_twice(&f)?;
-        let complete = load(&f.store, ROOT)?.context("adopted journal")?;
-        assert!(complete.phase == Phase::Complete && !open(&complete));
-        assert!(!pending(&f.store)?);
-        assert!(
-            rows(&f.store.target)? == current,
-            "current Q row must survive forward replay"
-        );
+        assert_conflict_preserved(&f)?;
+        let journal = load(&f.store, ROOT)?.context("postdecision conflict journal")?;
+        assert!(open(&journal) && journal.phase == old.phase);
+        assert!(rows(&f.store.target)? == current);
         assert_eq!(fs::read(target)?, body);
         assert_eq!(guard::identity(target)?, witness.files[0].identity);
-        assert_eq!(complete.files[0].bytes, body.len() as u64);
-        assert_eq!(complete.files[0].sha256, hash(target)?);
-        assert!(witness.files[0].names.iter().all(|name| !name.exists()));
-        assert!(!witness.files[0].stage.exists());
+        assert_eq!(journal.files[0].bytes, old.files[0].bytes);
         no_rows(&f.source)?;
         assert!(public_names(&f.source, ROOT)?.is_empty());
-        assert_eq!(public_names(&f.store.target, ROOT)?.len(), 1);
-        assert_eq!(owner(&f.store, ROOT)?, Some(f.store.target.clone()));
-        let map: serde_json::Value = serde_json::from_slice(&fs::read(&f.store.map_path)?)?;
-        assert_eq!(
-            Path::new(map["sessions"][ROOT].as_str().unwrap()),
-            f.store.target
-        );
         assert_evidence(&f, &old)?;
     }
     Ok(())
@@ -1527,7 +1546,7 @@ fn eligible_target_append_with_a_late_compressed_child_preserves_the_original_op
         assert!(rows(&f.store.target)? == current);
         assert_eq!(fs::read(target)?, body);
         assert_eq!(fs::read(&child)?, compressed);
-        assert!(!f.store.map_path.exists());
+        mapping::verify(&original.map)?;
         no_rows(&f.source)?;
     }
     Ok(())
@@ -1542,10 +1561,11 @@ fn native_target_append_after_state_only_commit_preserves_missing_goal_as_open_c
     map["sessions"][ROOT] = serde_json::to_value(&f.source)?;
     map["sessions"][CHILD] = serde_json::to_value(&f.store.target)?;
     fs::write(&f.store.map_path, serde_json::to_vec_pretty(&map)?)?;
+
+    let witness = interrupt(&f, "published", 1)?;
     let map_bytes = fs::read(&f.store.map_path)?;
     let map_identity = guard::identity(&f.store.map_path)?;
 
-    let witness = interrupt(&f, "published", 1)?;
     let m = load(&f.store, ROOT)?.context("published state-only journal")?;
     assert!(m.phase == Phase::Decided && open(&m));
     let file = &witness.files[0];
@@ -1748,7 +1768,7 @@ fn unchanged_source_hardlink_reappearance_after_decision_is_a_nondestructive_con
 }
 
 #[test]
-fn decreasing_operational_integers_conflict_for_source_and_target_appends() -> Result<()> {
+fn source_abort_preserves_decreasing_integers_while_target_append_conflicts() -> Result<()> {
     for target in [false, true] {
         for field in ["updated_at", "tokens_used"] {
             let f = Fixture::new()?;
@@ -1788,8 +1808,16 @@ fn decreasing_operational_integers_conflict_for_source_and_target_appends() -> R
                 "stable fields or goal changed during setup"
             );
             assert!(fs::read(name)?.starts_with(&witness.files[0].body));
-            assert_conflict_preserved(&f)
-                .with_context(|| format!("decreasing {field} during append (target={target})"))?;
+            if target {
+                assert_conflict_preserved(&f)
+                    .with_context(|| format!("decreasing {field} target append"))?;
+            } else {
+                recover_twice(&f)?;
+                assert!(
+                    load(&f.store, ROOT)?.context("source abort")?.phase
+                        == Phase::AbortedSourceKept
+                );
+            }
             assert!(rows(home)? == expected, "conflict replaced current rows");
         }
     }
@@ -1986,5 +2014,115 @@ fn return_and_redo_keep_prior_encrypted_journals_and_private_duplicate_evidence_
     assert!(public_names(&f.source, ROOT)?.is_empty());
     assert!(public_names(&peer, ROOT)?.is_empty());
     recover_twice(&f)?;
+    Ok(())
+}
+
+#[test]
+fn selected_compressed_rollout_moves_and_returns_without_decoding_its_body() -> Result<()> {
+    let mut f = Fixture::new()?;
+    let compressed = f.original.with_extension("jsonl.zst");
+    let bytes = zstd::stream::encode_all(fs::read(&f.original)?.as_slice(), 1)?;
+    fs::write(&compressed, &bytes)?;
+    fs::remove_file(&f.original)?;
+    f.original = compressed;
+    age(&f.original)?;
+    Connection::open(f.source.join("state_5.sqlite"))?.execute(
+        "UPDATE threads SET rollout_path=?1 WHERE id=?2",
+        params![f.original.to_str().context("compressed path")?, ROOT],
+    )?;
+    let identity = guard::identity(&f.original)?;
+    let plan = f.plan()?;
+    let target = plan.files[0]
+        .target
+        .clone()
+        .context("compressed destination")?;
+    run_plan(&f.store, plan)?;
+    assert!(!f.original.exists());
+    assert_eq!(fs::read(&target)?, bytes);
+    assert_eq!(guard::identity(&target)?, identity);
+    assert_eq!(guard::hardlink_count(&target)?, 1);
+    return_current(&f.store, ROOT, None, true, true)?;
+    assert!(!target.exists());
+    assert_eq!(fs::read(&f.original)?, bytes);
+    assert_eq!(guard::identity(&f.original)?, identity);
+    assert_eq!(guard::hardlink_count(&f.original)?, 1);
+    Ok(())
+}
+
+#[test]
+fn explicit_map_resolution_closes_decided_move_preserving_other_uuid_changes() -> Result<()> {
+    let f = Fixture::new()?;
+    let witness = interrupt(&f, "decided", 1)?;
+    let mut current: serde_json::Value = serde_json::from_slice(&fs::read(&f.store.map_path)?)?;
+    current["sessions"][ROOT] = "SYNTHETIC conflicting home".into();
+    current["sessions"][CHILD] = "SYNTHETIC concurrently updated other home".into();
+    current["future"] = serde_json::json!({"preserve": true});
+    fs::write(&f.store.map_path, serde_json::to_vec(&current)?)?;
+    assert!(recover(&f.store, ROOT).is_err());
+    assert!(open(&load(&f.store, ROOT)?.context("open journal")?));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&fs::read(&f.store.map_path)?)?,
+        current
+    );
+    recover_resolve(&f.store, ROOT)?;
+    let m = load(&f.store, ROOT)?.context("resolved journal")?;
+    assert!(m.phase == Phase::Complete && !open(&m));
+    current["sessions"][ROOT] = serde_json::to_value(&f.store.target)?;
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&fs::read(&f.store.map_path)?)?,
+        current
+    );
+    assert!(!f.original.exists());
+    let target = witness.files[0].target.as_ref().context("target")?;
+    assert_eq!(fs::read(target)?, witness.files[0].body);
+    assert_eq!(guard::identity(target)?, witness.files[0].identity);
+    no_rows(&f.source)?;
+    assert!(rows(&f.store.target)?.goal.is_some());
+    recover_twice(&f)?;
+    Ok(())
+}
+
+#[test]
+fn source_append_after_partial_alias_removal_keeps_cleared_goal_and_short_evidence() -> Result<()> {
+    let f = Fixture::new()?;
+    let alias = f
+        .source
+        .join("archived_sessions")
+        .join(f.original.file_name().unwrap());
+    fs::create_dir_all(alias.parent().context("alias parent")?)?;
+    fs::hard_link(&f.original, &alias)?;
+    let witness = interrupt(&f, "source_name_removed", 1)?;
+    let public = witness.files[0]
+        .names
+        .iter()
+        .find(|p| p.exists())
+        .context("remaining source alias")?;
+    append_bytes(public, APPEND)?;
+    Connection::open(f.source.join("goals_1.sqlite"))?
+        .execute("DELETE FROM thread_goals WHERE thread_id=?1", [ROOT])?;
+    let current = rows(&f.source)?;
+    recover_twice(&f)?;
+    assert!(rows(&f.source)? == current);
+    assert!(rows(&f.source)?.goal.is_none());
+    assert!(f.original.exists() && alias.exists());
+    assert!(!witness.files[0].stage.exists());
+    assert_eq!(guard::hardlink_count(&f.original)?, 2);
+    let evidence = f
+        .store
+        .home
+        .join("journal/session-moves-evidence")
+        .join(format!("{ROOT}-aborted-source-kept.json"));
+    let envelope: serde_json::Value = serde_json::from_slice(&fs::read(evidence)?)?;
+    let decoded = crate::cutover::unprotect(envelope["payload"].as_str().context("payload")?)?;
+    let text = String::from_utf8(decoded)?;
+    assert!(!text.contains("SYNTHETIC") && !text.contains("objective") && !text.contains("rows"));
+    let short: serde_json::Value = serde_json::from_str(&text)?;
+    assert_eq!(short["outcome"], "aborted-source-kept");
+    assert!(
+        short["files"][0]["current_bytes"].as_u64().unwrap()
+            > short["files"][0]["planned_bytes"].as_u64().unwrap()
+    );
+    assert!(short["files"][0]["identity"].is_object());
+    assert!(short["files"][0]["modified_unix_ms"].is_number());
     Ok(())
 }
