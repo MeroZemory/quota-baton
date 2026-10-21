@@ -7,11 +7,14 @@ macro_rules! println_utf8 {
 }
 
 mod accounts_cli;
+mod catalog_snapshot;
 mod cutover;
 mod image_canary;
 mod image_launch;
+mod launch_client;
 mod launcher_label;
 mod launcher_script;
+mod resume_selection;
 mod routing_cli;
 mod sessions;
 mod sessions_admission;
@@ -64,7 +67,7 @@ enum Command {
         #[command(subcommand)]
         command: routing_cli::RoutingCommand,
     },
-    /// Internal child launch; no core config or credentials are loaded.
+    /// Internal managed child launch; ordinary Codex uses authenticated issuance.
     #[command(hide = true)]
     LaunchClient {
         #[arg(long, value_enum, default_value = "claude")]
@@ -192,6 +195,12 @@ async fn main() {
 }
 
 fn friendly_error(error: &anyhow::Error) -> String {
+    if let Some(message) = launch_client::friendly_error(error) {
+        return message;
+    }
+    if let Some(message) = catalog_snapshot::friendly_error(error) {
+        return message;
+    }
     if let Some(message) = image_canary::friendly_error(error) {
         return message;
     }
@@ -424,21 +433,13 @@ async fn run() -> anyhow::Result<()> {
             drop(permit);
             std::process::exit(status?);
         }
-        let (permit, child_args) = if matches!(client, launcher_label::Client::Codex) {
-            let home = qb_core::home()?;
-            sessions::admission_check(&home, sessions::resume_uuid(args)?.as_deref())?;
-            sessions_admission::preflight_launch(args, command)?;
-            sessions::before_codex_resume(args)?;
-            let (permit, child_args) = sessions_admission::prepare_launch(args, command)?;
-            sessions::admission_check(&home, sessions::resume_uuid(args)?.as_deref())?;
-            (Some(permit), child_args)
-        } else {
-            (None, args.clone())
-        };
-        let status = launcher_label::run(*client, command, settings.as_deref(), &child_args);
-        // process::exit does not run destructors. The contained process tree
-        // has finished before we release admission on success or launch error.
-        drop(permit);
+        if matches!(client, launcher_label::Client::Codex) {
+            let status = launch_client::run_codex(command, settings.as_deref(), args).await;
+            // run_codex explicitly releases snapshot/admission on success and
+            // errors, after the existing contained runner's tree cleanup.
+            std::process::exit(status?);
+        }
+        let status = launcher_label::run(*client, command, settings.as_deref(), args);
         std::process::exit(status?);
     }
     let home = qb_core::home()?;
