@@ -554,10 +554,10 @@ impl BindingTable {
         if usable && !model_move && !request.model_is_explicit && old_model.is_none() {
             // A legacy binding has no proved current model. An incompatible
             // implicit default never turns that into permission to relocate.
-            if let (Some(id), Some(default)) = (previous.as_deref(), model.as_deref()) {
-                if !entitlements.get(id).is_some_and(|s| s.contains(default)) {
-                    model = None;
-                }
+            if let (Some(id), Some(default)) = (previous.as_deref(), model.as_deref())
+                && !entitlements.get(id).is_some_and(|s| s.contains(default))
+            {
+                model = None;
             }
         }
         for candidate in candidates {
@@ -767,10 +767,10 @@ impl BindingTable {
                 {
                     // Bound routing remains available even if coalescing an
                     // optional provisional handle would exceed metadata caps.
-                    if let Err(error) = self.merge_provisional(&mut d, &source, &key) {
-                        if error != LaunchError::Capacity {
-                            return Err(error);
-                        }
+                    if let Err(error) = self.merge_provisional(&mut d, &source, &key)
+                        && error != LaunchError::Capacity
+                    {
+                        return Err(error);
                     }
                 }
             }
@@ -949,10 +949,10 @@ impl BindingTable {
         anchor: Option<&str>,
     ) -> std::result::Result<LaunchInfo, LaunchError> {
         let d = self.data.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(key) = request_key {
-            if let Ok(existing) = info(&d, key) {
-                return Ok(existing);
-            }
+        if let Some(key) = request_key
+            && let Ok(existing) = info(&d, key)
+        {
+            return Ok(existing);
         }
         info(&d, anchor.ok_or(LaunchError::UnknownLaunch)?)
     }
