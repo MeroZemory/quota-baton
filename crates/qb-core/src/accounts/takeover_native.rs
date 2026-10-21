@@ -462,6 +462,7 @@ pub(crate) struct SharedProfile {
     pub endpoint: String,
 }
 impl ProfileResolver for SharedProfile {
+    #[cfg(any(test, feature = "testkit"))]
     fn endpoint(&self) -> &str {
         &self.endpoint
     }

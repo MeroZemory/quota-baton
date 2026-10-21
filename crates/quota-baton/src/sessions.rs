@@ -1754,9 +1754,14 @@ pub(crate) fn before_codex_resume(args: &[OsString]) -> Result<()> {
     let Some(id) = requested else {
         return Ok(());
     };
-    let id = id.as_str();
     let store = Store::open(&qb_core::home()?)?;
-    let previous_owner = staged::owner(&store, id)?;
+    before_resume_in_store(&store, &id)
+}
+
+// The launcher checks admission before this preparation and again while holding
+// its shared launch permit. Keep journal validation ahead of the local-row path.
+fn before_resume_in_store(store: &Store, id: &str) -> Result<()> {
+    let previous_owner = staged::owner(store, id)?;
     if previous_owner.as_ref() == Some(&store.target) {
         ensure!(
             db::thread_path(&store.target, id)?.is_some(),
@@ -1764,7 +1769,7 @@ pub(crate) fn before_codex_resume(args: &[OsString]) -> Result<()> {
         );
         return Ok(());
     }
-    returning::ensure_not_pending(&store, id)?;
+    returning::ensure_not_pending(store, id)?;
     let journal = store.load()?;
     if let Some(entry) = resume_entry(&journal, id)?
         && (entry.root == id || db::thread_path(&store.target, id)?.is_some())
@@ -1782,12 +1787,8 @@ pub(crate) fn before_codex_resume(args: &[OsString]) -> Result<()> {
         return Ok(());
     }
     if db::thread_path(&store.target, id)?.is_some() {
-        let catalog = discovery::catalog(&store.target)?;
-        let files = catalog.chain(id)?;
-        let names = files.iter().map(|f| f.path.clone()).collect::<Vec<_>>();
-        let threads = files.iter().map(|f| f.thread.clone()).collect::<Vec<_>>();
-        let (homes, names) = store.probes(&store.target, &threads, &names)?;
-        let _guards = guard::probe_decoded(&homes, &threads, &names)?;
+        // Q already owns this thread. Import eligibility (including historical
+        // ancestor providers such as cliproxyapi) does not apply to a resume.
         return Ok(());
     }
     let user = std::env::var_os("USERPROFILE")
@@ -1837,7 +1838,7 @@ pub(crate) fn before_codex_resume(args: &[OsString]) -> Result<()> {
     }
     crate::sessions_admission::verify_installed_version()?;
     import_one(
-        &store,
+        store,
         &matches[0],
         id,
         ImportOptions {
@@ -1861,7 +1862,7 @@ pub(crate) fn before_codex_resume(args: &[OsString]) -> Result<()> {
         ))?;
     }
     import_one(
-        &store,
+        store,
         &matches[0],
         id,
         ImportOptions {

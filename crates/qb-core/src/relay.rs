@@ -77,6 +77,7 @@ pub struct RelayState {
     #[cfg(all(feature = "testkit", debug_assertions))]
     takeover_test_dependencies: Option<crate::accounts::takeover::Dependencies>,
     websocket: crate::config::WebsocketConfig,
+    ws_capacity: Arc<websocket::capacity::Capacity>,
     reconnect_exclusions: Mutex<BTreeMap<(String, String), Instant>>,
     draining: AtomicBool,
     drain_started: AtomicBool,
@@ -490,6 +491,7 @@ impl RelayState {
             #[cfg(all(feature = "testkit", debug_assertions))]
             takeover_test_dependencies: None,
             websocket: config.websocket.clone(),
+            ws_capacity: Arc::new(websocket::capacity::Capacity::default()),
             reconnect_exclusions: Mutex::new(BTreeMap::new()),
             draining: AtomicBool::new(false),
             drain_started: AtomicBool::new(false),

@@ -166,6 +166,7 @@ pub struct ProfileIdentity {
     pub plan: Option<String>,
 }
 pub trait ProfileResolver: Send + Sync {
+    #[cfg(any(test, feature = "testkit"))]
     fn endpoint(&self) -> &str;
     /// Non-refresh GET only; primary adapter supplies shared client + helper.
     fn claude<'a>(&'a self, access: &'a str) -> AsyncResult<'a, ProfileIdentity>;

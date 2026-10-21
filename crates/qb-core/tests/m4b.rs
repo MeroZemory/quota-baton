@@ -1282,3 +1282,144 @@ async fn cold_binding_with_expired_windows_treats_old_usage_as_zero_and_stays() 
             .any(|row| row["event"] == "binding_move" && !row["from"].is_null())
     );
 }
+
+#[tokio::test]
+async fn outage_release_hold_requires_confirmation_and_preserves_credentials() {
+    let h = Harness::new(Provider::Codex).await;
+    let id = h.ids()[0].clone();
+    h.store
+        .update_metadata(&id, |account| {
+            account.health = Health::Cooling {
+                reason: HealthReason::Quota,
+                until: Utc::now() + ChronoDuration::days(5),
+                scope: "account".into(),
+            };
+            account.quota_credit_releasable = false;
+        })
+        .unwrap();
+    let before = h.store.load(&id).unwrap();
+    let account_path = h.home.join("accounts").join(format!("{id}.json"));
+    let stored_before: Value = serde_json::from_slice(&fs::read(&account_path).unwrap()).unwrap();
+    let before_tokens = h.store.tokens(&h.store.load(&id).unwrap()).unwrap();
+    let url = format!(
+        "http://{}/admin/v1/accounts/{id}/release-hold",
+        h.servers.admin_addr
+    );
+    let denied = h
+        .client
+        .post(&url)
+        .bearer_auth("synthetic-admin")
+        .json(&json!({"confirm":"wrong"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 400);
+    assert_eq!(h.store.load(&id).unwrap().health, before.health);
+    let unauth = h
+        .client
+        .post(&url)
+        .json(&json!({"confirm":id}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauth.status(), 401);
+    let result = h
+        .admin(
+            reqwest::Method::POST,
+            &format!("/admin/v1/accounts/{id}/release-hold"),
+            Some(json!({"confirm":id})),
+        )
+        .await;
+    assert_eq!(result["released"], true);
+    let after = h.store.load(&id).unwrap();
+    assert_eq!(after.health, Health::Ready);
+    let stored_after: Value = serde_json::from_slice(&fs::read(&account_path).unwrap()).unwrap();
+    assert_eq!(
+        stored_after["secret_dpapi_b64"],
+        stored_before["secret_dpapi_b64"]
+    );
+    assert!(stored_after["secret_dpapi_b64"].is_string());
+    assert_eq!(after.token_meta, before.token_meta);
+    assert!(after.generation > before.generation);
+    assert_eq!(after.source, before.source);
+    assert_eq!(after.user_state, before.user_state);
+    assert_eq!(
+        h.store
+            .tokens(&h.store.load(&id).unwrap())
+            .unwrap()
+            .access_token,
+        before_tokens.access_token
+    );
+    assert_eq!(
+        h.store
+            .tokens(&h.store.load(&id).unwrap())
+            .unwrap()
+            .refresh_token,
+        before_tokens.refresh_token
+    );
+    assert!(h.state.accounts.release_quota_hold(&id).await.is_err());
+    h.store
+        .update_metadata(&id, |a| {
+            a.health = Health::NeedsRelogin {
+                reason: "synthetic".into(),
+                since: Utc::now(),
+            }
+        })
+        .unwrap();
+    assert!(h.state.accounts.release_quota_hold(&id).await.is_err());
+    assert!(matches!(
+        h.store.load(&id).unwrap().health,
+        Health::NeedsRelogin { .. }
+    ));
+}
+
+#[tokio::test]
+async fn outage_real_quota_rejection_can_be_operator_probed() {
+    let h = Harness::with_hold(Provider::Codex, 0).await;
+    let ids = h.ids();
+    let id = &ids[0];
+    h.store
+        .update_metadata(&ids[1], |a| {
+            a.user_state = qb_core::accounts::UserState::Disabled
+        })
+        .unwrap();
+    h.fake.state.push(ScriptedResponse::json(StatusCode::TOO_MANY_REQUESTS,
+        r#"{"error":{"type":"usage_limit_reached","resets_in_seconds":3600,"message":"synthetic quota"}}"#));
+    let (status, _, _) = h
+        .send(
+            "/v1/responses",
+            &[("session_id", "synthetic-release-probe")],
+            RAW,
+        )
+        .await;
+    assert_eq!(status, 429);
+    let held = h.store.load(id).unwrap();
+    assert!(matches!(
+        held.health,
+        Health::Cooling {
+            reason: HealthReason::Quota,
+            ..
+        }
+    ));
+    assert!(!held.quota_credit_releasable);
+    h.admin(
+        reqwest::Method::POST,
+        &format!("/admin/v1/accounts/{id}/release-hold"),
+        Some(json!({"confirm":id})),
+    )
+    .await;
+    h.fake
+        .state
+        .push(ScriptedResponse::json(StatusCode::OK, r#"{"probe":"ok"}"#));
+    let (status, account, body) = h
+        .send(
+            "/v1/responses",
+            &[("session_id", "synthetic-release-probe")],
+            RAW,
+        )
+        .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(account, *id);
+    assert_eq!(body, br#"{"probe":"ok"}"#);
+    assert_eq!(h.store.load(id).unwrap().health, Health::Ready);
+}
