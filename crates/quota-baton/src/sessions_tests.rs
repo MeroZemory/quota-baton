@@ -1230,3 +1230,6 @@ fn share_selected_compressed_rollout_keeps_original_bytes_and_file_identity() {
     assert_eq!(guard::identity(&compressed).unwrap(), identity);
     assert_eq!(guard::hardlink_count(&compressed).unwrap(), 1);
 }
+
+#[path = "sessions_share_safety_tests.rs"]
+mod share_safety;

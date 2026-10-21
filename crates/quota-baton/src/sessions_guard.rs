@@ -111,6 +111,14 @@ mod platform {
         _ancestors: Vec<File>,
     }
 
+    impl Guards {
+        /// Retain thread/coordination locks and directory pins while allowing
+        /// unlink_validated to acquire SHARE_NONE and recheck the same object.
+        pub(crate) fn release_rollouts_for_unlink(&mut self) {
+            self._rollouts.clear();
+        }
+    }
+
     // No Debug: owned handles can reveal paths. Drop the marker before pins.
     pub(crate) struct PublicationGuard {
         _anchor: File,
@@ -1016,6 +1024,9 @@ pub(crate) use platform::{probe_all, reserve_commit, reserve_commit_exclusive};
 mod platform {
     use super::*;
     pub(crate) struct Guards;
+    impl Guards {
+        pub(crate) fn release_rollouts_for_unlink(&mut self) {}
+    }
     pub(crate) struct PublicationGuard;
     pub(crate) fn prepare_parent(_: &Path, _: &Path) -> Result<PublicationGuard> {
         anyhow::bail!("세션 경로 보호는 Windows에서만 지원됩니다")
@@ -2398,5 +2409,34 @@ mod tests {
             .is_err()
         );
         assert!(probe_all(&[home], &[ID.into()], &[rollout]).is_err());
+    }
+    #[test]
+    fn releasing_rollout_handles_keeps_locks_and_rechecks_the_last_name() {
+        let temp = fixture();
+        let root = home(temp.path(), "release");
+        let source = root.join("sessions/source.jsonl");
+        let target = root.join("sessions/target.jsonl");
+        fs::write(&source, b"SYNTHETIC never delete last name").unwrap();
+        fs::hard_link(&source, &target).unwrap();
+        let identity_before = identity(&target).unwrap();
+        let mut held = reserve_commit(
+            std::slice::from_ref(&root),
+            &[ID.into()],
+            &[source.clone(), target.clone()],
+        )
+        .unwrap();
+        assert!(OpenOptions::new().append(true).open(&target).is_err());
+        held.release_rollouts_for_unlink();
+        assert!(reserve_commit_exclusive(std::slice::from_ref(&root), &[ID.into()], &[]).is_err());
+        assert!(fs::rename(&root, temp.path().join("renamed")).is_err());
+        fs::remove_file(&source).unwrap();
+        let error = unlink_counted(&root, &target, identity_before, 1).unwrap_err();
+        assert!(error.to_string().contains("마지막 하드링크"));
+        assert_eq!(identity(&target).unwrap(), identity_before);
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            b"SYNTHETIC never delete last name"
+        );
+        assert_eq!(hardlink_count(&target).unwrap(), 1);
     }
 }

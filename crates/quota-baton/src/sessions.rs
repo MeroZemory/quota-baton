@@ -18,6 +18,7 @@ pub(crate) fn friendly_error(error: &anyhow::Error) -> Option<String> {
         "전용 Codex 홈 연결을 먼저 완료하세요",
         "전용 Codex 홈이 없습니다",
         "대화 ID는 UUID여야 합니다",
+        "세션 파일의 마지막 하드링크는 삭제할 수 없습니다",
         "원본에서 대화를 찾지 못했습니다",
         "최근에 사용한 대화입니다. 먼저 대화를 종료하고 120초 후 다시 시도하세요",
         "openai 제공자의 대화만 가져올 수 있습니다",
@@ -441,6 +442,25 @@ fn same_contents(left: &Path, right: &Path) -> Result<bool> {
     }
 }
 
+fn check_physical_owners(
+    source: &Path,
+    home: &Path,
+    expected: &[discovery::Rollout],
+    other: &discovery::Catalog,
+) -> Result<()> {
+    if other.all().any(|item| {
+        expected
+            .iter()
+            .any(|file| file.physical == item.physical && file.thread != item.thread)
+    }) {
+        return Err(InventoryConflict {
+            homes: vec![source.to_owned(), home.to_owned()],
+        }
+        .into());
+    }
+    Ok(())
+}
+
 fn stale_plan(store: &Store, catalog: &discovery::Catalog, id: &str) -> Result<Vec<StaleCopy>> {
     let active = catalog.active(id)?;
     let source_chain = migration_files(catalog, id)?;
@@ -453,6 +473,7 @@ fn stale_plan(store: &Store, catalog: &discovery::Catalog, id: &str) -> Result<V
             continue;
         }
         let other = discovery::catalog(&home)?;
+        check_physical_owners(&catalog.home, &home, &source_chain, &other)?;
         if other.threads.contains_key(id) {
             inventory.push((home, other));
         }
@@ -558,15 +579,16 @@ fn check_destination_inventory(
         .collect();
     destination.ensure_readable_for(&related)?;
     let threads: BTreeSet<_> = files.iter().map(|file| &file.thread).collect();
+    let physicals: BTreeSet<_> = files.iter().map(|file| &file.physical).collect();
     for item in destination
-        .rollouts
-        .values()
-        .filter(|item| threads.contains(&item.thread))
+        .all()
+        .filter(|item| threads.contains(&item.thread) || physicals.contains(&item.physical))
     {
         // Only the exact hardlink we would reuse is harmless. An extra name,
         // even without a threads row, would leave an ambiguous physical id.
         let candidate = files.iter().find(|file| {
-            file.physical == item.physical
+            file.thread == item.thread
+                && file.physical == item.physical
                 && item.path == target.join("sessions").join(&file.relative)
         });
         let compatible = match candidate {
@@ -1409,7 +1431,7 @@ fn unimport(store: &Store, id: &str, apply: bool, force: bool) -> Result<()> {
     let compressed_names = names
         .iter()
         .any(|p| p.extension().is_some_and(|ext| ext == "zst"));
-    let _guards = match (apply, compressed_names) {
+    let mut guards = match (apply, compressed_names) {
         (true, true) => guard::reserve_decoded(&homes, &entry.threads, &names)?,
         (false, true) => guard::probe_decoded(&homes, &entry.threads, &names)?,
         (true, false) => guard::reserve_cleanup(&homes, &entry.threads, &names)?,
@@ -1421,6 +1443,22 @@ fn unimport(store: &Store, id: &str, apply: bool, force: bool) -> Result<()> {
                 guard::identity(&link.target)? == link.identity,
                 "대상 파일 소유권이 달라 되돌릴 수 없습니다"
             );
+            let retained_by_other = journal.imports.iter().any(|(other_id, other)| {
+                other_id != id
+                    && other
+                        .files
+                        .iter()
+                        .any(|peer| peer.target == link.target && peer.identity == link.identity)
+            });
+            let restores_source = entry.move_started
+                && (link.moved || link.thread == entry.root)
+                && !link.source.exists();
+            if link.owned && !retained_by_other && !restores_source {
+                ensure!(
+                    guard::hardlink_count(&link.target)? > 1,
+                    "세션 파일의 마지막 하드링크는 삭제할 수 없습니다"
+                );
+            }
             if !force {
                 ensure!(
                     fs::metadata(&link.target)?.len() == link.length,
@@ -1550,9 +1588,22 @@ fn unimport(store: &Store, id: &str, apply: bool, force: bool) -> Result<()> {
         .cloned()
         .collect::<Vec<_>>();
     update_index(&store.target, &remove_index, true)?;
+    guards.release_rollouts_for_unlink();
     for link in &entry.files {
         if link.owned && !retained.contains(&link.target) && link.target.exists() {
-            guard::remove_verified(&entry.target_home, &link.target, link.identity)?;
+            guard::unlink_validated(
+                &entry.target_home,
+                &link.target,
+                link.identity,
+                guard::hardlink_count(&link.target)?,
+                |file| {
+                    ensure!(
+                        force || file.metadata()?.len() == link.length,
+                        "가져온 뒤 기록이 변경되었습니다. 확인 후 --force를 사용하세요"
+                    );
+                    Ok(())
+                },
+            )?;
         }
     }
     journal.imports.remove(id);
