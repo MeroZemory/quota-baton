@@ -9,7 +9,7 @@ This file names the verification for each unit and each row. The row list and th
 목표: 보이는 대시보드의 유휴 CPU와 조작 지연을 줄인다
 핵심 지표: 새 경로 출시 1/2 · R11은 HTTP 통합 저장, WS 경계 2건과 출시 관문 남음
 사용자 대기: 없음 (R2 Part B만 사용자 결정 대기)
-갱신: 2026-10-22 03:14 KST (a47b44c; hover·scroll 목표 통과, tab 최적화 진행)
+갱신: 2026-10-22 03:46 KST (a0c01b4; 조작 통과, 전체 재작성 비용 절감 중)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -98,12 +98,23 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-22 03:14 | R12.10 동기 입력→production paint v3 프레임 p95 (hover/scroll/tab) | 1.389 / 7.210 / 71.627 ms | 각 16 ms 미만 | 각100회; hover와 scroll 통과, tab 실패; 누락·제외 없음 |
 | 2026-10-22 03:14 | R12.10 스크롤 동등성·텍스트·그리기 생략 focused 테스트 | 20/20 통과 | 20/20 통과 | release: region5, text11, paint4; a47b44c |
 | 2026-10-22 03:14 | R12.10 표시 시각 deadline focused 테스트 | 9/9 통과 | 9/9 통과 | 동일 release actual-Host 실행 파일; DST·자정·숨긴 행 |
+| 2026-10-22 03:27 | R12.10 동기 입력→production paint v3 프레임 p95 (hover/scroll/tab) | 4.235 / 17.196 / 47.699 ms | 각 16 ms 미만 | after-tab-metric-v3; 모든100회 보존; hover만 통과, full 재작성50ms 기준 통과 |
+| 2026-10-22 03:27 | R12.10 합성 HWND 유휴 CPU (30계정·40세션, 코어 하나 기준) | 0.0000 % | 2 % 미만 | 30초 CPU tick 증가0; 0보다 작은 비용이라는 뜻 아님 |
+| 2026-10-22 03:27 | R12.10 전체 배치 metric 캐시 focused 테스트 | 3/3 통과 | 3/3 통과 | 867cec1; warm 1회 배치 및 fresh 장면 동등성·입력 변화·경계 |
+| 2026-10-22 03:27 | R12.10 실제 HWND 검수 회귀·UIA 조상 깊이 | 3/3 통과 | 3/3 통과 | Host1 (pointer release4경로·역시각·자정 포함), depth2; 새 탭 캐시 통합 전 |
+| 2026-10-22 03:38 | R12.10 동기 production paint v4 프레임 p95 (hover/scroll/tab) | 9.900 / 15.527 / 12.686 ms | 각 16 ms 미만 | 각100회 전부 보존; 바깥 입력→paint scroll p95 16.668 ms로 미달 |
+| 2026-10-22 03:38 | R12.10 합성 HWND 유휴 CPU (30계정·40세션, 코어 하나 기준) | 0.208297 % | 2 % 미만 | after-tab-cache-v4; 전체 관문은 미완료 |
+| 2026-10-22 03:38 | R12.10 새 snapshot 전체 재작성 v4 (30회, 탭별10회) p95 | 133.578 ms | 50 ms 미만 | 새 계열; 지역 재작성·탭 캐시 교체 제외; median24.996 ms, 실패 |
+| 2026-10-22 03:46 | R12.10 동기 production paint v4 프레임 p95 (hover/scroll/tab) | 1.620 / 8.972 / 10.850 ms | 각16 ms 미만 | after-scroll-cpu-v4; 각100회 보존; 바깥 입력 p95 2.138/9.138/12.353 ms |
+| 2026-10-22 03:46 | R12.10 합성 HWND 유휴 CPU (30계정·40세션, 코어 하나 기준) | 0.052074 % | 2 % 미만 | 30초 완료; 전체 재작성 미달로 실행 실패 |
+| 2026-10-22 03:46 | R12.10 새 snapshot 전체 재작성 v4 (30회, 탭별10회) p95 | 56.833 ms | 50 ms 미만 | CPU tick p95 62.5 ms(15.625 ms 단위); 전체 재작성 비용 절감 계속 |
+| 2026-10-22 03:46 | R12.10 실제 HWND 탭 캐시·prepared UIA·부분 그리기 동등성 | 8/8 통과 | 8/8 통과 | Host1, prepared3, WIC픽셀4; depth 필터 오기로0회는 미검증으로 제외 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 행동 |
 |---|---|---|---|
 | R11 실행별 계정 | HTTP 통합 저장, WS 경계 2건과 출시 관문 남음 | 관문 통과와 설치 | R12.10 뒤 WS 경계 2건 마무리 후 관문 |
-| 대시보드 지연 (R12.10) | 합성 유휴 0.1041 %, 조작 p95 1.4/7.2/71.6 ms | 유휴 2 % 미만, 조작 p95 16 ms 미만 | 탭 배치 metric 재사용·UIA 조상 검증 메모 후 재측정 |
+| 대시보드 지연 (R12.10) | 유휴0.0521 %, 조작1.6/9.0/10.9 ms, 전체56.8 ms | 유휴2 %, 조작16 ms, 전체50 ms 미만 | 사용량 시각 형식·UIA 검증/조회 중복 절감 후 재측정 |
 | R13 소진 예측·아이콘·차트·캐시 보류 | 설계 완료, 구현 0/5 부분 | 5/5 부분 병합과 설치 | R11과 R12.10 뒤 시작 |
 <!-- gaps:end -->
