@@ -26,6 +26,7 @@ use qb_tray::{
 };
 use serde_json::json;
 use std::{
+    cell::RefCell,
     path::PathBuf,
     sync::{
         Arc,
@@ -35,7 +36,7 @@ use std::{
     time::{Duration, Instant},
 };
 use windows::Win32::{
-    Foundation::{HWND, LPARAM, POINT, RECT, WPARAM},
+    Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
     Graphics::Gdi::{ClientToScreen, InvalidateRect, UpdateWindow},
     System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize},
     UI::{
@@ -213,6 +214,89 @@ impl Run {
         self.pump(180);
     }
 }
+// Count actual WM_PAINT dispatch without altering the production WndProc.
+thread_local! {
+    static PAINT_PROBE: RefCell<Option<(WNDPROC, u64)>> = const { RefCell::new(None) };
+}
+unsafe extern "system" fn observe_paints(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    let old = PAINT_PROBE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        slot.as_mut().and_then(|(old, count)| {
+            if msg == WM_PAINT {
+                *count = count.saturating_add(1);
+            }
+            *old
+        })
+    });
+    unsafe { CallWindowProcW(old, hwnd, msg, w, l) }
+}
+struct PaintProbe {
+    hwnd: HWND,
+    previous: isize,
+}
+impl PaintProbe {
+    fn new(hwnd: HWND) -> Self {
+        let previous = unsafe {
+            SetWindowLongPtrW(
+                hwnd,
+                GWLP_WNDPROC,
+                observe_paints as *const () as usize as isize,
+            )
+        };
+        assert_ne!(previous, 0);
+        let old = unsafe { std::mem::transmute::<isize, WNDPROC>(previous) };
+        PAINT_PROBE.with(|slot| assert!(slot.borrow_mut().replace((old, 0)).is_none()));
+        Self { hwnd, previous }
+    }
+    fn count(&self) -> u64 {
+        PAINT_PROBE.with(|slot| slot.borrow().as_ref().unwrap().1)
+    }
+}
+impl Drop for PaintProbe {
+    fn drop(&mut self) {
+        unsafe {
+            SetWindowLongPtrW(self.hwnd, GWLP_WNDPROC, self.previous);
+        }
+        PAINT_PROBE.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+fn root_encoding_probes(hwnd: HWND, run: &mut Run) {
+    let probe = PaintProbe::new(hwnd);
+    let root = windows::Win32::UI::Accessibility::UiaRootObjectId;
+    for object in [root as isize, root as u32 as isize] {
+        unsafe {
+            SendMessageW(hwnd, WM_SIZE, None, None);
+        }
+        let before = probe.count();
+        let result = unsafe { SendMessageW(hwnd, WM_GETOBJECT, None, Some(LPARAM(object))) };
+        assert_ne!(
+            result.0, 0,
+            "real provider returned for root encoding {object:#x}"
+        );
+        assert!(
+            probe.count() > before,
+            "pending root encoding {object:#x} must complete a real paint"
+        );
+        run.actions.push(format!(
+            "pending WM_GETOBJECT {object:#x}: actual WM_PAINT observed"
+        ));
+    }
+    unsafe {
+        SendMessageW(hwnd, WM_SIZE, None, None);
+    }
+    let before = probe.count();
+    unsafe {
+        SendMessageW(hwnd, WM_GETOBJECT, None, Some(LPARAM(1)));
+    }
+    assert_eq!(
+        probe.count(),
+        before,
+        "non-root must not force production paint"
+    );
+    run.actions
+        .push("non-root WM_GETOBJECT: no forced WM_PAINT".into());
+}
+
 struct Cleanup;
 impl Drop for Cleanup {
     fn drop(&mut self) {
@@ -331,6 +415,10 @@ fn r10_dashboard_native() {
         .unwrap();
     }
     run.pump(200);
+    if state == 1 && !dark {
+        root_encoding_probes(hwnd, &mut run);
+        run.pump(80);
+    }
     match state {
         2 => run.scroll(hwnd),
         3 | 9 | 15 => {
