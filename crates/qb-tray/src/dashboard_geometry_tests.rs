@@ -1461,7 +1461,21 @@ fn r10_client_number_column_is_fixed_and_does_not_share_session_label_box() {
                 }
             })
             .collect();
-        let id = labels.iter().find(|(_, text)| *text == suffix).unwrap().0;
+        // Fixture short ids can collide. Match this actual row, not the first
+        // identical suffix elsewhere in the table.
+        let top = scene
+            .session_rows
+            .iter()
+            .find(|r| r.id == row.id)
+            .unwrap()
+            .rect
+            .top
+            + 7.;
+        let id = labels
+            .iter()
+            .find(|(r, text)| *text == suffix && r.top == top)
+            .unwrap()
+            .0;
         assert!(width(id) > 0.);
         let client = labels
             .iter()
@@ -1484,7 +1498,7 @@ fn r10_client_number_column_is_fixed_and_does_not_share_session_label_box() {
         assert!(
             labels
                 .iter()
-                .any(|(r, text)| *text == row.label && r.right <= id.left)
+                .any(|(r, text)| *text == row.label && r.top == top && r.right <= id.left)
         );
     }
 }
@@ -1551,7 +1565,18 @@ fn r101_client_number_stays_adjacent_for_long_clients_at_narrow_and_wide_sizes()
             let mut checked = 0;
             for row in &v.flat {
                 let suffix = format!(" · {}", row.short_id);
-                if let Some((id, _)) = labels.iter().find(|(_, text)| *text == suffix) {
+                let top = scene
+                    .session_rows
+                    .iter()
+                    .find(|r| r.id == row.id)
+                    .unwrap()
+                    .rect
+                    .top
+                    + 7.;
+                if let Some((id, _)) = labels
+                    .iter()
+                    .find(|(r, text)| *text == suffix && r.top == top)
+                {
                     let (name, _) = labels
                         .iter()
                         .find(|(r, text)| *text == client && r.top == id.top)
