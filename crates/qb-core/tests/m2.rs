@@ -174,6 +174,16 @@ impl Harness {
 async fn every_route_preserves_path_query_and_c3_headers() {
     let _serial = SERIAL.lock().await;
     let h = Harness::new(64, 384).await;
+    let codex = h
+        .store
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|account| account.provider == qb_core::accounts::Provider::Codex)
+        .unwrap();
+    h.store
+        .update_metadata(&codex.id, |account| account.plan = Some("plus".into()))
+        .unwrap();
     for (method, path, claude, upstream) in [
         (
             "POST",
@@ -205,6 +215,15 @@ async fn every_route_preserves_path_query_and_c3_headers() {
             "/models?client_version=0.162.1",
         ),
     ] {
+        // Image routes now require a known paid account and a valid operation
+        // payload. Keep the same byte/header assertions for these routes too.
+        let body = match path {
+            "/v1/images/generations" => r#"{ "model": "gpt-image-2", "prompt": "synthetic" }"#,
+            "/v1/images/edits" => {
+                r#"{ "model": "gpt-image-2", "images": [{"image_url":"data:image/png;base64,c3ludGhldGlj"}] }"#
+            }
+            _ => "{ \"input\": [] }",
+        };
         let mut request = h
             .client
             .request(method.parse().unwrap(), h.url(path))
@@ -220,7 +239,8 @@ async fn every_route_preserves_path_query_and_c3_headers() {
             .header("accept-encoding", "gzip, zstd")
             .header("anthropic-beta", "existing-beta")
             .header("session-id", "synthetic-session")
-            .body("{ \"input\": [] }");
+            .header("content-type", "application/json")
+            .body(body);
         if claude {
             request = request.header("anthropic-version", "2023-06-01");
         }
@@ -258,7 +278,7 @@ async fn every_route_preserves_path_query_and_c3_headers() {
         } else {
             assert_eq!(request.headers["chatgpt-account-id"], "synthetic-codex");
         }
-        assert_eq!(request.body.as_ref(), b"{ \"input\": [] }");
+        assert_eq!(request.body.as_ref(), body.as_bytes());
     }
     for path in ["/v1/memories/trace_summarize", "/unknown"] {
         let response = h.send(path, "{}").await;
