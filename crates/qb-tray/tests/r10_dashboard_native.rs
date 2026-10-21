@@ -190,6 +190,11 @@ impl Run {
     fn key(&mut self, hwnd: HWND, key: usize) {
         if self.edge.is_some() {
             assert_owned(hwnd);
+            // The owned window can be occluded by the collector. Complete its
+            // pending production paint before dispatching the next input.
+            unsafe {
+                let _ = UpdateWindow(hwnd);
+            }
         }
         self.actions.push(format!("WM_KEYDOWN/UP {key:#x}"));
         unsafe {
