@@ -16,7 +16,7 @@ mod wic;
 use dashboard_window::{Bridge, Event, UiPort};
 use qb_tray::{
     dashboard_model as model,
-    geometry::{self, Scene, Target},
+    geometry::{Scene, Target},
     render,
     state::{Command, DashboardState, ScrollRegion, Tab},
 };
@@ -215,22 +215,21 @@ fn owned_dashboard() -> HWND {
             if count > 0
                 && String::from_utf16_lossy(&class[..count as usize]) == "QuotaBatonDashboard"
             {
-                unsafe { *(context.0 as *mut HWND) = hwnd };
-                return false.into();
+                unsafe { (*(context.0 as *mut Vec<HWND>)).push(hwnd) };
             }
         }
         true.into()
     }
-    let mut found = HWND::default();
+    let mut found = Vec::<HWND>::new();
     unsafe {
-        // Returning FALSE terminates enumeration once our own window was found.
-        let _ = EnumWindows(Some(visit), LPARAM((&mut found as *mut HWND) as isize));
+        EnumWindows(Some(visit), LPARAM((&mut found as *mut Vec<HWND>) as isize)).unwrap();
     }
-    assert!(
-        !found.is_invalid(),
-        "this process must own a dashboard HWND"
+    assert_eq!(
+        found.len(),
+        1,
+        "this process must own exactly one dashboard"
     );
-    found
+    found[0]
 }
 
 #[test]
@@ -243,6 +242,10 @@ fn r10_dashboard_native() {
     );
     let state: u8 = std::env::var("R10_STATE").unwrap().parse().unwrap();
     assert!((1..=15).contains(&state));
+    let theme = std::env::var("R10_THEME").expect("R10_THEME");
+    assert!(matches!(theme.as_str(), "light" | "dark"));
+    let run_id = std::env::var("R10_RUN_ID").expect("R10_RUN_ID");
+    assert!(run_id.len() == 32 && run_id.bytes().all(|c| c.is_ascii_hexdigit()));
     unsafe {
         let previous = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         assert!(!previous.is_invalid(), "per-thread physical DPI awareness");
@@ -251,7 +254,7 @@ fn r10_dashboard_native() {
     let _cleanup = Cleanup;
     let (send, recv) = mpsc::sync_channel(256);
     let snapshot = Arc::new(fixture::snapshot(state));
-    let dark = matches!(state, 10 | 11);
+    let dark = theme == "dark";
     let size = if matches!(state, 7 | 15) {
         [1024., 640.]
     } else {
@@ -381,7 +384,18 @@ fn r10_dashboard_native() {
             "value":n.value,"expanded":n.expanded,"target":format!("{:?}",n.target)})
         })
         .collect();
-    let ready = json!({"schema":1,"state":state,"pid":pid,"hwnd":hwnd.0 as usize,
+    unsafe {
+        let _ = InvalidateRect(Some(hwnd), None, false);
+        let _ = UpdateWindow(hwnd);
+    }
+    run.pump(120);
+    let mut client = RECT::default();
+    unsafe { GetClientRect(hwnd, &mut client).unwrap() };
+    assert_eq!(
+        [client.right, client.bottom],
+        [size[0] as i32, size[1] as i32]
+    );
+    let ready = json!({"schema":1,"state":state,"run_id":run_id,"pid":pid,"hwnd":hwnd.0 as usize,
         "dpi":dpi,"client_dip":size,"synthetic_clock":fixture::clock().now.to_rfc3339(),
         "theme":if dark {"dark"} else {"light"},"actions":run.actions,"commands":run.commands,
         "expected_uia":expected,"focus_required":if state == 9 {Some(fixture::SELECTED)} else {None},
@@ -401,4 +415,22 @@ fn r10_dashboard_native() {
         }
         run.pump(40);
     }
+    assert_eq!(
+        std::fs::read_to_string(output.join("release")).unwrap(),
+        run_id
+    );
+    drop(_cleanup);
+    assert!(!unsafe { IsWindow(Some(hwnd)) }.as_bool());
+    let completion = json!({"schema":1,"state":state,"theme":theme,"pid":pid,
+        "run_id":run_id,"status":"completed","window_closed":true});
+    std::fs::write(
+        output.join("completion.tmp"),
+        serde_json::to_vec_pretty(&completion).unwrap(),
+    )
+    .unwrap();
+    std::fs::rename(
+        output.join("completion.tmp"),
+        output.join("completion.json"),
+    )
+    .unwrap();
 }
