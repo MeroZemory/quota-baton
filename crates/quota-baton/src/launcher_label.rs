@@ -179,6 +179,12 @@ pub(crate) fn canary_run(
         let mut child = contained::Child::spawn(&command, Some(&null))?;
         let status = child.wait(Some(std::time::Duration::from_secs(15)));
         drop(child);
+        #[cfg(all(feature = "testkit", debug_assertions))]
+        match &status {
+            Ok(code) if *code != 0 => eprintln!("qb-image-canary: native-exit={code}"),
+            Err(error) => eprintln!("qb-image-canary: native-wait={:?}", error.kind()),
+            _ => {}
+        }
         if status? == 0 {
             Ok(())
         } else {
