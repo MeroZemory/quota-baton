@@ -271,6 +271,7 @@ fn compressed_hardlink_alias_is_retained_and_sqlite_can_select_it() {
     let found = catalog(home.path()).unwrap();
     assert_eq!(found.all().count(), 2);
     assert_eq!(found.aliases.len(), 1);
+    assert!(found.conflicts.is_empty());
     let selected = &found.aliases[0].path;
     let db = rusqlite::Connection::open(home.path().join("state_5.sqlite")).unwrap();
     db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL);")
@@ -292,7 +293,179 @@ fn compressed_plain_duplicate_physical_id_is_not_a_fileid_alias() {
     let home = home();
     write(home.path(), A, A, None, None, false);
     write(home.path(), A, A, None, None, true);
-    let error = catalog(home.path()).err().unwrap().to_string();
-    assert!(error.contains(A));
-    assert!(error.contains("서로 다른 파일"));
+    write(home.path(), B, B, None, None, true);
+    let found = catalog(home.path()).unwrap();
+    assert_eq!(found.conflicts, ids(A));
+    assert_eq!(found.all().count(), 3);
+    assert_eq!(found.threads[A], [A]);
+    for error in [
+        found.ensure_readable_for(&ids(A)).unwrap_err(),
+        found.active(A).err().unwrap(),
+        found.chain(A).err().unwrap(),
+    ] {
+        assert!(error.is::<PhysicalConflict>());
+        assert_eq!(
+            error.to_string(),
+            format!("같은 대화 기록 ID가 서로 다른 파일에 중복되어 있습니다: {A}")
+        );
+    }
+    assert!(found.ensure_readable_for(&ids(B)).is_ok());
+    assert_eq!(found.chain(B).unwrap().len(), 1);
+}
+
+#[cfg(windows)]
+#[test]
+fn physical_conflicts_retain_all_names_threads_and_refuse_only_related_selections() {
+    for compressed in [false, true] {
+        for archived in [false, true] {
+            for other_thread in [A, B] {
+                let home = home();
+                let primary = write(home.path(), A, D, None, None, compressed);
+                let duplicate = home
+                    .path()
+                    .join(if archived {
+                        "archived_sessions"
+                    } else {
+                        "sessions/duplicate"
+                    })
+                    .join(primary.file_name().unwrap());
+                fs::create_dir_all(duplicate.parent().unwrap()).unwrap();
+                let bytes = record(other_thread, None, None);
+                fs::write(
+                    &duplicate,
+                    if compressed {
+                        zstd::stream::encode_all(bytes.as_bytes(), 1).unwrap()
+                    } else {
+                        bytes.into_bytes()
+                    },
+                )
+                .unwrap();
+                write(home.path(), C, C, None, None, !compressed);
+                let found = catalog(home.path()).unwrap();
+                assert_eq!(found.conflicts, ids(D));
+                assert_eq!(found.all().count(), 3);
+                assert!(found.all().any(|r| r.path == primary));
+                assert!(found.all().any(|r| r.path == duplicate));
+                assert_eq!(found.threads[A], [D]);
+                assert_eq!(found.threads[other_thread], [D]);
+                for selected in [A, other_thread, D] {
+                    assert!(
+                        found
+                            .ensure_readable_for(&ids(selected))
+                            .unwrap_err()
+                            .is::<PhysicalConflict>()
+                    );
+                    assert!(
+                        found
+                            .active(selected)
+                            .err()
+                            .unwrap()
+                            .is::<PhysicalConflict>()
+                    );
+                    assert!(
+                        found
+                            .chain(selected)
+                            .err()
+                            .unwrap()
+                            .is::<PhysicalConflict>()
+                    );
+                }
+                assert!(found.ensure_readable_for(&ids(C)).is_ok());
+                assert_eq!(found.chain(C).unwrap().len(), 1);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn conflicting_copies_preserve_logical_and_physical_parent_edges_in_each_root() {
+    for history in [false, true] {
+        for archived in [false, true] {
+            let home = home();
+            write(home.path(), A, A, None, None, false);
+            write(home.path(), B, D, None, None, true);
+            let duplicate = home
+                .path()
+                .join(if archived {
+                    "archived_sessions"
+                } else {
+                    "sessions/duplicate"
+                })
+                .join(format!("rollout-conflict-{D}.jsonl.zst"));
+            fs::create_dir_all(duplicate.parent().unwrap()).unwrap();
+            fs::write(
+                duplicate,
+                zstd::stream::encode_all(
+                    record(B, history.then_some(A), (!history).then_some(A)).as_bytes(),
+                    1,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            write(home.path(), C, C, None, None, true);
+            let found = catalog(home.path()).unwrap();
+            assert_eq!(
+                found.related_ids(&ids(A)),
+                BTreeSet::from([A.into(), B.into(), D.into()])
+            );
+            for selected in [A, B, D] {
+                assert!(
+                    found
+                        .ensure_readable_for(&ids(selected))
+                        .unwrap_err()
+                        .is::<PhysicalConflict>()
+                );
+                assert!(
+                    found
+                        .active(selected)
+                        .err()
+                        .unwrap()
+                        .is::<PhysicalConflict>()
+                );
+                assert!(
+                    found
+                        .chain(selected)
+                        .err()
+                        .unwrap()
+                        .is::<PhysicalConflict>()
+                );
+            }
+            assert_eq!(found.chain(C).unwrap().len(), 1);
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn cross_home_graph_propagates_only_related_physical_conflicts() {
+    for history in [false, true] {
+        let root = home();
+        let other = home();
+        write(root.path(), A, A, None, None, false);
+        write(
+            root.path(),
+            B,
+            B,
+            history.then_some(D),
+            (!history).then_some(D),
+            true,
+        );
+        write(other.path(), C, D, None, None, false);
+        write(other.path(), C, D, None, None, true);
+        let first = catalog(root.path()).unwrap();
+        let second = catalog(other.path()).unwrap();
+        assert_eq!(first.chain(A).unwrap().len(), 1);
+        assert!(
+            second
+                .ensure_readable_for(&first.related_ids(&ids(A)))
+                .is_ok()
+        );
+        assert!(
+            second
+                .ensure_readable_for(&first.related_ids(&ids(B)))
+                .unwrap_err()
+                .is::<PhysicalConflict>()
+        );
+    }
 }

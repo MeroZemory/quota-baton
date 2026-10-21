@@ -2206,7 +2206,9 @@ fn r91_authorized_readonly_inventory() -> Result<()> {
             Ok(_) => movable += 1,
             Err(error) => {
                 let message = error.to_string();
-                let reason = if error.is::<super::super::InventoryConflict>() {
+                let reason = if error.is::<discovery::PhysicalConflict>() {
+                    "physical_id_conflict"
+                } else if error.is::<super::super::InventoryConflict>() {
                     "inventory_divergence"
                 } else if error.is::<guard::LiveWriter>() {
                     "live_writer"

@@ -31,7 +31,9 @@ pub(crate) struct Rollout {
 pub(crate) struct Catalog {
     pub home: PathBuf,
     pub rollouts: BTreeMap<String, Rollout>,
+    /// Nonprimary readable names: hardlink aliases or conflicting physical copies.
     pub aliases: Vec<Rollout>,
+    pub conflicts: BTreeSet<String>,
     /// All compressed names, including successfully decoded headers (counts only).
     pub compressed: Vec<PathBuf>,
     pub unreadable: Vec<UnreadableRollout>,
@@ -57,6 +59,21 @@ impl std::fmt::Display for RelatedUnreadable {
     }
 }
 impl std::error::Error for RelatedUnreadable {}
+
+#[derive(Debug)]
+pub(crate) struct PhysicalConflict {
+    id: String,
+}
+impl std::fmt::Display for PhysicalConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "같은 대화 기록 ID가 서로 다른 파일에 중복되어 있습니다: {}",
+            self.id
+        )
+    }
+}
+impl std::error::Error for PhysicalConflict {}
 
 const HEADER_LIMIT: u64 = 4 * 1024 * 1024;
 const COMPRESSED_LIMIT: u64 = 8 * 1024 * 1024;
@@ -274,6 +291,7 @@ fn scan_catalog(home: PathBuf) -> Result<Catalog> {
         home: home.clone(),
         rollouts: BTreeMap::new(),
         aliases: Vec::new(),
+        conflicts: BTreeSet::new(),
         compressed: Vec::new(),
         unreadable: Vec::new(),
         threads: BTreeMap::new(),
@@ -333,22 +351,20 @@ fn scan_catalog(home: PathBuf) -> Result<Catalog> {
                     }
                     Err(error) => return Err(error),
                 };
+                let choices = result.threads.entry(item.thread.clone()).or_default();
+                if !choices.contains(&physical) {
+                    choices.push(physical.clone());
+                }
                 if let Some(existing) = result.rollouts.get(&physical) {
-                    ensure!(
-                        crate::sessions_guard::identity(&existing.path)?
-                            == crate::sessions_guard::identity(&item.path)?
-                            && existing.thread == item.thread,
-                        "같은 대화 기록 ID가 서로 다른 파일에 중복되어 있습니다: {}",
-                        physical
-                    );
+                    if crate::sessions_guard::identity(&existing.path)?
+                        != crate::sessions_guard::identity(&item.path)?
+                        || existing.thread != item.thread
+                    {
+                        result.conflicts.insert(physical);
+                    }
                     result.aliases.push(item);
                     continue;
                 }
-                result
-                    .threads
-                    .entry(item.thread.clone())
-                    .or_default()
-                    .push(physical.clone());
                 result.rollouts.insert(physical, item);
             }
         }
@@ -385,10 +401,13 @@ impl Catalog {
         found
     }
 
-    /// Refuse only unreadable names whose exact filename UUID is in the known
+    /// Refuse conflicting or unreadable names whose filename UUID is in the known
     /// graph. Unknown IDs do not imply a relationship. No rows are read here.
     pub(crate) fn ensure_readable_for(&self, ids: &BTreeSet<String>) -> Result<()> {
         let related = self.related_ids(ids);
+        if let Some(id) = self.conflicts.intersection(&related).next() {
+            return Err(PhysicalConflict { id: id.clone() }.into());
+        }
         for item in &self.unreadable {
             if let Some(id) = &item.physical
                 && related.contains(id)
@@ -403,7 +422,7 @@ impl Catalog {
         Ok(())
     }
 
-    /// Every discoverable name, including hardlink aliases of a physical segment.
+    /// Every readable name, including hardlink aliases and conflicting copies.
     pub(crate) fn all(&self) -> impl Iterator<Item = &Rollout> {
         self.rollouts.values().chain(self.aliases.iter())
     }
@@ -446,6 +465,7 @@ impl Catalog {
     }
 
     pub(crate) fn active(&self, id: &str) -> Result<&Rollout> {
+        self.ensure_readable_for(&BTreeSet::from([id.to_owned()]))?;
         let choices = self
             .threads
             .get(id)
@@ -687,7 +707,11 @@ mod tests {
         let home = home();
         write(home.path(), A, A, None, None, false);
         write(home.path(), A, A, None, None, true);
-        assert!(catalog(home.path()).is_err());
+        let found = catalog(home.path()).unwrap();
+        assert_eq!(found.all().count(), 2);
+        assert_eq!(found.conflicts, BTreeSet::from([A.into()]));
+        assert!(found.active(A).err().unwrap().is::<PhysicalConflict>());
+        assert!(found.chain(A).err().unwrap().is::<PhysicalConflict>());
     }
 
     #[test]
