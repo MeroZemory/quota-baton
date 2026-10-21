@@ -4,11 +4,12 @@
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     rc::Rc,
     time::{Duration, SystemTime},
@@ -79,6 +80,127 @@ const HEADER_LIMIT: u64 = 4 * 1024 * 1024;
 const COMPRESSED_LIMIT: u64 = 8 * 1024 * 1024;
 const CACHE_HOME_LIMIT: usize = 64;
 const CATALOG_NODE_LIMIT: usize = 100_000;
+
+// Only successful, allowlisted header metadata is memoized. Each hit hashes the
+// exact compressed input prefix observed by its original decoder, from a newly
+// validated open file. Size/mtime/file-id equality alone never authorizes a hit.
+// Names, aliases, graph closure, unreadable files and absence are always fresh.
+const HEADER_CACHE_ENTRIES: usize = 8192;
+const HEADER_CACHE_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Clone)]
+struct CompressedHeader {
+    input_bytes: u64,
+    digest: [u8; 32],
+    rollout: Rollout,
+    cost: usize,
+}
+
+#[derive(Default)]
+struct HeaderCache {
+    entries: BTreeMap<PathBuf, CompressedHeader>,
+    bytes: usize,
+}
+
+static COMPRESSED_HEADERS: std::sync::Mutex<HeaderCache> = std::sync::Mutex::new(HeaderCache {
+    entries: BTreeMap::new(),
+    bytes: 0,
+});
+
+fn with_headers<T>(operation: impl FnOnce(&mut HeaderCache) -> T) -> T {
+    let mut cache = COMPRESSED_HEADERS.lock().unwrap_or_else(|poison| {
+        let mut cache = poison.into_inner();
+        *cache = HeaderCache::default();
+        cache
+    });
+    operation(&mut cache)
+}
+
+struct HeaderInput<R> {
+    inner: R,
+    digest: Sha256,
+    bytes: u64,
+}
+
+impl<R: Read> Read for HeaderInput<R> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        // Bound raw compressed read-ahead independently of decoded output.
+        let capacity = output.len().min(8192);
+        let count = self.inner.read(&mut output[..capacity])?;
+        self.digest.update(&output[..count]);
+        self.bytes += count as u64;
+        Ok(count)
+    }
+}
+
+fn cached_compressed(
+    path: &Path,
+    opened: &crate::sessions_guard::HeaderOpen,
+) -> Result<Option<Rollout>> {
+    let Some(entry) = with_headers(|cache| cache.entries.get(path).cloned()) else {
+        return Ok(None);
+    };
+    let metadata = opened.file().metadata()?;
+    let mut input = HeaderInput {
+        inner: opened.file().take(entry.input_bytes),
+        digest: Sha256::new(),
+        bytes: 0,
+    };
+    let mut scratch = [0u8; 8192];
+    while input.read(&mut scratch)? != 0 {}
+    if input.bytes != entry.input_bytes || <[u8; 32]>::from(input.digest.finalize()) != entry.digest
+    {
+        opened.file().seek(SeekFrom::Start(0))?;
+        return Ok(None);
+    }
+    let mut rollout = entry.rollout;
+    rollout.bytes = metadata.len();
+    if rollout.metadata.contains_key("updated_at") {
+        rollout.metadata.insert(
+            "updated_at".into(),
+            crate::sessions_db::DbValue::Integer(
+                metadata
+                    .modified()?
+                    .duration_since(SystemTime::UNIX_EPOCH)?
+                    .as_secs()
+                    .try_into()?,
+            ),
+        );
+    }
+    Ok(Some(rollout))
+}
+
+fn cache_compressed(
+    path: &Path,
+    rollout: &Rollout,
+    input_bytes: u64,
+    digest: [u8; 32],
+) -> Result<()> {
+    let cost = serde_json::to_vec(rollout)?.len() + 128;
+    if cost > HEADER_CACHE_BYTES {
+        return Ok(());
+    }
+    with_headers(|cache| {
+        if let Some(old) = cache.entries.remove(path) {
+            cache.bytes -= old.cost;
+        }
+        if cache.entries.len() >= HEADER_CACHE_ENTRIES || cache.bytes + cost > HEADER_CACHE_BYTES {
+            // Bounded eviction only costs a fresh decode; it never hides a file.
+            *cache = HeaderCache::default();
+        }
+        cache.bytes += cost;
+        cache.entries.insert(
+            path.to_owned(),
+            CompressedHeader {
+                input_bytes,
+                digest,
+                rollout: rollout.clone(),
+                cost,
+            },
+        );
+    });
+    Ok(())
+}
 
 #[derive(Clone, Default)]
 struct MetadataCache {
@@ -162,27 +284,46 @@ fn physical_id(path: &Path) -> Option<String> {
     valid_id(id).then(|| id.to_ascii_lowercase())
 }
 
-fn read_meta(path: &Path, relative: PathBuf, physical: String) -> Result<Rollout> {
-    let metadata = ordinary(path)?;
-    ensure!(metadata.is_file(), "대화 기록이 일반 파일이 아닙니다");
-    let file = fs::File::open(path)?;
-    let reader: Box<dyn Read> = if path.extension().is_some_and(|s| s == "zst") {
-        let mut decoder =
-            zstd::stream::read::Decoder::new(file.take(COMPRESSED_LIMIT))?.single_frame();
+fn read_meta(
+    directory: &crate::sessions_guard::HeaderDirectory,
+    path: &Path,
+    relative: PathBuf,
+    physical: String,
+) -> Result<Rollout> {
+    let opened = crate::sessions_guard::open_header(directory, path)?;
+    let compressed = path.extension().is_some_and(|s| s == "zst");
+    if compressed && let Some(mut rollout) = cached_compressed(path, &opened)? {
+        rollout.relative = relative;
+        rollout.physical = physical;
+        return Ok(rollout);
+    }
+    let mut witness = None;
+    let (line, metadata) = if compressed {
+        let metadata = opened.file().metadata()?;
+        let mut input = HeaderInput {
+            inner: opened.file().take(COMPRESSED_LIMIT),
+            digest: Sha256::new(),
+            bytes: 0,
+        };
+        let mut decoder = zstd::stream::read::Decoder::new(&mut input)?.single_frame();
         decoder.window_log_max(23)?;
-        Box::new(decoder)
+        let mut line = String::new();
+        // No decoded read-ahead into conversation records. Input/window remain
+        // bounded independently; only the first frame can provide metadata.
+        let count =
+            BufReader::with_capacity(1, decoder.take(HEADER_LIMIT + 1)).read_line(&mut line)?;
+        ensure!(
+            count as u64 <= HEADER_LIMIT && line.ends_with('\n'),
+            "대화 메타데이터를 안전하게 읽을 수 없습니다"
+        );
+        witness = Some((input.bytes, <[u8; 32]>::from(input.digest.finalize())));
+        (line, metadata)
     } else {
-        Box::new(file)
+        let (line, metadata) = crate::sessions_plain_header::read(&opened, HEADER_LIMIT as usize)?;
+        let line = String::from_utf8(line)
+            .map_err(|_| anyhow::anyhow!("대화 메타데이터 형식이 올바르지 않습니다"))?;
+        (line, metadata)
     };
-    let mut line = String::new();
-    // Only the first record can be session_meta. Never scan assistant/user text.
-    // Capacity one prevents decoded read-ahead into the next record. Decoder
-    // input and window are bounded independently of the decoded header limit.
-    let count = BufReader::with_capacity(1, reader.take(HEADER_LIMIT + 1)).read_line(&mut line)?;
-    ensure!(
-        count as u64 <= HEADER_LIMIT && line.ends_with('\n'),
-        "대화 메타데이터를 안전하게 읽을 수 없습니다"
-    );
     let value: Value = serde_json::from_str(&line)
         .map_err(|_| anyhow::anyhow!("대화 메타데이터 형식이 올바르지 않습니다"))?;
     ensure!(
@@ -232,7 +373,7 @@ fn read_meta(path: &Path, relative: PathBuf, physical: String) -> Result<Rollout
             ),
         );
     }
-    Ok(Rollout {
+    let rollout = Rollout {
         path: path.to_owned(),
         relative,
         thread,
@@ -245,7 +386,11 @@ fn read_meta(path: &Path, relative: PathBuf, physical: String) -> Result<Rollout
         forked_from: reference(meta.get("forked_from_id"))?,
         bytes: metadata.len(),
         metadata: fields,
-    })
+    };
+    if let Some((bytes, digest)) = witness {
+        cache_compressed(path, &rollout, bytes, digest)?;
+    }
+    Ok(rollout)
 }
 
 pub(crate) fn catalog(home: &Path) -> Result<Catalog> {
@@ -286,6 +431,49 @@ pub(crate) fn catalog(home: &Path) -> Result<Catalog> {
     Ok(result)
 }
 
+struct HeaderJob {
+    directory: crate::sessions_guard::HeaderDirectory,
+    path: PathBuf,
+    relative: PathBuf,
+    physical: String,
+    compressed: bool,
+}
+
+fn read_jobs(jobs: &[HeaderJob]) -> Result<Vec<Result<Rollout>>> {
+    let read = |job: &HeaderJob| {
+        read_meta(
+            &job.directory,
+            &job.path,
+            job.relative.clone(),
+            job.physical.clone(),
+        )
+    };
+    if jobs.len() < 32 {
+        return Ok(jobs.iter().map(read).collect());
+    }
+    // Four bounded readers; each owns its decoder/mapping. Join in enumeration
+    // order so conflict/error classification is unchanged. No graph is shared.
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for chunk in jobs.chunks(jobs.len().div_ceil(4)) {
+            handles.push(
+                std::thread::Builder::new()
+                    .name("qb-session-header".into())
+                    .spawn_scoped(scope, move || chunk.iter().map(read).collect::<Vec<_>>())?,
+            );
+        }
+        let mut results = Vec::with_capacity(jobs.len());
+        for handle in handles {
+            results.extend(
+                handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("대화 메타데이터 작업을 완료하지 못했습니다"))?,
+            );
+        }
+        Ok(results)
+    })
+}
+
 fn scan_catalog(home: PathBuf) -> Result<Catalog> {
     let mut result = Catalog {
         home: home.clone(),
@@ -296,6 +484,7 @@ fn scan_catalog(home: PathBuf) -> Result<Catalog> {
         unreadable: Vec::new(),
         threads: BTreeMap::new(),
     };
+    let mut jobs = Vec::new();
     for top in ["sessions", "archived_sessions"] {
         let base = home.join(top);
         if !base.exists() {
@@ -305,6 +494,7 @@ fn scan_catalog(home: PathBuf) -> Result<Catalog> {
         while let Some((dir, depth)) = pending.pop() {
             ensure!(depth <= 8, "대화 폴더 깊이가 너무 큽니다");
             ordinary(&dir)?;
+            let directory = crate::sessions_guard::header_directory(&home, &dir)?;
             for entry in fs::read_dir(&dir)? {
                 let entry = entry?;
                 let path = entry.path();
@@ -334,40 +524,47 @@ fn scan_catalog(home: PathBuf) -> Result<Catalog> {
                     }
                     continue;
                 };
-                ensure!(
-                    result.rollouts.len() + result.aliases.len() < CATALOG_NODE_LIMIT,
-                    "대화 파일이 너무 많습니다"
-                );
+                ensure!(jobs.len() < CATALOG_NODE_LIMIT, "대화 파일이 너무 많습니다");
                 let relative = path.strip_prefix(&base)?.to_owned();
-                let item = match read_meta(&path, relative, physical.clone()) {
-                    Ok(item) => item,
-                    Err(_) if compressed => {
-                        result.unreadable.push(UnreadableRollout {
-                            path,
-                            physical: Some(physical),
-                            reason: "압축 대화 메타데이터를 안전하게 읽을 수 없습니다",
-                        });
-                        continue;
-                    }
-                    Err(error) => return Err(error),
-                };
-                let choices = result.threads.entry(item.thread.clone()).or_default();
-                if !choices.contains(&physical) {
-                    choices.push(physical.clone());
-                }
-                if let Some(existing) = result.rollouts.get(&physical) {
-                    if crate::sessions_guard::identity(&existing.path)?
-                        != crate::sessions_guard::identity(&item.path)?
-                        || existing.thread != item.thread
-                    {
-                        result.conflicts.insert(physical);
-                    }
-                    result.aliases.push(item);
-                    continue;
-                }
-                result.rollouts.insert(physical, item);
+                jobs.push(HeaderJob {
+                    directory: directory.clone(),
+                    path,
+                    relative,
+                    physical,
+                    compressed,
+                });
             }
         }
+    }
+    for (job, parsed) in jobs.iter().zip(read_jobs(&jobs)?) {
+        let physical = job.physical.clone();
+        let item = match parsed {
+            Ok(item) => item,
+            Err(_) if job.compressed => {
+                result.unreadable.push(UnreadableRollout {
+                    path: job.path.clone(),
+                    physical: Some(physical),
+                    reason: "압축 대화 메타데이터를 안전하게 읽을 수 없습니다",
+                });
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let choices = result.threads.entry(item.thread.clone()).or_default();
+        if !choices.contains(&physical) {
+            choices.push(physical.clone());
+        }
+        if let Some(existing) = result.rollouts.get(&physical) {
+            if crate::sessions_guard::identity(&existing.path)?
+                != crate::sessions_guard::identity(&item.path)?
+                || existing.thread != item.thread
+            {
+                result.conflicts.insert(physical);
+            }
+            result.aliases.push(item);
+            continue;
+        }
+        result.rollouts.insert(physical, item);
     }
     Ok(result)
 }

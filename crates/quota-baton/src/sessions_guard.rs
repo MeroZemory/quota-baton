@@ -11,6 +11,57 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// A regular leaf opened beneath retained, no-reparse ancestor pins. Not Debug:
+/// neither a path nor session bytes belong in diagnostics.
+pub(crate) struct HeaderOpen {
+    file: std::fs::File,
+    _directory: HeaderDirectory,
+}
+
+#[derive(Clone)]
+pub(crate) struct HeaderDirectory {
+    path: PathBuf,
+    _pins: std::sync::Arc<Vec<std::fs::File>>,
+}
+
+impl HeaderOpen {
+    pub(crate) fn file(&self) -> &std::fs::File {
+        &self.file
+    }
+}
+
+#[cfg(windows)]
+pub(crate) use platform::{header_directory, open_header};
+
+#[cfg(not(windows))]
+pub(crate) fn header_directory(root: &Path, path: &Path) -> Result<HeaderDirectory> {
+    anyhow::ensure!(
+        path.starts_with(root),
+        "세션 경로가 지정한 홈 밖에 있습니다"
+    );
+    Ok(HeaderDirectory {
+        path: path.to_owned(),
+        _pins: std::sync::Arc::new(Vec::new()),
+    })
+}
+
+#[cfg(not(windows))]
+pub(crate) fn open_header(directory: &HeaderDirectory, path: &Path) -> Result<HeaderOpen> {
+    anyhow::ensure!(
+        path.parent() == Some(directory.path.as_path()),
+        "세션 경로가 지정한 폴더 밖에 있습니다"
+    );
+    let metadata = std::fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "대화 기록이 일반 파일이 아닙니다"
+    );
+    Ok(HeaderOpen {
+        file: std::fs::File::open(path)?,
+        _directory: directory.clone(),
+    })
+}
+
 /// Windows volume serial and 64-bit file index, not a pathname or content hash.
 /// Compare only while the relevant handles remain alive (file ids can be reused).
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -404,6 +455,171 @@ mod platform {
     /// A standalone check is not a reservation; probe_all retains its own pins.
     pub(crate) fn safe_path(root: &Path, path: &Path) -> Result<()> {
         pin_path(root, path).map(drop)
+    }
+
+    pub(crate) fn header_directory(root: &Path, path: &Path) -> Result<HeaderDirectory> {
+        let root = absolute(root)?;
+        let path = absolute(path)?;
+        if !path.starts_with(&root) {
+            bail!("세션 경로가 지정한 홈 밖에 있습니다");
+        }
+        let mut pins = Vec::new();
+        let mut current = PathBuf::new();
+        for component in path.components() {
+            current.push(component.as_os_str());
+            let child = match component {
+                Component::Prefix(_) => continue,
+                Component::RootDir => {
+                    directory(&root, &current, FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0)?
+                }
+                Component::Normal(name) => relative_header_open(
+                    pins.last()
+                        .ok_or_else(|| anyhow!("세션 볼륨을 확인하지 못했습니다"))?,
+                    name,
+                    true,
+                )?,
+                _ => bail!("세션 경로를 확인하지 못했습니다"),
+            };
+            if information(&child)?.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 == 0 {
+                bail!("세션 경로가 폴더가 아닙니다");
+            }
+            pins.push(child);
+        }
+        Ok(HeaderDirectory {
+            path,
+            _pins: std::sync::Arc::new(pins),
+        })
+    }
+
+    pub(crate) fn open_header(directory: &HeaderDirectory, path: &Path) -> Result<HeaderOpen> {
+        open_header_using(directory, path, || Ok(()))
+    }
+
+    pub(super) fn open_header_using(
+        directory: &HeaderDirectory,
+        path: &Path,
+        before_open: impl FnOnce() -> Result<()>,
+    ) -> Result<HeaderOpen> {
+        let path = absolute(path)?;
+        if path.parent() != Some(directory.path.as_path()) {
+            bail!("세션 경로가 지정한 폴더 밖에 있습니다");
+        }
+        // Tags are checked, but are not a check/open exclusion protocol. The
+        // leaf is resolved relative to the retained directory HANDLE, never
+        // through the pathname which could now traverse a junction.
+        for pin in directory._pins.iter() {
+            information(pin)?;
+        }
+        before_open()?;
+        let file = relative_header_open(
+            directory
+                ._pins
+                .last()
+                .ok_or_else(|| anyhow!("세션 폴더가 없습니다"))?,
+            path.file_name()
+                .ok_or_else(|| anyhow!("세션 파일 이름이 없습니다"))?,
+            false,
+        )?;
+        if information(&file)?.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0 {
+            bail!("대화 기록이 일반 파일이 아닙니다");
+        }
+        Ok(HeaderOpen {
+            file,
+            _directory: directory.clone(),
+        })
+    }
+
+    fn relative_header_open(
+        parent: &File,
+        name: &std::ffi::OsStr,
+        is_directory: bool,
+    ) -> Result<File> {
+        use std::os::windows::io::FromRawHandle;
+        use windows::{
+            Wdk::{
+                Foundation::OBJECT_ATTRIBUTES,
+                Storage::FileSystem::{
+                    FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
+                    FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+                },
+            },
+            Win32::{
+                Foundation::{OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE, UNICODE_STRING},
+                Storage::FileSystem::{FILE_FLAGS_AND_ATTRIBUTES, SYNCHRONIZE},
+                System::IO::IO_STATUS_BLOCK,
+            },
+            core::PWSTR,
+        };
+        let mut name_units: Vec<u16> = name.encode_wide().collect();
+        if name_units.is_empty() || name_units.iter().any(|c| matches!(*c, 0 | 47 | 92 | 58)) {
+            bail!("세션 파일 이름이 올바르지 않습니다");
+        }
+        let length = u16::try_from(
+            name_units
+                .len()
+                .checked_mul(2)
+                .ok_or_else(|| anyhow!("세션 파일 이름이 너무 깁니다"))?,
+        )?;
+        let name = UNICODE_STRING {
+            Length: length,
+            MaximumLength: length,
+            Buffer: PWSTR(name_units.as_mut_ptr()),
+        };
+        let attributes = OBJECT_ATTRIBUTES {
+            Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: HANDLE(parent.as_raw_handle()),
+            ObjectName: &name,
+            Attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+            ..Default::default()
+        };
+        let mut handle = HANDLE::default();
+        let mut status = IO_STATUS_BLOCK::default();
+        let access = FILE_READ_ATTRIBUTES
+            | SYNCHRONIZE
+            | if is_directory {
+                FILE_LIST_DIRECTORY
+            } else {
+                FILE_READ_DATA
+            };
+        let sharing = if is_directory {
+            FILE_SHARE_READ | FILE_SHARE_WRITE
+        } else {
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+        };
+        // SAFETY: typed NT structures and UTF-16 storage remain alive for this
+        // synchronous call. A single relative component cannot escape parent.
+        // OPEN never creates/truncates; no inherited handle or reparse traversal.
+        let result = unsafe {
+            NtCreateFile(
+                &mut handle,
+                access,
+                &attributes,
+                &mut status,
+                None,
+                FILE_FLAGS_AND_ATTRIBUTES(0),
+                sharing,
+                FILE_OPEN,
+                FILE_OPEN_REPARSE_POINT
+                    | FILE_SYNCHRONOUS_IO_NONALERT
+                    | if is_directory {
+                        FILE_DIRECTORY_FILE
+                    } else {
+                        FILE_NON_DIRECTORY_FILE
+                    },
+                None,
+                0,
+            )
+        };
+        if result.0 < 0 || handle.is_invalid() {
+            bail!(
+                "세션 파일의 상대 경로 열기에 실패했습니다 (NT 코드 {})",
+                result.0
+            );
+        }
+        // SAFETY: a successful synchronous NtCreateFile transfers one handle.
+        let file = unsafe { File::from_raw_handle(handle.0) };
+        information(&file)?;
+        Ok(file)
     }
 
     pub(crate) fn identity(path: &Path) -> Result<FileIdentity> {
@@ -2409,6 +2625,94 @@ mod tests {
             .is_err()
         );
         assert!(probe_all(&[home], &[ID.into()], &[rollout]).is_err());
+    }
+
+    #[test]
+    fn header_open_retains_ancestor_pins_but_releases_before_exclusive_unlink() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let temp = fixture();
+        let root = home(temp.path(), "header");
+        let directory_path = root.join("sessions");
+        let path = directory_path.join("header.jsonl");
+        fs::write(&path, b"synthetic\n").unwrap();
+        let directory = header_directory(&root, &directory_path).unwrap();
+        let opened = open_header(&directory, &path).unwrap();
+        drop(directory);
+        assert!(fs::rename(&directory_path, root.join("renamed")).is_err());
+        assert_eq!(opened.file().metadata().unwrap().len(), 10);
+        assert!(
+            OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&path)
+                .is_err()
+        );
+        drop(opened);
+        let exclusive = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        drop(exclusive);
+        fs::rename(directory_path, root.join("renamed")).unwrap();
+    }
+
+    #[test]
+    fn header_open_binds_the_opened_leaf_not_a_later_pathname_replacement() {
+        use std::io::Read;
+        let temp = fixture();
+        let root = home(temp.path(), "replacement");
+        let directory = header_directory(&root, &root.join("sessions")).unwrap();
+        let path = root.join("sessions/header.jsonl");
+        fs::write(&path, b"old\n").unwrap();
+        let opened = open_header(&directory, &path).unwrap();
+        fs::rename(&path, root.join("sessions/old.jsonl")).unwrap();
+        fs::write(&path, b"new\n").unwrap();
+        let mut bytes = Vec::new();
+        opened.file().read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"old\n");
+        assert_eq!(fs::read(&path).unwrap(), b"new\n");
+        assert!(open_header(&directory, &root.join("outside.jsonl")).is_err());
+        assert!(open_header(&directory, &root.join("sessions")).is_err());
+    }
+
+    #[test]
+    fn header_open_never_follows_parent_junction_retagged_after_last_check() {
+        use std::os::windows::fs::MetadataExt;
+        let temp = fixture();
+        let root = home(temp.path(), "header-retag");
+        let outside = home(temp.path(), "synthetic-outside");
+        let parent = root.join("sessions");
+        let leaf = parent.join("header.jsonl");
+        fs::write(&leaf, b"original prefix\n").unwrap();
+        fs::write(
+            outside.join("header.jsonl"),
+            b"OUTSIDE_PREFIX_MUST_NOT_BE_READ\n",
+        )
+        .unwrap();
+        let directory = header_directory(&root, &parent).unwrap();
+        let result = platform::open_header_using(&directory, &leaf, || {
+            // Exact review counterexample, deterministically after tag checks:
+            // remove the last child, then retag the still-pinned empty parent.
+            fs::rename(&leaf, root.join("parked.jsonl"))?;
+            directory_tag(&parent, &outside, false)?;
+            assert_ne!(fs::symlink_metadata(&parent)?.file_attributes() & 0x400, 0);
+            Ok(())
+        });
+        assert!(
+            result.is_err(),
+            "an absolute-path open would read the outside prefix"
+        );
+        drop(directory);
+        fs::remove_dir(parent).unwrap();
+        assert_eq!(
+            fs::read(root.join("parked.jsonl")).unwrap(),
+            b"original prefix\n"
+        );
+        assert_eq!(
+            fs::read(outside.join("header.jsonl")).unwrap(),
+            b"OUTSIDE_PREFIX_MUST_NOT_BE_READ\n"
+        );
     }
     #[test]
     fn releasing_rollout_handles_keeps_locks_and_rechecks_the_last_name() {
