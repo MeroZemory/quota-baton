@@ -27,11 +27,21 @@ pub(super) fn request_model(headers: &HeaderMap, prefix: &[u8]) -> Result<String
     } else {
         let reader: Box<dyn Read> = match encoding.as_str() {
             "zstd" => {
-                Box::new(zstd::stream::read::Decoder::new(Cursor::new(prefix)).map_err(|_| ())?)
+                let mut decoder =
+                    zstd::stream::read::Decoder::new(Cursor::new(prefix)).map_err(|_| ())?;
+                decoder.window_log_max(23).map_err(|_| ())?;
+                Box::new(decoder)
             }
             "gzip" => Box::new(flate2::read::GzDecoder::new(Cursor::new(prefix))),
             "deflate" => Box::new(flate2::read::ZlibDecoder::new(Cursor::new(prefix))),
-            "br" => Box::new(brotli::Decompressor::new(Cursor::new(prefix), 4096)),
+            "br" => {
+                // Match the relay side decoders: reject the large-window
+                // extension before the library can allocate its ring buffer.
+                if prefix.first().is_some_and(|byte| byte & 0x7f == 0x11) {
+                    return Err(());
+                }
+                Box::new(brotli::Decompressor::new(Cursor::new(prefix), 4096))
+            }
             _ => return Err(()),
         };
         // A compressed prefix can end before the input stream does. Keep only
@@ -460,6 +470,47 @@ mod tests {
     use serde_json::json;
     use std::{fs, path::Path};
 
+    #[test]
+    fn request_model_bounds_compressed_metadata_windows() {
+        use std::io::Write;
+        let json = br#"{"model":"gpt-synthetic","input":[]}"#;
+        for encoding in ["gzip", "deflate", "br", "zstd"] {
+            let encoded = match encoding {
+                "gzip" => {
+                    let mut writer =
+                        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+                    writer.write_all(json).unwrap();
+                    writer.finish().unwrap()
+                }
+                "deflate" => {
+                    let mut writer =
+                        flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+                    writer.write_all(json).unwrap();
+                    writer.finish().unwrap()
+                }
+                "br" => {
+                    let mut output = Vec::new();
+                    {
+                        let mut writer = brotli::CompressorWriter::new(&mut output, 4096, 4, 22);
+                        writer.write_all(json).unwrap();
+                    }
+                    output
+                }
+                _ => zstd::stream::encode_all(std::io::Cursor::new(json), 1).unwrap(),
+            };
+            let mut headers = HeaderMap::new();
+            headers.insert("content-encoding", encoding.parse().unwrap());
+            assert_eq!(
+                request_model(&headers, &encoded).unwrap(),
+                "gpt-synthetic",
+                "{encoding}"
+            );
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert("content-encoding", "br".parse().unwrap());
+        assert!(request_model(&headers, &[0x11, 0xff, 0xff, 0xff]).is_err());
+    }
+
     struct Fixture {
         _root: tempfile::TempDir,
         cpa: std::path::PathBuf,
@@ -592,24 +643,27 @@ mod tests {
     #[tokio::test]
     async fn catalog_current_401_uses_shared_linked_reload_without_marking_relogin() {
         let f = Fixture::new().await;
-        fs::write(
-            f.cpa.join("account.json"),
-            serde_json::to_vec(&credential(1)).unwrap(),
-        )
-        .unwrap();
         f.reply(
             StatusCode::UNAUTHORIZED,
             json!({"error":{"code":"invalid_token"}}),
         );
         f.reply(StatusCode::OK, json!({"models":[{"slug":"after-reload"}]}));
-        assert!(
-            f.relay
-                .launch_catalog(&f.id, false, false)
+        let (arrived, release) = f.upstream.state.pause_next_response();
+        let (catalog, ()) = tokio::join!(f.relay.launch_catalog(&f.id, false, false), async {
+            tokio::time::timeout(Duration::from_secs(5), arrived)
                 .await
-                .unwrap()
-                .supported()
-                .contains("after-reload")
-        );
+                .expect("first catalog request did not arrive")
+                .expect("first catalog response gate dropped");
+            // The first before_request reload must still read token 0.
+            // Publish its replacement only after that request is recorded.
+            fs::write(
+                f.cpa.join("account.json"),
+                serde_json::to_vec(&credential(1)).unwrap(),
+            )
+            .unwrap();
+            release.send(()).expect("catalog response gate abandoned");
+        });
+        assert!(catalog.unwrap().supported().contains("after-reload"));
         let calls = f.upstream.state.requests();
         assert_eq!(calls.len(), 2);
         assert_eq!(
@@ -1260,7 +1314,10 @@ mod operation_catalog_owner_tests {
     use super::*;
     use crate::catalog::{CatalogCache, Observation};
     use std::future::Future;
-    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
 
     struct ObserveWake {
         cache: CatalogCache,
@@ -1269,16 +1326,22 @@ mod operation_catalog_owner_tests {
     }
 
     impl std::task::Wake for ObserveWake {
-        fn wake(self: Arc<Self>) { self.wake_by_ref(); }
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
         fn wake_by_ref(self: &Arc<Self>) {
-            self.saw_refreshing.store(self.cache.view("a").unwrap().refreshing, Ordering::SeqCst);
+            self.saw_refreshing
+                .store(self.cache.view("a").unwrap().refreshing, Ordering::SeqCst);
             self.woke.store(true, Ordering::SeqCst);
         }
     }
 
     fn ready<F: Future>(mut future: std::pin::Pin<&mut F>) -> bool {
         let waker = std::task::Waker::noop();
-        future.as_mut().poll(&mut std::task::Context::from_waker(waker)).is_ready()
+        future
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(waker))
+            .is_ready()
     }
 
     #[tokio::test]
@@ -1286,14 +1349,27 @@ mod operation_catalog_owner_tests {
         let cache = CatalogCache::default();
         let changed = tokio::sync::Notify::new();
         let owner = CatalogRefreshOwner::new(
-            cache.begin_refresh("a", RefreshMode::Force).unwrap().unwrap(), &changed);
+            cache
+                .begin_refresh("a", RefreshMode::Force)
+                .unwrap()
+                .unwrap(),
+            &changed,
+        );
         let notified = changed.notified();
         tokio::pin!(notified);
         notified.as_mut().enable(); // same ordering as launch_catalog
-        let observer = Arc::new(ObserveWake { cache: cache.clone(),
-            woke: AtomicBool::new(false), saw_refreshing: AtomicBool::new(true) });
+        let observer = Arc::new(ObserveWake {
+            cache: cache.clone(),
+            woke: AtomicBool::new(false),
+            saw_refreshing: AtomicBool::new(true),
+        });
         let waker = std::task::Waker::from(observer.clone());
-        assert!(notified.as_mut().poll(&mut std::task::Context::from_waker(&waker)).is_pending());
+        assert!(
+            notified
+                .as_mut()
+                .poll(&mut std::task::Context::from_waker(&waker))
+                .is_pending()
+        );
         assert!(cache.view("a").unwrap().refreshing);
         drop(owner);
         assert!(observer.woke.load(Ordering::SeqCst));
@@ -1301,9 +1377,13 @@ mod operation_catalog_owner_tests {
         assert!(ready(notified.as_mut()));
         let view = cache.view("a").unwrap();
         assert!(!view.refreshing);
-        assert!(matches!(view.observation, Observation::RefreshFailed {
-            reason: RefreshFailure::Cancelled, ..
-        }));
+        assert!(matches!(
+            view.observation,
+            Observation::RefreshFailed {
+                reason: RefreshFailure::Cancelled,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -1311,14 +1391,21 @@ mod operation_catalog_owner_tests {
         let cache = CatalogCache::default();
         let changed = tokio::sync::Notify::new();
         let owner = CatalogRefreshOwner::new(
-            cache.begin_refresh("a", RefreshMode::Force).unwrap().unwrap(), &changed);
+            cache
+                .begin_refresh("a", RefreshMode::Force)
+                .unwrap()
+                .unwrap(),
+            &changed,
+        );
         let mut waiter = Box::pin(changed.notified());
         waiter.as_mut().enable();
         assert!(!ready(waiter.as_mut()));
         drop(waiter);
         assert!(cache.view("a").unwrap().refreshing);
-        assert!(matches!(cache.begin_refresh("a", RefreshMode::Force),
-            Err(CatalogError::RefreshInFlight)));
+        assert!(matches!(
+            cache.begin_refresh("a", RefreshMode::Force),
+            Err(CatalogError::RefreshInFlight)
+        ));
         drop(owner);
         assert!(!cache.view("a").unwrap().refreshing);
     }
@@ -1329,15 +1416,23 @@ mod operation_catalog_owner_tests {
             let cache = CatalogCache::default();
             let changed = tokio::sync::Notify::new();
             let owner = CatalogRefreshOwner::new(
-                cache.begin_refresh("a", RefreshMode::Force).unwrap().unwrap(), &changed);
+                cache
+                    .begin_refresh("a", RefreshMode::Force)
+                    .unwrap()
+                    .unwrap(),
+                &changed,
+            );
             let notified = changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             if mode == 0 {
-                assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                    let _owner = owner;
-                    panic!("synthetic owner unwind");
-                })).is_err());
+                assert!(
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                        let _owner = owner;
+                        panic!("synthetic owner unwind");
+                    }))
+                    .is_err()
+                );
             } else if mode == 1 {
                 owner.finish(Err(RefreshFailure::Transport)).unwrap();
             } else {
@@ -1346,7 +1441,10 @@ mod operation_catalog_owner_tests {
             assert!(ready(notified.as_mut()));
             assert!(!cache.view("a").unwrap().refreshing);
             if mode == 2 {
-                assert!(matches!(cache.view("a").unwrap().observation, Observation::Known(_)));
+                assert!(matches!(
+                    cache.view("a").unwrap().observation,
+                    Observation::Known(_)
+                ));
             }
         }
     }
@@ -1367,7 +1465,8 @@ mod operation_catalog_owner_tests {
     async fn cancellation_during_admitted_blocking_work_keeps_token_with_task() {
         let registry = crate::launch_tokens::LaunchTokenRegistry::default();
         let operation = crate::issue_operation::IssueOperation::new(
-            tokio::time::Instant::now() + Duration::from_secs(3600));
+            tokio::time::Instant::now() + Duration::from_secs(3600),
+        );
         let (entered, entered_rx) = tokio::sync::oneshot::channel();
         let (release, release_rx) = std::sync::mpsc::channel();
         let (dropped, dropped_rx) = tokio::sync::oneshot::channel();
@@ -1378,11 +1477,18 @@ mod operation_catalog_owner_tests {
             tokio::task::spawn_blocking(move || {
                 let pending = PendingIssue::new(task_registry, "launch:operation-pin").unwrap();
                 task_operation.admit().unwrap();
-                entered.send(pending.token.expose_secret().to_owned()).unwrap();
+                entered
+                    .send(pending.token.expose_secret().to_owned())
+                    .unwrap();
                 release_rx.recv().unwrap();
                 assert!(task_operation.check().is_ok());
-                OutputOwner { pending: Some(pending), dropped: Some(dropped) }
-            }).await.unwrap()
+                OutputOwner {
+                    pending: Some(pending),
+                    dropped: Some(dropped),
+                }
+            })
+            .await
+            .unwrap()
         });
         assert!(!ready(caller.as_mut()));
         let handle = entered_rx.await.unwrap();
@@ -1401,9 +1507,12 @@ mod operation_catalog_owner_tests {
         let handle = pending.token.expose_secret().to_owned();
         let (dropped, dropped_rx) = tokio::sync::oneshot::channel();
         let join = tokio::task::spawn_blocking(move || OutputOwner {
-            pending: Some(pending), dropped: Some(dropped),
+            pending: Some(pending),
+            dropped: Some(dropped),
         });
-        while !join.is_finished() { tokio::task::yield_now().await; }
+        while !join.is_finished() {
+            tokio::task::yield_now().await;
+        }
         drop(join); // never poll the ready JoinHandle's output
         dropped_rx.await.unwrap();
         assert!(registry.get_or_pin(&handle).is_err());
@@ -1423,7 +1532,8 @@ impl RelayState {
             tokio::time::Instant::now() + ISSUE_CATALOG_BUDGET,
         );
         let _caller = operation.caller_guard();
-        self.issue_launch_for_operation(request, data_port, operation).await
+        self.issue_launch_for_operation(request, data_port, operation)
+            .await
     }
 
     pub(crate) async fn issue_launch_for_operation(
@@ -1434,9 +1544,12 @@ impl RelayState {
     ) -> Result<LaunchReply, LaunchError> {
         // Guard also makes direct cancellation of this future observable.
         let caller = operation.caller_guard();
-        let result = tokio::time::timeout_at(operation.deadline(),
-            self.issue_launch_with_preference(request, data_port, operation.clone()))
-            .await.map_err(|_| LaunchError::Unavailable)?;
+        let result = tokio::time::timeout_at(
+            operation.deadline(),
+            self.issue_launch_with_preference(request, data_port, operation.clone()),
+        )
+        .await
+        .map_err(|_| LaunchError::Unavailable)?;
         caller.disarm();
         result
     }
@@ -1459,10 +1572,17 @@ impl RelayState {
         let prior_key = resume_key.clone();
         let prior_operation = operation.clone();
         let prior = tokio::task::spawn_blocking(move || {
-            prior_operation.check().map_err(|_| LaunchError::Unavailable)?;
-            Ok::<_, LaunchError>(prior_key.as_deref()
-                .and_then(|key| prior_table.launch_info(key, chrono::Utc::now()).ok()))
-        }).await.map_err(|_| LaunchError::Store)??;
+            prior_operation
+                .check()
+                .map_err(|_| LaunchError::Unavailable)?;
+            Ok::<_, LaunchError>(
+                prior_key
+                    .as_deref()
+                    .and_then(|key| prior_table.launch_info(key, chrono::Utc::now()).ok()),
+            )
+        })
+        .await
+        .map_err(|_| LaunchError::Store)??;
         operation.check().map_err(|_| LaunchError::Unavailable)?;
         if request.model.is_none()
             && prior
@@ -1475,11 +1595,13 @@ impl RelayState {
         let store = self.store.clone();
         let list_operation = operation.clone();
         let accounts = tokio::task::spawn_blocking(move || {
-            list_operation.check().map_err(|_| LaunchError::Unavailable)?;
+            list_operation
+                .check()
+                .map_err(|_| LaunchError::Unavailable)?;
             store.list().map_err(|_| LaunchError::Store)
         })
-            .await
-            .map_err(|_| LaunchError::Store)??;
+        .await
+        .map_err(|_| LaunchError::Store)??;
         operation.check().map_err(|_| LaunchError::Unavailable)?;
         let preference = resolve_issue_preference(
             request.account_pref.as_deref(),
@@ -1570,7 +1692,9 @@ impl RelayState {
                         &entitlements,
                         chrono::Utc::now(),
                         Some(&operation),
-                        |policies, consent| policies.authorize_model_move_for_issue(consent, Some(&operation)),
+                        |policies, consent| {
+                            policies.authorize_model_move_for_issue(consent, Some(&operation))
+                        },
                     )
                     .map_err(issue_binding_error)?;
                 for event in &placement.moves {
@@ -1810,5 +1934,185 @@ impl RelayState {
                 }
             }
         })
+    }
+}
+
+// Bounded resolver/model checks; endpoint callers own native protocol framing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DataLaunchError {
+    Relaunch,
+    Invalid,
+    Busy,
+    UnsupportedModel,
+    Unavailable,
+    PolicyBlocked,
+    Changed,
+}
+
+impl DataLaunchError {
+    pub(super) fn code(self) -> &'static str {
+        match self {
+            Self::Relaunch => "launch_expired",
+            Self::Invalid => "invalid_launch",
+            Self::Busy => "launch_busy",
+            Self::UnsupportedModel => "model_not_supported",
+            Self::Unavailable => "launch_unavailable",
+            Self::PolicyBlocked => "routing_policy_blocked",
+            Self::Changed => "launch_binding_changed",
+        }
+    }
+
+    pub(super) fn message(self) -> &'static str {
+        match self {
+            Self::Relaunch => "실행 연결이 만료되었습니다. codex-qb를 다시 실행해 주세요.",
+            Self::Invalid => "실행 연결의 대화 정보를 확인하지 못했습니다.",
+            Self::Busy => {
+                "이 대화에 진행 중인 요청이나 연결이 있습니다. 끝난 뒤 다시 실행해 주세요."
+            }
+            Self::UnsupportedModel => {
+                "이 대화의 계정은 요청한 모델을 지원하지 않습니다. 모델을 바꾸거나 --move-for-model로 다시 실행해 주세요."
+            }
+            Self::Unavailable => {
+                "계정의 모델 목록이나 연결을 확인하지 못했습니다. 잠시 후 다시 시도해 주세요."
+            }
+            Self::PolicyBlocked => "대화의 계정 사용 정책을 확인해 주세요.",
+            Self::Changed => "대화의 계정이 변경되었습니다. codex-qb를 다시 실행해 주세요.",
+        }
+    }
+
+    pub(super) fn status(self) -> StatusCode {
+        match self {
+            Self::Invalid => StatusCode::BAD_REQUEST,
+            Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+            _ => StatusCode::CONFLICT,
+        }
+    }
+}
+
+fn data_binding_error(error: crate::bindings::LaunchError) -> DataLaunchError {
+    use crate::bindings::LaunchError as E;
+    match error {
+        E::UnknownLaunch => DataLaunchError::Relaunch,
+        E::InvalidMetadata | E::AnchorConflict => DataLaunchError::Invalid,
+        E::Busy => DataLaunchError::Busy,
+        E::ModelUnsupported | E::ConsentRequired => DataLaunchError::UnsupportedModel,
+        E::PolicyBlocked => DataLaunchError::PolicyBlocked,
+        E::BindingChanged => DataLaunchError::Changed,
+        E::NoEligibleAccount | E::EntitlementsUnknown | E::Capacity | E::Retired => {
+            DataLaunchError::Unavailable
+        }
+    }
+}
+
+impl RelayState {
+    /// Existing C8 binding authority is resolved before optional token authority.
+    /// None denotes ordinary unbound legacy traffic, never scoped expiry.
+    pub(super) async fn resolve_data_launch(
+        &self,
+        ingress: Option<&LaunchIngress>,
+        request_key: Option<&str>,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<crate::bindings::LaunchInfo>, DataLaunchError> {
+        if self.is_draining() {
+            return Err(DataLaunchError::Unavailable);
+        }
+        let scoped = ingress.is_some();
+        let anchor = ingress
+            .and_then(|ingress| ingress.pin.as_ref())
+            .map(|pin| pin.metadata().binding_anchor_key);
+        let key = request_key.map(str::to_owned);
+        let table = self.bindings.clone();
+        let operation = crate::issue_operation::IssueOperation::new(deadline);
+        let caller = operation.caller_guard();
+        let task_operation = operation.clone();
+        let resolved = tokio::time::timeout_at(
+            deadline,
+            tokio::task::spawn_blocking(move || {
+                table.resolve_launch_for_operation(
+                    anchor.as_deref(),
+                    key.as_deref(),
+                    chrono::Utc::now(),
+                    Some(&task_operation),
+                )
+            }),
+        )
+        .await
+        .map_err(|_| DataLaunchError::Unavailable)?
+        .map_err(|_| DataLaunchError::Unavailable)?;
+        if !operation.can_reply() || self.is_draining() {
+            return Err(DataLaunchError::Unavailable);
+        }
+        caller.disarm();
+        match resolved {
+            Ok(info) => Ok(Some(info)),
+            Err(crate::bindings::LaunchError::UnknownLaunch) if !scoped => Ok(None),
+            Err(error) => Err(data_binding_error(error)),
+        }
+    }
+
+    /// Side metadata only. The original HTTP body / WS frame is never rewritten.
+    /// Unknown catalogs do not authorize a model or imply an empty entitlement.
+    pub(super) async fn admit_data_model(
+        &self,
+        info: &crate::bindings::LaunchInfo,
+        requested_model: Option<&str>,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<String>, DataLaunchError> {
+        if !info.managed {
+            return Ok(requested_model.map(str::to_owned));
+        }
+        let model = requested_model
+            .or(info.current_model.as_deref())
+            .and_then(crate::observability::safe_identifier)
+            .ok_or(DataLaunchError::Invalid)?;
+        let mut catalog =
+            tokio::time::timeout_at(deadline, self.launch_catalog(&info.account, false, true))
+                .await
+                .map_err(|_| DataLaunchError::Unavailable)?
+                .map_err(|_| DataLaunchError::Unavailable)?;
+        if !catalog.supported().contains(&model) {
+            // A menu can change between launches. Re-observe only this account;
+            // an unsupported pick never shops other accounts or sends the body.
+            if let Ok(Ok(updated)) =
+                tokio::time::timeout_at(deadline, self.launch_catalog(&info.account, true, true))
+                    .await
+            {
+                catalog = updated;
+            }
+        }
+        if !catalog.supported().contains(&model) {
+            return Err(DataLaunchError::UnsupportedModel);
+        }
+        if self.is_draining() {
+            return Err(DataLaunchError::Unavailable);
+        }
+        let table = self.bindings.clone();
+        let key = info.canonical_key.clone();
+        let account = info.account.clone();
+        let accepted_model = model.clone();
+        let operation = crate::issue_operation::IssueOperation::new(deadline);
+        let caller = operation.caller_guard();
+        let task_operation = operation.clone();
+        tokio::time::timeout_at(
+            deadline,
+            tokio::task::spawn_blocking(move || {
+                table.record_launch_model_for_operation(
+                    &key,
+                    &account,
+                    &accepted_model,
+                    chrono::Utc::now(),
+                    Some(&task_operation),
+                )
+            }),
+        )
+        .await
+        .map_err(|_| DataLaunchError::Unavailable)?
+        .map_err(|_| DataLaunchError::Unavailable)?
+        .map_err(data_binding_error)?;
+        if !operation.can_reply() || self.is_draining() {
+            return Err(DataLaunchError::Unavailable);
+        }
+        caller.disarm();
+        Ok(Some(model))
     }
 }

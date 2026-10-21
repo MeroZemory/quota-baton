@@ -1,9 +1,11 @@
 pub(crate) mod credentials;
 mod headers;
 mod hold;
-mod launch;
+mod http_data;
 mod images;
+mod launch;
 mod ledger;
+mod models;
 pub(crate) mod notices;
 mod outcome;
 mod response;
@@ -725,7 +727,7 @@ impl RelayState {
         tried: &BTreeSet<String>,
     ) -> Result<Option<Account>, ()> {
         if key.is_none()
-            && self.bindings.policies.plan(None).settings.mode == crate::routing::Mode::Strict
+            && self.bindings.routing_plan(None).settings.mode == crate::routing::Mode::Strict
         {
             return Ok(None);
         }
@@ -804,7 +806,7 @@ impl RelayState {
         // waits for the disk writer. No await separates it from the caller.
         eligible
             && !self.accounts.blocked_in_memory(id)
-            && self.bindings.policies.permits_dispatch(key, id)
+            && self.bindings.permits_dispatch(key, id)
             && key.is_none_or(|key| {
                 self.bindings
                     .current(Some(key))
@@ -833,8 +835,23 @@ impl RelayState {
         tried: &BTreeSet<String>,
         admit: Option<websocket::capacity::Admission>,
     ) -> Result<Option<Account>, ()> {
+        self.select_request_configured(provider, session, completion, model, tried, admit, None)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn select_request_configured(
+        &self,
+        provider: Provider,
+        session: &session::Session,
+        completion: &mut Completion,
+        model: Option<&str>,
+        tried: &BTreeSet<String>,
+        admit: Option<websocket::capacity::Admission>,
+        launch: Option<&http_data::ManagedHttp>,
+    ) -> Result<Option<Account>, ()> {
         if session.key.is_none()
-            && self.bindings.policies.plan(None).settings.mode == crate::routing::Mode::Strict
+            && self.bindings.routing_plan(None).settings.mode == crate::routing::Mode::Strict
         {
             completion.policy_blocked = true;
             return Ok(None);
@@ -877,6 +894,23 @@ impl RelayState {
             let candidates = self
                 .candidates(provider, session.key.as_deref(), model, &excluded)
                 .await?;
+            let (candidates, coverage) = if let Some(launch) = launch {
+                self.launch_candidates(
+                    launch,
+                    candidates,
+                    &excluded,
+                    completion
+                        .precommit_deadline
+                        .map(tokio::time::Instant::from_std)
+                        .unwrap_or_else(|| {
+                            tokio::time::Instant::now()
+                                + Duration::from_secs(self.request_timeout_secs)
+                        }),
+                )
+                .await?
+            } else {
+                (candidates, None)
+            };
             #[cfg(feature = "testkit")]
             if admit.is_some() {
                 self.ws_capacity.before_selection().await;
@@ -895,27 +929,44 @@ impl RelayState {
             let admit = admit.clone();
             let denied = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let denied_choice = denied.clone();
+            let admission_runtime = launch.map(|_| self.accounts.clone());
             let choice = tokio::task::spawn_blocking(move || {
-                table.choose_with_hold_at_admitted(
-                    provider,
-                    key.as_deref(),
-                    parent.as_deref(),
-                    owned_model.as_deref(),
-                    &choices,
-                    pinned.as_deref(),
-                    bytes,
-                    hold_allowed,
-                    hold_timed_out,
-                    chrono::Utc::now(),
-                    |account| {
-                        let allowed = admit.as_ref().is_none_or(|admit| admit(account));
-                        denied_choice.store(!allowed, Ordering::Release);
-                        allowed
-                    },
-                )
+                let choose = |eligible: &dyn Fn(&str, bool) -> bool| {
+                    table.choose_with_hold_at_admitted_coverage(
+                        provider,
+                        key.as_deref(),
+                        parent.as_deref(),
+                        owned_model.as_deref(),
+                        &choices,
+                        pinned.as_deref(),
+                        bytes,
+                        hold_allowed,
+                        hold_timed_out,
+                        chrono::Utc::now(),
+                        coverage.as_ref(),
+                        |account| {
+                            let allowed = eligible(
+                                account,
+                                table.existing_placement(key.as_deref(), account),
+                            ) && admit.as_ref().is_none_or(|admit| admit(account));
+                            denied_choice.store(!allowed, Ordering::Release);
+                            allowed
+                        },
+                    )
+                };
+                if let Some(runtime) = admission_runtime {
+                    runtime.with_selection_admission(
+                        &table,
+                        provider,
+                        owned_model.as_deref(),
+                        choose,
+                    )
+                } else {
+                    Ok(choose(&|_, _| true))
+                }
             })
             .await
-            .map_err(|_| ())?;
+            .map_err(|_| ())??;
             match choice {
                 crate::bindings::Decision::None if denied.load(Ordering::Acquire) => {
                     return Ok(None);
@@ -927,8 +978,7 @@ impl RelayState {
                 crate::bindings::Decision::None
                     if self
                         .bindings
-                        .policies
-                        .plan(session.key.as_deref())
+                        .routing_plan(session.key.as_deref())
                         .settings
                         .mode
                         == crate::routing::Mode::Strict =>
@@ -1047,12 +1097,12 @@ impl RelayState {
             let changed = self.bindings.policies.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            let plan = self.bindings.policies.plan(key);
+            let plan = self.bindings.routing_plan(key);
             if self.is_draining()
                 || plan.settings.reset_wait_secs == 0
                 || deadline.saturating_duration_since(tokio::time::Instant::now())
                     > Duration::from_secs(plan.settings.reset_wait_secs)
-                || id.is_some_and(|id| !self.bindings.policies.permits_dispatch(key, id))
+                || id.is_some_and(|id| !self.bindings.permits_dispatch(key, id))
             {
                 return false;
             }
@@ -1124,8 +1174,7 @@ impl RelayState {
         };
         let reset_budget = self
             .bindings
-            .policies
-            .plan(session.key.as_deref())
+            .routing_plan(session.key.as_deref())
             .settings
             .reset_wait_secs;
         if wait > Duration::from_secs(reset_budget) {
@@ -1489,9 +1538,17 @@ async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Re
         }
     };
     *request.uri_mut() = normalized.uri;
-    // D22 checkpoint: never let an incomplete scoped launch fall through to
-    // the ordinary account selector. Remove when canonical resolution lands.
-    if normalized.token.is_some() {
+    // Scoped endpoints must resolve local binding authority before forwarding.
+    if normalized.token.is_some()
+        && !(request.method() == Method::POST
+            && matches!(
+                request.uri().path(),
+                "/v1/responses" | "/v1/responses/compact" | "/v1/alpha/search"
+            )
+            || request.method() == Method::GET
+                && matches!(request.uri().path(), "/v1/models" | "/v1/responses")
+                && !request.headers().contains_key("anthropic-version"))
+    {
         return native_error(
             StatusCode::SERVICE_UNAVAILABLE,
             Provider::Codex,
@@ -1641,6 +1698,13 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
         completion.outcome(response.status().as_u16(), "memory_guard");
         return response;
     }
+    if provider == Provider::Codex
+        && parts.method == Method::GET
+        && path == "/v1/models"
+        && let Some(ingress) = parts.extensions.get::<launch::LaunchIngress>()
+    {
+        return models::serve(state, &parts.headers, ingress, &mut completion).await;
+    }
     let incoming_zstd = parts
         .headers
         .get("content-encoding")
@@ -1675,7 +1739,35 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
         let _ = handle.complete().await;
         session_body = handle.metadata();
     }
-    let session = session::classify(provider, path, &parts.headers, &session_body);
+    let mut session = session::classify(provider, path, &parts.headers, &session_body);
+    let data_deadline = tokio::time::Instant::from_std(
+        completion
+            .precommit_deadline
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(state.request_timeout_secs)),
+    );
+    let managed_http = if provider == Provider::Codex
+        && parts.method == Method::POST
+        && matches!(
+            path,
+            "/v1/responses" | "/v1/responses/compact" | "/v1/alpha/search"
+        ) {
+        match state
+            .prepare_http_launch(
+                parts.extensions.get::<launch::LaunchIngress>(),
+                &mut session,
+                &parts.headers,
+                &upload.prefix,
+                path == "/v1/alpha/search",
+                data_deadline,
+            )
+            .await
+        {
+            Ok(managed) => managed,
+            Err(error) => return http_data::error(&mut completion, error),
+        }
+    } else {
+        None
+    };
     // input_bytes may be only the first streaming chunk, not full context.
     completion.selection_cost = routing_input_cost(&parts.headers, &upload.prefix, provider);
     if let Some(bytes) = completion.selection_cost {
@@ -1714,7 +1806,18 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
             .flatten()
     };
     #[cfg(all(feature = "phase0", debug_assertions))]
-    let selection = if let Some(ForcedAccount(id)) = parts.extensions.get::<ForcedAccount>() {
+    let selection = if managed_http.is_some() {
+        state
+            .select_http_request(
+                provider,
+                &session,
+                &mut completion,
+                request_model.as_deref(),
+                &tried,
+                managed_http.as_ref(),
+            )
+            .await
+    } else if let Some(ForcedAccount(id)) = parts.extensions.get::<ForcedAccount>() {
         let store = state.store.clone();
         let id = id.clone();
         tokio::task::spawn_blocking(move || {
@@ -1727,23 +1830,25 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
         .unwrap_or(Err(()))
     } else {
         state
-            .select_request(
+            .select_http_request(
                 provider,
                 &session,
                 &mut completion,
                 request_model.as_deref(),
                 &tried,
+                managed_http.as_ref(),
             )
             .await
     };
     #[cfg(not(all(feature = "phase0", debug_assertions)))]
     let selection = state
-        .select_request(
+        .select_http_request(
             provider,
             &session,
             &mut completion,
             request_model.as_deref(),
             &tried,
+            managed_http.as_ref(),
         )
         .await;
     let account = match selection {
@@ -1842,12 +1947,13 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
     let (status, response_headers, held) = loop {
         if !account.eligible(request_model.as_deref()) {
             let next = state
-                .select_request(
+                .select_http_request(
                     provider,
                     &session,
                     &mut completion,
                     request_model.as_deref(),
                     &tried,
+                    managed_http.as_ref(),
                 )
                 .await;
             if tried.len() >= 4 || !matches!(next, Ok(Some(_))) {
@@ -1907,6 +2013,13 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
         completion.rate_wait(admission_started.elapsed().as_millis() as u64);
         let mut forced_send = admission.as_ref().is_none_or(|a| a.forced())
             || rate_hold_deadline.is_some_and(|at| Instant::now() >= at);
+        if let Some(managed) = &managed_http
+            && let Err(error) = state
+                .guard_http_launch(managed, &account.id, data_deadline)
+                .await
+        {
+            return http_data::error(&mut completion, error);
+        }
         if !state
             .dispatch_allowed(
                 session.key.as_deref(),
@@ -1917,7 +2030,6 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
         {
             completion.policy_blocked = !state
                 .bindings
-                .policies
                 .permits_dispatch(session.key.as_deref(), &account.id);
             let response = state
                 .unavailable(&mut completion, provider, false, request_model.as_deref())
@@ -2088,8 +2200,35 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
         );
         decision.reconcile_quota(&credit_observation);
         completion.record.upstream_error_code = hold::error_code(&response_headers, &held.prefix);
-        if let Some(model) = decision.model.take() {
+        if let Some(model) = decision.model.take().filter(|_| managed_http.is_none()) {
             request_model = Some(model);
+        }
+        if managed_http.is_some() && decision.kind == outcome::Kind::ModelPermission {
+            // A failed or unchanged catalog refresh must not erase C6 row 6a's
+            // observed model-specific denial. Keep its normal durable hold.
+            if let Some(signal) = decision.signal.take()
+                && state
+                    .accounts
+                    .transition(&account.id, signal)
+                    .await
+                    .is_err()
+            {
+                return failure(
+                    &mut completion,
+                    StatusCode::BAD_GATEWAY,
+                    provider,
+                    "store_error",
+                    "Could not persist account health",
+                );
+            }
+            // New entitlement evidence belongs to this account. Refresh its menu
+            // without replaying the rejected model on a different account.
+            let _ = tokio::time::timeout_at(
+                data_deadline,
+                state.launch_catalog(&account.id, true, true),
+            )
+            .await;
+            return http_data::error(&mut completion, launch::DataLaunchError::UnsupportedModel);
         }
         if decision.kind == outcome::Kind::Revoked && credentials::is_linked(&account) {
             decision.kind = outcome::Kind::Auth;
@@ -2343,15 +2482,16 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
                     .notice_quota(&account.id, None, request_model.as_deref())
                     .await;
             }
-            if state
-                .select(
-                    provider,
-                    session.key.as_deref(),
-                    request_model.as_deref(),
-                    &tried,
-                )
-                .await
-                .is_ok_and(|next| next.is_none())
+            if managed_http.is_none()
+                && state
+                    .select(
+                        provider,
+                        session.key.as_deref(),
+                        request_model.as_deref(),
+                        &tried,
+                    )
+                    .await
+                    .is_ok_and(|next| next.is_none())
                 && matches!(
                     decision.kind,
                     outcome::Kind::Quota
@@ -2370,12 +2510,13 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
         }
         completion.failover(decision.reason());
         let next = state
-            .select_request(
+            .select_http_request(
                 provider,
                 &session,
                 &mut completion,
                 request_model.as_deref(),
                 &tried,
+                managed_http.as_ref(),
             )
             .await;
         if decision.kind == outcome::Kind::Quota

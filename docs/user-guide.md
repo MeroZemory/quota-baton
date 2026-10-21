@@ -284,6 +284,33 @@ quota-baton.exe unwire --apply
 
 사용자가 수정한 파일은 자동으로 덮어쓰지 않습니다. 변경 내용을 확인하고 force가 필요한 경우에만 별도 승인을 사용합니다. 전환은 [C11 관리 API](contract.md#c11-admin-api)와 [C12 저장 형식](contract.md#c12-persistence-formats)에 맞춰 journal과 함께 처리됩니다.
 
+### Codex 실행 계정과 모델 고르기
+
+일반 `codex-qb`는 실행할 때 사용할 계정을 고릅니다. `-m`으로 모델을 지정하지 않으면 전용 홈의 기본 모델을 사용합니다. 그 모델을 지원하는 계정 중에서 선택합니다.
+
+```powershell
+codex-qb --account "계정 이름" -m "모델 이름"
+codex-qb resume <UUID>
+codex-qb resume <UUID> -m "모델 이름" --move-for-model
+```
+
+`--account`는 우선 사용할 계정입니다. 그 계정을 사용할 수 없으면 다른 사용 가능한 계정을 고릅니다. 기존 대화를 재개할 때는 연결된 계정을 우선 유지합니다.
+
+모델 메뉴는 그 계정이 지원하는 목록을 보여 줍니다. 메뉴를 새로 받는다고 계정을 바꾸지 않습니다. 지원하지 않는 모델을 직접 입력하면 요청을 보내기 전에 이유를 알려 줍니다. 기존 대화의 계정이 지원하지 않는 모델로 옮기려면 `--move-for-model`이나 `--account`로 이동에 동의해야 합니다. 계정을 옮기면 캐시와 이전 추론을 모두 재사용할 수 있다고 보장하지 않습니다.
+
+계정을 사용할 수 없어 자동으로 옮길 때도 현재 모델을 지원하는 계정만 고릅니다. 가능하면 기존 메뉴의 모델을 모두 지원하는 계정을 우선합니다. 옮긴 계정에서 지원하지 않는 모델은 따로 안내합니다.
+
+계정별 짧은 명령도 만들 수 있습니다. 데이터 폴더의 `config.toml`에 다음처럼 두 글자 소문자 이름을 지정하고 `wire`의 변경 미리보기를 확인합니다. 적용하면 `codex-rh`가 `codex-qb --account <계정 ID>` 역할을 합니다. 같은 이름을 중복해서 쓰거나 `qb`를 사용할 수 없습니다. 별칭은 기본으로 만들지 않습니다.
+
+```toml
+[accounts."계정 ID"]
+short = "rh"
+```
+
+창 제목에는 실제 선택된 계정의 짧은 이름을 표시합니다. 자세한 계정·모델 선택 규칙은 [D22](decisions.md#d22-the-account-is-chosen-at-codex-qb-launch-and-the-model-catalog-is-that-accounts-resolves-o13--accepted-user-direction-plus-panel-2026-10-21)를 참고하세요.
+
+`codex-qb resume`는 대화 ID 목록을 페이지로 보여 줍니다. 입력과 출력이 모두 터미널이어야 합니다. `resume --last`는 현재 폴더의 최근 대화를 먼저 정한 뒤 그 대화의 계정과 모델 목록으로 시작합니다. 목록을 안전하게 확인할 수 없거나 최근 시간이 같은 대화가 있으면 `resume <UUID>`로 ID를 지정하라고 안내합니다. 별도 프로젝트 설정이나 연결된 Git worktree 때문에 선택 범위를 확인할 수 없을 때도 ID를 지정하세요.
+
 ### Codex에서 이미지 만들기
 
 `codex-qb --images`는 이미지 전용 홈에서 새 대화를 시작합니다. 일반 `codex-qb` 홈과 대화 목록이 다릅니다. 처음에는 `wire` 업그레이드가 필요합니다. 기존 대화를 이미지 모드로 옮기거나 재개하는 기능은 아직 지원하지 않습니다. 새 이미지 세션을 여세요.
@@ -304,7 +331,7 @@ codex-qb --images exec "이미지를 만들고 PNG로 저장해 주세요."
 
 ### 기존 Codex 대화 가져오기
 
-먼저 `wire --codex-mode dedicated --apply`로 Codex 전용 명령을 준비합니다. 대화 이전 기능(가져오기·공유·일괄 이동·돌려보내기와 자동 이동 제안)은 **Codex CLI 0.163.0**에서만 지원합니다. 버전이 다르면 한국어 사유를 보여 주고 해당 기능을 거절합니다. 일반 `codex-qb` 실행과 이미 qb에 있는 대화의 재개에는 이 버전 제한을 적용하지 않습니다. 프롬프트, 프로필·설정 옵션, daemon·app-server 등 Codex의 기본 인자는 그대로 전달하며 `--no-daemon`을 자동으로 붙이지 않습니다. 아래의 `<HOME>`은 기존 Codex 홈 폴더입니다. `<UUID>`는 대화 ID입니다.
+먼저 `wire --codex-mode dedicated --apply`로 Codex 전용 명령을 준비합니다. 대화 이전 기능(가져오기·공유·일괄 이동·돌려보내기와 자동 이동 제안)은 **Codex CLI 0.163.0**에서만 지원합니다. 버전이 다르면 한국어 사유를 보여 주고 해당 기능을 거절합니다. 일반 `codex-qb` 실행과 이미 qb에 있는 대화의 재개에는 이 버전 제한을 적용하지 않습니다. 일반 실행은 프롬프트와 지원하는 설정 옵션을 유지하며 `--no-daemon`을 자동으로 붙이지 않습니다. 계정별 모델 목록을 보장할 수 없는 프로필·사용자 라우팅 설정과 daemon·app-server 같은 별도 명령은 일반 `codex-qb` 경로에서 거절합니다. 아래의 `<HOME>`은 기존 Codex 홈 폴더입니다. `<UUID>`는 대화 ID입니다.
 
 ```powershell
 quota-baton.exe sessions import --from <HOME> --list

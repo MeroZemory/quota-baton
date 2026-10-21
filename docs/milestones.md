@@ -12,7 +12,7 @@ This file names the verification for each unit and each row. The row list and th
 갱신: 2026-10-22 01:04 KST (R12.9 dev c899b6a 설치 완료)
 <!-- status:end -->
 
-Only the design session edits this block, when priority, approval or the core metric changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
+The implementer updates this block at each gate; the design session also updates priority, approval and the core metric. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
 
 ## Unit check (closes a unit)
 

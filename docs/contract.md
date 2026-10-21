@@ -537,7 +537,7 @@ Associating a project preserves an explicit root override unless `inherit: true`
 
 Both apply only to identity-encoded bodies, allocate no DOM, and never feed into rewriting.
 
-**Codex bodies** are never decoded on the normal path. The exceptions are debug-only: the `shape-capture` and `phase0` builds (architecture §13).
+**Codex bodies:** D22 launch-scoped requests permit a bounded side-copy peek of the top-level `model` in HTTP responses/compact requests and WebSocket `response.create` frames, including bounded decompression for HTTP. This validates the model against the bound account's catalog; it never supplies a session identity or rewrites forwarded bytes. Search requests use the launch's current model because their schema has no model selector. Unscoped Codex requests retain the original no-decode path. The debug-only `shape-capture` and `phase0` builds have the additional inspection allowed by architecture §13.
 
 ## C9. Usage signals
 
