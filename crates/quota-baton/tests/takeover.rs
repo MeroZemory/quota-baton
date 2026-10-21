@@ -62,6 +62,35 @@ fn safe_url(url: &str) {
     assert!(!matches!(url.port(), None | Some(10100 | 10101)));
 }
 
+// Startup catalog observations must not consume a scripted inference response.
+struct CatalogUpstream {
+    url: String,
+    state: qb_testkit::ScriptedState,
+    _task: AbortTask<()>,
+}
+impl CatalogUpstream {
+    async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        safe_url(&url);
+        let state = qb_testkit::ScriptedState::default();
+        let app = state.router().route(
+            "/models",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({"models":[{"slug":"fixture"}]}))
+            }),
+        );
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        Self {
+            url,
+            state,
+            _task: AbortTask(Some(task)),
+        }
+    }
+}
+
 struct Home {
     _root: TempDir,
     path: PathBuf,
@@ -416,17 +445,31 @@ impl Delayed401 {
         let (entered_tx, entered) = oneshot::channel();
         let (release, released) = oneshot::channel();
         let task = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut bytes = Vec::new();
-            let mut buffer = [0u8; 2048];
-            loop {
-                let n = socket.read(&mut buffer).await.unwrap();
-                assert_ne!(n, 0);
-                bytes.extend_from_slice(&buffer[..n]);
-                if bytes.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
+            let mut socket = loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut buffer = [0u8; 2048];
+                loop {
+                    let n = socket.read(&mut buffer).await.unwrap();
+                    assert_ne!(n, 0);
+                    bytes.extend_from_slice(&buffer[..n]);
+                    if bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
                 }
-            }
+                if bytes.starts_with(b"GET /models?") || bytes.starts_with(b"GET /models ") {
+                    let body = b"{\"models\":[{\"slug\":\"fixture\"}]}";
+                    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
+                    socket.write_all(body).await.unwrap();
+                    socket.shutdown().await.unwrap();
+                    continue;
+                }
+                assert!(
+                    bytes.starts_with(b"POST /responses "),
+                    "unexpected fake route"
+                );
+                break socket;
+            };
             let body = b"{\"error\":{\"type\":\"invalid_request_error\",\"code\":\"invalid_api_key\",\"message\":\"synthetic current token 401\"}}";
             socket.write_all(format!("HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nX-Synthetic-401: unchanged\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
             entered_tx.send(()).unwrap();
@@ -556,7 +599,7 @@ e2e!(
 );
 
 e2e!(takeover_lets_inflight_http_stream_finish_on_old_core, {
-    let upstream = ScriptedUpstream::start().await.unwrap();
+    let upstream = CatalogUpstream::start().await;
     let home = Home::new(&upstream.url).await;
     accounts(&home, 1);
     let client = client();
@@ -767,7 +810,16 @@ e2e!(
             data_account(&client, &home, "held:agent:independent").await,
             ids[0]
         );
-        for request in upstream.state.requests() {
+        let turns: Vec<_> = upstream
+            .state
+            .requests()
+            .into_iter()
+            .filter(|request| {
+                request.method == reqwest::Method::POST && request.path_and_query == "/responses"
+            })
+            .collect();
+        assert_eq!(turns.len(), 2);
+        for request in turns {
             assert_eq!(
                 request.headers["authorization"],
                 "Bearer synthetic-access-0"
@@ -781,14 +833,27 @@ e2e!(
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let before = upstream.state.requests().len();
+        let before = upstream
+            .state
+            .requests()
+            .into_iter()
+            .filter(|request| request.method == reqwest::Method::POST)
+            .count();
         let response = request(&client, &home, "held:agent:independent")
             .send()
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::CONFLICT);
         response.bytes().await.unwrap();
-        assert_eq!(upstream.state.requests().len(), before);
+        assert_eq!(
+            upstream
+                .state
+                .requests()
+                .into_iter()
+                .filter(|request| request.method == reqwest::Method::POST)
+                .count(),
+            before
+        );
         lease_busy(&home);
     }
 );
@@ -866,9 +931,11 @@ e2e!(drain_stops_refresh_and_relays_401_unchanged, {
     assert!(form.contains("grant_type=refresh_token"));
     assert!(form.contains("refresh_token=synthetic-refresh-0"));
     assert!(b_data.state.requests().iter().any(|r| {
-        r.headers
-            .get("authorization")
-            .is_some_and(|h| h == "Bearer synthetic-rotated-access")
+        r.method == reqwest::Method::POST
+            && r.path_and_query == "/responses"
+            && r.headers
+                .get("authorization")
+                .is_some_and(|h| h == "Bearer synthetic-rotated-access")
     }));
     let refreshed = AccountStore::list_metadata(&home.path).unwrap();
     assert!(refreshed[0].generation > due.generation);
@@ -899,7 +966,7 @@ e2e!(second_serve_without_takeover_refuses_while_lease_held, {
 });
 
 e2e!(drain_timeout_forces_exit, {
-    let upstream = ScriptedUpstream::start().await.unwrap();
+    let upstream = CatalogUpstream::start().await;
     let mut home = Home::new(&upstream.url).await;
     home.drain_secs = 2;
     home.write_config();
@@ -954,7 +1021,9 @@ async fn port_case(release_port: bool) {
     let url = format!("http://{}", listener.local_addr().unwrap());
     let (complete, completed) = oneshot::channel::<()>();
     let completed = Arc::new(TokioMutex::new(Some(completed)));
-    let app = axum::Router::new().fallback(move || {
+    let app = axum::Router::new().route("/models", axum::routing::get(|| async {
+        axum::Json(serde_json::json!({"models":[{"slug":"fixture"}]}))
+    })).route("/responses", axum::routing::post(move || {
         let completed = completed.clone();
         async move {
             // Only A's first response waits; B's later request must complete.
@@ -974,7 +1043,7 @@ async fn port_case(release_port: bool) {
                 }),
             )
         }
-    });
+    }));
     let _upstream = AbortTask(Some(tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     })));

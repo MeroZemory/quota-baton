@@ -1014,7 +1014,8 @@ async fn quota_reset_hold_waits_two_seconds_and_keeps_http_binding() {
     let h = Harness::new(Provider::Codex).await;
     let headers = [("session-id", "reset-hold"), ("x-stainless-timeout", "5")];
     let first = h.turn("/v1/responses", &headers, RAW).await;
-    h.store
+    let cooled = h
+        .store
         .update_metadata(&first, |account| {
             let now = Utc::now();
             let reset = now + ChronoDuration::seconds(2);
@@ -1030,10 +1031,24 @@ async fn quota_reset_hold_waits_two_seconds_and_keeps_http_binding() {
             }
         })
         .unwrap();
+    let reset = cooled
+        .quota_cooling
+        .expect("synthetic reset metadata")
+        .reset_at;
+    // Durable setup consumes part of the reset interval. Measure only the
+    // remaining hold, without letting an already-expired fixture pass.
     let start = Instant::now();
+    let remaining = (reset - Utc::now())
+        .to_std()
+        .expect("synthetic reset expired during metadata setup");
+    assert!(
+        !remaining.is_zero(),
+        "synthetic reset must still be pending"
+    );
     assert_eq!(h.turn("/v1/responses", &headers, RAW).await, first);
-    assert!(start.elapsed() >= Duration::from_millis(1500));
-    assert!(start.elapsed() < Duration::from_secs(5));
+    let elapsed = start.elapsed();
+    assert!(elapsed >= remaining, "{elapsed:?}, remaining {remaining:?}");
+    assert!(elapsed < Duration::from_secs(5));
     assert_eq!(h.fake.state.requests().len(), 2);
 }
 
