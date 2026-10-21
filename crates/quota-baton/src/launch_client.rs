@@ -1478,9 +1478,7 @@ mod tests {
                 false,
             ),
             (
-                format!(
-                    "HTTP/1.1 307 Temporary Redirect\r\nLocation: /trap\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                ),
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: /trap\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
                 "catalog",
                 false,
             ),

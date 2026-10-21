@@ -744,9 +744,10 @@ fn validate_manifest(paths: &CutoverPaths, m: &Manifest) -> Result<()> {
     image_home::validate_metadata(m)?;
     account_alias::validate_records(m.mode, &m.npm, &m.account_aliases, &m.entries)?;
     anyhow::ensure!(
-        !(m.alias_install_pending && m.image_install_pending)
-            && (!m.alias_install_pending
-                || (m.install_completed == Some(false) && !m.account_aliases.is_empty())),
+        !m.alias_install_pending
+            || (!m.image_install_pending
+                && m.install_completed == Some(false)
+                && !m.account_aliases.is_empty()),
         "invalid alias extension state"
     );
     let mut tasks = std::collections::HashSet::new();

@@ -295,7 +295,7 @@ fn validate_scope(cwd: &Path, request: &Request) -> Result<()> {
 }
 
 fn require_terminal(last: bool, input: bool, output: bool) -> Result<()> {
-    if !last && !(input && output) {
+    if !(last || input && output) {
         return Err(SelectionError(TTY_REQUIRED).into());
     }
     Ok(())
@@ -369,10 +369,11 @@ fn pick_with_io(
                 page += 1;
             }
             value => {
-                if let Ok(index) = value.parse::<usize>() {
-                    if index > 0 && index <= rows.len().min(PAGE_SIZE) {
-                        return selected_args(home, request, &rows[index - 1]).map(Some);
-                    }
+                if let Ok(index) = value.parse::<usize>()
+                    && index > 0
+                    && index <= rows.len().min(PAGE_SIZE)
+                {
+                    return selected_args(home, request, &rows[index - 1]).map(Some);
                 }
                 writeln!(output, "표시된 번호나 이동 명령을 입력해 주세요.")
                     .map_err(|_| refused())?;
