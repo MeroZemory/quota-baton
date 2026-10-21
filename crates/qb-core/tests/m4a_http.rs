@@ -3737,3 +3737,1057 @@ async fn committed_probe_store_failure_preserves_success_and_blocks_later_dispat
     assert_eq!(h.fake.state.requests().len(), 1);
     assert!(h.ledger().iter().any(|r|r["event"]=="core_warning" && r["code"]=="probe_store_failed_after_commit"));
 }
+
+// Authenticated D22 data-port integration with synthetic accounts only.
+async fn r11_http_issue(h: &Harness) -> qb_core::relay::LaunchReply {
+    for _ in h.ids() {
+        h.fake.state.push(ScriptedResponse::json(
+            StatusCode::OK,
+            r#"{"models":[{"slug":"synthetic-model"}]}"#,
+        ));
+    }
+    h.state
+        .issue_launch(
+            qb_core::relay::LaunchRequest {
+                model: Some("synthetic-model".into()),
+                model_is_explicit: true,
+                account_pref: None,
+                resume_id: None,
+                move_for_model: false,
+            },
+            h.servers.data_addr.port(),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn r11_http_entry_c8_adoption_preserves_original_body_and_known_key_precedence() {
+    let h = Harness::new(Provider::Codex, 1, 64, 1024).await;
+    let launch = r11_http_issue(&h).await;
+    // The body member is deliberately not an identity authority. C8 header wins.
+    let raw = r#"{
+  "model": "synthetic-model", "session_id": "not-a-c8-key", "input": [] }"#
+        .to_owned();
+    h.fake.state.push(ok());
+    let response = reqwest::Client::new()
+        .post(format!("{}/responses", launch.base_url))
+        .bearer_auth("synthetic-client")
+        .header("session-id", "synthetic-c8")
+        .body(raw.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.unwrap();
+    let calls = h.fake.state.requests();
+    let sent = calls
+        .iter()
+        .find(|call| call.path_and_query == "/responses")
+        .unwrap();
+    assert_eq!(sent.body.as_ref(), raw.as_bytes());
+    assert_eq!(
+        h.state
+            .bindings
+            .current(Some("codex:synthetic-c8"))
+            .as_deref(),
+        Some(launch.account.as_str())
+    );
+    assert!(
+        h.state
+            .bindings
+            .current(Some("codex:not-a-c8-key"))
+            .is_none()
+    );
+    let unknown = "Z".repeat(43);
+    h.fake.state.push(ok());
+    let response = reqwest::Client::new()
+        .post(format!(
+            "http://{}/l/{unknown}/v1/responses",
+            h.servers.data_addr
+        ))
+        .bearer_auth("synthetic-client")
+        .header("session-id", "synthetic-c8")
+        .body(raw)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "known C8 binding outranks missing token authority"
+    );
+    response.bytes().await.unwrap();
+    let response = reqwest::Client::new()
+        .post(format!(
+            "http://{}/l/{unknown}/v1/responses",
+            h.servers.data_addr
+        ))
+        .bearer_auth("synthetic-client")
+        .header("session-id", "synthetic-unbound")
+        .body(r#"{"model":"synthetic-model","input":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["error"]["type"],
+        "launch_expired"
+    );
+    assert_eq!(
+        h.fake
+            .state
+            .requests()
+            .iter()
+            .filter(|call| call.path_and_query == "/responses")
+            .count(),
+        2
+    );
+    let handle = launch
+        .base_url
+        .split("/l/")
+        .nth(1)
+        .unwrap()
+        .split('/')
+        .next()
+        .unwrap();
+    assert!(
+        !h.ledger()
+            .iter()
+            .any(|row| row.to_string().contains(handle) || row.to_string().contains(&unknown))
+    );
+}
+
+#[tokio::test]
+async fn r11_http_entry_unsupported_model_does_not_dispatch_or_replace_current_model() {
+    let h = Harness::new(Provider::Codex, 2, 64, 1024).await;
+    let launch = r11_http_issue(&h).await;
+    let response = reqwest::Client::new()
+        .post(format!("{}/responses", launch.base_url))
+        .bearer_auth("synthetic-client")
+        .header("session-id", "synthetic-unsupported")
+        .body(r#"{"model":"not-advertised","input":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["error"]["type"],
+        "model_not_supported"
+    );
+    assert!(
+        !h.fake
+            .state
+            .requests()
+            .iter()
+            .any(|call| call.path_and_query == "/responses")
+    );
+    let info = h
+        .state
+        .bindings
+        .launch_info("codex:synthetic-unsupported", Utc::now())
+        .unwrap();
+    assert_eq!(info.account, launch.account);
+    assert_eq!(info.current_model.as_deref(), Some("synthetic-model"));
+}
+
+#[tokio::test]
+async fn r11_http_entry_unusable_bound_account_moves_to_compatible_fallback() {
+    let h = Harness::new(Provider::Codex, 2, 64, 1024).await;
+    let launch = r11_http_issue(&h).await;
+    h.state
+        .accounts
+        .change(&launch.account, Some(UserState::Paused), None, None, None)
+        .await
+        .unwrap();
+    h.fake.state.push(ok());
+    let response = reqwest::Client::new()
+        .post(format!("{}/responses", launch.base_url))
+        .bearer_auth("synthetic-client")
+        .header("session-id", "synthetic-forced-seam")
+        .body(r#"{"model":"synthetic-model","input":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.unwrap();
+    assert_ne!(
+        h.state
+            .bindings
+            .current(Some("codex:synthetic-forced-seam"))
+            .as_deref(),
+        Some(launch.account.as_str())
+    );
+    assert_eq!(
+        h.fake
+            .state
+            .requests()
+            .iter()
+            .filter(|call| call.path_and_query == "/responses")
+            .count(),
+        1
+    );
+}
+
+async fn r11_http_warm_distinct(h: &Harness, models: &[&[&str]]) -> Vec<String> {
+    let ids = h.ids();
+    assert_eq!(ids.len(), models.len());
+    // Isolate each fetch so a script can never become a different account's
+    // catalog under concurrent issue collection.
+    for (index, id) in ids.iter().enumerate() {
+        for candidate in &ids {
+            h.state
+                .accounts
+                .change(
+                    candidate,
+                    Some(if candidate == id {
+                        UserState::Active
+                    } else {
+                        UserState::Paused
+                    }),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        h.fake.state.push(ScriptedResponse::json(StatusCode::OK,
+            json!({"models": models[index].iter().map(|slug| json!({"slug": slug})).collect::<Vec<_>>()}).to_string()));
+        let warm = h
+            .state
+            .issue_launch(
+                qb_core::relay::LaunchRequest {
+                    model: Some(models[index][0].into()),
+                    model_is_explicit: true,
+                    account_pref: Some(id.clone()),
+                    resume_id: None,
+                    move_for_model: false,
+                },
+                h.servers.data_addr.port(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(&warm.account, id);
+    }
+    for id in &ids {
+        h.state
+            .accounts
+            .change(id, Some(UserState::Active), None, None, None)
+            .await
+            .unwrap();
+    }
+    ids
+}
+
+#[tokio::test]
+async fn r11_http_entry_forced_move_filters_model_and_prefers_whole_advertised_catalog() {
+    let h = Harness::new(Provider::Codex, 4, 64, 1024).await;
+    let ids = r11_http_warm_distinct(
+        &h,
+        &[
+            &["common", "menu"],
+            &["different"],
+            &["common"],
+            &["common", "menu"],
+        ],
+    )
+    .await;
+    let launch = h
+        .state
+        .issue_launch(
+            qb_core::relay::LaunchRequest {
+                model: Some("common".into()),
+                model_is_explicit: true,
+                account_pref: Some(ids[0].clone()),
+                resume_id: None,
+                move_for_model: false,
+            },
+            h.servers.data_addr.port(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(launch.account, ids[0]);
+    // Resolve a real C8 key before recording the menu, just as /models does.
+    h.fake.state.push(ok());
+    let client = reqwest::Client::new();
+    let send = || {
+        client
+            .post(format!("{}/responses", launch.base_url))
+            .bearer_auth("synthetic-client")
+            .header("session-id", "r11-compatible")
+            .body(r#"{"model":"common","input":[]}"#)
+    };
+    let response = send().send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.unwrap();
+    h.state
+        .bindings
+        .record_launch_advertised(
+            "codex:r11-compatible",
+            &ids[0],
+            &["common".to_owned(), "menu".to_owned()]
+                .into_iter()
+                .collect(),
+            Utc::now(),
+        )
+        .unwrap();
+    h.state
+        .accounts
+        .change(&ids[0], Some(UserState::Paused), None, None, None)
+        .await
+        .unwrap();
+    h.fake.state.push(ok());
+    let response = send().send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.unwrap();
+    assert_eq!(
+        h.state.bindings.current(Some("codex:r11-compatible")),
+        Some(ids[3].clone())
+    );
+    let requests = h.fake.state.requests();
+    let responses: Vec<_> = requests
+        .iter()
+        .filter(|call| call.path_and_query == "/responses")
+        .collect();
+    assert_eq!(responses.len(), 2);
+    assert_ne!(
+        responses[0].headers["chatgpt-account-id"],
+        responses[1].headers["chatgpt-account-id"]
+    );
+    assert_eq!(
+        responses[1].body.as_ref(),
+        br#"{"model":"common","input":[]}"#
+    );
+    let metadata = h
+        .state
+        .bindings
+        .launch_info("codex:r11-compatible", Utc::now())
+        .unwrap();
+    assert_eq!(metadata.current_model.as_deref(), Some("common"));
+    assert_eq!(metadata.advertised_models.len(), 2);
+}
+
+#[tokio::test]
+async fn r11_http_entry_forced_move_never_uses_a_healthy_incompatible_account() {
+    let h = Harness::new(Provider::Codex, 2, 64, 1024).await;
+    let ids = r11_http_warm_distinct(&h, &[&["common"], &["different"]]).await;
+    let launch = h
+        .state
+        .issue_launch(
+            qb_core::relay::LaunchRequest {
+                model: Some("common".into()),
+                model_is_explicit: true,
+                account_pref: Some(ids[0].clone()),
+                resume_id: None,
+                move_for_model: false,
+            },
+            h.servers.data_addr.port(),
+        )
+        .await
+        .unwrap();
+    h.state
+        .accounts
+        .change(&ids[0], Some(UserState::Paused), None, None, None)
+        .await
+        .unwrap();
+    let response = reqwest::Client::new()
+        .post(format!("{}/responses", launch.base_url))
+        .bearer_auth("synthetic-client")
+        .header("session-id", "r11-no-compatible")
+        .body(r#"{"model":"common","input":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert!(!response.status().is_success());
+    response.bytes().await.unwrap();
+    assert_eq!(
+        h.state.bindings.current(Some("codex:r11-no-compatible")),
+        Some(ids[0].clone())
+    );
+    assert!(
+        !h.fake
+            .state
+            .requests()
+            .iter()
+            .any(|call| call.path_and_query == "/responses")
+    );
+}
+
+#[tokio::test]
+async fn r11_http_entry_new_model_refreshes_only_bound_catalog_before_dispatch() {
+    let h = Harness::new(Provider::Codex, 2, 64, 1024).await;
+    let launch = r11_http_issue(&h).await;
+    let before = h.fake.state.requests().len();
+    h.fake.state.push(ScriptedResponse::json(
+        StatusCode::OK,
+        r#"{"models":[{"slug":"synthetic-model"},{"slug":"newly-added"}]}"#,
+    ));
+    h.fake.state.push(ok());
+    let response = reqwest::Client::new()
+        .post(format!("{}/responses", launch.base_url))
+        .bearer_auth("synthetic-client")
+        .header("session-id", "r11-new-model")
+        .body(r#"{"model":"newly-added","input":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.unwrap();
+    let calls = h.fake.state.requests();
+    let added = &calls[before..];
+    assert_eq!(added.len(), 2);
+    assert!(added[0].path_and_query.starts_with("/models"));
+    assert_eq!(added[1].path_and_query, "/responses");
+    assert_eq!(
+        added[0].headers["chatgpt-account-id"],
+        added[1].headers["chatgpt-account-id"]
+    );
+    let info = h
+        .state
+        .bindings
+        .launch_info("codex:r11-new-model", Utc::now())
+        .unwrap();
+    assert_eq!(info.account, launch.account);
+    assert_eq!(info.current_model.as_deref(), Some("newly-added"));
+}
+
+#[tokio::test]
+async fn r11_http_entry_upstream_model_denial_refreshes_menu_without_shopping() {
+    let h = Harness::new(Provider::Codex, 2, 64, 1024).await;
+    let launch = r11_http_issue(&h).await;
+    let before = h.fake.state.requests().len();
+    h.fake.state.push(ScriptedResponse::json(
+        StatusCode::BAD_REQUEST,
+        r#"{"error":{"code":"model_not_found","message":"model is not supported when using Codex with a ChatGPT account"}}"#,
+    ));
+    h.fake.state.push(ScriptedResponse::json(
+        StatusCode::OK,
+        r#"{"models":[{"slug":"replacement"}]}"#,
+    ));
+    let response = reqwest::Client::new()
+        .post(format!("{}/responses", launch.base_url))
+        .bearer_auth("synthetic-client")
+        .header("session-id", "r11-denied-model")
+        .body(r#"{"model":"synthetic-model","input":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["error"]["type"],
+        "model_not_supported"
+    );
+    let calls = h.fake.state.requests();
+    let added = &calls[before..];
+    assert_eq!(added.len(), 2);
+    assert_eq!(added[0].path_and_query, "/responses");
+    assert!(added[1].path_and_query.starts_with("/models"));
+    assert_eq!(
+        added[0].headers["chatgpt-account-id"],
+        added[1].headers["chatgpt-account-id"]
+    );
+    assert_eq!(
+        h.state.bindings.current(Some("codex:r11-denied-model")),
+        Some(launch.account)
+    );
+}
+
+#[tokio::test]
+async fn r11_http_entry_recovered_original_wins_after_destination_catalog_wait() {
+    let h = Harness::new(Provider::Codex, 2, 64, 1024).await;
+    let ids = h.ids();
+    h.state
+        .accounts
+        .change(&ids[1], Some(UserState::Paused), None, None, None)
+        .await
+        .unwrap();
+    h.fake.state.push(ScriptedResponse::json(
+        StatusCode::OK,
+        r#"{"models":[{"slug":"common"}]}"#,
+    ));
+    let launch = h
+        .state
+        .issue_launch(
+            qb_core::relay::LaunchRequest {
+                model: Some("common".into()),
+                model_is_explicit: true,
+                account_pref: Some(ids[0].clone()),
+                resume_id: None,
+                move_for_model: false,
+            },
+            h.servers.data_addr.port(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(launch.account, ids[0]);
+    h.state
+        .accounts
+        .change(&ids[0], Some(UserState::Paused), None, None, None)
+        .await
+        .unwrap();
+    h.state
+        .accounts
+        .change(&ids[1], Some(UserState::Active), None, None, None)
+        .await
+        .unwrap();
+    h.fake.state.push(ScriptedResponse::json(
+        StatusCode::OK,
+        r#"{"models":[{"slug":"common"}]}"#,
+    ));
+    h.fake.state.push(ok());
+    let (arrived, release) = h.fake.state.pause_next_response();
+    let request = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(format!("{}/responses", launch.base_url))
+            .bearer_auth("synthetic-client")
+            .header("session-id", "r11-recovered")
+            .body(r#"{"model":"common","input":[]}"#)
+            .send()
+            .await
+            .unwrap()
+    });
+    tokio::time::timeout(Duration::from_secs(5), arrived)
+        .await
+        .unwrap()
+        .unwrap();
+    let calls = h.fake.state.requests();
+    assert_eq!(calls.len(), 2);
+    assert!(calls[1].path_and_query.starts_with("/models"));
+    assert_ne!(
+        calls[0].headers["chatgpt-account-id"],
+        calls[1].headers["chatgpt-account-id"]
+    );
+    h.state
+        .accounts
+        .change(&ids[0], Some(UserState::Active), None, None, None)
+        .await
+        .unwrap();
+    release.send(()).unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(5), request)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.unwrap();
+    assert_eq!(
+        h.state.bindings.current(Some("codex:r11-recovered")),
+        Some(ids[0].clone())
+    );
+    let calls = h.fake.state.requests();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[2].path_and_query, "/responses");
+    assert_eq!(
+        calls[0].headers["chatgpt-account-id"],
+        calls[2].headers["chatgpt-account-id"]
+    );
+    assert!(
+        !h.ledger()
+            .iter()
+            .any(|row| row["event"] == "session_move" && row["reason"] == "forced")
+    );
+}
+
+#[tokio::test]
+async fn r11_http_entry_concurrent_launches_adopt_one_real_c8_binding() {
+    let h = Harness::new(Provider::Codex, 2, 64, 1024).await;
+    let first = r11_http_issue(&h).await;
+    let other = h.ids().into_iter().find(|id| *id != first.account).unwrap();
+    let second = h
+        .state
+        .issue_launch(
+            qb_core::relay::LaunchRequest {
+                model: Some("synthetic-model".into()),
+                model_is_explicit: true,
+                account_pref: Some(other.clone()),
+                resume_id: None,
+                move_for_model: false,
+            },
+            h.servers.data_addr.port(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.account, other);
+    h.fake.state.push(ok());
+    h.fake.state.push(ok());
+    let client = reqwest::Client::new();
+    let send = |base: String| {
+        client
+            .post(format!("{base}/responses"))
+            .bearer_auth("synthetic-client")
+            .header("session-id", "r11-simultaneous")
+            .body(r#"{"model":"synthetic-model","input":[]}"#)
+            .send()
+    };
+    let (a, b) = tokio::join!(send(first.base_url), send(second.base_url));
+    let a = a.unwrap();
+    let b = b.unwrap();
+    assert_eq!(a.status(), StatusCode::OK);
+    assert_eq!(b.status(), StatusCode::OK);
+    a.bytes().await.unwrap();
+    b.bytes().await.unwrap();
+    let canonical = h
+        .state
+        .bindings
+        .launch_info("codex:r11-simultaneous", Utc::now())
+        .unwrap();
+    assert!(canonical.managed);
+    assert_eq!(canonical.canonical_key, "codex:r11-simultaneous");
+    let snapshot = h.state.bindings.export().unwrap();
+    assert_eq!(snapshot["bindings"].as_array().unwrap().len(), 1);
+    let calls = h.fake.state.requests();
+    let sent: Vec<_> = calls
+        .iter()
+        .filter(|call| call.path_and_query == "/responses")
+        .collect();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(
+        sent[0].headers["chatgpt-account-id"],
+        sent[1].headers["chatgpt-account-id"]
+    );
+}
+
+#[tokio::test]
+async fn r11_http_entry_search_uses_launch_account_and_preserves_search_schema() {
+    let h = Harness::new(Provider::Codex, 1, 64, 1024).await;
+    let launch = r11_http_issue(&h).await;
+    let raw = r#"{ "query": "synthetic search", "limit": 3 }"#;
+    h.fake.state.push(ok());
+    let response = reqwest::Client::new()
+        .post(format!("{}/alpha/search", launch.base_url))
+        .bearer_auth("synthetic-client")
+        .header("x-codex-turn-metadata", r#"{"session_id":"r11-search"}"#)
+        .body(raw)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.unwrap();
+    let calls = h.fake.state.requests();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1].path_and_query, "/alpha/search");
+    assert_eq!(calls[1].body.as_ref(), raw.as_bytes());
+    assert_eq!(
+        calls[0].headers["chatgpt-account-id"],
+        calls[1].headers["chatgpt-account-id"]
+    );
+    assert_eq!(
+        h.state.bindings.current(Some("codex:r11-search")),
+        Some(launch.account)
+    );
+}
+
+// Append to crates/qb-core/tests/m4a_http.rs after the existing R11 HTTP tests.
+// Synthetic loopback only; uses the existing Harness and shared serial guard.
+async fn r11_models_issue_raw(h: &Harness, raw: &Value) -> qb_core::relay::LaunchReply {
+    for _ in h.ids() {
+        h.fake
+            .state
+            .push(ScriptedResponse::json(StatusCode::OK, raw.to_string()));
+    }
+    h.state
+        .issue_launch(
+            qb_core::relay::LaunchRequest {
+                model: Some("synthetic-model".into()),
+                model_is_explicit: true,
+                account_pref: None,
+                resume_id: None,
+                move_for_model: false,
+            },
+            h.servers.data_addr.port(),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn r11_models_entry_raw_fields_bound_account_and_no_adoption() {
+    let h = Harness::new(Provider::Codex, 1, 64, 1024).await;
+    let raw = json!({"models":[{"slug":"synthetic-model", "display_name":"Synthetic",
+        "supported_reasoning_levels":[{"effort":"high","description":"fixture"}],
+        "future_provider_field":{"nested":[1,true,"keep"]}}], "provider_extension":{"v":7}});
+    let launch = r11_models_issue_raw(&h, &raw).await;
+    let before = h.fake.state.requests().len();
+    let response = reqwest::Client::new()
+        .get(format!("{}/models", launch.base_url))
+        .bearer_auth("synthetic-client")
+        .header("session-id", "models-not-adopted")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["x-quota-baton-account"]
+            .to_str()
+            .unwrap(),
+        launch.account
+    );
+    assert_eq!(response.json::<Value>().await.unwrap(), raw);
+    assert_eq!(
+        h.fake.state.requests().len(),
+        before,
+        "shared fresh catalog, no new fetch or shopping"
+    );
+    assert!(
+        h.state
+            .bindings
+            .current(Some("codex:models-not-adopted"))
+            .is_none()
+    );
+    let models_record = h
+        .ledger()
+        .into_iter()
+        .find(|r| r["route"] == "GET /v1/models")
+        .unwrap();
+    assert_eq!(models_record["account"], launch.account);
+    assert_eq!(models_record["attempts"], 0);
+    assert!(models_record["upstream_status"].is_null());
+    let token = launch
+        .base_url
+        .split("/l/")
+        .nth(1)
+        .unwrap()
+        .split('/')
+        .next()
+        .unwrap();
+    assert!(!models_record.to_string().contains(token));
+}
+
+#[tokio::test]
+async fn r11_models_entry_known_c8_outranks_unknown_token_and_records_before_reply() {
+    let h = Harness::new(Provider::Codex, 1, 64, 1024).await;
+    let raw = json!({"models":[{"slug":"synthetic-model","opaque":{"preserve":true}}]});
+    let launch = r11_models_issue_raw(&h, &raw).await;
+    h.fake.state.push(ok());
+    let client = reqwest::Client::new();
+    let adopted = client
+        .post(format!("{}/responses", launch.base_url))
+        .bearer_auth("synthetic-client")
+        .header("session-id", "models-existing-c8")
+        .body(r#"{"model":"synthetic-model","input":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(adopted.status(), StatusCode::OK);
+    adopted.bytes().await.unwrap();
+    let before = h.fake.state.requests().len();
+    let unknown = "Z".repeat(43);
+    let response = client
+        .get(format!(
+            "http://{}/l/{unknown}/v1/models",
+            h.servers.data_addr
+        ))
+        .bearer_auth("synthetic-client")
+        .header("session-id", "models-existing-c8")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["x-quota-baton-account"]
+            .to_str()
+            .unwrap(),
+        launch.account
+    );
+    let info = h
+        .state
+        .bindings
+        .launch_info("codex:models-existing-c8", Utc::now())
+        .unwrap();
+    assert_eq!(info.account, launch.account);
+    assert!(info.advertised_models.contains("synthetic-model"));
+    assert_eq!(response.json::<Value>().await.unwrap(), raw);
+    assert_eq!(h.fake.state.requests().len(), before);
+    assert!(!h.ledger().iter().any(|r| r.to_string().contains(&unknown)));
+}
+
+#[tokio::test]
+async fn r11_models_entry_unknown_token_unbound_key_cannot_place_or_shop() {
+    let h = Harness::new(Provider::Codex, 2, 64, 1024).await;
+    let unknown = "Z".repeat(43);
+    let response = reqwest::Client::new()
+        .get(format!(
+            "http://{}/l/{unknown}/v1/models",
+            h.servers.data_addr
+        ))
+        .bearer_auth("synthetic-client")
+        .header("session-id", "models-never-place")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(!response.headers().contains_key("x-quota-baton-account"));
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["error"]["type"],
+        "launch_expired"
+    );
+    assert!(
+        h.state
+            .bindings
+            .current(Some("codex:models-never-place"))
+            .is_none()
+    );
+    assert!(h.fake.state.requests().is_empty());
+    assert!(!h.ledger().iter().any(|r| r.to_string().contains(&unknown)));
+}
+
+#[tokio::test]
+async fn r11_models_entry_ordinary_c8_fails_closed_without_managed_promotion() {
+    let h = Harness::new(Provider::Codex, 1, 64, 1024).await;
+    h.fake.state.push(ok());
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("http://{}/v1/responses", h.servers.data_addr))
+        .bearer_auth("synthetic-client")
+        .header("session-id", "models-ordinary")
+        .body(r#"{"model":"synthetic-model","input":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.unwrap();
+    let before = h
+        .state
+        .bindings
+        .launch_info("codex:models-ordinary", Utc::now())
+        .unwrap();
+    assert!(!before.managed);
+    let calls = h.fake.state.requests().len();
+    let response = client
+        .get(format!(
+            "http://{}/l/{}/v1/models",
+            h.servers.data_addr,
+            "Z".repeat(43)
+        ))
+        .bearer_auth("synthetic-client")
+        .header("session-id", "models-ordinary")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!response.headers().contains_key("x-quota-baton-account"));
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["error"]["type"],
+        "launch_unavailable"
+    );
+    let after = h
+        .state
+        .bindings
+        .launch_info("codex:models-ordinary", Utc::now())
+        .unwrap();
+    assert_eq!(after, before);
+    assert_eq!(h.fake.state.requests().len(), calls);
+}
+
+#[tokio::test]
+async fn r11_models_entry_claude_legacy_route_unchanged() {
+    let h = Harness::new(Provider::Claude, 1, 64, 1024).await;
+    let raw = json!({"data":[{"id":"synthetic-claude","type":"model"}],"has_more":false});
+    h.fake
+        .state
+        .push(ScriptedResponse::json(StatusCode::OK, raw.to_string()));
+    let response = reqwest::Client::new()
+        .get(format!("http://{}/v1/models", h.servers.data_addr))
+        .bearer_auth("synthetic-client")
+        .header("anthropic-version", "2023-06-01")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.json::<Value>().await.unwrap(), raw);
+    assert_eq!(h.fake.state.requests().len(), 1);
+    assert_eq!(h.fake.state.requests()[0].path_and_query, "/v1/models");
+}
+
+#[tokio::test]
+async fn r11_http_entry_compressed_model_peek_preserves_wire_bytes() {
+    use std::io::Write;
+    let h = Harness::new(Provider::Codex, 1, 64, 1024).await;
+    let launch = r11_http_issue(&h).await;
+    let raw = br#"{ "model":"synthetic-model", "input":[{"role":"user","content":"fixture"}] }"#;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder.write_all(raw).unwrap();
+    let wire = encoder.finish().unwrap();
+    h.fake.state.push(ok());
+    let response = reqwest::Client::new()
+        .post(format!("{}/responses", launch.base_url))
+        .bearer_auth("synthetic-client")
+        .header("session-id", "r11-gzip")
+        .header("content-encoding", "gzip")
+        .body(wire.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.unwrap();
+    let calls = h.fake.state.requests();
+    let sent = calls
+        .iter()
+        .find(|call| call.path_and_query == "/responses")
+        .unwrap();
+    assert_eq!(sent.body.as_ref(), wire);
+    assert_eq!(sent.headers["content-encoding"], "gzip");
+    assert_eq!(
+        h.state.bindings.current(Some("codex:r11-gzip")),
+        Some(launch.account)
+    );
+}
+
+#[tokio::test]
+async fn r11_http_entry_invalid_model_metadata_never_dispatches() {
+    let h = Harness::new(Provider::Codex, 1, 64, 1024).await;
+    let launch = r11_http_issue(&h).await;
+    let before = h.fake.state.requests().len();
+    let client = reqwest::Client::new();
+    for raw in [
+        r#"{"model":"synthetic-model","model":"other","input":[]}"#,
+        r#"{"model":null,"input":[]}"#,
+        r#"{"model":42,"input":[]}"#,
+        r#"{"model":"synthetic-model","input":[],bad}"#,
+    ] {
+        let response = client
+            .post(format!("{}/responses", launch.base_url))
+            .bearer_auth("synthetic-client")
+            .header("session-id", "r11-invalid-model")
+            .body(raw)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        response.bytes().await.unwrap();
+    }
+    assert_eq!(h.fake.state.requests().len(), before);
+}
+
+#[tokio::test]
+async fn r11_http_entry_model_denial_keeps_hold_when_catalog_does_not_remove_model() {
+    for refresh_fails in [false, true] {
+        let h = Harness::new(Provider::Codex, 1, 64, 1024).await;
+        let launch = r11_http_issue(&h).await;
+        h.fake.state.push(ScriptedResponse::json(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"The 'synthetic-model' model is not supported when using Codex with a ChatGPT account"}}"#,
+        ));
+        h.fake.state.push(ScriptedResponse::json(
+            if refresh_fails {
+                StatusCode::BAD_GATEWAY
+            } else {
+                StatusCode::OK
+            },
+            if refresh_fails {
+                "{}"
+            } else {
+                r#"{"models":[{"slug":"synthetic-model"}]}"#
+            },
+        ));
+        let client = reqwest::Client::new();
+        let send = || {
+            client
+                .post(format!("{}/responses", launch.base_url))
+                .bearer_auth("synthetic-client")
+                .header("session-id", "r11-model-hold")
+                .body(r#"{"model":"synthetic-model","input":[]}"#)
+                .send()
+        };
+        let response = send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        response.bytes().await.unwrap();
+        let account = h.store.load(&launch.account).unwrap();
+        assert!(!account.eligible(Some("synthetic-model")));
+        assert!(account.eligible(Some("different-model")));
+        assert!(matches!(
+            account.health,
+            Health::Cooling {
+                reason: HealthReason::Permission,
+                ..
+            }
+        ));
+        let response = tokio::time::timeout(Duration::from_secs(10), send())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::OK);
+        response.bytes().await.unwrap();
+        assert_eq!(
+            h.fake
+                .state
+                .requests()
+                .iter()
+                .filter(|r| r.path_and_query == "/responses")
+                .count(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn r11_http_entry_destination_pause_before_admission_never_publishes_move() {
+    let h = Harness::new(Provider::Codex, 2, 64, 1024).await;
+    let ids = r11_http_warm_distinct(&h, &[&["common"], &["common"]]).await;
+    let launch = h
+        .state
+        .issue_launch(
+            qb_core::relay::LaunchRequest {
+                model: Some("common".into()),
+                model_is_explicit: true,
+                account_pref: Some(ids[0].clone()),
+                resume_id: None,
+                move_for_model: false,
+            },
+            h.servers.data_addr.port(),
+        )
+        .await
+        .unwrap();
+    let client = reqwest::Client::new();
+    let send = || {
+        client
+            .post(format!("{}/responses", launch.base_url))
+            .bearer_auth("synthetic-client")
+            .header("session-id", "r11-paused-target")
+            .body(r#"{"model":"common","input":[]}"#)
+            .send()
+    };
+    h.fake.state.push(ok());
+    let initial = send().await.unwrap();
+    assert_eq!(initial.status(), StatusCode::OK);
+    initial.bytes().await.unwrap();
+    h.state
+        .accounts
+        .change(&ids[0], Some(UserState::Paused), None, None, None)
+        .await
+        .unwrap();
+    let before = h.fake.state.requests().len();
+    let (collected, release) = h.state.pause_next_ws_selection();
+    let pending = send();
+    let mutate = async {
+        tokio::time::timeout(Duration::from_secs(5), collected)
+            .await
+            .unwrap()
+            .unwrap();
+        h.state
+            .accounts
+            .change(&ids[1], Some(UserState::Paused), None, None, None)
+            .await
+            .unwrap();
+        release.send(()).unwrap();
+    };
+    let (response, ()) = tokio::join!(pending, mutate);
+    let response = response.unwrap();
+    assert_ne!(response.status(), StatusCode::OK);
+    response.bytes().await.unwrap();
+    assert_eq!(
+        h.fake.state.requests().len(),
+        before,
+        "no dispatch after destination pause"
+    );
+    assert_eq!(
+        h.state.bindings.current(Some("codex:r11-paused-target")),
+        Some(ids[0].clone()),
+        "a send guard alone must not leave a move to paused B"
+    );
+    assert!(
+        !h.ledger()
+            .iter()
+            .any(|row| row["event"] == "session_move" && row["reason"] == "forced")
+    );
+}

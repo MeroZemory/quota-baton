@@ -501,7 +501,11 @@ impl DispatchReceipt {
 }
 impl Drop for BindingLease {
     fn drop(&mut self) {
-        let _mutation = self.table.mutations.lock().unwrap_or_else(|e| e.into_inner());
+        let _mutation = self
+            .table
+            .mutations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut d = self.table.data.lock().unwrap_or_else(|e| e.into_inner());
         decrement(&mut d.pending, &self.account);
         let now = Utc::now();
@@ -523,7 +527,11 @@ pub struct SocketPin {
 impl Drop for SocketPin {
     fn drop(&mut self) {
         if let Some(group) = &self.group {
-            let _mutation = self.table.mutations.lock().unwrap_or_else(|e| e.into_inner());
+            let _mutation = self
+                .table
+                .mutations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let mut d = self.table.data.lock().unwrap_or_else(|e| e.into_inner());
             let group = launch::ownership_group(&d, group).to_owned();
             decrement(&mut d.pins, &group);
@@ -1702,6 +1710,40 @@ impl BindingTable {
         now: DateTime<Utc>,
         admit: impl FnOnce(&str) -> bool,
     ) -> Decision {
+        self.choose_with_hold_at_admitted_coverage(
+            provider,
+            key,
+            parent,
+            model,
+            candidates,
+            pinned,
+            request_bytes,
+            hold_allowed,
+            hold_timed_out,
+            now,
+            None,
+            admit,
+        )
+    }
+
+    /// D22 retains C7's gates and ordering, with full-menu coverage preferred
+    /// within the ordinary eligible pools. It never bypasses routing policy.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn choose_with_hold_at_admitted_coverage(
+        self: &Arc<Self>,
+        provider: Provider,
+        key: Option<&str>,
+        parent: Option<&str>,
+        model: Option<&str>,
+        candidates: &[Candidate],
+        pinned: Option<&str>,
+        request_bytes: u64,
+        hold_allowed: bool,
+        hold_timed_out: bool,
+        now: DateTime<Utc>,
+        coverage: Option<&BTreeSet<String>>,
+        admit: impl FnOnce(&str) -> bool,
+    ) -> Decision {
         let _mutation = self.mutations.lock().unwrap_or_else(|e| e.into_inner());
         let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
         for c in candidates {
@@ -1726,7 +1768,12 @@ impl BindingTable {
                 .or_default();
             *known = (*known).max(request_bytes);
         }
-        let (choice, reason) = self.select(
+        let preference = coverage.map(|coverage| launch::SelectionPreference {
+            account: None,
+            coverage: Some(coverage),
+            model_move: false,
+        });
+        let (choice, reason) = self.select_ordered(
             &d,
             provider,
             key,
@@ -1736,6 +1783,7 @@ impl BindingTable {
             pinned,
             now,
             hold_allowed,
+            preference.as_ref(),
         );
         let account = match choice {
             PreviewDecision::Hold { until } => return Decision::Hold { until },

@@ -37,6 +37,8 @@ pub struct LaunchPlacement {
 pub struct LaunchInfo {
     pub canonical_key: String,
     pub account: String,
+    /// The canonical group has D22 launch metadata, rather than only a legacy binding.
+    pub managed: bool,
     pub current_model: Option<String>,
     pub advertised_models: BTreeSet<String>,
 }
@@ -399,6 +401,7 @@ fn info(d: &Data, key: &str) -> std::result::Result<LaunchInfo, LaunchError> {
     Ok(LaunchInfo {
         canonical_key: key.to_owned(),
         account: group.account.clone(),
+        managed: d.launches.contains_key(key),
         current_model: metadata.and_then(|m| m.current_model.clone()),
         advertised_models: metadata.map_or_else(BTreeSet::new, |m| m.advertised_models.clone()),
     })
@@ -723,8 +726,23 @@ impl BindingTable {
         request_key: Option<&str>,
         now: DateTime<Utc>,
     ) -> std::result::Result<LaunchInfo, LaunchError> {
+        self.resolve_launch_for_operation(anchor, request_key, now, None)
+    }
+
+    pub(crate) fn resolve_launch_for_operation(
+        &self,
+        anchor: Option<&str>,
+        request_key: Option<&str>,
+        now: DateTime<Utc>,
+        operation: Option<&crate::issue_operation::IssueOperation>,
+    ) -> std::result::Result<LaunchInfo, LaunchError> {
         let _mutation = self.mutations.lock().unwrap_or_else(|e| e.into_inner());
         let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        // Admission checks cancellation/deadline atomically, before even pruning.
+        // Once it wins, caller cancellation cannot revoke the required mutation.
+        if let Some(operation) = operation {
+            operation.admit().map_err(|_| LaunchError::PolicyBlocked)?;
+        }
         self.prune(&mut d, now);
         if let Some(key) = request_key
             .and_then(|k| canonical(&d, k))
@@ -923,6 +941,39 @@ impl BindingTable {
         Ok(())
     }
 
+    /// Advisory read-only snapshot. Final advertised CAS below performs the
+    /// existing expiry/prune check before any successful menu publication.
+    pub(crate) fn models_launch_snapshot(
+        &self,
+        request_key: Option<&str>,
+        anchor: Option<&str>,
+    ) -> std::result::Result<LaunchInfo, LaunchError> {
+        let d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(key) = request_key {
+            if let Ok(existing) = info(&d, key) {
+                return Ok(existing);
+            }
+        }
+        info(&d, anchor.ok_or(LaunchError::UnknownLaunch)?)
+    }
+
+    pub(crate) fn record_models_advertised_for_operation(
+        &self,
+        key: &str,
+        account: &str,
+        models: &BTreeSet<String>,
+        now: DateTime<Utc>,
+        operation: &crate::issue_operation::IssueOperation,
+        admit: &dyn Fn() -> bool,
+    ) -> std::result::Result<LaunchInfo, LaunchError> {
+        if !valid_models(models) {
+            return Err(LaunchError::InvalidMetadata);
+        }
+        self.record_launch_metadata(key, account, now, Some(operation), Some(admit), |m| {
+            m.advertised_models.extend(models.iter().cloned())
+        })
+    }
+
     /// Read/touch metadata only; never places, moves, reserves, or uses sticky.
     pub fn launch_info(
         &self,
@@ -944,10 +995,21 @@ impl BindingTable {
         model: &str,
         now: DateTime<Utc>,
     ) -> std::result::Result<LaunchInfo, LaunchError> {
+        self.record_launch_model_for_operation(key, account, model, now, None)
+    }
+
+    pub(crate) fn record_launch_model_for_operation(
+        &self,
+        key: &str,
+        expected_account: &str,
+        model: &str,
+        now: DateTime<Utc>,
+        operation: Option<&crate::issue_operation::IssueOperation>,
+    ) -> std::result::Result<LaunchInfo, LaunchError> {
         if !valid_model(model) {
             return Err(LaunchError::InvalidMetadata);
         }
-        self.record_launch_metadata(key, account, now, |m| {
+        self.record_launch_metadata(key, expected_account, now, operation, None, |m| {
             m.current_model = Some(model.to_owned())
         })
     }
@@ -964,7 +1026,7 @@ impl BindingTable {
         if !valid_models(models) {
             return Err(LaunchError::InvalidMetadata);
         }
-        self.record_launch_metadata(key, account, now, |m| {
+        self.record_launch_metadata(key, account, now, None, None, |m| {
             m.advertised_models.extend(models.iter().cloned())
         })
     }
@@ -973,6 +1035,8 @@ impl BindingTable {
         key: &str,
         account: &str,
         now: DateTime<Utc>,
+        operation: Option<&crate::issue_operation::IssueOperation>,
+        admit: Option<&dyn Fn() -> bool>,
         update: impl FnOnce(&mut Metadata),
     ) -> std::result::Result<LaunchInfo, LaunchError> {
         let _mutation = self.mutations.lock().unwrap_or_else(|e| e.into_inner());
@@ -980,6 +1044,12 @@ impl BindingTable {
             return Err(LaunchError::Retired);
         }
         let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        if admit.is_some_and(|admit| !admit()) {
+            return Err(LaunchError::PolicyBlocked);
+        }
+        if let Some(operation) = operation {
+            operation.admit().map_err(|_| LaunchError::PolicyBlocked)?;
+        }
         self.prune(&mut d, now);
         let before = info(&d, key)?;
         if before.account != account {
@@ -1008,20 +1078,46 @@ impl BindingTable {
 #[cfg(test)]
 mod r11_active_adoption_tests {
     use super::*;
+    use crate::issue_operation::IssueOperation;
     use crate::routing::{Mode, Project, Settings, session_id};
 
     const SOURCE: &str = "launch:active-adoption";
     const REAL: &str = "codex:active-adoption";
 
-    fn fixture(mode: Mode) -> (tempfile::TempDir, Arc<BindingTable>, Vec<Candidate>, LaunchEntitlements) {
+    fn fixture(
+        mode: Mode,
+    ) -> (
+        tempfile::TempDir,
+        Arc<BindingTable>,
+        Vec<Candidate>,
+        LaunchEntitlements,
+    ) {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join(".sandbox/r11-prep/active-adoption-test-runs");
         fs::create_dir_all(&root).unwrap();
-        let home = tempfile::Builder::new().prefix("case-").tempdir_in(root).unwrap();
+        let home = tempfile::Builder::new()
+            .prefix("case-")
+            .tempdir_in(root)
+            .unwrap();
         let mut config = RoutingConfig::default();
-        config.mode = mode;
+        // Strict is a scoped policy; global Strict is deliberately invalid.
+        config.mode = if mode == Mode::Strict {
+            Mode::Rebalance
+        } else {
+            mode
+        };
         let table = BindingTable::new(home.path(), config).unwrap();
+        if mode == Mode::Strict {
+            table
+                .policies
+                .set_session(&session_id(SOURCE), Some(strict()), None, Some("a"))
+                .unwrap();
+        }
+        assert_eq!(table.routing_plan(Some(SOURCE)).settings.mode, mode);
         let mut candidates = Vec::new();
         for id in ["a", "b"] {
             let mut c = super::super::tests::candidate(id, 10.0, 30, 2);
@@ -1035,7 +1131,10 @@ mod r11_active_adoption_tests {
         }
         let entitlements = BTreeMap::from([
             ("a".to_owned(), BTreeSet::from(["m1".to_owned()])),
-            ("b".to_owned(), BTreeSet::from(["m1".to_owned(), "m2".to_owned()])),
+            (
+                "b".to_owned(),
+                BTreeSet::from(["m1".to_owned(), "m2".to_owned()]),
+            ),
         ]);
         (home, table, candidates, entitlements)
     }
@@ -1052,7 +1151,12 @@ mod r11_active_adoption_tests {
     }
 
     fn place(t: &BindingTable, cs: &[Candidate], es: &LaunchEntitlements) {
-        assert_eq!(t.place_launch(request(SOURCE), cs, es, Utc::now()).unwrap().account, "a");
+        assert_eq!(
+            t.place_launch(request(SOURCE), cs, es, Utc::now())
+                .unwrap()
+                .account,
+            "a"
+        );
     }
 
     fn counts(t: &BindingTable, key: &str, active: usize, pins: usize, pending: usize) {
@@ -1078,7 +1182,9 @@ mod r11_active_adoption_tests {
         let pending = t.pending_count("a");
         let policy_before = t.policies.list();
         let placement_before = t.data.lock().unwrap().placements["a"].total;
-        let resolved = t.resolve_launch(Some(SOURCE), Some(REAL), Utc::now()).unwrap();
+        let resolved = t
+            .resolve_launch(Some(SOURCE), Some(REAL), Utc::now())
+            .unwrap();
         assert_eq!(resolved.canonical_key, REAL);
         assert_eq!(resolved.account, "a");
         counts(&t, REAL, 1, 1, pending);
@@ -1114,7 +1220,8 @@ mod r11_active_adoption_tests {
         drop(gone_pin);
         drop(gone_lease);
         counts(&t, SOURCE, 0, 1, 0);
-        t.resolve_launch(Some(SOURCE), Some(REAL), Utc::now()).unwrap();
+        t.resolve_launch(Some(SOURCE), Some(REAL), Utc::now())
+            .unwrap();
         // A caller that captured the anchor before the rename still reserves
         // the adopted group, rather than resurrecting counters on source.
         let later_pin = t.pin(Some(SOURCE));
@@ -1133,7 +1240,8 @@ mod r11_active_adoption_tests {
         let (_home, t, cs, es) = fixture(Mode::Rebalance);
         place(&t, &cs, &es);
         let pin = t.pin(Some(SOURCE));
-        t.resolve_launch(Some(SOURCE), Some(REAL), Utc::now()).unwrap();
+        t.resolve_launch(Some(SOURCE), Some(REAL), Utc::now())
+            .unwrap();
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let worker = {
             let t = t.clone();
@@ -1151,7 +1259,12 @@ mod r11_active_adoption_tests {
             })
         };
         barrier.wait();
-        assert_eq!(t.resolve_launch(Some(SOURCE), Some(REAL), Utc::now()).unwrap().account, "a");
+        assert_eq!(
+            t.resolve_launch(Some(SOURCE), Some(REAL), Utc::now())
+                .unwrap()
+                .account,
+            "a"
+        );
         assert_eq!(worker.join().unwrap(), Err(LaunchError::Busy));
         counts(&t, REAL, 0, 1, 0);
         assert_eq!(t.current(Some(REAL)).as_deref(), Some("a"));
@@ -1161,7 +1274,10 @@ mod r11_active_adoption_tests {
         r.model = Some("m2");
         r.account_pref = Some("b");
         r.allow_move_for_model = true;
-        assert_eq!(t.place_launch(r, &cs, &es, Utc::now()).unwrap().account, "b");
+        assert_eq!(
+            t.place_launch(r, &cs, &es, Utc::now()).unwrap().account,
+            "b"
+        );
     }
 
     #[test]
@@ -1172,10 +1288,20 @@ mod r11_active_adoption_tests {
             let mut r = request("launch:bound-winner");
             r.resume_key = Some(REAL);
             r.account_pref = Some(target_account);
-            assert_eq!(t.place_launch(r, &cs, &es, Utc::now()).unwrap().account, target_account);
+            // Establish each winner explicitly: a preference cannot bypass D20's cap.
+            let target = cs.iter().find(|c| c.account.id == target_account).unwrap();
+            assert_eq!(
+                t.place_launch(r, std::slice::from_ref(target), &es, Utc::now())
+                    .unwrap()
+                    .account,
+                target_account
+            );
             let pin = t.pin(Some(SOURCE));
             let lease = t.begin_request(Some(SOURCE), "a");
-            assert_eq!(t.resolve_launch(Some(SOURCE), Some(REAL), Utc::now()), Err(LaunchError::Busy));
+            assert_eq!(
+                t.resolve_launch(Some(SOURCE), Some(REAL), Utc::now()),
+                Err(LaunchError::Busy)
+            );
             counts(&t, SOURCE, 1, 1, 1);
             assert_eq!(t.launch_info(SOURCE, Utc::now()).unwrap().account, "a");
             assert_eq!(t.current(Some(REAL)).as_deref(), Some(target_account));
@@ -1186,7 +1312,10 @@ mod r11_active_adoption_tests {
     }
 
     fn strict() -> Settings {
-        Settings { mode: Mode::Strict, reset_wait_secs: 0 }
+        Settings {
+            mode: Mode::Strict,
+            reset_wait_secs: 0,
+        }
     }
 
     #[test]
@@ -1196,7 +1325,10 @@ mod r11_active_adoption_tests {
         let source_pin = t.pin(Some(SOURCE));
         let target_pin = t.pin(Some(REAL));
         let target_lease = t.begin_request(Some(REAL), "b");
-        assert_eq!(t.resolve_launch(Some(SOURCE), Some(REAL), Utc::now()), Err(LaunchError::Busy));
+        assert_eq!(
+            t.resolve_launch(Some(SOURCE), Some(REAL), Utc::now()),
+            Err(LaunchError::Busy)
+        );
         {
             let d = t.data.lock().unwrap();
             assert_eq!(d.pins.get(SOURCE), Some(&1));
@@ -1207,7 +1339,8 @@ mod r11_active_adoption_tests {
         }
         drop(target_lease);
         drop(target_pin);
-        t.resolve_launch(Some(SOURCE), Some(REAL), Utc::now()).unwrap();
+        t.resolve_launch(Some(SOURCE), Some(REAL), Utc::now())
+            .unwrap();
         drop(source_pin);
         let d = t.data.lock().unwrap();
         assert!(d.active.is_empty() && d.pins.is_empty() && d.pending.is_empty());
@@ -1217,10 +1350,15 @@ mod r11_active_adoption_tests {
     fn r11_active_adoption_strict_target_anchor_conflict_is_unchanged() {
         let (_home, t, cs, es) = fixture(Mode::Rebalance);
         place(&t, &cs, &es);
-        t.policies.set_session(&session_id(REAL), Some(strict()), None, Some("b")).unwrap();
+        t.policies
+            .set_session(&session_id(REAL), Some(strict()), None, Some("b"))
+            .unwrap();
         let pin = t.pin(Some(SOURCE));
         let before = t.policies.list();
-        assert_eq!(t.resolve_launch(Some(SOURCE), Some(REAL), Utc::now()), Err(LaunchError::PolicyBlocked));
+        assert_eq!(
+            t.resolve_launch(Some(SOURCE), Some(REAL), Utc::now()),
+            Err(LaunchError::PolicyBlocked)
+        );
         assert_eq!(t.policies.list(), before);
         counts(&t, SOURCE, 0, 1, 0);
         assert!(!t.data.lock().unwrap().bindings.contains_key(REAL));
@@ -1232,15 +1370,29 @@ mod r11_active_adoption_tests {
         for source_project in [false, true] {
             let (_home, t, cs, es) = fixture(Mode::Rebalance);
             place(&t, &cs, &es);
-            t.policies.put_project(Some("adoption"), Project { name: "adoption".into(), settings: strict() }).unwrap();
+            let project = t
+                .policies
+                .put_project(
+                    None,
+                    Project {
+                        name: "adoption".into(),
+                        settings: strict(),
+                    },
+                )
+                .unwrap();
             if source_project {
-                t.associate_project(SOURCE, "adoption").unwrap();
+                t.associate_project(SOURCE, &project).unwrap();
             }
             // Same-account target policy must not change a live owner's identity.
-            t.policies.associate_with_anchor(REAL, "adoption", Some("a")).unwrap();
+            t.policies
+                .associate_with_anchor(REAL, &project, Some("a"))
+                .unwrap();
             let pin = t.pin(Some(SOURCE));
             let before = t.policies.list();
-            assert_eq!(t.resolve_launch(Some(SOURCE), Some(REAL), Utc::now()), Err(LaunchError::PolicyBlocked));
+            assert_eq!(
+                t.resolve_launch(Some(SOURCE), Some(REAL), Utc::now()),
+                Err(LaunchError::PolicyBlocked)
+            );
             counts(&t, SOURCE, 0, 1, 0);
             assert_eq!(t.policies.list(), before);
             assert_eq!(t.data.lock().unwrap().launches[SOURCE].policy_key, SOURCE);
@@ -1257,27 +1409,35 @@ mod r11_active_adoption_tests {
         let policy_path = home.path().join("state/routing-policies.json");
         let policy_bytes = fs::read(&policy_path).unwrap();
         let before = t.policies.list();
-        t.resolve_launch(Some(SOURCE), Some(REAL), Utc::now()).unwrap();
+        t.resolve_launch(Some(SOURCE), Some(REAL), Utc::now())
+            .unwrap();
         lease.dispatched();
-        t.record_launch_advertised(REAL, "a", &es["a"], Utc::now()).unwrap();
+        t.record_launch_advertised(REAL, "a", &es["a"], Utc::now())
+            .unwrap();
         t.flush().unwrap();
         assert_eq!(fs::read(&policy_path).unwrap(), policy_bytes);
         assert_eq!(t.policies.list(), before);
         // An independent reload does not restore runtime counters, but its
         // persisted anchor and policy key still identify the adopted binding.
-        let mut config = RoutingConfig::default();
-        config.mode = Mode::Strict;
-        let restored = BindingTable::new(home.path(), config).unwrap();
-        let resolved = restored.resolve_launch(Some(SOURCE), None, Utc::now()).unwrap();
+        let restored = BindingTable::new(home.path(), RoutingConfig::default()).unwrap();
+        let resolved = restored
+            .resolve_launch(Some(SOURCE), None, Utc::now())
+            .unwrap();
         assert_eq!(resolved.canonical_key, REAL);
         assert_eq!(resolved.account, "a");
         assert_eq!(resolved.advertised_models, es["a"]);
         assert_eq!(resolved.current_model.as_deref(), Some("m1"));
         assert!(restored.permits_dispatch(Some(REAL), "a"));
         assert!(!restored.permits_dispatch(Some(REAL), "b"));
-        assert_eq!(restored.routing_plan(Some(REAL)).settings.mode, Mode::Strict);
+        assert_eq!(
+            restored.routing_plan(Some(REAL)).settings.mode,
+            Mode::Strict
+        );
         counts(&restored, REAL, 0, 0, 0);
-        assert_eq!(restored.data.lock().unwrap().launches[REAL].policy_key, SOURCE);
+        assert_eq!(
+            restored.data.lock().unwrap().launches[REAL].policy_key,
+            SOURCE
+        );
         // The live original still owns its pin/lease after its snapshot.
         counts(&t, REAL, 1, 1, 1);
         drop(pin);
@@ -1290,7 +1450,8 @@ mod r11_active_adoption_tests {
         let (_home, t, cs, es) = fixture(Mode::Rebalance);
         place(&t, &cs, &es);
         let pin = t.pin(Some(SOURCE));
-        t.resolve_launch(Some(SOURCE), Some(REAL), Utc::now()).unwrap();
+        t.resolve_launch(Some(SOURCE), Some(REAL), Utc::now())
+            .unwrap();
         let gate = t.mutations.lock().unwrap();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -1312,8 +1473,247 @@ mod r11_active_adoption_tests {
         worker.join().unwrap();
         counts(&t, REAL, 0, 0, 0);
     }
-}
 
+    fn resolution_state(table: &BindingTable) -> (serde_json::Value, u64) {
+        let data = table.data.lock().unwrap();
+        (
+            serde_json::to_value(super::super::snapshot(&data)).unwrap(),
+            data.revision,
+        )
+    }
+
+    #[test]
+    fn r11_resolve_cancelled_or_expired_behind_mutation_gate_preserves_state() {
+        for expired in [false, true] {
+            let (_home, table, candidates, entitlements) = fixture(Mode::Rebalance);
+            let now = Utc::now();
+            table
+                .place_launch(request(SOURCE), &candidates, &entitlements, now)
+                .unwrap();
+            // A rejected resolver must not even prune unrelated stale metadata.
+            table
+                .place_launch(
+                    request("launch:stale-operation"),
+                    &candidates,
+                    &entitlements,
+                    now - chrono::Duration::days(2),
+                )
+                .unwrap();
+            let before = resolution_state(&table);
+            let policies = table.policies.list();
+            let operation = IssueOperation::new(
+                tokio::time::Instant::now()
+                    + if expired {
+                        std::time::Duration::ZERO
+                    } else {
+                        std::time::Duration::from_secs(3600)
+                    },
+            );
+            let caller = operation.caller_guard();
+            let held = table.mutations.lock().unwrap();
+            let ready = Arc::new(std::sync::Barrier::new(2));
+            let task = {
+                let table = table.clone();
+                let operation = operation.clone();
+                let ready = ready.clone();
+                std::thread::spawn(move || {
+                    ready.wait();
+                    table.resolve_launch_for_operation(
+                        Some(SOURCE),
+                        Some(REAL),
+                        now + chrono::Duration::seconds(1),
+                        Some(&operation),
+                    )
+                })
+            };
+            ready.wait();
+            if expired {
+                caller.disarm();
+            } else {
+                drop(caller);
+            }
+            drop(held);
+            assert_eq!(task.join().unwrap(), Err(LaunchError::PolicyBlocked));
+            assert_eq!(resolution_state(&table), before);
+            assert_eq!(table.policies.list(), policies);
+        }
+    }
+
+    #[test]
+    fn r11_resolve_admission_survives_caller_cancel_without_reversing_ownership() {
+        let (_home, table, candidates, mut entitlements) = fixture(Mode::Strict);
+        entitlements.get_mut("a").unwrap().insert("m2".into());
+        let now = Utc::now();
+        table
+            .place_launch(request(SOURCE), &candidates, &entitlements, now)
+            .unwrap();
+        let pin = table.pin(Some(SOURCE));
+        let lease = table.begin_request(Some(SOURCE), "a");
+        let policies = table.policies.list();
+        let placements = table.data.lock().unwrap().placements["a"].total;
+        let operation =
+            IssueOperation::new(tokio::time::Instant::now() + std::time::Duration::from_secs(3600));
+        let caller = operation.caller_guard();
+        let resolved = table
+            .resolve_launch_for_operation(Some(SOURCE), Some(REAL), now, Some(&operation))
+            .unwrap();
+        assert!(resolved.managed);
+        assert_eq!(resolved.canonical_key, REAL);
+        drop(caller);
+        assert!(!operation.can_reply());
+        assert!(operation.check().is_ok());
+        let alias = table
+            .resolve_launch_for_operation(
+                Some(SOURCE),
+                Some("codex:operation-alias"),
+                now + chrono::Duration::seconds(1),
+                Some(&operation),
+            )
+            .unwrap();
+        assert_eq!(alias.canonical_key, REAL);
+        let updated = table
+            .record_launch_model_for_operation(
+                REAL,
+                "a",
+                "m2",
+                now + chrono::Duration::seconds(2),
+                Some(&operation),
+            )
+            .unwrap();
+        assert_eq!(updated.current_model.as_deref(), Some("m2"));
+        assert!(updated.managed);
+        assert_eq!(
+            table.record_launch_model_for_operation(REAL, "b", "m1", now, Some(&operation)),
+            Err(LaunchError::BindingChanged)
+        );
+        assert_eq!(
+            table.data.lock().unwrap().launches[REAL]
+                .current_model
+                .as_deref(),
+            Some("m2")
+        );
+        assert_eq!(table.policies.list(), policies);
+        assert_eq!(table.data.lock().unwrap().placements["a"].total, placements);
+        assert_eq!(table.data.lock().unwrap().launches[REAL].policy_key, SOURCE);
+        lease.dispatched();
+        counts(&table, REAL, 1, 1, 1);
+        drop(lease);
+        drop(pin);
+        counts(&table, REAL, 0, 0, 0);
+    }
+
+    #[test]
+    fn r11_resolve_bound_key_precedes_anchor_and_distinguishes_managed_from_legacy() {
+        let (_home, table, candidates, entitlements) = fixture(Mode::Rebalance);
+        let now = Utc::now();
+        let mut implicit = request(SOURCE);
+        implicit.model = None;
+        implicit.model_is_explicit = false;
+        table
+            .place_launch(implicit, &candidates, &entitlements, now)
+            .unwrap();
+        table.resolve_launch(Some(SOURCE), Some(REAL), now).unwrap();
+        let legacy = "codex:ordinary-operation";
+        match table.choose(
+            Provider::Codex,
+            Some(legacy),
+            None,
+            None,
+            &candidates,
+            Some("a"),
+            1,
+        ) {
+            Decision::Selected { account, lease, .. } => {
+                assert_eq!(account, "a");
+                lease.dispatched();
+            }
+            other => panic!("{other:?}"),
+        }
+        for (key, managed) in [(REAL, true), (legacy, false)] {
+            for anchor in [
+                None,
+                Some("invalid-anchor"),
+                Some("launch:missing-operation"),
+            ] {
+                let operation = IssueOperation::new(
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(3600),
+                );
+                let _caller = operation.caller_guard();
+                let resolved = table
+                    .resolve_launch_for_operation(anchor, Some(key), now, Some(&operation))
+                    .unwrap();
+                assert_eq!(resolved.canonical_key, key);
+                assert_eq!(resolved.account, "a");
+                assert_eq!(resolved.managed, managed);
+                assert!(resolved.current_model.is_none());
+                assert!(resolved.advertised_models.is_empty());
+                assert_eq!(
+                    table.data.lock().unwrap().launches.contains_key(key),
+                    managed
+                );
+            }
+        }
+        assert_eq!(
+            table.resolve_launch(None, Some("codex:unknown-operation"), now),
+            Err(LaunchError::UnknownLaunch)
+        );
+    }
+
+    #[test]
+    fn r11_model_write_cancelled_or_expired_behind_mutation_gate_preserves_model() {
+        for expired in [false, true] {
+            let (_home, table, candidates, entitlements) = fixture(Mode::Rebalance);
+            let now = Utc::now();
+            table
+                .place_launch(request(SOURCE), &candidates, &entitlements, now)
+                .unwrap();
+            let before = resolution_state(&table);
+            let policies = table.policies.list();
+            let operation = IssueOperation::new(
+                tokio::time::Instant::now()
+                    + if expired {
+                        std::time::Duration::ZERO
+                    } else {
+                        std::time::Duration::from_secs(3600)
+                    },
+            );
+            let caller = operation.caller_guard();
+            let held = table.mutations.lock().unwrap();
+            let ready = Arc::new(std::sync::Barrier::new(2));
+            let task = {
+                let table = table.clone();
+                let operation = operation.clone();
+                let ready = ready.clone();
+                std::thread::spawn(move || {
+                    ready.wait();
+                    table.record_launch_model_for_operation(
+                        SOURCE,
+                        "a",
+                        "m2",
+                        now + chrono::Duration::seconds(1),
+                        Some(&operation),
+                    )
+                })
+            };
+            ready.wait();
+            if expired {
+                caller.disarm();
+            } else {
+                drop(caller);
+            }
+            drop(held);
+            assert_eq!(task.join().unwrap(), Err(LaunchError::PolicyBlocked));
+            assert_eq!(resolution_state(&table), before);
+            assert_eq!(
+                table.data.lock().unwrap().launches[SOURCE]
+                    .current_model
+                    .as_deref(),
+                Some("m1")
+            );
+            assert_eq!(table.policies.list(), policies);
+        }
+    }
+}
 
 #[cfg(test)]
 mod issue_operation_binding_tests {
@@ -1328,8 +1728,8 @@ mod issue_operation_binding_tests {
         std::fs::create_dir_all(&root).unwrap();
         let dir = tempfile::tempdir_in(root).unwrap();
         let table = BindingTable::new(dir.path(), crate::config::RoutingConfig::default()).unwrap();
-        let operation = IssueOperation::new(tokio::time::Instant::now()
-            + std::time::Duration::from_secs(3600));
+        let operation =
+            IssueOperation::new(tokio::time::Instant::now() + std::time::Duration::from_secs(3600));
         let caller = operation.caller_guard();
         let ready = Arc::new(Barrier::new(2));
         let held = table.mutations.lock().unwrap();
@@ -1339,18 +1739,30 @@ mod issue_operation_binding_tests {
             let ready = ready.clone();
             std::thread::spawn(move || {
                 ready.wait();
-                table.place_launch_for_issue(LaunchRequest {
-                    anchor_key: "launch:operation-cancel", resume_key: None,
-                    model: Some("m"), model_is_explicit: true,
-                    account_pref: None, allow_move_for_model: false,
-                }, &[], &LaunchEntitlements::new(), chrono::Utc::now(), Some(&operation),
-                    |_, _| panic!("cancelled placement must not authorize"))
+                table.place_launch_for_issue(
+                    LaunchRequest {
+                        anchor_key: "launch:operation-cancel",
+                        resume_key: None,
+                        model: Some("m"),
+                        model_is_explicit: true,
+                        account_pref: None,
+                        allow_move_for_model: false,
+                    },
+                    &[],
+                    &LaunchEntitlements::new(),
+                    chrono::Utc::now(),
+                    Some(&operation),
+                    |_, _| panic!("cancelled placement must not authorize"),
+                )
             })
         };
         ready.wait();
         drop(caller);
         drop(held);
-        assert!(matches!(task.join().unwrap(), Err(LaunchError::PolicyBlocked)));
+        assert!(matches!(
+            task.join().unwrap(),
+            Err(LaunchError::PolicyBlocked)
+        ));
         let data = table.data.lock().unwrap();
         assert!(data.launches.is_empty());
         assert!(data.launch_anchors.is_empty());

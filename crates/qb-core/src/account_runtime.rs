@@ -536,6 +536,289 @@ mod release_probe_tests {
     }
 }
 
+#[cfg(test)]
+mod selection_admission_tests {
+    use super::*;
+    use crate::{
+        accounts::{
+            Tokens,
+            takeover::{Receipt, ReceiptState},
+        },
+        bindings::{BindingTable, Candidate, Decision},
+        config::RoutingConfig,
+    };
+
+    struct Fixture {
+        runtime: Arc<AccountRuntime>,
+        table: Arc<BindingTable>,
+        account: Account,
+        _home: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../.sandbox/r11-prep/selection-admission-fixtures");
+            std::fs::create_dir_all(&base).unwrap();
+            let home = tempfile::tempdir_in(base).unwrap();
+            let store = Arc::new(AccountStore::acquire(home.path()).unwrap());
+            let obs = Arc::new(Observability::new(home.path(), None).unwrap());
+            let runtime = AccountRuntime::new(store.clone(), obs, 0.0);
+            let table = BindingTable::new(home.path(), RoutingConfig::default()).unwrap();
+            let account = store
+                .save(
+                    &crate::accounts::health::tests::fixture(),
+                    &Self::tokens("synthetic-access"),
+                    None,
+                )
+                .unwrap();
+            Self {
+                runtime,
+                table,
+                account,
+                _home: home,
+            }
+        }
+
+        fn tokens(access: &str) -> Tokens {
+            Tokens {
+                access_token: access.into(),
+                refresh_token: "synthetic-refresh".into(),
+                id_token: None,
+            }
+        }
+
+        fn eligible(&self, existing: bool) -> bool {
+            self.runtime
+                .with_selection_admission(&self.table, Provider::Codex, None, |eligible| {
+                    eligible(&self.account.id, existing)
+                })
+                .unwrap()
+        }
+    }
+
+    #[test]
+    fn r11_selection_admission_rejects_stale_paused_destination_without_publication() {
+        let f = Fixture::new();
+        let stale = Candidate {
+            account: f.account.clone(),
+            quota: None,
+            inflight: 0,
+        };
+        let key = "codex:r11-stale-destination";
+        let before = f.table.routing_view();
+        f.runtime
+            .store
+            .update_metadata(&f.account.id, |a| a.user_state = UserState::Paused)
+            .unwrap();
+        let decision = f
+            .runtime
+            .with_selection_admission(&f.table, Provider::Codex, None, |eligible| {
+                f.table.choose_with_hold_at_admitted_coverage(
+                    Provider::Codex,
+                    Some(key),
+                    None,
+                    None,
+                    &[stale],
+                    None,
+                    0,
+                    true,
+                    false,
+                    Utc::now(),
+                    None,
+                    |id| eligible(id, f.table.existing_placement(Some(key), id)),
+                )
+            })
+            .unwrap();
+        assert!(matches!(decision, Decision::None));
+        assert_eq!(f.table.current(Some(key)), None);
+        assert_eq!(f.table.pending_count(&f.account.id), 0);
+        assert_eq!(f.table.routing_view(), before);
+    }
+
+    #[test]
+    fn r11_selection_admission_preserves_existing_drain_rules_and_runtime_blockers() {
+        let f = Fixture::new();
+        assert!(f.eligible(false));
+        f.runtime
+            .store
+            .update_metadata(&f.account.id, |a| a.drain = true)
+            .unwrap();
+        assert!(!f.eligible(false));
+        assert!(f.eligible(true));
+        let account = f
+            .runtime
+            .store
+            .update_metadata(&f.account.id, |a| {
+                a.drain = false;
+                a.auth_failures = 1;
+            })
+            .unwrap();
+        let probe = f.runtime.begin_probe(&account).unwrap().unwrap();
+        f.runtime
+            .with_selection_admission(&f.table, Provider::Codex, None, |eligible| {
+                assert!(f.runtime.released_quota.try_lock().is_err());
+                assert!(f.runtime.probes.try_lock().is_err());
+                assert!(f.runtime.volatile.try_lock().is_err());
+                assert!(!eligible(&f.account.id, true));
+            })
+            .unwrap();
+        drop(probe);
+        assert!(f.eligible(false));
+        let mut blocked = account;
+        blocked.health = Health::Cooling {
+            reason: HealthReason::StoreError,
+            until: Utc::now() + Duration::minutes(1),
+            scope: "account".into(),
+        };
+        f.runtime.emit_account(&blocked);
+        assert!(!f.eligible(true));
+        f.runtime.clear_memory_health(&blocked);
+        assert!(f.eligible(false));
+        f.runtime
+            .store
+            .update_metadata(&f.account.id, |a| {
+                a.health = Health::NeedsRelogin {
+                    reason: "synthetic".into(),
+                    since: Utc::now(),
+                };
+            })
+            .unwrap();
+        assert!(!f.eligible(true));
+    }
+
+    #[test]
+    fn r11_selection_admission_checks_current_credentials_takeover_and_stop() {
+        for fenced in [false, true] {
+            let f = Fixture::new();
+            assert!(f.eligible(false));
+            if fenced {
+                f.runtime
+                    .store
+                    .save_takeover_receipt(
+                        &f.account,
+                        &Fixture::tokens("synthetic-access"),
+                        Some(f.account.generation),
+                        None,
+                        &Receipt {
+                            operation: "1".repeat(64),
+                            state: ReceiptState::Installed,
+                        },
+                    )
+                    .unwrap();
+            } else {
+                f.runtime
+                    .store
+                    .save(&f.account, &Fixture::tokens(""), Some(f.account.generation))
+                    .unwrap();
+            }
+            assert!(!f.eligible(true));
+        }
+        let f = Fixture::new();
+        f.runtime.store.stop_writes();
+        assert!(!f.eligible(true));
+    }
+
+    #[test]
+    fn r11_selection_admission_uses_actual_quota_and_preserves_c7_hold() {
+        let f = Fixture::new();
+        let key = "codex:r11-admission-hold";
+        let now = Utc::now();
+        let until = now + Duration::seconds(30);
+        let snapshot = |used, at| {
+            json!({
+                "observed_at": at, "source":"poll", "windows":[
+                    {"name":"5h", "used_pct":used, "reset_at":until, "observed_at":at}
+                ]
+            })
+        };
+        f.runtime
+            .obs
+            .observe_poll(&f.account.id, snapshot(98.0, now), true)
+            .unwrap();
+        let pending = f.table.begin_request(None, &f.account.id);
+        // D20 projection reaches 99%, but actual usage still permits dispatch.
+        assert!(f.eligible(false));
+        drop(pending);
+        let candidate = Candidate {
+            account: f.account.clone(),
+            quota: f.runtime.obs.quota_snapshot(&f.account.id),
+            inflight: 0,
+        };
+        match f.table.choose(
+            Provider::Codex,
+            Some(key),
+            None,
+            None,
+            &[candidate],
+            None,
+            0,
+        ) {
+            Decision::Selected { lease, .. } => {
+                lease.dispatched();
+                drop(lease);
+            }
+            other => panic!("{other:?}"),
+        }
+        f.runtime
+            .obs
+            .observe_poll(
+                &f.account.id,
+                snapshot(100.0, now + Duration::seconds(1)),
+                true,
+            )
+            .unwrap();
+        assert!(!f.eligible(true));
+        let account = f
+            .runtime
+            .store
+            .update_metadata(&f.account.id, |a| {
+                a.health = Health::Cooling {
+                    reason: HealthReason::Quota,
+                    until,
+                    scope: "account".into(),
+                };
+                a.quota_cooling = Some(crate::accounts::QuotaCooling {
+                    window: "5h".into(),
+                    reset_at: until,
+                    started_at: now,
+                });
+            })
+            .unwrap();
+        let candidate = Candidate {
+            account,
+            quota: None,
+            inflight: 0,
+        };
+        let called = std::cell::Cell::new(false);
+        let decision = f
+            .runtime
+            .with_selection_admission(&f.table, Provider::Codex, None, |eligible| {
+                f.table.choose_with_hold_at_admitted_coverage(
+                    Provider::Codex,
+                    Some(key),
+                    None,
+                    None,
+                    &[candidate],
+                    None,
+                    0,
+                    true,
+                    false,
+                    now,
+                    None,
+                    |id| {
+                        called.set(true);
+                        eligible(id, true)
+                    },
+                )
+            })
+            .unwrap();
+        assert!(matches!(decision, Decision::Hold { until: reset } if reset == until));
+        assert!(!called.get(), "C7 must hold before dispatch admission");
+        assert_eq!(f.table.current(Some(key)), Some(f.account.id));
+    }
+}
+
 /// The exact upstream observation that a later successful commit may confirm.
 #[derive(Clone, Default)]
 pub struct QuotaObservation {
@@ -1484,6 +1767,61 @@ impl AccountRuntime {
         };
         filter_released_quota(account, snapshot, release);
         quota
+    }
+
+    /// Wrap the blocking chooser, then call `eligible(id, existing_placement)`
+    /// from its admission callback while the binding mutation gate is held.
+    /// Keep candidates intact so C7 can still hold a cooling original account.
+    ///
+    /// Lock order: store transaction -> released quota -> probes -> volatile
+    /// health -> binding mutation. The callback must not reacquire store/runtime
+    /// locks. All guards remain held through policy and binding publication.
+    pub(crate) fn with_selection_admission<T>(
+        &self,
+        bindings: &crate::bindings::BindingTable,
+        provider: Provider,
+        model: Option<&str>,
+        choose: impl FnOnce(&dyn Fn(&str, bool) -> bool) -> T,
+    ) -> Result<T, ()> {
+        let _transaction = self.store.transaction().map_err(|_| ())?;
+        // begin_probe also locks released quota before probes.
+        let released = self.released_quota.lock().map_err(|_| ())?;
+        let probes = self.probes.lock().map_err(|_| ())?;
+        let volatile = self.volatile.lock().map_err(|_| ())?;
+        let eligible = |id: &str, existing_placement: bool| {
+            if self.store.writes_stopped() || probes.contains(id) || volatile.contains_key(id) {
+                return false;
+            }
+            let Ok(mut account) = self.store.read_account_unlocked(id) else {
+                return false;
+            };
+            // Expire only this local copy: no observer or durable mutation is
+            // needed to assess the current row under the transaction.
+            account.expire_health(Utc::now());
+            if account.provider != provider
+                || !account.eligible(model)
+                || (account.drain && !existing_placement)
+                || !self
+                    .store
+                    .tokens_unlocked(&account)
+                    .is_ok_and(|tokens| !tokens.access_token.is_empty())
+            {
+                return false;
+            }
+            let mut quota = self.obs.quota_snapshot(id);
+            if let (Some(snapshot), Some(release)) = (quota.as_mut(), released.get(id)) {
+                filter_released_quota(&account, snapshot, release);
+            }
+            bindings.account_dispatch_eligible(
+                &crate::bindings::Candidate {
+                    account,
+                    quota,
+                    inflight: 0,
+                },
+                model,
+            )
+        };
+        Ok(choose(&eligible))
     }
 
     pub async fn transition(&self, id: &str, signal: HealthSignal) -> Result<Account, ()> {

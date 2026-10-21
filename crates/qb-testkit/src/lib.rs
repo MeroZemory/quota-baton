@@ -53,6 +53,12 @@ pub struct ScriptedState {
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
     responses: Arc<Mutex<VecDeque<ScriptedResponse>>>,
     window_limiter: Arc<Mutex<Option<WindowLimiter>>>,
+    next_response_gate: Arc<Mutex<Option<ResponseGate>>>,
+}
+
+struct ResponseGate {
+    arrived: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
 }
 
 #[derive(Clone)]
@@ -71,6 +77,31 @@ struct LimiterStartBatch {
 }
 
 impl ScriptedState {
+    /// Hold exactly the next observed request before returning its script.
+    /// The caller owns release; abandonment fails the request rather than hangs.
+    pub fn pause_next_response(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (arrived, observed) = tokio::sync::oneshot::channel();
+        let (release, gate) = tokio::sync::oneshot::channel();
+        let previous = self
+            .next_response_gate
+            .lock()
+            .unwrap()
+            .replace(ResponseGate {
+                arrived,
+                release: gate,
+            });
+        assert!(
+            previous.is_none(),
+            "synthetic response gate already pending"
+        );
+        (observed, release)
+    }
+
     pub fn push(&self, response: ScriptedResponse) {
         self.responses.lock().unwrap().push_back(response);
     }
@@ -193,6 +224,19 @@ async fn scripted(State(state): State<ScriptedState>, request: Request) -> Respo
         body,
         received_at: Instant::now(),
     });
+    let gate = state.next_response_gate.lock().unwrap().take();
+    if let Some(gate) = gate {
+        let _ = gate.arrived.send(());
+        if !matches!(
+            tokio::time::timeout(Duration::from_secs(10), gate.release).await,
+            Ok(Ok(()))
+        ) {
+            return Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from("synthetic response gate abandoned"))
+                .unwrap();
+        }
+    }
     if !state.wait_for_limiter_start().await {
         return Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
