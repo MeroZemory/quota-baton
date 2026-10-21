@@ -11,30 +11,42 @@ pub(super) fn usage(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardStat
         Color::Text,
         false,
     );
+    let summary = format!(
+        "남은 양 · 00:00–24:00 · {}",
+        v.clock.day_label(v.clock.utc())
+    );
+    let summary_width = b.measured_width(&summary, 12., false) + 4.;
     b.text(
-        rect(card.left + 144., card.top + 16., 300., 20.),
-        format!(
-            "남은 양 · 00:00–24:00 · {}",
-            v.clock.day_label(v.clock.utc())
+        rect(card.left + 144., card.top + 16., summary_width, 20.),
+        summary,
+        12.,
+        false,
+        Color::Secondary,
+        false,
+    );
+    let legend = "━ 5시간 (Free는 30일)  ┄ 주간  ⋮ 초기화  ▧ 크레딧으로 처리";
+    let legend_width = b.measured_width(legend, 12., false) + 4.;
+    let legend_left = card.right - 16. - legend_width;
+    let legend_wrap = legend_left < card.left + 144. + summary_width + 16.;
+    b.text(
+        rect(
+            legend_left,
+            card.top + if legend_wrap { 40. } else { 16. },
+            legend_width,
+            20.,
         ),
+        legend,
         12.,
         false,
         Color::Secondary,
         false,
     );
-    b.text(
-        rect(card.right - 520., card.top + 16., 504., 20.),
-        "━ 5시간 남은 양  ┄ 주간 남은 양  ⋮ 초기화  ▧ 크레딧으로 처리",
-        12.,
-        false,
-        Color::Secondary,
-        false,
-    );
+    let header_extra = if legend_wrap { 24. } else { 0. };
     let viewport = rect(
         card.left + 12.,
-        card.top + 52.,
+        card.top + 52. + header_extra,
         width(card) - 24.,
-        height(card) - 64.,
+        height(card) - 64. - header_extra,
     );
     let columns = if width(card) < 1140. { 2 } else { 3 };
     let tw = (width(viewport) - (columns - 1) as f32 * 12.) / columns as f32;
@@ -288,12 +300,14 @@ fn usage_tile(
     }
     let nowx = x(v.clock.utc());
     b.line([nowx, plot.top], [nowx, plot.bottom], Color::Text, 1., None);
+    // Reserve a separate caption row below future-reset text and above the plot.
+    let now_width = b.measured_width("지금", 11., true) + 4.;
     b.text(
         rect(
-            (nowx - 12.).clamp(plot.left, plot.right - 26.),
-            plot.top - 18.,
-            28.,
-            18.,
+            (nowx - now_width / 2.).clamp(plot.left, plot.right - now_width),
+            plot.top - 22.,
+            now_width,
+            16.,
         ),
         "지금",
         11.,
@@ -586,11 +600,13 @@ fn usage_tile(
 
 // §7: symmetric separation, then a common shift at either plot edge.
 fn end_label_positions(preferred: &[f32], plot: Rect) -> Vec<f32> {
+    // Keep at least §7's 14 DIP separation and room for each 16 DIP backing.
+    const GAP: f32 = 16.;
     let mut positions = preferred.to_vec();
     // Pool colliding neighbours around their original mean (also handles >2 windows).
     let mut blocks: Vec<(usize, usize, f32)> = Vec::new();
     for (i, &y) in preferred.iter().enumerate() {
-        blocks.push((i, 1, y - i as f32 * 14.));
+        blocks.push((i, 1, y - i as f32 * GAP));
         while blocks.len() > 1 {
             let n = blocks.len();
             if blocks[n - 2].2 <= blocks[n - 1].2 {
@@ -609,7 +625,7 @@ fn end_label_positions(preferred: &[f32], plot: Rect) -> Vec<f32> {
     }
     for (start, count, mean) in blocks {
         for (i, y) in positions.iter_mut().enumerate().skip(start).take(count) {
-            *y = mean + i as f32 * 14.;
+            *y = mean + i as f32 * GAP;
         }
     }
     if let Some(&first) = positions.first() {

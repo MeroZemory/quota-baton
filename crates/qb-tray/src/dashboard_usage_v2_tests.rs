@@ -43,8 +43,11 @@ fn fixture() -> (m::DashboardView, m::UsageTile) {
     (v, t)
 }
 fn scene(v: &m::DashboardView, t: &m::UsageTile) -> Scene {
+    scene_at_width(v, t, 406.)
+}
+fn scene_at_width(v: &m::DashboardView, t: &m::UsageTile, tile_width: f32) -> Scene {
     let metrics = Metrics::default();
-    let outer = rect(0., 0., 406., 288.);
+    let outer = rect(0., 0., tile_width, 288.);
     let mut b = Builder {
         scene: Scene {
             modal: false,
@@ -155,6 +158,7 @@ fn r10_usage_end_labels_separate_symmetrically_clamp_and_have_backings() {
         let (ai, ar, _) = endpoint_text(&s, &format!("{a}%"));
         let (bi, br, _) = endpoint_text(&s, &format!("{b}%"));
         assert!((ar.top - br.top).abs() >= 14.);
+        assert!(intersection(ar, br).is_none());
         for (i, r) in [(ai, ar), (bi, br)] {
             assert!(
                 r.top >= plot.top + 6. && r.bottom <= plot.bottom - 2.,
@@ -177,6 +181,105 @@ fn r10_usage_end_labels_separate_symmetrically_clamp_and_have_backings() {
                         .signed_duration_since(v.clock.day_start)
                         .num_milliseconds() as f32;
             assert!((ar.left - now_x - 6.).abs() < 0.01);
+        }
+    }
+}
+
+#[test]
+fn r10_usage_now_caption_and_edge_endpoints_have_separate_bounded_rows() {
+    let (v, mut t) = fixture();
+    for tile_width in [406., 476.] {
+        for future_reset in [false, true] {
+            for (a, b) in [(100., 100.), (0., 0.), (99., 100.), (0., 1.), (64., 65.)] {
+                for (series, pct) in t.series.iter_mut().zip([a, b]) {
+                    series.points.last_mut().unwrap().1 = Some(pct);
+                    series.future_resets = if future_reset {
+                        vec![v.clock.utc() + Duration::hours(1)]
+                    } else {
+                        vec![]
+                    };
+                }
+                let s = scene_at_width(&v, &t, tile_width);
+                let plot = s.charts[0].rect;
+                let (_, now, _) = text(&s, "지금");
+                assert!(now.top >= 60. && now.bottom <= plot.top - 6.);
+                assert!(now.left >= plot.left && now.right <= plot.right);
+                if future_reset {
+                    let reset = format!(
+                        "{} 초기화",
+                        v.clock.time(Some(v.clock.utc() + Duration::hours(1)))
+                    );
+                    assert!(intersection(now, text(&s, &reset).1).is_none());
+                }
+                for pct in [a, b] {
+                    let (i, label, _) = endpoint_text(&s, &format!("{pct}%"));
+                    assert!(intersection(now, label).is_none());
+                    assert!(label.top >= plot.top + 6. && label.bottom <= plot.bottom - 2.);
+                    assert!(label.left >= plot.left && label.right <= plot.right);
+                    backed(&s, i, label);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn r10_usage_full_legend_is_measured_contained_and_clear_of_header_and_tiles() {
+    let (mut v, t) = fixture();
+    v.usage = vec![t];
+    let state = DashboardState {
+        tab: Tab::Usage,
+        ..Default::default()
+    };
+    let legend = "━ 5시간 (Free는 30일)  ┄ 주간  ⋮ 초기화  ▧ 크레딧으로 처리";
+    let summary = format!(
+        "남은 양 · 00:00–24:00 · {}",
+        v.clock.day_label(v.clock.utc())
+    );
+    for size in [[1320., 960.], [1024., 640.]] {
+        for measured_legend_width in [500., 600.] {
+            let mut metrics = Metrics::default();
+            let measure = Measure {
+                text: legend.into(),
+                size: 12.,
+                line_height: 20.,
+                width: 4096.,
+                bold: false,
+                wrap: false,
+                face: Face::Text,
+                align: TextAlign::Leading,
+            };
+            metrics.widths.insert(measure.key(), measured_legend_width);
+            metrics.widths.insert(
+                Measure {
+                    text: summary.clone(),
+                    ..measure
+                }
+                .key(),
+                340.,
+            );
+            let s = Scene::build(&v, &state, size, &metrics);
+            let (_, bounds, _) = text(&s, legend);
+            assert_eq!(width(bounds), measured_legend_width + 4.);
+            assert!(bounds.left >= 36. && bounds.right <= size[0] - 36.);
+            for value in ["오늘 사용량", summary.as_str()] {
+                assert!(intersection(bounds, text(&s, value).1).is_none());
+            }
+            assert!(
+                s.targets
+                    .iter()
+                    .all(|target| intersection(bounds, target.rect).is_none())
+            );
+            assert!(s.draw.iter().all(|d| match d {
+                Draw::Stroke {
+                    rect,
+                    color: Color::GroupBorder,
+                    radius,
+                    ..
+                } if *radius == 6. => bounds.bottom + 8. <= rect.top,
+                _ => true,
+            }));
+            assert_eq!(bounds.top, if size[0] == 1024. { 104. } else { 80. });
         }
     }
 }

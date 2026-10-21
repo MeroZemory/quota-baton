@@ -466,6 +466,56 @@ impl Renderer {
 mod tests {
     use super::*;
     #[test]
+    fn r10_relogin_action_keeps_its_complete_directwrite_label_at_boundary_widths() -> Result<()> {
+        let renderer = Renderer::new(false)?;
+        let mut state = DashboardState::default();
+        let mut view = crate::dashboard_model::project(
+            &crate::dashboard_fixtures::snapshot(),
+            &mut state,
+            &crate::dashboard_fixtures::clock(),
+        );
+        view.groups.truncate(1);
+        view.groups[0].name = "아주 긴 합성 계정 이름을 가진 재로그인 대상".into();
+        view.groups[0].relogin = true;
+        view.groups[0].relogin_reason = "다시 로그인 필요".into();
+        for width in [1024., 1179., 1180., 1320.] {
+            let scene = renderer.scene(&view, &state, [width, 960.])?;
+            let button = scene
+                .targets
+                .iter()
+                .find(|t| t.target == Target::OpenTrayAccount(view.groups[0].id.clone()))
+                .unwrap()
+                .rect;
+            let (rect, measure) = scene
+                .draw
+                .iter()
+                .find_map(|draw| match draw {
+                    Draw::Text { rect, measure, .. }
+                        if measure.text == "트레이에서 다시 로그인"
+                            && rect.left >= button.left
+                            && rect.right <= button.right
+                            && rect.top >= button.top
+                            && rect.bottom <= button.bottom =>
+                    {
+                        Some((*rect, measure))
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            let layout = renderer.shared.dashboard_text().layout(
+                &measure.text,
+                bounds(rect),
+                style(measure),
+            )?;
+            assert_eq!(layout.metrics.visible_lines, 1);
+            assert!(
+                !layout.metrics.trimmed,
+                "relogin action must not truncate at {width} DIP"
+            );
+        }
+        Ok(())
+    }
+    #[test]
     fn r10_single_line_account_names_fit_their_actual_directwrite_line_boxes() -> Result<()> {
         let renderer = Renderer::new(false)?;
         let mut state = DashboardState::default();
