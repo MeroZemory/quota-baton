@@ -69,6 +69,8 @@ pub enum AccountsCommand {
     Enable { id: String },
     #[command(about = "계정 사용량을 갱신합니다")]
     RefreshUsage { id: String },
+    #[command(about = "사용량 한도를 해제하고 다음 요청으로 다시 시도합니다")]
+    ReleaseHold { id: String },
     #[command(about = "CPA 연결 계정을 직접 갱신하도록 전환합니다")]
     Adopt {
         #[arg(required = true, num_args = 1..)]
@@ -145,6 +147,7 @@ pub async fn run(command: AccountsCommand, home: &Path, config: &Config) -> anyh
         }
         AccountsCommand::Adopt { ids, from } => adopt_accounts(home, config, ids, from).await?,
         AccountsCommand::Refresh { id, force } => refresh_tokens(home, config, id, force).await?,
+        AccountsCommand::ReleaseHold { id } => release_hold(home, config, &id).await?,
         AccountsCommand::RefreshUsage { id } => refresh_usage(home, config, &id).await?,
         AccountsCommand::Pause { id } => action(home, config, &id, "pause").await?,
         AccountsCommand::Resume { id } => action(home, config, &id, "resume").await?,
@@ -865,6 +868,49 @@ async fn action(home: &Path, config: &Config, id: &str, action: &str) -> anyhow:
         "계정 {}: {}",
         cell(&serde_json::json!(id)),
         translated(&serde_json::to_value(state)?)
+    );
+    Ok(())
+}
+
+async fn release_hold(home: &Path, config: &Config, id: &str) -> anyhow::Result<()> {
+    use std::io::{IsTerminal, Write};
+    valid_account_id(id)?;
+    if !std::io::stdin().is_terminal() {
+        return Err(account_error(
+            "대화형 터미널에서 계정 ID를 입력해 확인해 주세요.",
+        ));
+    }
+    println_utf8!(
+        "계정 {}의 사용량 한도를 해제합니다. 다음 요청은 상위 서비스에 다시 시도합니다. 계정 ID를 입력하세요:",
+        id
+    );
+    std::io::stdout().flush()?;
+    let mut confirm = String::new();
+    std::io::stdin().read_line(&mut confirm)?;
+    if confirm.trim() != id {
+        return Err(account_error("확인이 일치하지 않아 취소했습니다."));
+    }
+    let (client, base, token) = running_admin(home, config)
+        .await?
+        .ok_or_else(|| account_error("한도를 해제하려면 코어를 먼저 실행해 주세요."))?;
+    account_response(
+        admin_route_response(
+            client
+                .post(format!("{base}/accounts/{id}/release-hold"))
+                .bearer_auth(token.trim())
+                .json(&serde_json::json!({"confirm":id}))
+                .send()
+                .await?,
+            &client,
+            &base,
+            &token,
+        )
+        .await?,
+    )
+    .await?;
+    println_utf8!(
+        "계정 {}의 한도를 해제했습니다. 다음 요청으로 다시 시도합니다.",
+        id
     );
     Ok(())
 }

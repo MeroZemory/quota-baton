@@ -1245,6 +1245,11 @@ fn dispatch_account(hwnd: HWND, id: String, action: MenuAction, ticket: Option<T
                 );
                 use super::client::{AccountAction as A, AccountPatch};
                 match action {
+                    MenuAction::ReleaseHold => {
+                        anyhow::ensure!(row.menu.show_release_hold, "unavailable");
+                        // Selecting this explicit action supplies the operator confirmation.
+                        client.account_action(&id, A::ReleaseHold).await?;
+                    }
                     MenuAction::RefreshUsage => {
                         anyhow::ensure!(row.menu.show_refresh_usage, "unavailable");
                         client.account_action(&id, A::RefreshUsage).await?;

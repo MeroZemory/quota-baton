@@ -165,7 +165,7 @@ async fn upgrade_uses_its_own_ingress_deadline_independent_of_http_timeout() {
     }
 }
 
-async fn strict(h: &Harness) {
+pub(super) async fn strict(h: &Harness) {
     let table = h.state.bindings.clone();
     tokio::task::spawn_blocking(move || {
         table.set_routing_session(

@@ -22,6 +22,7 @@ The documentation map is in `docs/README.md`. The normative behaviour is in `doc
   - Keep only what a report or review cites: `.sandbox/reports/<M>.md` with its cited evidence files, `.sandbox/reviews`, `.sandbox/briefs` and `.sandbox/research`.
   - Never copy test executables or debug symbols (`*.exe`, `*.pdb`) into `.sandbox`. Cite their test names instead.
   - Body captures that contain conversation content are deleted as soon as their result is recorded.
+  - Native Codex run harnesses delete each run's temporary home at run close, after copying the result JSON into the report evidence. Native Codex installs its own app-server daemon package (`profile/.codex/packages/app-server-daemon`, ~0.32 GiB `codex.exe`) into every fresh home, so a kept home costs that much per run. Keep a home only while its run is live or under a named review.
 
 ## Working rules for the implementer main (supervisor common rules, 2026-10-13)
 

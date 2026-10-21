@@ -792,6 +792,143 @@ fn r9_pending_root_is_never_shadowed_by_completed_child_provenance() {
     assert!(resume_entry(&f.store.load().unwrap(), A).is_ok());
 }
 
+fn r12_9_q_owned_cpa_history() -> (Fixture, [PathBuf; 3]) {
+    let mut f = Fixture::new();
+    let ancestor = f.add(A, None, false, "active");
+    let parent = f.add(B, Some(A), false, "active");
+    let child = f.add(C, Some(B), false, "active");
+    for path in [&ancestor, &parent] {
+        let mut meta: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        meta["payload"]["model_provider"] = "cliproxyapi".into();
+        fs::write(path, format!("{meta}\n")).unwrap();
+    }
+    Connection::open(f.source.join("state_5.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE threads SET model_provider='cliproxyapi' WHERE id IN (?1,?2)",
+            rusqlite::params![A, B],
+        )
+        .unwrap();
+    // Import eligibility remains strict for a genuinely external session.
+    assert_eq!(
+        f.import(C, false).unwrap_err().to_string(),
+        "지원하지 않는 대화 제공자 'cliproxyapi': openai 또는 qb만 이동할 수 있습니다"
+    );
+
+    // The same history is already in Q's home, with an authoritative row.
+    f.store.target = f.source.clone();
+    // A local resume must not search external homes either.
+    f.store
+        .search_homes
+        .push(f._root.path().join("absent-home"));
+    (f, [ancestor, parent, child])
+}
+
+#[test]
+fn r12_9_q_owned_resume_skips_cpa_ancestor_import_validation() {
+    let (f, paths) = r12_9_q_owned_cpa_history();
+    let before = source_snapshot(&f.store.target);
+    let rollouts = paths.each_ref().map(|path| fs::read(path).unwrap());
+    assert!(db::thread_path(&f.store.target, C).unwrap().is_some());
+    assert!(resume_in_target(&f.store, C, None).unwrap());
+    assert!(source_snapshot(&f.store.target) == before);
+    assert_eq!(
+        paths.each_ref().map(|path| fs::read(path).unwrap()),
+        rollouts
+    );
+    assert!(!f.store.path().exists());
+    assert!(!f.store.home.join("journal/session-moves").exists());
+    assert!(!f.store.map_path.exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn r12_9_q_owned_resume_refuses_writer_through_hardlink() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows::Win32::Storage::FileSystem::{
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let (f, paths) = r12_9_q_owned_cpa_history();
+    let other_home = f._root.path().join("other-home");
+    fs::create_dir_all(&other_home).unwrap();
+    let alias = other_home.join("writer.jsonl");
+    for path in &paths {
+        fs::hard_link(path, &alias).unwrap();
+        let before = source_snapshot(&f.store.target);
+        let bytes = fs::read(path).unwrap();
+        // The writer permits all sharing; the Q rollout probe must deny it.
+        let writer = File::options()
+            .append(true)
+            .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0)
+            .open(&alias)
+            .unwrap();
+        let error = resume_in_target(&f.store, C, None).unwrap_err();
+        assert!(error.downcast_ref::<guard::LiveWriter>().is_some());
+        assert!(source_snapshot(&f.store.target) == before);
+        assert_eq!(fs::read(path).unwrap(), bytes);
+        assert!(!f.store.path().exists());
+        drop(writer);
+        assert!(resume_in_target(&f.store, C, None).unwrap());
+        fs::remove_file(&alias).unwrap();
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn r12_9_q_owned_resume_refuses_native_ancestor_thread_lock() {
+    let (f, _) = r12_9_q_owned_cpa_history();
+    let locks = f.store.target.join("thread-writer-locks");
+    fs::create_dir_all(&locks).unwrap();
+    for id in [A, B, C] {
+        let lock = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(locks.join(format!("{id}.lock")))
+            .unwrap();
+        lock.try_lock().unwrap();
+        let error = resume_in_target(&f.store, C, None).unwrap_err();
+        assert!(error.downcast_ref::<guard::LiveWriter>().is_some());
+        drop(lock);
+        assert!(resume_in_target(&f.store, C, None).unwrap());
+    }
+}
+
+#[test]
+fn r12_9_q_row_does_not_bypass_incomplete_import_journal() {
+    let f = Fixture::new();
+    f.add(A, None, false, "active");
+    f.import(A, true).unwrap();
+    let mut journal = f.store.load().unwrap();
+    journal.imports.get_mut(A).unwrap().complete = false;
+    f.store.save(&journal).unwrap();
+    let before = fs::read(f.store.path()).unwrap();
+    assert!(db::thread_path(&f.store.target, A).unwrap().is_some());
+    assert_eq!(
+        resume_in_target(&f.store, A, None).unwrap_err().to_string(),
+        "대화 가져오기가 완료되지 않았습니다"
+    );
+    assert_eq!(fs::read(f.store.path()).unwrap(), before);
+}
+
+#[test]
+fn r12_9_q_row_keeps_completed_import_link_validation() {
+    let f = Fixture::new();
+    f.add(A, None, false, "active");
+    f.import(A, true).unwrap();
+    let entry = f.store.load().unwrap().imports[A].clone();
+    let path = &entry.files[0].target;
+    let bytes = fs::read(path).unwrap();
+    fs::remove_file(path).unwrap();
+    fs::write(path, bytes).unwrap();
+    let before = fs::read(f.store.path()).unwrap();
+    assert!(db::thread_path(&f.store.target, A).unwrap().is_some());
+    assert!(resume_in_target(&f.store, A, None).is_err());
+    assert_eq!(fs::read(f.store.path()).unwrap(), before);
+}
+
 #[test]
 fn r9_paginated_stale_rows_deleted_before_rename_recover_from_journal() {
     let mut f = Fixture::new();

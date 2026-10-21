@@ -125,7 +125,9 @@ impl CurrentCompletion {
         let kind = event
             .and_then(|value| value.get("type"))
             .and_then(Value::as_str);
-        let error = matches!(kind, Some("error" | "response.failed"));
+        let error = matches!(kind, Some("error" | "response.failed"))
+            || (matches!(kind, Some("response.done" | "response.completed"))
+                && event.is_some_and(|event| event["response"]["status"] == "failed"));
         if error {
             self.completion.record.upstream_error_code = event.and_then(safe_error_code);
             if let Some(status) = event
@@ -141,11 +143,35 @@ impl CurrentCompletion {
             self.last_create = None;
         }
         match kind {
+            _ if error => Some("upstream_error"),
             Some("response.completed" | "response.done") => Some("ok"),
-            Some("error" | "response.failed") => Some("upstream_error"),
             _ => None,
         }
     }
+}
+
+// Connection diagnostics have no turn/session attribution. Reuse the socket's
+// random connection ID as req so this bounded record joins ws_open/ws_close.
+fn record_connection_error(context: &Context, event: &Value) {
+    let mut diagnostic = Completion::new(
+        context.observability.clone(),
+        &Method::GET,
+        "/v1/responses",
+        Codex,
+        &HeaderMap::new(),
+    );
+    diagnostic.dashboard_enabled = false;
+    diagnostic.record.req = context.connection.clone();
+    diagnostic.record.transport = "ws".into();
+    diagnostic.record.account = Some(context.account.clone());
+    diagnostic.record.status = event
+        .get("status")
+        .and_then(Value::as_u64)
+        .filter(|status| (100..=599).contains(status))
+        .map_or(101, |status| status as u16);
+    diagnostic.record.upstream_status = Some(diagnostic.record.status);
+    diagnostic.record.upstream_error_code = safe_error_code(event);
+    diagnostic.finish("ws_connection_error");
 }
 
 // One budget belongs to a response.create, including a cancelled open-socket
@@ -965,6 +991,7 @@ async fn run_with_read_timeout(
     let mut initial_ready = false;
     let mut current = BTreeMap::<u64, CurrentCompletion>::new();
     let mut next_request = 0;
+    let mut connection_errors = 0_u8;
     let mut model: Option<String> = None;
     let mut drain_signal = context.drain_signal.take();
     let context = Arc::new(context);
@@ -1297,6 +1324,16 @@ async fn run_with_read_timeout(
                         }
                         let event = if let Message::Text(text) = &message { parsed(text.as_str()) } else { None };
                         let request = response_completion(&mut current, event.as_ref());
+                        if request.is_none() && connection_errors < 16
+                            && let Some(error) = event.as_ref().filter(|event| {
+                                matches!(event["type"].as_str(), Some("error" | "response.failed"))
+                                    || (matches!(event["type"].as_str(), Some("response.done" | "response.completed"))
+                                        && event["response"]["status"] == "failed")
+                            })
+                        {
+                            record_connection_error(&context, error);
+                            connection_errors += 1;
+                        }
                         let mut suppress_rate_event = false;
                         if let Some(event) = event.as_ref() {
                             if let Some(runtime) = &context.runtime {
@@ -1313,6 +1350,12 @@ async fn run_with_read_timeout(
                                 context.observability.observe_codex_event(&context.account, event);
                             }
                             if matches!(event.get("type").and_then(Value::as_str), Some("error" | "response.failed")) {
+                                if event.get("status").and_then(Value::as_u64) == Some(400)
+                                    && safe_error_code(event).as_deref() == Some("websocket_connection_limit_reached")
+                                    && let Some(relay) = &context.relay
+                                {
+                                    relay.ws_capacity.stream_connection_limit(&context.account);
+                                }
                                 let active_model = request.and_then(|id| current.get(&id)).and_then(|active| active.model.as_deref());
                                 // During takeover, relay the current turn's error unchanged:
                                 // no auth refresh, health transition, failover, or rate retry.
