@@ -64,7 +64,7 @@ Implement quota-baton exactly as specified, milestone by milestone, until M8 is 
 | R9 | merged (dev 11851c2). Merge review INSTALL-AFTER-FIXES → R9.1 before install |
 | R9.1 | merged (fd7a8dc), but the live install was ROLLED BACK: every codex-qb launch failed on the real profile → R9.2 |
 | R9.2 | merged and INSTALLED (6caf65a); live move and return work, but are slow → R9.3 |
-| R9.3 | single-id move/return speed (382 s + about 9 min today; target ≤ 10 s / ≤ 20 s) and herdr map path format; right after R10's gate; brief `R9.3-live-move-findings.md` |
+| R9.3 | merged (`10f93e4`; production `9682d50` plus test-only hardening). Full gate: default 1,753/0, full 1,874/0, core 573/0; strict clippy and schema-3 journal read-only check passed. Synthetic 5,300 rollouts: preview 3.32 s, move commit 4.41 s, return commit 0.43 s. Report `.sandbox/reports/R9.3.md`; live timing/install belongs to design |
 | R10 | merged and INSTALLED (a35be74); live acceptance 13 pass / 3 partial, no must-fix |
 | R10.1 | dashboard live fixes S1-S5, O-a (Codex model '—'), O-b (originator label), F17 capture; after R9.3; brief `R10.1-dashboard-live-fixes.md` |
 | R11 | launch-scoped account and per-account model catalog (D22, resolves O13: /daybreak through codex-qb); after R10; brief `R11-launch-account.md` |
