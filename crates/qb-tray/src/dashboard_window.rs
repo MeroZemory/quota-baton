@@ -3,6 +3,8 @@
 #![cfg(windows)]
 #[path = "dashboard_bridge.rs"]
 pub mod dashboard_bridge;
+#[path = "dashboard_time.rs"]
+mod dashboard_time;
 #[path = "window_logic.rs"]
 mod window_logic;
 use super::accessibility;
@@ -16,7 +18,7 @@ use qb_tray::{
 };
 use std::{
     cell::RefCell,
-    collections::BTreeMap,
+    collections::{BTreeSet, HashMap, HashSet},
     ffi::c_void,
     mem::size_of,
     rc::Rc,
@@ -29,13 +31,14 @@ use std::{
 use window_logic::{Editor, Lifecycle, Stamp};
 use windows::{
     Win32::{
-        Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
+        Foundation::{FILETIME, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
         Graphics::{
             Direct2D::{
                 Common::{D2D_SIZE_U, D2D1_ALPHA_MODE_IGNORE, D2D1_PIXEL_FORMAT},
                 D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_HWND_RENDER_TARGET_PROPERTIES,
-                D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES, D2D1CreateFactory,
-                ID2D1Factory, ID2D1HwndRenderTarget,
+                D2D1_PRESENT_OPTIONS_IMMEDIATELY, D2D1_PRESENT_OPTIONS_RETAIN_CONTENTS,
+                D2D1_RENDER_TARGET_PROPERTIES, D2D1CreateFactory, ID2D1Factory,
+                ID2D1HwndRenderTarget,
             },
             Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
             Gdi::{
@@ -44,7 +47,10 @@ use windows::{
                 PAINTSTRUCT, ScreenToClient,
             },
         },
-        System::LibraryLoader::GetModuleHandleW,
+        System::{
+            LibraryLoader::GetModuleHandleW,
+            Threading::{GetCurrentThread, GetThreadTimes},
+        },
         UI::{
             HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI},
             Input::KeyboardAndMouse::{
@@ -72,11 +78,131 @@ thread_local! {
 }
 
 struct Frame {
-    scene: Scene,
+    scene: render::CachedScene,
+    view: Arc<model::DashboardView>,
     stamp: Stamp,
     actions: Vec<Target>,
     elements: Vec<(i32, Target)>,
+    focus: Option<Target>,
+    keyboard_focus: bool,
+    focused: bool,
+    next_clock: Option<chrono::DateTime<chrono::Utc>>,
+    prepared: Option<accessibility::PreparedSnapshot>,
 }
+/// Bounded, opt-in timings. EndDraw is submission/present-call time, not GPU completion.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct FrameTiming {
+    pub input_seq: u64,
+    pub rebuild_reason: Option<&'static str>,
+    pub tab: String,
+    pub hover: Option<String>,
+    pub offsets: [f32; 4],
+    pub snapshot_us: u64,
+    pub project_us: u64,
+    pub scene_us: u64,
+    pub paint_us: u64,
+    pub publish_us: u64,
+    pub frame_us: u64,
+    pub thread_cpu_us: Option<u64>,
+    pub nodes: usize,
+    pub rebuilt: bool,
+    pub full_scene_build: bool,
+    pub retained_target: bool,
+    pub partial_scroll: bool,
+    pub paint_clip: Option<[f32; 4]>,
+    pub draw_commands: usize,
+    pub uia: PublicationTiming,
+    pub phases: render::PhaseStats,
+}
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct PublicationTiming {
+    pub ids_us: u64,
+    pub elements_us: u64,
+    pub validate_us: u64,
+    pub swap_us: u64,
+}
+fn micros(start: Instant) -> u64 {
+    start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+}
+fn thread_cpu_ticks() -> Option<u64> {
+    let (mut created, mut exited, mut kernel, mut user) = (
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+    );
+    unsafe {
+        GetThreadTimes(
+            GetCurrentThread(),
+            &mut created,
+            &mut exited,
+            &mut kernel,
+            &mut user,
+        )
+        .ok()?;
+    }
+    let ticks = |t: FILETIME| (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime);
+    Some(ticks(kernel).saturating_add(ticks(user)))
+}
+#[cfg(feature = "testkit")]
+#[allow(dead_code)]
+pub fn perf_take_frames(hwnd: HWND) -> Vec<FrameTiming> {
+    current(hwnd).map_or_else(Vec::new, |h| std::mem::take(&mut h.borrow_mut().timings))
+}
+#[cfg(feature = "testkit")]
+#[allow(dead_code)]
+pub fn perf_scene(hwnd: HWND) -> Option<Scene> {
+    current(hwnd).and_then(|h| {
+        h.borrow()
+            .frame
+            .as_ref()
+            .map(|f| f.scene.as_scene().clone())
+    })
+}
+#[cfg(feature = "testkit")]
+#[allow(dead_code)]
+pub fn perf_input_seq(hwnd: HWND) -> u64 {
+    current(hwnd).map_or(0, |h| h.borrow().input_seq)
+}
+#[cfg(feature = "testkit")]
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct PerfCacheState {
+    pub epoch: usize,
+    pub actions: usize,
+    pub elements: usize,
+    pub next_clock: Option<chrono::DateTime<chrono::Utc>>,
+    pub clock_reconcile: bool,
+}
+#[cfg(feature = "testkit")]
+#[allow(dead_code)]
+pub fn perf_cache_state(hwnd: HWND) -> Option<PerfCacheState> {
+    let host = current(hwnd)?;
+    let h = host.borrow();
+    let f = h.frame.as_ref()?;
+    Some(PerfCacheState {
+        epoch: f.stamp.epoch,
+        actions: f.actions.len(),
+        elements: f.elements.len(),
+        next_clock: h.next_clock,
+        clock_reconcile: h.clock_reconcile,
+    })
+}
+#[cfg(feature = "testkit")]
+#[allow(dead_code)]
+pub fn perf_set_time(hwnd: HWND, clock: model::Clock, uptime_ms: u64) {
+    if let Some(host) = current(hwnd) {
+        let mut h = host.borrow_mut();
+        h.clock = clock;
+        h.clock_at = Instant::now();
+        if let Some(started) =
+            Instant::now().checked_sub(std::time::Duration::from_millis(uptime_ms))
+        {
+            h.started = started;
+        }
+    }
+}
+
 struct Host {
     hwnd: HWND,
     port: UiPort,
@@ -88,6 +214,7 @@ struct Host {
     started: Instant,
     last_tick: u64,
     last_clock_request: u64,
+    clock_reconcile: bool,
     dark: bool,
     state: DashboardState,
     input: render::Interaction,
@@ -98,13 +225,23 @@ struct Host {
     renderer: render::Renderer,
     editor_text: qb_tray::v2_text::Text,
     frame: Option<Frame>,
+    tab_frames: Vec<(Tab, Frame)>,
+    pending_tab: Option<Frame>,
+    scroll_scene: Option<(render::CachedScene, ScrollRegion, Option<qb_tray::Rect>)>,
     root: Option<accessibility::RootProvider>,
-    ids: BTreeMap<String, i32>,
+    ids: HashMap<String, i32>,
     next_id: i32,
     suppress_geometry: bool,
     closing: bool,
     pointer_region: Option<ScrollRegion>,
     focused: bool,
+    profiling: bool,
+    timings: Vec<FrameTiming>,
+    input_seq: u64,
+    dirty_reason: &'static str,
+    projected: Option<Arc<model::DashboardView>>,
+    next_clock: Option<chrono::DateTime<chrono::Utc>>,
+    target_metrics: Option<([u32; 2], u32)>,
 }
 fn current(hwnd: HWND) -> Option<Rc<RefCell<Host>>> {
     HOST.with(|slot| {
@@ -168,12 +305,21 @@ fn invalidate_frame(h: &mut Host) {
     // Retain the last completed read snapshot until its replacement is ready.
     // Close action admission immediately; reopen only after successful publication.
     h.frame = None;
+    h.tab_frames.clear();
+    h.pending_tab = None;
+    h.scroll_scene = None;
     h.life.invalidate();
 }
 
 fn redraw(hwnd: HWND) {
+    redraw_for(hwnd, "state");
+}
+fn redraw_for(hwnd: HWND, reason: &'static str) {
     if let Some(host) = current(hwnd) {
-        invalidate_frame(&mut host.borrow_mut());
+        let mut h = host.borrow_mut();
+        invalidate_frame(&mut h);
+        h.projected = None;
+        h.dirty_reason = reason;
     }
     repaint(hwnd);
 }
@@ -281,6 +427,7 @@ pub fn open_or_focus(
             started: Instant::now(),
             last_tick: 0,
             last_clock_request: 0,
+            clock_reconcile: false,
             dark,
             state,
             input: Default::default(),
@@ -291,13 +438,24 @@ pub fn open_or_focus(
             renderer,
             editor_text,
             frame: None,
+            tab_frames: vec![],
+            pending_tab: None,
+            scroll_scene: None,
             root,
-            ids: BTreeMap::new(),
+            ids: HashMap::new(),
             next_id: 1,
             suppress_geometry: true,
             closing: false,
             pointer_region: None,
             focused: false,
+            profiling: cfg!(any(debug_assertions, feature = "testkit"))
+                && std::env::var_os("QB_DASHBOARD_PROFILE").is_some(),
+            timings: Vec::new(),
+            input_seq: 0,
+            dirty_reason: "initial",
+            projected: None,
+            next_clock: None,
+            target_metrics: None,
         })))
     });
     bridge.enqueue(Event::Opened { port });
@@ -368,6 +526,7 @@ fn activate(hwnd: HWND, target: Target) {
 }
 fn activate_target(hwnd: HWND, target: Target, enter: bool) {
     let Some(host) = current(hwnd) else { return };
+    let previous_tab = host.borrow().state.tab;
     let commands = {
         let mut h = host.borrow_mut();
         if !frame_valid(&h)
@@ -393,10 +552,49 @@ fn activate_target(hwnd: HWND, target: Target, enter: bool) {
             h.state.activate(&target)
         }
     };
-    if !matches!(target, Target::Search | Target::EventSearch) {
-        finish_edit(hwnd);
+    let edited = !matches!(target, Target::Search | Target::EventSearch) && finish_edit(hwnd);
+    if matches!(target, Target::Tab(_)) && !edited {
+        // Projection contains all tabs and does not depend on state.tab. A tab
+        // change only changes geometry. Mail/time/filter invalidation still
+        // clears this projection through redraw_for before it can be reused.
+        if let Some(host) = current(hwnd) {
+            let mut h = host.borrow_mut();
+            let clock = virtual_clock(&h).utc();
+            let expired = h.next_clock.is_some_and(|at| clock >= at)
+                || h.tab_frames.iter().any(|(tab, frame)| {
+                    *tab == h.state.tab
+                        && (clock < frame.view.clock.utc()
+                            || frame.next_clock.is_some_and(|at| clock >= at))
+                });
+            if expired {
+                invalidate_frame(&mut h);
+                h.projected = None;
+            } else {
+                if let Some(frame) = h.frame.take()
+                    && !frame.scene.modal
+                {
+                    h.tab_frames.retain(|(tab, _)| *tab != previous_tab);
+                    h.tab_frames.push((previous_tab, frame));
+                }
+                h.pending_tab = h
+                    .tab_frames
+                    .iter()
+                    .position(|(tab, _)| *tab == h.state.tab)
+                    .map(|index| h.tab_frames.swap_remove(index).1);
+                if h.pending_tab.is_none() {
+                    // A newly revealed tab may have earlier time buckets than
+                    // the old visible tab. Project it at the current clock.
+                    h.projected = None;
+                }
+                h.scroll_scene = None;
+                h.life.invalidate();
+            }
+            h.dirty_reason = "tab";
+        }
+        repaint(hwnd);
+    } else {
+        redraw(hwnd);
     }
-    redraw(hwnd);
     dispatch(hwnd, commands);
 }
 fn focus_edit(hwnd: HWND, target: Target) {
@@ -468,6 +666,7 @@ fn apply_mail(hwnd: HWND) {
     let pending = host.borrow().port.take();
     let Some(mut mail) = pending else { return };
     let mut placement = None;
+    let mut changed = false;
     {
         let mut h = host.borrow_mut();
         if h.closing {
@@ -483,19 +682,39 @@ fn apply_mail(hwnd: HWND) {
                 h.input.pressed = None;
                 h.state.popup = None;
             }
+            changed = !Arc::ptr_eq(&h.snapshot, &snapshot);
             h.snapshot = snapshot;
             h.clock = clock;
             h.clock_at = Instant::now();
+            h.clock_reconcile = false;
         }
         if let Some(clock) = mail.clock.take() {
+            let old_now = virtual_clock(&h).utc();
+            changed |= h.clock.day_start != clock.day_start
+                || h.clock.day_end != clock.day_end
+                || h.clock.now.offset() != clock.now.offset()
+                || (old_now - clock.utc()).num_seconds().abs() > 2
+                || h.projected
+                    .as_ref()
+                    .is_some_and(|view| clock.utc() < view.clock.utc())
+                || h.tab_frames
+                    .iter()
+                    .any(|(_, frame)| clock.utc() < frame.view.clock.utc())
+                || h.pending_tab
+                    .as_ref()
+                    .is_some_and(|frame| clock.utc() < frame.view.clock.utc())
+                || h.next_clock.is_some_and(|at| clock.utc() >= at);
             h.clock = clock;
             h.clock_at = Instant::now();
+            h.clock_reconcile = false;
         }
         if let Some((ticket, detail)) = mail.detail.take() {
             h.state.publish_detail(&ticket, detail);
+            changed = true;
         }
         for id in mail.removed {
             h.state.detail_removed(&id);
+            changed = true;
         }
         if let Some(dark) = mail.theme.take()
             && h.dark != dark
@@ -503,6 +722,7 @@ fn apply_mail(hwnd: HWND) {
         {
             h.renderer = renderer;
             h.dark = dark;
+            changed = true;
         }
         if let Some(saved) = mail.geometry.take() {
             let token = h.life.owner;
@@ -548,7 +768,9 @@ fn apply_mail(hwnd: HWND) {
             host.borrow_mut().suppress_geometry = false;
         }
     }
-    redraw(hwnd);
+    if changed {
+        redraw_for(hwnd, "mail");
+    }
 }
 
 unsafe fn remember_geometry(hwnd: HWND) {
@@ -612,8 +834,7 @@ unsafe fn print_client(hwnd: HWND, dc: HDC) -> Result<()> {
     // Refresh the same frame used by hit-testing and UIA before Windows copies it.
     unsafe { paint(hwnd) }?;
     let host = current(hwnd).ok_or_else(invalid)?;
-    let h = host.borrow();
-    let frame = h.frame.as_ref().ok_or_else(invalid)?;
+    let mut h = host.borrow_mut();
     let (pixels, dpi) = unsafe { metrics(hwnd) }.ok_or_else(invalid)?;
     let target = unsafe {
         h.factory
@@ -638,7 +859,16 @@ unsafe fn print_client(hwnd: HWND, dc: HDC) -> Result<()> {
             },
         )?;
     }
-    h.renderer.paint(&target, &frame.scene, &h.input)
+    let mut frame = h.frame.take().ok_or_else(invalid)?;
+    let result = paint_decorated(&h, &mut frame.scene, &target, None);
+    h.frame = Some(frame);
+    result
+}
+
+fn virtual_clock(h: &Host) -> model::Clock {
+    let mut clock = h.clock.clone();
+    clock.now += chrono::Duration::seconds(h.clock_at.elapsed().as_secs().min(120) as i64);
+    clock
 }
 
 unsafe fn paint(hwnd: HWND) -> Result<()> {
@@ -653,9 +883,21 @@ unsafe fn paint(hwnd: HWND) -> Result<()> {
         if pixels.contains(&0) {
             return Ok(());
         }
-        invalidate_frame(&mut h);
+        let profile = h.profiling;
+        h.renderer.set_phase_stats_enabled(profile);
+        h.renderer.reset_phase_stats();
+        h.editor_text.set_phase_stats_enabled(profile);
+        h.editor_text.reset_phase_stats();
+        let frame_start = profile.then(Instant::now);
+        let thread_start = profile.then(thread_cpu_ticks).flatten();
+        if h.frame.is_some() && !frame_valid(&h) {
+            invalidate_frame(&mut h);
+            h.projected = None;
+        }
+        let retained_target = h.target.is_some() && h.target_metrics == Some((pixels, dpi));
         if h.target.is_none() {
-            let rt = unsafe {
+            h.renderer.clear_target_resources();
+            h.target = Some(unsafe {
                 h.factory.CreateHwndRenderTarget(
                     &D2D1_RENDER_TARGET_PROPERTIES {
                         dpiX: dpi as f32,
@@ -668,60 +910,191 @@ unsafe fn paint(hwnd: HWND) -> Result<()> {
                             width: pixels[0],
                             height: pixels[1],
                         },
-                        presentOptions: D2D1_PRESENT_OPTIONS_NONE,
+                        // Event-driven painting must not block the window thread
+                        // for a refresh boundary. Retain pixels for damage clips.
+                        presentOptions: D2D1_PRESENT_OPTIONS_RETAIN_CONTENTS
+                            | D2D1_PRESENT_OPTIONS_IMMEDIATELY,
                     },
                 )
-            }?;
-            h.target = Some(rt);
+            }?);
+            h.target_metrics = Some((pixels, dpi));
         }
         let target = h.target.as_ref().unwrap().clone();
+        if h.target_metrics != Some((pixels, dpi)) {
+            unsafe {
+                target.Resize(&D2D_SIZE_U {
+                    width: pixels[0],
+                    height: pixels[1],
+                })?;
+                target.SetDpi(dpi as f32, dpi as f32);
+            }
+            h.target_metrics = Some((pixels, dpi));
+        }
         unsafe {
-            target.Resize(&D2D_SIZE_U {
-                width: pixels[0],
-                height: pixels[1],
-            })?;
-            target.SetDpi(dpi as f32, dpi as f32);
             target.SetTransform(&Matrix3x2::identity());
         }
-        let mut clock = h.clock.clone();
-        let delta = h.clock_at.elapsed().as_secs().min(120) as i64;
-        clock.now += chrono::Duration::seconds(delta);
-        let snapshot = h.snapshot.clone();
-        let view = model::project(&snapshot, &mut h.state, &clock);
-        let size = [
-            pixels[0] as f32 * 96. / dpi as f32,
-            pixels[1] as f32 * 96. / dpi as f32,
-        ];
-        let mut scene = h.renderer.scene(&view, &h.state, size)?;
-        for r in &scene.content {
-            h.state.scroll(r.region, r.offset, r.max_offset);
-        }
-        // Renderer measurement and model projection are performed once per
-        // complete frame; hit/UIA never compute an independent layout.
-        if let Some(focus) = h.input.focus.as_ref()
-            && !scene
-                .targets
-                .iter()
-                .any(|t| t.enabled && &t.target == focus)
+        let restored = h.pending_tab.take();
+        let republished = restored.is_some();
+        let rebuilt = h.frame.is_none() && !republished;
+        let (mut snapshot_us, mut project_us, mut scene_us) = (0, 0, 0);
+        let mut scroll_damage = None;
+        let mut frame = if let Some(frame) = h.frame.take().or(restored) {
+            h.next_clock = frame.next_clock;
+            h.projected = Some(frame.view.clone());
+            frame
+        } else {
+            let clock = virtual_clock(&h);
+            let view = if let Some(view) = &h.projected {
+                view.clone()
+            } else {
+                let part = profile.then(Instant::now);
+                let snapshot = h.snapshot.clone();
+                snapshot_us = part.map_or(0, micros);
+                let part = profile.then(Instant::now);
+                let view = Arc::new(model::project(&snapshot, &mut h.state, &clock));
+                project_us = part.map_or(0, micros);
+                h.projected = Some(view.clone());
+                view
+            };
+            let size = [
+                pixels[0] as f32 * 96. / dpi as f32,
+                pixels[1] as f32 * 96. / dpi as f32,
+            ];
+            let part = profile.then(Instant::now);
+            let scene = if let Some((previous, region, proposed)) = h.scroll_scene.take() {
+                let scene = h
+                    .renderer
+                    .scene_scroll(&view, &h.state, size, &previous, region)?;
+                if retained_target
+                    && let Some(proposed) = proposed
+                    && scene.scroll_damage_from(&previous) == Some(proposed)
+                    && scroll_decorations_contained(&h, &previous, &scene, proposed)
+                {
+                    scroll_damage = Some(proposed);
+                }
+                scene
+            } else {
+                h.renderer.scene_shared(&view, &h.state, size)?
+            };
+            scene_us = part.map_or(0, micros);
+            for region in &scene.content {
+                h.state
+                    .scroll(region.region, region.offset, region.max_offset);
+            }
+            if h.input.focus.as_ref().is_some_and(|focus| {
+                !scene
+                    .targets
+                    .iter()
+                    .any(|t| t.enabled && &t.target == focus)
+            }) {
+                h.input.focus = None;
+            }
+            h.next_clock = dashboard_time::next_visible_time_change(
+                &h.snapshot,
+                &h.state,
+                &scene,
+                &view.clock,
+                dpi,
+            );
+            Frame {
+                scene,
+                view,
+                stamp: Stamp {
+                    owner: h.life.owner,
+                    epoch: epoch().ok_or_else(invalid)?,
+                    pixels,
+                    dpi,
+                },
+                actions: vec![],
+                elements: vec![],
+                focus: h.input.focus.clone(),
+                keyboard_focus: h.input.keyboard_focus,
+                focused: h.focused,
+                next_clock: h.next_clock,
+                prepared: None,
+            }
+        };
+        let part = profile.then(Instant::now);
+        let clip = ((!rebuilt || scroll_damage.is_some())
+            && !republished
+            && ps.rcPaint.right > ps.rcPaint.left
+            && ps.rcPaint.bottom > ps.rcPaint.top)
+            .then(|| qb_tray::Rect {
+                left: ps.rcPaint.left as f32 * 96. / dpi as f32,
+                top: ps.rcPaint.top as f32 * 96. / dpi as f32,
+                right: ps.rcPaint.right as f32 * 96. / dpi as f32,
+                bottom: ps.rcPaint.bottom as f32 * 96. / dpi as f32,
+            });
+        paint_decorated(&h, &mut frame.scene, &target, clip)?;
+        let paint_us = part.map_or(0, micros);
+        let part = profile.then(Instant::now);
+        let mut uia = PublicationTiming::default();
+        if rebuilt
+            || republished
+            || frame.focus != h.input.focus
+            || frame.keyboard_focus != h.input.keyboard_focus
+            || frame.focused != h.focused
         {
-            h.input.focus = None;
+            let reuse = !rebuilt
+                && frame.focus == h.input.focus
+                && frame.keyboard_focus == h.input.keyboard_focus
+                && frame.focused == h.focused;
+            if !rebuilt {
+                frame.stamp.epoch = epoch().ok_or_else(invalid)?;
+            }
+            frame.focus = h.input.focus.clone();
+            frame.keyboard_focus = h.input.keyboard_focus;
+            frame.focused = h.focused;
+            uia = publish_accessibility(&mut h, &mut frame, reuse)?;
+            h.life.painted(frame.stamp);
         }
-        decorate_editor(&h, &mut scene)?;
-        h.renderer.paint(&target, &scene, &h.input)?;
-        let stamp = Stamp {
-            owner: h.life.owner,
-            epoch: epoch().ok_or_else(invalid)?,
-            pixels,
-            dpi,
-        };
-        let mut frame = Frame {
-            scene,
-            stamp,
-            actions: vec![],
-            elements: vec![],
-        };
-        publish_accessibility(&mut h, &mut frame)?;
-        h.life.painted(stamp);
+        let publish_us = part.map_or(0, micros);
+        if let Some(start) = frame_start {
+            let mut phases = h.renderer.phase_stats();
+            let editor = h.editor_text.phase_stats();
+            phases.text_measure_us = phases
+                .text_measure_us
+                .saturating_add(editor.text_measure_us);
+            phases.layout_creations = phases
+                .layout_creations
+                .saturating_add(editor.layout_creations);
+            phases.format_creations = phases
+                .format_creations
+                .saturating_add(editor.format_creations);
+            let timing = FrameTiming {
+                input_seq: h.input_seq,
+                rebuild_reason: rebuilt.then_some(h.dirty_reason),
+                tab: format!("{:?}", h.state.tab),
+                hover: h.input.hover.as_ref().map(|v| format!("{v:?}")),
+                offsets: [
+                    h.state.table_offset,
+                    h.state.side_offset,
+                    h.state.events_offset,
+                    h.state.usage_offset,
+                ],
+                snapshot_us,
+                project_us,
+                scene_us,
+                paint_us,
+                publish_us,
+                frame_us: micros(start),
+                thread_cpu_us: thread_start.and_then(|before| {
+                    thread_cpu_ticks().map(|after| after.saturating_sub(before) / 10)
+                }),
+                nodes: frame.scene.accessibility.len(),
+                rebuilt,
+                full_scene_build: rebuilt && frame.scene.rebuilt_region().is_none(),
+                retained_target,
+                partial_scroll: scroll_damage.is_some(),
+                paint_clip: clip.map(|r| [r.left, r.top, r.right, r.bottom]),
+                draw_commands: frame.scene.draw.len(),
+                uia,
+                phases,
+            };
+            if h.timings.len() < 4096 {
+                h.timings.push(timing);
+            }
+        }
         h.frame = Some(frame);
         Ok(())
     })();
@@ -732,14 +1105,32 @@ unsafe fn paint(hwnd: HWND) -> Result<()> {
         && let Some(host) = current(hwnd)
     {
         let mut h = host.borrow_mut();
+        h.renderer.clear_target_resources();
         h.target = None;
+        h.target_metrics = None;
         invalidate_frame(&mut h);
     }
     result
 }
+
+fn paint_decorated(
+    h: &Host,
+    scene: &mut Scene,
+    target: &windows::Win32::Graphics::Direct2D::ID2D1RenderTarget,
+    clip: Option<qb_tray::Rect>,
+) -> Result<()> {
+    let original_len = scene.draw.len();
+    let inserted = decorate_editor(h, scene)?;
+    let result = h.renderer.paint_clipped(target, scene, &h.input, clip);
+    if let Some(index) = inserted {
+        scene.draw.remove(index);
+    }
+    scene.draw.truncate(original_len);
+    result
+}
 /// Search selection/caret is appended to the SAME Scene using its exact text
 /// style and boxes, measured by the same shared DirectWrite primitive.
-fn decorate_editor(h: &Host, scene: &mut Scene) -> Result<()> {
+fn decorate_editor(h: &Host, scene: &mut Scene) -> Result<Option<usize>> {
     use geometry::{Color, Draw};
     use qb_tray::v2_text::{Align, Face, Style, Wrap};
     use windows::Win32::Graphics::{
@@ -747,13 +1138,13 @@ fn decorate_editor(h: &Host, scene: &mut Scene) -> Result<()> {
         DirectWrite::{DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD},
     };
     if !h.focused {
-        return Ok(());
+        return Ok(None);
     }
     let Some(edit) = h.editing.as_ref() else {
-        return Ok(());
+        return Ok(None);
     };
     let Some(hit) = scene.targets.iter().find(|t| &t.target == edit) else {
-        return Ok(());
+        return Ok(None);
     };
     let Some((index, rect, measure)) = scene.draw.iter().enumerate().find_map(|(i, draw)| {
         if let Draw::Text { rect, measure, .. } = draw
@@ -764,7 +1155,7 @@ fn decorate_editor(h: &Host, scene: &mut Scene) -> Result<()> {
         }
         None
     }) else {
-        return Ok(());
+        return Ok(None);
     };
     let style = Style {
         face: match measure.face {
@@ -808,24 +1199,23 @@ fn decorate_editor(h: &Host, scene: &mut Scene) -> Result<()> {
     } else {
         from + h.edit.composition.chars().count()
     };
+    let mut selection = None;
+    let mut suffix = Vec::new();
     if from != to && h.edit.composition.is_empty() {
-        let selection = qb_tray::Rect {
+        let selected_rect = qb_tray::Rect {
             left: advance(from)?,
             right: advance(to)?,
             top: rect.top,
             bottom: (rect.top + measure.line_height).min(rect.bottom),
         };
-        scene.draw.insert(
-            index,
-            Draw::Fill {
-                rect: selection,
-                color: Color::Select,
-                radius: 0.,
-            },
-        );
+        selection = Some(Draw::Fill {
+            rect: selected_rect,
+            color: Color::Select,
+            radius: 0.,
+        });
     }
     if !h.edit.composition.is_empty() {
-        scene.draw.push(Draw::Line {
+        suffix.push(Draw::Line {
             from: [advance(from)?, rect.bottom - 1.],
             to: [advance(cursor)?, rect.bottom - 1.],
             color: Color::Accent,
@@ -835,7 +1225,7 @@ fn decorate_editor(h: &Host, scene: &mut Scene) -> Result<()> {
     }
     if now(h) % 1000 < 500 {
         let x = advance(cursor)?;
-        scene.draw.push(Draw::Line {
+        suffix.push(Draw::Line {
             from: [x, rect.top],
             to: [x, (rect.top + measure.line_height).min(rect.bottom)],
             color: Color::Text,
@@ -843,7 +1233,12 @@ fn decorate_editor(h: &Host, scene: &mut Scene) -> Result<()> {
             dash: None,
         });
     }
-    Ok(())
+    let inserted = selection.map(|draw| {
+        scene.draw.insert(index, draw);
+        index
+    });
+    scene.draw.extend(suffix);
+    Ok(inserted)
 }
 
 fn physical(rect: qb_tray::Rect, origin: POINT, scale: f64) -> [f64; 4] {
@@ -854,7 +1249,37 @@ fn physical(rect: qb_tray::Rect, origin: POINT, scale: f64) -> [f64; 4] {
         (rect.bottom - rect.top).max(0.) as f64 * scale,
     ]
 }
-fn publish_accessibility(h: &mut Host, frame: &mut Frame) -> Result<()> {
+fn accessibility_interactive(
+    node: &geometry::AccessibleNode,
+    enabled_hits: &BTreeSet<&Target>,
+) -> bool {
+    !node.hidden
+        && node.enabled
+        && geometry::width(node.rect) > 0.
+        && geometry::height(node.rect) > 0.
+        && node
+            .target
+            .as_ref()
+            .is_some_and(|t| enabled_hits.contains(t))
+}
+fn publish_accessibility(
+    h: &mut Host,
+    frame: &mut Frame,
+    reuse: bool,
+) -> Result<PublicationTiming> {
+    let mut timing = PublicationTiming::default();
+    let started = h.profiling.then(Instant::now);
+    if reuse && let Some(prepared) = &frame.prepared {
+        h.root
+            .as_ref()
+            .ok_or_else(invalid)?
+            .publish_prepared(prepared, frame.stamp.epoch)?;
+        timing.swap_us = started.map_or(0, micros);
+        return Ok(timing);
+    }
+    // A focus-only publication replaces its map just like a new scene.
+    frame.actions.clear();
+    frame.elements.clear();
     let failure = |reason| Error::new(windows::Win32::Foundation::E_FAIL, reason);
     let mut origin = POINT::default();
     if !unsafe { ClientToScreen(h.hwnd, &mut origin) }.as_bool() {
@@ -862,36 +1287,59 @@ fn publish_accessibility(h: &mut Host, frame: &mut Frame) -> Result<()> {
     }
     // Allocate every current semantic node before resolving any parent. Hidden
     // chart table/cells remain in the tree even though they have no hit target.
-    let keys: std::collections::BTreeSet<&str> = frame
+    let mut keys: HashSet<&str> = frame
         .scene
         .accessibility
         .iter()
         .map(|node| node.key.as_str())
         .collect();
-    h.ids.retain(|key, _| keys.contains(key.as_str()));
     if keys.len() != frame.scene.accessibility.len() {
         return Err(failure("dashboard UIA duplicate semantic key"));
     }
     let required = keys.iter().filter(|key| !h.ids.contains_key(**key)).count();
+    for (_, cached) in &h.tab_frames {
+        keys.extend(
+            cached
+                .scene
+                .accessibility
+                .iter()
+                .map(|node| node.key.as_str()),
+        );
+    }
+    h.ids.retain(|key, _| keys.contains(key.as_str()));
     let Ok(required) = i32::try_from(required) else {
         return Err(failure("dashboard UIA element count overflow"));
     };
     if h.next_id <= 0 || h.next_id.checked_add(required).is_none() {
         return Err(failure("dashboard UIA id range exhausted"));
     }
+    let mut node_ids = Vec::with_capacity(frame.scene.accessibility.len());
     for node in &frame.scene.accessibility {
-        if !h.ids.contains_key(&node.key) {
+        let id = if let Some(id) = h.ids.get(&node.key) {
+            *id
+        } else {
             let Some(next) = h.next_id.checked_add(1) else {
                 return Err(failure("dashboard UIA id allocation overflow"));
             };
-            h.ids.insert(node.key.clone(), h.next_id);
+            let id = h.next_id;
+            h.ids.insert(node.key.clone(), id);
             h.next_id = next;
-        }
+            id
+        };
+        node_ids.push(id);
     }
-    let mut elements = vec![];
+    let enabled_hits: BTreeSet<_> = frame
+        .scene
+        .targets
+        .iter()
+        .filter(|hit| hit.enabled)
+        .map(|hit| &hit.target)
+        .collect();
+    let mut elements = Vec::with_capacity(frame.scene.accessibility.len());
+    timing.ids_us = started.map_or(0, micros);
+    let started = h.profiling.then(Instant::now);
     let mut focused = false;
-    for node in &frame.scene.accessibility {
-        let id = h.ids[&node.key];
+    for (node, id) in frame.scene.accessibility.iter().zip(node_ids) {
         let parent = match node.parent.as_ref() {
             Some(key) => {
                 let Some(id) = h.ids.get(key) else {
@@ -914,17 +1362,7 @@ fn publish_accessibility(h: &mut Host, frame: &mut Frame) -> Result<()> {
             geometry::Role::Chart => accessibility::Kind::Chart,
             geometry::Role::Group => accessibility::Kind::Group,
         };
-        let interactive = !node.hidden
-            && node.enabled
-            && geometry::width(node.rect) > 0.
-            && geometry::height(node.rect) > 0.
-            && node.target.as_ref().is_some_and(|t| {
-                frame
-                    .scene
-                    .targets
-                    .iter()
-                    .any(|hit| hit.enabled && &hit.target == t)
-            });
+        let interactive = accessibility_interactive(node, &enabled_hits);
         let text = kind == accessibility::Kind::Text;
         let action = if interactive && !text {
             node.target.as_ref().map(|t| {
@@ -961,24 +1399,32 @@ fn publish_accessibility(h: &mut Host, frame: &mut Frame) -> Result<()> {
             expanded: node.expanded,
         });
     }
+    timing.elements_us = started.map_or(0, micros);
     if let Some(root) = h.root.as_ref() {
         #[cfg(all(test, feature = "testkit"))]
         let count = elements.len();
-        let result = root.publish(
-            accessibility::Snapshot {
-                automation_id: "quota-baton.dashboard",
-                name: "quota-baton 대시보드".into(),
-                bounds: physical(frame.scene.rect, origin, frame.stamp.dpi as f64 / 96.),
-                elements,
-            },
-            frame.stamp.epoch,
-        );
+        let started = h.profiling.then(Instant::now);
+        let prepared = accessibility::prepare_snapshot(accessibility::Snapshot {
+            automation_id: "quota-baton.dashboard",
+            name: "quota-baton 대시보드".into(),
+            bounds: physical(frame.scene.rect, origin, frame.stamp.dpi as f64 / 96.),
+            elements,
+        })?;
+        timing.validate_us = started.map_or(0, micros);
+        let started = h.profiling.then(Instant::now);
+        let result = root.publish_prepared(&prepared, frame.stamp.epoch);
+        if result.is_ok() {
+            frame.prepared = Some(prepared);
+        }
         #[cfg(all(test, feature = "testkit"))]
-        eprintln!(
-            "dashboard UIA publish epoch={} nodes={} result={result:?}",
-            frame.stamp.epoch, count
-        );
-        result
+        if !h.profiling {
+            eprintln!(
+                "dashboard UIA publish epoch={} nodes={} result={result:?}",
+                frame.stamp.epoch, count
+            );
+        }
+        timing.swap_us = started.map_or(0, micros);
+        result.map(|()| timing)
     } else {
         Err(failure("dashboard UIA provider unavailable"))
     }
@@ -999,6 +1445,8 @@ fn mouse_point(hwnd: HWND, lparam: LPARAM, screen: bool) -> [f32; 2] {
 }
 fn mouse_move(hwnd: HWND, p: [f32; 2]) {
     let Some(host) = current(hwnd) else { return };
+    let dirty;
+    let released;
     {
         let mut h = host.borrow_mut();
         if !frame_valid(&h) {
@@ -1006,6 +1454,30 @@ fn mouse_move(hwnd: HWND, p: [f32; 2]) {
         }
         let scene = &h.frame.as_ref().unwrap().scene;
         let hover = scene.hit_test(p[0], p[1]).cloned();
+        // Tooltips/charts can extend past a control; conservatively repaint the
+        // whole client in that case. Plain controls affect only old/new bounds.
+        dirty = if !scene.charts.is_empty()
+            || scene.tooltip_at(p[0], p[1]).is_some()
+            || h.input
+                .pointer
+                .is_some_and(|p| scene.tooltip_at(p[0], p[1]).is_some())
+        {
+            None
+        } else {
+            scene
+                .targets
+                .iter()
+                .filter(|t| {
+                    Some(&t.target) == hover.as_ref() || Some(&t.target) == h.input.hover.as_ref()
+                })
+                .map(|t| t.rect)
+                .reduce(|a, b| qb_tray::Rect {
+                    left: a.left.min(b.left),
+                    top: a.top.min(b.top),
+                    right: a.right.max(b.right),
+                    bottom: a.bottom.max(b.bottom),
+                })
+        };
         let region = scene
             .content
             .iter()
@@ -1013,6 +1485,7 @@ fn mouse_move(hwnd: HWND, p: [f32; 2]) {
             .find(|r| geometry::contains(r.viewport, p[0], p[1]))
             .map(|r| r.region);
         let time = now(&h);
+        let frozen = (h.state.table_freeze.frozen, h.state.recent_freeze.frozen);
         if h.pointer_region != region
             && let Some(old) = h.pointer_region
         {
@@ -1024,6 +1497,8 @@ fn mouse_move(hwnd: HWND, p: [f32; 2]) {
         h.pointer_region = region;
         h.input.hover = hover;
         h.input.pointer = Some(p);
+        released = (frozen.0 && !h.state.table_freeze.frozen)
+            || (frozen.1 && !h.state.recent_freeze.frozen);
     }
     unsafe {
         let mut tracking = TRACKMOUSEEVENT {
@@ -1034,7 +1509,22 @@ fn mouse_move(hwnd: HWND, p: [f32; 2]) {
         };
         let _ = TrackMouseEvent(&mut tracking);
     }
-    repaint(hwnd);
+    if released {
+        redraw_for(hwnd, "pointer-release");
+    } else if let Some(r) = dirty {
+        let scale = unsafe { GetDpiForWindow(hwnd) }.max(48) as f32 / 96.;
+        let r = RECT {
+            left: ((r.left - 4.) * scale).floor() as i32,
+            top: ((r.top - 4.) * scale).floor() as i32,
+            right: ((r.right + 4.) * scale).ceil() as i32,
+            bottom: ((r.bottom + 4.) * scale).ceil() as i32,
+        };
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), Some(&r), false);
+        }
+    } else {
+        repaint(hwnd);
+    }
 }
 fn scroll(hwnd: HWND, p: [f32; 2], delta: f32) {
     let Some(host) = current(hwnd) else { return };
@@ -1048,7 +1538,90 @@ fn scroll(hwnd: HWND, p: [f32; 2], delta: f32) {
             return;
         }
     }
-    redraw(hwnd);
+    let mut damage = None;
+    if let Some(host) = current(hwnd) {
+        let mut h = host.borrow_mut();
+        let frame = h.frame.take().unwrap();
+        let retained =
+            h.target.is_some() && h.target_metrics == Some((frame.stamp.pixels, frame.stamp.dpi));
+        let previous = frame.scene;
+        let region = previous
+            .content
+            .iter()
+            .rev()
+            .find(|r| geometry::contains(r.viewport, p[0], p[1]))
+            .map(|r| r.region)
+            .unwrap();
+        if retained
+            && region == ScrollRegion::Table
+            && let Some(rect) = previous.table_scroll_damage()
+            && scroll_decorations_contained(&h, &previous, &previous, rect)
+        {
+            damage = Some(rect);
+        }
+        invalidate_frame(&mut h);
+        h.scroll_scene = Some((previous, region, damage));
+        h.dirty_reason = "scroll";
+    }
+    if let Some(r) = damage {
+        let scale = unsafe { GetDpiForWindow(hwnd) }.max(48) as f32 / 96.;
+        let rect = RECT {
+            left: (r.left * scale).floor() as i32,
+            top: (r.top * scale).floor() as i32,
+            right: (r.right * scale).ceil() as i32,
+            bottom: (r.bottom * scale).ceil() as i32,
+        };
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), Some(&rect), false);
+        }
+    } else {
+        repaint(hwnd);
+    }
+}
+
+/// Decorations outside the card may remain only when their geometry is identical.
+/// Popup/editor/chart effects have wider bounds, so keep their full-paint path.
+fn scroll_decorations_contained(h: &Host, old: &Scene, new: &Scene, damage: qb_tray::Rect) -> bool {
+    if h.editing.is_some()
+        || h.input.tooltip_ready
+        || !old.charts.is_empty()
+        || !new.charts.is_empty()
+        || h.input.pointer.is_some_and(|p| {
+            old.tooltip_at(p[0], p[1]).is_some() || new.tooltip_at(p[0], p[1]).is_some()
+        })
+    {
+        return false;
+    }
+    for target in [&h.input.hover, &h.input.pressed, &h.input.focus]
+        .into_iter()
+        .flatten()
+    {
+        let boxes = |scene: &Scene| {
+            scene
+                .targets
+                .iter()
+                .filter(|hit| hit.enabled && &hit.target == target)
+                .map(|hit| hit.rect)
+                .collect::<Vec<_>>()
+        };
+        let before = boxes(old);
+        let after = boxes(new);
+        // A vanished focus is cleared during layout, which changes decoration.
+        if h.input.focus.as_ref() == Some(target) && after.is_empty() {
+            return false;
+        }
+        if before != after
+            && before.iter().chain(&after).any(|r| {
+                r.left - 4. < damage.left
+                    || r.top - 4. < damage.top
+                    || r.right + 4. > damage.right
+                    || r.bottom + 4. > damage.bottom
+            })
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn held(vk: i32) -> bool {
@@ -1402,6 +1975,7 @@ fn teardown(hwnd: HWND) {
         h.life.close();
         h.frame = None;
         let root = h.root.take();
+        h.renderer.clear_target_resources();
         h.target = None;
         let mut preferences = h.state.clone();
         preferences.search.clear();
@@ -1426,6 +2000,14 @@ unsafe extern "system" fn wndproc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if matches!(
+        message,
+        WM_MOUSEMOVE | WM_MOUSEWHEEL | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_KEYDOWN | WM_CHAR
+    ) && let Some(host) = current(hwnd)
+    {
+        let mut h = host.borrow_mut();
+        h.input_seq = h.input_seq.saturating_add(1);
+    }
     match message {
         WM_ERASEBKGND => return LRESULT(1),
         WM_PRINT | WM_PRINTCLIENT => {
@@ -1451,15 +2033,26 @@ unsafe extern "system" fn wndproc(
         WM_TIMER if wparam.0 == TIMER => {
             apply_mail(hwnd);
             let mut tick = false;
+            let mut caret = false;
             if let Some(host) = current(hwnd) {
                 let mut h = host.borrow_mut();
                 let time = now(&h);
                 if time / 500 != h.last_tick {
                     h.last_tick = time / 500;
+                    let frozen = (h.state.table_freeze.frozen, h.state.recent_freeze.frozen);
                     h.state.release_idle(time);
-                    tick = true;
+                    tick |= frozen != (h.state.table_freeze.frozen, h.state.recent_freeze.frozen);
+                    caret = h.focused && h.editing.is_some();
                 }
-                if time.saturating_sub(h.last_clock_request) >= 15000 {
+                let clock = virtual_clock(&h);
+                let reconcile = clock.utc() < clock.day_start || clock.utc() >= clock.day_end;
+                if !reconcile {
+                    tick |= h.next_clock.is_some_and(|at| clock.utc() >= at);
+                }
+                if (reconcile && !h.clock_reconcile)
+                    || time.saturating_sub(h.last_clock_request) >= 15000
+                {
+                    h.clock_reconcile = reconcile;
                     h.last_clock_request = time;
                     h.bridge.enqueue(Event::ClockNeeded {
                         owner: h.life.owner,
@@ -1468,7 +2061,9 @@ unsafe extern "system" fn wndproc(
             }
             flush_geometry(hwnd, false);
             if tick {
-                redraw(hwnd);
+                redraw_for(hwnd, "timer");
+            } else if caret {
+                repaint(hwnd);
             }
             return LRESULT(0);
         }
@@ -1590,17 +2185,24 @@ unsafe extern "system" fn wndproc(
             return LRESULT(0);
         }
         WM_MOUSELEAVE_MESSAGE => {
+            let mut released = false;
             if let Some(host) = current(hwnd) {
                 let mut h = host.borrow_mut();
                 let time = now(&h);
+                let frozen = (h.state.table_freeze.frozen, h.state.recent_freeze.frozen);
                 if let Some(region) = h.pointer_region.take() {
                     h.state.pointer(region, false, time);
                 }
                 h.input.hover = None;
                 h.input.pointer = None;
+                released = (frozen.0 && !h.state.table_freeze.frozen)
+                    || (frozen.1 && !h.state.recent_freeze.frozen);
             }
-            // Like mouse movement, leaving changes decoration, not hit geometry.
-            repaint(hwnd);
+            if released {
+                redraw_for(hwnd, "pointer-release");
+            } else {
+                repaint(hwnd);
+            }
             return LRESULT(0);
         }
         WM_LBUTTONDOWN => {
@@ -1860,4 +2462,206 @@ unsafe extern "system" fn wndproc(
         _ => {}
     }
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+}
+
+#[cfg(test)]
+mod r1210_uia_hit_index_tests {
+    use super::*;
+    use qb_tray::{
+        Rect,
+        geometry::{AccessibleNode, HitTarget, Role},
+        state::{EventFilter, ProviderFilter, Range, SortKey},
+    };
+
+    fn hit(target: Target, enabled: bool) -> HitTarget {
+        HitTarget {
+            // The old predicate checks enabled and target, not hit geometry.
+            rect: Rect {
+                left: 0.,
+                top: 0.,
+                right: 0.,
+                bottom: 0.,
+            },
+            target,
+            enabled,
+            tooltip: None,
+        }
+    }
+
+    fn node(target: Option<Target>) -> AccessibleNode {
+        AccessibleNode {
+            key: "test".into(),
+            parent: None,
+            role: Role::Button,
+            name: "test".into(),
+            rect: Rect {
+                left: 2.,
+                top: 3.,
+                right: 12.,
+                bottom: 13.,
+            },
+            target,
+            enabled: true,
+            selected: false,
+            expanded: None,
+            value: None,
+            hidden: false,
+        }
+    }
+
+    fn old_interactive(node: &AccessibleNode, hits: &[HitTarget]) -> bool {
+        !node.hidden
+            && node.enabled
+            && geometry::width(node.rect) > 0.
+            && geometry::height(node.rect) > 0.
+            && node
+                .target
+                .as_ref()
+                .is_some_and(|t| hits.iter().any(|hit| hit.enabled && &hit.target == t))
+    }
+
+    #[test]
+    fn r1210_uia_hit_index_matches_legacy_predicate() {
+        let mut targets = vec![
+            Target::DismissPopup,
+            Target::RangeMenu,
+            Target::ToggleGrouping,
+            Target::Search,
+            Target::EventSearch,
+            Target::CloseDetail,
+            Target::DetailSurface,
+            Target::EventDaysMenu,
+            Target::AllEvents,
+            Target::OpenTrayAdd,
+            Target::Today,
+        ];
+        targets.extend([Tab::Overview, Tab::Events, Tab::Usage].map(Target::Tab));
+        targets.extend(
+            [
+                ProviderFilter::All,
+                ProviderFilter::Claude,
+                ProviderFilter::Codex,
+            ]
+            .map(Target::Provider),
+        );
+        targets.extend(Range::ALL.map(Target::Range));
+        targets.extend(
+            [
+                SortKey::Status,
+                SortKey::Session,
+                SortKey::Client,
+                SortKey::Account,
+                SortKey::Model,
+                SortKey::Start,
+                SortKey::LastActivity,
+                SortKey::Requests,
+                SortKey::Memo,
+            ]
+            .map(Target::Sort),
+        );
+        targets.extend(EventFilter::ALL.map(Target::EventFilter));
+        targets.extend([0, 1, 255].map(Target::EventDays));
+        for value in ["", "same", "계정🦀"] {
+            targets.extend([
+                Target::Group(value.into()),
+                Target::Session(value.into()),
+                Target::SessionLink(value.into()),
+                Target::AccountLink(value.into()),
+                Target::OpenTrayAccount(value.into()),
+                Target::Chart(value.into()),
+            ]);
+        }
+        let mixed: Vec<_> = targets
+            .iter()
+            .enumerate()
+            .flat_map(|(i, t)| {
+                [
+                    hit(t.clone(), false),
+                    hit(t.clone(), i % 3 == 0),
+                    hit(t.clone(), i % 5 == 0),
+                ]
+            })
+            .collect();
+        let reversed = mixed.iter().rev().cloned().collect();
+        let cases = [
+            Vec::new(),
+            targets.iter().cloned().map(|t| hit(t, false)).collect(),
+            mixed,
+            reversed,
+        ];
+        let queries: Vec<_> = targets
+            .into_iter()
+            .map(Some)
+            .chain([None, Some(Target::Chart("missing".into()))])
+            .collect();
+        for hits in &cases {
+            let enabled_hits = hits
+                .iter()
+                .filter(|hit| hit.enabled)
+                .map(|hit| &hit.target)
+                .collect();
+            for target in &queries {
+                for hidden in [false, true] {
+                    for enabled in [false, true] {
+                        for (width, height) in
+                            [(10., 10.), (0., 10.), (10., 0.), (-1., 10.), (10., -1.)]
+                        {
+                            let mut node = node(target.clone());
+                            node.hidden = hidden;
+                            node.enabled = enabled;
+                            node.rect.right = node.rect.left + width;
+                            node.rect.bottom = node.rect.top + height;
+                            assert_eq!(
+                                accessibility_interactive(&node, &enabled_hits),
+                                old_interactive(&node, hits),
+                                "target={target:?}, hidden={hidden}, enabled={enabled}, size={width}x{height}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn r1210_uia_hit_index_keeps_duplicate_disabled_and_missing_semantics() {
+        for hits in [
+            vec![
+                hit(Target::Search, false),
+                hit(Target::Group("same".into()), false),
+                hit(Target::Group("same".into()), true),
+                hit(Target::Session("same".into()), false),
+            ],
+            vec![
+                hit(Target::Session("same".into()), false),
+                hit(Target::Group("same".into()), true),
+                hit(Target::Group("same".into()), false),
+                hit(Target::Search, false),
+            ],
+        ] {
+            let enabled_hits: BTreeSet<_> = hits
+                .iter()
+                .filter(|hit| hit.enabled)
+                .map(|hit| &hit.target)
+                .collect();
+            assert_eq!(enabled_hits.len(), 1);
+            assert!(accessibility_interactive(
+                &node(Some(Target::Group("same".into()))),
+                &enabled_hits
+            ));
+            for target in [
+                None,
+                Some(Target::Search),
+                Some(Target::Session("same".into())),
+                Some(Target::Chart("missing".into())),
+            ] {
+                assert!(!accessibility_interactive(&node(target), &enabled_hits));
+            }
+            // Text still passes this membership predicate; the unchanged
+            // publication code separately excludes its actions and focus.
+            let mut text = node(Some(Target::Group("same".into())));
+            text.role = Role::Text;
+            assert!(accessibility_interactive(&text, &enabled_hits));
+        }
+    }
 }
