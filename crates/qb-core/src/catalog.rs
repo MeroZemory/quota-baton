@@ -303,15 +303,15 @@ impl Drop for RefreshGuard {
             return;
         }
         let mut state = self.inner.lock();
-        if let Some(entry) = state.entries.get_mut(&self.account) {
-            if entry.active_ticket == Some(self.ticket) {
-                entry.observation = Observation::RefreshFailed {
-                    previous: entry.observation.last_known().cloned(),
-                    reason: RefreshFailure::Cancelled,
-                };
-                entry.completed_at = Some((self.inner.clock)());
-                entry.active_ticket = None;
-            }
+        if let Some(entry) = state.entries.get_mut(&self.account)
+            && entry.active_ticket == Some(self.ticket)
+        {
+            entry.observation = Observation::RefreshFailed {
+                previous: entry.observation.last_known().cloned(),
+                reason: RefreshFailure::Cancelled,
+            };
+            entry.completed_at = Some((self.inner.clock)());
+            entry.active_ticket = None;
         }
     }
 }

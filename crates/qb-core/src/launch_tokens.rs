@@ -186,7 +186,7 @@ impl LaunchTokenRegistry {
         // Bound retries even if the entropy provider repeatedly returns a collision.
         for _ in 0..GENERATION_ATTEMPTS {
             let bytes = entropy()?;
-            let token = LaunchToken(Zeroizing::new(URL_SAFE_NO_PAD.encode(&*bytes)));
+            let token = LaunchToken(Zeroizing::new(URL_SAFE_NO_PAD.encode(*bytes)));
             let digest = token_digest(token.expose_secret());
             let mut entries = self.0.lock();
             let now = (self.0.clock)();
