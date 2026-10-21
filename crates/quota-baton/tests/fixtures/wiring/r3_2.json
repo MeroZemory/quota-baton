@@ -1,0 +1,23 @@
+{
+  "schema": 3,
+  "mode": "dedicated",
+  "claude_mode": "dedicated",
+  "command": {"path":"SYNTHETIC_CLAUDE_EXE","hash":"synthetic-command","identity":{"volume":1,"index":6}},
+  "home": "SYNTHETIC_TARGET",
+  "npm": "SYNTHETIC_NPM",
+  "claude": "SYNTHETIC_CLAUDE_SETTINGS",
+  "claude_before": "synthetic-before",
+  "claude_after": "synthetic-after",
+  "claude_original": "SYNTHETIC_ENCRYPTED_BACKUP",
+  "claude_payload": "SYNTHETIC_ENCRYPTED_PATCH",
+  "claude_identity": null,
+  "claude_restored": true,
+  "autostart": null,
+  "tasks": [],
+  "optional_restored": false,
+  "retained": false,
+  "entries": [
+    {"path":"SYNTHETIC_TARGET","kind":"Directory","target":null,"hash":"","identity":{"volume":1,"index":3},"pending_identity":null,"pending":null,"payload":null,"done":true,"removed":false,"abandoned":[],"original":null,"upgrade":null},
+    {"path":"SYNTHETIC_TARGET/config.toml","kind":"File","target":null,"hash":"synthetic-upgraded","identity":{"volume":1,"index":7},"pending_identity":null,"pending":null,"payload":"SYNTHETIC_ENCRYPTED_CONFIG","done":true,"removed":false,"abandoned":[],"original":null,"upgrade":null}
+  ]
+}

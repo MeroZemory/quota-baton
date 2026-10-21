@@ -197,6 +197,72 @@ fn assert_success(output: &Output) {
     );
 }
 
+#[test]
+fn r92_released_wire_journals_allow_plain_version_resume_and_import() {
+    for shape in [
+        include_str!("fixtures/wiring/r3.json"),
+        include_str!("fixtures/wiring/r3_1.json"),
+        include_str!("fixtures/wiring/r3_2.json"),
+    ] {
+        let f = Fixture::new();
+        let mut journal: serde_json::Value = serde_json::from_str(shape).unwrap();
+        journal["home"] = serde_json::json!(f.target);
+        let path = f.qb.join("journal/wiring.json");
+        let before = serde_json::to_vec_pretty(&journal).unwrap();
+        fs::write(&path, &before).unwrap();
+        assert_success(&f.cli(&["launch-client".as_ref(), "--check".as_ref()]));
+        assert!(!f.sentinel.exists());
+        assert!(!f.target.join(".quota-baton-admission.lock").exists());
+        assert_success(&f.launch(&["--version"]));
+        assert_success(&f.launch(&[]));
+        f.add(A, false, "openai");
+        assert_success(&f.import(A, false));
+        assert_success(&f.import(A, true));
+        assert_success(&f.resume(A));
+        assert_eq!(
+            fs::read(path).unwrap(),
+            before,
+            "reads must not migrate wiring"
+        );
+    }
+}
+
+#[test]
+fn r92_read_only_launch_check_rejects_partial_wire_without_a_child_or_lock() {
+    for mutation in [
+        "not_done",
+        "removed",
+        "upgrade",
+        "restoring",
+        "terminal_false",
+    ] {
+        let f = Fixture::new();
+        let mut journal: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/wiring/r3_2.json")).unwrap();
+        journal["home"] = serde_json::json!(f.target);
+        match mutation {
+            "not_done" => journal["entries"][0]["done"] = false.into(),
+            "removed" => journal["entries"][0]["removed"] = true.into(),
+            "upgrade" => journal["entries"][1]["upgrade"] = serde_json::json!({"hash":"synthetic"}),
+            "restoring" => {
+                journal["entries"][1]["original"] = serde_json::json!({"restoring":true})
+            }
+            "terminal_false" => journal["install_completed"] = false.into(),
+            _ => unreachable!(),
+        }
+        let path = f.qb.join("journal/wiring.json");
+        let before = serde_json::to_vec_pretty(&journal).unwrap();
+        fs::write(&path, &before).unwrap();
+        assert_refused(
+            &f,
+            &f.cli(&["launch-client".as_ref(), "--check".as_ref()]),
+            "전용 Codex 홈 연결",
+        );
+        assert!(!f.target.join(".quota-baton-admission.lock").exists());
+        assert_eq!(fs::read(path).unwrap(), before);
+    }
+}
+
 fn assert_refused(fixture: &Fixture, output: &Output, reason: &str) {
     assert!(!output.status.success());
     assert!(!fixture.sentinel.exists());

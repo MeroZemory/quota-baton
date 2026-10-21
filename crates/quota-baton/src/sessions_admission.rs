@@ -42,10 +42,54 @@ pub(crate) fn friendly_error(error: &anyhow::Error) -> Option<String> {
 struct Wiring {
     schema: u32,
     mode: String,
-    install_completed: bool,
     home: PathBuf,
     #[cfg_attr(test, allow(dead_code))]
     codex_command: Option<PathBuf>,
+}
+
+/// R3 journals predate the terminal install marker. Completed entry metadata
+/// may retain a historical scratch path; `pending` alone does not mean that a
+/// done entry is incomplete. Active upgrade/restore markers do.
+pub(crate) fn completed_wiring(value: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    if value["schema"] != 3 || value["mode"] != "dedicated" {
+        return false;
+    }
+    // claude_restored is independent: dedicated Claude upgrades legitimately
+    // restore the old default settings while the Codex installation stays live.
+    for marker in ["retained", "optional_restored", "partial"] {
+        if value
+            .get(marker)
+            .is_some_and(|v| !v.is_null() && v != false)
+        {
+            return false;
+        }
+    }
+    let entries = value.get("entries").and_then(Value::as_array);
+    if value.get("entries").is_some() && entries.is_none() {
+        return false;
+    }
+    if entries.is_some_and(|entries| {
+        entries.iter().any(|entry| {
+            entry["done"] != true
+                || entry.get("removed").is_some_and(|v| v != false)
+                || entry.get("upgrade").is_some_and(|v| !v.is_null())
+                || entry["original"]["restoring"] == true
+        })
+    }) {
+        return false;
+    }
+    match value.get("install_completed") {
+        Some(Value::Bool(true)) => true,
+        None => entries.is_some_and(|entries| !entries.is_empty()),
+        _ => false,
+    }
+}
+
+/// Deliberately read-only: no admission lock, version probe, configuration or
+/// credential access, journal migration, launcher spawn, or auto-import.
+pub(crate) fn check_wiring(home: &Path) -> Result<()> {
+    wiring(home).map(drop)
 }
 
 fn wiring(home: &Path) -> Result<Wiring> {
@@ -58,10 +102,13 @@ fn wiring(home: &Path) -> Result<Wiring> {
     if bytes.len() > 16 * 1024 * 1024 {
         return Err(refusal(WIRING));
     }
-    let wiring: Wiring = serde_json::from_slice(&bytes).map_err(|_| refusal(WIRING))?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| refusal(WIRING))?;
+    if !completed_wiring(&value) {
+        return Err(refusal(WIRING));
+    }
+    let wiring: Wiring = serde_json::from_value(value).map_err(|_| refusal(WIRING))?;
     if wiring.schema != 3
         || wiring.mode != "dedicated"
-        || !wiring.install_completed
         || !wiring.home.is_absolute()
         || !wiring.home.is_dir()
     {
@@ -273,6 +320,41 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn r92_released_completion_shapes_accept_only_terminal_legacy_entries() {
+        for raw in [
+            include_str!("../tests/fixtures/wiring/r3.json"),
+            include_str!("../tests/fixtures/wiring/r3_1.json"),
+            include_str!("../tests/fixtures/wiring/r3_2.json"),
+        ] {
+            let value: serde_json::Value = serde_json::from_str(raw).unwrap();
+            assert!(completed_wiring(&value));
+            for marker in ["retained", "optional_restored", "partial"] {
+                let mut incomplete = value.clone();
+                incomplete[marker] = true.into();
+                assert!(!completed_wiring(&incomplete));
+            }
+            for marker in [
+                serde_json::json!(false),
+                serde_json::Value::Null,
+                serde_json::json!("true"),
+            ] {
+                let mut incomplete = value.clone();
+                incomplete["install_completed"] = marker;
+                assert!(!completed_wiring(&incomplete));
+            }
+            for entries in [
+                serde_json::json!([]),
+                serde_json::json!({}),
+                serde_json::Value::Null,
+            ] {
+                let mut incomplete = value.clone();
+                incomplete["entries"] = entries;
+                assert!(!completed_wiring(&incomplete));
+            }
+        }
     }
 
     #[test]
