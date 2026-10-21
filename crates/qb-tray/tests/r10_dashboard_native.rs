@@ -193,7 +193,7 @@ impl Run {
             // The owned window can be occluded by the collector. Complete its
             // pending production paint before dispatching the next input.
             unsafe {
-                let _ = UpdateWindow(hwnd);
+                SendMessageW(hwnd, WM_PAINT, None, None);
             }
         }
         self.actions.push(format!("WM_KEYDOWN/UP {key:#x}"));
