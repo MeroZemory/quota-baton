@@ -5,6 +5,106 @@ fn view(state: &mut DashboardState) -> m::DashboardView {
 }
 
 #[test]
+fn r10_disconnected_manual_controls_are_dimmed_but_account_data_is_not() {
+    let mut state = DashboardState::default();
+    let mut v = view(&mut state);
+    v.connection.core_ok = false;
+    let scene = Scene::build(&v, &state, [1320., 960.], &Metrics::default());
+    let mut alpha = 1.;
+    let mut checked = std::collections::BTreeSet::new();
+    for draw in &scene.draw {
+        match draw {
+            Draw::Alpha(next) => alpha = *next,
+            Draw::Text { measure, .. }
+                if ["개요", "계정별로 묶기", "폴더, 세션 번호, 계정 검색"]
+                    .contains(&measure.text.as_str()) =>
+            {
+                assert_eq!(alpha, 0.5, "disabled control {}", measure.text);
+                checked.insert(measure.text.as_str());
+            }
+            Draw::Text { measure, .. } if v.groups.iter().any(|g| g.name == measure.text) => {
+                assert_eq!(alpha, 1.)
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(checked.len(), 3);
+}
+
+#[test]
+fn r10_no_matching_search_is_centered_with_forty_dip_padding() {
+    for size in [[1024., 640.], [1320., 960.]] {
+        let mut state = DashboardState {
+            search: "zzz-no-synthetic-match".into(),
+            ..Default::default()
+        };
+        let v = view(&mut state);
+        let scene = Scene::build(&v, &state, size, &Metrics::default());
+        let viewport = scene
+            .content
+            .iter()
+            .find(|r| r.region == ScrollRegion::Table)
+            .unwrap()
+            .viewport;
+        let text = scene
+            .accessibility
+            .iter()
+            .find(|n| n.key == "empty:search")
+            .unwrap()
+            .rect;
+        assert!(((text.top + text.bottom) - (viewport.top + viewport.bottom)).abs() < 1.);
+        assert_eq!(text.left - viewport.left, 40.);
+        assert_eq!(viewport.right - text.right, 40.);
+        assert!(text.top - viewport.top >= 40. && viewport.bottom - text.bottom >= 40.);
+        assert!(
+            scene
+                .draw
+                .iter()
+                .any(|d| matches!(d, Draw::Text { rect, measure, .. }
+            if *rect == text && measure.align == TextAlign::Center))
+        );
+    }
+}
+
+#[test]
+fn r10_event_filters_use_twenty_eight_dip_pills_without_changing_other_controls() {
+    let mut state = DashboardState {
+        tab: Tab::Events,
+        ..Default::default()
+    };
+    let v = view(&mut state);
+    let scene = Scene::build(&v, &state, [1320., 960.], &Metrics::default());
+    let filters: Vec<_> = scene
+        .targets
+        .iter()
+        .filter(|t| matches!(t.target, Target::EventFilter(_)))
+        .collect();
+    assert_eq!(filters.len(), v.event_counts.len());
+    for filter in filters {
+        assert_eq!(height(filter.rect), 28.);
+        assert!(
+            scene
+                .draw
+                .iter()
+                .any(|d| matches!(d, Draw::Stroke { rect, radius, .. }
+            if *rect == filter.rect && *radius == 14.))
+        );
+    }
+    let search = scene
+        .targets
+        .iter()
+        .find(|t| t.target == Target::EventSearch)
+        .unwrap();
+    assert!(
+        scene
+            .draw
+            .iter()
+            .any(|d| matches!(d, Draw::Stroke { rect, radius, .. }
+        if *rect == search.rect && *radius == 4.))
+    );
+}
+
+#[test]
 fn r10_header_pips_show_exactly_five_or_twenty_one_when_they_fit() {
     for threshold in [5, 21] {
         for offset in [0., 96.] {
@@ -1081,6 +1181,15 @@ fn r10_client_number_column_is_fixed_and_does_not_share_session_label_box() {
             .collect();
         let id = labels.iter().find(|(_, text)| *text == suffix).unwrap().0;
         assert!(width(id) > 0.);
+        let model = labels
+            .iter()
+            .find(|(r, text)| *text == row.model && r.top == id.top)
+            .unwrap()
+            .0;
+        assert!(
+            model.left - id.right >= 8.,
+            "session id must remain separate from the next column"
+        );
         assert!(
             labels
                 .iter()

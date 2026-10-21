@@ -299,6 +299,16 @@ impl Builder<'_> {
             radius,
         });
     }
+    fn begin_control_paint(&mut self) {
+        if !self.enabled {
+            self.scene.draw.push(Draw::Alpha(0.5));
+        }
+    }
+    fn end_control_paint(&mut self) {
+        if !self.enabled {
+            self.scene.draw.push(Draw::Alpha(1.));
+        }
+    }
     fn stroke(&mut self, r: Rect, c: Color, w: f32, radius: f32) {
         self.scene.draw.push(Draw::Stroke {
             rect: r,
@@ -486,6 +496,19 @@ impl Builder<'_> {
         selected: bool,
         tip: Option<String>,
     ) {
+        self.control_radius(r, label, target, role, selected, tip, 4.);
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn control_radius(
+        &mut self,
+        r: Rect,
+        label: &str,
+        target: Target,
+        role: Role,
+        selected: bool,
+        tip: Option<String>,
+        radius: f32,
+    ) {
         let accent = matches!(&target, Target::OpenTrayAccount(_) | Target::OpenTrayAdd);
         if !self.enabled {
             self.scene.draw.push(Draw::Alpha(0.5));
@@ -534,13 +557,13 @@ impl Builder<'_> {
             } else {
                 Color::Surface
             },
-            4.,
+            radius,
         );
         self.stroke(
             r,
             if accent { Color::Accent } else { Color::Border },
             1.,
-            4.,
+            radius,
         );
         self.text(
             rect(r.left + 8., r.top + 5., width(r) - 16., height(r) - 6.),
@@ -803,6 +826,7 @@ impl Scene {
 
 fn app_header(b: &mut Builder<'_>, v: &m::DashboardView, state: &DashboardState, w: f32) {
     let mut x = 20.;
+    b.begin_control_paint();
     for (tab, label) in [
         (Tab::Overview, "개요"),
         (Tab::Events, "기록"),
@@ -845,6 +869,7 @@ fn app_header(b: &mut Builder<'_>, v: &m::DashboardView, state: &DashboardState,
         }
         x += tw;
     }
+    b.end_control_paint();
     if !v.connection.core_ok {
         b.text(
             rect((w - 330.).max(x + 16.), 16., 310., 22.),
@@ -1110,6 +1135,7 @@ fn recent_strip(b: &mut Builder<'_>, v: &m::DashboardView, r: Rect) {
         false,
         None,
     );
+    b.begin_control_paint();
     b.text(
         rect(link.left, link.top + 5., width(link), 18.),
         "기록 모두 보기 ›",
@@ -1118,6 +1144,7 @@ fn recent_strip(b: &mut Builder<'_>, v: &m::DashboardView, r: Rect) {
         Color::Accent,
         false,
     );
+    b.end_control_paint();
     if let Some(event) = v.recent.first() {
         let tag_w = b.measured_width(&event.tag, 12., true) + 16.;
         chip(
@@ -1181,6 +1208,7 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
     );
     let start = card.left + 64.;
     let segment = rect(start, y, 192., 28.);
+    b.begin_control_paint();
     b.stroke(segment, Color::Border, 1., 4.);
     for (i, (filter, label)) in [
         (ProviderFilter::All, "전체"),
@@ -1216,6 +1244,7 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
             false,
         );
     }
+    b.end_control_paint();
     b.control(
         rect(start + 204., y, 96., 28.),
         s.range.label(),
@@ -1225,6 +1254,7 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
         None,
     );
     let check = rect(start + 312., y, 134., 28.);
+    b.begin_control_paint();
     b.target(
         check,
         "계정별로 묶기",
@@ -1257,8 +1287,10 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
         Color::Text,
         false,
     );
+    b.end_control_paint();
     let search_w = (card.right - 16. - check.right - 12.).clamp(100., 220.);
     let search = rect(card.right - search_w - 16., y, search_w, 28.);
+    b.begin_control_paint();
     b.fill(search, Color::Surface, 4.);
     b.stroke(search, Color::Border, 1., 4.);
     b.target(search, "세션 검색", Target::Search, Role::Edit, false, None);
@@ -1288,6 +1320,7 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
         Face::Icon,
         TextAlign::Leading,
     );
+    b.end_control_paint();
     if let Some(node) = b
         .scene
         .accessibility
@@ -1563,22 +1596,26 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
             }
         }
         m::EmptyState::NoMatch(text) => {
+            let message = format!("“{text}”와 맞는 세션이 없습니다");
+            let available = (width(viewport) - 80.).max(1.);
+            let message_height = b
+                .measured_height(&message, available, 14., false)
+                .min((height(viewport) - 80.).max(20.));
+            let message_rect = rect(
+                viewport.left + 40.,
+                viewport.top + (height(viewport) - message_height) / 2.,
+                available,
+                message_height,
+            );
             b.semantic(
                 "empty:search".into(),
                 Some("sessions:table".into()),
                 Role::Text,
-                format!("“{text}”와 맞는 세션이 없습니다"),
-                rect(viewport.left + 24., ry + 32., width(viewport) - 48., 40.),
+                message.clone(),
+                message_rect,
                 None,
             );
-            b.text(
-                rect(viewport.left + 24., ry + 32., width(viewport) - 48., 40.),
-                format!("“{text}”와 맞는 세션이 없습니다"),
-                14.,
-                false,
-                Color::Secondary,
-                true,
-            )
+            b.center_text(message_rect, message, 14., false, Color::Secondary, true)
         }
         _ => {
             if s.grouped {
@@ -1857,6 +1894,7 @@ fn group_header(b: &mut Builder<'_>, g: &m::AccountGroup, r: Rect, sticky: bool)
     {
         node.expanded = Some(!g.collapsed);
     }
+    b.begin_control_paint();
     b.text_face(
         rect(r.left + 12., r.top + 15., 20., 16.),
         if g.collapsed { "\u{e76c}" } else { "\u{e70d}" },
@@ -1867,6 +1905,7 @@ fn group_header(b: &mut Builder<'_>, g: &m::AccountGroup, r: Rect, sticky: bool)
         Face::Icon,
         TextAlign::Leading,
     );
+    b.end_control_paint();
     let threshold = g.threshold.unwrap_or(5).max(1);
     let over = g.active.saturating_sub(threshold);
     let count_text = format!("{} / {threshold}", g.active);
@@ -1881,7 +1920,11 @@ fn group_header(b: &mut Builder<'_>, g: &m::AccountGroup, r: Rect, sticky: bool)
     } else {
         0.
     };
-    let button_width = if g.relogin { 146. } else { 0. };
+    let button_width = if g.relogin {
+        b.measured_width("트레이에서 다시 로그인", 13., false) + 20.
+    } else {
+        0.
+    };
     let chip_width = if g.chip.is_empty() {
         0.
     } else {
@@ -2228,8 +2271,9 @@ fn session(
             SortKey::Client => {
                 let id_text = format!(" · {}", row.short_id);
                 let id_width = b.measured_width(&id_text, 12., false);
+                let id_right = cr.right - 8.;
                 b.text(
-                    rect(cr.left, cr.top, (*cw - id_width).max(0.), 20.),
+                    rect(cr.left, cr.top, (*cw - id_width - 8.).max(0.), 20.),
                     row.client.clone(),
                     12.,
                     false,
@@ -2237,7 +2281,7 @@ fn session(
                     false,
                 );
                 b.text(
-                    rect(cr.right - id_width, cr.top, id_width, 20.),
+                    rect(id_right - id_width, cr.top, id_width, 20.),
                     id_text,
                     12.,
                     false,
@@ -2672,13 +2716,14 @@ fn events(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card: R
             x = card.left + 12.;
             toolbar_y += 36.;
         }
-        b.control(
+        b.control_radius(
             rect(x, toolbar_y, w, 28.),
             &label,
             Target::EventFilter(*filter),
             Role::Button,
             s.event_filter == *filter,
             None,
+            14.,
         );
         x += w + 6.;
     }
