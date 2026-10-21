@@ -1295,7 +1295,8 @@ fn r10_dashboard_native() {
     assert!(run.port.as_ref().unwrap().clock(fixture::clock()));
     run.pump(80);
     unsafe {
-        KillTimer(Some(hwnd), 0x71).unwrap();
+        // Edge checkpoints may already have stopped the synthetic clock.
+        let _ = KillTimer(Some(hwnd), 0x71);
         let _ = InvalidateRect(Some(hwnd), None, false);
         let _ = UpdateWindow(hwnd);
     }
