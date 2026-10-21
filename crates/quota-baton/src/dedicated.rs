@@ -1,5 +1,7 @@
 //! R3 implementation, deliberately private behind the cutover module boundary.
 use super::*;
+#[path = "image_home.rs"]
+mod image_home;
 use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
 
 const SHARED: &[&str] = &[
@@ -413,6 +415,9 @@ struct Entry {
     abandoned: Vec<PathBuf>,
     /// Protected bytes support retry without rereading a changed source/key.
     payload: Option<String>,
+    /// Generated Qi baseline, separate from installed bytes containing local edits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image_base: Option<String>,
     done: bool,
     removed: bool,
     #[serde(default)]
@@ -511,6 +516,12 @@ struct Manifest {
     #[serde(default)]
     command: Option<CommandRecord>,
     home: PathBuf,
+    /// Optional in pre-R12 schema-3 journals; never infer ownership.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image_home: Option<PathBuf>,
+    /// Qi extension is unfinished; original optional actions already completed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    image_install_pending: bool,
     npm: PathBuf,
     claude: PathBuf,
     claude_before: String,
@@ -523,7 +534,7 @@ struct Manifest {
     tasks: Vec<TaskJournal>,
     optional_restored: bool,
     retained: bool,
-    /// None is legacy R3; false is an incomplete new install.
+    /// None is legacy R3; false means installation or Qi extension is unfinished.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     install_completed: Option<bool>,
     entries: Vec<Entry>,
@@ -684,6 +695,7 @@ fn new_entry(
         } else {
             None
         },
+        image_base: None,
         done: false,
         removed: false,
         original: None,
@@ -722,6 +734,7 @@ fn validate_manifest(paths: &CutoverPaths, m: &Manifest) -> Result<()> {
     {
         bail!("wiring journal의 경로/모드가 현재 홈과 일치하지 않습니다");
     }
+    image_home::validate_metadata(m)?;
     let mut tasks = std::collections::HashSet::new();
     for task in &m.tasks {
         if !matches!(
@@ -784,6 +797,7 @@ fn validate_manifest(paths: &CutoverPaths, m: &Manifest) -> Result<()> {
                     .iter()
                     .any(|n| e.path == m.home.join(n))
                 || SHARED.iter().any(|n| e.path == m.home.join(n)));
+        let allowed_image = image_home::allowed(m, &e.path);
         let allowed_parent = m.mode == CodexMode::Dedicated
             && e.kind == Kind::Directory
             && m.home.parent() == Some(e.path.as_path());
@@ -794,6 +808,7 @@ fn validate_manifest(paths: &CutoverPaths, m: &Manifest) -> Result<()> {
             || !(allowed_existing
                 || allowed_claude
                 || allowed_home
+                || allowed_image
                 || allowed_parent
                 || (m.mode == CodexMode::Dedicated && e.path == m.npm.join("codex-qb.cmd")))
             || !seen.insert(e.path.clone())
@@ -803,19 +818,32 @@ fn validate_manifest(paths: &CutoverPaths, m: &Manifest) -> Result<()> {
         if m.mode == CodexMode::None && !allowed_claude {
             bail!("none journal에 Codex 생성 경로가 있습니다");
         }
-        let expected_kind =
-            if e.path == ch || e.path == m.home || e.path == m.home.join("log") || allowed_parent {
-                Kind::Directory
-            } else if SHARED.iter().any(|name| e.path == m.home.join(name)) {
-                Kind::Junction
-            } else if ["AGENTS.md", "hooks.json"]
-                .iter()
-                .any(|name| e.path == m.home.join(name))
-            {
-                Kind::Hardlink
-            } else {
-                Kind::File
-            };
+        let expected_kind = if e.path == ch
+            || e.path == m.home
+            || e.path == m.home.join("log")
+            || allowed_parent
+            || m.image_home
+                .as_ref()
+                .is_some_and(|h| e.path == *h || e.path == h.join("log"))
+        {
+            Kind::Directory
+        } else if SHARED.iter().any(|name| {
+            e.path == m.home.join(name)
+                || m.image_home
+                    .as_ref()
+                    .is_some_and(|h| e.path == h.join(name))
+        }) {
+            Kind::Junction
+        } else if ["AGENTS.md", "hooks.json"].iter().any(|name| {
+            e.path == m.home.join(name)
+                || m.image_home
+                    .as_ref()
+                    .is_some_and(|h| e.path == h.join(name))
+        }) {
+            Kind::Hardlink
+        } else {
+            Kind::File
+        };
         if e.kind != expected_kind {
             bail!("journal 경로의 파일 종류가 올바르지 않습니다");
         }
@@ -829,6 +857,18 @@ fn validate_manifest(paths: &CutoverPaths, m: &Manifest) -> Result<()> {
                 || u.hash != hash_bytes(&unprotect(&u.payload)?))
         {
             bail!("업그레이드 journal 범위/내용이 올바르지 않습니다");
+        }
+        if let Some(base) = &e.image_base {
+            if e.kind != Kind::File
+                || m.image_home
+                    .as_ref()
+                    .is_none_or(|h| e.path != h.join("config.toml"))
+            {
+                bail!("Qi 기준 config journal 범위가 올바르지 않습니다");
+            }
+            // Cross-check connection semantics after Q's key/port diagnostics.
+            // Manifest validation still requires readable protected baseline bytes.
+            unprotect(base)?;
         }
         ancestors_safe(&e.path)?;
         if e.kind == Kind::Junction || e.kind == Kind::Hardlink {
@@ -1359,10 +1399,23 @@ fn existing_entry(path: PathBuf, after: &[u8], apply: bool) -> Result<Entry> {
     Ok(e)
 }
 
-fn install(paths: &CutoverPaths, m: &mut Manifest) -> Result<()> {
+fn install_entries(paths: &CutoverPaths, m: &mut Manifest, start: usize) -> Result<()> {
+    let end = m.entries.len();
+    install_entry_range(paths, m, start, end)
+}
+
+fn install_entry_range(
+    paths: &CutoverPaths,
+    m: &mut Manifest,
+    start: usize,
+    end: usize,
+) -> Result<()> {
     validate_manifest(paths, m)?;
-    for i in 0..m.entries.len() {
+    for i in start..end {
         let e = &m.entries[i];
+        if m.image_install_pending && !image_home::allowed(m, &e.path) {
+            continue;
+        }
         if e.removed {
             bail!("부분 해제 journal입니다. unwire를 먼저 완료하세요");
         }
@@ -1419,6 +1472,14 @@ fn install(paths: &CutoverPaths, m: &mut Manifest) -> Result<()> {
             fs::remove_file(pending_path(&m.entries[i]))?;
         }
     }
+    Ok(())
+}
+
+fn install(paths: &CutoverPaths, m: &mut Manifest) -> Result<()> {
+    if m.image_install_pending {
+        return finish_image_install(paths, m, 0);
+    }
+    install_entries(paths, m, 0)?;
     if m.claude_mode == ClaudeMode::Default {
         let current = hash_file(&m.claude)?;
         if current == m.claude_before {
@@ -1439,6 +1500,39 @@ fn install(paths: &CutoverPaths, m: &mut Manifest) -> Result<()> {
         }
         disable_cpa_tasks(&m.tasks)?;
     }
+    m.install_completed = Some(true);
+    atomic_json(&paths.journal(), m)?;
+    Ok(())
+}
+
+fn finish_image_install(paths: &CutoverPaths, m: &mut Manifest, start: usize) -> Result<()> {
+    validate_manifest(paths, m)?;
+    for e in m
+        .entries
+        .iter()
+        .filter(|e| !image_home::allowed(m, &e.path))
+    {
+        if !e.done || e.removed || e.upgrade.is_some() {
+            bail!("Qi 확장 전 원본 설치가 완료되지 않았습니다");
+        }
+        let mut observed = e.clone();
+        if e.path == m.home.join("config.toml") {
+            ancestors_safe(&e.path)?;
+            observed.identity = Some(identity(&e.path)?);
+            let bytes = fs::read(&e.path)?;
+            validate_upgrade_connection(m, e, &bytes)?;
+            // Read-only observation does not grant unwire deletion ownership.
+            observed.hash = hash_bytes(&bytes);
+        }
+        if !matches_entry(&observed, false)? {
+            bail!("Qi 확장 중 원본 경로가 변경되었습니다");
+        }
+    }
+    if m.claude_mode == ClaudeMode::Default && hash_file(&m.claude)? != m.claude_after {
+        bail!("Claude 설정이 변경되어 적용을 중단했습니다");
+    }
+    install_entries(paths, m, start)?;
+    m.image_install_pending = false;
     m.install_completed = Some(true);
     atomic_json(&paths.journal(), m)?;
     Ok(())
@@ -1470,7 +1564,11 @@ fn upgrade_path(m: &Manifest, path: &Path) -> Result<bool> {
         .context("사용자 홈 경로가 없습니다")?
         .join(".claude-qb");
     Ok((m.mode == CodexMode::Dedicated
-        && (path == m.home.join("config.toml") || path == m.npm.join("codex-qb.cmd")))
+        && (path == m.home.join("config.toml")
+            || path == m.npm.join("codex-qb.cmd")
+            || m.image_home
+                .as_ref()
+                .is_some_and(|h| path == h.join("config.toml"))))
         || (m.claude_mode == ClaudeMode::Dedicated
             && (path == ch.join("settings.json") || path == m.npm.join("claude-qb.cmd"))))
 }
@@ -1619,7 +1717,7 @@ fn upgrade_completed(
         summary: vec!["요약: 별도 홈 제목 설정 업그레이드를 확인합니다".into()],
         ..Report::default()
     };
-    let mut plans = Vec::new();
+    let mut plans: Vec<(Entry, Vec<u8>, Vec<u8>)> = Vec::new();
     let mut secrets = Vec::new();
     let mut publication_scratch = Vec::new();
     // R3 could journal done before unlinking its publication hardlink. Prove
@@ -1650,7 +1748,10 @@ fn upgrade_completed(
         }
         let mut observed = e.clone();
         let merge_config = m.mode == CodexMode::Dedicated
-            && e.path == m.home.join("config.toml")
+            && (e.path == m.home.join("config.toml")
+                || m.image_home
+                    .as_ref()
+                    .is_some_and(|h| e.path == h.join("config.toml")))
             && e.identity.is_some();
         if e.upgrade.is_some() {
             upgrade_state(e)?;
@@ -1680,6 +1781,26 @@ fn upgrade_completed(
         }
         let after = if let Some(u) = &e.upgrade {
             unprotect(&u.payload)?
+        } else if m
+            .image_home
+            .as_ref()
+            .is_some_and(|h| e.path == h.join("config.toml"))
+        {
+            let (_, _, config) = plans
+                .iter()
+                .find(|(q, _, _)| q.path == m.home.join("config.toml"))
+                .context("Q config 업그레이드 계획이 없습니다")?;
+            let saved = unprotect(
+                e.image_base
+                    .as_deref()
+                    .or(e.payload.as_deref())
+                    .context("Qi config 기준 payload가 없습니다")?,
+            )?;
+            let generated = image_home::config_bytes(config, &m.home)?;
+            if apply && saved != generated {
+                observed.image_base = Some(protect(&generated)?);
+            }
+            image_home::sync_config(config, &before, &saved, &m.home)?
         } else if e.path == m.home.join("config.toml") {
             dedicated_codex_title_bytes(&before)?
         } else if e.path.file_name().is_some_and(|n| n == "settings.json") {
@@ -1709,6 +1830,17 @@ fn upgrade_completed(
         }
         plans.push((observed, before, after));
     }
+    // Qi must derive from the very same observed Q snapshot used by the
+    // upgrade, not a second source read that could race with native trust writes.
+    let image_addition = if m.mode == CodexMode::Dedicated && m.image_home.is_none() {
+        let (_, _, config) = plans
+            .iter()
+            .find(|(e, _, _)| e.path == m.home.join("config.toml"))
+            .context("Q config 업그레이드 계획이 없습니다")?;
+        Some(image_home::plan(paths, &m.entries, config, apply)?)
+    } else {
+        None
+    };
     // Known journal credentials are redacted wherever values recur in the diff.
     for e in &m.entries {
         if let Some(payload) = &e.payload {
@@ -1755,6 +1887,7 @@ fn upgrade_completed(
                 }
                 // Bind recovery to the observed input, never to a later rewrite.
                 e.identity = observed.identity;
+                e.image_base = observed.image_base;
                 e.upgrade = Some(Upgrade {
                     old_hash: hash_bytes(&before),
                     old_identity: e
@@ -1769,6 +1902,31 @@ fn upgrade_completed(
                 atomic_json(&paths.journal(), m)?;
             }
             resume_upgrade(paths, m, i)?;
+        } else if apply && observed.image_base != m.entries[i].image_base {
+            // Updating the generated baseline never transfers deletion ownership.
+            if !matches_entry(&observed, false)? {
+                bail!("Qi 기준 config 관찰 대상이 변경되었습니다");
+            }
+            m.entries[i].image_base = observed.image_base;
+            atomic_json(&paths.journal(), m)?;
+        }
+    }
+    if let Some((home, entries)) = image_addition {
+        report
+            .changed
+            .extend(entries.iter().map(|e| e.path.display().to_string()));
+        report
+            .summary
+            .push(format!("이미지 전용 홈: {}", home.display()));
+        if apply {
+            let start = m.entries.len();
+            m.image_home = Some(home);
+            m.image_install_pending = true;
+            m.install_completed = Some(false);
+            m.entries.extend(entries);
+            validate_manifest(paths, m)?;
+            atomic_json(&paths.journal(), m)?;
+            finish_image_install(paths, m, start)?;
         }
     }
     report.warnings.extend(scratch_warnings(m));
@@ -1807,6 +1965,12 @@ fn validate_upgrade_connection(m: &Manifest, e: &Entry, bytes: &[u8]) -> Result<
     let invalid = || anyhow::anyhow!("기존 연결 journal 형식이 올바르지 않습니다");
     let mismatch =
         || anyhow::anyhow!("기존 연결의 포트/키가 현재 설정과 다릅니다. 먼저 unwire를 실행하세요");
+    if m.image_home
+        .as_ref()
+        .is_some_and(|h| e.path == h.join("config.toml"))
+    {
+        return image_home::validate_config(m, bytes);
+    }
     if e.path == m.home.join("config.toml") {
         let saved = unprotect(e.payload.as_deref().ok_or_else(invalid)?)?;
         let parse = |bytes: &[u8]| -> Result<DocumentMut> {
@@ -1924,6 +2088,15 @@ fn validate_resume_inputs(paths: &CutoverPaths, options: &WireOptions, m: &Manif
         if hash_bytes(&bytes) != e.hash {
             return Err(invalid());
         }
+        if m.image_home
+            .as_ref()
+            .is_some_and(|h| e.path == h.join("config.toml"))
+        {
+            if let Some(base) = &e.image_base {
+                image_home::validate_config(m, &unprotect(base)?)?;
+            }
+            image_home::validate_config(m, &bytes)?;
+        }
     }
     if m.claude_mode == ClaudeMode::Default
         && hash_bytes(&unprotect(&m.claude_payload).map_err(|_| invalid())?) != m.claude_after
@@ -1978,6 +2151,24 @@ pub(super) fn wire(
             {
                 bail!("부분 해제 journal입니다. unwire를 먼저 완료하세요");
             }
+            if old.image_install_pending {
+                if apply {
+                    validate_resume_inputs(paths, &options, &old)?;
+                    finish_image_install(paths, &mut old, 0)?;
+                    return upgrade_completed(paths, &mut old, true, options.force, command_update);
+                }
+                return Ok(Report {
+                    summary: vec!["요약: journal에서 Qi 확장을 재개합니다".into()],
+                    changed: old
+                        .entries
+                        .iter()
+                        .filter(|e| image_home::allowed(&old, &e.path) && !e.done)
+                        .map(|e| e.path.display().to_string())
+                        .collect(),
+                    warnings: scratch_warnings(&old),
+                    ..Report::default()
+                });
+            }
             if completed_install(&old)? {
                 if apply {
                     validate_resume_inputs(paths, &options, &old)?;
@@ -2000,6 +2191,13 @@ pub(super) fn wire(
                 if let Some(command) = command_update {
                     old.command = Some(command);
                     atomic_json(&paths.journal(), &old)?;
+                }
+                if old.mode == CodexMode::Dedicated && old.image_home.is_none() {
+                    let migration = upgrade_completed(paths, &mut old, true, options.force, None)?;
+                    report.summary.extend(migration.summary);
+                    report.changed.extend(migration.changed);
+                    report.diff.extend(migration.diff);
+                    report.warnings.extend(migration.warnings);
                 }
             }
             report.warnings.extend(scratch_warnings(&old));
@@ -2231,6 +2429,8 @@ pub(super) fn wire(
             Some(&launcher()?),
             apply,
         )?);
+        let (_, image_entries) = image_home::plan(paths, &entries, &config, apply)?;
+        entries.extend(image_entries);
         for e in &entries {
             if e.original.is_none()
                 && exists(&e.path)?
@@ -2327,6 +2527,12 @@ pub(super) fn wire(
         claude_mode,
         command,
         home: paths.codex_qb_home.clone(),
+        image_home: if mode == CodexMode::Dedicated {
+            Some(image_home::path(&paths.codex_qb_home)?)
+        } else {
+            None
+        },
+        image_install_pending: false,
         npm: paths.npm_dir.clone(),
         claude: paths.claude_settings.clone(),
         claude_before: hash_bytes(&claude_before),
@@ -2716,6 +2922,554 @@ pub(super) fn unwire(paths: &CutoverPaths, apply: bool, force: bool) -> Result<R
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Synthetic only; the coordinator runs Cargo for this independently owned task.
+    fn r12_remove_image_home(p: &CutoverPaths) {
+        let mut m = manifest(p);
+        let home = m.image_home.take().unwrap();
+        for e in m.entries.iter().rev().filter(|e| e.path.starts_with(&home)) {
+            match e.kind {
+                Kind::Directory | Kind::Junction => fs::remove_dir(&e.path).unwrap(),
+                Kind::File | Kind::Hardlink => fs::remove_file(&e.path).unwrap(),
+            }
+        }
+        m.entries.retain(|e| !e.path.starts_with(&home));
+        let mut old = serde_json::to_value(&m).unwrap();
+        old.as_object_mut().unwrap().remove("image_home");
+        atomic_json(&p.journal(), &old).unwrap();
+    }
+
+    #[test]
+    fn r12_image_feature_overrides_inherited_false_without_changing_q() {
+        for features in [
+            "[features]\nimage_generation = false\nkeep_feature = false\n",
+            "features = { image_generation = false, keep_feature = false }\n",
+            "features = {}\n",
+        ] {
+            let (_dir, p) = fixture();
+            // Keep source tables after root inline settings.
+            let source = fs::read_to_string(&p.codex_config).unwrap();
+            let source = if features.starts_with("[") {
+                format!("{source}\n{features}")
+            } else {
+                format!("{features}{source}")
+            };
+            fs::write(&p.codex_config, &source).unwrap();
+            let expected_q = config_bytes(&p, WireOptions::default().data_port).unwrap();
+            run(&p, true, Some(CodexMode::Dedicated)).unwrap();
+            assert_eq!(
+                fs::read(p.codex_qb_home.join("config.toml")).unwrap(),
+                expected_q
+            );
+            assert_eq!(fs::read_to_string(&p.codex_config).unwrap(), source);
+            let m = manifest(&p);
+            let qi = m.image_home.as_ref().unwrap().join("config.toml");
+            let bytes = fs::read(&qi).unwrap();
+            image_home::validate_config(&m, &bytes).unwrap();
+            let mut doc = std::str::from_utf8(&bytes)
+                .unwrap()
+                .parse::<DocumentMut>()
+                .unwrap();
+            assert_eq!(doc["features"]["image_generation"].as_bool(), Some(true));
+            if features.contains("keep_feature") {
+                assert_eq!(doc["features"]["keep_feature"].as_bool(), Some(false));
+            }
+            let q = std::str::from_utf8(&expected_q)
+                .unwrap()
+                .parse::<DocumentMut>()
+                .unwrap();
+            assert_ne!(
+                q["features"]
+                    .get("image_generation")
+                    .and_then(toml_edit::Item::as_bool),
+                Some(true)
+            );
+            for replacement in [Some(false), None] {
+                if let Some(value) = replacement {
+                    doc["features"]["image_generation"] = toml_edit::value(value);
+                } else {
+                    doc["features"]
+                        .as_table_like_mut()
+                        .unwrap()
+                        .remove("image_generation");
+                }
+                assert!(image_home::validate_config(&m, doc.to_string().as_bytes()).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn r12_image_config_replaces_inherited_provider_auth_with_env_name_only() {
+        let (_dir, p) = fixture();
+        let q = config_bytes(&p, 10280).unwrap();
+        let mut doc = std::str::from_utf8(&q)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        doc["model_providers"]["qb"]["experimental_bearer_token"] = toml_edit::value(KEY);
+        doc["model_providers"]["qb"]["http_headers"]["Authorization"] = toml_edit::value(KEY);
+        let input = doc.to_string();
+        let result = image_home::config_bytes(input.as_bytes(), &p.codex_qb_home).unwrap();
+        let text = std::str::from_utf8(&result).unwrap();
+        assert!(!text.contains(KEY));
+        assert!(!text.contains("experimental_bearer_token"));
+        assert!(text.contains("QB_IMAGE_CLIENT_KEY"));
+        let image = text.parse::<DocumentMut>().unwrap();
+        assert_eq!(
+            image["model_providers"]["qb"]["http_headers"]
+                .as_table_like()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.get("model_provider")
+                .and_then(toml_edit::Item::as_str)
+                .unwrap_or("openai"),
+            "openai"
+        );
+    }
+
+    #[test]
+    fn r12_image_fresh_wire_config_sharing_idempotence_and_unwire() {
+        let (_dir, p) = fixture();
+        let sources = snapshot(&p);
+        run(&p, true, Some(CodexMode::Dedicated)).unwrap();
+        let m = manifest(&p);
+        let home = image_home::path(&p.codex_qb_home).unwrap();
+        assert_eq!(m.image_home.as_ref(), Some(&home));
+        let metadata: Value = serde_json::from_slice(&fs::read(p.journal()).unwrap()).unwrap();
+        assert_eq!(
+            PathBuf::from(metadata["image_home"].as_str().unwrap()),
+            home
+        );
+        let q = fs::read(p.codex_qb_home.join("config.toml")).unwrap();
+        let q_doc = std::str::from_utf8(&q)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            q_doc
+                .get("model_provider")
+                .and_then(toml_edit::Item::as_str)
+                .unwrap_or("openai"),
+            "openai"
+        );
+        let q_auth = fs::read(p.codex_qb_home.join("auth.json")).unwrap();
+        let q_id = identity(&p.codex_qb_home.join("config.toml")).unwrap();
+        let bytes = fs::read(home.join("config.toml")).unwrap();
+        image_home::validate_config(&m, &bytes).unwrap();
+        let doc = std::str::from_utf8(&bytes)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        let provider = &doc["model_providers"]["qb"];
+        assert_eq!(doc["model_provider"].as_str(), Some("qb"));
+        assert_eq!(provider["name"].as_str(), Some("OpenAI"));
+        assert_eq!(provider["wire_api"].as_str(), Some("responses"));
+        assert_eq!(provider["env_key"].as_str(), Some("QB_IMAGE_CLIENT_KEY"));
+        assert_eq!(provider["supports_websockets"].as_bool(), Some(true));
+        assert_eq!(provider["requires_openai_auth"].as_bool(), Some(false));
+        assert_eq!(
+            provider["http_headers"]["x-openai-actor-authorization"].as_str(),
+            Some("qb-local")
+        );
+        assert_eq!(
+            provider["capabilities"]["remote_compaction"].as_str(),
+            Some("v2")
+        );
+        assert_eq!(
+            provider["base_url"].as_str(),
+            doc["openai_base_url"].as_str()
+        );
+        assert!(!std::str::from_utf8(&bytes).unwrap().contains(KEY));
+        assert!(!home.join("auth.json").exists());
+        assert_eq!(
+            identity(&home.join("AGENTS.md")).unwrap(),
+            identity(&p.codex_config.parent().unwrap().join("AGENTS.md")).unwrap()
+        );
+        assert!(home.join("skills/source-marker").is_file());
+        let journal = fs::read(p.journal()).unwrap();
+        assert!(
+            run(&p, true, Some(CodexMode::Dedicated))
+                .unwrap()
+                .changed
+                .is_empty()
+        );
+        assert_eq!(fs::read(p.journal()).unwrap(), journal);
+        assert_eq!(fs::read(p.codex_qb_home.join("config.toml")).unwrap(), q);
+        assert_eq!(
+            identity(&p.codex_qb_home.join("config.toml")).unwrap(),
+            q_id
+        );
+        assert_eq!(fs::read(p.codex_qb_home.join("auth.json")).unwrap(), q_auth);
+        super::unwire(&p, true, false).unwrap();
+        assert!(!home.exists());
+        assert_eq!(snapshot(&p), sources);
+    }
+
+    #[test]
+    fn r12_image_legacy_schema3_upgrade_uses_current_q_without_rewriting_it() {
+        let (_dir, p) = fixture();
+        run(&p, true, Some(CodexMode::Dedicated)).unwrap();
+        r12_remove_image_home(&p);
+        let config = p.codex_qb_home.join("config.toml");
+        let current = format!(
+            "r12_current_setting = 'current-Q'\n{}",
+            fs::read_to_string(&config).unwrap()
+        );
+        atomic_bytes(&config, current.as_bytes()).unwrap();
+        let q_id = identity(&config).unwrap();
+        // Upgrade must not regenerate from the real/default source config.
+        fs::write(&p.codex_config, "invalid source TOML [").unwrap();
+        let journal = fs::read(p.journal()).unwrap();
+        let home = image_home::path(&p.codex_qb_home).unwrap();
+        assert!(
+            !run(&p, false, Some(CodexMode::Dedicated))
+                .unwrap()
+                .changed
+                .is_empty()
+        );
+        assert!(!home.exists());
+        assert_eq!(fs::read(p.journal()).unwrap(), journal);
+        run(&p, true, Some(CodexMode::Dedicated)).unwrap();
+        assert_eq!(fs::read(&config).unwrap(), current.as_bytes());
+        assert_eq!(identity(&config).unwrap(), q_id);
+        let qi = fs::read_to_string(home.join("config.toml")).unwrap();
+        assert_eq!(
+            qi.parse::<DocumentMut>().unwrap()["r12_current_setting"].as_str(),
+            Some("current-Q")
+        );
+        let journal = fs::read(p.journal()).unwrap();
+        assert!(
+            run(&p, true, Some(CodexMode::Dedicated))
+                .unwrap()
+                .changed
+                .is_empty()
+        );
+        assert_eq!(fs::read(p.journal()).unwrap(), journal);
+        for force in [false, true] {
+            assert!(super::unwire(&p, true, force).is_err());
+            assert_eq!(fs::read(&config).unwrap(), current.as_bytes());
+            assert_eq!(identity(&config).unwrap(), q_id);
+        }
+        assert!(p.journal().exists());
+        assert!(!home.exists());
+    }
+
+    #[test]
+    fn r12_image_collision_and_unknown_journal_paths_are_refused() {
+        for legacy in [false, true] {
+            let (_dir, p) = fixture();
+            if legacy {
+                run(&p, true, Some(CodexMode::Dedicated)).unwrap();
+                r12_remove_image_home(&p);
+            }
+            let home = image_home::path(&p.codex_qb_home).unwrap();
+            fs::create_dir_all(&home).unwrap();
+            fs::write(home.join("unknown"), "keep").unwrap();
+            let journal = fs::read(p.journal()).ok();
+            for apply in [false, true] {
+                assert!(run(&p, apply, Some(CodexMode::Dedicated)).is_err());
+                assert_eq!(fs::read(p.journal()).ok(), journal);
+                assert_eq!(fs::read_to_string(home.join("unknown")).unwrap(), "keep");
+            }
+        }
+        let (_dir, p) = fixture();
+        run(&p, true, Some(CodexMode::Dedicated)).unwrap();
+        let mut m = manifest(&p);
+        let home = m.image_home.clone().unwrap();
+        for name in ["auth.json", "unknown-owned.txt"] {
+            m.entries.push(
+                new_entry(home.join(name), Kind::File, None, Some(b"unknown"), true).unwrap(),
+            );
+            assert!(validate_manifest(&p, &m).is_err());
+            m.entries.pop();
+        }
+        let config = home.join("config.toml");
+        fs::write(&config, "unknown edited owned config").unwrap();
+        let journal = fs::read(p.journal()).unwrap();
+        assert!(run(&p, true, Some(CodexMode::Dedicated)).is_err());
+        assert_eq!(fs::read(p.journal()).unwrap(), journal);
+        assert_eq!(
+            fs::read_to_string(config).unwrap(),
+            "unknown edited owned config"
+        );
+    }
+
+    #[test]
+    fn r12_image_creation_interrupt_recovers_for_fresh_and_legacy_wire() {
+        for legacy in [false, true] {
+            for (name, recover) in [
+                ("qb-images", true),
+                ("config.toml", true),
+                ("config.toml", false),
+            ] {
+                let (_dir, p) = fixture();
+                if legacy {
+                    run(&p, true, Some(CodexMode::Dedicated)).unwrap();
+                    r12_remove_image_home(&p);
+                }
+                let home = image_home::path(&p.codex_qb_home).unwrap();
+                let boundary = if name == "qb-images" {
+                    home.clone()
+                } else {
+                    home.join(name)
+                };
+                INTERRUPT.with(|slot| *slot.borrow_mut() = Some((boundary, "after-publish")));
+                assert!(run(&p, true, Some(CodexMode::Dedicated)).is_err());
+                assert!(manifest(&p).image_home.is_some());
+                if recover {
+                    run(&p, true, Some(CodexMode::Dedicated)).unwrap();
+                    let m = manifest(&p);
+                    assert!(m.entries.iter().all(|e| e.done));
+                    image_home::validate_config(&m, &fs::read(home.join("config.toml")).unwrap())
+                        .unwrap();
+                }
+                super::unwire(&p, true, false).unwrap();
+                assert!(!home.exists());
+            }
+        }
+    }
+
+    struct R12ResetOptionalMutations;
+    impl Drop for R12ResetOptionalMutations {
+        fn drop(&mut self) {
+            OPTIONAL_MUTATIONS.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    fn r12_fake_recorded_actions(m: &mut Manifest) -> OptionalMutationState {
+        m.autostart = Some(OptionalActionJournal {
+            before: Original {
+                present: false,
+                value: None,
+            },
+            before_type: 1,
+            after: "synthetic-recorded-autostart".into(),
+            after_type: 1,
+        });
+        m.tasks = vec![TaskJournal {
+            name: "cliproxyapi-proxy".into(),
+            was_enabled: true,
+            after_enabled: false,
+        }];
+        OptionalMutationState {
+            autostart: "synthetic-user-changed-autostart".into(),
+            tasks: [("cliproxyapi-proxy".into(), true)].into_iter().collect(),
+            calls: 0,
+        }
+    }
+
+    #[test]
+    fn r12_legacy_markerless_image_extension_recovers_without_optional_replay_or_q_adoption() {
+        let (_dir, p) = fixture();
+        run(&p, true, Some(CodexMode::Dedicated)).unwrap();
+        r12_remove_image_home(&p);
+        let mut m = manifest(&p);
+        m.install_completed = None;
+        let initial = r12_fake_recorded_actions(&mut m);
+        atomic_json(&p.journal(), &m).unwrap();
+        let raw: Value = serde_json::from_slice(&fs::read(p.journal()).unwrap()).unwrap();
+        assert!(raw.get("install_completed").is_none());
+        assert!(raw.get("image_home").is_none());
+        let q_config = p.codex_qb_home.join("config.toml");
+        let q_anchor =
+            serde_json::to_value(m.entries.iter().find(|e| e.path == q_config).unwrap()).unwrap();
+        let text = format!(
+            "r12_q_only = 'preserve'\n{}",
+            fs::read_to_string(&q_config).unwrap()
+        );
+        atomic_bytes(&q_config, text.as_bytes()).unwrap();
+        let q_identity = identity(&q_config).unwrap();
+        let _reset = R12ResetOptionalMutations;
+        OPTIONAL_MUTATIONS.with(|slot| *slot.borrow_mut() = Some(initial.clone()));
+        let home = image_home::path(&p.codex_qb_home).unwrap();
+        INTERRUPT.with(|slot| *slot.borrow_mut() = Some((home.clone(), "after-publish")));
+        assert!(run(&p, true, Some(CodexMode::Dedicated)).is_err());
+        let pending = manifest(&p);
+        assert!(pending.image_install_pending);
+        assert_eq!(pending.install_completed, Some(false));
+        assert!(!completed_install(&pending).unwrap());
+        OPTIONAL_MUTATIONS.with(|slot| assert_eq!(slot.borrow().as_ref(), Some(&initial)));
+        let journal = fs::read(p.journal()).unwrap();
+        run(&p, false, Some(CodexMode::Dedicated)).unwrap();
+        assert_eq!(fs::read(p.journal()).unwrap(), journal);
+        run(&p, true, Some(CodexMode::Dedicated)).unwrap();
+        let complete = manifest(&p);
+        assert!(!complete.image_install_pending);
+        assert_eq!(complete.install_completed, Some(true));
+        assert!(complete.entries.iter().all(|e| e.done));
+        assert_eq!(
+            serde_json::to_value(
+                complete
+                    .entries
+                    .iter()
+                    .find(|e| e.path == q_config)
+                    .unwrap()
+            )
+            .unwrap(),
+            q_anchor
+        );
+        assert_eq!(identity(&q_config).unwrap(), q_identity);
+        assert_eq!(fs::read(&q_config).unwrap(), text.as_bytes());
+        assert!(home.join("config.toml").is_file());
+        OPTIONAL_MUTATIONS.with(|slot| assert_eq!(slot.borrow().as_ref(), Some(&initial)));
+    }
+
+    #[test]
+    fn r12_qi_atomic_save_merges_local_trust_without_adopting_noop_replacement() {
+        for force in [false, true] {
+            let (_dir, p) = fixture();
+            r32_run(&p, true, false).unwrap();
+            let path = image_home::path(&p.codex_qb_home)
+                .unwrap()
+                .join("config.toml");
+            let text = format!(
+                "{}\n[projects.'C:\\synthetic\\qi-local']\ntrust_level = 'trusted'\n",
+                fs::read_to_string(&path).unwrap()
+            );
+            atomic_bytes(&path, text.as_bytes()).unwrap();
+            let replacement = identity(&path).unwrap();
+            let journal = fs::read(p.journal()).unwrap();
+            for apply in [false, true] {
+                assert!(r32_run(&p, apply, force).unwrap().changed.is_empty());
+                assert_eq!(fs::read(p.journal()).unwrap(), journal);
+                assert_eq!(fs::read(&path).unwrap(), text.as_bytes());
+                assert_eq!(identity(&path).unwrap(), replacement);
+            }
+            // Observation alone never makes a client replacement deletable.
+            assert!(super::unwire(&p, true, force).is_err());
+            assert_eq!(fs::read(&path).unwrap(), text.as_bytes());
+            assert_eq!(identity(&path).unwrap(), replacement);
+            assert!(p.journal().exists());
+        }
+        let (_dir, p) = fixture();
+        run(&p, true, Some(CodexMode::Dedicated)).unwrap();
+        let q = p.codex_qb_home.join("config.toml");
+        let qi = image_home::path(&p.codex_qb_home)
+            .unwrap()
+            .join("config.toml");
+        let current = format!(
+            "qi_local = 'keep'\n{}\n[projects.'C:\\synthetic\\qi-merge']\ntrust_level = 'trusted'\n",
+            fs::read_to_string(&qi).unwrap()
+        );
+        atomic_bytes(&qi, current.as_bytes()).unwrap();
+        let q_current = format!(
+            "q_current = 'propagate'\n{}\n[projects.'C:\\synthetic\\shared-from-q']\ntrust_level = 'trusted'\n",
+            fs::read_to_string(&q).unwrap()
+        );
+        atomic_bytes(&q, q_current.as_bytes()).unwrap();
+        let report = run(&p, true, Some(CodexMode::Dedicated)).unwrap();
+        assert_eq!(report.changed, vec![qi.display().to_string()]);
+        let merged = fs::read_to_string(&qi)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(merged["qi_local"].as_str(), Some("keep"));
+        assert_eq!(merged["q_current"].as_str(), Some("propagate"));
+        assert_eq!(
+            merged["projects"]["C:\\synthetic\\shared-from-q"]["trust_level"].as_str(),
+            Some("trusted")
+        );
+        assert_eq!(
+            merged["projects"]["C:\\synthetic\\qi-merge"]["trust_level"].as_str(),
+            Some("trusted")
+        );
+        assert_eq!(fs::read(&q).unwrap(), q_current.as_bytes());
+        assert!(
+            run(&p, true, Some(CodexMode::Dedicated))
+                .unwrap()
+                .changed
+                .is_empty()
+        );
+        // A later inherited deletion must not become a permanent Qi-local edit.
+        let mut updated = q_current.parse::<DocumentMut>().unwrap();
+        updated.remove("q_current");
+        updated.remove("projects");
+        atomic_bytes(&q, updated.to_string().as_bytes()).unwrap();
+        run(&p, true, Some(CodexMode::Dedicated)).unwrap();
+        let merged = fs::read_to_string(&qi)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert!(merged.get("q_current").is_none());
+        assert!(
+            merged["projects"]
+                .get("C:\\synthetic\\shared-from-q")
+                .is_none()
+        );
+        assert_eq!(merged["qi_local"].as_str(), Some("keep"));
+        assert_eq!(
+            merged["projects"]["C:\\synthetic\\qi-merge"]["trust_level"].as_str(),
+            Some("trusted")
+        );
+    }
+
+    #[test]
+    fn r12_qi_atomic_save_with_changed_controlled_provider_is_refused() {
+        let (_dir, p) = fixture();
+        r32_run(&p, true, false).unwrap();
+        let path = image_home::path(&p.codex_qb_home)
+            .unwrap()
+            .join("config.toml");
+        let mut doc = fs::read_to_string(&path)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        doc["model_providers"]["qb"]["base_url"] = toml_edit::value("https://example.invalid/v1");
+        let current = doc.to_string();
+        atomic_bytes(&path, current.as_bytes()).unwrap();
+        let journal = fs::read(p.journal()).unwrap();
+        for force in [false, true] {
+            for apply in [false, true] {
+                assert!(r32_run(&p, apply, force).is_err());
+                assert_eq!(fs::read(p.journal()).unwrap(), journal);
+                assert_eq!(fs::read(&path).unwrap(), current.as_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn r12_preimage_partial_install_finishes_qi_migration_in_one_apply() {
+        for legacy_marker in [false, true] {
+            let (_dir, p) = fixture();
+            run(&p, true, Some(CodexMode::Dedicated)).unwrap();
+            r12_remove_image_home(&p);
+            let mut m = manifest(&p);
+            let path = p.npm_dir.join("codex-qb.cmd");
+            let entry = m.entries.iter_mut().find(|e| e.path == path).unwrap();
+            fs::remove_file(&path).unwrap();
+            entry.done = false;
+            entry.identity = None;
+            entry.pending = None;
+            entry.pending_identity = None;
+            m.install_completed = if legacy_marker { None } else { Some(false) };
+            let initial = r12_fake_recorded_actions(&mut m);
+            atomic_json(&p.journal(), &m).unwrap();
+            let _reset = R12ResetOptionalMutations;
+            OPTIONAL_MUTATIONS.with(|slot| *slot.borrow_mut() = Some(initial));
+            let home = image_home::path(&p.codex_qb_home).unwrap();
+            assert!(!home.exists());
+            // A single call recovers the old object and publishes all Qi objects.
+            run(&p, true, Some(CodexMode::Dedicated)).unwrap();
+            let after = manifest(&p);
+            assert_eq!(after.image_home, Some(home.clone()));
+            assert!(!after.image_install_pending);
+            assert_eq!(after.install_completed, Some(true));
+            assert!(after.entries.iter().all(|e| e.done));
+            assert!(path.is_file());
+            assert!(home.join("config.toml").is_file());
+            OPTIONAL_MUTATIONS.with(|slot| {
+                let state = slot.borrow();
+                let state = state.as_ref().unwrap();
+                assert_eq!(state.calls, 2); // Original actions execute once each.
+                assert_eq!(state.autostart, "synthetic-recorded-autostart");
+                assert!(!state.tasks["cliproxyapi-proxy"]);
+            });
+        }
+    }
+
     // Synthetic preparation only: these tests have NOT been executed.
     #[test]
     fn r32_codex_title_merge_preserves_unknown_keys_comments_and_inline_tables() {
@@ -3566,10 +4320,12 @@ trusted_hash = "synthetic-hook-hash"
                 }
                 e.pending_identity = None;
             }
-            let rest = m.entries.split_off(boundary);
+            // Keep the full ownership plan durable while publishing only a prefix.
+            // R12 manifests must always include Qi's home/log/config entries.
             atomic_json(&p.journal(), &m).unwrap();
-            install(&p, &mut m).unwrap();
-            m.entries.extend(rest);
+            install_entry_range(&p, &mut m, 0, boundary).unwrap();
+            assert!(m.entries[..boundary].iter().all(|e| e.done));
+            assert!(m.entries[boundary..].iter().all(|e| !e.done));
             atomic_json(&p.journal(), &m).unwrap();
             run(&p, true, None).unwrap();
             unwire(&p, true, false).unwrap();
@@ -3624,10 +4380,10 @@ trusted_hash = "synthetic-hook-hash"
             e.pending_identity = None;
         }
         let first_file = m.entries.iter().position(|e| e.kind == Kind::File).unwrap();
-        let rest = m.entries.split_off(first_file);
         atomic_json(&p.journal(), &m).unwrap();
-        install(&p, &mut m).unwrap();
-        m.entries.extend(rest);
+        install_entry_range(&p, &mut m, 0, first_file).unwrap();
+        assert!(m.entries[..first_file].iter().all(|e| e.done));
+        assert!(m.entries[first_file..].iter().all(|e| !e.done));
         let tmp = pending_path(&m.entries[first_file]);
         fs::write(&tmp, "interrupted incomplete synthetic bytes").unwrap();
         m.entries[first_file].pending_identity = Some(identity(&tmp).unwrap());
@@ -4707,6 +5463,15 @@ trusted_hash = "synthetic-hook-hash"
         // These extras existed in the owned R3 file, not in its default source.
         doc["r32_extra"] = toml_edit::value("current-dedicated-only");
         fs::write(&config, doc.to_string()).unwrap();
+        let qi_config =
+            image_home::config_bytes(doc.to_string().as_bytes(), &p.codex_qb_home).unwrap();
+        fs::write(
+            image_home::path(&p.codex_qb_home)
+                .unwrap()
+                .join("config.toml"),
+            qi_config,
+        )
+        .unwrap();
         let settings = claude_home(p).unwrap().join("settings.json");
         let mut json: Value = serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
         json["env"]
@@ -5201,11 +5966,11 @@ trusted_hash = "synthetic-hook-hash"
             let journal = fs::read(p.journal()).unwrap();
             let before = r32_owned(&p);
             let dry = r32_run(&p, false, force).unwrap();
-            assert_eq!(dry.changed.len(), 4);
+            assert_eq!(dry.changed.len(), 5);
             assert_eq!(fs::read(p.journal()).unwrap(), journal);
             assert_eq!(r32_owned(&p), before);
 
-            assert_eq!(r32_run(&p, true, force).unwrap().changed.len(), 4);
+            assert_eq!(r32_run(&p, true, force).unwrap().changed.len(), 5);
             let actual = fs::read(&path).unwrap();
             assert_eq!(
                 std::str::from_utf8(&actual)
@@ -5313,9 +6078,36 @@ trusted_hash = "synthetic-hook-hash"
         atomic_bytes(&path, text.as_bytes()).unwrap();
         let id = identity(&path).unwrap();
         let journal = fs::read(p.journal()).unwrap();
+        let anchor = serde_json::to_value(
+            manifest(&p)
+                .entries
+                .iter()
+                .find(|e| e.path == path)
+                .unwrap(),
+        )
+        .unwrap();
+        let qi_config = image_home::path(&p.codex_qb_home)
+            .unwrap()
+            .join("config.toml");
         for apply in [false, true] {
-            assert!(r32_run(&p, apply, false).unwrap().changed.is_empty());
-            assert_eq!(fs::read(p.journal()).unwrap(), journal);
+            assert_eq!(
+                r32_run(&p, apply, false).unwrap().changed,
+                vec![qi_config.display().to_string()]
+            );
+            if !apply {
+                assert_eq!(fs::read(p.journal()).unwrap(), journal);
+            }
+            assert_eq!(
+                serde_json::to_value(
+                    manifest(&p)
+                        .entries
+                        .iter()
+                        .find(|e| e.path == path)
+                        .unwrap()
+                )
+                .unwrap(),
+                anchor
+            );
             assert_eq!(fs::read(&path).unwrap(), text.as_bytes());
             assert_eq!(identity(&path).unwrap(), id);
         }
