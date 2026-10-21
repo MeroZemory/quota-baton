@@ -26,6 +26,7 @@ struct AccountFacts {
     user: crate::accounts::UserState,
     drain: bool,
     credits: bool,
+    quota_cooling: Option<crate::accounts::QuotaCooling>,
 }
 struct Lookup {
     id: SessionId,
@@ -547,6 +548,7 @@ impl Runtime {
                 user: account.user_state,
                 drain: account.drain,
                 credits: account.allow_credits,
+                quota_cooling: account.quota_cooling.clone(),
             });
         }
     }
@@ -561,6 +563,7 @@ impl Runtime {
             user: account.user_state,
             drain: account.drain,
             credits: account.allow_credits,
+            quota_cooling: account.quota_cooling.clone(),
         };
         let previous = {
             let Some(mut state) = self.writable() else {
@@ -614,7 +617,34 @@ impl Runtime {
             });
         }
     }
+    pub(crate) fn account_health(
+        &self,
+        account: &crate::accounts::Account,
+        from: &crate::accounts::Health,
+    ) {
+        // The callback precedes account_changed; facts retain the old C5
+        // evidence after expiry/early recovery clears the account's evidence.
+        let evidence = if matches!(account.health, crate::accounts::Health::Ready) {
+            AccountId::try_from(account.id.clone())
+                .ok()
+                .and_then(|id| self.writable()?.accounts.get(&id)?.quota_cooling.clone())
+        } else {
+            account.quota_cooling.clone()
+        };
+        self.health_with_evidence(&account.id, from, &account.health, evidence.as_ref());
+    }
+
     pub fn health(&self, id: &str, from: &crate::accounts::Health, to: &crate::accounts::Health) {
+        self.health_with_evidence(id, from, to, None);
+    }
+
+    fn health_with_evidence(
+        &self,
+        id: &str,
+        from: &crate::accounts::Health,
+        to: &crate::accounts::Health,
+        evidence: Option<&crate::accounts::QuotaCooling>,
+    ) {
         use crate::accounts::{Health, HealthReason};
         let now = Utc::now();
         let kind = match to {
@@ -654,10 +684,23 @@ impl Runtime {
             }
             _ => return,
         };
-        let (window, reset) = match to {
-            Health::Cooling { scope, until, .. } => (scope.clone().try_into().ok(), Some(*until)),
-            _ => (None, None),
-        };
+        // Health scope is never a window name. Fallback cooldown deadlines
+        // are not observed reset evidence; leave unknown fields absent.
+        let (window, reset) =
+            if matches!(kind, ActivityKind::QuotaReached | ActivityKind::QuotaReset) {
+                (
+                    evidence.and_then(|e| e.window.clone().try_into().ok()),
+                    evidence.map(|e| e.reset_at),
+                )
+            } else {
+                (
+                    None,
+                    match to {
+                        Health::Cooling { until, .. } => Some(*until),
+                        _ => None,
+                    },
+                )
+            };
         self.activity(ActivityInput {
             ts: now,
             kind,
@@ -861,6 +904,110 @@ pub fn request_outcome(outcome: &str) -> RequestOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn r101_activity_carries_c5_window_through_reached_extension_and_reset() {
+        use crate::accounts::{Health, HealthReason, QuotaCooling};
+        for name in ["5h", "7d", "43200m", "primary"] {
+            let runtime = Runtime::new();
+            let mut account = crate::accounts::health::tests::fixture();
+            runtime.baseline_accounts(&[account.clone()]);
+            let now = Utc::now();
+            let reset = now + chrono::Duration::hours(2);
+            account.health = Health::Cooling {
+                reason: HealthReason::Quota,
+                until: reset,
+                scope: "account".into(),
+            };
+            account.quota_cooling = Some(QuotaCooling {
+                window: name.into(),
+                reset_at: reset,
+                started_at: now,
+            });
+            runtime.account_health(&account, &Health::Ready);
+            runtime.account_changed(&account);
+            let old = account.health.clone();
+            account.health = Health::Cooling {
+                reason: HealthReason::Quota,
+                until: reset + chrono::Duration::seconds(1),
+                scope: "account".into(),
+            };
+            account.quota_cooling.as_mut().unwrap().reset_at += chrono::Duration::seconds(1);
+            runtime.account_health(&account, &old);
+            runtime.account_changed(&account);
+            let old = account.health.clone();
+            account.health = Health::Ready;
+            account.quota_cooling = None;
+            runtime.account_health(&account, &old);
+            runtime.account_changed(&account);
+            let events = runtime.activity_page(None, 100, 1).unwrap().events;
+            assert_eq!(events.len(), 2, "extension must remain one episode");
+            for kind in [ActivityKind::QuotaReached, ActivityKind::QuotaReset] {
+                let event = events.iter().find(|e| e.kind == kind).unwrap();
+                assert_eq!(event.data.window.as_ref().unwrap().as_str(), name);
+                assert_eq!(
+                    event.data.reset_at,
+                    Some(if kind == ActivityKind::QuotaReset {
+                        reset + chrono::Duration::seconds(1)
+                    } else {
+                        reset
+                    })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn r101_activity_unknown_window_does_not_use_account_scope_or_hold_deadline() {
+        use crate::accounts::{Health, HealthReason};
+        let runtime = Runtime::new();
+        let mut account = crate::accounts::health::tests::fixture();
+        runtime.baseline_accounts(&[account.clone()]);
+        account.health = Health::Cooling {
+            reason: HealthReason::Quota,
+            until: Utc::now() + chrono::Duration::minutes(5),
+            scope: "account".into(),
+        };
+        runtime.account_health(&account, &Health::Ready);
+        let events = runtime.activity_page(None, 100, 1).unwrap().events;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, ActivityKind::QuotaReached);
+        assert!(events[0].data.window.is_none());
+        assert!(events[0].data.reset_at.is_none());
+    }
+
+    #[test]
+    fn r101_activity_restored_cooling_keeps_reset_window_and_unknown_stays_unknown() {
+        use crate::accounts::{Health, HealthReason, QuotaCooling};
+        for known in [false, true] {
+            let runtime = Runtime::new();
+            let mut account = crate::accounts::health::tests::fixture();
+            let reset = Utc::now() + chrono::Duration::hours(1);
+            account.health = Health::Cooling {
+                reason: HealthReason::Quota,
+                until: reset,
+                scope: "account".into(),
+            };
+            account.quota_cooling = known.then(|| QuotaCooling {
+                window: "43200m".into(),
+                reset_at: reset,
+                started_at: Utc::now(),
+            });
+            runtime.baseline_accounts(&[account.clone()]);
+            let old = account.health.clone();
+            account.health = Health::Ready;
+            account.quota_cooling = None;
+            runtime.account_health(&account, &old);
+            let events = runtime.activity_page(None, 100, 1).unwrap().events;
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].kind, ActivityKind::QuotaReset);
+            assert_eq!(
+                events[0].data.window.as_ref().map(WindowName::as_str),
+                known.then_some("43200m")
+            );
+            assert_eq!(events[0].data.reset_at, known.then_some(reset));
+        }
+    }
+
     #[test]
     fn r10_quota_activity_suppresses_only_continuous_account_cooling() {
         use crate::accounts::{Health, HealthReason};

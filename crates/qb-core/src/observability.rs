@@ -904,6 +904,15 @@ impl Observability {
         })));
     }
 
+    pub(crate) fn record_account_health(
+        &self,
+        account: &crate::accounts::Account,
+        from: &crate::accounts::Health,
+    ) {
+        self.dashboard.account_health(account, from);
+        self.record_health_ledger(&account.id, from, &account.health);
+    }
+
     pub fn record_health(
         &self,
         id: &str,
@@ -911,6 +920,15 @@ impl Observability {
         to: &crate::accounts::Health,
     ) {
         self.dashboard.health(id, from, to);
+        self.record_health_ledger(id, from, to);
+    }
+
+    fn record_health_ledger(
+        &self,
+        id: &str,
+        from: &crate::accounts::Health,
+        to: &crate::accounts::Health,
+    ) {
         let value = serde_json::to_value(to).unwrap_or_default();
         self.enqueue(Command::Ledger(serde_json::json!({"ts":Utc::now().to_rfc3339(),"event":"health_changed","account":id,"from":from,"to":to,"reason":value["reason"],"until":value["until"]})));
     }
