@@ -41,6 +41,7 @@ use windows::{
                 DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow,
                 SetThreadDpiAwarenessContext,
             },
+            Input::KeyboardAndMouse::{GetFocus, SetFocus},
             WindowsAndMessaging::*,
         },
     },
@@ -245,6 +246,9 @@ impl Run {
         action: impl FnOnce() -> Result<()>,
     ) -> Result<Value> {
         self.dispatch()?;
+        if matches!(&expected, ExpectedState::Tab(_)) {
+            focus_for_tab(hwnd)?;
+        }
         // Complete any pending production paint before admitting this input.
         // This is outside latency timing; no measured slow frame is discarded.
         unsafe {
@@ -373,6 +377,19 @@ fn click(hwnd: HWND, p: [i32; 2]) -> Result<()> {
             Some(packed(p[0], p[1])),
         );
     }
+    Ok(())
+}
+fn focus_for_tab(hwnd: HWND) -> Result<()> {
+    // A click can synchronously acquire focus during button-down. The original
+    // product invalidates its action frame in that focus callback, so establish
+    // this controlled input precondition before timing, not by retrying clicks.
+    unsafe {
+        let _ = SetFocus(Some(hwnd));
+    }
+    ensure!(
+        unsafe { GetFocus() } == hwnd,
+        "owned tab window did not acquire focus"
+    );
     Ok(())
 }
 fn wheel(hwnd: HWND, p: [i32; 2], delta: i16) -> Result<()> {
@@ -666,6 +683,10 @@ fn measure(output: &Path, report: &mut Value) -> Result<()> {
     for i in 0..30 {
         let tab = [Tab::Overview, Tab::Usage, Tab::Events][i % 3];
         let p = point(&scene(hwnd)?, &Target::Tab(tab))?;
+        focus_for_tab(hwnd)?;
+        unsafe {
+            let _ = UpdateWindow(hwnd);
+        }
         click(hwnd, p)?;
         unsafe {
             let _ = UpdateWindow(hwnd);
@@ -834,11 +855,11 @@ fn r1210_dashboard_perf() {
         "use a fresh output directory"
     );
     let mut report = json!({"schema":2,"status":"running","profile":"release",
-        "workload":"r1210-perf-v1","measurement":"r1210-sync-production-paint-v4","idle_seconds":30,"actions_per_kind":100,
+        "workload":"r1210-perf-v1","measurement":"r1210-sync-production-paint-v5","idle_seconds":30,"actions_per_kind":100,
         "full_rebuild_workload":"30 new snapshot publications after warm-up; 10 per tab; regional and cached frames excluded",
         "input_latency_kind":"synchronous HWND input through UpdateWindow production paint; excludes OS input queue latency",
         "marker_encoding":{"tab_hover":"Host Debug strings","offsets":["Table","Side","Events","Usage"]},
-        "cause_limit":"Host v2 uses timer/mail/state; raw labels retained. During timed actions this harness publishes only clock mail, never snapshot/detail/theme mail.",
+        "cause_limit":"Action segment publishes only clock mail. The separate full-rebuild segment publishes 30 new snapshots. Tab focus is established and pending paints completed before each timed input; no click retries or sample filtering.",
         "scope_limits":["single light desktop viewport; no physical display completion timestamp",
             "synchronous injected HWND messages; not an end-to-end physical mouse latency measurement",
             "cold first scene reported separately; threshold uses warm full rebuilds",
