@@ -206,7 +206,7 @@ pub(crate) fn prepare_images(
 ) -> Result<(Guard, Vec<OsString>)> {
     preflight_images(args, command, image)?;
     let permit = shared_for(&image.home, None)?;
-    Ok((permit, managed_args(args)))
+    Ok((permit, crate::image_launch::child_args(args)))
 }
 
 fn launch_plan(args: &[OsString], command: &Path, installed: &Wiring) -> Result<Vec<OsString>> {

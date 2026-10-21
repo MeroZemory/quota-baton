@@ -162,12 +162,38 @@ pub(crate) fn version_output(program: &Path) -> std::io::Result<Vec<u8>> {
 
 /// Isolated D23 capability probe. The job owns the complete process tree and
 /// output goes to NUL; callers retain only the loopback tool-presence boolean.
+#[derive(Debug)]
+pub(crate) enum CanaryRunError {
+    Spawn(std::io::Error),
+    Wait(std::io::Error),
+    Exit,
+}
+
+impl std::fmt::Display for CanaryRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Spawn(_) => "native-spawn",
+            Self::Wait(_) => "native-wait",
+            Self::Exit => "native-exit",
+        })
+    }
+}
+
+impl std::error::Error for CanaryRunError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Spawn(error) | Self::Wait(error) => Some(error),
+            Self::Exit => None,
+        }
+    }
+}
+
 pub(crate) fn canary_run(
     program: &Path,
     args: &[std::ffi::OsString],
     environment: &[(&str, std::ffi::OsString)],
     cwd: &Path,
-) -> std::io::Result<()> {
+) -> Result<(), CanaryRunError> {
     #[cfg(windows)]
     {
         let mut command = client_command(Client::Codex, program);
@@ -175,8 +201,12 @@ pub(crate) fn canary_run(
             .args(args)
             .envs(environment.iter().map(|(key, value)| (*key, value)))
             .current_dir(cwd);
-        let null = std::fs::OpenOptions::new().write(true).open("NUL")?;
-        let mut child = contained::Child::spawn(&command, Some(&null))?;
+        let null = std::fs::OpenOptions::new()
+            .write(true)
+            .open("NUL")
+            .map_err(CanaryRunError::Spawn)?;
+        let mut child =
+            contained::Child::spawn(&command, Some(&null)).map_err(CanaryRunError::Spawn)?;
         let status = child.wait(Some(std::time::Duration::from_secs(15)));
         drop(child);
         #[cfg(all(feature = "testkit", debug_assertions))]
@@ -185,16 +215,18 @@ pub(crate) fn canary_run(
             Err(error) => eprintln!("qb-image-canary: native-wait={:?}", error.kind()),
             _ => {}
         }
-        if status? == 0 {
+        if status.map_err(CanaryRunError::Wait)? == 0 {
             Ok(())
         } else {
-            Err(std::io::Error::other("이미지 도구 검사 실패"))
+            Err(CanaryRunError::Exit)
         }
     }
     #[cfg(not(windows))]
     {
         let _ = (program, args, environment, cwd);
-        Err(std::io::ErrorKind::Unsupported.into())
+        Err(CanaryRunError::Spawn(
+            std::io::ErrorKind::Unsupported.into(),
+        ))
     }
 }
 
