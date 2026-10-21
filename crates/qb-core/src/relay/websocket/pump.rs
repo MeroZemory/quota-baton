@@ -1584,8 +1584,13 @@ async fn run_with_read_timeout(
                             if relay.is_draining() {
                                 return (sink, false, Delivered { bytes: 0, request: Some(pending.request), terminal: Some("takeover_drain"), completed: false });
                             }
-                            if !relay.bindings.permits_dispatch(context.session.key.as_deref(), &context.account)
-                                || relay.bindings.current(context.session.key.as_deref()).as_deref() != Some(context.account.as_str()) {
+                            // A live provisional pin can redirect to its adopted C8 key.
+                            // Resolve that current account before checking its durable policy.
+                            let dispatch_info = context.session.key.as_deref()
+                                .and_then(|key| relay.bindings.launch_info(key, chrono::Utc::now()).ok());
+                            if !dispatch_info.as_ref().is_some_and(|info| info.managed
+                                && info.account == context.account
+                                && relay.bindings.permits_dispatch(Some(&info.canonical_key), &context.account)) {
                                 return (sink, false, Delivered { bytes: 0, request: Some(pending.request), terminal: Some("routing_policy_blocked"), completed: false });
                             }
                         }

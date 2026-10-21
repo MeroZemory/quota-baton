@@ -444,9 +444,11 @@ mod r11_actual {
         let t = LaunchHarness::new(2).await;
         let launch = t.issue(Some(&t.h.ids[0])).await;
         let mut live = t.connect(&launch, Some("r11-cap-live")).await;
-        let rejected_launch = t.issue(Some(&launch.account)).await;
+        // A new launch preference may fall back under D20's evidence cap.
+        // Reuse the bound launch so this rejection measures A, not another
+        // account selected for a fresh session.
         t.h.fake.state.queue_send(Message::text(json!({"type":"error","status":400,"error":{"code":"websocket_connection_limit_reached"}}).to_string()));
-        let mut rejected = t.connect(&rejected_launch, Some("r11-cap-rejected")).await;
+        let mut rejected = t.connect(&launch, Some("r11-cap-live")).await;
         let Message::Text(error) = receive(&mut rejected).await else {
             panic!("synthetic capacity evidence expected")
         };
@@ -458,9 +460,51 @@ mod r11_actual {
         drop(rejected);
         capacity_count(&t.h, &launch.account, 1).await;
         let before = t.h.fake.state.requests().len();
+        // Capture identity before the pending selector can hold the data mutex.
+        // Failure diagnostics must not synchronously wait on that same mutex.
+        let canonical_before =
+            t.h.state
+                .bindings
+                .launch_info("codex:r11-cap-live", Utc::now())
+                .map(|info| (info.canonical_key, info.account, info.current_model));
+        let waits_before = t.h.state.ws_capacity_waits_for_test();
         let request = t.request(&launch.base_url, Some("r11-cap-live"));
-        let waiting = tokio::spawn(async move { connect_async(request).await });
-        capacity_wait_started(&t.h).await;
+        let mut waiting = tokio::spawn(async move { connect_async(request).await });
+        let observed = tokio::select! {
+            biased;
+            result = &mut waiting => Err(match result {
+                Ok(Err(Error::Http(response))) => {
+                    let body = response.body().as_deref().map(|body|
+                        String::from_utf8_lossy(&body[..body.len().min(512)]).into_owned());
+                    format!("HTTP {} body={body:?}", response.status())
+                }
+                Ok(Err(error)) => format!("client error: {error}"),
+                Ok(Ok((_client, response))) => format!(
+                    "unexpected HTTP {} account={:?}", response.status(),
+                    response.headers().get("x-quota-baton-account")),
+                Err(error) => format!("upgrade task: {error}"),
+            }),
+            result = tokio::time::timeout(Duration::from_secs(2), async {
+                while t.h.state.ws_capacity_waits_for_test() == waits_before {
+                    tokio::task::yield_now().await;
+                }
+            }) => result.map_err(|_| "capacity wait marker timeout".to_owned()),
+        };
+        if let Err(detail) = observed {
+            let upgrade_pending = !waiting.is_finished();
+            waiting.abort();
+            panic!(
+                "actual upgrade did not remain in capacity wait: {detail}; \
+                 upgrade_pending={upgrade_pending}; waits={waits_before}->{}; \
+                 upstream_requests={before}->{}; reserved={:?}; canonical_before={canonical_before:?}",
+                t.h.state.ws_capacity_waits_for_test(),
+                t.h.fake.state.requests().len(),
+                t.h.ids
+                    .iter()
+                    .map(|id| (id, t.h.state.ws_reserved_for_test(id)))
+                    .collect::<Vec<_>>(),
+            );
+        }
         assert_eq!(t.h.fake.state.requests().len(), before);
         assert_eq!(
             t.h.state
