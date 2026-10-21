@@ -45,7 +45,7 @@ use windows::Win32::{
             DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow,
             SetThreadDpiAwarenessContext,
         },
-        Input::KeyboardAndMouse::{GetKeyboardState, SetKeyboardState, VK_SHIFT},
+        Input::KeyboardAndMouse::{GetKeyboardState, SetFocus, SetKeyboardState, VK_SHIFT},
         WindowsAndMessaging::*,
     },
 };
