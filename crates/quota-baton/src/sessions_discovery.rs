@@ -717,10 +717,7 @@ impl Catalog {
             "대화 연결이 순환합니다"
         );
         ensure!(visiting.len() <= 256, "대화 연결이 너무 깊습니다");
-        ensure!(
-            item.provider.as_deref() == Some("openai"),
-            "openai 제공자의 대화만 가져올 수 있습니다"
-        );
+        crate::sessions_db::require_provider(item.provider.as_deref().unwrap_or("(없음)"))?;
         if let Some(base) = &item.history_base {
             self.visit(
                 self.rollouts

@@ -175,6 +175,32 @@ pub(crate) fn preflight_launch(args: &[OsString], command: &Path) -> Result<()> 
     launch_plan(args, command, &wiring(&qb_core::home()?)?).map(drop)
 }
 
+/// Validate the normal launcher home first, then acquire the journaled Qi gate.
+/// The caller supplies Qi only after checking the completed wiring metadata.
+pub(crate) fn preflight_images(
+    args: &[OsString],
+    command: &Path,
+    image: &crate::image_launch::ImageLaunch,
+) -> Result<()> {
+    let installed = wiring(&qb_core::home()?)?;
+    launch_plan(args, command, &installed)?;
+    if fs::canonicalize(&installed.home)? != fs::canonicalize(&image.ordinary_home)? {
+        return Err(refusal(WRONG_HOME));
+    }
+    Ok(())
+}
+
+pub(crate) fn prepare_images(
+    args: &[OsString],
+    command: &Path,
+    image: &crate::image_launch::ImageLaunch,
+) -> Result<(Guard, Vec<OsString>)> {
+    preflight_images(args, command, image)?;
+    let id = crate::sessions::resume_uuid(args)?;
+    let permit = shared_for(&image.home, id.as_deref())?;
+    Ok((permit, managed_args(args)))
+}
+
 fn launch_plan(args: &[OsString], command: &Path, installed: &Wiring) -> Result<Vec<OsString>> {
     let actual = PathBuf::from(std::env::var_os("CODEX_HOME").ok_or_else(|| refusal(WRONG_HOME))?);
     if !actual.is_absolute() {
