@@ -358,6 +358,8 @@ impl QuotaConfig {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AccountConfig {
+    /// Optional dedicated Codex launcher suffix; two ASCII lowercase letters.
+    pub short: Option<String>,
     pub drain: bool,
     pub allow_credits: bool,
     pub spread_threshold: Option<usize>,
@@ -391,6 +393,21 @@ mod image_account_tests {
 }
 
 impl Config {
+    pub fn validate_account_aliases(&self) -> anyhow::Result<()> {
+        let mut seen = std::collections::BTreeSet::new();
+        for account in self.accounts.values() {
+            if let Some(short) = account.short.as_deref() {
+                anyhow::ensure!(
+                    short.len() == 2 && short.bytes().all(|b| b.is_ascii_lowercase()),
+                    "accounts.<id>.short must contain exactly two ASCII lowercase letters"
+                );
+                anyhow::ensure!(short != "qb", "accounts.<id>.short reserves qb");
+                anyhow::ensure!(seen.insert(short), "duplicate accounts.<id>.short");
+            }
+        }
+        Ok(())
+    }
+
     pub fn load(home: &Path) -> anyhow::Result<Self> {
         let text = match fs::read_to_string(home.join("config.toml")) {
             Ok(text) => text,
@@ -422,6 +439,7 @@ impl Config {
         config.websocket.validate()?;
         config.routing.validate()?;
         config.quota.validate()?;
+        config.validate_account_aliases()?;
         anyhow::ensure!(
             config.websocket.idle_close_secs < config.routing.rebalance_idle_secs,
             "websocket.idle_close_secs must be less than routing.rebalance_idle_secs"
@@ -430,6 +448,7 @@ impl Config {
         warn_unknown(&value, &known, "");
         if let Some(accounts) = value.get("accounts").and_then(toml::Value::as_table) {
             let known = toml::Value::try_from(AccountConfig {
+                short: Some("rh".into()),
                 spread_threshold: Some(1),
                 images_last_resort: Some(false),
                 ..AccountConfig::default()
@@ -837,5 +856,51 @@ mod r8_routing_config_tests {
         config.placement_allowance_pct = 2.0;
         config.weak_evidence_new_sessions = 0;
         assert!(config.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod account_alias_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_and_serde_roundtrip() {
+        assert!(AccountConfig::default().short.is_none());
+        let config: Config =
+            toml::from_str("[accounts.one]\nshort='rh'\n[accounts.two]\n").unwrap();
+        config.validate_account_aliases().unwrap();
+        let again: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(again.accounts["one"].short.as_deref(), Some("rh"));
+        assert!(again.accounts["two"].short.is_none());
+        assert!(toml::from_str::<Config>("[accounts.one]\nshort=1\n").is_err());
+    }
+
+    #[test]
+    fn invalid_reserved_and_duplicate_aliases() {
+        for short in [
+            "", "r", "rhh", "RH", "rH", "é", "한글", "r1", "qb", "..", "r/", "r\\", "r\n", "%x",
+            "&x", "!x", "r\"",
+        ] {
+            let mut config = Config::default();
+            config.accounts.insert(
+                "one".into(),
+                AccountConfig {
+                    short: Some(short.into()),
+                    ..Default::default()
+                },
+            );
+            assert!(config.validate_account_aliases().is_err());
+        }
+        let mut config = Config::default();
+        for id in ["one", "two"] {
+            config.accounts.insert(
+                id.into(),
+                AccountConfig {
+                    short: Some("rh".into()),
+                    ..Default::default()
+                },
+            );
+        }
+        assert!(config.validate_account_aliases().is_err());
     }
 }

@@ -228,6 +228,16 @@ pub(super) fn retained(d: &Data, key: &str, now: DateTime<Utc>) -> bool {
 pub(super) fn idle_placement(d: &Data, key: &str) -> bool {
     d.launches.get(key).is_some_and(|m| m.idle_placement)
 }
+// Ownership redirects use only launch anchors, never arbitrary request aliases.
+// A provisional anchor can be renamed once; an adopted anchor is never redirected.
+// prune retains it while either transferred counter is nonzero. No extra runtime
+// map or persisted schema is needed, and stale receipts still require their epoch.
+pub(super) fn ownership_group<'a>(d: &'a Data, key: &'a str) -> &'a str {
+    d.launch_anchors
+        .get(key)
+        .map_or(key, |a| a.canonical_key.as_str())
+}
+
 pub(super) fn policy_key<'a>(d: &'a Data, key: Option<&'a str>) -> Option<&'a str> {
     key.map(|key| {
         d.launches
@@ -432,6 +442,18 @@ impl BindingTable {
         now: DateTime<Utc>,
         authorize: impl FnOnce(&crate::routing::PolicyStore, &LaunchPolicyMove) -> Result<()>,
     ) -> std::result::Result<LaunchPlacement, LaunchError> {
+        self.place_launch_for_issue(request, candidates, entitlements, now, None, authorize)
+    }
+
+    pub(crate) fn place_launch_for_issue(
+        &self,
+        request: LaunchRequest<'_>,
+        candidates: &[Candidate],
+        entitlements: &LaunchEntitlements,
+        now: DateTime<Utc>,
+        operation: Option<&crate::issue_operation::IssueOperation>,
+        authorize: impl FnOnce(&crate::routing::PolicyStore, &LaunchPolicyMove) -> Result<()>,
+    ) -> std::result::Result<LaunchPlacement, LaunchError> {
         if !is_anchor(request.anchor_key)
             || request.resume_key.is_some_and(|k| !real_key(k))
             || request.model.is_some_and(|m| !valid_model(m))
@@ -444,6 +466,10 @@ impl BindingTable {
             return Err(LaunchError::Retired);
         }
         let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        // Both binding gates are held; this remains a precommit check.
+        if let Some(operation) = operation {
+            operation.check().map_err(|_| LaunchError::PolicyBlocked)?;
+        }
         self.prune(&mut d, now);
         if let Some(anchor) = d.launch_anchors.get(request.anchor_key) {
             if request
@@ -454,6 +480,9 @@ impl BindingTable {
             }
             let key = anchor.canonical_key.clone();
             let prior = info(&d, &key)?;
+            if let Some(operation) = operation {
+                operation.admit().map_err(|_| LaunchError::PolicyBlocked)?;
+            }
             touch(&mut d, &key, now);
             return Ok(LaunchPlacement {
                 canonical_key: key,
@@ -648,12 +677,13 @@ impl BindingTable {
             authorize(&self.policies, &consent).map_err(|_| LaunchError::PolicyBlocked)?;
         }
         self.policies
-            .dispatch(
+            .dispatch_for_issue(
                 Some(&policy_key),
                 &account,
                 previous.as_deref(),
                 reason,
                 now,
+                operation,
             )
             .map_err(|_| LaunchError::PolicyBlocked)?;
         let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
@@ -706,9 +736,15 @@ impl BindingTable {
                 .and_then(|a| d.launch_anchors.get(a))
                 .map(|a| a.canonical_key.clone())
             {
+                if source != key && is_anchor(&source) && protected(&d, &source) {
+                    // The socket still uses its original account's credentials.
+                    // Never report a bound winner while a losing owner is live.
+                    // Even same-account live merges need a separate epoch/policy
+                    // merge protocol; only a fresh-key rename is supported here.
+                    return Err(LaunchError::Busy);
+                }
                 if source != key
                     && is_anchor(&source)
-                    && !protected(&d, &source)
                     && !self.writes_stopped.load(Ordering::Acquire)
                 {
                     // Bound routing remains available even if coalescing an
@@ -736,7 +772,10 @@ impl BindingTable {
                 return Err(LaunchError::InvalidMetadata);
             }
             if is_anchor(&source) {
-                if protected(&d, &source) {
+                let live = protected(&d, &source);
+                // Unbound keys can still have owners through pin/begin_request.
+                // Renaming is not a merge with those independent owners either.
+                if protected(&d, request_key) {
                     return Err(LaunchError::Busy);
                 }
                 let mut metadata = d
@@ -751,6 +790,10 @@ impl BindingTable {
                     .as_deref()
                     .is_some_and(|a| a != d.groups[&source].account)
                     || (target_plan.source != "global" && old_plan.source != "global")
+                    // Live owners/receipts retain their original policy identity.
+                    // A target-specific policy requires reconnect, even if it
+                    // currently permits the same account. Idle behavior is unchanged.
+                    || (live && target_plan.source != "global")
                 {
                     return Err(LaunchError::PolicyBlocked);
                 }
@@ -798,7 +841,18 @@ impl BindingTable {
                 if let Some(bytes) = d.last_request_bytes.remove(&source) {
                     d.last_request_bytes.insert(request_key.to_owned(), bytes);
                 }
-                d.epochs.remove(&source);
+                // The mutation gate plus data lock makes this a single rename:
+                // no unpinned interval, new placement, or account/policy move.
+                // Existing owners keep source and resolve its immutable anchor.
+                if let Some(count) = d.active.remove(&source) {
+                    *d.active.entry(request_key.to_owned()).or_default() += count;
+                }
+                if let Some(count) = d.pins.remove(&source) {
+                    *d.pins.entry(request_key.to_owned()).or_default() += count;
+                }
+                if let Some(epoch) = d.epochs.remove(&source) {
+                    d.epochs.insert(request_key.to_owned(), epoch);
+                }
                 d.overload_marks.remove(&source);
                 for hits in d.rate_hits.values_mut() {
                     hits.remove(&source);
@@ -948,5 +1002,358 @@ impl BindingTable {
         touch(&mut d, &key, now);
         d.changed();
         info(&d, &key)
+    }
+}
+
+#[cfg(test)]
+mod r11_active_adoption_tests {
+    use super::*;
+    use crate::routing::{Mode, Project, Settings, session_id};
+
+    const SOURCE: &str = "launch:active-adoption";
+    const REAL: &str = "codex:active-adoption";
+
+    fn fixture(mode: Mode) -> (tempfile::TempDir, Arc<BindingTable>, Vec<Candidate>, LaunchEntitlements) {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap()
+            .join(".sandbox/r11-prep/active-adoption-test-runs");
+        fs::create_dir_all(&root).unwrap();
+        let home = tempfile::Builder::new().prefix("case-").tempdir_in(root).unwrap();
+        let mut config = RoutingConfig::default();
+        config.mode = mode;
+        let table = BindingTable::new(home.path(), config).unwrap();
+        let mut candidates = Vec::new();
+        for id in ["a", "b"] {
+            let mut c = super::super::tests::candidate(id, 10.0, 30, 2);
+            c.account.provider = Provider::Codex;
+            c.account.identity = crate::accounts::Identity::Codex {
+                user_id: None,
+                account_id: id.into(),
+                email: "synthetic@example.invalid".into(),
+            };
+            candidates.push(c);
+        }
+        let entitlements = BTreeMap::from([
+            ("a".to_owned(), BTreeSet::from(["m1".to_owned()])),
+            ("b".to_owned(), BTreeSet::from(["m1".to_owned(), "m2".to_owned()])),
+        ]);
+        (home, table, candidates, entitlements)
+    }
+
+    fn request(anchor: &str) -> LaunchRequest<'_> {
+        LaunchRequest {
+            anchor_key: anchor,
+            resume_key: None,
+            model: Some("m1"),
+            model_is_explicit: true,
+            account_pref: Some("a"),
+            allow_move_for_model: false,
+        }
+    }
+
+    fn place(t: &BindingTable, cs: &[Candidate], es: &LaunchEntitlements) {
+        assert_eq!(t.place_launch(request(SOURCE), cs, es, Utc::now()).unwrap().account, "a");
+    }
+
+    fn counts(t: &BindingTable, key: &str, active: usize, pins: usize, pending: usize) {
+        let d = t.data.lock().unwrap();
+        assert_eq!(d.active.get(key).copied().unwrap_or(0), active);
+        assert_eq!(d.pins.get(key).copied().unwrap_or(0), pins);
+        assert_eq!(d.pending.get("a").copied().unwrap_or(0), pending);
+        if key == REAL {
+            assert!(!d.active.contains_key(SOURCE));
+            assert!(!d.pins.contains_key(SOURCE));
+        }
+    }
+
+    #[test]
+    fn r11_active_adoption_live_pin_first_actual_key_and_old_receipt() {
+        let (_home, t, cs, es) = fixture(Mode::Rebalance);
+        place(&t, &cs, &es);
+        let pin = t.pin(Some(SOURCE));
+        let mut lease = t.begin_request(Some(SOURCE), "a");
+        lease.after_move = true;
+        lease.defer_after_move();
+        let receipt = lease.receipt();
+        let pending = t.pending_count("a");
+        let policy_before = t.policies.list();
+        let placement_before = t.data.lock().unwrap().placements["a"].total;
+        let resolved = t.resolve_launch(Some(SOURCE), Some(REAL), Utc::now()).unwrap();
+        assert_eq!(resolved.canonical_key, REAL);
+        assert_eq!(resolved.account, "a");
+        counts(&t, REAL, 1, 1, pending);
+        receipt.dispatched();
+        {
+            let d = t.data.lock().unwrap();
+            assert_eq!(d.groups.len(), 1);
+            assert_eq!(d.bindings.len(), 1);
+            assert_eq!(d.bindings[REAL].accepted, Some(true));
+            assert_eq!(d.launches[REAL].policy_key, SOURCE);
+            assert_eq!(d.placements["a"].total, placement_before);
+            assert!(!d.lru.iter().any(|(_, key)| key == REAL));
+            assert!(Arc::ptr_eq(&d.epochs[REAL], &receipt.epoch));
+        }
+        assert_eq!(t.policies.list(), policy_before);
+        drop(lease);
+        counts(&t, REAL, 0, 1, 0);
+        assert!(t.data.lock().unwrap().after_move.contains(REAL));
+        drop(pin);
+        counts(&t, REAL, 0, 0, 0);
+        let d = t.data.lock().unwrap();
+        assert!(d.active.is_empty() && d.pins.is_empty() && d.pending.is_empty());
+        assert!(d.lru.iter().any(|(_, key)| key == REAL));
+    }
+
+    #[test]
+    fn r11_active_adoption_pre_adoption_drops_and_stale_source_reservations() {
+        let (_home, t, cs, es) = fixture(Mode::Rebalance);
+        place(&t, &cs, &es);
+        let keep_pin = t.pin(Some(SOURCE));
+        let gone_pin = t.pin(Some(SOURCE));
+        let gone_lease = t.begin_request(Some(SOURCE), "a");
+        drop(gone_pin);
+        drop(gone_lease);
+        counts(&t, SOURCE, 0, 1, 0);
+        t.resolve_launch(Some(SOURCE), Some(REAL), Utc::now()).unwrap();
+        // A caller that captured the anchor before the rename still reserves
+        // the adopted group, rather than resurrecting counters on source.
+        let later_pin = t.pin(Some(SOURCE));
+        let later_lease = t.begin_request(Some(SOURCE), "a");
+        counts(&t, REAL, 1, 2, 1);
+        drop(keep_pin);
+        counts(&t, REAL, 1, 1, 1);
+        drop(later_pin);
+        counts(&t, REAL, 1, 0, 1);
+        drop(later_lease);
+        counts(&t, REAL, 0, 0, 0);
+    }
+
+    #[test]
+    fn r11_active_adoption_socket_blocks_concurrent_resume_model_move() {
+        let (_home, t, cs, es) = fixture(Mode::Rebalance);
+        place(&t, &cs, &es);
+        let pin = t.pin(Some(SOURCE));
+        t.resolve_launch(Some(SOURCE), Some(REAL), Utc::now()).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let worker = {
+            let t = t.clone();
+            let barrier = barrier.clone();
+            let cs = cs.clone();
+            let es = es.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let mut r = request("launch:concurrent-resume");
+                r.resume_key = Some(REAL);
+                r.model = Some("m2");
+                r.account_pref = Some("b");
+                r.allow_move_for_model = true;
+                t.place_launch(r, &cs, &es, Utc::now()).map(|p| p.account)
+            })
+        };
+        barrier.wait();
+        assert_eq!(t.resolve_launch(Some(SOURCE), Some(REAL), Utc::now()).unwrap().account, "a");
+        assert_eq!(worker.join().unwrap(), Err(LaunchError::Busy));
+        counts(&t, REAL, 0, 1, 0);
+        assert_eq!(t.current(Some(REAL)).as_deref(), Some("a"));
+        drop(pin);
+        let mut r = request("launch:resume-after-close");
+        r.resume_key = Some(REAL);
+        r.model = Some("m2");
+        r.account_pref = Some("b");
+        r.allow_move_for_model = true;
+        assert_eq!(t.place_launch(r, &cs, &es, Utc::now()).unwrap().account, "b");
+    }
+
+    #[test]
+    fn r11_active_adoption_live_bound_winner_is_busy_without_redirect() {
+        for target_account in ["a", "b"] {
+            let (_home, t, cs, es) = fixture(Mode::Rebalance);
+            place(&t, &cs, &es);
+            let mut r = request("launch:bound-winner");
+            r.resume_key = Some(REAL);
+            r.account_pref = Some(target_account);
+            assert_eq!(t.place_launch(r, &cs, &es, Utc::now()).unwrap().account, target_account);
+            let pin = t.pin(Some(SOURCE));
+            let lease = t.begin_request(Some(SOURCE), "a");
+            assert_eq!(t.resolve_launch(Some(SOURCE), Some(REAL), Utc::now()), Err(LaunchError::Busy));
+            counts(&t, SOURCE, 1, 1, 1);
+            assert_eq!(t.launch_info(SOURCE, Utc::now()).unwrap().account, "a");
+            assert_eq!(t.current(Some(REAL)).as_deref(), Some(target_account));
+            drop(pin);
+            drop(lease);
+            counts(&t, SOURCE, 0, 0, 0);
+        }
+    }
+
+    fn strict() -> Settings {
+        Settings { mode: Mode::Strict, reset_wait_secs: 0 }
+    }
+
+    #[test]
+    fn r11_active_adoption_unbound_target_owners_are_not_merged() {
+        let (_home, t, cs, es) = fixture(Mode::Rebalance);
+        place(&t, &cs, &es);
+        let source_pin = t.pin(Some(SOURCE));
+        let target_pin = t.pin(Some(REAL));
+        let target_lease = t.begin_request(Some(REAL), "b");
+        assert_eq!(t.resolve_launch(Some(SOURCE), Some(REAL), Utc::now()), Err(LaunchError::Busy));
+        {
+            let d = t.data.lock().unwrap();
+            assert_eq!(d.pins.get(SOURCE), Some(&1));
+            assert_eq!(d.pins.get(REAL), Some(&1));
+            assert_eq!(d.active.get(REAL), Some(&1));
+            assert_eq!(d.pending.get("b"), Some(&1));
+            assert!(!d.bindings.contains_key(REAL));
+        }
+        drop(target_lease);
+        drop(target_pin);
+        t.resolve_launch(Some(SOURCE), Some(REAL), Utc::now()).unwrap();
+        drop(source_pin);
+        let d = t.data.lock().unwrap();
+        assert!(d.active.is_empty() && d.pins.is_empty() && d.pending.is_empty());
+    }
+
+    #[test]
+    fn r11_active_adoption_strict_target_anchor_conflict_is_unchanged() {
+        let (_home, t, cs, es) = fixture(Mode::Rebalance);
+        place(&t, &cs, &es);
+        t.policies.set_session(&session_id(REAL), Some(strict()), None, Some("b")).unwrap();
+        let pin = t.pin(Some(SOURCE));
+        let before = t.policies.list();
+        assert_eq!(t.resolve_launch(Some(SOURCE), Some(REAL), Utc::now()), Err(LaunchError::PolicyBlocked));
+        assert_eq!(t.policies.list(), before);
+        counts(&t, SOURCE, 0, 1, 0);
+        assert!(!t.data.lock().unwrap().bindings.contains_key(REAL));
+        drop(pin);
+    }
+
+    #[test]
+    fn r11_active_adoption_project_policy_conflicts_and_live_identity_guard() {
+        for source_project in [false, true] {
+            let (_home, t, cs, es) = fixture(Mode::Rebalance);
+            place(&t, &cs, &es);
+            t.policies.put_project(Some("adoption"), Project { name: "adoption".into(), settings: strict() }).unwrap();
+            if source_project {
+                t.associate_project(SOURCE, "adoption").unwrap();
+            }
+            // Same-account target policy must not change a live owner's identity.
+            t.policies.associate_with_anchor(REAL, "adoption", Some("a")).unwrap();
+            let pin = t.pin(Some(SOURCE));
+            let before = t.policies.list();
+            assert_eq!(t.resolve_launch(Some(SOURCE), Some(REAL), Utc::now()), Err(LaunchError::PolicyBlocked));
+            counts(&t, SOURCE, 0, 1, 0);
+            assert_eq!(t.policies.list(), before);
+            assert_eq!(t.data.lock().unwrap().launches[SOURCE].policy_key, SOURCE);
+            drop(pin);
+        }
+    }
+
+    #[test]
+    fn r11_active_adoption_strict_identity_history_and_snapshot_reload() {
+        let (home, t, cs, es) = fixture(Mode::Strict);
+        place(&t, &cs, &es);
+        let pin = t.pin(Some(SOURCE));
+        let lease = t.begin_request(Some(SOURCE), "a");
+        let policy_path = home.path().join("state/routing-policies.json");
+        let policy_bytes = fs::read(&policy_path).unwrap();
+        let before = t.policies.list();
+        t.resolve_launch(Some(SOURCE), Some(REAL), Utc::now()).unwrap();
+        lease.dispatched();
+        t.record_launch_advertised(REAL, "a", &es["a"], Utc::now()).unwrap();
+        t.flush().unwrap();
+        assert_eq!(fs::read(&policy_path).unwrap(), policy_bytes);
+        assert_eq!(t.policies.list(), before);
+        // An independent reload does not restore runtime counters, but its
+        // persisted anchor and policy key still identify the adopted binding.
+        let mut config = RoutingConfig::default();
+        config.mode = Mode::Strict;
+        let restored = BindingTable::new(home.path(), config).unwrap();
+        let resolved = restored.resolve_launch(Some(SOURCE), None, Utc::now()).unwrap();
+        assert_eq!(resolved.canonical_key, REAL);
+        assert_eq!(resolved.account, "a");
+        assert_eq!(resolved.advertised_models, es["a"]);
+        assert_eq!(resolved.current_model.as_deref(), Some("m1"));
+        assert!(restored.permits_dispatch(Some(REAL), "a"));
+        assert!(!restored.permits_dispatch(Some(REAL), "b"));
+        assert_eq!(restored.routing_plan(Some(REAL)).settings.mode, Mode::Strict);
+        counts(&restored, REAL, 0, 0, 0);
+        assert_eq!(restored.data.lock().unwrap().launches[REAL].policy_key, SOURCE);
+        // The live original still owns its pin/lease after its snapshot.
+        counts(&t, REAL, 1, 1, 1);
+        drop(pin);
+        drop(lease);
+        counts(&t, REAL, 0, 0, 0);
+    }
+
+    #[test]
+    fn r11_active_adoption_gate_orders_drop_and_retains_idle_anchor_while_pinned() {
+        let (_home, t, cs, es) = fixture(Mode::Rebalance);
+        place(&t, &cs, &es);
+        let pin = t.pin(Some(SOURCE));
+        t.resolve_launch(Some(SOURCE), Some(REAL), Utc::now()).unwrap();
+        let gate = t.mutations.lock().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            drop(pin);
+            done_tx.send(()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(done_rx.try_recv().is_err());
+        {
+            let mut d = t.data.lock().unwrap();
+            prune(&mut d, Utc::now() + chrono::Duration::days(2));
+            assert_eq!(d.launch_anchors[SOURCE].canonical_key, REAL);
+            assert_eq!(d.pins.get(REAL), Some(&1));
+        }
+        drop(gate);
+        done_rx.recv().unwrap();
+        worker.join().unwrap();
+        counts(&t, REAL, 0, 0, 0);
+    }
+}
+
+
+#[cfg(test)]
+mod issue_operation_binding_tests {
+    use super::*;
+    use crate::issue_operation::IssueOperation;
+    use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn cancellation_behind_actual_binding_gate_prevents_placement() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.sandbox/r11-operation-tests");
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = tempfile::tempdir_in(root).unwrap();
+        let table = BindingTable::new(dir.path(), crate::config::RoutingConfig::default()).unwrap();
+        let operation = IssueOperation::new(tokio::time::Instant::now()
+            + std::time::Duration::from_secs(3600));
+        let caller = operation.caller_guard();
+        let ready = Arc::new(Barrier::new(2));
+        let held = table.mutations.lock().unwrap();
+        let task = {
+            let table = table.clone();
+            let operation = operation.clone();
+            let ready = ready.clone();
+            std::thread::spawn(move || {
+                ready.wait();
+                table.place_launch_for_issue(LaunchRequest {
+                    anchor_key: "launch:operation-cancel", resume_key: None,
+                    model: Some("m"), model_is_explicit: true,
+                    account_pref: None, allow_move_for_model: false,
+                }, &[], &LaunchEntitlements::new(), chrono::Utc::now(), Some(&operation),
+                    |_, _| panic!("cancelled placement must not authorize"))
+            })
+        };
+        ready.wait();
+        drop(caller);
+        drop(held);
+        assert!(matches!(task.join().unwrap(), Err(LaunchError::PolicyBlocked)));
+        let data = table.data.lock().unwrap();
+        assert!(data.launches.is_empty());
+        assert!(data.launch_anchors.is_empty());
+        assert!(data.bindings.is_empty());
     }
 }

@@ -1,5 +1,7 @@
 //! R3 implementation, deliberately private behind the cutover module boundary.
 use super::*;
+#[path = "account_alias.rs"]
+mod account_alias;
 #[path = "image_home.rs"]
 mod image_home;
 use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
@@ -522,6 +524,11 @@ struct Manifest {
     /// Qi extension is unfinished; original optional actions already completed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     image_install_pending: bool,
+    /// Independent alias extension; original optional actions already completed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    alias_install_pending: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    account_aliases: Vec<account_alias::Record>,
     npm: PathBuf,
     claude: PathBuf,
     claude_before: String,
@@ -735,6 +742,13 @@ fn validate_manifest(paths: &CutoverPaths, m: &Manifest) -> Result<()> {
         bail!("wiring journal의 경로/모드가 현재 홈과 일치하지 않습니다");
     }
     image_home::validate_metadata(m)?;
+    account_alias::validate_records(m.mode, &m.npm, &m.account_aliases, &m.entries)?;
+    anyhow::ensure!(
+        !(m.alias_install_pending && m.image_install_pending)
+            && (!m.alias_install_pending
+                || (m.install_completed == Some(false) && !m.account_aliases.is_empty())),
+        "invalid alias extension state"
+    );
     let mut tasks = std::collections::HashSet::new();
     for task in &m.tasks {
         if !matches!(
@@ -809,6 +823,7 @@ fn validate_manifest(paths: &CutoverPaths, m: &Manifest) -> Result<()> {
                 || allowed_claude
                 || allowed_home
                 || allowed_image
+                || account_alias::allowed(&m.npm, &m.account_aliases, &e.path)
                 || allowed_parent
                 || (m.mode == CodexMode::Dedicated && e.path == m.npm.join("codex-qb.cmd")))
             || !seen.insert(e.path.clone())
@@ -1413,7 +1428,10 @@ fn install_entry_range(
     validate_manifest(paths, m)?;
     for i in start..end {
         let e = &m.entries[i];
-        if m.image_install_pending && !image_home::allowed(m, &e.path) {
+        if (m.image_install_pending && !image_home::allowed(m, &e.path))
+            || (m.alias_install_pending
+                && !account_alias::allowed(&m.npm, &m.account_aliases, &e.path))
+        {
             continue;
         }
         if e.removed {
@@ -1476,6 +1494,9 @@ fn install_entry_range(
 }
 
 fn install(paths: &CutoverPaths, m: &mut Manifest) -> Result<()> {
+    if m.alias_install_pending {
+        return finish_alias_install(paths, m);
+    }
     if m.image_install_pending {
         return finish_image_install(paths, m, 0);
     }
@@ -1500,6 +1521,46 @@ fn install(paths: &CutoverPaths, m: &mut Manifest) -> Result<()> {
         }
         disable_cpa_tasks(&m.tasks)?;
     }
+    m.install_completed = Some(true);
+    atomic_json(&paths.journal(), m)?;
+    Ok(())
+}
+
+// Publish aliases after Qi and title upgrades, without replaying optional actions.
+fn finish_alias_install(paths: &CutoverPaths, m: &mut Manifest) -> Result<()> {
+    validate_manifest(paths, m)?;
+    account_alias::preflight_saved(m, false)?;
+    for e in m
+        .entries
+        .iter()
+        .filter(|e| !account_alias::allowed(&m.npm, &m.account_aliases, &e.path))
+    {
+        anyhow::ensure!(
+            e.done && !e.removed && e.upgrade.is_none(),
+            "alias extension requires completed installation"
+        );
+        let mut observed = e.clone();
+        if e.path == m.home.join("config.toml")
+            || m.image_home
+                .as_ref()
+                .is_some_and(|h| e.path == h.join("config.toml"))
+        {
+            ancestors_safe(&e.path)?;
+            observed.identity = Some(identity(&e.path)?);
+            let bytes = fs::read(&e.path)?;
+            validate_upgrade_connection(m, e, &bytes)?;
+            observed.hash = hash_bytes(&bytes);
+        }
+        anyhow::ensure!(
+            matches_entry(&observed, false)?,
+            "original path changed during alias extension"
+        );
+    }
+    if m.claude_mode == ClaudeMode::Default && hash_file(&m.claude)? != m.claude_after {
+        bail!("Claude 설정이 변경되어 적용을 중단했습니다");
+    }
+    install_entries(paths, m, 0)?;
+    m.alias_install_pending = false;
     m.install_completed = Some(true);
     atomic_json(&paths.journal(), m)?;
     Ok(())
@@ -1566,6 +1627,7 @@ fn upgrade_path(m: &Manifest, path: &Path) -> Result<bool> {
     Ok((m.mode == CodexMode::Dedicated
         && (path == m.home.join("config.toml")
             || path == m.npm.join("codex-qb.cmd")
+            || account_alias::allowed(&m.npm, &m.account_aliases, path)
             || m.image_home
                 .as_ref()
                 .is_some_and(|h| path == h.join("config.toml"))))
@@ -1701,7 +1763,10 @@ fn upgrade_completed(
     apply: bool,
     force: bool,
     command_update: Option<CommandRecord>,
+    aliases: &[account_alias::Planned],
 ) -> Result<Report> {
+    account_alias::preflight_saved(m, false)?;
+    account_alias::preflight_new(aliases)?;
     upgrade_directories(m)?;
     // Title upgrades do not reinstall the other objects, but still enforce
     // their existing ownership/content boundaries before any upgrade write.
@@ -1807,6 +1872,10 @@ fn upgrade_completed(
             dedicated_claude_title_bytes(&before)?
         } else if e.path == m.npm.join("codex-qb.cmd") {
             launcher()?
+        } else if let Some(bytes) =
+            account_alias::upgrade_bytes(&m.npm, &m.account_aliases, &e.path)?
+        {
+            bytes
         } else {
             claude_launcher(
                 &m.command
@@ -1841,6 +1910,7 @@ fn upgrade_completed(
     } else {
         None
     };
+    let alias_entries = account_alias::entries_for_new(aliases, apply)?;
     // Known journal credentials are redacted wherever values recur in the diff.
     for e in &m.entries {
         if let Some(payload) = &e.payload {
@@ -1928,6 +1998,20 @@ fn upgrade_completed(
             atomic_json(&paths.journal(), m)?;
             finish_image_install(paths, m, start)?;
         }
+    }
+    report
+        .changed
+        .extend(aliases.iter().map(|p| p.path.display().to_string()));
+    if apply && !aliases.is_empty() {
+        account_alias::preflight_new(aliases)?;
+        m.account_aliases
+            .extend(aliases.iter().map(|p| p.record.clone()));
+        m.entries.extend(alias_entries);
+        m.alias_install_pending = true;
+        m.install_completed = Some(false);
+        validate_manifest(paths, m)?;
+        atomic_json(&paths.journal(), m)?;
+        finish_alias_install(paths, m)?;
     }
     report.warnings.extend(scratch_warnings(m));
     Ok(report)
@@ -2114,6 +2198,7 @@ pub(super) fn wire(
     claude_mode: ClaudeMode,
     task_query: &dyn Fn(&str) -> Option<bool>,
 ) -> Result<Report> {
+    let desired_aliases = account_alias::desired(paths, mode)?;
     let count = active_linked_count(&paths.qb_home)?;
     check_cpa_dependency(count, &options)?;
     let mut retained_home = false;
@@ -2143,6 +2228,11 @@ pub(super) fn wire(
             .flatten();
         let command_updated = command_update.is_some();
         if !old.retained {
+            let aliases = account_alias::additions(&desired_aliases, &old.account_aliases)?;
+            account_alias::preflight_new(&aliases)?;
+            account_alias::preflight_saved(&old, false)?;
+            // Recover the saved transaction first; additions publish only after
+            // it and any Qi extension finish. All alias conflicts preflight above.
             if old
                 .entries
                 .iter()
@@ -2151,11 +2241,46 @@ pub(super) fn wire(
             {
                 bail!("부분 해제 journal입니다. unwire를 먼저 완료하세요");
             }
+            if old.alias_install_pending {
+                if apply {
+                    validate_resume_inputs(paths, &options, &old)?;
+                    finish_alias_install(paths, &mut old)?;
+                    return upgrade_completed(
+                        paths,
+                        &mut old,
+                        true,
+                        options.force,
+                        command_update,
+                        &aliases,
+                    );
+                }
+                return Ok(Report {
+                    summary: vec!["요약: journal에서 계정 별칭 연결을 재개합니다".into()],
+                    changed: old
+                        .entries
+                        .iter()
+                        .filter(|e| {
+                            account_alias::allowed(&old.npm, &old.account_aliases, &e.path)
+                                && !e.done
+                        })
+                        .map(|e| e.path.display().to_string())
+                        .collect(),
+                    warnings: scratch_warnings(&old),
+                    ..Report::default()
+                });
+            }
             if old.image_install_pending {
                 if apply {
                     validate_resume_inputs(paths, &options, &old)?;
                     finish_image_install(paths, &mut old, 0)?;
-                    return upgrade_completed(paths, &mut old, true, options.force, command_update);
+                    return upgrade_completed(
+                        paths,
+                        &mut old,
+                        true,
+                        options.force,
+                        command_update,
+                        &aliases,
+                    );
                 }
                 return Ok(Report {
                     summary: vec!["요약: journal에서 Qi 확장을 재개합니다".into()],
@@ -2173,7 +2298,14 @@ pub(super) fn wire(
                 if apply {
                     validate_resume_inputs(paths, &options, &old)?;
                 }
-                return upgrade_completed(paths, &mut old, apply, options.force, command_update);
+                return upgrade_completed(
+                    paths,
+                    &mut old,
+                    apply,
+                    options.force,
+                    command_update,
+                    &aliases,
+                );
             }
             let mut report = Report {
                 summary: vec!["요약: 기존 journal에서 연결을 재개합니다".into()],
@@ -2192,8 +2324,11 @@ pub(super) fn wire(
                     old.command = Some(command);
                     atomic_json(&paths.journal(), &old)?;
                 }
-                if old.mode == CodexMode::Dedicated && old.image_home.is_none() {
-                    let migration = upgrade_completed(paths, &mut old, true, options.force, None)?;
+                if !aliases.is_empty()
+                    || (old.mode == CodexMode::Dedicated && old.image_home.is_none())
+                {
+                    let migration =
+                        upgrade_completed(paths, &mut old, true, options.force, None, &aliases)?;
                     report.summary.extend(migration.summary);
                     report.changed.extend(migration.changed);
                     report.diff.extend(migration.diff);
@@ -2211,6 +2346,7 @@ pub(super) fn wire(
         }
         retained_entries.extend(old.entries.into_iter().filter(|e| !e.removed));
     }
+    account_alias::preflight_new(&desired_aliases)?;
     let key = if apply {
         read_key(&paths.client_key)?
     } else {
@@ -2429,6 +2565,7 @@ pub(super) fn wire(
             Some(&launcher()?),
             apply,
         )?);
+        entries.extend(account_alias::entries_for_new(&desired_aliases, apply)?);
         let (_, image_entries) = image_home::plan(paths, &entries, &config, apply)?;
         entries.extend(image_entries);
         for e in &entries {
@@ -2533,6 +2670,8 @@ pub(super) fn wire(
             None
         },
         image_install_pending: false,
+        alias_install_pending: false,
+        account_aliases: desired_aliases.iter().map(|p| p.record.clone()).collect(),
         npm: paths.npm_dir.clone(),
         claude: paths.claude_settings.clone(),
         claude_before: hash_bytes(&claude_before),
@@ -2708,6 +2847,7 @@ pub(super) fn unwire(paths: &CutoverPaths, apply: bool, force: bool) -> Result<R
     let mut m: Manifest = serde_json::from_slice(&fs::read(paths.journal())?)
         .map_err(|_| anyhow::anyhow!("dedicated journal 형식이 올바르지 않습니다"))?;
     validate_manifest(paths, &m)?;
+    account_alias::preflight_saved(&m, force)?;
     let mut report = Report {
         summary: vec!["요약: journal에 기록된 연결만 되돌립니다".into()],
         ..Report::default()
@@ -3751,6 +3891,359 @@ mod tests {
         assert_eq!(snapshot(&p), before);
         assert!(!p.codex_qb_home.exists());
         assert!(!claude_home(&p).unwrap().exists());
+    }
+
+    #[test]
+    fn r11_fresh_alias_publication_recovers_or_unwires_saved_payloads() {
+        for recover in [false, true] {
+            for stage in ["after-create", "after-publish"] {
+                let (_dir, p) = fixture();
+                let id = r11_account(&p, "fresh", false);
+                r11_config(&p, &[(&id, "rh")]);
+                let alias = p.npm_dir.join("codex-rh.cmd");
+                INTERRUPT.with(|slot| *slot.borrow_mut() = Some((alias.clone(), stage)));
+                assert!(run(&p, true, Some(CodexMode::Dedicated)).is_err());
+                let pending = manifest(&p);
+                assert!(!pending.alias_install_pending); // original install
+                let saved = pending.entries.iter().find(|e| e.path == alias).unwrap();
+                let bytes = unprotect(saved.payload.as_deref().unwrap()).unwrap();
+                if recover {
+                    run(&p, true, Some(CodexMode::Dedicated)).unwrap();
+                    assert_eq!(fs::read(&alias).unwrap(), bytes);
+                    assert_eq!(manifest(&p).install_completed, Some(true));
+                }
+                super::unwire(&p, true, false).unwrap();
+                assert!(!alias.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn r11_pending_qi_extension_checks_alias_conflict_before_recovery_writes() {
+        let (_dir, p) = fixture();
+        run(&p, true, Some(CodexMode::Dedicated)).unwrap();
+        r12_remove_image_home(&p);
+        let id = r11_account(&p, "qi-recovery", false);
+        r11_config(&p, &[(&id, "rh")]);
+        let qi = image_home::path(&p.codex_qb_home).unwrap();
+        INTERRUPT.with(|slot| *slot.borrow_mut() = Some((qi.clone(), "after-publish")));
+        assert!(run(&p, true, Some(CodexMode::Dedicated)).is_err());
+        let m = manifest(&p);
+        assert!(m.image_install_pending);
+        assert!(m.account_aliases.is_empty()); // ordered after Qi completes
+        let alias = p.npm_dir.join("codex-rh.cmd");
+        fs::write(&alias, "foreign").unwrap();
+        let journal = fs::read(p.journal()).unwrap();
+        for apply in [false, true] {
+            assert!(run(&p, apply, Some(CodexMode::Dedicated)).is_err());
+            assert_eq!(fs::read(p.journal()).unwrap(), journal);
+            assert_eq!(fs::read(&alias).unwrap(), b"foreign");
+        }
+        fs::remove_file(&alias).unwrap();
+        run(&p, true, Some(CodexMode::Dedicated)).unwrap();
+        assert!(alias.exists());
+        assert_eq!(manifest(&p).install_completed, Some(true));
+        super::unwire(&p, true, false).unwrap();
+        assert!(!alias.exists() && !qi.exists());
+    }
+
+    #[test]
+    fn r11_conflicting_pending_alias_blocks_resume_and_unwire_before_any_write() {
+        let (_dir, p) = fixture();
+        let id = r11_account(&p, "pending", false);
+        r11_config(&p, &[(&id, "rh")]);
+        let alias = p.npm_dir.join("codex-rh.cmd");
+        INTERRUPT.with(|slot| *slot.borrow_mut() = Some((alias.clone(), "after-create")));
+        assert!(run(&p, true, Some(CodexMode::Dedicated)).is_err());
+        fs::write(&alias, "foreign").unwrap();
+        let journal = fs::read(p.journal()).unwrap();
+        for force in [false, true] {
+            let mut options = opts(Some(CodexMode::Dedicated));
+            options.force = force;
+            assert!(
+                wire_with_task_query(&p, true, options, &|_| panic!("unrequested backend"))
+                    .is_err()
+            );
+            assert!(super::unwire(&p, true, force).is_err());
+            assert_eq!(fs::read(p.journal()).unwrap(), journal);
+            assert_eq!(fs::read(&alias).unwrap(), b"foreign");
+        }
+    }
+
+    #[test]
+    fn r11_alias_upgrade_dispatch_and_crash_recovery_never_use_claude_launcher() {
+        for stage in [
+            "upgrade-before-scratch",
+            "after-create",
+            "upgrade-after-identity",
+            "upgrade-after-replace",
+            "upgrade-before-final-journal",
+        ] {
+            let (_dir, p) = fixture();
+            let id = r11_account(&p, "upgrade", false);
+            r11_config(&p, &[(&id, "rh")]);
+            run(&p, true, Some(CodexMode::Dedicated)).unwrap();
+            let alias = p.npm_dir.join("codex-rh.cmd");
+            let mut m = manifest(&p);
+            let expected = account_alias::launcher_bytes(&m.account_aliases[0]).unwrap();
+            // Model a journal-owned previous launcher version, same stable ID.
+            let mut old = b"rem synthetic previous version\r\n".to_vec();
+            old.extend_from_slice(&expected);
+            fs::write(&alias, &old).unwrap();
+            let e = m.entries.iter_mut().find(|e| e.path == alias).unwrap();
+            e.hash = hash_bytes(&old);
+            e.payload = Some(protect(&old).unwrap());
+            atomic_json(&p.journal(), &m).unwrap();
+            INTERRUPT.with(|slot| *slot.borrow_mut() = Some((alias.clone(), stage)));
+            assert!(
+                run(&p, true, Some(CodexMode::Dedicated)).is_err(),
+                "{stage}"
+            );
+            run(&p, true, Some(CodexMode::Dedicated)).unwrap();
+            assert_eq!(fs::read(&alias).unwrap(), expected);
+            assert!(manifest(&p).entries.iter().all(|e| e.upgrade.is_none()));
+            super::unwire(&p, true, false).unwrap();
+            assert!(!alias.exists());
+        }
+    }
+
+    #[test]
+    fn r11_edited_alias_refuses_all_wire_writes_and_unwire_force_keeps_identity_boundary() {
+        let (_dir, p) = fixture();
+        let id = r11_account(&p, "edited", false);
+        r11_config(&p, &[(&id, "rh")]);
+        run(&p, true, Some(CodexMode::Dedicated)).unwrap();
+        let alias = p.npm_dir.join("codex-rh.cmd");
+        let owned = identity(&alias).unwrap();
+        fs::write(&alias, "user edit").unwrap();
+        assert_eq!(identity(&alias).unwrap(), owned);
+        let journal = fs::read(p.journal()).unwrap();
+        let mut options = opts(Some(CodexMode::Dedicated));
+        options.force = true;
+        assert!(
+            wire_with_task_query(&p, true, options, &|_| panic!("unrequested backend")).is_err()
+        );
+        assert!(super::unwire(&p, true, false).is_err());
+        assert_eq!(fs::read(p.journal()).unwrap(), journal);
+        assert_eq!(fs::read(&alias).unwrap(), b"user edit");
+        super::unwire(&p, true, true).unwrap();
+        assert!(!alias.exists());
+    }
+
+    // Public synthetic account records deliberately contain an invalid secret:
+    // wire must resolve aliases without decrypting or leasing the account store.
+    fn r11_account(p: &CutoverPaths, label: &str, claude: bool) -> String {
+        let identity = if claude {
+            qb_core::accounts::Identity::Claude {
+                account_uuid: format!("synthetic-{label}"),
+                organization_uuid: None,
+                email: format!("{label}@example.invalid"),
+            }
+        } else {
+            qb_core::accounts::Identity::Codex {
+                account_id: format!("synthetic-{label}"),
+                email: format!("{label}@example.invalid"),
+                user_id: None,
+            }
+        };
+        let id = identity.id();
+        fs::create_dir_all(p.qb_home.join("accounts")).unwrap();
+        fs::write(p.qb_home.join("accounts").join(format!("{id}.json")),
+            serde_json::to_vec(&serde_json::json!({
+                "schema":1, "id":id, "provider":identity.provider(), "label":label,
+                "email":format!("{label}@example.invalid"), "plan":null, "identity":identity,
+                "source":{"kind":"oauth"}, "user_state":"paused", "health":{"kind":"ready"},
+                "generation":1, "token_meta":{"expires_at":null,"last_refresh_at":null,"refresh_uncertain":false},
+                "secret_dpapi_b64":"synthetic-not-a-credential"
+            })).unwrap()).unwrap();
+        id
+    }
+
+    fn r11_config(p: &CutoverPaths, mappings: &[(&str, &str)]) {
+        let text = mappings
+            .iter()
+            .map(|(id, short)| format!("[accounts.'{id}']\nshort = '{short}'\n"))
+            .collect::<String>();
+        fs::write(p.qb_home.join("config.toml"), text).unwrap();
+    }
+
+    #[test]
+    fn r11_fresh_dry_run_wire_idempotence_and_unwire_use_stable_metadata() {
+        let (_dir, p) = fixture();
+        let id = r11_account(&p, "friendly-label", false);
+        r11_config(&p, &[(&id, "rh")]);
+        let alias = p.npm_dir.join("codex-rh.cmd");
+        let before = snapshot(&p);
+        assert!(
+            run(&p, false, Some(CodexMode::Dedicated))
+                .unwrap()
+                .changed
+                .iter()
+                .any(|p| p.ends_with("codex-rh.cmd"))
+        );
+        assert!(!alias.exists());
+        assert!(!p.journal().exists());
+        run(&p, true, Some(CodexMode::Dedicated)).unwrap();
+        let m = manifest(&p);
+        assert_eq!(m.account_aliases[0].account_id, id);
+        assert_eq!(
+            fs::read(&alias).unwrap(),
+            account_alias::launcher_bytes(&m.account_aliases[0]).unwrap()
+        );
+        assert_eq!(snapshot(&p), before);
+        let journal = fs::read(p.journal()).unwrap();
+        assert!(
+            run(&p, true, Some(CodexMode::Dedicated))
+                .unwrap()
+                .changed
+                .is_empty()
+        );
+        assert_eq!(fs::read(p.journal()).unwrap(), journal);
+        // Unwire must not load current account config or require account records.
+        fs::write(p.qb_home.join("config.toml"), "invalid = [").unwrap();
+        super::unwire(&p, true, false).unwrap();
+        assert!(!alias.exists());
+        assert_eq!(snapshot(&p), before);
+    }
+
+    #[test]
+    fn r11_invalid_targets_and_late_alias_conflicts_leave_everything_unchanged() {
+        for case in ["missing", "label", "claude", "existing", "pending"] {
+            let (_dir, p) = fixture();
+            let id = r11_account(&p, "friendly", case == "claude");
+            let target = match case {
+                "missing" => "cx-000000",
+                "label" => "friendly",
+                _ => &id,
+            };
+            r11_config(&p, &[(target, "rh")]);
+            let conflict = p.npm_dir.join(if case == "pending" {
+                "codex-rh.qb-pending"
+            } else {
+                "codex-rh.cmd"
+            });
+            if matches!(case, "existing" | "pending") {
+                fs::write(&conflict, "foreign").unwrap();
+            }
+            let before = snapshot(&p);
+            for apply in [false, true] {
+                assert!(
+                    run(&p, apply, Some(CodexMode::Dedicated)).is_err(),
+                    "{case}"
+                );
+                assert!(!p.journal().exists());
+                assert!(!p.codex_qb_home.exists());
+                assert_eq!(snapshot(&p), before);
+                if matches!(case, "existing" | "pending") {
+                    assert_eq!(fs::read(&conflict).unwrap(), b"foreign");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn r11_addition_conflict_precedes_qi_upgrade_and_preserves_user_edits() {
+        let (_dir, p) = fixture();
+        run(&p, true, Some(CodexMode::Dedicated)).unwrap();
+        r12_remove_image_home(&p);
+        let q = p.codex_qb_home.join("config.toml");
+        let text = format!(
+            "r11_user_setting = 'keep'\n{}",
+            fs::read_to_string(&q).unwrap()
+        );
+        fs::write(&q, &text).unwrap();
+        let id = r11_account(&p, "friendly", false);
+        r11_config(&p, &[(&id, "rh")]);
+        let alias = p.npm_dir.join("codex-rh.cmd");
+        fs::write(&alias, "foreign").unwrap();
+        let journal = fs::read(p.journal()).unwrap();
+        for apply in [false, true] {
+            assert!(run(&p, apply, Some(CodexMode::Dedicated)).is_err());
+            assert_eq!(fs::read(p.journal()).unwrap(), journal);
+            assert_eq!(fs::read_to_string(&q).unwrap(), text);
+            assert!(!image_home::path(&p.codex_qb_home).unwrap().exists());
+        }
+        fs::remove_file(&alias).unwrap();
+        run(&p, true, Some(CodexMode::Dedicated)).unwrap();
+        assert_eq!(fs::read_to_string(&q).unwrap(), text);
+        let m = manifest(&p);
+        assert!(m.image_home.is_some());
+        assert_eq!(m.account_aliases.len(), 1);
+        assert_eq!(m.install_completed, Some(true));
+        assert!(!m.alias_install_pending && !m.image_install_pending);
+    }
+
+    #[test]
+    fn r11_alias_extension_recovers_each_boundary_without_optional_replay() {
+        for legacy_qi in [false, true] {
+            for stage in ["after-create", "after-publish"] {
+                let (_dir, p) = fixture();
+                run(&p, true, Some(CodexMode::Dedicated)).unwrap();
+                if legacy_qi {
+                    r12_remove_image_home(&p);
+                }
+                let id = r11_account(&p, "friendly", false);
+                r11_config(&p, &[(&id, "rh")]);
+                let mut m = manifest(&p);
+                let initial = r12_fake_recorded_actions(&mut m);
+                atomic_json(&p.journal(), &m).unwrap();
+                let _reset = R12ResetOptionalMutations;
+                OPTIONAL_MUTATIONS.with(|slot| *slot.borrow_mut() = Some(initial.clone()));
+                let alias = p.npm_dir.join("codex-rh.cmd");
+                INTERRUPT.with(|slot| *slot.borrow_mut() = Some((alias.clone(), stage)));
+                assert!(run(&p, true, Some(CodexMode::Dedicated)).is_err());
+                let pending = manifest(&p);
+                assert!(pending.alias_install_pending);
+                assert!(!pending.image_install_pending);
+                let unproven = pending
+                    .entries
+                    .iter()
+                    .find(|e| e.path == alias)
+                    .unwrap()
+                    .pending
+                    .clone()
+                    .unwrap();
+                run(&p, true, Some(CodexMode::Dedicated)).unwrap();
+                let complete = manifest(&p);
+                assert!(!complete.alias_install_pending);
+                assert_eq!(complete.install_completed, Some(true));
+                assert!(complete.entries.iter().all(|e| e.done));
+                if stage == "after-create" {
+                    assert!(unproven.exists());
+                }
+                OPTIONAL_MUTATIONS.with(|slot| assert_eq!(slot.borrow().as_ref(), Some(&initial)));
+            }
+        }
+    }
+
+    #[test]
+    fn r11_mapping_edits_and_replaced_alias_refuse_before_writes_even_force() {
+        let (_dir, p) = fixture();
+        let id = r11_account(&p, "one", false);
+        r11_config(&p, &[(&id, "rh")]);
+        run(&p, true, Some(CodexMode::Dedicated)).unwrap();
+        let journal = fs::read(p.journal()).unwrap();
+        let alias = p.npm_dir.join("codex-rh.cmd");
+        for mapping in [vec![], vec![(&id[..], "aa")]] {
+            r11_config(&p, &mapping);
+            assert!(run(&p, true, Some(CodexMode::Dedicated)).is_err());
+            assert_eq!(fs::read(p.journal()).unwrap(), journal);
+        }
+        r11_config(&p, &[(&id, "rh")]);
+        let bytes = fs::read(&alias).unwrap();
+        fs::rename(&alias, p.npm_dir.join("held-original.cmd")).unwrap();
+        fs::write(&alias, &bytes).unwrap();
+        for force in [false, true] {
+            let mut options = opts(Some(CodexMode::Dedicated));
+            options.force = force;
+            assert!(
+                wire_with_task_query(&p, true, options, &|_| panic!("unrequested backend"))
+                    .is_err()
+            );
+            assert!(super::unwire(&p, true, force).is_err());
+            assert_eq!(fs::read(p.journal()).unwrap(), journal);
+            assert_eq!(fs::read(&alias).unwrap(), bytes);
+        }
     }
 
     const KEY: &str = "synthetic-client-KEY-9281";

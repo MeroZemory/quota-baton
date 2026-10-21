@@ -207,6 +207,12 @@ impl LaunchTokenRegistry {
         Err(LaunchTokenError::Entropy)
     }
 
+    /// Issuance-only cleanup: caller owns a never-published handle and has
+    /// dropped its private pin. Do not use this to revoke a delivered launch.
+    pub(crate) fn discard_unpublished(&self, token: &LaunchToken) {
+        self.0.lock().remove(&token_digest(token.expose_secret()));
+    }
+
     /// Atomically validate and pin. Each request obtains its own non-cloneable guard.
     /// Missing/expired failures are for the caller to apply only when a token is needed.
     pub fn get_or_pin(&self, token: &str) -> Result<LaunchPin, LaunchTokenError> {

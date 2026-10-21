@@ -207,7 +207,9 @@ fn runtime_router(state: RuntimeAdmin) -> Router {
     Router::new()
         .route(
             "/admin/v1/launches",
-            post(issue_launch).layer(axum::extract::DefaultBodyLimit::max(8192)),
+            post(issue_launch)
+                .layer(axum::extract::DefaultBodyLimit::max(8192))
+                .layer(axum::middleware::from_fn(issue_operation_entry)),
         )
         .route(
             "/admin/v1/routing",
@@ -236,11 +238,36 @@ fn runtime_router(state: RuntimeAdmin) -> Router {
         .with_state(state)
 }
 
+// Candidate admission/wait budget, not a filesystem completion deadline.
+const ISSUE_OPERATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+
+async fn issue_operation_entry(
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let operation = crate::issue_operation::IssueOperation::new(
+        tokio::time::Instant::now() + ISSUE_OPERATION_BUDGET,
+    );
+    let _caller = operation.caller_guard();
+    request.extensions_mut().insert(operation.clone());
+    let result = tokio::time::timeout_at(operation.deadline(), next.run(request)).await;
+    match result {
+        Ok(response) if operation.can_reply() => response,
+        _ => {
+            let error = crate::relay::LaunchError::Unavailable;
+            (error.status(), Json(serde_json::json!({"error": {
+                "code": error.code(), "message": error.message()
+            }}))).into_response()
+        }
+    }
+}
+
 async fn issue_launch(
     State(state): State<RuntimeAdmin>,
+    axum::Extension(operation): axum::Extension<crate::issue_operation::IssueOperation>,
     Json(request): Json<crate::relay::LaunchRequest>,
 ) -> Response {
-    match state.relay.issue_launch(request, state.data_port).await {
+    match state.relay.issue_launch_for_operation(request, state.data_port, operation).await {
         Ok(reply) => {
             let mut response = Json(reply).into_response();
             response.headers_mut().insert(
