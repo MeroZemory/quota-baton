@@ -2,6 +2,9 @@
 use crate::{sessions_db as db, sessions_discovery as discovery, sessions_guard as guard};
 
 pub(crate) fn friendly_error(error: &anyhow::Error) -> Option<String> {
+    if error.is::<discovery::PhysicalConflict>() {
+        return Some("같은 물리 대화 ID의 서로 다른 파일이 있습니다. doctor로 확인하세요".into());
+    }
     if error.is::<discovery::RelatedUnreadable>() {
         return Some("관련된 압축 대화 기록을 읽을 수 없습니다. doctor로 확인하세요".into());
     }
@@ -873,6 +876,7 @@ fn import_refusal_class(error: &anyhow::Error) -> usize {
     {
         0
     } else if error.is::<InventoryConflict>()
+        || error.is::<discovery::PhysicalConflict>()
         || message.contains("분기")
         || message == "대상에 다른 대화 기록이 있습니다"
     {
@@ -959,9 +963,22 @@ pub(crate) fn run(home: &Path, command: SessionsCommand) -> Result<()> {
                     .map(|t| (t.id, t.model_provider))
                     .collect::<BTreeMap<_, _>>();
                 for id in catalog.threads.keys() {
+                    let refusal = catalog
+                        .ensure_readable_for(&BTreeSet::from([id.clone()]))
+                        .err();
                     crate::print_stdout(format_args!(
                         "{id}{}",
-                        if providers.get(id).is_some_and(|p| p != "openai") {
+                        if refusal
+                            .as_ref()
+                            .is_some_and(|e| e.is::<discovery::PhysicalConflict>())
+                        {
+                            " · 물리 ID 중복 (가져오기 거절)"
+                        } else if refusal
+                            .as_ref()
+                            .is_some_and(|e| e.is::<discovery::RelatedUnreadable>())
+                        {
+                            " · 관련 압축 기록을 읽을 수 없음"
+                        } else if providers.get(id).is_some_and(|p| p != "openai") {
                             " · openai 제공자가 아님"
                         } else {
                             ""

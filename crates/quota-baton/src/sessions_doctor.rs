@@ -442,6 +442,18 @@ fn check_records(
         })();
         match inspected {
             Ok(home) if seen.insert(home.catalog.home.clone()) => {
+                for physical in &home.catalog.conflicts {
+                    report(
+                        &mut out,
+                        "물리_ID_중복",
+                        Some(physical),
+                        home.catalog
+                            .all()
+                            .filter(|r| &r.physical == physical)
+                            .map(|r| r.path.clone())
+                            .collect(),
+                    );
+                }
                 for unreadable in &home.catalog.unreadable {
                     report(
                         &mut out,
@@ -539,6 +551,37 @@ mod tests {
                 .iter()
                 .any(|d| d.paths.contains(&canonical(&compressed).unwrap()))
         );
+    }
+
+    #[test]
+    fn conflicting_physical_copies_are_reported_without_poisoning_the_home() {
+        let root = fixture();
+        let q = root.path().join("q");
+        let original = write(&q, A, A, None, None);
+        let copy = q
+            .join("archived_sessions")
+            .join(original.file_name().unwrap());
+        fs::create_dir_all(copy.parent().unwrap()).unwrap();
+        fs::copy(&original, &copy).unwrap();
+        write(&q, B, B, None, None);
+        let store = Store {
+            home: root.path().join("qb"),
+            target: canonical(&q).unwrap(),
+            search_homes: Vec::new(),
+            map_path: root.path().join("map.json"),
+        };
+        let diagnostics = check_records(&store, Vec::new()).unwrap();
+        let conflicts: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.code == "물리_ID_중복")
+            .collect();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].id.as_deref(), Some(A));
+        assert_eq!(conflicts[0].paths.len(), 2);
+        assert!(conflicts[0].paths.contains(&canonical(&original).unwrap()));
+        assert!(conflicts[0].paths.contains(&canonical(&copy).unwrap()));
+        assert!(!diagnostics.iter().any(|d| d.code == "홈_검사_실패"));
+        assert!(discovery::catalog(&q).unwrap().chain(B).is_ok());
     }
 
     fn write(

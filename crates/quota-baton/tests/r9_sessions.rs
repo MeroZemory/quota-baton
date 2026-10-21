@@ -808,3 +808,33 @@ fn r9_cli_live_unknown_provider_and_missing_wiring_refuse() {
     fs::remove_file(f.qb.join("journal/wiring.json")).unwrap();
     assert!(!f.import(A, true).status.success());
 }
+
+#[test]
+fn r91_list_marks_duplicate_physical_id_and_keeps_unrelated_sessions_visible() {
+    let f = Fixture::new();
+    let a = f.add(A, false, "openai");
+    let b = f.add(B, false, "openai");
+    let duplicate = f
+        .source
+        .join("archived_sessions")
+        .join(a.file_name().unwrap());
+    fs::create_dir_all(duplicate.parent().unwrap()).unwrap();
+    fs::copy(&a, &duplicate).unwrap();
+    let before_a = fs::read(&a).unwrap();
+    let before_b = fs::read(&b).unwrap();
+    let result = f.cli(&[
+        "sessions".as_ref(),
+        "import".as_ref(),
+        "--from".as_ref(),
+        f.source.as_os_str(),
+        "--list".as_ref(),
+    ]);
+    assert_success(&result);
+    let text = String::from_utf8_lossy(&result.stdout);
+    assert!(text.contains(&format!("{A} · 물리 ID 중복")));
+    assert!(text.lines().any(|line| line == B));
+    assert_eq!(fs::read(&a).unwrap(), before_a);
+    assert_eq!(fs::read(&b).unwrap(), before_b);
+    assert!(!f.target.join("sessions").exists());
+    assert!(!f.qb.join("journal/sessions-import.json").exists());
+}

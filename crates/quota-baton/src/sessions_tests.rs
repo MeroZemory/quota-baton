@@ -16,6 +16,12 @@ fn r9_cli_diagnostics_allow_only_fixed_messages_not_attached_content() {
     assert!(friendly_error(&anyhow::anyhow!("SYNTHETIC-PRIVATE SQL error")).is_none());
     assert!(
         friendly_error(&anyhow::anyhow!(
+            "같은 대화 기록 ID가 서로 다른 파일에 중복되어 있습니다: SYNTHETIC-PRIVATE"
+        ))
+        .is_none()
+    );
+    assert!(
+        friendly_error(&anyhow::anyhow!(
             "압축 대화 메타데이터를 안전하게 읽을 수 없습니다: SYNTHETIC-PRIVATE"
         ))
         .is_none()
