@@ -77,6 +77,39 @@ struct Frame {
     actions: Vec<Target>,
     elements: Vec<(i32, Target)>,
 }
+/// Bounded, opt-in timings. EndDraw is submission/present-call time, not GPU completion.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct FrameTiming {
+    pub input_seq: u64,
+    pub rebuild_reason: Option<&'static str>,
+    pub tab: String,
+    pub hover: Option<String>,
+    pub offsets: [f32; 4],
+    pub snapshot_us: u64,
+    pub project_us: u64,
+    pub scene_us: u64,
+    pub paint_us: u64,
+    pub publish_us: u64,
+    pub frame_us: u64,
+    pub nodes: usize,
+    pub rebuilt: bool,
+    pub phases: render::PhaseStats,
+}
+fn micros(start: Instant) -> u64 {
+    start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+}
+#[cfg(feature = "testkit")]
+pub fn perf_take_frames(hwnd: HWND) -> Vec<FrameTiming> {
+    current(hwnd).map_or_else(Vec::new, |h| std::mem::take(&mut h.borrow_mut().timings))
+}
+#[cfg(feature = "testkit")]
+pub fn perf_scene(hwnd: HWND) -> Option<Scene> {
+    current(hwnd).and_then(|h| h.borrow().frame.as_ref().map(|f| f.scene.clone()))
+}
+#[cfg(feature = "testkit")]
+pub fn perf_input_seq(hwnd: HWND) -> u64 {
+    current(hwnd).map_or(0, |h| h.borrow().input_seq)
+}
 struct Host {
     hwnd: HWND,
     port: UiPort,
@@ -105,6 +138,10 @@ struct Host {
     closing: bool,
     pointer_region: Option<ScrollRegion>,
     focused: bool,
+    profiling: bool,
+    timings: Vec<FrameTiming>,
+    input_seq: u64,
+    dirty_reason: &'static str,
 }
 fn current(hwnd: HWND) -> Option<Rc<RefCell<Host>>> {
     HOST.with(|slot| {
@@ -172,8 +209,13 @@ fn invalidate_frame(h: &mut Host) {
 }
 
 fn redraw(hwnd: HWND) {
+    redraw_for(hwnd, "state");
+}
+fn redraw_for(hwnd: HWND, reason: &'static str) {
     if let Some(host) = current(hwnd) {
-        invalidate_frame(&mut host.borrow_mut());
+        let mut h = host.borrow_mut();
+        invalidate_frame(&mut h);
+        h.dirty_reason = reason;
     }
     repaint(hwnd);
 }
@@ -298,6 +340,11 @@ pub fn open_or_focus(
             closing: false,
             pointer_region: None,
             focused: false,
+            profiling: cfg!(any(debug_assertions, feature = "testkit"))
+                && std::env::var_os("QB_DASHBOARD_PROFILE").is_some(),
+            timings: Vec::new(),
+            input_seq: 0,
+            dirty_reason: "initial",
         })))
     });
     bridge.enqueue(Event::Opened { port });
@@ -548,7 +595,7 @@ fn apply_mail(hwnd: HWND) {
             host.borrow_mut().suppress_geometry = false;
         }
     }
-    redraw(hwnd);
+    redraw_for(hwnd, "mail");
 }
 
 unsafe fn remember_geometry(hwnd: HWND) {
@@ -653,6 +700,12 @@ unsafe fn paint(hwnd: HWND) -> Result<()> {
         if pixels.contains(&0) {
             return Ok(());
         }
+        let profile = h.profiling;
+        h.renderer.set_phase_stats_enabled(profile);
+        h.renderer.reset_phase_stats();
+        h.editor_text.set_phase_stats_enabled(profile);
+        h.editor_text.reset_phase_stats();
+        let frame_start = profile.then(Instant::now);
         invalidate_frame(&mut h);
         if h.target.is_none() {
             let rt = unsafe {
@@ -686,13 +739,19 @@ unsafe fn paint(hwnd: HWND) -> Result<()> {
         let mut clock = h.clock.clone();
         let delta = h.clock_at.elapsed().as_secs().min(120) as i64;
         clock.now += chrono::Duration::seconds(delta);
+        let part = profile.then(Instant::now);
         let snapshot = h.snapshot.clone();
+        let snapshot_us = part.map_or(0, micros);
+        let part = profile.then(Instant::now);
         let view = model::project(&snapshot, &mut h.state, &clock);
+        let project_us = part.map_or(0, micros);
         let size = [
             pixels[0] as f32 * 96. / dpi as f32,
             pixels[1] as f32 * 96. / dpi as f32,
         ];
+        let part = profile.then(Instant::now);
         let mut scene = h.renderer.scene(&view, &h.state, size)?;
+        let scene_us = part.map_or(0, micros);
         for r in &scene.content {
             h.state.scroll(r.region, r.offset, r.max_offset);
         }
@@ -707,7 +766,9 @@ unsafe fn paint(hwnd: HWND) -> Result<()> {
             h.input.focus = None;
         }
         decorate_editor(&h, &mut scene)?;
+        let part = profile.then(Instant::now);
         h.renderer.paint(&target, &scene, &h.input)?;
+        let paint_us = part.map_or(0, micros);
         let stamp = Stamp {
             owner: h.life.owner,
             epoch: epoch().ok_or_else(invalid)?,
@@ -720,8 +781,47 @@ unsafe fn paint(hwnd: HWND) -> Result<()> {
             actions: vec![],
             elements: vec![],
         };
+        let part = profile.then(Instant::now);
         publish_accessibility(&mut h, &mut frame)?;
+        let publish_us = part.map_or(0, micros);
         h.life.painted(stamp);
+        if let Some(start) = frame_start {
+            let mut phases = h.renderer.phase_stats();
+            let editor = h.editor_text.phase_stats();
+            phases.text_measure_us = phases
+                .text_measure_us
+                .saturating_add(editor.text_measure_us);
+            phases.layout_creations = phases
+                .layout_creations
+                .saturating_add(editor.layout_creations);
+            phases.format_creations = phases
+                .format_creations
+                .saturating_add(editor.format_creations);
+            let timing = FrameTiming {
+                input_seq: h.input_seq,
+                rebuild_reason: Some(h.dirty_reason),
+                tab: format!("{:?}", h.state.tab),
+                hover: h.input.hover.as_ref().map(|v| format!("{v:?}")),
+                offsets: [
+                    h.state.table_offset,
+                    h.state.side_offset,
+                    h.state.events_offset,
+                    h.state.usage_offset,
+                ],
+                snapshot_us,
+                project_us,
+                scene_us,
+                paint_us,
+                publish_us,
+                frame_us: micros(start),
+                nodes: frame.scene.accessibility.len(),
+                rebuilt: true,
+                phases,
+            };
+            if h.timings.len() < 4096 {
+                h.timings.push(timing);
+            }
+        }
         h.frame = Some(frame);
         Ok(())
     })();
@@ -974,10 +1074,12 @@ fn publish_accessibility(h: &mut Host, frame: &mut Frame) -> Result<()> {
             frame.stamp.epoch,
         );
         #[cfg(all(test, feature = "testkit"))]
-        eprintln!(
-            "dashboard UIA publish epoch={} nodes={} result={result:?}",
-            frame.stamp.epoch, count
-        );
+        if !h.profiling {
+            eprintln!(
+                "dashboard UIA publish epoch={} nodes={} result={result:?}",
+                frame.stamp.epoch, count
+            );
+        }
         result
     } else {
         Err(failure("dashboard UIA provider unavailable"))
@@ -1426,6 +1528,15 @@ unsafe extern "system" fn wndproc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if matches!(
+        message,
+        WM_MOUSEMOVE | WM_MOUSEWHEEL | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_KEYDOWN | WM_CHAR
+    ) {
+        if let Some(host) = current(hwnd) {
+            let mut h = host.borrow_mut();
+            h.input_seq = h.input_seq.saturating_add(1);
+        }
+    }
     match message {
         WM_ERASEBKGND => return LRESULT(1),
         WM_PRINT | WM_PRINTCLIENT => {
@@ -1468,7 +1579,7 @@ unsafe extern "system" fn wndproc(
             }
             flush_geometry(hwnd, false);
             if tick {
-                redraw(hwnd);
+                redraw_for(hwnd, "timer");
             }
             return LRESULT(0);
         }

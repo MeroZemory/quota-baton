@@ -3,6 +3,8 @@
 //! and is released on hide; WIC uses one engine per render.
 #![cfg(target_os = "windows")]
 
+#[cfg(any(debug_assertions, feature = "testkit"))]
+use std::{cell::Cell, time::Instant};
 use windows::{
     Win32::{
         Foundation::{E_FAIL, E_INVALIDARG},
@@ -56,6 +58,60 @@ pub struct Text {
     text_family: &'static str,
     icon_family: &'static str,
     mono_family: &'static str,
+    #[cfg(any(debug_assertions, feature = "testkit"))]
+    phases: TextPhaseCounters,
+}
+
+/// Per-engine elapsed wall durations since reset, not process CPU time.
+/// Creation counts include failed COM attempts.
+/// Plain release builds expose the same API and return zero totals.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct TextPhaseStats {
+    /// Elapsed wall time in layout(), including shaping, metrics and wrapping.
+    pub text_measure_us: u64,
+    pub layout_creations: u64,
+    pub format_creations: u64,
+}
+
+#[cfg(any(debug_assertions, feature = "testkit"))]
+#[derive(Default)]
+struct TextPhaseCounters {
+    enabled: Cell<bool>,
+    text_measure_ns: Cell<u64>,
+    layout_creations: Cell<u64>,
+    format_creations: Cell<u64>,
+}
+
+#[cfg(any(debug_assertions, feature = "testkit"))]
+pub(crate) fn phase_elapsed_ns(started: Instant) -> u64 {
+    started.elapsed().as_nanos().min(u64::MAX as u128) as u64
+}
+
+/// Includes early-error paths without reading the clock when disabled.
+#[cfg(any(debug_assertions, feature = "testkit"))]
+pub(crate) struct PhaseTimer<'a> {
+    started: Option<Instant>,
+    total: &'a Cell<u64>,
+}
+
+#[cfg(any(debug_assertions, feature = "testkit"))]
+impl<'a> PhaseTimer<'a> {
+    pub(crate) fn new(enabled: bool, total: &'a Cell<u64>) -> Self {
+        Self {
+            started: enabled.then(Instant::now),
+            total,
+        }
+    }
+}
+
+#[cfg(any(debug_assertions, feature = "testkit"))]
+impl Drop for PhaseTimer<'_> {
+    fn drop(&mut self) {
+        if let Some(started) = self.started {
+            self.total
+                .set(self.total.get().saturating_add(phase_elapsed_ns(started)));
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -100,7 +156,44 @@ impl Text {
             icon_family: choose_family(&collection, &["Segoe Fluent Icons", "Segoe MDL2 Assets"])?,
             mono_family: choose_family(&collection, &["Cascadia Mono", "Consolas"])?,
             factory,
+            #[cfg(any(debug_assertions, feature = "testkit"))]
+            phases: TextPhaseCounters::default(),
         })
+    }
+
+    /// Default off. Disabling retains totals; reset does not change this flag.
+    pub fn set_phase_stats_enabled(&self, enabled: bool) {
+        #[cfg(any(debug_assertions, feature = "testkit"))]
+        self.phases.enabled.set(enabled);
+        #[cfg(not(any(debug_assertions, feature = "testkit")))]
+        let _ = enabled;
+    }
+
+    pub fn reset_phase_stats(&self) {
+        #[cfg(any(debug_assertions, feature = "testkit"))]
+        {
+            self.phases.text_measure_ns.set(0);
+            self.phases.layout_creations.set(0);
+            self.phases.format_creations.set(0);
+        }
+    }
+
+    pub fn phase_stats(&self) -> TextPhaseStats {
+        #[cfg(any(debug_assertions, feature = "testkit"))]
+        {
+            TextPhaseStats {
+                text_measure_us: self.phases.text_measure_ns.get() / 1_000,
+                layout_creations: self.phases.layout_creations.get(),
+                format_creations: self.phases.format_creations.get(),
+            }
+        }
+        #[cfg(not(any(debug_assertions, feature = "testkit")))]
+        TextPhaseStats::default()
+    }
+
+    #[cfg(any(debug_assertions, feature = "testkit"))]
+    pub(crate) fn phase_measure_ns(&self) -> u64 {
+        self.phases.text_measure_ns.get()
     }
 
     pub fn families(&self) -> (&'static str, &'static str) {
@@ -116,6 +209,12 @@ impl Text {
         // No custom font collection/fallback: DirectWrite's system fallback
         // resolves Hangul (normally Malgun Gothic on Korean Windows).
         unsafe {
+            #[cfg(any(debug_assertions, feature = "testkit"))]
+            if self.phases.enabled.get() {
+                self.phases
+                    .format_creations
+                    .set(self.phases.format_creations.get().saturating_add(1));
+            }
             let format = self.factory.CreateTextFormat(
                 PCWSTR(family.as_ptr()),
                 None,
@@ -155,6 +254,12 @@ impl Text {
         let utf16: Vec<u16> = value.encode_utf16().collect();
         let length = u32::try_from(utf16.len()).map_err(|_| Error::from_hresult(E_INVALIDARG))?;
         unsafe {
+            #[cfg(any(debug_assertions, feature = "testkit"))]
+            if self.phases.enabled.get() {
+                self.phases
+                    .layout_creations
+                    .set(self.phases.layout_creations.get().saturating_add(1));
+            }
             let layout = self
                 .factory
                 .CreateTextLayout(&utf16, format, width, height)?;
@@ -194,6 +299,8 @@ impl Text {
     /// opportunities; CRLF/CR/LF are explicit breaks. Long words stay intact
     /// in the wrapping algorithm and are ellipsized by DirectWrite when drawn.
     pub fn layout(&self, value: &str, bounds: D2D_RECT_F, style: Style) -> Result<Layout> {
+        #[cfg(any(debug_assertions, feature = "testkit"))]
+        let _measurement = PhaseTimer::new(self.phases.enabled.get(), &self.phases.text_measure_ns);
         let width = bounds.right - bounds.left;
         let height = bounds.bottom - bounds.top;
         if ![
@@ -387,6 +494,46 @@ fn choose_family(
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
     use super::*;
+
+    #[cfg(any(debug_assertions, feature = "testkit"))]
+    #[test]
+    fn r1210_phase_stats_count_actual_calls_and_preserve_enable_reset_semantics() -> Result<()> {
+        let text = Text::new()?;
+        text.layout("disabled", rect(240., 24.), style(Wrap::SingleLine))?;
+        assert_eq!(text.phase_stats(), TextPhaseStats::default());
+
+        text.set_phase_stats_enabled(true);
+        for value in ["enabled before reset", "enabled after reset"] {
+            text.reset_phase_stats();
+            assert_eq!(text.phase_stats(), TextPhaseStats::default());
+            text.layout(value, rect(240., 24.), style(Wrap::SingleLine))?;
+            let stats = text.phase_stats();
+            assert_eq!(stats.format_creations, 1);
+            // Natural advance, line-height probe, and final shaped line.
+            assert_eq!(stats.layout_creations, 3);
+        }
+
+        let before = text.phase_stats();
+        text.set_phase_stats_enabled(false);
+        text.layout("disabled again", rect(240., 24.), style(Wrap::SingleLine))?;
+        assert_eq!(text.phase_stats(), before);
+        text.reset_phase_stats();
+        text.layout(
+            "reset while disabled",
+            rect(240., 24.),
+            style(Wrap::SingleLine),
+        )?;
+        assert_eq!(text.phase_stats(), TextPhaseStats::default());
+
+        text.set_phase_stats_enabled(true);
+        assert!(
+            text.layout("invalid", rect(0., 24.), style(Wrap::SingleLine))
+                .is_err()
+        );
+        assert_eq!(text.phase_stats().format_creations, 0);
+        assert_eq!(text.phase_stats().layout_creations, 0);
+        Ok(())
+    }
 
     fn style(wrap: Wrap) -> Style {
         Style {
