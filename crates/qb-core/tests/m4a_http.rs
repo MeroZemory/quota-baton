@@ -4791,3 +4791,339 @@ async fn r11_http_entry_destination_pause_before_admission_never_publishes_move(
             .any(|row| row["event"] == "session_move" && row["reason"] == "forced")
     );
 }
+
+// Reconstruct the relay and both listeners, not just a second BindingTable.
+// The synthetic account store, ledger writer and upstream remain fixture-owned.
+async fn r11_http_restart_fixture() -> (
+    Harness,
+    qb_core::relay::LaunchReply,
+    qb_core::bindings::LaunchInfo,
+) {
+    let mut h = Harness::new(Provider::Codex, 2, 64, 1024).await;
+    let raw = json!({"models":[{"slug":"synthetic-model"},{"slug":"menu-model"}]});
+    let launch = r11_models_issue_raw(&h, &raw).await;
+    let client = reqwest::Client::new();
+    h.fake.state.push(ok());
+    let response = client
+        .post(format!("{}/responses", launch.base_url))
+        .bearer_auth("synthetic-client")
+        .header("session-id", "r11-persisted-resume")
+        .body(r#"{"model":"synthetic-model","input":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.unwrap();
+    let response = client
+        .get(&launch.catalog_url)
+        .bearer_auth("synthetic-client")
+        .header("session-id", "r11-persisted-resume")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.json::<Value>().await.unwrap(), raw);
+    drop(client);
+    let persisted = h
+        .state
+        .bindings
+        .launch_info("codex:r11-persisted-resume", Utc::now())
+        .unwrap();
+    assert_eq!(persisted.account, launch.account);
+    assert_eq!(persisted.canonical_key, "codex:r11-persisted-resume");
+    assert_eq!(persisted.current_model.as_deref(), Some("synthetic-model"));
+    assert_eq!(
+        persisted.advertised_models,
+        ["synthetic-model".to_owned(), "menu-model".to_owned()]
+            .into_iter()
+            .collect()
+    );
+    // Retire the old snapshot writer before constructing the replacement.
+    h.state.bindings.flush().unwrap();
+    h.state.bindings.freeze().unwrap();
+    h.obs.flush().unwrap();
+    h.servers.shutdown();
+    tokio::time::timeout(Duration::from_secs(5), &mut h.servers.data_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), &mut h.servers.admin_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let mut config = Config::default();
+    // Reuse the data port so the original handle URL is exercised verbatim.
+    config.server.data_port = h.servers.data_addr.port();
+    config.server.admin_port = 0;
+    config.guard.inflight_budget_mib = 64;
+    config.guard.memory_hard_limit_mib = 1024;
+    config.upstream.codex_base = h.fake.url.clone();
+    config.upstream.anthropic_base = h.fake.url.clone();
+    h.state = Arc::new(
+        RelayState::new(
+            h.store.clone(),
+            &config,
+            h.obs.clone(),
+            Arc::new(DebugPins::default()),
+        )
+        .unwrap()
+        .with_token_endpoint(Provider::Codex, h.fake.url.clone()),
+    );
+    h.servers = http::spawn_with_routes(
+        &config,
+        LocalSecrets {
+            client_key: "synthetic-client".into(),
+            admin_token: "synthetic-admin".into(),
+        },
+        relay::router(h.state.clone()),
+        qb_core::admin::runtime_routes(h.state.clone(), 0),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        h.state
+            .bindings
+            .launch_info("codex:r11-persisted-resume", Utc::now())
+            .unwrap(),
+        persisted,
+        "account, model, menu and canonical identity survive disk reload"
+    );
+    (h, launch, persisted)
+}
+
+#[tokio::test]
+async fn r11_http_entry_reconstructed_relay_uses_persisted_c8_without_runtime_handle() {
+    let (h, launch, persisted) = r11_http_restart_fixture().await;
+    let client = reqwest::Client::new();
+    let before = h.fake.state.requests().len();
+    let routing = h.state.bindings.routing_view();
+    let bindings = h.state.bindings.export().unwrap();
+    let moves: Vec<_> = h
+        .ledger()
+        .into_iter()
+        .filter(|row| row["event"] == "session_move")
+        .collect();
+    // The original handle really lost its runtime authority. Both it and an
+    // unknown handle must refuse catalog/new-session requests without known C8.
+    for base in [
+        launch.base_url.clone(),
+        format!("http://{}/l/{}/v1", h.servers.data_addr, "Z".repeat(43)),
+    ] {
+        for session in [None, Some("r11-not-persisted")] {
+            for models in [true, false] {
+                let mut request = if models {
+                    client.get(format!("{base}/models"))
+                } else {
+                    client
+                        .post(format!("{base}/responses"))
+                        .body(r#"{"model":"synthetic-model","input":[]}"#)
+                }
+                .bearer_auth("synthetic-client");
+                if let Some(session) = session {
+                    request = request.header("session-id", session);
+                }
+                let response = request.send().await.unwrap();
+                assert_eq!(response.status(), StatusCode::CONFLICT);
+                assert_eq!(
+                    response.json::<Value>().await.unwrap()["error"]["type"],
+                    "launch_expired"
+                );
+            }
+        }
+    }
+    assert_eq!(h.fake.state.requests().len(), before);
+    assert_eq!(h.state.bindings.export().unwrap(), bindings);
+
+    h.fake.state.push(ScriptedResponse::json(
+        StatusCode::OK,
+        r#"{"models":[{"slug":"synthetic-model"},{"slug":"menu-model"}]}"#,
+    ));
+    let response = client
+        .get(&launch.catalog_url)
+        .bearer_auth("synthetic-client")
+        .header("session-id", "r11-persisted-resume")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["x-quota-baton-account"]
+            .to_str()
+            .unwrap(),
+        launch.account
+    );
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["models"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        h.state
+            .bindings
+            .launch_info("codex:r11-persisted-resume", Utc::now())
+            .unwrap(),
+        persisted,
+        "/models reads the persisted binding without placing or moving"
+    );
+    h.fake.state.push(ok());
+    let response = client
+        .post(format!("{}/responses", launch.base_url))
+        .bearer_auth("synthetic-client")
+        .header("session-id", "r11-persisted-resume")
+        .body(r#"{"model":"synthetic-model","input":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.unwrap();
+    let calls = h.fake.state.requests();
+    assert_eq!(calls.len(), before + 2);
+    assert!(calls[before].path_and_query.starts_with("/models"));
+    assert_eq!(calls[before + 1].path_and_query, "/responses");
+    let original = calls
+        .iter()
+        .find(|call| call.path_and_query == "/responses")
+        .unwrap();
+    for call in &calls[before..] {
+        assert_eq!(
+            call.headers["chatgpt-account-id"],
+            original.headers["chatgpt-account-id"]
+        );
+    }
+    assert_eq!(h.state.bindings.routing_view(), routing);
+    assert_eq!(
+        h.state.bindings.export().unwrap()["bindings"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        h.ledger()
+            .into_iter()
+            .filter(|row| row["event"] == "session_move")
+            .collect::<Vec<_>>(),
+        moves
+    );
+}
+
+#[tokio::test]
+async fn r11_http_entry_simultaneous_resume_issuance_preserves_persisted_authority() {
+    let (h, _old_launch, persisted) = r11_http_restart_fixture().await;
+    let other = h
+        .ids()
+        .into_iter()
+        .find(|id| *id != persisted.account)
+        .unwrap();
+    let anchors_before = h.state.bindings.export().unwrap()["launch_anchors"]
+        .as_object()
+        .unwrap()
+        .len();
+    let routing = h.state.bindings.routing_view();
+    let moves: Vec<_> = h
+        .ledger()
+        .into_iter()
+        .filter(|row| row["event"] == "session_move")
+        .collect();
+    let before = h.fake.state.requests().len();
+    // Cold catalogs after reconstruction, with a deterministic upstream gate:
+    // both issuance futures are polled while the first fetch is held.
+    for _ in h.ids() {
+        h.fake.state.push(ScriptedResponse::json(
+            StatusCode::OK,
+            r#"{"models":[{"slug":"synthetic-model"},{"slug":"menu-model"}]}"#,
+        ));
+    }
+    let (arrived, release) = h.fake.state.pause_next_response();
+    let issue = || {
+        h.state.issue_launch(
+            qb_core::relay::LaunchRequest {
+                model: None,
+                model_is_explicit: false,
+                account_pref: Some(other.clone()),
+                resume_id: Some("r11-persisted-resume".into()),
+                move_for_model: false,
+            },
+            h.servers.data_addr.port(),
+        )
+    };
+    let (first, second, ()) = tokio::time::timeout(Duration::from_secs(15), async {
+        tokio::join!(issue(), issue(), async {
+            tokio::time::timeout(Duration::from_secs(5), arrived)
+                .await
+                .unwrap()
+                .unwrap();
+            release.send(()).unwrap();
+        })
+    })
+    .await
+    .unwrap();
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert_ne!(first.base_url, second.base_url);
+    for launch in [&first, &second] {
+        assert_eq!(launch.account, persisted.account);
+        assert_eq!(launch.model, persisted.current_model);
+        h.fake.state.push(ok());
+    }
+    let client = reqwest::Client::new();
+    // No C8 header: each new handle must independently resolve to the same
+    // persisted canonical binding, not merely be overridden by a known key.
+    let send = |base: &str| {
+        client
+            .post(format!("{base}/responses"))
+            .bearer_auth("synthetic-client")
+            .body(r#"{"model":"synthetic-model","input":[]}"#)
+            .send()
+    };
+    let (a, b) = tokio::join!(send(&first.base_url), send(&second.base_url));
+    for response in [a.unwrap(), b.unwrap()] {
+        assert_eq!(response.status(), StatusCode::OK);
+        response.bytes().await.unwrap();
+    }
+    assert_eq!(
+        h.state
+            .bindings
+            .launch_info("codex:r11-persisted-resume", Utc::now())
+            .unwrap(),
+        persisted
+    );
+    let snapshot = h.state.bindings.export().unwrap();
+    assert_eq!(snapshot["bindings"].as_array().unwrap().len(), 1);
+    assert_eq!(snapshot["launches"].as_object().unwrap().len(), 1);
+    assert_eq!(
+        snapshot["launch_anchors"].as_object().unwrap().len(),
+        anchors_before + 2
+    );
+    for anchor in snapshot["launch_anchors"].as_object().unwrap().values() {
+        assert_eq!(anchor["canonical_key"], persisted.canonical_key);
+    }
+    let calls = h.fake.state.requests();
+    let original = calls
+        .iter()
+        .find(|call| call.path_and_query == "/responses")
+        .unwrap();
+    let sent: Vec<_> = calls[before..]
+        .iter()
+        .filter(|call| call.path_and_query == "/responses")
+        .collect();
+    assert_eq!(sent.len(), 2);
+    for call in sent {
+        assert_eq!(
+            call.headers["chatgpt-account-id"],
+            original.headers["chatgpt-account-id"]
+        );
+    }
+    assert_eq!(h.state.bindings.routing_view(), routing);
+    assert_eq!(
+        h.ledger()
+            .into_iter()
+            .filter(|row| row["event"] == "session_move")
+            .collect::<Vec<_>>(),
+        moves
+    );
+}
