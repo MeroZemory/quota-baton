@@ -5,6 +5,172 @@ fn view(state: &mut DashboardState) -> m::DashboardView {
 }
 
 #[test]
+fn r10_header_pips_show_exactly_five_or_twenty_one_when_they_fit() {
+    for threshold in [5, 21] {
+        for offset in [0., 96.] {
+            let mut state = DashboardState {
+                table_offset: offset,
+                ..Default::default()
+            };
+            let mut v = view(&mut state);
+            v.groups[0].threshold = Some(threshold);
+            v.groups[0].active = 3;
+            let scene = Scene::build(&v, &state, [1320., 960.], &Metrics::default());
+            let name_tops: Vec<_> = scene
+                .draw
+                .iter()
+                .filter_map(|draw| match draw {
+                    Draw::Text { rect, measure, .. } if measure.text == v.groups[0].name => {
+                        Some(rect.top)
+                    }
+                    _ => None,
+                })
+                .collect();
+            let headers: Vec<_> = scene
+                .draw
+                .iter()
+                .filter_map(|draw| match draw {
+                    Draw::Text { rect, measure, .. }
+                        if measure.text == "활성 세션"
+                            && name_tops.iter().any(|top| rect.top == top + 1.) =>
+                    {
+                        Some(*rect)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(headers.len(), if offset == 0. { 1 } else { 2 });
+            for header in headers {
+                let pips: Vec<_> = scene
+                    .draw
+                    .iter()
+                    .filter_map(|draw| match draw {
+                        Draw::Fill {
+                            rect,
+                            color: Color::Accent,
+                            ..
+                        }
+                        | Draw::Stroke {
+                            rect,
+                            color: Color::PipOutline,
+                            ..
+                        } if rect.top == header.top + 4.
+                            && width(*rect) == 8.
+                            && height(*rect) == 8. =>
+                        {
+                            Some(*rect)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(pips.len() as u64, threshold);
+                assert_eq!(pips[0].left, header.right);
+                for pair in pips.windows(2) {
+                    assert_eq!(pair[1].left - pair[0].right, 3.);
+                }
+            }
+            assert!(!scene.draw.iter().any(|draw| matches!(draw,
+                Draw::Text { measure, .. } if measure.text == "…")));
+        }
+    }
+}
+
+#[test]
+fn r10_extreme_header_threshold_is_bounded_and_explicit_with_full_measured_counts() {
+    let threshold = i64::MAX as u64;
+    for size in [[1024., 640.], [1180., 960.], [1320., 960.]] {
+        for active in [0, threshold] {
+            let mut state = DashboardState::default();
+            let mut v = view(&mut state);
+            v.groups.truncate(1);
+            let group = &mut v.groups[0];
+            group.threshold = Some(threshold);
+            group.active = active;
+            let id = group.id.clone();
+            let count = format!("{active} / {threshold}");
+            let probe = Scene::build(&v, &state, size, &Metrics::default());
+            let mut metrics = Metrics::default();
+            let measure = probe
+                .measurements
+                .iter()
+                .find(|m| m.text == count && m.width == 4096.)
+                .unwrap();
+            // Native measurements can exceed the deterministic fallback estimate.
+            let measured_count = count.chars().count() as f32 * 7.2 + 17.;
+            metrics.widths.insert(measure.key(), measured_count);
+            let scene = Scene::build(&v, &state, size, &metrics);
+            let header = scene
+                .targets
+                .iter()
+                .find(|n| n.target == Target::Group(id.clone()))
+                .unwrap()
+                .rect;
+            let pips: Vec<_> = scene
+                .draw
+                .iter()
+                .filter_map(|draw| match draw {
+                    Draw::Fill {
+                        rect,
+                        color: Color::Accent,
+                        ..
+                    }
+                    | Draw::Stroke {
+                        rect,
+                        color: Color::PipOutline,
+                        ..
+                    } if rect.top == header.top + 16.
+                        && width(*rect) == 8.
+                        && height(*rect) == 8. =>
+                    {
+                        Some(*rect)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert!(!pips.is_empty());
+            assert!(pips.len() < (width(header) / 11.) as usize);
+            assert!(scene.draw.len() < 2000, "scene work must not scale with T");
+            for pip in pips {
+                assert!(pip.left.is_finite() && pip.right.is_finite());
+                assert!(pip.left >= header.left && pip.right <= header.right);
+            }
+            let line: Vec<_> = scene
+                .draw
+                .iter()
+                .filter_map(|draw| match draw {
+                    Draw::Text { rect, measure, .. }
+                        if rect.top >= header.top + 10. && rect.top <= header.top + 15. =>
+                    {
+                        Some((*rect, measure.text.as_str()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert!(line.iter().any(|(_, text)| *text == "…"));
+            let (count_rect, _) = line.iter().find(|(_, text)| *text == count).unwrap();
+            assert!(width(*count_rect) >= measured_count.ceil());
+            for (rect, _) in line {
+                assert!(width(rect) > 0. && height(rect) > 0.);
+                assert!(rect.left.is_finite() && rect.right.is_finite());
+                assert!(rect.left >= header.left && rect.right <= header.right);
+            }
+            assert!(scene.tooltips.iter().any(
+                |t| t.text.contains(&format!("기준 {threshold}개")) && t.text.contains("생략")
+            ));
+            assert!(
+                scene
+                    .accessibility
+                    .iter()
+                    .any(|n| n.name.contains(&format!("{active} / {threshold}")))
+            );
+            assert!(scene.accessibility.iter().any(|n| {
+                n.name.contains(&format!("기준 {threshold}개")) && n.name.contains("생략")
+            }));
+        }
+    }
+}
+
+#[test]
 fn r10_retained_banner_and_polling_footer_use_the_last_data_time() {
     for connected in [false, true] {
         let mut data = fixtures::snapshot();

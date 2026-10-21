@@ -466,6 +466,41 @@ impl Renderer {
 mod tests {
     use super::*;
     #[test]
+    fn r10_single_line_account_names_fit_their_actual_directwrite_line_boxes() -> Result<()> {
+        let renderer = Renderer::new(false)?;
+        let mut state = DashboardState::default();
+        let mut view = crate::dashboard_model::project(
+            &crate::dashboard_fixtures::snapshot(),
+            &mut state,
+            &crate::dashboard_fixtures::clock(),
+        );
+        for name in ["hello.sample-acct", "합성 계정"] {
+            view.groups[0].name = name.into();
+            let scene = renderer.scene(&view, &state, [1320., 960.])?;
+            let (rect, measure) = scene
+                .draw
+                .iter()
+                .find_map(|draw| match draw {
+                    Draw::Text { rect, measure, .. } if measure.text == name => {
+                        Some((*rect, measure))
+                    }
+                    _ => None,
+                })
+                .expect("actual account header draw");
+            let layout =
+                renderer
+                    .shared
+                    .dashboard_text()
+                    .layout(name, bounds(rect), style(measure))?;
+            assert_eq!(layout.metrics.visible_lines, 1, "header name must be drawn");
+            assert!(
+                !layout.metrics.ink_overflow,
+                "Korean strokes must fit the line box"
+            );
+        }
+        Ok(())
+    }
+    #[test]
     fn r7_directwrite_wrap_preserves_long_tokens_and_measured_height() -> Result<()> {
         let renderer = Renderer::new(false)?;
         let measure = Measure {

@@ -369,15 +369,20 @@ impl Builder<'_> {
         face: Face,
         align: TextAlign,
     ) {
+        let line_height: f32 = if size >= 15. {
+            22.
+        } else if size <= 12. {
+            16.
+        } else {
+            20.
+        };
         let measure = Measure {
             text: value.into(),
             size,
-            line_height: if size >= 15. {
-                22.
-            } else if size <= 12. {
-                16.
+            line_height: if wrap {
+                line_height
             } else {
-                20.
+                line_height.min(height(r).max(1.))
             },
             width: width(r),
             bold,
@@ -1863,18 +1868,20 @@ fn group_header(b: &mut Builder<'_>, g: &m::AccountGroup, r: Rect, sticky: bool)
         TextAlign::Leading,
     );
     let threshold = g.threshold.unwrap_or(5).max(1);
-    let pip_count = threshold.min(20);
     let over = g.active.saturating_sub(threshold);
+    let count_text = format!("{} / {threshold}", g.active);
+    let count_width = b.measured_width(&count_text, 12., true).max(34.);
     let over_width = if over > 0 {
         b.measured_width(&format!("기준보다 {over}개 많음"), 12., false) + 8.
     } else {
         0.
     };
-    let extra_width = if over > 0 { 30. } else { 0. };
-    let load_width = 64. + pip_count as f32 * 11. + extra_width + 42. + over_width;
-    let load_left = r.right - 12. - load_width;
+    let extra_width = if over > 0 {
+        (b.measured_width(&format!("+{over}"), 12., true) + 6.).max(30.)
+    } else {
+        0.
+    };
     let button_width = if g.relogin { 146. } else { 0. };
-    let content_right = load_left - if g.relogin { button_width + 24. } else { 12. };
     let chip_width = if g.chip.is_empty() {
         0.
     } else {
@@ -1892,6 +1899,36 @@ fn group_header(b: &mut Builder<'_>, g: &m::AccountGroup, r: Rect, sticky: bool)
         0.
     };
     let name_left = r.left + 32. + prefix_width;
+    let measured_name = b.measured_width(&g.name, 13., true);
+    let action_gap = if g.relogin { button_width + 24. } else { 12. };
+    // Bound work by header space, never by the (potentially i64::MAX) threshold.
+    // Keep some name visible before spending the remaining space on pips.
+    let pip_space = (r.right
+        - 12.
+        - name_left
+        - measured_name.min(32.)
+        - plan_width
+        - chip_width
+        - 20.
+        - action_gap
+        - 64.
+        - 8.
+        - extra_width
+        - count_width
+        - over_width)
+        .max(0.);
+    let capacity = (pip_space / 11.).floor() as u64;
+    let omitted = threshold > capacity;
+    let omission_width = if omitted {
+        b.measured_width("…", 12., false) + 3.
+    } else {
+        0.
+    };
+    let pip_count = threshold.min(((pip_space - omission_width).max(0.) / 11.).floor() as u64);
+    let load_width =
+        64. + pip_count as f32 * 11. + omission_width + 8. + extra_width + count_width + over_width;
+    let load_left = r.right - 12. - load_width;
+    let content_right = load_left - action_gap;
     if sticky {
         b.text(
             rect(r.left + 32., r.top + 11., prefix_width, 18.),
@@ -1902,9 +1939,8 @@ fn group_header(b: &mut Builder<'_>, g: &m::AccountGroup, r: Rect, sticky: bool)
             false,
         );
     }
-    let name_width = b
-        .measured_width(&g.name, 13., true)
-        .min((content_right - name_left - plan_width - chip_width - 20.).max(0.));
+    let name_width =
+        measured_name.min((content_right - name_left - plan_width - chip_width - 20.).max(0.));
     b.text(
         rect(name_left, r.top + 11., name_width, 18.),
         g.name.clone(),
@@ -1962,20 +1998,31 @@ fn group_header(b: &mut Builder<'_>, g: &m::AccountGroup, r: Rect, sticky: bool)
         }
     }
     let mut count_left = pip_left + pip_count as f32 * 11. + 8.;
+    if omitted {
+        b.text(
+            rect(count_left - 8., r.top + 12., omission_width, 16.),
+            "…",
+            12.,
+            false,
+            Color::Secondary,
+            false,
+        );
+        count_left += omission_width;
+    }
     if over > 0 {
         b.text(
-            rect(count_left - 6., r.top + 12., 30., 16.),
+            rect(count_left - 6., r.top + 12., extra_width, 16.),
             format!("+{over}"),
             12.,
             true,
             Color::Accent,
             false,
         );
-        count_left += 30.;
+        count_left += extra_width;
     }
     b.text(
-        rect(count_left, r.top + 12., 42., 16.),
-        format!("{} / {threshold}", g.active),
+        rect(count_left, r.top + 12., count_width, 16.),
+        count_text,
         12.,
         true,
         Color::Text,
@@ -1983,7 +2030,12 @@ fn group_header(b: &mut Builder<'_>, g: &m::AccountGroup, r: Rect, sticky: bool)
     );
     if over > 0 {
         b.text(
-            rect(count_left + 42., r.top + 12., over_width, 16.),
+            rect(
+                count_left + count_width + 8.,
+                r.top + 12.,
+                over_width - 8.,
+                16.,
+            ),
             format!("기준보다 {over}개 많음"),
             12.,
             false,
@@ -1991,7 +2043,30 @@ fn group_header(b: &mut Builder<'_>, g: &m::AccountGroup, r: Rect, sticky: bool)
             false,
         );
     }
-    b.tooltip(rect(load_left, r.top + 8., load_width, 24.), format!("활성 세션 {}개 / 기준 {}개. 기준을 넘으면 새 세션은 여유 있는 다른 계정에 먼저 배정합니다. 연결된 세션 {}개.", g.active, threshold, g.bound));
+    let omission = if omitted {
+        format!(
+            " 공간 부족으로 기준 표시 {pip_count}개만 표시, {}개 생략.",
+            threshold - pip_count
+        )
+    } else {
+        String::new()
+    };
+    let load_rect = rect(load_left, r.top + 8., load_width, 24.);
+    let load_description = format!(
+        "활성 세션 {}개 / 기준 {}개. 기준을 넘으면 새 세션은 여유 있는 다른 계정에 먼저 배정합니다. 연결된 세션 {}개.{omission}",
+        g.active, threshold, g.bound
+    );
+    if omitted {
+        b.semantic(
+            format!("{}:load:{}", b.scope, g.id),
+            Some(format!("group:{}", g.id)),
+            Role::Text,
+            load_description.clone(),
+            load_rect,
+            None,
+        );
+    }
+    b.tooltip(load_rect, load_description);
     if !g.relogin_reason.is_empty() {
         b.text(
             rect(r.left + 32., r.top + 36., width(r) - 44., 16.),
