@@ -91,6 +91,141 @@ fn compressed_root_is_a_normal_selectable_rollout_without_body_retention() {
 }
 
 #[test]
+fn content_memo_detects_same_size_header_rewrite_with_restored_mtime() {
+    let home = home();
+    let path = name(home.path(), A, true);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let first = zstd::stream::encode_all(record(A, None, Some(B)).as_bytes(), 0).unwrap();
+    let second = zstd::stream::encode_all(record(A, None, Some(C)).as_bytes(), 0).unwrap();
+    assert_eq!(first.len(), second.len());
+    fs::write(&path, &first).unwrap();
+    let modified = fs::metadata(&path).unwrap().modified().unwrap();
+    assert_eq!(
+        catalog(home.path()).unwrap().rollouts[A]
+            .forked_from
+            .as_deref(),
+        Some(B)
+    );
+    let directory =
+        crate::sessions_guard::header_directory(home.path(), path.parent().unwrap()).unwrap();
+    let opened = crate::sessions_guard::open_header(&directory, &path).unwrap();
+    assert!(cached_compressed(&path, &opened).unwrap().is_some());
+    drop(opened);
+    fs::write(&path, second).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    assert_eq!(
+        catalog(home.path()).unwrap().rollouts[A]
+            .forked_from
+            .as_deref(),
+        Some(C)
+    );
+}
+
+#[test]
+fn content_memo_never_caches_names_descendants_or_corrupt_headers() {
+    let home = home();
+    let path = write(home.path(), A, A, None, None, true);
+    assert!(catalog(home.path()).unwrap().descendants(A).is_empty());
+    let child = write(home.path(), B, B, Some(A), Some(A), true);
+    let archived = home.path().join("archived_sessions");
+    fs::create_dir_all(&archived).unwrap();
+    let alias = archived.join(path.file_name().unwrap());
+    fs::hard_link(&path, &alias).unwrap();
+    let warm = catalog(home.path()).unwrap();
+    assert!(warm.descendants(A).contains(B));
+    assert_eq!(warm.aliases.len(), 1);
+    fs::write(&child, b"not a zstd header").unwrap();
+    assert!(
+        catalog(home.path())
+            .unwrap()
+            .ensure_readable_for(&ids(B))
+            .is_err()
+    );
+    write(home.path(), B, B, None, Some(C), true);
+    assert_eq!(
+        catalog(home.path()).unwrap().rollouts[B]
+            .forked_from
+            .as_deref(),
+        Some(C)
+    );
+    fs::remove_file(&alias).unwrap();
+    assert!(catalog(home.path()).unwrap().aliases.is_empty());
+}
+
+#[test]
+fn content_memo_revalidates_replacement_and_current_file_size_without_retaining_body() {
+    let home = home();
+    let path = write(home.path(), A, A, None, Some(B), true);
+    catalog(home.path()).unwrap();
+    let replacement = write(home.path(), C, C, None, None, true);
+    fs::remove_file(&path).unwrap();
+    fs::rename(replacement, &path).unwrap();
+    let current = catalog(home.path()).unwrap();
+    assert_eq!(current.rollouts[A].thread, C);
+    assert_eq!(current.rollouts[A].forked_from, None);
+    // Bytes beyond the original decoder's observed prefix cannot change its
+    // first record. They still affect current size; neither raw bytes nor the
+    // decoded conversation body are retained in the memo.
+    let mut append = fs::File::options().append(true).open(&path).unwrap();
+    use std::io::Write;
+    append.write_all(b"SYNTHETIC_PRIVATE_SESSION_BODY").unwrap();
+    drop(append);
+    let current = catalog(home.path()).unwrap();
+    assert_eq!(
+        current.rollouts[A].bytes,
+        fs::metadata(&path).unwrap().len()
+    );
+    with_headers(|cache| {
+        for entry in cache.entries.values() {
+            let metadata = serde_json::to_string(&entry.rollout).unwrap();
+            assert!(!metadata.contains("SYNTHETIC_PRIVATE_SESSION_BODY"));
+        }
+    });
+}
+
+#[test]
+fn content_memo_capacity_eviction_means_fresh_decode_not_missing_inventory() {
+    let home = home();
+    write(home.path(), A, A, None, None, true);
+    catalog(home.path()).unwrap();
+    with_headers(|cache| cache.bytes = HEADER_CACHE_BYTES);
+    write(home.path(), B, B, None, Some(A), true);
+    let current = catalog(home.path()).unwrap();
+    assert!(current.descendants(A).contains(B));
+    assert_eq!(current.rollouts.len(), 2);
+    with_headers(|cache| assert!(cache.bytes <= HEADER_CACHE_BYTES));
+}
+
+#[test]
+fn parallel_header_inventory_rebuilds_late_descendants_aliases_and_unreadable_names() {
+    let home = home();
+    write(home.path(), A, A, None, None, false);
+    for slot in 0..64 {
+        let id = format!("aaaaaaaa-0000-0000-0000-{slot:012x}");
+        write(home.path(), &id, &id, None, None, true);
+    }
+    let first = catalog(home.path()).unwrap();
+    assert_eq!(first.rollouts.len(), 65);
+    assert!(first.descendants(A).is_empty());
+    let child = write(home.path(), B, B, Some(A), Some(A), true);
+    let archived = home.path().join("archived_sessions");
+    fs::create_dir_all(&archived).unwrap();
+    fs::hard_link(&child, archived.join(child.file_name().unwrap())).unwrap();
+    corrupt(home.path(), C);
+    let second = catalog(home.path()).unwrap();
+    assert!(second.descendants(A).contains(B));
+    assert_eq!(second.aliases.len(), 1);
+    assert!(second.ensure_readable_for(&ids(C)).is_err());
+    assert!(second.ensure_readable_for(&ids(A)).is_ok());
+    assert_eq!(second.rollouts.len(), 66);
+}
+
+#[test]
 fn mixed_plain_compressed_fork_and_physical_history_are_transitive() {
     let home = home();
     write(home.path(), A, D, None, None, true);

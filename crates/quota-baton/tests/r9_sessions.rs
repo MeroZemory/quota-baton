@@ -14,6 +14,52 @@ const B: &str = "22222222-2222-2222-2222-222222222222";
 const C: &str = "33333333-3333-3333-3333-333333333333";
 const D: &str = "44444444-4444-4444-4444-444444444444";
 const PRIVATE_BODY: &str = "SYNTHETIC_PRIVATE_SESSION_BODY";
+
+/// Run alone with `cargo test -p quota-baton --test r9_sessions
+/// r93_5300_rollout_preview_timing -- --ignored --nocapture`.
+/// Typed-confirmation move/return phase timings use the report's ConPTY bench.
+#[test]
+#[ignore = "explicit machine timing benchmark; 5300 project-local synthetic rollouts"]
+fn r93_5300_rollout_preview_timing() {
+    let fixture = Fixture::new();
+    let selected = fixture.add(A, false, "openai");
+    let directory = fixture.source.join("archived_sessions/2026/10/21");
+    fs::create_dir_all(&directory).unwrap();
+    for slot in 1..5300 {
+        let id = format!("aaaaaaaa-0000-0000-0000-{slot:012x}");
+        let header = serde_json::json!({"type":"session_meta","payload":{
+            "id":id,"model_provider":"openai","base_instructions":{"text":"x".repeat(16384)}
+        }});
+        let bytes = format!("{header}\n{{\"private\":\"{PRIVATE_BODY}\"}}\n");
+        let compressed = slot <= 3950;
+        let path = directory.join(format!(
+            "rollout-test-{id}.jsonl{}",
+            if compressed { ".zst" } else { "" }
+        ));
+        let bytes = if compressed {
+            zstd::stream::encode_all(bytes.as_bytes(), 1).unwrap()
+        } else {
+            bytes.into_bytes()
+        };
+        fs::write(path, bytes).unwrap();
+    }
+    let start = Instant::now();
+    let output = fixture.import(A, false);
+    let elapsed = start.elapsed();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        elapsed <= Duration::from_secs(10),
+        "preview took {elapsed:?}"
+    );
+    assert!(selected.exists());
+    assert!(!fixture.target.join("state_5.sqlite").exists());
+    assert!(!fixture.qb.join("journal/sessions-import.json").exists());
+    println!("5300 rollouts / 3950 zstd: preview {elapsed:?}; read-only");
+}
 struct Fixture {
     _root: tempfile::TempDir,
     user: PathBuf,
