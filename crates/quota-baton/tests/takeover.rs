@@ -950,21 +950,38 @@ e2e!(drain_timeout_forces_exit, {
 });
 
 async fn port_case(release_port: bool) {
-    let upstream = ScriptedUpstream::start().await.unwrap();
-    let home = Home::new(&upstream.url).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (complete, completed) = oneshot::channel::<()>();
+    let completed = Arc::new(TokioMutex::new(Some(completed)));
+    let app = axum::Router::new().fallback(move || {
+        let completed = completed.clone();
+        async move {
+            // Only A's first response waits; B's later request must complete.
+            let completed = completed.lock().await.take();
+            (
+                [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                axum::body::Body::from_stream(async_stream::stream! {
+                    yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                        b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"held\"}\n\n",
+                    ));
+                    if let Some(completed) = completed {
+                        completed.await.unwrap();
+                    }
+                    yield Ok(bytes::Bytes::from_static(
+                        b"data: {\"type\":\"response.completed\"}\n\n",
+                    ));
+                }),
+            )
+        }
+    });
+    let _upstream = AbortTask(Some(tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    })));
+    let home = Home::new(&url).await;
     accounts(&home, 1);
     let client = client();
     let (a, token) = start(&home, &client).await;
-    upstream.state.push(ScriptedResponse::sse(vec![
-        (
-            Duration::ZERO,
-            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"held\"}\n\n".into(),
-        ),
-        (
-            Duration::from_secs(4),
-            "data: {\"type\":\"response.completed\"}\n\n".into(),
-        ),
-    ]));
     let response = request(&client, &home, "port-held-stream")
         .send()
         .await
@@ -1001,6 +1018,8 @@ async fn port_case(release_port: bool) {
         drop(recovered);
         drop(holder);
     }
+    // Keep A's response unfinished until all port/lease assertions have run.
+    complete.send(()).unwrap();
     let mut remainder = Vec::new();
     while let Some(chunk) = stream.next().await {
         remainder.extend_from_slice(&chunk.unwrap());
