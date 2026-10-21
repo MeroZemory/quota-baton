@@ -4,7 +4,7 @@
 #![allow(non_snake_case)]
 
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     ffi::c_void,
     marker::PhantomData,
     mem::{ManuallyDrop, offset_of},
@@ -296,14 +296,14 @@ fn disconnect_cache(
 }
 
 fn validate(snapshot: &Snapshot) -> Result<()> {
-    let mut ids = HashSet::new();
     let mut focus_count = 0;
     if !valid_bounds(snapshot.bounds) {
         return Err(Error::from_hresult(E_INVALIDARG));
     }
+    let mut parents = HashMap::with_capacity(snapshot.elements.len());
     for e in &snapshot.elements {
         if e.id <= 0
-            || !ids.insert(e.id)
+            || parents.insert(e.id, (e.parent, None::<usize>)).is_some()
             || !valid_bounds(e.bounds)
             || (e.kind == Kind::Text && (e.action.is_some() || e.focusable || e.focused))
             || (e.focused && (!e.enabled || !e.focusable))
@@ -315,11 +315,6 @@ fn validate(snapshot: &Snapshot) -> Result<()> {
     if focus_count > 1 {
         return Err(Error::from_hresult(E_INVALIDARG));
     }
-    let mut parents: std::collections::HashMap<_, _> = snapshot
-        .elements
-        .iter()
-        .map(|e| (e.id, (e.parent, None::<usize>)))
-        .collect();
     for e in &snapshot.elements {
         // Resolve each ancestor once. A fixed path avoids allocating a HashSet
         // for every cell in a large chart's hidden accessibility table.
@@ -1453,7 +1448,7 @@ static VALUE: IValueProvider_Vtbl = IValueProvider_Vtbl {
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use std::{cell::RefCell, collections::HashSet};
     use windows::Win32::System::Ole::SafeArrayGetElement;
     use windows::core::BSTR;
 
