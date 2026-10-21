@@ -653,20 +653,6 @@ impl Fixture {
             .stdin(Stdio::null())
             .stdout(fs::File::create(&stdout).unwrap())
             .stderr(fs::File::create(&stderr).unwrap());
-        // env_clear otherwise drops the parent's explicit diagnostic opt-in.
-        if std::env::var_os("QB_R9_IMPORT_TRACE").as_deref() == Some(std::ffi::OsStr::new("1"))
-            && self.qb.is_absolute()
-            && self
-                .qb
-                .components()
-                .any(|part| part.as_os_str() == ".sandbox")
-            && !self
-                .qb
-                .components()
-                .any(|part| part == std::path::Component::ParentDir)
-        {
-            command.env("QB_R9_IMPORT_TRACE", "1");
-        }
         if let Some((label, address)) = checkpoint {
             command
                 .env("QB_R9_CHECKPOINT", label)
