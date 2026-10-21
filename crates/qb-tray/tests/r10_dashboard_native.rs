@@ -12,6 +12,8 @@ mod dashboard_persistence;
 mod dashboard_window;
 #[path = "support/r10_fixtures.rs"]
 mod fixture;
+#[path = "support/r10_hwnd_capture.rs"]
+mod hwnd_capture;
 #[path = "support/r10_wic.rs"]
 mod wic;
 
@@ -397,6 +399,7 @@ fn r10_dashboard_native() {
         [client.right, client.bottom],
         [size[0] as i32, size[1] as i32]
     );
+    hwnd_capture::save(hwnd, &output.join("hwnd-client-1x.bgra")).unwrap();
     let ready = json!({"schema":1,"state":state,"run_id":run_id,"pid":pid,"hwnd":hwnd.0 as usize,
         "dpi":dpi,"client_dip":size,"synthetic_clock":fixture::clock().now.to_rfc3339(),
         "theme":if dark {"dark"} else {"light"},"actions":run.actions,"commands":run.commands,
