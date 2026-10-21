@@ -1300,11 +1300,11 @@ fn menu_info(
         show_relogin: a.source.owned_or_adopted(),
         show_release_hold: quota(a)
             && a.credits.as_ref().is_some_and(|c| {
-                c.has_credits == Some(true)
-                    || c.balance
-                        .as_ref()
-                        .and_then(|n| n.as_f64())
-                        .is_some_and(|n| n > 0.)
+                qb_core::credits::available(
+                    c.has_credits,
+                    c.unlimited,
+                    c.balance.as_ref().and_then(|n| n.as_f64()),
+                )
             }),
         show_refresh_token: a.source.owned_or_adopted()
             && !a.drain
@@ -1458,12 +1458,12 @@ mod tests {
     fn release_hold_projection_requires_quota_cooling_and_available_credits() {
         for (credits, expected) in [
             (json!({"has_credits":true}), true),
-            (json!({"has_credits":true,"balance":0}), true),
-            (json!({"has_credits":false,"balance":12.5}), true),
+            (json!({"has_credits":true,"balance":0}), false),
+            (json!({"has_credits":false,"balance":12.5}), false),
             (json!({"balance":0.01}), true),
             (json!({"has_credits":false,"balance":0}), false),
             (json!({"balance":-1}), false),
-            (json!({"unlimited":true}), false),
+            (json!({"unlimited":true}), true),
             (json!(null), false),
         ] {
             for allow_credits in [false, true] {

@@ -1917,12 +1917,19 @@ fn resume_in_target(store: &Store, id: &str, previous_owner: Option<&Path>) -> R
         return Ok(true);
     }
     if db::thread_path(&store.target, id)?.is_some() {
-        let catalog = discovery::catalog(&store.target)?;
+        let mut catalog = discovery::catalog(&store.target)?;
+        // Q already owns this row. Bypass only import provider eligibility in
+        // this disposable catalog; retain chain/path validation and writer probes.
+        // Historical CPA ancestors are valid local history, not new imports.
+        for file in catalog.rollouts.values_mut().chain(&mut catalog.aliases) {
+            file.provider = Some("openai".into());
+        }
         let files = catalog.chain(id)?;
         let names = files.iter().map(|f| f.path.clone()).collect::<Vec<_>>();
         let threads = files.iter().map(|f| f.thread.clone()).collect::<Vec<_>>();
-        let (homes, names) = store.probes(&store.target, &threads, &names)?;
-        let _guards = guard::probe_decoded(&homes, &threads, &names)?;
+        // Probe Q directly: rollout sharing detects writers through hardlinks
+        // in other homes without external import discovery.
+        let _guards = guard::probe_decoded(std::slice::from_ref(&store.target), &threads, &names)?;
         return Ok(true);
     }
     Ok(false)
