@@ -1994,7 +1994,7 @@ pub(crate) fn before_codex_resume_at(args: &[OsString], target: Option<&Path>) -
     }
     crate::sessions_admission::verify_installed_version()?;
     import_one(
-        store,
+        &store,
         &matches[0],
         id,
         ImportOptions {
@@ -2018,7 +2018,7 @@ pub(crate) fn before_codex_resume_at(args: &[OsString], target: Option<&Path>) -
         ))?;
     }
     import_one(
-        store,
+        &store,
         &matches[0],
         id,
         ImportOptions {
