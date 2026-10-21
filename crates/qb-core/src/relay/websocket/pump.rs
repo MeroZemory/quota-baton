@@ -68,6 +68,19 @@ impl Context {
             )
     }
 
+    // A same-account resume may promote an ordinary socket's pinned binding.
+    // Observe metadata without replacing the socket or any active completion.
+    fn has_managed_binding(&self) -> bool {
+        self.relay.as_ref().is_some_and(|relay| {
+            self.session.key.as_deref().is_some_and(|key| {
+                relay
+                    .bindings
+                    .launch_info(key, chrono::Utc::now())
+                    .is_ok_and(|info| info.managed)
+            })
+        })
+    }
+
     async fn managed_launch(
         &self,
         deadline: Instant,
@@ -763,7 +776,8 @@ fn requested_create_model(bytes: &[u8]) -> Result<Option<String>, DataLaunchErro
         deserializer: D,
     ) -> Result<Option<String>, D::Error> {
         let value = <String as serde::Deserialize>::deserialize(deserializer)?;
-        safe_identifier(&value)
+        crate::catalog::valid_model_id(&value)
+            .then_some(value)
             .map(Some)
             .ok_or_else(|| serde::de::Error::custom("invalid model"))
     }
@@ -877,7 +891,135 @@ struct PendingInitial {
 }
 
 type LaunchPreparation = BoxFuture<'static, Result<(Session, String), DataLaunchError>>;
-type CreateAdmission = BoxFuture<'static, Result<(), DataLaunchError>>;
+type CreateAdmission = BoxFuture<'static, Result<String, DataLaunchError>>;
+
+// An ordinary observer has not admitted this frame as managed data. Reject it
+// if promotion wins the final gate; keep the socket and older completions alive.
+const PROMOTED_BEFORE_WRITE: &str = "launch_promoted_before_write";
+
+#[cfg(feature = "testkit")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OrdinaryDispatchStage {
+    AfterPacing,
+    BeforeWrite,
+}
+
+#[cfg(feature = "testkit")]
+struct OrdinaryDispatchGate {
+    relay: std::sync::Weak<crate::relay::RelayState>,
+    session: String,
+    payload: Vec<u8>,
+    stage: OrdinaryDispatchStage,
+    arrived: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(feature = "testkit")]
+static ORDINARY_DISPATCH_GATES: Mutex<Vec<OrdinaryDispatchGate>> = Mutex::new(Vec::new());
+
+#[cfg(feature = "testkit")]
+impl crate::relay::RelayState {
+    /// Pause the specified ordinary frame after pacing, before observing promotion.
+    pub fn pause_ws_ordinary_after_pacing(
+        self: &Arc<Self>,
+        session: &str,
+        payload: &[u8],
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        pause_ordinary_dispatch(self, session, payload, OrdinaryDispatchStage::AfterPacing)
+    }
+
+    /// Pause the specified ordinary frame after awaited policy checks, before write.
+    pub fn pause_ws_ordinary_before_write(
+        self: &Arc<Self>,
+        session: &str,
+        payload: &[u8],
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        pause_ordinary_dispatch(self, session, payload, OrdinaryDispatchStage::BeforeWrite)
+    }
+}
+
+#[cfg(feature = "testkit")]
+fn pause_ordinary_dispatch(
+    relay: &Arc<crate::relay::RelayState>,
+    session: &str,
+    payload: &[u8],
+    stage: OrdinaryDispatchStage,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (arrived, observed) = tokio::sync::oneshot::channel();
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let owner = Arc::downgrade(relay);
+    let mut gates = ORDINARY_DISPATCH_GATES
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    gates.retain(|gate| gate.relay.strong_count() > 0 && !gate.arrived.is_closed());
+    assert!(
+        !gates.iter().any(|gate| gate.relay.ptr_eq(&owner)
+            && gate.session == session
+            && gate.payload == payload
+            && gate.stage == stage),
+        "ordinary frame gate already pending"
+    );
+    gates.push(OrdinaryDispatchGate {
+        relay: owner,
+        session: session.into(),
+        payload: payload.into(),
+        stage,
+        arrived,
+        release: gate,
+    });
+    (observed, release)
+}
+
+#[cfg(feature = "testkit")]
+async fn wait_ordinary_dispatch(
+    context: &Context,
+    message: &Message,
+    stage: OrdinaryDispatchStage,
+) -> bool {
+    let Some(relay) = &context.relay else {
+        return true;
+    };
+    let payload: &[u8] = match message {
+        Message::Text(text) => text.as_bytes(),
+        Message::Binary(bytes) => bytes,
+        _ => return true,
+    };
+    let gate = {
+        let owner = Arc::downgrade(relay);
+        let mut gates = ORDINARY_DISPATCH_GATES
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        gates
+            .iter()
+            .position(|gate| {
+                gate.relay.ptr_eq(&owner)
+                    && Some(gate.session.as_str()) == context.session.key.as_deref()
+                    && gate.payload == payload
+                    && gate.stage == stage
+            })
+            .map(|at| gates.remove(at))
+    };
+    if let Some(gate) = gate {
+        let _ = gate.arrived.send(());
+        tokio::select! {
+            biased;
+            _ = relay.wait_for_drain_start() => return false,
+            result = tokio::time::timeout_at(context.launch_deadline(), gate.release) => {
+                return result.is_ok_and(|result| result.is_ok());
+            }
+        }
+    }
+    true
+}
 
 #[cfg(feature = "testkit")]
 struct CreateDispatchGate {
@@ -938,21 +1080,21 @@ fn admit_create(context: Arc<Context>, model: Option<String>) -> CreateAdmission
                 }
             }
         }
-        context
-            .guard_launch_model(model.as_deref(), deadline)
+        let (_, model) = context
+            .prepare_launch_create(model.as_deref(), deadline)
             .await?;
         if let Some(relay) = &context.relay
             && !relay
                 .dispatch_data_allowed(
                     context.session.key.as_deref(),
                     &context.account,
-                    model.as_deref(),
+                    Some(&model),
                 )
                 .await
         {
             return Err(DataLaunchError::PolicyBlocked);
         }
-        Ok(())
+        Ok(model)
     })
 }
 
@@ -1016,6 +1158,7 @@ fn guarded_upstream_write<S>(
     reservation: Reservation,
     delivered: Delivered,
     model: Option<String>,
+    managed: bool,
 ) -> Write<S>
 where
     S: Sink<Message> + Send + Unpin + 'static,
@@ -1042,9 +1185,10 @@ where
                     },
                 );
             }
-            if let Err(error) = context
-                .guard_launch_model(model.as_deref(), context.launch_deadline())
-                .await
+            if managed
+                && let Err(error) = context
+                    .guard_launch_model(model.as_deref(), context.launch_deadline())
+                    .await
             {
                 return (
                     sink,
@@ -1087,6 +1231,39 @@ where
                 Delivered {
                     bytes: 0,
                     terminal: Some("routing_policy_blocked"),
+                    ..delivered
+                },
+            );
+        }
+        #[cfg(feature = "testkit")]
+        if !managed
+            && !wait_ordinary_dispatch(&context, &message, OrdinaryDispatchStage::BeforeWrite).await
+        {
+            return (
+                sink,
+                false,
+                Delivered {
+                    bytes: 0,
+                    request: None,
+                    terminal: Some("takeover_drain"),
+                    ..delivered
+                },
+            );
+        }
+        // The observer fallback also awaits pacing/model/policy. It must not
+        // write ordinary data after a concurrent resume promotes this binding.
+        // Keep its observer completion (which may belong to an older turn).
+        if matches!(message, Message::Text(_) | Message::Binary(_))
+            && !managed
+            && context.has_managed_binding()
+        {
+            return (
+                sink,
+                false,
+                Delivered {
+                    bytes: 0,
+                    request: None,
+                    terminal: Some(PROMOTED_BEFORE_WRITE),
                     ..delivered
                 },
             );
@@ -1301,7 +1478,7 @@ async fn run_with_read_timeout(
     let mut upstream_activity = last_activity;
     let mut ending: Option<(Option<CloseFrame>, &'static str)> = None;
     let mut end_deadline = last_activity;
-    let managed_socket = if draining {
+    let mut managed_socket = if draining {
         false
     } else {
         match context.managed_launch(context.launch_deadline()).await {
@@ -1487,13 +1664,26 @@ async fn run_with_read_timeout(
                     end_deadline = Instant::now() + CLOSE_TIMEOUT;
                     continue;
                 }
-                pending_initial = Some(pending);
+                // Promotion may also happen while this unsent turn waits for rate admission.
+                managed_socket |= context.has_managed_binding();
                 if managed_socket {
-                    let model = pending_initial.as_ref().and_then(|pending| current.get(&pending.request)).and_then(|active| active.model.clone());
-                    create_admission = Some(admit_create(context.clone(), model));
+                    // Logging metadata intentionally loses some protocol model IDs.
+                    // Reparse the preserved frame, including explicit null/invalid.
+                    let requested = match requested_create_model(&pending.message.clone().into_data()) {
+                        Ok(requested) => requested,
+                        Err(error) => {
+                            pending_launch_error = Some(launch_error(error));
+                            if let Some(mut active) = current.remove(&pending.request) {
+                                active.completion.record.outcome = error.code().into();
+                            }
+                            continue;
+                        }
+                    };
+                    create_admission = Some(admit_create(context.clone(), requested));
                 } else {
                     initial_ready = true;
                 }
+                pending_initial = Some(pending);
             }
             result = async { create_admission.as_mut().unwrap().await }, if create_admission.is_some() && to_upstream.is_none() && ending.is_none() => {
                 create_admission = None;
@@ -1502,11 +1692,22 @@ async fn run_with_read_timeout(
                 // still in upstream_sink. Drain cancels just this turn above.
                 if draining { continue; }
                 match result {
-                    Ok(()) => initial_ready = true,
+                    Ok(accepted_model) => {
+                        if let Some(active) = pending_initial.as_ref().and_then(|pending| current.get_mut(&pending.request)) {
+                            active.model = Some(accepted_model.clone());
+                            active.completion.record.model = Some(accepted_model.clone());
+                            active.completion.dashboard_model(Some(&accepted_model));
+                        }
+                        initial_ready = true;
+                    }
                     Err(error) => {
                         pending_launch_error = Some(launch_error(error));
-                        if let Some(active) = pending_initial.as_ref().and_then(|pending| current.get_mut(&pending.request)) {
-                            active.completion.record.outcome = error.code().into();
+                        if let Some(pending) = pending_initial.take()
+                            && let Some(mut active) = current.remove(&pending.request) {
+                                active.completion.record.outcome = error.code().into();
+                        }
+                        if matches!(error, DataLaunchError::UnsupportedModel | DataLaunchError::Invalid) {
+                            continue;
                         }
                         ending = Some((Some(CloseFrame { code:1000.into(), reason:"".into() }), error.code()));
                         end_deadline = Instant::now() + CLOSE_TIMEOUT;
@@ -1577,6 +1778,15 @@ async fn run_with_read_timeout(
                             && !relay.dispatch_data_allowed(context.session.key.as_deref(), &context.account, dispatch_model.as_deref()).await {
                             return (sink, false, Delivered { bytes: 0, request: Some(pending.request), terminal: Some("routing_policy_blocked"), completed: false });
                         }
+                        #[cfg(feature = "testkit")]
+                        if !managed && !wait_ordinary_dispatch(&context, &pending.message, OrdinaryDispatchStage::BeforeWrite).await {
+                            return (sink, false, Delivered { bytes: 0, request: Some(pending.request), terminal: Some("takeover_drain"), completed: false });
+                        }
+                        // No await from this fresh classification through the first
+                        // write poll. Ordinary model metadata is not admission.
+                        if !managed && context.has_managed_binding() {
+                            return (sink, false, Delivered { bytes: 0, request: Some(pending.request), terminal: Some(PROMOTED_BEFORE_WRITE), completed: false });
+                        }
                         if managed && let Some(relay) = &context.relay {
                             // No await between this final authority/drain check
                             // and the first write poll. The awaited gate retained
@@ -1614,6 +1824,14 @@ async fn run_with_read_timeout(
                 if !success && delivered.terminal == Some("takeover_drain") {
                     draining = true;
                     if let Some(request) = delivered.request { current.remove(&request); }
+                    continue;
+                }
+                if !success && delivered.terminal == Some(PROMOTED_BEFORE_WRITE) {
+                    managed_socket = true;
+                    pending_launch_error = Some(launch_error(DataLaunchError::Changed));
+                    if let Some(mut active) = delivered.request.and_then(|id| current.remove(&id)) {
+                        active.completion.record.outcome = DataLaunchError::Changed.code().into();
+                    }
                     continue;
                 }
                 if success { last_activity = Instant::now(); }
@@ -1688,6 +1906,11 @@ async fn run_with_read_timeout(
                         let bytes = message.len();
                         let reservation = reservation.unwrap_or_else(|| context.budget.reserve_message(bytes));
                         let mut request = current.keys().next().copied();
+                        // Upgrade-time classification cannot outlive authoritative promotion.
+                        // Keep the original message/reservation and use normal managed preparation.
+                        if !managed_socket && matches!(&message, Message::Text(_) | Message::Binary(_)) {
+                            managed_socket = context.has_managed_binding();
+                        }
                         if managed_socket && matches!(&message, Message::Text(_) | Message::Binary(_)) {
                             let data = message.clone().into_data();
                             let Some(meta) = super::super::wire_metadata::Metadata::parse(&data) else {
@@ -1757,17 +1980,22 @@ async fn run_with_read_timeout(
                             pending_initial = Some(PendingInitial { request, message, reservation, rate: rate.clone() });
                             let context = context.clone();
                             let model = model.clone();
+                            #[cfg(feature = "testkit")]
+                            let wait_message = pending_initial.as_ref().unwrap().message.clone();
                             initial_admission = Some(Box::pin(async move {
                                 if !rate.admit(context.runtime.as_ref(), &context.account).await { return false; }
-                                match &context.runtime {
+                                let eligible = match &context.runtime {
                                     Some(runtime) => if model.is_some() { runtime.eligible(&context.account, model.as_deref()).await } else { runtime.eligible_unknown_model(&context.account).await },
                                     None => true,
-                                }
+                                };
+                                #[cfg(feature = "testkit")]
+                                if eligible && !wait_ordinary_dispatch(&context, &wait_message, OrdinaryDispatchStage::AfterPacing).await { return false; }
+                                eligible
                             }));
                         } else {
                             let fallback_model = if let Message::Text(text) = &message { super::super::wire_metadata::Metadata::parse(text.as_bytes()).and_then(|meta| meta.model()) } else { None };
                             to_upstream = Some(guarded_upstream_write(context.clone(), upstream_sink.take().unwrap(), message, reservation,
-                                Delivered { bytes, request, terminal: None, completed: false }, fallback_model));
+                                Delivered { bytes, request, terminal: None, completed: false }, fallback_model, managed_socket));
                         }
                     }
                     _ => { ending = Some((None, "client_eof")); end_deadline = Instant::now() + CLOSE_TIMEOUT; }
