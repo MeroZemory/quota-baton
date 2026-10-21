@@ -1,4 +1,6 @@
 //! Synthetic loopback only; no production management or image endpoints.
+#![cfg(feature = "testkit")]
+
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use bytes::Bytes;
 use qb_core::{
