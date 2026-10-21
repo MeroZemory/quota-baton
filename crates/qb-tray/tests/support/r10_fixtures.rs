@@ -90,6 +90,13 @@ pub fn edge_snapshot(edge: EdgeCase) -> DashboardSnapshot {
     if edge == EdgeCase::ReloginLinked {
         first["source"] = json!({"kind":"cpa","mode":"linked"});
     }
+    if edge == EdgeCase::Sticky {
+        // Keep the action-bearing group first under production status ordering.
+        // The paused second group still has rows and pushes the pinned header.
+        let next = rows.iter_mut().find(|a| a["id"] == NEXT_ACCOUNT).unwrap();
+        next["user_state"] = json!("paused");
+        next["active_sessions"] = json!(0);
+    }
     if matches!(edge, EdgeCase::ReloginOwned | EdgeCase::ReloginLinked) {
         rows.retain(|a| a["id"] == EDGE_ACCOUNT);
     }
