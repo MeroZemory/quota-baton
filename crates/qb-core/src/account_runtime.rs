@@ -62,6 +62,480 @@ pub(crate) struct PendingQuotaTicket {
 }
 type PendingQuota = BTreeMap<String, PendingQuotaTicket>;
 
+struct ReleasedQuota {
+    at: DateTime<Utc>,
+    pending: bool,
+    signals: serde_json::Map<String, Value>,
+    signal_times: BTreeMap<String, DateTime<Utc>>,
+    window_statuses: BTreeMap<String, (Value, DateTime<Utc>)>,
+}
+
+impl ReleasedQuota {
+    fn observe(&mut self, reported: &Value, snapshot: &Value) {
+        let time = |value: &Value| value.as_str()?.parse::<DateTime<Utc>>().ok();
+        if let Some(at) = time(&reported["observed_at"]).filter(|at| *at > self.at) {
+            if let Some(signals) = reported["signals"].as_object() {
+                for (key, value) in signals {
+                    if !value.is_null()
+                        && self.signal_times.get(key).is_none_or(|prior| at >= *prior)
+                    {
+                        self.signals.insert(key.clone(), value.clone());
+                        self.signal_times.insert(key.clone(), at);
+                    }
+                }
+            }
+            if let Some(windows) = reported["windows"].as_array() {
+                for window in windows {
+                    if let Some(name) = window["name"].as_str()
+                        && !window["status"].is_null()
+                        && self
+                            .window_statuses
+                            .get(name)
+                            .is_none_or(|(_, prior)| at >= *prior)
+                    {
+                        self.window_statuses
+                            .insert(name.to_owned(), (window.clone(), at));
+                    }
+                }
+            }
+        }
+        // Canonical nulls include reset invalidations. Retain their timestamps
+        // so a delayed explicit report cannot resurrect a superseded claim.
+        if let Some(at) = time(&snapshot["observed_at"]).filter(|at| *at > self.at) {
+            if let Some(signals) = snapshot["signals"].as_object() {
+                for (key, value) in signals {
+                    if value.is_null()
+                        && self.signal_times.get(key).is_none_or(|prior| at >= *prior)
+                    {
+                        self.signals.remove(key);
+                        self.signal_times.insert(key.clone(), at);
+                    }
+                }
+            }
+            if let Some(windows) = snapshot["windows"].as_array() {
+                for window in windows {
+                    if let Some(name) = window["name"].as_str()
+                        && window["status"].is_null()
+                        && self
+                            .window_statuses
+                            .get(name)
+                            .is_none_or(|(_, prior)| at >= *prior)
+                    {
+                        self.window_statuses
+                            .insert(name.to_owned(), (window.clone(), at));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn filter_released_quota(account: &Account, snapshot: &mut Value, release: &ReleasedQuota) {
+    // Clearing quota is never permission to spend disallowed credits.
+    if account.provider == Provider::Codex
+        && !account.allow_credits
+        && (crate::credits::entitled(snapshot)
+            || snapshot["signals"]["serving_from_credits"] == true
+            || snapshot["signals"]["active_limit"] == "credits")
+    {
+        return;
+    }
+    let newer = |value: &Value| {
+        value
+            .as_str()
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .is_some_and(|observed| observed.with_timezone(&Utc) > release.at)
+    };
+    if let Some(windows) = snapshot["windows"].as_array_mut() {
+        windows.retain_mut(|window| {
+            let numeric_fresh = newer(&window["observed_at"]);
+            let status = window["name"]
+                .as_str()
+                .and_then(|name| release.window_statuses.get(name));
+            window["status"] =
+                status.map_or(Value::Null, |(reported, _)| reported["status"].clone());
+            if !numeric_fresh {
+                window["used_pct"] = Value::Null;
+                window["observed_at"] = Value::Null;
+                window["reset_at"] =
+                    status.map_or(Value::Null, |(reported, _)| reported["reset_at"].clone());
+            }
+            numeric_fresh || !window["status"].is_null()
+        });
+    }
+    // A credit-only partial update must not make an inherited old limit flag
+    // fresh. Only flags actually reported after release regain authority.
+    snapshot["signals"] = Value::Object(release.signals.clone());
+}
+
+#[cfg(test)]
+mod release_probe_tests {
+    use super::*;
+
+    struct PollFixture {
+        runtime: Arc<AccountRuntime>,
+        id: String,
+        _home: tempfile::TempDir,
+    }
+
+    impl PollFixture {
+        fn new() -> Self {
+            let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../.sandbox/r12.9/runtime-fixtures");
+            std::fs::create_dir_all(&base).unwrap();
+            let home = tempfile::tempdir_in(base).unwrap();
+            let store = Arc::new(AccountStore::acquire(home.path()).unwrap());
+            let obs = Arc::new(Observability::new(home.path(), None).unwrap());
+            let runtime = AccountRuntime::new(store.clone(), obs, 0.0);
+            let mut account = crate::accounts::health::tests::fixture();
+            account.allow_credits = true;
+            store
+                .save(
+                    &account,
+                    &crate::accounts::Tokens {
+                        access_token: "synthetic-access".into(),
+                        refresh_token: "synthetic-refresh".into(),
+                        id_token: None,
+                    },
+                    None,
+                )
+                .unwrap();
+            Self {
+                runtime,
+                id: account.id,
+                _home: home,
+            }
+        }
+
+        fn merge(&self, body: Value, at: DateTime<Utc>) -> (Value, Value) {
+            let reported = crate::quota::parse_snapshot_for_test(
+                Provider::Codex,
+                &serde_json::to_vec(&body).unwrap(),
+                at,
+            )
+            .unwrap();
+            // These fixtures contain only the primary slot, so production also
+            // treats them as partial polls and preserves missing windows.
+            let merged = self
+                .runtime
+                .obs
+                .observe_poll(&self.id, reported.clone(), false)
+                .unwrap();
+            (merged, reported)
+        }
+
+        async fn apply(&self, merged: Value, reported: &Value) -> Account {
+            self.runtime
+                .apply_quota_snapshot_reported(&self.id, merged, reported, None)
+                .await
+                .unwrap()
+        }
+
+        async fn release(&self, initial: Value) -> DateTime<Utc> {
+            let (merged, reported) = self.merge(initial, Utc::now() - Duration::seconds(10));
+            let held = self.apply(merged, &reported).await;
+            assert!(matches!(
+                held.health,
+                Health::Cooling {
+                    reason: HealthReason::Quota,
+                    ..
+                }
+            ));
+            self.runtime.release_quota_hold(&self.id).await.unwrap();
+            self.runtime.released_quota.lock().unwrap()[&self.id].at
+        }
+
+        fn selection(&self, account: &Account, merged: Value) -> Value {
+            self.runtime.selection_quota(account, Some(merged)).unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn outage_release_poll_status_only_keeps_fresh_status_without_old_numbers() {
+        for (status, rejected) in [("rejected", true), ("allowed", false)] {
+            let f = PollFixture::new();
+            let reset = Utc::now() + Duration::hours(1);
+            let released = f.release(json!({"rate_limit":{"primary_window":{
+                "limit_window_seconds":18000,"used_percent":100,"status":"rejected","reset_at":reset
+            }}})).await;
+            let at = released + Duration::seconds(1);
+            let (merged, reported) = f.merge(
+                json!({"rate_limit":{"primary_window":{
+                    "limit_window_seconds":18000,"status":status
+                }}}),
+                at,
+            );
+            assert!(reported["windows"][0]["observed_at"].is_null());
+            assert_eq!(merged["windows"][0]["used_pct"], 100.0);
+            let raw = f.runtime.obs.quota_snapshot(&f.id).unwrap();
+            let account = f.apply(merged.clone(), &reported).await;
+            assert_eq!(
+                matches!(
+                    account.health,
+                    Health::Cooling {
+                        reason: HealthReason::Quota,
+                        ..
+                    }
+                ),
+                rejected
+            );
+            if rejected {
+                assert!(!account.quota_credit_releasable);
+            } else {
+                assert_eq!(account.health, Health::Ready);
+            }
+            let selected = f.selection(&account, merged);
+            assert_eq!(selected["windows"][0]["status"], status);
+            assert!(selected["windows"][0]["used_pct"].is_null());
+            assert!(selected["windows"][0]["reset_at"].is_null());
+            assert_eq!(f.runtime.obs.quota_snapshot(&f.id).unwrap(), raw);
+            if rejected {
+                let (merged, delayed) = f.merge(
+                    json!({"rate_limit":{"primary_window":{
+                        "limit_window_seconds":18000,"status":"allowed"
+                    }}}),
+                    at - Duration::milliseconds(500),
+                );
+                let account = f.apply(merged.clone(), &delayed).await;
+                assert_eq!(
+                    f.selection(&account, merged)["windows"][0]["status"],
+                    "rejected"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn outage_release_poll_numeric_update_does_not_refresh_inherited_status() {
+        let f = PollFixture::new();
+        let reset = Utc::now() + Duration::hours(1);
+        let released = f
+            .release(json!({"rate_limit":{"primary_window":{
+                "limit_window_seconds":18000,"used_percent":100,"status":"rejected","reset_at":reset
+            }}}))
+            .await;
+        let (merged, reported) = f.merge(
+            json!({"rate_limit":{"primary_window":{
+                "limit_window_seconds":18000,"used_percent":10,"reset_at":reset
+            }}}),
+            released + Duration::seconds(1),
+        );
+        assert!(reported["windows"][0]["status"].is_null());
+        assert_eq!(merged["windows"][0]["status"], "rejected");
+        let raw = f.runtime.obs.quota_snapshot(&f.id).unwrap();
+        let account = f.apply(merged.clone(), &reported).await;
+        assert_eq!(account.health, Health::Ready);
+        let selected = f.selection(&account, merged);
+        assert_eq!(selected["windows"][0]["used_pct"], 10.0);
+        assert!(selected["windows"][0]["status"].is_null());
+        assert_eq!(f.runtime.obs.quota_snapshot(&f.id).unwrap(), raw);
+    }
+
+    #[tokio::test]
+    async fn outage_release_poll_reset_invalidates_cached_limit_and_delayed_report() {
+        let f = PollFixture::new();
+        let reset = Utc::now() + Duration::hours(1);
+        let full = json!({"rate_limit":{"limit_reached":true,"primary_window":{
+            "limit_window_seconds":18000,"used_percent":100,"reset_at":reset
+        }}});
+        let released = f.release(full.clone()).await;
+        let (merged, delayed) = f.merge(full, released + Duration::seconds(1));
+        let account = f.apply(merged, &delayed).await;
+        assert!(matches!(
+            account.health,
+            Health::Cooling {
+                reason: HealthReason::Quota,
+                ..
+            }
+        ));
+        let (merged, reported) = f.merge(
+            json!({"rate_limit":{"primary_window":{
+                "limit_window_seconds":18000,"used_percent":10,"reset_at":reset+Duration::hours(5)
+            }}}),
+            released + Duration::seconds(2),
+        );
+        assert!(merged["signals"]["limit_reached"].is_null());
+        let account = f.apply(merged.clone(), &reported).await;
+        assert_eq!(account.health, Health::Ready);
+        assert!(f.selection(&account, merged.clone())["signals"]["limit_reached"].is_null());
+        let account = f.apply(merged, &delayed).await;
+        assert_eq!(account.health, Health::Ready);
+        let (merged, partial) = f.merge(
+            json!({"credits":{"balance":0}}),
+            released + Duration::seconds(3),
+        );
+        let account = f.apply(merged.clone(), &partial).await;
+        assert_eq!(account.health, Health::Ready);
+        assert!(f.selection(&account, merged)["signals"]["limit_reached"].is_null());
+    }
+
+    #[tokio::test]
+    async fn outage_release_preserves_nonquota_volatile_blockers() {
+        for reason in [
+            HealthReason::StoreError,
+            HealthReason::Auth,
+            HealthReason::LinkStale,
+        ] {
+            let f = PollFixture::new();
+            let mut blocked = f.runtime.store.load(&f.id).unwrap();
+            blocked.health = Health::Cooling {
+                reason,
+                until: Utc::now() + Duration::hours(1),
+                scope: "account".into(),
+            };
+            f.runtime.emit_account(&blocked);
+            f.release(json!({"rate_limit":{"limit_reached":true,"primary_window":{
+                "limit_window_seconds":18000,"used_percent":100,"reset_at":Utc::now()+Duration::hours(1)
+            }}})).await;
+            assert_eq!(f.runtime.store.load(&f.id).unwrap().health, Health::Ready);
+            assert!(f.runtime.blocked_in_memory(&f.id));
+            assert_eq!(f.runtime.volatile.lock().unwrap()[&f.id], blocked.health);
+        }
+    }
+
+    #[test]
+    fn outage_release_supersedes_only_old_evidence_and_preserves_credit_permission() {
+        let now = Utc::now();
+        for allow in [false, true] {
+            for credits in [json!({"has_credits":false}), json!({"has_credits":true})] {
+                let mut account = crate::accounts::health::tests::fixture();
+                account.allow_credits = allow;
+                let mut snapshot = json!({"observed_at":now-Duration::seconds(1),
+                    "windows":[
+                        {"name":"5h","used_pct":100,"observed_at":now-Duration::seconds(1)},
+                        {"name":"7d","used_pct":100,"observed_at":now+Duration::seconds(1)}
+                    ],"credits":credits,"signals":{"limit_reached":true}});
+                let original = snapshot.clone();
+                let mut release = ReleasedQuota {
+                    at: now,
+                    pending: true,
+                    signals: Default::default(),
+                    signal_times: Default::default(),
+                    window_statuses: Default::default(),
+                };
+                filter_released_quota(&account, &mut snapshot, &release);
+                if !allow && credits["has_credits"] == true {
+                    assert_eq!(snapshot, original);
+                } else {
+                    assert_eq!(snapshot["windows"].as_array().unwrap().len(), 1);
+                    assert_eq!(snapshot["windows"][0]["name"], "7d");
+                    assert!(snapshot["signals"].as_object().unwrap().is_empty());
+                    assert_eq!(snapshot["credits"], credits);
+                }
+                let mut fresh = original;
+                fresh["observed_at"] = json!(now + Duration::seconds(1));
+                release.signals.insert("limit_reached".into(), true.into());
+                filter_released_quota(&account, &mut fresh, &release);
+                assert_eq!(fresh["signals"]["limit_reached"], true);
+            }
+        }
+    }
+
+    #[test]
+    fn outage_release_probe_is_single_flight_and_cancellation_allows_retry() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.sandbox/r12.9/runtime-fixtures");
+        std::fs::create_dir_all(&base).unwrap();
+        let home = tempfile::tempdir_in(base).unwrap();
+        let store = Arc::new(AccountStore::acquire(home.path()).unwrap());
+        let obs = Arc::new(Observability::new(home.path(), None).unwrap());
+        let runtime = AccountRuntime::new(store, obs, 0.0);
+        let account = crate::accounts::health::tests::fixture();
+        runtime.released_quota.lock().unwrap().insert(
+            account.id.clone(),
+            ReleasedQuota {
+                at: Utc::now(),
+                pending: true,
+                signals: Default::default(),
+                signal_times: Default::default(),
+                window_statuses: Default::default(),
+            },
+        );
+        let first = runtime
+            .begin_probe(&account)
+            .unwrap()
+            .expect("quota probe guard");
+        assert!(runtime.begin_probe(&account).is_err());
+        drop(first);
+        assert!(runtime.begin_probe(&account).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn outage_release_partial_credit_update_does_not_refresh_inherited_limit() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.sandbox/r12.9/runtime-fixtures");
+        std::fs::create_dir_all(&base).unwrap();
+        let home = tempfile::tempdir_in(base).unwrap();
+        let store = Arc::new(AccountStore::acquire(home.path()).unwrap());
+        let obs = Arc::new(Observability::new(home.path(), None).unwrap());
+        let runtime = AccountRuntime::new(store.clone(), obs, 0.0);
+        let account = crate::accounts::health::tests::fixture();
+        let id = &account.id;
+        store
+            .save(
+                &account,
+                &crate::accounts::Tokens {
+                    access_token: "synthetic-access".into(),
+                    refresh_token: "synthetic-refresh".into(),
+                    id_token: None,
+                },
+                None,
+            )
+            .unwrap();
+        let old = Utc::now() - Duration::seconds(10);
+        let mut merged = json!({"observed_at":old,"windows":[{
+            "name":"5h","used_pct":100,"reset_at":Utc::now()+Duration::hours(1),"observed_at":old
+        }],"signals":{"limit_reached":true},"credits":{"has_credits":false,"balance":0}});
+        runtime
+            .apply_quota_snapshot(id, merged.clone(), None)
+            .await
+            .unwrap();
+        runtime.release_quota_hold(id).await.unwrap();
+        let at = runtime.released_quota.lock().unwrap()[id].at + Duration::seconds(1);
+        merged["observed_at"] = json!(at);
+        let partial = json!({"observed_at":at,"signals":{},"credits":{"balance":0}});
+        assert_eq!(
+            runtime
+                .apply_quota_snapshot_reported(id, merged.clone(), &partial, None)
+                .await
+                .unwrap()
+                .health,
+            Health::Ready
+        );
+        assert!(
+            runtime
+                .selection_quota(&account, Some(merged.clone()))
+                .unwrap()["signals"]
+                .as_object()
+                .unwrap()
+                .is_empty()
+        );
+        let fresh = json!({"observed_at":at+Duration::seconds(1),"signals":{"limit_reached":true}});
+        assert!(matches!(
+            runtime
+                .apply_quota_snapshot_reported(id, merged.clone(), &fresh, None)
+                .await
+                .unwrap()
+                .health,
+            Health::Cooling {
+                reason: HealthReason::Quota,
+                ..
+            }
+        ));
+        // A delayed flag report cannot overwrite a newer report merely
+        // because a different partial update made the merged snapshot newer.
+        let delayed = json!({"observed_at":at,"signals":{"limit_reached":false}});
+        runtime
+            .apply_quota_snapshot_reported(id, merged.clone(), &delayed, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime.selection_quota(&account, Some(merged)).unwrap()["signals"]["limit_reached"],
+            true
+        );
+    }
+}
+
 /// The exact upstream observation that a later successful commit may confirm.
 #[derive(Clone, Default)]
 pub struct QuotaObservation {
@@ -75,6 +549,7 @@ pub struct AccountRuntime {
     events: broadcast::Sender<Value>,
     limits: Mutex<BTreeMap<String, LimitResponse>>,
     probes: Mutex<BTreeSet<String>>,
+    released_quota: Arc<Mutex<BTreeMap<String, ReleasedQuota>>>,
     volatile: Mutex<BTreeMap<String, Health>>,
     inflight: Mutex<BTreeMap<String, usize>>,
     poller: Mutex<Option<Weak<crate::quota::UsagePoller>>>,
@@ -267,6 +742,7 @@ impl AccountRuntime {
             events,
             limits: Mutex::new(BTreeMap::new()),
             probes: Mutex::new(BTreeSet::new()),
+            released_quota: Arc::new(Mutex::new(BTreeMap::new())),
             volatile: Mutex::new(BTreeMap::new()),
             inflight: Mutex::new(BTreeMap::new()),
             poller: Mutex::new(None),
@@ -833,19 +1309,36 @@ impl AccountRuntime {
             .unwrap_or(true)
     }
     pub fn clear_memory_health(&self, account: &Account) {
+        self.clear_memory_health_if(account, false);
+    }
+
+    fn clear_memory_health_if(&self, account: &Account, quota_only: bool) {
         if let Ok(mut pending) = self.pending_quota.lock() {
             pending.remove(&account.id);
         }
         if let Ok(mut notices) = self.quota_notices.lock() {
             notices.remove(&account.id);
         }
-        if let Ok(mut health) = self.volatile.lock() {
+        if let Ok(mut health) = self.volatile.lock()
+            && (!quota_only
+                || health.get(&account.id).is_some_and(|health| {
+                    matches!(
+                        health,
+                        Health::Cooling {
+                            reason: HealthReason::Quota,
+                            ..
+                        }
+                    )
+                }))
+        {
             health.remove(&account.id);
         }
         let _=self.events.send(json!({"event":"account_changed","data":{"id":account.id,"health":account.health,"user_state":account.user_state}}));
     }
     pub fn begin_probe(self: &Arc<Self>, account: &Account) -> Result<Option<Probe>, ProbeBusy> {
-        if (!account.auth_probe_pending && account.auth_failures == 0)
+        let released = self.released_quota.lock().map_err(|_| ProbeBusy)?;
+        let quota_pending = released.get(&account.id).is_some_and(|r| r.pending);
+        if (!account.auth_probe_pending && account.auth_failures == 0 && !quota_pending)
             || !matches!(
                 account.health,
                 Health::Ready
@@ -867,8 +1360,17 @@ impl AccountRuntime {
         }))
     }
     pub async fn probe_success(&self, id: &str) -> Result<(), ()> {
+        self.finish_probe(id, true).await
+    }
+
+    pub(crate) async fn poll_probe_success(&self, id: &str) -> Result<(), ()> {
+        self.finish_probe(id, false).await
+    }
+
+    async fn finish_probe(&self, id: &str, serving: bool) -> Result<(), ()> {
         let store = self.store.clone();
         let id = id.to_owned();
+        let released_id = id.clone();
         tokio::task::spawn_blocking(move || {
             store
                 .update_metadata(&id, |a| {
@@ -881,6 +1383,12 @@ impl AccountRuntime {
         })
         .await
         .map_err(|_| ())??;
+        if serving
+            && let Ok(mut released) = self.released_quota.lock()
+            && let Some(release) = released.get_mut(&released_id)
+        {
+            release.pending = false;
+        }
         Ok(())
     }
 
@@ -895,6 +1403,87 @@ impl AccountRuntime {
             health.insert(account.id.clone(), account.health.clone());
         }
         let _=self.events.send(json!({"event":"account_changed","data":{"id":account.id,"health":account.health,"user_state":account.user_state}}));
+    }
+
+    /// Explicit operator probe. Only quota cooling is cleared; credentials,
+    /// payment/auth restrictions and user choices remain unchanged.
+    pub async fn release_quota_hold(self: &Arc<Self>, id: &str) -> Result<Account, ()> {
+        let store = self.store.clone();
+        let runtime = self.clone();
+        let id = id.to_owned();
+        let account = tokio::task::spawn_blocking(move || {
+            let _guard = store.transaction().map_err(|_| ())?;
+            let account = store.read_account_unlocked(&id).map_err(|_| ())?;
+            if store.writes_stopped() {
+                return Err(());
+            }
+            // A paid-serving claim is a payment permission gate, not just
+            // exhausted subscription quota. Releasing it cannot grant consent.
+            if account.provider == Provider::Codex
+                && !account.allow_credits
+                && runtime.obs.quota_snapshot(&id).is_some_and(|snapshot| {
+                    snapshot["signals"]["serving_from_credits"] == true
+                        || snapshot["signals"]["active_limit"] == "credits"
+                })
+            {
+                return Err(());
+            }
+            if !matches!(
+                account.health,
+                Health::Cooling {
+                    reason: HealthReason::Quota,
+                    ..
+                }
+            ) {
+                return Err(());
+            }
+            // Publish the cutoff with the durable state under the same writer
+            // lock. Cancellation cannot leave Ready without its probe marker.
+            let released_at = Utc::now();
+            let account = store
+                .update_metadata_unlocked(&id, |account| {
+                    account.health = Health::Ready;
+                    account.quota_cooling = None;
+                    account.quota_credit_releasable = false;
+                })
+                .map_err(|_| ())?;
+            runtime.released_quota.lock().map_err(|_| ())?.insert(
+                account.id.clone(),
+                ReleasedQuota {
+                    at: released_at,
+                    pending: true,
+                    signals: Default::default(),
+                    signal_times: Default::default(),
+                    window_statuses: Default::default(),
+                },
+            );
+            runtime.clear_memory_health_if(&account, true);
+            Ok::<_, ()>(account)
+        })
+        .await
+        .map_err(|_| ())??;
+        Ok(account)
+    }
+
+    /// Explicit release supersedes only older selection evidence. Display and
+    /// persisted usage stay intact; fresh observations and health gates win.
+    /// Process-local: restart conservatively requires another operator release.
+    pub(crate) fn selection_quota(
+        &self,
+        account: &Account,
+        mut quota: Option<Value>,
+    ) -> Option<Value> {
+        let Ok(released) = self.released_quota.lock() else {
+            return quota;
+        };
+        let Some(release) = released.get(&account.id) else {
+            return quota;
+        };
+        let Some(snapshot) = quota.as_mut() else {
+            return quota;
+        };
+        filter_released_quota(account, snapshot, release);
+        quota
     }
 
     pub async fn transition(&self, id: &str, signal: HealthSignal) -> Result<Account, ()> {
@@ -1083,6 +1672,9 @@ impl AccountRuntime {
                     && a.auth_failures == 0
             })
             .collect();
+        if let Ok(mut released) = self.released_quota.lock() {
+            released.retain(|id, _| accounts.iter().any(|a| &a.id == id));
+        }
         if let Ok(mut resets) = self.quota_resets.lock() {
             resets.retain(|id, reset| *reset > now && accounts.iter().any(|a| &a.id == id));
         }
@@ -1308,7 +1900,7 @@ impl AccountRuntime {
         }
         let observed_at = snapshot["observed_at"].clone();
         let quota_until = self
-            .apply_quota_snapshot(id, snapshot, model)
+            .apply_quota_snapshot_reported(id, snapshot, &reported, model)
             .await
             .ok()
             .and_then(|account| match account.health {
@@ -1375,7 +1967,9 @@ impl AccountRuntime {
             bindings.note_usage_observation_asof_token(id, &reported, asof);
         }
         let observed_at = snapshot["observed_at"].clone();
-        let _ = self.apply_quota_snapshot(id, snapshot, model).await;
+        let _ = self
+            .apply_quota_snapshot_reported(id, snapshot, &reported, model)
+            .await;
         let limits = event.get("rate_limits").unwrap_or(event);
         let serving = event
             .get("serving_from_credits")
@@ -1399,11 +1993,25 @@ impl AccountRuntime {
         snapshot: Value,
         model: Option<&str>,
     ) -> Result<Account, ()> {
+        let reported = snapshot.clone();
+        self.apply_quota_snapshot_reported(id, snapshot, &reported, model)
+            .await
+    }
+
+    pub(crate) async fn apply_quota_snapshot_reported(
+        &self,
+        id: &str,
+        snapshot: Value,
+        reported: &Value,
+        model: Option<&str>,
+    ) -> Result<Account, ()> {
+        let reported = reported.clone();
         let store = self.store.clone();
         let obs = self.obs.clone();
         let notices = self.quota_notices.clone();
         let account_id = id.to_owned();
         let model = model.map(str::to_owned);
+        let released_quota = self.released_quota.clone();
         let (account, snapshot) = tokio::task::spawn_blocking(move || -> Result<_, ()> {
             let _guard = store.transaction().map_err(|_| ())?;
             let time = |v: &Value| v.as_str().and_then(|s| s.parse::<DateTime<Utc>>().ok());
@@ -1419,11 +2027,22 @@ impl AccountRuntime {
                 }
                 snapshot = current;
             }
+            if let Ok(mut released) = released_quota.lock()
+                && let Some(release) = released.get_mut(&account_id)
+            {
+                release.observe(&reported, &snapshot);
+            }
             let account = store
                 .update_metadata_unlocked(&account_id, |account| {
+                    let mut health_snapshot = snapshot.clone();
+                    if let Ok(released) = released_quota.lock()
+                        && let Some(release) = released.get(&account_id)
+                    {
+                        filter_released_quota(account, &mut health_snapshot, release);
+                    }
                     account.apply_health_signal(
                         crate::accounts::HealthSignal::UsageSnapshot {
-                            snapshot: snapshot.clone(),
+                            snapshot: health_snapshot,
                             model: model.clone(),
                             projected_allowance: 0.0,
                         },

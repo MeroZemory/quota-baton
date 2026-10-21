@@ -123,6 +123,7 @@ pub enum FooterAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MenuAction {
     RefreshUsage,
+    ReleaseHold,
     Relogin,
     RefreshToken,
     ToggleCredits,
@@ -1078,6 +1079,9 @@ fn row_parts(row: &v2::AccountRow, core_ok: bool) -> Vec<Part> {
     if row.menu.show_refresh_usage {
         groups[0].push((MenuAction::RefreshUsage, "사용량 새로고침", None));
     }
+    if row.menu.show_release_hold {
+        groups[0].push((MenuAction::ReleaseHold, "한도 해제 후 다시 시도", None));
+    }
     if row.menu.show_relogin {
         groups[0].push((MenuAction::Relogin, "다시 로그인", None));
     }
@@ -1746,6 +1750,57 @@ mod tests {
         a["credits"] = json!({"has_credits":true,"balance":19395.23});
         a["pool_eligible"] = json!(false);
         a
+    }
+
+    #[test]
+    fn release_hold_menu_is_explicit_and_disabled_when_core_is_unavailable() {
+        let mut a = credits();
+        a["quota_credit_releasable"] = json!(false);
+        a["allow_credits"] = json!(true);
+        let v = view(vec![a], 0);
+        for core_ok in [false, true] {
+            let scene = Scene::build(
+                &v,
+                Presentation {
+                    core_ok,
+                    overlay: Overlay::RowMenu("a".into()),
+                    ..Presentation::default()
+                },
+                1000.,
+            );
+            let popup = scene.popup.as_ref().unwrap();
+            let target = Target::Menu {
+                id: Some("a".into()),
+                action: MenuAction::ReleaseHold,
+            };
+            let item = popup
+                .items
+                .iter()
+                .find(|item| item.target == target)
+                .unwrap();
+            assert_eq!(item.text, "한도 해제 후 다시 시도");
+            assert_eq!(item.enabled, core_ok);
+            assert!(inside(item.label, item.rect));
+        }
+        let v = ready_view();
+        assert!(
+            !row_parts(&v.sections[1].rows[0], true)
+                .iter()
+                .any(|part| matches!(
+                    part,
+                    Part::Item(
+                        _,
+                        _,
+                        _,
+                        _,
+                        Target::Menu {
+                            action: MenuAction::ReleaseHold,
+                            ..
+                        },
+                        _
+                    )
+                ))
+        );
     }
 
     #[test]

@@ -20,6 +20,47 @@ impl std::fmt::Display for ExistingSessionRefusal {
 }
 impl std::error::Error for ExistingSessionRefusal {}
 
+#[derive(Debug)]
+struct ConfigRefusal(&'static str);
+impl std::fmt::Display for ConfigRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "이미지 모드에서는 qb가 관리하는 {} 설정을 바꿀 수 없습니다. 모델은 -m, 그 밖의 설정은 -c로 지정하세요.",
+            self.0
+        )
+    }
+}
+impl std::error::Error for ConfigRefusal {}
+
+fn validate_config(value: &str) -> Result<()> {
+    let key = value.split_once('=').map_or(value, |(key, _)| key).trim();
+    // Parse dotted/quoted keys without parsing or exposing the user's value.
+    let keys = toml_edit::Key::parse(key).map_err(|_| {
+        anyhow::anyhow!("설정 키를 읽지 못했습니다. -c key=value 형식을 확인하세요.")
+    })?;
+    let keys: Vec<_> = keys.iter().map(toml_edit::Key::get).collect();
+    let owned = match keys.as_slice() {
+        ["model_provider", ..] => Some("model_provider"),
+        ["openai_base_url", ..] => Some("openai_base_url"),
+        // Replacing a parent can also replace the owned qb provider.
+        ["model_providers"] | ["model_providers", "qb", ..] => Some("model_providers.qb"),
+        _ => None,
+    };
+    if let Some(key) = owned {
+        return Err(anyhow::Error::new(ConfigRefusal(key)));
+    }
+    Ok(())
+}
+
+/// Qi config is loaded first; our provider pin precedes user overrides. Keep
+/// every native argument and literal boundary in its original order.
+pub(crate) fn child_args(args: &[OsString]) -> Vec<OsString> {
+    let mut result = vec!["-c".into(), "model_provider=\"qb\"".into()];
+    result.extend_from_slice(args);
+    result
+}
+
 pub(crate) fn existing_session_refusal() -> anyhow::Error {
     anyhow::Error::new(ExistingSessionRefusal)
 }
@@ -69,18 +110,28 @@ pub(crate) fn validate_args(args: &[OsString]) -> Result<()> {
         {
             return Err(existing_session_refusal());
         }
-        ensure!(
-            !(arg == "--config"
-                || arg.starts_with("--config=")
-                || arg.starts_with("-c")
-                || arg == "--profile"
-                || arg.starts_with("--profile=")
-                || arg.starts_with("-p")
-                || arg == "--oss"
-                || arg == "--local-provider"
-                || arg.starts_with("--local-provider=")),
-            "이미지 실행에서는 제공자를 바꾸는 config/profile 옵션을 사용할 수 없습니다."
-        );
+        if arg == "-c" || arg == "--config" {
+            if let Some(value) = args.next() {
+                validate_config(&value.to_string_lossy())?;
+            }
+            continue;
+        }
+        if let Some(value) = arg
+            .strip_prefix("--config=")
+            .or_else(|| arg.strip_prefix("-c"))
+        {
+            validate_config(value.strip_prefix('=').unwrap_or(value))?;
+            continue;
+        }
+        if arg == "--profile"
+            || arg.starts_with("--profile=")
+            || arg.starts_with("-p")
+            || arg == "--oss"
+            || arg == "--local-provider"
+            || arg.starts_with("--local-provider=")
+        {
+            return Err(anyhow::Error::new(ConfigRefusal("공급자/profile")));
+        }
         if matches!(arg.as_ref(), "exec" | "e") {
             exec = true;
         }
@@ -252,6 +303,9 @@ impl std::fmt::Display for ImageRefusal {
 }
 impl std::error::Error for ImageRefusal {}
 pub(crate) fn friendly_error(error: &anyhow::Error) -> Option<String> {
+    if let Some(error) = error.downcast_ref::<ConfigRefusal>() {
+        return Some(error.to_string());
+    }
     if error.downcast_ref::<ExistingSessionRefusal>().is_some() {
         return Some(EXISTING_SESSION.to_owned());
     }
@@ -378,6 +432,62 @@ mod tests {
             ]))
             .is_ok()
         );
+    }
+
+    #[test]
+    fn r12_1_user_config_survives_after_owned_overrides_for_exec_and_interactive() {
+        for values in [
+            vec!["-c", "model_reasoning_effort='high'", "draw"],
+            vec!["exec", "--config=model_reasoning_effort='high'", "draw"],
+            vec![
+                "-cmodel='gpt-6.1-sol'",
+                "exec",
+                "-c",
+                "features.image_generation=true",
+                "draw",
+            ],
+            vec!["exec", "-c=model='gpt-6.1-sol'", "--color", "never", "draw"],
+            vec![
+                "--config",
+                "model_providers.other.base_url='http://example.invalid'",
+                "draw",
+            ],
+            vec!["-c", "notice='resume'", "exec", "draw"],
+            vec!["--", "-c", "model_provider=literal prompt"],
+        ] {
+            let input = args(&values);
+            validate_args(&input).unwrap_or_else(|error| panic!("{values:?}: {error}"));
+            let actual = child_args(&input);
+            assert_eq!(actual[..2], args(&["-c", "model_provider=\"qb\""]));
+            assert_eq!(actual[2..], input);
+        }
+    }
+
+    #[test]
+    fn r12_1_owned_config_refusal_is_specific_and_never_prints_values() {
+        for key in [
+            "model_provider",
+            "openai_base_url",
+            "model_providers.qb.base_url",
+            "model_providers.qb.http_headers",
+            "model_providers.qb",
+            "model_providers",
+            "\"model_provider\"",
+            "model_providers.'qb'.env_key",
+        ] {
+            let setting = format!("{key}='synthetic-secret-never-print'");
+            for values in [
+                vec!["-c".to_owned(), setting.clone()],
+                vec!["exec".to_owned(), format!("--config={setting}")],
+                vec![format!("-c{setting}"), "draw".to_owned()],
+            ] {
+                let input: Vec<_> = values.iter().map(OsString::from).collect();
+                let error = validate_args(&input).unwrap_err().context("outer wrapper");
+                let text = friendly_error(&error).expect("typed user-facing refusal");
+                assert!(text.contains("qb가 관리하는"));
+                assert!(!text.contains("synthetic-secret-never-print"));
+            }
+        }
     }
 
     #[test]

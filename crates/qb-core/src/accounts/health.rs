@@ -343,8 +343,22 @@ impl Account {
         }
         let windows = snapshot["windows"].as_array().cloned().unwrap_or_default();
         let reset = |w: &Value| timestamp(&w["reset_at"]);
-        let fresh: Vec<_> = windows
+        let valid: Vec<_> = windows
             .iter()
+            .filter(|w| {
+                self.provider != Provider::Codex
+                    || w["name"].as_str().is_some_and(|name| {
+                        matches!(name, "primary" | "secondary")
+                            || crate::dashboard::history::WindowName::try_from(
+                                name.split('_').next().unwrap_or(name).to_owned(),
+                            )
+                            .is_ok()
+                    })
+            })
+            .collect();
+        let fresh: Vec<_> = valid
+            .iter()
+            .copied()
             .filter(|w| reset(w).is_none_or(|r| r > now))
             .collect();
         let subbucket = |w: &Value| w["name"].as_str().is_some_and(|n| n.contains('_'));
@@ -384,8 +398,8 @@ impl Account {
         // available upstream keeps serving from credits, so only an explicit
         // rejection (or a request-level usage_limit_reached, handled in relay)
         // makes the hold global (D19 correction, 2026-10-21 outage).
-        let global = (snapshot["signals"]["limit_reached"] == true && !paid_allowed)
-            || snapshot["signals"]["unified_status"] == "rejected";
+        let rejected = snapshot["signals"]["unified_status"] == "rejected";
+        let global = (snapshot["signals"]["limit_reached"] == true && !paid_allowed) || rejected;
         let serving = credits && snapshot["signals"]["serving_from_credits"] == true;
         let qualifies = |w: &Value| {
             w["used_pct"]
@@ -409,7 +423,7 @@ impl Account {
         let account_hold = !triggering.is_empty()
             || ((global || serving)
                 && !sub_only
-                && (windows.is_empty() || !account_windows.is_empty()));
+                && (valid.is_empty() || !account_windows.is_empty()));
         let (scope, candidates) = if account_hold {
             (
                 Some("account".to_owned()),
@@ -450,7 +464,7 @@ impl Account {
             let releasable = self.provider == Provider::Codex
                 && account_hold
                 && !hard_hold
-                && !global
+                && !rejected
                 && !fresh.iter().any(|w| w["status"] == "rejected");
             let incoming = self.cool(HealthReason::Quota, until, scope);
             self.quota_credit_releasable = releasable;
@@ -606,6 +620,138 @@ pub(crate) mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn outage_phantom_codex_windows_never_cool() {
+        let now = Utc::now();
+        for name in ["0m", "unknown"] {
+            let mut account = fixture();
+            account.apply_health_signal(HealthSignal::UsageSnapshot {
+                snapshot: serde_json::json!({"windows":[{"name":name,"used_pct":100,"status":"rejected","reset_at":now+Duration::days(5)}]}),
+                model:None, projected_allowance:0.0,
+            }, now);
+            assert_eq!(account.health, Health::Ready, "{name}");
+        }
+    }
+
+    #[test]
+    fn outage_provider_buckets_without_duration_keep_explicit_quota_and_reset() {
+        let now = Utc::now();
+        let reset = now + Duration::hours(1);
+        for name in ["primary", "secondary"] {
+            for used in [serde_json::Value::Null, serde_json::json!(100)] {
+                let mut account = fixture();
+                account.apply_health_signal(
+                    HealthSignal::UsageSnapshot {
+                        snapshot: serde_json::json!({
+                            "windows":[{"name":name,"used_pct":used,"reset_at":reset}],
+                            "signals":{"limit_reached":true,"active_limit":name}
+                        }),
+                        model: None,
+                        projected_allowance: 0.0,
+                    },
+                    now,
+                );
+                assert_eq!(
+                    account.health,
+                    Health::Cooling {
+                        reason: HealthReason::Quota,
+                        until: reset,
+                        scope: "account".into()
+                    }
+                );
+                assert!(account.quota_credit_releasable);
+            }
+        }
+    }
+
+    #[test]
+    fn outage_phantom_windows_do_not_veto_account_level_signals() {
+        let now = Utc::now();
+        for signals in [
+            serde_json::json!({"limit_reached":true}),
+            serde_json::json!({"serving_from_credits":true}),
+        ] {
+            for name in ["0m", "unknown"] {
+                let mut account = fixture();
+                account.apply_health_signal(HealthSignal::UsageSnapshot {
+                    snapshot: serde_json::json!({
+                        "windows":[{"name":name,"used_pct":100,"reset_at":now+Duration::days(5)}],
+                        "signals":signals,"credits":{"has_credits":true,"balance":12.5}
+                    }), model:None, projected_allowance:0.0,
+                }, now);
+                assert_eq!(
+                    account.health,
+                    Health::Cooling {
+                        reason: HealthReason::Quota,
+                        until: now + Duration::minutes(5),
+                        scope: "account".into()
+                    },
+                    "{name}: {signals}"
+                );
+                assert!(account.quota_credit_releasable);
+            }
+        }
+    }
+
+    #[test]
+    fn outage_poll_limit_is_releasable_but_real_rejection_is_not() {
+        let now = Utc::now();
+        for rejected in [false, true] {
+            let mut account = fixture();
+            let mut snapshot = serde_json::json!({
+                "windows":[{"name":"7d","used_pct":100,"reset_at":now+Duration::days(5)}],
+                "signals":{"limit_reached":true},"credits":{"has_credits":true,"balance":12.5}
+            });
+            if rejected {
+                snapshot["signals"]["unified_status"] = "rejected".into();
+            }
+            account.apply_health_signal(
+                HealthSignal::UsageSnapshot {
+                    snapshot: snapshot.clone(),
+                    model: None,
+                    projected_allowance: 0.0,
+                },
+                now,
+            );
+            assert!(matches!(
+                account.health,
+                Health::Cooling {
+                    reason: HealthReason::Quota,
+                    ..
+                }
+            ));
+            assert_eq!(account.quota_credit_releasable, !rejected);
+            account.allow_credits = true;
+            account.apply_health_signal(
+                HealthSignal::UsageSnapshot {
+                    snapshot,
+                    model: None,
+                    projected_allowance: 0.0,
+                },
+                now,
+            );
+            assert_eq!(account.health == Health::Ready, !rejected);
+        }
+    }
+
+    #[test]
+    fn outage_expired_real_window_is_not_a_phantom_fallback() {
+        let now = Utc::now();
+        let mut account = fixture();
+        account.apply_health_signal(
+            HealthSignal::UsageSnapshot {
+                snapshot: serde_json::json!({
+                    "windows":[{"name":"5h","used_pct":100,"reset_at":now-Duration::seconds(1)}],
+                    "signals":{"limit_reached":true}
+                }),
+                model: None,
+                projected_allowance: 0.0,
+            },
+            now,
+        );
+        assert_eq!(account.health, Health::Ready);
     }
 
     #[test]

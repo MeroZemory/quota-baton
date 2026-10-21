@@ -192,9 +192,27 @@ impl AdminClient {
         id: &str,
         action: AccountAction,
     ) -> Result<TrayAccount, ClientError> {
-        let path = format!("/admin/v1/accounts/{id}/{}", action.as_str());
-        self.send_json(reqwest::Method::POST, &path, &serde_json::json!({}))
+        test_response_delay().await;
+        let response = self
+            .account_action_request(id, action)
+            .send()
             .await
+            .map_err(ClientError::Transport)?;
+        Self::check_response(response)
+            .await?
+            .json()
+            .await
+            .map_err(ClientError::Decode)
+    }
+
+    fn account_action_request(&self, id: &str, action: AccountAction) -> reqwest::RequestBuilder {
+        let path = format!("/admin/v1/accounts/{id}/{}", action.as_str());
+        let body = if action == AccountAction::ReleaseHold {
+            serde_json::json!({"confirm": id})
+        } else {
+            serde_json::json!({})
+        };
+        self.request(reqwest::Method::POST, &path).json(&body)
     }
 
     pub async fn refresh_tokens(&self, id: &str) -> Result<(), ClientError> {
@@ -375,6 +393,7 @@ async fn test_response_delay() {
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountAction {
+    ReleaseHold,
     Pause,
     Resume,
     Disable,
@@ -385,6 +404,7 @@ pub enum AccountAction {
 impl AccountAction {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::ReleaseHold => "release-hold",
             Self::Pause => "pause",
             Self::Resume => "resume",
             Self::Disable => "disable",
@@ -396,6 +416,7 @@ impl AccountAction {
     #[cfg(test)]
     pub fn from_str(value: &str) -> Option<Self> {
         match value {
+            "release-hold" => Some(Self::ReleaseHold),
             "pause" => Some(Self::Pause),
             "resume" => Some(Self::Resume),
             "disable" => Some(Self::Disable),
@@ -900,6 +921,7 @@ mod tests {
     #[test]
     fn account_action_parser_round_trips_typed_actions_and_rejects_unknown() {
         for action in [
+            AccountAction::ReleaseHold,
             AccountAction::Pause,
             AccountAction::Resume,
             AccountAction::Disable,
@@ -909,6 +931,35 @@ mod tests {
             assert_eq!(AccountAction::from_str(action.as_str()), Some(action));
         }
         assert_eq!(AccountAction::from_str("unknown"), None);
+    }
+
+    #[test]
+    fn release_hold_request_is_authenticated_and_confirms_only_the_selected_account() {
+        let client = AdminClient::new(10201, "synthetic-token").unwrap();
+        for id in ["cx-synthetic-a", "cx-synthetic-b"] {
+            let request = client
+                .account_action_request(id, AccountAction::ReleaseHold)
+                .build()
+                .unwrap();
+            assert_eq!(request.method(), reqwest::Method::POST);
+            assert_eq!(
+                request.url().as_str(),
+                format!("http://127.0.0.1:10201/admin/v1/accounts/{id}/release-hold")
+            );
+            assert_eq!(
+                request.headers()[header::AUTHORIZATION],
+                "Bearer synthetic-token"
+            );
+            assert_eq!(request.headers()[header::HOST], "127.0.0.1:10201");
+            let body: serde_json::Value =
+                serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+            assert_eq!(body, serde_json::json!({"confirm": id}));
+        }
+        let request = client
+            .account_action_request("cx-synthetic-a", AccountAction::RefreshUsage)
+            .build()
+            .unwrap();
+        assert_eq!(request.body().unwrap().as_bytes().unwrap(), b"{}");
     }
 
     #[test]

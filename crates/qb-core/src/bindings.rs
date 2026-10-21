@@ -1671,6 +1671,37 @@ impl BindingTable {
         hold_timed_out: bool,
         now: DateTime<Utc>,
     ) -> Decision {
+        self.choose_with_hold_at_admitted(
+            provider,
+            key,
+            parent,
+            model,
+            candidates,
+            pinned,
+            request_bytes,
+            hold_allowed,
+            hold_timed_out,
+            now,
+            |_| true,
+        )
+    }
+
+    /// Reserve before publishing routing policy or moving a group.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn choose_with_hold_at_admitted(
+        self: &Arc<Self>,
+        provider: Provider,
+        key: Option<&str>,
+        parent: Option<&str>,
+        model: Option<&str>,
+        candidates: &[Candidate],
+        pinned: Option<&str>,
+        request_bytes: u64,
+        hold_allowed: bool,
+        hold_timed_out: bool,
+        now: DateTime<Utc>,
+        admit: impl FnOnce(&str) -> bool,
+    ) -> Decision {
         let _mutation = self.mutations.lock().unwrap_or_else(|e| e.into_inner());
         let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
         for c in candidates {
@@ -1749,6 +1780,9 @@ impl BindingTable {
             .map(|g| g.account.clone());
         let policy_key = launch::policy_key(&d, key).map(str::to_owned);
         drop(d);
+        if !admit(&account) {
+            return Decision::None;
+        }
         if self
             .policies
             .dispatch(
