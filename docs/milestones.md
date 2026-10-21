@@ -9,7 +9,7 @@ This file names the verification for each unit and each row. The row list and th
 목표: 보이는 대시보드의 유휴 CPU와 조작 지연을 줄인다
 핵심 지표: 새 경로 출시 1/2 · R11은 HTTP 통합 저장, WS 경계 2건과 출시 관문 남음
 사용자 대기: 없음 (R2 Part B만 사용자 결정 대기)
-갱신: 2026-10-22 03:46 KST (a0c01b4; 조작 통과, 전체 재작성 비용 절감 중)
+갱신: 2026-10-22 03:54 KST (7556ada; 성능 조건 통과, 최종 관문 진행)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -109,12 +109,16 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-22 03:46 | R12.10 합성 HWND 유휴 CPU (30계정·40세션, 코어 하나 기준) | 0.052074 % | 2 % 미만 | 30초 완료; 전체 재작성 미달로 실행 실패 |
 | 2026-10-22 03:46 | R12.10 새 snapshot 전체 재작성 v4 (30회, 탭별10회) p95 | 56.833 ms | 50 ms 미만 | CPU tick p95 62.5 ms(15.625 ms 단위); 전체 재작성 비용 절감 계속 |
 | 2026-10-22 03:46 | R12.10 실제 HWND 탭 캐시·prepared UIA·부분 그리기 동등성 | 8/8 통과 | 8/8 통과 | Host1, prepared3, WIC픽셀4; depth 필터 오기로0회는 미검증으로 제외 |
+| 2026-10-22 03:54 | R12.10 동기 production paint v4 프레임 p95 (hover/scroll/tab) | 8.289 / 6.896 / 9.305 ms | 각16 ms 미만 | after-full-repair-v4; 각100회; 입력→paint p95 8.389/7.352/12.290 ms |
+| 2026-10-22 03:54 | R12.10 합성 HWND 유휴 CPU (30계정·40세션, 코어 하나 기준) | 0.156218 % | 2 % 미만 | 30초 구간, 성능 수용 조건 전체 통과 |
+| 2026-10-22 03:54 | R12.10 새 snapshot 전체 재작성 v4 (30회, 탭별10회) p95 | 42.431 ms | 50 ms 미만 | median19.785, max51.542 ms; 모든30회 보존 |
+| 2026-10-22 03:54 | R12.10 비용 절감 후 release 회귀 | 라이브러리211, Host순수53, 실제창1 통과 | 모두 통과 | 추가 실제창 editor/tooltip fallback 통과; 최종 scoped gate 진행 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 행동 |
 |---|---|---|---|
 | R11 실행별 계정 | HTTP 통합 저장, WS 경계 2건과 출시 관문 남음 | 관문 통과와 설치 | R12.10 뒤 WS 경계 2건 마무리 후 관문 |
-| 대시보드 지연 (R12.10) | 유휴0.0521 %, 조작1.6/9.0/10.9 ms, 전체56.8 ms | 유휴2 %, 조작16 ms, 전체50 ms 미만 | 사용량 시각 형식·UIA 검증/조회 중복 절감 후 재측정 |
+| 대시보드 지연 (R12.10) | 유휴0.1562 %, 조작8.3/6.9/9.3 ms, 전체42.4 ms | 성능 조건 통과; 최종 관문·병합 필요 | 동일 v4 원본 비교와 scoped gate 완료 후 병합 |
 | R13 소진 예측·아이콘·차트·캐시 보류 | 설계 완료, 구현 0/5 부분 | 5/5 부분 병합과 설치 | R11과 R12.10 뒤 시작 |
 <!-- gaps:end -->
