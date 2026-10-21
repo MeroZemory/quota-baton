@@ -500,26 +500,108 @@ async fn precommit_quota_reset_hold_retries_same_account_once_with_exact_body() 
 
 #[tokio::test]
 async fn second_precommit_429_fails_over_immediately_without_another_hold() {
-    let h = Harness::with_hold(Provider::Codex, 3).await;
+    // Buffer these replies: ScriptedUpstream sleeps even for zero-delay chunks,
+    // which would introduce an unrelated timer into the frozen-clock proof.
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (paused_tx, paused_rx) = tokio::sync::oneshot::channel();
+    let paused_tx = Arc::new(std::sync::Mutex::new(Some(paused_tx)));
+    let app = axum::Router::new().fallback({
+        let requests = requests.clone();
+        move |request: axum::extract::Request| {
+            let requests = requests.clone();
+            let paused_tx = paused_tx.clone();
+            async move {
+                let (parts, body) = request.into_parts();
+                let body = axum::body::to_bytes(body, 1024).await.unwrap();
+                let index = {
+                    let mut requests = requests.lock().unwrap();
+                    let index = requests.len();
+                    requests.push(qb_testkit::RecordedRequest {
+                        method: parts.method,
+                        path_and_query: parts.uri.path_and_query().unwrap().as_str().into(),
+                        headers: parts.headers,
+                        body,
+                        received_at: Instant::now(),
+                    });
+                    index
+                };
+                let reply = match index {
+                    0 => ScriptedResponse::json(StatusCode::OK, "{\"fake\":true}"),
+                    1 | 2 => near_reset_limit(),
+                    3 => ScriptedResponse::json(StatusCode::OK, "{\"failover\":true}"),
+                    _ => panic!("unexpected upstream attempt"),
+                };
+                assert_eq!(reply.chunks.len(), 1);
+                assert_eq!(reply.chunks[0].0, Duration::ZERO);
+                let mut response = axum::response::Response::new(axum::body::Body::from(
+                    reply.chunks[0].1.clone(),
+                ));
+                *response.status_mut() = reply.status;
+                *response.headers_mut() = reply.headers;
+                if index == 2 {
+                    // Freeze before A's second rejection reaches the relay, not
+                    // merely when its request is captured. The first hold uses
+                    // real time because account eligibility also checks Utc.
+                    tokio::time::pause();
+                    paused_tx
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .unwrap()
+                        .send(tokio::time::Instant::now())
+                        .unwrap();
+                }
+                response
+            }
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    struct UpstreamTask(tokio::task::JoinHandle<()>);
+    impl Drop for UpstreamTask {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let _upstream = UpstreamTask(tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    }));
+    let h = Harness::with_limits_and_config(Provider::Codex, 3, 300, 60, |config| {
+        config.upstream.codex_base = url;
+    })
+    .await;
     let headers = [("session-id", "hold-once")];
     let first = h.turn("/v1/responses", &headers, RAW).await;
     let other = h.ids().into_iter().find(|id| id != &first).unwrap();
-    h.fake.state.push(near_reset_limit());
-    h.fake.state.push(near_reset_limit());
-    h.fake.state.push(ScriptedResponse::json(
-        StatusCode::OK,
-        "{\"failover\":true}",
-    ));
-    let start = Instant::now();
-    let (status, account, body) = h.send("/v1/responses", &headers, RAW).await;
-    let elapsed = start.elapsed();
+    let request = h.send("/v1/responses", &headers, RAW);
+    tokio::pin!(request);
+    let frozen_at = tokio::select! {
+        biased;
+        frozen_at = paused_rx => frozen_at.expect("second quota response barrier dropped"),
+        _ = &mut request => panic!("request completed without A's second quota rejection"),
+    };
+    let watchdog = Instant::now();
+    let (status, account, body) = loop {
+        tokio::select! {
+            biased;
+            result = &mut request => break result,
+            _ = tokio::task::yield_now() => {
+                // Keep runnable work so Tokio cannot auto-advance a second hold.
+                // The existing HTTP deadline bounds liveness, not hold duration.
+                assert!(watchdog.elapsed() < DEADLINE,
+                    "failover did not complete with the second reset timer frozen");
+            }
+        }
+    };
+    assert_eq!(tokio::time::Instant::now(), frozen_at);
+    tokio::time::resume();
     assert_eq!(status, 200);
     assert_eq!(account, other);
     assert_eq!(body, b"{\"failover\":true}");
-    assert!(elapsed >= Duration::from_millis(1500), "{elapsed:?}");
-    assert!(elapsed < Duration::from_millis(3500), "{elapsed:?}");
-    let attempts = h.fake.state.requests();
+    let attempts = requests.lock().unwrap().clone();
     assert_eq!(attempts.len(), 4);
+    let first_hold = attempts[2].received_at - attempts[1].received_at;
+    assert!(first_hold >= Duration::from_millis(1500), "{first_hold:?}");
     assert_eq!(
         attempts[1].headers["authorization"],
         attempts[0].headers["authorization"]
@@ -538,6 +620,25 @@ async fn second_precommit_429_fails_over_immediately_without_another_hold() {
             .all(|attempt| attempt.body.as_ref() == RAW.as_bytes())
     );
     h.counts(&[(&first, 0), (&other, 1)]).await;
+    let row = h
+        .ledger()
+        .into_iter()
+        .find(|row| row["attempts"] == 3 && row["status"] == 200 && row["outcome"] == "ok")
+        .expect("successful A/A/B request missing from ledger");
+    let details = row["attempt_details"].as_array().unwrap();
+    assert_eq!(details.len(), 3);
+    assert_eq!(details[0]["account"], first);
+    assert_eq!(details[1]["account"], first);
+    assert_eq!(details[2]["account"], other);
+    assert_eq!(details[0]["failover_reason"], "reset_hold_retry");
+    assert_eq!(details[1]["failover_reason"], "quota");
+    assert_eq!(
+        details
+            .iter()
+            .filter(|attempt| attempt["failover_reason"] == "reset_hold_retry")
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
