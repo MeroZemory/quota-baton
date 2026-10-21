@@ -593,20 +593,57 @@ async fn c7_upgrade_second_near_reset_limit_fails_over_without_another_hold() {
     let h = Harness::new(2).await;
     let (mut first, original) = h.connect().await;
     first.close(None).await.unwrap();
-    for _ in 0..2 {
-        h.fake.state.push_handshake(
-            StatusCode::TOO_MANY_REQUESTS,
-            r#"{"error":{"type":"usage_limit_reached","resets_in_seconds":2}}"#,
-            HeaderMap::new(),
-        );
+    let limit = r#"{"error":{"type":"usage_limit_reached","resets_in_seconds":2}}"#;
+    h.fake
+        .state
+        .push_handshake(StatusCode::TOO_MANY_REQUESTS, limit, HeaderMap::new());
+    let paused = Arc::new(tokio::sync::Notify::new());
+    let notify = paused.clone();
+    h.fake.state.push_handshake_with_callback(
+        StatusCode::TOO_MANY_REQUESTS,
+        limit,
+        HeaderMap::new(),
+        move || {
+            // The first hold uses real time: quota eligibility uses Utc, too.
+            // Freeze before the second rejection can start another hold.
+            tokio::time::pause();
+            notify.notify_one();
+        },
+    );
+    let started = std::time::Instant::now();
+    let connection = h.connect();
+    tokio::pin!(connection);
+    tokio::select! {
+        biased;
+        _ = paused.notified() => {}
+        _ = &mut connection => panic!("upgrade completed without A's second rejection"),
     }
-    let start = std::time::Instant::now();
-    let (mut retry, account) = h.connect().await;
+    let frozen_at = tokio::time::Instant::now();
+    let watchdog = std::time::Instant::now();
+    let (mut retry, account) = loop {
+        tokio::select! {
+            biased;
+            result = &mut connection => break result,
+            _ = tokio::task::yield_now() => {
+                // Keep a task runnable so Tokio cannot auto-advance the frozen
+                // clock. This is a liveness watchdog, not the no-second-hold proof.
+                assert!(watchdog.elapsed() < Duration::from_secs(15),
+                    "failover did not complete with the second reset timer frozen");
+            }
+        }
+    };
+    assert_eq!(tokio::time::Instant::now(), frozen_at);
+    tokio::time::resume();
+    // A second two-second hold must fit even at completion; otherwise C9's
+    // real-time connect deadline could skip it and make this proof vacuous.
+    assert!(
+        started.elapsed() + Duration::from_secs(2) < Duration::from_secs(10),
+        "fixture exhausted the budget needed to exercise a second reset hold"
+    );
     assert_ne!(account, original);
-    assert!(start.elapsed() >= Duration::from_millis(1800));
-    assert!(start.elapsed() < Duration::from_millis(3800));
     let requests = h.fake.state.requests();
     assert_eq!(requests.len(), 4);
+    assert!(requests[2].received_at - requests[1].received_at >= Duration::from_millis(1800));
     assert_eq!(
         requests[1].headers["authorization"],
         requests[2].headers["authorization"]
@@ -614,6 +651,21 @@ async fn c7_upgrade_second_near_reset_limit_fails_over_without_another_hold() {
     assert_ne!(
         requests[2].headers["authorization"],
         requests[3].headers["authorization"]
+    );
+    let upgrade = h
+        .ledger()
+        .into_iter()
+        .find(|row| row["outcome"] == "ws_upgrade" && row["attempts"] == 3)
+        .unwrap();
+    let attempts = upgrade["attempt_details"].as_array().unwrap();
+    assert_eq!(attempts[0]["failover_reason"], "reset_hold_retry");
+    assert_eq!(attempts[1]["failover_reason"], "quota");
+    assert_eq!(
+        attempts
+            .iter()
+            .filter(|attempt| attempt["failover_reason"] == "reset_hold_retry")
+            .count(),
+        1
     );
     retry.close(None).await.unwrap();
 }

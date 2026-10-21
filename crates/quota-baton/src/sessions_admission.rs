@@ -122,10 +122,18 @@ fn wiring(home: &Path) -> Result<Wiring> {
 /// version string, testkit environment variable, or cached probe result.
 pub(crate) fn verify_version(command: &Path) -> Result<()> {
     if !command.is_absolute() || !command.is_file() {
+        #[cfg(all(feature = "testkit", debug_assertions))]
+        eprintln!("qb-version-probe stage=precondition");
         return Err(refusal(VERSION));
     }
     let output = crate::launcher_label::version_output(command).map_err(|_| refusal(VERSION))?;
     if !pinned_version(&output) {
+        #[cfg(all(feature = "testkit", debug_assertions))]
+        eprintln!(
+            "qb-version-probe stage=shape bytes={} trimmed_matches={}",
+            output.len(),
+            output.trim_ascii() == b"codex-cli 0.163.0"
+        );
         return Err(refusal(VERSION));
     }
     Ok(())
@@ -173,6 +181,32 @@ pub(crate) fn prepare_launch(args: &[OsString], command: &Path) -> Result<(Guard
 /// Version compatibility is checked separately by mutating move callers.
 pub(crate) fn preflight_launch(args: &[OsString], command: &Path) -> Result<()> {
     launch_plan(args, command, &wiring(&qb_core::home()?)?).map(drop)
+}
+
+/// Validate the normal launcher home first, then acquire the journaled Qi gate.
+/// The caller supplies Qi only after checking the completed wiring metadata.
+pub(crate) fn preflight_images(
+    args: &[OsString],
+    command: &Path,
+    image: &crate::image_launch::ImageLaunch,
+) -> Result<()> {
+    crate::image_launch::validate_args(args)?;
+    let installed = wiring(&qb_core::home()?)?;
+    launch_plan(args, command, &installed)?;
+    if fs::canonicalize(&installed.home)? != fs::canonicalize(&image.ordinary_home)? {
+        return Err(refusal(WRONG_HOME));
+    }
+    Ok(())
+}
+
+pub(crate) fn prepare_images(
+    args: &[OsString],
+    command: &Path,
+    image: &crate::image_launch::ImageLaunch,
+) -> Result<(Guard, Vec<OsString>)> {
+    preflight_images(args, command, image)?;
+    let permit = shared_for(&image.home, None)?;
+    Ok((permit, managed_args(args)))
 }
 
 fn launch_plan(args: &[OsString], command: &Path, installed: &Wiring) -> Result<Vec<OsString>> {

@@ -21,6 +21,9 @@ pub(super) fn filtered(headers: &HeaderMap, request: bool) -> HeaderMap {
     for (name, value) in headers {
         if name.as_str() == crate::dashboard::labels::LABEL_HEADER
             || name.as_str() == crate::routing::PROJECT_HEADER
+            || name
+                .as_str()
+                .eq_ignore_ascii_case("x-openai-actor-authorization")
             || per_hop(name.as_str())
             || connection
                 .iter()
@@ -147,6 +150,14 @@ mod tests {
             headers.insert(name, HeaderValue::from_static(value));
         }
         headers.append("anthropic-beta", HeaderValue::from_static("second"));
+        headers.append(
+            "X-OpenAI-Actor-Authorization",
+            HeaderValue::from_static("qb-local"),
+        );
+        headers.append(
+            "x-openai-actor-authorization",
+            HeaderValue::from_static("duplicate"),
+        );
         let cl = account(Provider::Claude);
         let result = upstream(&headers, &cl, "upstream-fixture").unwrap();
         assert_eq!(result["authorization"], "Bearer upstream-fixture");
@@ -158,6 +169,7 @@ mod tests {
             "x-private-hop",
             "proxy-fixture",
             "sec-websocket-key",
+            "x-openai-actor-authorization",
         ] {
             assert!(!result.contains_key(name));
         }
@@ -178,6 +190,7 @@ mod tests {
         let cx = upstream(&headers, &account(Provider::Codex), "upstream-fixture").unwrap();
         assert_eq!(cx["chatgpt-account-id"], "fixture-account");
         let response = filtered(&headers, false);
+        assert!(!response.contains_key("x-openai-actor-authorization"));
         assert_eq!(response["content-encoding"], "zstd");
         assert_eq!(response["user-agent"], "fixture/1");
         assert!(!response.contains_key("x-private-hop"));

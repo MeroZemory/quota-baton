@@ -618,13 +618,13 @@ async fn adopt_account(
     #[cfg(feature = "testkit")]
     let probe = state.adoption_probe;
     let result = tokio::task::spawn_blocking(move || {
-        let result = (|| {
-            #[cfg(feature = "testkit")]
-            if let Some(probe) = probe {
-                return crate::accounts::adopt::run_with_probe(&store, &id, request, probe);
-            }
-            crate::accounts::adopt::run(&store, &id, request)
-        })()?;
+        #[cfg(feature = "testkit")]
+        let result = match probe {
+            Some(probe) => crate::accounts::adopt::run_with_probe(&store, &id, request, probe),
+            None => crate::accounts::adopt::run(&store, &id, request),
+        }?;
+        #[cfg(not(feature = "testkit"))]
+        let result = crate::accounts::adopt::run(&store, &id, request)?;
         if let Ok(account) = store.load(&result.id) {
             poller.queue_profile(&account);
         }

@@ -15,7 +15,7 @@ Implement quota-baton exactly as specified, row by row, until every row of the m
 1. **Pick the current milestone.** It is the first entry in the list below that is not yet merged into `dev`. Its brief is `C:/_projects/SampleUser/quota-baton/.sandbox/briefs/<M>.md`. A fix brief (`<M>.<n>-fixes.md`) for the current milestone takes priority over everything else. The newest file by time wins.
 2. **If no brief exists yet** for the next milestone, implement it directly from `docs/architecture.md` §17 and the referenced contract sections. Do not wait.
 3. **Branching.** Work only in the worktree `C:/_projects/SampleUser/quota-baton-impl`. Never create another worktree: switch branches inside this one (AGENTS.md build hygiene). Create the branch `impl/<m>` from `dev`, run `git merge dev` before each milestone and after each fix brief, and make atomic English commits. Never push. Merge into `dev` yourself only after the full gate (rule 4) and, for anything that touches launch or wiring, the read-only real-profile check `quota-baton.exe launch-client --check`. Never install or touch the real profile; the design session installs and verifies.
-4. **Verification.** The unit check and the gate check are the concrete commands in `docs/milestones.md`. A unit closes on its unit check (focused tests or captures covering what the unit changed, plus strict clippy on the touched crate). A row closes on the gate check (full matrix, independent review where the brief asks for one). Run them one after another in the default target with `CARGO_INCREMENTAL=0`. Record each result's **fingerprint** once (commit, command, exit, scope, totals). A result is reused while its fingerprint is unchanged; never re-run an unchanged check, and the design session reuses your gate for the same commit.
+4. **Verification.** The unit check, gate check and dependency-aware fingerprint reuse are defined in `docs/milestones.md`. Repair failing tests with focused re-runs. Run the full matrix once, as the final gate of a row. A docs-only change never re-runs a passed executable check, and a pre-existing failure outside the row's scope does not block the row.
 5. **Report once per row, at the gate; records batch at unit close.** Evidence, hashes, review verdicts and report updates are written once when a unit or gate closes. No record-only or diagnosis-only commits or turns; a diagnosis goes into the next change. Write `C:/_projects/SampleUser/quota-baton/.sandbox/reports/<M>.md` (body in English, under the Korean status head of rule 11). Then send the report:
 
    `herdr agent prompt <pane> "[quota-baton-codex 구현 보고 · 사용자 입력 아님] <short report>"`
@@ -25,7 +25,7 @@ Implement quota-baton exactly as specified, row by row, until every row of the m
 7. **Recovering after an interruption** (429, compaction error, restart): re-read this file, the current brief, and the `git status` / `git diff --stat` of the worktree, then continue from that state.
 9. **Long measurements** (soaks, benchmarks, live harness runs) run in the background, BelowNormal and hidden, with **one** completion signal: the process exits and writes a result file. They are never a gate for other work. Never poll them in a loop, and never send or record "still running" turns. Check once whenever you finish a unit of work. When a run finishes, write up its result within the same working session. Every wait has a next ready node in the lane table below; take it instead of waiting. If none exists, say so in the report so the design session re-plans the lanes. When a message to `<pane>` cannot be delivered (pane blocked), keep the undelivered items in one pending batch and retry at most three times at unit close; never resend the same message repeatedly.
 10. **The goal stays open while any row in the table below is not merged.** Mark the goal blocked only under the shared rule: every remaining path needs a user or supervisor decision that GOAL and the design documents do not settle, and you have already asked through the question route. Before marking the goal complete, compare the open rows of this table and `docs/milestones.md`; completion follows the design session's gate judgment.
-11. **Report format** (`.sandbox/reports/<M>.md`). The file opens with a current-status head in Korean:
+11. **Report format** (`.sandbox/reports/<M>.md`). The head is never hand-edited. At each unit close, run `python -I .sandbox/scripts/status_head.py`; it copies the status block of `docs/milestones.md` into `RESUME.md` and the current row's report. The body below the head is the plain-language result:
     - `목표:` one line
     - `진행:` done / remaining
     - `사용자 대기:` what waits on the user, or 없음
@@ -36,14 +36,9 @@ Implement quota-baton exactly as specified, row by row, until every row of the m
     Then comes the plain-language result. Gate, mark, hash and test-count listings go into a collapsed `<details>` block at the end. When a milestone finishes, its report is updated to read as finished (never "running"). Follow `C:/_projects/research/methods/reporting/devlog-and-interim-report.md` for wording.
 8. **Follow every rule in `AGENTS.md`:** question routing, build hygiene, the retention of `.sandbox` artifacts, and no secret dumps.
 
-## Lanes and next ready nodes (re-planned 2026-10-21)
+## Lanes and next ready nodes
 
-| Lane | Items | Waits on | Next ready node while waiting |
-|---|---|---|---|
-| A: product | R12 (images, priority) → R11 (launch-scoped account, per-account aliases) | nothing (synthetic and loopback tests) | — |
-| B: held | R2 Part B (retire-cpa / restore-cpa) | the user's go (D9) | lane A |
-| C: live | install, real-profile checks, live move/return, live image test | the design session (it installs) | lane A |
-| D: background | long gates, native harness runs, independent reviews | one completion signal each | the next unit of lane A |
+The current plan, with lanes, owners and start commands, is the "Plan" section of `docs/milestones.md`. The design session owns it. Dashboard and tray polish is frozen until R12 (new-Qi images) and R11 ship.
 
 ## Milestone order (architecture §17)
 

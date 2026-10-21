@@ -1312,6 +1312,7 @@ dependencies = [
  "tokio-tungstenite",
  "toml_edit",
  "windows",
+ "zeroize",
  "zstd",
 ]
 

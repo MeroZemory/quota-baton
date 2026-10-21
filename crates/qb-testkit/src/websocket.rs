@@ -42,6 +42,7 @@ struct HandshakeFailure {
     body: String,
     headers: HeaderMap,
     body_delay: Duration,
+    before_response: Option<Box<dyn FnOnce() + Send>>,
 }
 
 struct Inner {
@@ -106,6 +107,29 @@ impl WebSocketState {
                 body: body.into(),
                 headers,
                 body_delay,
+                before_response: None,
+            });
+    }
+
+    /// Run a synchronous hook after recording this handshake, before sending its rejection.
+    /// The hook runs on the fake's Tokio runtime, without holding the state lock.
+    pub fn push_handshake_with_callback(
+        &self,
+        status: StatusCode,
+        body: impl Into<String>,
+        headers: HeaderMap,
+        before_response: impl FnOnce() + Send + 'static,
+    ) {
+        self.0
+            .lock()
+            .unwrap()
+            .handshakes
+            .push_back(HandshakeFailure {
+                status,
+                body: body.into(),
+                headers,
+                body_delay: Duration::ZERO,
+                before_response: Some(Box::new(before_response)),
             });
     }
 
@@ -236,6 +260,10 @@ async fn serve_socket(stream: tokio::net::TcpStream, state: WebSocketState) {
                 received_at: std::time::Instant::now(),
             });
             if let Some(failure) = inner.handshakes.pop_front() {
+                drop(inner);
+                if let Some(before_response) = failure.before_response {
+                    before_response();
+                }
                 *callback_delay.lock().unwrap() = failure.body_delay;
                 let mut response = ErrorResponse::new(Some(failure.body));
                 *response.status_mut() = failure.status;
