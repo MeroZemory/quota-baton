@@ -627,6 +627,56 @@ async fn error_status_accepts_only_integer_http_statuses() {
 }
 
 #[tokio::test]
+async fn r12_9_failed_done_envelopes_record_only_bounded_safe_error_codes_verbatim() {
+    let mut pair = pair(Duration::from_secs(60), false, PARSE_LIMIT).await;
+    let cases = [
+        (
+            "response.done",
+            "usage_limit_reached".to_owned(),
+            Some("usage_limit_reached"),
+        ),
+        (
+            "response.completed",
+            "server_error".to_owned(),
+            Some("server_error"),
+        ),
+        ("response.failed", "x".repeat(101), None),
+        ("error", "private message with spaces".to_owned(), None),
+        ("error", "sk-synthetic-secret".to_owned(), None),
+        ("error", "eyJsynthetic".to_owned(), None),
+    ];
+    for (index, (kind, code, expected)) in cases.into_iter().enumerate() {
+        pair.client
+            .send(Message::Text(r#"{"type":"response.create"}"#.into()))
+            .await
+            .unwrap();
+        next(&mut pair.peer).await;
+        let error = serde_json::json!({"code":code,"message":"never-ledger-payload"});
+        let event = if kind == "error" {
+            serde_json::json!({"type":kind,"error":error})
+        } else {
+            serde_json::json!({"type":kind,"response":{"status":"failed","error":error}})
+        }
+        .to_string();
+        pair.peer
+            .send(Message::Text(event.clone().into()))
+            .await
+            .unwrap();
+        assert_eq!(next(&mut pair.client).await, Message::Text(event.into()));
+        let rows = requests(&pair, index + 1).await;
+        let row = &rows[index];
+        assert_eq!(row["outcome"], "upstream_error");
+        assert_eq!(
+            row.get("upstream_error_code").and_then(Value::as_str),
+            expected
+        );
+        assert!(!row.to_string().contains("never-ledger-payload"));
+        assert!(!row.to_string().contains("private message"));
+        assert!(!row.to_string().contains("synthetic-secret"));
+    }
+}
+
+#[tokio::test]
 async fn forty_mib_single_frames_are_verbatim_in_both_directions() {
     let mut pair = pair(Duration::from_secs(60), false, PARSE_LIMIT).await;
     let bytes = bytes::Bytes::from(vec![0xa5; 40 * PARSE_LIMIT]);

@@ -20,6 +20,15 @@ use std::{
 };
 use tokio::{sync::Semaphore, time::Instant};
 
+#[cfg(test)]
+pub(crate) fn parse_snapshot_for_test(
+    provider: Provider,
+    body: &[u8],
+    now: DateTime<Utc>,
+) -> Option<serde_json::Value> {
+    parse::snapshot(provider, body, now)
+}
+
 const MAX_BODY: usize = 256 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -513,19 +522,20 @@ impl UsagePoller {
                     table.note_usage_observation_asof_token(id, &snapshot, asof);
                 }
             }
+            let reported = snapshot.clone();
             let snapshot = self
                 .obs
                 .observe_poll(id, snapshot, replace_windows)
                 .ok_or(PollError::Unavailable)?;
             if probe.is_some() {
                 self.runtime
-                    .probe_success(id)
+                    .poll_probe_success(id)
                     .await
                     .map_err(|_| PollError::Unavailable)?;
             }
             let account = self
                 .runtime
-                .apply_quota_snapshot(id, snapshot, None)
+                .apply_quota_snapshot_reported(id, snapshot, &reported, None)
                 .await
                 .map_err(|_| PollError::Unavailable)?;
             reservation.succeeded = true;
@@ -769,6 +779,94 @@ mod tests {
                 r#"{"rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":18000,"reset_after_seconds":3600}}}"#,
             )
         }
+    }
+
+    #[tokio::test]
+    async fn outage_poll_preserves_named_bucket_without_inventing_duration() {
+        for slot in ["primary", "secondary"] {
+            for numeric_only in [false, true] {
+                let f = Fixture::new(1).await;
+                let until = DateTime::from_timestamp(
+                    (Utc::now() + chrono::Duration::hours(1)).timestamp(),
+                    0,
+                )
+                .unwrap();
+                let mut rate = json!({});
+                rate[format!("{slot}_window")] = json!({"reset_at": until.timestamp()});
+                if numeric_only {
+                    rate[format!("{slot}_window")]["used_percent"] = json!(100);
+                } else {
+                    rate["limit_reached"] = json!(true);
+                    rate["active_limit"] = json!(slot);
+                }
+                f.fake.state.push(ScriptedResponse::json(
+                    reqwest::StatusCode::OK,
+                    json!({"rate_limit": rate}).to_string(),
+                ));
+                f.relay.quota.poll(&f.ids[0]).await.unwrap();
+                assert!(
+                    matches!(f.account(0).health,
+                    Health::Cooling {reason: HealthReason::Quota, until: actual, ref scope}
+                    if actual == until && scope == "account"),
+                    "{slot} numeric={numeric_only}"
+                );
+                let snapshot = f.relay.quota.obs.quota_snapshot(&f.ids[0]).unwrap();
+                assert_eq!(snapshot["windows"].as_array().unwrap().len(), 1);
+                assert_eq!(snapshot["windows"][0]["name"], slot);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn outage_poll_rejects_explicit_invalid_duration_placeholders() {
+        for duration in [json!(0), json!(null), json!("opaque"), json!(-1)] {
+            let f = Fixture::new(1).await;
+            f.fake.state.push(ScriptedResponse::json(
+                reqwest::StatusCode::OK,
+                json!({"plan_type": "plus", "rate_limit": {
+                    "primary_window": {"limit_window_seconds": duration, "used_percent": 100,
+                        "reset_at": (Utc::now() + chrono::Duration::hours(1)).timestamp()}
+                }})
+                .to_string(),
+            ));
+            f.relay.quota.poll(&f.ids[0]).await.unwrap();
+            assert!(matches!(f.account(0).health, Health::Ready));
+            let snapshot = f.relay.quota.obs.quota_snapshot(&f.ids[0]).unwrap();
+            assert!(snapshot["windows"].as_array().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn outage_usage_poll_success_does_not_complete_serving_probe() {
+        let f = Fixture::new(1).await;
+        let id = &f.ids[0];
+        f.relay
+            .quota
+            .store
+            .update_metadata(id, |a| {
+                a.health = Health::Cooling {
+                    reason: HealthReason::Quota,
+                    until: Utc::now() + chrono::Duration::hours(1),
+                    scope: "account".into(),
+                };
+            })
+            .unwrap();
+        f.relay.accounts.release_quota_hold(id).await.unwrap();
+        f.fake.state.push(ScriptedResponse::json(
+            reqwest::StatusCode::OK,
+            r#"{"plan_type":"pro"}"#,
+        ));
+        f.relay.quota.poll(id).await.unwrap();
+        let account = f.account(0);
+        let serving = f
+            .relay
+            .accounts
+            .begin_probe(&account)
+            .unwrap()
+            .expect("usage GET does not prove serving success");
+        assert!(f.relay.accounts.begin_probe(&account).is_err());
+        drop(serving);
+        assert!(f.relay.accounts.begin_probe(&account).unwrap().is_some());
     }
 
     #[test]
