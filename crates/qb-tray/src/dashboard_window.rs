@@ -1400,8 +1400,13 @@ unsafe extern "system" fn wndproc(
 ) -> LRESULT {
     match message {
         WM_ERASEBKGND => return LRESULT(1),
-        WM_PRINTCLIENT => {
-            let _ = unsafe { print_client(hwnd, HDC(wparam.0 as *mut c_void)) };
+        WM_PRINT | WM_PRINTCLIENT => {
+            let result = unsafe { print_client(hwnd, HDC(wparam.0 as *mut c_void)) };
+            #[cfg(all(test, feature = "testkit"))]
+            eprintln!("dashboard print message {message:#x}: {result:?}");
+            if result.is_err() {
+                return LRESULT(-1);
+            }
             return LRESULT(0);
         }
         WM_PAINT => {
