@@ -255,9 +255,13 @@ async fn issue_operation_entry(
         Ok(response) if operation.can_reply() => response,
         _ => {
             let error = crate::relay::LaunchError::Unavailable;
-            (error.status(), Json(serde_json::json!({"error": {
-                "code": error.code(), "message": error.message()
-            }}))).into_response()
+            (
+                error.status(),
+                Json(serde_json::json!({"error": {
+                    "code": error.code(), "message": error.message()
+                }})),
+            )
+                .into_response()
         }
     }
 }
@@ -267,7 +271,11 @@ async fn issue_launch(
     axum::Extension(operation): axum::Extension<crate::issue_operation::IssueOperation>,
     Json(request): Json<crate::relay::LaunchRequest>,
 ) -> Response {
-    match state.relay.issue_launch_for_operation(request, state.data_port, operation).await {
+    match state
+        .relay
+        .issue_launch_for_operation(request, state.data_port, operation)
+        .await
+    {
         Ok(reply) => {
             let mut response = Json(reply).into_response();
             response.headers_mut().insert(
