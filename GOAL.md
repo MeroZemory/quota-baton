@@ -66,7 +66,7 @@ Implement quota-baton exactly as specified, milestone by milestone, until M8 is 
 | R9.2 | merged and INSTALLED (6caf65a); live move and return work, but are slow → R9.3 |
 | R9.3 | merged and INSTALLED (5ce0afe). Live on the real profile: codex-qb resume preview 21 s and commit 8 s (before: 382 s and about 9 min); return prompt 6 s and commit 7 s; the map is written as C:/Users/... |
 | R10 | merged and INSTALLED (a35be74); live acceptance 13 pass / 3 partial, no must-fix |
-| R10.1 | dashboard live fixes S1-S5, O-a (Codex model '—'), O-b (originator label), F17 capture; after R9.3; brief `R10.1-dashboard-live-fixes.md` |
+| R10.1 | merged (production/test gate `1793de5`): S1–S5, WS in-flight/overlap models, known originators, 10 actual HWND light/dark/narrow/restart captures. Scoped tests core 6 + integration 5 + dashboard 49 + spawned-core 1 + tray 189, all pass; strict touched-crate clippy. Sol source review and integrated fixes recorded in `.sandbox/reports/R10.1.md`; install/live acceptance belongs to design |
 | R11 | launch-scoped account and per-account model catalog (D22, resolves O13: /daybreak through codex-qb); after R10; brief `R11-launch-account.md` |
 | R8.1 | merged (round 2 39345fd, dev 6dbbfae); installed and verified live: the herdr pane title shows `codex-qb · quota-baton` from 1 s to 19 s, and a codex-qb exec request returned ok |
 
