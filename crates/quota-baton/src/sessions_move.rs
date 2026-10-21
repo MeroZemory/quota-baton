@@ -387,6 +387,7 @@ fn make_plan(
     }
     for catalog in &inventory {
         catalog.ensure_readable_for(&related)?;
+        super::check_physical_owners(&source, &catalog.home, &files, catalog)?;
     }
     // A compressed child's history_base may point at a physical segment in
     // another home. Resolve that edge across the complete inventory, including
