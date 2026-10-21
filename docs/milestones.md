@@ -170,12 +170,14 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-22 06:59 | R11 실제 두 코어 takeover 집중 | 처음8/9 → 보완9/9 | 9/9 | catalog와SSE script 분리; 모든 strict·401·refresh·lease 조건 유지 |
 | 2026-10-22 06:59 | R11 기존 launcher focused | title1통과·R9 15통과/3실패 | 모든 지원경로 통과 | UUID없는 선택의 DB·TTY 경계가 원인; 양성/경계 분리 후 재검증 |
 | 2026-10-22 06:59 | R11 세 번째 native | 0/5 완료 | 5/5 | warmup·일반 image viewing 도구의 과도한 거부 진단; cleanup정지true·잔류0 |
+| 2026-10-22 07:07 | R11 기존 launcher·세션 focused 최종 | 20통과 / 0실패 / 3제외 | 모든 지원경로 통과 | 입력7126328e, R9 b316c05e·title e971f584, 독립 정적 closeout PASS |
+| 2026-10-22 07:07 | R11 native warmup·tool 하네스 순수 검사 | 27/27 통과 | 전 검사 통과 | frozen6381b346, 독립 정적 PASS; 실제 native 통과 아님 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 행동 |
 |---|---|---|---|
-| R11 실행별 계정 | HTTP32·WS15 통과, 전체 기본14실패 | native·최종 관문 통과 | 실패 fixture focused 보완 후 나머지 기능조합·native; 실패 행 보존 |
+| R11 실행별 계정 | HTTP32·WS15 및 실패 fixture focused31건 통과 | native·최종 관문 통과 | 전체 기능·standalone 완료 뒤 실제 Codex 5경우; 기본 실패 기록 보존 |
 | 대시보드 지연 (R12.10) | 합성 실제 창 성능·최종 scoped gate 통과 | 실제 설치 확인 | 설계 세션이 설치하고 사용자 환경 확인 |
 | R13 소진 예측·아이콘·차트·캐시 보류 | 설계 완료, 병합 0/3 단위 | 3/3 단위 병합과 설치 | R11 뒤 B+B2+D, A, C+E 순서 |
 <!-- gaps:end -->
