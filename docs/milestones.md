@@ -46,7 +46,7 @@ The Codex main updates this block at each unit and gate close; the design sessio
 | C | Install, live image generation (TUI and `codex-qb --images exec`), then **broadcast the exact command to every image-generating session**: sample-proj-a `<pane>`, sample-prj-opus `<pane>`, and any other session found running image work | design session `<pane>` | when A1 merges: build a release in a temp worktree, pre-check, install, and run one `codex-qb --images` generation | the image is produced through qb and sample-proj-a is told |
 | D | Full gates and independent reviews | whoever starts them | always in the background with one completion signal, checked once at unit close | — |
 | Held | R2 Part B (retire-cpa) | user decision (D9) | — | — |
-| Backlog | further dashboard and tray polish | — | not before A1 and A2 ship | — |
+| Backlog | further dashboard and tray polish; launcher move of a session whose ancestor chain lives only in the source home (refused today as "조상 전용 대화"; done by hand with `.sandbox/codex-migrate/move_one.py` for inside main on 10-22). Needs a design ruling on blocking the ancestor's resume paths (D21 panel 2) | — | not before A1 and A2 ship | — |
 
 **No polling.** Nobody polls a running job or a pane in a loop. Every wait has the next ready node from this table.
 
