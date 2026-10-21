@@ -1958,11 +1958,10 @@ unsafe extern "system" fn wndproc(
     if matches!(
         message,
         WM_MOUSEMOVE | WM_MOUSEWHEEL | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_KEYDOWN | WM_CHAR
-    ) {
-        if let Some(host) = current(hwnd) {
-            let mut h = host.borrow_mut();
-            h.input_seq = h.input_seq.saturating_add(1);
-        }
+    ) && let Some(host) = current(hwnd)
+    {
+        let mut h = host.borrow_mut();
+        h.input_seq = h.input_seq.saturating_add(1);
     }
     match message {
         WM_ERASEBKGND => return LRESULT(1),
