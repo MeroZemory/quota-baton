@@ -32,8 +32,8 @@ use std::{
 };
 use windows::{
     Win32::{
-        Foundation::{HWND, LPARAM, POINT, WPARAM},
-        Graphics::Gdi::{ClientToScreen, UpdateWindow},
+        Foundation::{HWND, LPARAM, POINT, RECT, WPARAM},
+        Graphics::Gdi::{ClientToScreen, GetUpdateRect, UpdateWindow},
         System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize},
         UI::{HiDpi::GetDpiForWindow, WindowsAndMessaging::*},
     },
@@ -507,6 +507,194 @@ fn cached_future_clock_regression(run: &mut Run, hwnd: HWND) -> Result<()> {
             "future cached target epoch dispatched after correction: via_mail={via_mail}"
         );
     }
+    Ok(())
+}
+
+// Inspect invalidation before any paint or queue drain consumes it.
+fn scroll_pending_damage(hwnd: HWND) -> Result<(f32, RECT, RECT)> {
+    let mut pending = RECT::default();
+    ensure!(
+        !unsafe { GetUpdateRect(hwnd, Some(&mut pending), false) }.as_bool(),
+        "fallback fixture has pre-existing damage: {pending:?}"
+    );
+    let mut client = RECT::default();
+    unsafe {
+        GetClientRect(hwnd, &mut client)?;
+    }
+    let scene = dashboard_window::perf_scene(hwnd).context("missing fallback scene")?;
+    let region = scene
+        .content
+        .iter()
+        .find(|r| r.region == ScrollRegion::Table)
+        .context("fallback Table missing")?;
+    ensure!(
+        region.max_offset > region.offset,
+        "fallback Table has no scroll room"
+    );
+    let scale = unsafe { GetDpiForWindow(hwnd) } as f32 / 96.;
+    let mut point = POINT {
+        x: ((region.viewport.left + 10.) * scale).round() as i32,
+        y: ((region.viewport.top + 10.) * scale).round() as i32,
+    };
+    ensure!(
+        unsafe { ClientToScreen(hwnd, &mut point) }.as_bool(),
+        "wheel coordinate conversion failed"
+    );
+    send(
+        hwnd,
+        WM_MOUSEWHEEL,
+        usize::from((-120_i16) as u16) << 16,
+        (((point.y as u32 & 0xffff) << 16) | (point.x as u32 & 0xffff)) as isize,
+    );
+    ensure!(
+        unsafe { GetUpdateRect(hwnd, Some(&mut pending), false) }.as_bool(),
+        "fallback wheel did not invalidate"
+    );
+    Ok((region.offset, pending, client))
+}
+
+fn scroll_damage_is_full(damage: RECT, client: RECT) -> bool {
+    damage.left == client.left
+        && damage.top == client.top
+        && damage.right == client.right
+        && damage.bottom == client.bottom
+}
+
+fn finish_fallback_scroll(hwnd: HWND, previous_offset: f32) -> Result<()> {
+    sync_paint(hwnd)?;
+    ensure!(
+        dashboard_window::perf_scene(hwnd)
+            .context("missing completed fallback scene")?
+            .content
+            .iter()
+            .any(|r| r.region == ScrollRegion::Table && r.offset > previous_offset),
+        "fallback wheel did not actually advance Table"
+    );
+    Ok(())
+}
+
+fn scroll_full_fallback_regressions(run: &mut Run, hwnd: HWND) -> Result<()> {
+    let port = run
+        .port
+        .as_ref()
+        .context("missing fallback mailbox")?
+        .clone();
+    if selected_tab(hwnd)? != Tab::Overview {
+        let _ = switch_tab(run, hwnd, Tab::Overview)?;
+    }
+    send(hwnd, MOUSE_LEAVE, 0, 0);
+    sync_paint(hwnd)?;
+    publish_fixture(hwnd, &port, &fixture::input(), 18)?;
+    let scene = dashboard_window::perf_scene(hwnd).context("missing fallback fixture")?;
+    ensure!(
+        scene.charts.is_empty() && scene.content.iter().any(|r| r.region == ScrollRegion::Side),
+        "positive control needs chart-free wide Overview"
+    );
+
+    // This same retained Table must normally use partial invalidation: a
+    // permanently disabled partial path must not pass the negative cases.
+    let (offset, damage, client) = scroll_pending_damage(hwnd)?;
+    ensure!(
+        !scroll_damage_is_full(damage, client)
+            && damage.right < client.right
+            && damage.right > damage.left
+            && damage.bottom > damage.top,
+        "undecorated Table did not use partial invalidation: damage={damage:?}, client={client:?}"
+    );
+    finish_fallback_scroll(hwnd, offset)?;
+
+    // UIA Search invocation enters the production editor. Committing a space
+    // proves editing is active while every synthetic session still matches.
+    let scene = dashboard_window::perf_scene(hwnd).context("missing editor fixture")?;
+    let slot = scene
+        .accessibility
+        .iter()
+        .filter(|n| {
+            !n.hidden
+                && n.enabled
+                && n.role != qb_tray::geometry::Role::Text
+                && n.rect.right > n.rect.left
+                && n.rect.bottom > n.rect.top
+                && n.target
+                    .as_ref()
+                    .is_some_and(|t| scene.targets.iter().any(|h| h.enabled && &h.target == t))
+        })
+        .position(|n| n.target == Some(Target::Search))
+        .context("Search action missing")?;
+    send(
+        hwnd,
+        accessibility::WM_UIA_INVOKE,
+        slot,
+        isize::try_from(cache(hwnd)?.epoch)?,
+    );
+    send(hwnd, WM_CHAR, usize::from(b' '), 0);
+    sync_paint(hwnd)?;
+    ensure!(
+        dashboard_window::perf_scene(hwnd)
+            .context("missing editor scene")?
+            .accessibility
+            .iter()
+            .any(|n| n.target == Some(Target::Search) && n.value.as_deref() == Some(" ")),
+        "Search invocation did not enter the production editor"
+    );
+    let (offset, damage, client) = scroll_pending_damage(hwnd)?;
+    ensure!(
+        scroll_damage_is_full(damage, client),
+        "active editor must force full invalidation: damage={damage:?}, client={client:?}"
+    );
+    finish_fallback_scroll(hwnd, offset)?;
+    send(hwnd, WM_KEYDOWN, 0x1b, 0); // Exit editing before the separate tooltip case.
+    sync_paint(hwnd)?;
+
+    // Use a visible tooltip intersection, not a guessed row or desktop cursor.
+    // Read synchronous damage before queued TrackMouseEvent leaves can run.
+    let scene = dashboard_window::perf_scene(hwnd).context("missing tooltip fixture")?;
+    let viewport = scene
+        .content
+        .iter()
+        .find(|r| r.region == ScrollRegion::Table)
+        .context("tooltip Table missing")?
+        .viewport;
+    let (x, y) = scene
+        .tooltips
+        .iter()
+        .find_map(|tooltip| {
+            let left = tooltip.rect.left.max(viewport.left);
+            let right = tooltip.rect.right.min(viewport.right);
+            let top = tooltip.rect.top.max(viewport.top);
+            let bottom = tooltip.rect.bottom.min(viewport.bottom);
+            if right - left <= 2. || bottom - top <= 2. {
+                return None;
+            }
+            let point = ((left + right) / 2., (top + bottom) / 2.);
+            scene.tooltip_at(point.0, point.1).map(|_| point)
+        })
+        .context("no visible synthetic Table tooltip")?;
+    let scale = unsafe { GetDpiForWindow(hwnd) } as f32 / 96.;
+    let px = (x * scale).round() as i32;
+    let py = (y * scale).round() as i32;
+    ensure!(
+        scene
+            .tooltip_at(px as f32 / scale, py as f32 / scale)
+            .is_some(),
+        "rounded tooltip point escaped its bounds"
+    );
+    send(
+        hwnd,
+        WM_MOUSEMOVE,
+        0,
+        (((py as u32 & 0xffff) << 16) | (px as u32 & 0xffff)) as isize,
+    );
+    sync_paint(hwnd)?;
+    let (offset, damage, client) = scroll_pending_damage(hwnd)?;
+    ensure!(
+        scroll_damage_is_full(damage, client),
+        "pointer tooltip must force full invalidation: damage={damage:?}, client={client:?}"
+    );
+    finish_fallback_scroll(hwnd, offset)?;
+    send(hwnd, MOUSE_LEAVE, 0, 0);
+    sync_paint(hwnd)?;
+    run.collect()?;
     Ok(())
 }
 
@@ -1103,6 +1291,7 @@ fn r1210_host_cache() -> Result<()> {
     backward_clock_regression(&mut run, hwnd)?;
     tab_invalidation_regressions(&mut run, hwnd)?;
     cached_future_clock_regression(&mut run, hwnd)?;
+    scroll_full_fallback_regressions(&mut run, hwnd)?;
     dashboard_window::close_now_on_ui_thread()?;
     ensure!(
         !unsafe { IsWindow(Some(hwnd)) }.as_bool(),

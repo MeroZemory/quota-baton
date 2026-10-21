@@ -1247,7 +1247,7 @@ fn publish_accessibility(h: &mut Host, frame: &mut Frame, reuse: bool) -> Result
     }
     // Allocate every current semantic node before resolving any parent. Hidden
     // chart table/cells remain in the tree even though they have no hit target.
-    let keys: HashSet<&str> = frame
+    let mut keys: HashSet<&str> = frame
         .scene
         .accessibility
         .iter()
@@ -1256,9 +1256,9 @@ fn publish_accessibility(h: &mut Host, frame: &mut Frame, reuse: bool) -> Result
     if keys.len() != frame.scene.accessibility.len() {
         return Err(failure("dashboard UIA duplicate semantic key"));
     }
-    let mut retained = keys.clone();
+    let required = keys.iter().filter(|key| !h.ids.contains_key(**key)).count();
     for (_, cached) in &h.tab_frames {
-        retained.extend(
+        keys.extend(
             cached
                 .scene
                 .accessibility
@@ -1266,27 +1266,31 @@ fn publish_accessibility(h: &mut Host, frame: &mut Frame, reuse: bool) -> Result
                 .map(|node| node.key.as_str()),
         );
     }
-    h.ids.retain(|key, _| retained.contains(key.as_str()));
-    let required = keys.iter().filter(|key| !h.ids.contains_key(**key)).count();
+    h.ids.retain(|key, _| keys.contains(key.as_str()));
     let Ok(required) = i32::try_from(required) else {
         return Err(failure("dashboard UIA element count overflow"));
     };
     if h.next_id <= 0 || h.next_id.checked_add(required).is_none() {
         return Err(failure("dashboard UIA id range exhausted"));
     }
+    let mut node_ids = Vec::with_capacity(frame.scene.accessibility.len());
     for node in &frame.scene.accessibility {
-        if !h.ids.contains_key(&node.key) {
+        let id = if let Some(id) = h.ids.get(&node.key) {
+            *id
+        } else {
             let Some(next) = h.next_id.checked_add(1) else {
                 return Err(failure("dashboard UIA id allocation overflow"));
             };
-            h.ids.insert(node.key.clone(), h.next_id);
+            let id = h.next_id;
+            h.ids.insert(node.key.clone(), id);
             h.next_id = next;
-        }
+            id
+        };
+        node_ids.push(id);
     }
-    let mut elements = vec![];
+    let mut elements = Vec::with_capacity(frame.scene.accessibility.len());
     let mut focused = false;
-    for node in &frame.scene.accessibility {
-        let id = h.ids[&node.key];
+    for (node, id) in frame.scene.accessibility.iter().zip(node_ids) {
         let parent = match node.parent.as_ref() {
             Some(key) => {
                 let Some(id) = h.ids.get(key) else {

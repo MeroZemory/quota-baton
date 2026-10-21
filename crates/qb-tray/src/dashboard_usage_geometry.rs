@@ -54,6 +54,9 @@ pub(super) fn usage(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardStat
     let content = rows as f32 * 300.;
     let (old, offset) = b.begin_region(ScrollRegion::Usage, viewport, content, s.usage_offset);
     let available_nodes = history::SCENE_NODE_BUDGET.saturating_sub(b.scene.accessibility.len());
+    // All account charts share this frame's clock. Format each sampled instant
+    // once, rather than twice per row in every account's hidden UIA table.
+    let mut stamps = BTreeMap::new();
     for (i, tile) in v.usage.iter().enumerate() {
         let r = rect(
             viewport.left + (i % columns) as f32 * (tw + 12.),
@@ -66,7 +69,7 @@ pub(super) fn usage(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardStat
             history::row_limit(tile.series.len(), v.usage.len(), available_nodes),
         );
         let draw_start = b.scene.draw.len();
-        usage_tile(b, v, tile, r, &table);
+        usage_tile(b, v, tile, r, &table, &mut stamps);
         // Retain bounded offscreen semantics, but do not paint invisible history lines.
         if intersection(r, b.clip).is_none() {
             b.scene.draw.truncate(draw_start);
@@ -95,6 +98,7 @@ fn usage_tile(
     t: &m::UsageTile,
     r: Rect,
     table: &history::Table,
+    stamps: &mut BTreeMap<DateTime<Utc>, String>,
 ) {
     let tile_clip = intersection(r, b.clip);
     if let Some(clip) = tile_clip {
@@ -575,6 +579,7 @@ fn usage_tile(
     }
     for row in &table.rows {
         let at = row.at;
+        let stamp = stamps.entry(at).or_insert_with(|| v.clock.stamp(Some(at)));
         let values: Vec<_> = t
             .series
             .iter()
@@ -598,15 +603,12 @@ fn usage_tile(
             rowkey.clone(),
             Some(tablekey.clone()),
             Role::Row,
-            format!("{} · {}", v.clock.stamp(Some(at)), values.join(" · ")),
+            format!("{stamp} · {}", values.join(" · ")),
             plot,
             None,
         );
         b.scene.accessibility[idx].hidden = true;
-        for (i, value) in std::iter::once(v.clock.stamp(Some(at)))
-            .chain(values)
-            .enumerate()
-        {
+        for (i, value) in std::iter::once(stamp.clone()).chain(values).enumerate() {
             let idx = b.semantic(
                 format!("{rowkey}:cell:{i}"),
                 Some(rowkey.clone()),
