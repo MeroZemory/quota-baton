@@ -12,12 +12,12 @@ use windows::{
         Graphics::{
             Direct2D::{
                 Common::{D2D_RECT_F, D2D1_COLOR_F},
-                D2D1_DRAW_TEXT_OPTIONS_NONE, ID2D1RenderTarget,
+                D2D1_DRAW_TEXT_OPTIONS_NONE, ID2D1RenderTarget, ID2D1SolidColorBrush,
             },
             DirectWrite::*,
         },
     },
-    core::{Error, PCWSTR, Result},
+    core::{Error, Interface, PCWSTR, Result},
 };
 use windows_numerics::Vector2;
 
@@ -60,6 +60,17 @@ const LAYOUT_CACHE_LINE_LIMIT: usize = 8_192;
 const LAYOUT_CACHE_TEXT_LIMIT: usize = 1024 * 1024;
 const LAYOUT_CACHE_INPUT_LIMIT: usize = 16 * 1024;
 const LAYOUT_CACHE_ENTRY_LINE_LIMIT: usize = 256;
+const SOLID_BRUSH_CACHE_CAPACITY: usize = 128;
+
+#[derive(Default)]
+struct SolidBrushCache {
+    // Pin the actual target interface so its address cannot be recycled while
+    // its brushes remain cached. A different interface is conservatively cold.
+    target: Option<ID2D1RenderTarget>,
+    brushes: BTreeMap<[u32; 4], ID2D1SolidColorBrush>,
+    #[cfg(test)]
+    creations: usize,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct StyleKey {
@@ -219,6 +230,7 @@ pub struct Text {
     icon_family: &'static str,
     mono_family: &'static str,
     cache: RefCell<TextCache>,
+    solid_brushes: RefCell<SolidBrushCache>,
     #[cfg(any(debug_assertions, feature = "testkit"))]
     phases: TextPhaseCounters,
 }
@@ -319,6 +331,7 @@ impl Text {
             mono_family: choose_family(&collection, &["Cascadia Mono", "Consolas"])?,
             factory,
             cache: RefCell::new(TextCache::default()),
+            solid_brushes: RefCell::new(SolidBrushCache::default()),
             #[cfg(any(debug_assertions, feature = "testkit"))]
             phases: TextPhaseCounters::default(),
         })
@@ -588,6 +601,50 @@ impl Text {
         Ok(self.cached_layout(value, bounds, style)?.metrics)
     }
 
+    /// Release target-dependent resources before creating a replacement target.
+    /// Device-independent text caches and diagnostic creation counts are retained.
+    pub(crate) fn clear_target_resources(&self) {
+        let mut cache = self.solid_brushes.borrow_mut();
+        cache.brushes.clear();
+        cache.target = None;
+    }
+
+    /// Shared target-local brushes are immutable: callers must not change their
+    /// color, opacity or transform. A full cache bypasses retention.
+    pub(crate) fn solid_brush(
+        &self,
+        target: &ID2D1RenderTarget,
+        color: D2D1_COLOR_F,
+    ) -> Result<ID2D1SolidColorBrush> {
+        let mut cache = self.solid_brushes.borrow_mut();
+        if cache
+            .target
+            .as_ref()
+            .is_none_or(|old| old.as_raw() != target.as_raw())
+        {
+            cache.brushes.clear();
+            cache.target = Some(target.clone());
+        }
+        let key = [
+            color.r.to_bits(),
+            color.g.to_bits(),
+            color.b.to_bits(),
+            color.a.to_bits(),
+        ];
+        if let Some(brush) = cache.brushes.get(&key) {
+            return Ok(brush.clone());
+        }
+        #[cfg(test)]
+        {
+            cache.creations += 1;
+        }
+        let brush = unsafe { target.CreateSolidColorBrush(&color, None)? };
+        if cache.brushes.len() < SOLID_BRUSH_CACHE_CAPACITY {
+            cache.brushes.insert(key, brush.clone());
+        }
+        Ok(brush)
+    }
+
     /// Draw a cached plain layout at the current bounds' origin.
     pub fn draw(
         &self,
@@ -598,14 +655,15 @@ impl Text {
         color: D2D1_COLOR_F,
     ) -> Result<Metrics> {
         let layout = self.cached_layout(value, bounds, style)?;
-        layout.draw_at(
+        let brush = self.solid_brush(target, color)?;
+        layout.draw_with_brush_at(
             target,
-            color,
+            &brush,
             Vector2 {
                 X: bounds.left,
                 Y: bounds.top,
             },
-        )?;
+        );
         Ok(layout.metrics)
     }
 }
@@ -647,17 +705,26 @@ impl Layout {
         origin: Vector2,
     ) -> Result<()> {
         let brush = unsafe { target.CreateSolidColorBrush(&color, None)? };
+        self.draw_with_brush_at(target, &brush, origin);
+        Ok(())
+    }
+
+    fn draw_with_brush_at(
+        &self,
+        target: &ID2D1RenderTarget,
+        brush: &ID2D1SolidColorBrush,
+        origin: Vector2,
+    ) {
         for line in &self.lines {
             unsafe {
                 target.DrawTextLayout(
                     line.at(origin),
                     &line.layout,
-                    &brush,
+                    brush,
                     D2D1_DRAW_TEXT_OPTIONS_NONE,
                 );
             }
         }
-        Ok(())
     }
 }
 
@@ -728,6 +795,337 @@ fn choose_family(
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
     use super::*;
+    use crate::{v2_colors::Rgb, v2_render::Renderer};
+    use windows::Win32::{
+        Graphics::{
+            Direct2D::{
+                Common::{D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_PIXEL_FORMAT},
+                D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_RENDER_TARGET_PROPERTIES,
+                D2D1_ROUNDED_RECT, D2D1CreateFactory, ID2D1Factory,
+            },
+            Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
+            Imaging::{
+                CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICBitmap,
+                IWICImagingFactory, WICBitmapCacheOnLoad,
+            },
+        },
+        System::Com::{
+            CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+            CoUninitialize,
+        },
+    };
+
+    struct Com;
+    impl Com {
+        fn enter() -> Result<Self> {
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()? };
+            Ok(Self)
+        }
+    }
+    impl Drop for Com {
+        fn drop(&mut self) {
+            unsafe { CoUninitialize() };
+        }
+    }
+
+    struct BrushSurface {
+        target: ID2D1RenderTarget,
+        bitmap: IWICBitmap,
+    }
+    impl BrushSurface {
+        fn new() -> Result<Self> {
+            unsafe {
+                let wic: IWICImagingFactory =
+                    CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
+                let bitmap = wic.CreateBitmap(
+                    256,
+                    192,
+                    &GUID_WICPixelFormat32bppPBGRA,
+                    WICBitmapCacheOnLoad,
+                )?;
+                let factory: ID2D1Factory =
+                    D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
+                let target = factory.CreateWicBitmapRenderTarget(
+                    &bitmap,
+                    &D2D1_RENDER_TARGET_PROPERTIES {
+                        pixelFormat: D2D1_PIXEL_FORMAT {
+                            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                        },
+                        dpiX: 96.,
+                        dpiY: 96.,
+                        ..Default::default()
+                    },
+                )?;
+                Ok(Self { target, bitmap })
+            }
+        }
+
+        fn pixels(&self) -> Result<Vec<u8>> {
+            let mut pixels = vec![0; 256 * 192 * 4];
+            unsafe {
+                self.bitmap
+                    .CopyPixels(std::ptr::null(), 256 * 4, &mut pixels)?;
+            }
+            Ok(pixels)
+        }
+    }
+
+    fn brush_fixture(surface: &BrushSurface, renderer: &Renderer, cached: bool) -> Result<()> {
+        let target = &surface.target;
+        unsafe {
+            target.BeginDraw();
+            target.Clear(Some(&D2D1_COLOR_F {
+                r: 0.02,
+                g: 0.04,
+                b: 0.08,
+                a: 0.25,
+            }));
+        }
+        for repeat in 0..2 {
+            for (index, (rgb, alpha)) in [
+                (Rgb(14, 105, 241), 1.),
+                (Rgb(14, 105, 241), 0.25),
+                (Rgb(14, 105, 241), 0.),
+                (Rgb(241, 36, 82), 0.5),
+                (Rgb(14, 105, 241), 1.),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let y = 8. + index as f32 * 33. + repeat as f32 * 2.;
+                let box_ = crate::Rect {
+                    left: 8. + repeat as f32,
+                    top: y,
+                    right: 244.,
+                    bottom: y + 26.,
+                };
+                let bounds = D2D_RECT_F {
+                    left: box_.left,
+                    top: box_.top,
+                    right: box_.right,
+                    bottom: box_.bottom,
+                };
+                let label = D2D_RECT_F {
+                    left: box_.left + 8.,
+                    top: y + 2.,
+                    right: 232.,
+                    bottom: y + 24.,
+                };
+                let color = D2D1_COLOR_F {
+                    r: rgb.0 as f32 / 255.,
+                    g: rgb.1 as f32 / 255.,
+                    b: rgb.2 as f32 / 255.,
+                    a: alpha,
+                };
+                let from = Vector2 {
+                    X: box_.left,
+                    Y: y + 29.,
+                };
+                let to = Vector2 {
+                    X: box_.right,
+                    Y: y + 29.,
+                };
+                if cached {
+                    renderer.fill(target, box_, rgb, alpha, 3.)?;
+                    renderer.stroke(target, box_, rgb, 1.5, 3., alpha)?;
+                    renderer.dashboard_line(
+                        target,
+                        [from.X, from.Y],
+                        [to.X, to.Y],
+                        rgb,
+                        1.5,
+                        alpha,
+                    )?;
+                    renderer.dashboard_text().draw(
+                        target,
+                        "계정 상태 38%",
+                        label,
+                        style(Wrap::SingleLine),
+                        color,
+                    )?;
+                } else {
+                    let brush = unsafe { target.CreateSolidColorBrush(&color, None)? };
+                    let rounded = D2D1_ROUNDED_RECT {
+                        rect: bounds,
+                        radiusX: 3.,
+                        radiusY: 3.,
+                    };
+                    unsafe {
+                        target.FillRoundedRectangle(&rounded, &brush);
+                        target.DrawRoundedRectangle(&rounded, &brush, 1.5, None);
+                        target.DrawLine(from, to, &brush, 1.5, None);
+                    }
+                    renderer
+                        .dashboard_text()
+                        .layout("계정 상태 38%", label, style(Wrap::SingleLine))?
+                        .draw(target, color)?;
+                }
+            }
+        }
+        unsafe { target.EndDraw(None, None) }
+    }
+
+    #[test]
+    fn r1210_solid_brush_cached_draws_match_uncached_wic_pixels() -> Result<()> {
+        let _com = Com::enter()?;
+        let cached = Renderer::new(false)?;
+        let uncached = Renderer::new(false)?;
+        let surface = BrushSurface::new()?;
+        let reference = BrushSurface::new()?;
+        for _ in 0..3 {
+            brush_fixture(&surface, &cached, true)?;
+            brush_fixture(&reference, &uncached, false)?;
+            let pixels = surface.pixels()?;
+            assert_eq!(pixels, reference.pixels()?);
+            assert!(pixels.chunks_exact(4).any(|pixel| pixel[3] > 64));
+            assert!(
+                pixels
+                    .chunks_exact(4)
+                    .any(|pixel| pixel[3] > 0 && pixel[3] < 255)
+            );
+            assert_eq!(cached.dashboard_text().solid_brushes.borrow().creations, 4);
+        }
+        assert!(
+            uncached
+                .dashboard_text()
+                .solid_brushes
+                .borrow()
+                .brushes
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn r1210_solid_brush_exact_bits_and_full_cache_bypass_preserve_retained_brushes() -> Result<()>
+    {
+        let _com = Com::enter()?;
+        let text = Text::new()?;
+        let surface = BrushSurface::new()?;
+        let color = D2D1_COLOR_F {
+            r: 0.,
+            g: 0.25,
+            b: 0.75,
+            a: 0.5,
+        };
+        let first = text.solid_brush(&surface.target, color)?;
+        let hit = text.solid_brush(&surface.target, color)?;
+        assert_eq!(first.as_raw(), hit.as_raw());
+        let negative_zero = text.solid_brush(&surface.target, D2D1_COLOR_F { r: -0., ..color })?;
+        assert_ne!(first.as_raw(), negative_zero.as_raw());
+        for index in 1..SOLID_BRUSH_CACHE_CAPACITY - 1 {
+            text.solid_brush(
+                &surface.target,
+                D2D1_COLOR_F {
+                    r: index as f32 / SOLID_BRUSH_CACHE_CAPACITY as f32,
+                    ..color
+                },
+            )?;
+        }
+        assert_eq!(
+            text.solid_brushes.borrow().brushes.len(),
+            SOLID_BRUSH_CACHE_CAPACITY
+        );
+        assert_eq!(
+            text.solid_brushes.borrow().creations,
+            SOLID_BRUSH_CACHE_CAPACITY
+        );
+        let extra = D2D1_COLOR_F { g: 0.375, ..color };
+        let bypass = text.solid_brush(&surface.target, extra)?;
+        let bypass_again = text.solid_brush(&surface.target, extra)?;
+        assert_ne!(bypass.as_raw(), bypass_again.as_raw());
+        assert_eq!(
+            text.solid_brush(&surface.target, color)?.as_raw(),
+            first.as_raw()
+        );
+        assert_eq!(
+            text.solid_brushes.borrow().brushes.len(),
+            SOLID_BRUSH_CACHE_CAPACITY
+        );
+        assert_eq!(
+            text.solid_brushes.borrow().creations,
+            SOLID_BRUSH_CACHE_CAPACITY + 2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn r1210_solid_brush_clear_target_resources_releases_pin_and_repaints() -> Result<()> {
+        let _com = Com::enter()?;
+        let renderer = Renderer::new(false)?;
+        let surface = BrushSurface::new()?;
+        brush_fixture(&surface, &renderer, true)?;
+        let expected = surface.pixels()?;
+        let text = renderer.dashboard_text();
+        let creations = text.solid_brushes.borrow().creations;
+        assert_eq!(creations, 4);
+        assert!(text.solid_brushes.borrow().target.is_some());
+
+        renderer.clear_target_resources();
+        {
+            let cache = text.solid_brushes.borrow();
+            assert!(cache.brushes.is_empty());
+            assert!(cache.target.is_none());
+            assert_eq!(cache.creations, creations);
+        }
+        // Clearing an already empty domain must also preserve the counter.
+        renderer.clear_target_resources();
+        assert_eq!(text.solid_brushes.borrow().creations, creations);
+
+        // Repainting the same live target must recreate every previously cached
+        // color, then reuse those new brushes without changing the pixels.
+        for _ in 0..2 {
+            brush_fixture(&surface, &renderer, true)?;
+            assert_eq!(surface.pixels()?, expected);
+            let cache = text.solid_brushes.borrow();
+            assert_eq!(cache.brushes.len(), 4);
+            assert_eq!(cache.creations, creations + 4);
+            assert_eq!(
+                cache.target.as_ref().unwrap().as_raw(),
+                surface.target.as_raw()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn r1210_solid_brush_target_swap_clears_domain_and_pins_target() -> Result<()> {
+        let _com = Com::enter()?;
+        let text = Text::new()?;
+        let first_surface = BrushSurface::new()?;
+        let color = D2D1_COLOR_F {
+            r: 0.25,
+            g: 0.5,
+            b: 0.75,
+            a: 0.5,
+        };
+        let old_target = first_surface.target.as_raw();
+        let old_brush = text.solid_brush(&first_surface.target, color)?;
+        drop(first_surface);
+        let pinned = text.solid_brushes.borrow().target.as_ref().unwrap().clone();
+        assert_eq!(pinned.as_raw(), old_target);
+        let surface = BrushSurface::new()?;
+        assert_ne!(surface.target.as_raw(), old_target);
+        let brush = text.solid_brush(&surface.target, color)?;
+        assert_ne!(brush.as_raw(), old_brush.as_raw());
+        let alias = surface.target.clone();
+        assert_eq!(text.solid_brush(&alias, color)?.as_raw(), brush.as_raw());
+        assert_eq!(text.solid_brushes.borrow().brushes.len(), 1);
+        assert_eq!(text.solid_brushes.borrow().creations, 2);
+        unsafe {
+            surface.target.BeginDraw();
+            surface.target.Clear(None);
+            surface.target.FillRectangle(&rect(80., 24.), &brush);
+            surface.target.EndDraw(None, None)?;
+        }
+        assert!(surface.pixels()?.iter().any(|byte| *byte != 0));
+        let rebound = text.solid_brush(&pinned, color)?;
+        assert_ne!(rebound.as_raw(), old_brush.as_raw());
+        assert_eq!(text.solid_brushes.borrow().brushes.len(), 1);
+        assert_eq!(text.solid_brushes.borrow().creations, 3);
+        Ok(())
+    }
 
     #[cfg(any(debug_assertions, feature = "testkit"))]
     #[test]

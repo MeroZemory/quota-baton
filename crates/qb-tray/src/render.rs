@@ -512,6 +512,11 @@ pub fn color(p: Palette, c: Color) -> Rgb {
     }
 }
 impl Renderer {
+    /// Retire native target resources while preserving device-independent text.
+    pub fn clear_target_resources(&self) {
+        self.shared.clear_target_resources();
+    }
+
     pub fn new(dark: bool) -> Result<Self> {
         Ok(Self {
             shared: v2_render::Renderer::new(dark)?,

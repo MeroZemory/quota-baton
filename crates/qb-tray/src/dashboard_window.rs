@@ -884,6 +884,7 @@ unsafe fn paint(hwnd: HWND) -> Result<()> {
         }
         let retained_target = h.target.is_some() && h.target_metrics == Some((pixels, dpi));
         if h.target.is_none() {
+            h.renderer.clear_target_resources();
             h.target = Some(unsafe {
                 h.factory.CreateHwndRenderTarget(
                     &D2D1_RENDER_TARGET_PROPERTIES {
@@ -1086,6 +1087,7 @@ unsafe fn paint(hwnd: HWND) -> Result<()> {
         && let Some(host) = current(hwnd)
     {
         let mut h = host.borrow_mut();
+        h.renderer.clear_target_resources();
         h.target = None;
         h.target_metrics = None;
         invalidate_frame(&mut h);
@@ -1931,6 +1933,7 @@ fn teardown(hwnd: HWND) {
         h.life.close();
         h.frame = None;
         let root = h.root.take();
+        h.renderer.clear_target_resources();
         h.target = None;
         let mut preferences = h.state.clone();
         preferences.search.clear();
