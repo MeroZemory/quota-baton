@@ -348,8 +348,8 @@ impl Account {
             .filter(|w| {
                 self.provider != Provider::Codex
                     || w["name"].as_str().is_some_and(|name| {
-                        !matches!(name, "primary" | "secondary")
-                            && crate::dashboard::history::WindowName::try_from(
+                        matches!(name, "primary" | "secondary")
+                            || crate::dashboard::history::WindowName::try_from(
                                 name.split('_').next().unwrap_or(name).to_owned(),
                             )
                             .is_ok()
@@ -625,7 +625,7 @@ pub(crate) mod tests {
     #[test]
     fn outage_phantom_codex_windows_never_cool() {
         let now = Utc::now();
-        for name in ["0m", "primary", "secondary", "unknown"] {
+        for name in ["0m", "unknown"] {
             let mut account = fixture();
             account.apply_health_signal(HealthSignal::UsageSnapshot {
                 snapshot: serde_json::json!({"windows":[{"name":name,"used_pct":100,"status":"rejected","reset_at":now+Duration::days(5)}]}),
@@ -636,13 +636,44 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn outage_provider_buckets_without_duration_keep_explicit_quota_and_reset() {
+        let now = Utc::now();
+        let reset = now + Duration::hours(1);
+        for name in ["primary", "secondary"] {
+            for used in [serde_json::Value::Null, serde_json::json!(100)] {
+                let mut account = fixture();
+                account.apply_health_signal(
+                    HealthSignal::UsageSnapshot {
+                        snapshot: serde_json::json!({
+                            "windows":[{"name":name,"used_pct":used,"reset_at":reset}],
+                            "signals":{"limit_reached":true,"active_limit":name}
+                        }),
+                        model: None,
+                        projected_allowance: 0.0,
+                    },
+                    now,
+                );
+                assert_eq!(
+                    account.health,
+                    Health::Cooling {
+                        reason: HealthReason::Quota,
+                        until: reset,
+                        scope: "account".into()
+                    }
+                );
+                assert!(account.quota_credit_releasable);
+            }
+        }
+    }
+
+    #[test]
     fn outage_phantom_windows_do_not_veto_account_level_signals() {
         let now = Utc::now();
         for signals in [
             serde_json::json!({"limit_reached":true}),
             serde_json::json!({"serving_from_credits":true}),
         ] {
-            for name in ["0m", "primary", "secondary", "unknown"] {
+            for name in ["0m", "unknown"] {
                 let mut account = fixture();
                 account.apply_health_signal(HealthSignal::UsageSnapshot {
                     snapshot: serde_json::json!({

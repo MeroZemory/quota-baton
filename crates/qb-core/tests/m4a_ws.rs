@@ -911,6 +911,7 @@ async fn r12_9_timed_out_blocking_admission_cannot_move_binding_or_break_old_cre
     capacity_count(&h, b, 0).await;
     let (entered, resume) = h.state.pause_next_ws_admission();
     let request = h.request();
+    let waiting_since = std::time::Instant::now();
     let pending = tokio::spawn(async move { connect_async(request).await });
     tokio::time::timeout(Duration::from_secs(2), entered)
         .await
@@ -918,7 +919,6 @@ async fn r12_9_timed_out_blocking_admission_cannot_move_binding_or_break_old_cre
         .unwrap();
     // The blocking selector now owns the mutation gate. Let the actual HTTP
     // upgrade expire and drop its owner before allowing admission to proceed.
-    let waiting_since = std::time::Instant::now();
     let Error::Http(response) = tokio::time::timeout(Duration::from_secs(2), pending)
         .await
         .unwrap()
