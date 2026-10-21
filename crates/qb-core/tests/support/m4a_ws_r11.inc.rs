@@ -851,4 +851,679 @@ mod r11_actual {
             recovered.close(None).await.unwrap();
         }
     }
+    #[tokio::test]
+    async fn r11_ws_live_ordinary_same_account_promotion_enforces_managed_models() {
+        for binary in [false, true] {
+            let t = LaunchHarness::new(2).await;
+            let key = "r11-live-promoted";
+            let canonical = format!("codex:{key}");
+            let base = format!("http://{}/v1", t.h.servers.data_addr);
+            let (mut client, response) = connect_async(t.request(&base, Some(key))).await.unwrap();
+            assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+            let account = response.headers()["x-quota-baton-account"]
+                .to_str()
+                .unwrap()
+                .to_owned();
+            capacity_count(&t.h, &account, 1).await;
+            let first = r#"{ "type":"response.create", "model":"synthetic-model", "input":[] }"#;
+            t.turn(&mut client, first).await;
+            assert!(
+                !t.h.state
+                    .bindings
+                    .launch_info(&canonical, Utc::now())
+                    .unwrap()
+                    .managed
+            );
+            assert_eq!(t.data(), vec![Message::text(first)]);
+
+            // The other account supports the rejected model. Promotion must
+            // keep this live socket on its existing account without shopping.
+            let other = t.h.ids.iter().find(|id| **id != account).unwrap();
+            t.catalogs
+                .set(&t.h, other, &["synthetic-model", "other-account-only"]);
+            let launch =
+                t.h.state
+                    .issue_launch(
+                        relay::LaunchRequest {
+                            model: Some("synthetic-model".into()),
+                            model_is_explicit: true,
+                            account_pref: Some(account.clone()),
+                            resume_id: Some(key.into()),
+                            move_for_model: false,
+                        },
+                        t.h.servers.data_addr.port(),
+                    )
+                    .await
+                    .unwrap();
+            assert_eq!(
+                launch.account, account,
+                "same-account live resume remains legitimate"
+            );
+            let response = reqwest::Client::new()
+                .get(&launch.catalog_url)
+                .bearer_auth("synthetic-local-key")
+                .header("session-id", key)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let menu = response.json::<Value>().await.unwrap();
+            assert!(
+                menu["models"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["slug"] == "alternate-model")
+            );
+            assert!(
+                !menu["models"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["slug"] == "other-account-only")
+            );
+            let promoted =
+                t.h.state
+                    .bindings
+                    .launch_info(&canonical, Utc::now())
+                    .unwrap();
+            assert!(promoted.managed);
+            assert_eq!(promoted.account, account);
+            assert_eq!(promoted.canonical_key, canonical);
+            assert!(promoted.advertised_models.contains("alternate-model"));
+            let routing = t.h.state.bindings.routing_view();
+            let moves: Vec<_> =
+                t.h.ledger()
+                    .into_iter()
+                    .filter(|row| row["event"] == "session_move")
+                    .collect();
+            let catalog_before = t.catalogs.requests.lock().unwrap().len();
+
+            let unsupported =
+                r#"{ "type":"response.create", "model":"other-account-only", "input":[] }"#;
+            let frame = |raw: &str| {
+                if binary {
+                    Message::binary(raw.as_bytes().to_vec())
+                } else {
+                    Message::text(raw.to_owned())
+                }
+            };
+            client.send(frame(unsupported)).await.unwrap();
+            let Message::Text(error) = receive(&mut client).await else {
+                panic!("local model explanation expected")
+            };
+            let error: Value = serde_json::from_str(&error).unwrap();
+            assert_eq!(error["error"]["code"], "model_not_supported");
+            assert!(!error["error"]["message"].as_str().unwrap().is_ascii());
+            assert_eq!(
+                t.data(),
+                vec![Message::text(first)],
+                "unsupported turn never reaches upstream"
+            );
+            assert_eq!(
+                t.h.fake.state.requests().len(),
+                1,
+                "no move or replacement WS dial"
+            );
+            assert_eq!(
+                t.h.state
+                    .bindings
+                    .launch_info(&canonical, Utc::now())
+                    .unwrap(),
+                promoted
+            );
+            capacity_count(&t.h, &account, 1).await;
+            let row = t.h.store.load(&account).unwrap();
+            let token = t.h.store.tokens(&row).unwrap();
+            assert_eq!(
+                &t.catalogs.requests.lock().unwrap()[catalog_before..],
+                &[format!("Bearer {}", token.access_token)],
+                "unsupported-model refresh only visits the bound account"
+            );
+
+            // Keep using the original ordinary socket after the local error.
+            let supported = r#"{ "input":[], "type" : "response.create", "model":"alternate-model", "fixture_extra":{"preserve":true} }"#;
+            let supported_frame = frame(supported);
+            t.h.fake
+                .state
+                .push_reply([Message::text(r#"{"type":"response.completed"}"#)]);
+            client.send(supported_frame.clone()).await.unwrap();
+            assert_eq!(
+                receive(&mut client).await,
+                Message::text(r#"{"type":"response.completed"}"#)
+            );
+            assert_eq!(t.data(), vec![Message::text(first), supported_frame]);
+            assert_eq!(t.h.fake.state.requests().len(), 1);
+            let after =
+                t.h.state
+                    .bindings
+                    .launch_info(&canonical, Utc::now())
+                    .unwrap();
+            assert_eq!(after.account, account);
+            assert_eq!(after.canonical_key, canonical);
+            assert_eq!(after.current_model.as_deref(), Some("alternate-model"));
+            assert_eq!(after.advertised_models, promoted.advertised_models);
+            assert_eq!(
+                t.h.state.bindings.export().unwrap()["bindings"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(t.h.state.bindings.routing_view(), routing);
+            assert_eq!(
+                t.h.ledger()
+                    .into_iter()
+                    .filter(|row| row["event"] == "session_move")
+                    .collect::<Vec<_>>(),
+                moves
+            );
+            client.close(None).await.unwrap();
+            drop(client);
+            capacity_count(&t.h, &account, 0).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn r11_ws_advertised_long_and_slash_model_ids_preserve_original_turn_bytes() {
+        for model in ["m".repeat(101), "synthetic/model".to_owned()] {
+            let t = LaunchHarness::new(1).await;
+            let account = &t.h.ids[0];
+            t.catalogs.set(&t.h, account, &[&model]);
+            let launch =
+                t.h.state
+                    .issue_launch(
+                        relay::LaunchRequest {
+                            model: Some(model.clone()),
+                            model_is_explicit: true,
+                            account_pref: Some(account.clone()),
+                            resume_id: None,
+                            move_for_model: false,
+                        },
+                        t.h.servers.data_addr.port(),
+                    )
+                    .await
+                    .unwrap();
+            assert_eq!(&launch.account, account);
+            assert_eq!(launch.model.as_deref(), Some(model.as_str()));
+            let key = "r11-wide-model-id";
+            let mut client = t.connect(&launch, Some(key)).await;
+            let response = reqwest::Client::new()
+                .get(&launch.catalog_url)
+                .bearer_auth("synthetic-local-key")
+                .header("session-id", key)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.json::<Value>().await.unwrap()["models"][0]["slug"],
+                model
+            );
+            let raw = format!(
+                r#"{{ "input":[], "type":"response.create", "model":"{model}", "fixture_extra":{{"keep":true}} }}"#
+            );
+            t.turn(&mut client, &raw).await;
+            assert_eq!(t.data(), vec![Message::text(raw)]);
+            assert_eq!(t.h.fake.state.requests().len(), 1);
+            let info =
+                t.h.state
+                    .bindings
+                    .launch_info(&format!("codex:{key}"), Utc::now())
+                    .unwrap();
+            assert!(info.managed);
+            assert_eq!(&info.account, account);
+            assert_eq!(info.current_model.as_deref(), Some(model.as_str()));
+            assert!(info.advertised_models.contains(&model));
+            client.close(None).await.unwrap();
+            drop(client);
+            capacity_count(&t.h, account, 0).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn r11_ws_pending_upgrade_http_adoption_rejects_stale_choice_without_orphan_or_capacity_leak()
+     {
+        let t = LaunchHarness::new(2).await;
+        let launch = t.issue(None).await;
+        let snapshot = t.h.state.bindings.export().unwrap();
+        let provisional = snapshot["bindings"][0]["key"].as_str().unwrap().to_owned();
+        assert!(provisional.starts_with("launch:"));
+        let key = "r11-pending-upgrade-adoption";
+        let canonical = format!("codex:{key}");
+        let (arrived, release) = t.h.state.pause_next_ws_selection();
+        // Poll a real token-only upgrade through model admission and candidate
+        // collection, then hold its selector before the mutation gate.
+        let pending = connect_async(t.request(&launch.base_url, None));
+        tokio::pin!(pending);
+        tokio::select! {
+            _ = &mut pending => panic!("upgrade escaped the selection pause"),
+            result = tokio::time::timeout(Duration::from_secs(5), arrived) => {
+                result.unwrap().unwrap();
+            }
+        }
+        assert!(
+            t.h.fake.state.requests().is_empty(),
+            "no upstream WS dial before admission"
+        );
+        for account in &t.h.ids {
+            capacity_count(&t.h, account, 0).await;
+        }
+        t.http_reply();
+        let raw = r#"{ "model":"synthetic-model", "input":[], "fixture_extra":"HTTP adoption" }"#;
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap()
+                .post(format!("{}/responses", launch.base_url))
+                .bearer_auth("synthetic-local-key")
+                .header("session-id", key)
+                .body(raw)
+                .send(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        tokio::time::timeout(Duration::from_secs(5), response.bytes())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            t.h.state.bindings.current(Some(&canonical)).as_deref(),
+            Some(launch.account.as_str())
+        );
+        assert!(t.h.state.bindings.current(Some(&provisional)).is_none());
+        let calls = t.h.token_fake.state.requests();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].path_and_query, "/responses");
+        assert_eq!(calls[0].body.as_ref(), raw.as_bytes());
+
+        // The HTTP request has adopted and completed before the stale upgrade
+        // can acquire mutations. Refusal must happen before capacity or dial.
+        release.send(()).unwrap();
+        let Error::Http(response) = tokio::time::timeout(Duration::from_secs(5), &mut pending)
+            .await
+            .unwrap()
+            .unwrap_err()
+        else {
+            panic!("stale upgrade must receive an explicit HTTP refusal")
+        };
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error: Value = serde_json::from_slice(response.body().as_ref().unwrap()).unwrap();
+        assert_eq!(error["error"]["type"], "invalid_request_error");
+        assert!(error["error"]["message"].is_string());
+        assert!(
+            t.h.fake.state.requests().is_empty(),
+            "stale choice never dials upstream"
+        );
+        assert!(t.data().is_empty());
+        for account in &t.h.ids {
+            capacity_count(&t.h, account, 0).await;
+        }
+
+        let assert_reloadable = || {
+            assert!(t.h.state.bindings.current(Some(&provisional)).is_none());
+            let info =
+                t.h.state
+                    .bindings
+                    .launch_info(&provisional, Utc::now())
+                    .unwrap();
+            assert!(info.managed);
+            assert_eq!(info.canonical_key, canonical);
+            assert_eq!(info.account, launch.account);
+            let snapshot = t.h.state.bindings.export().unwrap();
+            assert_eq!(snapshot["bindings"].as_array().unwrap().len(), 1);
+            assert_eq!(snapshot["bindings"][0]["key"], canonical);
+            assert_eq!(snapshot["bindings"][0]["account"], launch.account);
+            assert_eq!(snapshot["launches"].as_object().unwrap().len(), 1);
+            let anchors = snapshot["launch_anchors"].as_object().unwrap();
+            assert!(!anchors.is_empty());
+            for anchor in anchors.values() {
+                assert_eq!(anchor["canonical_key"], canonical);
+            }
+            t.h.state.bindings.flush().unwrap();
+            let restored =
+                qb_core::bindings::BindingTable::new(&t.h.home, Default::default()).unwrap();
+            assert_eq!(
+                restored.launch_info(&provisional, Utc::now()).unwrap(),
+                info
+            );
+        };
+        assert_reloadable();
+        let routing = t.h.state.bindings.routing_view();
+        let moves: Vec<_> =
+            t.h.ledger()
+                .into_iter()
+                .filter(|row| row["event"] == "session_move")
+                .collect();
+
+        // Retry the original handle without a C8 header. Its anchor must now
+        // own the adopted account/group, with exactly one live socket slot.
+        let mut client = t.connect(&launch, None).await;
+        capacity_count(&t.h, &launch.account, 1).await;
+        for account in t.h.ids.iter().filter(|account| **account != launch.account) {
+            capacity_count(&t.h, account, 0).await;
+        }
+        let raw = r#"{ "type":"response.create", "model":"alternate-model", "input":[], "fixture_extra":{"preserve":true} }"#;
+        t.turn(&mut client, raw).await;
+        assert_eq!(t.data(), vec![Message::text(raw)]);
+        let calls = t.h.fake.state.requests();
+        assert_eq!(calls.len(), 1, "only the fresh upgrade dials upstream");
+        assert_eq!(
+            calls[0].headers["chatgpt-account-id"],
+            t.h.token_fake.state.requests()[0].headers["chatgpt-account-id"]
+        );
+        assert_reloadable();
+        assert_eq!(
+            t.h.state
+                .bindings
+                .launch_info(&canonical, Utc::now())
+                .unwrap()
+                .current_model
+                .as_deref(),
+            Some("alternate-model")
+        );
+        client.close(None).await.unwrap();
+        drop(client);
+        for account in &t.h.ids {
+            capacity_count(&t.h, account, 0).await;
+        }
+        assert_reloadable();
+        assert_eq!(t.h.state.bindings.routing_view(), routing);
+        assert_eq!(
+            t.h.ledger()
+                .into_iter()
+                .filter(|row| row["event"] == "session_move")
+                .collect::<Vec<_>>(),
+            moves
+        );
+    }
+
+    async fn ordinary_with_open_turn(t: &LaunchHarness, key: &str) -> (Client, String, Message) {
+        let base = format!("http://{}/v1", t.h.servers.data_addr);
+        let (mut client, response) = connect_async(t.request(&base, Some(key))).await.unwrap();
+        let account = response.headers()["x-quota-baton-account"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        capacity_count(&t.h, &account, 1).await;
+        let first = Message::text(
+            r#"{ "type":"response.create", "model":"synthetic-model", "input":[], "fixture_marker":"older turn" }"#,
+        );
+        let created =
+            Message::text(r#"{"type":"response.created","response":{"id":"r11-promoted-old"}}"#);
+        t.h.fake.state.push_reply([created.clone()]);
+        client.send(first.clone()).await.unwrap();
+        assert_eq!(receive(&mut client).await, created);
+        assert!(
+            !t.h.state
+                .bindings
+                .launch_info(&format!("codex:{key}"), Utc::now())
+                .unwrap()
+                .managed
+        );
+        (client, account, first)
+    }
+
+    async fn promote_open_ordinary(t: &LaunchHarness, key: &str, account: &str) {
+        let launch = tokio::time::timeout(
+            Duration::from_secs(5),
+            t.h.state.issue_launch(
+                relay::LaunchRequest {
+                    model: Some("synthetic-model".into()),
+                    model_is_explicit: true,
+                    account_pref: Some(account.into()),
+                    resume_id: Some(key.into()),
+                    move_for_model: false,
+                },
+                t.h.servers.data_addr.port(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            launch.account, account,
+            "live promotion stays on the bound account"
+        );
+        let info =
+            t.h.state
+                .bindings
+                .launch_info(&format!("codex:{key}"), Utc::now())
+                .unwrap();
+        assert!(info.managed);
+        assert_eq!(info.account, account);
+    }
+
+    async fn drain_promoted_old_turn(t: &LaunchHarness, client: &mut Client, account: &str) {
+        t.h.state.begin_drain().await.unwrap();
+        let tail = Message::text(
+            r#"{"type":"response.output_text.delta","response_id":"r11-promoted-old","delta":"old tail"}"#,
+        );
+        let terminal =
+            Message::text(r#"{"type":"response.completed","response":{"id":"r11-promoted-old"}}"#);
+        t.h.fake.state.send(tail.clone()).unwrap();
+        t.h.fake.state.send(terminal.clone()).unwrap();
+        assert_eq!(receive(client).await, tail, "older completion remains live");
+        assert_eq!(receive(client).await, terminal);
+        assert_close(receive(client).await, 1001);
+        capacity_count(&t.h, account, 0).await;
+        for other in t.h.ids.iter().filter(|id| id.as_str() != account) {
+            capacity_count(&t.h, other, 0).await;
+        }
+        assert_eq!(t.h.fake.state.requests().len(), 1, "no shopping or redial");
+    }
+
+    #[tokio::test]
+    async fn r11_ws_queued_ordinary_promotion_reparses_original_model_after_pacing() {
+        let allowed = format!("vendor/{}", "m".repeat(101));
+        let rejected_long = "u".repeat(101);
+        for (case, requested, expected_error) in [
+            ("null", Some(Value::Null), Some("invalid_launch")),
+            (
+                "slash",
+                Some(json!("other/account-only")),
+                Some("model_not_supported"),
+            ),
+            (
+                "long",
+                Some(json!(&rejected_long)),
+                Some("model_not_supported"),
+            ),
+            ("supported", Some(json!(&allowed)), None),
+            ("omitted", None, None),
+        ] {
+            let t = LaunchHarness::new(2).await;
+            let key = format!("r11-after-pacing-{case}");
+            let canonical = format!("codex:{key}");
+            let (mut client, account, first) = ordinary_with_open_turn(&t, &key).await;
+            t.catalogs.set(
+                &t.h,
+                &account,
+                &["synthetic-model", "alternate-model", &allowed],
+            );
+            let other = t.h.ids.iter().find(|id| **id != account).unwrap();
+            t.catalogs.set(
+                &t.h,
+                other,
+                &["synthetic-model", "other/account-only", &rejected_long],
+            );
+            let field = requested
+                .as_ref()
+                .map_or_else(String::new, |model| format!("\"model\":{model},"));
+            let raw = format!(
+                r#"{{ "type":"response.create", {field} "input":[], "fixture_marker":"after-pacing-{case}" }}"#
+            );
+            let (arrived, release) =
+                t.h.state
+                    .pause_ws_ordinary_after_pacing(&canonical, raw.as_bytes());
+            client.send(Message::text(raw.clone())).await.unwrap();
+            // This holds the ordinary admission future after pacing/eligibility,
+            // before the pump observes the new managed metadata. No timer races.
+            tokio::time::timeout(Duration::from_secs(5), arrived)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(t.data(), vec![first.clone()]);
+            promote_open_ordinary(&t, &key, &account).await;
+            if expected_error.is_none() {
+                t.h.fake.state.push_reply([
+                    Message::text(
+                        r#"{"type":"response.created","response":{"id":"r11-promoted-new"}}"#,
+                    ),
+                    Message::text(
+                        r#"{"type":"response.completed","response":{"id":"r11-promoted-new"}}"#,
+                    ),
+                ]);
+            }
+            release.send(()).unwrap();
+            if let Some(code) = expected_error {
+                let Message::Text(error) = receive(&mut client).await else {
+                    panic!("local model error expected")
+                };
+                let error: Value = serde_json::from_str(&error).unwrap();
+                assert_eq!(error["error"]["code"], code, "{case}");
+                assert_eq!(
+                    t.data(),
+                    vec![first.clone()],
+                    "rejected original frame never sent"
+                );
+            } else {
+                assert_eq!(
+                    receive(&mut client).await,
+                    Message::text(
+                        r#"{"type":"response.created","response":{"id":"r11-promoted-new"}}"#
+                    )
+                );
+                assert_eq!(
+                    receive(&mut client).await,
+                    Message::text(
+                        r#"{"type":"response.completed","response":{"id":"r11-promoted-new"}}"#
+                    )
+                );
+                assert_eq!(
+                    t.data(),
+                    vec![first.clone(), Message::text(raw)],
+                    "original accepted bytes preserved"
+                );
+            }
+            let info =
+                t.h.state
+                    .bindings
+                    .launch_info(&canonical, Utc::now())
+                    .unwrap();
+            assert_eq!(info.account, account);
+            let expected_model = if case == "supported" {
+                allowed.as_str()
+            } else {
+                "synthetic-model"
+            };
+            assert_eq!(info.current_model.as_deref(), Some(expected_model));
+            capacity_count(&t.h, &account, 1).await;
+            drain_promoted_old_turn(&t, &mut client, &account).await;
+            drop(client);
+        }
+    }
+
+    #[tokio::test]
+    async fn r11_ws_final_ordinary_promotion_veto_preserves_older_turn_text_and_binary() {
+        for binary in [false, true] {
+            let t = LaunchHarness::new(2).await;
+            let key = "r11-final-ordinary-promotion";
+            let canonical = format!("codex:{key}");
+            let (mut client, account, first) = ordinary_with_open_turn(&t, key).await;
+            let raw = r#"{ "type":"response.create", "model":"other/account-only", "input":[], "fixture_marker":"final ordinary gate" }"#;
+            // Different pending targets must not steal this frame's gate even when
+            // registered earlier on the same RelayState.
+            let (mut other_session, other_session_release) =
+                t.h.state
+                    .pause_ws_ordinary_before_write("codex:r11-other-session", raw.as_bytes());
+            let (mut other_payload, other_payload_release) =
+                t.h.state
+                    .pause_ws_ordinary_before_write(&canonical, b"different frame");
+            let (arrived, release) =
+                t.h.state
+                    .pause_ws_ordinary_before_write(&canonical, raw.as_bytes());
+            let frame = if binary {
+                Message::binary(raw.as_bytes().to_vec())
+            } else {
+                Message::text(raw)
+            };
+            client.send(frame).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), arrived)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                other_session.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            assert!(matches!(
+                other_payload.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            assert_eq!(
+                t.data(),
+                vec![first.clone()],
+                "pause occurs before first write"
+            );
+            promote_open_ordinary(&t, key, &account).await;
+            release.send(()).unwrap();
+            let Message::Text(error) = receive(&mut client).await else {
+                panic!("local promotion veto expected")
+            };
+            let error: Value = serde_json::from_str(&error).unwrap();
+            assert_eq!(error["error"]["code"], "launch_binding_changed");
+            assert_eq!(
+                t.data(),
+                vec![first.clone()],
+                "no bytes from the unadmitted frame"
+            );
+            capacity_count(&t.h, &account, 1).await;
+
+            // Promotion has been observed: the same socket can now admit a valid
+            // turn normally, while the earlier dispatched completion stays open.
+            let supported = r#"{ "type":"response.create", "model":"alternate-model", "input":[], "fixture_marker":"after veto" }"#;
+            t.h.fake.state.push_reply([
+                Message::text(
+                    r#"{"type":"response.created","response":{"id":"r11-promoted-new"}}"#,
+                ),
+                Message::text(
+                    r#"{"type":"response.completed","response":{"id":"r11-promoted-new"}}"#,
+                ),
+            ]);
+            client.send(Message::text(supported)).await.unwrap();
+            assert_eq!(
+                receive(&mut client).await,
+                Message::text(
+                    r#"{"type":"response.created","response":{"id":"r11-promoted-new"}}"#
+                )
+            );
+            assert_eq!(
+                receive(&mut client).await,
+                Message::text(
+                    r#"{"type":"response.completed","response":{"id":"r11-promoted-new"}}"#
+                )
+            );
+            assert_eq!(t.data(), vec![first, Message::text(supported)]);
+            let info =
+                t.h.state
+                    .bindings
+                    .launch_info(&canonical, Utc::now())
+                    .unwrap();
+            assert_eq!(info.account, account);
+            assert_eq!(info.current_model.as_deref(), Some("alternate-model"));
+            drain_promoted_old_turn(&t, &mut client, &account).await;
+            drop(client);
+            drop((
+                other_session,
+                other_payload,
+                other_session_release,
+                other_payload_release,
+            ));
+        }
+    }
 }
