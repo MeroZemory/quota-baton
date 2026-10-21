@@ -319,6 +319,12 @@ impl Run {
 
     fn edge_checkpoint(&mut self, hwnd: HWND, stage: &str, mut facts: Value, focus: Option<&str>) {
         assert_owned(hwnd);
+        // Keep the synthetic clock fixed while external UIA traverses one frame.
+        // A timer repaint republishes epoch-bound providers during traversal.
+        // Input and admin messages still flow through the production window.
+        unsafe {
+            let _ = KillTimer(Some(hwnd), 0x71);
+        }
         self.edge_step += 1;
         let directory = self.output.join(format!("edge-{:02}", self.edge_step));
         std::fs::create_dir(&directory).unwrap();
