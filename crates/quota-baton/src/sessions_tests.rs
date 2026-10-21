@@ -14,6 +14,12 @@ fn r9_cli_diagnostics_allow_only_fixed_messages_not_attached_content() {
     );
     assert!(friendly_error(&anyhow::anyhow!("{fixed} SYNTHETIC-PRIVATE")).is_none());
     assert!(friendly_error(&anyhow::anyhow!("SYNTHETIC-PRIVATE SQL error")).is_none());
+    assert!(
+        friendly_error(&anyhow::anyhow!(
+            "압축 대화 메타데이터를 안전하게 읽을 수 없습니다: SYNTHETIC-PRIVATE"
+        ))
+        .is_none()
+    );
     assert_eq!(goal_status("active"), "진행 중");
     assert_eq!(goal_status("SYNTHETIC-PRIVATE"), "알 수 없음");
 }
@@ -1080,7 +1086,7 @@ fn bulk_excluded_item_stays_at_source_even_if_its_transient_refusal_disappears()
         .set_times(fs::FileTimes::new().set_modified(SystemTime::now()))
         .unwrap();
     let catalog = discovery::catalog(&f.source).unwrap();
-    let (included, skipped) = preview_imports(
+    let (included, refused) = preview_imports(
         &f.store,
         &catalog,
         &[A.into(), B.into()],
@@ -1091,7 +1097,7 @@ fn bulk_excluded_item_stays_at_source_even_if_its_transient_refusal_disappears()
     )
     .unwrap();
     assert_eq!(included, vec![B.to_owned()]);
-    assert_eq!(skipped, 1);
+    assert_eq!(refused, [1, 0, 0]);
     File::options()
         .write(true)
         .open(&a)
@@ -1123,4 +1129,104 @@ fn bulk_excluded_item_stays_at_source_even_if_its_transient_refusal_disappears()
             .threads
             .contains_key(A)
     );
+}
+
+#[test]
+fn share_related_unreadable_compressed_inventory_refuses_before_target_mutation() {
+    for location in ["source", "target", "peer"] {
+        let mut f = Fixture::new();
+        let original = f.add(A, None, false, "active");
+        let home = match location {
+            "source" => f.source.clone(),
+            "target" => f.store.target.clone(),
+            _ => {
+                let peer = f._root.path().join("peer");
+                fs::create_dir_all(&peer).unwrap();
+                f.store.search_homes.push(peer.clone());
+                peer
+            }
+        };
+        let corrupt = home
+            .join("archived_sessions")
+            .join(format!("rollout-2026-10-21T00-00-00-{A}.jsonl.zst"));
+        fs::create_dir_all(corrupt.parent().unwrap()).unwrap();
+        fs::write(&corrupt, b"SYNTHETIC corrupt compressed header").unwrap();
+        for apply in [false, true] {
+            let result = f.import(A, apply);
+            assert!(
+                result.is_err(),
+                "{location} preflight allowed a related unreadable rollout"
+            );
+            assert!(original.exists());
+            assert!(!f.store.path().exists());
+            assert!(!f.store.target.join("state_5.sqlite").exists());
+            assert!(!f.store.target.join("goals_1.sqlite").exists());
+            assert!(!f.store.target.join("session_index.jsonl").exists());
+            assert!(!f.store.target.join("sessions").exists());
+            assert_eq!(
+                fs::read(&corrupt).unwrap(),
+                b"SYNTHETIC corrupt compressed header"
+            );
+        }
+    }
+}
+
+#[test]
+fn share_unrelated_unreadable_compressed_inventory_is_allowed() {
+    let f = Fixture::new();
+    let original = f.add(A, None, false, "active");
+    let corrupt = f
+        .store
+        .target
+        .join("archived_sessions")
+        .join(format!("rollout-2026-10-21T00-00-00-{C}.jsonl.zst"));
+    fs::create_dir_all(corrupt.parent().unwrap()).unwrap();
+    fs::write(&corrupt, b"SYNTHETIC unrelated corrupt compressed header").unwrap();
+    assert!(f.import(A, false).unwrap());
+    assert!(f.import(A, true).unwrap());
+    assert!(original.exists());
+    assert_eq!(
+        fs::read(&corrupt).unwrap(),
+        b"SYNTHETIC unrelated corrupt compressed header"
+    );
+    assert!(f.store.load().unwrap().imports[A].complete);
+}
+
+#[test]
+fn share_selected_compressed_rollout_keeps_original_bytes_and_file_identity() {
+    let f = Fixture::new();
+    let original = f.add(A, None, false, "active");
+    let compressed = original.with_extension("jsonl.zst");
+    let body = zstd::stream::encode_all(fs::read(&original).unwrap().as_slice(), 1).unwrap();
+    fs::write(&compressed, &body).unwrap();
+    fs::remove_file(original).unwrap();
+    File::options()
+        .write(true)
+        .open(&compressed)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(300)))
+        .unwrap();
+    Connection::open(f.source.join("state_5.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE threads SET rollout_path=?1 WHERE id=?2",
+            rusqlite::params![compressed.to_str().unwrap(), A],
+        )
+        .unwrap();
+    let identity = guard::identity(&compressed).unwrap();
+    assert!(f.import(A, false).unwrap());
+    assert!(f.import(A, true).unwrap());
+    let journal = f.store.load().unwrap();
+    let shared = &journal.imports[A].files[0].target;
+    assert_eq!(fs::read(&compressed).unwrap(), body);
+    assert_eq!(fs::read(shared).unwrap(), body);
+    assert_eq!(guard::identity(shared).unwrap(), identity);
+    assert_eq!(guard::hardlink_count(shared).unwrap(), 2);
+    assert!(journal.imports[A].complete);
+    unimport(&f.store, A, false, false).unwrap();
+    unimport(&f.store, A, true, false).unwrap();
+    assert!(!shared.exists());
+    assert_eq!(fs::read(&compressed).unwrap(), body);
+    assert_eq!(guard::identity(&compressed).unwrap(), identity);
+    assert_eq!(guard::hardlink_count(&compressed).unwrap(), 1);
 }

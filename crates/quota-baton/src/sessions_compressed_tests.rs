@@ -136,7 +136,12 @@ fn unrelated_corrupt_and_unknown_filename_do_not_abort_catalog_or_chain() {
     );
     assert!(found.ensure_readable_for(&ids(A)).is_ok());
     assert!(found.chain(A).is_ok());
-    let error = found.ensure_readable_for(&ids(B)).unwrap_err().to_string();
+    let refusal = found.ensure_readable_for(&ids(B)).unwrap_err();
+    assert_eq!(
+        crate::sessions::friendly_error(&refusal).as_deref(),
+        Some("관련된 압축 대화 기록을 읽을 수 없습니다. doctor로 확인하세요")
+    );
+    let error = refusal.to_string();
     assert!(error.contains(B));
     assert!(!error.contains("SYNTHETIC-PRIVATE"));
 }

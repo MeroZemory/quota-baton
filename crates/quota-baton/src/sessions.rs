@@ -2,6 +2,9 @@
 use crate::{sessions_db as db, sessions_discovery as discovery, sessions_guard as guard};
 
 pub(crate) fn friendly_error(error: &anyhow::Error) -> Option<String> {
+    if error.is::<discovery::RelatedUnreadable>() {
+        return Some("관련된 압축 대화 기록을 읽을 수 없습니다. doctor로 확인하세요".into());
+    }
     if let Some(conflict) = error.downcast_ref::<InventoryConflict>() {
         return Some(conflict.to_string());
     }
@@ -522,12 +525,38 @@ fn stale_plan(store: &Store, catalog: &discovery::Catalog, id: &str) -> Result<V
     Ok(result)
 }
 
+fn ensure_readable_inventory(homes: &[PathBuf], seeds: &BTreeSet<String>) -> Result<()> {
+    let catalogs = homes
+        .iter()
+        .map(|h| discovery::catalog(h))
+        .collect::<Result<Vec<_>>>()?;
+    let mut related = seeds.clone();
+    loop {
+        let before = related.len();
+        for catalog in &catalogs {
+            related.extend(catalog.related_ids(&related));
+        }
+        if related.len() == before {
+            break;
+        }
+    }
+    for catalog in &catalogs {
+        catalog.ensure_readable_for(&related)?;
+    }
+    Ok(())
+}
+
 fn check_destination_inventory(
     source: &Path,
     target: &Path,
     files: &[discovery::Rollout],
 ) -> Result<()> {
     let destination = discovery::catalog(target)?;
+    let related = files
+        .iter()
+        .flat_map(|f| [f.thread.clone(), f.physical.clone()])
+        .collect();
+    destination.ensure_readable_for(&related)?;
     let threads: BTreeSet<_> = files.iter().map(|file| &file.thread).collect();
     for item in destination
         .rollouts
@@ -748,11 +777,6 @@ fn verify_links(entry: &Import, growth: bool) -> Result<()> {
             source == link.identity && guard::identity(&link.target)? == source,
             "대화 기록이 분기되었습니다. sessions unimport 후 다시 가져오세요"
         );
-        ensure!(
-            !link.source.with_extension("jsonl.zst").exists()
-                && !link.target.with_extension("jsonl.zst").exists(),
-            "압축된 대화 기록이 있습니다. sessions unimport 후 다시 가져오세요"
-        );
         if growth {
             ensure!(
                 fs::metadata(&link.target)?.len() == link.length,
@@ -760,6 +784,10 @@ fn verify_links(entry: &Import, growth: bool) -> Result<()> {
             );
         }
     }
+    ensure_readable_inventory(
+        &[entry.source_home.clone(), entry.target_home.clone()],
+        &entry.threads.iter().cloned().collect(),
+    )?;
     for id in &entry.threads {
         ensure!(
             db::thread_provider(&entry.target_home, id)?.is_none_or(|p| p == "openai"),
@@ -816,6 +844,29 @@ fn known_homes(user: &Path) -> Vec<PathBuf> {
     result
 }
 
+fn import_refusal_class(error: &anyhow::Error) -> usize {
+    let message = error.to_string();
+    if error.is::<guard::LiveWriter>()
+        || message == "최근에 사용한 대화입니다. 먼저 대화를 종료하고 120초 후 다시 시도하세요"
+    {
+        0
+    } else if error.is::<InventoryConflict>()
+        || message.contains("분기")
+        || message == "대상에 다른 대화 기록이 있습니다"
+    {
+        1
+    } else {
+        2
+    }
+}
+fn import_refusal_label(class: usize) -> &'static str {
+    match class {
+        0 => "실행 중/최근 사용으로 건너뜀",
+        1 => "기록 분기로 건너뜀",
+        _ => "실패 (원본과 journal을 확인하세요)",
+    }
+}
+
 fn preview_imports(
     store: &Store,
     catalog: &discovery::Catalog,
@@ -824,9 +875,9 @@ fn preview_imports(
     keep_source: bool,
     clean_stale: bool,
     skip_existing: bool,
-) -> Result<(Vec<String>, usize)> {
+) -> Result<(Vec<String>, [usize; 3])> {
     let mut included = Vec::new();
-    let mut skipped = 0;
+    let mut refused = [0; 3];
     for id in ids {
         match import_one(
             store,
@@ -841,14 +892,18 @@ fn preview_imports(
             },
         ) {
             Ok(_) => included.push(id.clone()),
-            Err(_) if bulk => {
-                skipped += 1;
-                crate::print_stdout(format_args!("{id}: 사전 검사에서 제외됨"))?
+            Err(error) if bulk => {
+                let class = import_refusal_class(&error);
+                refused[class] += 1;
+                crate::print_stdout(format_args!(
+                    "{id}: {} · 사전 검사에서 제외됨",
+                    import_refusal_label(class)
+                ))?
             }
             Err(error) => return Err(error),
         }
     }
-    Ok((included, skipped))
+    Ok((included, refused))
 }
 
 pub(crate) fn run(home: &Path, command: SessionsCommand) -> Result<()> {
@@ -904,10 +959,10 @@ pub(crate) fn run(home: &Path, command: SessionsCommand) -> Result<()> {
                 std::cmp::Reverse(catalog.chain(id).map(|c| c.len()).unwrap_or(0))
             });
             let bulk = all || ids.len() > 1;
-            let mut preflight_skipped = 0;
+            let mut preflight_refused = [0; 3];
             if apply {
                 crate::print_stdout(format_args!("가져오기 계획 · 대화 {}개", ids.len()))?;
-                (ids, preflight_skipped) =
+                (ids, preflight_refused) =
                     preview_imports(&store, &catalog, &ids, bulk, keep_source, clean_stale, all)?;
                 use crate::sessions_confirm::{self, Mode};
                 if !ids.is_empty() {
@@ -921,10 +976,8 @@ pub(crate) fn run(home: &Path, command: SessionsCommand) -> Result<()> {
                 }
             }
             let mut imported = 0;
-            let mut skipped = preflight_skipped;
-            let mut live = 0;
-            let mut diverged = 0;
-            let mut failed = 0;
+            let mut skipped = 0;
+            let [mut live, mut diverged, mut failed] = preflight_refused;
             for id in ids {
                 match import_one(
                     &store,
@@ -941,23 +994,13 @@ pub(crate) fn run(home: &Path, command: SessionsCommand) -> Result<()> {
                     Ok(true) => imported += 1,
                     Ok(false) => skipped += 1,
                     Err(error) if bulk => {
-                        let message = error.to_string();
-                        let outcome = if error.downcast_ref::<guard::LiveWriter>().is_some()
-                            || message
-                                == "최근에 사용한 대화입니다. 먼저 대화를 종료하고 120초 후 다시 시도하세요"
-                        {
-                            live += 1;
-                            "실행 중/최근 사용으로 건너뜀"
-                        } else if error.downcast_ref::<InventoryConflict>().is_some()
-                            || message.contains("분기")
-                            || message == "대상에 다른 대화 기록이 있습니다"
-                        {
-                            diverged += 1;
-                            "기록 분기로 건너뜀"
-                        } else {
-                            failed += 1;
-                            "실패 (원본과 journal을 확인하세요)"
-                        };
+                        let class = import_refusal_class(&error);
+                        match class {
+                            0 => live += 1,
+                            1 => diverged += 1,
+                            _ => failed += 1,
+                        }
+                        let outcome = import_refusal_label(class);
                         crate::print_stdout(format_args!("{id}: {outcome}"))?;
                     }
                     Err(error) => return Err(error),
@@ -1050,15 +1093,31 @@ fn import_one_using(
         keep_source,
         clean_stale,
     } = options;
-    let _admission = if apply {
-        Some(crate::sessions_admission::exclusive(
-            &[catalog.home.clone(), store.target.clone()],
-            id,
-        )?)
-    } else {
-        None
-    };
+    admission_check(&store.home, Some(id))?;
+    let initial_files = migration_files(catalog, id)?;
+    let fenced_ids: BTreeSet<_> = std::iter::once(id.to_owned())
+        .chain(
+            initial_files
+                .iter()
+                .flat_map(|f| [f.thread.clone(), f.physical.clone()]),
+        )
+        .collect();
+    let mut admission_guards = Vec::new();
+    for selected in &fenced_ids {
+        admission_check(&store.home, Some(selected))?;
+        if apply {
+            admission_guards.push(crate::sessions_admission::exclusive(
+                &[catalog.home.clone(), store.target.clone()],
+                selected,
+            )?);
+        }
+    }
     let _lock = if apply { Some(store.lock()?) } else { None };
+    // Recheck durable admission under exclusion/store lock. Include ancestors
+    // and physical aliases that sharing would make discoverable in Q.
+    for selected in &fenced_ids {
+        admission_check(&store.home, Some(selected))?;
+    }
     let mut journal = store.load()?;
     if let Some(entry) = journal.imports.get(id) {
         let names = entry
@@ -1087,6 +1146,15 @@ fn import_one_using(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
+    ensure!(
+        files
+            .iter()
+            .all(|f| fenced_ids.contains(&f.thread) && fenced_ids.contains(&f.physical)),
+        "대화 관계가 사전 검사 뒤 변경되었습니다"
+    );
+    let mut inventory_homes = vec![catalog.home.clone(), store.target.clone()];
+    inventory_homes.extend(store.search_homes.iter().cloned());
+    ensure_readable_inventory(&inventory_homes, &fenced_ids)?;
     let names: Vec<_> = files.iter().map(|f| f.path.clone()).collect();
     let (homes, names) = store.probes(&catalog.home, &threads, &names)?;
     let _guards = if apply {
@@ -1336,10 +1404,16 @@ fn unimport(store: &Store, id: &str, apply: bool, force: bool) -> Result<()> {
     homes.push(store.home.clone());
     homes.sort();
     homes.dedup();
-    let _guards = if apply {
-        guard::reserve_cleanup(&homes, &entry.threads, &names)?
-    } else {
-        guard::probe_cleanup(&homes, &entry.threads, &names)?
+    // Decoded imports may own compressed names. Journal identity authorizes
+    // unlink-only cleanup; this path does not publish or reinterpret headers.
+    let compressed_names = names
+        .iter()
+        .any(|p| p.extension().is_some_and(|ext| ext == "zst"));
+    let _guards = match (apply, compressed_names) {
+        (true, true) => guard::reserve_decoded(&homes, &entry.threads, &names)?,
+        (false, true) => guard::probe_decoded(&homes, &entry.threads, &names)?,
+        (true, false) => guard::reserve_cleanup(&homes, &entry.threads, &names)?,
+        (false, false) => guard::probe_cleanup(&homes, &entry.threads, &names)?,
     };
     for link in &entry.files {
         if link.target.exists() {
