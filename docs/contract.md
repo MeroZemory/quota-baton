@@ -56,6 +56,7 @@ These rules apply to the data port and the admin port alike.
      - Extension negotiation per leg follows [D12](decisions.md#d12).
    - `Host`, which the client library sets
    - `Authorization` and `x-api-key`, which carry the local client key
+   - `x-openai-actor-authorization`, including all duplicates and casing variants. D23's `qb-local` value is a local image-tool compatibility sentinel, never upstream authorization and never a substitute for C2 authentication.
    - `Origin` (rejected anyway, C2)
 2. Add the credential headers for the selected account.
 

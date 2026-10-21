@@ -1,6 +1,7 @@
 pub(crate) mod credentials;
 mod headers;
 mod hold;
+mod images;
 mod ledger;
 pub(crate) mod notices;
 mod outcome;
@@ -74,6 +75,8 @@ pub struct RelayState {
     observability: Arc<Observability>,
     pins: Arc<DebugPins>,
     tokens: TokenGates,
+    images: Mutex<images::ImageState>,
+    image_account_config: BTreeMap<String, crate::config::AccountConfig>,
     #[cfg(all(feature = "testkit", debug_assertions))]
     takeover_test_dependencies: Option<crate::accounts::takeover::Dependencies>,
     websocket: crate::config::WebsocketConfig,
@@ -487,6 +490,8 @@ impl RelayState {
             observability,
             pins,
             tokens,
+            images: Mutex::new(images::ImageState::default()),
+            image_account_config: config.accounts.clone(),
             #[cfg(all(feature = "testkit", debug_assertions))]
             takeover_test_dependencies: None,
             websocket: config.websocket.clone(),
@@ -1428,6 +1433,8 @@ async fn precommit_timeout<T>(
     }
 }
 async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Response {
+    let image_edit = images::matches(request.method(), request.uri().path())
+        .then(|| request.uri().path().ends_with("/edits"));
     let provider = if request.uri().path().starts_with("/v1/messages") {
         Provider::Claude
     } else {
@@ -1452,6 +1459,9 @@ async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Re
     precommit_timeout(timeout, committed, relay_inner(state, request))
         .await
         .unwrap_or_else(|| {
+            if let Some(edit) = image_edit {
+                return images::timeout(edit);
+            }
             native_error(
                 StatusCode::GATEWAY_TIMEOUT,
                 provider,
@@ -1509,6 +1519,9 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
             .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"))
     {
         return websocket::upgrade(state, request).await;
+    }
+    if images::matches(request.method(), request.uri().path()) {
+        return images::relay(state, request).await;
     }
     let (parts, body) = request.into_parts();
     let path = parts.uri.path();
