@@ -182,12 +182,15 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-22 08:05 | R11 복구 실패 분류 정정 (07:59 행) | grammar27·스키마1·import기한초과5 | 실패0 | 이전 기한초과0 기록은 오류; 원본 로그·정적 분류 JSON 보존, 시간 제한 유지 |
 | 2026-10-22 08:22 | R11 변경 코어 전체 기능 crate | 1213통과·0실패·4제외 | 실패0 | core-allfeatures-repair; 입력 aa13cf7d…, 981.7초 |
 | 2026-10-22 08:22 | R11 복구 fixture 두 번째 focused 실행 | 개별3/3, 병렬50통과·4실패 | 병렬54/54 | 문법·스키마 보완 통과; 4건 모두 초기 import20초 기한 초과, 기한 유지 |
+| 2026-10-22 08:24 | R11 실제 HWND 변경 상태 | 4/4 캡처·직접 시각 검수 통과 | 4/4 | detail/activity × light/dark; 실제1320×960 HDC, 별도WIC는 미집계 |
+| 2026-10-22 08:24 | R11 전체 기능 lint·빌드·읽기 전용 launch 점검 | 모두 exit0 | exit0 | independent-final; 실제journal 쓰기 없음 |
+| 2026-10-22 08:24 | R11 native 네 번째 시도 | 0/5, 첫 case 중단 | 5/5 | 계정 제목 확인; typed Daybreak request access missing, cleanup stopped·retained없음 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 행동 |
 |---|---|---|---|
-| R11 실행별 계정 | HTTP33·WS15, 코어591·트레이223·기본 clippy 통과 | native·최종 관문 통과 | CLI29·standalone705·전체 기능 코어1213 통과; 병렬 복구4건 추적, 실제 창·Codex 5경우 검증 |
+| R11 실행별 계정 | HTTP33·WS15, 코어591·트레이223·기본 clippy 통과 | native·최종 관문 통과 | 코어1213·CLI29·실제 창4·전체 clippy 통과; 병렬 복구4건·native Daybreak 증거 보완 |
 | 대시보드 지연 (R12.10) | 합성 실제 창 성능·최종 scoped gate 통과 | 실제 설치 확인 | 설계 세션이 설치하고 사용자 환경 확인 |
 | R13 소진 예측·아이콘·차트·캐시 보류 | 설계 완료, 병합 0/3 단위 | 3/3 단위 병합과 설치 | R11 뒤 B+B2+D, A, C+E 순서 |
 <!-- gaps:end -->

@@ -566,7 +566,83 @@ fn activity() -> Vec<ActivityEvent> {
     }
     events
 }
+
+// Opt-in synthetic capture input, never a product configuration or endpoint.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct R11PanelFixture {
+    accounts: Value,
+    detail: SessionDetail,
+    activity: Vec<ActivityEvent>,
+}
+fn r11_panel_fixture(state: u8) -> Option<R11PanelFixture> {
+    if !matches!(state, 3 | 4) {
+        return None;
+    }
+    let directory = std::env::var_os("R10_STATE_DIR")?;
+    let path = std::path::PathBuf::from(directory).join("r11-panel.json");
+    if !path
+        .try_exists()
+        .expect("synthetic panel fixture existence")
+    {
+        return None;
+    }
+    let sandbox = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.sandbox")
+        .canonicalize()
+        .unwrap();
+    assert!(
+        path.is_absolute(),
+        "isolated absolute capture directory required"
+    );
+    let path = path.canonicalize().unwrap();
+    assert!(
+        path.starts_with(sandbox),
+        "fixture must stay inside project sandbox"
+    );
+    let metadata = std::fs::metadata(&path).unwrap();
+    assert!(
+        metadata.is_file() && metadata.len() <= 32 * 1024,
+        "bounded synthetic fixture"
+    );
+    let fixture: R11PanelFixture = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(fixture.detail.session.id, SELECTED);
+    assert_eq!(fixture.detail.session.provider, "codex");
+    assert_eq!(fixture.detail.timeline.len(), 2);
+    assert_eq!(fixture.detail.timeline[0].kind, "placed");
+    assert_eq!(
+        fixture.detail.timeline[0].reason.as_deref(),
+        Some("launch_model")
+    );
+    assert!(fixture.detail.timeline[0].from.is_none());
+    assert!(fixture.detail.timeline[0].next_turn_cache.is_none());
+    assert_eq!(fixture.detail.timeline[1].kind, "move");
+    assert_eq!(
+        fixture.detail.timeline[1].reason.as_deref(),
+        Some("model_choice")
+    );
+    assert_eq!(fixture.detail.session.moves_today.len(), 1);
+    assert_eq!(fixture.activity.len(), 1);
+    assert_eq!(fixture.activity[0].kind, "move");
+    assert_eq!(
+        fixture.activity[0].data.reason.as_deref(),
+        Some("model_choice")
+    );
+    Some(fixture)
+}
+
 pub fn snapshot(state: u8) -> DashboardSnapshot {
+    if let Some(fixture) = r11_panel_fixture(state) {
+        let view = v2::project(&fixture.accounts.to_string(), clock().utc().into()).unwrap();
+        let mut snapshot = DashboardSnapshot::new(view);
+        snapshot.data_at = Some(clock().utc());
+        snapshot.revision = 11;
+        snapshot.sessions.now = Some(clock().utc());
+        snapshot.sessions.active_window_secs = Some(300);
+        snapshot.sessions.sessions = vec![fixture.detail.session];
+        snapshot.activity = fixture.activity;
+        return snapshot;
+    }
     let accounts = accounts(state);
     let view = v2::project(
         &json!({"version":"R10-synthetic","accounts":accounts,
@@ -662,6 +738,14 @@ pub fn snapshot(state: u8) -> DashboardSnapshot {
     s
 }
 pub fn detail(session: Session) -> SessionDetail {
+    if let Some(fixture) = std::env::var("R10_STATE")
+        .ok()
+        .and_then(|state| state.parse().ok())
+        .and_then(r11_panel_fixture)
+    {
+        assert_eq!(session.id, fixture.detail.session.id);
+        return fixture.detail;
+    }
     SessionDetail {
         session,
         original_short_id: Some("30f878".into()),
