@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: R11 (실행별 계정·모델 목록 마무리)
-목표: R11의 모델 배정과 실행 검증을 마무리한다
-핵심 지표: 새 경로 출시 1/2 · 전체 기능 코어1213·CLI29 통과; 복구50/54 보완 중
+현재 마일스톤: R11 (관문 완료·병합, 실제 설치는 설계 세션)
+목표: 실행별 계정·모델 목록을 출시하고 R13 첫 단위로 이어간다
+핵심 지표: 새 경로 출시 1/2 · R11 native5·HTTP33·WS15·복구54 통과, 설치 대기
 사용자 대기: 없음 (R2 Part B: CPA 종료·복원 작업만 보류)
-갱신: 2026-10-22 08:22 KST (병렬 import 기한 초과4건 단계 추적; 창·native 독립 검증)
+갱신: 2026-10-22 09:01 KST (R11 실제 캐시 잔존·동시 실행까지 통과, 관문 지문 결합 완료)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -98,6 +98,9 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-22 07:49 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | 모델 배정 표시 수정 전1실패→수정 후1통과; 전체 기능 실패 fixture 보완 중, 미출시 |
 | 2026-10-22 07:59 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | 단독 코어705·CLI29 통과; 복구 fixture33실패 원인 보완 중, 미출시 |
 | 2026-10-22 08:22 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | 전체 기능 코어1213·복구50/54; 병렬 지연4건 미해결, 미출시 |
+| 2026-10-22 08:34 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | 복구54/54 병렬4로 통과, native 미완료; 미출시 |
+| 2026-10-22 08:49 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R11 native 제목 보조 요청 형식 확인; 첫 종료 확인 실패, 미출시 |
+| 2026-10-22 09:01 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R11 관문 통과·self-merge; 실제 설치 전이므로 출시 수 유지 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -185,12 +188,25 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-22 08:24 | R11 실제 HWND 변경 상태 | 4/4 캡처·직접 시각 검수 통과 | 4/4 | detail/activity × light/dark; 실제1320×960 HDC, 별도WIC는 미집계 |
 | 2026-10-22 08:24 | R11 전체 기능 lint·빌드·읽기 전용 launch 점검 | 모두 exit0 | exit0 | independent-final; 실제journal 쓰기 없음 |
 | 2026-10-22 08:24 | R11 native 네 번째 시도 | 0/5, 첫 case 중단 | 5/5 | 계정 제목 확인; typed Daybreak request access missing, cleanup stopped·retained없음 |
+| 2026-10-22 08:34 | R11 원본 소스 복구 전체 target (동시4) | 54통과·0실패 | 54/54 | 20초 기한·assertions 유지; 입력 d6737f49…, 고병렬 기한초과는 별도 보존 |
+| 2026-10-22 08:34 | R11 임시 단계 추적 실행 | 첫54/54, 둘째53/54 | 원인 구간 확인 | 둘째 실패는 preview 약9초·targetrows17초 후 종료; 단일 정체 증거 없음, 소스 복원 확인 |
+| 2026-10-22 08:49 | R11 native 5·6·7·8차 | 1/5·1/5·1/5·1/5 완료 뒤 실패 | 5/5·종료·보안 검사 통과 | 5·6차 차단 CONNECT 분류, 7차 제목 schema, 8차 종료EOF 확인 실패; 모두 잔류home0 |
+| 2026-10-22 08:49 | R11 native 하네스 순수 경계 | 26+10 통과 | 전 검사 통과 | 관측한 title min1/max36 구분; 모든 CONNECT403, 실제 native 수용과 별도 |
+| 2026-10-22 09:01 | R11 native 종료 진단 | A1 종료0/reader완료, B 종료0/reader미완료 | 프로세스 종료와 snapshot 정리 확인 | ConPTY EOF 지연 확인; 같은6초 OS process handle 대기로 보완, pure16/16 |
+| 2026-10-22 09:01 | R11 native 9차 | 5/5 통과 | 5/5 | 제목·typed Daybreak·C8·strict이동·종료0·정리 통과, native 자체 디스크 캐시 생성 없음 |
+| 2026-10-22 09:01 | R11 외부 캐시 잔존 첫 실행 | 3/5 후 concurrentA 목록 불일치 | 5/5 | 오래된 관측과 배치mark 영향 가능, 제품 원인 미확정; 원본 보존 |
+| 2026-10-22 09:01 | R11 실제 사용량 조회 추가 첫 실행 | cold시작0/5, admin거부 | 5/5 | HTTP 상태 미보존으로 원인 미확정; cold 중복조회 제외·다음 응답상태 보존 |
+| 2026-10-22 09:01 | R11 외부 캐시 잔존 최종 native | 5/5 통과·제목5·종료0·snapshot5 | 5/5 | 실제 admin조회200 ×4, seeded 외부캐시; native 캐시 hit 주장은 안 함 |
+| 2026-10-22 09:01 | R11 최종 기본 workspace strict clippy | exit0 | exit0 | 최신 고정코드, 명령은workspace; runner기록digest범위core는 전체코드별도확인으로 보완 |
+| 2026-10-22 09:01 | R11 최종 하네스 순수·정적 경계 | 26+10+16 통과, 독립 정적 closeout | 전 검사 통과 | runtime5/5와 별도; source hash62eacf, 모든CONNECT403 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 행동 |
 |---|---|---|---|
-| R11 실행별 계정 | HTTP33·WS15, 코어591·트레이223·기본 clippy 통과 | native·최종 관문 통과 | 코어1213·CLI29·실제 창4·전체 clippy 통과; 병렬 복구4건·native Daybreak 증거 보완 |
+| R11 실행별 계정 설치 | 관문 통과·dev 병합, native5·HTTP33·WS15 | 실제 설치·사용자 환경 확인 | 설계 세션이 검수 후 설치 |
 | 대시보드 지연 (R12.10) | 합성 실제 창 성능·최종 scoped gate 통과 | 실제 설치 확인 | 설계 세션이 설치하고 사용자 환경 확인 |
-| R13 소진 예측·아이콘·차트·캐시 보류 | 설계 완료, 병합 0/3 단위 | 3/3 단위 병합과 설치 | R11 뒤 B+B2+D, A, C+E 순서 |
+| R13 소진 예측·아이콘·차트·캐시 보류 | 설계 완료, 병합 0/3 단위 | 3/3 단위 병합과 설치 | B+B2+D, A, C+E 순서로 구현 |
 <!-- gaps:end -->
+
+R11 Windows process/crash focused verification uses `cargo test -p quota-baton --all-features --test r9_crash --no-fail-fast -- --test-threads=4`. It still runs cases concurrently and preserves every in-case race, kill checkpoint, 20-second command deadline and five-second reap deadline. Default high-concurrency deadline failures and diagnostic traces remain cited; the bounded run is not a claim that the default-load timing issue was fixed. No product timing or ownership workaround was added.

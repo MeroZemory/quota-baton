@@ -69,7 +69,7 @@ The current plan, with lanes, owners and start commands, is the "Plan" section o
 | R12.9 | merged and INSTALLED (c899b6a, 10-22 01:02): outage follow-ups (credit hold fix kept, WS capacity spreading, release-hold, Q-owned CPA resume) |
 | R12.10 | merged (성능 조건·qb-tray scoped 관문 통과; `.sandbox/reports/R12.10.md`); 설치는 설계 세션 |
 | R13 | burn rate and projected exhaustion, dashboard icon, plain active count, rolling chart (D24), cache-lifetime hold (D25); brief `R13-burn-icon-hold.md`; after R11 and R12.10 |
-| R11 | launch-scoped account and per-account model catalog (D22, resolves O13: /daybreak through codex-qb); after R10; brief `R11-launch-account.md` |
+| R11 | merged (실제 native5/5·HTTP33·WS15·코어1213·복구54·창4, focused repair gate 통과). 실제 설치는 설계 세션. 보고서 `.sandbox/reports/R11.md` |
 | R8.1 | merged (round 2 39345fd, dev 6dbbfae); installed and verified live: the herdr pane title shows `codex-qb · quota-baton` from 1 s to 19 s, and a codex-qb exec request returned ok |
 
 ## Hard boundaries (never)
