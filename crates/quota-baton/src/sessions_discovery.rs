@@ -46,6 +46,18 @@ pub(crate) struct UnreadableRollout {
     pub reason: &'static str,
 }
 
+#[derive(Debug)]
+pub(crate) struct RelatedUnreadable {
+    id: String,
+    reason: &'static str,
+}
+impl std::fmt::Display for RelatedUnreadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.reason, self.id)
+    }
+}
+impl std::error::Error for RelatedUnreadable {}
+
 const HEADER_LIMIT: u64 = 4 * 1024 * 1024;
 const COMPRESSED_LIMIT: u64 = 8 * 1024 * 1024;
 const CACHE_HOME_LIMIT: usize = 64;
@@ -381,7 +393,11 @@ impl Catalog {
             if let Some(id) = &item.physical
                 && related.contains(id)
             {
-                bail!("{}: {}", item.reason, id);
+                return Err(RelatedUnreadable {
+                    id: id.clone(),
+                    reason: item.reason,
+                }
+                .into());
             }
         }
         Ok(())

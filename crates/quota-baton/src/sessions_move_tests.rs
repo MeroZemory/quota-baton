@@ -2126,3 +2126,124 @@ fn source_append_after_partial_alias_removal_keeps_cleared_goal_and_short_eviden
     assert!(short["files"][0]["modified_unix_ms"].is_number());
     Ok(())
 }
+
+#[test]
+fn manual_share_refuses_open_move_ids_and_borrowed_ancestors_before_publication() -> Result<()> {
+    for borrowed_ancestor in [false, true] {
+        let f = Fixture::new()?;
+        let witness = interrupt(&f, "staged", 2)?;
+        let selected = if borrowed_ancestor {
+            rollout(&f.source, CHILD, CHILD_PHYSICAL, Some(ROOT), Some(PHYSICAL))?;
+            CHILD
+        } else {
+            ROOT
+        };
+        let catalog = discovery::catalog(&f.source)?;
+        for apply in [false, true] {
+            let error = super::super::import_one(
+                &f.store,
+                &catalog,
+                selected,
+                ImportOptions {
+                    apply,
+                    skip_existing: false,
+                    announce: false,
+                    keep_source: true,
+                    clean_stale: false,
+                },
+            )
+            .expect_err("open move must fence manual sharing and its ancestors");
+            assert!(
+                error
+                    .to_string()
+                    .contains("이 대화는 이동 복구가 필요합니다")
+            );
+            assert!(!f.store.path().exists());
+            assert!(public_names(&f.store.target, ROOT)?.is_empty());
+            assert!(public_names(&f.store.target, CHILD)?.is_empty());
+            no_rows(&f.store.target)?;
+            assert!(open(&load(&f.store, ROOT)?.context("preserved move")?));
+        }
+        if borrowed_ancestor {
+            let child = discovery::catalog(&f.source)?.active(CHILD)?.path.clone();
+            fs::remove_file(child)?;
+        }
+        recover_twice(&f)?;
+        assert!(f.original.exists());
+        assert!(!witness.files[0].stage.exists());
+    }
+    Ok(())
+}
+
+/// Opt-in evidence aid. The default and full suites never read a real home.
+#[cfg(feature = "testkit")]
+#[test]
+#[ignore = "explicit R9.1 authorization and read-only source/output paths required"]
+fn r91_authorized_readonly_inventory() -> Result<()> {
+    let source = PathBuf::from(
+        std::env::var_os("QB_R91_READONLY_HOME").context("explicit source required")?,
+    );
+    ensure!(
+        source == Path::new("C:/Users/SampleUser/.codex"),
+        "authorized session inventory only"
+    );
+    let output = PathBuf::from(
+        std::env::var_os("QB_R91_READONLY_REPORT").context("explicit report required")?,
+    );
+    ensure!(
+        output.is_absolute() && output.components().any(|p| p.as_os_str() == ".sandbox"),
+        "project evidence only"
+    );
+    let mut f = Fixture::new()?;
+    f.source = fs::canonicalize(&source)?;
+    f.store.search_homes = super::super::known_homes(source.parent().context("source parent")?);
+    let _cache = discovery::read_only_cache();
+    let catalog = discovery::catalog(&source)?;
+    let mut movable = 0usize;
+    let mut refused = BTreeMap::<&str, usize>::new();
+    for id in catalog.threads.keys() {
+        match make_plan(&f.store, &source, &f.store.target, id, false, &source) {
+            Ok(_) => movable += 1,
+            Err(error) => {
+                let message = error.to_string();
+                let reason = if error.is::<super::super::InventoryConflict>() {
+                    "inventory_divergence"
+                } else if error.is::<guard::LiveWriter>() {
+                    "live_writer"
+                } else if message.contains("갈라진 대화") {
+                    "descendants"
+                } else if message.contains("조상 전용") {
+                    "ancestor_dependency"
+                } else if message.contains("120초") {
+                    "recent_use"
+                } else if message.contains("openai 제공자") {
+                    "different_provider"
+                } else if message.contains("압축") {
+                    "related_compressed_unreadable"
+                } else if message.contains("버전")
+                    || message.contains("마이그레이션")
+                    || message.contains("스키마")
+                {
+                    "metadata_schema"
+                } else {
+                    "other_preflight_refusal"
+                };
+                *refused.entry(reason).or_default() += 1;
+            }
+        }
+    }
+    let mut unreadable = BTreeMap::<&str, usize>::new();
+    for item in &catalog.unreadable {
+        *unreadable.entry(item.reason).or_default() += 1;
+    }
+    fs::write(
+        output,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "read_only":true,"credential_or_config_access":false,"content_retained":false,
+            "logical_ids":catalog.threads.len(),"compressed_names":catalog.compressed.len(),
+            "movable":movable,"refused_with_reason":refused,"unreadable_names_by_reason":unreadable,
+            "scope":"same production make_plan; synthetic destination/map/journal; no mutation engine invoked"
+        }))?,
+    )?;
+    Ok(())
+}
