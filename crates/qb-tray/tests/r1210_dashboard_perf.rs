@@ -21,13 +21,17 @@ use qb_tray::{
 use serde_json::{Value, json};
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, mpsc},
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 use windows::{
     Win32::{
         Foundation::{FILETIME, HWND, LPARAM, POINT, RECT, WPARAM},
-        Graphics::Gdi::ClientToScreen,
+        Graphics::Gdi::{ClientToScreen, UpdateWindow},
         System::{
             Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize},
             Threading::{GetCurrentProcess, GetProcessTimes},
@@ -97,7 +101,7 @@ fn latency_summary(samples: &[Value]) -> Value {
     let p50 = percentile(&mut values, 0.50);
     let p95 = percentile(&mut values, 0.95);
     json!({"n":values.len(),"p50":p50,"p95":p95,"max":max,
-        "includes_clock_due_samples":true,"kind":"input-to-observed-frame upper bound"})
+        "includes_clock_due_samples":true,"kind":"synchronous HWND input-to-production-paint upper bound; no OS queue latency"})
 }
 fn cause_counts(frames: &[Value]) -> Value {
     let mut counts = std::collections::BTreeMap::<String, usize>::new();
@@ -114,18 +118,32 @@ fn independent_rebuild(frame: &Value) -> bool {
     )
 }
 
-struct FakeBridge(mpsc::SyncSender<Event>);
+struct FakeBridge {
+    sender: mpsc::SyncSender<Event>,
+    fault: Arc<AtomicU8>,
+}
 impl Bridge for FakeBridge {
     fn enqueue(&self, event: Event) {
-        self.0
-            .try_send(event)
-            .expect("performance bridge overflow/disconnect");
+        let code = match self.sender.try_send(event) {
+            Ok(()) => return,
+            Err(mpsc::TrySendError::Full(_)) => 1,
+            Err(mpsc::TrySendError::Disconnected(_)) => 2,
+        };
+        // Called from WndProc: record failure without unwinding across the ABI.
+        let _ = self
+            .fault
+            .compare_exchange(0, code, Ordering::Relaxed, Ordering::Relaxed);
     }
 }
-struct Cleanup;
+struct Cleanup {
+    cursor: POINT,
+}
 impl Drop for Cleanup {
     fn drop(&mut self) {
         let _ = dashboard_window::close_now_on_ui_thread();
+        unsafe {
+            let _ = SetCursorPos(self.cursor.x, self.cursor.y);
+        }
         unsafe {
             CoUninitialize();
         }
@@ -137,9 +155,15 @@ struct Run {
     started: Instant,
     deadline: Instant,
     read_commands: Vec<String>,
+    bridge_fault: Arc<AtomicU8>,
 }
 impl Run {
     fn service(&mut self) -> Result<()> {
+        match self.bridge_fault.load(Ordering::Relaxed) {
+            0 => {}
+            1 => anyhow::bail!("performance bridge overflow"),
+            _ => anyhow::bail!("performance bridge disconnected"),
+        }
         while let Ok(event) = self.inbox.try_recv() {
             match event {
                 Event::Opened { port } => self.port = Some(port),
@@ -221,6 +245,11 @@ impl Run {
         action: impl FnOnce() -> Result<()>,
     ) -> Result<Value> {
         self.dispatch()?;
+        // Complete any pending production paint before admitting this input.
+        // This is outside latency timing; no measured slow frame is discarded.
+        unsafe {
+            let _ = UpdateWindow(hwnd);
+        }
         let _ = dashboard_window::perf_take_frames(hwnd);
         let before_seq = dashboard_window::perf_input_seq(hwnd);
         let started = Instant::now();
@@ -230,30 +259,28 @@ impl Run {
             input_seq > before_seq,
             "injection did not advance Host input sequence"
         );
-        let until = started + Duration::from_secs(5);
-        let mut observed = Vec::new();
-        loop {
-            self.dispatch()?;
-            let frames = dashboard_window::perf_take_frames(hwnd);
-            let matched = frames
-                .iter()
-                .position(|f| f.input_seq == input_seq && expected.matches(f));
-            let matched_index = matched.map(|index| observed.len() + index);
-            observed.extend(frames);
-            if let Some(index) = matched_index {
-                // Stop before serialization; keep every observed frame and every
-                // latency, including matching frames rebuilt by timer/clock mail.
-                let observed_us = started.elapsed().as_micros() as u64;
-                return Ok(json!({"input_seq_before":before_seq,"input_seq":input_seq,
-                    "expected_state":expected.description(),"matched_frame_index":index,
-                    "input_to_observed_frame_us":observed_us,"frames":observed}));
-            }
-            ensure!(
-                Instant::now() < until,
-                "no input-sequence/state-correlated frame within five seconds"
-            );
-            self.wait_message(until);
+        // Paint the production HWND immediately after the synchronous input.
+        // No queued desktop input may supersede this action before its frame.
+        // This measures the real Host paint, not OS input-queue latency.
+        unsafe {
+            let _ = UpdateWindow(hwnd);
         }
+        let observed = dashboard_window::perf_take_frames(hwnd);
+        let observed_us = started.elapsed().as_micros() as u64;
+        let matched = observed
+            .iter()
+            .position(|f| f.input_seq >= input_seq && expected.matches(f));
+        ensure!(
+            matched.is_some(),
+            "no synchronous correlated frame; expected={} injected_seq={} observed={}",
+            expected.description(),
+            input_seq,
+            serde_json::to_value(&observed)?
+        );
+        // Keep all frames and slow samples. No retries or latency filtering.
+        Ok(json!({"input_seq_before":before_seq,"input_seq":input_seq,
+            "expected_state":expected.description(),"matched_frame_index":matched.unwrap(),
+            "input_to_observed_frame_us":observed_us,"frames":observed}))
     }
 }
 
@@ -307,9 +334,12 @@ fn point(scene: &Scene, target: &Target) -> Result<[i32; 2]> {
 fn packed(x: i32, y: i32) -> LPARAM {
     LPARAM((((y as u32 & 0xffff) << 16) | (x as u32 & 0xffff)) as isize)
 }
-fn move_to(hwnd: HWND, p: [i32; 2]) {
+fn move_to(hwnd: HWND, p: [i32; 2]) -> Result<()> {
     let p = pixels(hwnd, p);
     unsafe {
+        // Inject the actual window message without moving the user's cursor.
+        // sample() completes the production paint before queued mouse-leave or
+        // external input can supersede it. Natural queue latency is out of scope.
         SendMessageW(
             hwnd,
             WM_MOUSEMOVE,
@@ -317,6 +347,7 @@ fn move_to(hwnd: HWND, p: [i32; 2]) {
             Some(packed(p[0], p[1])),
         );
     }
+    Ok(())
 }
 fn pixels(hwnd: HWND, p: [i32; 2]) -> [i32; 2] {
     let scale = unsafe { GetDpiForWindow(hwnd) } as f32 / 96.;
@@ -326,7 +357,7 @@ fn pixels(hwnd: HWND, p: [i32; 2]) -> [i32; 2] {
     ]
 }
 fn click(hwnd: HWND, p: [i32; 2]) -> Result<()> {
-    move_to(hwnd, p);
+    move_to(hwnd, p)?;
     let p = pixels(hwnd, p);
     unsafe {
         SendMessageW(
@@ -441,6 +472,10 @@ fn measure(output: &Path, report: &mut Value) -> Result<()> {
     report["fixture"] = fixture::manifest(&bytes);
     std::fs::write(output.join("fixture.json"), &bytes)?;
     let snapshot = Arc::new(fixture::snapshot(&raw));
+    let mut cursor = POINT::default();
+    unsafe {
+        GetCursorPos(&mut cursor)?;
+    }
     unsafe {
         ensure!(
             !SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2).is_invalid(),
@@ -448,8 +483,8 @@ fn measure(output: &Path, report: &mut Value) -> Result<()> {
         );
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
     }
-    let _cleanup = Cleanup;
     let (send, inbox) = mpsc::sync_channel(256);
+    let bridge_fault = Arc::new(AtomicU8::new(0));
     let started = Instant::now();
     let mut run = Run {
         inbox,
@@ -457,10 +492,18 @@ fn measure(output: &Path, report: &mut Value) -> Result<()> {
         started,
         deadline: started + Duration::from_secs(600),
         read_commands: vec![],
+        bridge_fault: bridge_fault.clone(),
     };
+    // Locals drop in reverse declaration order. Close the HWND while Run still
+    // owns the receiver: shutdown synchronously enqueues GeometryDirty/Closed,
+    // including when a measurement returns early with an error.
+    let _cleanup = Cleanup { cursor };
     dashboard_window::open_or_focus(
         HWND::default(),
-        Arc::new(FakeBridge(send)),
+        Arc::new(FakeBridge {
+            sender: send,
+            fault: bridge_fault,
+        }),
         snapshot,
         fixture::clock(),
         false,
@@ -549,7 +592,7 @@ fn measure(output: &Path, report: &mut Value) -> Result<()> {
             target: format!("{target:?}"),
         };
         let mut sample = run.sample(hwnd, expected, || {
-            move_to(hwnd, p);
+            move_to(hwnd, p)?;
             Ok(())
         })?;
         sample["index"] = json!(i);
@@ -704,6 +747,9 @@ fn measure(output: &Path, report: &mut Value) -> Result<()> {
         "fixed acceptance thresholds failed"
     );
     drop(_cleanup);
+    // Surface a shutdown callback failure only on the success path. An earlier
+    // measurement error returns unchanged while Cleanup runs without panicking.
+    run.service()?;
     ensure!(
         !unsafe { IsWindow(Some(hwnd)) }.as_bool(),
         "owned HWND survived cleanup"
@@ -734,11 +780,12 @@ fn r1210_dashboard_perf() {
         "use a fresh output directory"
     );
     let mut report = json!({"schema":2,"status":"running","profile":"release",
-        "workload":"r1210-perf-v1","measurement":"r1210-correlated-v2","idle_seconds":30,"actions_per_kind":100,
-        "input_latency_kind":"input-to-observed-correlated-frame upper bound; includes drain/wakeup overhead",
+        "workload":"r1210-perf-v1","measurement":"r1210-sync-production-paint-v3","idle_seconds":30,"actions_per_kind":100,
+        "input_latency_kind":"synchronous HWND input through UpdateWindow production paint; excludes OS input queue latency",
         "marker_encoding":{"tab_hover":"Host Debug strings","offsets":["Table","Side","Events","Usage"]},
         "cause_limit":"Host v2 uses timer/mail/state; raw labels retained. During timed actions this harness publishes only clock mail, never snapshot/detail/theme mail.",
         "scope_limits":["single light desktop viewport; no physical display completion timestamp",
+            "synchronous injected HWND messages; not an end-to-end physical mouse latency measurement",
             "cold first scene reported separately; threshold uses warm full rebuilds",
             "timer no-visible-label-change rebuild regression needs controlled clock test"]});
     let result = measure(&output, &mut report);
