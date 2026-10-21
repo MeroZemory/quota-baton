@@ -63,7 +63,7 @@ Implement quota-baton exactly as specified, milestone by milestone, until M8 is 
 | R8.4 | merged (`922a1f1`; scoped gate 256 pass, 7 explicit live tests excluded; strict qb-tray clippy and fmt, actual light/dark overview/exhausted HWND captures; Sol max closeout PASS). Report: `.sandbox/reports/R8.4.md` |
 | R9 | merged (dev 11851c2). Merge review INSTALL-AFTER-FIXES → R9.1 before install |
 | R9.1 | merged (fd7a8dc), but the live install was ROLLED BACK: every codex-qb launch failed on the real profile → R9.2 |
-| R9.2 | URGENT: accept R3-era wiring journals (no install_completed), real-profile read-only check before install-ready, wire upgrade tolerating Codex config.toml rewrites; before R10; brief `R9.2-live-install-blocker.md` |
+| R9.2 | merged (product `96ac9b2`; full gate default 1661, full 1743, standalone core 568; strict clippy passed). Released schema-3 wiring compatibility and content merge for client-rewritten config; read-only real-journal check passed without mutation. Report: `.sandbox/reports/R9.2.md`; actual install remains with the design session |
 | R10 | dashboard v2 + chip-limit colour in the dashboard and tray (user-approved, O1=A); O2 duplicate quota_reached; O3 default labels; after R9; brief `R10-dashboard-v2.md` |
 | R11 | launch-scoped account and per-account model catalog (D22, resolves O13: /daybreak through codex-qb); after R10; brief `R11-launch-account.md` |
 | R8.1 | merged (round 2 39345fd, dev 6dbbfae); installed and verified live: the herdr pane title shows `codex-qb · quota-baton` from 1 s to 19 s, and a codex-qb exec request returned ok |
