@@ -8,6 +8,8 @@ macro_rules! println_utf8 {
 
 mod accounts_cli;
 mod cutover;
+mod image_canary;
+mod image_launch;
 mod launcher_label;
 mod launcher_script;
 mod routing_cli;
@@ -190,6 +192,12 @@ async fn main() {
 }
 
 fn friendly_error(error: &anyhow::Error) -> String {
+    if let Some(message) = image_canary::friendly_error(error) {
+        return message;
+    }
+    if let Some(message) = image_launch::friendly_error(error) {
+        return message;
+    }
     if let Some(message) = sessions_admission::friendly_error(error) {
         return message;
     }
@@ -390,6 +398,32 @@ async fn run() -> anyhow::Result<()> {
         let command = command
             .as_deref()
             .expect("clap requires --command without --check");
+        let (images, native_args) = image_launch::split(args);
+        if images {
+            anyhow::ensure!(
+                matches!(client, launcher_label::Client::Codex),
+                "--images는 codex-qb에서만 사용할 수 있습니다"
+            );
+            let home = qb_core::home()?;
+            image_launch::validate_args(native_args)?;
+            let image = image_launch::ImageLaunch::load(&home)?;
+            let id = sessions::resume_uuid(native_args)?;
+            sessions::admission_check(&home, id.as_deref())?;
+            sessions_admission::preflight_images(native_args, command, &image)?;
+            image_canary::check(command, &home).await?;
+            let (permit, child_args) =
+                sessions_admission::prepare_images(native_args, command, &image)?;
+            sessions::admission_check(&home, id.as_deref())?;
+            let status = launcher_label::run_with_environment(
+                *client,
+                command,
+                settings.as_deref(),
+                &child_args,
+                &image.environment(),
+            );
+            drop(permit);
+            std::process::exit(status?);
+        }
         let (permit, child_args) = if matches!(client, launcher_label::Client::Codex) {
             let home = qb_core::home()?;
             sessions::admission_check(&home, sessions::resume_uuid(args)?.as_deref())?;
