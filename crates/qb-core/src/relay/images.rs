@@ -3,6 +3,7 @@ use super::*;
 use axum::body::Body;
 use futures_util::StreamExt;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 #[derive(Default)]
 pub(super) struct ImageState {
@@ -11,9 +12,50 @@ pub(super) struct ImageState {
 }
 
 struct ImageHealth {
-    token: crate::accounts::TokenMeta,
+    generation: u64,
+    credential: [u8; 32],
     exhausted: Option<chrono::DateTime<chrono::Utc>>,
     incapable: bool,
+}
+
+impl ImageState {
+    fn observe(&mut self, id: &str, generation: u64, credential: [u8; 32]) -> &mut ImageHealth {
+        let health = self.accounts.entry(id.into()).or_insert(ImageHealth {
+            generation,
+            credential,
+            exhausted: None,
+            incapable: false,
+        });
+        if generation >= health.generation {
+            if health.credential != credential {
+                health.credential = credential;
+                health.incapable = false;
+            }
+            health.generation = generation;
+        }
+        health
+    }
+
+    fn failure(
+        &mut self,
+        id: &str,
+        generation: u64,
+        credential: [u8; 32],
+        auth: bool,
+        reset: Option<chrono::DateTime<chrono::Utc>>,
+    ) {
+        let health = self.observe(id, generation, credential);
+        if health.credential == credential {
+            health.incapable |= auth;
+        }
+        if let Some(at) = reset {
+            health.exhausted = Some(health.exhausted.map_or(at, |old| old.max(at)));
+        }
+    }
+}
+
+fn credential_key(tokens: &crate::accounts::Tokens) -> [u8; 32] {
+    Sha256::digest(tokens.access_token.as_bytes()).into()
 }
 
 pub(super) fn matches(method: &Method, path: &str) -> bool {
@@ -21,20 +63,68 @@ pub(super) fn matches(method: &Method, path: &str) -> bool {
 }
 
 fn eligible(a: &Account) -> bool {
+    let now = chrono::Utc::now();
     a.provider == Provider::Codex
         && a.user_state == UserState::Active
         && !a.drain
-        && !matches!(a.health, Health::NeedsRelogin { .. })
+        && a.payment_until.is_none_or(|until| until <= now)
+        && (matches!(
+            a.health,
+            Health::Cooling {
+                reason: crate::accounts::HealthReason::Quota,
+                ..
+            }
+        ) || a.eligible_at(Some("gpt-image-2"), now))
         && !a.token_meta.refresh_uncertain
-        && a.token_meta
-            .expires_at
-            .is_none_or(|at| at > chrono::Utc::now())
+        && a.token_meta.expires_at.is_none_or(|at| at > now)
         && a.plan.as_deref().is_some_and(|p| {
             matches!(
                 p,
                 "plus" | "pro" | "team" | "business" | "enterprise" | "edu" | "go"
             )
         })
+}
+
+enum EditAdmission {
+    TooLarge,
+    Memory,
+}
+
+// Charge capacity growth, not incoming frame count. Geometric growth bounds
+// reservation records to O(log(cap)); 128 extra bytes charge each record and
+// its vector slot. Four capacity copies cover inspection and parser storage.
+fn extend_edit(
+    raw: &mut Vec<u8>,
+    reservations: &mut Vec<crate::guard::Reservation>,
+    chunk: &[u8],
+    cap: usize,
+    budget: &Arc<crate::guard::InflightBudget>,
+) -> Result<(), EditAdmission> {
+    if chunk.is_empty() {
+        return Ok(());
+    }
+    let needed = raw
+        .len()
+        .checked_add(chunk.len())
+        .filter(|n| *n <= cap)
+        .ok_or(EditAdmission::TooLarge)?;
+    if needed > raw.capacity() {
+        let capacity = needed
+            .max(4096)
+            .checked_next_power_of_two()
+            .unwrap_or(cap)
+            .min(cap);
+        let charge = capacity
+            .saturating_sub(raw.capacity())
+            .saturating_mul(4)
+            .saturating_add(128);
+        let reservation = budget.try_reserve(charge).ok_or(EditAdmission::Memory)?;
+        raw.try_reserve_exact(capacity - raw.len())
+            .map_err(|_| EditAdmission::Memory)?;
+        reservations.push(reservation);
+    }
+    raw.extend_from_slice(chunk);
+    Ok(())
 }
 
 fn error(completion: &mut Completion, edit: bool, status: StatusCode, reason: &str) -> Response {
@@ -458,24 +548,21 @@ pub(super) async fn relay(state: Arc<RelayState>, request: Request) -> Response 
                     "body_uninspectable",
                 );
             };
-            if chunk.len() > state.retain_cap.saturating_sub(raw.len()) {
-                return error(
-                    &mut completion,
-                    edit,
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "body_uninspectable",
-                );
+            if let Err(reason) = extend_edit(
+                &mut raw,
+                &mut inspection_reservations,
+                &chunk,
+                state.retain_cap,
+                &state.budget,
+            ) {
+                let (status, code) = match reason {
+                    EditAdmission::TooLarge => {
+                        (StatusCode::PAYLOAD_TOO_LARGE, "body_uninspectable")
+                    }
+                    EditAdmission::Memory => (StatusCode::SERVICE_UNAVAILABLE, "memory_guard"),
+                };
+                return error(&mut completion, edit, status, code);
             }
-            let Some(reservation) = state.budget.try_reserve(chunk.len().saturating_mul(4)) else {
-                return error(
-                    &mut completion,
-                    edit,
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "memory_guard",
-                );
-            };
-            inspection_reservations.push(reservation);
-            raw.extend_from_slice(&chunk);
         }
         let local = if content_type
             .split(';')
@@ -542,7 +629,7 @@ pub(super) async fn relay(state: Arc<RelayState>, request: Request) -> Response 
                         return None;
                     }
                     let tokens = store.tokens_unlocked(&a).ok()?;
-                    (!tokens.access_token.is_empty()).then_some(a)
+                    (!tokens.access_token.is_empty()).then(|| (a, credential_key(&tokens)))
                 })
                 .collect::<Vec<_>>(),
         ))
@@ -559,7 +646,7 @@ pub(super) async fn relay(state: Arc<RelayState>, request: Request) -> Response 
     // Unset protects all Pro accounts conservatively; explicit false opts out.
     // Last-resort priority is stronger than affinity, without account-name rules.
     // The bound account is preferred among accounts in the same priority tier.
-    candidates.sort_by_key(|a| {
+    candidates.sort_by_key(|(a, _)| {
         (
             state
                 .image_account_config
@@ -575,11 +662,11 @@ pub(super) async fn relay(state: Arc<RelayState>, request: Request) -> Response 
     {
         let mut health = state.images.lock().unwrap_or_else(|e| e.into_inner());
         health.accounts.retain(|id, _| known.contains(id));
-        candidates.retain(|a| {
+        candidates.retain(|(a, credential)| {
             let Some(h) = health.accounts.get(&a.id) else {
                 return true;
             };
-            if h.incapable && h.token == a.token_meta {
+            if h.incapable && h.credential == *credential {
                 incapable = true;
                 return false;
             }
@@ -614,7 +701,7 @@ pub(super) async fn relay(state: Arc<RelayState>, request: Request) -> Response 
     }
     let count = candidates.len();
     let mut pending_quota = None;
-    for (index, snapshot) in candidates.into_iter().enumerate() {
+    for (index, (snapshot, _)) in candidates.into_iter().enumerate() {
         // No await occurs between this transaction result and request dispatch.
         // Reload settings, health and tokens after every prior quota response.
         let (account, tokens) = match current_account(&state, snapshot.id).await {
@@ -622,11 +709,11 @@ pub(super) async fn relay(state: Arc<RelayState>, request: Request) -> Response 
             Ok(None) | Err(()) => continue,
         };
         {
-            let health = state.images.lock().unwrap_or_else(|e| e.into_inner());
-            if health.accounts.get(&account.id).is_some_and(|h| {
-                (h.incapable && h.token == account.token_meta)
-                    || h.exhausted.is_some_and(|at| at > chrono::Utc::now())
-            }) {
+            let mut health = state.images.lock().unwrap_or_else(|e| e.into_inner());
+            let h = health.observe(&account.id, account.generation, credential_key(&tokens));
+            if (h.incapable && h.credential == credential_key(&tokens))
+                || h.exhausted.is_some_and(|at| at > chrono::Utc::now())
+            {
                 continue;
             }
         }
@@ -681,12 +768,19 @@ pub(super) async fn relay(state: Arc<RelayState>, request: Request) -> Response 
             Duration::from_secs(2),
         )
         .await;
+        // Incomplete/opaque errors cannot establish absence of moderation.
+        // Preserve their bytes and never replay the prompt across accounts.
+        let quota_code = quota_evidence(&response_headers, &held.prefix);
+        let classified = (held.complete || quota_code)
+            && held.terminal.is_none()
+            && hold::decoded_side(&original_headers, &held.prefix).is_some_and(|bytes| {
+                bytes.is_empty() || serde_json::from_slice::<serde::de::IgnoredAny>(&bytes).is_ok()
+            });
         let is_moderation = moderation(&response_headers, &held.prefix);
-        let quota = !is_moderation
-            && (status == StatusCode::TOO_MANY_REQUESTS
-                || quota_evidence(&response_headers, &held.prefix));
+        let quota =
+            classified && !is_moderation && (status == StatusCode::TOO_MANY_REQUESTS || quota_code);
         let auth = matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN);
-        let reason = if is_moderation {
+        let reason = if !classified || is_moderation {
             None
         } else if auth {
             Some("auth_rejected")
@@ -706,14 +800,12 @@ pub(super) async fn relay(state: Arc<RelayState>, request: Request) -> Response 
                 .images
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .accounts
-                .insert(
-                    account.id.clone(),
-                    ImageHealth {
-                        token: account.token_meta.clone(),
-                        exhausted: at,
-                        incapable: auth,
-                    },
+                .failure(
+                    &account.id,
+                    account.generation,
+                    credential_key(&tokens),
+                    auth,
+                    at,
                 );
             if let Some(at) = at {
                 retry_after(&mut response_headers, at);
@@ -916,6 +1008,65 @@ fn retry_after(headers: &mut HeaderMap, at: chrono::DateTime<chrono::Utc>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fragmented_edit_admission_has_logarithmic_records_and_returns_all_budget() {
+        let cap = 1024 * 1024;
+        let budget = crate::guard::InflightBudget::new(cap * 5);
+        let mut raw = Vec::new();
+        let mut reservations = Vec::new();
+        for _ in 0..cap {
+            assert!(extend_edit(&mut raw, &mut reservations, b"x", cap, &budget).is_ok());
+            assert!(extend_edit(&mut raw, &mut reservations, b"", cap, &budget).is_ok());
+        }
+        assert_eq!(raw.len(), cap);
+        assert_eq!(reservations.len(), 9);
+        assert_eq!(budget.used(), cap * 4 + 128 * 9);
+        assert!(matches!(
+            extend_edit(&mut raw, &mut reservations, b"x", cap, &budget),
+            Err(EditAdmission::TooLarge)
+        ));
+        drop(raw);
+        drop(reservations);
+        assert_eq!(budget.used(), 0);
+        let small = crate::guard::InflightBudget::new(4096 * 4);
+        assert!(matches!(
+            extend_edit(&mut Vec::new(), &mut Vec::new(), b"x", cap, &small),
+            Err(EditAdmission::Memory)
+        ));
+        assert_eq!(small.used(), 0);
+    }
+
+    #[test]
+    fn concurrent_restrictions_merge_and_old_credential_failures_cannot_replace_newer_evidence() {
+        let mut state = ImageState::default();
+        let soon = chrono::Utc::now() + chrono::Duration::seconds(1);
+        let later = soon + chrono::Duration::hours(1);
+        state.failure("a", 1, [1; 32], true, None);
+        state.failure("a", 1, [1; 32], false, Some(later));
+        state.failure("a", 1, [1; 32], false, Some(soon));
+        let h = state.observe("a", 2, [1; 32]);
+        assert!(
+            h.incapable,
+            "metadata changes do not pardon the same credential"
+        );
+        assert_eq!(h.exhausted, Some(later));
+        assert!(!state.observe("a", 3, [2; 32]).incapable);
+        state.failure("a", 1, [1; 32], true, None);
+        let h = state.observe("a", 3, [2; 32]);
+        assert!(
+            !h.incapable,
+            "a late old-token rejection cannot poison the replacement"
+        );
+        assert_eq!(
+            h.exhausted,
+            Some(later),
+            "quota is account-wide across credentials"
+        );
+        state.failure("a", 3, [2; 32], true, None);
+        state.failure("a", 1, [1; 32], false, Some(soon));
+        assert!(state.observe("a", 3, [2; 32]).incapable);
+    }
 
     #[test]
     fn model_receipts_use_actual_metadata_without_opaque_fallback() {

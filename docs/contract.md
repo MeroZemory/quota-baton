@@ -100,8 +100,9 @@ These rules apply to the data port and the admin port alike.
 | E2 | Withdrawn (2026-10-13) | Strip foreign Codex reasoning items | In the tested V2 HTTP cases, the request completed with token counts consistent with the items being ignored. Genuine Codex replays them verbatim, too. This is not a universal compatibility guarantee. |
 | E3 | Withdrawn (2026-10-13) | Strip foreign Claude thinking blocks | Tested V2 HTTP cases completed, including inside a tool-use turn. Stripping is itself a history edit, which preserved-thinking models may reject. Acceptance and preservation remain model/path dependent. |
 | E2r | Withdrawn (2026-10-13) | Strip and retry after a foreign-content rejection | The tested V2 cases did not establish a need for this rewrite. They do not prove foreign-content rejection impossible. Compaction cannot generally be stripped to recover missing history; sticky bindings reduce moves but cannot guarantee remaining on the minting account. |
+| E4 | Accepted under D23 (2026-10-21) | The image routes generate operation-specific OpenAI-shaped local errors for conclusively classified authentication, quota and unsupported-endpoint failures. They preserve request bytes, successful responses, moderation errors and unclassified/incompletely inspected errors. | D23's approved error taxonomy; r12_images classified-failure, moderation pass-through and incomplete-error regressions. |
 
-The register is empty. Encrypted and signed conversation items are relayed exactly as the client sent them, which is what the genuine clients themselves do ([D10](decisions.md#d10)). This preserves pass-through correctness; it does not certify cross-account resumption, cache reuse or preserved reasoning.
+There are no conversation-payload exceptions. Encrypted and signed conversation items are relayed exactly as the client sent them, which is what the genuine clients themselves do ([D10](decisions.md#d10)). This preserves pass-through correctness; it does not certify cross-account resumption, cache reuse or preserved reasoning.
 
 ## C5. Account state
 

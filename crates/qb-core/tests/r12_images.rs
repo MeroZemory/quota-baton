@@ -2,7 +2,7 @@
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use bytes::Bytes;
 use qb_core::{
-    accounts::{AccountStore, Health, Provider, UserState, import},
+    accounts::{AccountStore, Health, HealthReason, Provider, UserState, import},
     config::Config,
     debug_pin::DebugPins,
     http::{self, RunningServers},
@@ -245,6 +245,54 @@ impl Harness {
                     .collect::<Vec<_>>()
             })
             .collect()
+    }
+
+    async fn wait_requests(&self, count: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while self.fake.state.requests().len() < count {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("synthetic upstream did not observe expected dispatches");
+        assert_eq!(self.fake.state.requests().len(), count);
+    }
+
+    fn safety_hold(&self, id: &str, reason: Option<HealthReason>, payment: bool) {
+        let until = chrono::Utc::now() + chrono::Duration::hours(6);
+        self.store
+            .update_metadata(id, |a| {
+                a.health = reason.map_or(Health::Ready, |reason| Health::Cooling {
+                    reason,
+                    until,
+                    scope: "account".into(),
+                });
+                a.payment_until = payment.then_some(until);
+            })
+            .unwrap();
+    }
+
+    fn replace_token(&self, id: &str) {
+        let mut account = self.store.load(id).unwrap();
+        let mut tokens = self.store.tokens(&account).unwrap();
+        let generation = account.generation;
+        tokens.access_token = "synthetic-current-generation-access".into();
+        account.token_meta.last_refresh_at = Some(
+            account
+                .token_meta
+                .last_refresh_at
+                .expect("synthetic fixture refresh timestamp")
+                + chrono::Duration::seconds(1),
+        );
+        let updated = self
+            .store
+            .save(&account, &tokens, Some(generation))
+            .unwrap();
+        assert!(updated.generation > generation);
+        assert_eq!(
+            self.store.tokens(&updated).unwrap().access_token,
+            "synthetic-current-generation-access"
+        );
     }
 }
 
@@ -564,49 +612,54 @@ async fn transport_failure_is_operation_specific_without_retry_or_token_changes(
 
 #[tokio::test]
 async fn explicit_quota_body_rotates_once_and_known_reset_is_honored() {
-    let h = Harness::new(&[Some("plus"), Some("pro")], false).await;
-    let mut quota = ScriptedResponse::json(
-        StatusCode::BAD_REQUEST,
-        "{\"error\":{\"code\":\"insufficient_quota\"}}",
-    );
-    quota.headers.insert(
-        "x-ratelimit-reset",
-        (chrono::Utc::now() + chrono::Duration::hours(48))
-            .timestamp()
-            .to_string()
-            .parse()
-            .unwrap(),
-    );
-    h.fake.state.push(quota);
-    h.fake
-        .state
-        .push(ScriptedResponse::json(StatusCode::OK, "{}"));
-    assert_eq!(
+    for status in [StatusCode::BAD_REQUEST, StatusCode::OK] {
+        let h = Harness::new(&[Some("plus"), Some("pro")], false).await;
+        let mut quota =
+            ScriptedResponse::json(status, "{\"error\":{\"code\":\"insufficient_quota\"}}");
+        quota.headers.insert(
+            "x-ratelimit-reset",
+            (chrono::Utc::now() + chrono::Duration::hours(48))
+                .timestamp()
+                .to_string()
+                .parse()
+                .unwrap(),
+        );
+        h.fake.state.push(quota);
+        h.fake
+            .state
+            .push(ScriptedResponse::json(StatusCode::OK, "{}"));
+        assert_eq!(
+            h.request(GENERATE, "{}")
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+            "{}"
+        );
+        let attempts = h.fake.state.requests();
+        assert_eq!(attempts.len(), 2);
+        assert_ne!(
+            attempts[0].headers["authorization"],
+            attempts[1].headers["authorization"]
+        );
+        h.fake
+            .state
+            .push(ScriptedResponse::json(StatusCode::OK, "{}"));
         h.request(GENERATE, "{}")
             .send()
             .await
             .unwrap()
-            .text()
+            .bytes()
             .await
-            .unwrap(),
-        "{}"
-    );
-    assert_eq!(h.fake.state.requests().len(), 2);
-    h.fake
-        .state
-        .push(ScriptedResponse::json(StatusCode::OK, "{}"));
-    h.request(GENERATE, "{}")
-        .send()
-        .await
-        .unwrap()
-        .bytes()
-        .await
-        .unwrap();
-    let requests = h.fake.state.requests();
-    assert_eq!(
-        requests[1].headers["authorization"],
-        requests[2].headers["authorization"]
-    );
+            .unwrap();
+        let requests = h.fake.state.requests();
+        assert_eq!(
+            requests[1].headers["authorization"],
+            requests[2].headers["authorization"]
+        );
+    }
 }
 
 #[tokio::test]
@@ -885,6 +938,7 @@ async fn classified_failures_reach_tool_body_and_record_original_status_and_actu
             StatusCode::BAD_REQUEST,
             "image_generation_quota_exhausted",
         ),
+        (GENERATE, StatusCode::OK, "image_generation_quota_exhausted"),
         (
             EDIT,
             StatusCode::NOT_FOUND,
@@ -892,7 +946,7 @@ async fn classified_failures_reach_tool_body_and_record_original_status_and_actu
         ),
     ] {
         let h = Harness::new(&[Some("plus")], false).await;
-        let body = if status == StatusCode::BAD_REQUEST {
+        let body = if matches!(status, StatusCode::BAD_REQUEST | StatusCode::OK) {
             "{\"error\":{\"code\":\"insufficient_quota\",\"message\":\"synthetic-upstream-private-body\"}}"
         } else {
             "{ \"error\": {\"message\":\"synthetic-upstream-private-body\"} }"
@@ -1008,4 +1062,282 @@ async fn unsupported_endpoints_return_operation_specific_json_without_retry() {
         Harness::code(response, status, code).await;
     }
     assert_eq!(h.fake.state.requests().len(), 3);
+}
+
+#[tokio::test]
+async fn incomplete_oversized_and_delayed_429_moderation_preserves_bytes_without_retry() {
+    for delayed in [false, true] {
+        let h = Harness::new(&[Some("plus"), Some("plus")], false).await;
+        let (body, chunks) = if delayed {
+            // The relevant code arrives after the two-second bounded hold.
+            let first = Bytes::from_static(b"{\"error\":{\"message\":\"synthetic moderation\",");
+            let last = Bytes::from_static(b"\"code\":\"moderation_blocked\"}}");
+            let mut body = first.to_vec();
+            body.extend_from_slice(&last);
+            (
+                Bytes::from(body),
+                vec![(Duration::ZERO, first), (Duration::from_secs(3), last)],
+            )
+        } else {
+            let body = Bytes::from(format!(
+                "{{\"error\":{{\"code\":\"moderation_blocked\",\"message\":\"{}\"}}}}",
+                "x".repeat(65_537)
+            ));
+            assert!(body.len() > 65_536);
+            (body.clone(), vec![(Duration::ZERO, body)])
+        };
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["error"]["code"], "moderation_blocked");
+        let mut upstream = ScriptedResponse::json(StatusCode::TOO_MANY_REQUESTS, body.clone());
+        upstream.chunks = chunks;
+        h.fake.state.push(upstream);
+        // This response must remain queued until an explicit new client request.
+        h.fake
+            .state
+            .push(ScriptedResponse::json(StatusCode::OK, "{}"));
+        let response = h
+            .request(GENERATE, "{\"prompt\":\"synthetic\"}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(response.headers().contains_key("x-qb-image-account"));
+        assert!(!response.headers().contains_key("x-qb-image-error"));
+        assert_eq!(response.bytes().await.unwrap(), body);
+        assert_eq!(h.fake.state.requests().len(), 1);
+        let response = h.request(GENERATE, "{}").send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response.bytes().await.unwrap();
+        let requests = h.fake.state.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].headers["authorization"], requests[1].headers["authorization"],
+            "inconclusive error inspection incorrectly exhausted the first account"
+        );
+    }
+}
+
+#[tokio::test]
+async fn image_routes_exclude_account_safety_holds_and_independent_payment_deadline() {
+    for (reason, payment) in [
+        (Some(HealthReason::Payment), true),
+        (Some(HealthReason::Auth), false),
+        (Some(HealthReason::StoreError), false),
+        (Some(HealthReason::LinkStale), false),
+        (None, true),
+        (Some(HealthReason::Quota), true),
+    ] {
+        let h = Harness::new(&[Some("plus"), Some("plus")], false).await;
+        let ids = h.ids();
+        h.safety_hold(&ids[0], reason, payment);
+        let before = h.store.list().unwrap();
+        let allowed = h.store.load(&ids[1]).unwrap();
+        let expected = format!("Bearer {}", h.store.tokens(&allowed).unwrap().access_token);
+        for path in [GENERATE, EDIT] {
+            h.fake
+                .state
+                .push(ScriptedResponse::json(StatusCode::OK, "{}"));
+            let response = h
+                .request(path, if path == EDIT { INLINE } else { "{}" })
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            response.bytes().await.unwrap();
+        }
+        let requests = h.fake.state.requests();
+        assert_eq!(requests.len(), 2);
+        for request in &requests {
+            assert_eq!(request.headers["authorization"], expected);
+        }
+        assert_eq!(h.store.list().unwrap(), before);
+        h.store
+            .update_metadata(&ids[1], |a| a.drain = true)
+            .unwrap();
+        for (path, code) in [
+            (GENERATE, "image_generation_no_eligible_account"),
+            (EDIT, "image_edit_no_eligible_account"),
+        ] {
+            Harness::code(
+                h.request(path, if path == EDIT { INLINE } else { "{}" })
+                    .send()
+                    .await
+                    .unwrap(),
+                StatusCode::BAD_REQUEST,
+                code,
+            )
+            .await;
+        }
+        assert_eq!(h.fake.state.requests().len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn responses_quota_only_cooling_keeps_both_image_routes_eligible() {
+    let h = Harness::new(&[Some("plus")], false).await;
+    let id = h.ids().remove(0);
+    h.safety_hold(&id, Some(HealthReason::Quota), false);
+    let before = h.store.list().unwrap();
+    for path in [GENERATE, EDIT] {
+        h.fake
+            .state
+            .push(ScriptedResponse::json(StatusCode::OK, "{}"));
+        let response = h
+            .request(path, if path == EDIT { INLINE } else { "{}" })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response.bytes().await.unwrap();
+    }
+    assert_eq!(h.fake.state.requests().len(), 2);
+    assert_eq!(h.store.list().unwrap(), before);
+}
+
+#[tokio::test]
+async fn quota_retry_rechecks_new_account_safety_holds_before_dispatch() {
+    for (reason, payment) in [
+        (Some(HealthReason::Payment), true),
+        (Some(HealthReason::Auth), false),
+        (Some(HealthReason::StoreError), false),
+        (Some(HealthReason::LinkStale), false),
+        (None, true),
+    ] {
+        let h = Harness::new(&[Some("plus"), Some("plus")], false).await;
+        let ids = h.ids();
+        let mut first = ScriptedResponse::json(
+            StatusCode::TOO_MANY_REQUESTS,
+            "{\"error\":{\"code\":\"image_quota_exceeded\"}}",
+        );
+        first.headers.insert("retry-after", "3600".parse().unwrap());
+        first.chunks[0].0 = Duration::from_secs(1);
+        h.fake.state.push(first);
+        h.fake
+            .state
+            .push(ScriptedResponse::json(StatusCode::OK, "{}"));
+        let request = h.request(GENERATE, "{}");
+        let pending = tokio::spawn(async move { request.send().await.unwrap() });
+        h.wait_requests(1).await;
+        h.safety_hold(&ids[1], reason, payment);
+        let before = h.store.list().unwrap();
+        Harness::code(
+            pending.await.unwrap(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "image_generation_quota_exhausted",
+        )
+        .await;
+        assert_eq!(h.fake.state.requests().len(), 1);
+        Harness::code(
+            h.request(GENERATE, "{}").send().await.unwrap(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "image_generation_quota_exhausted",
+        )
+        .await;
+        assert_eq!(h.fake.state.requests().len(), 1);
+        assert_eq!(h.store.list().unwrap(), before);
+    }
+}
+
+#[tokio::test]
+async fn concurrent_delayed_quota_cannot_erase_auth_rejection_for_current_credentials() {
+    for replace_between_dispatches in [false, true] {
+        let h = Harness::new(&[Some("plus")], false).await;
+        let id = h.ids().remove(0);
+        let mut quota = ScriptedResponse::json(StatusCode::TOO_MANY_REQUESTS, "{}");
+        quota.headers.insert("retry-after", "1".parse().unwrap());
+        quota.chunks[0].0 = Duration::from_secs(1);
+        h.fake.state.push(quota);
+        let request = h.request(GENERATE, "{}");
+        let delayed = tokio::spawn(async move { request.send().await.unwrap() });
+        h.wait_requests(1).await;
+        if replace_between_dispatches {
+            h.replace_token(&id);
+        }
+        let before = h.store.list().unwrap();
+        h.fake
+            .state
+            .push(ScriptedResponse::json(StatusCode::UNAUTHORIZED, "{}"));
+        Harness::code(
+            h.request(GENERATE, "{}").send().await.unwrap(),
+            StatusCode::UNAUTHORIZED,
+            "image_generation_auth_rejected",
+        )
+        .await;
+        h.wait_requests(2).await;
+        Harness::code(
+            delayed.await.unwrap(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "image_generation_quota_exhausted",
+        )
+        .await;
+        // Expire the independent short quota deadline, leaving auth as the
+        // reason to reject reuse. A queued success must never be consumed.
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        h.fake
+            .state
+            .push(ScriptedResponse::json(StatusCode::OK, "{}"));
+        Harness::code(
+            h.request(GENERATE, "{}").send().await.unwrap(),
+            StatusCode::BAD_REQUEST,
+            "image_generation_auth_rejected",
+        )
+        .await;
+        assert_eq!(h.fake.state.requests().len(), 2);
+        let requests = h.fake.state.requests();
+        assert_eq!(
+            requests[0].headers["authorization"] == requests[1].headers["authorization"],
+            !replace_between_dispatches
+        );
+        assert_eq!(h.store.list().unwrap(), before);
+    }
+}
+
+#[tokio::test]
+async fn concurrent_delayed_auth_cannot_erase_quota_after_legitimate_token_replacement() {
+    let h = Harness::new(&[Some("plus")], false).await;
+    let id = h.ids().remove(0);
+    let mut auth = ScriptedResponse::json(StatusCode::UNAUTHORIZED, "{}");
+    auth.chunks[0].0 = Duration::from_secs(1);
+    h.fake.state.push(auth);
+    let request = h.request(GENERATE, "{}");
+    let delayed = tokio::spawn(async move { request.send().await.unwrap() });
+    h.wait_requests(1).await;
+    let mut quota = ScriptedResponse::json(StatusCode::TOO_MANY_REQUESTS, "{}");
+    quota.headers.insert("retry-after", "3600".parse().unwrap());
+    h.fake.state.push(quota);
+    Harness::code(
+        h.request(GENERATE, "{}").send().await.unwrap(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "image_generation_quota_exhausted",
+    )
+    .await;
+    h.wait_requests(2).await;
+    Harness::code(
+        delayed.await.unwrap(),
+        StatusCode::UNAUTHORIZED,
+        "image_generation_auth_rejected",
+    )
+    .await;
+    h.replace_token(&id);
+    let before = h.store.list().unwrap();
+    h.fake
+        .state
+        .push(ScriptedResponse::json(StatusCode::OK, "{}"));
+    let response = h.request(GENERATE, "{}").send().await.unwrap();
+    assert!(
+        response.headers()["retry-after"]
+            .to_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+            > 3000
+    );
+    Harness::code(
+        response,
+        StatusCode::TOO_MANY_REQUESTS,
+        "image_generation_quota_exhausted",
+    )
+    .await;
+    assert_eq!(h.fake.state.requests().len(), 2);
+    assert_eq!(h.store.list().unwrap(), before);
 }
