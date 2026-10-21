@@ -308,6 +308,10 @@ async fn eligible_known_paid_only_and_real_credentials() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    let local_account = response.headers()["x-quota-baton-account"]
+        .to_str()
+        .unwrap()
+        .to_owned();
     response.bytes().await.unwrap();
     let requests = h.fake.state.requests();
     assert_eq!(requests.len(), 1);
@@ -319,6 +323,7 @@ async fn eligible_known_paid_only_and_real_credentials() {
         .into_iter()
         .find(|a| a.plan.as_deref() == Some("plus"))
         .unwrap();
+    assert_eq!(local_account, paid.id);
     let tokens = h.store.tokens(&paid).unwrap();
     assert_eq!(
         requests[0].headers["authorization"],
@@ -978,6 +983,11 @@ async fn classified_failures_reach_tool_body_and_record_original_status_and_actu
         assert!(!response.headers().contains_key("etag"));
         assert_eq!(response.headers()["content-type"], "application/json");
         assert!(response.headers().contains_key("x-qb-image-account"));
+        assert!(h.ids().iter().any(|id| {
+            id == response.headers()["x-quota-baton-account"]
+                .to_str()
+                .unwrap()
+        }));
         if downstream == StatusCode::TOO_MANY_REQUESTS {
             assert!(response.headers().contains_key("retry-after"));
         }

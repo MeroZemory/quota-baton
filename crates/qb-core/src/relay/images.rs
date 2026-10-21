@@ -929,6 +929,9 @@ fn upstream_response(
     } else {
         (status, held)
     };
+    if let Ok(id) = HeaderValue::from_str(&account.id) {
+        response_headers.insert("x-quota-baton-account", id);
+    }
     if let Ok(label) = HeaderValue::from_str(&account.label) {
         response_headers.insert("x-qb-image-account", label);
     }
