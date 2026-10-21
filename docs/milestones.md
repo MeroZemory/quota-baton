@@ -9,7 +9,7 @@ This file names the verification for each unit and each row. The row list and th
 목표: 보이는 대시보드의 유휴 CPU와 조작 지연을 줄인다
 핵심 지표: 새 경로 출시 1/2 · R11은 HTTP 통합 저장, WS 경계 2건과 출시 관문 남음
 사용자 대기: 없음 (R2 Part B만 사용자 결정 대기)
-갱신: 2026-10-22 02:04 KST (R11 단위 체크포인트 eb9da81, 긴급 성능 수정 시작)
+갱신: 2026-10-22 03:14 KST (a47b44c; hover·scroll 목표 통과, tab 최적화 진행)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -75,18 +75,35 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-21 22:47 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R12 설치, codex-qb로 실제 이미지 생성 성공 |
 | 2026-10-21 23:14 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R12.1 설치, 변화 없음 |
 | 2026-10-22 01:02 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R12.9 설치, 변화 없음 |
+| 2026-10-22 02:27 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R12.10 계측 단위, 출시 수 변화 없음 |
+| 2026-10-22 02:42 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R12.10 텍스트 캐시 단위 2a6f6db, 출시 수 변화 없음 |
+| 2026-10-22 03:02 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R12.10 실제 HWND 캐시 회귀 통과; 성능 관문 미완료 |
 <!-- metric:end -->
 
 <!-- support:begin -->
 | 측정 시각 (KST) | 보조 지표 | 값 | 목표 | 비고 |
 |---|---|---|---|---|
 | 2026-10-22 01시대 (분 미기록) | 대시보드 유휴 CPU (코어 하나 기준, 창 열림) | 60.7 % | 2 % 미만 | 최소화 시 1.4 %; R12.10 전 측정 |
+| 2026-10-22 02:27 | R12.10 합성 HWND 유휴 CPU (30계정·40세션, 코어 하나 기준) | 40.65 % | 2 % 미만 | 변경 전 30초 구간 완료; 이후 동작 구간은 도구 종료 오류로 미완료 |
+| 2026-10-22 02:27 | R12.10 합성 HWND 유휴 재작성 프레임 p95 | 936.74 ms | 전체 재작성 50 ms 미만 | 변경 전 유휴 구간; 조작 p95 아님 |
+| 2026-10-22 02:39 | R12.10 합성 HWND 유휴 CPU (30계정·40세션, 코어 하나 기준) | 29.75 % | 2 % 미만 | 변경 전 재측정; 첫 hover 상관 검사 실패로 전체 실행 실패 |
+| 2026-10-22 02:42 | R12.10 DirectWrite 텍스트·캐시 focused 테스트 | 10/10 통과 | 10/10 통과 | release; HWND 성능 수용 판정과 별개 |
+| 2026-10-22 03:02 | R12.10 합성 HWND 유휴 CPU (30계정·40세션, 코어 하나 기준) | 31.18 % | 2 % 미만 | 변경 전 before-final; hover 17회 뒤 외부 입력 혼입으로 실패 |
+| 2026-10-22 03:02 | R12.10 합성 HWND 유휴 CPU (30계정·40세션, 코어 하나 기준) | 0.2083 % | 2 % 미만 | after-sync-v3; 30초 완료, 전체 실행은 조작 시간 초과로 실패 |
+| 2026-10-22 03:02 | R12.10 동기 입력→production paint v3 프레임 p95 (hover/scroll/tab) | 89.20 / 31.52 / 223.98 ms | 각 16 ms 미만 | 100회씩; 모두 보존, 실패; OS 입력 큐 지연은 측정하지 않음 |
+| 2026-10-22 03:02 | R12.10 실제 HWND 캐시·UIA·자정 회귀 | 1/1 통과 | 1/1 통과 | release/testkit; 타이머 20회, hover 20회, focus 40회, 자정 시각 보정 |
+| 2026-10-22 03:14 | R12.10 合成 HWND 同条件 v3 baseline 유휴 CPU | 40.57 % | 2 % 미만 | baseline 전체 완료; hover/scroll/tab 각100회, 수정 전 |
+| 2026-10-22 03:14 | R12.10 同条件 v3 baseline 프레임 p95 (hover/scroll/tab) | 195.59 / 196.72 / 549.21 ms | 각 16 ms 미만 | 전체 실행 완료, 동일 30계정·40세션 fixture |
+| 2026-10-22 03:14 | R12.10 합성 HWND 유휴 CPU (30계정·40세션, 코어 하나 기준) | 0.1041 % | 2 % 미만 | after-repair-v3; 조작 구간은 탭 목표 미달로 실패 |
+| 2026-10-22 03:14 | R12.10 동기 입력→production paint v3 프레임 p95 (hover/scroll/tab) | 1.389 / 7.210 / 71.627 ms | 각 16 ms 미만 | 각100회; hover와 scroll 통과, tab 실패; 누락·제외 없음 |
+| 2026-10-22 03:14 | R12.10 스크롤 동등성·텍스트·그리기 생략 focused 테스트 | 20/20 통과 | 20/20 통과 | release: region5, text11, paint4; a47b44c |
+| 2026-10-22 03:14 | R12.10 표시 시각 deadline focused 테스트 | 9/9 통과 | 9/9 통과 | 동일 release actual-Host 실행 파일; DST·자정·숨긴 행 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 행동 |
 |---|---|---|---|
 | R11 실행별 계정 | HTTP 통합 저장, WS 경계 2건과 출시 관문 남음 | 관문 통과와 설치 | R12.10 뒤 WS 경계 2건 마무리 후 관문 |
-| 대시보드 지연 (R12.10) | 유휴 CPU 60.7 %, 장면당 약 300 ms | 유휴 2 % 미만, 조작 p95 16 ms 미만 | 장면 단계별 시간 측정 후 다시 그리기 조건 제한 |
+| 대시보드 지연 (R12.10) | 합성 유휴 0.1041 %, 조작 p95 1.4/7.2/71.6 ms | 유휴 2 % 미만, 조작 p95 16 ms 미만 | 탭 배치 metric 재사용·UIA 조상 검증 메모 후 재측정 |
 | R13 소진 예측·아이콘·차트·캐시 보류 | 설계 완료, 구현 0/5 부분 | 5/5 부분 병합과 설치 | R11과 R12.10 뒤 시작 |
 <!-- gaps:end -->
