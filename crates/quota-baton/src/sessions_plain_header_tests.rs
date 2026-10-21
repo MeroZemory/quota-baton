@@ -47,7 +47,7 @@ struct GuardedMemory {
 
 impl GuardedMemory {
     fn new(readable: usize) -> Self {
-        assert!(readable > 0 && readable % PAGE_BOUNDARY == 0);
+        assert!(readable > 0 && readable.is_multiple_of(PAGE_BOUNDARY));
         let total = readable + PAGE_BOUNDARY;
         // SAFETY: request private committed memory; no Rust reference aliases it.
         let pointer =
