@@ -83,6 +83,82 @@ impl CachedScene {
     pub fn rebuilt_region(&self) -> Option<ScrollRegion> {
         self.rebuilt_region
     }
+
+    /// Damage available before rebuilding a Table scroll. This is only a
+    /// proposed invalidation; validate the completed rebuild with
+    /// `scroll_damage_from` before relying on retained pixels during painting.
+    pub fn table_scroll_damage(&self) -> Option<crate::Rect> {
+        if self.modal || self.inputs.popup.is_some() {
+            return None;
+        }
+        let mut tables = self
+            .content
+            .iter()
+            .filter(|r| r.region == ScrollRegion::Table);
+        tables.next()?;
+        if tables.next().is_some() {
+            return None;
+        }
+        let (old, new) = self.sections.table_cards_for_damage(&self.sections)?;
+        for r in [old, new, self.rect] {
+            if ![r.left, r.top, r.right, r.bottom]
+                .iter()
+                .all(|n| n.is_finite())
+                || r.right <= r.left
+                || r.bottom <= r.top
+            {
+                return None;
+            }
+        }
+        crate::v2_geometry::intersection(
+            crate::Rect {
+                left: old.left.min(new.left) - 4.,
+                top: old.top.min(new.top) - 4.,
+                right: old.right.max(new.right) + 4.,
+                bottom: old.bottom.max(new.bottom) + 4.,
+            },
+            self.rect,
+        )
+    }
+
+    /// Conservative damage for a Table-only rebuild of the same projection.
+    /// The Host must separately validate retained target pixels/metrics and union
+    /// this with all pending damage. Replay the entire composed scene in the clip.
+    pub fn scroll_damage_from(&self, previous: &Self) -> Option<crate::Rect> {
+        if self.rebuilt_region != Some(ScrollRegion::Table)
+            || !Arc::ptr_eq(&self.view, &previous.view)
+            || self.inputs != previous.inputs
+            || self.inputs.popup.is_some()
+            || self.modal
+            || previous.modal
+            || self.rect != previous.rect
+            || self.content.len() != previous.content.len()
+        {
+            return None;
+        }
+        // A caller may supply an older completed frame. Only Table's offset
+        // may differ; another region's damage cannot be certified by this card.
+        let mut tables = 0;
+        for (new, old) in self.content.iter().zip(&previous.content) {
+            if new.region != old.region
+                || new.viewport != old.viewport
+                || new.content_height != old.content_height
+                || new.max_offset != old.max_offset
+            {
+                return None;
+            }
+            if new.region == ScrollRegion::Table {
+                tables += 1;
+            } else if new.offset != old.offset {
+                return None;
+            }
+        }
+        if tables != 1 {
+            return None;
+        }
+        self.sections.table_cards_for_damage(&previous.sections)?;
+        self.table_scroll_damage()
+    }
 }
 impl Deref for CachedScene {
     type Target = Scene;
@@ -1777,5 +1853,433 @@ mod scene_metric_tests {
                 [snapshot.heights[key], snapshot.widths[key]]
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod scroll_damage_tests {
+    use super::*;
+    use crate::{dashboard_fixtures as fixtures, dashboard_model as model};
+    use windows::Win32::{
+        Graphics::{
+            Direct2D::{
+                Common::{D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_PIXEL_FORMAT},
+                D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_RENDER_TARGET_PROPERTIES,
+                D2D1CreateFactory, ID2D1Factory,
+            },
+            Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
+            Imaging::{
+                CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICBitmap,
+                IWICImagingFactory, WICBitmapCacheOnLoad,
+            },
+        },
+        System::Com::{
+            CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+            CoUninitialize,
+        },
+    };
+
+    struct Com;
+    impl Com {
+        fn enter() -> Result<Self> {
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()? };
+            Ok(Self)
+        }
+    }
+    impl Drop for Com {
+        fn drop(&mut self) {
+            unsafe { CoUninitialize() };
+        }
+    }
+
+    // Same WIC/Direct2D setup as tests/support/r10_wic.rs, but keep the actual
+    // target between paints and inspect pixels in memory. No HWND or file I/O.
+    struct Surface {
+        target: ID2D1RenderTarget,
+        bitmap: IWICBitmap,
+        width: u32,
+        height: u32,
+        dpi: f32,
+    }
+    impl Surface {
+        fn new(size: [f32; 2], dpi: f32) -> Result<Self> {
+            unsafe {
+                let wic: IWICImagingFactory =
+                    CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
+                let width = (size[0] * dpi / 96.).round() as u32;
+                let height = (size[1] * dpi / 96.).round() as u32;
+                let bitmap = wic.CreateBitmap(
+                    width,
+                    height,
+                    &GUID_WICPixelFormat32bppPBGRA,
+                    WICBitmapCacheOnLoad,
+                )?;
+                let factory: ID2D1Factory =
+                    D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
+                let target = factory.CreateWicBitmapRenderTarget(
+                    &bitmap,
+                    &D2D1_RENDER_TARGET_PROPERTIES {
+                        pixelFormat: D2D1_PIXEL_FORMAT {
+                            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                        },
+                        dpiX: dpi,
+                        dpiY: dpi,
+                        ..Default::default()
+                    },
+                )?;
+                Ok(Self {
+                    target,
+                    bitmap,
+                    width,
+                    height,
+                    dpi,
+                })
+            }
+        }
+        fn pixels(&self) -> Result<Vec<u8>> {
+            let mut pixels = vec![0; (self.width * self.height * 4) as usize];
+            unsafe {
+                self.bitmap
+                    .CopyPixels(std::ptr::null(), self.width * 4, &mut pixels)?
+            };
+            Ok(pixels)
+        }
+        // Model an outward-rounded Win32 physical update RECT, converted back
+        // to client DIPs. Fractional clip edges must not blend retained pixels.
+        fn physical_clip(&self, r: crate::Rect) -> crate::Rect {
+            let scale = self.dpi / 96.;
+            crate::Rect {
+                left: (r.left * scale).floor() / scale,
+                top: (r.top * scale).floor() / scale,
+                right: (r.right * scale).ceil() / scale,
+                bottom: (r.bottom * scale).ceil() / scale,
+            }
+        }
+    }
+
+    fn fixture(detail: bool) -> (Arc<DashboardView>, DashboardState) {
+        let mut state = DashboardState::default();
+        let mut view = model::project(&fixtures::snapshot(), &mut state, &fixtures::clock());
+        let group = view.groups.iter_mut().find(|g| !g.rows.is_empty()).unwrap();
+        let row = group.rows[0].clone();
+        group.rows = (0..32)
+            .map(|i| {
+                let mut row = row.clone();
+                row.id = format!("damage-session-{i}");
+                row
+            })
+            .collect();
+        group.collapsed = false;
+        group.relogin = true;
+        group.relogin_reason = "합성 다시 로그인 필요".into();
+        view.flat = view.groups.iter().flat_map(|g| g.rows.clone()).collect();
+        if detail {
+            view.detail = Some(model::DetailView {
+                id: "damage-detail".into(),
+                title: "합성 상세".into(),
+                subtitle: "겹치는 상세 카드".into(),
+                raw_prefix: Some("12345678".into()),
+                status: "준비".into(),
+                status_tone: view.groups[0].tone,
+                account_status: "합성 계정".into(),
+                facts: vec![("합성 항목".into(), "합성 상세 값 ".repeat(8)); 16],
+                timeline: vec!["합성 타임라인".into(); 8],
+                requests: vec!["합성 요청".into(); 8],
+                expired: false,
+            });
+        }
+        (Arc::new(view), state)
+    }
+
+    fn normalize(state: &mut DashboardState, scene: &Scene) {
+        for region in &scene.content {
+            state.scroll(region.region, region.offset, region.max_offset);
+        }
+    }
+
+    fn union(a: crate::Rect, b: crate::Rect) -> crate::Rect {
+        crate::Rect {
+            left: a.left.min(b.left),
+            top: a.top.min(b.top),
+            right: a.right.max(b.right),
+            bottom: a.bottom.max(b.bottom),
+        }
+    }
+
+    fn equal_pixels(actual: &[u8], expected: &[u8], width: u32) {
+        assert_eq!(actual.len(), expected.len());
+        let mismatches = actual
+            .chunks_exact(4)
+            .zip(expected.chunks_exact(4))
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>();
+        assert!(
+            mismatches.is_empty(),
+            "{} differing pixels, first at {:?}",
+            mismatches.len(),
+            mismatches
+                .first()
+                .map(|i| (i % width as usize, i / width as usize))
+        );
+    }
+
+    fn full_pixels(
+        view: &Arc<DashboardView>,
+        state: &DashboardState,
+        size: [f32; 2],
+        dpi: f32,
+        dark: bool,
+        interaction: &Interaction,
+    ) -> Result<Vec<u8>> {
+        let fresh = Renderer::new(dark)?;
+        let scene = fresh.scene(view, state, size)?;
+        let surface = Surface::new(size, dpi)?;
+        fresh.paint(&surface.target, &scene, interaction)?;
+        surface.pixels()
+    }
+
+    #[test]
+    fn r1210_scroll_damage_wic_sticky_and_newly_revealed_match_full() -> Result<()> {
+        let _com = Com::enter()?;
+        for (dark, dpi) in [(false, 96.), (true, 192.)] {
+            let renderer = Renderer::new(dark)?;
+            let (view, mut state) = fixture(false);
+            let size = [1320., 640.];
+            let mut previous = renderer.scene_shared(&view, &state, size)?;
+            normalize(&mut state, &previous);
+            let viewport = previous
+                .content
+                .iter()
+                .find(|r| r.region == ScrollRegion::Table)
+                .unwrap()
+                .viewport;
+            let hidden = previous
+                .session_rows
+                .iter()
+                .find(|r| r.rect.top >= viewport.bottom)
+                .unwrap()
+                .id
+                .clone();
+            assert!(
+                !previous
+                    .targets
+                    .iter()
+                    .any(|t| t.target == Target::Session(hidden.clone()))
+            );
+            let reveal = previous.reveal_session(&hidden).unwrap();
+            let surface = Surface::new(size, dpi)?;
+            renderer.paint(&surface.target, &previous, &Interaction::default())?;
+            for offset in [96., reveal] {
+                let old_pixels = surface.pixels()?;
+                state.table_offset = offset;
+                let next =
+                    renderer.scene_scroll(&view, &state, size, &previous, ScrollRegion::Table)?;
+                let damage = next
+                    .scroll_damage_from(&previous)
+                    .expect("Table card damage");
+                // The card includes its static toolbar and footer, not only rows.
+                assert!(damage.top < viewport.top && damage.bottom > viewport.bottom);
+                assert!(
+                    next.accessibility
+                        .iter()
+                        .any(|n| n.key.starts_with("sticky:"))
+                );
+                let expected =
+                    full_pixels(&view, &state, size, dpi, dark, &Interaction::default())?;
+                assert!(
+                    old_pixels != expected,
+                    "scroll must actually change retained pixels"
+                );
+                renderer.paint_clipped(
+                    &surface.target,
+                    &next,
+                    &Interaction::default(),
+                    Some(surface.physical_clip(damage)),
+                )?;
+                equal_pixels(&surface.pixels()?, &expected, surface.width);
+                normalize(&mut state, &next);
+                previous = next;
+            }
+            assert!(
+                previous
+                    .targets
+                    .iter()
+                    .any(|t| t.target == Target::Session(hidden.clone()))
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn r1210_scroll_damage_wic_narrow_overlapping_suffix_matches_full() -> Result<()> {
+        let _com = Com::enter()?;
+        for (dark, dpi) in [(false, 96.), (true, 192.)] {
+            let renderer = Renderer::new(dark)?;
+            let (view, mut state) = fixture(true);
+            let size = [1024., 640.];
+            let previous = renderer.scene_shared(&view, &state, size)?;
+            normalize(&mut state, &previous);
+            let surface = Surface::new(size, dpi)?;
+            renderer.paint(&surface.target, &previous, &Interaction::default())?;
+            let old_pixels = surface.pixels()?;
+            state.table_offset = 96.;
+            let next =
+                renderer.scene_scroll(&view, &state, size, &previous, ScrollRegion::Table)?;
+            let damage = next
+                .scroll_damage_from(&previous)
+                .expect("Table card damage");
+            let overlay = next
+                .targets
+                .iter()
+                .find(|t| t.target == Target::DetailSurface)
+                .unwrap();
+            assert!(crate::v2_geometry::intersection(overlay.rect, damage).is_some());
+            assert!(
+                next.draw
+                    .iter()
+                    .any(|d| matches!(d, Draw::Alpha(a) if *a == 0.03))
+            );
+            let expected = full_pixels(&view, &state, size, dpi, dark, &Interaction::default())?;
+            assert!(old_pixels != expected);
+            // Whole composed scene, including the unchanged overlay and shadow,
+            // must replay after the Table background under the same dirty clip.
+            renderer.paint_clipped(
+                &surface.target,
+                &next,
+                &Interaction::default(),
+                Some(surface.physical_clip(damage)),
+            )?;
+            equal_pixels(&surface.pixels()?, &expected, surface.width);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn r1210_scroll_damage_wic_coalesced_outside_rect_matches_full() -> Result<()> {
+        let _com = Com::enter()?;
+        let (view, mut state) = fixture(false);
+        let size = [1320., 640.];
+        let renderer = Renderer::new(false)?;
+        let previous = renderer.scene_shared(&view, &state, size)?;
+        normalize(&mut state, &previous);
+        let old_interaction = Interaction {
+            hover: Some(Target::AllEvents),
+            ..Default::default()
+        };
+        let surface = Surface::new(size, 144.)?;
+        let card_only = Surface::new(size, 144.)?;
+        renderer.paint(&surface.target, &previous, &old_interaction)?;
+        renderer.paint(&card_only.target, &previous, &old_interaction)?;
+        state.table_offset = 96.;
+        let next = renderer.scene_scroll(&view, &state, size, &previous, ScrollRegion::Table)?;
+        let damage = next
+            .scroll_damage_from(&previous)
+            .expect("Table card damage");
+        let outside = previous
+            .targets
+            .iter()
+            .find(|t| t.target == Target::AllEvents)
+            .unwrap()
+            .rect;
+        assert!(
+            outside.left > damage.right,
+            "pending hover damage is outside Table card"
+        );
+        let pending = crate::Rect {
+            left: outside.left - 4.,
+            top: outside.top - 4.,
+            right: outside.right + 4.,
+            bottom: outside.bottom + 4.,
+        };
+        let expected = full_pixels(&view, &state, size, 144., false, &Interaction::default())?;
+        renderer.paint_clipped(
+            &card_only.target,
+            &next,
+            &Interaction::default(),
+            Some(card_only.physical_clip(damage)),
+        )?;
+        assert!(
+            card_only.pixels()? != expected,
+            "card-only repaint must leave the old Side hover"
+        );
+        renderer.paint_clipped(
+            &surface.target,
+            &next,
+            &Interaction::default(),
+            Some(surface.physical_clip(union(damage, pending))),
+        )?;
+        equal_pixels(&surface.pixels()?, &expected, surface.width);
+        Ok(())
+    }
+
+    #[test]
+    fn r1210_scroll_damage_rejects_non_table_and_mismatched_frames() -> Result<()> {
+        let renderer = Renderer::new(false)?;
+        let (view, mut state) = fixture(false);
+        let size = [1320., 640.];
+        let previous = renderer.scene_shared(&view, &state, size)?;
+        normalize(&mut state, &previous);
+        state.table_offset = 96.;
+        let next = renderer.scene_scroll(&view, &state, size, &previous, ScrollRegion::Table)?;
+        assert!(next.scroll_damage_from(&previous).is_some());
+        assert_eq!(
+            next.scroll_damage_from(&previous),
+            previous.table_scroll_damage()
+        );
+        assert!(previous.scroll_damage_from(&previous).is_none());
+        for region in [
+            ScrollRegion::Side,
+            ScrollRegion::Events,
+            ScrollRegion::Usage,
+        ] {
+            let mut changed = next.clone();
+            changed.rebuilt_region = Some(region);
+            assert!(changed.scroll_damage_from(&previous).is_none());
+        }
+        let mut changed = next.clone();
+        changed.view = Arc::new((*view).clone());
+        assert!(changed.scroll_damage_from(&previous).is_none());
+        changed = next.clone();
+        changed.inputs.size[0] += 1.;
+        assert!(changed.scroll_damage_from(&previous).is_none());
+        changed = next.clone();
+        changed.inputs.popup = Some(Popup::Range);
+        assert!(changed.scroll_damage_from(&previous).is_none());
+        assert!(changed.table_scroll_damage().is_none());
+        changed = next.clone();
+        changed.scene.modal = true;
+        assert!(changed.scroll_damage_from(&previous).is_none());
+        assert!(changed.table_scroll_damage().is_none());
+        changed = next.clone();
+        changed.scene.rect.right -= 1.;
+        assert!(changed.scroll_damage_from(&previous).is_none());
+        changed = next.clone();
+        changed
+            .content
+            .iter_mut()
+            .find(|r| r.region == ScrollRegion::Side)
+            .unwrap()
+            .offset += 1.;
+        assert!(changed.scroll_damage_from(&previous).is_none());
+        changed = next.clone();
+        changed
+            .content
+            .iter_mut()
+            .find(|r| r.region == ScrollRegion::Table)
+            .unwrap()
+            .viewport
+            .top += 1.;
+        assert!(changed.scroll_damage_from(&previous).is_none());
+        // The old-frame proposal is clipped to client bounds; it is not
+        // permission to reuse pixels after an actual target/size change.
+        changed = previous.clone();
+        changed.scene.rect = rect(30., 100., 50., 80.);
+        assert_eq!(changed.table_scroll_damage(), Some(changed.scene.rect));
+        changed.scene.rect.right = f32::NAN;
+        assert!(changed.table_scroll_damage().is_none());
+        Ok(())
     }
 }

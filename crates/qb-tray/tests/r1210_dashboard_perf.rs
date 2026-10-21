@@ -426,6 +426,7 @@ fn summary(frames: &[Value]) -> Value {
         "paint_us",
         "publish_us",
         "frame_us",
+        "thread_cpu_us",
     ];
     let mut result = json!({"frames":frames.len(),"rebuilt":frames.iter().filter(|f|f["rebuilt"]==true).count()});
     for key in keys.into_iter().chain([
@@ -658,7 +659,61 @@ fn measure(output: &Path, report: &mut Value) -> Result<()> {
             .unwrap()
             .push(sample);
     }
+    // Force ten real data publications per tab after the text/layout working
+    // sets are warm. Regional scrolls and cached tab swaps are not full builds.
     let mut warm_full = vec![];
+    let mut full_samples = vec![];
+    for i in 0..30 {
+        let tab = [Tab::Overview, Tab::Usage, Tab::Events][i % 3];
+        let p = point(&scene(hwnd)?, &Target::Tab(tab))?;
+        click(hwnd, p)?;
+        unsafe {
+            let _ = UpdateWindow(hwnd);
+        }
+        run.dispatch()?;
+        unsafe {
+            let _ = UpdateWindow(hwnd);
+        }
+        let _ = dashboard_window::perf_take_frames(hwnd);
+        let mut fresh = fixture::snapshot(&raw);
+        fresh.revision += 1_000 + i as u64;
+        let mut clock = fixture::clock();
+        clock.now += chrono::Duration::milliseconds(run.started.elapsed().as_millis() as i64);
+        let fresh = Arc::new(fresh);
+        let started = Instant::now();
+        ensure!(
+            run.port
+                .as_ref()
+                .context("missing port")?
+                .snapshot(fresh, clock),
+            "snapshot mailbox closed"
+        );
+        unsafe {
+            SendMessageW(hwnd, WM_TIMER, Some(WPARAM(0x71)), Some(LPARAM(0)));
+            let _ = UpdateWindow(hwnd);
+        }
+        let elapsed = started.elapsed().as_micros() as u64;
+        let frames = serde_json::to_value(dashboard_window::perf_take_frames(hwnd))?;
+        let full: Vec<_> = frames
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| {
+                f["tab"] == format!("{tab:?}")
+                    && f["full_scene_build"]
+                        .as_bool()
+                        .unwrap_or(f["rebuilt"] == true)
+            })
+            .cloned()
+            .collect();
+        ensure!(
+            full.len() == 1,
+            "data publication did not produce exactly one full frame: {frames}"
+        );
+        warm_full.extend(full);
+        full_samples.push(json!({"index":i,"tab":format!("{tab:?}"),"frames":frames,"publication_to_paint_us":elapsed}));
+    }
+    report["full_rebuild_samples"] = json!(full_samples);
     report["phase_stats"] = json!({});
     report["matched_frame_phase_stats"] = json!({});
     report["input_latency_us"] = json!({});
@@ -681,7 +736,6 @@ fn measure(output: &Path, report: &mut Value) -> Result<()> {
         ensure!(latency["n"] == 100, "missing input-latency samples");
         let matched_stats = summary(&matched);
         let causes = cause_counts(&frames);
-        warm_full.extend(frames.iter().filter(|f| f["rebuilt"] == true).cloned());
         report["phase_stats"][kind] = summary(&frames);
         report["matched_frame_phase_stats"][kind] = matched_stats;
         report["input_latency_us"][kind] = latency;
@@ -780,7 +834,8 @@ fn r1210_dashboard_perf() {
         "use a fresh output directory"
     );
     let mut report = json!({"schema":2,"status":"running","profile":"release",
-        "workload":"r1210-perf-v1","measurement":"r1210-sync-production-paint-v3","idle_seconds":30,"actions_per_kind":100,
+        "workload":"r1210-perf-v1","measurement":"r1210-sync-production-paint-v4","idle_seconds":30,"actions_per_kind":100,
+        "full_rebuild_workload":"30 new snapshot publications after warm-up; 10 per tab; regional and cached frames excluded",
         "input_latency_kind":"synchronous HWND input through UpdateWindow production paint; excludes OS input queue latency",
         "marker_encoding":{"tab_hover":"Host Debug strings","offsets":["Table","Side","Events","Usage"]},
         "cause_limit":"Host v2 uses timer/mail/state; raw labels retained. During timed actions this harness publishes only clock mail, never snapshot/detail/theme mail.",

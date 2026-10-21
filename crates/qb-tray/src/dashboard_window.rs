@@ -31,7 +31,7 @@ use std::{
 use window_logic::{Editor, Lifecycle, Stamp};
 use windows::{
     Win32::{
-        Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
+        Foundation::{FILETIME, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
         Graphics::{
             Direct2D::{
                 Common::{D2D_SIZE_U, D2D1_ALPHA_MODE_IGNORE, D2D1_PIXEL_FORMAT},
@@ -47,7 +47,10 @@ use windows::{
                 PAINTSTRUCT, ScreenToClient,
             },
         },
-        System::LibraryLoader::GetModuleHandleW,
+        System::{
+            LibraryLoader::GetModuleHandleW,
+            Threading::{GetCurrentThread, GetThreadTimes},
+        },
         UI::{
             HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI},
             Input::KeyboardAndMouse::{
@@ -76,12 +79,15 @@ thread_local! {
 
 struct Frame {
     scene: render::CachedScene,
+    view: Arc<model::DashboardView>,
     stamp: Stamp,
     actions: Vec<Target>,
     elements: Vec<(i32, Target)>,
     focus: Option<Target>,
     keyboard_focus: bool,
     focused: bool,
+    next_clock: Option<chrono::DateTime<chrono::Utc>>,
+    prepared: Option<accessibility::PreparedSnapshot>,
 }
 /// Bounded, opt-in timings. EndDraw is submission/present-call time, not GPU completion.
 #[derive(Clone, Debug, serde::Serialize)]
@@ -97,12 +103,34 @@ pub struct FrameTiming {
     pub paint_us: u64,
     pub publish_us: u64,
     pub frame_us: u64,
+    pub thread_cpu_us: Option<u64>,
     pub nodes: usize,
     pub rebuilt: bool,
+    pub full_scene_build: bool,
     pub phases: render::PhaseStats,
 }
 fn micros(start: Instant) -> u64 {
     start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+}
+fn thread_cpu_ticks() -> Option<u64> {
+    let (mut created, mut exited, mut kernel, mut user) = (
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+    );
+    unsafe {
+        GetThreadTimes(
+            GetCurrentThread(),
+            &mut created,
+            &mut exited,
+            &mut kernel,
+            &mut user,
+        )
+        .ok()?;
+    }
+    let ticks = |t: FILETIME| (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime);
+    Some(ticks(kernel).saturating_add(ticks(user)))
 }
 #[cfg(feature = "testkit")]
 #[allow(dead_code)]
@@ -185,7 +213,9 @@ struct Host {
     renderer: render::Renderer,
     editor_text: qb_tray::v2_text::Text,
     frame: Option<Frame>,
-    scroll_scene: Option<(render::CachedScene, ScrollRegion)>,
+    tab_frames: Vec<(Tab, Frame)>,
+    pending_tab: Option<Frame>,
+    scroll_scene: Option<(render::CachedScene, ScrollRegion, Option<qb_tray::Rect>)>,
     root: Option<accessibility::RootProvider>,
     ids: HashMap<String, i32>,
     next_id: i32,
@@ -263,6 +293,8 @@ fn invalidate_frame(h: &mut Host) {
     // Retain the last completed read snapshot until its replacement is ready.
     // Close action admission immediately; reopen only after successful publication.
     h.frame = None;
+    h.tab_frames.clear();
+    h.pending_tab = None;
     h.scroll_scene = None;
     h.life.invalidate();
 }
@@ -394,6 +426,8 @@ pub fn open_or_focus(
             renderer,
             editor_text,
             frame: None,
+            tab_frames: vec![],
+            pending_tab: None,
             scroll_scene: None,
             root,
             ids: HashMap::new(),
@@ -480,6 +514,7 @@ fn activate(hwnd: HWND, target: Target) {
 }
 fn activate_target(hwnd: HWND, target: Target, enter: bool) {
     let Some(host) = current(hwnd) else { return };
+    let previous_tab = host.borrow().state.tab;
     let commands = {
         let mut h = host.borrow_mut();
         if !frame_valid(&h)
@@ -512,7 +547,36 @@ fn activate_target(hwnd: HWND, target: Target, enter: bool) {
         // clears this projection through redraw_for before it can be reused.
         if let Some(host) = current(hwnd) {
             let mut h = host.borrow_mut();
-            invalidate_frame(&mut h);
+            let clock = virtual_clock(&h).utc();
+            let expired = h.next_clock.is_some_and(|at| clock >= at)
+                || h.tab_frames.iter().any(|(tab, frame)| {
+                    *tab == h.state.tab
+                        && (clock < frame.view.clock.utc()
+                            || frame.next_clock.is_some_and(|at| clock >= at))
+                });
+            if expired {
+                invalidate_frame(&mut h);
+                h.projected = None;
+            } else {
+                if let Some(frame) = h.frame.take()
+                    && !frame.scene.modal
+                {
+                    h.tab_frames.retain(|(tab, _)| *tab != previous_tab);
+                    h.tab_frames.push((previous_tab, frame));
+                }
+                h.pending_tab = h
+                    .tab_frames
+                    .iter()
+                    .position(|(tab, _)| *tab == h.state.tab)
+                    .map(|index| h.tab_frames.swap_remove(index).1);
+                if h.pending_tab.is_none() {
+                    // A newly revealed tab may have earlier time buckets than
+                    // the old visible tab. Project it at the current clock.
+                    h.projected = None;
+                }
+                h.scroll_scene = None;
+                h.life.invalidate();
+            }
             h.dirty_reason = "tab";
         }
         repaint(hwnd);
@@ -621,6 +685,12 @@ fn apply_mail(hwnd: HWND) {
                 || h.projected
                     .as_ref()
                     .is_some_and(|view| clock.utc() < view.clock.utc())
+                || h.tab_frames
+                    .iter()
+                    .any(|(_, frame)| clock.utc() < frame.view.clock.utc())
+                || h.pending_tab
+                    .as_ref()
+                    .is_some_and(|frame| clock.utc() < frame.view.clock.utc())
                 || h.next_clock.is_some_and(|at| clock.utc() >= at);
             h.clock = clock;
             h.clock_at = Instant::now();
@@ -807,10 +877,12 @@ unsafe fn paint(hwnd: HWND) -> Result<()> {
         h.editor_text.set_phase_stats_enabled(profile);
         h.editor_text.reset_phase_stats();
         let frame_start = profile.then(Instant::now);
+        let thread_start = profile.then(thread_cpu_ticks).flatten();
         if h.frame.is_some() && !frame_valid(&h) {
             invalidate_frame(&mut h);
             h.projected = None;
         }
+        let retained_target = h.target.is_some() && h.target_metrics == Some((pixels, dpi));
         if h.target.is_none() {
             h.target = Some(unsafe {
                 h.factory.CreateHwndRenderTarget(
@@ -848,9 +920,14 @@ unsafe fn paint(hwnd: HWND) -> Result<()> {
         unsafe {
             target.SetTransform(&Matrix3x2::identity());
         }
-        let rebuilt = h.frame.is_none();
+        let restored = h.pending_tab.take();
+        let republished = restored.is_some();
+        let rebuilt = h.frame.is_none() && !republished;
         let (mut snapshot_us, mut project_us, mut scene_us) = (0, 0, 0);
-        let mut frame = if let Some(frame) = h.frame.take() {
+        let mut scroll_damage = None;
+        let mut frame = if let Some(frame) = h.frame.take().or(restored) {
+            h.next_clock = frame.next_clock;
+            h.projected = Some(frame.view.clone());
             frame
         } else {
             let clock = virtual_clock(&h);
@@ -871,9 +948,18 @@ unsafe fn paint(hwnd: HWND) -> Result<()> {
                 pixels[1] as f32 * 96. / dpi as f32,
             ];
             let part = profile.then(Instant::now);
-            let scene = if let Some((previous, region)) = h.scroll_scene.take() {
-                h.renderer
-                    .scene_scroll(&view, &h.state, size, &previous, region)?
+            let scene = if let Some((previous, region, proposed)) = h.scroll_scene.take() {
+                let scene = h
+                    .renderer
+                    .scene_scroll(&view, &h.state, size, &previous, region)?;
+                if retained_target
+                    && let Some(proposed) = proposed
+                    && scene.scroll_damage_from(&previous) == Some(proposed)
+                    && scroll_decorations_contained(&h, &previous, &scene, proposed)
+                {
+                    scroll_damage = Some(proposed);
+                }
+                scene
             } else {
                 h.renderer.scene_shared(&view, &h.state, size)?
             };
@@ -899,6 +985,7 @@ unsafe fn paint(hwnd: HWND) -> Result<()> {
             );
             Frame {
                 scene,
+                view,
                 stamp: Stamp {
                     owner: h.life.owner,
                     epoch: epoch().ok_or_else(invalid)?,
@@ -910,32 +997,41 @@ unsafe fn paint(hwnd: HWND) -> Result<()> {
                 focus: h.input.focus.clone(),
                 keyboard_focus: h.input.keyboard_focus,
                 focused: h.focused,
+                next_clock: h.next_clock,
+                prepared: None,
             }
         };
         let part = profile.then(Instant::now);
-        let clip =
-            (!rebuilt && ps.rcPaint.right > ps.rcPaint.left && ps.rcPaint.bottom > ps.rcPaint.top)
-                .then(|| qb_tray::Rect {
-                    left: ps.rcPaint.left as f32 * 96. / dpi as f32,
-                    top: ps.rcPaint.top as f32 * 96. / dpi as f32,
-                    right: ps.rcPaint.right as f32 * 96. / dpi as f32,
-                    bottom: ps.rcPaint.bottom as f32 * 96. / dpi as f32,
-                });
+        let clip = ((!rebuilt || scroll_damage.is_some())
+            && !republished
+            && ps.rcPaint.right > ps.rcPaint.left
+            && ps.rcPaint.bottom > ps.rcPaint.top)
+            .then(|| qb_tray::Rect {
+                left: ps.rcPaint.left as f32 * 96. / dpi as f32,
+                top: ps.rcPaint.top as f32 * 96. / dpi as f32,
+                right: ps.rcPaint.right as f32 * 96. / dpi as f32,
+                bottom: ps.rcPaint.bottom as f32 * 96. / dpi as f32,
+            });
         paint_decorated(&h, &mut frame.scene, &target, clip)?;
         let paint_us = part.map_or(0, micros);
         let part = profile.then(Instant::now);
         if rebuilt
+            || republished
             || frame.focus != h.input.focus
             || frame.keyboard_focus != h.input.keyboard_focus
             || frame.focused != h.focused
         {
+            let reuse = !rebuilt
+                && frame.focus == h.input.focus
+                && frame.keyboard_focus == h.input.keyboard_focus
+                && frame.focused == h.focused;
             if !rebuilt {
                 frame.stamp.epoch = epoch().ok_or_else(invalid)?;
             }
             frame.focus = h.input.focus.clone();
             frame.keyboard_focus = h.input.keyboard_focus;
             frame.focused = h.focused;
-            publish_accessibility(&mut h, &mut frame)?;
+            publish_accessibility(&mut h, &mut frame, reuse)?;
             h.life.painted(frame.stamp);
         }
         let publish_us = part.map_or(0, micros);
@@ -968,8 +1064,12 @@ unsafe fn paint(hwnd: HWND) -> Result<()> {
                 paint_us,
                 publish_us,
                 frame_us: micros(start),
+                thread_cpu_us: thread_start.and_then(|before| {
+                    thread_cpu_ticks().map(|after| after.saturating_sub(before) / 10)
+                }),
                 nodes: frame.scene.accessibility.len(),
                 rebuilt,
+                full_scene_build: rebuilt && frame.scene.rebuilt_region().is_none(),
                 phases,
             };
             if h.timings.len() < 4096 {
@@ -1129,7 +1229,14 @@ fn physical(rect: qb_tray::Rect, origin: POINT, scale: f64) -> [f64; 4] {
         (rect.bottom - rect.top).max(0.) as f64 * scale,
     ]
 }
-fn publish_accessibility(h: &mut Host, frame: &mut Frame) -> Result<()> {
+fn publish_accessibility(h: &mut Host, frame: &mut Frame, reuse: bool) -> Result<()> {
+    if reuse && let Some(prepared) = &frame.prepared {
+        return h
+            .root
+            .as_ref()
+            .ok_or_else(invalid)?
+            .publish_prepared(prepared, frame.stamp.epoch);
+    }
     // A focus-only publication replaces its map just like a new scene.
     frame.actions.clear();
     frame.elements.clear();
@@ -1146,10 +1253,20 @@ fn publish_accessibility(h: &mut Host, frame: &mut Frame) -> Result<()> {
         .iter()
         .map(|node| node.key.as_str())
         .collect();
-    h.ids.retain(|key, _| keys.contains(key.as_str()));
     if keys.len() != frame.scene.accessibility.len() {
         return Err(failure("dashboard UIA duplicate semantic key"));
     }
+    let mut retained = keys.clone();
+    for (_, cached) in &h.tab_frames {
+        retained.extend(
+            cached
+                .scene
+                .accessibility
+                .iter()
+                .map(|node| node.key.as_str()),
+        );
+    }
+    h.ids.retain(|key, _| retained.contains(key.as_str()));
     let required = keys.iter().filter(|key| !h.ids.contains_key(**key)).count();
     let Ok(required) = i32::try_from(required) else {
         return Err(failure("dashboard UIA element count overflow"));
@@ -1242,15 +1359,16 @@ fn publish_accessibility(h: &mut Host, frame: &mut Frame) -> Result<()> {
     if let Some(root) = h.root.as_ref() {
         #[cfg(all(test, feature = "testkit"))]
         let count = elements.len();
-        let result = root.publish(
-            accessibility::Snapshot {
-                automation_id: "quota-baton.dashboard",
-                name: "quota-baton 대시보드".into(),
-                bounds: physical(frame.scene.rect, origin, frame.stamp.dpi as f64 / 96.),
-                elements,
-            },
-            frame.stamp.epoch,
-        );
+        let prepared = accessibility::prepare_snapshot(accessibility::Snapshot {
+            automation_id: "quota-baton.dashboard",
+            name: "quota-baton 대시보드".into(),
+            bounds: physical(frame.scene.rect, origin, frame.stamp.dpi as f64 / 96.),
+            elements,
+        })?;
+        let result = root.publish_prepared(&prepared, frame.stamp.epoch);
+        if result.is_ok() {
+            frame.prepared = Some(prepared);
+        }
         #[cfg(all(test, feature = "testkit"))]
         if !h.profiling {
             eprintln!(
@@ -1372,9 +1490,13 @@ fn scroll(hwnd: HWND, p: [f32; 2], delta: f32) {
             return;
         }
     }
+    let mut damage = None;
     if let Some(host) = current(hwnd) {
         let mut h = host.borrow_mut();
-        let previous = h.frame.take().unwrap().scene;
+        let frame = h.frame.take().unwrap();
+        let retained =
+            h.target.is_some() && h.target_metrics == Some((frame.stamp.pixels, frame.stamp.dpi));
+        let previous = frame.scene;
         let region = previous
             .content
             .iter()
@@ -1382,11 +1504,76 @@ fn scroll(hwnd: HWND, p: [f32; 2], delta: f32) {
             .find(|r| geometry::contains(r.viewport, p[0], p[1]))
             .map(|r| r.region)
             .unwrap();
+        if retained
+            && region == ScrollRegion::Table
+            && let Some(rect) = previous.table_scroll_damage()
+            && scroll_decorations_contained(&h, &previous, &previous, rect)
+        {
+            damage = Some(rect);
+        }
         invalidate_frame(&mut h);
-        h.scroll_scene = Some((previous, region));
+        h.scroll_scene = Some((previous, region, damage));
         h.dirty_reason = "scroll";
     }
-    repaint(hwnd);
+    if let Some(r) = damage {
+        let scale = unsafe { GetDpiForWindow(hwnd) }.max(48) as f32 / 96.;
+        let rect = RECT {
+            left: (r.left * scale).floor() as i32,
+            top: (r.top * scale).floor() as i32,
+            right: (r.right * scale).ceil() as i32,
+            bottom: (r.bottom * scale).ceil() as i32,
+        };
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), Some(&rect), false);
+        }
+    } else {
+        repaint(hwnd);
+    }
+}
+
+/// Decorations outside the card may remain only when their geometry is identical.
+/// Popup/editor/chart effects have wider bounds, so keep their full-paint path.
+fn scroll_decorations_contained(h: &Host, old: &Scene, new: &Scene, damage: qb_tray::Rect) -> bool {
+    if h.editing.is_some()
+        || h.input.tooltip_ready
+        || !old.charts.is_empty()
+        || !new.charts.is_empty()
+        || h.input.pointer.is_some_and(|p| {
+            old.tooltip_at(p[0], p[1]).is_some() || new.tooltip_at(p[0], p[1]).is_some()
+        })
+    {
+        return false;
+    }
+    for target in [&h.input.hover, &h.input.pressed, &h.input.focus]
+        .into_iter()
+        .flatten()
+    {
+        let boxes = |scene: &Scene| {
+            scene
+                .targets
+                .iter()
+                .filter(|hit| hit.enabled && &hit.target == target)
+                .map(|hit| hit.rect)
+                .collect::<Vec<_>>()
+        };
+        let before = boxes(old);
+        let after = boxes(new);
+        // A vanished focus is cleared during layout, which changes decoration.
+        if h.input.focus.as_ref() == Some(target) && after.is_empty() {
+            return false;
+        }
+        if before != after
+            && before.iter().chain(&after).any(|r| {
+                r.left - 4. < damage.left
+                    || r.top - 4. < damage.top
+                    || r.right + 4. > damage.right
+                    || r.bottom + 4. > damage.bottom
+            })
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn held(vk: i32) -> bool {

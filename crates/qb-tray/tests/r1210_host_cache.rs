@@ -32,8 +32,8 @@ use std::{
 };
 use windows::{
     Win32::{
-        Foundation::{HWND, LPARAM, WPARAM},
-        Graphics::Gdi::UpdateWindow,
+        Foundation::{HWND, LPARAM, POINT, WPARAM},
+        Graphics::Gdi::{ClientToScreen, UpdateWindow},
         System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize},
         UI::{HiDpi::GetDpiForWindow, WindowsAndMessaging::*},
     },
@@ -256,6 +256,257 @@ fn sync_paint(hwnd: HWND) -> Result<()> {
         unsafe { UpdateWindow(hwnd) }.as_bool(),
         "synchronous paint failed"
     );
+    Ok(())
+}
+
+fn switch_tab(run: &mut Run, hwnd: HWND, tab: Tab) -> Result<Vec<dashboard_window::FrameTiming>> {
+    let _ = dashboard_window::perf_take_frames(hwnd);
+    invoke_tab(hwnd, tab, cache(hwnd)?.epoch)?;
+    // UIA invoke completes the production paint synchronously. Observe it before
+    // unrelated desktop messages; this path never answers a worker request.
+    run.collect()?;
+    ensure!(selected_tab(hwnd)? == tab, "tab did not dispatch: {tab:?}");
+    let frames = dashboard_window::perf_take_frames(hwnd);
+    ensure!(!frames.is_empty(), "tab frame instrumentation absent");
+    Ok(frames)
+}
+
+fn fresh_tab(frames: &[dashboard_window::FrameTiming], stage: &str) -> Result<()> {
+    ensure!(
+        frames.iter().filter(|f| f.rebuilt).count() == 1
+            && frames
+                .iter()
+                .any(|f| f.rebuilt && f.full_scene_build && f.project_us > 0),
+        "{stage}: uncached tab must build full scene with fresh projection: {frames:?}"
+    );
+    Ok(())
+}
+
+fn warm_tab(frames: &[dashboard_window::FrameTiming], stage: &str) -> Result<()> {
+    ensure!(
+        frames.iter().all(|f| !f.rebuilt
+            && !f.full_scene_build
+            && f.scene_us == 0
+            && f.project_us == 0
+            && f.snapshot_us == 0),
+        "{stage}: warm tab rebuilt scene/projection/snapshot: {frames:?}"
+    );
+    Ok(())
+}
+
+fn tab_invalidation_regressions(run: &mut Run, hwnd: HWND) -> Result<()> {
+    let port = run.port.as_ref().context("missing mailbox")?.clone();
+    let mut revision = 10;
+    for reason in ["data", "filter", "scroll"] {
+        if selected_tab(hwnd)? != Tab::Overview {
+            let _ = switch_tab(run, hwnd, Tab::Overview)?;
+        }
+        revision += 1;
+        let input = fixture::input();
+        publish_fixture(hwnd, &port, &input, revision)?;
+        dashboard_window::perf_set_time(hwnd, fixture::clock(), 40_000);
+        fresh_tab(&switch_tab(run, hwnd, Tab::Usage)?, "seed Usage")?;
+        dashboard_window::perf_set_time(hwnd, fixture::clock(), 40_000);
+        warm_tab(&switch_tab(run, hwnd, Tab::Overview)?, "seed Overview")?;
+        match reason {
+            "data" => {
+                let mut changed = input;
+                changed["accounts"]["accounts"][0]["label"] =
+                    serde_json::json!("cache revision changed");
+                revision += 1;
+                publish_fixture(hwnd, &port, &changed, revision)?;
+            }
+            "filter" => {
+                let scene = dashboard_window::perf_scene(hwnd).context("missing filter scene")?;
+                let grouped = scene
+                    .accessibility
+                    .iter()
+                    .find(|n| n.target == Some(Target::ToggleGrouping))
+                    .context("grouping state missing")?
+                    .selected;
+                let slot = scene
+                    .accessibility
+                    .iter()
+                    .filter(|n| {
+                        !n.hidden
+                            && n.enabled
+                            && n.role != qb_tray::geometry::Role::Text
+                            && n.rect.right > n.rect.left
+                            && n.rect.bottom > n.rect.top
+                            && n.target.as_ref().is_some_and(|t| {
+                                scene.targets.iter().any(|h| h.enabled && &h.target == t)
+                            })
+                    })
+                    .position(|n| n.target == Some(Target::ToggleGrouping))
+                    .context("grouping action missing")?;
+                send(
+                    hwnd,
+                    accessibility::WM_UIA_INVOKE,
+                    slot,
+                    isize::try_from(cache(hwnd)?.epoch)?,
+                );
+                run.collect()?;
+                ensure!(
+                    dashboard_window::perf_scene(hwnd)
+                        .context("missing regrouped scene")?
+                        .accessibility
+                        .iter()
+                        .any(|n| n.target == Some(Target::ToggleGrouping) && n.selected != grouped),
+                    "grouping action did not change state"
+                );
+            }
+            "scroll" => {
+                let scene = dashboard_window::perf_scene(hwnd).context("missing scroll scene")?;
+                let region = scene
+                    .content
+                    .iter()
+                    .find(|r| r.region == ScrollRegion::Table)
+                    .context("scroll Table missing")?;
+                ensure!(
+                    region.max_offset > region.offset,
+                    "scroll fixture already at bottom"
+                );
+                let scale = unsafe { GetDpiForWindow(hwnd) } as f32 / 96.;
+                let mut point = POINT {
+                    x: ((region.viewport.left + 10.) * scale) as i32,
+                    y: ((region.viewport.top + 10.) * scale) as i32,
+                };
+                ensure!(
+                    unsafe { ClientToScreen(hwnd, &mut point) }.as_bool(),
+                    "scroll coordinate conversion failed"
+                );
+                send(
+                    hwnd,
+                    WM_MOUSEWHEEL,
+                    usize::from((-120_i16) as u16) << 16,
+                    (((point.y as u32 & 0xffff) << 16) | (point.x as u32 & 0xffff)) as isize,
+                );
+                sync_paint(hwnd)?;
+                let scrolled =
+                    dashboard_window::perf_scene(hwnd).context("missing scrolled scene")?;
+                ensure!(
+                    scrolled
+                        .content
+                        .iter()
+                        .any(|r| r.region == ScrollRegion::Table && r.offset > region.offset),
+                    "synthetic wheel did not scroll Table"
+                );
+            }
+            _ => unreachable!(),
+        }
+        // Isolate invalidation from target deadline expiry, regardless of the
+        // machine's time spent parsing the synthetic snapshot or painting.
+        dashboard_window::perf_set_time(hwnd, fixture::clock(), 40_000);
+        fresh_tab(&switch_tab(run, hwnd, Tab::Usage)?, reason)?;
+    }
+
+    // Let only the INACTIVE Overview deadline expire while Events remains valid.
+    // No timer or mail may invalidate the cache before the restore attempt.
+    let _ = switch_tab(run, hwnd, Tab::Overview)?;
+    revision += 1;
+    publish_fixture(hwnd, &port, &fixture::input(), revision)?;
+    let overview = cache(hwnd)?;
+    let deadline = overview.next_clock.context("Overview expiry missing")?;
+    fresh_tab(
+        &switch_tab(run, hwnd, Tab::Events)?,
+        "first Events after data",
+    )?;
+    ensure!(
+        cache(hwnd)?.next_clock.is_some_and(|at| at > deadline),
+        "active Events deadline does not isolate inactive Overview expiry"
+    );
+    let mut expired = fixture::clock();
+    expired.now = deadline.with_timezone(expired.now.offset());
+    dashboard_window::perf_set_time(hwnd, expired, 40_000);
+    fresh_tab(
+        &switch_tab(run, hwnd, Tab::Overview)?,
+        "expired Overview restore",
+    )?;
+    let restored = cache(hwnd)?;
+    ensure!(
+        restored.epoch > overview.epoch && restored.next_clock.is_some_and(|at| at > deadline),
+        "expired target did not refresh publication/deadline: old={overview:?}, new={restored:?}"
+    );
+    let before = run.commands.len();
+    invoke_tab(hwnd, Tab::Usage, overview.epoch)?;
+    run.collect()?;
+    ensure!(
+        selected_tab(hwnd)? == Tab::Overview && run.commands.len() == before,
+        "expired cached epoch dispatched an action"
+    );
+    Ok(())
+}
+
+fn cached_future_clock_regression(run: &mut Run, hwnd: HWND) -> Result<()> {
+    let port = run.port.as_ref().context("missing mailbox")?.clone();
+    // Active Usage is rendered at T; inactive Overview is rendered at T+100ms.
+    // A correction to T+50ms is forward relative to the active completed view,
+    // below the >2s jump threshold, but backward relative to the cached target.
+    for (revision, via_mail) in [(16, false), (17, true)] {
+        if selected_tab(hwnd)? != Tab::Usage {
+            let _ = switch_tab(run, hwnd, Tab::Usage)?;
+        }
+        let clock = fixture::clock();
+        publish_fixture(hwnd, &port, &fixture::input(), revision)?;
+        let older = cache(hwnd)?;
+        let mut future = clock.clone();
+        future.now += chrono::Duration::milliseconds(100);
+        ensure!(
+            older.next_clock.is_some_and(|at| at > future.utc()),
+            "Usage deadline must not confound cached-clock lower bound: {older:?}"
+        );
+        dashboard_window::perf_set_time(hwnd, future.clone(), 40_000);
+        fresh_tab(
+            &switch_tab(run, hwnd, Tab::Overview)?,
+            "future Overview first visit",
+        )?;
+        let future_overview = cache(hwnd)?;
+        dashboard_window::perf_set_time(hwnd, future, 40_000);
+        warm_tab(
+            &switch_tab(run, hwnd, Tab::Usage)?,
+            "older Usage restoration",
+        )?;
+        let active = cache(hwnd)?;
+        let mut correction = clock;
+        correction.now += chrono::Duration::milliseconds(50);
+        if via_mail {
+            let _ = dashboard_window::perf_take_frames(hwnd);
+            ensure!(
+                port.clock(correction.clone()),
+                "cached-future clock mailbox closed"
+            );
+            sync_mail(hwnd, &port)?;
+            let frames = dashboard_window::perf_take_frames(hwnd);
+            fresh_tab(&frames, "clock mail must invalidate future inactive view")?;
+            ensure!(
+                cache(hwnd)?.epoch > active.epoch,
+                "future cached clock mail did not publish a new active epoch"
+            );
+        } else {
+            // No timer/mail invalidation: exercise the requested-frame lower
+            // bound guard itself, separately from apply_mail's cache scan.
+            dashboard_window::perf_set_time(hwnd, correction.clone(), 40_000);
+        }
+        dashboard_window::perf_set_time(hwnd, correction, 40_000);
+        fresh_tab(
+            &switch_tab(run, hwnd, Tab::Overview)?,
+            "reject future cached Overview",
+        )?;
+        let restored = cache(hwnd)?;
+        ensure!(
+            restored.epoch > future_overview.epoch,
+            "future cached target did not receive a fresh publication: via_mail={via_mail}"
+        );
+        let before = run.commands.len();
+        invoke_tab(hwnd, Tab::Events, future_overview.epoch)?;
+        run.collect()?;
+        ensure!(
+            selected_tab(hwnd)? == Tab::Overview
+                && cache(hwnd)?.epoch == restored.epoch
+                && run.commands.len() == before,
+            "future cached target epoch dispatched after correction: via_mail={via_mail}"
+        );
+    }
     Ok(())
 }
 
@@ -648,6 +899,9 @@ fn r1210_host_cache() -> Result<()> {
         "stale invoke changed publication"
     );
     run.no_rebuild(hwnd, "stale epoch invocation")?;
+    let mut tab_clock = fixture::clock();
+    tab_clock.now += chrono::Duration::seconds(5);
+    dashboard_window::perf_set_time(hwnd, tab_clock.clone(), 5_000);
     invoke_tab(hwnd, Tab::Usage, previous_epoch)?;
     run.frame(hwnd)?;
     let tab_frames = dashboard_window::perf_take_frames(hwnd);
@@ -656,12 +910,7 @@ fn r1210_host_cache() -> Result<()> {
             && tab_frames.iter().any(|f| f.rebuilt && f.tab == "Usage"),
         "current epoch tab action must rebuild Usage geometry exactly once: frames={tab_frames:?}"
     );
-    ensure!(
-        tab_frames
-            .iter()
-            .all(|f| f.project_us == 0 && f.snapshot_us == 0),
-        "tab-only action must retain projection and snapshot: frames={tab_frames:?}"
-    );
+    fresh_tab(&tab_frames, "first Usage reveals hidden clock labels")?;
     ensure!(
         selected_tab(hwnd)? == Tab::Usage,
         "current epoch positive control did not dispatch"
@@ -672,8 +921,60 @@ fn r1210_host_cache() -> Result<()> {
             .any(|c| matches!(c, Command::Usage)),
         "current epoch positive control did not reach the memory bridge"
     );
-    invoke_tab(hwnd, Tab::Overview, cache(hwnd)?.epoch)?;
-    run.frame(hwnd)?;
+    let usage = cache(hwnd)?;
+    dashboard_window::perf_set_time(hwnd, tab_clock.clone(), 5_000);
+    warm_tab(
+        &switch_tab(&mut run, hwnd, Tab::Overview)?,
+        "first warm Overview",
+    )?;
+    ensure!(
+        cache(hwnd)?.epoch > usage.epoch,
+        "warm Overview did not advance epoch"
+    );
+    dashboard_window::perf_set_time(hwnd, tab_clock.clone(), 5_000);
+    fresh_tab(&switch_tab(&mut run, hwnd, Tab::Events)?, "first Events")?;
+    let events = cache(hwnd)?;
+    let mut latest_epoch = events.epoch;
+    // Repeatedly cycle all three completed frames. Map counts must be bounded
+    // per tab even though every prepared UIA publication gets a new epoch.
+    for _ in 0..6 {
+        for (tab, expected) in [
+            (Tab::Usage, &usage),
+            (Tab::Overview, &retained),
+            (Tab::Events, &events),
+        ] {
+            dashboard_window::perf_set_time(hwnd, tab_clock.clone(), 5_000);
+            warm_tab(&switch_tab(&mut run, hwnd, tab)?, "three-tab warm cache")?;
+            let current = cache(hwnd)?;
+            ensure!(
+                current.epoch > latest_epoch
+                    && current.actions == expected.actions
+                    && current.elements == expected.elements,
+                "warm prepared publication epoch/maps invalid: tab={tab:?}, current={current:?}, expected={expected:?}"
+            );
+            latest_epoch = current.epoch;
+        }
+    }
+    dashboard_window::perf_set_time(hwnd, tab_clock.clone(), 5_000);
+    warm_tab(
+        &switch_tab(&mut run, hwnd, Tab::Usage)?,
+        "warm Usage before stale invoke",
+    )?;
+    let warm_usage = cache(hwnd)?;
+    let command_count = run.commands.len();
+    invoke_tab(hwnd, Tab::Overview, usage.epoch)?;
+    run.collect()?;
+    ensure!(
+        selected_tab(hwnd)? == Tab::Usage
+            && cache(hwnd)?.epoch == warm_usage.epoch
+            && run.commands.len() == command_count,
+        "old cached Usage epoch dispatched"
+    );
+    dashboard_window::perf_set_time(hwnd, tab_clock, 5_000);
+    warm_tab(
+        &switch_tab(&mut run, hwnd, Tab::Overview)?,
+        "warm Overview before midnight",
+    )?;
 
     // Install an authoritative old-day sample through the real mailbox, then
     // withhold all clock replies while advancing past midnight without sleeping.
@@ -766,7 +1067,7 @@ fn r1210_host_cache() -> Result<()> {
         run.clocks,
         dashboard_window::perf_cache_state(hwnd)
     );
-    // In contrast to a tab-only geometry change, authoritative changed-clock
+    // In contrast to a warm tab restoration, authoritative changed-clock
     // mail must replace the old projection. This large fixture makes projection
     // work measurable with the production microsecond counter.
     ensure!(
@@ -800,6 +1101,8 @@ fn r1210_host_cache() -> Result<()> {
     );
     pointer_release_regressions(&mut run, hwnd)?;
     backward_clock_regression(&mut run, hwnd)?;
+    tab_invalidation_regressions(&mut run, hwnd)?;
+    cached_future_clock_regression(&mut run, hwnd)?;
     dashboard_window::close_now_on_ui_thread()?;
     ensure!(
         !unsafe { IsWindow(Some(hwnd)) }.as_bool(),

@@ -99,11 +99,21 @@ pub struct Snapshot {
     pub elements: Vec<Element>,
 }
 
+/// Validated, immutable geometry, focus and action indexes from one frame.
+/// Clones share the snapshot; changed frame contents require preparation again.
+#[derive(Clone, Debug)]
+pub struct PreparedSnapshot(Arc<Snapshot>);
+
+pub fn prepare_snapshot(snapshot: Snapshot) -> Result<PreparedSnapshot> {
+    validate(&snapshot)?;
+    Ok(PreparedSnapshot(Arc::new(snapshot)))
+}
+
 struct Cache {
     hwnd: isize,
     alive: bool,
     epoch: usize,
-    snapshot: Snapshot,
+    snapshot: Arc<Snapshot>,
     value_requests: Vec<ValueRequest>,
 }
 
@@ -129,12 +139,12 @@ pub fn create_root_provider(hwnd: isize) -> Result<RootProvider> {
         hwnd,
         alive: true,
         epoch: 0,
-        snapshot: Snapshot {
+        snapshot: Arc::new(Snapshot {
             automation_id: "quota-baton.flyout",
             name: String::new(),
             bounds: [0.0; 4],
             elements: Vec::new(),
-        },
+        }),
         value_requests: Vec::new(),
     }));
     Ok(RootProvider {
@@ -149,7 +159,12 @@ impl RootProvider {
     /// Consume an epoch even when republishing identical geometry/focus. The UI
     /// coordinator must not reset/reuse epochs across replacement owners/HWNDs.
     pub fn publish(&self, snapshot: Snapshot, epoch: usize) -> Result<()> {
-        validate(&snapshot)?;
+        self.publish_prepared(&prepare_snapshot(snapshot)?, epoch)
+    }
+
+    /// Reuse a validated frame, consuming a fresh epoch on every publication.
+    /// Liveness, epoch checks and pending-value invalidation still apply.
+    pub fn publish_prepared(&self, snapshot: &PreparedSnapshot, epoch: usize) -> Result<()> {
         let mut cache = self.root.cache.lock().map_err(|_| unavailable())?;
         if !cache.alive {
             return Err(unavailable());
@@ -157,7 +172,7 @@ impl RootProvider {
         if epoch <= cache.epoch || epoch > isize::MAX as usize {
             return Err(Error::from_hresult(E_INVALIDARG));
         }
-        cache.snapshot = snapshot;
+        cache.snapshot = Arc::clone(&snapshot.0);
         cache.epoch = epoch;
         cache.value_requests.clear();
         Ok(())
@@ -258,11 +273,12 @@ fn deactivate_cache(cache: &Mutex<Cache>) -> isize {
     let hwnd = cache.hwnd;
     cache.alive = false;
     cache.hwnd = 0;
-    cache.snapshot.name.clear();
-    cache.snapshot.name.shrink_to_fit();
-    cache.snapshot.elements.clear();
-    cache.snapshot.elements.shrink_to_fit();
-    cache.snapshot.bounds = [0.0; 4];
+    cache.snapshot = Arc::new(Snapshot {
+        automation_id: cache.snapshot.automation_id,
+        name: String::new(),
+        bounds: [0.0; 4],
+        elements: Vec::new(),
+    });
     cache.value_requests.clear();
     cache.value_requests.shrink_to_fit();
     hwnd // Guard is dropped before either cleanup callback can run.
@@ -2297,6 +2313,119 @@ mod tests {
             unsafe { value.Value() }.err().map(|e| e.code()),
             Some(unavailable().code())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn r1210_prepared_snapshot_rejects_invalid_geometry_focus_and_parents() {
+        let mut bounds = scene();
+        bounds.bounds[2] = -1.;
+        let mut duplicate = scene();
+        duplicate.elements[2].id = duplicate.elements[1].id;
+        let mut focus = scene();
+        focus.elements[2].focused = true;
+        let mut missing = scene();
+        missing.elements[1].parent = Some(999);
+        let mut cycle = scene();
+        cycle.elements[0].parent = Some(2);
+        cycle.elements[1].parent = Some(1);
+        for snapshot in [bounds, duplicate, focus, missing, cycle] {
+            assert_eq!(
+                prepare_snapshot(snapshot).err().map(|e| e.code()),
+                Some(E_INVALIDARG)
+            );
+        }
+    }
+
+    #[test]
+    fn r1210_prepared_publication_checks_epochs_and_clears_value_requests() -> Result<()> {
+        let posts = PostCapture::new();
+        let owner = create_root_provider(1)?;
+        let prepared = prepare_snapshot(pattern_scene())?;
+        owner.publish_prepared(&prepared, 1)?;
+        let value = com_pattern::<IValueProvider>(&com_element(&owner, 7)?, UIA_ValuePatternId)?;
+        let input = wide("pending prepared search");
+        unsafe { value.SetValue(PCWSTR(input.as_ptr()))? };
+        let (_, _, token, epoch) = posts.messages()[0];
+        for refused in [0, 1, isize::MAX as usize + 1] {
+            assert_eq!(
+                owner
+                    .publish_prepared(&prepared, refused)
+                    .err()
+                    .map(|e| e.code()),
+                Some(E_INVALIDARG)
+            );
+            let cache = owner.root.read()?;
+            assert_eq!(cache.epoch, 1);
+            assert_eq!(cache.value_requests.len(), 1);
+            assert!(Arc::ptr_eq(&cache.snapshot, &prepared.0));
+        }
+        owner.publish_prepared(&prepared, 2)?;
+        assert!(owner.root.read()?.value_requests.is_empty());
+        assert!(
+            owner
+                .take_value_request(WPARAM(token), LPARAM(epoch))?
+                .is_none()
+        );
+        assert_eq!(
+            unsafe { value.Value() }.err().map(|e| e.code()),
+            Some(unavailable().code())
+        );
+        owner.publish_prepared(&prepared, isize::MAX as usize)?;
+        owner.deactivate();
+        assert_eq!(
+            owner
+                .publish_prepared(&prepared, isize::MAX as usize)
+                .err()
+                .map(|e| e.code()),
+            Some(unavailable().code())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn r1210_prepared_snapshots_stay_immutable_across_publication_and_teardown() -> Result<()> {
+        let owner = create_root_provider(1)?;
+        let other = create_root_provider(1)?;
+        let prepared = prepare_snapshot(pattern_scene())?;
+        let shared = prepared.clone();
+        let weak = Arc::downgrade(&prepared.0);
+        owner.publish_prepared(&prepared, 1)?;
+        other.publish_prepared(&shared, 1)?;
+        let retained = Arc::clone(&owner.root.read()?.snapshot);
+        assert!(Arc::ptr_eq(&retained, &prepared.0));
+        let before = format!("{retained:?}");
+        let child = owner.root.navigate(NavigateDirection_FirstChild)?.unwrap();
+        owner.deactivate();
+        assert!(child.read().is_err());
+        assert_eq!(format!("{retained:?}"), before);
+        assert!(Arc::ptr_eq(&other.root.read()?.snapshot, &prepared.0));
+
+        let mut changed = retained.as_ref().clone();
+        changed.name = "changed prepared frame".into();
+        changed.elements[6].value = Some("changed prepared value".into());
+        let next = prepare_snapshot(changed)?;
+        other.publish_prepared(&next, 2)?;
+        assert!(Arc::ptr_eq(&other.root.read()?.snapshot, &next.0));
+        assert_eq!(
+            BSTR::try_from(&other.root.property(UIA_NamePropertyId)?)?.to_string(),
+            "changed prepared frame"
+        );
+        let value = com_pattern::<IValueProvider>(&com_element(&other, 7)?, UIA_ValuePatternId)?;
+        assert_eq!(
+            unsafe { value.Value()? }.to_string(),
+            "changed prepared value"
+        );
+        assert_eq!(format!("{retained:?}"), before);
+        drop(prepared);
+        drop(shared);
+        assert!(weak.upgrade().is_some());
+        drop(retained);
+        assert!(weak.upgrade().is_none());
+        other.deactivate();
+        assert!(other.root.read().is_err());
+        assert_eq!(next.0.name, "changed prepared frame");
+        assert_eq!(next.0.elements.len(), 15);
         Ok(())
     }
 

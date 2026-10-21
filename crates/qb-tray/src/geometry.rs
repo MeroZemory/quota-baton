@@ -329,6 +329,24 @@ struct SceneSection {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SceneSections(Vec<SceneSection>);
 impl SceneSections {
+    /// Read-only identity check for the conservative Table-card damage path.
+    pub(crate) fn table_cards_for_damage(&self, previous: &Self) -> Option<(Rect, Rect)> {
+        fn table(sections: &SceneSections) -> Option<&SceneSection> {
+            let mut tables = sections
+                .0
+                .iter()
+                .filter(|s| matches!(s.kind, SectionKind::Table));
+            let table = tables.next()?;
+            tables.next().is_none().then_some(table)
+        }
+        let old = table(previous)?;
+        let new = table(self)?;
+        if old.card != new.card || old.clip != new.clip || old.scope != new.scope {
+            return None;
+        }
+        Some((old.card, new.card))
+    }
+
     fn build(
         &mut self,
         kind: SectionKind,
