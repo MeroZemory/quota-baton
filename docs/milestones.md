@@ -9,7 +9,7 @@ This file names the verification for each unit and each row. The row list and th
 목표: 대시보드 수정을 전달하고 R11을 마무리한다
 핵심 지표: 새 경로 출시 1/2 · R11 HTTP32·WS15 통과, native·최종 관문 남음
 사용자 대기: 없음 (R2 Part B만 사용자 결정 대기)
-갱신: 2026-10-22 05:56 KST (R11 수정 단위 통과, 미출시)
+갱신: 2026-10-22 06:01 KST (R11 독립 검수·반례 확인 완료, 미출시)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -88,6 +88,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-22 05:38 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R11 추가 독립 검수 반영 중; 하네스 자체검사 14/14, 제품 실행 결과 아님 |
 | 2026-10-22 05:48 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R11 검수 보완 HTTP30 실행: 28통과·2 fixture 시각 비교 실패; 미출시 |
 | 2026-10-22 05:56 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R11 보완 HTTP32/32·실제 WS15/15 통과, native·최종 관문 미완료 |
+| 2026-10-22 06:01 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R11 수정 전 반례7/7 실패·소스 복원 확인; 최종 관문 미완료 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -151,12 +152,13 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-22 05:38 | R11 native 하네스 순수 자체검사 | 14/14 통과 | 14/14 | 실제 native·제품 실행 없이 오판 방지 규칙 재검증 |
 | 2026-10-22 05:48 | R11 검수 보완 HTTP 회귀 | 28/30 통과 | 30/30 | 고정 입력7efebecd; 실패2건은 launch_anchors.last_used 비교, 수정·재실행 예정 |
 | 2026-10-22 05:56 | R11 검수 보완 HTTP/실제 WS 회귀 | 32/32 · 15/15 통과 | 모두 통과 | 고정 입력dda712bf; F1–F5·추가 경합·재개 모델·동의·프로브·legacy 포함 |
+| 2026-10-22 06:01 | R11 수정 전 반례 검출 | 7/7 예상 실패 확인 | 7/7 | F1/F3/F5·F4 초기 후보 반례, F2는 로컬 오류 대기 timeout; 현재 소스 지문 복원 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 행동 |
 |---|---|---|---|
-| R11 실행별 계정 | 보완 HTTP32/32·WS15/15 통과 | native·최종 관문 통과 | 독립 closeout, 수정 전 실패 확인, A/B/A·동시 실행과 전체 검사 |
+| R11 실행별 계정 | 보완 HTTP32/32·WS15/15 통과 | native·최종 관문 통과 | A/B/A·동시 실행과 전체 검사; 독립 검수·반례7건 완료 |
 | 대시보드 지연 (R12.10) | 합성 실제 창 성능·최종 scoped gate 통과 | 실제 설치 확인 | 설계 세션이 설치하고 사용자 환경 확인 |
 | R13 소진 예측·아이콘·차트·캐시 보류 | 설계 완료, 병합 0/3 단위 | 3/3 단위 병합과 설치 | R11 뒤 B+B2+D, A, C+E 순서 |
 <!-- gaps:end -->
