@@ -471,3 +471,55 @@ fn utf16_ime_and_edit_selection_do_not_split_characters_or_insert_controls() {
     edit.insert(&"x".repeat(500));
     assert_eq!(edit.text.chars().count(), 256);
 }
+#[test]
+fn uia_search_values_respect_connection_modal_state_and_idempotence() {
+    use qb_tray::{
+        geometry::Target,
+        state::{DashboardState, Popup},
+    };
+    let mut state = DashboardState::default();
+    state.table_offset = 100.;
+    state.events_offset = 200.;
+    let before = format!("{state:?}");
+    assert!(!set_search_value(
+        &mut state,
+        &Target::Search,
+        "query".into(),
+        false
+    ));
+    assert_eq!(format!("{state:?}"), before);
+    state.popup = Some(Popup::Range);
+    assert!(!set_search_value(
+        &mut state,
+        &Target::Search,
+        "query".into(),
+        true
+    ));
+    assert!(state.search.is_empty());
+    state.popup = None;
+    assert!(set_search_value(
+        &mut state,
+        &Target::Search,
+        "query".into(),
+        true
+    ));
+    assert_eq!(state.search, "query");
+    assert_eq!(state.table_offset, 0.);
+    assert_eq!(state.events_offset, 200.);
+    state.table_offset = 50.;
+    assert!(!set_search_value(
+        &mut state,
+        &Target::Search,
+        "query".into(),
+        true
+    ));
+    assert_eq!(state.table_offset, 50.);
+    assert!(set_search_value(
+        &mut state,
+        &Target::EventSearch,
+        "event".into(),
+        true
+    ));
+    assert_eq!(state.events_offset, 0.);
+    assert_eq!(state.search, "query");
+}

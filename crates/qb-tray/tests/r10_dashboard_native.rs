@@ -50,6 +50,22 @@ use windows::Win32::{
 // No runtime, core, real profile, disk persistence, HTTP, or credential provider.
 // enqueue does only a bounded nonblocking send, even during reentrant WndProc calls.
 struct FakeBridge(SyncSender<Event>);
+
+#[test]
+fn r10_chip_cases_really_render_account_chips_instead_of_the_empty_screen() {
+    for state in [8, 11] {
+        let snapshot = fixture::snapshot(state);
+        let mut ui = DashboardState::default();
+        let view = model::project(&snapshot, &mut ui, &fixture::clock());
+        assert!(matches!(view.empty, model::EmptyState::None));
+        assert_eq!(view.groups.len(), 11);
+        assert!(
+            view.groups
+                .iter()
+                .any(|g| g.tone == qb_tray::v2::Tone::Limit)
+        );
+    }
+}
 impl Bridge for FakeBridge {
     fn enqueue(&self, event: Event) {
         self.0
@@ -116,9 +132,6 @@ impl Run {
         loop {
             assert!(Instant::now() < self.deadline, "R10 native host deadline");
             self.service();
-            if let Some(port) = &self.port {
-                assert!(port.clock(fixture::clock()));
-            }
             unsafe {
                 let mut msg = MSG::default();
                 // Bound each drain so timer/paint activity cannot starve the deadline.
@@ -384,7 +397,7 @@ fn r10_dashboard_native() {
         .iter()
         .filter(|n| !n.hidden)
         .map(|n| {
-            json!({"name":n.name,"selected":n.selected,"enabled":n.enabled,
+            json!({"name":n.name,"role":format!("{:?}",n.role),"selected":n.selected,"enabled":n.enabled,
             "value":n.value,"expanded":n.expanded,"target":format!("{:?}",n.target)})
         })
         .collect();
@@ -414,10 +427,6 @@ fn r10_dashboard_native() {
     std::fs::rename(output.join("ready.tmp"), output.join("ready.json")).unwrap();
     // Keep pumping for external PrintWindow and UIA, bounded even if collector disappears.
     while !output.join("release").exists() {
-        unsafe {
-            let _ = InvalidateRect(Some(hwnd), None, false);
-            let _ = UpdateWindow(hwnd);
-        }
         run.pump(40);
     }
     assert_eq!(

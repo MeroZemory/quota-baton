@@ -164,24 +164,16 @@ unsafe fn metrics(hwnd: HWND) -> Option<([u32; 2], u32)> {
     ];
     Some((size, unsafe { GetDpiForWindow(hwnd) }.max(48)))
 }
-fn empty_accessibility(h: &mut Host) {
+fn invalidate_frame(h: &mut Host) {
+    // Retain the last completed read snapshot until its replacement is ready.
+    // Close action admission immediately; reopen only after successful publication.
     h.frame = None;
     h.life.invalidate();
-    if let (Some(root), Some(e)) = (h.root.as_ref(), epoch()) {
-        let _ = root.publish(
-            accessibility::Snapshot {
-                automation_id: "quota-baton.dashboard",
-                name: "quota-baton 대시보드".into(),
-                bounds: [0.; 4],
-                elements: vec![],
-            },
-            e,
-        );
-    }
 }
+
 fn redraw(hwnd: HWND) {
     if let Some(host) = current(hwnd) {
-        empty_accessibility(&mut host.borrow_mut());
+        invalidate_frame(&mut host.borrow_mut());
     }
     repaint(hwnd);
 }
@@ -636,7 +628,7 @@ unsafe fn paint(hwnd: HWND) -> Result<()> {
         if pixels.contains(&0) {
             return Ok(());
         }
-        empty_accessibility(&mut h);
+        invalidate_frame(&mut h);
         if h.target.is_none() {
             let rt = unsafe {
                 h.factory.CreateHwndRenderTarget(
@@ -703,7 +695,7 @@ unsafe fn paint(hwnd: HWND) -> Result<()> {
             actions: vec![],
             elements: vec![],
         };
-        publish_accessibility(&mut h, &mut frame);
+        publish_accessibility(&mut h, &mut frame)?;
         h.life.painted(stamp);
         h.frame = Some(frame);
         Ok(())
@@ -716,7 +708,7 @@ unsafe fn paint(hwnd: HWND) -> Result<()> {
     {
         let mut h = host.borrow_mut();
         h.target = None;
-        empty_accessibility(&mut h);
+        invalidate_frame(&mut h);
     }
     result
 }
@@ -837,10 +829,11 @@ fn physical(rect: qb_tray::Rect, origin: POINT, scale: f64) -> [f64; 4] {
         (rect.bottom - rect.top).max(0.) as f64 * scale,
     ]
 }
-fn publish_accessibility(h: &mut Host, frame: &mut Frame) {
+fn publish_accessibility(h: &mut Host, frame: &mut Frame) -> Result<()> {
+    let failure = |reason| Error::new(windows::Win32::Foundation::E_FAIL, reason);
     let mut origin = POINT::default();
     if !unsafe { ClientToScreen(h.hwnd, &mut origin) }.as_bool() {
-        return;
+        return Err(failure("dashboard UIA client origin unavailable"));
     }
     // Allocate every current semantic node before resolving any parent. Hidden
     // chart table/cells remain in the tree even though they have no hit target.
@@ -852,19 +845,19 @@ fn publish_accessibility(h: &mut Host, frame: &mut Frame) {
         .collect();
     h.ids.retain(|key, _| keys.contains(key.as_str()));
     if keys.len() != frame.scene.accessibility.len() {
-        return;
+        return Err(failure("dashboard UIA duplicate semantic key"));
     }
     let required = keys.iter().filter(|key| !h.ids.contains_key(**key)).count();
     let Ok(required) = i32::try_from(required) else {
-        return;
+        return Err(failure("dashboard UIA element count overflow"));
     };
     if h.next_id <= 0 || h.next_id.checked_add(required).is_none() {
-        return;
+        return Err(failure("dashboard UIA id range exhausted"));
     }
     for node in &frame.scene.accessibility {
         if !h.ids.contains_key(&node.key) {
             let Some(next) = h.next_id.checked_add(1) else {
-                return;
+                return Err(failure("dashboard UIA id allocation overflow"));
             };
             h.ids.insert(node.key.clone(), h.next_id);
             h.next_id = next;
@@ -877,7 +870,7 @@ fn publish_accessibility(h: &mut Host, frame: &mut Frame) {
         let parent = match node.parent.as_ref() {
             Some(key) => {
                 let Some(id) = h.ids.get(key) else {
-                    return;
+                    return Err(failure("dashboard UIA missing semantic parent"));
                 };
                 Some(*id)
             }
@@ -944,7 +937,9 @@ fn publish_accessibility(h: &mut Host, frame: &mut Frame) {
         });
     }
     if let Some(root) = h.root.as_ref() {
-        let _ = root.publish(
+        #[cfg(all(test, feature = "testkit"))]
+        let count = elements.len();
+        let result = root.publish(
             accessibility::Snapshot {
                 automation_id: "quota-baton.dashboard",
                 name: "quota-baton 대시보드".into(),
@@ -953,6 +948,14 @@ fn publish_accessibility(h: &mut Host, frame: &mut Frame) {
             },
             frame.stamp.epoch,
         );
+        #[cfg(all(test, feature = "testkit"))]
+        eprintln!(
+            "dashboard UIA publish epoch={} nodes={} result={result:?}",
+            frame.stamp.epoch, count
+        );
+        result
+    } else {
+        Err(failure("dashboard UIA provider unavailable"))
     }
 }
 
@@ -1685,15 +1688,71 @@ unsafe extern "system" fn wndproc(
             redraw(hwnd);
         }
         WM_GETOBJECT => {
+            #[cfg(all(test, feature = "testkit"))]
+            eprintln!("dashboard WM_GETOBJECT {:#x}", lparam.0);
             if let Some(host) = current(hwnd) {
                 let h = host.borrow();
-                if frame_valid(&h)
+                // Keep the provider identity stable while a new frame is pending.
+                // Snapshot publication and action dispatch retain their epoch guards.
+                if !h.closing
                     && let Some(root) = h.root.as_ref()
                     && let Some(result) = root.handle_wm_getobject(wparam, lparam)
                 {
+                    #[cfg(all(test, feature = "testkit"))]
+                    eprintln!("dashboard provider return {:#x}", result.0);
                     return result;
                 }
             }
+        }
+        accessibility::WM_UIA_VALUE => {
+            let changed = current(hwnd).is_some_and(|host| {
+                let mut h = host.borrow_mut();
+                if !frame_valid(&h) || !h.snapshot.connection.core_ok {
+                    return false;
+                }
+                let frame = h.frame.as_ref().unwrap();
+                if lparam.0 <= 0 || frame.stamp.epoch != lparam.0 as usize {
+                    return false;
+                }
+                let Some(root) = h.root.as_ref() else {
+                    return false;
+                };
+                let Ok(Some((id, epoch, value))) = root.take_value_request(wparam, lparam) else {
+                    return false;
+                };
+                if epoch != frame.stamp.epoch {
+                    return false;
+                }
+                let Some(target) = frame
+                    .elements
+                    .iter()
+                    .find(|(element, _)| *element == id)
+                    .map(|(_, t)| t.clone())
+                else {
+                    return false;
+                };
+                if !frame
+                    .scene
+                    .targets
+                    .iter()
+                    .any(|hit| hit.enabled && hit.target == target)
+                {
+                    return false;
+                }
+                let connected = h.snapshot.connection.core_ok;
+                if !window_logic::set_search_value(&mut h.state, &target, value.clone(), connected)
+                {
+                    return false;
+                }
+                if h.editing.as_ref() == Some(&target) {
+                    h.edit.reset(&value);
+                }
+                true
+            });
+            if changed {
+                redraw(hwnd);
+            }
+            return LRESULT(0);
         }
         accessibility::WM_UIA_INVOKE | accessibility::WM_UIA_FOCUS => {
             let target = current(hwnd).and_then(|h| {
