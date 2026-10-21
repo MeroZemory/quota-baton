@@ -111,6 +111,14 @@ mod platform {
         _ancestors: Vec<File>,
     }
 
+    impl Guards {
+        /// Retain thread/coordination locks and directory pins while allowing
+        /// unlink_validated to acquire SHARE_NONE and recheck the same object.
+        pub(crate) fn release_rollouts_for_unlink(&mut self) {
+            self._rollouts.clear();
+        }
+    }
+
     // No Debug: owned handles can reveal paths. Drop the marker before pins.
     pub(crate) struct PublicationGuard {
         _anchor: File,
@@ -787,12 +795,13 @@ mod platform {
     /// Rollout read handles deny write sharing through hardlinks, but allow
     /// delete sharing for link/unimport. Names can therefore be replaced: the
     /// planner must recheck identity and compression immediately before mutation.
+    #[cfg(test)]
     pub(crate) fn probe_all(
         homes: &[PathBuf],
         ids: &[String],
         rollouts: &[PathBuf],
     ) -> Result<Guards> {
-        probe(homes, ids, rollouts, false, false, true)
+        probe(homes, ids, rollouts, false, false, true, false)
     }
 
     /// Unlink-only recovery: retain all writer/path/share checks, but leave any
@@ -803,18 +812,19 @@ mod platform {
         ids: &[String],
         plain_rollouts: &[PathBuf],
     ) -> Result<Guards> {
-        probe(homes, ids, plain_rollouts, true, false, true)
+        probe(homes, ids, plain_rollouts, true, false, true, false)
     }
 
     /// Applying operations reserve even absent per-home Codex locks. Existing
     /// rollouts are pinned against writers first; all coordination locks are
     /// acquired before creating/taking thread locks, and retained through commit.
+    #[cfg(test)]
     pub(crate) fn reserve_commit(
         homes: &[PathBuf],
         ids: &[String],
         rollouts: &[PathBuf],
     ) -> Result<Guards> {
-        probe(homes, ids, rollouts, false, true, true)
+        probe(homes, ids, rollouts, false, true, true, false)
     }
 
     /// Reserve coordination/thread locks and directory pins for panel 2 commit.
@@ -822,10 +832,41 @@ mod platform {
     /// handles are dropped before returning so `unlink_validated` can acquire SHARE_NONE.
     /// This does NOT exclude raw rollout readers/writers after the transient
     /// check: every destructive step must use `unlink_validated` to check exclusively.
+    #[cfg(test)]
     pub(crate) fn reserve_commit_exclusive(
         homes: &[PathBuf],
         ids: &[String],
         rollouts: &[PathBuf],
+    ) -> Result<Guards> {
+        reserve_exclusive(homes, ids, rollouts, false)
+    }
+    /// Call only after a complete metadata catalog checked compressed headers.
+    pub(crate) fn reserve_decoded_exclusive(
+        homes: &[PathBuf],
+        ids: &[String],
+        rollouts: &[PathBuf],
+    ) -> Result<Guards> {
+        reserve_exclusive(homes, ids, rollouts, true)
+    }
+    pub(crate) fn probe_decoded(
+        homes: &[PathBuf],
+        ids: &[String],
+        rollouts: &[PathBuf],
+    ) -> Result<Guards> {
+        probe(homes, ids, rollouts, true, false, true, true)
+    }
+    pub(crate) fn reserve_decoded(
+        homes: &[PathBuf],
+        ids: &[String],
+        rollouts: &[PathBuf],
+    ) -> Result<Guards> {
+        probe(homes, ids, rollouts, true, true, true, true)
+    }
+    fn reserve_exclusive(
+        homes: &[PathBuf],
+        ids: &[String],
+        rollouts: &[PathBuf],
+        decoded: bool,
     ) -> Result<Guards> {
         check_ids(ids)?;
         let homes = homes
@@ -848,7 +889,7 @@ mod platform {
         for home in &homes {
             parents.push(anchored_parent(home, home, false)?);
         }
-        let mut guards = probe(&homes, ids, rollouts, false, true, false)?;
+        let mut guards = probe(&homes, ids, rollouts, decoded, true, false, decoded)?;
         guards._publications.extend(parents);
         Ok(guards)
     }
@@ -858,7 +899,7 @@ mod platform {
         ids: &[String],
         rollouts: &[PathBuf],
     ) -> Result<Guards> {
-        probe(homes, ids, rollouts, true, true, true)
+        probe(homes, ids, rollouts, true, true, true, false)
     }
 
     fn check_ids(ids: &[String]) -> Result<()> {
@@ -879,6 +920,7 @@ mod platform {
         allow_compressed_sibling: bool,
         reserve: bool,
         retain_rollouts: bool,
+        decoded_input: bool,
     ) -> Result<Guards> {
         check_ids(ids)?;
         let mut guards = Guards {
@@ -907,7 +949,9 @@ mod platform {
             let compressed_input = path
                 .extension()
                 .is_some_and(|ext| ext.as_encoded_bytes().eq_ignore_ascii_case(b"zst"));
-            if compressed_input || (!allow_compressed_sibling && compressed_sibling(&path)) {
+            if (compressed_input && !decoded_input)
+                || (!allow_compressed_sibling && compressed_sibling(&path))
+            {
                 bail!(
                     "압축된 rollout 또는 .zst 형제가 있습니다. sessions unimport 후 다시 가져오세요"
                 );
@@ -965,19 +1009,24 @@ mod platform {
 
 #[cfg(windows)]
 pub(crate) use platform::{
-    hardlink_count, identity, probe_all, probe_cleanup, remove_verified, rename_verified,
-    reserve_cleanup, reserve_commit, reserve_commit_exclusive, safe_path, same_volume,
+    hardlink_count, identity, probe_cleanup, probe_decoded, remove_verified, rename_verified,
+    reserve_cleanup, reserve_decoded, reserve_decoded_exclusive, safe_path, same_volume,
     unlink_counted, unlink_validated,
 };
 
 // Optional admission/uncounted compatibility APIs are for qualification tests.
 #[cfg(test)]
 pub(crate) use platform::{check_home_idle, unlink_exclusive, unlink_exclusive as unlink};
+#[cfg(all(test, windows))]
+pub(crate) use platform::{probe_all, reserve_commit, reserve_commit_exclusive};
 
 #[cfg(not(windows))]
 mod platform {
     use super::*;
     pub(crate) struct Guards;
+    impl Guards {
+        pub(crate) fn release_rollouts_for_unlink(&mut self) {}
+    }
     pub(crate) struct PublicationGuard;
     pub(crate) fn prepare_parent(_: &Path, _: &Path) -> Result<PublicationGuard> {
         anyhow::bail!("세션 경로 보호는 Windows에서만 지원됩니다")
@@ -1050,6 +1099,27 @@ mod platform {
     ) -> Result<Guards> {
         probe_all(homes, ids, rollouts)
     }
+    pub(crate) fn reserve_decoded_exclusive(
+        homes: &[PathBuf],
+        ids: &[String],
+        rollouts: &[PathBuf],
+    ) -> Result<Guards> {
+        probe_all(homes, ids, rollouts)
+    }
+    pub(crate) fn probe_decoded(
+        homes: &[PathBuf],
+        ids: &[String],
+        rollouts: &[PathBuf],
+    ) -> Result<Guards> {
+        probe_all(homes, ids, rollouts)
+    }
+    pub(crate) fn reserve_decoded(
+        homes: &[PathBuf],
+        ids: &[String],
+        rollouts: &[PathBuf],
+    ) -> Result<Guards> {
+        probe_all(homes, ids, rollouts)
+    }
     pub(crate) fn probe_cleanup(
         homes: &[PathBuf],
         ids: &[String],
@@ -1060,9 +1130,9 @@ mod platform {
 }
 #[cfg(not(windows))]
 pub(crate) use platform::{
-    hardlink_count, identity, probe_all, probe_cleanup, remove_verified, rename_verified,
-    reserve_cleanup, reserve_commit, reserve_commit_exclusive, safe_path, same_volume,
-    unlink_counted, unlink_validated,
+    hardlink_count, identity, probe_all, probe_cleanup, probe_decoded, remove_verified,
+    rename_verified, reserve_cleanup, reserve_commit, reserve_commit_exclusive, reserve_decoded,
+    reserve_decoded_exclusive, safe_path, same_volume, unlink_counted, unlink_validated,
 };
 
 #[cfg(all(test, windows))]
@@ -2339,5 +2409,34 @@ mod tests {
             .is_err()
         );
         assert!(probe_all(&[home], &[ID.into()], &[rollout]).is_err());
+    }
+    #[test]
+    fn releasing_rollout_handles_keeps_locks_and_rechecks_the_last_name() {
+        let temp = fixture();
+        let root = home(temp.path(), "release");
+        let source = root.join("sessions/source.jsonl");
+        let target = root.join("sessions/target.jsonl");
+        fs::write(&source, b"SYNTHETIC never delete last name").unwrap();
+        fs::hard_link(&source, &target).unwrap();
+        let identity_before = identity(&target).unwrap();
+        let mut held = reserve_commit(
+            std::slice::from_ref(&root),
+            &[ID.into()],
+            &[source.clone(), target.clone()],
+        )
+        .unwrap();
+        assert!(OpenOptions::new().append(true).open(&target).is_err());
+        held.release_rollouts_for_unlink();
+        assert!(reserve_commit_exclusive(std::slice::from_ref(&root), &[ID.into()], &[]).is_err());
+        assert!(fs::rename(&root, temp.path().join("renamed")).is_err());
+        fs::remove_file(&source).unwrap();
+        let error = unlink_counted(&root, &target, identity_before, 1).unwrap_err();
+        assert!(error.to_string().contains("마지막 하드링크"));
+        assert_eq!(identity(&target).unwrap(), identity_before);
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            b"SYNTHETIC never delete last name"
+        );
+        assert_eq!(hardlink_count(&target).unwrap(), 1);
     }
 }
