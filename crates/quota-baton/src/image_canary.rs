@@ -1,5 +1,5 @@
 //! D23 discovery only: no real home, account, image, or upstream request.
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -36,6 +36,69 @@ const PATH_ENV: &[&str] = &[
 ];
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProbeStage {
+    Version,
+    CachePublication,
+    Worker,
+    Setup,
+    Cleanup,
+    NativeSpawn,
+    NativeWait,
+    NativeExit,
+    ServerTimeout,
+    Server,
+    ToolAbsent,
+}
+
+impl ProbeStage {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Version => "version",
+            Self::CachePublication => "cache-publication",
+            Self::Worker => "worker",
+            Self::Setup => "setup",
+            Self::Cleanup => "cleanup",
+            Self::NativeSpawn => "native-spawn",
+            Self::NativeWait => "native-wait",
+            Self::NativeExit => "native-exit",
+            Self::ServerTimeout => "server-timeout",
+            Self::Server => "server",
+            Self::ToolAbsent => "tool-absent",
+        }
+    }
+
+    fn retryable(self) -> bool {
+        matches!(self, Self::NativeWait | Self::ServerTimeout)
+    }
+}
+
+impl std::fmt::Display for ProbeStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+impl std::error::Error for ProbeStage {}
+
+fn probe_with_retry(mut attempt: impl FnMut() -> Result<()>) -> Result<()> {
+    for retry in [true, false] {
+        match attempt() {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let stage = error
+                    .downcast_ref::<ProbeStage>()
+                    .copied()
+                    .unwrap_or(ProbeStage::Setup);
+                if !retry || !stage.retryable() {
+                    return Err(error);
+                }
+                diagnostic(stage.name(), true);
+            }
+        }
+    }
+    unreachable!()
+}
+
 #[derive(Debug)]
 struct CanaryRefusal;
 
@@ -59,14 +122,29 @@ pub(crate) async fn check(program: &Path, qb_home: &Path) -> Result<()> {
     let qb_home = qb_home.to_owned();
     tokio::task::spawn_blocking(move || check_inner(&program, &qb_home))
         .await
-        .map_err(|_| CanaryRefusal)?
+        .map_err(|_| {
+            diagnostic(ProbeStage::Worker.name(), true);
+            CanaryRefusal
+        })?
         .map_err(|_| CanaryRefusal.into())
 }
 
 fn check_inner(program: &Path, qb_home: &Path) -> Result<()> {
-    let version_output = crate::launcher_label::version_output(program);
-    diagnostic("version", version_output.is_err());
-    let version = version(&version_output?)?;
+    let result = check_inner_impl(program, qb_home);
+    if let Err(error) = &result {
+        let stage = error
+            .downcast_ref::<ProbeStage>()
+            .copied()
+            .unwrap_or(ProbeStage::Setup);
+        diagnostic(stage.name(), true);
+    }
+    result
+}
+
+fn check_inner_impl(program: &Path, qb_home: &Path) -> Result<()> {
+    let version_output =
+        crate::launcher_label::version_output(program).context(ProbeStage::Version)?;
+    let version = version(&version_output).context(ProbeStage::Version)?;
     let qb_home = fs::canonicalize(qb_home)?;
     let base = qb_home.join("state/image-canary");
     // Pins the no-reparse ancestors for cache publication and scratch lifetime.
@@ -77,24 +155,21 @@ fn check_inner(program: &Path, qb_home: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let scratch = Scratch::create(&qb_home, &base)?;
-    let result = probe(program, &scratch.path);
-    // A successful cache entry also requires successful owned-state cleanup.
-    let cleanup = scratch.cleanup();
-    diagnostic("cleanup", cleanup.is_err());
-    cleanup?;
-    result?;
-    publish_pass(&qb_home, &cache, &version)
+    probe_with_retry(|| {
+        let scratch = Scratch::create(&qb_home, &base)?;
+        let result = probe(program, &scratch.path);
+        // Every attempt is isolated and cleaned before retry or publication.
+        scratch.cleanup().context(ProbeStage::Cleanup)?;
+        result
+    })?;
+    publish_pass(&qb_home, &cache, &version).context(ProbeStage::CachePublication)
 }
 
 fn diagnostic(stage: &'static str, failed: bool) {
     // Fixed stage names only: never native output, request bodies or error chains.
-    #[cfg(all(feature = "testkit", debug_assertions))]
     if failed {
         eprintln!("qb-image-canary: {stage}");
     }
-    #[cfg(not(all(feature = "testkit", debug_assertions)))]
-    let _ = (stage, failed);
 }
 
 fn version(output: &[u8]) -> Result<String> {
@@ -360,14 +435,45 @@ fn probe(program: &Path, path: &Path) -> Result<()> {
     }
     args.extend(["--".into(), "Reply OK without calling any tools.".into()]);
     let native = crate::launcher_label::canary_run(program, &args, &env, path);
-    diagnostic("native", native.is_err());
     let found = server.finish();
-    diagnostic("server", found.is_err());
-    let found = found?;
+    probe_outcome(native, found)
+}
+
+fn probe_outcome(
+    native: std::result::Result<(), crate::launcher_label::CanaryRunError>,
+    found: Result<bool>,
+) -> Result<()> {
+    let native = native.map_err(|error| match error {
+        crate::launcher_label::CanaryRunError::Spawn(_) => ProbeStage::NativeSpawn,
+        crate::launcher_label::CanaryRunError::Wait(_) => ProbeStage::NativeWait,
+        crate::launcher_label::CanaryRunError::Exit => ProbeStage::NativeExit,
+    });
+    if let Err(stage @ (ProbeStage::NativeSpawn | ProbeStage::NativeWait)) = native {
+        return Err(stage.into());
+    }
+    // A server read/write timeout may itself cause a native nonzero exit.
+    // Preserve that typed timeout instead of losing its single retry.
+    let found = found.map_err(server_failure)?;
     native?;
-    diagnostic("tool-absent", !found);
-    ensure!(found, "image tool absent");
+    if !found {
+        return Err(ProbeStage::ToolAbsent.into());
+    }
     Ok(())
+}
+
+fn server_failure(error: anyhow::Error) -> ProbeStage {
+    if error.downcast_ref::<ProbeStage>() == Some(&ProbeStage::ServerTimeout)
+        || error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            )
+        })
+    {
+        ProbeStage::ServerTimeout
+    } else {
+        ProbeStage::Server
+    }
 }
 
 struct Server {
@@ -405,6 +511,9 @@ impl Server {
                     Err(error) => return Err(error.into()),
                 }
             }
+            if !signal.load(Ordering::Acquire) && Instant::now() >= deadline {
+                return Err(ProbeStage::ServerTimeout.into());
+            }
             Ok(found)
         });
         Ok(Self {
@@ -435,7 +544,9 @@ impl Drop for Server {
 
 fn read_deadline(reader: &mut impl Read, mut bytes: &mut [u8], deadline: Instant) -> Result<()> {
     while !bytes.is_empty() {
-        ensure!(Instant::now() < deadline, "probe deadline");
+        if Instant::now() >= deadline {
+            return Err(ProbeStage::ServerTimeout.into());
+        }
         let count = reader.read(bytes)?;
         ensure!(count > 0, "probe EOF");
         bytes = &mut bytes[count..];
@@ -652,6 +763,196 @@ fn code_declaration(description: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retries_native_wait_and_server_timeout_once_then_succeeds() -> Result<()> {
+        for stage in [ProbeStage::NativeWait, ProbeStage::ServerTimeout] {
+            let mut attempts = 0;
+            probe_with_retry(|| {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(stage.into())
+                } else {
+                    Ok(())
+                }
+            })?;
+            assert_eq!(attempts, 2);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn retry_stops_after_second_wait_or_timeout_failure() {
+        for stage in [ProbeStage::NativeWait, ProbeStage::ServerTimeout] {
+            let mut attempts = 0;
+            let error = probe_with_retry(|| {
+                attempts += 1;
+                Err(stage.into())
+            })
+            .unwrap_err();
+            assert_eq!(attempts, 2);
+            assert_eq!(error.downcast_ref::<ProbeStage>(), Some(&stage));
+        }
+    }
+
+    #[test]
+    fn confirmed_absence_and_other_failures_never_retry() {
+        for stage in [
+            ProbeStage::ToolAbsent,
+            ProbeStage::NativeSpawn,
+            ProbeStage::NativeExit,
+            ProbeStage::Server,
+            ProbeStage::Setup,
+            ProbeStage::Cleanup,
+        ] {
+            let mut attempts = 0;
+            let error = probe_with_retry(|| {
+                attempts += 1;
+                Err(stage.into())
+            })
+            .unwrap_err();
+            assert_eq!(attempts, 1, "{stage}");
+            assert_eq!(error.downcast_ref::<ProbeStage>(), Some(&stage));
+        }
+        let mut attempts = 0;
+        let error = probe_with_retry(|| {
+            attempts += 1;
+            Err::<(), anyhow::Error>(ProbeStage::NativeWait.into()).context(ProbeStage::Cleanup)
+        })
+        .unwrap_err();
+        assert_eq!(attempts, 1, "cleanup failure must prevent retry");
+        assert_eq!(
+            error.downcast_ref::<ProbeStage>(),
+            Some(&ProbeStage::Cleanup)
+        );
+    }
+
+    #[test]
+    fn confirmed_absence_after_timeout_never_gets_a_third_attempt() {
+        let mut attempts = 0;
+        let error = probe_with_retry(|| {
+            attempts += 1;
+            Err(if attempts == 1 {
+                ProbeStage::ServerTimeout
+            } else {
+                ProbeStage::ToolAbsent
+            }
+            .into())
+        })
+        .unwrap_err();
+        assert_eq!(attempts, 2);
+        assert_eq!(
+            error.downcast_ref::<ProbeStage>(),
+            Some(&ProbeStage::ToolAbsent)
+        );
+    }
+
+    #[test]
+    fn server_timeouts_are_typed_and_protocol_errors_are_terminal() {
+        for kind in [std::io::ErrorKind::TimedOut, std::io::ErrorKind::WouldBlock] {
+            assert_eq!(
+                server_failure(std::io::Error::from(kind).into()),
+                ProbeStage::ServerTimeout
+            );
+        }
+        let mut byte = [0];
+        let error = read_deadline(&mut &b"x"[..], &mut byte, Instant::now()).unwrap_err();
+        assert_eq!(server_failure(error), ProbeStage::ServerTimeout);
+        assert_eq!(
+            server_failure(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into()),
+            ProbeStage::Server
+        );
+        assert_eq!(
+            server_failure(advertised(b"broken", None).unwrap_err()),
+            ProbeStage::Server
+        );
+    }
+
+    #[test]
+    fn server_timeout_survives_native_nonzero_exit_and_absence_requires_success() {
+        use crate::launcher_label::CanaryRunError;
+        let error = probe_outcome(
+            Err(CanaryRunError::Exit),
+            Err(ProbeStage::ServerTimeout.into()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ProbeStage>(),
+            Some(&ProbeStage::ServerTimeout)
+        );
+        let error = probe_outcome(Err(CanaryRunError::Exit), Ok(false)).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ProbeStage>(),
+            Some(&ProbeStage::NativeExit)
+        );
+        let error = probe_outcome(Ok(()), Ok(false)).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ProbeStage>(),
+            Some(&ProbeStage::ToolAbsent)
+        );
+        let error = probe_outcome(
+            Err(CanaryRunError::Wait(std::io::ErrorKind::TimedOut.into())),
+            Ok(true),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ProbeStage>(),
+            Some(&ProbeStage::NativeWait)
+        );
+        assert!(probe_outcome(Ok(()), Ok(true)).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "runs pinned native 0.163 with isolated homes and loopback only"]
+    fn fresh_native_0163_canary_publishes_legacy_cache() -> Result<()> {
+        let program = Path::new(
+            "C:/Users/SampleUser/AppData/Roaming/npm/node_modules/@openai/codex/node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe",
+        );
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r12.1/canary");
+        fs::create_dir_all(&base)?;
+        let base = fs::canonicalize(base)?;
+        let home = tempfile::Builder::new()
+            .prefix("native-check-")
+            .tempdir_in(base)?;
+        assert_eq!(
+            version(&crate::launcher_label::version_output(program)?)?,
+            "0.163.0"
+        );
+        check_inner(program, home.path())?;
+        let cache = home
+            .path()
+            .join("state/image-canary")
+            .join(cache_name("0.163.0"));
+        assert!(cached_pass(&cache, "0.163.0"));
+        assert_eq!(
+            fs::read_dir(cache.parent().unwrap())?.count(),
+            1,
+            "scratch and publication anchors must be removed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn operator_cache_keeps_exact_legacy_name_and_record() -> Result<()> {
+        assert_eq!(
+            cache_name("0.163.0"),
+            "d23-image-discovery-1-5897d33ae539eec6ed68de926547f2a7b57aae9f90823c91e13be20a07a96184.json"
+        );
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r12.1/canary");
+        fs::create_dir_all(&base)?;
+        let base = fs::canonicalize(base)?;
+        let home = tempfile::Builder::new()
+            .prefix("operator-cache-")
+            .tempdir_in(base)?;
+        let cache = home.path().join(cache_name("0.163.0"));
+        let record = b"{\"version\":\"0.163.0\",\"pass\":true}\n";
+        fs::write(&cache, record)?;
+        assert!(cached_pass(&cache, "0.163.0"));
+        publish_pass(home.path(), &cache, "0.163.0")?;
+        assert_eq!(fs::read(&cache)?, record);
+        Ok(())
+    }
 
     #[test]
     fn denied_ancillary_proxy_requests_never_forward_or_replace_tool_evidence() -> Result<()> {
