@@ -182,6 +182,15 @@ fn repaint(hwnd: HWND) {
         let _ = InvalidateRect(Some(hwnd), None, false);
     }
 }
+fn complete_automation_frame(hwnd: HWND) {
+    // Win32 can defer a low-priority paint for an occluded client. Dispatch the
+    // same production WM_PAINT synchronously, after releasing all Host borrows,
+    // so automation can read the completed state it just changed.
+    unsafe {
+        SendMessageW(hwnd, WM_PAINT, None, None);
+    }
+}
+
 fn frame_valid(h: &Host) -> bool {
     let Some(f) = h.frame.as_ref() else {
         return false;
@@ -409,14 +418,30 @@ fn focus_edit(hwnd: HWND, target: Target) {
     unsafe {
         let _ = SetFocus(Some(hwnd));
     }
-    redraw(hwnd);
+    // Focus/caret decoration does not change hit geometry. Preserve the current
+    // frame for a following UIA Value message admitted from that same frame.
+    repaint(hwnd);
 }
-fn finish_edit(hwnd: HWND) {
+fn finish_edit(hwnd: HWND) -> bool {
     if let Some(host) = current(hwnd) {
         let mut h = host.borrow_mut();
         h.edit.composition.clear();
+        let changed = match h.editing {
+            Some(Target::Search) => {
+                h.state.search != h.edit.text
+                    || h.state.table_offset != 0.
+                    || h.state.table_freeze.frozen
+            }
+            Some(Target::EventSearch) => {
+                h.state.event_search != h.edit.text || h.state.events_offset != 0.
+            }
+            _ => false,
+        };
         sync_search(&mut h);
         h.editing = None;
+        changed
+    } else {
+        false
     }
 }
 fn sync_search(h: &mut Host) {
@@ -1574,7 +1599,8 @@ unsafe extern "system" fn wndproc(
                 h.input.hover = None;
                 h.input.pointer = None;
             }
-            redraw(hwnd);
+            // Like mouse movement, leaving changes decoration, not hit geometry.
+            repaint(hwnd);
             return LRESULT(0);
         }
         WM_LBUTTONDOWN => {
@@ -1680,14 +1706,31 @@ unsafe extern "system" fn wndproc(
             repaint(hwnd);
         }
         WM_KILLFOCUS => {
-            finish_edit(hwnd);
+            let changed = finish_edit(hwnd);
             if let Some(h) = current(hwnd) {
                 h.borrow_mut().focused = false;
                 h.borrow_mut().input.pressed = None;
             }
-            redraw(hwnd);
+            if changed {
+                redraw(hwnd);
+            } else {
+                repaint(hwnd);
+            }
         }
         WM_GETOBJECT => {
+            // An occluded window may not receive WM_PAINT before an automation
+            // client reads it. Complete the pending frame on the owning UI thread
+            // before returning the provider; never dispatch against stale geometry.
+            // No Host borrow spans synchronous WndProc re-entry.
+            if lparam.0 == windows::Win32::UI::Accessibility::UiaRootObjectId as isize
+                && current(hwnd).is_some_and(|h| {
+                    let h = h.borrow();
+                    !h.closing && !frame_valid(&h)
+                })
+            {
+                repaint(hwnd);
+                complete_automation_frame(hwnd);
+            }
             #[cfg(all(test, feature = "testkit"))]
             eprintln!("dashboard WM_GETOBJECT {:#x}", lparam.0);
             if let Some(host) = current(hwnd) {
@@ -1751,6 +1794,10 @@ unsafe extern "system" fn wndproc(
             });
             if changed {
                 redraw(hwnd);
+                // Automation may operate on an occluded window. Publish the
+                // completed result before its next property read, even when the
+                // compositor would defer an ordinary WM_PAINT.
+                complete_automation_frame(hwnd);
             }
             return LRESULT(0);
         }
@@ -1777,6 +1824,7 @@ unsafe extern "system" fn wndproc(
             if let Some(target) = target {
                 if message == accessibility::WM_UIA_INVOKE {
                     activate(hwnd, target);
+                    complete_automation_frame(hwnd);
                 } else if matches!(target, Target::Search | Target::EventSearch) {
                     focus_edit(hwnd, target);
                 } else if let Some(h) = current(hwnd) {
@@ -1784,7 +1832,8 @@ unsafe extern "system" fn wndproc(
                     unsafe {
                         let _ = SetFocus(Some(hwnd));
                     }
-                    redraw(hwnd);
+                    // Keep a same-frame UIA invoke valid across its focus step.
+                    repaint(hwnd);
                 }
             }
             return LRESULT(0);
