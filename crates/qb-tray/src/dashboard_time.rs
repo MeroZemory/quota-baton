@@ -120,12 +120,11 @@ pub(super) fn next_visible_time_change(
                 } else {
                     due.age(s.last_used_at);
                 }
-                if memo_visible {
-                    if let Some(p) = &s.pacing_wait {
-                        if p.waiting.unwrap_or(0) > 0 {
-                            due.bucket(p.since, 1);
-                        }
-                    }
+                if memo_visible
+                    && let Some(p) = &s.pacing_wait
+                    && p.waiting.unwrap_or(0) > 0
+                {
+                    due.bucket(p.since, 1);
                 }
             }
             // Range changes can change counts/rows even if this row is offscreen.
@@ -169,12 +168,11 @@ pub(super) fn next_visible_time_change(
             if fact("마지막 활동") {
                 due.age(s.last_used_at);
             }
-            if fact("속도 조절 대기") {
-                if let Some(p) = &s.pacing_wait {
-                    if p.waiting.unwrap_or(0) > 0 {
-                        due.bucket(p.since, 1);
-                    }
-                }
+            if fact("속도 조절 대기")
+                && let Some(p) = &s.pacing_wait
+                && p.waiting.unwrap_or(0) > 0
+            {
+                due.bucket(p.since, 1);
             }
             for r in &d.recent_requests {
                 due.add(r.ts);
@@ -391,7 +389,6 @@ mod tests {
         snap.sessions.sessions[0].pacing_wait = Some(m::PacingWait {
             waiting: Some(1),
             since: Some(c.utc() - Duration::milliseconds(1500)),
-            ..Default::default()
         });
         assert_eq!(
             next_visible_time_change(&snap, &state, &scene, &c, 96),
