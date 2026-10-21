@@ -7,9 +7,9 @@ This file names the verification for each unit and each row. The row list and th
 <!-- status:begin -->
 현재 마일스톤: R11 (실행별 계정·모델 목록 마무리)
 목표: 대시보드 수정을 전달하고 R11을 마무리한다
-핵심 지표: 새 경로 출시 1/2 · R11은 HTTP 통합 저장, WS 경계 2건과 출시 관문 남음
+핵심 지표: 새 경로 출시 1/2 · R11 HTTP19·WS10 통과, native 출시 검증·최종 관문 남음
 사용자 대기: 없음 (R2 Part B만 사용자 결정 대기)
-갱신: 2026-10-22 04:59 KST (성능 조건·qb-tray scoped 관문 통과)
+갱신: 2026-10-22 05:08 KST (R11 실제 WS10/10, native 검증 준비)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -83,6 +83,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-22 04:50 | 1/2 | R12.10 성능 단위 통과, 최종 관문 미완료; 기능 출시 수 변화 없음 |
 | 2026-10-22 04:53 | 1/2 | R12.10 성능 통과, 최종 실행 검사는 OS bind 재현으로 미완료; R11 독립 통합 진행 |
 | 2026-10-22 04:59 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R12.10 성능·scoped 관문 완료; 기능 출시 수 변화 없음 |
+| 2026-10-22 05:08 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R11 WS10/10 단위 완료; native·최종 관문 미완료 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -139,12 +140,14 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-22 04:53 | R12.10 최종 qb-tray 테스트 시도 | 기존 HTTP 검사6건이 kernel bind에서 정지, 소유 실행 취소 | 전체 완료 | 제품 assertion 실패로 단정하지 않음; 테스트 통과로 세지 않음 |
 | 2026-10-22 04:53 | 외부 조건 독립 Python IPv4 bind8초 | timeout | 숫자 loopback 새 bind가 반환 | qb import 없음; socket().bind(127.0.0.1:0), 프로세스 제한 시간8초 |
 | 2026-10-22 04:59 | R12.10 OS 복구 후 최종 scoped 관문 | HTTP6/6 한 번씩 재통과; fmt·clippy·build exit0 | 감독 판정에 따른 종결 | interrupted aggregate 및222 library pass 보존; 완전한 전체 합계 미주장 |
+| 2026-10-22 05:08 | R11 실제 WS 업그레이드 회귀 | 10통과 / 0실패 | 10/10 | HTTP 채택 redirect 수정; 다른 계정 cap을 만들던 fixture 전제 교정, 이전9/10 보존 |
+| 2026-10-22 05:12 | R11 qb-core strict all-targets testkit clippy | exit0 | 경고0 | 최초 통합 스타일5건·fixture 초기화1건 수정; 실패 기록과 최종 입력별 fingerprint 보존 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 행동 |
 |---|---|---|---|
-| R11 실행별 계정 | HTTP 통합 저장, WS 경계 2건과 출시 관문 남음 | 관문 통과와 설치 | R12.10 뒤 WS 경계 2건 마무리 후 관문 |
+| R11 실행별 계정 | HTTP19·WS10 통과; native·최종 관문 남음 | 실제 A/B/A·동시·picker/daybreak와 관문 통과 | 독립 검수 뒤 합성 native 실행 |
 | 대시보드 지연 (R12.10) | 합성 실제 창 성능·최종 scoped gate 통과 | 실제 설치 확인 | 설계 세션이 설치하고 사용자 환경 확인 |
 | R13 소진 예측·아이콘·차트·캐시 보류 | 설계 완료, 구현 0/5 부분 | 5/5 부분 병합과 설치 | R11과 R12.10 뒤 시작 |
 <!-- gaps:end -->
