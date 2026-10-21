@@ -91,6 +91,11 @@ fn account<'a>(view: &'a v2::View, id: &str) -> Option<&'a v2::AccountRow> {
 }
 
 impl Renderer {
+    /// Release the old target domain before creating its replacement.
+    pub fn clear_target_resources(&self) {
+        self.text.clear_target_resources();
+    }
+
     pub(crate) fn dashboard_text(&self) -> &Text {
         &self.text
     }
@@ -106,7 +111,7 @@ impl Renderer {
         width: f32,
         alpha: f32,
     ) -> Result<()> {
-        let brush = unsafe { target.CreateSolidColorBrush(&rgb(color, alpha), None)? };
+        let brush = self.text.solid_brush(target, rgb(color, alpha))?;
         unsafe {
             target.DrawLine(
                 windows_numerics::Vector2 {
@@ -273,7 +278,7 @@ impl Renderer {
         alpha: f32,
         radius: f32,
     ) -> Result<()> {
-        let brush = unsafe { target.CreateSolidColorBrush(&rgb(color, alpha), None)? };
+        let brush = self.text.solid_brush(target, rgb(color, alpha))?;
         unsafe {
             target.FillRoundedRectangle(
                 &D2D1_ROUNDED_RECT {
@@ -295,7 +300,7 @@ impl Renderer {
         radius: f32,
         alpha: f32,
     ) -> Result<()> {
-        let brush = unsafe { target.CreateSolidColorBrush(&rgb(color, alpha), None)? };
+        let brush = self.text.solid_brush(target, rgb(color, alpha))?;
         unsafe {
             target.DrawRoundedRectangle(
                 &D2D1_ROUNDED_RECT {
@@ -585,7 +590,7 @@ impl Renderer {
                     v2::Tone::Bad => 2,
                     _ => 3,
                 }];
-                let brush = unsafe { target.CreateSolidColorBrush(&rgb(dot, 1.), None)? };
+                let brush = self.text.solid_brush(target, rgb(dot, 1.))?;
                 unsafe {
                     target.FillEllipse(
                         &D2D1_ELLIPSE {
@@ -1427,8 +1432,8 @@ impl Renderer {
             X: (b.ring.left + b.ring.right) / 2.,
             Y: (b.ring.top + b.ring.bottom) / 2.,
         };
-        let track = unsafe { target.CreateSolidColorBrush(&rgb(p.track, 1.), None)? };
-        let accent = unsafe { target.CreateSolidColorBrush(&rgb(p.accent, 1.), None)? };
+        let track = self.text.solid_brush(target, rgb(p.track, 1.))?;
+        let accent = self.text.solid_brush(target, rgb(p.accent, 1.))?;
         unsafe {
             target.DrawEllipse(
                 &D2D1_ELLIPSE {

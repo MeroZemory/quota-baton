@@ -985,6 +985,9 @@ pub fn project(
         .iter()
         .copied()
         .filter(|s| {
+            if needle.is_empty() {
+                return true;
+            }
             let row = session_row(s, &snapshot.accounts, clock, state.selected.as_deref());
             [
                 row.label,
@@ -1143,15 +1146,16 @@ pub fn project(
     let event_needle = clean(&state.event_search).to_lowercase();
     events.retain(|e| {
         state.event_filter.matches(e)
-            && format!(
-                "{} {} {} {}",
-                e.title,
-                e.body,
-                e.session_label.as_deref().unwrap_or(""),
-                e.session.as_deref().unwrap_or("")
-            )
-            .to_lowercase()
-            .contains(&event_needle)
+            && (event_needle.is_empty()
+                || format!(
+                    "{} {} {} {}",
+                    e.title,
+                    e.body,
+                    e.session_label.as_deref().unwrap_or(""),
+                    e.session.as_deref().unwrap_or("")
+                )
+                .to_lowercase()
+                .contains(&event_needle))
     });
     let empty = if snapshot.accounts.empty {
         EmptyState::NoAccounts

@@ -1,11 +1,25 @@
-//! Shared v2 Direct2D/DirectWrite renderer adapter; no HWND, GDI, I/O or clock.
+//! Shared v2 Direct2D/DirectWrite renderer adapter; no HWND, GDI or I/O.
+//! Optional debug/testkit phase profiling is off by default.
+#[cfg(any(debug_assertions, feature = "testkit"))]
+use crate::v2_text::{PhaseTimer, phase_elapsed_ns};
 use crate::{
     dashboard_model::DashboardView,
     geometry::*,
-    state::DashboardState,
+    state::{
+        DashboardState, EventFilter, Popup, ProviderFilter, Range, ScrollRegion, SortKey, Tab,
+    },
     v2_colors::{Palette, Rgb},
     v2_render, v2_text,
 };
+use std::{
+    borrow::Cow,
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    ops::{Deref, DerefMut},
+    sync::Arc,
+};
+#[cfg(any(debug_assertions, feature = "testkit"))]
+use std::{cell::Cell, time::Instant};
 use windows::{
     Win32::Graphics::{
         Direct2D::{Common::D2D_RECT_F, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, ID2D1RenderTarget},
@@ -16,6 +30,216 @@ use windows::{
 
 pub struct Renderer {
     shared: v2_render::Renderer,
+    paint_text_proofs: RefCell<PaintTextProofs>,
+    scene_metrics: RefCell<SceneMetricCache>,
+    wrapped_text: RefCell<WrappedTextCache>,
+    #[cfg(test)]
+    scene_builds: std::cell::Cell<usize>,
+    #[cfg(any(debug_assertions, feature = "testkit"))]
+    phases: RendererPhaseCounters,
+}
+
+/// A completed scene plus section spans and measurements for the same immutable
+/// projection. The Host keeps this value until geometry or data is invalidated.
+#[derive(Clone, Debug)]
+pub struct CachedScene {
+    scene: Scene,
+    view: Arc<DashboardView>,
+    inputs: ScrollInputs,
+    sections: SceneSections,
+    metrics: Metrics,
+    rebuilt_region: Option<ScrollRegion>,
+}
+impl CachedScene {
+    fn new(
+        scene: Scene,
+        view: &Arc<DashboardView>,
+        inputs: ScrollInputs,
+        sections: SceneSections,
+        mut metrics: Metrics,
+        rebuilt_region: Option<ScrollRegion>,
+    ) -> Self {
+        // Bound even unusual floating-point measurement variants by this frame's
+        // working set, rather than retaining a history of earlier scroll keys.
+        if metrics.heights.len() > scene.measurements.len()
+            || metrics.widths.len() > scene.measurements.len()
+        {
+            let keys: std::collections::BTreeSet<_> =
+                scene.measurements.iter().map(Measure::key).collect();
+            metrics.heights.retain(|key, _| keys.contains(key));
+            metrics.widths.retain(|key, _| keys.contains(key));
+        }
+        Self {
+            scene,
+            view: view.clone(),
+            inputs,
+            sections,
+            metrics,
+            rebuilt_region,
+        }
+    }
+    pub fn as_scene(&self) -> &Scene {
+        &self.scene
+    }
+    /// None means the entire scene was rebuilt, including a safe fallback.
+    pub fn rebuilt_region(&self) -> Option<ScrollRegion> {
+        self.rebuilt_region
+    }
+
+    /// Damage available before rebuilding a Table scroll. This is only a
+    /// proposed invalidation; validate the completed rebuild with
+    /// `scroll_damage_from` before relying on retained pixels during painting.
+    pub fn table_scroll_damage(&self) -> Option<crate::Rect> {
+        if self.modal || self.inputs.popup.is_some() {
+            return None;
+        }
+        let mut tables = self
+            .content
+            .iter()
+            .filter(|r| r.region == ScrollRegion::Table);
+        tables.next()?;
+        if tables.next().is_some() {
+            return None;
+        }
+        let (old, new) = self.sections.table_cards_for_damage(&self.sections)?;
+        for r in [old, new, self.rect] {
+            if ![r.left, r.top, r.right, r.bottom]
+                .iter()
+                .all(|n| n.is_finite())
+                || r.right <= r.left
+                || r.bottom <= r.top
+            {
+                return None;
+            }
+        }
+        crate::v2_geometry::intersection(
+            crate::Rect {
+                left: old.left.min(new.left) - 4.,
+                top: old.top.min(new.top) - 4.,
+                right: old.right.max(new.right) + 4.,
+                bottom: old.bottom.max(new.bottom) + 4.,
+            },
+            self.rect,
+        )
+    }
+
+    /// Conservative damage for a Table-only rebuild of the same projection.
+    /// The Host must separately validate retained target pixels/metrics and union
+    /// this with all pending damage. Replay the entire composed scene in the clip.
+    pub fn scroll_damage_from(&self, previous: &Self) -> Option<crate::Rect> {
+        if self.rebuilt_region != Some(ScrollRegion::Table)
+            || !Arc::ptr_eq(&self.view, &previous.view)
+            || self.inputs != previous.inputs
+            || self.inputs.popup.is_some()
+            || self.modal
+            || previous.modal
+            || self.rect != previous.rect
+            || self.content.len() != previous.content.len()
+        {
+            return None;
+        }
+        // A caller may supply an older completed frame. Only Table's offset
+        // may differ; another region's damage cannot be certified by this card.
+        let mut tables = 0;
+        for (new, old) in self.content.iter().zip(&previous.content) {
+            if new.region != old.region
+                || new.viewport != old.viewport
+                || new.content_height != old.content_height
+                || new.max_offset != old.max_offset
+            {
+                return None;
+            }
+            if new.region == ScrollRegion::Table {
+                tables += 1;
+            } else if new.offset != old.offset {
+                return None;
+            }
+        }
+        if tables != 1 {
+            return None;
+        }
+        self.sections.table_cards_for_damage(&previous.sections)?;
+        self.table_scroll_damage()
+    }
+}
+impl Deref for CachedScene {
+    type Target = Scene;
+    fn deref(&self) -> &Self::Target {
+        &self.scene
+    }
+}
+impl DerefMut for CachedScene {
+    // The Host may add and remove temporary editor decorations while painting.
+    // Permanent scene changes must use scene_shared rather than mutate this cache.
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.scene
+    }
+}
+#[derive(Clone, Debug, PartialEq)]
+struct ScrollInputs {
+    size: [f32; 2],
+    tab: Tab,
+    popup: Option<Popup>,
+    provider: ProviderFilter,
+    range: Range,
+    grouped: bool,
+    search: String,
+    sort: SortKey,
+    descending: bool,
+    event_filter: EventFilter,
+    event_days: u8,
+    event_search: String,
+}
+impl ScrollInputs {
+    fn new(state: &DashboardState, size: [f32; 2]) -> Self {
+        Self {
+            size,
+            tab: state.tab,
+            popup: state.popup,
+            provider: state.provider,
+            range: state.range,
+            grouped: state.grouped,
+            search: state.search.clone(),
+            sort: state.sort,
+            descending: state.descending,
+            event_filter: state.event_filter,
+            event_days: state.event_days,
+            event_search: state.event_search.clone(),
+        }
+    }
+}
+fn scroll_offset(state: &DashboardState, region: ScrollRegion) -> f32 {
+    match region {
+        ScrollRegion::Table => state.table_offset,
+        ScrollRegion::Side => state.side_offset,
+        ScrollRegion::Events => state.events_offset,
+        ScrollRegion::Usage => state.usage_offset,
+    }
+}
+
+/// Per-renderer elapsed wall durations since reset, not process CPU time.
+/// Includes this renderer's text engine.
+/// Add separately owned editor Text stats at the Host boundary.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct PhaseStats {
+    /// Scene/section rebuild passes, excluding text measurement between passes.
+    pub scene_geometry_us: u64,
+    pub text_measure_us: u64,
+    /// BeginDraw through clip cleanup, excluding measured text layout work.
+    pub draw_us: u64,
+    /// EndDraw elapsed wall duration; may include waits/vsync. Not display completion.
+    pub present_us: u64,
+    pub layout_creations: u64,
+    pub format_creations: u64,
+}
+
+#[cfg(any(debug_assertions, feature = "testkit"))]
+#[derive(Default)]
+struct RendererPhaseCounters {
+    enabled: Cell<bool>,
+    scene_geometry_ns: Cell<u64>,
+    draw_ns: Cell<u64>,
+    present_ns: Cell<u64>,
 }
 #[derive(Default)]
 pub struct Interaction {
@@ -32,6 +256,256 @@ fn bounds(r: crate::Rect) -> D2D_RECT_F {
         top: r.top,
         right: r.right,
         bottom: r.bottom,
+    }
+}
+
+// Unknown bounds always draw. Text can overhang its requested box, so only a
+// measured, contained layout may use that box for culling (see paint_clipped).
+#[derive(Clone, Copy, Debug)]
+enum PaintBounds {
+    Unknown,
+    Empty,
+    Rect(crate::Rect),
+}
+impl PaintBounds {
+    fn expanded(r: crate::Rect, margin: [f32; 2]) -> Self {
+        let expanded = crate::Rect {
+            left: r.left - margin[0],
+            top: r.top - margin[1],
+            right: r.right + margin[0],
+            bottom: r.bottom + margin[1],
+        };
+        if ![r.left, r.top, r.right, r.bottom, margin[0], margin[1]]
+            .iter()
+            .all(|v| v.is_finite())
+            || r.right < r.left
+            || r.bottom < r.top
+            || ![expanded.left, expanded.top, expanded.right, expanded.bottom]
+                .iter()
+                .all(|v| v.is_finite())
+        {
+            Self::Unknown
+        } else {
+            Self::Rect(expanded)
+        }
+    }
+    fn intersect(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Empty, _) | (_, Self::Empty) => Self::Empty,
+            (Self::Unknown, other) | (other, Self::Unknown) => other,
+            (Self::Rect(a), Self::Rect(b)) => {
+                crate::v2_geometry::intersection(a, b).map_or(Self::Empty, Self::Rect)
+            }
+        }
+    }
+}
+
+struct PaintClip {
+    stack: Vec<PaintBounds>,
+    aa: [f32; 2],
+}
+impl PaintClip {
+    fn new(outer: crate::Rect, dpi: [f32; 2]) -> Self {
+        // One physical pixel on EACH side of the intersection, also covering
+        // DirectWrite's 0.01 DIP ink-containment tolerance. Invalid DPI disables
+        // geometric culling instead of guessing a smaller antialias footprint.
+        let aa = dpi.map(|v| {
+            if v.is_finite() && v > 0. {
+                96. / v + 0.01
+            } else {
+                f32::INFINITY
+            }
+        });
+        Self {
+            stack: vec![Self::clip_bounds(outer, aa)],
+            aa,
+        }
+    }
+    fn clip_bounds(r: crate::Rect, aa: [f32; 2]) -> PaintBounds {
+        if [r.left, r.top, r.right, r.bottom]
+            .iter()
+            .all(|v| v.is_finite())
+            && (r.right == r.left || r.bottom == r.top)
+        {
+            PaintBounds::Empty
+        } else {
+            PaintBounds::expanded(r, aa)
+        }
+    }
+    fn push(&mut self, r: crate::Rect) {
+        let next = self.current().intersect(Self::clip_bounds(r, self.aa));
+        self.stack.push(next);
+    }
+    fn pop(&mut self) {
+        if self.stack.len() > 1 {
+            self.stack.pop();
+        }
+    }
+    fn current(&self) -> PaintBounds {
+        *self.stack.last().expect("outer paint clip")
+    }
+    fn visible(&self, r: crate::Rect, outset: f32) -> bool {
+        if !outset.is_finite() || outset < 0. {
+            return true;
+        }
+        !matches!(
+            self.current()
+                .intersect(PaintBounds::expanded(r, self.aa.map(|aa| aa + outset))),
+            PaintBounds::Empty
+        )
+    }
+    fn keeps(&self, draw: &Draw) -> bool {
+        match draw {
+            Draw::Fill { rect, .. } => self.visible(*rect, 0.),
+            Draw::Stroke { rect, width, .. } => self.visible(*rect, *width / 2.),
+            Draw::Line {
+                from, to, width, ..
+            } => {
+                if !from.iter().chain(to).all(|v| v.is_finite()) {
+                    return true;
+                }
+                self.visible(
+                    crate::Rect {
+                        left: from[0].min(to[0]),
+                        top: from[1].min(to[1]),
+                        right: from[0].max(to[0]),
+                        bottom: from[1].max(to[1]),
+                    },
+                    *width / 2.,
+                )
+            }
+            Draw::Text { .. } => !matches!(self.current(), PaintBounds::Empty),
+            // Always execute state transitions, even inside an empty clip.
+            Draw::Clip(_) | Draw::Unclip | Draw::Alpha(_) => true,
+        }
+    }
+}
+
+const PAINT_TEXT_PROOF_CAPACITY: usize = 4_096;
+const PAINT_TEXT_PROOF_BYTES: usize = 1024 * 1024;
+#[derive(Default)]
+struct PaintTextProofs {
+    contained: BTreeSet<String>,
+    bytes: usize,
+}
+impl PaintTextProofs {
+    fn key(measure: &Measure, r: crate::Rect) -> String {
+        format!(
+            "{}:{}:{}",
+            width(r).to_bits(),
+            height(r).to_bits(),
+            measure.key()
+        )
+    }
+    fn remember(&mut self, key: String) {
+        if key.len() > 16 * 1024 || self.contained.contains(&key) {
+            return;
+        }
+        while self.contained.len() >= PAINT_TEXT_PROOF_CAPACITY
+            || self.bytes + key.len() > PAINT_TEXT_PROOF_BYTES
+        {
+            let Some(old) = self.contained.pop_first() else {
+                break;
+            };
+            self.bytes -= old.len();
+        }
+        self.bytes += key.len();
+        self.contained.insert(key);
+    }
+}
+
+// Cache only prepared UTF-8, never native layouts or caller-visible mutable data.
+// Measure::key covers every input; fonts and fallback stay with this Renderer.
+const WRAPPED_TEXT_CAPACITY: usize = 4_096;
+const WRAPPED_TEXT_BYTES: usize = 1024 * 1024;
+const WRAPPED_TEXT_INPUT_LIMIT: usize = 16 * 1024;
+#[derive(Default)]
+struct WrappedTextCache {
+    entries: BTreeMap<String, String>,
+    order: VecDeque<String>,
+    // Actual retained string capacities: map key + FIFO key + wrapped value.
+    bytes: usize,
+    #[cfg(test)]
+    preparations: usize,
+}
+impl WrappedTextCache {
+    fn remember(&mut self, key: String, value: &str) {
+        if self.entries.contains_key(&key)
+            || key.len().saturating_mul(2).saturating_add(value.len()) > WRAPPED_TEXT_BYTES
+        {
+            return;
+        }
+        let order_key = key.clone();
+        let value = value.to_owned();
+        let bytes = key
+            .capacity()
+            .saturating_add(order_key.capacity())
+            .saturating_add(value.capacity());
+        // An oversized entry must not evict useful retained text.
+        if bytes > WRAPPED_TEXT_BYTES {
+            return;
+        }
+        while self.entries.len() >= WRAPPED_TEXT_CAPACITY || self.bytes + bytes > WRAPPED_TEXT_BYTES
+        {
+            let old = self.order.pop_front().expect("retained wrapped-text key");
+            let (key, value) = self
+                .entries
+                .remove_entry(&old)
+                .expect("retained wrapped text");
+            self.bytes -= old.capacity() + key.capacity() + value.capacity();
+        }
+        self.bytes += bytes;
+        self.order.push_back(order_key);
+        self.entries.insert(key, value);
+    }
+}
+
+// Keep measurements, never scene geometry, across full builds. The Text engine's
+// fonts live for this Renderer; Measure::key includes every measurement input.
+// FIFO eviction only causes a normal probe miss. Count BOTH retained key copies.
+const SCENE_METRIC_CAPACITY: usize = 4_096;
+const SCENE_METRIC_KEY_BYTES: usize = 2 * 1024 * 1024;
+#[derive(Default)]
+struct SceneMetricCache {
+    entries: BTreeMap<String, [f32; 2]>,
+    order: VecDeque<String>,
+    bytes: usize,
+}
+impl SceneMetricCache {
+    fn snapshot(&self) -> Metrics {
+        let mut metrics = Metrics::default();
+        for (key, [height, width]) in &self.entries {
+            metrics.heights.insert(key.clone(), *height);
+            metrics.widths.insert(key.clone(), *width);
+        }
+        metrics
+    }
+    fn remember(&mut self, requests: &[Measure], metrics: &Metrics) {
+        for request in requests {
+            let key = request.key();
+            if key.len() > 16 * 1024 || self.entries.contains_key(&key) {
+                continue;
+            }
+            let (Some(&height), Some(&width)) =
+                (metrics.heights.get(&key), metrics.widths.get(&key))
+            else {
+                continue;
+            };
+            if !height.is_finite() || !width.is_finite() {
+                continue;
+            }
+            let bytes = key.len() * 2;
+            while self.entries.len() >= SCENE_METRIC_CAPACITY
+                || self.bytes + bytes > SCENE_METRIC_KEY_BYTES
+            {
+                let old = self.order.pop_front().expect("retained metric key");
+                self.entries.remove(&old);
+                self.bytes -= old.len() * 2;
+            }
+            self.bytes += bytes;
+            self.order.push_back(key.clone());
+            self.entries.insert(key, [height, width]);
+        }
     }
 }
 fn style(m: &Measure) -> v2_text::Style {
@@ -86,12 +560,117 @@ pub fn color(p: Palette, c: Color) -> Rgb {
     }
 }
 impl Renderer {
+    /// Retire native target resources while preserving device-independent text.
+    pub fn clear_target_resources(&self) {
+        self.shared.clear_target_resources();
+    }
+
     pub fn new(dark: bool) -> Result<Self> {
         Ok(Self {
             shared: v2_render::Renderer::new(dark)?,
+            paint_text_proofs: RefCell::default(),
+            scene_metrics: RefCell::default(),
+            wrapped_text: RefCell::default(),
+            #[cfg(test)]
+            scene_builds: std::cell::Cell::new(0),
+            #[cfg(any(debug_assertions, feature = "testkit"))]
+            phases: RendererPhaseCounters::default(),
         })
     }
-    fn wrapped(&self, measure: &Measure) -> Result<String> {
+
+    /// Default off. Plain release builds ignore enabling and report zeros.
+    pub fn set_phase_stats_enabled(&self, enabled: bool) {
+        #[cfg(any(debug_assertions, feature = "testkit"))]
+        self.phases.enabled.set(enabled);
+        self.shared
+            .dashboard_text()
+            .set_phase_stats_enabled(enabled);
+    }
+
+    /// Clear totals while preserving whether profiling is enabled.
+    pub fn reset_phase_stats(&self) {
+        #[cfg(any(debug_assertions, feature = "testkit"))]
+        {
+            self.phases.scene_geometry_ns.set(0);
+            self.phases.draw_ns.set(0);
+            self.phases.present_ns.set(0);
+        }
+        self.shared.dashboard_text().reset_phase_stats();
+    }
+
+    pub fn phase_stats(&self) -> PhaseStats {
+        #[cfg(any(debug_assertions, feature = "testkit"))]
+        {
+            let text = self.shared.dashboard_text().phase_stats();
+            PhaseStats {
+                scene_geometry_us: self.phases.scene_geometry_ns.get() / 1_000,
+                text_measure_us: text.text_measure_us,
+                draw_us: self.phases.draw_ns.get() / 1_000,
+                present_us: self.phases.present_ns.get() / 1_000,
+                layout_creations: text.layout_creations,
+                format_creations: text.format_creations,
+            }
+        }
+        #[cfg(not(any(debug_assertions, feature = "testkit")))]
+        PhaseStats::default()
+    }
+
+    fn build_scene(
+        &self,
+        view: &DashboardView,
+        state: &DashboardState,
+        size: [f32; 2],
+        metrics: &Metrics,
+    ) -> (Scene, SceneSections) {
+        #[cfg(test)]
+        self.scene_builds.set(self.scene_builds.get() + 1);
+        #[cfg(any(debug_assertions, feature = "testkit"))]
+        let _geometry = PhaseTimer::new(self.phases.enabled.get(), &self.phases.scene_geometry_ns);
+        Scene::build_sections(view, state, size, metrics)
+    }
+
+    fn rebuild_section(
+        &self,
+        previous: &CachedScene,
+        state: &DashboardState,
+        region: ScrollRegion,
+        metrics: &Metrics,
+    ) -> Option<(Scene, SceneSections)> {
+        #[cfg(any(debug_assertions, feature = "testkit"))]
+        let _geometry = PhaseTimer::new(self.phases.enabled.get(), &self.phases.scene_geometry_ns);
+        previous
+            .sections
+            .rebuild(&previous.view, state, &previous.scene, region, metrics)
+    }
+
+    fn wrapped<'a>(&self, measure: &'a Measure) -> Result<Cow<'a, str>> {
+        if !measure.wrap {
+            return Ok(Cow::Borrowed(&measure.text));
+        }
+        // Nonfinite floats do not have a complete textual key (NaN payloads).
+        // Preserve their existing behavior, but do not retain their results.
+        let key = (measure.text.len() <= WRAPPED_TEXT_INPUT_LIMIT
+            && measure.size.is_finite()
+            && measure.line_height.is_finite()
+            && measure.width.is_finite())
+        .then(|| measure.key());
+        if let Some(key) = key.as_ref()
+            && let Some(value) = self.wrapped_text.borrow().entries.get(key)
+        {
+            return Ok(Cow::Owned(value.clone()));
+        }
+        #[cfg(test)]
+        {
+            self.wrapped_text.borrow_mut().preparations += 1;
+        }
+        let out = self.wrap_uncached(measure)?;
+        if let Some(key) = key {
+            self.wrapped_text.borrow_mut().remember(key, &out);
+        }
+        Ok(Cow::Owned(out))
+    }
+
+    fn wrap_uncached(&self, measure: &Measure) -> Result<String> {
         if !measure.wrap {
             return Ok(measure.text.clone());
         }
@@ -106,7 +685,7 @@ impl Renderer {
                 let advance = self
                     .shared
                     .dashboard_text()
-                    .layout(
+                    .measure(
                         token,
                         D2D_RECT_F {
                             left: 0.,
@@ -116,7 +695,6 @@ impl Renderer {
                         },
                         probe,
                     )?
-                    .metrics
                     .natural_width;
                 if advance <= measure.width {
                     out.push_str(token);
@@ -128,7 +706,7 @@ impl Renderer {
                     let width = self
                         .shared
                         .dashboard_text()
-                        .layout(
+                        .measure(
                             &next,
                             D2D_RECT_F {
                                 left: 0.,
@@ -138,7 +716,6 @@ impl Renderer {
                             },
                             probe,
                         )?
-                        .metrics
                         .natural_width;
                     if !chunk.is_empty() && width > measure.width {
                         out.push_str(&chunk);
@@ -158,38 +735,125 @@ impl Renderer {
         state: &DashboardState,
         size: [f32; 2],
     ) -> Result<Scene> {
-        let mut metrics = Metrics::default();
+        self.scene_parts(view, state, size)
+            .map(|(scene, _, _)| scene)
+    }
+
+    fn scene_parts(
+        &self,
+        view: &DashboardView,
+        state: &DashboardState,
+        size: [f32; 2],
+    ) -> Result<(Scene, SceneSections, Metrics)> {
+        let mut metrics = self.scene_metrics.borrow().snapshot();
         // Probe collects exact width/font requests, then build with measured line
         // heights. Second probe covers content newly revealed by offset clamping.
         for _ in 0..3 {
-            let scene = Scene::build(view, state, size, &metrics);
-            let mut added = false;
-            for measure in &scene.measurements {
-                if let std::collections::btree_map::Entry::Vacant(entry) =
-                    metrics.heights.entry(measure.key())
-                {
-                    let layout = self.shared.dashboard_text().layout(
-                        &self.wrapped(measure)?,
-                        D2D_RECT_F {
-                            left: 0.,
-                            top: 0.,
-                            right: measure.width.max(1.),
-                            bottom: 65536.,
-                        },
-                        style(measure),
-                    )?;
-                    entry.insert(layout.metrics.required_height);
-                    metrics
-                        .widths
-                        .insert(measure.key(), layout.metrics.natural_width);
-                    added = true;
-                }
-            }
-            if !added {
-                return Ok(scene);
+            let (scene, sections) = self.build_scene(view, state, size, &metrics);
+            if !self.measure_missing(&scene.measurements, &mut metrics)? {
+                self.scene_metrics
+                    .borrow_mut()
+                    .remember(&scene.measurements, &metrics);
+                return Ok((scene, sections, metrics));
             }
         }
-        Ok(Scene::build(view, state, size, &metrics))
+        let (scene, sections) = self.build_scene(view, state, size, &metrics);
+        self.scene_metrics
+            .borrow_mut()
+            .remember(&scene.measurements, &metrics);
+        Ok((scene, sections, metrics))
+    }
+
+    fn measure_missing(&self, requests: &[Measure], metrics: &mut Metrics) -> Result<bool> {
+        let mut added = false;
+        for measure in requests {
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                metrics.heights.entry(measure.key())
+            {
+                let measured = self.shared.dashboard_text().measure(
+                    &self.wrapped(measure)?,
+                    D2D_RECT_F {
+                        left: 0.,
+                        top: 0.,
+                        right: measure.width.max(1.),
+                        bottom: 65536.,
+                    },
+                    style(measure),
+                )?;
+                entry.insert(measured.required_height);
+                metrics.widths.insert(measure.key(), measured.natural_width);
+                added = true;
+            }
+        }
+        Ok(added)
+    }
+
+    pub fn scene_shared(
+        &self,
+        view: &Arc<DashboardView>,
+        state: &DashboardState,
+        size: [f32; 2],
+    ) -> Result<CachedScene> {
+        let (scene, sections, metrics) = self.scene_parts(view, state, size)?;
+        Ok(CachedScene::new(
+            scene,
+            view,
+            ScrollInputs::new(state, size),
+            sections,
+            metrics,
+            None,
+        ))
+    }
+
+    /// Regenerate one complete scrolling card, including sticky headers and
+    /// newly visible hit/UIA nodes. Reuse requires the same retained projection,
+    /// structural inputs and all other region offsets; otherwise build fully.
+    pub fn scene_scroll(
+        &self,
+        view: &Arc<DashboardView>,
+        state: &DashboardState,
+        size: [f32; 2],
+        previous: &CachedScene,
+        region: ScrollRegion,
+    ) -> Result<CachedScene> {
+        if !Arc::ptr_eq(view, &previous.view)
+            || previous.inputs != ScrollInputs::new(state, size)
+            || previous.scene.content.iter().any(|other| {
+                other.region != region && scroll_offset(state, other.region) != other.offset
+            })
+        {
+            return self.scene_shared(view, state, size);
+        }
+        let mut metrics = previous.metrics.clone();
+        for _ in 0..3 {
+            let Some((scene, sections)) = self.rebuild_section(previous, state, region, &metrics)
+            else {
+                return self.scene_shared(view, state, size);
+            };
+            let requests = sections.measurements(region).expect("rebuilt section");
+            if !self.measure_missing(&scene.measurements[requests], &mut metrics)? {
+                return Ok(CachedScene::new(
+                    scene,
+                    view,
+                    previous.inputs.clone(),
+                    sections,
+                    metrics,
+                    Some(region),
+                ));
+            }
+        }
+        let Some((scene, sections)) = self.rebuild_section(previous, state, region, &metrics)
+        else {
+            return self.scene_shared(view, state, size);
+        };
+        Ok(CachedScene::new(
+            scene,
+            view,
+            previous.inputs.clone(),
+            sections,
+            metrics,
+            Some(region),
+        ))
     }
     pub fn paint(
         &self,
@@ -197,7 +861,29 @@ impl Renderer {
         scene: &Scene,
         interaction: &Interaction,
     ) -> Result<()> {
+        self.paint_clipped(target, scene, interaction, None)
+    }
+
+    /// Paint the full scene through an optional dirty rectangle in scene-space DIPs.
+    pub fn paint_clipped(
+        &self,
+        target: &ID2D1RenderTarget,
+        scene: &Scene,
+        interaction: &Interaction,
+        clip: Option<crate::Rect>,
+    ) -> Result<()> {
+        #[cfg(any(debug_assertions, feature = "testkit"))]
+        let draw_started = self.phases.enabled.get().then(Instant::now);
+        #[cfg(any(debug_assertions, feature = "testkit"))]
+        let text_before = self.shared.dashboard_text().phase_measure_ns();
         let p = self.shared.dashboard_palette();
+        let outer_clip = clip.map_or(scene.rect, |clip| {
+            crate::v2_geometry::intersection(scene.rect, clip)
+                .unwrap_or_else(|| rect(scene.rect.left, scene.rect.top, 0., 0.))
+        });
+        let (mut dpi_x, mut dpi_y) = (96., 96.);
+        unsafe { target.GetDpi(&mut dpi_x, &mut dpi_y) };
+        let mut paint_clip = PaintClip::new(outer_clip, [dpi_x, dpi_y]);
         let mut clips = 0usize;
         let mut alpha = 1.;
         unsafe {
@@ -205,10 +891,13 @@ impl Renderer {
         }
         let result = (|| -> Result<()> {
             unsafe {
-                target.PushAxisAlignedClip(&bounds(scene.rect), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                target.PushAxisAlignedClip(&bounds(outer_clip), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
             }
             clips += 1;
             for draw in &scene.draw {
+                if !paint_clip.keeps(draw) {
+                    continue;
+                }
                 match draw {
                     Draw::Fill {
                         rect,
@@ -229,14 +918,37 @@ impl Renderer {
                         rect,
                         measure,
                         color: c,
-                    } => self.shared.text(
-                        target,
-                        *rect,
-                        &self.wrapped(measure)?,
-                        style(measure),
-                        color(p, *c),
-                        alpha,
-                    )?,
+                    } => {
+                        let outside = width(*rect) > 0.
+                            && height(*rect) > 0.
+                            && !paint_clip.visible(*rect, 0.);
+                        let proof = outside.then(|| PaintTextProofs::key(measure, *rect));
+                        if proof.as_ref().is_some_and(|key| {
+                            self.paint_text_proofs.borrow().contained.contains(key)
+                        }) {
+                            continue;
+                        }
+                        let wrapped = self.wrapped(measure)?;
+                        if let Some(key) = proof {
+                            let metrics = self.shared.dashboard_text().measure(
+                                &wrapped,
+                                bounds(*rect),
+                                style(measure),
+                            )?;
+                            if !metrics.ink_overflow {
+                                self.paint_text_proofs.borrow_mut().remember(key);
+                                continue;
+                            }
+                        }
+                        self.shared.text(
+                            target,
+                            *rect,
+                            &wrapped,
+                            style(measure),
+                            color(p, *c),
+                            alpha,
+                        )?;
+                    }
                     Draw::Line {
                         from,
                         to,
@@ -252,6 +964,7 @@ impl Renderer {
                             );
                         }
                         clips += 1;
+                        paint_clip.push(*rect);
                     }
                     Draw::Unclip => {
                         if clips > 1 {
@@ -259,6 +972,7 @@ impl Renderer {
                                 target.PopAxisAlignedClip();
                             }
                             clips -= 1;
+                            paint_clip.pop();
                         }
                     }
                     Draw::Alpha(value) => alpha = *value,
@@ -359,7 +1073,23 @@ impl Renderer {
             }
             clips -= 1;
         }
+        #[cfg(any(debug_assertions, feature = "testkit"))]
+        if let Some(started) = draw_started {
+            let text_ns = self
+                .shared
+                .dashboard_text()
+                .phase_measure_ns()
+                .saturating_sub(text_before);
+            let draw_ns = phase_elapsed_ns(started).saturating_sub(text_ns);
+            self.phases
+                .draw_ns
+                .set(self.phases.draw_ns.get().saturating_add(draw_ns));
+        }
+        #[cfg(any(debug_assertions, feature = "testkit"))]
+        let present = PhaseTimer::new(self.phases.enabled.get(), &self.phases.present_ns);
         let ended = unsafe { target.EndDraw(None, None) };
+        #[cfg(any(debug_assertions, feature = "testkit"))]
+        drop(present);
         result.and(ended)
     }
     fn tooltip(
@@ -384,7 +1114,7 @@ impl Renderer {
         let h = self
             .shared
             .dashboard_text()
-            .layout(
+            .measure(
                 text,
                 D2D_RECT_F {
                     left: 0.,
@@ -394,7 +1124,6 @@ impl Renderer {
                 },
                 style(&measure),
             )?
-            .metrics
             .required_height
             + 16.;
         let x = (pointer[0] + 12.).clamp(
@@ -587,5 +1316,1239 @@ mod tests {
         assert_eq!(color(dark, Color::Page), Rgb::hex(0x1b1b1b));
         assert_eq!(color(light, Color::BarOk), light.bars[0]);
         assert_ne!(color(light, Color::Series7d), color(light, Color::BarOk));
+    }
+}
+
+#[cfg(test)]
+mod wrapped_text_tests {
+    use super::*;
+
+    fn request(text: &str) -> Measure {
+        Measure {
+            text: text.into(),
+            size: 13.,
+            line_height: 18.,
+            width: 90.,
+            bold: false,
+            wrap: true,
+            face: Face::Text,
+            align: TextAlign::Leading,
+        }
+    }
+
+    fn assert_bounds(cache: &WrappedTextCache) {
+        assert!(cache.entries.len() <= WRAPPED_TEXT_CAPACITY);
+        assert!(cache.bytes <= WRAPPED_TEXT_BYTES);
+        assert_eq!(cache.order.len(), cache.entries.len());
+        assert!(
+            cache
+                .order
+                .iter()
+                .all(|key| cache.entries.contains_key(key))
+        );
+        assert_eq!(
+            cache.bytes,
+            cache
+                .entries
+                .iter()
+                .map(|(k, v)| k.capacity() + v.capacity())
+                .sum::<usize>()
+                + cache.order.iter().map(String::capacity).sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn r1210_wrapped_text_no_wrap_borrows_original_bytes() -> Result<()> {
+        let renderer = Renderer::new(false)?;
+        let mut measure = request("한글 🙂 trailing  \n\n");
+        measure.wrap = false;
+        let wrapped = renderer.wrapped(&measure)?;
+        assert!(matches!(wrapped, Cow::Borrowed(_)));
+        assert_eq!(wrapped.as_ptr(), measure.text.as_ptr());
+        assert_eq!(wrapped.as_ref(), measure.text);
+        let cache = renderer.wrapped_text.borrow();
+        assert_eq!(cache.preparations, 0);
+        assert!(cache.entries.is_empty());
+        assert_bounds(&cache);
+        Ok(())
+    }
+
+    #[test]
+    fn r1210_wrapped_text_unicode_matches_uncached_and_keeps_results_immutable() -> Result<()> {
+        let renderer = Renderer::new(false)?;
+        for text in [
+            "short \n\n한글  \n".to_owned(),
+            "verylongunbrokenfoldername0123456789".repeat(4),
+            "긴경로이름한글문자열".repeat(6),
+            "🙂🔬🌏".repeat(12),
+        ] {
+            let measure = request(&text);
+            let expected = renderer.wrap_uncached(&measure)?;
+            assert_eq!(expected.replace('\n', ""), text.replace('\n', ""));
+            if !text.contains('\n') {
+                assert!(expected.contains('\n'), "long token must wrap");
+            }
+            let before = renderer.wrapped_text.borrow().preparations;
+            assert_eq!(renderer.wrapped(&measure)?.as_ref(), expected);
+            assert_eq!(renderer.wrapped_text.borrow().preparations, before + 1);
+            let mut hit = renderer.wrapped(&measure)?;
+            assert_eq!(hit.as_ref(), expected);
+            hit.to_mut().push_str(" caller mutation");
+            renderer.clear_target_resources();
+            assert_eq!(renderer.wrapped(&measure)?.as_ref(), expected);
+            assert_eq!(renderer.wrapped_text.borrow().preparations, before + 1);
+        }
+        assert_bounds(&renderer.wrapped_text.borrow());
+        Ok(())
+    }
+
+    #[test]
+    fn r1210_wrapped_text_complete_measure_key_keeps_styles_and_widths_separate() -> Result<()> {
+        let renderer = Renderer::new(false)?;
+        let base = request("긴단어longunbrokentoken0123456789");
+        let mut variants = vec![base.clone()];
+        let mut next = base.clone();
+        next.text.push('!');
+        variants.push(next);
+        let mut next = base.clone();
+        next.size += 1.;
+        variants.push(next);
+        let mut next = base.clone();
+        next.line_height += 1.;
+        variants.push(next);
+        let mut next = base.clone();
+        next.width += 1.;
+        variants.push(next);
+        let mut next = base.clone();
+        next.bold = true;
+        variants.push(next);
+        let mut next = base.clone();
+        next.face = Face::Mono;
+        variants.push(next);
+        let mut next = base.clone();
+        next.face = Face::Icon;
+        variants.push(next);
+        let mut next = base.clone();
+        next.align = TextAlign::Center;
+        variants.push(next);
+        for measure in &variants {
+            let expected = renderer.wrap_uncached(measure)?;
+            assert_eq!(renderer.wrapped(measure)?.as_ref(), expected);
+            assert_eq!(renderer.wrapped(measure)?.as_ref(), expected);
+        }
+        let cache = renderer.wrapped_text.borrow();
+        assert_eq!(cache.entries.len(), variants.len());
+        assert_eq!(cache.preparations, variants.len());
+        assert_bounds(&cache);
+        Ok(())
+    }
+
+    #[test]
+    fn r1210_wrapped_text_fifo_bounds_all_key_and_value_capacities() {
+        let mut cache = WrappedTextCache::default();
+        for i in 0..=WRAPPED_TEXT_CAPACITY {
+            cache.remember(format!("tiny-{i}"), "value");
+        }
+        assert_eq!(cache.entries.len(), WRAPPED_TEXT_CAPACITY);
+        assert!(!cache.entries.contains_key("tiny-0"));
+        assert_bounds(&cache);
+
+        let mut cache = WrappedTextCache::default();
+        let value = "wrapped".repeat(600);
+        for i in 0..180 {
+            cache.remember(format!("large-{i}-{}", "한".repeat(1024)), &value);
+            assert_bounds(&cache);
+        }
+        assert!(
+            cache.entries.len() < 180,
+            "byte bound must evict before entry bound"
+        );
+        let keys: Vec<_> = cache.entries.keys().cloned().collect();
+        let bytes = cache.bytes;
+        cache.remember(
+            "oversized-value".into(),
+            &"x".repeat(WRAPPED_TEXT_BYTES + 1),
+        );
+        let mut oversized_capacity = String::with_capacity(WRAPPED_TEXT_BYTES + 1);
+        oversized_capacity.push_str("small-key-with-oversized-allocation");
+        cache.remember(oversized_capacity, "small value");
+        assert!(cache.entries.keys().eq(keys.iter()));
+        assert_eq!(cache.bytes, bytes, "oversized inputs must not evict");
+        assert_bounds(&cache);
+    }
+
+    #[test]
+    fn r1210_wrapped_text_oversized_and_nonfinite_inputs_bypass_retention() -> Result<()> {
+        let renderer = Renderer::new(false)?;
+        let mut oversized = request(&"x".repeat(WRAPPED_TEXT_INPUT_LIMIT + 1));
+        oversized.width = 1_000_000.;
+        for measure in [
+            oversized,
+            Measure {
+                width: f32::INFINITY,
+                ..request("short")
+            },
+            Measure {
+                width: f32::NAN,
+                ..request("short")
+            },
+        ] {
+            let expected = renderer.wrap_uncached(&measure)?;
+            let before = renderer.wrapped_text.borrow().preparations;
+            for _ in 0..2 {
+                assert_eq!(renderer.wrapped(&measure)?.as_ref(), expected);
+            }
+            let cache = renderer.wrapped_text.borrow();
+            assert_eq!(cache.preparations, before + 2);
+            assert!(cache.entries.is_empty());
+            assert_bounds(&cache);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod region_scroll_tests {
+    use super::*;
+    use crate::{dashboard_fixtures as fixtures, dashboard_model as model};
+
+    fn fixture() -> (Arc<DashboardView>, DashboardState) {
+        let mut state = DashboardState::default();
+        let mut view = model::project(&fixtures::snapshot(), &mut state, &fixtures::clock());
+        let row = view
+            .groups
+            .iter()
+            .flat_map(|g| &g.rows)
+            .next()
+            .unwrap()
+            .clone();
+        let group = view.groups.iter_mut().find(|g| !g.rows.is_empty()).unwrap();
+        group.rows = (0..32)
+            .map(|i| {
+                let mut row = row.clone();
+                row.id = format!("scroll-session-{i}");
+                row
+            })
+            .collect();
+        group.collapsed = false;
+        group.relogin = true;
+        group.relogin_reason = "합성 다시 로그인 필요".into();
+        view.flat = view.groups.iter().flat_map(|g| g.rows.clone()).collect();
+        let events = view.events.clone();
+        assert!(!events.is_empty());
+        view.events = (0..24)
+            .map(|i| {
+                let mut event = events[i % events.len()].clone();
+                event.seq = 1000 + i as u64;
+                event.body = "합성 기록 본문 ".repeat(12);
+                event
+            })
+            .collect();
+        view.recent = view.events.iter().take(8).cloned().collect();
+        let tile = view
+            .usage
+            .iter()
+            .find(|t| t.series.iter().any(|s| !s.points.is_empty()))
+            .expect("synthetic history fixture")
+            .clone();
+        view.usage = (0..12)
+            .map(|i| {
+                let mut tile = tile.clone();
+                tile.id = format!("scroll-account-{i}");
+                tile
+            })
+            .collect();
+        (Arc::new(view), state)
+    }
+
+    fn normalize(state: &mut DashboardState, scene: &Scene) {
+        for region in &scene.content {
+            state.scroll(region.region, region.offset, region.max_offset);
+        }
+    }
+
+    fn set_offset(state: &mut DashboardState, region: ScrollRegion, offset: f32) {
+        match region {
+            ScrollRegion::Table => state.table_offset = offset,
+            ScrollRegion::Side => state.side_offset = offset,
+            ScrollRegion::Events => state.events_offset = offset,
+            ScrollRegion::Usage => state.usage_offset = offset,
+        }
+    }
+
+    fn equivalent(actual: &Scene, expected: &Scene) {
+        assert_eq!(actual.rect, expected.rect);
+        assert_eq!(actual.modal, expected.modal);
+        // Compare every public vector, including ordering and measurements;
+        // matching pixels alone would miss stale hit/UIA/history metadata.
+        macro_rules! same {
+            ($($field:ident),+ $(,)?) => {$(
+                assert_eq!(format!("{:?}", actual.$field), format!("{:?}", expected.$field),
+                    "{} differs from full scene", stringify!($field));
+            )+};
+        }
+        same!(
+            content,
+            targets,
+            accessibility,
+            draw,
+            measurements,
+            charts,
+            tooltips,
+            session_rows
+        );
+    }
+
+    fn scroll(
+        renderer: &Renderer,
+        view: &Arc<DashboardView>,
+        state: &mut DashboardState,
+        size: [f32; 2],
+        previous: &CachedScene,
+        region: ScrollRegion,
+        offset: f32,
+    ) -> Result<CachedScene> {
+        set_offset(state, region, offset);
+        let next = renderer.scene_scroll(view, state, size, previous, region)?;
+        assert_eq!(next.rebuilt_region(), Some(region));
+        equivalent(&next, &renderer.scene(view, state, size)?);
+        assert!(next.metrics.heights.len() <= next.measurements.len());
+        assert!(next.metrics.widths.len() <= next.measurements.len());
+        normalize(state, &next);
+        Ok(next)
+    }
+
+    #[test]
+    fn r1210_region_scroll_sticky_reveal_and_alternating_cards_match_full() -> Result<()> {
+        let renderer = Renderer::new(false)?;
+        let (view, mut state) = fixture();
+        let size = [1320., 640.];
+        let mut scene = renderer.scene_shared(&view, &state, size)?;
+        normalize(&mut state, &scene);
+        let viewport = scene
+            .content
+            .iter()
+            .find(|r| r.region == ScrollRegion::Table)
+            .unwrap()
+            .viewport;
+        let hidden = scene
+            .session_rows
+            .iter()
+            .find(|r| r.rect.top >= viewport.bottom)
+            .unwrap()
+            .id
+            .clone();
+        let key = format!("session:{hidden}");
+        assert_eq!(
+            height(
+                scene
+                    .accessibility
+                    .iter()
+                    .find(|n| n.key == key)
+                    .unwrap()
+                    .rect
+            ),
+            0.
+        );
+        assert!(
+            !scene
+                .targets
+                .iter()
+                .any(|t| t.target == Target::Session(hidden.clone()))
+        );
+        let reveal = scene.reveal_session(&hidden).unwrap();
+        scene = scroll(
+            &renderer,
+            &view,
+            &mut state,
+            size,
+            &scene,
+            ScrollRegion::Table,
+            96.,
+        )?;
+        assert!(
+            scene
+                .accessibility
+                .iter()
+                .any(|n| n.key.starts_with("sticky:"))
+        );
+        scene = scroll(
+            &renderer,
+            &view,
+            &mut state,
+            size,
+            &scene,
+            ScrollRegion::Table,
+            reveal,
+        )?;
+        let node = scene.accessibility.iter().find(|n| n.key == key).unwrap();
+        assert_eq!(height(node.rect), 35.);
+        let target = Target::Session(hidden);
+        assert!(
+            scene
+                .targets
+                .iter()
+                .any(|t| t.target == target && t.rect == node.rect)
+        );
+        assert_eq!(
+            scene.hit_test(
+                (node.rect.left + node.rect.right) / 2.,
+                (node.rect.top + node.rect.bottom) / 2.
+            ),
+            Some(&target)
+        );
+        // Changing Table's sticky controls changes vector lengths before Side.
+        // Alternate regions to exercise the shifted suffix spans, not just one rebuild.
+        for (region, offset) in [
+            (ScrollRegion::Side, 96.),
+            (ScrollRegion::Table, 1e6),
+            (ScrollRegion::Side, 1e6),
+            (ScrollRegion::Table, -5.),
+            (ScrollRegion::Side, 0.),
+            (ScrollRegion::Table, 0.),
+        ] {
+            scene = scroll(&renderer, &view, &mut state, size, &scene, region, offset)?;
+        }
+        assert_eq!(state.table_offset, 0.);
+        assert_eq!(state.side_offset, 0.);
+        Ok(())
+    }
+
+    #[test]
+    fn r1210_region_scroll_detail_and_narrow_overlay_match_full() -> Result<()> {
+        let renderer = Renderer::new(false)?;
+        let (view, state) = fixture();
+        let mut detailed = (*view).clone();
+        detailed.detail = Some(model::DetailView {
+            id: "synthetic-detail".into(),
+            title: "합성 상세".into(),
+            subtitle: "지역 스크롤 회귀".into(),
+            raw_prefix: Some("12345678".into()),
+            status: "준비".into(),
+            status_tone: detailed.groups[0].tone,
+            account_status: "합성 계정".into(),
+            facts: (0..24)
+                .map(|i| (format!("항목 {i}"), "합성 상세 값 ".repeat(8)))
+                .collect(),
+            timeline: vec!["합성 타임라인".into(); 8],
+            requests: vec!["합성 요청".into(); 8],
+            expired: false,
+        });
+        let view = Arc::new(detailed);
+        for size in [[1320., 640.], [1024., 640.]] {
+            let mut state = state.clone();
+            let mut scene = renderer.scene_shared(&view, &state, size)?;
+            normalize(&mut state, &scene);
+            assert!(
+                scene
+                    .content
+                    .iter()
+                    .any(|r| r.region == ScrollRegion::Side && r.max_offset > 0.)
+            );
+            for offset in [96., 193.25, 1e6, -1., 0.] {
+                scene = scroll(
+                    &renderer,
+                    &view,
+                    &mut state,
+                    size,
+                    &scene,
+                    ScrollRegion::Side,
+                    offset,
+                )?;
+                assert!(
+                    scene
+                        .targets
+                        .iter()
+                        .any(|t| t.target == Target::CloseDetail)
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn r1210_region_scroll_events_usage_and_disabled_controls_match_full() -> Result<()> {
+        let renderer = Renderer::new(false)?;
+        let (view, initial) = fixture();
+        for core_ok in [true, false] {
+            let mut v = (*view).clone();
+            v.connection.core_ok = core_ok;
+            let view = Arc::new(v);
+            for (tab, region) in [
+                (Tab::Events, ScrollRegion::Events),
+                (Tab::Usage, ScrollRegion::Usage),
+            ] {
+                for size in [[1320., 640.], [1024., 640.]] {
+                    let mut state = initial.clone();
+                    state.tab = tab;
+                    let mut scene = renderer.scene_shared(&view, &state, size)?;
+                    normalize(&mut state, &scene);
+                    assert!(
+                        scene
+                            .content
+                            .iter()
+                            .any(|r| r.region == region && r.max_offset > 0.)
+                    );
+                    for offset in [96., 173.25, 1e6, 1e6, -1., 0.] {
+                        scene = scroll(&renderer, &view, &mut state, size, &scene, region, offset)?;
+                        if !core_ok {
+                            assert!(scene.targets.iter().all(|t| !t.enabled));
+                            assert!(
+                                scene
+                                    .accessibility
+                                    .iter()
+                                    .filter(|n| n.target.is_some())
+                                    .all(|n| !n.enabled)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn r1210_region_scroll_structural_and_unsupported_inputs_fall_back() -> Result<()> {
+        let renderer = Renderer::new(false)?;
+        let (view, mut state) = fixture();
+        let size = [1320., 640.];
+        let previous = renderer.scene_shared(&view, &state, size)?;
+        normalize(&mut state, &previous);
+        let fallback =
+            |view: &Arc<DashboardView>, state: &DashboardState, size, region| -> Result<()> {
+                let next = renderer.scene_scroll(view, state, size, &previous, region)?;
+                assert_eq!(next.rebuilt_region(), None);
+                equivalent(&next, &renderer.scene(view, state, size)?);
+                Ok(())
+            };
+        fallback(&view, &state, [1024., 640.], ScrollRegion::Table)?;
+        fallback(&view, &state, size, ScrollRegion::Usage)?; // no Usage section on Overview
+        let mut changed = state.clone();
+        changed.popup = Some(Popup::Range);
+        fallback(&view, &changed, size, ScrollRegion::Table)?;
+        changed = state.clone();
+        changed.grouped = !changed.grouped;
+        fallback(&view, &changed, size, ScrollRegion::Table)?;
+        changed = state.clone();
+        changed.tab = Tab::Events;
+        fallback(&view, &changed, size, ScrollRegion::Events)?;
+        changed = state.clone();
+        changed.side_offset = 96.;
+        fallback(&view, &changed, size, ScrollRegion::Table)?; // two regions changed
+        let replacement = Arc::new((*view).clone());
+        fallback(&replacement, &state, size, ScrollRegion::Table)?;
+        // Retaining the projection makes identity safe, rather than comparing a
+        // possibly reused address or relying only on a data revision number.
+        let mut retained = view.clone();
+        assert!(Arc::get_mut(&mut retained).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn r1210_region_scroll_metric_retention_is_bounded_by_current_working_set() -> Result<()> {
+        let renderer = Renderer::new(false)?;
+        let (view, mut state) = fixture();
+        let size = [1320., 640.];
+        let mut scene = renderer.scene_shared(&view, &state, size)?;
+        normalize(&mut state, &scene);
+        for i in 0..32 {
+            let region = if i % 2 == 0 {
+                ScrollRegion::Table
+            } else {
+                ScrollRegion::Side
+            };
+            let max = scene
+                .content
+                .iter()
+                .find(|r| r.region == region)
+                .unwrap()
+                .max_offset;
+            let offset = (i as f32 * 73.125) % max.max(1.);
+            scene = scroll(&renderer, &view, &mut state, size, &scene, region, offset)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod paint_culling_tests {
+    use super::*;
+
+    fn fill(r: crate::Rect) -> Draw {
+        Draw::Fill {
+            rect: r,
+            color: Color::Text,
+            radius: 0.,
+        }
+    }
+
+    #[test]
+    fn r1210_paint_culling_keeps_stroke_line_and_antialias_edges() {
+        let clip = PaintClip::new(rect(0., 0., 100., 100.), [96., 96.]);
+        assert!(!clip.keeps(&fill(rect(-20., 10., 2., 20.))));
+        assert!(clip.keeps(&fill(rect(-2., 10., 0.5, 20.))));
+        assert!(!clip.keeps(&fill(rect(-4., 10., 1., 20.))));
+        let low_dpi = PaintClip::new(rect(0., 0., 100., 100.), [48., 48.]);
+        assert!(low_dpi.keeps(&fill(rect(-4., 10., 1., 20.))));
+        assert!(clip.keeps(&Draw::Stroke {
+            rect: rect(-6., 10., 2., 20.),
+            color: Color::Text,
+            width: 10.,
+            radius: 0.,
+        }));
+        for (from, to, width, expected) in [
+            ([-4., 10.], [-4., 90.], 8., true),
+            ([-10., 10.], [-10., 90.], 2., false),
+            ([-10., 50.], [110., 50.], 1., true),
+            ([110., 110.], [-10., -10.], 1., true),
+            ([50., 50.], [50., 50.], 1., true),
+        ] {
+            assert_eq!(
+                clip.keeps(&Draw::Line {
+                    from,
+                    to,
+                    color: Color::Text,
+                    width,
+                    dash: Some([1., 3.]),
+                }),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn r1210_paint_culling_nested_empty_clips_preserve_state_and_restore_parent() {
+        let mut clip = PaintClip::new(rect(0., 0., 100., 100.), [96., 96.]);
+        clip.push(rect(10., 10., 30., 30.));
+        assert!(clip.keeps(&fill(rect(20., 20., 2., 2.))));
+        assert!(!clip.keeps(&fill(rect(80., 80., 2., 2.))));
+        clip.push(rect(200., 200., 10., 10.));
+        assert!(!clip.keeps(&fill(rect(20., 20., 2., 2.))));
+        for state in [
+            Draw::Alpha(0.25),
+            Draw::Clip(rect(0., 0., 5., 5.)),
+            Draw::Unclip,
+        ] {
+            assert!(clip.keeps(&state));
+        }
+        clip.pop();
+        assert!(clip.keeps(&fill(rect(20., 20., 2., 2.))));
+        assert!(!clip.keeps(&fill(rect(80., 80., 2., 2.))));
+        clip.pop();
+        clip.pop(); // An unmatched Unclip cannot remove the outer dirty clip.
+        assert!(clip.keeps(&fill(rect(80., 80., 2., 2.))));
+        assert!(!clip.keeps(&fill(rect(180., 80., 2., 2.))));
+    }
+
+    #[test]
+    fn r1210_paint_culling_unknown_geometry_and_unproven_text_draw_conservatively() {
+        let mut clip = PaintClip::new(rect(0., 0., 100., 100.), [96., 96.]);
+        assert!(clip.keeps(&fill(rect(f32::NAN, 10., 2., 2.))));
+        assert!(
+            PaintClip::new(rect(0., 0., 100., 100.), [0., f32::NAN])
+                .keeps(&fill(rect(200., 200., 2., 2.)))
+        );
+        let text = Draw::Text {
+            rect: rect(200., 200., 20., 20.),
+            measure: Measure {
+                text: "가".into(),
+                size: 24.,
+                line_height: 1.,
+                width: 20.,
+                bold: false,
+                wrap: false,
+                face: Face::Text,
+                align: TextAlign::Leading,
+            },
+            color: Color::Text,
+        };
+        // Requested text boxes do not bound unmeasured fallback-font ink.
+        assert!(clip.keeps(&text));
+        clip.push(rect(200., 200., 2., 2.));
+        assert!(!clip.keeps(&text));
+        assert!(clip.keeps(&Draw::Alpha(1.)));
+    }
+
+    #[test]
+    fn r1210_paint_culling_text_proofs_include_dimensions_and_stay_bounded() {
+        let m = Measure {
+            text: "synthetic".into(),
+            size: 12.,
+            line_height: 20.,
+            width: 40.,
+            bold: false,
+            wrap: false,
+            face: Face::Text,
+            align: TextAlign::Leading,
+        };
+        let key = PaintTextProofs::key(&m, rect(0., 0., 40., 20.));
+        assert_eq!(key, PaintTextProofs::key(&m, rect(100., 200., 40., 20.)));
+        assert_ne!(key, PaintTextProofs::key(&m, rect(0., 0., 40., 1.)));
+        assert_ne!(key, PaintTextProofs::key(&m, rect(0., 0., 41., 20.)));
+        let mut changed = m.clone();
+        changed.wrap = true;
+        assert_ne!(key, PaintTextProofs::key(&changed, rect(0., 0., 40., 20.)));
+        let mut proofs = PaintTextProofs::default();
+        for i in 0..PAINT_TEXT_PROOF_CAPACITY + 8 {
+            proofs.remember(format!("{i:08}"));
+        }
+        assert_eq!(proofs.contained.len(), PAINT_TEXT_PROOF_CAPACITY);
+        for i in 0..PAINT_TEXT_PROOF_CAPACITY {
+            proofs.remember(format!("{i:08}{}", "x".repeat(512)));
+        }
+        assert!(proofs.bytes <= PAINT_TEXT_PROOF_BYTES);
+        assert!(proofs.contained.len() <= PAINT_TEXT_PROOF_CAPACITY);
+        assert_eq!(
+            proofs.bytes,
+            proofs.contained.iter().map(String::len).sum::<usize>()
+        );
+    }
+}
+
+#[cfg(test)]
+mod scene_metric_tests {
+    use super::*;
+    use crate::{dashboard_fixtures as fixtures, dashboard_model as model};
+
+    #[test]
+    fn r1210_scene_metrics_warm_tabs_build_once_and_match_fresh_scenes() -> Result<()> {
+        let renderer = Renderer::new(false)?;
+        assert!(renderer.scene_metrics.borrow().entries.is_empty());
+        let mut state = DashboardState::default();
+        let view = model::project(&fixtures::snapshot(), &mut state, &fixtures::clock());
+        let size = [1320., 640.];
+        for tab in [Tab::Overview, Tab::Events, Tab::Usage] {
+            state.tab = tab;
+            renderer.scene(&view, &state, size)?;
+        }
+        for tab in [Tab::Overview, Tab::Events, Tab::Usage, Tab::Overview] {
+            state.tab = tab;
+            renderer.scene_builds.set(0);
+            let warm = renderer.scene(&view, &state, size)?;
+            assert_eq!(renderer.scene_builds.get(), 1, "warm {tab:?}");
+            let fresh = Renderer::new(false)?;
+            let cold = fresh.scene(&view, &state, size)?;
+            assert!(fresh.scene_builds.get() > 1, "cold {tab:?} must probe");
+            assert_eq!(format!("{warm:?}"), format!("{cold:?}"), "{tab:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn r1210_scene_metrics_changed_source_width_and_popup_match_fresh_scenes() -> Result<()> {
+        let renderer = Renderer::new(false)?;
+        let mut state = DashboardState::default();
+        let mut view = model::project(&fixtures::snapshot(), &mut state, &fixtures::clock());
+        renderer.scene(&view, &state, [1320., 640.])?;
+        view.groups[0].name.push_str(" 합성 이름 변경");
+        view.events[0].body = "변경된 합성 본문 ".repeat(40);
+        view.usage[0].name.push_str(" 합성 사용량 이름 변경");
+        for (tab, popup, size) in [
+            (Tab::Overview, Some(Popup::Range), [1024., 720.]),
+            (Tab::Events, None, [1024., 720.]),
+            (Tab::Usage, None, [1320., 720.]),
+        ] {
+            state.tab = tab;
+            state.popup = popup;
+            let next = renderer.scene(&view, &state, size)?;
+            let cold = Renderer::new(false)?.scene(&view, &state, size)?;
+            assert_eq!(format!("{next:?}"), format!("{cold:?}"), "{tab:?}");
+            renderer.scene_builds.set(0);
+            let warm = renderer.scene(&view, &state, size)?;
+            assert_eq!(renderer.scene_builds.get(), 1, "repeated {tab:?}");
+            assert_eq!(format!("{warm:?}"), format!("{cold:?}"), "{tab:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn r1210_scene_metrics_cache_requires_pairs_and_bounds_keys_and_bytes() {
+        let request = Measure {
+            text: "synthetic".into(),
+            size: 12.,
+            line_height: 20.,
+            width: 40.,
+            bold: false,
+            wrap: false,
+            face: Face::Text,
+            align: TextAlign::Leading,
+        };
+        let mut cache = SceneMetricCache::default();
+        let mut metrics = Metrics::default();
+        metrics.heights.insert(request.key(), 20.);
+        cache.remember(std::slice::from_ref(&request), &metrics);
+        assert!(cache.entries.is_empty());
+        metrics.widths.insert(request.key(), 31.);
+        cache.remember(std::slice::from_ref(&request), &metrics);
+        let original = request.key();
+        assert_eq!(cache.snapshot().heights[&original], 20.);
+        assert_eq!(cache.snapshot().widths[&original], 31.);
+        let mut requests = Vec::new();
+        for i in 0..SCENE_METRIC_CAPACITY + 1 {
+            let mut r = request.clone();
+            r.text = format!("metric-{i}");
+            metrics.heights.insert(r.key(), i as f32);
+            metrics.widths.insert(r.key(), (i + 1) as f32);
+            requests.push(r);
+        }
+        cache.remember(&requests, &metrics);
+        assert_eq!(cache.entries.len(), SCENE_METRIC_CAPACITY);
+        assert!(!cache.entries.contains_key(&original));
+        for r in &mut requests {
+            r.text.push_str(&"x".repeat(512));
+            metrics.heights.insert(r.key(), 20.);
+            metrics.widths.insert(r.key(), 31.);
+        }
+        let mut oversized = request.clone();
+        oversized.text = "x".repeat(16 * 1024);
+        metrics.heights.insert(oversized.key(), 20.);
+        metrics.widths.insert(oversized.key(), 31.);
+        requests.push(oversized.clone());
+        cache.remember(&requests, &metrics);
+        assert!(!cache.entries.contains_key(&oversized.key()));
+        assert!(cache.entries.len() <= SCENE_METRIC_CAPACITY);
+        assert!(cache.bytes <= SCENE_METRIC_KEY_BYTES);
+        assert_eq!(
+            cache.bytes,
+            cache.entries.keys().map(|k| k.len() * 2).sum::<usize>()
+        );
+        assert_eq!(cache.order.len(), cache.entries.len());
+        let snapshot = cache.snapshot();
+        assert!(snapshot.heights.keys().eq(snapshot.widths.keys()));
+        for key in snapshot.heights.keys() {
+            assert_eq!(
+                cache.entries[key],
+                [snapshot.heights[key], snapshot.widths[key]]
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod scroll_damage_tests {
+    use super::*;
+    use crate::{dashboard_fixtures as fixtures, dashboard_model as model};
+    use windows::Win32::{
+        Graphics::{
+            Direct2D::{
+                Common::{D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_PIXEL_FORMAT},
+                D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_RENDER_TARGET_PROPERTIES,
+                D2D1CreateFactory, ID2D1Factory,
+            },
+            Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
+            Imaging::{
+                CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICBitmap,
+                IWICImagingFactory, WICBitmapCacheOnLoad,
+            },
+        },
+        System::Com::{
+            CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+            CoUninitialize,
+        },
+    };
+
+    struct Com;
+    impl Com {
+        fn enter() -> Result<Self> {
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()? };
+            Ok(Self)
+        }
+    }
+    impl Drop for Com {
+        fn drop(&mut self) {
+            unsafe { CoUninitialize() };
+        }
+    }
+
+    // Same WIC/Direct2D setup as tests/support/r10_wic.rs, but keep the actual
+    // target between paints and inspect pixels in memory. No HWND or file I/O.
+    struct Surface {
+        target: ID2D1RenderTarget,
+        bitmap: IWICBitmap,
+        width: u32,
+        height: u32,
+        dpi: f32,
+    }
+    impl Surface {
+        fn new(size: [f32; 2], dpi: f32) -> Result<Self> {
+            unsafe {
+                let wic: IWICImagingFactory =
+                    CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
+                let width = (size[0] * dpi / 96.).round() as u32;
+                let height = (size[1] * dpi / 96.).round() as u32;
+                let bitmap = wic.CreateBitmap(
+                    width,
+                    height,
+                    &GUID_WICPixelFormat32bppPBGRA,
+                    WICBitmapCacheOnLoad,
+                )?;
+                let factory: ID2D1Factory =
+                    D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
+                let target = factory.CreateWicBitmapRenderTarget(
+                    &bitmap,
+                    &D2D1_RENDER_TARGET_PROPERTIES {
+                        pixelFormat: D2D1_PIXEL_FORMAT {
+                            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                        },
+                        dpiX: dpi,
+                        dpiY: dpi,
+                        ..Default::default()
+                    },
+                )?;
+                Ok(Self {
+                    target,
+                    bitmap,
+                    width,
+                    height,
+                    dpi,
+                })
+            }
+        }
+        fn pixels(&self) -> Result<Vec<u8>> {
+            let mut pixels = vec![0; (self.width * self.height * 4) as usize];
+            unsafe {
+                self.bitmap
+                    .CopyPixels(std::ptr::null(), self.width * 4, &mut pixels)?
+            };
+            Ok(pixels)
+        }
+        // Model an outward-rounded Win32 physical update RECT, converted back
+        // to client DIPs. Fractional clip edges must not blend retained pixels.
+        fn physical_clip(&self, r: crate::Rect) -> crate::Rect {
+            let scale = self.dpi / 96.;
+            crate::Rect {
+                left: (r.left * scale).floor() / scale,
+                top: (r.top * scale).floor() / scale,
+                right: (r.right * scale).ceil() / scale,
+                bottom: (r.bottom * scale).ceil() / scale,
+            }
+        }
+    }
+
+    fn fixture(detail: bool) -> (Arc<DashboardView>, DashboardState) {
+        let mut state = DashboardState::default();
+        let mut view = model::project(&fixtures::snapshot(), &mut state, &fixtures::clock());
+        let group = view.groups.iter_mut().find(|g| !g.rows.is_empty()).unwrap();
+        let row = group.rows[0].clone();
+        group.rows = (0..32)
+            .map(|i| {
+                let mut row = row.clone();
+                row.id = format!("damage-session-{i}");
+                row
+            })
+            .collect();
+        group.collapsed = false;
+        group.relogin = true;
+        group.relogin_reason = "합성 다시 로그인 필요".into();
+        view.flat = view.groups.iter().flat_map(|g| g.rows.clone()).collect();
+        if detail {
+            view.detail = Some(model::DetailView {
+                id: "damage-detail".into(),
+                title: "합성 상세".into(),
+                subtitle: "겹치는 상세 카드".into(),
+                raw_prefix: Some("12345678".into()),
+                status: "준비".into(),
+                status_tone: view.groups[0].tone,
+                account_status: "합성 계정".into(),
+                facts: vec![("합성 항목".into(), "합성 상세 값 ".repeat(8)); 16],
+                timeline: vec!["합성 타임라인".into(); 8],
+                requests: vec!["합성 요청".into(); 8],
+                expired: false,
+            });
+        }
+        (Arc::new(view), state)
+    }
+
+    fn normalize(state: &mut DashboardState, scene: &Scene) {
+        for region in &scene.content {
+            state.scroll(region.region, region.offset, region.max_offset);
+        }
+    }
+
+    fn union(a: crate::Rect, b: crate::Rect) -> crate::Rect {
+        crate::Rect {
+            left: a.left.min(b.left),
+            top: a.top.min(b.top),
+            right: a.right.max(b.right),
+            bottom: a.bottom.max(b.bottom),
+        }
+    }
+
+    fn equal_pixels(actual: &[u8], expected: &[u8], width: u32) {
+        assert_eq!(actual.len(), expected.len());
+        let mismatches = actual
+            .chunks_exact(4)
+            .zip(expected.chunks_exact(4))
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>();
+        assert!(
+            mismatches.is_empty(),
+            "{} differing pixels, first at {:?}",
+            mismatches.len(),
+            mismatches
+                .first()
+                .map(|i| (i % width as usize, i / width as usize))
+        );
+    }
+
+    fn full_pixels(
+        view: &Arc<DashboardView>,
+        state: &DashboardState,
+        size: [f32; 2],
+        dpi: f32,
+        dark: bool,
+        interaction: &Interaction,
+    ) -> Result<Vec<u8>> {
+        let fresh = Renderer::new(dark)?;
+        let scene = fresh.scene(view, state, size)?;
+        let surface = Surface::new(size, dpi)?;
+        fresh.paint(&surface.target, &scene, interaction)?;
+        surface.pixels()
+    }
+
+    #[test]
+    fn r1210_scroll_damage_wic_sticky_and_newly_revealed_match_full() -> Result<()> {
+        let _com = Com::enter()?;
+        for (dark, dpi) in [(false, 96.), (true, 192.)] {
+            let renderer = Renderer::new(dark)?;
+            let (view, mut state) = fixture(false);
+            let size = [1320., 640.];
+            let mut previous = renderer.scene_shared(&view, &state, size)?;
+            normalize(&mut state, &previous);
+            let viewport = previous
+                .content
+                .iter()
+                .find(|r| r.region == ScrollRegion::Table)
+                .unwrap()
+                .viewport;
+            let hidden = previous
+                .session_rows
+                .iter()
+                .find(|r| r.rect.top >= viewport.bottom)
+                .unwrap()
+                .id
+                .clone();
+            assert!(
+                !previous
+                    .targets
+                    .iter()
+                    .any(|t| t.target == Target::Session(hidden.clone()))
+            );
+            let reveal = previous.reveal_session(&hidden).unwrap();
+            let surface = Surface::new(size, dpi)?;
+            renderer.paint(&surface.target, &previous, &Interaction::default())?;
+            for offset in [96., reveal] {
+                let old_pixels = surface.pixels()?;
+                state.table_offset = offset;
+                let next =
+                    renderer.scene_scroll(&view, &state, size, &previous, ScrollRegion::Table)?;
+                let damage = next
+                    .scroll_damage_from(&previous)
+                    .expect("Table card damage");
+                // The card includes its static toolbar and footer, not only rows.
+                assert!(damage.top < viewport.top && damage.bottom > viewport.bottom);
+                assert!(
+                    next.accessibility
+                        .iter()
+                        .any(|n| n.key.starts_with("sticky:"))
+                );
+                let expected =
+                    full_pixels(&view, &state, size, dpi, dark, &Interaction::default())?;
+                assert!(
+                    old_pixels != expected,
+                    "scroll must actually change retained pixels"
+                );
+                renderer.paint_clipped(
+                    &surface.target,
+                    &next,
+                    &Interaction::default(),
+                    Some(surface.physical_clip(damage)),
+                )?;
+                equal_pixels(&surface.pixels()?, &expected, surface.width);
+                normalize(&mut state, &next);
+                previous = next;
+            }
+            assert!(
+                previous
+                    .targets
+                    .iter()
+                    .any(|t| t.target == Target::Session(hidden.clone()))
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn r1210_scroll_damage_wic_narrow_overlapping_suffix_matches_full() -> Result<()> {
+        let _com = Com::enter()?;
+        for (dark, dpi) in [(false, 96.), (true, 192.)] {
+            let renderer = Renderer::new(dark)?;
+            let (view, mut state) = fixture(true);
+            let size = [1024., 640.];
+            let previous = renderer.scene_shared(&view, &state, size)?;
+            normalize(&mut state, &previous);
+            let surface = Surface::new(size, dpi)?;
+            renderer.paint(&surface.target, &previous, &Interaction::default())?;
+            let old_pixels = surface.pixels()?;
+            state.table_offset = 96.;
+            let next =
+                renderer.scene_scroll(&view, &state, size, &previous, ScrollRegion::Table)?;
+            let damage = next
+                .scroll_damage_from(&previous)
+                .expect("Table card damage");
+            let overlay = next
+                .targets
+                .iter()
+                .find(|t| t.target == Target::DetailSurface)
+                .unwrap();
+            assert!(crate::v2_geometry::intersection(overlay.rect, damage).is_some());
+            assert!(
+                next.draw
+                    .iter()
+                    .any(|d| matches!(d, Draw::Alpha(a) if *a == 0.03))
+            );
+            let expected = full_pixels(&view, &state, size, dpi, dark, &Interaction::default())?;
+            assert!(old_pixels != expected);
+            // Whole composed scene, including the unchanged overlay and shadow,
+            // must replay after the Table background under the same dirty clip.
+            renderer.paint_clipped(
+                &surface.target,
+                &next,
+                &Interaction::default(),
+                Some(surface.physical_clip(damage)),
+            )?;
+            equal_pixels(&surface.pixels()?, &expected, surface.width);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn r1210_scroll_damage_wic_coalesced_outside_rect_matches_full() -> Result<()> {
+        let _com = Com::enter()?;
+        let (view, mut state) = fixture(false);
+        let size = [1320., 640.];
+        let renderer = Renderer::new(false)?;
+        let previous = renderer.scene_shared(&view, &state, size)?;
+        normalize(&mut state, &previous);
+        let old_interaction = Interaction {
+            hover: Some(Target::AllEvents),
+            ..Default::default()
+        };
+        let surface = Surface::new(size, 144.)?;
+        let card_only = Surface::new(size, 144.)?;
+        renderer.paint(&surface.target, &previous, &old_interaction)?;
+        renderer.paint(&card_only.target, &previous, &old_interaction)?;
+        state.table_offset = 96.;
+        let next = renderer.scene_scroll(&view, &state, size, &previous, ScrollRegion::Table)?;
+        let damage = next
+            .scroll_damage_from(&previous)
+            .expect("Table card damage");
+        let outside = previous
+            .targets
+            .iter()
+            .find(|t| t.target == Target::AllEvents)
+            .unwrap()
+            .rect;
+        assert!(
+            outside.left > damage.right,
+            "pending hover damage is outside Table card"
+        );
+        let pending = crate::Rect {
+            left: outside.left - 4.,
+            top: outside.top - 4.,
+            right: outside.right + 4.,
+            bottom: outside.bottom + 4.,
+        };
+        let expected = full_pixels(&view, &state, size, 144., false, &Interaction::default())?;
+        renderer.paint_clipped(
+            &card_only.target,
+            &next,
+            &Interaction::default(),
+            Some(card_only.physical_clip(damage)),
+        )?;
+        assert!(
+            card_only.pixels()? != expected,
+            "card-only repaint must leave the old Side hover"
+        );
+        renderer.paint_clipped(
+            &surface.target,
+            &next,
+            &Interaction::default(),
+            Some(surface.physical_clip(union(damage, pending))),
+        )?;
+        equal_pixels(&surface.pixels()?, &expected, surface.width);
+        Ok(())
+    }
+
+    #[test]
+    fn r1210_scroll_damage_rejects_non_table_and_mismatched_frames() -> Result<()> {
+        let renderer = Renderer::new(false)?;
+        let (view, mut state) = fixture(false);
+        let size = [1320., 640.];
+        let previous = renderer.scene_shared(&view, &state, size)?;
+        normalize(&mut state, &previous);
+        state.table_offset = 96.;
+        let next = renderer.scene_scroll(&view, &state, size, &previous, ScrollRegion::Table)?;
+        assert!(next.scroll_damage_from(&previous).is_some());
+        assert_eq!(
+            next.scroll_damage_from(&previous),
+            previous.table_scroll_damage()
+        );
+        assert!(previous.scroll_damage_from(&previous).is_none());
+        for region in [
+            ScrollRegion::Side,
+            ScrollRegion::Events,
+            ScrollRegion::Usage,
+        ] {
+            let mut changed = next.clone();
+            changed.rebuilt_region = Some(region);
+            assert!(changed.scroll_damage_from(&previous).is_none());
+        }
+        let mut changed = next.clone();
+        changed.view = Arc::new((*view).clone());
+        assert!(changed.scroll_damage_from(&previous).is_none());
+        changed = next.clone();
+        changed.inputs.size[0] += 1.;
+        assert!(changed.scroll_damage_from(&previous).is_none());
+        changed = next.clone();
+        changed.inputs.popup = Some(Popup::Range);
+        assert!(changed.scroll_damage_from(&previous).is_none());
+        assert!(changed.table_scroll_damage().is_none());
+        changed = next.clone();
+        changed.scene.modal = true;
+        assert!(changed.scroll_damage_from(&previous).is_none());
+        assert!(changed.table_scroll_damage().is_none());
+        changed = next.clone();
+        changed.scene.rect.right -= 1.;
+        assert!(changed.scroll_damage_from(&previous).is_none());
+        changed = next.clone();
+        changed
+            .content
+            .iter_mut()
+            .find(|r| r.region == ScrollRegion::Side)
+            .unwrap()
+            .offset += 1.;
+        assert!(changed.scroll_damage_from(&previous).is_none());
+        changed = next.clone();
+        changed
+            .content
+            .iter_mut()
+            .find(|r| r.region == ScrollRegion::Table)
+            .unwrap()
+            .viewport
+            .top += 1.;
+        assert!(changed.scroll_damage_from(&previous).is_none());
+        // The old-frame proposal is clipped to client bounds; it is not
+        // permission to reuse pixels after an actual target/size change.
+        changed = previous.clone();
+        changed.scene.rect = rect(30., 100., 50., 80.);
+        assert_eq!(changed.table_scroll_damage(), Some(changed.scene.rect));
+        changed.scene.rect.right = f32::NAN;
+        assert!(changed.table_scroll_damage().is_none());
+        Ok(())
     }
 }

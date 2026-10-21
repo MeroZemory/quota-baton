@@ -72,6 +72,7 @@ fn scene_at_width(v: &m::DashboardView, t: &m::UsageTile, tile_width: f32) -> Sc
         t,
         outer,
         &history::project(t, history::CHART_ROW_BUDGET),
+        &mut BTreeMap::new(),
     );
     b.scene
 }

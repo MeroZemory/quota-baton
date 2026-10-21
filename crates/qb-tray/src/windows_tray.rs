@@ -945,6 +945,7 @@ fn paint_window(hwnd: HWND) -> Result<()> {
                 target.SetDpi(dpi as f32, dpi as f32);
                 return Ok(target.clone());
             }
+            renderer.clear_target_resources();
             let factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
             let properties = D2D1_RENDER_TARGET_PROPERTIES {
                 r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
@@ -1101,6 +1102,7 @@ fn paint_window(hwnd: HWND) -> Result<()> {
             Err(error) => {
                 PAINTED.with(|slot| *slot.borrow_mut() = None);
                 if error.code().0 as u32 == 0x8899000C {
+                    renderer.clear_target_resources();
                     RENDER_TARGET.with(|slot| *slot.borrow_mut() = None);
                 } else {
                     return Err(error.into());
