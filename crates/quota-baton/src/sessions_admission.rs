@@ -122,10 +122,18 @@ fn wiring(home: &Path) -> Result<Wiring> {
 /// version string, testkit environment variable, or cached probe result.
 pub(crate) fn verify_version(command: &Path) -> Result<()> {
     if !command.is_absolute() || !command.is_file() {
+        #[cfg(all(feature = "testkit", debug_assertions))]
+        eprintln!("qb-version-probe stage=precondition");
         return Err(refusal(VERSION));
     }
     let output = crate::launcher_label::version_output(command).map_err(|_| refusal(VERSION))?;
     if !pinned_version(&output) {
+        #[cfg(all(feature = "testkit", debug_assertions))]
+        eprintln!(
+            "qb-version-probe stage=shape bytes={} trimmed_matches={}",
+            output.len(),
+            output.trim_ascii() == b"codex-cli 0.163.0"
+        );
         return Err(refusal(VERSION));
     }
     Ok(())

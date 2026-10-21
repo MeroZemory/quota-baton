@@ -488,6 +488,9 @@ impl Fixture {
         }
         command
             .args(args)
+            // Preserve process/test concurrency without multiplying every
+            // machine CPU into a reactor thread in each checkpointed CLI.
+            .env("TOKIO_WORKER_THREADS", "2")
             .env("QB_HOME", &self.qb)
             .env("USERPROFILE", &self.user)
             .env("HOME", &self.user)

@@ -654,7 +654,14 @@ mod contained {
         }
         let read = File::from(owned(read)?);
         let write = File::from(owned(write)?);
-        let mut child = Child::spawn(command, Some(&write))?;
+        let mut child = Child::spawn(command, Some(&write)).inspect_err(|_error| {
+            #[cfg(all(feature = "testkit", debug_assertions))]
+            eprintln!(
+                "qb-version-probe stage=spawn kind={:?} os={:?}",
+                _error.kind(),
+                _error.raw_os_error()
+            );
+        })?;
         drop(write);
         let reader = std::thread::spawn(move || {
             let mut bytes = Vec::new();
@@ -666,6 +673,20 @@ mod contained {
         let output = reader
             .join()
             .map_err(|_| io::Error::other("버전 출력 검사 실패"))??;
+        #[cfg(all(feature = "testkit", debug_assertions))]
+        match &status {
+            Err(error) => eprintln!(
+                "qb-version-probe stage=wait kind={:?} os={:?} bytes={}",
+                error.kind(),
+                error.raw_os_error(),
+                output.len()
+            ),
+            Ok(code) if *code != 0 || output.len() > 4096 => eprintln!(
+                "qb-version-probe stage=result exit={code} bytes={}",
+                output.len()
+            ),
+            _ => {}
+        }
         if status? != 0 || output.len() > 4096 {
             return Err(io::Error::other("Codex 버전을 확인하지 못했습니다"));
         }
