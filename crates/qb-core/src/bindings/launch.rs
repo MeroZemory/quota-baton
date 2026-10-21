@@ -11,6 +11,8 @@ const MODELS_BYTES: usize = 64 * 1024;
 /// Only known catalogs are present. Absence is not evidence of no entitlement.
 pub type LaunchEntitlements = BTreeMap<String, BTreeSet<String>>;
 
+type LaunchAdmission<'a> = dyn Fn(&str, bool, Option<&str>) -> bool + 'a;
+
 #[derive(Clone, Copy, Debug)]
 pub struct LaunchRequest<'a> {
     /// Unique nonsecret identifier beginning with `launch:`, never a token.
@@ -478,7 +480,7 @@ impl BindingTable {
         entitlements: &LaunchEntitlements,
         now: DateTime<Utc>,
         operation: Option<&crate::issue_operation::IssueOperation>,
-        admit: Option<&dyn Fn(&str, bool, Option<&str>) -> bool>,
+        admit: Option<&LaunchAdmission<'_>>,
         authorize: impl FnOnce(&crate::routing::PolicyStore, &LaunchPolicyMove) -> Result<()>,
     ) -> std::result::Result<LaunchPlacement, LaunchError> {
         if !is_anchor(request.anchor_key)
