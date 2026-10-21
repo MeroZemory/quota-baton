@@ -53,7 +53,17 @@ fn r9_resume_uuid_parses_global_resume_options_values_and_separator() {
                 .is_none()
         );
     }
-    assert!(resume_uuid(&["resume".into(), "--unknown".into(), A.into()]).is_err());
+    assert!(
+        resume_uuid(&["resume".into(), "--unknown".into(), A.into()])
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        resume_uuid(&["resume".into(), A.into(), "--native-new".into()])
+            .unwrap()
+            .as_deref(),
+        Some(A)
+    );
 }
 
 struct Fixture {
@@ -1056,4 +1066,61 @@ fn r9_import_refuses_destination_without_row_at_other_or_archived_path() {
             assert!(!f.store.target.join("sessions/2026/10/21").exists());
         }
     }
+}
+
+#[test]
+fn bulk_excluded_item_stays_at_source_even_if_its_transient_refusal_disappears() {
+    let f = Fixture::new();
+    let a = f.add(A, None, false, "active");
+    let b = f.add(B, None, false, "active");
+    File::options()
+        .write(true)
+        .open(&a)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(SystemTime::now()))
+        .unwrap();
+    let catalog = discovery::catalog(&f.source).unwrap();
+    let (included, skipped) = preview_imports(
+        &f.store,
+        &catalog,
+        &[A.into(), B.into()],
+        true,
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+    assert_eq!(included, vec![B.to_owned()]);
+    assert_eq!(skipped, 1);
+    File::options()
+        .write(true)
+        .open(&a)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(300)))
+        .unwrap();
+    let options = |apply| ImportOptions {
+        apply,
+        skip_existing: false,
+        announce: false,
+        keep_source: false,
+        clean_stale: false,
+    };
+    assert!(import_one(&f.store, &catalog, A, options(false)).is_ok());
+    for id in included {
+        import_one(&f.store, &catalog, &id, options(true)).unwrap();
+    }
+    assert!(a.exists());
+    assert!(!b.exists());
+    assert!(
+        discovery::catalog(&f.store.target)
+            .unwrap()
+            .threads
+            .contains_key(B)
+    );
+    assert!(
+        !discovery::catalog(&f.store.target)
+            .unwrap()
+            .threads
+            .contains_key(A)
+    );
 }

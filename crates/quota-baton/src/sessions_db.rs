@@ -990,6 +990,40 @@ pub(crate) fn source_snapshot(home: &Path, root_ids: &[String]) -> Result<DbPlan
     })
 }
 
+/// Abort a pre-decision move without replacing a source's current rows.
+/// Missing rows removed by the interrupted move are restored; current rows,
+/// including changed goals, become the exact comparison baseline for apply.
+pub(crate) fn restore_source_preserving_current(saved: &DbPlan) -> Result<()> {
+    ensure!(saved.is_source_snapshot, "source snapshot required");
+    let ids = saved
+        .threads
+        .iter()
+        .map(|t| t.id.clone())
+        .collect::<Vec<_>>();
+    let current = source_snapshot(&saved.target_home, &ids)?;
+    let mut restore = saved.clone();
+    if current.threads_schema.is_some() {
+        restore.threads_schema = current.threads_schema;
+    }
+    if current.goals_schema.is_some() {
+        restore.goals_schema = current.goals_schema;
+    }
+    for planned in &mut restore.threads {
+        if let Some(now) = current.threads.iter().find(|t| t.id == planned.id) {
+            if now.thread.is_some() {
+                planned.thread = now.thread.clone();
+                // A live source row also makes an absent current goal
+                // authoritative: it may have been deliberately cleared.
+                planned.goal = now.goal.clone();
+            }
+            if now.goal.is_some() {
+                planned.goal = now.goal.clone();
+            }
+        }
+    }
+    apply(&restore)
+}
+
 /// Read-only post-apply verification before a move deletes its source. A thread
 /// row must exactly match the full snapshot at its planned path/provider, and
 /// its optional goal must match (or remain absent). Includes borrowed rows;

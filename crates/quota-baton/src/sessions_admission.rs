@@ -1,9 +1,9 @@
-//! Home-wide managed admission. A launch holds a shared gate for its entire
-//! contained child lifetime; moves hold exclusive gates in every affected home.
+//! Per-session managed admission. Named launches hold a shared session gate;
+//! moves exclude that session across affected homes without stopping other work.
 use anyhow::Result;
 use serde::Deserialize;
 use std::{
-    ffi::{OsStr, OsString},
+    ffi::OsString,
     fs::{self, File},
     io::Read,
     path::{Path, PathBuf},
@@ -16,7 +16,7 @@ const BUSY: &str = "다른 관리 Codex 실행 또는 대화 이동이 진행 �
 const INSPECTION: &str = "대화 실행 잠금을 안전하게 확인하지 못했습니다";
 const WIRING: &str = "전용 Codex 홈 연결을 확인하지 못했습니다. 먼저 wire를 실행하세요";
 const WRONG_HOME: &str = "관리 Codex 실행의 CODEX_HOME이 연결된 전용 홈과 다릅니다";
-const UNSUPPORTED: &str = "이 Codex 명령이나 옵션은 관리 실행에서 지원하지 않습니다. daemon과 app-server 직접 실행은 사용할 수 없습니다";
+const COMMAND: &str = "관리 Codex 실행 파일을 확인하지 못했습니다";
 const VERSION: &str =
     "이 대화 기능은 Codex CLI 0.163.0만 지원합니다. 설치된 Codex 버전을 확인하세요";
 
@@ -102,12 +102,12 @@ pub(crate) fn verify_installed_version() -> Result<()> {
     verify_version(&command)
 }
 
-pub(crate) fn shared_for(home: &Path) -> Result<Guard> {
-    platform::acquire(&[home.to_path_buf()], false)
+pub(crate) fn shared_for(home: &Path, id: Option<&str>) -> Result<Guard> {
+    platform::acquire(&[home.to_path_buf()], false, id)
 }
 
-pub(crate) fn exclusive(homes: &[PathBuf]) -> Result<Guard> {
-    platform::acquire(homes, true)
+pub(crate) fn exclusive(homes: &[PathBuf], id: &str) -> Result<Guard> {
+    platform::acquire(homes, true, Some(id))
 }
 
 /// The caller checks the durable journals again while this permit is held.
@@ -115,13 +115,15 @@ pub(crate) fn exclusive(homes: &[PathBuf]) -> Result<Guard> {
 /// self-deadlock. The permit must outlive launcher_label::run, including errors.
 pub(crate) fn prepare_launch(args: &[OsString], command: &Path) -> Result<(Guard, Vec<OsString>)> {
     let installed = wiring(&qb_core::home()?)?;
-    let permit = shared_for(&installed.home)?;
+    let id = crate::sessions::resume_uuid(args)?;
+    let permit = shared_for(&installed.home, id.as_deref())?;
     let args = launch_plan(args, command, &installed)?;
     Ok((permit, args))
 }
 
 /// Read-only validation before explicit auto-import, repeated under the shared
-/// gate afterward. Bad arguments/home/version must not trigger a move first.
+/// gate afterward. Invalid command/home wiring must not trigger a move first.
+/// Version compatibility is checked separately by mutating move callers.
 pub(crate) fn preflight_launch(args: &[OsString], command: &Path) -> Result<()> {
     launch_plan(args, command, &wiring(&qb_core::home()?)?).map(drop)
 }
@@ -137,134 +139,16 @@ fn launch_plan(args: &[OsString], command: &Path, installed: &Wiring) -> Result<
     {
         return Err(refusal(WRONG_HOME));
     }
-    let args = managed_args(args)?;
-    verify_version(command)?;
-    Ok(args)
-}
-
-/// A deliberately bounded grammar for the pinned CLI. In particular, config
-/// overrides cannot change home/daemon/features, and switches are never passed
-/// through merely because the native CLI might understand them.
-fn managed_args(args: &[OsString]) -> Result<Vec<OsString>> {
-    let mut output = vec![OsString::from("--no-daemon")];
-    let mut command = None;
-    let mut positional = false;
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        if arg == "--" {
-            output.extend_from_slice(&args[index..]);
-            break;
-        }
-        let text = arg.to_str().ok_or_else(|| refusal(UNSUPPORTED))?;
-        if text.starts_with('-') && text != "-" {
-            let (flag, inline) = text
-                .split_once('=')
-                .map_or((text, None), |(k, v)| (k, Some(v)));
-            if flag == "--no-daemon" && inline.is_none() {
-                index += 1;
-                continue;
-            }
-            let value = matches!(
-                flag,
-                "--model"
-                    | "-m"
-                    | "--sandbox"
-                    | "-s"
-                    | "--ask-for-approval"
-                    | "-a"
-                    | "--cd"
-                    | "-C"
-                    | "--add-dir"
-                    | "--image"
-                    | "-i"
-                    | "--config"
-                    | "-c"
-                    | "--output-last-message"
-                    | "-o"
-                    | "--output-schema"
-                    | "--color"
-            );
-            if value {
-                let option_value = match inline {
-                    Some(value) if !value.is_empty() => OsStr::new(value),
-                    Some(_) => return Err(refusal(UNSUPPORTED)),
-                    None => {
-                        index += 1;
-                        args.get(index)
-                            .ok_or_else(|| refusal(UNSUPPORTED))?
-                            .as_os_str()
-                    }
-                };
-                if matches!(flag, "--config" | "-c") && !safe_config(option_value) {
-                    return Err(refusal(UNSUPPORTED));
-                }
-                if inline.is_none() {
-                    output.push(arg.clone());
-                    output.push(option_value.to_owned());
-                } else {
-                    output.push(arg.clone());
-                }
-            } else if inline.is_none()
-                && matches!(
-                    flag,
-                    "--help"
-                        | "-h"
-                        | "--version"
-                        | "-V"
-                        | "--no-alt-screen"
-                        | "--full-auto"
-                        | "--dangerously-bypass-approvals-and-sandbox"
-                        | "--search"
-                        | "--last"
-                        | "--all"
-                        | "--json"
-                        | "--skip-git-repo-check"
-                        | "--ephemeral"
-                )
-            {
-                output.push(arg.clone());
-            } else {
-                return Err(refusal(UNSUPPORTED));
-            }
-        } else if command.is_none() {
-            command = Some(text);
-            if !matches!(text, "resume" | "fork" | "exec" | "e") {
-                // An explicit -- permits free-form TUI prompts without allowing
-                // an unknown native subcommand to bypass this admission grammar.
-                return Err(refusal(UNSUPPORTED));
-            }
-            output.push(arg.clone());
-        } else {
-            if !positional && matches!(command, Some("exec" | "e")) && text == "review" {
-                return Err(refusal(UNSUPPORTED));
-            }
-            positional = true;
-            output.push(arg.clone());
-        }
-        index += 1;
+    if !command.is_absolute() || !command.is_file() {
+        return Err(refusal(COMMAND));
     }
-    Ok(output)
+    Ok(managed_args(args))
 }
 
-fn safe_config(value: &OsStr) -> bool {
-    value
-        .to_str()
-        .and_then(|value| value.split_once('='))
-        .is_some_and(|(key, value)| {
-            if key.trim() == "model_provider" {
-                return matches!(value.trim(), "openai" | "\"openai\"" | "'openai'");
-            }
-            matches!(
-                key.trim(),
-                "model"
-                    | "model_reasoning_effort"
-                    | "model_verbosity"
-                    | "approval_policy"
-                    | "sandbox_mode"
-                    | "personality"
-            )
-        })
+/// Own flags and resume UUIDs are handled by the caller. Native arguments,
+/// including unknown options, config overrides and literal boundaries, are opaque.
+fn managed_args(args: &[OsString]) -> Vec<OsString> {
+    args.to_vec()
 }
 
 #[cfg(windows)]
@@ -307,7 +191,10 @@ mod platform {
         options
     }
 
-    pub(crate) fn acquire(homes: &[PathBuf], exclusive: bool) -> Result<Guard> {
+    pub(crate) fn acquire(homes: &[PathBuf], exclusive: bool, id: Option<&str>) -> Result<Guard> {
+        if id.is_some_and(|id| !crate::sessions_discovery::valid_id(id)) {
+            return Err(refusal(INSPECTION));
+        }
         if homes.is_empty() {
             return Err(refusal(INSPECTION));
         }
@@ -325,12 +212,15 @@ mod platform {
                 crate::sessions_guard::prepare_parent(&home, &home)
                     .map_err(|_| refusal(INSPECTION))?,
             );
+            let Some(id) = id else {
+                continue;
+            };
             let file = options()
                 .read(true)
                 .write(true)
                 .create(true)
                 .truncate(false)
-                .open(home.join(GATE))
+                .open(home.join(format!("{GATE}.{id}")))
                 .map_err(|_| refusal(INSPECTION))?;
             let info = info(&file)?;
             if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0 {
@@ -370,7 +260,7 @@ mod platform {
 mod platform {
     use super::*;
     pub(crate) struct Guard;
-    pub(crate) fn acquire(_: &[PathBuf], _: bool) -> Result<Guard> {
+    pub(crate) fn acquire(_: &[PathBuf], _: bool, _: Option<&str>) -> Result<Guard> {
         Err(refusal(INSPECTION))
     }
 }
@@ -379,6 +269,7 @@ pub(crate) use platform::Guard;
 #[cfg(test)]
 mod tests {
     use super::*;
+    const SESSION: &str = "11111111-1111-1111-1111-111111111111";
 
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
@@ -405,26 +296,37 @@ mod tests {
     }
 
     #[test]
-    fn every_supported_path_gets_global_no_daemon() {
+    fn native_arguments_pass_through_without_injected_flags() {
         for input in [
             vec![],
             args(&["resume"]),
             args(&["resume", "--last"]),
             args(&["exec", "resume", "--last"]),
             args(&["--", "a prompt"]),
+            args(&["fix X"]),
+            args(&["--profile", "work", "--oss", "--enable", "new_feature"]),
+            args(&[
+                "-c",
+                "openai_base_url='http://synthetic.invalid/v1'",
+                "--config=model_catalog_url='http://synthetic.invalid/catalog'",
+                "-i",
+                "one.png",
+                "-i",
+                "two.png",
+                "--",
+                "--literal",
+            ]),
         ] {
-            let output = managed_args(&input).unwrap();
-            assert_eq!(output[0], "--no-daemon");
-            assert_eq!(&output[1..], input);
+            assert_eq!(managed_args(&input), input);
         }
         assert_eq!(
-            managed_args(&args(&["resume", "--no-daemon"])).unwrap(),
-            args(&["--no-daemon", "resume"])
+            managed_args(&args(&["resume", "--no-daemon"])),
+            args(&["resume", "--no-daemon"])
         );
     }
 
     #[test]
-    fn daemon_unknown_flags_and_home_overrides_refuse() {
+    fn native_commands_unknown_flags_and_config_overrides_pass_through() {
         for input in [
             args(&["app-server"]),
             args(&["daemon"]),
@@ -435,25 +337,25 @@ mod tests {
             args(&["--enable", "daemon"]),
             args(&["--model"]),
         ] {
-            assert!(managed_args(&input).is_err(), "{input:?}");
+            assert_eq!(managed_args(&input), input);
         }
         let input = args(&["-c", "model_reasoning_effort='high'", "resume", "--last"]);
-        assert!(managed_args(&input).is_ok());
+        assert_eq!(managed_args(&input), input);
     }
 
     #[test]
-    fn provider_override_accepts_only_literal_openai_in_every_option_form() {
-        for (value, allowed) in [
-            ("openai", true),
-            ("'openai'", true),
-            ("\"openai\"", true),
-            (" 'openai' ", true),
-            ("other", false),
-            ("'other'", false),
-            ("\"other\"", false),
-            ("openai_other", false),
-            ("\" openai \"", false),
-            ("'openai'\nfeatures.daemon=true", false),
+    fn provider_override_is_opaque_in_every_option_form() {
+        for value in [
+            "openai",
+            "'openai'",
+            "\"openai\"",
+            " 'openai' ",
+            "other",
+            "'other'",
+            "\"other\"",
+            "openai_other",
+            "\" openai \"",
+            "'openai'\nfeatures.daemon=true",
         ] {
             let config = format!("model_provider={value}");
             let inline = format!("--config={config}");
@@ -462,9 +364,91 @@ mod tests {
                 args(&["--config", &config, "resume"]),
                 args(&[&inline, "resume"]),
             ] {
-                assert_eq!(managed_args(&input).is_ok(), allowed, "{input:?}");
+                assert_eq!(managed_args(&input), input);
             }
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn non_unicode_native_arguments_are_preserved() {
+        use std::os::windows::ffi::OsStringExt;
+        let input = vec![OsString::from_wide(&[0xd800, 0x61])];
+        assert_eq!(managed_args(&input), input);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "isolated child of launch_validation_keeps_wiring_without_version_probe"]
+    fn launch_validation_probe() {
+        let home = qb_core::home().unwrap();
+        let installed = wiring(&home).unwrap();
+        let command = home.join("codex.cmd");
+        for input in [
+            vec![],
+            args(&["fix X"]),
+            args(&["resume", "11111111-1111-1111-1111-111111111111"]),
+        ] {
+            preflight_launch(&input, &command).unwrap();
+            let (permit, output) = prepare_launch(&input, &command).unwrap();
+            assert_eq!(output, input);
+            drop(permit);
+        }
+        assert!(!home.join("version-probed").exists());
+        for command in [
+            PathBuf::from("relative.cmd"),
+            home.join("missing.cmd"),
+            home.clone(),
+        ] {
+            let error = launch_plan(&[], &command, &installed).unwrap_err();
+            assert_eq!(friendly_error(&error).as_deref(), Some(COMMAND));
+        }
+        let mut wrong = wiring(&home).unwrap();
+        wrong.home = home.clone();
+        let error = launch_plan(&[], &command, &wrong).unwrap_err();
+        assert_eq!(friendly_error(&error).as_deref(), Some(WRONG_HOME));
+        fs::write(home.join("journal/wiring.json"), b"{}").unwrap();
+        let error = preflight_launch(&[], &command).unwrap_err();
+        assert_eq!(friendly_error(&error).as_deref(), Some(WIRING));
+        // Positive control: the explicit move API still probes and refuses.
+        let error = verify_version(&command).unwrap_err();
+        assert_eq!(friendly_error(&error).as_deref(), Some(VERSION));
+        assert!(home.join("version-probed").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn launch_validation_keeps_wiring_without_version_probe() {
+        let root = pin_fixture();
+        let home = root.path().join("qb");
+        let target = root.path().join("target");
+        fs::create_dir_all(home.join("journal")).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(
+            home.join("journal/wiring.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema":3,"mode":"dedicated","install_completed":true,"home":target
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(home.join("codex.cmd"), b"@echo off\r\necho probe>\"%QB_HOME%\\version-probed\"\r\necho codex-cli 0.999.0\r\nexit /b 0\r\n").unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "sessions_admission::tests::launch_validation_probe",
+                "--test-threads=1",
+            ])
+            .env("QB_HOME", &home)
+            .env("CODEX_HOME", &target)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(
+            home.join("version-probed").exists(),
+            "validation helper did not run"
+        );
     }
 
     #[cfg(windows)]
@@ -535,17 +519,59 @@ mod tests {
         let b = root.path().join("b");
         fs::create_dir_all(&a).unwrap();
         fs::create_dir_all(&b).unwrap();
-        let first = shared_for(&a).unwrap();
-        let second = shared_for(&a).unwrap();
-        assert!(exclusive(&[b.clone(), a.clone()]).is_err());
+        let first = shared_for(&a, Some(SESSION)).unwrap();
+        let second = shared_for(&a, Some(SESSION)).unwrap();
+        assert!(exclusive(&[b.clone(), a.clone()], SESSION).is_err());
         drop((first, second));
-        let moving = exclusive(&[a.clone(), b.clone(), a.clone()]).unwrap();
-        assert!(shared_for(&a).is_err());
-        assert!(shared_for(&b).is_err());
-        assert!(exclusive(&[b.clone(), a.clone()]).is_err());
+        let moving = exclusive(&[a.clone(), b.clone(), a.clone()], SESSION).unwrap();
+        assert!(shared_for(&a, Some(SESSION)).is_err());
+        assert!(shared_for(&b, Some(SESSION)).is_err());
+        assert!(exclusive(&[b.clone(), a.clone()], SESSION).is_err());
         drop(moving);
-        assert!(shared_for(&a).is_ok());
-        assert!(shared_for(&b).is_ok());
+        assert!(shared_for(&a, Some(SESSION)).is_ok());
+        assert!(shared_for(&b, Some(SESSION)).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exclusive_session_allows_fresh_and_other_ids_without_releasing_directory_pins() {
+        const OTHER: &str = "22222222-2222-2222-2222-222222222222";
+        for id in [None, Some(OTHER)] {
+            let root = pin_fixture();
+            let parent = root.path().join("parent");
+            let a = parent.join("a");
+            let b = parent.join("b");
+            fs::create_dir_all(&a).unwrap();
+            fs::create_dir_all(&b).unwrap();
+            let moving = exclusive(&[a.clone(), b.clone()], SESSION).unwrap();
+            let first = shared_for(&a, id).unwrap();
+            let second = shared_for(&b, id).unwrap();
+            for home in [&a, &b] {
+                assert_eq!(
+                    shared_for(home, Some(SESSION)).err().unwrap().to_string(),
+                    BUSY
+                );
+            }
+            drop(moving);
+            for home in [&a, &b] {
+                assert!(shared_for(home, Some(SESSION)).is_ok());
+                assert_eq!(
+                    fs::rename(home, parent.join("renamed-home"))
+                        .unwrap_err()
+                        .raw_os_error(),
+                    Some(32)
+                );
+            }
+            assert_eq!(
+                fs::rename(&parent, root.path().join("renamed-parent"))
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(32)
+            );
+            drop((first, second));
+            fs::rename(&a, parent.join("renamed-home")).unwrap();
+            fs::rename(&parent, root.path().join("renamed-parent")).unwrap();
+        }
     }
 
     #[cfg(windows)]
@@ -568,9 +594,9 @@ mod tests {
             let target = home.join("published");
             fs::write(&source, b"synthetic rollout").unwrap();
             let held = if moving {
-                exclusive(std::slice::from_ref(&home)).unwrap()
+                exclusive(std::slice::from_ref(&home), SESSION).unwrap()
             } else {
-                shared_for(&home).unwrap()
+                shared_for(&home, Some(SESSION)).unwrap()
             };
             assert_eq!(
                 fs::rename(&home, parent.join("moved-home"))
@@ -683,9 +709,9 @@ mod tests {
             fs::remove_dir(&empty).unwrap();
             let writer = metadata_writer(&home);
             let held = if moving {
-                exclusive(std::slice::from_ref(&home)).unwrap()
+                exclusive(std::slice::from_ref(&home), SESSION).unwrap()
             } else {
-                shared_for(&home).unwrap()
+                shared_for(&home, Some(SESSION)).unwrap()
             };
             assert_eq!(
                 set_mount_point(&writer, &target)
@@ -694,7 +720,7 @@ mod tests {
                 Some(145)
             );
             drop(held);
-            fs::remove_file(home.join(GATE)).unwrap();
+            fs::remove_file(home.join(format!("{GATE}.{SESSION}"))).unwrap();
             assert_eq!(
                 fs::read_dir(&home).unwrap().count(),
                 0,
