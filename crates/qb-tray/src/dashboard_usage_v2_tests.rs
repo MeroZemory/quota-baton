@@ -148,9 +148,24 @@ fn r10_usage_header_has_sixty_dip_divider_all_windows_and_limit_chip() {
 }
 
 #[test]
+fn r10_usage_end_label_positions_handle_empty_tiny_and_over_capacity_plots() {
+    let plot = rect(0., 100., 100., 40.);
+    assert!(end_label_positions(&[], plot).is_empty());
+    assert!(end_label_positions(&[100.], rect(0., 100., 100., 23.)).is_empty());
+    assert_eq!(
+        end_label_positions(&[100., 100., 100.], plot),
+        vec![106., 122.]
+    );
+    assert_eq!(
+        end_label_positions(&[100., 100.], rect(0., 100., 100., 24.)),
+        vec![106.]
+    );
+}
+
+#[test]
 fn r10_usage_end_labels_separate_symmetrically_clamp_and_have_backings() {
     let (v, mut t) = fixture();
-    for (a, b) in [(64., 65.), (0., 1.), (99., 100.)] {
+    for (a, b) in [(64., 65.), (0., 1.), (99., 100.), (100., 0.), (0., 100.)] {
         t.series[0].points.last_mut().unwrap().1 = Some(a);
         t.series[1].points.last_mut().unwrap().1 = Some(b);
         let s = scene(&v, &t);
@@ -190,7 +205,15 @@ fn r10_usage_now_caption_and_edge_endpoints_have_separate_bounded_rows() {
     let (v, mut t) = fixture();
     for tile_width in [406., 476.] {
         for future_reset in [false, true] {
-            for (a, b) in [(100., 100.), (0., 0.), (99., 100.), (0., 1.), (64., 65.)] {
+            for (a, b) in [
+                (100., 100.),
+                (0., 0.),
+                (99., 100.),
+                (0., 1.),
+                (64., 65.),
+                (100., 0.),
+                (0., 100.),
+            ] {
                 for (series, pct) in t.series.iter_mut().zip([a, b]) {
                     series.points.last_mut().unwrap().1 = Some(pct);
                     series.future_resets = if future_reset {
