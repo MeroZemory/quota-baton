@@ -1648,17 +1648,36 @@ fn upgrade_completed(
         if !upgrade_path(m, &e.path)? {
             continue;
         }
+        let mut observed = e.clone();
+        let merge_config = m.mode == CodexMode::Dedicated
+            && e.path == m.home.join("config.toml")
+            && e.identity.is_some();
         if e.upgrade.is_some() {
             upgrade_state(e)?;
         } else {
             ancestors_safe(&e.path)?;
-            if !matches_entry(e, force)? {
+            // Codex atomically rewrites its config when recording project trust.
+            // Merge current content at this validated path; other files and
+            // in-flight intents still require their exact journaled identities.
+            if merge_config {
+                observed.identity = Some(identity(&e.path)?);
+            }
+            if !matches_entry(&observed, force || merge_config)? {
                 bail!(
                     "전용 파일이 변경되었습니다. 같은 파일의 내용 변경만 --force로 허용할 수 있습니다"
                 );
             }
         }
         let before = fs::read(&e.path)?;
+        if e.upgrade.is_none() {
+            if !force && !merge_config && hash_bytes(&before) != e.hash {
+                bail!("업그레이드 교체 대상이 변경되었습니다");
+            }
+            observed.hash = hash_bytes(&before);
+            if !matches_entry(&observed, false)? {
+                bail!("업그레이드 교체 대상이 변경되었습니다");
+            }
+        }
         let after = if let Some(u) = &e.upgrade {
             unprotect(&u.payload)?
         } else if e.path == m.home.join("config.toml") {
@@ -1688,7 +1707,7 @@ fn upgrade_completed(
                 json_strings(&json, &mut secrets);
             }
         }
-        plans.push((e.path.clone(), before, after));
+        plans.push((observed, before, after));
     }
     // Known journal credentials are redacted wherever values recur in the diff.
     for e in &m.entries {
@@ -1713,7 +1732,8 @@ fn upgrade_completed(
             cleanup_publication_scratch(&m.entries[i])?;
         }
     }
-    for (path, before, after) in plans {
+    for (observed, before, after) in plans {
+        let path = observed.path.clone();
         let i = m.entries.iter().position(|e| e.path == path).unwrap();
         if before != after || m.entries[i].upgrade.is_some() {
             report.changed.push(path.display().to_string());
@@ -1725,7 +1745,7 @@ fn upgrade_completed(
             }
             if m.entries[i].upgrade.is_none() {
                 let e = &mut m.entries[i];
-                if !matches_entry(e, force)? || hash_file(&e.path)? != hash_bytes(&before) {
+                if !matches_entry(&observed, false)? {
                     bail!("업그레이드 교체 대상이 변경되었습니다");
                 }
                 if let Some(tmp) = &e.pending
@@ -1733,6 +1753,8 @@ fn upgrade_completed(
                 {
                     bail!("기존 임시 파일을 먼저 확인하세요");
                 }
+                // Bind recovery to the observed input, never to a later rewrite.
+                e.identity = observed.identity;
                 e.upgrade = Some(Upgrade {
                     old_hash: hash_bytes(&before),
                     old_identity: e
@@ -5113,7 +5135,7 @@ trusted_hash = "synthetic-hook-hash"
     }
 
     #[test]
-    fn r32_upgrade_content_refuses_then_force_merges_current_owned_file() {
+    fn r92_upgrade_config_content_merges_without_force() {
         let (_dir, p) = fixture();
         r32_old_install(&p);
         let config = p.codex_qb_home.join("config.toml");
@@ -5122,15 +5144,7 @@ trusted_hash = "synthetic-hook-hash"
         text.insert_str(0, "user_extra = 'keep-force-edit'\n");
         fs::write(&config, text).unwrap();
         assert_eq!(identity(&config).unwrap(), before_id);
-        let journal = fs::read(p.journal()).unwrap();
-        assert!(
-            r32_run(&p, true, false)
-                .unwrap_err()
-                .to_string()
-                .contains("--force")
-        );
-        assert_eq!(fs::read(p.journal()).unwrap(), journal);
-        r32_run(&p, true, true).unwrap();
+        r32_run(&p, true, false).unwrap();
         assert!(
             fs::read_to_string(config)
                 .unwrap()
@@ -5143,7 +5157,7 @@ trusted_hash = "synthetic-hook-hash"
     fn r32_upgrade_force_refuses_same_bytes_substitute() {
         let (_dir, p) = fixture();
         r32_old_install(&p);
-        let path = p.codex_qb_home.join("config.toml");
+        let path = claude_home(&p).unwrap().join("settings.json");
         let bytes = fs::read(&path).unwrap();
         // Keep the old object alive, avoiding file-ID reuse in this test.
         fs::rename(&path, path.with_extension("held-old")).unwrap();
@@ -5152,6 +5166,245 @@ trusted_hash = "synthetic-hook-hash"
         assert!(r32_run(&p, true, true).is_err());
         assert_eq!(fs::read(&path).unwrap(), bytes);
         assert_eq!(fs::read(p.journal()).unwrap(), journal);
+    }
+
+    #[test]
+    fn r92_upgrade_atomic_config_replace_preserves_220_projects_and_user_settings() {
+        for force in [false, true] {
+            let (_dir, p) = fixture();
+            r32_old_install(&p);
+            let sources = snapshot(&p);
+            let path = p.codex_qb_home.join("config.toml");
+            let old_id = identity(&path).unwrap();
+            let held = p.qb_home.join("held-r3-config");
+            fs::hard_link(&path, &held).unwrap();
+            let mut doc = fs::read_to_string(&path)
+                .unwrap()
+                .parse::<DocumentMut>()
+                .unwrap();
+            let mut notifications = toml_edit::Array::new();
+            notifications.push("approval-requested");
+            doc["tui"]["notifications"] = toml_edit::value(notifications);
+            let mut text = doc.to_string();
+            text.insert_str(
+                0,
+                "# client-maintained settings\nuser_extra = 'keep-client-edit'\n",
+            );
+            for i in 0..220 {
+                text.push_str(&format!(
+                    "\n[projects.'C:\\synthetic\\project-{i:03}']\ntrust_level = 'trusted' # keep project {i}\n"
+                ));
+            }
+            atomic_bytes(&path, text.as_bytes()).unwrap();
+            let replaced_id = identity(&path).unwrap();
+            assert_ne!(replaced_id, old_id);
+            let journal = fs::read(p.journal()).unwrap();
+            let before = r32_owned(&p);
+            let dry = r32_run(&p, false, force).unwrap();
+            assert_eq!(dry.changed.len(), 4);
+            assert_eq!(fs::read(p.journal()).unwrap(), journal);
+            assert_eq!(r32_owned(&p), before);
+
+            assert_eq!(r32_run(&p, true, force).unwrap().changed.len(), 4);
+            let actual = fs::read(&path).unwrap();
+            assert_eq!(
+                std::str::from_utf8(&actual)
+                    .unwrap()
+                    .replacen("terminal_title = []\n", "", 1),
+                text
+            );
+            let doc = std::str::from_utf8(&actual)
+                .unwrap()
+                .parse::<DocumentMut>()
+                .unwrap();
+            assert_eq!(doc["user_extra"].as_str(), Some("keep-client-edit"));
+            assert_eq!(doc["projects"].as_table().unwrap().len(), 220);
+            for i in 0..220 {
+                assert_eq!(
+                    doc["projects"][format!("C:\\synthetic\\project-{i:03}").as_str()]["trust_level"]
+                        .as_str(),
+                    Some("trusted")
+                );
+            }
+            assert!(doc["tui"]["terminal_title"].as_array().unwrap().is_empty());
+            assert_eq!(
+                doc["tui"]["notifications"]
+                    .as_array()
+                    .unwrap()
+                    .get(0)
+                    .unwrap()
+                    .as_str(),
+                Some("approval-requested")
+            );
+            assert_eq!(identity(&held).unwrap(), old_id);
+            let m = manifest(&p);
+            let e = m.entries.iter().find(|e| e.path == path).unwrap();
+            assert_eq!(e.identity, Some(identity(&path).unwrap()));
+            assert_eq!(e.hash, hash_bytes(&actual));
+            assert_eq!(unprotect(e.payload.as_deref().unwrap()).unwrap(), actual);
+            assert!(e.upgrade.is_none());
+            let journal = fs::read(p.journal()).unwrap();
+            let owned = r32_owned(&p);
+            assert!(r32_run(&p, true, force).unwrap().changed.is_empty());
+            assert_eq!(fs::read(p.journal()).unwrap(), journal);
+            assert_eq!(r32_owned(&p), owned);
+            assert_eq!(snapshot(&p), sources);
+            super::unwire(&p, true, false).unwrap();
+            assert!(!path.exists());
+            assert!(!p.journal().exists());
+            assert_eq!(identity(&held).unwrap(), old_id);
+        }
+    }
+
+    #[test]
+    fn r92_upgrade_old_r3_default_claude_shape_merges_atomic_config_replace() {
+        let (_dir, p) = fixture();
+        run(&p, true, Some(CodexMode::Dedicated)).unwrap();
+        let path = p.codex_qb_home.join("config.toml");
+        let mut doc = fs::read_to_string(&path)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        doc["tui"]
+            .as_table_like_mut()
+            .unwrap()
+            .remove("terminal_title");
+        fs::write(&path, doc.to_string()).unwrap();
+        let mut m = manifest(&p);
+        let e = m.entries.iter_mut().find(|e| e.path == path).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        e.hash = hash_bytes(&bytes);
+        e.payload = Some(protect(&bytes).unwrap());
+        // Earlier R3 used default Claude and omitted the later optional fields.
+        let mut old = serde_json::to_value(m).unwrap();
+        for field in ["install_completed", "claude_mode", "command"] {
+            old.as_object_mut().unwrap().remove(field);
+        }
+        for e in old["entries"].as_array_mut().unwrap() {
+            for field in ["upgrade", "original", "abandoned"] {
+                e.as_object_mut().unwrap().remove(field);
+            }
+        }
+        atomic_json(&p.journal(), &old).unwrap();
+        assert_eq!(manifest(&p).claude_mode, ClaudeMode::Default);
+        let text =
+            format!("{doc}\n[projects.'C:\\synthetic\\legacy-r3']\ntrust_level = 'trusted'\n");
+        atomic_bytes(&path, text.as_bytes()).unwrap();
+        let default_claude = fs::read(&p.claude_settings).unwrap();
+        let before = resume_snapshot(&p);
+        run(&p, false, Some(CodexMode::Dedicated)).unwrap();
+        assert_eq!(resume_snapshot(&p), before);
+        run(&p, true, Some(CodexMode::Dedicated)).unwrap();
+        let actual = fs::read_to_string(&path).unwrap();
+        assert!(actual.contains("terminal_title = []"));
+        assert_eq!(actual.replacen("terminal_title = []\n", "", 1), text);
+        assert_eq!(fs::read(&p.claude_settings).unwrap(), default_claude);
+        super::unwire(&p, true, false).unwrap();
+        assert!(!p.journal().exists());
+    }
+
+    #[test]
+    fn r92_upgrade_current_replaced_config_is_not_adopted_for_unwire() {
+        let (_dir, p) = fixture();
+        r32_run(&p, true, false).unwrap();
+        let path = p.codex_qb_home.join("config.toml");
+        let mut text = fs::read_to_string(&path).unwrap();
+        text.push_str("\n[projects.'C:\\synthetic\\current']\ntrust_level = 'trusted'\n");
+        atomic_bytes(&path, text.as_bytes()).unwrap();
+        let id = identity(&path).unwrap();
+        let journal = fs::read(p.journal()).unwrap();
+        for apply in [false, true] {
+            assert!(r32_run(&p, apply, false).unwrap().changed.is_empty());
+            assert_eq!(fs::read(p.journal()).unwrap(), journal);
+            assert_eq!(fs::read(&path).unwrap(), text.as_bytes());
+            assert_eq!(identity(&path).unwrap(), id);
+        }
+        for force in [false, true] {
+            assert!(super::unwire(&p, true, force).is_err());
+            assert_eq!(fs::read(&path).unwrap(), text.as_bytes());
+            assert_eq!(identity(&path).unwrap(), id);
+        }
+    }
+
+    #[test]
+    fn r92_upgrade_pending_config_intent_refuses_later_replacement_even_with_force() {
+        let (_dir, p) = fixture();
+        r32_old_install(&p);
+        let path = p.codex_qb_home.join("config.toml");
+        let text = fs::read(&path).unwrap();
+        atomic_bytes(&path, &text).unwrap();
+        let observed_id = identity(&path).unwrap();
+        INTERRUPT.with(|slot| *slot.borrow_mut() = Some((path.clone(), "upgrade-before-scratch")));
+        assert!(
+            r32_run(&p, true, false)
+                .unwrap_err()
+                .to_string()
+                .contains("synthetic creation interruption")
+        );
+        let m = manifest(&p);
+        let e = m.entries.iter().find(|e| e.path == path).unwrap();
+        assert_eq!(e.upgrade.as_ref().unwrap().old_identity, observed_id);
+        fs::hard_link(&path, path.with_extension("held-intent")).unwrap();
+        atomic_bytes(&path, &text).unwrap();
+        assert_ne!(identity(&path).unwrap(), observed_id);
+        let before = resume_snapshot(&p);
+        for force in [false, true] {
+            for apply in [false, true] {
+                assert!(r32_run(&p, apply, force).is_err());
+                assert_eq!(resume_snapshot(&p), before);
+            }
+            assert!(super::unwire(&p, true, force).is_err());
+            assert_eq!(resume_snapshot(&p), before);
+        }
+    }
+
+    #[test]
+    fn r92_upgrade_config_merge_refuses_unsafe_paths_without_mutation() {
+        for case in [
+            "directory",
+            "reparse",
+            "parent-reparse",
+            "foreign-journal-path",
+        ] {
+            let (_dir, p) = fixture();
+            r32_old_install(&p);
+            let path = p.codex_qb_home.join("config.toml");
+            let foreign = p.qb_home.join("foreign");
+            fs::create_dir(&foreign).unwrap();
+            let marker = foreign.join("marker");
+            fs::write(&marker, "preserve foreign content").unwrap();
+            match case {
+                "directory" | "reparse" => {
+                    fs::remove_file(&path).unwrap();
+                    fs::create_dir(&path).unwrap();
+                    if case == "reparse" {
+                        junction(&path, &foreign).unwrap();
+                    }
+                }
+                "parent-reparse" => {
+                    fs::rename(&p.codex_qb_home, p.qb_home.join("held-home")).unwrap();
+                    fs::create_dir(&p.codex_qb_home).unwrap();
+                    junction(&p.codex_qb_home, &foreign).unwrap();
+                }
+                "foreign-journal-path" => {
+                    let mut m = manifest(&p);
+                    m.entries.iter_mut().find(|e| e.path == path).unwrap().path = marker.clone();
+                    atomic_json(&p.journal(), &m).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let before = resume_snapshot(&p);
+            for force in [false, true] {
+                for apply in [false, true] {
+                    assert!(r32_run(&p, apply, force).is_err(), "{case}");
+                    assert_eq!(resume_snapshot(&p), before, "{case}");
+                    assert_eq!(
+                        fs::read_to_string(&marker).unwrap(),
+                        "preserve foreign content"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

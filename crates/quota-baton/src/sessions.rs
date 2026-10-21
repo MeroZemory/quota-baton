@@ -208,9 +208,7 @@ impl Store {
         let value: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|_| anyhow::anyhow!("연결 기록을 읽을 수 없습니다"))?;
         ensure!(
-            value["mode"] == "dedicated"
-                && value["install_completed"] == true
-                && value["schema"] == 3,
+            crate::sessions_admission::completed_wiring(&value),
             "전용 Codex 홈 연결을 먼저 완료하세요"
         );
         let target = PathBuf::from(value["home"].as_str().context("전용 홈 경로가 없습니다")?);
