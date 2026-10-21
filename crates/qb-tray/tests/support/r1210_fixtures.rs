@@ -43,12 +43,12 @@ pub fn input() -> Value {
     let sessions: Vec<_> = (0..SESSIONS).map(|i| {
         let account = i % ACCOUNTS;
         json!({"id":format!("{i:012x}"),"account":ids[account],
-            "provider":if account%2==0 {"codex"} else {"claude"},
-            "client":{"kind":if account%2==0 {"codex_cli"} else {"claude_cli"}},
+            "provider":if account.is_multiple_of(2) {"codex"} else {"claude"},
+            "client":{"kind":if account.is_multiple_of(2) {"codex_cli"} else {"claude_cli"}},
             "label":{"text":format!("합성 session {i:02} · dashboard performance"),"source":"codex_workspace"},
             "first_seen_at":now-Duration::hours(2),"bound_since":now-Duration::hours(1),
             "last_used_at":now-Duration::seconds(20),"active":true,
-            "model":if account%2==0 {"synthetic-codex"} else {"synthetic-claude"},
+            "model":if account.is_multiple_of(2) {"synthetic-codex"} else {"synthetic-claude"},
             "inflight":{"requests":0,"ws_open":0},"inflight_known":true,
             "requests_today":100+i,"failures_today":0,"subagents_today":2,
             "subagents_known":true,"moves_known":true,"counters_complete":true})
