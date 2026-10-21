@@ -254,7 +254,7 @@ Claude는 기본적으로 `claude-qb` 명령을 만듭니다. 클라이언트 �
 
 이미 연결한 환경도 `wire`로 미리 본 뒤 `wire --apply`로 제목 설정을 갱신할 수 있습니다. 바뀔 전용 파일만 표시하고 교체합니다. 전용 설정의 다른 항목과 원래 되돌리기용 백업은 보존합니다.
 
-직접 수정한 파일은 기본적으로 거절합니다. 내용을 확인한 뒤 `wire --apply --force`를 쓸 수 있습니다. 설정의 다른 항목은 유지하지만 실행기 본문은 다시 만듭니다. 연결 주소나 인증 값이 기존 연결 계획과 다르면 갱신을 중단합니다. 다른 파일로 교체된 경로는 `--force`도 덮어쓰지 않습니다.
+Codex 전용 `config.toml`은 현재 내용을 읽어 필요한 제목 설정만 합칩니다. Codex가 파일을 새로 쓰거나 프로젝트 신뢰 항목을 추가해도 그 내용은 보존합니다. 연결 주소나 인증 값이 기존 계획과 다르면 중단합니다. 다른 전용 파일의 직접 수정은 기본적으로 거절합니다. 내용을 확인한 뒤 `wire --apply --force`를 쓸 수 있지만, 다른 파일로 교체된 경로는 거절합니다. 실행기 본문은 다시 만듭니다. 경로가 우회 연결로 바뀌었거나 진행 중인 교체 대상이 다시 바뀌면 중단합니다.
 
 기본 홈이 API key 방식으로 CPA에 연결된 예전 구성이라면, `wire`는 기존 방식대로 기본 홈의 연결 주소와 인증을 바꿉니다. 관련 모델 카탈로그와 CPA provider 주소도 바꿉니다. 원래 값은 journal에 보호해 둡니다.
 
@@ -372,6 +372,16 @@ quota-baton.exe sessions recover <UUID> --resolve-map
 자세한 조건은 [D21 대화 하드링크 가져오기](decisions.md#d21-codex-qb-keeps-a-separate-codex-home-existing-sessions-are-brought-in-by-hardlink-import-automatically-on-resume--accepted-user-direction-2026-10-21)를 따릅니다.
 
 ## 문제 해결
+
+### Codex 실행 연결 검사
+
+다음 명령은 설치 연결 기록만 읽어 검사합니다. Codex나 코어를 실행하지 않습니다. 인증 파일을 읽거나 대화를 이동하지 않습니다.
+
+```powershell
+quota-baton.exe launch-client --check
+```
+
+예전 `wire` 기록에 `install_completed` 항목이 없어도 모든 파일 항목이 완료되어 있으면 사용합니다. 부분 설치·해제·업그레이드가 남아 있으면 거절합니다. 검사를 이유로 `wire`나 `unwire`를 실제 적용할 필요는 없습니다. `--check`에는 실행 인자나 `--command`를 붙이지 마세요.
 
 ### 401
 

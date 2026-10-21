@@ -1,0 +1,21 @@
+{
+  "schema": 3,
+  "mode": "dedicated",
+  "home": "SYNTHETIC_TARGET",
+  "npm": "SYNTHETIC_NPM",
+  "claude": "SYNTHETIC_CLAUDE_SETTINGS",
+  "claude_before": "synthetic-before",
+  "claude_after": "synthetic-after",
+  "claude_original": "SYNTHETIC_ENCRYPTED_BACKUP",
+  "claude_payload": "SYNTHETIC_ENCRYPTED_PATCH",
+  "claude_identity": {"volume": 1, "index": 2},
+  "claude_restored": false,
+  "autostart": null,
+  "tasks": [],
+  "optional_restored": false,
+  "retained": false,
+  "entries": [
+    {"path":"SYNTHETIC_TARGET","kind":"Directory","target":null,"hash":"","identity":{"volume":1,"index":3},"pending_identity":null,"pending":null,"payload":null,"done":true,"removed":false},
+    {"path":"SYNTHETIC_TARGET/config.toml","kind":"File","target":null,"hash":"synthetic-hash","identity":{"volume":1,"index":4},"pending_identity":{"volume":1,"index":4},"pending":"SYNTHETIC_PUBLISHED_SCRATCH","payload":"SYNTHETIC_ENCRYPTED_CONFIG","done":true,"removed":false}
+  ]
+}
