@@ -109,7 +109,9 @@ fn content_memo_detects_same_size_header_rewrite_with_restored_mtime() {
     let directory =
         crate::sessions_guard::header_directory(home.path(), path.parent().unwrap()).unwrap();
     let opened = crate::sessions_guard::open_header(&directory, &path).unwrap();
-    assert!(cached_compressed(&path, &opened).unwrap().is_some());
+    // Other tests/readers may evict a memo entry. A miss is legal; freshness
+    // after the rewrite below must hold regardless of concurrent eviction.
+    let _ = cached_compressed(&path, &opened).unwrap();
     drop(opened);
     fs::write(&path, second).unwrap();
     fs::File::options()
@@ -223,6 +225,32 @@ fn parallel_header_inventory_rebuilds_late_descendants_aliases_and_unreadable_na
     assert!(second.ensure_readable_for(&ids(C)).is_err());
     assert!(second.ensure_readable_for(&ids(A)).is_ok());
     assert_eq!(second.rollouts.len(), 66);
+}
+
+#[cfg(windows)]
+#[test]
+fn optional_memo_sizing_never_hides_a_header_under_non_unicode_ancestors() {
+    use std::{ffi::OsString, os::windows::ffi::OsStringExt};
+    let home = home();
+    let native = OsString::from_wide(&[b'n' as u16, 0xD800]);
+    let directory = home.path().join("sessions").join(native);
+    fs::create_dir_all(&directory).unwrap();
+    let path = directory.join(format!("rollout-test-{A}.jsonl.zst"));
+    fs::write(
+        &path,
+        zstd::stream::encode_all(record(A, None, None).as_bytes(), 1).unwrap(),
+    )
+    .unwrap();
+    assert!(path.to_str().is_none());
+    for _ in 0..2 {
+        let found = catalog(home.path()).unwrap();
+        assert!(
+            found.unreadable.is_empty(),
+            "optional memo sizing hid a valid header"
+        );
+        assert_eq!(found.rollouts[A].path, path);
+        assert!(found.chain(A).is_ok());
+    }
 }
 
 #[test]

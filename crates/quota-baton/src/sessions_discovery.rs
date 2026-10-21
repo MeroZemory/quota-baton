@@ -170,15 +170,15 @@ fn cached_compressed(
     Ok(Some(rollout))
 }
 
-fn cache_compressed(
-    path: &Path,
-    rollout: &Rollout,
-    input_bytes: u64,
-    digest: [u8; 32],
-) -> Result<()> {
-    let cost = serde_json::to_vec(rollout)?.len() + 128;
+fn cache_compressed(path: &Path, rollout: &Rollout, input_bytes: u64, digest: [u8; 32]) {
+    // Sizing is optional. Native non-Unicode ancestor names are valid paths;
+    // serde's inability to encode them must not hide a successfully read header.
+    let Ok(encoded) = serde_json::to_vec(rollout) else {
+        return;
+    };
+    let cost = encoded.len() + 128;
     if cost > HEADER_CACHE_BYTES {
-        return Ok(());
+        return;
     }
     with_headers(|cache| {
         if let Some(old) = cache.entries.remove(path) {
@@ -199,7 +199,6 @@ fn cache_compressed(
             },
         );
     });
-    Ok(())
 }
 
 #[derive(Clone, Default)]
@@ -388,7 +387,7 @@ fn read_meta(
         metadata: fields,
     };
     if let Some((bytes, digest)) = witness {
-        cache_compressed(path, &rollout, bytes, digest)?;
+        cache_compressed(path, &rollout, bytes, digest);
     }
     Ok(rollout)
 }
