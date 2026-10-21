@@ -2691,14 +2691,20 @@ mod tests {
         )
         .unwrap();
         let directory = header_directory(&root, &parent).unwrap();
+        let mut retagged = false;
         let result = platform::open_header_using(&directory, &leaf, || {
             // Exact review counterexample, deterministically after tag checks:
             // remove the last child, then retag the still-pinned empty parent.
             fs::rename(&leaf, root.join("parked.jsonl"))?;
             directory_tag(&parent, &outside, false)?;
             assert_ne!(fs::symlink_metadata(&parent)?.file_attributes() & 0x400, 0);
+            retagged = true;
             Ok(())
         });
+        assert!(
+            retagged,
+            "junction fixture did not reach the leaf-open boundary"
+        );
         assert!(
             result.is_err(),
             "an absolute-path open would read the outside prefix"
