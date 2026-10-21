@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: R12.10 (대시보드 지연 수정)
-목표: 보이는 대시보드의 유휴 CPU와 조작 지연을 줄인다
+현재 마일스톤: R11 (실행별 계정·모델 목록 마무리)
+목표: 대시보드 수정을 전달하고 R11을 마무리한다
 핵심 지표: 새 경로 출시 1/2 · R11은 HTTP 통합 저장, WS 경계 2건과 출시 관문 남음
 사용자 대기: 없음 (R2 Part B만 사용자 결정 대기)
-갱신: 2026-10-22 04:36 KST (release 라이브러리220통과, 실제 창·성능 수용 검증 중)
+갱신: 2026-10-22 04:59 KST (성능 조건·qb-tray scoped 관문 통과)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -79,6 +79,9 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-22 02:42 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R12.10 텍스트 캐시 단위 2a6f6db, 출시 수 변화 없음 |
 | 2026-10-22 03:02 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R12.10 실제 HWND 캐시 회귀 통과; 성능 관문 미완료 |
 | 2026-10-22 04:36 | 1/2 | 브러시 수명 단위 저장, 출시 수 변화 없음; 실제 HWND 회귀 통과, 성능 수용 미완료 |
+| 2026-10-22 04:50 | 1/2 | R12.10 성능 단위 통과, 최종 관문 미완료; 기능 출시 수 변화 없음 |
+| 2026-10-22 04:53 | 1/2 | R12.10 성능 통과, 최종 실행 검사는 OS bind 재현으로 미완료; R11 독립 통합 진행 |
+| 2026-10-22 04:59 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R12.10 성능·scoped 관문 완료; 기능 출시 수 변화 없음 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -125,12 +128,22 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-22 04:22 | R12.10 브러시 픽셀·색·대상·해제 release 라이브러리 검사 | 215통과 / 0실패 | 실제 WIC 픽셀·경계 검사 | 대상 자원 해제 추가; HWND 바이너리 가시성 오류는 수정 후 별도 확인 |
 | 2026-10-22 04:36 | R12.10 줄바꿈 재사용 포함 release 라이브러리 | 220통과 / 0실패 | cached/uncached·범위·한글·대상 해제 검사 | prepared-text-stage/library.log; 실제 성능 수용과 별도 |
 | 2026-10-22 04:36 | R12.10 대상 해제 수정 후 실제 HWND 캐시 회귀 | 1통과 / 0실패 | 실제 창 동작·UIA·자정 회귀 | host-brush-clear-fixed; 최초 가시성 오류 수정 뒤 확인 |
+| 2026-10-22 04:50 | R12.10 동기 production paint v5 준비 텍스트 프레임 p95 (hover/scroll/tab) | 2.190 / 12.146 / 9.642 ms | 각16 ms 미만 | prepared-text-v5 입력 고정 측정 완료; 소스82ac1a71, 이후 clippy 스타일 수정 |
+| 2026-10-22 04:50 | R12.10 합성 HWND 유휴 CPU (30계정·40세션, 코어 하나 기준) | 0.260350 % | 2 % 미만 | after-prepared-text-v5 30초 완료 |
+| 2026-10-22 04:50 | R12.10 새 snapshot 전체 재작성 v5 준비 텍스트 (30회) p95 | 46.527 ms | 50 ms 미만 | after-prepared-text-v5 통과, 최대80.964ms 포함 모두 보존 |
+| 2026-10-22 04:50 | R12.10 원본 v5 비교 | hover100·scroll100 완료, tab19회 뒤 focus 확보 실패 | 전체 실행 | 완전한 baseline에서 제외, 실패 원인 단정 안 함 |
+| 2026-10-22 04:50 | R12.10 UIA 색인 비교 검사 | 2통과 / 0실패 | 기존 대상 선택과 동일 | release actual-Host 포함 타깃; native Host 별도1통과 |
+| 2026-10-22 04:50 | R12.10 준비 텍스트 관문 시도 | fmt통과, clippy 조건문 스타일1건 실패 | 전 검사 통과 | 77df5ef에서 수정; 최종 관문 다시 실행 |
+| 2026-10-22 04:53 | R12.10 최종 strict clippy | 통과 (exit0) | qb-tray all-targets testkit -D warnings | 스타일 수정77df5ef 이후; native 테스트 별도 |
+| 2026-10-22 04:53 | R12.10 최종 qb-tray 테스트 시도 | 기존 HTTP 검사6건이 kernel bind에서 정지, 소유 실행 취소 | 전체 완료 | 제품 assertion 실패로 단정하지 않음; 테스트 통과로 세지 않음 |
+| 2026-10-22 04:53 | 외부 조건 독립 Python IPv4 bind8초 | timeout | 숫자 loopback 새 bind가 반환 | qb import 없음; socket().bind(127.0.0.1:0), 프로세스 제한 시간8초 |
+| 2026-10-22 04:59 | R12.10 OS 복구 후 최종 scoped 관문 | HTTP6/6 한 번씩 재통과; fmt·clippy·build exit0 | 감독 판정에 따른 종결 | interrupted aggregate 및222 library pass 보존; 완전한 전체 합계 미주장 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 행동 |
 |---|---|---|---|
 | R11 실행별 계정 | HTTP 통합 저장, WS 경계 2건과 출시 관문 남음 | 관문 통과와 설치 | R12.10 뒤 WS 경계 2건 마무리 후 관문 |
-| 대시보드 지연 (R12.10) | 최근 조작 p95 3.3/64.4/19.1 ms, 전체68.8 ms | 조작16 ms, 전체50 ms 미만 | 실제 draw·UIA 비용을 줄이고 재측정 |
+| 대시보드 지연 (R12.10) | 합성 실제 창 성능·최종 scoped gate 통과 | 실제 설치 확인 | 설계 세션이 설치하고 사용자 환경 확인 |
 | R13 소진 예측·아이콘·차트·캐시 보류 | 설계 완료, 구현 0/5 부분 | 5/5 부분 병합과 설치 | R11과 R12.10 뒤 시작 |
 <!-- gaps:end -->

@@ -51,3 +51,19 @@ Implementation continues on typed confirmation, inventory, current-state return,
 비차단 관문 질문입니다. 대시보드 v2 §3.3은 기준 T개만큼 칸을 그리도록 하지만 C7의 유효 기준은 i64::MAX까지입니다. 유한한 창에서 그 수를 모두 표시할 수 없습니다. 구현은 기본 5칸과 폭에 들어가는 21칸을 정확히 표시합니다. 들어가지 않는 경우에는 칸 수를 폭으로 제한하고 줄임표, 전체 N/T, 생략 수 접근성 설명을 유지합니다. 기준 수만큼 반복·할당하지 않습니다.
 
 추천: 이 한정된 표현을 극단값의 공식 예외로 승인합니다. 설정 상한을 새로 줄이거나 나머지 필드를 밀어내는 변경은 하지 않았습니다. literal T 규칙과의 편차 및 회귀 근거는 `.sandbox/reports/R10-evidence/pip-fallback.md`와 독립 검수 `R10-final-requirements-sol.md` D1에 기록했습니다. 전체 관문 보고에서 한 번만 확인하며 다른 구현·검증은 계속합니다.
+
+
+## R12.10: Windows loopback bind가 커널에서 반환하지 않음
+
+관문 시점의 외부 환경 질문입니다. 렌더 수정의 실제 창 성능 조건, release 라이브러리220건, UIA 비교2건, 실제 Host1건과 strict clippy는 통과했습니다. 최종 qb-tray 테스트 중 기존 HTTP 검사6건이 Windows socket bind에서 멈췄습니다. 실행 소유권을 확인한 뒤 해당 cargo/test 프로세스만 종료했습니다.
+
+별도 `python -I -S` 프로세스에서 qb를 불러오지 않고 `socket().bind((127.0.0.1,0))`만 실행해도8초 안에 반환하지 않습니다. 테스트 native stack은 std::net::TcpListener::bind → ws2_32!bind → mswsock → NtDeviceIoControlFile이며, 다른 테스트들은 mio 초기화 Once를 기다립니다. 보고서 보조 Python도 전역 site hook의 IPv6 지원 확인 bind에서 멈췄고, site를 건너뛰면 보고서 생성은 정상입니다. TCP 상태 집계는 Established110, TimeWait160, Bound260으로 기록했지만 원인은 단정하지 않습니다.
+
+OS/보안/네트워크 계층의 담당 확인과 점검을 감독 세션에서 맡아 주실 수 있나요? 실제 서비스·설정·계정은 변경하지 않았습니다. 시스템 재시작이나 보안/네트워크 설정 변경은 하지 않습니다. 근거는 `.sandbox/reports/R12.10-evidence/gate-stall/`입니다. 이 외부 조건을 기다리는 동안 네트워크가 필요 없는 R11 통합을 계속합니다. 관문은 통과로 표시하거나 dev로 병합하지 않았습니다.
+
+
+### R12.10 OS bind 판정과 관문 종결
+
+감독 세션은 OS System 로그로 원인을 확인했습니다. 보고된 타임라인: 04:38:53 nProtect Online Security (PFS), INCA nossvc 설치 및 TKFWFV/TKFWVT/TkIdsVt 로드; 04:39:04 TKFsFtM; 04:40:19 Hyper-V VmSwitch의 WSL/Default Switch 재구성; 04:50–04:51 trustlet 시작/종료. 약04:49 bind 중단은 이 구간에 있었으며 QB·포트 고갈 결함이 아닌 일시적 보안 소프트웨어 설치 영향으로 판정됐습니다. 이후 새 이름 exe를 포함한 loopback bind는1–3ms였습니다. 제품 우회 코드는 추가하지 않았습니다.
+
+감독 지시에 따라 멈췄던 HTTP6건을 각각 한 번만 재실행했고 모두 exit0/1 passed였습니다. 이 판정으로 관문을 인정합니다. 원본 aggregate는 interrupted로 보존합니다(라이브러리222통과; 완료된 전체 합계는 주장하지 않음). fmt·strict clippy·정상 제품 build exit0. 근거: `R12.10-evidence/gate-stall/retry-six/completion.json`, `normal-build.json`, `final-fingerprint.json`.
