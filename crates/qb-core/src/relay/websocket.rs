@@ -102,6 +102,16 @@ impl RelayState {
     ) {
         self.ws_capacity.pause_selection()
     }
+
+    /// Pause one managed create after pacing, before its final dispatch gate.
+    pub fn pause_next_ws_create_dispatch(
+        self: &Arc<Self>,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        pump::pause_create_dispatch(self)
+    }
 }
 
 pub(super) type UpstreamSocket = WebSocketStream<reqwest::Upgraded>;
@@ -110,30 +120,36 @@ pub(super) type ClientSocket = WebSocketStream<hyper_util::rt::TokioIo<hyper::up
 async fn redial_same_account(
     context: &pump::Context,
     model: Option<&str>,
-) -> Result<UpstreamSocket, ()> {
-    let relay = context.relay.as_ref().ok_or(())?;
-    let (account, token) = context.credentials.as_ref().ok_or(())?;
+) -> Result<UpstreamSocket, &'static str> {
+    let failure = "upstream_write_error";
+    let relay = context.relay.as_ref().ok_or(failure)?;
+    let (account, token) = context.credentials.as_ref().ok_or(failure)?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    context
+        .guard_launch_model(model, deadline)
+        .await
+        .map_err(|error| error.code())?;
     if relay.is_draining()
         || !relay
             .dispatch_data_allowed(context.session.key.as_deref(), &account.id, model)
             .await
     {
-        return Err(());
+        return Err(failure);
     }
-    let mut forwarded = headers::upstream(&context.headers, account, token).map_err(|_| ())?;
+    let mut forwarded = headers::upstream(&context.headers, account, token).map_err(|_| failure)?;
     let key = generate_key();
     forwarded.insert("connection", HeaderValue::from_static("Upgrade"));
     forwarded.insert("upgrade", HeaderValue::from_static("websocket"));
     forwarded.insert("sec-websocket-version", HeaderValue::from_static("13"));
     forwarded.insert(
         "sec-websocket-key",
-        HeaderValue::from_str(&key).map_err(|_| ())?,
+        HeaderValue::from_str(&key).map_err(|_| failure)?,
     );
     if relay.is_draining() {
-        return Err(());
+        return Err(failure);
     }
-    let response = tokio::time::timeout(
-        Duration::from_secs(15),
+    let response = tokio::time::timeout_at(
+        deadline,
         relay
             .client
             .get(&context.upstream_url)
@@ -141,8 +157,8 @@ async fn redial_same_account(
             .send(),
     )
     .await
-    .map_err(|_| ())?
-    .map_err(|_| ())?;
+    .map_err(|_| failure)?
+    .map_err(|_| failure)?;
     if response.status() != StatusCode::SWITCHING_PROTOCOLS
         || response
             .headers()
@@ -153,7 +169,7 @@ async fn redial_same_account(
         || response.headers().contains_key("sec-websocket-extensions")
         || response.headers().contains_key("sec-websocket-protocol")
     {
-        return Err(());
+        return Err(failure);
     }
     if let Some(key) = context.session.key.as_deref() {
         relay.observability.dashboard().response_model(
@@ -164,7 +180,20 @@ async fn redial_same_account(
                 .and_then(|v| v.to_str().ok()),
         );
     }
-    let stream = response.upgrade().await.map_err(|_| ())?;
+    let stream = tokio::time::timeout_at(deadline, response.upgrade())
+        .await
+        .map_err(|_| failure)?
+        .map_err(|_| failure)?;
+    context
+        .guard_launch_model(model, deadline)
+        .await
+        .map_err(|error| error.code())?;
+    if !relay
+        .dispatch_data_allowed(context.session.key.as_deref(), &account.id, model)
+        .await
+    {
+        return Err("routing_policy_blocked");
+    }
     let limit = mib_bytes(relay.websocket.max_message_size_mib);
     let config = WebSocketConfig::default()
         .max_message_size(Some(limit))
@@ -261,7 +290,36 @@ async fn upgrade_inner(
         .remove::<crate::dashboard::labels::IngressLabel>()
         .and_then(|e| e.0);
     let (parts, _) = request.into_parts();
-    let session = session::classify(Provider::Codex, "/v1/responses", &parts.headers, &[]);
+    let ingress = parts.extensions.get::<launch::LaunchIngress>().cloned();
+    let launch_pin = ingress.as_ref().and_then(|ingress| ingress.pin.clone());
+    let mut session = session::classify(Provider::Codex, "/v1/responses", &parts.headers, &[]);
+    let launch_deadline = tokio::time::Instant::from_std(deadline);
+    let managed = match state
+        .resolve_data_launch(ingress.as_ref(), session.key.as_deref(), launch_deadline)
+        .await
+    {
+        Ok(Some(info)) => {
+            session.key = Some(info.canonical_key.clone());
+            if info.managed {
+                // The upgrade has no body model. Use the effective launch model;
+                // each response.create is admitted separately by the pump.
+                match state.admit_data_model(&info, None, launch_deadline).await {
+                    Ok(Some(model)) => {
+                        session.model = Some(model.clone());
+                        Some(http_data::ManagedHttp { info, model })
+                    }
+                    Ok(None) => {
+                        return http_data::error(completion, launch::DataLaunchError::Invalid);
+                    }
+                    Err(error) => return http_data::error(completion, error),
+                }
+            } else {
+                None
+            }
+        }
+        Ok(None) => None,
+        Err(error) => return http_data::error(completion, error),
+    };
     if state
         .prepare_project(
             &session,
@@ -319,7 +377,13 @@ async fn upgrade_inner(
         // a WS-only exclusion: normal routing may move to another eligible
         // account; strict anchors stay anchored and wait for their slot.
         let capped = state.ws_capacity.capped();
-        let excluded = tried.union(&capped).cloned().collect();
+        // A local cap is not evidence that a managed launch's account failed.
+        // Keep its healthy binding and let the reservation refusal wait below.
+        let excluded = if managed.is_some() {
+            tried.clone()
+        } else {
+            tried.union(&capped).cloned().collect()
+        };
         let reserved = Arc::new(std::sync::Mutex::new(None));
         let admission_denied = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let admit = {
@@ -346,12 +410,13 @@ async fn upgrade_inner(
         };
         completion.policy_blocked = false;
         let selected = state
-            .select_request_admitted(
+            .select_launch_request_admitted(
                 Provider::Codex,
                 &session,
                 completion,
-                None,
+                session.model.as_deref(),
                 &excluded,
+                managed.as_ref(),
                 Some(admit),
             )
             .await;
@@ -371,13 +436,12 @@ async fn upgrade_inner(
         let account = match selected {
             Ok(Some(account)) => account,
             Ok(None) => {
-                let policy = state.bindings.policies.plan(session.key.as_deref());
+                let policy = state.bindings.routing_plan(session.key.as_deref());
                 if policy.settings.mode == crate::routing::Mode::Strict
                     && (state.bindings.policies.strict_dispatch_blocked()
                         || policy.anchor.as_deref().is_some_and(|anchor| {
                             !state
                                 .bindings
-                                .policies
                                 .permits_dispatch(session.key.as_deref(), anchor)
                         }))
                 {
@@ -390,7 +454,8 @@ async fn upgrade_inner(
                 // exclusions removed. In particular, unrelated full accounts
                 // cannot mask an unavailable strict anchor or drain policy.
                 let capacity_blocked = admission_denied.load(Ordering::Acquire)
-                    || (!capped.is_empty()
+                    || (managed.is_none()
+                        && !capped.is_empty()
                         && capacity_candidate(&state, &session, &tried, &capped).await);
                 if capacity_blocked {
                     completion.end_attempt();
@@ -429,7 +494,11 @@ async fn upgrade_inner(
             Ok(snapshot) => snapshot,
             Err(_) => return network_failure(),
         };
-        if !state.accounts.eligible(&account.id, None).await {
+        if !state
+            .accounts
+            .eligible(&account.id, session.model.as_deref())
+            .await
+        {
             continue;
         }
         let mut probe = match state.accounts.begin_probe(&account) {
@@ -451,13 +520,23 @@ async fn upgrade_inner(
                 u64::try_from(admission_started.elapsed().as_millis()).unwrap_or(u64::MAX),
             );
             let mut forced = admission.forced() || std::time::Instant::now() >= upgrade_deadline;
+            if let Some(managed) = &managed
+                && let Err(error) = state
+                    .guard_http_launch(managed, &account.id, launch_deadline)
+                    .await
+            {
+                return http_data::error(completion, error);
+            }
             if !state
-                .dispatch_allowed(session.key.as_deref(), &account.id, None)
+                .dispatch_data_allowed(
+                    session.key.as_deref(),
+                    &account.id,
+                    session.model.as_deref(),
+                )
                 .await
             {
                 completion.policy_blocked = !state
                     .bindings
-                    .policies
                     .permits_dispatch(session.key.as_deref(), &account.id);
                 return state
                     .unavailable(completion, Provider::Codex, true, None)
@@ -557,6 +636,27 @@ async fn upgrade_inner(
                 if probe.is_some() && state.accounts.probe_success(&account.id).await.is_err() {
                     return network_failure();
                 }
+                if let Some(managed) = &managed {
+                    if let Err(error) = state
+                        .guard_http_launch(managed, &account.id, launch_deadline)
+                        .await
+                    {
+                        return http_data::error(completion, error);
+                    }
+                    if !state
+                        .dispatch_data_allowed(
+                            session.key.as_deref(),
+                            &account.id,
+                            session.model.as_deref(),
+                        )
+                        .await
+                    {
+                        return http_data::error(
+                            completion,
+                            launch::DataLaunchError::PolicyBlocked,
+                        );
+                    }
+                }
                 drop(probe);
                 break 'accounts (
                     WebSocketStream::from_raw_socket(stream, Role::Client, Some(config)).await,
@@ -607,7 +707,7 @@ async fn upgrade_inner(
                 error.status,
                 &error.headers,
                 &error.raw,
-                None,
+                session.model.as_deref(),
             );
             decision.reconcile_quota(&credit_observation);
             if super::credentials::is_linked(&account)
@@ -730,6 +830,16 @@ async fn upgrade_inner(
                     .is_err()
             {
                 return network_failure();
+            }
+            if managed.is_some() && decision.kind == super::outcome::Kind::ModelPermission {
+                // Keep C6 row 6a's durable model hold above, then refresh only
+                // this account. A capability denial never authorizes shopping.
+                let _ = tokio::time::timeout_at(
+                    launch_deadline,
+                    state.launch_catalog(&account.id, true, true),
+                )
+                .await;
+                return error.into_response();
             }
             if failover {
                 completion.failover(reason);
@@ -867,10 +977,6 @@ async fn upgrade_inner(
         .key
         .as_deref()
         .and_then(|key| state.observability.dashboard().socket(key));
-    let launch_pin = parts
-        .extensions
-        .get::<super::launch::LaunchIngress>()
-        .and_then(|ingress| ingress.pin.clone());
     tokio::spawn(async move {
         let _launch_pin = launch_pin;
         // The slot survives the HTTP 101 and is released on client-upgrade
@@ -920,7 +1026,7 @@ async fn capacity_candidate(
     capped: &BTreeSet<String>,
 ) -> bool {
     if session.key.is_none()
-        && state.bindings.policies.plan(None).settings.mode == crate::routing::Mode::Strict
+        && state.bindings.routing_plan(None).settings.mode == crate::routing::Mode::Strict
     {
         return false;
     }

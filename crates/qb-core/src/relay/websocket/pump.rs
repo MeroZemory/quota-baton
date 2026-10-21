@@ -29,6 +29,7 @@ use crate::{
     accounts::Provider::Codex,
     guard::{InflightBudget, Reservation},
     observability::{Observability, safe_error_code, safe_identifier},
+    relay::launch::DataLaunchError,
     relay::ledger::Completion,
     session::Session,
 };
@@ -57,6 +58,80 @@ pub(super) struct Context {
     pub connection: String,
 }
 
+impl Context {
+    pub(super) fn launch_deadline(&self) -> Instant {
+        Instant::now()
+            + Duration::from_secs(
+                self.relay
+                    .as_ref()
+                    .map_or(15, |relay| relay.request_timeout_secs),
+            )
+    }
+
+    async fn managed_launch(
+        &self,
+        deadline: Instant,
+    ) -> Result<Option<crate::bindings::LaunchInfo>, DataLaunchError> {
+        let Some(relay) = &self.relay else {
+            return Ok(None);
+        };
+        let info = tokio::select! {
+            biased;
+            _ = relay.wait_for_drain_start() => return Err(DataLaunchError::Unavailable),
+            info = relay.resolve_data_launch(None, self.session.key.as_deref(), deadline) => info?,
+        };
+        let Some(info) = info.filter(|info| info.managed) else {
+            return Ok(None);
+        };
+        if info.account != self.account {
+            return Err(DataLaunchError::Changed);
+        }
+        Ok(Some(info))
+    }
+
+    pub(super) async fn guard_launch_model(
+        &self,
+        model: Option<&str>,
+        deadline: Instant,
+    ) -> Result<(), DataLaunchError> {
+        let Some(info) = self.managed_launch(deadline).await? else {
+            return Ok(());
+        };
+        let relay = self.relay.as_ref().expect("managed launch has relay");
+        tokio::select! {
+            biased;
+            _ = relay.wait_for_drain_start() => Err(DataLaunchError::Unavailable),
+            result = relay.admit_data_model(&info, model, deadline) => result.map(|_| ()),
+        }
+    }
+
+    async fn prepare_launch_create(
+        &self,
+        requested: Option<&str>,
+        deadline: Instant,
+    ) -> Result<(Session, String), DataLaunchError> {
+        let info = self
+            .managed_launch(deadline)
+            .await?
+            .ok_or(DataLaunchError::Changed)?;
+        let relay = self.relay.as_ref().expect("managed launch has relay");
+        let model = tokio::select! {
+            biased;
+            _ = relay.wait_for_drain_start() => return Err(DataLaunchError::Unavailable),
+            result = relay.admit_data_model(&info, requested, deadline) => result?,
+        }
+        .ok_or(DataLaunchError::Invalid)?;
+        Ok((
+            Session {
+                key: Some(info.canonical_key),
+                parent: self.session.parent.clone(),
+                model: Some(model.clone()),
+            },
+            model,
+        ))
+    }
+}
+
 pub(in crate::relay) struct CurrentCompletion {
     completion: Completion,
     committed: bool,
@@ -69,6 +144,10 @@ pub(in crate::relay) struct CurrentCompletion {
 
 impl CurrentCompletion {
     async fn new(context: &Context) -> Option<Self> {
+        Self::new_for_session(context, &context.session).await
+    }
+
+    async fn new_for_session(context: &Context, session: &Session) -> Option<Self> {
         let mut completion = Completion::new(
             context.observability.clone(),
             &Method::GET,
@@ -77,14 +156,14 @@ impl CurrentCompletion {
             &context.headers,
         );
         completion.record.transport = "ws".into();
-        completion.session(&context.session);
+        completion.session(session);
         completion.runtime = context.runtime.clone();
         if let Some(relay) = &context.relay {
             completion.track(relay.inflight_requests.clone());
             completion.binding = Some(
                 relay
                     .bindings
-                    .begin_request_async(context.session.key.as_deref(), &context.account)
+                    .begin_request_async(session.key.as_deref(), &context.account)
                     .await
                     .ok()?,
             );
@@ -566,6 +645,26 @@ async fn apply_error(
     } else if let (Some(runtime), Some(signal)) = (&context.runtime, decision.signal.take()) {
         runtime.transition(&context.account, signal).await?;
     }
+    if decision.kind == Kind::ModelPermission
+        && let Some(relay) = &context.relay
+    {
+        let deadline = context.launch_deadline();
+        if context
+            .managed_launch(deadline)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            // Persist the model-specific denial before observing a changed or
+            // unchanged menu. Refresh this socket's account without replay.
+            tokio::select! {
+                biased;
+                _ = relay.wait_for_drain_start() => {},
+                _ = tokio::time::timeout_at(deadline, relay.launch_catalog(&context.account, true, true)) => {},
+            }
+        }
+    }
     // No replay of a WS response.create across connections. C7 is resolved
     // on the next placement of this session (including precommit reconnect).
     if decision.kind == Kind::Quota
@@ -583,7 +682,7 @@ async fn apply_error(
     Ok(decision)
 }
 
-async fn reconnect_available(context: &Context) -> Result<bool, ()> {
+async fn reconnect_available(context: &Context, model: Option<&str>) -> Result<bool, ()> {
     let Some(relay) = &context.relay else {
         return Ok(false);
     };
@@ -594,6 +693,39 @@ async fn reconnect_available(context: &Context) -> Result<bool, ()> {
         return Ok(false);
     }
     let tried = std::collections::BTreeSet::from([context.account.clone()]);
+    let deadline = context.launch_deadline();
+    if let Some(info) = context.managed_launch(deadline).await.map_err(|_| ())? {
+        let model = model
+            .or(info.current_model.as_deref())
+            .ok_or(())?
+            .to_owned();
+        let managed = super::super::http_data::ManagedHttp { info, model };
+        let key = Some(managed.info.canonical_key.as_str());
+        let candidates = relay
+            .candidates(Codex, key, Some(&managed.model), &tried)
+            .await?;
+        let (candidates, _) = relay
+            .launch_candidates(&managed, candidates, &tried, deadline)
+            .await?;
+        // A live socket owns its placement. Preview compatibility without
+        // publishing a move through that pin; the next upgrade admits it.
+        if !matches!(
+            relay.bindings.preview(
+                Codex,
+                key,
+                context.session.parent.as_deref(),
+                Some(&managed.model),
+                &candidates,
+                relay.pins.get(Codex, key).as_deref(),
+                0
+            ),
+            crate::bindings::PreviewDecision::Selected { .. }
+        ) {
+            return Ok(false);
+        }
+        relay.exclude_reconnect(key, &context.account);
+        return Ok(true);
+    }
     if relay.select(Codex, key, None, &tried).await?.is_none() {
         return Ok(false);
     }
@@ -617,6 +749,53 @@ fn parsed(text: &str) -> Option<Value> {
 
 fn response_create(text: &str) -> bool {
     super::super::wire_metadata::Metadata::parse(text.as_bytes()).is_some_and(|m| m.create())
+}
+
+// Metadata bounds string fields without allocating input trees. Preserve the
+// distinction between an omitted model and an explicitly invalid model.
+fn requested_create_model(bytes: &[u8]) -> Result<Option<String>, DataLaunchError> {
+    #[derive(serde::Deserialize)]
+    struct Requested {
+        #[serde(default, deserialize_with = "model")]
+        model: Option<String>,
+    }
+    fn model<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<String>, D::Error> {
+        let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+        safe_identifier(&value)
+            .map(Some)
+            .ok_or_else(|| serde::de::Error::custom("invalid model"))
+    }
+    super::super::wire_metadata::Metadata::parse(bytes).ok_or(DataLaunchError::Invalid)?;
+    serde_json::from_slice::<Requested>(bytes)
+        .map(|request| request.model)
+        .map_err(|_| DataLaunchError::Invalid)
+}
+
+fn launch_error(error: DataLaunchError) -> Message {
+    Message::text(
+        serde_json::json!({
+            "type": "error",
+            "status": error.status().as_u16(),
+            "error": {"type": error.code(), "code": error.code(), "message": error.message()},
+        })
+        .to_string(),
+    )
+}
+
+fn launch_failure(code: &str) -> Option<DataLaunchError> {
+    [
+        DataLaunchError::Relaunch,
+        DataLaunchError::Invalid,
+        DataLaunchError::Busy,
+        DataLaunchError::UnsupportedModel,
+        DataLaunchError::Unavailable,
+        DataLaunchError::PolicyBlocked,
+        DataLaunchError::Changed,
+    ]
+    .into_iter()
+    .find(|error| error.code() == code)
 }
 
 fn count_type(counts: &mut BTreeMap<String, u64>, event: &Value) {
@@ -697,6 +876,86 @@ struct PendingInitial {
     rate: Arc<RateBudget>,
 }
 
+type LaunchPreparation = BoxFuture<'static, Result<(Session, String), DataLaunchError>>;
+type CreateAdmission = BoxFuture<'static, Result<(), DataLaunchError>>;
+
+#[cfg(feature = "testkit")]
+struct CreateDispatchGate {
+    relay: std::sync::Weak<crate::relay::RelayState>,
+    arrived: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+#[cfg(feature = "testkit")]
+static CREATE_DISPATCH_GATES: Mutex<Vec<CreateDispatchGate>> = Mutex::new(Vec::new());
+
+#[cfg(feature = "testkit")]
+pub(super) fn pause_create_dispatch(
+    relay: &Arc<crate::relay::RelayState>,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (arrived, observed) = tokio::sync::oneshot::channel();
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let owner = Arc::downgrade(relay);
+    let mut gates = CREATE_DISPATCH_GATES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    gates.retain(|gate| gate.relay.strong_count() > 0);
+    assert!(
+        !gates.iter().any(|gate| gate.relay.ptr_eq(&owner)),
+        "create gate already pending"
+    );
+    gates.push(CreateDispatchGate {
+        relay: owner,
+        arrived,
+        release: gate,
+    });
+    (observed, release)
+}
+
+fn admit_create(context: Arc<Context>, model: Option<String>) -> CreateAdmission {
+    let deadline = context.launch_deadline();
+    Box::pin(async move {
+        #[cfg(feature = "testkit")]
+        if let Some(relay) = &context.relay {
+            let gate = {
+                let owner = Arc::downgrade(relay);
+                let mut gates = CREATE_DISPATCH_GATES
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                gates
+                    .iter()
+                    .position(|gate| gate.relay.ptr_eq(&owner))
+                    .map(|at| gates.remove(at))
+            };
+            if let Some(gate) = gate {
+                let _ = gate.arrived.send(());
+                tokio::select! {
+                    biased;
+                    _ = relay.wait_for_drain_start() => return Err(DataLaunchError::Unavailable),
+                    _ = tokio::time::timeout_at(deadline, gate.release) => {},
+                }
+            }
+        }
+        context
+            .guard_launch_model(model.as_deref(), deadline)
+            .await?;
+        if let Some(relay) = &context.relay
+            && !relay
+                .dispatch_data_allowed(
+                    context.session.key.as_deref(),
+                    &context.account,
+                    model.as_deref(),
+                )
+                .await
+        {
+            return Err(DataLaunchError::PolicyBlocked);
+        }
+        Ok(())
+    })
+}
+
 type Write<S> = BoxFuture<'static, (S, bool, Delivered)>;
 
 fn write<S>(
@@ -748,8 +1007,8 @@ where
     })
 }
 
-/// Classification is an observer, never an authorization boundary. Unknown
-/// and large client data still belongs to this socket's pinned account.
+/// Legacy classification is an observer. Managed data has already passed its
+/// metadata check and revalidates the account/model after pacing, before send.
 fn guarded_upstream_write<S>(
     context: Arc<Context>,
     sink: S,
@@ -779,6 +1038,20 @@ where
                     Delivered {
                         bytes: 0,
                         terminal: Some("rate_wait_timeout"),
+                        ..delivered
+                    },
+                );
+            }
+            if let Err(error) = context
+                .guard_launch_model(model.as_deref(), context.launch_deadline())
+                .await
+            {
+                return (
+                    sink,
+                    false,
+                    Delivered {
+                        bytes: 0,
+                        terminal: Some(error.code()),
                         ..delivered
                     },
                 );
@@ -880,6 +1153,10 @@ fn redial_rate(context: Arc<Context>, pending: PendingRateResend) -> RateRedial 
         {
             return Err("rate_wait_timeout");
         }
+        context
+            .guard_launch_model(pending.model.as_deref(), context.launch_deadline())
+            .await
+            .map_err(|error| error.code())?;
         if let Some(relay) = &context.relay
             && !relay
                 .dispatch_data_allowed(
@@ -894,15 +1171,28 @@ fn redial_rate(context: Arc<Context>, pending: PendingRateResend) -> RateRedial 
         // Pacing expiry authorizes one final send. The reconnect retains its
         // own bounded dial timeout; an exhausted pacing budget is not a zero
         // duration connect deadline.
-        let socket = super::redial_same_account(&context, pending.model.as_deref())
-            .await
-            .map_err(|_| "upstream_write_error")?;
+        let socket = super::redial_same_account(&context, pending.model.as_deref()).await?;
         let (sink, read) = socket.split();
         let bytes = pending.message.len();
         let reservation = pending.reservation;
         // Count a retry only when its write is actually polled, after a dial.
         let rate = pending.rate;
         let write = Box::pin(async move {
+            if let Err(error) = context
+                .guard_launch_model(pending.model.as_deref(), context.launch_deadline())
+                .await
+            {
+                return (
+                    sink,
+                    false,
+                    Delivered {
+                        bytes: 0,
+                        request: Some(pending.request),
+                        terminal: Some(error.code()),
+                        completed: false,
+                    },
+                );
+            }
             if let (Some(relay), Some(_)) = (&context.relay, &context.runtime)
                 && !relay
                     .dispatch_data_allowed(
@@ -986,8 +1276,12 @@ async fn run_with_read_timeout(
     let mut pending_rate_redial: Option<PendingRateResend> = None;
     let mut rate_redial: Option<RateRedial> = None;
     let mut deferred_client: Option<(Message, Reservation)> = None;
+    let mut pending_launch_create: Option<(Message, Reservation)> = None;
+    let mut launch_preparation: Option<LaunchPreparation> = None;
+    let mut pending_launch_error: Option<Message> = None;
     let mut pending_initial: Option<PendingInitial> = None;
     let mut initial_admission: Option<BoxFuture<'static, bool>> = None;
+    let mut create_admission: Option<CreateAdmission> = None;
     let mut initial_ready = false;
     let mut current = BTreeMap::<u64, CurrentCompletion>::new();
     let mut next_request = 0;
@@ -1007,6 +1301,25 @@ async fn run_with_read_timeout(
     let mut upstream_activity = last_activity;
     let mut ending: Option<(Option<CloseFrame>, &'static str)> = None;
     let mut end_deadline = last_activity;
+    let managed_socket = if draining {
+        false
+    } else {
+        match context.managed_launch(context.launch_deadline()).await {
+            Ok(info) => info.is_some(),
+            Err(error) => {
+                pending_launch_error = Some(launch_error(error));
+                ending = Some((
+                    Some(CloseFrame {
+                        code: 1000.into(),
+                        reason: "".into(),
+                    }),
+                    error.code(),
+                ));
+                end_deadline = Instant::now() + CLOSE_TIMEOUT;
+                false
+            }
+        }
+    };
     context.observability.record_ws_connection(
         &context.connection,
         &context.account,
@@ -1036,8 +1349,13 @@ async fn run_with_read_timeout(
             .is_some_and(|relay| relay.is_draining());
         // Keep an admitted payload here until the write arm is polled, so
         // drain can cancel it without losing the upstream sink or older turns.
+        if draining && pending_launch_create.take().is_some() {
+            launch_preparation = None;
+            deferred_client = None;
+        }
         if draining && let Some(pending) = pending_initial.take() {
             initial_admission = None;
+            create_admission = None;
             initial_ready = false;
             deferred_client = None;
             current.remove(&pending.request);
@@ -1053,7 +1371,10 @@ async fn run_with_read_timeout(
             end_deadline = Instant::now() + CLOSE_TIMEOUT;
         }
         if ending.is_some() {
+            launch_preparation = None;
+            pending_launch_create = None;
             initial_admission = None;
+            create_admission = None;
             pending_initial = None;
             initial_ready = false;
             rate_redial = None;
@@ -1061,6 +1382,22 @@ async fn run_with_read_timeout(
                 to_upstream = None;
             }
             deferred_client = None;
+        }
+        if to_client.is_none()
+            && let Some(message) = pending_launch_error.take()
+        {
+            let bytes = message.len();
+            to_client = Some(write(
+                client_sink.take().unwrap(),
+                message,
+                context.budget.reserve_message(bytes),
+                Delivered {
+                    bytes,
+                    request: None,
+                    terminal: None,
+                    completed: false,
+                },
+            ));
         }
         if ending.is_some() && to_client.is_none() && to_upstream.is_none() {
             break;
@@ -1072,6 +1409,58 @@ async fn run_with_read_timeout(
         tokio::select! {
             _ = async { drain_signal.as_mut().unwrap().await }, if drain_signal.is_some() && !draining && ending.is_none() => {
                 draining = true;
+            }
+            result = async { launch_preparation.as_mut().unwrap().await }, if launch_preparation.is_some() && ending.is_none() => {
+                launch_preparation = None;
+                let (message, reservation) = pending_launch_create.take().expect("launch preparation owns payload");
+                draining |= context.relay.as_ref().is_some_and(|relay| relay.is_draining());
+                if draining { continue; }
+                let (session, accepted_model) = match result {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        pending_launch_error = Some(launch_error(error));
+                        if !matches!(error, DataLaunchError::UnsupportedModel | DataLaunchError::Invalid) {
+                            ending = Some((Some(CloseFrame { code: 1000.into(), reason: "".into() }), error.code()));
+                            end_deadline = Instant::now() + CLOSE_TIMEOUT;
+                        }
+                        continue;
+                    }
+                };
+                model = Some(accepted_model);
+                if let Some(runtime) = &context.runtime && !runtime.eligible(&context.account, model.as_deref()).await {
+                    ending = Some((Some(CloseFrame { code: 1000.into(), reason: "".into() }), "account_ineligible"));
+                    end_deadline = Instant::now() + CLOSE_TIMEOUT;
+                    continue;
+                }
+                let Some(mut active) = CurrentCompletion::new_for_session(&context, &session).await else {
+                    pending_launch_error = Some(launch_error(DataLaunchError::Changed));
+                    ending = Some((Some(CloseFrame {code:1001.into(),reason:"".into()}),"routing_unavailable"));
+                    end_deadline = Instant::now() + CLOSE_TIMEOUT;
+                    continue;
+                };
+                active.model = model.clone();
+                active.completion.record.model = model.clone();
+                active.completion.dashboard_model(model.as_deref());
+                active.last_create = Some((message.clone(), reservation.clone()));
+                active.completion.input_bytes.fetch_add(message.len() as u64, Ordering::Relaxed);
+                if let Some(relay) = &context.relay {
+                    if has_previous_response_id(&message) { relay.bindings.unknown_request_cost(session.key.as_deref()); }
+                    else { relay.bindings.request_bytes(session.key.as_deref(), message.len() as u64); }
+                }
+                let rate = active.rate.clone();
+                let request = next_request;
+                next_request += 1;
+                current.insert(request, active);
+                pending_initial = Some(PendingInitial { request, message, reservation, rate: rate.clone() });
+                let context = context.clone();
+                let model = model.clone();
+                initial_admission = Some(Box::pin(async move {
+                    if !rate.admit(context.runtime.as_ref(), &context.account).await { return false; }
+                    match &context.runtime {
+                        Some(runtime) => runtime.eligible(&context.account, model.as_deref()).await,
+                        None => true,
+                    }
+                }));
             }
             eligible = async { initial_admission.as_mut().unwrap().await }, if initial_admission.is_some() && to_upstream.is_none() && ending.is_none() => {
                 initial_admission = None;
@@ -1099,13 +1488,37 @@ async fn run_with_read_timeout(
                     continue;
                 }
                 pending_initial = Some(pending);
-                initial_ready = true;
+                if managed_socket {
+                    let model = pending_initial.as_ref().and_then(|pending| current.get(&pending.request)).and_then(|active| active.model.clone());
+                    create_admission = Some(admit_create(context.clone(), model));
+                } else {
+                    initial_ready = true;
+                }
+            }
+            result = async { create_admission.as_mut().unwrap().await }, if create_admission.is_some() && to_upstream.is_none() && ending.is_none() => {
+                create_admission = None;
+                draining |= context.relay.as_ref().is_some_and(|relay| relay.is_draining());
+                // pending_initial still owns the unsent payload and the sink is
+                // still in upstream_sink. Drain cancels just this turn above.
+                if draining { continue; }
+                match result {
+                    Ok(()) => initial_ready = true,
+                    Err(error) => {
+                        pending_launch_error = Some(launch_error(error));
+                        if let Some(active) = pending_initial.as_ref().and_then(|pending| current.get_mut(&pending.request)) {
+                            active.completion.record.outcome = error.code().into();
+                        }
+                        ending = Some((Some(CloseFrame { code:1000.into(), reason:"".into() }), error.code()));
+                        end_deadline = Instant::now() + CLOSE_TIMEOUT;
+                    }
+                }
             }
             result = async { rate_redial.as_mut().unwrap().await }, if rate_redial.is_some() && ending.is_none() => {
                 rate_redial = None;
                 match result {
                     Ok((write, read)) => { upstream_read = read; to_upstream = Some(write); }
                     Err(reason) => {
+                        if managed_socket && let Some(error) = launch_failure(reason) { pending_launch_error = Some(launch_error(error)); }
                         for active in current.values_mut() { active.completion.record.outcome = reason.into(); }
                         ending = Some((Some(CloseFrame { code: (if reason == "rate_wait_timeout" {1012} else {1000}).into(), reason: "".into() }), reason));
                         end_deadline = Instant::now() + CLOSE_TIMEOUT;
@@ -1156,12 +1569,25 @@ async fn run_with_read_timeout(
                     let sink = upstream_sink.take().expect("initial admission retains upstream sink");
                     let bytes = pending.message.len();
                     let context = context.clone();
-                    let dispatch_model = model.clone();
+                    let managed = managed_socket;
+                    let dispatch_model = current.get(&pending.request).and_then(|active| active.model.clone());
                     let dispatch_receipt = current.get(&pending.request).and_then(|active| active.completion.binding.as_ref()).map(|binding| binding.receipt());
                     to_upstream = Some(Box::pin(async move {
-                        if let (Some(relay), Some(_)) = (&context.relay, &context.runtime)
+                        if !managed && let (Some(relay), Some(_)) = (&context.relay, &context.runtime)
                             && !relay.dispatch_data_allowed(context.session.key.as_deref(), &context.account, dispatch_model.as_deref()).await {
                             return (sink, false, Delivered { bytes: 0, request: Some(pending.request), terminal: Some("routing_policy_blocked"), completed: false });
+                        }
+                        if managed && let Some(relay) = &context.relay {
+                            // No await between this final authority/drain check
+                            // and the first write poll. The awaited gate retained
+                            // the sink and payload in cancellable slots above.
+                            if relay.is_draining() {
+                                return (sink, false, Delivered { bytes: 0, request: Some(pending.request), terminal: Some("takeover_drain"), completed: false });
+                            }
+                            if !relay.bindings.permits_dispatch(context.session.key.as_deref(), &context.account)
+                                || relay.bindings.current(context.session.key.as_deref()).as_deref() != Some(context.account.as_str()) {
+                                return (sink, false, Delivered { bytes: 0, request: Some(pending.request), terminal: Some("routing_policy_blocked"), completed: false });
+                            }
                         }
                         if !pending.rate.can_send() {
                             return (sink, false, Delivered {bytes:0,request:Some(pending.request),terminal:Some("rate_wait_timeout"),completed:false});
@@ -1180,10 +1606,16 @@ async fn run_with_read_timeout(
                 let (sink, success, delivered) = result;
                 upstream_sink = Some(sink);
                 to_upstream = None;
+                if !success && delivered.terminal == Some("takeover_drain") {
+                    draining = true;
+                    if let Some(request) = delivered.request { current.remove(&request); }
+                    continue;
+                }
                 if success { last_activity = Instant::now(); }
                 if success {
                     pending_rate_redial = None;
                 } else if ending.is_none() && let Some(reason) = delivered.terminal {
+                    if managed_socket && let Some(error) = launch_failure(reason) { pending_launch_error = Some(launch_error(error)); }
                     if let Some(active) = delivered.request.and_then(|id| current.get_mut(&id)) { active.completion.record.outcome = reason.into(); }
                     ending = Some((Some(CloseFrame {code: (if reason == "rate_wait_timeout" {1012} else {1000}).into(), reason:"".into()}), reason));
                     end_deadline = Instant::now() + CLOSE_TIMEOUT;
@@ -1210,13 +1642,13 @@ async fn run_with_read_timeout(
                 } else {
                     (client_read.next().await, None)
                 }
-            }, if ending.is_none() && (
-                (deferred_client.is_none() && (pending_initial.is_some() || pending_rate_redial.is_some() || rate_redial.is_some()))
+            }, if ending.is_none() && pending_launch_error.is_none() && (
+                (deferred_client.is_none() && (pending_launch_create.is_some() || pending_initial.is_some() || pending_rate_redial.is_some() || rate_redial.is_some() || (managed_socket && to_upstream.is_some())))
                 || ((deferred_client.is_some() || (client_admitted && !context.memory_guard.is_guarded()))
-                    && to_upstream.is_none() && pending_initial.is_none() && rate_redial.is_none() && pending_rate_redial.is_none() && !terminal_pending)
+                    && to_upstream.is_none() && pending_launch_create.is_none() && pending_initial.is_none() && rate_redial.is_none() && pending_rate_redial.is_none() && !terminal_pending)
             ) => {
                 let (message, reservation) = incoming;
-                if pending_initial.is_some() || to_upstream.is_some() || pending_rate_redial.is_some() || rate_redial.is_some() {
+                if pending_launch_create.is_some() || pending_initial.is_some() || to_upstream.is_some() || pending_rate_redial.is_some() || rate_redial.is_some() {
                     match message {
                         Some(Ok(Message::Ping(_))) => {
                             if to_client.is_none() { to_client = Some(flush(client_sink.take().unwrap())); }
@@ -1234,7 +1666,10 @@ async fn run_with_read_timeout(
                         }
                     }
                     to_upstream = None;
+                    launch_preparation = None;
+                    pending_launch_create = None;
                     initial_admission = None;
+                    create_admission = None;
                     pending_initial = None;
                     rate_redial = None;
                     pending_rate_redial = None;
@@ -1248,6 +1683,26 @@ async fn run_with_read_timeout(
                         let bytes = message.len();
                         let reservation = reservation.unwrap_or_else(|| context.budget.reserve_message(bytes));
                         let mut request = current.keys().next().copied();
+                        if managed_socket && matches!(&message, Message::Text(_) | Message::Binary(_)) {
+                            let data = message.clone().into_data();
+                            let Some(meta) = super::super::wire_metadata::Metadata::parse(&data) else {
+                                pending_launch_error = Some(launch_error(DataLaunchError::Invalid));
+                                continue;
+                            };
+                            if meta.create() {
+                                draining |= context.relay.as_ref().is_some_and(|relay| relay.is_draining());
+                                if draining { continue; }
+                                let requested = match requested_create_model(&data) {
+                                    Ok(model) => model,
+                                    Err(error) => { pending_launch_error = Some(launch_error(error)); continue; }
+                                };
+                                let context = context.clone();
+                                let deadline = context.launch_deadline();
+                                launch_preparation = Some(Box::pin(async move { context.prepare_launch_create(requested.as_deref(), deadline).await }));
+                                pending_launch_create = Some((message, reservation));
+                                continue;
+                            }
+                        }
                         if let Message::Text(text) = &message && response_create(text.as_str()) {
                             draining |= context.relay.as_ref().is_some_and(|relay| relay.is_draining());
                             if draining { continue; }
@@ -1356,14 +1811,14 @@ async fn run_with_read_timeout(
                                 {
                                     relay.ws_capacity.stream_connection_limit(&context.account);
                                 }
-                                let active_model = request.and_then(|id| current.get(&id)).and_then(|active| active.model.as_deref());
+                                let active_model = request.and_then(|id| current.get(&id)).and_then(|active| active.model.clone());
                                 // During takeover, relay the current turn's error unchanged:
                                 // no auth refresh, health transition, failover, or rate retry.
                                 draining |= context.relay.as_ref().is_some_and(|relay| relay.is_draining());
                                 let decision = if draining {
                                     None
                                 } else {
-                                    match apply_error(&context, event, active_model).await {
+                                    match apply_error(&context, event, active_model.as_deref()).await {
                                         Ok(decision) => Some(decision),
                                         Err(()) => {
                                             ending = Some((Some(CloseFrame { code: 1011.into(), reason: "".into() }), "health_store_error"));
@@ -1389,7 +1844,8 @@ async fn run_with_read_timeout(
                                 // Row 13a excludes row 3 rate limits and requires a current request.
                                 if current.len() == 1 && request.and_then(|id| current.get(&id)).is_some_and(|active| !active.committed)
                                     && decision.as_ref().is_some_and(|decision| decision.failover() && decision.kind != crate::relay::outcome::Kind::Rate)
-                                    && reconnect_available(&context).await.unwrap_or(false) {
+                                    && !(managed_socket && decision.as_ref().is_some_and(|decision| decision.kind == crate::relay::outcome::Kind::ModelPermission))
+                                    && reconnect_available(&context, active_model.as_deref()).await.unwrap_or(false) {
                                     if let Some(mut active) = request.and_then(|id| current.remove(&id)) {
                                         active.upstream(Some(event));
                                         active
@@ -1440,6 +1896,10 @@ async fn run_with_read_timeout(
                                             if !rate.admit(runtime.as_ref(), &account).await {
                                                 if rate.is_committed() { return (sink,true,Delivered {bytes:0,request,terminal:None,completed:false}); }
                                                 return (sink, false, Delivered {bytes:0, request, terminal:Some("rate_wait_timeout"), completed:false});
+                                            }
+                                            if let Err(error) = retry_context.guard_launch_model(retry_model.as_deref(), retry_context.launch_deadline()).await {
+                                                if rate.is_committed() { return (sink,true,Delivered {bytes:0,request,terminal:None,completed:false}); }
+                                                return (sink, false, Delivered {bytes:0, request, terminal:Some(error.code()), completed:false});
                                             }
                                             if let (Some(relay), Some(_)) = (&relay, &runtime)
                                                 && !relay.dispatch_data_allowed(key.as_deref(), &account, retry_model.as_deref()).await {
@@ -1561,7 +2021,10 @@ async fn run_with_read_timeout(
     // End waits and release retained slots before the close handshake and the
     // completion snapshot. Direct cancellation still uses the Drop fallback.
     drop(to_upstream);
+    drop(launch_preparation);
+    drop(pending_launch_create);
     drop(initial_admission);
+    drop(create_admission);
     drop(pending_initial);
     drop(rate_redial);
     drop(pending_rate_redial);
