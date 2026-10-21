@@ -410,7 +410,7 @@ fn assert_target(f: &Fixture, witness: &Witness) -> Result<()> {
     );
     let map: serde_json::Value = serde_json::from_slice(&fs::read(&f.store.map_path)?)?;
     assert_eq!(
-        Path::new(map["sessions"][ROOT].as_str().unwrap()),
+        fs::canonicalize(Path::new(map["sessions"][ROOT].as_str().unwrap()))?,
         f.store.target
     );
     Ok(())
@@ -1904,7 +1904,10 @@ fn return_and_undo_move_current_goal_thread_and_index_instead_of_original_snapsh
         assert_eq!(last["thread_name"], "SYNTHETIC current title");
         assert_eq!(last["synthetic_extra"], "preserved");
         let map: serde_json::Value = serde_json::from_slice(&fs::read(&f.store.map_path)?)?;
-        assert_eq!(Path::new(map["sessions"][ROOT].as_str().unwrap()), f.source);
+        assert_eq!(
+            fs::canonicalize(Path::new(map["sessions"][ROOT].as_str().unwrap()))?,
+            f.source
+        );
         recover_twice(&f)?;
         let closed = tree(f.root.path(), true)?;
         return_current(&f.store, ROOT, None, true, true)?;
@@ -2067,7 +2070,13 @@ fn explicit_map_resolution_closes_decided_move_preserving_other_uuid_changes() -
     recover_resolve(&f.store, ROOT)?;
     let m = load(&f.store, ROOT)?.context("resolved journal")?;
     assert!(m.phase == Phase::Complete && !open(&m));
-    current["sessions"][ROOT] = serde_json::to_value(&f.store.target)?;
+    let destination = f.store.target.to_str().context("map destination text")?;
+    current["sessions"][ROOT] = serde_json::json!(
+        destination
+            .strip_prefix(r"\\?\")
+            .unwrap_or(destination)
+            .replace('\\', "/")
+    );
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&fs::read(&f.store.map_path)?)?,
         current

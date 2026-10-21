@@ -28,6 +28,7 @@ impl Fixture {
             target: root.path().join("synthetic-qb-home"),
             _root: root,
         };
+        fs::create_dir(&fixture.target).unwrap();
         fixture.write(&json!({
             "sessions": {A: "synthetic-source", B: "synthetic-other-home"},
             "future": {"keep": [1, true], "padding": "synthetic".repeat(1600)}
@@ -53,7 +54,7 @@ impl Fixture {
     }
 
     fn resolved(&self, mut value: Value) -> Value {
-        value["sessions"][A] = json!(self.target.to_str().unwrap());
+        value["sessions"][A] = json!(map_home_value(&self.target).unwrap());
         value
     }
 }
@@ -493,6 +494,38 @@ fn a_file_blocking_a_missing_backup_ancestor_is_preserved_and_refused() {
     assert!(f.bytes() == before);
     assert!(fs::read(blocker).unwrap() == b"synthetic blocking evidence");
     assert!(!p.backup_dir.exists());
+}
+
+#[test]
+fn resolution_of_legacy_extended_intent_keeps_the_original_after_and_backups() {
+    let f = Fixture::new();
+    let native_after = f.target.to_str().unwrap();
+    assert!(native_after.starts_with(r"\\?\"));
+    let mut stored = serde_json::to_value(f.plan()).unwrap();
+    stored["change"]["after"] = json!(native_after);
+    let old = reload(&serde_json::to_vec(&stored).unwrap());
+    save_backup(&old).unwrap();
+    let evidence = fs::read(backup_path(&old).unwrap()).unwrap();
+    let mut latest = f.value();
+    latest["sessions"][A] = json!("synthetic-conflicting-home");
+    latest["sessions"][B] = json!("synthetic-latest-other-home");
+    f.write(&latest);
+    let next = replan_resolution(&old).unwrap();
+    assert_eq!(next.change.after, native_after);
+    assert!(next.resolution.as_ref().unwrap().change == old.change);
+    assert_eq!(
+        next.change.before.as_deref(),
+        Some("synthetic-conflicting-home")
+    );
+    let persisted = serde_json::to_vec(&next).unwrap();
+    let recovered = reload(&persisted);
+    apply_resolution(&recovered).unwrap();
+    apply_resolution(&reload(&persisted)).unwrap();
+    verify(&recovered).unwrap();
+    latest["sessions"][A] = json!(native_after);
+    assert!(f.value() == latest);
+    assert!(check_backup(&recovered).unwrap());
+    assert_eq!(fs::read(backup_path(&old).unwrap()).unwrap(), evidence);
 }
 
 #[test]
