@@ -1434,13 +1434,16 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
     );
     b.fill(foot, Color::Footer, 0.);
     if v.counters_unknown {
-        b.text(
-            rect(foot.left + 12., foot.top + 30., width(foot) - 24., 18.),
-            "오늘 요청 수 확인 전 · 이전 실행의 집계는 확인할 수 없습니다.",
-            12.,
-            false,
-            Color::Secondary,
-            false,
+        let bounds = rect(foot.left + 12., foot.top + 30., width(foot) - 24., 18.);
+        let notice = "오늘 요청 수 확인 전 · 이전 실행의 집계는 확인할 수 없습니다.";
+        b.text(bounds, notice, 12., false, Color::Secondary, false);
+        b.semantic(
+            "sessions:counters-unknown".into(),
+            Some("sessions:table".into()),
+            Role::Text,
+            notice.into(),
+            bounds,
+            None,
         );
     }
     let mut fx = foot.left + 12.;

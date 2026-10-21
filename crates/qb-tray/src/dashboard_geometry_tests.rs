@@ -1596,32 +1596,50 @@ fn r101_client_number_stays_adjacent_for_long_clients_at_narrow_and_wide_sizes()
 fn r101_unknown_counter_notice_is_once_in_reserved_bottom_row() {
     let mut state = DashboardState::default();
     let mut data = fixtures::snapshot();
-    for s in &mut data.sessions.sessions {
-        s.counters_complete = false;
-    }
-    let v = m::project(&data, &mut state, &fixtures::clock());
-    assert!(v.counters_unknown);
-    for size in [[1024., 640.], [1320., 960.]] {
-        let scene = Scene::build(&v, &state, size, &Metrics::default());
-        let notices: Vec<_> = scene
-            .draw
-            .iter()
-            .filter_map(|draw| match draw {
-                Draw::Text { rect, measure, .. }
-                    if measure.text.contains("오늘 요청 수 확인 전") =>
-                {
-                    Some(*rect)
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(notices.len(), 1);
-        assert!(notices[0].bottom <= size[1]);
-        let table = scene
-            .content
-            .iter()
-            .find(|r| r.region == ScrollRegion::Table)
-            .unwrap();
-        assert!(notices[0].top >= table.viewport.bottom);
+    for unknown in [false, true] {
+        for s in &mut data.sessions.sessions {
+            s.counters_complete = !unknown;
+        }
+        let v = m::project(&data, &mut state, &fixtures::clock());
+        assert_eq!(v.counters_unknown, unknown);
+        for size in [[1024., 640.], [1320., 960.]] {
+            let scene = Scene::build(&v, &state, size, &Metrics::default());
+            let notices: Vec<_> = scene
+                .draw
+                .iter()
+                .filter_map(|draw| match draw {
+                    Draw::Text { rect, measure, .. }
+                        if measure.text.contains("오늘 요청 수 확인 전") =>
+                    {
+                        Some((*rect, measure.text.as_str()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let semantic_notices: Vec<_> = scene
+                .accessibility
+                .iter()
+                .filter(|node| node.name.contains("오늘 요청 수 확인 전"))
+                .collect();
+            assert_eq!(notices.len(), usize::from(unknown));
+            assert_eq!(semantic_notices.len(), usize::from(unknown));
+            if unknown {
+                let (bounds, text) = notices[0];
+                assert!(bounds.bottom <= size[1]);
+                let table = scene
+                    .content
+                    .iter()
+                    .find(|r| r.region == ScrollRegion::Table)
+                    .unwrap();
+                assert!(bounds.top >= table.viewport.bottom);
+                let node = semantic_notices[0];
+                assert_eq!(node.key, "sessions:counters-unknown");
+                assert_eq!(node.parent.as_deref(), Some("sessions:table"));
+                assert_eq!(node.role, Role::Text);
+                assert_eq!(node.name, text);
+                assert_eq!(node.rect, bounds);
+                assert!(node.target.is_none() && !node.hidden);
+            }
+        }
     }
 }
