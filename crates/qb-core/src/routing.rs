@@ -1017,7 +1017,19 @@ impl PolicyStore {
         volatile_on_failure: bool,
         f: impl FnOnce(&mut State) -> Result<T>,
     ) -> Result<T> {
+        self.update_inner_for_issue(volatile_on_failure, None, f)
+    }
+
+    fn update_inner_for_issue<T>(
+        &self,
+        volatile_on_failure: bool,
+        operation: Option<&crate::issue_operation::IssueOperation>,
+        f: impl FnOnce(&mut State) -> Result<T>,
+    ) -> Result<T> {
         let _writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(operation) = operation {
+            operation.check().map_err(|_| anyhow::anyhow!("launch admission cancelled"))?;
+        }
         let state = self.snapshot();
         if state.frozen {
             bail!("routing policy writer retired");
@@ -1049,6 +1061,11 @@ impl PolicyStore {
         }
         next.reindex();
         validate_state(&next)?;
+        // Writer gate is held, f only changed a private clone. Cancellation
+        // competes here before durable writes/publication; never after them.
+        if let Some(operation) = operation {
+            operation.admit().map_err(|_| anyhow::anyhow!("launch admission cancelled"))?;
+        }
         let before = durable_state(&state, &self.defaults);
         let mut durable = durable_state(&next, &self.defaults);
         // Volatile movement history never advances the durable generation.
@@ -1586,6 +1603,62 @@ impl PolicyStore {
                     })
             })
     }
+    /// Authorize an explicitly consented Strict model move before binding commit.
+    /// The caller holds BindingTable's mutation gate and has checked consent,
+    /// entitlement, eligibility and inactivity. Ordinary dispatch still rechecks
+    /// authority afterwards. This does not relax policy or replace its history.
+    pub fn authorize_model_move(&self, consent: &crate::bindings::LaunchPolicyMove) -> Result<()> {
+        self.authorize_model_move_for_issue(consent, None)
+    }
+
+    pub(crate) fn authorize_model_move_for_issue(
+        &self,
+        consent: &crate::bindings::LaunchPolicyMove,
+        operation: Option<&crate::issue_operation::IssueOperation>,
+    ) -> Result<()> {
+        if consent.previous == consent.account
+            || crate::observability::safe_identifier(&consent.previous).is_none()
+            || crate::observability::safe_identifier(&consent.account).is_none()
+        {
+            bail!("invalid explicit model move");
+        }
+        self.update_inner_for_issue(false, operation, |state| {
+            // update holds the writer gate through persistence and publication.
+            // Resolve aliases here too, rather than against a pre-lock snapshot.
+            if self.persistence_failed.load(Ordering::Acquire) || self.strict_dispatch_blocked() {
+                bail!("routing policy recovery incomplete");
+            }
+            if state.revision != consent.expected_revision {
+                bail!("routing policy changed before explicit model move");
+            }
+            let id = state.policy_id(&consent.key);
+            let entry = state.sessions.get_mut(&id).ok_or_else(|| {
+                anyhow::anyhow!("explicit model move requires an anchored policy")
+            })?;
+            if entry.settings(&self.defaults).mode != Mode::Strict
+                || entry.anchor.as_deref() != Some(consent.previous.as_str())
+            {
+                bail!("routing anchor changed before explicit model move");
+            }
+            // Consent is not an automatic rebalance: retain all existing budget
+            // evidence and add a non-discretionary revisit guard. Dispatch will
+            // see the new anchor and must not record this move a second time.
+            // A consented move may fail closed at capacity; never erase live
+            // evidence to make room or fall back to volatile publication.
+            if entry.movements.iter().filter(|m| !m.discretionary).count() >= MAX_FORCED_HISTORY {
+                bail!("routing explicit model move history capacity reached");
+            }
+            entry.movements.push(Movement {
+                id: Some(format!("{:032x}", rand::random::<u128>())),
+                from: consent.previous.clone(),
+                to: consent.account.clone(),
+                at: consent.at,
+                discretionary: false,
+            });
+            entry.anchor = Some(consent.account.clone());
+            Ok(())
+        })
+    }
     /// Persist explicit intent before strict dispatch. Default movement guards are volatile.
     /// Non-strict movement remains available when persistence fails.
     pub fn dispatch(
@@ -1596,6 +1669,18 @@ impl PolicyStore {
         reason: &str,
         now: DateTime<Utc>,
     ) -> Result<()> {
+        self.dispatch_for_issue(key, account, previous, reason, now, None)
+    }
+
+    pub(crate) fn dispatch_for_issue(
+        &self,
+        key: Option<&str>,
+        account: &str,
+        previous: Option<&str>,
+        reason: &str,
+        now: DateTime<Utc>,
+        operation: Option<&crate::issue_operation::IssueOperation>,
+    ) -> Result<()> {
         if self.snapshot().frozen {
             bail!("routing policy writer retired");
         }
@@ -1604,6 +1689,11 @@ impl PolicyStore {
             bail!("routing policy recovery incomplete");
         }
         let Some(key) = key else {
+            if let Some(operation) = operation {
+                let _publication = self.publication.read().unwrap_or_else(|e| e.into_inner());
+                if self.snapshot().frozen { bail!("routing policy writer retired"); }
+                operation.admit().map_err(|_| anyhow::anyhow!("launch admission cancelled"))?;
+            }
             return Ok(());
         };
         let id = self.snapshot().policy_id(key);
@@ -1626,12 +1716,18 @@ impl PolicyStore {
                 && (plan.settings.mode != Mode::Strict
                     || state.sessions.get(&id).is_some_and(|s| s.anchor.is_some()))
             {
+                if let Some(operation) = operation {
+                    operation.admit().map_err(|_| anyhow::anyhow!("launch admission cancelled"))?;
+                }
                 return Ok(());
             }
             if anchor.is_none()
                 && plan.settings.mode != Mode::Strict
                 && !state.sessions.contains_key(&id)
             {
+                if let Some(operation) = operation {
+                    operation.admit().map_err(|_| anyhow::anyhow!("launch admission cancelled"))?;
+                }
                 return Ok(());
             }
         }
@@ -1647,6 +1743,9 @@ impl PolicyStore {
             if state.sessions.len() > MAX_SESSIONS || state.projects.len() > MAX_PROJECTS {
                 if self.plan(Some(key)).settings.mode == Mode::Strict {
                     bail!("routing policy recovery incomplete");
+                }
+                if let Some(operation) = operation {
+                    operation.admit().map_err(|_| anyhow::anyhow!("launch admission cancelled"))?;
                 }
                 let mut next = (*state).clone();
                 let until = now + chrono::Duration::seconds(self.limits.revisit_secs as i64);
@@ -1665,7 +1764,7 @@ impl PolicyStore {
                 return Ok(());
             }
         }
-        self.update_inner(plan.settings.mode != Mode::Strict, |state| {
+        self.update_inner_for_issue(plan.settings.mode != Mode::Strict, operation, |state| {
             let current = self.plan(Some(key));
             if current.settings.mode == Mode::Strict
                 && (self.strict_dispatch_blocked() || plan.settings.mode != Mode::Strict)
@@ -1833,6 +1932,327 @@ mod tests {
             reset_wait_secs: 7,
         }
     }
+    fn r11_consent(
+        store: &PolicyStore,
+        key: &str,
+        account: &str,
+    ) -> crate::bindings::LaunchPolicyMove {
+        let plan = store.plan(Some(key));
+        crate::bindings::LaunchPolicyMove {
+            key: key.to_owned(),
+            previous: plan.anchor.unwrap(),
+            account: account.to_owned(),
+            expected_revision: plan.revision,
+            at: clock(),
+        }
+    }
+
+    #[test]
+    fn r11_model_cas_preserves_strict_policy_inheritance_and_history_on_restart() {
+        for kind in 0..3 {
+            let dir = home();
+            let defaults = settings(if kind == 0 {
+                Mode::Strict
+            } else {
+                Mode::Rebalance
+            });
+            let store = PolicyStore::new(dir.path(), defaults.clone()).unwrap();
+            let key = "codex:r11-policy";
+            let id = session_id(key);
+            let project = store
+                .put_project(
+                    None,
+                    Project {
+                        name: "r11".into(),
+                        settings: settings(Mode::Strict),
+                    },
+                )
+                .unwrap();
+            if kind == 0 {
+                store.capture_strict_anchors([(key, "cx-a")]).unwrap();
+            } else {
+                store
+                    .set_session(
+                        &id,
+                        (kind == 2).then(|| settings(Mode::Strict)),
+                        Some(&project),
+                        Some("cx-a"),
+                    )
+                    .unwrap();
+                // The inherited baseline must not follow later project edits.
+                store
+                    .put_project(
+                        Some(&project),
+                        Project {
+                            name: "changed".into(),
+                            settings: settings(Mode::Recover),
+                        },
+                    )
+                    .unwrap();
+            }
+            store
+                .update(|state| {
+                    state
+                        .sessions
+                        .get_mut(&id)
+                        .unwrap()
+                        .movements
+                        .push(Movement {
+                            id: Some(format!("{:032x}", 1)),
+                            from: "cx-old".into(),
+                            to: "cx-a".into(),
+                            at: clock(),
+                            discretionary: true,
+                        });
+                    Ok(())
+                })
+                .unwrap();
+            let before = store.snapshot().sessions[&id].clone();
+            let consent = r11_consent(&store, key, "cx-b");
+            store.authorize_model_move(&consent).unwrap();
+            assert_eq!(
+                store.plan(Some(key)).revision,
+                consent.expected_revision + 1
+            );
+            assert!(!store.permits_dispatch(Some(key), "cx-a"));
+            assert!(store.permits_dispatch(Some(key), "cx-b"));
+            assert!(
+                store
+                    .dispatch(Some(key), "cx-a", Some("cx-b"), "forced", clock())
+                    .is_err()
+            );
+            store
+                .dispatch(Some(key), "cx-b", Some("cx-a"), "model_choice", clock())
+                .unwrap();
+            drop(store);
+            let store = PolicyStore::new(dir.path(), defaults).unwrap();
+            let state = store.snapshot();
+            let after = &state.sessions[&id];
+            assert_eq!(after.settings(&store.defaults).mode, Mode::Strict);
+            assert_eq!(after.project, before.project);
+            assert_eq!(after.baseline, before.baseline);
+            assert_eq!(after.explicit, before.explicit);
+            assert_eq!(after.anchor.as_deref(), Some("cx-b"));
+            assert_eq!(after.movements.len(), before.movements.len() + 1);
+            assert_eq!(
+                &after.movements[..before.movements.len()],
+                before.movements.as_slice()
+            );
+            let movement = after.movements.last().unwrap();
+            assert_eq!((&*movement.from, &*movement.to), ("cx-a", "cx-b"));
+            assert_eq!(movement.at, consent.at);
+            assert!(!movement.discretionary);
+            assert_eq!(state.pool_moves["cx"].len(), 1);
+            // If policy later permits rebalance, the explicit move still guards
+            // revisiting its source after the older discretionary dwell expires.
+            store
+                .set_session(&id, Some(settings(Mode::Rebalance)), None, None)
+                .unwrap();
+            let later = clock() + chrono::Duration::seconds(store.limits.dwell_secs as i64);
+            assert!(store.discretionary_allowed(key, Some("cx-fresh"), later));
+            assert!(!store.discretionary_allowed(key, Some("cx-a"), later));
+        }
+    }
+
+    #[test]
+    fn r11_model_cas_checks_revision_and_anchor_without_publishing_on_conflict() {
+        let dir = home();
+        let store = PolicyStore::new(dir.path(), Settings::default()).unwrap();
+        let key = "codex:r11-conflict";
+        store
+            .set_session(
+                &session_id(key),
+                Some(settings(Mode::Strict)),
+                None,
+                Some("cx-a"),
+            )
+            .unwrap();
+        let stale = r11_consent(&store, key, "cx-b");
+        store
+            .put_project(
+                None,
+                Project {
+                    name: "unrelated".into(),
+                    settings: Settings::default(),
+                },
+            )
+            .unwrap();
+        let before = fs::read(&store.path).unwrap();
+        assert!(store.authorize_model_move(&stale).is_err());
+        let mut wrong = r11_consent(&store, key, "cx-b");
+        wrong.previous = "cx-wrong".into();
+        assert!(store.authorize_model_move(&wrong).is_err());
+        let mut noop = r11_consent(&store, key, "cx-a");
+        assert!(store.authorize_model_move(&noop).is_err());
+        noop.account = "bad/account".into();
+        assert!(store.authorize_model_move(&noop).is_err());
+        assert_eq!(fs::read(&store.path).unwrap(), before);
+        assert_eq!(store.plan(Some(key)).anchor.as_deref(), Some("cx-a"));
+        let valid = r11_consent(&store, key, "cx-b");
+        store.authorize_model_move(&valid).unwrap();
+        assert!(store.authorize_model_move(&valid).is_err());
+    }
+
+    #[test]
+    fn r11_model_cas_simultaneous_moves_have_one_durable_winner() {
+        let dir = home();
+        let store = Arc::new(PolicyStore::new(dir.path(), Settings::default()).unwrap());
+        let key = "codex:r11-race";
+        store
+            .set_session(
+                &session_id(key),
+                Some(settings(Mode::Strict)),
+                None,
+                Some("cx-a"),
+            )
+            .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for account in ["cx-b", "cx-c"] {
+            let consent = r11_consent(&store, key, account);
+            let store = store.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                store.authorize_model_move(&consent).is_ok()
+            }));
+        }
+        barrier.wait();
+        let won = workers
+            .into_iter()
+            .map(|w| usize::from(w.join().unwrap()))
+            .sum::<usize>();
+        assert_eq!(won, 1);
+        let plan = store.plan(Some(key));
+        drop(store);
+        let store = PolicyStore::new(dir.path(), Settings::default()).unwrap();
+        assert_eq!(store.plan(Some(key)).revision, plan.revision);
+        assert_eq!(store.plan(Some(key)).anchor, plan.anchor);
+        assert_eq!(
+            store.snapshot().sessions[&session_id(key)].movements.len(),
+            1
+        );
+    }
+
+    #[test]
+    fn r11_model_cas_rejects_persist_failure_recovery_and_freeze() {
+        for frozen in [false, true] {
+            let dir = home();
+            let store = PolicyStore::new(dir.path(), Settings::default()).unwrap();
+            let key = "codex:r11-failure";
+            store
+                .set_session(
+                    &session_id(key),
+                    Some(settings(Mode::Strict)),
+                    None,
+                    Some("cx-a"),
+                )
+                .unwrap();
+            let consent = r11_consent(&store, key, "cx-b");
+            let before = serde_json::to_vec(&*store.snapshot()).unwrap();
+            if frozen {
+                store.freeze();
+            } else {
+                // Leave the policy intact but make the fence destination unwritable.
+                let fence = fence_path(&store.path);
+                fs::remove_file(&fence).unwrap();
+                fs::create_dir(&fence).unwrap();
+            }
+            assert!(store.authorize_model_move(&consent).is_err());
+            assert_eq!(serde_json::to_vec(&*store.snapshot()).unwrap(), before);
+            assert!(!store.permits_dispatch(Some(key), "cx-b"));
+            if !frozen {
+                assert!(store.persistence_failed.load(Ordering::Acquire));
+                // Restoring the destination alone cannot bypass failed-persistence state.
+                fs::remove_dir(fence_path(&store.path)).unwrap();
+                assert!(store.authorize_model_move(&consent).is_err());
+                assert_eq!(store.plan(Some(key)).revision, consent.expected_revision);
+            }
+        }
+    }
+
+    #[test]
+    fn r11_model_cas_preserves_legacy_alias_authority_and_fails_closed_at_capacity() {
+        let dir = home();
+        let store = PolicyStore::new(dir.path(), Settings::default()).unwrap();
+        let parent = "codex:r11-legacy";
+        let child = "codex:r11-legacy:agent:one";
+        let id = session_id(parent);
+        store
+            .set_session(&id, Some(settings(Mode::Strict)), None, Some("cx-a"))
+            .unwrap();
+        store
+            .update(|state| {
+                state.legacy_codex_roots.insert(id.clone());
+                Ok(())
+            })
+            .unwrap();
+        store
+            .authorize_model_move(&r11_consent(&store, child, "cx-b"))
+            .unwrap();
+        assert_eq!(store.plan(Some(parent)).anchor.as_deref(), Some("cx-b"));
+        assert!(!store.snapshot().sessions.contains_key(&session_id(child)));
+        store
+            .update(|state| {
+                let entry = state.sessions.get_mut(&id).unwrap();
+                for n in 1..MAX_FORCED_HISTORY {
+                    entry.movements.push(Movement {
+                        id: Some(format!("{:032x}", n)),
+                        from: "cx-old".into(),
+                        to: "cx-b".into(),
+                        at: clock(),
+                        discretionary: false,
+                    });
+                }
+                Ok(())
+            })
+            .unwrap();
+        let before = fs::read(&store.path).unwrap();
+        assert!(
+            store
+                .authorize_model_move(&r11_consent(&store, child, "cx-c"))
+                .is_err()
+        );
+        assert_eq!(fs::read(&store.path).unwrap(), before);
+        drop(store);
+        let store = PolicyStore::new(dir.path(), Settings::default()).unwrap();
+        assert_eq!(store.plan(Some(child)).anchor.as_deref(), Some("cx-b"));
+        assert_eq!(
+            store.snapshot().sessions[&id].movements.len(),
+            MAX_FORCED_HISTORY
+        );
+    }
+
+    #[test]
+    fn r11_model_cas_rejects_missing_anchor_and_non_strict_policy() {
+        let dir = home();
+        let store = PolicyStore::new(dir.path(), Settings::default()).unwrap();
+        let key = "codex:r11-unanchored";
+        store
+            .set_session(&session_id(key), Some(settings(Mode::Strict)), None, None)
+            .unwrap();
+        let mut consent = crate::bindings::LaunchPolicyMove {
+            key: key.into(),
+            previous: "cx-a".into(),
+            account: "cx-b".into(),
+            expected_revision: store.plan(Some(key)).revision,
+            at: clock(),
+        };
+        assert!(store.authorize_model_move(&consent).is_err());
+        store
+            .set_session(
+                &session_id(key),
+                Some(settings(Mode::Recover)),
+                None,
+                Some("cx-a"),
+            )
+            .unwrap();
+        consent.expected_revision = store.plan(Some(key)).revision;
+        let before = fs::read(&store.path).unwrap();
+        assert!(store.authorize_model_move(&consent).is_err());
+        assert_eq!(fs::read(&store.path).unwrap(), before);
+    }
+
     #[test]
     fn duplicate_policy_fields_and_session_map_keys_fail_closed_before_migration() {
         let dir = home();
@@ -4182,5 +4602,76 @@ mod tests {
                 assert!(store.discretionary_allowed(group, Some(target), deadline));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod issue_operation_writer_tests {
+    use super::*;
+    use crate::issue_operation::IssueOperation;
+    use std::sync::{Barrier, mpsc};
+
+    #[test]
+    fn cancellation_behind_actual_policy_writer_prevents_cas() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.sandbox/r11-operation-tests");
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = tempfile::tempdir_in(root).unwrap();
+        let store = Arc::new(PolicyStore::new(dir.path(), Settings {
+            mode: Mode::Strict, reset_wait_secs: 7,
+        }).unwrap());
+        let key = "codex:operation-cancel";
+        store.capture_strict_anchors([(key, "cx-a")]).unwrap();
+        let plan = store.plan(Some(key));
+        let consent = crate::bindings::LaunchPolicyMove {
+            key: key.into(), previous: "cx-a".into(), account: "cx-b".into(),
+            expected_revision: plan.revision, at: chrono::Utc::now(),
+        };
+        let before = std::fs::read(&store.path).unwrap();
+        let operation = IssueOperation::new(tokio::time::Instant::now()
+            + std::time::Duration::from_secs(3600));
+        let caller = operation.caller_guard();
+        let ready = Arc::new(Barrier::new(2));
+        let held = store.writer.lock().unwrap();
+        let (send, recv) = mpsc::channel();
+        let task = {
+            let store = store.clone();
+            let operation = operation.clone();
+            let ready = ready.clone();
+            std::thread::spawn(move || {
+                ready.wait();
+                send.send(store.authorize_model_move_for_issue(&consent, Some(&operation)).is_err())
+                    .unwrap();
+            })
+        };
+        ready.wait();
+        drop(caller);
+        drop(held);
+        assert!(recv.recv().unwrap());
+        task.join().unwrap();
+        assert_eq!(std::fs::read(&store.path).unwrap(), before);
+        assert_eq!(store.plan(Some(key)).anchor.as_deref(), Some("cx-a"));
+        assert_eq!(store.plan(Some(key)).revision, plan.revision);
+    }
+
+    #[test]
+    fn admitted_operation_still_obeys_late_dispatch_recheck() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.sandbox/r11-operation-tests");
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = tempfile::tempdir_in(root).unwrap();
+        let store = PolicyStore::new(dir.path(), Settings {
+            mode: Mode::Strict, reset_wait_secs: 7,
+        }).unwrap();
+        let key = "codex:operation-recheck";
+        store.capture_strict_anchors([(key, "cx-a")]).unwrap();
+        let operation = IssueOperation::new(tokio::time::Instant::now()
+            + std::time::Duration::from_secs(3600));
+        let caller = operation.caller_guard();
+        operation.admit().unwrap();
+        drop(caller);
+        assert!(store.dispatch_for_issue(Some(key), "cx-b", Some("cx-a"),
+            "model_choice", chrono::Utc::now(), Some(&operation)).is_err());
+        assert_eq!(store.plan(Some(key)).anchor.as_deref(), Some("cx-a"));
     }
 }

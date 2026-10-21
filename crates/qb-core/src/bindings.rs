@@ -466,9 +466,10 @@ pub struct DispatchReceipt {
 impl DispatchReceipt {
     pub fn dispatched(&self) {
         let mut d = self.table.data.lock().unwrap_or_else(|e| e.into_inner());
+        let epoch_key = launch::ownership_group(&d, &self.epoch_key).to_owned();
         if !d
             .epochs
-            .get(&self.epoch_key)
+            .get(&epoch_key)
             .is_some_and(|epoch| Arc::ptr_eq(epoch, &self.epoch))
         {
             return;
@@ -479,6 +480,7 @@ impl DispatchReceipt {
             }
             return;
         };
+        let group = launch::ownership_group(&d, group);
         let Some(entry) = d.groups.get(group).filter(|g| g.account == self.account) else {
             return;
         };
@@ -499,13 +501,15 @@ impl DispatchReceipt {
 }
 impl Drop for BindingLease {
     fn drop(&mut self) {
+        let _mutation = self.table.mutations.lock().unwrap_or_else(|e| e.into_inner());
         let mut d = self.table.data.lock().unwrap_or_else(|e| e.into_inner());
         decrement(&mut d.pending, &self.account);
         let now = Utc::now();
         if let Some(group) = &self.group {
-            decrement(&mut d.active, group);
-            touch_group(&mut d, group, now);
-            release_group(&mut d, group);
+            let group = launch::ownership_group(&d, group).to_owned();
+            decrement(&mut d.active, &group);
+            touch_group(&mut d, &group, now);
+            release_group(&mut d, &group);
             if self.defer && self.after_move {
                 d.after_move.insert(group.clone());
             }
@@ -519,10 +523,12 @@ pub struct SocketPin {
 impl Drop for SocketPin {
     fn drop(&mut self) {
         if let Some(group) = &self.group {
+            let _mutation = self.table.mutations.lock().unwrap_or_else(|e| e.into_inner());
             let mut d = self.table.data.lock().unwrap_or_else(|e| e.into_inner());
-            decrement(&mut d.pins, group);
-            launch::touch(&mut d, group, Utc::now());
-            release_group(&mut d, group);
+            let group = launch::ownership_group(&d, group).to_owned();
+            decrement(&mut d.pins, &group);
+            launch::touch(&mut d, &group, Utc::now());
+            release_group(&mut d, &group);
         }
     }
 }
@@ -1499,9 +1505,10 @@ impl BindingTable {
         }
     }
     pub fn pin(self: &Arc<Self>, key: Option<&str>) -> SocketPin {
-        let g = key.map(|k| group(k).to_owned());
+        let _mutation = self.mutations.lock().unwrap_or_else(|e| e.into_inner());
+        let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        let g = key.map(|k| launch::ownership_group(&d, group(k)).to_owned());
         if let Some(g) = &g {
-            let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
             *d.pins.entry(g.clone()).or_default() += 1;
             protect_group(&mut d, g);
         }
@@ -1541,7 +1548,7 @@ impl BindingTable {
     fn reserve(self: &Arc<Self>, d: &mut Data, key: Option<&str>, account: &str) -> BindingLease {
         *d.pending.entry(account.into()).or_default() += 1;
         d.traffic.insert(account.into(), Utc::now());
-        let g = key.map(|k| group(k).to_owned());
+        let g = key.map(|k| launch::ownership_group(d, group(k)).to_owned());
         if let Some(g) = &g {
             launch::request_started(d, g, Utc::now());
         }

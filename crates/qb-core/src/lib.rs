@@ -11,6 +11,7 @@ pub mod credits;
 pub mod dashboard;
 pub mod debug_pin;
 pub mod guard;
+pub(crate) mod issue_operation;
 mod json_unique;
 pub(crate) mod launch_path;
 pub mod launch_tokens;
