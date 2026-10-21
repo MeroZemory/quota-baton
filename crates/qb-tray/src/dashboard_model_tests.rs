@@ -151,16 +151,8 @@ fn r7_core_completeness_false_zero_is_unknown_true_zero_is_known() {
         ..Default::default()
     };
     let v = detail_view(&detail, &data.accounts, &c, false);
-    assert!(
-        v.facts
-            .iter()
-            .any(|(key, value)| key == "오늘 요청" && value.starts_with('—'))
-    );
-    assert!(
-        v.facts
-            .iter()
-            .any(|(key, value)| key == "하위 에이전트" && value == "—")
-    );
+    assert!(!v.facts.iter().any(|(key, _)| key == "오늘 요청"));
+    assert!(!v.facts.iter().any(|(key, _)| key == "하위 에이전트"));
     assert!(v.facts.iter().any(|(key, _)| key == "계정 이력 범위"));
     assert!(v.facts.iter().any(|(key, _)| key == "최근 요청 범위"));
     assert!(
@@ -729,14 +721,18 @@ fn r10_folding_requires_every_key_known_equal_no_moves_and_eligible() {
             _ => new.data.actionable = true, // Actionability alone is not a folding veto.
         }
         let rows = r10_fold(&[old.clone(), new.clone()]);
-        assert_eq!(rows.len(), if case == 14 { 1 } else { 2 }, "case {case}");
+        assert_eq!(
+            rows.len(),
+            if [6, 7, 11, 14].contains(&case) { 1 } else { 2 },
+            "case {case}"
+        );
         // Every veto applies equally to the older member of the pair.
         let mut changed_old = new;
         changed_old.seq = 1;
         changed_old.ts = old.ts;
         assert_eq!(
             r10_fold(&[changed_old, r10_quota(2, 1)]).len(),
-            if case == 14 { 1 } else { 2 },
+            if [6, 7, 11, 14].contains(&case) { 1 } else { 2 },
             "older case {case}"
         );
     }
@@ -1033,7 +1029,7 @@ fn r10_final_failures_survive_failover_and_today_counts_respect_boundaries_and_p
             &detail_view(&detail, &data.accounts, &clock(), false),
             "오늘 요청"
         ),
-        "— · 실패 최소 9건 · 이전 실행 기록 확인 전"
+        "실패 최소 9건"
     );
     detail.session.counters_complete = true;
     detail.session.failures_today = None;
@@ -1144,4 +1140,184 @@ fn r10_relogin_unknown_observation_time_never_claims_a_known_timestamp() {
         "확인 불가 · 기준 시각 확인 전 5시간 90%"
     );
     assert_eq!(usage_tiles(&data, &clock())[0].last_observed, None);
+}
+
+#[test]
+fn r101_legacy_unknown_client_maps_only_known_codex_product_spellings() {
+    let mut s = Session::default();
+    s.client.kind = "unknown".into();
+    for (product, expected) in [
+        ("codex-tui", "Codex CLI"),
+        ("codex_cli_rs", "Codex CLI"),
+        ("codex_vscode", "Codex VS Code"),
+        ("codex_exec", "Codex exec"),
+        ("Codex Desktop", "Codex 앱"),
+        ("codex_desktop", "Codex 앱"),
+        ("my-codex-client", "my-codex-client"),
+        ("codex-tui-extra", "codex-tui-extra"),
+    ] {
+        s.client.product = Some(product.into());
+        assert_eq!(client(&s), expected);
+    }
+    s.client.kind = "codex_vscode".into();
+    s.client.product = Some("codex-tui".into());
+    assert_eq!(client(&s), "Codex VS Code", "known kind retains precedence");
+}
+
+#[test]
+fn r101_legacy_duplicates_use_only_unique_supplied_window_evidence() {
+    for window in [None, Some(""), Some("5h")] {
+        let mut old = r10_quota(1, 47);
+        old.data.window = window.map(str::to_owned);
+        old.data.moved_groups = None;
+        let mut new = old.clone();
+        new.seq = 3;
+        new.ts = Some(clock().utc() - chrono::Duration::minutes(1));
+        let rows = r10_fold(&[old.clone(), new.clone()]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].seq, 3);
+        assert!(rows[0].body.contains("같은 알림 1번 더"));
+        let mut other = new.clone();
+        other.data.window = Some("7d".into());
+        assert_eq!(
+            r10_fold(&[old.clone(), other]).len(),
+            if window == Some("5h") { 2 } else { 1 }
+        );
+        new.data.reset_at = new.data.reset_at.map(|at| at + chrono::Duration::hours(1));
+        assert_eq!(r10_fold(&[old, new]).len(), 2);
+    }
+}
+
+#[test]
+fn r101_mixed_legacy_new_windows_fold_only_when_unambiguous() {
+    let mut legacy = r10_quota(1, 47);
+    legacy.data.window = None;
+    legacy.data.moved_groups = None;
+    let current = r10_quota(2, 1);
+    let rows = r10_fold(&[legacy.clone(), current.clone()]);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].seq, 2);
+    assert!(rows[0].body.contains("같은 알림 1번 더"));
+    // Known evidence may be older: matching must not depend on input order.
+    let mut newer_legacy = legacy.clone();
+    newer_legacy.seq = 3;
+    newer_legacy.ts = Some(clock().utc());
+    assert_eq!(r10_fold(&[current.clone(), newer_legacy.clone()]).len(), 1);
+    let mut weekly = current.clone();
+    weekly.seq = 4;
+    weekly.data.window = Some("7d".into());
+    let rows = r10_fold(&[
+        legacy.clone(),
+        current.clone(),
+        weekly.clone(),
+        newer_legacy,
+    ]);
+    assert_eq!(
+        rows.len(),
+        3,
+        "unknown folds only with unknown when two known windows exist"
+    );
+    assert!(rows.iter().any(|r| r.seq == 2));
+    assert!(rows.iter().any(|r| r.seq == 4));
+    // Another cycle's known value cannot supply the missing window.
+    weekly.data.reset_at = weekly.data.reset_at.map(|t| t + chrono::Duration::hours(1));
+    assert_eq!(r10_fold(&[legacy, current, weekly]).len(), 2);
+}
+
+#[test]
+fn r101_moves_and_positive_move_counts_break_legacy_folding_in_both_accounts() {
+    for kind in ["move", "quota_reached", "quota_reset"] {
+        for destination in [false, true] {
+            for dated in [false, true] {
+                let old = r10_quota(1, 3);
+                let mut barrier = r10_quota(2, 2);
+                barrier.kind = kind.into();
+                barrier.data.moved_groups = Some(1);
+                barrier.notable = false;
+                if destination {
+                    barrier.account_to = barrier.account.clone();
+                    barrier.account = Some("cl-b".into());
+                }
+                if !dated {
+                    barrier.ts = None;
+                }
+                let new = r10_quota(3, 1);
+                let rows = r10_fold(&[old.clone(), barrier.clone(), new.clone()]);
+                assert_eq!(rows.iter().filter(|r| r.seq == 1 || r.seq == 3).count(), 2);
+                let mut data = snapshot();
+                data.activity = vec![old, barrier, new];
+                let view = project(&data, &mut DashboardState::default(), &clock());
+                assert_eq!(
+                    view.recent
+                        .iter()
+                        .filter(|r| r.seq == 1 || r.seq == 3)
+                        .count(),
+                    2
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn r101_titles_and_detail_subtitle_have_no_empty_parts() {
+    for kind in ["quota_reached", "quota_reset", "credits_stopped"] {
+        for window in [None, Some(""), Some("   "), Some("5h")] {
+            let mut e = r10_quota(1, 1);
+            e.kind = kind.into();
+            e.data.window = window.map(str::to_owned);
+            let row = event_row(&e, &snapshot().accounts, &clock()).unwrap();
+            assert!(!row.title.is_empty());
+            assert!(!row.title.contains("  "));
+            assert!(row.title.split('·').all(|part| !part.trim().is_empty()));
+        }
+    }
+    let d = SessionDetail::default();
+    let view = detail_view(&d, &snapshot().accounts, &clock(), false);
+    assert!(!view.subtitle.contains("  "));
+}
+
+#[test]
+fn r101_unknown_totals_hide_stats_but_keep_failure_lower_bound_and_active_wait() {
+    let mut d = SessionDetail::default();
+    d.session.counters_complete = false;
+    d.session.failures_today = Some(2);
+    d.session.pacing_wait = Some(
+        serde_json::from_value(serde_json::json!({
+            "waiting": 1, "since": clock().utc() - chrono::Duration::seconds(7)
+        }))
+        .unwrap(),
+    );
+    let v = detail_view(&d, &snapshot().accounts, &clock(), false);
+    assert_eq!(r10_fact(&v, "오늘 요청"), "실패 최소 2건");
+    assert_eq!(r10_fact(&v, "속도 조절 대기"), "지금 7초째");
+    assert!(
+        !v.facts
+            .iter()
+            .any(|(_, value)| value.contains("—번") || value.contains("—초"))
+    );
+    d.session.pacing_wait.as_mut().unwrap().since = None;
+    let v = detail_view(&d, &snapshot().accounts, &clock(), false);
+    assert_eq!(r10_fact(&v, "속도 조절 대기"), "지금 대기 중");
+    d.session.failures_today = None;
+    d.recent_requests.push(RequestSummary {
+        ts: Some(clock().utc()),
+        outcome: "upstream_error".into(),
+        ..Default::default()
+    });
+    let v = detail_view(&d, &snapshot().accounts, &clock(), false);
+    assert_eq!(r10_fact(&v, "오늘 요청"), "실패 최소 1건");
+    d.recent_requests.clear();
+    d.session.pacing_wait = None;
+    let v = detail_view(&d, &snapshot().accounts, &clock(), false);
+    assert!(
+        !v.facts
+            .iter()
+            .any(|(key, _)| key == "오늘 요청" || key == "속도 조절 대기")
+    );
+    assert!(
+        !session_row(&d.session, &snapshot().accounts, &clock(), None)
+            .memo
+            .contains("오늘 요청 수 확인 전")
+    );
 }
