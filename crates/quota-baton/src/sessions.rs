@@ -994,7 +994,7 @@ pub(crate) fn run(home: &Path, command: SessionsCommand) -> Result<()> {
             } else {
                 id.into_iter().map(|s| s.to_ascii_lowercase()).collect()
             };
-            ids.sort_by_key(|id| {
+            ids.sort_by_cached_key(|id| {
                 std::cmp::Reverse(catalog.chain(id).map(|c| c.len()).unwrap_or(0))
             });
             let bulk = all || ids.len() > 1;
