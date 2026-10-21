@@ -119,7 +119,7 @@ fn value<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Option<(T, &'a [u8])> {
     Some((parsed, &bytes[values.byte_offset()..]))
 }
 
-fn head_model(body: &[u8]) -> Option<String> {
+pub(crate) fn head_model(body: &[u8]) -> Option<String> {
     let mut rest = whitespace(&body[..body.len().min(SCAN_LIMIT)]).strip_prefix(b"{")?;
     loop {
         let (key, next) = value::<String>(whitespace(rest))?;
