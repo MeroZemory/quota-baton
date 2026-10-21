@@ -9,7 +9,7 @@ This file names the verification for each unit and each row. The row list and th
 목표: 대시보드 수정을 전달하고 R11을 마무리한다
 핵심 지표: 새 경로 출시 1/2 · R11 HTTP32·WS15·clippy·빌드 통과, native·전체 관문 남음
 사용자 대기: 없음 (R2 Part B만 사용자 결정 대기)
-갱신: 2026-10-22 06:14 KST (R11 native 하네스 보완·전체 검사 병행, 미출시)
+갱신: 2026-10-22 06:20 KST (R11 workspace lint 보완 통과, native·전체 관문 미완료)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -90,6 +90,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-22 05:56 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R11 보완 HTTP32/32·실제 WS15/15 통과, native·최종 관문 미완료 |
 | 2026-10-22 06:01 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R11 수정 전 반례7/7 실패·소스 복원 확인; 최종 관문 미완료 |
 | 2026-10-22 06:09 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R11 strict clippy·제품 build 통과; native 설정 순서 fixture 보완, 미출시 |
+| 2026-10-22 06:20 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R11 두 번째 native 실패0/5와 workspace lint4건 수정 기록; 미출시 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -157,6 +158,8 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-22 06:09 | R11 strict core clippy / testkit 제품 build | exit0 / exit0 | 모두 exit0 | callback 타입 복잡도1건은 type alias로 수정; 입력9d09e0bb |
 | 2026-10-22 06:09 | R11 첫 native 설정 시도 | 0/5 완료 | 5/5 완료 | wire-before-serve 하네스 오류로6.8초 종료; job 정지·잔류 home0 확인 |
 | 2026-10-22 06:14 (초기 결과 소급 기록) | R11 최초 strict clippy | exit101 · 타입 복잡도1건 | exit0 | 행동 변경 없이56e0fde alias 수정 후35.8초 exit0; 실패 로그 보존 |
+| 2026-10-22 06:20 | R11 두 번째 실제 native | 0/5 완료 | 5/5 완료 | A picker·Daybreak 표시 성공, 첫 WS 추론 실패; cleanup 정지true·잔류0 |
+| 2026-10-22 06:20 | R11 workspace default strict clippy | 최초exit101 → 수정 뒤exit0 | exit0 | 스타일4건5dc8a2f; 이전 실패 지문 보존, all-features·tests 진행 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
