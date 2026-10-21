@@ -15,7 +15,7 @@ use crate::{
 use std::{cell::Cell, time::Instant};
 use std::{
     cell::RefCell,
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet, VecDeque},
     ops::{Deref, DerefMut},
     sync::Arc,
 };
@@ -30,6 +30,9 @@ use windows::{
 pub struct Renderer {
     shared: v2_render::Renderer,
     paint_text_proofs: RefCell<PaintTextProofs>,
+    scene_metrics: RefCell<SceneMetricCache>,
+    #[cfg(test)]
+    scene_builds: std::cell::Cell<usize>,
     #[cfg(any(debug_assertions, feature = "testkit"))]
     phases: RendererPhaseCounters,
 }
@@ -332,6 +335,55 @@ impl PaintTextProofs {
         self.contained.insert(key);
     }
 }
+
+// Keep measurements, never scene geometry, across full builds. The Text engine's
+// fonts live for this Renderer; Measure::key includes every measurement input.
+// FIFO eviction only causes a normal probe miss. Count BOTH retained key copies.
+const SCENE_METRIC_CAPACITY: usize = 4_096;
+const SCENE_METRIC_KEY_BYTES: usize = 2 * 1024 * 1024;
+#[derive(Default)]
+struct SceneMetricCache {
+    entries: BTreeMap<String, [f32; 2]>,
+    order: VecDeque<String>,
+    bytes: usize,
+}
+impl SceneMetricCache {
+    fn snapshot(&self) -> Metrics {
+        let mut metrics = Metrics::default();
+        for (key, [height, width]) in &self.entries {
+            metrics.heights.insert(key.clone(), *height);
+            metrics.widths.insert(key.clone(), *width);
+        }
+        metrics
+    }
+    fn remember(&mut self, requests: &[Measure], metrics: &Metrics) {
+        for request in requests {
+            let key = request.key();
+            if key.len() > 16 * 1024 || self.entries.contains_key(&key) {
+                continue;
+            }
+            let (Some(&height), Some(&width)) =
+                (metrics.heights.get(&key), metrics.widths.get(&key))
+            else {
+                continue;
+            };
+            if !height.is_finite() || !width.is_finite() {
+                continue;
+            }
+            let bytes = key.len() * 2;
+            while self.entries.len() >= SCENE_METRIC_CAPACITY
+                || self.bytes + bytes > SCENE_METRIC_KEY_BYTES
+            {
+                let old = self.order.pop_front().expect("retained metric key");
+                self.entries.remove(&old);
+                self.bytes -= old.len() * 2;
+            }
+            self.bytes += bytes;
+            self.order.push_back(key.clone());
+            self.entries.insert(key, [height, width]);
+        }
+    }
+}
 fn style(m: &Measure) -> v2_text::Style {
     v2_text::Style {
         face: match m.face {
@@ -388,6 +440,9 @@ impl Renderer {
         Ok(Self {
             shared: v2_render::Renderer::new(dark)?,
             paint_text_proofs: RefCell::default(),
+            scene_metrics: RefCell::default(),
+            #[cfg(test)]
+            scene_builds: std::cell::Cell::new(0),
             #[cfg(any(debug_assertions, feature = "testkit"))]
             phases: RendererPhaseCounters::default(),
         })
@@ -437,6 +492,8 @@ impl Renderer {
         size: [f32; 2],
         metrics: &Metrics,
     ) -> (Scene, SceneSections) {
+        #[cfg(test)]
+        self.scene_builds.set(self.scene_builds.get() + 1);
         #[cfg(any(debug_assertions, feature = "testkit"))]
         let _geometry = PhaseTimer::new(self.phases.enabled.get(), &self.phases.scene_geometry_ns);
         Scene::build_sections(view, state, size, metrics)
@@ -531,16 +588,22 @@ impl Renderer {
         state: &DashboardState,
         size: [f32; 2],
     ) -> Result<(Scene, SceneSections, Metrics)> {
-        let mut metrics = Metrics::default();
+        let mut metrics = self.scene_metrics.borrow().snapshot();
         // Probe collects exact width/font requests, then build with measured line
         // heights. Second probe covers content newly revealed by offset clamping.
         for _ in 0..3 {
             let (scene, sections) = self.build_scene(view, state, size, &metrics);
             if !self.measure_missing(&scene.measurements, &mut metrics)? {
+                self.scene_metrics
+                    .borrow_mut()
+                    .remember(&scene.measurements, &metrics);
                 return Ok((scene, sections, metrics));
             }
         }
         let (scene, sections) = self.build_scene(view, state, size, &metrics);
+        self.scene_metrics
+            .borrow_mut()
+            .remember(&scene.measurements, &metrics);
         Ok((scene, sections, metrics))
     }
 
@@ -1595,5 +1658,124 @@ mod paint_culling_tests {
             proofs.bytes,
             proofs.contained.iter().map(String::len).sum::<usize>()
         );
+    }
+}
+
+#[cfg(test)]
+mod scene_metric_tests {
+    use super::*;
+    use crate::{dashboard_fixtures as fixtures, dashboard_model as model};
+
+    #[test]
+    fn r1210_scene_metrics_warm_tabs_build_once_and_match_fresh_scenes() -> Result<()> {
+        let renderer = Renderer::new(false)?;
+        assert!(renderer.scene_metrics.borrow().entries.is_empty());
+        let mut state = DashboardState::default();
+        let view = model::project(&fixtures::snapshot(), &mut state, &fixtures::clock());
+        let size = [1320., 640.];
+        for tab in [Tab::Overview, Tab::Events, Tab::Usage] {
+            state.tab = tab;
+            renderer.scene(&view, &state, size)?;
+        }
+        for tab in [Tab::Overview, Tab::Events, Tab::Usage, Tab::Overview] {
+            state.tab = tab;
+            renderer.scene_builds.set(0);
+            let warm = renderer.scene(&view, &state, size)?;
+            assert_eq!(renderer.scene_builds.get(), 1, "warm {tab:?}");
+            let fresh = Renderer::new(false)?;
+            let cold = fresh.scene(&view, &state, size)?;
+            assert!(fresh.scene_builds.get() > 1, "cold {tab:?} must probe");
+            assert_eq!(format!("{warm:?}"), format!("{cold:?}"), "{tab:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn r1210_scene_metrics_changed_source_width_and_popup_match_fresh_scenes() -> Result<()> {
+        let renderer = Renderer::new(false)?;
+        let mut state = DashboardState::default();
+        let mut view = model::project(&fixtures::snapshot(), &mut state, &fixtures::clock());
+        renderer.scene(&view, &state, [1320., 640.])?;
+        view.groups[0].name.push_str(" 합성 이름 변경");
+        view.events[0].body = "변경된 합성 본문 ".repeat(40);
+        view.usage[0].name.push_str(" 합성 사용량 이름 변경");
+        for (tab, popup, size) in [
+            (Tab::Overview, Some(Popup::Range), [1024., 720.]),
+            (Tab::Events, None, [1024., 720.]),
+            (Tab::Usage, None, [1320., 720.]),
+        ] {
+            state.tab = tab;
+            state.popup = popup;
+            let next = renderer.scene(&view, &state, size)?;
+            let cold = Renderer::new(false)?.scene(&view, &state, size)?;
+            assert_eq!(format!("{next:?}"), format!("{cold:?}"), "{tab:?}");
+            renderer.scene_builds.set(0);
+            let warm = renderer.scene(&view, &state, size)?;
+            assert_eq!(renderer.scene_builds.get(), 1, "repeated {tab:?}");
+            assert_eq!(format!("{warm:?}"), format!("{cold:?}"), "{tab:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn r1210_scene_metrics_cache_requires_pairs_and_bounds_keys_and_bytes() {
+        let request = Measure {
+            text: "synthetic".into(),
+            size: 12.,
+            line_height: 20.,
+            width: 40.,
+            bold: false,
+            wrap: false,
+            face: Face::Text,
+            align: TextAlign::Leading,
+        };
+        let mut cache = SceneMetricCache::default();
+        let mut metrics = Metrics::default();
+        metrics.heights.insert(request.key(), 20.);
+        cache.remember(std::slice::from_ref(&request), &metrics);
+        assert!(cache.entries.is_empty());
+        metrics.widths.insert(request.key(), 31.);
+        cache.remember(std::slice::from_ref(&request), &metrics);
+        let original = request.key();
+        assert_eq!(cache.snapshot().heights[&original], 20.);
+        assert_eq!(cache.snapshot().widths[&original], 31.);
+        let mut requests = Vec::new();
+        for i in 0..SCENE_METRIC_CAPACITY + 1 {
+            let mut r = request.clone();
+            r.text = format!("metric-{i}");
+            metrics.heights.insert(r.key(), i as f32);
+            metrics.widths.insert(r.key(), (i + 1) as f32);
+            requests.push(r);
+        }
+        cache.remember(&requests, &metrics);
+        assert_eq!(cache.entries.len(), SCENE_METRIC_CAPACITY);
+        assert!(!cache.entries.contains_key(&original));
+        for r in &mut requests {
+            r.text.push_str(&"x".repeat(512));
+            metrics.heights.insert(r.key(), 20.);
+            metrics.widths.insert(r.key(), 31.);
+        }
+        let mut oversized = request.clone();
+        oversized.text = "x".repeat(16 * 1024);
+        metrics.heights.insert(oversized.key(), 20.);
+        metrics.widths.insert(oversized.key(), 31.);
+        requests.push(oversized.clone());
+        cache.remember(&requests, &metrics);
+        assert!(!cache.entries.contains_key(&oversized.key()));
+        assert!(cache.entries.len() <= SCENE_METRIC_CAPACITY);
+        assert!(cache.bytes <= SCENE_METRIC_KEY_BYTES);
+        assert_eq!(
+            cache.bytes,
+            cache.entries.keys().map(|k| k.len() * 2).sum::<usize>()
+        );
+        assert_eq!(cache.order.len(), cache.entries.len());
+        let snapshot = cache.snapshot();
+        assert!(snapshot.heights.keys().eq(snapshot.widths.keys()));
+        for key in snapshot.heights.keys() {
+            assert_eq!(
+                cache.entries[key],
+                [snapshot.heights[key], snapshot.widths[key]]
+            );
+        }
     }
 }
