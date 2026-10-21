@@ -1109,25 +1109,31 @@ pub(super) fn return_current(
         );
         return recover(store, id);
     }
-    if let Some(m) = &previous
-        && m.phase == Phase::Complete
-        && let Some(to) = to
-        && fs::canonicalize(to)? == m.target
-    {
-        ensure!(db::thread_path(&m.target, id)?.is_some(), "{CONFLICT}");
-        return Ok(());
-    }
     let legacy = store.load()?;
     let origin = to
         .map(PathBuf::from)
         .or_else(|| previous.as_ref().map(|m| m.origin.clone()))
         .or_else(|| legacy.imports.get(id).map(|m| m.source_home.clone()))
         .context("돌려보낼 홈을 --to로 지정하세요")?;
+    let destination = fs::canonicalize(&origin)?;
+    // Wiring orders Q first and optional Qi second. Only new return plans are
+    // fenced: an open journal above must retain rollback/Decided rollforward.
+    if store.managed_homes()?.get(1) == Some(&destination) {
+        return Err(crate::image_launch::existing_session_refusal());
+    }
+    if let Some(m) = &previous
+        && m.phase == Phase::Complete
+        && to.is_some()
+        && destination == m.target
+    {
+        ensure!(db::thread_path(&m.target, id)?.is_some(), "{CONFLICT}");
+        return Ok(());
+    }
     if let Some(m) = &previous
         && m.phase == Phase::Complete
         && m.target != store.target
     {
-        ensure!(m.target == fs::canonicalize(&origin)?, "{CONFLICT}");
+        ensure!(m.target == destination, "{CONFLICT}");
         return Ok(());
     }
     let m = make_plan(store, &store.target, &origin, id, true, &origin)?;

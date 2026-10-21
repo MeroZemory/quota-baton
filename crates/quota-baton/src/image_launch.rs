@@ -20,6 +20,10 @@ impl std::fmt::Display for ExistingSessionRefusal {
 }
 impl std::error::Error for ExistingSessionRefusal {}
 
+pub(crate) fn existing_session_refusal() -> anyhow::Error {
+    anyhow::Error::new(ExistingSessionRefusal)
+}
+
 /// Only a leading launcher flag is ours. A prompt, option operand, or text
 /// after the native literal boundary must never become a launcher option.
 pub(crate) fn split(args: &[OsString]) -> (bool, &[OsString]) {
@@ -63,7 +67,7 @@ pub(crate) fn validate_args(args: &[OsString]) -> Result<()> {
                     "agents" | "daemon" | "app-server" | "app" | "remote-control" | "debug"
                 ))
         {
-            return Err(anyhow::Error::new(ExistingSessionRefusal));
+            return Err(existing_session_refusal());
         }
         ensure!(
             !(arg == "--config"
