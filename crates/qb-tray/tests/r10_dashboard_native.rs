@@ -205,6 +205,34 @@ impl Drop for Cleanup {
     }
 }
 
+fn owned_dashboard() -> HWND {
+    unsafe extern "system" fn visit(hwnd: HWND, context: LPARAM) -> windows::core::BOOL {
+        let mut pid = 0;
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+        if pid == std::process::id() {
+            let mut class = [0u16; 64];
+            let count = unsafe { GetClassNameW(hwnd, &mut class) };
+            if count > 0
+                && String::from_utf16_lossy(&class[..count as usize]) == "QuotaBatonDashboard"
+            {
+                unsafe { *(context.0 as *mut HWND) = hwnd };
+                return false.into();
+            }
+        }
+        true.into()
+    }
+    let mut found = HWND::default();
+    unsafe {
+        // Returning FALSE terminates enumeration once our own window was found.
+        let _ = EnumWindows(Some(visit), LPARAM((&mut found as *mut HWND) as isize));
+    }
+    assert!(
+        !found.is_invalid(),
+        "this process must own a dashboard HWND"
+    );
+    found
+}
+
 #[test]
 #[ignore = "manual production HWND evidence; coordinator must use r10-native-capture.py"]
 fn r10_dashboard_native() {
@@ -249,7 +277,7 @@ fn r10_dashboard_native() {
     )
     .unwrap();
     run.pump(220);
-    let hwnd = unsafe { FindWindowW(windows::core::w!("QuotaBatonDashboard"), None) }.unwrap();
+    let hwnd = owned_dashboard();
     let mut pid = 0;
     unsafe {
         GetWindowThreadProcessId(hwnd, Some(&mut pid));
