@@ -10,7 +10,10 @@ use std::{
     mem::{ManuallyDrop, offset_of},
     ptr,
     rc::Rc,
-    sync::{Arc, Mutex, MutexGuard, TryLockError},
+    sync::{
+        Arc, Mutex, MutexGuard, TryLockError,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 use windows::{
     Win32::{
@@ -28,12 +31,22 @@ use windows::{
             WindowsAndMessaging::{PostMessageW, WM_APP},
         },
     },
-    core::{BSTR, Error, GUID, HRESULT, IUnknown, IUnknown_Vtbl, Interface, Result},
+    core::{BOOL, BSTR, Error, GUID, HRESULT, IUnknown, IUnknown_Vtbl, Interface, PCWSTR, Result},
 };
 
-/// Reserve these two messages in the integrating window procedure.
+/// Reserve these messages in the integrating window procedure.
 pub const WM_UIA_INVOKE: u32 = WM_APP + 0x3b1;
 pub const WM_UIA_FOCUS: u32 = WM_APP + 0x3b2;
+/// WPARAM is an opaque request token, LPARAM is the publication epoch. Consume
+/// with RootProvider::take_value_request on the owning UI thread.
+/// At most eight requests are retained; values contain at most 256 Unicode
+/// scalar values (512 UTF-16 units). Successful SetValue only admits a message.
+pub const WM_UIA_VALUE: u32 = WM_APP + 0x3b3;
+
+const MAX_VALUE_REQUESTS: usize = 8;
+const MAX_VALUE_CHARS: usize = 256;
+// Never reuse tokens, including across owners/HWNDs with the same epoch.
+static NEXT_VALUE_REQUEST: AtomicUsize = AtomicUsize::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -66,8 +79,13 @@ pub struct Element {
     pub action: Option<usize>,
     pub focusable: bool,
     pub focused: bool,
+    /// ValuePattern is read-only unless kind is Edit. An Edit with None reads
+    /// as an empty string; every other kind requires Some to expose the pattern.
     pub value: Option<String>,
+    /// SelectionItem state for Tab/Row/DataRow, or Toggle state for Checkbox.
+    /// None withholds those patterns; other kinds do not expose SelectionItem.
     pub selected: Option<bool>,
+    /// Some exposes ExpandCollapse, including read-only/non-actionable nodes.
     pub expanded: Option<bool>,
 }
 
@@ -86,6 +104,14 @@ struct Cache {
     alive: bool,
     epoch: usize,
     snapshot: Snapshot,
+    value_requests: Vec<ValueRequest>,
+}
+
+struct ValueRequest {
+    token: usize,
+    id: i32,
+    epoch: usize,
+    value: String,
 }
 
 /// UI-thread owner. COM clients retain only cached state after this is dropped.
@@ -109,6 +135,7 @@ pub fn create_root_provider(hwnd: isize) -> Result<RootProvider> {
             bounds: [0.0; 4],
             elements: Vec::new(),
         },
+        value_requests: Vec::new(),
     }));
     Ok(RootProvider {
         root: Node::new(cache, None, None),
@@ -132,7 +159,45 @@ impl RootProvider {
         }
         cache.snapshot = snapshot;
         cache.epoch = epoch;
+        cache.value_requests.clear();
         Ok(())
+    }
+
+    /// Consume only this owner's admitted WM_UIA_VALUE request, once. Unknown,
+    /// duplicate and obsolete messages return None; a deactivated owner errors.
+    /// Publication and teardown discard pending strings. No pointer crosses the
+    /// message queue. The caller must also check its current frame/owner/epoch,
+    /// resolve the element ID to an Edit target, and apply the string on the UI
+    /// thread before publishing again. This method performs no UI or I/O work.
+    pub fn take_value_request(
+        &self,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> Result<Option<(i32, usize, String)>> {
+        let mut cache = self.root.cache.lock().map_err(|_| unavailable())?;
+        if !cache.alive {
+            return Err(unavailable());
+        }
+        if wparam.0 == 0 || lparam.0 <= 0 || lparam.0 as usize != cache.epoch {
+            return Ok(None);
+        }
+        let Some(index) = cache
+            .value_requests
+            .iter()
+            .position(|request| request.token == wparam.0 && request.epoch == lparam.0 as usize)
+        else {
+            return Ok(None);
+        };
+        let request = cache.value_requests.remove(index);
+        if !cache
+            .snapshot
+            .elements
+            .iter()
+            .any(|e| e.id == request.id && e.kind == Kind::Edit && e.enabled)
+        {
+            return Ok(None);
+        }
+        Ok(Some((request.id, request.epoch, request.value)))
     }
 
     /// Call only for WM_GETOBJECT; None means let the window's default handler
@@ -198,6 +263,8 @@ fn deactivate_cache(cache: &Mutex<Cache>) -> isize {
     cache.snapshot.elements.clear();
     cache.snapshot.elements.shrink_to_fit();
     cache.snapshot.bounds = [0.0; 4];
+    cache.value_requests.clear();
+    cache.value_requests.shrink_to_fit();
     hwnd // Guard is dropped before either cleanup callback can run.
 }
 
@@ -268,9 +335,9 @@ fn uia_error(code: u32) -> Error {
     Error::from_hresult(HRESULT(code as i32))
 }
 
-fn string_variant(value: &str) -> Result<VARIANT> {
+fn string_bstr(value: &str) -> Result<BSTR> {
     if value.is_empty() {
-        return Ok(VARIANT::from(BSTR::new()));
+        return Ok(BSTR::new());
     }
     let wide: Vec<u16> = value.encode_utf16().collect();
     // Guard the installed SysAllocStringLen slice wrapper's u32 conversion.
@@ -280,7 +347,45 @@ fn string_variant(value: &str) -> Result<VARIANT> {
     if bstr.is_empty() {
         return Err(Error::from_hresult(E_OUTOFMEMORY));
     }
-    Ok(VARIANT::from(bstr)) // Moves BSTR ownership; VARIANT Drop clears it.
+    Ok(bstr)
+}
+
+fn string_variant(value: &str) -> Result<VARIANT> {
+    Ok(VARIANT::from(string_bstr(value)?)) // Moves BSTR ownership.
+}
+
+#[derive(Clone, Copy, Default)]
+struct Patterns {
+    invoke: bool,
+    selection_item: bool,
+    expand_collapse: bool,
+    toggle: bool,
+    value: bool,
+}
+
+impl Patterns {
+    fn of(element: Option<&Element>) -> Self {
+        element.map_or_else(Self::default, |e| Self {
+            invoke: e.kind != Kind::Text && e.action.is_some(),
+            selection_item: matches!(e.kind, Kind::Tab | Kind::Row | Kind::DataRow)
+                && e.selected.is_some(),
+            expand_collapse: e.expanded.is_some(),
+            toggle: e.kind == Kind::Checkbox && e.selected.is_some(),
+            value: e.kind == Kind::Edit || e.value.is_some(),
+        })
+    }
+
+    #[allow(non_upper_case_globals)]
+    fn slot(self, id: UIA_PATTERN_ID) -> Option<usize> {
+        match id {
+            UIA_InvokePatternId if self.invoke => Some(3),
+            UIA_SelectionItemPatternId if self.selection_item => Some(4),
+            UIA_ExpandCollapsePatternId if self.expand_collapse => Some(5),
+            UIA_TogglePatternId if self.toggle => Some(6),
+            UIA_ValuePatternId if self.value => Some(7),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -288,9 +393,19 @@ struct Ticket {
     id: i32,
     epoch: usize,
     action: Option<usize>,
+    // Freeze QueryInterface support for the lifetime of this COM object. Method
+    // calls still validate the current owner/epoch and cached capabilities.
+    patterns: Patterns,
 }
 
-// Each COM interface is an address of one of these four vtable-reference slots.
+#[derive(Clone, Copy)]
+enum SelectionAction {
+    Select,
+    Add,
+    Remove,
+}
+
+// Each COM interface is an address of one of these eight vtable-reference slots.
 // repr(C) + offset_of (not a guessed layout) recover the Arc payload from `this`.
 // The object stores no HWND wrapper, thread-affine UI state, COM host, child list,
 // credentials or callbacks. All slots/vtables are immutable. Arc handles lifetime.
@@ -300,6 +415,10 @@ struct Node {
     fragment: &'static IRawElementProviderFragment_Vtbl,
     fragment_root: &'static IRawElementProviderFragmentRoot_Vtbl,
     invoke: &'static IInvokeProvider_Vtbl,
+    selection_item: &'static ISelectionItemProvider_Vtbl,
+    expand_collapse: &'static IExpandCollapseProvider_Vtbl,
+    toggle: &'static IToggleProvider_Vtbl,
+    value: &'static IValueProvider_Vtbl,
     cache: Arc<Mutex<Cache>>,
     /// Child -> canonical root only. Root never retains children: no cycle.
     root: Option<Arc<Node>>,
@@ -313,6 +432,10 @@ impl Node {
             fragment: &FRAGMENT,
             fragment_root: &FRAGMENT_ROOT,
             invoke: &INVOKE,
+            selection_item: &SELECTION_ITEM,
+            expand_collapse: &EXPAND_COLLAPSE,
+            toggle: &TOGGLE,
+            value: &VALUE,
             cache,
             root,
             ticket,
@@ -358,6 +481,7 @@ impl Node {
                 id: e.id,
                 epoch,
                 action: e.action,
+                patterns: Patterns::of(Some(e)),
             }),
         )
     }
@@ -482,7 +606,7 @@ impl Node {
         let cache = self.read()?;
         let element = self.element(&cache)?;
         let bounds = element.map_or(cache.snapshot.bounds, |e| e.bounds);
-        let actionable = element.is_some_and(|e| e.kind != Kind::Text && e.action.is_some());
+        let patterns = Patterns::of(element);
         Ok(match property {
             UIA_NamePropertyId => {
                 string_variant(element.map_or(cache.snapshot.name.as_str(), |e| e.name.as_str()))?
@@ -515,15 +639,13 @@ impl Node {
             {
                 string_variant("차트")?
             }
-            UIA_ValueValuePropertyId => element
-                .and_then(|e| e.value.as_deref())
-                .map(string_variant)
-                .transpose()?
-                .unwrap_or_default(),
-            UIA_ValueIsReadOnlyPropertyId => {
+            UIA_ValueValuePropertyId if patterns.value => {
+                string_variant(element.and_then(|e| e.value.as_deref()).unwrap_or(""))?
+            }
+            UIA_ValueIsReadOnlyPropertyId if patterns.value => {
                 VARIANT::from(element.is_none_or(|e| e.kind != Kind::Edit))
             }
-            UIA_SelectionItemIsSelectedPropertyId => element
+            UIA_SelectionItemIsSelectedPropertyId if patterns.selection_item => element
                 .and_then(|e| e.selected)
                 .map(VARIANT::from)
                 .unwrap_or_default(),
@@ -537,13 +659,26 @@ impl Node {
                     })
                 })
                 .unwrap_or_default(),
+            UIA_ToggleToggleStatePropertyId if patterns.toggle => {
+                VARIANT::from(if element.and_then(|e| e.selected) == Some(true) {
+                    ToggleState_On.0
+                } else {
+                    ToggleState_Off.0
+                })
+            }
             UIA_IsEnabledPropertyId => VARIANT::from(element.is_none_or(|e| e.enabled)),
             UIA_IsKeyboardFocusablePropertyId => {
                 VARIANT::from(element.is_some_and(|e| e.focusable))
             }
             UIA_HasKeyboardFocusPropertyId => VARIANT::from(element.is_some_and(|e| e.focused)),
             UIA_IsControlElementPropertyId | UIA_IsContentElementPropertyId => VARIANT::from(true),
-            UIA_IsInvokePatternAvailablePropertyId => VARIANT::from(actionable),
+            UIA_IsInvokePatternAvailablePropertyId => VARIANT::from(patterns.invoke),
+            UIA_IsSelectionItemPatternAvailablePropertyId => VARIANT::from(patterns.selection_item),
+            UIA_IsExpandCollapsePatternAvailablePropertyId => {
+                VARIANT::from(patterns.expand_collapse)
+            }
+            UIA_IsTogglePatternAvailablePropertyId => VARIANT::from(patterns.toggle),
+            UIA_IsValuePatternAvailablePropertyId => VARIANT::from(patterns.value),
             UIA_IsOffscreenPropertyId => VARIANT::from(bounds[2] == 0.0 || bounds[3] == 0.0),
             UIA_NativeWindowHandlePropertyId if element.is_none() => {
                 VARIANT::from(cache.hwnd as i32)
@@ -573,18 +708,186 @@ impl Node {
 
     fn post_invoke(&self) -> Result<()> {
         let cache = self.read()?;
-        let (index, epoch) = self.action_ticket(&cache)?;
+        self.post_invoke_cached(&cache)
+    }
+
+    fn post_invoke_cached(&self, cache: &Cache) -> Result<()> {
+        let (index, epoch) = self.action_ticket(cache)?;
         // Keep the short cache guard through PostMessageW: deactivate/publish
         // cannot invalidate HWND/epoch between validation and enqueueing.
         // UI MUST still compare epoch before resolving the frozen target index.
-        unsafe {
-            PostMessageW(
-                Some(HWND(cache.hwnd as *mut c_void)),
-                WM_UIA_INVOKE,
-                WPARAM(index),
-                LPARAM(epoch as isize),
-            )
+        post_message(
+            cache.hwnd,
+            WM_UIA_INVOKE,
+            WPARAM(index),
+            LPARAM(epoch as isize),
+        )
+    }
+
+    fn pattern_element<'a>(&self, cache: &'a Cache, id: UIA_PATTERN_ID) -> Result<&'a Element> {
+        self.element(cache)?
+            .filter(|e| Patterns::of(Some(e)).slot(id).is_some())
+            .ok_or_else(|| uia_error(UIA_E_NOTSUPPORTED))
+    }
+
+    fn enabled_pattern_element<'a>(
+        &self,
+        cache: &'a Cache,
+        id: UIA_PATTERN_ID,
+    ) -> Result<&'a Element> {
+        let element = self.pattern_element(cache, id)?;
+        if !element.enabled {
+            return Err(uia_error(UIA_E_ELEMENTNOTENABLED));
         }
+        Ok(element)
+    }
+
+    fn selected(&self) -> Result<BOOL> {
+        let cache = self.read()?;
+        Ok(BOOL::from(
+            self.pattern_element(&cache, UIA_SelectionItemPatternId)?
+                .selected
+                == Some(true),
+        ))
+    }
+
+    fn selection_container(&self) -> Result<Option<Arc<Node>>> {
+        let cache = self.read()?;
+        let element = self.pattern_element(&cache, UIA_SelectionItemPatternId)?;
+        Ok(Some(match element.parent {
+            Some(id) => self.child(
+                cache
+                    .snapshot
+                    .elements
+                    .iter()
+                    .find(|e| e.id == id)
+                    .ok_or_else(unavailable)?,
+                cache.epoch,
+            ),
+            None => self.root_arc(),
+        }))
+    }
+
+    fn change_selection(&self, action: SelectionAction) -> Result<()> {
+        let cache = self.read()?;
+        let element = self.enabled_pattern_element(&cache, UIA_SelectionItemPatternId)?;
+        let selected = element.selected == Some(true);
+        let selecting = !matches!(action, SelectionAction::Remove);
+        if selected == selecting {
+            return Ok(()); // Selecting an open row must not invoke/close it.
+        }
+        if !selecting && element.kind == Kind::Tab {
+            return Err(uia_error(UIA_E_INVALIDOPERATION)); // A tab cannot be deselected alone.
+        }
+        if matches!(action, SelectionAction::Add)
+            && cache.snapshot.elements.iter().any(|other| {
+                other.id != element.id
+                    && other.parent == element.parent
+                    && Patterns::of(Some(other)).selection_item
+                    && (other.kind == Kind::Tab) == (element.kind == Kind::Tab)
+                    && other.selected == Some(true)
+            })
+        {
+            return Err(uia_error(UIA_E_INVALIDOPERATION)); // No multiple selection.
+        }
+        self.post_invoke_cached(&cache)
+    }
+
+    fn expanded(&self) -> Result<ExpandCollapseState> {
+        let cache = self.read()?;
+        Ok(
+            if self
+                .pattern_element(&cache, UIA_ExpandCollapsePatternId)?
+                .expanded
+                == Some(true)
+            {
+                ExpandCollapseState_Expanded
+            } else {
+                ExpandCollapseState_Collapsed
+            },
+        )
+    }
+
+    fn change_expansion(&self, expanded: bool) -> Result<()> {
+        let cache = self.read()?;
+        let element = self.enabled_pattern_element(&cache, UIA_ExpandCollapsePatternId)?;
+        if element.expanded == Some(expanded) {
+            return Ok(());
+        }
+        self.post_invoke_cached(&cache)
+    }
+
+    fn toggle_state(&self) -> Result<ToggleState> {
+        let cache = self.read()?;
+        Ok(
+            if self.pattern_element(&cache, UIA_TogglePatternId)?.selected == Some(true) {
+                ToggleState_On
+            } else {
+                ToggleState_Off
+            },
+        )
+    }
+
+    fn post_toggle(&self) -> Result<()> {
+        let cache = self.read()?;
+        self.enabled_pattern_element(&cache, UIA_TogglePatternId)?;
+        self.post_invoke_cached(&cache)
+    }
+
+    fn value(&self) -> Result<BSTR> {
+        let cache = self.read()?;
+        string_bstr(
+            self.pattern_element(&cache, UIA_ValuePatternId)?
+                .value
+                .as_deref()
+                .unwrap_or(""),
+        )
+    }
+
+    fn value_read_only(&self) -> Result<BOOL> {
+        let cache = self.read()?;
+        Ok(BOOL::from(
+            self.pattern_element(&cache, UIA_ValuePatternId)?.kind != Kind::Edit,
+        ))
+    }
+
+    unsafe fn post_value(&self, value: PCWSTR) -> Result<()> {
+        let mut cache = self.read()?;
+        let element = self.enabled_pattern_element(&cache, UIA_ValuePatternId)?;
+        if element.kind != Kind::Edit {
+            return Err(uia_error(UIA_E_INVALIDOPERATION));
+        }
+        let id = element.id;
+        let epoch = cache.epoch;
+        if cache.value_requests.len() >= MAX_VALUE_REQUESTS {
+            return Err(uia_error(UIA_E_INVALIDOPERATION));
+        }
+        let value = unsafe { bounded_value(value)? };
+        cache
+            .value_requests
+            .try_reserve(1)
+            .map_err(|_| Error::from_hresult(E_OUTOFMEMORY))?;
+        let token = NEXT_VALUE_REQUEST
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .map_err(|_| uia_error(UIA_E_INVALIDOPERATION))?;
+        cache.value_requests.push(ValueRequest {
+            token,
+            id,
+            epoch,
+            value,
+        });
+        if let Err(error) = post_message(
+            cache.hwnd,
+            WM_UIA_VALUE,
+            WPARAM(token),
+            LPARAM(epoch as isize),
+        ) {
+            cache.value_requests.pop(); // Failed admission never strands a string/queue slot.
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn post_focus(&self) -> Result<()> {
@@ -598,26 +901,68 @@ impl Node {
         if !e.focusable {
             return Err(uia_error(UIA_E_NOTSUPPORTED));
         }
-        unsafe {
-            PostMessageW(
-                Some(HWND(cache.hwnd as *mut c_void)),
-                WM_UIA_FOCUS,
-                WPARAM(e.id as usize),
-                LPARAM(cache.epoch as isize),
-            )
-        }
+        post_message(
+            cache.hwnd,
+            WM_UIA_FOCUS,
+            WPARAM(e.id as usize),
+            LPARAM(cache.epoch as isize),
+        )
     }
+}
+
+/// The COM caller supplies a valid, NUL-terminated PCWSTR. Bound the scan too,
+/// allowing surrogate pairs for all 256 characters. Reject invalid UTF-16 and
+/// controls rather than silently changing a requested search value.
+unsafe fn bounded_value(value: PCWSTR) -> Result<String> {
+    if value.is_null() {
+        return Err(Error::from_hresult(E_POINTER));
+    }
+    let mut wide = [0u16; MAX_VALUE_CHARS * 2];
+    for length in 0..=wide.len() {
+        let unit = unsafe { value.0.add(length).read() };
+        if unit == 0 {
+            let mut text = String::new();
+            text.try_reserve(length * 3)
+                .map_err(|_| Error::from_hresult(E_OUTOFMEMORY))?;
+            for (index, character) in char::decode_utf16(wide[..length].iter().copied()).enumerate()
+            {
+                let character = character.map_err(|_| Error::from_hresult(E_INVALIDARG))?;
+                if index >= MAX_VALUE_CHARS || character.is_control() {
+                    return Err(Error::from_hresult(E_INVALIDARG));
+                }
+                text.push(character);
+            }
+            return Ok(text);
+        }
+        if length == wide.len() {
+            break;
+        }
+        wide[length] = unit;
+    }
+    Err(Error::from_hresult(E_INVALIDARG))
+}
+
+fn post_message(hwnd: isize, message: u32, wparam: WPARAM, lparam: LPARAM) -> Result<()> {
+    #[cfg(test)]
+    if let Some(result) = tests::capture_post(hwnd, message, wparam, lparam) {
+        return result;
+    }
+    unsafe { PostMessageW(Some(HWND(hwnd as *mut c_void)), message, wparam, lparam) }
 }
 
 // Raw ABI plumbing is necessary for S_OK + explicitly initialized null outputs
 // (no sibling/focus/pattern/host). Generated Result<Interface> trait shims cannot
 // express this without leaving the output untouched. No fabricated interfaces.
 
-const OFFSETS: [usize; 4] = [
+const OFFSETS: [usize; 8] = [
     offset_of!(Node, simple),
     offset_of!(Node, fragment),
     offset_of!(Node, fragment_root),
     offset_of!(Node, invoke),
+    offset_of!(Node, selection_item),
+    offset_of!(Node, expand_collapse),
+    offset_of!(Node, toggle),
+    offset_of!(Node, value),
 ];
 
 unsafe fn node<'a, const SLOT: usize>(this: *mut c_void) -> &'a Node {
@@ -691,14 +1036,23 @@ unsafe extern "system" fn query<const S: usize>(
     }
     let n = unsafe { node::<S>(this) };
     let iid = unsafe { *iid };
+    let patterns = n.ticket.map_or_else(Patterns::default, |t| t.patterns);
     let slot = if iid == IUnknown::IID || iid == IRawElementProviderSimple::IID {
         0
     } else if iid == IRawElementProviderFragment::IID {
         1
     } else if iid == IRawElementProviderFragmentRoot::IID && n.ticket.is_none() {
         2
-    } else if iid == IInvokeProvider::IID && n.ticket.is_some_and(|t| t.action.is_some()) {
+    } else if iid == IInvokeProvider::IID && patterns.invoke {
         3
+    } else if iid == ISelectionItemProvider::IID && patterns.selection_item {
+        4
+    } else if iid == IExpandCollapseProvider::IID && patterns.expand_collapse {
+        5
+    } else if iid == IToggleProvider::IID && patterns.toggle {
+        6
+    } else if iid == IValueProvider::IID && patterns.value {
+        7
     } else {
         return E_NOINTERFACE;
     };
@@ -759,22 +1113,29 @@ unsafe extern "system" fn pattern(
     id: UIA_PATTERN_ID,
     out: *mut *mut c_void,
 ) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    unsafe {
+        out.write(ptr::null_mut());
+    }
     let n = unsafe { node::<0>(this) };
-    let result = (|| {
+    let result: Result<Option<usize>> = (|| {
         let cache = n.read()?;
-        let actionable = n
-            .element(&cache)?
-            .is_some_and(|e| e.kind != Kind::Text && e.action.is_some());
-        if id != UIA_InvokePatternId || !actionable {
-            return Ok(None);
-        }
-        // Preserve this COM object's identity when returning its Invoke slot.
-        unsafe {
-            Arc::increment_strong_count(n as *const Node);
-        }
-        Ok(Some(unsafe { Arc::from_raw(n as *const Node) }))
+        Ok(Patterns::of(n.element(&cache)?).slot(id))
     })();
-    unsafe { interface_output(out, result, 3) }
+    match result {
+        Ok(Some(slot)) => {
+            // Every pattern preserves this COM object's canonical IUnknown.
+            unsafe {
+                Arc::increment_strong_count(n as *const Node);
+            }
+            let owned = unsafe { Arc::from_raw(n as *const Node) };
+            unsafe { interface_output(out, Ok(Some(owned)), slot) }
+        }
+        Ok(None) => HRESULT(0),
+        Err(error) => error.code(),
+    }
 }
 
 unsafe extern "system" fn property(
@@ -919,6 +1280,83 @@ unsafe extern "system" fn invoke(this: *mut c_void) -> HRESULT {
     status(unsafe { node::<3>(this) }.post_invoke())
 }
 
+unsafe extern "system" fn select(this: *mut c_void) -> HRESULT {
+    status(unsafe { node::<4>(this) }.change_selection(SelectionAction::Select))
+}
+
+unsafe extern "system" fn add_selection(this: *mut c_void) -> HRESULT {
+    status(unsafe { node::<4>(this) }.change_selection(SelectionAction::Add))
+}
+
+unsafe extern "system" fn remove_selection(this: *mut c_void) -> HRESULT {
+    status(unsafe { node::<4>(this) }.change_selection(SelectionAction::Remove))
+}
+
+unsafe fn scalar_output<T>(out: *mut T, initial: T, result: Result<T>) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    unsafe {
+        out.write(initial);
+        output(out, result)
+    }
+}
+
+unsafe extern "system" fn selected(this: *mut c_void, out: *mut BOOL) -> HRESULT {
+    unsafe { scalar_output(out, BOOL(0), node::<4>(this).selected()) }
+}
+
+unsafe extern "system" fn selection_container(this: *mut c_void, out: *mut *mut c_void) -> HRESULT {
+    unsafe { interface_output(out, node::<4>(this).selection_container(), 0) }
+}
+
+unsafe extern "system" fn expand(this: *mut c_void) -> HRESULT {
+    status(unsafe { node::<5>(this) }.change_expansion(true))
+}
+
+unsafe extern "system" fn collapse(this: *mut c_void) -> HRESULT {
+    status(unsafe { node::<5>(this) }.change_expansion(false))
+}
+
+unsafe extern "system" fn expanded(this: *mut c_void, out: *mut ExpandCollapseState) -> HRESULT {
+    unsafe {
+        scalar_output(
+            out,
+            ExpandCollapseState_Collapsed,
+            node::<5>(this).expanded(),
+        )
+    }
+}
+
+unsafe extern "system" fn toggle(this: *mut c_void) -> HRESULT {
+    status(unsafe { node::<6>(this) }.post_toggle())
+}
+
+unsafe extern "system" fn toggle_state(this: *mut c_void, out: *mut ToggleState) -> HRESULT {
+    unsafe { scalar_output(out, ToggleState_Off, node::<6>(this).toggle_state()) }
+}
+
+unsafe extern "system" fn set_value(this: *mut c_void, value: PCWSTR) -> HRESULT {
+    status(unsafe { node::<7>(this).post_value(value) })
+}
+
+unsafe extern "system" fn value(this: *mut c_void, out: *mut *mut c_void) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    unsafe {
+        out.write(ptr::null_mut());
+    }
+    let result = unsafe { node::<7>(this) }
+        .value()
+        .map(|text| text.into_raw().cast_mut().cast());
+    unsafe { output(out, result) }
+}
+
+unsafe extern "system" fn value_read_only(this: *mut c_void, out: *mut BOOL) -> HRESULT {
+    unsafe { scalar_output(out, BOOL(0), node::<7>(this).value_read_only()) }
+}
+
 static SIMPLE: IRawElementProviderSimple_Vtbl = IRawElementProviderSimple_Vtbl {
     base__: unknown::<0>(),
     ProviderOptions: options,
@@ -944,12 +1382,844 @@ static INVOKE: IInvokeProvider_Vtbl = IInvokeProvider_Vtbl {
     base__: unknown::<3>(),
     Invoke: invoke,
 };
+static SELECTION_ITEM: ISelectionItemProvider_Vtbl = ISelectionItemProvider_Vtbl {
+    base__: unknown::<4>(),
+    Select: select,
+    AddToSelection: add_selection,
+    RemoveFromSelection: remove_selection,
+    IsSelected: selected,
+    SelectionContainer: selection_container,
+};
+static EXPAND_COLLAPSE: IExpandCollapseProvider_Vtbl = IExpandCollapseProvider_Vtbl {
+    base__: unknown::<5>(),
+    Expand: expand,
+    Collapse: collapse,
+    ExpandCollapseState: expanded,
+};
+static TOGGLE: IToggleProvider_Vtbl = IToggleProvider_Vtbl {
+    base__: unknown::<6>(),
+    Toggle: toggle,
+    ToggleState: toggle_state,
+};
+static VALUE: IValueProvider_Vtbl = IValueProvider_Vtbl {
+    base__: unknown::<7>(),
+    SetValue: set_value,
+    Value: value,
+    IsReadOnly: value_read_only,
+};
 
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use windows::Win32::System::Ole::SafeArrayGetElement;
     use windows::core::BSTR;
+
+    #[derive(Default)]
+    struct Posts {
+        messages: Vec<(isize, u32, usize, isize)>,
+        fail_next: Option<HRESULT>,
+    }
+
+    thread_local! {
+        static POSTS: RefCell<Option<Posts>> = const { RefCell::new(None) };
+    }
+
+    // Only explicitly scoped tests intercept the Win32 enqueue boundary. The
+    // raw COM methods/vtables, cache checks and request admission remain real.
+    struct PostCapture;
+    impl PostCapture {
+        fn new() -> Self {
+            POSTS.with(|posts| assert!(posts.borrow_mut().replace(Posts::default()).is_none()));
+            Self
+        }
+
+        fn messages(&self) -> Vec<(isize, u32, usize, isize)> {
+            POSTS.with(|posts| posts.borrow().as_ref().unwrap().messages.clone())
+        }
+
+        fn fail_next(&self, error: HRESULT) {
+            POSTS.with(|posts| posts.borrow_mut().as_mut().unwrap().fail_next = Some(error));
+        }
+    }
+    impl Drop for PostCapture {
+        fn drop(&mut self) {
+            POSTS.with(|posts| *posts.borrow_mut() = None);
+        }
+    }
+
+    pub(super) fn capture_post(
+        hwnd: isize,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> Option<Result<()>> {
+        POSTS.with(|posts| {
+            let mut posts = posts.borrow_mut();
+            let posts = posts.as_mut()?;
+            posts.messages.push((hwnd, message, wparam.0, lparam.0));
+            Some(match posts.fail_next.take() {
+                Some(error) => Err(Error::from_hresult(error)),
+                None => Ok(()),
+            })
+        })
+    }
+
+    fn pattern_element(
+        id: i32,
+        kind: Kind,
+        selected: Option<bool>,
+        expanded: Option<bool>,
+        value: Option<&str>,
+        action: Option<usize>,
+    ) -> Element {
+        Element {
+            id,
+            parent: None,
+            name: format!("element {id}"),
+            kind,
+            bounds: [110., 210., 40., 20.],
+            enabled: true,
+            action,
+            focusable: action.is_some() || kind == Kind::Edit,
+            focused: false,
+            value: value.map(str::to_owned),
+            selected,
+            expanded,
+        }
+    }
+
+    fn pattern_scene() -> Snapshot {
+        let mut snapshot = scene();
+        snapshot.elements = vec![
+            pattern_element(1, Kind::Text, Some(false), None, None, None),
+            pattern_element(2, Kind::Tab, Some(true), None, None, Some(4)),
+            pattern_element(3, Kind::Tab, Some(false), None, None, Some(5)),
+            pattern_element(4, Kind::Row, Some(true), Some(true), None, Some(6)),
+            pattern_element(5, Kind::DataRow, Some(false), Some(false), None, Some(7)),
+            pattern_element(6, Kind::Checkbox, Some(true), None, None, Some(8)),
+            pattern_element(7, Kind::Edit, None, None, Some("한글 검색"), None),
+            pattern_element(8, Kind::Chart, None, None, Some("52 %"), None),
+            pattern_element(9, Kind::Text, None, None, Some("cell"), None),
+            pattern_element(10, Kind::Group, Some(false), None, None, None),
+            pattern_element(11, Kind::DataRow, Some(false), None, Some("row"), None),
+            pattern_element(12, Kind::Edit, None, None, None, None),
+            pattern_element(13, Kind::Checkbox, Some(false), None, None, Some(9)),
+            pattern_element(14, Kind::Group, None, Some(false), None, None),
+            pattern_element(15, Kind::DataRow, None, None, None, None),
+        ];
+        for element in &mut snapshot.elements {
+            if matches!(element.id, 4 | 5 | 11) {
+                element.parent = Some(10);
+            } else if element.id == 9 {
+                element.parent = Some(8);
+            }
+        }
+        snapshot
+    }
+
+    fn com_navigate(
+        node: &IRawElementProviderFragment,
+        direction: NavigateDirection,
+    ) -> Result<Option<IRawElementProviderFragment>> {
+        let mut raw = ptr::dangling_mut::<c_void>();
+        unsafe {
+            (node.vtable().Navigate)(node.as_raw(), direction, &mut raw).ok()?;
+        }
+        Ok(if raw.is_null() {
+            None
+        } else {
+            Some(unsafe { IRawElementProviderFragment::from_raw(raw) })
+        })
+    }
+
+    fn com_element(owner: &RootProvider, id: i32) -> Result<IRawElementProviderSimple> {
+        let expected = format!("quota-baton.element.{id}");
+        let mut pending = vec![owner.simple().cast::<IRawElementProviderFragment>()?];
+        while let Some(fragment) = pending.pop() {
+            let simple = fragment.cast::<IRawElementProviderSimple>()?;
+            if BSTR::try_from(&unsafe { simple.GetPropertyValue(UIA_AutomationIdPropertyId)? })?
+                == expected.as_str()
+            {
+                return Ok(simple);
+            }
+            for direction in [NavigateDirection_NextSibling, NavigateDirection_FirstChild] {
+                if let Some(next) = com_navigate(&fragment, direction)? {
+                    pending.push(next);
+                }
+            }
+        }
+        Err(unavailable())
+    }
+
+    fn com_pattern<T: Interface>(
+        simple: &IRawElementProviderSimple,
+        id: UIA_PATTERN_ID,
+    ) -> Result<T> {
+        let mut raw = ptr::dangling_mut::<c_void>();
+        unsafe {
+            (simple.vtable().GetPatternProvider)(simple.as_raw(), id, &mut raw).ok()?;
+        }
+        if raw.is_null() {
+            return Err(Error::from_hresult(E_NOINTERFACE));
+        }
+        unsafe { IUnknown::from_raw(raw) }.cast::<T>()
+    }
+
+    fn wide(value: &str) -> Vec<u16> {
+        value.encode_utf16().chain([0]).collect()
+    }
+
+    #[test]
+    fn raw_standard_patterns_match_availability_query_interface_and_identity() -> Result<()> {
+        let owner = create_root_provider(1)?;
+        owner.publish(pattern_scene(), 1)?;
+        let weak = Arc::downgrade(&owner.root);
+        let patterns = [
+            (
+                UIA_InvokePatternId,
+                UIA_IsInvokePatternAvailablePropertyId,
+                IInvokeProvider::IID,
+            ),
+            (
+                UIA_SelectionItemPatternId,
+                UIA_IsSelectionItemPatternAvailablePropertyId,
+                ISelectionItemProvider::IID,
+            ),
+            (
+                UIA_ExpandCollapsePatternId,
+                UIA_IsExpandCollapsePatternAvailablePropertyId,
+                IExpandCollapseProvider::IID,
+            ),
+            (
+                UIA_TogglePatternId,
+                UIA_IsTogglePatternAvailablePropertyId,
+                IToggleProvider::IID,
+            ),
+            (
+                UIA_ValuePatternId,
+                UIA_IsValuePatternAvailablePropertyId,
+                IValueProvider::IID,
+            ),
+        ];
+        for (id, expected) in [
+            (0, [false, false, false, false, false]),
+            (1, [false, false, false, false, false]),
+            (2, [true, true, false, false, false]),
+            (4, [true, true, true, false, false]),
+            (5, [true, true, true, false, false]),
+            (6, [true, false, false, true, false]),
+            (7, [false, false, false, false, true]),
+            (8, [false, false, false, false, true]),
+            (9, [false, false, false, false, true]),
+            (10, [false, false, false, false, false]),
+            (11, [false, true, false, false, true]),
+            (12, [false, false, false, false, true]),
+            (14, [false, false, true, false, false]),
+            (15, [false, false, false, false, false]),
+        ] {
+            let simple = if id == 0 {
+                owner.simple()
+            } else {
+                com_element(&owner, id)?
+            };
+            let identity = simple.cast::<IUnknown>()?;
+            for ((pattern_id, property_id, iid), expected) in patterns.into_iter().zip(expected) {
+                assert_eq!(
+                    bool::try_from(&unsafe { simple.GetPropertyValue(property_id)? })?,
+                    expected
+                );
+                let mut raw = ptr::dangling_mut::<c_void>();
+                unsafe {
+                    (simple.vtable().GetPatternProvider)(simple.as_raw(), pattern_id, &mut raw)
+                        .ok()?;
+                }
+                assert_eq!(!raw.is_null(), expected);
+                if expected {
+                    let pattern = unsafe { IUnknown::from_raw(raw) };
+                    assert_eq!(pattern.cast::<IUnknown>()?, identity);
+                    assert_eq!(pattern.cast::<IRawElementProviderSimple>()?, simple);
+                }
+                raw = ptr::dangling_mut::<c_void>();
+                let hr = unsafe {
+                    (simple.vtable().base__.QueryInterface)(simple.as_raw(), &iid, &mut raw)
+                };
+                if expected {
+                    hr.ok()?;
+                    let queried = unsafe { IUnknown::from_raw(raw) };
+                    assert_eq!(queried.cast::<IUnknown>()?, identity);
+                } else {
+                    assert_eq!(hr, E_NOINTERFACE);
+                    assert!(raw.is_null());
+                }
+            }
+        }
+        for (slot, offset) in OFFSETS.into_iter().enumerate() {
+            assert_eq!(offset, slot * std::mem::size_of::<usize>());
+        }
+        drop(owner);
+        assert!(weak.upgrade().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn raw_selection_and_expansion_only_invoke_when_the_requested_state_differs() -> Result<()> {
+        let posts = PostCapture::new();
+        let owner = create_root_provider(1)?;
+        owner.publish(pattern_scene(), 1)?;
+        let tab = com_pattern::<ISelectionItemProvider>(
+            &com_element(&owner, 2)?,
+            UIA_SelectionItemPatternId,
+        )?;
+        let other_tab = com_pattern::<ISelectionItemProvider>(
+            &com_element(&owner, 3)?,
+            UIA_SelectionItemPatternId,
+        )?;
+        let row_simple = com_element(&owner, 4)?;
+        let row = com_pattern::<ISelectionItemProvider>(&row_simple, UIA_SelectionItemPatternId)?;
+        let row_expansion =
+            com_pattern::<IExpandCollapseProvider>(&row_simple, UIA_ExpandCollapsePatternId)?;
+        let other_simple = com_element(&owner, 5)?;
+        let other =
+            com_pattern::<ISelectionItemProvider>(&other_simple, UIA_SelectionItemPatternId)?;
+        let other_expansion =
+            com_pattern::<IExpandCollapseProvider>(&other_simple, UIA_ExpandCollapsePatternId)?;
+        unsafe {
+            assert!(tab.IsSelected()?.as_bool());
+            tab.Select()?;
+            tab.AddToSelection()?;
+            assert_eq!(
+                tab.RemoveFromSelection().err().map(|e| e.code()),
+                Some(uia_error(UIA_E_INVALIDOPERATION).code())
+            );
+            other_tab.RemoveFromSelection()?;
+            assert_eq!(
+                other_tab.AddToSelection().err().map(|e| e.code()),
+                Some(uia_error(UIA_E_INVALIDOPERATION).code())
+            );
+            row.Select()?; // Existing selected detail must stay open.
+            row.AddToSelection()?;
+            row_expansion.Expand()?;
+            other.RemoveFromSelection()?;
+            other_expansion.Collapse()?;
+            assert!(posts.messages().is_empty());
+            assert_eq!(
+                tab.SelectionContainer()?.cast::<IUnknown>()?,
+                owner.simple().cast::<IUnknown>()?
+            );
+            assert_eq!(
+                BSTR::try_from(
+                    &row.SelectionContainer()?
+                        .GetPropertyValue(UIA_AutomationIdPropertyId)?
+                )?
+                .to_string(),
+                "quota-baton.element.10"
+            );
+            other_tab.Select()?;
+            row_expansion.Collapse()?;
+            row.RemoveFromSelection()?;
+            other.Select()?;
+            other_expansion.Expand()?;
+            assert!(!other.IsSelected()?.as_bool()); // No speculative cache mutation.
+            assert_eq!(
+                other_expansion.ExpandCollapseState()?,
+                ExpandCollapseState_Collapsed
+            );
+            assert_eq!(
+                other.AddToSelection().err().map(|e| e.code()),
+                Some(uia_error(UIA_E_INVALIDOPERATION).code())
+            );
+        }
+        assert_eq!(
+            posts.messages(),
+            [
+                (1, WM_UIA_INVOKE, 5, 1),
+                (1, WM_UIA_INVOKE, 6, 1),
+                (1, WM_UIA_INVOKE, 6, 1),
+                (1, WM_UIA_INVOKE, 7, 1),
+                (1, WM_UIA_INVOKE, 7, 1),
+            ]
+        );
+        let mut next = pattern_scene();
+        for element in &mut next.elements {
+            element.selected = element.selected.map(|_| false);
+        }
+        owner.publish(next, 2)?;
+        let tab = com_pattern::<ISelectionItemProvider>(
+            &com_element(&owner, 3)?,
+            UIA_SelectionItemPatternId,
+        )?;
+        let row = com_pattern::<ISelectionItemProvider>(
+            &com_element(&owner, 5)?,
+            UIA_SelectionItemPatternId,
+        )?;
+        unsafe {
+            tab.AddToSelection()?;
+            row.AddToSelection()?;
+        }
+        assert_eq!(
+            &posts.messages()[5..],
+            [(1, WM_UIA_INVOKE, 5, 2), (1, WM_UIA_INVOKE, 7, 2)]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn raw_toggle_and_value_patterns_expose_cached_state_and_read_only_semantic_values()
+    -> Result<()> {
+        let posts = PostCapture::new();
+        let owner = create_root_provider(1)?;
+        owner.publish(pattern_scene(), 9)?;
+        for (id, expected, action) in [(6, ToggleState_On, 8), (13, ToggleState_Off, 9)] {
+            let simple = com_element(&owner, id)?;
+            let toggle = com_pattern::<IToggleProvider>(&simple, UIA_TogglePatternId)?;
+            unsafe {
+                assert_eq!(toggle.ToggleState()?, expected);
+                assert_eq!(
+                    i32::try_from(&simple.GetPropertyValue(UIA_ToggleToggleStatePropertyId)?)?,
+                    expected.0
+                );
+                toggle.Toggle()?;
+            }
+            assert_eq!(
+                posts.messages().last(),
+                Some(&(1, WM_UIA_INVOKE, action, 9))
+            );
+        }
+        for (id, expected, read_only) in [
+            (7, "한글 검색", false),
+            (8, "52 %", true),
+            (9, "cell", true),
+            (11, "row", true),
+            (12, "", false),
+        ] {
+            let simple = com_element(&owner, id)?;
+            let value = com_pattern::<IValueProvider>(&simple, UIA_ValuePatternId)?;
+            unsafe {
+                assert_eq!(value.Value()?.to_string(), expected);
+                assert_eq!(value.IsReadOnly()?.as_bool(), read_only);
+                assert_eq!(
+                    BSTR::try_from(&simple.GetPropertyValue(UIA_ValueValuePropertyId)?)?
+                        .to_string(),
+                    expected
+                );
+                assert_eq!(
+                    bool::try_from(&simple.GetPropertyValue(UIA_ValueIsReadOnlyPropertyId)?)?,
+                    read_only
+                );
+                assert_eq!(
+                    (value.vtable().Value)(value.as_raw(), ptr::null_mut()),
+                    E_POINTER
+                );
+                assert_eq!(
+                    (value.vtable().IsReadOnly)(value.as_raw(), ptr::null_mut()),
+                    E_POINTER
+                );
+                if read_only {
+                    assert_eq!(
+                        value.SetValue(PCWSTR::null()).err().map(|e| e.code()),
+                        Some(uia_error(UIA_E_INVALIDOPERATION).code())
+                    );
+                }
+            }
+        }
+        let row = com_pattern::<ISelectionItemProvider>(
+            &com_element(&owner, 11)?,
+            UIA_SelectionItemPatternId,
+        )?;
+        let expansion = com_pattern::<IExpandCollapseProvider>(
+            &com_element(&owner, 14)?,
+            UIA_ExpandCollapsePatternId,
+        )?;
+        unsafe {
+            assert_eq!(
+                row.Select().err().map(|e| e.code()),
+                Some(uia_error(UIA_E_NOTSUPPORTED).code())
+            );
+            assert_eq!(
+                expansion.Expand().err().map(|e| e.code()),
+                Some(uia_error(UIA_E_NOTSUPPORTED).code())
+            );
+            expansion.Collapse()?;
+        }
+        assert_eq!(posts.messages().len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn raw_value_requests_are_bounded_owner_scoped_and_consumed_exactly_once() -> Result<()> {
+        let posts = PostCapture::new();
+        let owner = create_root_provider(1)?;
+        let other_owner = create_root_provider(1)?;
+        owner.publish(pattern_scene(), 41)?;
+        other_owner.publish(pattern_scene(), 41)?; // Same synthetic HWND/epoch.
+        let value = com_pattern::<IValueProvider>(&com_element(&owner, 7)?, UIA_ValuePatternId)?;
+        let requested: Vec<_> = (0..MAX_VALUE_REQUESTS)
+            .map(|index| format!("검색 🦀 {index}"))
+            .collect();
+        for text in &requested {
+            let text = wide(text);
+            unsafe {
+                (value.vtable().SetValue)(value.as_raw(), PCWSTR(text.as_ptr())).ok()?;
+            }
+        }
+        let overflow = wide("overflow");
+        assert_eq!(
+            unsafe { value.SetValue(PCWSTR(overflow.as_ptr())) }
+                .err()
+                .map(|e| e.code()),
+            Some(uia_error(UIA_E_INVALIDOPERATION).code())
+        );
+        let messages = posts.messages();
+        assert_eq!(messages.len(), MAX_VALUE_REQUESTS);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|(_, _, token, _)| *token)
+                .collect::<HashSet<_>>()
+                .len(),
+            MAX_VALUE_REQUESTS
+        );
+        assert_eq!(unsafe { value.Value()? }.to_string(), "한글 검색");
+        assert!(owner.take_value_request(WPARAM(0), LPARAM(41))?.is_none());
+        assert!(
+            owner
+                .take_value_request(WPARAM(messages[0].2), LPARAM(40))?
+                .is_none()
+        );
+        assert!(
+            owner
+                .take_value_request(WPARAM(usize::MAX), LPARAM(41))?
+                .is_none()
+        );
+        for ((hwnd, message, token, epoch), expected) in messages.into_iter().zip(requested) {
+            assert_eq!((hwnd, message, epoch), (1, WM_UIA_VALUE, 41));
+            assert!(
+                other_owner
+                    .take_value_request(WPARAM(token), LPARAM(epoch))?
+                    .is_none()
+            );
+            assert_eq!(
+                owner.take_value_request(WPARAM(token), LPARAM(epoch))?,
+                Some((7, 41, expected))
+            );
+            assert!(
+                owner
+                    .take_value_request(WPARAM(token), LPARAM(epoch))?
+                    .is_none()
+            );
+        }
+        let empty = [0u16];
+        unsafe {
+            value.SetValue(PCWSTR(empty.as_ptr()))?;
+        }
+        let (_, _, token, epoch) = *posts.messages().last().unwrap();
+        assert_eq!(
+            owner.take_value_request(WPARAM(token), LPARAM(epoch))?,
+            Some((7, 41, String::new()))
+        );
+        assert!(owner.root.read()?.value_requests.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn raw_value_input_scan_unicode_limit_and_failed_enqueue_are_bounded() -> Result<()> {
+        let posts = PostCapture::new();
+        let owner = create_root_provider(1)?;
+        owner.publish(pattern_scene(), 1)?;
+        let value = com_pattern::<IValueProvider>(&com_element(&owner, 7)?, UIA_ValuePatternId)?;
+        for text in ["가".repeat(MAX_VALUE_CHARS), "🦀".repeat(MAX_VALUE_CHARS)] {
+            let input = wide(&text);
+            unsafe {
+                value.SetValue(PCWSTR(input.as_ptr()))?;
+            }
+            let (_, _, token, epoch) = *posts.messages().last().unwrap();
+            assert_eq!(
+                owner.take_value_request(WPARAM(token), LPARAM(epoch))?,
+                Some((7, 1, text))
+            );
+        }
+        for input in [
+            wide(&"a".repeat(MAX_VALUE_CHARS + 1)),
+            wide(&"🦀".repeat(MAX_VALUE_CHARS + 1)),
+            wide("line\nbreak"),
+            vec![0xd800, 0],                   // Unpaired high surrogate.
+            vec![0xdc00, 0],                   // Unpaired low surrogate.
+            vec![65; MAX_VALUE_CHARS * 2 + 1], // No NUL within the bounded scan.
+        ] {
+            assert_eq!(
+                unsafe { value.SetValue(PCWSTR(input.as_ptr())) }
+                    .err()
+                    .map(|e| e.code()),
+                Some(E_INVALIDARG)
+            );
+        }
+        assert_eq!(
+            unsafe { value.SetValue(PCWSTR::null()) }
+                .err()
+                .map(|e| e.code()),
+            Some(E_POINTER)
+        );
+        assert_eq!(posts.messages().len(), 2);
+        assert!(owner.root.read()?.value_requests.is_empty());
+        posts.fail_next(E_OUTOFMEMORY);
+        let input = wide("admission failure");
+        assert_eq!(
+            unsafe { value.SetValue(PCWSTR(input.as_ptr())) }
+                .err()
+                .map(|e| e.code()),
+            Some(E_OUTOFMEMORY)
+        );
+        assert!(owner.root.read()?.value_requests.is_empty());
+        let (_, _, token, epoch) = *posts.messages().last().unwrap();
+        assert!(
+            owner
+                .take_value_request(WPARAM(token), LPARAM(epoch))?
+                .is_none()
+        );
+        unsafe {
+            value.SetValue(PCWSTR(input.as_ptr()))?;
+        }
+        let (_, _, token, epoch) = *posts.messages().last().unwrap();
+        assert_eq!(
+            owner.take_value_request(WPARAM(token), LPARAM(epoch))?,
+            Some((7, 1, "admission failure".into()))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn raw_patterns_keep_timeout_epoch_enabled_and_terminal_lifetime_guards() -> Result<()> {
+        let posts = PostCapture::new();
+        let owner = create_root_provider(1)?;
+        owner.publish(pattern_scene(), 1)?;
+        let row_simple = com_element(&owner, 4)?;
+        let row = com_pattern::<ISelectionItemProvider>(&row_simple, UIA_SelectionItemPatternId)?;
+        let expansion =
+            com_pattern::<IExpandCollapseProvider>(&row_simple, UIA_ExpandCollapsePatternId)?;
+        let toggle = com_pattern::<IToggleProvider>(&com_element(&owner, 6)?, UIA_TogglePatternId)?;
+        let edit_simple = com_element(&owner, 7)?;
+        let value = com_pattern::<IValueProvider>(&edit_simple, UIA_ValuePatternId)?;
+        for expected in [uia_error(UIA_E_TIMEOUT).code(), unavailable().code()] {
+            let guard = if expected == uia_error(UIA_E_TIMEOUT).code() {
+                Some(owner.root.cache.lock().map_err(|_| unavailable())?)
+            } else {
+                owner.publish(pattern_scene(), 2)?;
+                None
+            };
+            let mut selected = BOOL(1);
+            let mut expanded = ExpandCollapseState_Expanded;
+            let mut toggled = ToggleState_On;
+            let mut read_only = BOOL(1);
+            let mut raw = ptr::dangling_mut::<c_void>();
+            unsafe {
+                assert_eq!(
+                    (row.vtable().IsSelected)(row.as_raw(), &mut selected),
+                    expected
+                );
+                assert!(!selected.as_bool());
+                assert_eq!(
+                    (row.vtable().IsSelected)(row.as_raw(), ptr::null_mut()),
+                    E_POINTER
+                );
+                assert_eq!(
+                    (row.vtable().SelectionContainer)(row.as_raw(), &mut raw),
+                    expected
+                );
+                assert!(raw.is_null());
+                assert_eq!(
+                    (row.vtable().SelectionContainer)(row.as_raw(), ptr::null_mut()),
+                    E_POINTER
+                );
+                assert_eq!(
+                    (expansion.vtable().ExpandCollapseState)(expansion.as_raw(), &mut expanded),
+                    expected
+                );
+                assert_eq!(expanded, ExpandCollapseState_Collapsed);
+                assert_eq!(
+                    (expansion.vtable().ExpandCollapseState)(expansion.as_raw(), ptr::null_mut()),
+                    E_POINTER
+                );
+                assert_eq!(
+                    (toggle.vtable().ToggleState)(toggle.as_raw(), &mut toggled),
+                    expected
+                );
+                assert_eq!(toggled, ToggleState_Off);
+                assert_eq!(
+                    (toggle.vtable().ToggleState)(toggle.as_raw(), ptr::null_mut()),
+                    E_POINTER
+                );
+                raw = ptr::dangling_mut::<c_void>();
+                assert_eq!((value.vtable().Value)(value.as_raw(), &mut raw), expected);
+                assert!(raw.is_null());
+                assert_eq!(
+                    (value.vtable().IsReadOnly)(value.as_raw(), &mut read_only),
+                    expected
+                );
+                assert!(!read_only.as_bool());
+                assert_eq!(row.Select().err().map(|e| e.code()), Some(expected));
+                assert_eq!(row.AddToSelection().err().map(|e| e.code()), Some(expected));
+                assert_eq!(
+                    row.RemoveFromSelection().err().map(|e| e.code()),
+                    Some(expected)
+                );
+                assert_eq!(expansion.Expand().err().map(|e| e.code()), Some(expected));
+                assert_eq!(expansion.Collapse().err().map(|e| e.code()), Some(expected));
+                assert_eq!(toggle.Toggle().err().map(|e| e.code()), Some(expected));
+                assert_eq!(
+                    value.SetValue(PCWSTR::null()).err().map(|e| e.code()),
+                    Some(expected)
+                );
+                raw = ptr::dangling_mut::<c_void>();
+                assert_eq!(
+                    (edit_simple.vtable().GetPatternProvider)(
+                        edit_simple.as_raw(),
+                        UIA_ValuePatternId,
+                        &mut raw
+                    ),
+                    expected
+                );
+                assert!(raw.is_null());
+            }
+            drop(guard);
+        }
+        // QI's fixed interface set and IUnknown identity survive epoch expiry.
+        assert_eq!(value.cast::<IRawElementProviderSimple>()?, edit_simple);
+        assert_eq!(row.cast::<IRawElementProviderSimple>()?, row_simple);
+        let mut disabled = pattern_scene();
+        for element in &mut disabled.elements {
+            element.enabled = false;
+        }
+        owner.publish(disabled, 3)?;
+        let row = com_pattern::<ISelectionItemProvider>(
+            &com_element(&owner, 4)?,
+            UIA_SelectionItemPatternId,
+        )?;
+        let expansion = com_pattern::<IExpandCollapseProvider>(
+            &com_element(&owner, 4)?,
+            UIA_ExpandCollapsePatternId,
+        )?;
+        let toggle = com_pattern::<IToggleProvider>(&com_element(&owner, 6)?, UIA_TogglePatternId)?;
+        let value = com_pattern::<IValueProvider>(&com_element(&owner, 7)?, UIA_ValuePatternId)?;
+        let disabled = Some(uia_error(UIA_E_ELEMENTNOTENABLED).code());
+        unsafe {
+            assert!(row.IsSelected()?.as_bool());
+            assert_eq!(
+                expansion.ExpandCollapseState()?,
+                ExpandCollapseState_Expanded
+            );
+            assert_eq!(toggle.ToggleState()?, ToggleState_On);
+            assert_eq!(value.Value()?.to_string(), "한글 검색");
+            assert!(!value.IsReadOnly()?.as_bool());
+            assert_eq!(row.Select().err().map(|e| e.code()), disabled);
+            assert_eq!(row.AddToSelection().err().map(|e| e.code()), disabled);
+            assert_eq!(row.RemoveFromSelection().err().map(|e| e.code()), disabled);
+            assert_eq!(expansion.Expand().err().map(|e| e.code()), disabled);
+            assert_eq!(expansion.Collapse().err().map(|e| e.code()), disabled);
+            assert_eq!(toggle.Toggle().err().map(|e| e.code()), disabled);
+            assert_eq!(
+                value.SetValue(PCWSTR::null()).err().map(|e| e.code()),
+                disabled
+            );
+        }
+        owner.deactivate();
+        unsafe {
+            assert_eq!(
+                row.Select().err().map(|e| e.code()),
+                Some(unavailable().code())
+            );
+            assert_eq!(
+                expansion.Collapse().err().map(|e| e.code()),
+                Some(unavailable().code())
+            );
+            assert_eq!(
+                toggle.Toggle().err().map(|e| e.code()),
+                Some(unavailable().code())
+            );
+            assert_eq!(
+                value.SetValue(PCWSTR::null()).err().map(|e| e.code()),
+                Some(unavailable().code())
+            );
+        }
+        assert!(posts.messages().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn raw_value_requests_are_discarded_by_publication_deactivation_and_owner_drop() -> Result<()> {
+        let posts = PostCapture::new();
+        let owner = create_root_provider(1)?;
+        owner.publish(pattern_scene(), 1)?;
+        let input = wide("pending search");
+        let value = com_pattern::<IValueProvider>(&com_element(&owner, 7)?, UIA_ValuePatternId)?;
+        unsafe {
+            value.SetValue(PCWSTR(input.as_ptr()))?;
+        }
+        assert_eq!(owner.root.read()?.value_requests.len(), 1);
+        let (_, _, old_token, old_epoch) = posts.messages()[0];
+        assert!(owner.publish(pattern_scene(), 1).is_err());
+        assert_eq!(owner.root.read()?.value_requests.len(), 1);
+        owner.publish(pattern_scene(), 2)?;
+        assert!(owner.root.read()?.value_requests.is_empty());
+        assert!(
+            owner
+                .take_value_request(WPARAM(old_token), LPARAM(old_epoch))?
+                .is_none()
+        );
+        let value = com_pattern::<IValueProvider>(&com_element(&owner, 7)?, UIA_ValuePatternId)?;
+        unsafe {
+            value.SetValue(PCWSTR(input.as_ptr()))?;
+        }
+        let (_, _, token, epoch) = posts.messages()[1];
+        assert_ne!(token, old_token);
+        let cache = owner.root.cache.clone();
+        owner.deactivate();
+        {
+            let cache = cache.lock().map_err(|_| unavailable())?;
+            assert!(cache.value_requests.is_empty());
+            assert_eq!(cache.value_requests.capacity(), 0);
+        }
+        assert_eq!(
+            owner
+                .take_value_request(WPARAM(token), LPARAM(epoch))
+                .err()
+                .map(|e| e.code()),
+            Some(unavailable().code())
+        );
+        let replacement = create_root_provider(1)?;
+        replacement.publish(pattern_scene(), 2)?;
+        assert!(
+            replacement
+                .take_value_request(WPARAM(token), LPARAM(epoch))?
+                .is_none()
+        );
+        let value =
+            com_pattern::<IValueProvider>(&com_element(&replacement, 7)?, UIA_ValuePatternId)?;
+        unsafe {
+            value.SetValue(PCWSTR(input.as_ptr()))?;
+        }
+        let (_, _, replacement_token, _) = posts.messages()[2];
+        assert_ne!(replacement_token, token);
+        assert!(
+            replacement
+                .take_value_request(WPARAM(token), LPARAM(epoch))?
+                .is_none()
+        );
+        let cache = replacement.root.cache.clone();
+        drop(replacement);
+        assert!(
+            cache
+                .lock()
+                .map_err(|_| unavailable())?
+                .value_requests
+                .is_empty()
+        );
+        assert_eq!(
+            unsafe { value.Value() }.err().map(|e| e.code()),
+            Some(unavailable().code())
+        );
+        Ok(())
+    }
 
     fn scene() -> Snapshot {
         Snapshot {

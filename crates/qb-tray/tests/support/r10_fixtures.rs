@@ -342,14 +342,7 @@ fn activity() -> Vec<ActivityEvent> {
         ("05:15", "quota_reached", "codex", "cx-mero", "5h", None),
         ("04:52", "quota_reached", "codex", "cx-mero", "5h", None),
         ("04:44", "quota_reached", "codex", "cx-mero", "5h", None),
-        (
-            "04:44",
-            "overload_detected",
-            "claude",
-            "cl-mero",
-            "",
-            Some(2),
-        ),
+        ("04:44", "move", "claude", "cl-mero", "", Some(2)),
         (
             "03:42",
             "quota_reached",
@@ -371,11 +364,17 @@ fn activity() -> Vec<ActivityEvent> {
                 kind: kind.into(),
                 provider: provider.into(),
                 account: Some(account.into()),
-                account_to: (account == "cl-winapi").then_some("cl-mero".into()),
+                account_to: if account == "cl-winapi" {
+                    Some("cl-mero".into())
+                } else if kind == "move" {
+                    Some("cl-hello".into())
+                } else {
+                    None
+                },
                 notable: true,
                 data: ActivityData {
                     window: (!win.is_empty()).then_some(win.into()),
-                    moved_groups: moved,
+                    moved_groups: moved.or_else(|| (kind == "quota_reached").then_some(0)),
                     reset_at: if win == "5h" {
                         Some(today("07:29"))
                     } else if win == "7d" {
@@ -461,7 +460,20 @@ pub fn snapshot(state: u8) -> DashboardSnapshot {
         s.sessions.sessions.push(blog);
     }
     if matches!(state, 8 | 11) {
-        s.sessions.sessions.clear();
+        let mut sample = s.sessions.sessions[0].clone();
+        sample.id = "800000000001".into();
+        sample.provider = "codex".into();
+        sample.account = "cx-use".into();
+        sample.client.kind = "codex_cli".into();
+        sample.label = Some(Label {
+            text: "상태 확인".into(),
+            source: "codex_workspace".into(),
+        });
+        sample.model = Some("gpt-6.1-sol".into());
+        sample.inflight = Default::default();
+        sample.inflight.requests = Some(0);
+        sample.last_used_at = Some(clock().utc());
+        s.sessions.sessions = vec![sample];
         s.activity.clear();
     }
     for a in &s.accounts.raw.accounts {

@@ -2346,10 +2346,11 @@ fn publish_accessibility(hwnd: HWND, frame: &mut PaintedFrame) {
         let enabled = h.enabled
             && (!matches!(h.target, HitTarget::LoginCopy)
                 || login_copy_ready(frame.state.as_deref()));
-        let checkbox = frame.scene.popup.as_ref().is_some_and(|p| {
+        let checked = frame.scene.popup.as_ref().and_then(|p| {
             p.items
                 .iter()
-                .any(|i| i.target == h.target && i.checked.is_some())
+                .find(|i| i.target == h.target)
+                .and_then(|i| i.checked)
         });
         elements.push(Element {
             parent: None,
@@ -2357,7 +2358,7 @@ fn publish_accessibility(hwnd: HWND, frame: &mut PaintedFrame) {
             name: element_name(frame, &h.target),
             kind: if matches!(h.target, HitTarget::Row(_)) {
                 Kind::Row
-            } else if checkbox {
+            } else if checked.is_some() {
                 Kind::Checkbox
             } else {
                 Kind::Button
@@ -2368,7 +2369,7 @@ fn publish_accessibility(hwnd: HWND, frame: &mut PaintedFrame) {
             focusable: enabled,
             focused: enabled && focus.as_ref() == Some(&h.target),
             value: None,
-            selected: None,
+            selected: checked,
             expanded: None,
         });
     }

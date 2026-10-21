@@ -121,6 +121,31 @@ pub fn text_input_allowed(
     connected && state.popup.is_none() && editing
 }
 
+pub fn set_search_value(
+    state: &mut qb_tray::state::DashboardState,
+    target: &qb_tray::geometry::Target,
+    value: String,
+    connected: bool,
+) -> bool {
+    use qb_tray::geometry::Target;
+    if !connected || state.popup.is_some() {
+        return false;
+    }
+    match target {
+        Target::Search if state.search != value => {
+            state.search = value;
+            state.table_offset = 0.;
+            state.table_freeze.frozen = false;
+        }
+        Target::EventSearch if state.event_search != value => {
+            state.event_search = value;
+            state.events_offset = 0.;
+        }
+        _ => return false,
+    }
+    true
+}
+
 /// Enter opens a session; pointer activation continues to use state.activate's toggle.
 pub fn open_session(
     state: &mut qb_tray::state::DashboardState,
