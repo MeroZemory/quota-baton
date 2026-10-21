@@ -564,4 +564,149 @@ mod r11_review {
             Some(persisted.account.as_str())
         );
     }
+
+    // Observe real authenticated admin responses; do not inject dashboard events.
+    async fn model_choice_dashboard_get(h: &Harness, path: &str) -> Value {
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap()
+            .get(format!("http://{}/admin/v1/{path}", h.servers.admin_addr))
+            .bearer_auth("synthetic-admin")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "dashboard {path}");
+        response.json().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn r11_http_entry_model_choice_placement_and_move_surface_in_dashboard() {
+        let h = Harness::new(Provider::Codex, 2, 64, 1024).await;
+        let ids = r11_http_warm_distinct(&h, &[&["common", "a-only"], &["common", "b-only"]]).await;
+        // Avoid warmup placements consuming the weak/unobserved-account gate.
+        let headers = tray2_headers(0, (Utc::now() + ChronoDuration::days(7)).timestamp());
+        for id in &ids {
+            h.state
+                .accounts
+                .observe_headers(id, Provider::Codex, &headers)
+                .await;
+        }
+        let resume = "r11-model-choice-panel";
+        let id = qb_core::dashboard::SessionId::from_key(&format!("codex:{resume}"));
+        let path = format!("sessions/{}", id.as_str());
+        let before_calls = h.fake.state.requests().len();
+        let (status, initial) = issue_http(
+            &h,
+            json!({
+                "model":"a-only", "model_is_explicit":true,
+                "account_pref":ids[0], "resume_id":resume,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{initial}");
+        assert_eq!(initial["account"], ids[0]);
+        assert_eq!(h.fake.state.requests().len(), before_calls);
+
+        // This public-JSON assertion fails on the unfixed product before any
+        // inference can create a generic placement and mask the issuance gap.
+        let placed = model_choice_dashboard_get(&h, &path).await;
+        assert_eq!(placed["timeline"].as_array().unwrap().len(), 1);
+        let first = &placed["timeline"][0];
+        assert_eq!(first["kind"], "placed");
+        assert_eq!(first["reason"], "launch_model");
+        assert_eq!(first["account"], ids[0]);
+        assert!(first["from"].is_null());
+        assert!(first["next_turn_cache"].is_null());
+        assert_eq!(placed["account"], ids[0]);
+        assert_eq!(placed["first_account_today"], ids[0]);
+        assert!(placed["moves_today"].as_array().unwrap().is_empty());
+        let activity_before = model_choice_dashboard_get(&h, "activity").await;
+        assert!(
+            !activity_before["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["data"]["session"] == id.as_str())
+        );
+
+        let request = json!({"model":"b-only", "model_is_explicit":true, "resume_id":resume});
+        let (status, refused) = issue_http(&h, request.clone()).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(refused["error"]["code"], "model_move_consent_required");
+        let unchanged = model_choice_dashboard_get(&h, &path).await;
+        for field in ["timeline", "moves_today", "account", "first_account_today"] {
+            assert_eq!(unchanged[field], placed[field], "refusal changed {field}");
+        }
+        assert_eq!(
+            model_choice_dashboard_get(&h, "activity").await,
+            activity_before
+        );
+        assert_eq!(h.fake.state.requests().len(), before_calls);
+
+        // A first request reporting a cache hit must not label initial placement
+        // as an after-move cache result. Send and fully drain the actual HTTP body.
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let body = r#"{ "model":"a-only", "input":[] }"#;
+        h.fake.state.push(ScriptedResponse::json(
+            StatusCode::OK,
+            r#"{"usage":{"input_tokens":10,"input_tokens_details":{"cached_tokens":5}}}"#,
+        ));
+        let response = client
+            .post(format!(
+                "{}/responses",
+                initial["base_url"].as_str().unwrap()
+            ))
+            .bearer_auth("synthetic-client")
+            .header("session-id", resume)
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response.bytes().await.unwrap();
+        let observed = model_choice_dashboard_get(&h, &path).await;
+        assert_eq!(observed["timeline"], placed["timeline"]);
+        assert!(observed["moves_today"].as_array().unwrap().is_empty());
+
+        let mut consented = request;
+        consented["move_for_model"] = json!(true);
+        let (status, moved) = issue_http(&h, consented).await;
+        assert_eq!(status, StatusCode::OK, "{moved}");
+        assert_eq!(moved["account"], ids[1]);
+        assert_eq!(h.fake.state.requests().len(), before_calls + 1);
+        let detail = model_choice_dashboard_get(&h, &path).await;
+        assert_eq!(detail["account"], ids[1]);
+        assert_eq!(detail["first_account_today"], ids[0]);
+        assert_eq!(detail["timeline"].as_array().unwrap().len(), 2);
+        assert_eq!(detail["timeline"][0], placed["timeline"][0]);
+        let mv = &detail["timeline"][1];
+        assert_eq!(mv["kind"], "move");
+        assert_eq!(mv["reason"], "model_choice");
+        assert_eq!(mv["from"], ids[0]);
+        assert_eq!(mv["account"], ids[1]);
+        assert_eq!(detail["moves_today"].as_array().unwrap().len(), 1);
+        assert_eq!(detail["moves_today"][0]["reason"], "model_choice");
+        let activity = model_choice_dashboard_get(&h, "activity").await;
+        let events: Vec<_> = activity["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["data"]["session"] == id.as_str())
+            .collect();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["kind"], "move");
+        assert_eq!(events[0]["data"]["reason"], "model_choice");
+        assert_eq!(events[0]["account"], ids[0]);
+        assert_eq!(events[0]["account_to"], ids[1]);
+        assert_eq!(events[0]["notable"], true);
+        let calls = h.fake.state.requests();
+        assert_eq!(calls.last().unwrap().body.as_ref(), body.as_bytes());
+        assert_eq!(calls.last().unwrap().path_and_query, "/responses");
+    }
 }

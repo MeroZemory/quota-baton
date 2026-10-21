@@ -415,7 +415,7 @@ impl Runtime {
                     .timeline
                     .iter()
                     .rev()
-                    .find(|entry| entry.reason != MoveReason::New)
+                    .find(|entry| !entry.reason.is_initial_placement())
                     .map(|entry| entry.at)
             });
             if key != group_root(key) {
@@ -454,6 +454,8 @@ impl Runtime {
         }
         let reason = match reason {
             "new" => MoveReason::New,
+            "launch_model" => MoveReason::LaunchModel,
+            "model_choice" => MoveReason::ModelChoice,
             "forced" => MoveReason::Forced,
             "cold_rebalance" => MoveReason::ColdRebalance,
             "reset_hold_timeout" => MoveReason::ResetHoldTimeout,
@@ -478,7 +480,7 @@ impl Runtime {
                 },
             );
         }
-        if reason != MoveReason::New {
+        if !reason.is_initial_placement() {
             self.activity(ActivityInput {
                 ts: now,
                 kind: ActivityKind::Move,

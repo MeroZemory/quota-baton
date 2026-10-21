@@ -228,10 +228,17 @@ pub enum RequestOutcome {
 #[serde(rename_all = "snake_case")]
 pub enum MoveReason {
     New,
+    LaunchModel,
+    ModelChoice,
     Forced,
     ColdRebalance,
     ResetHoldTimeout,
     Overload,
+}
+impl MoveReason {
+    fn is_initial_placement(self) -> bool {
+        matches!(self, Self::New | Self::LaunchModel)
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -881,7 +888,7 @@ impl Dashboard {
                 .get_or_insert_with(|| mv.from.clone().unwrap_or_else(|| mv.to.clone()));
             s.timeline.push_back(TimelineView {
                 at: mv.at,
-                kind: if mv.reason == MoveReason::New {
+                kind: if mv.reason.is_initial_placement() {
                     "placed"
                 } else {
                     "move"
@@ -908,7 +915,7 @@ impl Dashboard {
     ) {
         if let Some(s) = self.sessions.get_mut(id)
             && let Some(mv) = s.timeline.iter_mut().find(|m| {
-                m.at == moved_at && m.reason != MoveReason::New && m.next_turn_cache.is_none()
+                m.at == moved_at && !m.reason.is_initial_placement() && m.next_turn_cache.is_none()
             })
         {
             mv.next_turn_cache = Some(result);
@@ -957,7 +964,7 @@ impl Dashboard {
             moves_today: if current_day {
                 s.timeline
                     .iter()
-                    .filter(|m| m.reason != MoveReason::New)
+                    .filter(|m| !m.reason.is_initial_placement())
                     .map(|m| MoveView {
                         at: m.at,
                         from: m.from.clone(),
@@ -1379,6 +1386,58 @@ mod tests {
                 .timeline
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn model_launch_initial_placement_never_becomes_a_move_or_cache_result() {
+        for initial in [MoveReason::New, MoveReason::LaunchModel] {
+            let mut d = model();
+            let b = binding("codex:model-choice");
+            let id = b.id.clone();
+            d.sync_bindings(vec![b], now()).unwrap();
+            d.placed(
+                &id,
+                MoveView {
+                    at: now(),
+                    from: None,
+                    to: account(),
+                    reason: initial,
+                    next_turn_cache: None,
+                },
+            );
+            d.move_cache_result(&id, now(), CacheResult::Hit);
+            let detail = d.detail(&id, now()).unwrap();
+            assert_eq!(detail.timeline[0].kind, "placed");
+            assert_eq!(detail.timeline[0].next_turn_cache, None);
+            assert!(detail.session.moves_today.is_empty());
+            assert_eq!(detail.session.first_account_today, Some(account()));
+
+            let moved = now() + chrono::Duration::seconds(1);
+            d.placed(
+                &id,
+                MoveView {
+                    at: moved,
+                    from: Some(account()),
+                    to: "cx-111111".to_owned().try_into().unwrap(),
+                    reason: MoveReason::ModelChoice,
+                    next_turn_cache: None,
+                },
+            );
+            d.move_cache_result(&id, moved, CacheResult::Miss);
+            let detail = d.detail(&id, moved).unwrap();
+            assert_eq!(detail.timeline.len(), 2);
+            assert_eq!(detail.timeline[0].next_turn_cache, None);
+            assert_eq!(detail.timeline[1].kind, "move");
+            assert_eq!(detail.session.moves_today.len(), 1);
+            assert_eq!(
+                detail.session.moves_today[0].reason,
+                MoveReason::ModelChoice
+            );
+            assert_eq!(
+                detail.session.moves_today[0].next_turn_cache,
+                Some(CacheResult::Miss)
+            );
+        }
     }
 
     fn assert_global_retention(d: &Dashboard) {
