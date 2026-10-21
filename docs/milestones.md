@@ -7,9 +7,9 @@ This file names the verification for each unit and each row. The row list and th
 <!-- status:begin -->
 현재 마일스톤: R11 (실행별 계정·모델 목록 마무리)
 목표: 대시보드 수정을 전달하고 R11을 마무리한다
-핵심 지표: 새 경로 출시 1/2 · R11 HTTP19·WS10 통과, native 출시 검증·최종 관문 남음
+핵심 지표: 새 경로 출시 1/2 · R11 HTTP32·WS15 통과, native·최종 관문 남음
 사용자 대기: 없음 (R2 Part B만 사용자 결정 대기)
-갱신: 2026-10-22 05:08 KST (R11 실제 WS10/10, native 검증 준비)
+갱신: 2026-10-22 05:56 KST (R11 수정 단위 통과, 미출시)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -84,6 +84,10 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-22 04:53 | 1/2 | R12.10 성능 통과, 최종 실행 검사는 OS bind 재현으로 미완료; R11 독립 통합 진행 |
 | 2026-10-22 04:59 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R12.10 성능·scoped 관문 완료; 기능 출시 수 변화 없음 |
 | 2026-10-22 05:08 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R11 WS10/10 단위 완료; native·최종 관문 미완료 |
+| 2026-10-22 05:28 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R11 HTTP21/21·WS10/10 단위 통과; 독립 검수5건 수정 중, 미출시 |
+| 2026-10-22 05:38 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R11 추가 독립 검수 반영 중; 하네스 자체검사 14/14, 제품 실행 결과 아님 |
+| 2026-10-22 05:48 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R11 검수 보완 HTTP30 실행: 28통과·2 fixture 시각 비교 실패; 미출시 |
+| 2026-10-22 05:56 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R11 보완 HTTP32/32·실제 WS15/15 통과, native·최종 관문 미완료 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -142,12 +146,17 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-22 04:59 | R12.10 OS 복구 후 최종 scoped 관문 | HTTP6/6 한 번씩 재통과; fmt·clippy·build exit0 | 감독 판정에 따른 종결 | interrupted aggregate 및222 library pass 보존; 완전한 전체 합계 미주장 |
 | 2026-10-22 05:08 | R11 실제 WS 업그레이드 회귀 | 10통과 / 0실패 | 10/10 | HTTP 채택 redirect 수정; 다른 계정 cap을 만들던 fixture 전제 교정, 이전9/10 보존 |
 | 2026-10-22 05:12 | R11 qb-core strict all-targets testkit clippy | exit0 | 경고0 | 최초 통합 스타일5건·fixture 초기화1건 수정; 실패 기록과 최종 입력별 fingerprint 보존 |
+| 2026-10-22 05:28 | R11 재구성·동시 resume 포함 실제 HTTP 회귀 | 21통과 / 0실패 | 전 검사 통과 | eleventh-http-build, 이후 독립 검수 F1–F5는 별도 회귀·수정 중 |
+| 2026-10-22 05:28 | R11 최신 qb-core clippy·제품 testkit build | 각 exit0 | 경고0·빌드 통과 | 입력2f6e0a0b…; 후속 F1–F5 입력으로 최종 통과 주장 안 함 |
+| 2026-10-22 05:38 | R11 native 하네스 순수 자체검사 | 14/14 통과 | 14/14 | 실제 native·제품 실행 없이 오판 방지 규칙 재검증 |
+| 2026-10-22 05:48 | R11 검수 보완 HTTP 회귀 | 28/30 통과 | 30/30 | 고정 입력7efebecd; 실패2건은 launch_anchors.last_used 비교, 수정·재실행 예정 |
+| 2026-10-22 05:56 | R11 검수 보완 HTTP/실제 WS 회귀 | 32/32 · 15/15 통과 | 모두 통과 | 고정 입력dda712bf; F1–F5·추가 경합·재개 모델·동의·프로브·legacy 포함 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 행동 |
 |---|---|---|---|
-| R11 실행별 계정 | HTTP19·WS10 통과; native·최종 관문 남음 | 실제 A/B/A·동시·picker/daybreak와 관문 통과 | 독립 검수 뒤 합성 native 실행 |
+| R11 실행별 계정 | 보완 HTTP32/32·WS15/15 통과 | native·최종 관문 통과 | 독립 closeout, 수정 전 실패 확인, A/B/A·동시 실행과 전체 검사 |
 | 대시보드 지연 (R12.10) | 합성 실제 창 성능·최종 scoped gate 통과 | 실제 설치 확인 | 설계 세션이 설치하고 사용자 환경 확인 |
-| R13 소진 예측·아이콘·차트·캐시 보류 | 설계 완료, 구현 0/5 부분 | 5/5 부분 병합과 설치 | R11과 R12.10 뒤 시작 |
+| R13 소진 예측·아이콘·차트·캐시 보류 | 설계 완료, 병합 0/3 단위 | 3/3 단위 병합과 설치 | R11 뒤 B+B2+D, A, C+E 순서 |
 <!-- gaps:end -->
