@@ -1722,7 +1722,7 @@ unsafe extern "system" fn wndproc(
             // client reads it. Complete the pending frame on the owning UI thread
             // before returning the provider; never dispatch against stale geometry.
             // No Host borrow spans synchronous WndProc re-entry.
-            if lparam.0 == windows::Win32::UI::Accessibility::UiaRootObjectId as isize
+            if lparam.0 as i32 == windows::Win32::UI::Accessibility::UiaRootObjectId
                 && current(hwnd).is_some_and(|h| {
                     let h = h.borrow();
                     !h.closing && !frame_valid(&h)
