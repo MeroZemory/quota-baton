@@ -8,6 +8,17 @@ use std::{
 };
 
 pub(crate) const KEY_ENV: &str = "QB_IMAGE_CLIENT_KEY";
+const EXISTING_SESSION: &str =
+    "기존 대화는 이미지 모드로 옮길 수 없습니다. 새 이미지 세션을 여세요";
+
+#[derive(Debug)]
+struct ExistingSessionRefusal;
+impl std::fmt::Display for ExistingSessionRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(EXISTING_SESSION)
+    }
+}
+impl std::error::Error for ExistingSessionRefusal {}
 
 /// Only a leading launcher flag is ours. A prompt, option operand, or text
 /// after the native literal boundary must never become a launcher option.
@@ -19,14 +30,41 @@ pub(crate) fn split(args: &[OsString]) -> (bool, &[OsString]) {
     }
 }
 
-/// Image mode exposes the local client key under a provider-specific variable.
-/// Do not allow a profile/config override to redirect that variable elsewhere.
+/// Qi admits new sessions only. Check before loading credentials, importing a
+/// thread, or running the canary. Native option operands and literal prompts
+/// are data, not commands. `exec` (alias `e`) has its own resume/fork commands.
+/// Provider overrides must not redirect the child-only local client key.
 pub(crate) fn validate_args(args: &[OsString]) -> Result<()> {
-    for arg in args {
+    let mut exec = false;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
         if arg == "--" {
             break;
         }
         let arg = arg.to_string_lossy();
+        let name = arg.split_once('=').map_or(arg.as_ref(), |(name, _)| name);
+        if matches!(
+            name,
+            "--last"
+                | "--resume"
+                | "--fork"
+                | "--resume-picker"
+                | "--fork-picker"
+                | "--resume-last"
+                | "--fork-last"
+                | "--resume-session-id"
+                | "--fork-session-id"
+                | "--remote"
+                | "--remote-auth-token-env"
+        ) || matches!(arg.as_ref(), "resume" | "fork")
+            || (!exec
+                && matches!(
+                    arg.as_ref(),
+                    "agents" | "daemon" | "app-server" | "app" | "remote-control" | "debug"
+                ))
+        {
+            return Err(anyhow::Error::new(ExistingSessionRefusal));
+        }
         ensure!(
             !(arg == "--config"
                 || arg.starts_with("--config=")
@@ -39,6 +77,34 @@ pub(crate) fn validate_args(args: &[OsString]) -> Result<()> {
                 || arg.starts_with("--local-provider=")),
             "이미지 실행에서는 제공자를 바꾸는 config/profile 옵션을 사용할 수 없습니다."
         );
+        if matches!(arg.as_ref(), "exec" | "e") {
+            exec = true;
+        }
+        // These native options take a separate operand unless supplied inline.
+        // Attached short values (-mMODEL, -iFILE, etc.) need no extra skip.
+        if matches!(
+            arg.as_ref(),
+            "--model"
+                | "-m"
+                | "--sandbox"
+                | "-s"
+                | "--cd"
+                | "-C"
+                | "--ask-for-approval"
+                | "-a"
+                | "--image"
+                | "-i"
+                | "--enable"
+                | "--disable"
+                | "--add-dir"
+                | "--output-last-message"
+                | "-o"
+                | "--output-schema"
+                | "--color"
+                | "--thread-source"
+        ) {
+            args.next();
+        }
     }
     Ok(())
 }
@@ -182,6 +248,9 @@ impl std::fmt::Display for ImageRefusal {
 }
 impl std::error::Error for ImageRefusal {}
 pub(crate) fn friendly_error(error: &anyhow::Error) -> Option<String> {
+    if error.downcast_ref::<ExistingSessionRefusal>().is_some() {
+        return Some(EXISTING_SESSION.to_owned());
+    }
     error
         .downcast_ref::<ImageRefusal>()
         .map(ToString::to_string)
@@ -210,6 +279,76 @@ mod tests {
         let (images, remaining) = split(&args);
         assert!(images);
         assert_eq!(remaining, &args[1..]);
+    }
+
+    #[test]
+    fn r12_existing_image_sessions_refuse_before_wiring_or_admission() {
+        // Deliberately nonexistent wiring/command: the new-session refusal
+        // must win without reading configuration or acquiring any home gate.
+        let image = ImageLaunch {
+            home: PathBuf::from("missing-image-home"),
+            ordinary_home: PathBuf::from("missing-ordinary-home"),
+            key: zeroize::Zeroizing::new(String::new()),
+        };
+        let command = Path::new("missing-codex");
+        for values in [
+            vec!["resume"],
+            vec!["resume", "11111111-1111-1111-1111-111111111111"],
+            vec!["resume", "thread-name"],
+            vec!["resume", "--last"],
+            vec!["resume", "--all"],
+            vec!["resume", "--", "thread-name"],
+            vec!["fork"],
+            vec!["fork", "--last"],
+            vec!["exec", "resume", "--last"],
+            vec!["e", "--model", "model", "resume", "thread-name"],
+            vec!["exec", "fork", "thread-name"],
+            vec!["--last"],
+            vec!["--resume-picker"],
+            vec!["--fork-picker"],
+            vec!["--cd", "project", "resume"],
+            vec!["daemon"],
+            vec!["app-server", "daemon", "start"],
+            vec!["agents"],
+            vec!["--remote=unix://codex.sock"],
+        ] {
+            let input = args(&values);
+            for error in [
+                validate_args(&input).unwrap_err(),
+                crate::sessions_admission::preflight_images(&input, command, &image).unwrap_err(),
+                crate::sessions_admission::prepare_images(&input, command, &image)
+                    .err()
+                    .expect("existing session admitted"),
+            ] {
+                assert_eq!(
+                    friendly_error(&error).as_deref(),
+                    Some("기존 대화는 이미지 모드로 옮길 수 없습니다. 새 이미지 세션을 여세요"),
+                    "{values:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn r12_new_image_prompts_operands_and_literal_boundary_are_preserved() {
+        for values in [
+            vec![],
+            vec!["draw an image"],
+            vec!["exec", "draw an image"],
+            vec!["e", "--full-auto", "draw an image"],
+            vec!["exec", "daemon"],
+            vec!["--model", "resume", "draw an image"],
+            vec!["--cd", "fork", "exec", "draw an image"],
+            vec!["-mresume", "exec", "-o", "app-server", "draw an image"],
+            vec!["--image", "resume", "--", "draw an image"],
+            vec!["--", "resume", "--last", "--config=literal"],
+            vec!["exec", "--", "resume", "fork", "--last"],
+        ] {
+            let input = args(&values);
+            let original = input.clone();
+            validate_args(&input).unwrap_or_else(|error| panic!("{values:?}: {error}"));
+            assert_eq!(input, original);
+        }
     }
 
     #[test]

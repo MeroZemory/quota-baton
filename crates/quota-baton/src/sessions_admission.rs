@@ -182,6 +182,7 @@ pub(crate) fn preflight_images(
     command: &Path,
     image: &crate::image_launch::ImageLaunch,
 ) -> Result<()> {
+    crate::image_launch::validate_args(args)?;
     let installed = wiring(&qb_core::home()?)?;
     launch_plan(args, command, &installed)?;
     if fs::canonicalize(&installed.home)? != fs::canonicalize(&image.ordinary_home)? {
@@ -196,8 +197,7 @@ pub(crate) fn prepare_images(
     image: &crate::image_launch::ImageLaunch,
 ) -> Result<(Guard, Vec<OsString>)> {
     preflight_images(args, command, image)?;
-    let id = crate::sessions::resume_uuid(args)?;
-    let permit = shared_for(&image.home, id.as_deref())?;
+    let permit = shared_for(&image.home, None)?;
     Ok((permit, managed_args(args)))
 }
 

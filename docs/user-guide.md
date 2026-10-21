@@ -286,13 +286,13 @@ quota-baton.exe unwire --apply
 
 ### Codex에서 이미지 만들기
 
-`codex-qb --images`는 이미지 전용 홈을 엽니다. 일반 `codex-qb` 홈과 대화 목록이 다릅니다. 처음에는 `wire` 업그레이드가 필요합니다. 기존 대화를 이어가려면 `codex-qb --images resume <대화 ID>`를 사용합니다. 이동 계획을 확인하고 `move`를 입력해야 옮깁니다. 기록은 복사하지 않습니다.
+`codex-qb --images`는 이미지 전용 홈에서 새 대화를 시작합니다. 일반 `codex-qb` 홈과 대화 목록이 다릅니다. 처음에는 `wire` 업그레이드가 필요합니다. 기존 대화를 이미지 모드로 옮기거나 재개하는 기능은 아직 지원하지 않습니다. 새 이미지 세션을 여세요.
 
 이미지는 사용 가능한 유료 Codex 계정으로 처리합니다. 이미지 한도를 다 쓰면 다른 이미지 계정을 한 번씩 시도합니다. 일반 대화의 계정 연결은 바꾸지 않습니다. 이미지 인증 오류가 나도 토큰을 폐기하거나 강제로 갱신하지 않습니다. Pro 계정은 기본적으로 마지막 후보입니다. `[accounts.<계정 ID>]`의 `images_last_resort = false`로 일반 후보로 바꾸거나 `true`로 다른 계정도 마지막 후보로 둘 수 있습니다.
 
 서버 이미지 ID로 편집할 때 제작 계정을 확인할 수 없으면 요청을 거절합니다. 로컬 이미지 파일로 편집할 수 있습니다.
 
-이미지 도구를 확인하지 못하면 실행을 중단하고 `codex-mz` 사용을 안내합니다. 일반 홈으로 돌아갈 때도 같은 대화를 지정해 이동합니다. 자세한 경계와 계정 선택은 [D23](decisions.md#d23-image-generation-through-qb-a-separate-image-home-qi-with-a-custom-provider-and-qb-relays-the-images-routes--accepted-user-direction-plus-panel-2026-10-21)을 확인하세요.
+이미지 도구를 확인하지 못하면 실행을 중단하고 `codex-mz` 사용을 안내합니다. 일반 대화는 `codex-qb`로 시작하세요. 자세한 경계와 계정 선택은 [D23](decisions.md#d23-image-generation-through-qb-a-separate-image-home-qi-with-a-custom-provider-and-qb-relays-the-images-routes--accepted-user-direction-plus-panel-2026-10-21)을 확인하세요.
 
 ### 기존 Codex 대화 가져오기
 

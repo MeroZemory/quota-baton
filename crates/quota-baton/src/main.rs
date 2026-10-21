@@ -411,7 +411,6 @@ async fn run() -> anyhow::Result<()> {
             sessions::admission_check(&home, id.as_deref())?;
             sessions_admission::preflight_images(native_args, command, &image)?;
             image_canary::check(command, &home).await?;
-            sessions::before_codex_resume_at(native_args, Some(&image.home))?;
             let (permit, child_args) =
                 sessions_admission::prepare_images(native_args, command, &image)?;
             sessions::admission_check(&home, id.as_deref())?;
