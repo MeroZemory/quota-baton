@@ -233,6 +233,7 @@ impl Run {
         // Synthetic input also runs when the owned window is occluded. Make
         // the previous production redraw complete before the next hit test.
         unsafe {
+            let _ = SetFocus(Some(hwnd));
             SendMessageW(hwnd, WM_PAINT, None, None);
         }
         let scene = self.scene();
