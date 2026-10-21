@@ -124,25 +124,43 @@ impl RelayState {
             info: fresh,
             model: managed.model.clone(),
         };
+        // Adoption can redirect the caller's provisional key during model I/O.
+        // Candidate lookup, policy selection and the committed lease must all
+        // use the same fresh canonical identity checked by admission below.
+        let canonical_session = session::Session {
+            key: Some(current.info.canonical_key.clone()),
+            parent: session.parent.clone(),
+            model: session.model.clone(),
+        };
         let expected = current.info.account.clone();
         let key = current.info.canonical_key.clone();
         let deadline = completion.precommit_deadline;
         let owner = Arc::new(());
         let weak_owner = Arc::downgrade(&owner);
         let relay = Arc::downgrade(self);
+        // The chooser holds mutations (but releases data) while calling this
+        // guard and through publication. A later adoption must reject this
+        // choice before reserving capacity or publishing policy/bindings.
         let admit = Arc::new(move |account: &str| {
             weak_owner.upgrade().is_some()
                 && deadline.is_none_or(|at| Instant::now() < at)
                 && relay.upgrade().is_some_and(|relay| {
                     !relay.is_draining()
-                        && relay.bindings.current(Some(&key)).as_deref() == Some(expected.as_str())
+                        && relay
+                            .bindings
+                            .launch_info(&key, chrono::Utc::now())
+                            .is_ok_and(|info| {
+                                info.managed
+                                    && info.canonical_key == key
+                                    && info.account == expected
+                            })
                 })
                 && admit.as_ref().is_none_or(|admit| admit(account))
         });
         let selected = self
             .select_request_configured(
                 provider,
-                session,
+                &canonical_session,
                 completion,
                 Some(&managed.model),
                 tried,

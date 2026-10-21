@@ -61,7 +61,7 @@ pub(super) fn request_model(headers: &HeaderMap, prefix: &[u8]) -> Result<String
         Err(_) => return Err(()),
     };
     model
-        .and_then(|model| crate::observability::safe_identifier(&model))
+        .filter(|model| crate::catalog::valid_model_id(model))
         .ok_or(())
 }
 
@@ -142,9 +142,10 @@ fn validate_issue_request(request: &LaunchRequest, port: u16) -> Result<(), Laun
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
     };
     if port == 0
-        || request.model.as_ref().is_some_and(|m| {
-            m.is_empty() || m.len() > 256 || m.chars().any(|c| c.is_control() || c.is_whitespace())
-        })
+        || request
+            .model
+            .as_ref()
+            .is_some_and(|m| !crate::catalog::valid_model_id(m))
         || (request.model_is_explicit && request.model.is_none())
         || request.resume_id.as_ref().is_some_and(|id| !identifier(id))
         || request.account_pref.as_ref().is_some_and(|name| {
@@ -1645,6 +1646,15 @@ impl RelayState {
         .await?
         .into_iter()
         .collect();
+        candidates = self
+            .candidates(
+                Provider::Codex,
+                resume_key.as_deref(),
+                request.model.as_deref(),
+                &BTreeSet::new(),
+            )
+            .await
+            .map_err(|_| LaunchError::Store)?;
         // Even a model-less selection must have a known catalog. Keep the bound
         // account for authoritative resume handling, never silently force it away.
         candidates.retain(|c| {
@@ -1661,73 +1671,112 @@ impl RelayState {
         }
         operation.check().map_err(|_| LaunchError::Unavailable)?;
         let task_operation = operation.clone();
+        let runtime = self.accounts.clone();
+        let store = self.store.clone();
+        let prior_model = prior.as_ref().and_then(|p| p.current_model.clone());
+        // Match placement: an implicit resume retains its proved current model.
+        let admission_model = if prior.is_some() && !request.model_is_explicit {
+            prior_model.or_else(|| request.model.clone())
+        } else {
+            request.model.clone().or(prior_model)
+        };
         let (reply, mut pending) =
             tokio::task::spawn_blocking(move || -> Result<_, LaunchError> {
-                let operation = task_operation;
-                operation.check().map_err(|_| LaunchError::Unavailable)?;
-                // Bound model/account changes while awaiting catalogs require a retry.
-                // Placement itself still re-resolves canonical identity under its gate.
-                let current = resume_key
-                    .as_deref()
-                    .and_then(|key| table.launch_info(key, chrono::Utc::now()).ok());
-                if current != prior {
-                    return Err(LaunchError::Unavailable);
-                }
-                operation.check().map_err(|_| LaunchError::Unavailable)?;
-                let anchor = issue_anchor()?;
-                // Allocate before durable policy/binding mutation. Empty means no
-                // menu advertised yet; /models owns acceptance and metadata recording.
-                let pending = PendingIssue::new(registry, &anchor)?;
-                let placement = table
-                    .place_launch_for_issue(
-                        crate::bindings::LaunchRequest {
-                            anchor_key: &anchor,
-                            resume_key: resume_key.as_deref(),
-                            model: request.model.as_deref(),
-                            model_is_explicit: request.model_is_explicit,
-                            account_pref: preference.as_deref(),
-                            allow_move_for_model: request.move_for_model,
-                        },
-                        &candidates,
-                        &entitlements,
-                        chrono::Utc::now(),
-                        Some(&operation),
-                        |policies, consent| {
-                            policies.authorize_model_move_for_issue(consent, Some(&operation))
-                        },
-                    )
-                    .map_err(issue_binding_error)?;
-                for event in &placement.moves {
-                    if event.is_placement {
-                        obs.record_placement(event);
-                    }
-                    obs.record_group_move(
-                        &event.key,
-                        event.from.as_deref(),
-                        &event.to,
-                        &event.reason,
-                        event.bytes,
-                        event.keys,
-                        event.debug_pin,
-                    );
-                    // Checkpoint ledger filters out model_choice/launch_model, but
-                    // this event and record_group_move's panel update preserve why.
-                    tracing::info!(account = %event.to, reason = %event.reason,
+                runtime
+                    .with_selection_admission_models(&table, Provider::Codex, |eligible| {
+                        let operation = task_operation;
+                        operation.check().map_err(|_| LaunchError::Unavailable)?;
+                        // Preserve the original's current denial for model/consent
+                        // classification. The transaction is already held; load()
+                        // would reacquire it. Final selected-account admission below
+                        // prevents this classification row authorizing dispatch.
+                        if let Some(info) = &prior {
+                            let candidate = candidates
+                                .iter_mut()
+                                .find(|candidate| candidate.account.id == info.account)
+                                .ok_or(LaunchError::Unavailable)?;
+                            candidate.account = store
+                                .read_account_unlocked(&info.account)
+                                .map_err(|_| LaunchError::Store)?;
+                            candidate.account.expire_health(chrono::Utc::now());
+                        }
+                        candidates.retain(|candidate| {
+                            prior
+                                .as_ref()
+                                .is_some_and(|info| info.account == candidate.account.id)
+                                || eligible(
+                                    &candidate.account.id,
+                                    false,
+                                    admission_model.as_deref(),
+                                )
+                        });
+                        // Bound model/account changes while awaiting catalogs require a retry.
+                        // Placement itself still re-resolves canonical identity under its gate.
+                        let current = resume_key
+                            .as_deref()
+                            .and_then(|key| table.launch_info(key, chrono::Utc::now()).ok());
+                        if current != prior {
+                            return Err(LaunchError::Unavailable);
+                        }
+                        operation.check().map_err(|_| LaunchError::Unavailable)?;
+                        let anchor = issue_anchor()?;
+                        // Allocate before durable policy/binding mutation. Empty means no
+                        // menu advertised yet; /models owns acceptance and metadata recording.
+                        let pending = PendingIssue::new(registry, &anchor)?;
+                        let placement = table
+                            .place_launch_for_issue_admitted(
+                                crate::bindings::LaunchRequest {
+                                    anchor_key: &anchor,
+                                    resume_key: resume_key.as_deref(),
+                                    model: request.model.as_deref(),
+                                    model_is_explicit: request.model_is_explicit,
+                                    account_pref: preference.as_deref(),
+                                    allow_move_for_model: request.move_for_model,
+                                },
+                                &candidates,
+                                &entitlements,
+                                chrono::Utc::now(),
+                                Some(&operation),
+                                Some(eligible),
+                                |policies, consent| {
+                                    policies
+                                        .authorize_model_move_for_issue(consent, Some(&operation))
+                                },
+                            )
+                            .map_err(issue_binding_error)?;
+                        for event in &placement.moves {
+                            if event.is_placement {
+                                obs.record_placement(event);
+                            }
+                            obs.record_group_move(
+                                &event.key,
+                                event.from.as_deref(),
+                                &event.to,
+                                &event.reason,
+                                event.bytes,
+                                event.keys,
+                                event.debug_pin,
+                            );
+                            // Checkpoint ledger filters out model_choice/launch_model, but
+                            // this event and record_group_move's panel update preserve why.
+                            tracing::info!(account = %event.to, reason = %event.reason,
                     "launch account placement");
-                }
-                let base_url = format!(
-                    "http://127.0.0.1:{data_port}/l/{}/v1",
-                    pending.token.expose_secret()
-                );
-                let reply = LaunchReply {
-                    catalog_url: format!("{base_url}/models"),
-                    base_url,
-                    account: placement.account,
-                    model: placement.effective_model,
-                };
-                // Returning the guard keeps cancellation cleanup alive in the task
-                // output too. Never attempt to undo a durable policy/binding move.
-                Ok((reply, pending))
+                        }
+                        let base_url = format!(
+                            "http://127.0.0.1:{data_port}/l/{}/v1",
+                            pending.token.expose_secret()
+                        );
+                        let reply = LaunchReply {
+                            catalog_url: format!("{base_url}/models"),
+                            base_url,
+                            account: placement.account,
+                            model: placement.effective_model,
+                        };
+                        // Returning the guard keeps cancellation cleanup alive in the task
+                        // output too. Never attempt to undo a durable policy/binding move.
+                        Ok((reply, pending))
+                    })
+                    .map_err(|_| LaunchError::Store)?
             })
             .await
             .map_err(|_| LaunchError::Store)??;
@@ -2063,25 +2112,42 @@ impl RelayState {
         }
         let model = requested_model
             .or(info.current_model.as_deref())
-            .and_then(crate::observability::safe_identifier)
+            .filter(|model| crate::catalog::valid_model_id(model))
+            .map(str::to_owned)
             .ok_or(DataLaunchError::Invalid)?;
-        let mut catalog =
+        let observed =
             tokio::time::timeout_at(deadline, self.launch_catalog(&info.account, false, true))
-                .await
-                .map_err(|_| DataLaunchError::Unavailable)?
-                .map_err(|_| DataLaunchError::Unavailable)?;
-        if !catalog.supported().contains(&model) {
-            // A menu can change between launches. Re-observe only this account;
-            // an unsupported pick never shops other accounts or sends the body.
-            if let Ok(Ok(updated)) =
-                tokio::time::timeout_at(deadline, self.launch_catalog(&info.account, true, true))
-                    .await
+                .await;
+        let mut catalog = match observed {
+            Ok(Ok(catalog)) => Some(catalog),
+            _ if info.current_model.as_deref() == Some(model.as_str())
+                && !self
+                    .dispatch_data_allowed(Some(&info.canonical_key), &info.account, Some(&model))
+                    .await =>
             {
-                catalog = updated;
+                None
             }
-        }
-        if !catalog.supported().contains(&model) {
-            return Err(DataLaunchError::UnsupportedModel);
+            _ => return Err(DataLaunchError::Unavailable),
+        };
+        // A proved current model can recover from an unusable source after
+        // restart. Destination entitlement and policy gates still run before
+        // dispatch; an unproved new pick never gets this exception.
+        if let Some(catalog) = catalog.as_mut() {
+            if !catalog.supported().contains(&model) {
+                // A menu can change between launches. Re-observe only this account;
+                // an unsupported pick never shops other accounts or sends the body.
+                if let Ok(Ok(updated)) = tokio::time::timeout_at(
+                    deadline,
+                    self.launch_catalog(&info.account, true, true),
+                )
+                .await
+                {
+                    *catalog = updated;
+                }
+            }
+            if !catalog.supported().contains(&model) {
+                return Err(DataLaunchError::UnsupportedModel);
+            }
         }
         if self.is_draining() {
             return Err(DataLaunchError::Unavailable);
