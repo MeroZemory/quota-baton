@@ -442,12 +442,24 @@ fn check_records(
         })();
         match inspected {
             Ok(home) if seen.insert(home.catalog.home.clone()) => {
-                if !home.catalog.compressed.is_empty() {
+                for physical in &home.catalog.conflicts {
                     report(
                         &mut out,
-                        "압축_대화_관계_미확인",
-                        None,
-                        home.catalog.compressed.clone(),
+                        "물리_ID_중복",
+                        Some(physical),
+                        home.catalog
+                            .all()
+                            .filter(|r| &r.physical == physical)
+                            .map(|r| r.path.clone())
+                            .collect(),
+                    );
+                }
+                for unreadable in &home.catalog.unreadable {
+                    report(
+                        &mut out,
+                        "압축_대화_읽기_실패",
+                        unreadable.physical.as_deref(),
+                        vec![unreadable.path.clone()],
                     );
                 }
                 homes.push(home);
@@ -495,6 +507,81 @@ mod tests {
         let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r9-doctor-tests");
         fs::create_dir_all(&base).unwrap();
         tempfile::tempdir_in(fs::canonicalize(base).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn readable_compressed_is_clean_and_only_failed_headers_are_reported() {
+        let root = fixture();
+        let q = root.path().join("q");
+        let plain = write(&q, A, A, None, None);
+        let compressed = plain.with_extension("jsonl.zst");
+        let bytes = zstd::stream::encode_all(fs::read(&plain).unwrap().as_slice(), 1).unwrap();
+        fs::write(&compressed, bytes).unwrap();
+        fs::remove_file(plain).unwrap();
+        let connection = rusqlite::Connection::open(q.join("state_5.sqlite")).unwrap();
+        connection.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, model_provider TEXT NOT NULL);").unwrap();
+        connection
+            .execute(
+                "INSERT INTO threads VALUES(?1, ?2, 'openai')",
+                rusqlite::params![A, compressed.to_str().unwrap()],
+            )
+            .unwrap();
+        drop(connection);
+        let store = Store {
+            home: root.path().join("qb"),
+            target: canonical(&q).unwrap(),
+            search_homes: Vec::new(),
+            map_path: root.path().join("map.json"),
+        };
+        assert!(check_records(&store, Vec::new()).unwrap().is_empty());
+        let bad = q
+            .join("sessions")
+            .join(format!("rollout-test-{B}.jsonl.zst"));
+        fs::write(&bad, b"SYNTHETIC-PRIVATE-INVALID-ZSTD").unwrap();
+        let result = check_records(&store, Vec::new()).unwrap();
+        let failures: Vec<_> = result
+            .iter()
+            .filter(|d| d.code == "압축_대화_읽기_실패")
+            .collect();
+        assert_eq!(failures.len(), 1, "{result:?}");
+        assert_eq!(failures[0].id.as_deref(), Some(B));
+        assert_eq!(failures[0].paths, [canonical(&bad).unwrap()]);
+        assert!(
+            !result
+                .iter()
+                .any(|d| d.paths.contains(&canonical(&compressed).unwrap()))
+        );
+    }
+
+    #[test]
+    fn conflicting_physical_copies_are_reported_without_poisoning_the_home() {
+        let root = fixture();
+        let q = root.path().join("q");
+        let original = write(&q, A, A, None, None);
+        let copy = q
+            .join("archived_sessions")
+            .join(original.file_name().unwrap());
+        fs::create_dir_all(copy.parent().unwrap()).unwrap();
+        fs::copy(&original, &copy).unwrap();
+        write(&q, B, B, None, None);
+        let store = Store {
+            home: root.path().join("qb"),
+            target: canonical(&q).unwrap(),
+            search_homes: Vec::new(),
+            map_path: root.path().join("map.json"),
+        };
+        let diagnostics = check_records(&store, Vec::new()).unwrap();
+        let conflicts: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.code == "물리_ID_중복")
+            .collect();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].id.as_deref(), Some(A));
+        assert_eq!(conflicts[0].paths.len(), 2);
+        assert!(conflicts[0].paths.contains(&canonical(&original).unwrap()));
+        assert!(conflicts[0].paths.contains(&canonical(&copy).unwrap()));
+        assert!(!diagnostics.iter().any(|d| d.code == "홈_검사_실패"));
+        assert!(discovery::catalog(&q).unwrap().chain(B).is_ok());
     }
 
     fn write(

@@ -12,6 +12,11 @@ const INPUT_FAILED: &str = "확인 입력을 읽지 못해 취소했습니다.";
 pub(crate) enum Mode {
     Move,
     Share,
+    Resolve,
+}
+
+pub(crate) fn ask_resolve(manual: &str) -> Result<()> {
+    ask(false, Mode::Resolve, false, manual).map(drop)
 }
 
 /// Ask once; cancellation and I/O failure return an error without retrying.
@@ -57,7 +62,9 @@ fn ask_with_io(
         bail!(NO_TERMINAL);
     }
 
-    let prompt = if allow_share {
+    let prompt = if default == Mode::Resolve {
+        "이 대화의 소유 위치를 복구하려면 'resolve'를 정확히 입력하세요: "
+    } else if allow_share {
         "계속하려면 'move' 또는 'share'를 정확히 입력하세요: "
     } else {
         "계속하려면 'move'를 정확히 입력하세요: "
@@ -69,6 +76,13 @@ fn ask_with_io(
 
     let mut input = String::new();
     read_line(&mut input).map_err(|_| anyhow!(INPUT_FAILED))?;
+    if default == Mode::Resolve {
+        let word = input.strip_suffix('\n').unwrap_or(&input);
+        let word = word.strip_suffix('\r').unwrap_or(word);
+        return (word == "resolve")
+            .then_some(Mode::Resolve)
+            .ok_or_else(|| anyhow!(CANCELLED));
+    }
     parse_mode(&input, allow_share).ok_or_else(|| anyhow!(CANCELLED))
 }
 
@@ -102,6 +116,75 @@ mod tests {
             &mut output,
         );
         (result, String::from_utf8(output).unwrap())
+    }
+
+    #[test]
+    fn typed_resolve_accepts_only_the_exact_word_and_line_ending() {
+        for input in ["resolve", "resolve\n", "resolve\r\n"] {
+            let (result, output) = with_resolve_text(input);
+            assert_eq!(result.unwrap(), Mode::Resolve);
+            assert_eq!(output.matches("입력하세요").count(), 1);
+            assert!(output.contains("'resolve'"));
+            assert!(!output.contains("'move'") && !output.contains("'share'"));
+        }
+    }
+
+    fn with_resolve_text(input: &str) -> (Result<Mode>, String) {
+        let mut reader = Cursor::new(input.as_bytes());
+        let mut output = Vec::new();
+        let result = ask_with_io(
+            false,
+            Mode::Resolve,
+            false,
+            "quota-baton sessions recover ID --resolve-map",
+            (true, true),
+            |line| reader.read_line(line),
+            &mut output,
+        );
+        (result, String::from_utf8(output).unwrap())
+    }
+
+    #[test]
+    fn typed_resolve_cancels_different_case_or_extra_input() {
+        for input in [
+            "",
+            "\n",
+            "move\n",
+            "share\n",
+            "cancel\n",
+            "Resolve\n",
+            "RESOLVE\r\n",
+            " resolve\n",
+            "resolve \n",
+            "resolve\t\n",
+            "resolve extra\n",
+            "'resolve'\n",
+        ] {
+            let (result, output) = with_resolve_text(input);
+            assert_eq!(result.unwrap_err().to_string(), CANCELLED, "{input:?}");
+            assert_eq!(output.matches("입력하세요").count(), 1);
+        }
+    }
+
+    #[test]
+    fn typed_resolve_refuses_either_nonterminal_without_reading() {
+        let manual = "quota-baton sessions recover ID --resolve-map";
+        for terminals in [(false, false), (false, true), (true, false)] {
+            let mut output = Vec::new();
+            let result = ask_with_io(
+                false,
+                Mode::Resolve,
+                false,
+                manual,
+                terminals,
+                |_| panic!("nonterminal resolve must not read confirmation"),
+                &mut output,
+            );
+            assert_eq!(result.unwrap_err().to_string(), NO_TERMINAL);
+            let output = String::from_utf8(output).unwrap();
+            assert!(output.contains(manual));
+            assert!(!output.contains("입력하세요"));
+        }
     }
 
     #[test]

@@ -7,6 +7,15 @@
 //! replaced after a racy pathname check. Unsupported TxF fails without fallback.
 //! New maps use atomic no-replace publication. Neither operation loses a map
 //! that an external writer published before our exclusive update began.
+//!
+//! Only typed, post-decision resolution may use apply_resolution instead of
+//! TxF. Persist replan_resolution's result first, then select the apply path
+//! with a persisted caller mode (also after a caller-journal reload). Resolution
+//! retains SHARE_NONE through the last write and journals the entire intended
+//! document with DPAPI before truncating. A killed writer can leave a prefix;
+//! repeat resolution to repair it. Replacement or unrecognized bytes refuse.
+//! This relies on Windows file identity/creation time and successful flushes,
+//! not on protection against a privileged writer forging identity/evidence.
 
 use anyhow::{Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
@@ -24,12 +33,43 @@ const BACKUP: &str = "herdr 세션 홈 백업을 확인할 수 없습니다";
 #[cfg(windows)]
 const TRANSACTION: &str = "herdr 세션 홈 파일을 안전한 트랜잭션으로 저장하지 못했습니다";
 const LIMIT: u64 = 4 * 1024 * 1024;
+const REPAIR_LIMIT: u64 = LIMIT * 4;
+const REPAIR_INTENT: &str = "resolution-intent.dpapi";
+const REPAIR_COMPLETE: &str = "resolution-complete.dpapi";
+const RESOLUTION: &str = "herdr 세션 홈 명시적 복구 기록을 확인할 수 없습니다";
 
-// No Debug: plans contain home paths. Only the selected UUID is journaled.
+// No Debug: plans contain home paths. Plans contain selected-UUID deltas only;
+// whole-document repair evidence lives separately, encrypted, in backup_dir.
 #[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct MapPlan {
     change: Change,
     backup_dir: PathBuf,
+    // Preserve the original intent and every intervening encrypted delta.
+    // Absence keeps old persisted plans on the ordinary TxF-only path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resolution: Option<Box<MapPlan>>,
+}
+
+impl MapPlan {
+    pub(crate) fn is_resolution(&self) -> bool {
+        self.resolution.is_some()
+    }
+}
+
+#[derive(Deserialize, Eq, PartialEq, Serialize)]
+struct RepairIdentity {
+    file: crate::sessions_guard::FileIdentity,
+    created: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+struct RepairIntent {
+    version: u8,
+    plan_sha256: String,
+    identity: RepairIdentity,
+    original_len: u64,
+    original_sha256: String,
+    intended: String,
 }
 
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
@@ -162,6 +202,27 @@ fn read(path: &Path) -> Result<Document> {
 }
 
 fn validate(plan: &MapPlan) -> Result<()> {
+    let mut current = plan;
+    let mut depth = 0;
+    loop {
+        validate_change(current)?;
+        let Some(previous) = &current.resolution else {
+            return Ok(());
+        };
+        depth += 1;
+        ensure!(depth <= 32, "{RESOLUTION}");
+        ensure!(
+            current.change.path == previous.change.path
+                && current.change.id == previous.change.id
+                && current.change.after == previous.change.after
+                && current.backup_dir.parent() == Some(previous.backup_dir.as_path()),
+            "{RESOLUTION}"
+        );
+        current = previous;
+    }
+}
+
+fn validate_change(plan: &MapPlan) -> Result<()> {
     ensure!(
         plan.change.version == 1 && uuid(&plan.change.id),
         "{BACKUP}"
@@ -378,6 +439,9 @@ fn update_existing(
         core::PCWSTR,
     };
 
+    #[cfg(test)]
+    resolution_checkpoint("map_txf_writer")?;
+
     struct Transaction {
         handle: HANDLE,
         committed: bool,
@@ -515,9 +579,380 @@ pub(crate) fn plan(path: &Path, id: &str, destination: &Path, backupdir: &Path) 
             map_was_missing: document.bytes.is_none(),
         },
         backup_dir: backupdir.to_path_buf(),
+        resolution: None,
     };
     validate(&plan)?;
     Ok(plan)
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn fingerprint(value: &impl Serialize) -> Result<String> {
+    Ok(sha256(
+        &serde_json::to_vec(value).map_err(|_| anyhow!(RESOLUTION))?,
+    ))
+}
+
+fn read_repair_marker<T: serde::de::DeserializeOwned>(
+    plan: &MapPlan,
+    name: &str,
+) -> Result<Option<T>> {
+    let path = plan.backup_dir.join(name);
+    crate::sessions_guard::safe_path(&plan.backup_dir, &path)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ};
+        options
+            .share_mode(FILE_SHARE_READ.0)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0);
+    }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(anyhow!(RESOLUTION)),
+    };
+    handle_identity(&file)?;
+    let mut encoded = String::new();
+    file.by_ref()
+        .take(REPAIR_LIMIT + 1)
+        .read_to_string(&mut encoded)
+        .map_err(|_| anyhow!(RESOLUTION))?;
+    ensure!(encoded.len() as u64 <= REPAIR_LIMIT, "{RESOLUTION}");
+    let bytes = crate::cutover::unprotect(&encoded).map_err(|_| anyhow!(RESOLUTION))?;
+    ensure!(bytes.len() as u64 <= REPAIR_LIMIT, "{RESOLUTION}");
+    Ok(Some(
+        serde_json::from_slice(&bytes).map_err(|_| anyhow!(RESOLUTION))?,
+    ))
+}
+
+fn save_repair_marker(plan: &MapPlan, name: &str, value: &impl Serialize) -> Result<()> {
+    let bytes = serde_json::to_vec(value).map_err(|_| anyhow!(RESOLUTION))?;
+    ensure!(bytes.len() as u64 <= REPAIR_LIMIT, "{RESOLUTION}");
+    let protected = crate::cutover::protect(&bytes).map_err(|_| anyhow!(RESOLUTION))?;
+    ensure!(protected.len() as u64 <= REPAIR_LIMIT, "{RESOLUTION}");
+    let path = fs::canonicalize(&plan.backup_dir)
+        .map_err(|_| anyhow!(RESOLUTION))?
+        .join(name);
+    // Immutable, no-replace evidence. Never use the map's pathname for this
+    // publication: the map itself stays open SHARE_NONE during every write.
+    publish(&path, protected.as_bytes(), || {
+        resolution_checkpoint(if name == REPAIR_INTENT {
+            "resolution_intent_staged"
+        } else {
+            "resolution_complete_staged"
+        })
+    })
+    .map_err(|error| error.context(RESOLUTION))
+}
+
+fn repair_intent(plan: &MapPlan) -> Result<Option<(RepairIntent, bool)>> {
+    let intent: Option<RepairIntent> = read_repair_marker(plan, REPAIR_INTENT)?;
+    let complete: Option<String> = read_repair_marker(plan, REPAIR_COMPLETE)?;
+    let Some(intent) = intent else {
+        ensure!(complete.is_none(), "{RESOLUTION}");
+        return Ok(None);
+    };
+    ensure!(
+        intent.version == 1
+            && intent.plan_sha256 == fingerprint(plan)?
+            && intent.original_len <= LIMIT
+            && intent.original_sha256.len() == 64
+            && intent
+                .original_sha256
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit())
+            && intent.intended.len() as u64 <= LIMIT,
+        "{RESOLUTION}"
+    );
+    let value: Value = serde_json::from_str(&intent.intended).map_err(|_| anyhow!(RESOLUTION))?;
+    ensure!(
+        entry(&value, &plan.change.id)? == Some(plan.change.after.as_str()),
+        "{RESOLUTION}"
+    );
+    if let Some(saved) = &complete {
+        ensure!(*saved == fingerprint(&intent)?, "{RESOLUTION}");
+    }
+    Ok(Some((intent, complete.is_some())))
+}
+
+fn save_resolution_backups(plan: &MapPlan) -> Result<()> {
+    let mut current = Some(plan);
+    while let Some(plan) = current {
+        save_backup(plan)?;
+        current = plan.resolution.as_deref();
+    }
+    Ok(())
+}
+
+fn check_resolution_backups(plan: &MapPlan) -> Result<()> {
+    let mut current = Some(plan);
+    while let Some(plan) = current {
+        ensure!(check_backup(plan)?, "{BACKUP}");
+        current = plan.resolution.as_deref();
+    }
+    Ok(())
+}
+
+/// Call only after typed `resolve`, after the publication decision. Re-read
+/// the selected entry and allocate a fresh evidence namespace; no writes here.
+/// Persist the returned plan in Move BEFORE apply_resolution. An interrupted
+/// in-place write returns the existing plan so its full-document intent cannot
+/// be discarded by replanning from a truncated or subsequently replaced map.
+pub(crate) fn replan_resolution(old: &MapPlan) -> Result<MapPlan> {
+    use std::{
+        sync::atomic::{AtomicU64, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    validate(old)?;
+    if old.is_resolution() && repair_intent(old)?.is_some_and(|(_, complete)| !complete) {
+        return Ok(old.clone());
+    }
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| anyhow!(RESOLUTION))?
+        .as_nanos();
+    for _ in 0..64 {
+        let serial = NEXT.fetch_add(1, Ordering::Relaxed);
+        let directory = old.backup_dir.join(format!(
+            "resolve-{}-{time:x}-{serial:x}",
+            std::process::id()
+        ));
+        if directory.try_exists().map_err(|_| anyhow!(RESOLUTION))? {
+            continue;
+        }
+        let mut new = plan(
+            &old.change.path,
+            &old.change.id,
+            Path::new(&old.change.after),
+            &directory,
+        )?;
+        new.resolution = Some(Box::new(old.clone()));
+        validate(&new)?;
+        return Ok(new);
+    }
+    Err(anyhow!(RESOLUTION))
+}
+
+#[cfg(test)]
+type ResolutionHook = Box<dyn FnMut(&str) -> Result<()>>;
+#[cfg(test)]
+thread_local! {
+    static RESOLUTION_HOOK: std::cell::RefCell<Option<ResolutionHook>> = std::cell::RefCell::new(None);
+}
+
+fn resolution_checkpoint(label: &str) -> Result<()> {
+    #[cfg(test)]
+    RESOLUTION_HOOK.with(|hook| -> Result<()> {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(label)?;
+        }
+        Ok(())
+    })?;
+    #[cfg(not(test))]
+    let _ = label;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn repair_identity(file: &File) -> Result<RepairIdentity> {
+    use std::os::windows::fs::MetadataExt;
+    let identity = RepairIdentity {
+        file: handle_identity(file)?,
+        created: file
+            .metadata()
+            .map_err(|_| anyhow!(RESOLUTION))?
+            .creation_time(),
+    };
+    ensure!(
+        identity.file.index != 0 && identity.created != 0,
+        "{RESOLUTION}"
+    );
+    Ok(identity)
+}
+
+#[cfg(windows)]
+fn locked_bytes(file: &mut File) -> Result<Vec<u8>> {
+    use std::io::{Seek, SeekFrom};
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| anyhow!(RESOLUTION))?;
+    let mut bytes = Vec::new();
+    Read::by_ref(file)
+        .take(LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| anyhow!(RESOLUTION))?;
+    ensure!(bytes.len() as u64 <= LIMIT, "{FORMAT}");
+    Ok(bytes)
+}
+
+#[cfg(windows)]
+fn prepare_resolution_parent(parent: &Path) -> Result<crate::sessions_guard::PublicationGuard> {
+    explicit(parent)?;
+    let mut root = parent;
+    loop {
+        match fs::symlink_metadata(root) {
+            Ok(metadata) => {
+                ensure!(metadata.is_dir(), "{RESOLUTION}");
+                // Root must already exist: new map parents and backup trees
+                // may have several missing components. The guard revalidates
+                // every component by handle, pins the existing ancestors, and
+                // creates only the suffix of this caller-authorized path. It
+                // rejects reparse points and a drive-root ownership boundary.
+                return crate::sessions_guard::prepare_parent(root, parent);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                root = root.parent().ok_or_else(|| anyhow!(RESOLUTION))?;
+            }
+            Err(error) => {
+                return Err(anyhow!(
+                    "herdr 세션 홈 복구 폴더 검사 실패 (OS 코드 {:?})",
+                    error.raw_os_error()
+                ));
+            }
+        }
+    }
+}
+
+/// Explicit, forward-only repair when TxF is unavailable or the selected UUID
+/// changed after the decision. Ordinary apply remains TxF-only. All unrelated
+/// entries are read under SHARE_NONE and included in the durable DPAPI intent.
+/// Process termination after truncation leaves only an intended prefix. Retry
+/// with the same persisted plan; a different file identity or unexpected bytes
+/// refuses without changing the map. Completed repairs never replay a snapshot
+/// over subsequent unrelated edits. File identity plus creation time is used
+/// across restarts; privileged identity/evidence forgery is outside this model.
+#[cfg(windows)]
+pub(crate) fn apply_resolution(plan: &MapPlan) -> Result<()> {
+    use std::{
+        io::{Seek, SeekFrom, Write},
+        os::windows::fs::OpenOptionsExt,
+    };
+    use windows::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_WRITE_THROUGH,
+    };
+    validate(plan)?;
+    ensure!(plan.is_resolution(), "{RESOLUTION}");
+    let parent = plan.change.path.parent().ok_or_else(|| anyhow!(FORMAT))?;
+    let _map_parent = prepare_resolution_parent(parent)
+        .map_err(|error| error.context("herdr 세션 홈 복구 대상 폴더 준비 실패"))?;
+    let _backup_parent = prepare_resolution_parent(&plan.backup_dir)
+        .map_err(|error| error.context("herdr 세션 홈 복구 백업 폴더 준비 실패"))?;
+    let saved = repair_intent(plan)?;
+    if saved.as_ref().is_some_and(|(_, complete)| *complete) {
+        return verify(plan);
+    }
+    let opened = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(0)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0 | FILE_FLAG_WRITE_THROUGH.0)
+        .open(&plan.change.path);
+    let mut file = match opened {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            ensure!(
+                saved.is_none() && plan.change.map_was_missing && plan.change.before.is_none(),
+                "{CONFLICT}"
+            );
+            save_resolution_backups(plan)?;
+            let mut value = json!({"sessions": {}});
+            value["sessions"][&plan.change.id] = json!(plan.change.after);
+            let bytes = serde_json::to_vec(&value).map_err(|_| anyhow!(FORMAT))?;
+            publish(&plan.change.path, &bytes, || {
+                resolution_checkpoint("resolution_before_publish")
+            })?;
+            resolution_checkpoint("resolution_published")?;
+            return verify(plan);
+        }
+        Err(_) => return Err(anyhow!(CONFLICT)),
+    };
+    resolution_checkpoint("resolution_locked")?;
+    let identity = repair_identity(&file)?;
+    let current = locked_bytes(&mut file)?;
+    let intent = if let Some((intent, _)) = saved {
+        check_resolution_backups(plan)?;
+        ensure!(intent.identity == identity, "{CONFLICT}");
+        intent
+    } else {
+        let mut value: Value = serde_json::from_slice(&current).map_err(|_| anyhow!(FORMAT))?;
+        let selected = entry(&value, &plan.change.id)?;
+        if selected == Some(plan.change.after.as_str()) {
+            if selected == plan.change.before.as_deref() {
+                save_resolution_backups(plan)?;
+            } else {
+                check_resolution_backups(plan)?;
+            }
+            drop(file);
+            return verify(plan);
+        }
+        ensure!(selected == plan.change.before.as_deref(), "{CONFLICT}");
+        save_resolution_backups(plan)?;
+        resolution_checkpoint("resolution_backups")?;
+        value["sessions"][&plan.change.id] = json!(plan.change.after);
+        let mut intended = serde_json::to_string_pretty(&value).map_err(|_| anyhow!(FORMAT))?;
+        intended.push('\n');
+        ensure!(intended.len() as u64 <= LIMIT, "{FORMAT}");
+        let intent = RepairIntent {
+            version: 1,
+            plan_sha256: fingerprint(plan)?,
+            identity,
+            original_len: current.len() as u64,
+            original_sha256: sha256(&current),
+            intended,
+        };
+        save_repair_marker(plan, REPAIR_INTENT, &intent)?;
+        resolution_checkpoint("resolution_journal")?;
+        intent
+    };
+    let intended = intent.intended.as_bytes();
+    let original =
+        current.len() as u64 == intent.original_len && sha256(&current) == intent.original_sha256;
+    ensure!(original || intended.starts_with(&current), "{CONFLICT}");
+    let mut offset = current.len();
+    if original && current.as_slice() != intended {
+        // Truncate FIRST: a partial write can then only be an intended prefix,
+        // never an ambiguous mix of intended bytes and old unrelated entries.
+        file.set_len(0).map_err(|_| anyhow!(RESOLUTION))?;
+        resolution_checkpoint("resolution_truncated")?;
+        file.sync_all().map_err(|_| anyhow!(RESOLUTION))?;
+        resolution_checkpoint("resolution_truncate_synced")?;
+        offset = 0;
+    }
+    file.seek(SeekFrom::Start(offset as u64))
+        .map_err(|_| anyhow!(RESOLUTION))?;
+    while offset < intended.len() {
+        let end = (offset + 4096).min(intended.len());
+        let written = match file.write(&intended[offset..end]) {
+            Ok(written) => written,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return Err(anyhow!(RESOLUTION)),
+        };
+        ensure!(written > 0, "{RESOLUTION}");
+        offset += written;
+        resolution_checkpoint("resolution_write")?;
+        file.sync_all().map_err(|_| anyhow!(RESOLUTION))?;
+        resolution_checkpoint("resolution_write_synced")?;
+    }
+    file.sync_all().map_err(|_| anyhow!(RESOLUTION))?;
+    ensure!(
+        locked_bytes(&mut file)?.as_slice() == intended,
+        "{CONFLICT}"
+    );
+    resolution_checkpoint("resolution_flushed")?;
+    save_repair_marker(plan, REPAIR_COMPLETE, &fingerprint(&intent)?)?;
+    resolution_checkpoint("resolution_completed")?;
+    drop(file);
+    verify(plan)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn apply_resolution(_: &MapPlan) -> Result<()> {
+    Err(anyhow!("herdr 세션 홈 변경은 Windows에서만 지원됩니다"))
 }
 
 /// Requires a persisted caller journal intent. Durable encrypted backup always
@@ -527,6 +962,7 @@ pub(crate) fn plan(path: &Path, id: &str, destination: &Path, backupdir: &Path) 
 /// this returns an error without attempting an unprotected map write.
 pub(crate) fn apply(plan: &MapPlan) -> Result<()> {
     validate(plan)?;
+    ensure!(!plan.is_resolution(), "{RESOLUTION}");
     let mut document = read(&plan.change.path)?;
     ensure!(
         plan.change.map_was_missing || document.bytes.is_some(),
@@ -555,6 +991,7 @@ pub(crate) fn apply(plan: &MapPlan) -> Result<()> {
 /// nothing except our generated empty sessions object remains.
 pub(crate) fn restore(plan: &MapPlan) -> Result<()> {
     validate(plan)?;
+    ensure!(!plan.is_resolution(), "{RESOLUTION}");
     let mut document = read(&plan.change.path)?;
     ensure!(
         plan.change.map_was_missing || document.bytes.is_some(),
@@ -594,6 +1031,12 @@ pub(crate) fn restore(plan: &MapPlan) -> Result<()> {
 /// Verify applied ownership and its durable delta backup. Does not modify files.
 pub(crate) fn verify(plan: &MapPlan) -> Result<()> {
     validate(plan)?;
+    if plan.is_resolution() {
+        if let Some((_, complete)) = repair_intent(plan)? {
+            ensure!(complete, "{RESOLUTION}");
+        }
+        check_resolution_backups(plan)?;
+    }
     let document = read(&plan.change.path)?;
     ensure!(
         document.bytes.is_some()
@@ -603,6 +1046,10 @@ pub(crate) fn verify(plan: &MapPlan) -> Result<()> {
     ensure!(check_backup(plan)?, "{BACKUP}");
     unchanged(plan, &document)
 }
+
+#[cfg(all(test, windows))]
+#[path = "sessions_map_resolve_tests.rs"]
+mod resolve_tests;
 
 #[cfg(all(test, windows))]
 mod tests {

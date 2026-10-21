@@ -538,7 +538,7 @@ fn r9_keep_source_every_resume_grammar_refuses_source_writer_before_launch() {
     }
 }
 #[test]
-fn r9_compressed_only_rowless_target_refuses_all_managed_picker_launches() {
+fn r9_readable_compressed_only_rowless_target_allows_managed_picker_launches() {
     let grammars: &[&[&str]] = &[&[], &["resume"], &["resume", "--last"]];
     for args in grammars {
         let f = Fixture::new();
@@ -573,35 +573,78 @@ fn r9_compressed_only_rowless_target_refuses_all_managed_picker_launches() {
         );
         fs::write(&compressed, &encoded).unwrap();
         assert!(!f.target.join("state_5.sqlite").exists());
+        let source_state = fs::read(f.source.join("state_5.sqlite")).unwrap();
 
-        assert_refused(
-            &f,
-            &f.launch(args),
-            "압축된 대화의 소유권을 확인할 수 없어 관리 실행을 거절합니다",
-        );
+        assert_success(&f.launch(args));
+        assert!(f.sentinel.exists(), "client did not launch: {args:?}");
         assert_eq!(fs::read(&compressed).unwrap(), encoded);
+        assert_eq!(
+            fs::read(f.source.join("state_5.sqlite")).unwrap(),
+            source_state
+        );
         assert!(!f.target.join("state_5.sqlite").exists());
+        assert!(!f.target.join("goals_1.sqlite").exists());
+        assert!(!f.target.join("session_index.jsonl").exists());
+        assert!(!f.qb.join("journal/sessions-import.json").exists());
+        assert!(!f.qb.join("journal/session-moves").exists());
     }
 }
 
 #[test]
-fn r9_auto_resume_diverged_or_compressed_records_never_launch() {
+fn r9_auto_resume_diverged_or_unreadable_selected_records_never_launch() {
     let f = Fixture::new();
     let source = f.add(A, false, "openai");
     assert_success(&f.import_options(A, true, &["--keep-source"]));
+    let target = f.target.join("sessions").join(source.file_name().unwrap());
+    let original = fs::read(&source).unwrap();
+    let source_state = fs::read(f.source.join("state_5.sqlite")).unwrap();
+    let target_state = fs::read(f.target.join("state_5.sqlite")).unwrap();
+    let journal = fs::read(f.qb.join("journal/sessions-import.json")).unwrap();
     let compressed = source.with_extension("jsonl.zst");
     fs::write(&compressed, b"synthetic compressed marker").unwrap();
     let out = f.resume(A);
     assert_refused(&f, &out, "압축");
+    assert_eq!(
+        fs::read(&compressed).unwrap(),
+        b"synthetic compressed marker"
+    );
+    assert_eq!(fs::read(&source).unwrap(), original);
+    assert_eq!(fs::read(&target).unwrap(), original);
+    assert_eq!(
+        fs::read(f.source.join("state_5.sqlite")).unwrap(),
+        source_state
+    );
+    assert_eq!(
+        fs::read(f.target.join("state_5.sqlite")).unwrap(),
+        target_state
+    );
+    assert_eq!(
+        fs::read(f.qb.join("journal/sessions-import.json")).unwrap(),
+        journal
+    );
     fs::remove_file(compressed).unwrap();
-    let target = f.target.join("sessions").join(source.file_name().unwrap());
+    // Break the shared link before introducing true target divergence.
     fs::remove_file(&target).unwrap();
     fs::write(&target, b"unrelated synthetic").unwrap();
     let out = f.resume(A);
     assert_refused(
         &f,
         &out,
-        "대화 소유권과 목록이 다릅니다. doctor로 확인하세요",
+        "대화 기록이 분기되었습니다. sessions unimport 후 다시 가져오세요",
+    );
+    assert_eq!(fs::read(&source).unwrap(), original);
+    assert_eq!(fs::read(&target).unwrap(), b"unrelated synthetic");
+    assert_eq!(
+        fs::read(f.source.join("state_5.sqlite")).unwrap(),
+        source_state
+    );
+    assert_eq!(
+        fs::read(f.target.join("state_5.sqlite")).unwrap(),
+        target_state
+    );
+    assert_eq!(
+        fs::read(f.qb.join("journal/sessions-import.json")).unwrap(),
+        journal
     );
 }
 
@@ -764,4 +807,34 @@ fn r9_cli_live_unknown_provider_and_missing_wiring_refuse() {
         .unwrap();
     fs::remove_file(f.qb.join("journal/wiring.json")).unwrap();
     assert!(!f.import(A, true).status.success());
+}
+
+#[test]
+fn r91_list_marks_duplicate_physical_id_and_keeps_unrelated_sessions_visible() {
+    let f = Fixture::new();
+    let a = f.add(A, false, "openai");
+    let b = f.add(B, false, "openai");
+    let duplicate = f
+        .source
+        .join("archived_sessions")
+        .join(a.file_name().unwrap());
+    fs::create_dir_all(duplicate.parent().unwrap()).unwrap();
+    fs::copy(&a, &duplicate).unwrap();
+    let before_a = fs::read(&a).unwrap();
+    let before_b = fs::read(&b).unwrap();
+    let result = f.cli(&[
+        "sessions".as_ref(),
+        "import".as_ref(),
+        "--from".as_ref(),
+        f.source.as_os_str(),
+        "--list".as_ref(),
+    ]);
+    assert_success(&result);
+    let text = String::from_utf8_lossy(&result.stdout);
+    assert!(text.contains(&format!("{A} · 물리 ID 중복")));
+    assert!(text.lines().any(|line| line == B));
+    assert_eq!(fs::read(&a).unwrap(), before_a);
+    assert_eq!(fs::read(&b).unwrap(), before_b);
+    assert!(!f.target.join("sessions").exists());
+    assert!(!f.qb.join("journal/sessions-import.json").exists());
 }

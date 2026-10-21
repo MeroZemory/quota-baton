@@ -2,6 +2,12 @@
 use crate::{sessions_db as db, sessions_discovery as discovery, sessions_guard as guard};
 
 pub(crate) fn friendly_error(error: &anyhow::Error) -> Option<String> {
+    if error.is::<discovery::PhysicalConflict>() {
+        return Some("같은 물리 대화 ID의 서로 다른 파일이 있습니다. doctor로 확인하세요".into());
+    }
+    if error.is::<discovery::RelatedUnreadable>() {
+        return Some("관련된 압축 대화 기록을 읽을 수 없습니다. doctor로 확인하세요".into());
+    }
     if let Some(conflict) = error.downcast_ref::<InventoryConflict>() {
         return Some(conflict.to_string());
     }
@@ -15,6 +21,7 @@ pub(crate) fn friendly_error(error: &anyhow::Error) -> Option<String> {
         "전용 Codex 홈 연결을 먼저 완료하세요",
         "전용 Codex 홈이 없습니다",
         "대화 ID는 UUID여야 합니다",
+        "세션 파일의 마지막 하드링크는 삭제할 수 없습니다",
         "원본에서 대화를 찾지 못했습니다",
         "최근에 사용한 대화입니다. 먼저 대화를 종료하고 120초 후 다시 시도하세요",
         "openai 제공자의 대화만 가져올 수 있습니다",
@@ -48,6 +55,10 @@ pub(crate) fn friendly_error(error: &anyhow::Error) -> Option<String> {
         "이 대화에서 갈라진 대화가 있습니다. 가족 이동을 지원하기 전에는 옮길 수 없습니다",
         "조상 전용 대화의 모든 관리 재개 경로를 차단할 수 없어 이 대화의 이동을 거절합니다",
         "대상 홈에 이미 조상 또는 대화 이름이 있습니다. 이동을 거절합니다",
+        "대상 qb 홈에 이 대화의 조상 별칭 또는 같은 대화 이름이 있습니다. 먼저 doctor로 확인하세요",
+        "이 대화는 이동 복구가 필요합니다. sessions recover로 먼저 복구하세요",
+        "이 대화의 이동 journal이 잘못되었습니다",
+        "게시 결정 전에는 --resolve-map 없이 sessions recover를 실행하세요",
         "발견하지 못한 하드링크가 있습니다. doctor로 확인하세요",
         "이동 기록과 현재 상태가 다릅니다. 증거를 보존했습니다. doctor로 확인하세요",
         "미완료 이동이 있습니다. sessions recover로 먼저 복구하세요",
@@ -123,7 +134,11 @@ pub(crate) enum SessionsCommand {
         yes: bool,
     },
     #[command(about = "중단된 대화 이동을 안전한 방향으로 복구합니다")]
-    Recover { id: String },
+    Recover {
+        id: String,
+        #[arg(long)]
+        resolve_map: bool,
+    },
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -430,6 +445,25 @@ fn same_contents(left: &Path, right: &Path) -> Result<bool> {
     }
 }
 
+fn check_physical_owners(
+    source: &Path,
+    home: &Path,
+    expected: &[discovery::Rollout],
+    other: &discovery::Catalog,
+) -> Result<()> {
+    if other.all().any(|item| {
+        expected
+            .iter()
+            .any(|file| file.physical == item.physical && file.thread != item.thread)
+    }) {
+        return Err(InventoryConflict {
+            homes: vec![source.to_owned(), home.to_owned()],
+        }
+        .into());
+    }
+    Ok(())
+}
+
 fn stale_plan(store: &Store, catalog: &discovery::Catalog, id: &str) -> Result<Vec<StaleCopy>> {
     let active = catalog.active(id)?;
     let source_chain = migration_files(catalog, id)?;
@@ -442,6 +476,7 @@ fn stale_plan(store: &Store, catalog: &discovery::Catalog, id: &str) -> Result<V
             continue;
         }
         let other = discovery::catalog(&home)?;
+        check_physical_owners(&catalog.home, &home, &source_chain, &other)?;
         if other.threads.contains_key(id) {
             inventory.push((home, other));
         }
@@ -514,22 +549,49 @@ fn stale_plan(store: &Store, catalog: &discovery::Catalog, id: &str) -> Result<V
     Ok(result)
 }
 
+fn ensure_readable_inventory(homes: &[PathBuf], seeds: &BTreeSet<String>) -> Result<()> {
+    let catalogs = homes
+        .iter()
+        .map(|h| discovery::catalog(h))
+        .collect::<Result<Vec<_>>>()?;
+    let mut related = seeds.clone();
+    loop {
+        let before = related.len();
+        for catalog in &catalogs {
+            related.extend(catalog.related_ids(&related));
+        }
+        if related.len() == before {
+            break;
+        }
+    }
+    for catalog in &catalogs {
+        catalog.ensure_readable_for(&related)?;
+    }
+    Ok(())
+}
+
 fn check_destination_inventory(
     source: &Path,
     target: &Path,
     files: &[discovery::Rollout],
 ) -> Result<()> {
     let destination = discovery::catalog(target)?;
+    let related = files
+        .iter()
+        .flat_map(|f| [f.thread.clone(), f.physical.clone()])
+        .collect();
+    destination.ensure_readable_for(&related)?;
     let threads: BTreeSet<_> = files.iter().map(|file| &file.thread).collect();
+    let physicals: BTreeSet<_> = files.iter().map(|file| &file.physical).collect();
     for item in destination
-        .rollouts
-        .values()
-        .filter(|item| threads.contains(&item.thread))
+        .all()
+        .filter(|item| threads.contains(&item.thread) || physicals.contains(&item.physical))
     {
         // Only the exact hardlink we would reuse is harmless. An extra name,
         // even without a threads row, would leave an ambiguous physical id.
         let candidate = files.iter().find(|file| {
-            file.physical == item.physical
+            file.thread == item.thread
+                && file.physical == item.physical
                 && item.path == target.join("sessions").join(&file.relative)
         });
         let compatible = match candidate {
@@ -740,11 +802,6 @@ fn verify_links(entry: &Import, growth: bool) -> Result<()> {
             source == link.identity && guard::identity(&link.target)? == source,
             "대화 기록이 분기되었습니다. sessions unimport 후 다시 가져오세요"
         );
-        ensure!(
-            !link.source.with_extension("jsonl.zst").exists()
-                && !link.target.with_extension("jsonl.zst").exists(),
-            "압축된 대화 기록이 있습니다. sessions unimport 후 다시 가져오세요"
-        );
         if growth {
             ensure!(
                 fs::metadata(&link.target)?.len() == link.length,
@@ -752,6 +809,10 @@ fn verify_links(entry: &Import, growth: bool) -> Result<()> {
             );
         }
     }
+    ensure_readable_inventory(
+        &[entry.source_home.clone(), entry.target_home.clone()],
+        &entry.threads.iter().cloned().collect(),
+    )?;
     for id in &entry.threads {
         ensure!(
             db::thread_provider(&entry.target_home, id)?.is_none_or(|p| p == "openai"),
@@ -808,6 +869,69 @@ fn known_homes(user: &Path) -> Vec<PathBuf> {
     result
 }
 
+fn import_refusal_class(error: &anyhow::Error) -> usize {
+    let message = error.to_string();
+    if error.is::<guard::LiveWriter>()
+        || message == "최근에 사용한 대화입니다. 먼저 대화를 종료하고 120초 후 다시 시도하세요"
+    {
+        0
+    } else if error.is::<InventoryConflict>()
+        || error.is::<discovery::PhysicalConflict>()
+        || message.contains("분기")
+        || message == "대상에 다른 대화 기록이 있습니다"
+    {
+        1
+    } else {
+        2
+    }
+}
+fn import_refusal_label(class: usize) -> &'static str {
+    match class {
+        0 => "실행 중/최근 사용으로 건너뜀",
+        1 => "기록 분기로 건너뜀",
+        _ => "실패 (원본과 journal을 확인하세요)",
+    }
+}
+
+fn preview_imports(
+    store: &Store,
+    catalog: &discovery::Catalog,
+    ids: &[String],
+    bulk: bool,
+    keep_source: bool,
+    clean_stale: bool,
+    skip_existing: bool,
+) -> Result<(Vec<String>, [usize; 3])> {
+    let mut included = Vec::new();
+    let mut refused = [0; 3];
+    for id in ids {
+        match import_one(
+            store,
+            catalog,
+            id,
+            ImportOptions {
+                apply: false,
+                skip_existing,
+                announce: true,
+                keep_source,
+                clean_stale,
+            },
+        ) {
+            Ok(_) => included.push(id.clone()),
+            Err(error) if bulk => {
+                let class = import_refusal_class(&error);
+                refused[class] += 1;
+                crate::print_stdout(format_args!(
+                    "{id}: {} · 사전 검사에서 제외됨",
+                    import_refusal_label(class)
+                ))?
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok((included, refused))
+}
+
 pub(crate) fn run(home: &Path, command: SessionsCommand) -> Result<()> {
     let store = Store::open(home)?;
     match command {
@@ -826,6 +950,11 @@ pub(crate) fn run(home: &Path, command: SessionsCommand) -> Result<()> {
                 !id.is_empty() || all || list,
                 "대화 ID, --all 또는 --list를 지정하세요"
             );
+            let _read_only_cache = if !apply {
+                Some(discovery::read_only_cache())
+            } else {
+                None
+            };
             let mut keep_source = !move_source && (keep_source || DEFAULT_KEEP_SOURCE);
             let catalog = discovery::catalog(&from)?;
             if list {
@@ -834,9 +963,22 @@ pub(crate) fn run(home: &Path, command: SessionsCommand) -> Result<()> {
                     .map(|t| (t.id, t.model_provider))
                     .collect::<BTreeMap<_, _>>();
                 for id in catalog.threads.keys() {
+                    let refusal = catalog
+                        .ensure_readable_for(&BTreeSet::from([id.clone()]))
+                        .err();
                     crate::print_stdout(format_args!(
                         "{id}{}",
-                        if providers.get(id).is_some_and(|p| p != "openai") {
+                        if refusal
+                            .as_ref()
+                            .is_some_and(|e| e.is::<discovery::PhysicalConflict>())
+                        {
+                            " · 물리 ID 중복 (가져오기 거절)"
+                        } else if refusal
+                            .as_ref()
+                            .is_some_and(|e| e.is::<discovery::RelatedUnreadable>())
+                        {
+                            " · 관련 압축 기록을 읽을 수 없음"
+                        } else if providers.get(id).is_some_and(|p| p != "openai") {
                             " · openai 제공자가 아님"
                         } else {
                             ""
@@ -845,6 +987,8 @@ pub(crate) fn run(home: &Path, command: SessionsCommand) -> Result<()> {
                 }
                 return Ok(());
             }
+            #[cfg(not(test))]
+            crate::sessions_admission::verify_installed_version()?;
             let mut ids: Vec<String> = if all {
                 catalog.threads.keys().cloned().collect()
             } else {
@@ -854,42 +998,25 @@ pub(crate) fn run(home: &Path, command: SessionsCommand) -> Result<()> {
                 std::cmp::Reverse(catalog.chain(id).map(|c| c.len()).unwrap_or(0))
             });
             let bulk = all || ids.len() > 1;
+            let mut preflight_refused = [0; 3];
             if apply {
                 crate::print_stdout(format_args!("가져오기 계획 · 대화 {}개", ids.len()))?;
-                for id in &ids {
-                    match import_one(
-                        &store,
-                        &catalog,
-                        id,
-                        ImportOptions {
-                            apply: false,
-                            skip_existing: all,
-                            announce: true,
-                            keep_source,
-                            clean_stale,
-                        },
-                    ) {
-                        Ok(_) => {}
-                        Err(_) if bulk => {
-                            crate::print_stdout(format_args!("{id}: 사전 검사에서 제외됨"))?
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
+                (ids, preflight_refused) =
+                    preview_imports(&store, &catalog, &ids, bulk, keep_source, clean_stale, all)?;
                 use crate::sessions_confirm::{self, Mode};
-                let mode = sessions_confirm::ask(
-                    yes,
-                    if keep_source { Mode::Share } else { Mode::Move },
-                    true,
-                    "quota-baton sessions import --from <HOME> <UUID> --apply",
-                )?;
-                keep_source = matches!(mode, Mode::Share);
+                if !ids.is_empty() {
+                    let mode = sessions_confirm::ask(
+                        yes,
+                        if keep_source { Mode::Share } else { Mode::Move },
+                        true,
+                        "quota-baton sessions import --from <HOME> <UUID> --apply",
+                    )?;
+                    keep_source = matches!(mode, Mode::Share);
+                }
             }
             let mut imported = 0;
             let mut skipped = 0;
-            let mut live = 0;
-            let mut diverged = 0;
-            let mut failed = 0;
+            let [mut live, mut diverged, mut failed] = preflight_refused;
             for id in ids {
                 match import_one(
                     &store,
@@ -906,23 +1033,13 @@ pub(crate) fn run(home: &Path, command: SessionsCommand) -> Result<()> {
                     Ok(true) => imported += 1,
                     Ok(false) => skipped += 1,
                     Err(error) if bulk => {
-                        let message = error.to_string();
-                        let outcome = if error.downcast_ref::<guard::LiveWriter>().is_some()
-                            || message
-                                == "최근에 사용한 대화입니다. 먼저 대화를 종료하고 120초 후 다시 시도하세요"
-                        {
-                            live += 1;
-                            "실행 중/최근 사용으로 건너뜀"
-                        } else if error.downcast_ref::<InventoryConflict>().is_some()
-                            || message.contains("분기")
-                            || message == "대상에 다른 대화 기록이 있습니다"
-                        {
-                            diverged += 1;
-                            "기록 분기로 건너뜀"
-                        } else {
-                            failed += 1;
-                            "실패 (원본과 journal을 확인하세요)"
-                        };
+                        let class = import_refusal_class(&error);
+                        match class {
+                            0 => live += 1,
+                            1 => diverged += 1,
+                            _ => failed += 1,
+                        }
+                        let outcome = import_refusal_label(class);
                         crate::print_stdout(format_args!("{id}: {outcome}"))?;
                     }
                     Err(error) => return Err(error),
@@ -966,7 +1083,16 @@ pub(crate) fn run(home: &Path, command: SessionsCommand) -> Result<()> {
         SessionsCommand::Return { id, to, yes } => {
             staged::return_current(&store, &id, to.as_deref(), yes, true)
         }
-        SessionsCommand::Recover { id } => staged::recover(&store, &id),
+        SessionsCommand::Recover { id, resolve_map } => {
+            if resolve_map {
+                crate::sessions_confirm::ask_resolve(
+                    "quota-baton sessions recover <UUID> --resolve-map",
+                )?;
+                staged::recover_resolve(&store, &id)
+            } else {
+                staged::recover(&store, &id)
+            }
+        }
     }
 }
 
@@ -1006,7 +1132,31 @@ fn import_one_using(
         keep_source,
         clean_stale,
     } = options;
+    admission_check(&store.home, Some(id))?;
+    let initial_files = migration_files(catalog, id)?;
+    let fenced_ids: BTreeSet<_> = std::iter::once(id.to_owned())
+        .chain(
+            initial_files
+                .iter()
+                .flat_map(|f| [f.thread.clone(), f.physical.clone()]),
+        )
+        .collect();
+    let mut admission_guards = Vec::new();
+    for selected in &fenced_ids {
+        admission_check(&store.home, Some(selected))?;
+        if apply {
+            admission_guards.push(crate::sessions_admission::exclusive(
+                &[catalog.home.clone(), store.target.clone()],
+                selected,
+            )?);
+        }
+    }
     let _lock = if apply { Some(store.lock()?) } else { None };
+    // Recheck durable admission under exclusion/store lock. Include ancestors
+    // and physical aliases that sharing would make discoverable in Q.
+    for selected in &fenced_ids {
+        admission_check(&store.home, Some(selected))?;
+    }
     let mut journal = store.load()?;
     if let Some(entry) = journal.imports.get(id) {
         let names = entry
@@ -1016,7 +1166,7 @@ fn import_one_using(
             .filter(|p| p.exists())
             .collect::<Vec<_>>();
         let (homes, names) = store.probes(&entry.source_home, &entry.threads, &names)?;
-        let _guards = guard::probe_all(&homes, &entry.threads, &names)?;
+        let _guards = guard::probe_decoded(&homes, &entry.threads, &names)?;
         verify_links(entry, false)?;
         if entry.complete {
             if announce {
@@ -1035,12 +1185,21 @@ fn import_one_using(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
+    ensure!(
+        files
+            .iter()
+            .all(|f| fenced_ids.contains(&f.thread) && fenced_ids.contains(&f.physical)),
+        "대화 관계가 사전 검사 뒤 변경되었습니다"
+    );
+    let mut inventory_homes = vec![catalog.home.clone(), store.target.clone()];
+    inventory_homes.extend(store.search_homes.iter().cloned());
+    ensure_readable_inventory(&inventory_homes, &fenced_ids)?;
     let names: Vec<_> = files.iter().map(|f| f.path.clone()).collect();
     let (homes, names) = store.probes(&catalog.home, &threads, &names)?;
     let _guards = if apply {
-        guard::reserve_commit(&homes, &threads, &names)?
+        guard::reserve_decoded(&homes, &threads, &names)?
     } else {
-        guard::probe_all(&homes, &threads, &names)?
+        guard::probe_decoded(&homes, &threads, &names)?
     };
     let retain_ancestor =
         !keep_source && source_has_dependents(&discovery::catalog(&catalog.home)?, id)?;
@@ -1284,10 +1443,16 @@ fn unimport(store: &Store, id: &str, apply: bool, force: bool) -> Result<()> {
     homes.push(store.home.clone());
     homes.sort();
     homes.dedup();
-    let _guards = if apply {
-        guard::reserve_cleanup(&homes, &entry.threads, &names)?
-    } else {
-        guard::probe_cleanup(&homes, &entry.threads, &names)?
+    // Decoded imports may own compressed names. Journal identity authorizes
+    // unlink-only cleanup; this path does not publish or reinterpret headers.
+    let compressed_names = names
+        .iter()
+        .any(|p| p.extension().is_some_and(|ext| ext == "zst"));
+    let mut guards = match (apply, compressed_names) {
+        (true, true) => guard::reserve_decoded(&homes, &entry.threads, &names)?,
+        (false, true) => guard::probe_decoded(&homes, &entry.threads, &names)?,
+        (true, false) => guard::reserve_cleanup(&homes, &entry.threads, &names)?,
+        (false, false) => guard::probe_cleanup(&homes, &entry.threads, &names)?,
     };
     for link in &entry.files {
         if link.target.exists() {
@@ -1295,6 +1460,22 @@ fn unimport(store: &Store, id: &str, apply: bool, force: bool) -> Result<()> {
                 guard::identity(&link.target)? == link.identity,
                 "대상 파일 소유권이 달라 되돌릴 수 없습니다"
             );
+            let retained_by_other = journal.imports.iter().any(|(other_id, other)| {
+                other_id != id
+                    && other
+                        .files
+                        .iter()
+                        .any(|peer| peer.target == link.target && peer.identity == link.identity)
+            });
+            let restores_source = entry.move_started
+                && (link.moved || link.thread == entry.root)
+                && !link.source.exists();
+            if link.owned && !retained_by_other && !restores_source {
+                ensure!(
+                    guard::hardlink_count(&link.target)? > 1,
+                    "세션 파일의 마지막 하드링크는 삭제할 수 없습니다"
+                );
+            }
             if !force {
                 ensure!(
                     fs::metadata(&link.target)?.len() == link.length,
@@ -1424,16 +1605,29 @@ fn unimport(store: &Store, id: &str, apply: bool, force: bool) -> Result<()> {
         .cloned()
         .collect::<Vec<_>>();
     update_index(&store.target, &remove_index, true)?;
+    guards.release_rollouts_for_unlink();
     for link in &entry.files {
         if link.owned && !retained.contains(&link.target) && link.target.exists() {
-            guard::remove_verified(&entry.target_home, &link.target, link.identity)?;
+            guard::unlink_validated(
+                &entry.target_home,
+                &link.target,
+                link.identity,
+                guard::hardlink_count(&link.target)?,
+                |file| {
+                    ensure!(
+                        force || file.metadata()?.len() == link.length,
+                        "가져온 뒤 기록이 변경되었습니다. 확인 후 --force를 사용하세요"
+                    );
+                    Ok(())
+                },
+            )?;
         }
     }
     journal.imports.remove(id);
     store.save(&journal)
 }
 
-fn resume_uuid(args: &[OsString]) -> Result<Option<String>> {
+pub(crate) fn resume_uuid(args: &[OsString]) -> Result<Option<String>> {
     let mut index = 0;
     let mut resume = false;
     let mut literal = false;
@@ -1522,14 +1716,9 @@ fn resume_uuid(args: &[OsString]) -> Result<Option<String>> {
             ) {
                 continue;
             }
-            if args.iter().any(|v| v == "resume")
-                && args
-                    .iter()
-                    .any(|v| v.to_str().is_some_and(discovery::valid_id))
-            {
-                bail!("재개 옵션을 확인할 수 없습니다. 지원되는 옵션과 UUID를 사용하세요");
-            }
-            return Ok(None);
+            // Native options are opaque. Keep a UUID already parsed as the
+            // resume positional, but never guess an unknown option's arity.
+            return Ok(if last { None } else { requested });
         }
         if !resume {
             match arg {
@@ -1562,8 +1751,9 @@ fn resume_entry<'a>(journal: &'a Journal, id: &str) -> Result<Option<&'a Import>
 }
 
 pub(crate) fn before_codex_resume(args: &[OsString]) -> Result<()> {
-    admission_check(&qb_core::home()?)?;
-    let Some(id) = resume_uuid(args)? else {
+    let requested = resume_uuid(args)?;
+    admission_check(&qb_core::home()?, requested.as_deref())?;
+    let Some(id) = requested else {
         return Ok(());
     };
     let id = id.as_str();
@@ -1589,7 +1779,7 @@ pub(crate) fn before_codex_resume(args: &[OsString]) -> Result<()> {
             .filter(|p| p.exists())
             .collect::<Vec<_>>();
         let (homes, names) = store.probes(&entry.source_home, &entry.threads, &names)?;
-        let _guards = guard::probe_all(&homes, &entry.threads, &names)?;
+        let _guards = guard::probe_decoded(&homes, &entry.threads, &names)?;
         verify_links(entry, false)?;
         return Ok(());
     }
@@ -1599,7 +1789,7 @@ pub(crate) fn before_codex_resume(args: &[OsString]) -> Result<()> {
         let names = files.iter().map(|f| f.path.clone()).collect::<Vec<_>>();
         let threads = files.iter().map(|f| f.thread.clone()).collect::<Vec<_>>();
         let (homes, names) = store.probes(&store.target, &threads, &names)?;
-        let _guards = guard::probe_all(&homes, &threads, &names)?;
+        let _guards = guard::probe_decoded(&homes, &threads, &names)?;
         return Ok(());
     }
     let user = std::env::var_os("USERPROFILE")
@@ -1647,6 +1837,7 @@ pub(crate) fn before_codex_resume(args: &[OsString]) -> Result<()> {
             .into());
         }
     }
+    crate::sessions_admission::verify_installed_version()?;
     import_one(
         &store,
         &matches[0],
@@ -1666,6 +1857,11 @@ pub(crate) fn before_codex_resume(args: &[OsString]) -> Result<()> {
     );
     let mode = sessions_confirm::ask(false, Mode::Move, true, &manual)?;
     let keep_source = matches!(mode, Mode::Share);
+    if keep_source {
+        crate::print_stdout(format_args!(
+            "경고: 공유한 대화를 두 홈에서 동시에 열지 마세요. 같은 기록을 수정합니다."
+        ))?;
+    }
     import_one(
         &store,
         &matches[0],
@@ -1696,10 +1892,6 @@ mod tests;
 
 #[path = "sessions_return_compat.rs"]
 mod return_compat;
-#[cfg(test)]
-#[path = "sessions_return.rs"]
-mod returning;
-#[cfg(not(test))]
 use return_compat as returning;
 
 #[path = "sessions_doctor.rs"]
@@ -1711,77 +1903,49 @@ pub(crate) fn doctor(home: &Path) -> Result<()> {
     doctor_impl::run(&Store::open(home)?)
 }
 
-pub(crate) fn admission_check(home: &Path) -> Result<()> {
+/// Journals fence their own IDs, not the whole dedicated home. Unnamed fresh
+/// launches/pickers do not request one of those IDs and must remain available.
+pub(crate) fn admission_check(home: &Path, requested: Option<&str>) -> Result<()> {
+    let Some(id) = requested else {
+        return Ok(());
+    };
+    ensure!(discovery::valid_id(id), "대화 ID는 UUID여야 합니다");
     let dir = home.join("journal/session-moves");
     guard::safe_path(home, &dir)?;
     if dir.exists() {
         for entry in fs::read_dir(&dir)? {
             let path = entry?.path();
             guard::safe_path(home, &path)?;
-            ensure!(
-                fs::metadata(&path)?.len() < 64 * 1024 * 1024,
-                "이동 journal이 잘못되었습니다"
-            );
-            let value: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
-            ensure!(
-                value["schema"] == 2 && value["open"].as_bool() == Some(false),
-                "미완료 이동이 있습니다. sessions recover로 먼저 복구하세요"
-            );
-        }
-    }
-    let journal = home.join("journal");
-    if journal.exists() {
-        for entry in fs::read_dir(&journal)? {
-            let path = entry?.path();
-            if let Some(name) = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(|n| n.strip_prefix("sessions-return-"))
-                .and_then(|n| n.strip_suffix(".json"))
-            {
-                let stub = Store {
-                    home: home.to_owned(),
-                    target: home.to_owned(),
-                    search_homes: Vec::new(),
-                    map_path: home.join("unused"),
-                };
-                return_compat::ensure_not_pending(&stub, name)?;
+            let exact = path.file_stem().and_then(|v| v.to_str()) == Some(id);
+            if fs::metadata(&path)?.len() >= 64 * 1024 * 1024 {
+                ensure!(!exact, "이 대화의 이동 journal이 잘못되었습니다");
+                continue;
+            }
+            let value: serde_json::Value = match serde_json::from_slice(&fs::read(&path)?) {
+                Ok(value) => value,
+                Err(_) if !exact => continue,
+                Err(_) => bail!("이 대화의 이동 journal이 잘못되었습니다"),
+            };
+            let mentions = exact
+                || value["ids"]
+                    .as_array()
+                    .is_some_and(|ids| ids.iter().any(|v| v.as_str() == Some(id)));
+            if mentions {
+                ensure!(
+                    value["schema"] == 2 && value["open"].as_bool() == Some(false),
+                    "이 대화는 이동 복구가 필요합니다. sessions recover로 먼저 복구하세요"
+                );
             }
         }
     }
     if !home.join("journal/wiring.json").exists() {
-        ensure!(
-            !home.join("journal/sessions-import.json").exists() && !dir.exists(),
-            "전용 Codex 홈 연결이 없습니다. 먼저 wire를 실행하세요"
-        );
         return Ok(());
     }
     let store = Store::open(home)?;
-    ensure!(
-        !staged::pending(&store)?,
-        "미완료 이동이 있습니다. sessions recover로 먼저 복구하세요"
-    );
-    let legacy = store.load()?;
-    ensure!(
-        legacy.imports.values().all(|i| i.complete),
-        "대화 가져오기가 완료되지 않았습니다"
-    );
-    for id in legacy.imports.keys() {
-        returning::ensure_not_pending(&store, id)?;
+    return_compat::ensure_not_pending(&store, id)?;
+    if store.path().exists() {
+        let legacy = store.load()?;
+        resume_entry(&legacy, id)?;
     }
-    let catalog = discovery::catalog(&store.target)
-        .map_err(|_| anyhow::anyhow!("대화 소유권과 목록이 다릅니다. doctor로 확인하세요"))?;
-    ensure!(
-        catalog.compressed.is_empty(),
-        "압축된 대화의 소유권을 확인할 수 없어 관리 실행을 거절합니다. doctor로 확인하세요"
-    );
-    let rows: BTreeSet<_> = db::threads(&store.target)?
-        .into_iter()
-        .map(|t| t.id)
-        .collect();
-    ensure!(
-        catalog.threads.keys().all(|id| rows.contains(id)),
-        "조상 전용 또는 고아 대화가 있어 관리 실행을 거절합니다. doctor로 확인하세요"
-    );
     Ok(())
 }
