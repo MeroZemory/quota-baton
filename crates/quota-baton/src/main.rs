@@ -66,8 +66,10 @@ enum Command {
     LaunchClient {
         #[arg(long, value_enum, default_value = "claude")]
         client: launcher_label::Client,
-        #[arg(long)]
-        command: std::path::PathBuf,
+        #[arg(long, required_unless_present = "check", conflicts_with = "check")]
+        command: Option<std::path::PathBuf>,
+        #[arg(long, help = "Codex 연결 기록만 읽어 검사하고 종료합니다")]
+        check: bool,
         #[arg(long)]
         settings: Option<std::path::PathBuf>,
         #[arg(last = true, allow_hyphen_values = true)]
@@ -371,10 +373,22 @@ async fn run() -> anyhow::Result<()> {
     if let Command::LaunchClient {
         client,
         command,
+        check,
         settings,
         args,
     } = &cli.command
     {
+        if *check {
+            if settings.is_some() || !args.is_empty() {
+                anyhow::bail!("--check에는 실행 인자나 설정 경로를 함께 지정할 수 없습니다");
+            }
+            sessions_admission::check_wiring(&qb_core::home()?)?;
+            println_utf8!("Codex 실행 연결 검사가 통과했습니다. 변경하지 않았습니다.");
+            return Ok(());
+        }
+        let command = command
+            .as_deref()
+            .expect("clap requires --command without --check");
         let (permit, child_args) = if matches!(client, launcher_label::Client::Codex) {
             let home = qb_core::home()?;
             sessions::admission_check(&home, sessions::resume_uuid(args)?.as_deref())?;
