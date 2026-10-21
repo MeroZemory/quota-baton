@@ -1103,13 +1103,15 @@ mod r11_active_adoption_tests {
             .prefix("case-")
             .tempdir_in(root)
             .unwrap();
-        let mut config = RoutingConfig::default();
-        // Strict is a scoped policy; global Strict is deliberately invalid.
-        config.mode = if mode == Mode::Strict {
-            Mode::Rebalance
-        } else {
-            mode
+        let config = RoutingConfig {
+            mode: if mode == Mode::Strict {
+                Mode::Rebalance
+            } else {
+                mode
+            },
+            ..RoutingConfig::default()
         };
+        // Strict is a scoped policy; global Strict is deliberately invalid.
         let table = BindingTable::new(home.path(), config).unwrap();
         if mode == Mode::Strict {
             table
