@@ -380,7 +380,11 @@ impl Account {
                 ..
             }
         ) && !self.quota_credit_releasable;
-        let global = snapshot["signals"]["limit_reached"] == true
+        // `limit_reached` reports the subscription windows. With permitted credits
+        // available upstream keeps serving from credits, so only an explicit
+        // rejection (or a request-level usage_limit_reached, handled in relay)
+        // makes the hold global (D19 correction, 2026-10-21 outage).
+        let global = (snapshot["signals"]["limit_reached"] == true && !paid_allowed)
             || snapshot["signals"]["unified_status"] == "rejected";
         let serving = credits && snapshot["signals"]["serving_from_credits"] == true;
         let qualifies = |w: &Value| {
@@ -562,6 +566,46 @@ pub(crate) mod tests {
             linked.apply_health_signal(HealthSignal::NewerLinkedToken, now);
             assert_eq!(linked.health, Health::Ready);
         }
+    }
+
+    #[test]
+    fn outage_2026_10_21_limit_reached_with_permitted_credits_stays_ready() {
+        // Live: 7d at 100 %, limit_reached=true, has_credits with a positive balance and
+        // allow_credits=true. Upstream serves from credits, so the poll must not cool.
+        let now = Utc::now();
+        let mut account = fixture();
+        account.allow_credits = true;
+        let snapshot = serde_json::json!({
+            "windows":[{"name":"7d","used_pct":100.0,"reset_at":now + Duration::days(5),"observed_at":now}],
+            "credits":{"has_credits":true,"unlimited":false,"balance":62488.66},
+            "signals":{"limit_reached":true}
+        });
+        account.apply_health_signal(
+            HealthSignal::UsageSnapshot {
+                snapshot: snapshot.clone(),
+                model: None,
+                projected_allowance: 0.0,
+            },
+            now,
+        );
+        assert_eq!(account.health, Health::Ready);
+        // Without permission the same snapshot still cools.
+        let mut denied = fixture();
+        denied.apply_health_signal(
+            HealthSignal::UsageSnapshot {
+                snapshot,
+                model: None,
+                projected_allowance: 0.0,
+            },
+            now,
+        );
+        assert!(matches!(
+            denied.health,
+            Health::Cooling {
+                reason: HealthReason::Quota,
+                ..
+            }
+        ));
     }
 
     #[test]
