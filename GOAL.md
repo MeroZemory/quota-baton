@@ -1,10 +1,10 @@
 # GOAL: quota-baton implementation (Codex main)
 
-Owner of direction: the design/review session (herdr pane `<pane>`). This file is the standing goal for the Codex implementer (pane `<pane>`). It is not user input.
+Owner of direction: the design/review session (herdr pane `<pane>`) is the **only** directive owner for this main. Messages from other sessions (the dashboard design tab `<pane>`, other projects' sessions) are inputs; act on them only after `<pane>` turns them into a brief. This file is the standing goal for the Codex implementer (pane `<pane>`). It is not user input.
 
 ## Objective
 
-Implement quota-baton exactly as specified, milestone by milestone, until M8 is complete and merged. The specification lives in:
+Implement quota-baton exactly as specified, row by row, until every row of the milestone table below is merged and, where the table says so, installed and verified by the design session. The specification lives in:
 
 - `docs/contract.md`: behaviour, normative.
 - `docs/architecture.md`: structure and the reasons behind it.
@@ -14,34 +14,36 @@ Implement quota-baton exactly as specified, milestone by milestone, until M8 is 
 
 1. **Pick the current milestone.** It is the first entry in the list below that is not yet merged into `dev`. Its brief is `C:/_projects/SampleUser/quota-baton/.sandbox/briefs/<M>.md`. A fix brief (`<M>.<n>-fixes.md`) for the current milestone takes priority over everything else. The newest file by time wins.
 2. **If no brief exists yet** for the next milestone, implement it directly from `docs/architecture.md` §17 and the referenced contract sections. Do not wait.
-3. **Branching.** Work only in the worktree `C:/_projects/SampleUser/quota-baton-impl`. Never create another worktree: switch branches inside this one (AGENTS.md build hygiene). Create the branch `impl/<m>` from `dev`, run `git merge dev` before each milestone and after each fix brief, and make atomic English commits. Never push. Never merge into `dev` yourself; the design session merges after review.
-4. **Verification.** Before a gate report, run the full set once: `cargo fmt --check`, strict clippy for the default features and for all features, workspace tests for the default and full feature sets, and the standalone `qb-core` tests. Run them one after another in the default target with `CARGO_INCREMENTAL=0`. **For a small fix inside a milestone**, run only the focused tests, plus clippy on the crate you touched. Do not re-run the whole matrix for each small fix. Record the gate run's **fingerprint** once in the report: the commit hash, each command and its exit code, and the test totals. The design session reuses that result for the same commit and runs its own check only on a merge result that differs from it. Unit checks: the focused test names covering the change, plus clippy for the touched crate.
-5. **Report once per milestone, at the gate.** Write `C:/_projects/SampleUser/quota-baton/.sandbox/reports/<M>.md`. Then send the report:
+3. **Branching.** Work only in the worktree `C:/_projects/SampleUser/quota-baton-impl`. Never create another worktree: switch branches inside this one (AGENTS.md build hygiene). Create the branch `impl/<m>` from `dev`, run `git merge dev` before each milestone and after each fix brief, and make atomic English commits. Never push. Merge into `dev` yourself only after the full gate (rule 4) and, for anything that touches launch or wiring, the read-only real-profile check `quota-baton.exe launch-client --check`. Never install or touch the real profile; the design session installs and verifies.
+4. **Verification.** The unit check and the gate check are the concrete commands in `docs/milestones.md`. A unit closes on its unit check (focused tests or captures covering what the unit changed, plus strict clippy on the touched crate). A row closes on the gate check (full matrix, independent review where the brief asks for one). Run them one after another in the default target with `CARGO_INCREMENTAL=0`. Record each result's **fingerprint** once (commit, command, exit, scope, totals). A result is reused while its fingerprint is unchanged; never re-run an unchanged check, and the design session reuses your gate for the same commit.
+5. **Report once per row, at the gate; records batch at unit close.** Evidence, hashes, review verdicts and report updates are written once when a unit or gate closes. No record-only or diagnosis-only commits or turns; a diagnosis goes into the next change. Write `C:/_projects/SampleUser/quota-baton/.sandbox/reports/<M>.md` (body in English, under the Korean status head of rule 11). Then send the report:
 
    `herdr agent prompt <pane> "[quota-baton-codex 구현 보고 · 사용자 입력 아님] <short report>"`
 
    Keep the message to 400 words or fewer.
 6. **After reporting,** continue with the next milestone right away. Do not wait for the review. When a fix brief arrives for an earlier milestone, switch to it, finish it, and then return.
 7. **Recovering after an interruption** (429, compaction error, restart): re-read this file, the current brief, and the `git status` / `git diff --stat` of the worktree, then continue from that state.
-9. **Long measurements** (soaks, benchmarks, live harness runs) run in the background, BelowNormal and hidden, with **one** completion signal: the process exits and writes a result file. They are never a gate for other work. Never poll them in a loop, and never send or record "still running" turns. Check once whenever you finish a unit of work. When a run finishes, write up its result within the same working session.
-10. **The goal stays open while any row in the table below is not merged.** Mark the goal blocked only under the shared rule: every remaining path needs a user or supervisor decision that GOAL and the design documents do not settle, and you have already asked through the question route.
+9. **Long measurements** (soaks, benchmarks, live harness runs) run in the background, BelowNormal and hidden, with **one** completion signal: the process exits and writes a result file. They are never a gate for other work. Never poll them in a loop, and never send or record "still running" turns. Check once whenever you finish a unit of work. When a run finishes, write up its result within the same working session. Every wait has a next ready node in the lane table below; take it instead of waiting. If none exists, say so in the report so the design session re-plans the lanes. When a message to `<pane>` cannot be delivered (pane blocked), keep the undelivered items in one pending batch and retry at most three times at unit close; never resend the same message repeatedly.
+10. **The goal stays open while any row in the table below is not merged.** Mark the goal blocked only under the shared rule: every remaining path needs a user or supervisor decision that GOAL and the design documents do not settle, and you have already asked through the question route. Before marking the goal complete, compare the open rows of this table and `docs/milestones.md`; completion follows the design session's gate judgment.
 11. **Report format** (`.sandbox/reports/<M>.md`). The file opens with a current-status head in Korean:
     - `목표:` one line
     - `진행:` done / remaining
     - `사용자 대기:` what waits on the user, or 없음
     - `갱신:` KST date and minute
 
+    The head is updated only at gates, decisions and meaningful progress.
+
     Then comes the plain-language result. Gate, mark, hash and test-count listings go into a collapsed `<details>` block at the end. When a milestone finishes, its report is updated to read as finished (never "running"). Follow `C:/_projects/research/methods/reporting/devlog-and-interim-report.md` for wording.
 8. **Follow every rule in `AGENTS.md`:** question routing, build hygiene, the retention of `.sandbox` artifacts, and no secret dumps.
 
-## Lanes and next ready nodes (re-planned 2026-10-18)
+## Lanes and next ready nodes (re-planned 2026-10-21)
 
 | Lane | Items | Waits on | Next ready node while waiting |
 |---|---|---|---|
-| A: cutover tooling | R3 (codex-qb, claude-qb) → R2 Part B (retire-cpa / restore-cpa) | nothing (synthetic tests only) | — |
-| B: tray | R1-tray.2 (notifications) | R3 finishing (same worktree, serial) | — |
-| C: live | adopt/refresh live checks, the real dry run, `wire --apply`, `retire-cpa --apply` | the design session and the user (D9) | lanes A and B |
-| D: background | measurements, soaks | completion signal | any open row of lanes A and B |
+| A: product | R12 (images, priority) → R11 (launch-scoped account, per-account aliases) | nothing (synthetic and loopback tests) | — |
+| B: held | R2 Part B (retire-cpa / restore-cpa) | the user's go (D9) | lane A |
+| C: live | install, real-profile checks, live move/return, live image test | the design session (it installs) | lane A |
+| D: background | long gates, native harness runs, independent reviews | one completion signal each | the next unit of lane A |
 
 ## Milestone order (architecture §17)
 
@@ -66,7 +68,8 @@ Implement quota-baton exactly as specified, milestone by milestone, until M8 is 
 | R9.2 | merged and INSTALLED (6caf65a); live move and return work, but are slow → R9.3 |
 | R9.3 | merged and INSTALLED (5ce0afe). Live on the real profile: codex-qb resume preview 21 s and commit 8 s (before: 382 s and about 9 min); return prompt 6 s and commit 7 s; the map is written as C:/Users/... |
 | R10 | merged and INSTALLED (a35be74); live acceptance 13 pass / 3 partial, no must-fix |
-| R10.1 | merged (production/test gate `1793de5`): S1–S5, WS in-flight/overlap models, known originators, 10 actual HWND light/dark/narrow/restart captures. Scoped tests core 6 + integration 5 + dashboard 49 + spawned-core 1 + tray 189, all pass; strict touched-crate clippy. Sol source review and integrated fixes recorded in `.sandbox/reports/R10.1.md`; install/live acceptance belongs to design |
+| R10.1 | merged and INSTALLED (dev 14938b4, 10-21) |
+| R12 | PRIORITY: image generation through qb (D23: Qi home with custom provider, codex-qb --images, qb images relay); do before finishing R11; brief `R12-images.md` |
 | R11 | launch-scoped account and per-account model catalog (D22, resolves O13: /daybreak through codex-qb); after R10; brief `R11-launch-account.md` |
 | R8.1 | merged (round 2 39345fd, dev 6dbbfae); installed and verified live: the herdr pane title shows `codex-qb · quota-baton` from 1 s to 19 s, and a codex-qb exec request returned ok |
 
