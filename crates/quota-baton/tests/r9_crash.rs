@@ -672,27 +672,40 @@ impl Fixture {
         let before = self.protected_state();
         for args in [
             vec!["resume", ROOT],
-            vec!["resume", "--last"],
-            vec!["resume"],
-            vec![],
-            vec!["app-server"],
+            vec!["exec", "resume", ROOT],
+            vec!["resume", SEGMENT_A],
+            vec!["resume", SEGMENT_B],
         ] {
             let sentinel = self.root.path().join("launched.txt");
             assert!(!sentinel.exists());
             let diagnostic = self.spawn(&self.launch_args(&args), None).failure();
             assert!(
-                diagnostic.contains("recover")
-                    || diagnostic.contains("복구")
-                    || diagnostic.contains("이동"),
-                "managed admission failed for an unrelated reason"
+                diagnostic.contains("복구") || diagnostic.contains("recover"),
+                "wrong refusal"
             );
-            assert!(
-                !sentinel.exists(),
-                "managed path started a client with an open journal"
-            );
+            assert!(!sentinel.exists());
             assert!(
                 self.protected_state() == before,
-                "managed refusal changed protected session state"
+                "ID refusal changed session state"
+            );
+        }
+        for args in [
+            vec![],
+            vec!["resume", "--last"],
+            vec!["resume"],
+            vec!["app-server"],
+            vec!["fresh synthetic prompt"],
+        ] {
+            self.run(&self.launch_args(&args));
+            let sentinel = self.root.path().join("launched.txt");
+            assert!(
+                sentinel.exists(),
+                "fresh/unbound launch was blocked by another ID's journal"
+            );
+            fs::remove_file(sentinel).unwrap();
+            assert!(
+                self.protected_state() == before,
+                "fresh recorder changed session state"
             );
         }
     }
@@ -1450,16 +1463,32 @@ fn append_conflict(label: &str) {
     )
     .unwrap();
     drop(file);
-    for _ in 0..2 {
-        assert_refusal_unchanged(&fixture, &fixture.recover_args());
+    if label == "stage:staged" {
+        let current = fixture.protected_state();
+        fixture.run(&fixture.recover_args());
+        assert_eq!(move_journal(&fixture.qb)["open"], false);
+        let after = fixture.protected_state();
+        assert_eq!(after.rows, current.rows);
+        assert_eq!(after.goals, current.goals);
+        assert_eq!(after.map, current.map);
+        assert_eq!(after.indices, current.indices);
+        assert_eq!(after.other, current.other);
         fixture.assert_namespace();
-        assert_eq!(move_journal(&fixture.qb)["open"], true);
+        fixture.assert_launcher_control();
+        fixture.run(&fixture.recover_args());
+    } else {
+        for _ in 0..2 {
+            assert_refusal_unchanged(&fixture, &fixture.recover_args());
+            fixture.assert_namespace();
+            assert_eq!(move_journal(&fixture.qb)["open"], true);
+        }
     }
 }
 #[test]
-fn unrecorded_append_before_decision_is_preserved_with_refusal() {
+fn unrecorded_append_before_decision_aborts_source_kept() {
     append_conflict("stage:staged");
 }
+
 #[test]
 fn unrecorded_append_after_decision_is_preserved_with_refusal() {
     append_conflict("stage:published");
