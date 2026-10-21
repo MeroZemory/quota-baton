@@ -1280,12 +1280,30 @@ async fn phase0_cli_capture_and_replay_print_counts_and_summary_only() {
         serde_json::to_vec(&cpa_fixture(1)).unwrap(),
     )
     .unwrap();
-    let fake = qb_testkit::ScriptedUpstream::start().await.unwrap();
+    // Catalog polling must not consume or appear as an inference request.
+    struct Upstream(tokio::task::JoinHandle<()>);
+    impl Drop for Upstream {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let fake = qb_testkit::ScriptedState::default();
+    let app = fake.router().route(
+        "/models",
+        axum::routing::get(|| async {
+            axum::Json(serde_json::json!({"models":[{"slug":"fixture"}]}))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let _upstream = Upstream(tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    }));
     let data = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let admin = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let data_port = data.local_addr().unwrap().port();
     let admin_port = admin.local_addr().unwrap().port();
-    std::fs::write(home.join("config.toml"), format!("[server]\ndata_port={data_port}\nadmin_port={admin_port}\n[upstream]\ncodex_base='{}'\n", fake.url)).unwrap();
+    std::fs::write(home.join("config.toml"), format!("[server]\ndata_port={data_port}\nadmin_port={admin_port}\n[upstream]\ncodex_base='{}'\n", upstream)).unwrap();
     drop((data, admin));
     let output = command(&home)
         .args(["accounts", "import", "cpa", "--dir"])
@@ -1384,10 +1402,23 @@ async fn phase0_cli_capture_and_replay_print_counts_and_summary_only() {
     ] {
         assert!(!text.contains(forbidden));
     }
-    let sent = fake.state.requests();
+    let requests = fake.requests();
+    let sent: Vec<_> = requests
+        .iter()
+        .filter(|request| {
+            request.method == reqwest::Method::POST && request.path_and_query == "/responses"
+        })
+        .collect();
     assert_eq!(sent.len(), 2);
+    assert_eq!(sent[0].body.as_ref(), body.as_bytes());
     let stripped: serde_json::Value = serde_json::from_slice(&sent[1].body).unwrap();
     assert_eq!(stripped["input"].as_array().unwrap().len(), 1);
+    let expected = serde_json::json!({"input":[{"type":"message","content":[{"type":"input_text","text":"synthetic conversation"}]}]});
+    assert_eq!(stripped, expected);
+    assert_eq!(
+        sent[1].body.as_ref(),
+        serde_json::to_vec(&expected).unwrap()
+    );
     assert_eq!(std::fs::read_dir(captures).unwrap().count(), 1);
 }
 
