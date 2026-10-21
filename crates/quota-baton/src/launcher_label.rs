@@ -76,6 +76,29 @@ pub(crate) fn run_with_environment(
     args: &[std::ffi::OsString],
     environment: &[(&str, &std::ffi::OsStr)],
 ) -> std::io::Result<i32> {
+    run_with_environment_and_account(client, program, settings, args, environment, None)
+}
+
+/// R11 ordinary Codex: only a configured short for the issued account may enter
+/// the title; routing URLs/handles and caller-supplied account preferences do not.
+pub(crate) fn run_with_account(
+    program: &Path,
+    args: &[std::ffi::OsString],
+    account_short: Option<&str>,
+) -> std::io::Result<i32> {
+    run_with_environment_and_account(Client::Codex, program, None, args, &[], account_short)
+}
+
+fn run_with_environment_and_account(
+    client: Client,
+    program: &Path,
+    settings: Option<&Path>,
+    args: &[std::ffi::OsString],
+    environment: &[(&str, &std::ffi::OsStr)],
+    account_short: Option<&str>,
+) -> std::io::Result<i32> {
+    #[cfg(not(windows))]
+    let _ = account_short;
     if !program.is_absolute()
         || settings.is_some_and(|p| !p.is_absolute())
         || matches!(client, Client::Claude) && settings.is_none()
@@ -105,7 +128,7 @@ pub(crate) fn run_with_environment(
     // this into an interpolated `cmd /c` string or CALL reparse.
     #[cfg(windows)]
     let title = matches!(client, Client::Codex)
-        .then(|| ConsoleTitle::new(program))
+        .then(|| ConsoleTitle::new(program, account_short))
         .transpose()?;
     #[cfg(windows)]
     let needs_title_repair = child.get_program() == program.as_os_str()
@@ -934,6 +957,16 @@ mod contained {
     }
 }
 
+#[cfg(any(windows, test))]
+fn codex_title(folder: &str, account_short: Option<&str>) -> String {
+    let account_short = account_short
+        .filter(|short| short.len() == 2 && short.bytes().all(|b| b.is_ascii_lowercase()));
+    match account_short {
+        Some(short) => format!("codex-qb-{short} · {folder}"),
+        None => format!("codex-qb · {folder}"),
+    }
+}
+
 #[cfg(windows)]
 struct ConsoleTitle {
     desired: String,
@@ -966,7 +999,7 @@ fn set_console_title(title: &str) {
 
 #[cfg(windows)]
 impl ConsoleTitle {
-    fn new(program: &Path) -> std::io::Result<Self> {
+    fn new(program: &Path, account_short: Option<&str>) -> std::io::Result<Self> {
         let cwd = std::env::current_dir()?;
         let folder: String = cwd
             .file_name()
@@ -975,7 +1008,7 @@ impl ConsoleTitle {
             .chars()
             .filter(|c| !c.is_control())
             .collect();
-        let desired = format!("codex-qb · {folder}");
+        let desired = codex_title(&folder, account_short);
         set_console_title(&desired);
         // Exact known shell/program titles only: never fight a client's own title.
         let program_title = program.to_string_lossy().into_owned();
@@ -1044,6 +1077,22 @@ fn is_cmd_title(current: &str, cmd_titles: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn r11_title_uses_only_a_configured_two_letter_short() {
+        assert_eq!(codex_title("project", Some("ab")), "codex-qb-ab · project");
+        assert_eq!(codex_title("project", None), "codex-qb · project");
+        for value in [
+            "http://127.0.0.1/l/private",
+            "account-name",
+            "A1",
+            "ab\n",
+            "abc",
+            "",
+        ] {
+            assert_eq!(codex_title("project", Some(value)), "codex-qb · project");
+        }
+    }
+
     #[test]
     fn r81_ambiguous_relative_or_current_directory_node_uses_shim_fallback() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r81-path-resolution");

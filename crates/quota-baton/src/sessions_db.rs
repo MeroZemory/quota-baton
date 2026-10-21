@@ -540,6 +540,132 @@ fn thread_info(row: &RowSnapshot) -> Result<ThreadInfo> {
     })
 }
 
+/// Bounded metadata-only startup selection. Native TUI requests UpdatedAt DESC,
+/// active/nonempty-preview, provider and source/cwd filters (native tui/lib.rs
+/// latest_session_lookup_params; state/runtime/threads.rs push_thread_filters).
+/// Our picker adds UUID DESC solely for stable pagination. Last refuses ties.
+pub(crate) struct ResumeCandidate {
+    pub id: String,
+    pub rollout_path: PathBuf,
+    pub updated_at_ms: i64,
+}
+
+pub(crate) struct ResumeCursor {
+    pub updated_at_ms: i64,
+    pub id: String,
+}
+
+struct ResumeBudget {
+    ticks: u32,
+    deadline: std::time::Instant,
+}
+
+unsafe extern "C" fn resume_progress(data: *mut std::ffi::c_void) -> std::ffi::c_int {
+    // SQLite invokes synchronously on this connection's caller. The boxed
+    // budget outlives the installed callback; ResumeRead clears it on drop.
+    let budget = unsafe { &mut *data.cast::<ResumeBudget>() };
+    if budget.ticks == 0 || std::time::Instant::now() >= budget.deadline {
+        return 1;
+    }
+    budget.ticks -= 1;
+    0
+}
+
+struct ResumeRead {
+    db: Connection,
+    _budget: Box<ResumeBudget>,
+}
+impl Drop for ResumeRead {
+    fn drop(&mut self) {
+        // No callback may retain a pointer into the dropped box.
+        unsafe {
+            rusqlite::ffi::sqlite3_progress_handler(self.db.handle(), 0, None, std::ptr::null_mut())
+        };
+    }
+}
+
+/// Read one page under its own short read transaction. Never creates/migrates a
+/// database, retains a transaction while waiting for terminal input, or reads
+/// preview/title/body values. Missing metadata requires an explicit UUID.
+pub(crate) fn resume_page(
+    home: &Path,
+    cwd: Option<&Path>,
+    include_non_interactive: bool,
+    after: Option<&ResumeCursor>,
+    limit: usize,
+) -> Result<Vec<ResumeCandidate>> {
+    ensure!((1..=101).contains(&limit), "invalid resume page bound");
+    let db = readonly(&home.join(STATE))?.context("resume metadata unavailable")?;
+    let mut budget = Box::new(ResumeBudget {
+        ticks: 10_000, // at most ~10 million VM operations, plus wall deadline
+        deadline: std::time::Instant::now() + Duration::from_secs(2),
+    });
+    unsafe {
+        // Bound individual SQLite values even before Rust borrows/copies them.
+        rusqlite::ffi::sqlite3_limit(db.handle(), rusqlite::ffi::SQLITE_LIMIT_LENGTH, 1024 * 1024);
+        rusqlite::ffi::sqlite3_progress_handler(
+            db.handle(),
+            1000,
+            Some(resume_progress),
+            (&mut *budget as *mut ResumeBudget).cast(),
+        );
+    }
+    let read = ResumeRead {
+        db,
+        _budget: budget,
+    };
+    // Do not permit a view/virtual table to replace the expected metadata table.
+    let ddl: String = read.db.query_row(
+        "SELECT sql FROM sqlite_schema WHERE type='table' AND name='threads'",
+        [],
+        |row| row.get(0),
+    )?;
+    ensure!(
+        !ddl.to_ascii_uppercase().contains("VIRTUAL"),
+        "unsupported resume metadata"
+    );
+    let cwd = cwd
+        .map(|value| value.to_str().context("non-Unicode resume cwd"))
+        .transpose()?;
+    let mut statement = read.db.prepare(
+        "SELECT id, rollout_path, updated_at_ms FROM threads
+         WHERE archived=0 AND preview<>'' AND model_provider='openai'
+           AND (source IN ('cli','vscode') OR (?1 AND source IN ('exec','mcp')))
+           AND (?2 IS NULL OR cwd=?2)
+           AND (?3 IS NULL OR updated_at_ms<?3 OR (updated_at_ms=?3 AND id<?4))
+         ORDER BY updated_at_ms DESC, id DESC LIMIT ?5",
+    )?;
+    let rows = statement.query_map(
+        rusqlite::params![
+            include_non_interactive,
+            cwd,
+            after.map(|v| v.updated_at_ms),
+            after.map(|v| v.id.as_str()),
+            limit as i64
+        ],
+        |row| {
+            // Borrow first so hostile long strings aren't copied into the page.
+            let id = row
+                .get_ref(0)?
+                .as_str()
+                .map_err(|_| rusqlite::Error::InvalidQuery)?;
+            let path = row
+                .get_ref(1)?
+                .as_str()
+                .map_err(|_| rusqlite::Error::InvalidQuery)?;
+            if !crate::sessions_discovery::valid_id(id) || path.len() > 32 * 1024 {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            Ok(ResumeCandidate {
+                id: id.to_owned(),
+                rollout_path: PathBuf::from(path),
+                updated_at_ms: row.get(2)?,
+            })
+        },
+    )?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 /// Discovery reads only id, rollout_path and model_provider, never titles/goals.
 pub(crate) fn threads(home: &Path) -> Result<Vec<ThreadInfo>> {
     let Some(db) = readonly(&home.join(STATE))? else {
