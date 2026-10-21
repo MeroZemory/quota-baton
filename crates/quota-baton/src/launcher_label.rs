@@ -64,6 +64,18 @@ pub fn run(
     settings: Option<&Path>,
     args: &[std::ffi::OsString],
 ) -> std::io::Result<i32> {
+    run_with_environment(client, program, settings, args, &[])
+}
+
+/// D23: image-home selection and its local client key affect only the managed
+/// process tree, never this process or an installed/global configuration.
+pub(crate) fn run_with_environment(
+    client: Client,
+    program: &Path,
+    settings: Option<&Path>,
+    args: &[std::ffi::OsString],
+    environment: &[(&str, &std::ffi::OsStr)],
+) -> std::io::Result<i32> {
     if !program.is_absolute()
         || settings.is_some_and(|p| !p.is_absolute())
         || matches!(client, Client::Claude) && settings.is_none()
@@ -72,6 +84,7 @@ pub fn run(
         return Err(std::io::ErrorKind::InvalidInput.into());
     }
     let mut child = client_command(client, program);
+    child.envs(environment.iter().copied());
     if let Some(settings) = settings {
         child.arg("--settings").arg(settings);
     }
@@ -144,6 +157,76 @@ pub(crate) fn version_output(program: &Path) -> std::io::Result<Vec<u8>> {
     {
         let _ = program;
         Err(std::io::ErrorKind::Unsupported.into())
+    }
+}
+
+/// Isolated D23 capability probe. The job owns the complete process tree and
+/// output goes to NUL; callers retain only the loopback tool-presence boolean.
+#[derive(Debug)]
+pub(crate) enum CanaryRunError {
+    Spawn(std::io::Error),
+    Wait(std::io::Error),
+    Exit,
+}
+
+impl std::fmt::Display for CanaryRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Spawn(_) => "native-spawn",
+            Self::Wait(_) => "native-wait",
+            Self::Exit => "native-exit",
+        })
+    }
+}
+
+impl std::error::Error for CanaryRunError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Spawn(error) | Self::Wait(error) => Some(error),
+            Self::Exit => None,
+        }
+    }
+}
+
+pub(crate) fn canary_run(
+    program: &Path,
+    args: &[std::ffi::OsString],
+    environment: &[(&str, std::ffi::OsString)],
+    cwd: &Path,
+) -> Result<(), CanaryRunError> {
+    #[cfg(windows)]
+    {
+        let mut command = client_command(Client::Codex, program);
+        command
+            .args(args)
+            .envs(environment.iter().map(|(key, value)| (*key, value)))
+            .current_dir(cwd);
+        let null = std::fs::OpenOptions::new()
+            .write(true)
+            .open("NUL")
+            .map_err(CanaryRunError::Spawn)?;
+        let mut child =
+            contained::Child::spawn(&command, Some(&null)).map_err(CanaryRunError::Spawn)?;
+        let status = child.wait(Some(std::time::Duration::from_secs(15)));
+        drop(child);
+        #[cfg(all(feature = "testkit", debug_assertions))]
+        match &status {
+            Ok(code) if *code != 0 => eprintln!("qb-image-canary: native-exit={code}"),
+            Err(error) => eprintln!("qb-image-canary: native-wait={:?}", error.kind()),
+            _ => {}
+        }
+        if status.map_err(CanaryRunError::Wait)? == 0 {
+            Ok(())
+        } else {
+            Err(CanaryRunError::Exit)
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (program, args, environment, cwd);
+        Err(CanaryRunError::Spawn(
+            std::io::ErrorKind::Unsupported.into(),
+        ))
     }
 }
 
@@ -247,7 +330,7 @@ mod contained {
             System::{
                 Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE},
                 Threading::{
-                    CREATE_NO_WINDOW, CREATE_SUSPENDED, CreateProcessW,
+                    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
                     DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
                     GetExitCodeProcess, IO_COUNTERS, InitializeProcThreadAttributeList,
                     LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
@@ -412,11 +495,7 @@ mod contained {
 
     impl Child {
         pub(super) fn spawn(command: &Command, output: Option<&File>) -> io::Result<Self> {
-            if command.get_envs().next().is_some() {
-                // Codex uses inherited environment. Avoid silently losing a
-                // future explicit environment override in this native path.
-                return Err(io::ErrorKind::Unsupported.into());
-            }
+            let environment = environment_block(command)?;
             let (program, mut line) = command_line(command)?;
             let job = owned(unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) })?;
             let mut limits = ExtendedLimits::default();
@@ -470,6 +549,9 @@ mod contained {
             if output.is_some() {
                 flags |= CREATE_NO_WINDOW;
             }
+            if environment.is_some() {
+                flags |= CREATE_UNICODE_ENVIRONMENT;
+            }
             // The job-list attribute assigns membership atomically at creation.
             // Even a launcher crash before ResumeThread cannot leave an orphan.
             unsafe {
@@ -480,7 +562,7 @@ mod contained {
                     None,
                     true,
                     flags,
-                    None,
+                    environment.as_ref().map(|block| block.as_ptr().cast()),
                     PCWSTR(cwd.as_ref().map_or(std::ptr::null(), |v| v.as_ptr())),
                     &startup.StartupInfo,
                     &mut information,
@@ -520,6 +602,54 @@ mod contained {
         }
     }
 
+    /// This path inherits the current environment and applies Command's
+    /// explicit set/remove operations. Callers never use env_clear here.
+    /// Values stay private and the native UTF-16 block is erased after spawn.
+    fn environment_block(command: &Command) -> io::Result<Option<zeroize::Zeroizing<Vec<u16>>>> {
+        if command.get_envs().next().is_none() {
+            return Ok(None);
+        }
+        fn key(value: &OsStr) -> Vec<u16> {
+            value
+                .encode_wide()
+                .map(|unit| {
+                    if (97..=122).contains(&unit) {
+                        unit - 32
+                    } else {
+                        unit
+                    }
+                })
+                .collect()
+        }
+        let mut values: std::collections::BTreeMap<_, _> = std::env::vars_os()
+            .map(|(name, value)| (key(&name), (name, value)))
+            .collect();
+        for (name, value) in command.get_envs() {
+            if let Some(value) = value {
+                values.insert(key(name), (name.to_owned(), value.to_owned()));
+            } else {
+                values.remove(&key(name));
+            }
+        }
+        let mut block = zeroize::Zeroizing::new(Vec::new());
+        for (_, (name, value)) in values {
+            let name: Vec<_> = name.encode_wide().collect();
+            let value = zeroize::Zeroizing::new(value.encode_wide().collect::<Vec<_>>());
+            if name.contains(&0) || value.contains(&0) {
+                return Err(io::ErrorKind::InvalidInput.into());
+            }
+            block.extend_from_slice(&name);
+            block.push(61);
+            block.extend_from_slice(&value);
+            block.push(0);
+        }
+        block.push(0);
+        if block.len() == 1 {
+            block.push(0);
+        }
+        Ok(Some(block))
+    }
+
     impl Drop for Child {
         fn drop(&mut self) {
             unsafe { TerminateJobObject(self.job.as_raw_handle(), 1) };
@@ -556,7 +686,14 @@ mod contained {
         }
         let read = File::from(owned(read)?);
         let write = File::from(owned(write)?);
-        let mut child = Child::spawn(command, Some(&write))?;
+        let mut child = Child::spawn(command, Some(&write)).inspect_err(|_error| {
+            #[cfg(all(feature = "testkit", debug_assertions))]
+            eprintln!(
+                "qb-version-probe stage=spawn kind={:?} os={:?}",
+                _error.kind(),
+                _error.raw_os_error()
+            );
+        })?;
         drop(write);
         let reader = std::thread::spawn(move || {
             let mut bytes = Vec::new();
@@ -568,6 +705,20 @@ mod contained {
         let output = reader
             .join()
             .map_err(|_| io::Error::other("버전 출력 검사 실패"))??;
+        #[cfg(all(feature = "testkit", debug_assertions))]
+        match &status {
+            Err(error) => eprintln!(
+                "qb-version-probe stage=wait kind={:?} os={:?} bytes={}",
+                error.kind(),
+                error.raw_os_error(),
+                output.len()
+            ),
+            Ok(code) if *code != 0 || output.len() > 4096 => eprintln!(
+                "qb-version-probe stage=result exit={code} bytes={}",
+                output.len()
+            ),
+            _ => {}
+        }
         if status? != 0 || output.len() > 4096 {
             return Err(io::Error::other("Codex 버전을 확인하지 못했습니다"));
         }
@@ -992,4 +1143,26 @@ mod tests {
         assert!(merge_headers("preserve", "bad\nInjected: yes").is_none());
         assert!(merge_headers(&"a".repeat(MAX_HEADERS + 1), "qb1:YQ").is_none());
     }
+}
+#[cfg(windows)]
+#[test]
+fn r12_contained_environment_sets_and_removes_only_child_variables() {
+    let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r12-environment-tests");
+    std::fs::create_dir_all(&base).unwrap();
+    let root = tempfile::tempdir_in(base).unwrap();
+    let script = root.path().join("environment.cmd");
+    std::fs::write(&script, b"@echo off\r\nif defined QB_SYNTHETIC_IMAGE_KEY (echo present:%QB_SYNTHETIC_IMAGE_KEY%) else (echo absent)\r\nexit /b 0\r\n").unwrap();
+    let mut command = std::process::Command::new(script);
+    command.env("QB_SYNTHETIC_IMAGE_KEY", "r12-synthetic-only");
+    let existed = std::env::var_os("QB_SYNTHETIC_IMAGE_KEY").is_some();
+    assert_eq!(
+        contained::capture(&command).unwrap(),
+        b"present:r12-synthetic-only\r\n"
+    );
+    assert_eq!(
+        std::env::var_os("QB_SYNTHETIC_IMAGE_KEY").is_some(),
+        existed
+    );
+    command.env_remove("QB_SYNTHETIC_IMAGE_KEY");
+    assert_eq!(contained::capture(&command).unwrap(), b"absent\r\n");
 }

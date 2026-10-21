@@ -284,6 +284,24 @@ quota-baton.exe unwire --apply
 
 사용자가 수정한 파일은 자동으로 덮어쓰지 않습니다. 변경 내용을 확인하고 force가 필요한 경우에만 별도 승인을 사용합니다. 전환은 [C11 관리 API](contract.md#c11-admin-api)와 [C12 저장 형식](contract.md#c12-persistence-formats)에 맞춰 journal과 함께 처리됩니다.
 
+### Codex에서 이미지 만들기
+
+`codex-qb --images`는 이미지 전용 홈에서 새 대화를 시작합니다. 일반 `codex-qb` 홈과 대화 목록이 다릅니다. 처음에는 `wire` 업그레이드가 필요합니다. 기존 대화를 이미지 모드로 옮기거나 재개하는 기능은 아직 지원하지 않습니다. 새 이미지 세션을 여세요.
+
+대화형 화면 없이 실행할 때도 새 이미지 세션을 만들 수 있습니다.
+
+```powershell
+codex-qb --images exec "이미지를 만들고 PNG로 저장해 주세요."
+```
+
+`--images exec resume`는 지원하지 않습니다. 일반 `codex-qb` 실행은 그대로 유지됩니다.
+
+이미지는 사용 가능한 유료 Codex 계정으로 처리합니다. 이미지 한도를 다 쓰면 다른 이미지 계정을 한 번씩 시도합니다. 일반 대화의 계정 연결은 바꾸지 않습니다. 이미지 인증 오류가 나도 토큰을 폐기하거나 강제로 갱신하지 않습니다. Pro 계정은 기본적으로 마지막 후보입니다. `[accounts.<계정 ID>]`의 `images_last_resort = false`로 일반 후보로 바꾸거나 `true`로 다른 계정도 마지막 후보로 둘 수 있습니다.
+
+서버 이미지 ID로 편집할 때 제작 계정을 확인할 수 없으면 요청을 거절합니다. 로컬 이미지 파일로 편집할 수 있습니다.
+
+이미지 도구를 확인하지 못하면 실행을 중단하고 `codex-mz` 사용을 안내합니다. 일반 대화는 `codex-qb`로 시작하세요. 자세한 경계와 계정 선택은 [D23](decisions.md#d23-image-generation-through-qb-a-separate-image-home-qi-with-a-custom-provider-and-qb-relays-the-images-routes--accepted-user-direction-plus-panel-2026-10-21)을 확인하세요.
+
 ### 기존 Codex 대화 가져오기
 
 먼저 `wire --codex-mode dedicated --apply`로 Codex 전용 명령을 준비합니다. 대화 이전 기능(가져오기·공유·일괄 이동·돌려보내기와 자동 이동 제안)은 **Codex CLI 0.163.0**에서만 지원합니다. 버전이 다르면 한국어 사유를 보여 주고 해당 기능을 거절합니다. 일반 `codex-qb` 실행과 이미 qb에 있는 대화의 재개에는 이 버전 제한을 적용하지 않습니다. 프롬프트, 프로필·설정 옵션, daemon·app-server 등 Codex의 기본 인자는 그대로 전달하며 `--no-daemon`을 자동으로 붙이지 않습니다. 아래의 `<HOME>`은 기존 Codex 홈 폴더입니다. `<UUID>`는 대화 ID입니다.

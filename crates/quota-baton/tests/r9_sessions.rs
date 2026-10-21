@@ -155,6 +155,9 @@ impl Fixture {
         let stderr = self._root.path().join("stderr.txt");
         let mut child = Command::new(env!("CARGO_BIN_EXE_quota-baton"))
             .args(args)
+            // Many fixtures run together; each short-lived CLI needs only two
+            // reactor workers, rather than one per machine CPU per process.
+            .env("TOKIO_WORKER_THREADS", "2")
             .env("QB_HOME", &self.qb)
             .env("USERPROFILE", &self.user)
             .env("APPDATA", self.user.join("AppData/Roaming"))

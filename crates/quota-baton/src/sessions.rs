@@ -2,6 +2,9 @@
 use crate::{sessions_db as db, sessions_discovery as discovery, sessions_guard as guard};
 
 pub(crate) fn friendly_error(error: &anyhow::Error) -> Option<String> {
+    if let Some(provider) = error.downcast_ref::<crate::sessions_db::UnsupportedProvider>() {
+        return Some(provider.to_string());
+    }
     if error.is::<discovery::PhysicalConflict>() {
         return Some("같은 물리 대화 ID의 서로 다른 파일이 있습니다. doctor로 확인하세요".into());
     }
@@ -25,6 +28,7 @@ pub(crate) fn friendly_error(error: &anyhow::Error) -> Option<String> {
         "원본에서 대화를 찾지 못했습니다",
         "최근에 사용한 대화입니다. 먼저 대화를 종료하고 120초 후 다시 시도하세요",
         "openai 제공자의 대화만 가져올 수 있습니다",
+        "openai 또는 qb 제공자의 대화만 가져올 수 있습니다",
         "대화 기록이 분기되었습니다. sessions unimport 후 다시 가져오세요",
         "활성 대화 기록이 분기되었습니다. sessions unimport 후 다시 가져오세요",
         "압축된 대화 기록이 있습니다. sessions unimport 후 다시 가져오세요",
@@ -65,6 +69,7 @@ pub(crate) fn friendly_error(error: &anyhow::Error) -> Option<String> {
         "조상 전용 또는 고아 대화가 있어 관리 실행을 거절합니다. doctor로 확인하세요",
         "이 대화는 다른 홈이 소유합니다. 원래 홈에서 재개하세요",
         "대화 소유권과 목록이 다릅니다. doctor로 확인하세요",
+        "여러 관리 홈에 가져오기 기록이 있습니다. doctor로 확인하세요",
         "이동 중 갈라진 대화가 나타나 원본으로 되돌렸습니다",
         "압축된 대화의 후손 관계를 확인할 수 없어 이동을 거절합니다. doctor로 확인하세요",
         "하나의 파일에 서로 다른 물리 대화 ID가 있어 이동을 거절합니다",
@@ -192,26 +197,56 @@ struct Journal {
     imports: BTreeMap<String, Import>,
 }
 
+#[derive(Clone)]
 struct Store {
     home: PathBuf,
     target: PathBuf,
     search_homes: Vec<PathBuf>,
     map_path: PathBuf,
 }
+fn wired_homes(home: &Path) -> Result<Vec<PathBuf>> {
+    let path = home.join("journal/wiring.json");
+    guard::safe_path(home, &path)?;
+    let bytes = fs::read(path).context("전용 Codex 홈 연결이 없습니다. 먼저 wire를 실행하세요")?;
+    ensure!(bytes.len() <= 16 * 1024 * 1024, "연결 기록이 너무 큽니다");
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|_| anyhow::anyhow!("연결 기록을 읽을 수 없습니다"))?;
+    ensure!(
+        crate::sessions_admission::completed_wiring(&value),
+        "전용 Codex 홈 연결을 먼저 완료하세요"
+    );
+    let ordinary = PathBuf::from(value["home"].as_str().context("전용 홈 경로가 없습니다")?);
+    let image = value["image_home"].as_str().map(PathBuf::from);
+    let mut homes = Vec::new();
+    for target in std::iter::once(ordinary).chain(image) {
+        ensure!(
+            target.is_absolute() && target.is_dir(),
+            "전용 Codex 홈이 없습니다"
+        );
+        guard::safe_path(&target, &target)?;
+        let target = fs::canonicalize(target)?;
+        ensure!(!homes.contains(&target), "연결된 관리 홈이 중복되었습니다");
+        homes.push(target);
+    }
+    Ok(homes)
+}
 impl Store {
     fn open(home: &Path) -> Result<Self> {
-        let path = home.join("journal/wiring.json");
-        guard::safe_path(home, &path)?;
-        let bytes =
-            fs::read(path).context("전용 Codex 홈 연결이 없습니다. 먼저 wire를 실행하세요")?;
-        ensure!(bytes.len() <= 16 * 1024 * 1024, "연결 기록이 너무 큽니다");
-        let value: serde_json::Value = serde_json::from_slice(&bytes)
-            .map_err(|_| anyhow::anyhow!("연결 기록을 읽을 수 없습니다"))?;
-        ensure!(
-            crate::sessions_admission::completed_wiring(&value),
-            "전용 Codex 홈 연결을 먼저 완료하세요"
-        );
-        let target = PathBuf::from(value["home"].as_str().context("전용 홈 경로가 없습니다")?);
+        Self::open_selected(home, None)
+    }
+
+    fn open_selected(home: &Path, selected: Option<&Path>) -> Result<Self> {
+        let homes = wired_homes(home)?;
+        let target = if let Some(selected) = selected {
+            let selected = fs::canonicalize(selected)?;
+            ensure!(
+                homes.contains(&selected),
+                "선택한 홈은 연결된 qb 홈이 아닙니다"
+            );
+            selected
+        } else {
+            homes[0].clone()
+        };
         ensure!(
             target.is_absolute() && target.is_dir(),
             "전용 Codex 홈이 없습니다"
@@ -220,7 +255,12 @@ impl Store {
         let user = std::env::var_os("USERPROFILE")
             .or_else(|| std::env::var_os("HOME"))
             .map(PathBuf::from);
-        let search_homes = user.as_deref().map(known_homes).unwrap_or_default();
+        let mut search_homes = user.as_deref().map(known_homes).unwrap_or_default();
+        for home in homes {
+            if home.is_dir() && !search_homes.contains(&home) {
+                search_homes.push(home);
+            }
+        }
         Ok(Self {
             home: home.to_owned(),
             target: fs::canonicalize(target)?,
@@ -231,8 +271,79 @@ impl Store {
                 .join("herdr/session-homes.json"),
         })
     }
+
+    fn managed_homes(&self) -> Result<Vec<PathBuf>> {
+        let journal = self.home.join("journal/wiring.json");
+        guard::safe_path(&self.home, &journal)?;
+        if journal.try_exists()? {
+            wired_homes(&self.home)
+        } else {
+            Ok(vec![self.target.clone()])
+        }
+    }
+
+    fn with_target(&self, target: PathBuf) -> Self {
+        Self {
+            target,
+            ..self.clone()
+        }
+    }
+
+    fn for_session(self, id: &str) -> Result<Self> {
+        let homes = self.managed_homes()?;
+        if let Some(owner) = staged::owner(&self, id)? {
+            return Ok(if homes.contains(&owner) {
+                self.with_target(owner)
+            } else {
+                self
+            });
+        }
+        let mut selected = None;
+        for home in homes {
+            let candidate = self.with_target(home);
+            if candidate
+                .load()?
+                .imports
+                .values()
+                .any(|entry| entry.root == id || entry.threads.iter().any(|thread| thread == id))
+            {
+                ensure!(
+                    selected.is_none(),
+                    "여러 관리 홈에 가져오기 기록이 있습니다. doctor로 확인하세요"
+                );
+                selected = Some(candidate);
+            }
+        }
+        Ok(selected.unwrap_or(self))
+    }
     fn path(&self) -> PathBuf {
-        self.home.join("journal/sessions-import.json")
+        // Only the journaled Qi path has this fixed basename. Keep legacy
+        // share journals separate; staged MOVE ownership remains global by ID.
+        self.home.join(
+            if self
+                .target
+                .file_name()
+                .is_some_and(|name| name == "qb-images")
+            {
+                "journal/sessions-import-images.json"
+            } else {
+                "journal/sessions-import.json"
+            },
+        )
+    }
+
+    fn staging_home(&self) -> Result<PathBuf> {
+        let journal = self.home.join("journal/wiring.json");
+        guard::safe_path(&self.home, &journal)?;
+        if !journal.try_exists()? {
+            return Ok(self.target.clone());
+        }
+        let bytes = fs::read(journal)?;
+        ensure!(bytes.len() <= 16 * 1024 * 1024, "연결 기록이 너무 큽니다");
+        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let home = PathBuf::from(value["home"].as_str().context("전용 홈 경로가 없습니다")?);
+        guard::safe_path(&home, &home)?;
+        Ok(fs::canonicalize(home)?)
     }
     fn load(&self) -> Result<Journal> {
         let path = self.path();
@@ -813,7 +924,9 @@ fn verify_links(entry: &Import, growth: bool) -> Result<()> {
     )?;
     for id in &entry.threads {
         ensure!(
-            db::thread_provider(&entry.target_home, id)?.is_none_or(|p| p == "openai"),
+            db::thread_provider(&entry.target_home, id)?
+                .is_none_or(|p| db::destination_provider(&entry.target_home)
+                    .is_ok_and(|expected| p == expected)),
             "대화 제공자가 변경되었습니다. sessions unimport 후 다시 가져오세요"
         );
         let source = db::thread_path(&entry.source_home, id)?;
@@ -931,7 +1044,21 @@ fn preview_imports(
 }
 
 pub(crate) fn run(home: &Path, command: SessionsCommand) -> Result<()> {
-    let store = Store::open(home)?;
+    run_with_store(Store::open(home)?, command)
+}
+
+fn run_with_store(mut store: Store, command: SessionsCommand) -> Result<()> {
+    // MOVE ownership is shared by Q and Qi. Return/recovery must operate on
+    // the current managed owner instead of assuming every thread lives in Q.
+    let requested = match &command {
+        SessionsCommand::Return { id, .. }
+        | SessionsCommand::Unimport { id, .. }
+        | SessionsCommand::Recover { id, .. } => Some(id.as_str()),
+        _ => None,
+    };
+    if let Some(id) = requested {
+        store = store.for_session(id)?;
+    }
     match command {
         SessionsCommand::Import {
             from,
@@ -1248,7 +1375,7 @@ fn import_one_using(
             let info = db::ThreadInfo {
                 id: id.clone(),
                 rollout_path: item.path.clone(),
-                model_provider: "openai".into(),
+                model_provider: item.provider.clone().context("대화 제공자가 없습니다")?,
             };
             db::add_synthetic_thread(&mut database, &info, fields).map_err(|_| {
                 anyhow::anyhow!("기록에서 필요한 대화 메타데이터를 복구하지 못했습니다")
@@ -1749,29 +1876,32 @@ fn resume_entry<'a>(journal: &'a Journal, id: &str) -> Result<Option<&'a Import>
 }
 
 pub(crate) fn before_codex_resume(args: &[OsString]) -> Result<()> {
-    let requested = resume_uuid(args)?;
-    admission_check(&qb_core::home()?, requested.as_deref())?;
-    let Some(id) = requested else {
-        return Ok(());
-    };
-    let store = Store::open(&qb_core::home()?)?;
-    before_resume_in_store(&store, &id)
+    before_codex_resume_at(args, None)
 }
 
-// The launcher checks admission before this preparation and again while holding
-// its shared launch permit. Keep journal validation ahead of the local-row path.
-fn before_resume_in_store(store: &Store, id: &str) -> Result<()> {
-    let previous_owner = staged::owner(store, id)?;
-    if previous_owner.as_ref() == Some(&store.target) {
+fn resume_in_target(store: &Store, id: &str, previous_owner: Option<&Path>) -> Result<bool> {
+    returning::ensure_not_pending(store, id)?;
+    let journal = store.load()?;
+    // Pending legacy work still fences the ID. Completed shares cannot
+    // override the newer staged move's authoritative owner.
+    let entry = resume_entry(&journal, id)?;
+    let entry = if let Some(owner) = previous_owner {
+        if owner != store.target.as_path() {
+            ensure!(
+                db::thread_path(&store.target, id)?.is_none(),
+                "대화 소유권과 목록이 다릅니다. doctor로 확인하세요"
+            );
+            return Ok(false);
+        }
         ensure!(
             db::thread_path(&store.target, id)?.is_some(),
             "대화 소유권과 목록이 다릅니다. doctor로 확인하세요"
         );
-        return Ok(());
-    }
-    returning::ensure_not_pending(store, id)?;
-    let journal = store.load()?;
-    if let Some(entry) = resume_entry(&journal, id)?
+        None
+    } else {
+        entry
+    };
+    if let Some(entry) = entry
         && (entry.root == id || db::thread_path(&store.target, id)?.is_some())
     {
         ensure!(entry.complete, "대화 가져오기가 완료되지 않았습니다");
@@ -1784,11 +1914,30 @@ fn before_resume_in_store(store: &Store, id: &str) -> Result<()> {
         let (homes, names) = store.probes(&entry.source_home, &entry.threads, &names)?;
         let _guards = guard::probe_decoded(&homes, &entry.threads, &names)?;
         verify_links(entry, false)?;
-        return Ok(());
+        return Ok(true);
     }
     if db::thread_path(&store.target, id)?.is_some() {
-        // Q already owns this thread. Import eligibility (including historical
-        // ancestor providers such as cliproxyapi) does not apply to a resume.
+        let catalog = discovery::catalog(&store.target)?;
+        let files = catalog.chain(id)?;
+        let names = files.iter().map(|f| f.path.clone()).collect::<Vec<_>>();
+        let threads = files.iter().map(|f| f.thread.clone()).collect::<Vec<_>>();
+        let (homes, names) = store.probes(&store.target, &threads, &names)?;
+        let _guards = guard::probe_decoded(&homes, &threads, &names)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+pub(crate) fn before_codex_resume_at(args: &[OsString], target: Option<&Path>) -> Result<()> {
+    let requested = resume_uuid(args)?;
+    admission_check(&qb_core::home()?, requested.as_deref())?;
+    let Some(id) = requested else {
+        return Ok(());
+    };
+    let id = id.as_str();
+    let store = Store::open_selected(&qb_core::home()?, target)?;
+    let previous_owner = staged::owner(&store, id)?;
+    if resume_in_target(&store, id, previous_owner.as_deref())? {
         return Ok(());
     }
     let user = std::env::var_os("USERPROFILE")
@@ -1940,9 +2089,18 @@ pub(crate) fn admission_check(home: &Path, requested: Option<&str>) -> Result<()
     if !home.join("journal/wiring.json").exists() {
         return Ok(());
     }
-    let store = Store::open(home)?;
+    // Admission reads journal scopes only; it must not discover user profiles
+    // or resolve a session map merely to check either managed home's journal.
+    let homes = wired_homes(home)?;
+    let mut store = Store {
+        home: home.to_owned(),
+        target: homes[0].clone(),
+        search_homes: Vec::new(),
+        map_path: PathBuf::new(),
+    };
     return_compat::ensure_not_pending(&store, id)?;
-    if store.path().exists() {
+    for target in homes {
+        store.target = target;
         let legacy = store.load()?;
         resume_entry(&legacy, id)?;
     }

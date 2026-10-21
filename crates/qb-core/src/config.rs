@@ -361,6 +361,33 @@ pub struct AccountConfig {
     pub drain: bool,
     pub allow_credits: bool,
     pub spread_threshold: Option<usize>,
+    /// Unset conservatively treats every Pro account as an image last resort.
+    /// Explicit false opts out; true puts any paid account in the last tier.
+    /// Priority tiers override affinity; binding preference applies within a tier.
+    pub images_last_resort: Option<bool>,
+}
+
+#[cfg(test)]
+mod image_account_tests {
+    use super::*;
+
+    #[test]
+    fn images_last_resort_defaults_none_and_roundtrips_explicit_bools() {
+        assert_eq!(AccountConfig::default().images_last_resort, None);
+        let config: Config = toml::from_str(
+            "[accounts.normal]\n[accounts.protected]\nimages_last_resort=true\n[accounts.optout]\nimages_last_resort=false\n",
+        ).unwrap();
+        assert_eq!(config.accounts["normal"].images_last_resort, None);
+        assert_eq!(config.accounts["protected"].images_last_resort, Some(true));
+        assert_eq!(config.accounts["optout"].images_last_resort, Some(false));
+        let again: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(again.accounts["normal"].images_last_resort, None);
+        assert_eq!(again.accounts["protected"].images_last_resort, Some(true));
+        assert_eq!(again.accounts["optout"].images_last_resort, Some(false));
+        assert!(
+            toml::from_str::<Config>("[accounts.invalid]\nimages_last_resort='yes'\n").is_err()
+        );
+    }
 }
 
 impl Config {
@@ -404,6 +431,7 @@ impl Config {
         if let Some(accounts) = value.get("accounts").and_then(toml::Value::as_table) {
             let known = toml::Value::try_from(AccountConfig {
                 spread_threshold: Some(1),
+                images_last_resort: Some(false),
                 ..AccountConfig::default()
             })?;
             for account in accounts.values() {

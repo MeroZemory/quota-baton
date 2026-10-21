@@ -718,7 +718,8 @@ pub(crate) fn plan(source_home: &Path, target_home: &Path, ids: &[String]) -> Re
 
 /// Read the authoritative home's CURRENT rows, never an old import snapshot.
 /// Preserve goal status, objective, counters and timestamps, and thread archive
-/// state. Map only rollout_path (and its generated dependents). Capture the
+/// state. Map rollout_path (and its generated dependents) and D23's destination
+/// provider. Capture the
 /// root-only source_snapshot separately under the same guards before removal.
 pub(crate) fn plan_return(
     source_home: &Path,
@@ -728,12 +729,85 @@ pub(crate) fn plan_return(
     plan_with_mode(source_home, target_home, ids, true)
 }
 
+/// D23 translates metadata rows only; rollout names remain hardlinks and their
+/// original session_meta is never rewritten. Native 0.163 round trips validate
+/// that the destination config/row wins over that historical provider.
+#[derive(Debug)]
+pub(crate) struct UnsupportedProvider(String);
+impl std::fmt::Display for UnsupportedProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "지원하지 않는 대화 제공자 '{}': openai 또는 qb만 이동할 수 있습니다",
+            self.0
+        )
+    }
+}
+impl std::error::Error for UnsupportedProvider {}
+pub(crate) fn require_provider(provider: &str) -> Result<()> {
+    if !matches!(provider, "openai" | "qb") {
+        let display = qb_core::observability::safe_identifier(provider)
+            .unwrap_or_else(|| "(표시할 수 없는 ID)".into());
+        return Err(anyhow::Error::new(UnsupportedProvider(display)));
+    }
+    Ok(())
+}
+
+pub(crate) fn destination_provider(home: &Path) -> Result<String> {
+    let path = home.join("config.toml");
+    crate::sessions_guard::safe_path(home, &path)?;
+    if !path.try_exists()? {
+        return Ok("openai".into());
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(std::fs::File::open(path)?, 1024 * 1024 + 1),
+        &mut bytes,
+    )?;
+    ensure!(
+        bytes.len() <= 1024 * 1024,
+        "destination config exceeds limit"
+    );
+    let text = std::str::from_utf8(&bytes)?.trim_start_matches('\u{feff}');
+    let doc: toml_edit::DocumentMut = text
+        .parse()
+        .map_err(|_| anyhow::anyhow!("destination provider config is invalid"))?;
+    let provider = match doc.get("model_provider") {
+        None => "openai",
+        Some(value) => value
+            .as_str()
+            .context("destination provider is not a string")?,
+    };
+    require_provider(provider)?;
+    Ok(provider.to_owned())
+}
+
+pub(crate) fn verify_destination_provider(plan: &DbPlan) -> Result<()> {
+    ensure!(
+        !plan.is_source_snapshot,
+        "destination provider requires a move plan"
+    );
+    let expected = destination_provider(&plan.target_home)?;
+    for row in plan
+        .threads
+        .iter()
+        .filter_map(|thread| thread.thread.as_ref())
+    {
+        ensure!(
+            field(row, "model_provider")? == expected,
+            "이동 계획 뒤 대상 제공자가 바뀌었습니다. 다시 계획하세요"
+        );
+    }
+    Ok(())
+}
+
 fn plan_with_mode(
     source_home: &Path,
     target_home: &Path,
     ids: &[String],
     preserve_current_state: bool,
 ) -> Result<DbPlan> {
+    let destination_provider = destination_provider(target_home)?;
     ensure!(
         source_home.is_absolute() && target_home.is_absolute(),
         "metadata homes must be absolute"
@@ -790,9 +864,11 @@ fn plan_with_mode(
             .flatten();
         let source = thread.as_ref().map(thread_info).transpose()?;
         if let Some(row) = &mut thread {
-            ensure!(
-                field(row, "model_provider")? == "openai",
-                "unsupported model provider for {id}"
+            let provider = field(row, "model_provider")?;
+            require_provider(provider)?;
+            row.values.insert(
+                "model_provider".into(),
+                DbValue::text(&destination_provider),
             );
             let path = mapped_path(
                 source_home,
@@ -1087,11 +1163,7 @@ pub(crate) fn add_synthetic_thread(
         !plan.is_source_snapshot,
         "cannot synthesize rows into an exact source snapshot"
     );
-    ensure!(
-        source.model_provider == "openai",
-        "unsupported model provider for {}",
-        source.id
-    );
+    require_provider(&source.model_provider)?;
     let position = plan
         .threads
         .iter()
@@ -1127,7 +1199,7 @@ pub(crate) fn add_synthetic_thread(
     );
     fields.insert(
         "model_provider".into(),
-        DbValue::text(&source.model_provider),
+        DbValue::text(&destination_provider(&plan.target_home)?),
     );
     fields.insert("archived".into(), DbValue::Integer(0));
     ensure!(
@@ -1508,6 +1580,39 @@ pub(crate) fn rollback_after_resume(plan: &DbPlan, force: bool) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn r12_destination_provider_is_bounded_and_unknown_ids_are_safely_named() -> Result<()> {
+        let (_root, home, _) = homes()?;
+        assert_eq!(destination_provider(&home)?, "openai");
+        for provider in ["openai", "qb"] {
+            std::fs::write(
+                home.join("config.toml"),
+                format!("model_provider='{provider}'\n"),
+            )?;
+            assert_eq!(destination_provider(&home)?, provider);
+        }
+        std::fs::write(
+            home.join("config.toml"),
+            "model_provider='custom-provider'\n",
+        )?;
+        assert!(
+            destination_provider(&home)
+                .unwrap_err()
+                .to_string()
+                .contains("custom-provider")
+        );
+        let unsafe_id = "sk-synthetic-secret-provider-never-print";
+        assert!(
+            !require_provider(unsafe_id)
+                .unwrap_err()
+                .to_string()
+                .contains(unsafe_id)
+        );
+        std::fs::write(home.join("config.toml"), vec![b' '; 1024 * 1024 + 1])?;
+        assert!(destination_provider(&home).is_err());
+        Ok(())
+    }
+
     fn homes() -> Result<(tempfile::TempDir, PathBuf, PathBuf)> {
         let sandbox = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox");
         std::fs::create_dir_all(&sandbox)?;
@@ -1795,7 +1900,7 @@ mod tests {
         )?;
         assert!(plan(&source, &target, &ids).is_err());
         db.execute(
-            "UPDATE threads SET rollout_path='sessions/inside.jsonl',model_provider='qb'",
+            "UPDATE threads SET rollout_path='sessions/inside.jsonl',model_provider='unknown-r12'",
             [],
         )?;
         assert!(plan(&source, &target, &ids).is_err());

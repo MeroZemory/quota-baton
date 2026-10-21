@@ -158,6 +158,9 @@ impl Core {
         )
     }
     fn from_command(mut command: Command, log: PathBuf) -> Self {
+        // Each synthetic core has its own runtime; keep paired-core tests
+        // bounded independently of the review host's logical CPU count.
+        command.env("TOKIO_WORKER_THREADS", "2");
         command.stderr(Stdio::from(fs::File::create(&log).unwrap()));
         let child = command.spawn().unwrap();
         let pid = child.id();

@@ -1,5 +1,6 @@
 #![cfg(windows)]
 
+use super::super::SessionsCommand;
 use super::*;
 use rusqlite::{Connection, params};
 use std::{cell::Cell, collections::BTreeMap, fs::OpenOptions, io::Write, rc::Rc, time::Duration};
@@ -12,6 +13,467 @@ const SECOND: &str = "66666666-6666-6666-6666-666666666666";
 const CHILD_PHYSICAL: &str = "77777777-7777-7777-7777-777777777777";
 const GRANDCHILD_PHYSICAL: &str = "88888888-8888-8888-8888-888888888888";
 const APPEND: &[u8] = b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"marker\":\"SYNTHETIC native append\"}}\n";
+
+#[test]
+fn r12_provider_roundtrip_keeps_hardlinks_and_original_rollout_bytes() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let ordinary = fixture.store.target.clone();
+    let image = fixture.root.path().join("qb-images");
+    fs::create_dir(&image)?;
+    let image = fs::canonicalize(image)?;
+    fs::write(ordinary.join("config.toml"), "model_provider='openai'\n")?;
+    fs::write(image.join("config.toml"), "model_provider='qb'\n")?;
+    fs::write(
+        fixture.source.join("config.toml"),
+        "model_provider='openai'\n",
+    )?;
+    fs::write(
+        fixture.store.home.join("journal/wiring.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema":3,"mode":"dedicated","install_completed":true,
+            "home":ordinary,"image_home":image
+        }))?,
+    )?;
+    fixture.store.search_homes = vec![fixture.source.clone(), ordinary.clone(), image.clone()];
+    let original_bytes = fs::read(&fixture.original)?;
+    let original_identity = guard::identity(&fixture.original)?;
+    let account = fixture.source.clone();
+    let mut source = account.clone();
+    for (target, expected) in [
+        (&image, "qb"),
+        (&account, "openai"),
+        (&ordinary, "openai"),
+        (&image, "qb"),
+        (&account, "openai"),
+    ] {
+        fixture.store.target = if source == image || target == &image {
+            image.clone()
+        } else {
+            ordinary.clone()
+        };
+        let plan = make_plan(&fixture.store, &source, target, ROOT, true, &account)?;
+        assert!(plan.files.iter().all(|file| {
+            file.stage
+                .starts_with(ordinary.join(".quota-baton/staging"))
+        }));
+        run_plan(&fixture.store, plan)?;
+        assert_eq!(
+            db::thread_provider(target, ROOT)?.as_deref(),
+            Some(expected)
+        );
+        assert!(db::thread_path(&source, ROOT)?.is_none());
+        let path = db::thread_path(target, ROOT)?.context("missing moved rollout")?;
+        assert_eq!(guard::identity(&path)?, original_identity);
+        assert_eq!(fs::read(&path)?, original_bytes);
+        assert_eq!(guard::hardlink_count(&path)?, 1);
+        assert_eq!(owner(&fixture.store, ROOT)?.as_ref(), Some(target));
+        source = target.clone();
+    }
+    Ok(())
+}
+
+#[test]
+fn r12_provider_change_after_preview_refuses_before_unlinking_source() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let plan = fixture.plan()?;
+    let original = fs::read(&fixture.original)?;
+    fs::write(
+        fixture.store.target.join("config.toml"),
+        "model_provider='qb'\n",
+    )?;
+    assert!(run_plan(&fixture.store, plan).is_err());
+    assert_eq!(fs::read(&fixture.original)?, original);
+    assert!(db::thread_path(&fixture.source, ROOT)?.is_some());
+    assert!(db::thread_path(&fixture.store.target, ROOT)?.is_none());
+    assert!(!pending(&fixture.store)?);
+    Ok(())
+}
+
+fn command_import(store: &Store, from: &Path, keep_source: bool) -> Result<()> {
+    super::super::run_with_store(
+        store.clone(),
+        SessionsCommand::Import {
+            from: from.to_owned(),
+            id: vec![ROOT.into()],
+            all: false,
+            list: false,
+            apply: true,
+            keep_source,
+            move_source: !keep_source,
+            yes: true,
+            clean_stale: false,
+        },
+    )
+}
+
+fn command_return(store: &Store, to: Option<&Path>) -> Result<()> {
+    super::super::run_with_store(
+        store.clone(),
+        SessionsCommand::Return {
+            id: ROOT.into(),
+            to: to.map(Path::to_owned),
+            yes: true,
+        },
+    )
+}
+
+fn command_unimport(store: &Store) -> Result<()> {
+    super::super::run_with_store(
+        store.clone(),
+        SessionsCommand::Unimport {
+            id: ROOT.into(),
+            apply: true,
+            force: false,
+            yes: true,
+        },
+    )
+}
+
+fn command_recover(store: &Store) -> Result<()> {
+    super::super::run_with_store(
+        store.clone(),
+        SessionsCommand::Recover {
+            id: ROOT.into(),
+            resolve_map: false,
+        },
+    )
+}
+
+#[test]
+fn r12_public_unimport_selects_unique_image_share_including_interrupted_share() -> Result<()> {
+    for complete in [false, true] {
+        let mut f = Fixture::new()?;
+        let image = f.enable_images()?;
+        let image_store = f.store.with_target(image.clone());
+        let body = fs::read(&f.original)?;
+        let identity = guard::identity(&f.original)?;
+        let original_rows = rows(&f.source)?;
+        if complete {
+            command_import(&image_store, &f.source, true)?;
+        } else {
+            let error = super::super::import_one_using(
+                &image_store,
+                &discovery::catalog(&f.source)?,
+                ROOT,
+                ImportOptions {
+                    apply: true,
+                    skip_existing: false,
+                    announce: false,
+                    keep_source: true,
+                    clean_stale: false,
+                },
+                |_, _| Err(std::io::Error::other("synthetic link interruption")),
+            )
+            .expect_err("share must stop after saving its journal");
+            assert!(error.to_string().contains("하드링크"));
+        }
+        assert!(load(&f.store, ROOT)?.is_none());
+        assert_eq!(image_store.load()?.imports[ROOT].complete, complete);
+        assert_eq!(
+            super::super::admission_check(&f.store.home, Some(ROOT)).is_ok(),
+            complete
+        );
+        super::super::admission_check(&f.store.home, Some(CHILD))?;
+        command_unimport(&f.store)?;
+        assert!(image_store.load()?.imports.is_empty());
+        assert!(f.store.load()?.imports.is_empty());
+        assert!(public_names(&image, ROOT)?.is_empty());
+        no_rows(&image)?;
+        assert!(rows(&f.source)? == original_rows);
+        assert_eq!(guard::identity(&f.original)?, identity);
+        assert_eq!(fs::read(&f.original)?, body);
+        assert_eq!(guard::hardlink_count(&f.original)?, 1);
+        super::super::admission_check(&f.store.home, Some(ROOT))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn r12_public_unimport_refuses_ambiguous_managed_share_journals_without_changes() -> Result<()> {
+    let mut f = Fixture::new()?;
+    let image = f.enable_images()?;
+    // Equal goal-free state permits two explicit shares of the same inode.
+    Connection::open(f.source.join("goals_1.sqlite"))?
+        .execute("DELETE FROM thread_goals WHERE thread_id=?1", [ROOT])?;
+    command_import(&f.store, &f.source, true)?;
+    command_import(&f.store.with_target(image), &f.source, true)?;
+    assert!(load(&f.store, ROOT)?.is_none());
+    let before = tree(f.root.path(), true)?;
+    let error = command_unimport(&f.store).expect_err("two journals require explicit repair");
+    assert!(error.to_string().contains("여러 관리 홈"));
+    assert_eq!(tree(f.root.path(), true)?, before);
+    assert_eq!(guard::hardlink_count(&f.original)?, 3);
+    Ok(())
+}
+
+#[test]
+fn r12_staged_owner_supersedes_completed_share_for_resume_and_public_move() -> Result<()> {
+    let mut f = Fixture::new()?;
+    let image = f.enable_images()?;
+    Connection::open(f.source.join("goals_1.sqlite"))?
+        .execute("DELETE FROM thread_goals WHERE thread_id=?1", [ROOT])?;
+    let body = fs::read(&f.original)?;
+    let identity = guard::identity(&f.original)?;
+    command_import(&f.store, &f.source, true)?;
+    command_import(&f.store.with_target(image.clone()), &f.source, false)?;
+    assert!(f.store.load()?.imports[ROOT].complete);
+    assert!(public_names(&f.store.target, ROOT)?.is_empty());
+    let current_owner = owner(&f.store, ROOT)?;
+    assert_eq!(current_owner.as_ref(), Some(&image));
+    assert!(!super::super::resume_in_target(
+        &f.store,
+        ROOT,
+        current_owner.as_deref()
+    )?);
+    assert!(super::super::resume_in_target(
+        &f.store.with_target(image.clone()),
+        ROOT,
+        current_owner.as_deref()
+    )?);
+    command_import(&f.store, &image, false)?;
+    let current_owner = owner(&f.store, ROOT)?;
+    assert_eq!(current_owner.as_ref(), Some(&f.store.target));
+    assert!(super::super::resume_in_target(
+        &f.store,
+        ROOT,
+        current_owner.as_deref()
+    )?);
+    let name = db::thread_path(&f.store.target, ROOT)?.context("moved back to Q")?;
+    assert_eq!(guard::identity(&name)?, identity);
+    assert_eq!(fs::read(&name)?, body);
+    assert_eq!(guard::hardlink_count(&name)?, 1);
+    Ok(())
+}
+
+#[test]
+fn r12_public_managed_returns_replay_without_changes_and_keep_default_account_origin() -> Result<()>
+{
+    let mut f = Fixture::new()?;
+    let image = f.enable_images()?;
+    let body = fs::read(&f.original)?;
+    let identity = guard::identity(&f.original)?;
+    command_import(&f.store, &f.source, false)?;
+    // Exercise import's origin selection as well as explicit managed returns.
+    command_import(&f.store.with_target(image.clone()), &f.store.target, false)?;
+    for target in [&f.store.target, &image] {
+        if target == &image {
+            let before = tree(f.root.path(), true)?;
+            let error = command_return(&f.store, Some(target))
+                .expect_err("public return into Qi must remain disabled");
+            assert_eq!(
+                crate::image_launch::friendly_error(&error).as_deref(),
+                Some("기존 대화는 이미지 모드로 옮길 수 없습니다. 새 이미지 세션을 여세요")
+            );
+            assert_eq!(tree(f.root.path(), true)?, before);
+            let current = load(&f.store, ROOT)?.context("preserved return journal")?;
+            assert_eq!(current.target, f.store.target);
+            assert_eq!(current.origin, f.source);
+            continue;
+        }
+        command_return(&f.store, Some(target))?;
+        let current = load(&f.store, ROOT)?.context("managed return journal")?;
+        assert!(current.phase == Phase::Complete);
+        assert_eq!(&current.target, target);
+        assert_eq!(current.origin, f.source);
+        let before = tree(f.root.path(), true)?;
+        command_return(&f.store, Some(target))?;
+        assert_eq!(
+            tree(f.root.path(), true)?,
+            before,
+            "explicit replay wrote state"
+        );
+    }
+    command_return(&f.store, None)?;
+    let before = tree(f.root.path(), true)?;
+    command_return(&f.store, None)?;
+    assert_eq!(
+        tree(f.root.path(), true)?,
+        before,
+        "account replay wrote state"
+    );
+    assert_eq!(owner(&f.store, ROOT)?, Some(f.source.clone()));
+    assert_eq!(guard::identity(&f.original)?, identity);
+    assert_eq!(fs::read(&f.original)?, body);
+    assert_eq!(guard::hardlink_count(&f.original)?, 1);
+    assert_eq!(
+        db::thread_provider(&f.source, ROOT)?.as_deref(),
+        Some("openai")
+    );
+    no_rows(&f.store.target)?;
+    no_rows(&image)?;
+    Ok(())
+}
+
+#[test]
+fn r12_public_return_refuses_canonical_qi_and_implicit_qi_origin_without_changes() -> Result<()> {
+    for destination in ["explicit", "canonical-alias", "implicit-origin"] {
+        let mut f = Fixture::new()?;
+        let image = f.enable_images()?;
+        command_import(&f.store, &f.source, false)?;
+        let to = match destination {
+            "explicit" => Some(image.clone()),
+            "canonical-alias" => Some(image.join(".")),
+            _ => {
+                // A historical completed journal can record Qi as its origin.
+                let mut previous = load(&f.store, ROOT)?.context("completed import")?;
+                previous.origin = image.clone();
+                save(&f.store, &previous)?;
+                None
+            }
+        };
+        let homes = [&f.source, &f.store.target, &image];
+        let before_rows = homes
+            .iter()
+            .map(|home| rows(home))
+            .collect::<Result<Vec<_>>>()?;
+        let name = db::thread_path(&f.store.target, ROOT)?.context("Q rollout")?;
+        let links = guard::hardlink_count(&name)?;
+        let before = tree(f.root.path(), true)?;
+        // Use the public command with yes=false too: refusal must precede any
+        // confirmation, not merely prevent execution after confirmation.
+        for yes in [false, true] {
+            let error = super::super::run_with_store(
+                f.store.clone(),
+                SessionsCommand::Return {
+                    id: ROOT.into(),
+                    to: to.clone(),
+                    yes,
+                },
+            )
+            .expect_err("existing session must not enter Qi");
+            assert_eq!(
+                crate::image_launch::friendly_error(&error).as_deref(),
+                Some("기존 대화는 이미지 모드로 옮길 수 없습니다. 새 이미지 세션을 여세요"),
+                "{destination}, yes={yes}"
+            );
+            for (home, expected) in homes.iter().zip(&before_rows) {
+                assert!(
+                    rows(home)? == *expected,
+                    "rows changed in {}",
+                    home.display()
+                );
+            }
+            assert_eq!(guard::hardlink_count(&name)?, links);
+            // Includes row DBs, rollout identities/bytes, map, wiring and all
+            // encrypted journals/history/evidence, including absent paths.
+            assert_eq!(tree(f.root.path(), true)?, before);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn r12_public_return_into_qi_recovers_open_journal_before_refusing_new_plans() -> Result<()> {
+    for (label, complete) in [("prepared", false), ("decided", true)] {
+        let mut f = Fixture::new()?;
+        let image = f.enable_images()?;
+        command_import(&f.store, &f.source, false)?;
+        let name = db::thread_path(&f.store.target, ROOT)?.context("Q rollout")?;
+        let identity = guard::identity(&name)?;
+        let body = fs::read(&name)?;
+        let plan = make_plan(&f.store, &f.store.target, &image, ROOT, true, &f.source)?;
+        interrupt_plan(&f, plan, label, 1)?;
+        command_return(&f.store, Some(&image))?;
+        let current = load(&f.store, ROOT)?.context("recovered journal")?;
+        assert!(
+            current.phase
+                == if complete {
+                    Phase::Complete
+                } else {
+                    Phase::Aborted
+                }
+        );
+        assert!(!open(&current));
+        let home = if complete { &image } else { &f.store.target };
+        let name = db::thread_path(home, ROOT)?.context("recovered rollout")?;
+        assert_eq!(guard::identity(&name)?, identity);
+        assert_eq!(fs::read(&name)?, body);
+        assert_eq!(guard::hardlink_count(&name)?, 1);
+        let before = tree(f.root.path(), true)?;
+        let error = command_return(&f.store, Some(&image))
+            .expect_err("closed journal must not authorize a new Qi return");
+        assert!(crate::image_launch::friendly_error(&error).is_some());
+        assert_eq!(tree(f.root.path(), true)?, before);
+    }
+    Ok(())
+}
+
+#[test]
+fn r12_public_recovery_keeps_account_origin_after_managed_abort_and_source_kept_abort() -> Result<()>
+{
+    for reverse in [false, true] {
+        for source_kept in [false, true] {
+            let mut f = Fixture::new()?;
+            let image = f.enable_images()?;
+            let identity = guard::identity(&f.original)?;
+            command_import(&f.store, &f.source, false)?;
+            if reverse {
+                command_import(&f.store.with_target(image.clone()), &f.store.target, false)?;
+            }
+            let (source, target) = if reverse {
+                (&image, &f.store.target)
+            } else {
+                (&f.store.target, &image)
+            };
+            let plan = make_plan(&f.store, source, target, ROOT, false, source)?;
+            assert_eq!(plan.origin, f.source);
+            let label = if source_kept {
+                "staged"
+            } else {
+                "source_rows_removed"
+            };
+            interrupt_plan(&f, plan, label, 1)?;
+            if source_kept {
+                let name = db::thread_path(source, ROOT)?.context("source-kept name")?;
+                append_bytes(&name, APPEND)?;
+                age(&name)?;
+                Connection::open(source.join("state_5.sqlite"))?.execute(
+                    "UPDATE threads SET updated_at=updated_at+1,tokens_used=tokens_used+1 WHERE id=?1",
+                    [ROOT],
+                )?;
+            }
+            let current_rows = if source_kept {
+                Some(rows(source)?)
+            } else {
+                None
+            };
+            command_recover(&f.store)?;
+            let recovered = load(&f.store, ROOT)?.context("recovered managed transition")?;
+            assert!(
+                recovered.phase
+                    == if source_kept {
+                        Phase::AbortedSourceKept
+                    } else {
+                        Phase::Aborted
+                    }
+            );
+            assert_eq!(recovered.origin, f.source);
+            assert_eq!(owner(&f.store, ROOT)?.as_ref(), Some(source));
+            if let Some(current_rows) = current_rows {
+                assert!(
+                    rows(source)? == current_rows,
+                    "recovery replayed old source rows"
+                );
+            }
+            let name = db::thread_path(source, ROOT)?.context("recovered owner name")?;
+            let body = fs::read(&name)?;
+            assert_eq!(guard::identity(&name)?, identity);
+            assert_eq!(guard::hardlink_count(&name)?, 1);
+            let before = tree(f.root.path(), true)?;
+            command_recover(&f.store)?;
+            assert_eq!(tree(f.root.path(), true)?, before);
+            // Unimport's staged route must use the logical account origin too.
+            command_unimport(&f.store)?;
+            assert_eq!(owner(&f.store, ROOT)?, Some(f.source.clone()));
+            assert_eq!(guard::identity(&f.original)?, identity);
+            assert_eq!(fs::read(&f.original)?, body);
+            assert_eq!(guard::hardlink_count(&f.original)?, 1);
+            no_rows(&f.store.target)?;
+            no_rows(&image)?;
+        }
+    }
+    Ok(())
+}
 
 type TestHook = Box<dyn FnMut(&str) -> Result<()>>;
 
@@ -87,6 +549,29 @@ impl Fixture {
             false,
             &self.source,
         )
+    }
+
+    fn enable_images(&mut self) -> Result<PathBuf> {
+        let image = self.root.path().join("qb-images");
+        fs::create_dir(&image)?;
+        let image = fs::canonicalize(image)?;
+        for home in [&self.source, &self.store.target] {
+            fs::write(home.join("config.toml"), "model_provider='openai'\n")?;
+        }
+        fs::write(image.join("config.toml"), "model_provider='qb'\n")?;
+        fs::write(
+            self.store.home.join("journal/wiring.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema":3,"mode":"dedicated","install_completed":true,
+                "home":self.store.target,"image_home":image
+            }))?,
+        )?;
+        self.store.search_homes = vec![
+            self.source.clone(),
+            self.store.target.clone(),
+            image.clone(),
+        ];
+        Ok(image)
     }
 
     fn hook_store(&self) -> Store {
