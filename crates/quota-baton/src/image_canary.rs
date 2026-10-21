@@ -64,7 +64,9 @@ pub(crate) async fn check(program: &Path, qb_home: &Path) -> Result<()> {
 }
 
 fn check_inner(program: &Path, qb_home: &Path) -> Result<()> {
-    let version = version(&crate::launcher_label::version_output(program)?)?;
+    let version_output = crate::launcher_label::version_output(program);
+    diagnostic("version", version_output.is_err());
+    let version = version(&version_output?)?;
     let qb_home = fs::canonicalize(qb_home)?;
     let base = qb_home.join("state/image-canary");
     // Pins the no-reparse ancestors for cache publication and scratch lifetime.
@@ -78,9 +80,21 @@ fn check_inner(program: &Path, qb_home: &Path) -> Result<()> {
     let scratch = Scratch::create(&qb_home, &base)?;
     let result = probe(program, &scratch.path);
     // A successful cache entry also requires successful owned-state cleanup.
-    scratch.cleanup()?;
+    let cleanup = scratch.cleanup();
+    diagnostic("cleanup", cleanup.is_err());
+    cleanup?;
     result?;
     publish_pass(&qb_home, &cache, &version)
+}
+
+fn diagnostic(stage: &'static str, failed: bool) {
+    // Fixed stage names only: never native output, request bodies or error chains.
+    #[cfg(all(feature = "testkit", debug_assertions))]
+    if failed {
+        eprintln!("qb-image-canary: {stage}");
+    }
+    #[cfg(not(all(feature = "testkit", debug_assertions)))]
+    let _ = (stage, failed);
 }
 
 fn version(output: &[u8]) -> Result<String> {
@@ -346,8 +360,12 @@ fn probe(program: &Path, path: &Path) -> Result<()> {
     }
     args.extend(["--".into(), "Reply OK without calling any tools.".into()]);
     let native = crate::launcher_label::canary_run(program, &args, &env, path);
-    let found = server.finish()?;
+    diagnostic("native", native.is_err());
+    let found = server.finish();
+    diagnostic("server", found.is_err());
+    let found = found?;
     native?;
+    diagnostic("tool-absent", !found);
     ensure!(found, "image tool absent");
     Ok(())
 }
@@ -439,7 +457,10 @@ fn serve(stream: &mut TcpStream, port: u16, deadline: Instant) -> Result<bool> {
     if lines.next() != Some("POST /v1/responses HTTP/1.1") {
         drop(reader);
         reply(stream, "403 Forbidden", "application/json", b"{}")?;
-        bail!("unexpected probe route");
+        // Native may attempt an ancillary catalog/update lookup through the
+        // sink proxy. Deny it locally; only an advertised tool on the allowed
+        // Responses request can make the probe pass.
+        return Ok(false);
     }
     let mut length = None;
     let mut encoding = None;
@@ -631,6 +652,43 @@ fn code_declaration(description: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn denied_ancillary_proxy_requests_never_forward_or_replace_tool_evidence() -> Result<()> {
+        let server = Server::start()?;
+        let exchange = |request: &[u8]| -> Result<Vec<u8>> {
+            let mut socket = TcpStream::connect((Ipv4Addr::LOCALHOST, server.port))?;
+            socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+            socket.write_all(request)?;
+            let mut response = Vec::new();
+            socket.read_to_end(&mut response)?;
+            Ok(response)
+        };
+        let denied =
+            exchange(b"CONNECT example.invalid:443 HTTP/1.1\r\nHost: example.invalid:443\r\n\r\n")?;
+        assert!(denied.starts_with(b"HTTP/1.1 403"));
+        let body = br#"{"tools":[{"type":"function","name":"image_gen__imagegen"}]}"#;
+        let request = format!(
+            "POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: {}\r\n\r\n{}",
+            server.port,
+            body.len(),
+            std::str::from_utf8(body)?
+        );
+        assert!(exchange(request.as_bytes())?.starts_with(b"HTTP/1.1 200"));
+        assert!(server.finish()?);
+        let denied_only = Server::start()?;
+        let mut socket = TcpStream::connect((Ipv4Addr::LOCALHOST, denied_only.port))?;
+        socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+        socket.write_all(b"CONNECT example.invalid:443 HTTP/1.1\r\n\r\n")?;
+        let mut response = Vec::new();
+        socket.read_to_end(&mut response)?;
+        assert!(response.starts_with(b"HTTP/1.1 403"));
+        assert!(
+            !denied_only.finish()?,
+            "denial alone never proves tool availability"
+        );
+        Ok(())
+    }
 
     #[test]
     fn qualified_and_nested_captured_tools_match() {
