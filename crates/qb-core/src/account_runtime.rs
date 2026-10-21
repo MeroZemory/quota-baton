@@ -1783,12 +1783,25 @@ impl AccountRuntime {
         model: Option<&str>,
         choose: impl FnOnce(&dyn Fn(&str, bool) -> bool) -> T,
     ) -> Result<T, ()> {
+        self.with_selection_admission_models(bindings, provider, |eligible| {
+            choose(&|id, existing| eligible(id, existing, model))
+        })
+    }
+
+    /// Placement may retain a proved model or clear an unproved implicit default.
+    /// Check its actual effective model without reacquiring any admission locks.
+    pub(crate) fn with_selection_admission_models<T>(
+        &self,
+        bindings: &crate::bindings::BindingTable,
+        provider: Provider,
+        choose: impl FnOnce(&dyn Fn(&str, bool, Option<&str>) -> bool) -> T,
+    ) -> Result<T, ()> {
         let _transaction = self.store.transaction().map_err(|_| ())?;
         // begin_probe also locks released quota before probes.
         let released = self.released_quota.lock().map_err(|_| ())?;
         let probes = self.probes.lock().map_err(|_| ())?;
         let volatile = self.volatile.lock().map_err(|_| ())?;
-        let eligible = |id: &str, existing_placement: bool| {
+        let eligible = |id: &str, existing_placement: bool, model: Option<&str>| {
             if self.store.writes_stopped() || probes.contains(id) || volatile.contains_key(id) {
                 return false;
             }

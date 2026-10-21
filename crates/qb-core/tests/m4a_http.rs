@@ -5127,3 +5127,210 @@ async fn r11_http_entry_simultaneous_resume_issuance_preserves_persisted_authori
         moves
     );
 }
+
+fn r11_http_assert_adopted_snapshot(
+    h: &Harness,
+    provisional: &str,
+    canonical: &str,
+    account: &str,
+) {
+    assert!(
+        h.state.bindings.current(Some(provisional)).is_none(),
+        "a stale selection must not recreate the retired provisional key"
+    );
+    let current = h
+        .state
+        .bindings
+        .launch_info(provisional, Utc::now())
+        .unwrap();
+    assert!(current.managed);
+    assert_eq!(current.canonical_key, canonical);
+    assert_eq!(current.account, account);
+    let snapshot = h.state.bindings.export().unwrap();
+    let bindings = snapshot["bindings"].as_array().unwrap();
+    assert_eq!(
+        bindings.len(),
+        1,
+        "adoption must not recreate a launch group"
+    );
+    assert_eq!(bindings[0]["key"], canonical);
+    assert_eq!(snapshot["launches"].as_object().unwrap().len(), 1);
+    for anchor in snapshot["launch_anchors"].as_object().unwrap().values() {
+        assert_eq!(anchor["canonical_key"], canonical);
+    }
+    h.state.bindings.flush().unwrap();
+    let restored = qb_core::bindings::BindingTable::new(&h.home, RoutingConfig::default()).unwrap();
+    assert_eq!(
+        restored.launch_info(provisional, Utc::now()).unwrap(),
+        current,
+        "the adopted snapshot must reload with its model and identity intact"
+    );
+}
+
+#[tokio::test]
+async fn r11_http_entry_adoption_during_model_refresh_keeps_one_reloadable_binding() {
+    let h = Harness::new(Provider::Codex, 1, 64, 1024).await;
+    let launch = r11_http_issue(&h).await;
+    let snapshot = h.state.bindings.export().unwrap();
+    let provisional = snapshot["bindings"][0]["key"].as_str().unwrap().to_owned();
+    assert!(provisional.starts_with("launch:"));
+    let canonical = "codex:r11-refresh-adoption";
+    // The pending request resolves its provisional Session before this forced
+    // catalog refresh. The C8 request below adopts it while that I/O is held.
+    h.fake.state.push(ScriptedResponse::json(
+        StatusCode::OK,
+        r#"{"models":[{"slug":"synthetic-model"},{"slug":"new-model"}]}"#,
+    ));
+    h.fake.state.push(ok());
+    h.fake.state.push(ok());
+    let (arrived, release) = h.fake.state.pause_next_response();
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let pending_raw = r#" { "model":"new-model", "input":[], "marker":"pending" } "#;
+    let adopting_raw = r#"{"model":"synthetic-model","input":[],"marker":"adopting"}"#;
+    let pending = client
+        .post(format!("{}/responses", launch.base_url))
+        .bearer_auth("synthetic-client")
+        .body(pending_raw)
+        .send();
+    tokio::pin!(pending);
+    tokio::select! {
+        _ = &mut pending => panic!("pending request escaped the catalog gate"),
+        result = tokio::time::timeout(Duration::from_secs(5), arrived) => {
+            result.unwrap().unwrap();
+        }
+    }
+    let calls = h.fake.state.requests();
+    assert_eq!(calls.len(), 2);
+    assert!(calls[1].path_and_query.starts_with("/models"));
+    let adopting = client
+        .post(format!("{}/responses", launch.base_url))
+        .bearer_auth("synthetic-client")
+        .header("session-id", "r11-refresh-adoption")
+        .body(adopting_raw)
+        .send();
+    tokio::pin!(adopting);
+    let adopted = async {
+        loop {
+            if h.state.bindings.current(Some(canonical)).as_deref() == Some(launch.account.as_str())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::select! {
+        _ = &mut pending => panic!("pending request escaped before adoption"),
+        _ = &mut adopting => panic!("C8 request escaped the in-flight catalog refresh"),
+        result = tokio::time::timeout(Duration::from_secs(5), adopted) => {
+            result.unwrap();
+        }
+    }
+    assert!(h.state.bindings.current(Some(&provisional)).is_none());
+    release.send(()).unwrap();
+    let (pending, adopting) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(&mut pending, &mut adopting)
+    })
+    .await
+    .unwrap();
+    let pending = pending.unwrap();
+    let adopting = adopting.unwrap();
+    let statuses = [pending.status(), adopting.status()];
+    for response in [pending, adopting] {
+        tokio::time::timeout(Duration::from_secs(5), response.bytes())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    r11_http_assert_adopted_snapshot(&h, &provisional, canonical, &launch.account);
+    for status in statuses {
+        assert_eq!(status, StatusCode::OK);
+    }
+    let calls = h.fake.state.requests();
+    let sent: Vec<_> = calls
+        .iter()
+        .filter(|call| call.path_and_query == "/responses")
+        .collect();
+    assert_eq!(sent.len(), 2);
+    for raw in [pending_raw, adopting_raw] {
+        assert!(sent.iter().any(|call| call.body.as_ref() == raw.as_bytes()));
+    }
+    for call in sent {
+        assert_eq!(
+            call.headers["chatgpt-account-id"],
+            calls[0].headers["chatgpt-account-id"]
+        );
+    }
+}
+
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn r11_http_entry_adoption_after_selection_snapshot_rejects_stale_publication() {
+    let h = Harness::new(Provider::Codex, 1, 64, 1024).await;
+    let launch = r11_http_issue(&h).await;
+    let snapshot = h.state.bindings.export().unwrap();
+    let provisional = snapshot["bindings"][0]["key"].as_str().unwrap().to_owned();
+    assert!(provisional.starts_with("launch:"));
+    let canonical = "codex:r11-selection-adoption";
+    // Managed HTTP shares this selector hook with WS. Pause after the fresh
+    // launch snapshot, before the mutation/admission gate, with no lock held.
+    let (arrived, release) = h.state.pause_next_ws_selection();
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let raw = r#"{"model":"synthetic-model","input":[]}"#;
+    let pending = client
+        .post(format!("{}/responses", launch.base_url))
+        .bearer_auth("synthetic-client")
+        .body(raw)
+        .send();
+    tokio::pin!(pending);
+    tokio::select! {
+        _ = &mut pending => panic!("request escaped the selection gate"),
+        result = tokio::time::timeout(Duration::from_secs(5), arrived) => {
+            result.unwrap().unwrap();
+        }
+    }
+    h.fake.state.push(ok());
+    let adopting = tokio::time::timeout(
+        Duration::from_secs(5),
+        client
+            .post(format!("{}/responses", launch.base_url))
+            .bearer_auth("synthetic-client")
+            .header("session-id", "r11-selection-adoption")
+            .body(raw)
+            .send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(adopting.status(), StatusCode::OK);
+    tokio::time::timeout(Duration::from_secs(5), adopting.bytes())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        h.state.bindings.current(Some(canonical)).as_deref(),
+        Some(launch.account.as_str())
+    );
+    release.send(()).unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(5), &mut pending)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(response.status(), StatusCode::OK);
+    tokio::time::timeout(Duration::from_secs(5), response.bytes())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        h.fake
+            .state
+            .requests()
+            .iter()
+            .filter(|call| call.path_and_query == "/responses")
+            .count(),
+        1,
+        "a stale choice cannot dispatch after the binding was adopted"
+    );
+    r11_http_assert_adopted_snapshot(&h, &provisional, canonical, &launch.account);
+}
+
+include!("support/m4a_http_r11_review.inc.rs");

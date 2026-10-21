@@ -16,6 +16,14 @@ pub const MAX_RAW_BYTES: usize = 1024 * 1024;
 pub const MAX_JSON_NODES: usize = 16_384;
 pub const MAX_JSON_DEPTH: usize = 32;
 pub const MAX_ID_BYTES: usize = 256;
+
+/// Provider model IDs are protocol data; logging uses a separate sanitizer.
+pub(crate) fn valid_model_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_ID_BYTES
+        && !id.chars().any(|c| c.is_control() || c.is_whitespace())
+}
+
 type Clock = dyn Fn() -> Instant + Send + Sync;
 
 // Content-bearing types deliberately have no derived Debug or serialization.
@@ -344,11 +352,7 @@ fn parse_catalog(raw: Value) -> Result<(Value, BTreeSet<String>), CatalogError> 
             .and_then(|item| item.get(field))
             .and_then(Value::as_str)
             .ok_or(CatalogError::InvalidModelId)?;
-        if id.is_empty()
-            || id.len() > MAX_ID_BYTES
-            || id.chars().any(char::is_whitespace)
-            || id.chars().any(char::is_control)
-        {
+        if !valid_model_id(id) {
             return Err(CatalogError::InvalidModelId);
         }
         supported.insert(id.to_owned());

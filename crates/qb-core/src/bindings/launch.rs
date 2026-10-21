@@ -457,6 +457,30 @@ impl BindingTable {
         operation: Option<&crate::issue_operation::IssueOperation>,
         authorize: impl FnOnce(&crate::routing::PolicyStore, &LaunchPolicyMove) -> Result<()>,
     ) -> std::result::Result<LaunchPlacement, LaunchError> {
+        self.place_launch_for_issue_admitted(
+            request,
+            candidates,
+            entitlements,
+            now,
+            operation,
+            None,
+            authorize,
+        )
+    }
+
+    /// The caller retains its account/runtime guards through this call. Admission
+    /// runs under the mutation gate, without the data lock, before publication.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn place_launch_for_issue_admitted(
+        &self,
+        request: LaunchRequest<'_>,
+        candidates: &[Candidate],
+        entitlements: &LaunchEntitlements,
+        now: DateTime<Utc>,
+        operation: Option<&crate::issue_operation::IssueOperation>,
+        admit: Option<&dyn Fn(&str, bool, Option<&str>) -> bool>,
+        authorize: impl FnOnce(&crate::routing::PolicyStore, &LaunchPolicyMove) -> Result<()>,
+    ) -> std::result::Result<LaunchPlacement, LaunchError> {
         if !is_anchor(request.anchor_key)
             || request.resume_key.is_some_and(|k| !real_key(k))
             || request.model.is_some_and(|m| !valid_model(m))
@@ -483,9 +507,17 @@ impl BindingTable {
             }
             let key = anchor.canonical_key.clone();
             let prior = info(&d, &key)?;
+            let existing = Self::accepted_in(&d, Some(&key), &prior.account);
+            drop(d);
+            if admit.is_some_and(|admit| {
+                !admit(&prior.account, existing, prior.current_model.as_deref())
+            }) {
+                return Err(LaunchError::NoEligibleAccount);
+            }
             if let Some(operation) = operation {
                 operation.admit().map_err(|_| LaunchError::PolicyBlocked)?;
             }
+            let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
             touch(&mut d, &key, now);
             return Ok(LaunchPlacement {
                 canonical_key: key,
@@ -675,7 +707,11 @@ impl BindingTable {
             expected_revision: plan.revision,
             at: now,
         };
+        let existing = Self::accepted_in(&d, Some(&key), &account);
         drop(d);
+        if admit.is_some_and(|admit| !admit(&account, existing, model.as_deref())) {
+            return Err(LaunchError::NoEligibleAccount);
+        }
         if model_move && plan.settings.mode == crate::routing::Mode::Strict {
             authorize(&self.policies, &consent).map_err(|_| LaunchError::PolicyBlocked)?;
         }
