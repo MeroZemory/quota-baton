@@ -812,7 +812,7 @@ fn r12_9_q_owned_cpa_history() -> (Fixture, [PathBuf; 3]) {
     // Import eligibility remains strict for a genuinely external session.
     assert_eq!(
         f.import(C, false).unwrap_err().to_string(),
-        "openai 제공자의 대화만 가져올 수 있습니다"
+        "지원하지 않는 대화 제공자 'cliproxyapi': openai 또는 qb만 이동할 수 있습니다"
     );
 
     // The same history is already in Q's home, with an authoritative row.
