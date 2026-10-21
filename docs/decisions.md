@@ -722,8 +722,37 @@ When the projection falls at or after the reset, it shows "초기화 전 소진 
    - **Codex:** the bound stays 60 s until the ledger shows how long Codex caches survive. Measure `cached_tokens` on the first turn after idle gaps of 1, 5, 15, 30 and 60 min on the same account, then set the bound to the longest gap that still hits.
 2. A hold must not break the client. Before raising any bound, test how long Claude Code and Codex wait for a held request (response headers or the first stream event). Cap every bound below the shortest client timeout found, with a margin. A hold that would exceed it moves instead.
 3. **Long waits.** No change: a session moves when forced (C7). The cost of moving equals the cost of waiting, and qb spreads forced moves (D15/D20) so one exhausted account does not cascade onto another.
-4. **The "urgent session" idea** does not pay off for the cache, for the reason in the facts. It does pay off for **money**: an account serving from paid credits. That choice is the user's and is asked separately; until answered, `allow_credits` stays per account as it is.
+4. **The "urgent session" idea** is decided in D26 (the user meant the 5h-limit choice between moving and waiting, not credits).
 
 **D24 amendment (user, 2026-10-22): the active-session count is not shown as a fraction.** "활성세션이 왜 1/5 2/5 이런식으로 잇는지도 모르겠네요 5개 제한할이유도 없는데". The 5 is D15's `spread_threshold`: a soft point where new-session packing stops preferring that account, never a cap (a full account still accepts sessions). Showing "2/5" reads as a limit. The dashboard and tray show the plain count ("활성 2"). They mark the account as crowded ("몰림") only when the count reaches the threshold, with a tooltip explaining that it is a spreading guide, not a limit. Routing is unchanged.
 
 **D24 amendment 2 (user, 2026-10-22; split decided by the design owner): the usage chart is a rolling window, not the calendar day.** "그래프그릴때 0시~24시 고저보다는 n시+24-n시 보여주는게 낫지않나 (e.g. 최근22시간+향후2시간)". The usage chart now spans the calendar day (`day_start..day_end` in `dashboard_usage_geometry.rs`), so in the morning most of the plot is empty future and yesterday evening is gone. The chart instead spans **now − 19 h to now + 5 h** (the user gave 22 h + 2 h only as an example and left the split open). The future band equals the 5h window length, because a 5h window always resets within 5 h. Its next reset and any projected exhaustion before that reset are therefore always on the chart; 2 h would cut most of them off. 19 h of history still reaches back to the previous evening. A 7d reset beyond the band appears as an edge label ("초기화 월 09:00 →"). A "지금" line marks now, and hour ticks keep clock labels, with the date at midnight. The 2-hour future area shows reset markers and, once Part A lands, the projected usage as a dashed line to the projected exhaustion or the window edge. The history fetch covers the full 19 h across midnight. The "오늘" filters of the session and event lists keep calendar-day meaning; only the chart changes.
+
+
+## D26. Urgent sessions move at a 5h limit; other sessions wait for the reset — Accepted (user direction, 2026-10-22)
+
+**User direction.** "긴급세션개념 도입해서 긴급세션아니면 기본적으로 5h한도같은건 기다리게하면 안되나요". Clarified: "긴급세션개념은 … 5h제한달았을때 계정바꿔서라도 재개할지 기다릴지".
+
+**Why waiting is worth it** (D25: it does not save the cache when the reset is far):
+- other accounts' quota stays free for urgent work;
+- a Codex session keeps its hidden reasoning (D22);
+- no cascade of cold re-reads onto the next account (D15).
+
+The cost is that the session pauses until the reset.
+
+**Decision.**
+1. **Urgency is a per-session setting.** It extends the D20 project and root policies with `on_5h_limit = wait | move`. The default is `wait` (not urgent).
+   - Mark a session urgent at launch with `codex-qb --urgent` or `claude-qb --urgent`.
+   - Mark it later from the dashboard session row or with `quota-baton sessions urgent <id> on|off`.
+   - A project can set the default for its sessions.
+2. **At a 5h limit:**
+   - A non-urgent session **waits** on its bound account until the reset.
+   - An urgent session **moves** at once (C7 forced move, D20 anti-herding; inside the D25 cache-lifetime bound it holds instead).
+3. **Weekly (7d) and other long limits:** every session moves, urgent or not, because waiting days is not a pause. `strict` sessions keep their D20 meaning and never move.
+4. **Credits.** An account that serves from permitted credits is not at a limit (D19), so its sessions just continue.
+5. **How a session waits.**
+   - **Preferred:** qb holds the request and keeps the client alive until the reset, then sends it to the same account.
+   - **Fallback:** when a client cannot be kept waiting that long, qb returns the provider's limit response with the reset time. The launcher then resumes the session after the reset: Codex `/goal resume` for a goal that was running (D21 goal rule); Claude continues the turn.
+
+   Which path each client gets is decided by the R13 Part C measurement of hold tolerance. A session must never stay stopped after its reset without a resume.
+6. **Visibility.** The dashboard shows waiting sessions with "초기화 HH:MM까지 대기" and a one-click "지금 옮기기" that marks the session urgent.
