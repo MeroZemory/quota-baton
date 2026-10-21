@@ -5,6 +5,101 @@ fn view(state: &mut DashboardState) -> m::DashboardView {
 }
 
 #[test]
+fn r10_retained_banner_and_polling_footer_use_the_last_data_time() {
+    for connected in [false, true] {
+        let mut data = fixtures::snapshot();
+        let mut clock = fixtures::clock();
+        data.data_at = Some(clock.utc());
+        data.connection.core_ok = connected;
+        data.connection.stream_ok = false;
+        clock.now += chrono::Duration::seconds(30);
+        let mut state = DashboardState::default();
+        let v = m::project(&data, &mut state, &clock);
+        let scene = Scene::build(&v, &state, [1320., 960.], &Metrics::default());
+        let text: Vec<_> = scene
+            .draw
+            .iter()
+            .filter_map(|d| match d {
+                Draw::Text { measure, .. } => Some(measure.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            text.iter()
+                .any(|t| t.starts_with("15:42:08 기준 · 다시 연결 중"))
+        );
+        if !connected {
+            assert!(
+                text.iter()
+                    .any(|t| t.contains("아래는 15:42:08의 마지막 값입니다"))
+            );
+        }
+    }
+}
+
+#[test]
+fn r10_linked_relogin_headers_show_the_reason_instead_of_retained_meters() {
+    let mut data = fixtures::snapshot();
+    data.accounts = v2::project(
+        &serde_json::json!({"accounts":[{
+            "id":"cl-a","provider":"claude","email":"linked@example.invalid",
+            "user_state":"active","source":{"kind":"cpa","mode":"linked"},
+            "health":{"kind":"needs_relogin"},"windows":[{"name":"5h","used_pct":10}]
+        }]})
+        .to_string(),
+        fixtures::clock().utc().into(),
+    )
+    .unwrap();
+    for row in &mut data.sessions.sessions {
+        row.account = "cl-a".into();
+        row.provider = "claude".into();
+    }
+    for offset in [0., 96.] {
+        let mut state = DashboardState {
+            table_offset: offset,
+            ..Default::default()
+        };
+        let v = m::project(&data, &mut state, &fixtures::clock());
+        let group = &v.groups[0];
+        assert!(!group.relogin, "linked accounts have no own-login action");
+        assert!(
+            !group.windows.is_empty(),
+            "regression requires retained stale observations"
+        );
+        let scene = Scene::build(&v, &state, [1024., 640.], &Metrics::default());
+        let text: Vec<_> = scene
+            .draw
+            .iter()
+            .filter_map(|d| match d {
+                Draw::Text { measure, .. } => Some(measure.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(text.contains(&group.relogin_reason.as_str()));
+        assert!(!text.contains(&"90% 남음"));
+        let group_node = scene
+            .accessibility
+            .iter()
+            .find(|n| n.key == "group:cl-a")
+            .unwrap();
+        assert!(group_node.name.contains(&group.relogin_reason));
+        assert!(!group_node.name.contains("90% 남음"));
+        if offset > 0. {
+            assert!(
+                text.iter().any(|t| t.starts_with("Claude · ")),
+                "must exercise the pinned header"
+            );
+        }
+        assert!(
+            !scene
+                .targets
+                .iter()
+                .any(|t| matches!(t.target, Target::OpenTrayAccount(_)))
+        );
+    }
+}
+
+#[test]
 fn r10_flat_account_chip_fits_its_column_and_leaves_the_session_id_visible() {
     for size in [[1024., 640.], [1180., 960.], [1320., 960.]] {
         let mut state = DashboardState {

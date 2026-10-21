@@ -431,6 +431,7 @@ pub fn snapshot(state: u8) -> DashboardSnapshot {
     )
     .unwrap();
     let mut s = DashboardSnapshot::new(view);
+    s.data_at = Some(clock().utc());
     s.revision = 10;
     s.sessions.now = Some(clock().utc());
     s.sessions.active_window_secs = Some(300);

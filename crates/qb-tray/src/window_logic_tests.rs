@@ -135,7 +135,7 @@ fn modal_keys_fence_underlay_and_navigate_only_popup_choices() {
         for key in [0x46, 0x21, 0x22, 0x41] {
             assert!(popup_key(&scene, &mut focus, key, false).is_none());
         }
-        assert!(!text_input_allowed(&state, true));
+        assert!(!text_input_allowed(&state, true, true));
         assert_eq!(state.search, "unchanged");
         assert_eq!(
             (state.table_offset, state.events_offset, state.usage_offset),
@@ -157,7 +157,7 @@ fn modal_keys_fence_underlay_and_navigate_only_popup_choices() {
         let action = popup_key(&scene, &mut focus, 0x1b, false).unwrap();
         assert_eq!(action, Target::DismissPopup);
         assert!(state.activate(&action).is_empty());
-        assert!(text_input_allowed(&state, true));
+        assert!(text_input_allowed(&state, true, true));
     }
 }
 
@@ -223,11 +223,16 @@ fn arrows_reveal_offscreen_rows_refresh_detail_and_invalidate_old_frame() {
     };
     let mut state = DashboardState::default();
     let old = state.select(Some("a".into())).unwrap();
+    let before = format!("{state:?}");
+    assert!(navigate_session(&mut state, &scene, None, false, false).is_none());
+    assert_eq!(format!("{state:?}"), before);
+    assert!(!text_input_allowed(&state, true, false));
     let (focus, commands) = navigate_session(
         &mut state,
         &scene,
         Some(&Target::Session("a".into())),
         false,
+        true,
     )
     .unwrap();
     assert_eq!(focus, Target::Session("b".into()));
@@ -253,15 +258,15 @@ fn arrows_reveal_offscreen_rows_refresh_detail_and_invalidate_old_frame() {
         row.rect.top -= 100.;
         row.rect.bottom -= 100.;
     }
-    let (focus, _) = navigate_session(&mut state, &scene, Some(&focus), true).unwrap();
+    let (focus, _) = navigate_session(&mut state, &scene, Some(&focus), true, true).unwrap();
     assert_eq!(focus, Target::Session("a".into()));
     assert_eq!(state.table_offset, 0.);
     state.select(None);
-    let (_, commands) = navigate_session(&mut state, &scene, Some(&focus), true).unwrap();
+    let (_, commands) = navigate_session(&mut state, &scene, Some(&focus), true, true).unwrap();
     assert!(commands.is_empty());
     assert!(state.selected.is_none());
     scene.modal = true;
-    assert!(navigate_session(&mut state, &scene, Some(&focus), false).is_none());
+    assert!(navigate_session(&mut state, &scene, Some(&focus), false, true).is_none());
 }
 
 #[test]

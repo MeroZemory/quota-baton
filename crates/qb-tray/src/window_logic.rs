@@ -30,12 +30,13 @@ pub fn navigate_session(
     scene: &qb_tray::geometry::Scene,
     focus: Option<&qb_tray::geometry::Target>,
     up: bool,
+    connected: bool,
 ) -> Option<(qb_tray::geometry::Target, Vec<qb_tray::state::Command>)> {
     use qb_tray::{
         geometry::Target,
         state::{Command, ScrollRegion},
     };
-    if scene.modal || scene.session_rows.is_empty() {
+    if !connected || scene.modal || scene.session_rows.is_empty() {
         return None;
     }
     let at = match focus {
@@ -112,8 +113,12 @@ pub fn popup_key(
     }
 }
 
-pub fn text_input_allowed(state: &qb_tray::state::DashboardState, editing: bool) -> bool {
-    state.popup.is_none() && editing
+pub fn text_input_allowed(
+    state: &qb_tray::state::DashboardState,
+    editing: bool,
+    connected: bool,
+) -> bool {
+    connected && state.popup.is_none() && editing
 }
 
 /// Enter opens a session; pointer activation continues to use state.activate's toggle.

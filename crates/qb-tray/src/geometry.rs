@@ -639,9 +639,16 @@ impl Scene {
             b.text(
                 rect(32., 68., w - 64., 20.),
                 format!(
-                    "{}초 후 다시 연결합니다 · 아래는 {}의 마지막 값입니다",
+                    "{}초 후 다시 연결합니다 · {}",
                     view.connection.retry_seconds,
-                    view.clock.now.format("%H:%M:%S")
+                    if view.data_at.is_some() {
+                        format!(
+                            "아래는 {}의 마지막 값입니다",
+                            view.clock.stamp(view.data_at)
+                        )
+                    } else {
+                        "마지막 갱신 시각 확인 전".into()
+                    }
                 ),
                 12.,
                 false,
@@ -1355,8 +1362,12 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
         fx += label_width + 28.;
     }
     let time = format!(
-        "{} 기준 · {}{}",
-        v.clock.now.format("%H:%M:%S"),
+        "{} · {}{}",
+        if v.data_at.is_some() {
+            format!("{} 기준", v.clock.stamp(v.data_at))
+        } else {
+            "갱신 시각 확인 전".into()
+        },
         if v.connection.stream_ok {
             "바뀌면 바로 반영"
         } else {
@@ -1617,12 +1628,16 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
                         } else {
                             String::new()
                         },
-                        group
-                            .windows
-                            .iter()
-                            .map(|w| format!("{} {} {}", w.label, w.remaining, w.reset))
-                            .collect::<Vec<_>>()
-                            .join(", ")
+                        if group.relogin_reason.is_empty() {
+                            group
+                                .windows
+                                .iter()
+                                .map(|w| format!("{} {} {}", w.label, w.remaining, w.reset))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        } else {
+                            group.relogin_reason.clone()
+                        }
                     );
                     b.semantic(
                         format!("group:{}", group.id),
@@ -1977,7 +1992,7 @@ fn group_header(b: &mut Builder<'_>, g: &m::AccountGroup, r: Rect, sticky: bool)
         );
     }
     b.tooltip(rect(load_left, r.top + 8., load_width, 24.), format!("활성 세션 {}개 / 기준 {}개. 기준을 넘으면 새 세션은 여유 있는 다른 계정에 먼저 배정합니다. 연결된 세션 {}개.", g.active, threshold, g.bound));
-    if g.relogin {
+    if !g.relogin_reason.is_empty() {
         b.text(
             rect(r.left + 32., r.top + 36., width(r) - 44., 16.),
             g.relogin_reason.clone(),
