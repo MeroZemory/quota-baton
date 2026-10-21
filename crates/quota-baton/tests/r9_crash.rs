@@ -13,7 +13,10 @@ use std::{
     os::windows::process::CommandExt,
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread,
     time::{Duration, Instant, SystemTime},
 };
@@ -24,6 +27,7 @@ const SEGMENT_B: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
 const OTHER: &str = "22222222-2222-2222-2222-222222222222";
 const CHILD: &str = "33333333-3333-3333-3333-333333333333";
 const GRANDCHILD: &str = "44444444-4444-4444-4444-444444444444";
+const KNOWN: &str = "55555555-5555-5555-5555-555555555555";
 const BODY: &str = "SYNTHETIC_R9_CRASH_BODY";
 const OLD_OBJECTIVE: &str = "SYNTHETIC_R9_OLD_OBJECTIVE";
 const CURRENT_OBJECTIVE: &str = "SYNTHETIC_R9_CURRENT_OBJECTIVE";
@@ -31,6 +35,132 @@ const OTHER_OBJECTIVE: &str = "SYNTHETIC_R9_OTHER_OBJECTIVE";
 const CURRENT_MARKER: &str = "SYNTHETIC_R9_CURRENT_ROLLOUT";
 const COMMAND_DEADLINE: Duration = Duration::from_secs(20);
 const REAP_DEADLINE: Duration = Duration::from_secs(5);
+
+// R9 retains real launcher/admission ownership; only R11's authenticated
+// account issue and model catalog are synthetic, as in r9_sessions.
+struct LaunchCore {
+    _runtime: tokio::runtime::Runtime,
+    issued: Arc<AtomicUsize>,
+    catalogs: Arc<AtomicUsize>,
+    resumes: Arc<Mutex<Vec<Option<String>>>>,
+}
+
+impl LaunchCore {
+    fn new(home: &Path, codex_home: &Path) -> Self {
+        use axum::{
+            Json, Router,
+            http::HeaderMap,
+            routing::{get, post},
+        };
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(!matches!(port, 10100 | 10101));
+        let admin = URL_SAFE_NO_PAD.encode([1u8; 32]);
+        let client = URL_SAFE_NO_PAD.encode([2u8; 32]);
+        let handle = URL_SAFE_NO_PAD.encode([3u8; 32]);
+        fs::write(home.join("admin.token"), &admin).unwrap();
+        fs::write(home.join("client.key"), &client).unwrap();
+        fs::write(
+            home.join("config.toml"),
+            format!("[server]\ndata_port={port}\nadmin_port={port}\n"),
+        )
+        .unwrap();
+        fs::write(
+            codex_home.join("config.toml"),
+            "model = \"synthetic-model\"\nmodel_provider = \"openai\"\n[features]\nworktrees = false\n",
+        )
+        .unwrap();
+        let issued = Arc::new(AtomicUsize::new(0));
+        let catalogs = Arc::new(AtomicUsize::new(0));
+        let resumes = Arc::new(Mutex::new(Vec::new()));
+        let issue_count = issued.clone();
+        let catalog_count = catalogs.clone();
+        let resume_ids = resumes.clone();
+        let base = format!("http://127.0.0.1:{port}/l/{handle}/v1");
+        let app = Router::new()
+            .route(
+                "/admin/v1/launches",
+                post(move |headers: HeaderMap, Json(request): Json<Value>| {
+                    let (admin, base, count, resume_ids) = (
+                        admin.clone(),
+                        base.clone(),
+                        issue_count.clone(),
+                        resume_ids.clone(),
+                    );
+                    async move {
+                        assert_eq!(
+                            headers.get("authorization").unwrap(),
+                            format!("Bearer {admin}").as_str()
+                        );
+                        assert_eq!(request["model"], "synthetic-model");
+                        assert_eq!(request["model_is_explicit"], false);
+                        assert_eq!(request["move_for_model"], false);
+                        resume_ids
+                            .lock()
+                            .unwrap()
+                            .push(request["resume_id"].as_str().map(str::to_owned));
+                        count.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({
+                            "base_url": base,
+                            "catalog_url": format!("{base}/models"),
+                            "account": "synthetic-launch-account",
+                            "model": request["model"],
+                        }))
+                    }
+                }),
+            )
+            .route(
+                &format!("/l/{handle}/v1/models"),
+                get(move |headers: HeaderMap| {
+                    let (client, count) = (client.clone(), catalog_count.clone());
+                    async move {
+                        assert_eq!(
+                            headers.get("authorization").unwrap(),
+                            format!("Bearer {client}").as_str()
+                        );
+                        assert_eq!(headers.get("accept-encoding").unwrap(), "identity");
+                        count.fetch_add(1, Ordering::SeqCst);
+                        (
+                            [("x-quota-baton-account", "synthetic-launch-account")],
+                            Json(json!({"models":[{"slug":"synthetic-model"}]})),
+                        )
+                    }
+                }),
+            );
+        runtime.spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        Self {
+            _runtime: runtime,
+            issued,
+            catalogs,
+            resumes,
+        }
+    }
+
+    fn counts(&self) -> (usize, usize) {
+        (
+            self.issued.load(Ordering::SeqCst),
+            self.catalogs.load(Ordering::SeqCst),
+        )
+    }
+
+    fn assert_launch(&self, before: (usize, usize), resume: Option<&str>) {
+        assert_eq!(self.counts(), (before.0 + 1, before.1 + 1));
+        assert_eq!(
+            self.resumes.lock().unwrap().last().cloned().unwrap(),
+            resume.map(str::to_owned)
+        );
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Goal {
@@ -201,6 +331,8 @@ struct Process {
     child: Child,
     stdout: PathBuf,
     stderr: PathBuf,
+    operation: &'static str,
+    started: Instant,
     reaped: bool,
 }
 
@@ -228,7 +360,11 @@ impl Process {
                 "CLI printed synthetic private content"
             );
         }
-        format!("stdout: {out}\nstderr: {err}")
+        format!(
+            "operation: {} (elapsed {:?})\nstdout: {out}\nstderr: {err}",
+            self.operation,
+            self.started.elapsed()
+        )
     }
 
     fn wait_until(&mut self, deadline: Instant) -> Option<ExitStatus> {
@@ -317,6 +453,8 @@ impl Drop for Process {
 }
 
 struct Fixture {
+    // Stop the owned fake server before deleting its synthetic home.
+    core: LaunchCore,
     root: tempfile::TempDir,
     user: PathBuf,
     appdata: PathBuf,
@@ -369,7 +507,7 @@ impl Fixture {
         .unwrap();
         fs::write(
             root.path().join("client.cmd"),
-            b"@echo off\r\nif \"%~1\"==\"--version\" (echo codex-cli 0.163.0& exit /b 0)\r\necho synthetic-launch>\"%QB_PANEL2_SENTINEL%\"\r\nexit /b 0\r\n",
+            b"@echo off\r\nif \"%~1\"==\"--version\" (echo codex-cli 0.163.0& exit /b 0)\r\necho %*>\"%QB_PANEL2_SENTINEL%\"\r\nexit /b 0\r\n",
         )
         .unwrap();
         fs::write(
@@ -415,7 +553,9 @@ impl Fixture {
         let contents = [fs::read(&a).unwrap(), fs::read(&b).unwrap()];
         let identities = [physical_id(&a), physical_id(&b)];
         let other_contents = fs::read(&other).unwrap();
+        let core = LaunchCore::new(&qb, &target);
         Self {
+            core,
             root,
             user,
             appdata,
@@ -507,19 +647,49 @@ impl Fixture {
             .env_remove("QB_R9_CHECKPOINT")
             .env_remove("QB_R9_CHECKPOINT_NOTIFY")
             .current_dir(self.root.path())
-            .creation_flags(0x08000000 | 0x00004000)
+            // Match r9_sessions: hide the console without deprioritizing a
+            // deadline-bound CLI beneath the concurrent workspace gate.
+            .creation_flags(0x08000000)
             .stdin(Stdio::null())
             .stdout(fs::File::create(&stdout).unwrap())
             .stderr(fs::File::create(&stderr).unwrap());
+        // env_clear otherwise drops the parent's explicit diagnostic opt-in.
+        if std::env::var_os("QB_R9_IMPORT_TRACE").as_deref() == Some(std::ffi::OsStr::new("1"))
+            && self.qb.is_absolute()
+            && self
+                .qb
+                .components()
+                .any(|part| part.as_os_str() == ".sandbox")
+            && !self
+                .qb
+                .components()
+                .any(|part| part == std::path::Component::ParentDir)
+        {
+            command.env("QB_R9_IMPORT_TRACE", "1");
+        }
         if let Some((label, address)) = checkpoint {
             command
                 .env("QB_R9_CHECKPOINT", label)
                 .env("QB_R9_CHECKPOINT_NOTIFY", address.to_string());
         }
+        let operation = match args.first().and_then(|arg| arg.to_str()) {
+            Some("sessions") => match args.get(1).and_then(|arg| arg.to_str()) {
+                Some("import") => "sessions import",
+                Some("unimport") => "sessions unimport",
+                Some("return") => "sessions return",
+                Some("recover") => "sessions recover",
+                _ => "sessions",
+            },
+            Some("launch-client") => "launch-client",
+            _ => "fixture CLI",
+        };
+        let started = Instant::now();
         Process {
             child: command.spawn().unwrap(),
             stdout,
             stderr,
+            operation,
+            started,
             reaped: false,
         }
     }
@@ -673,6 +843,7 @@ impl Fixture {
             return;
         }
         let before = self.protected_state();
+        let calls = self.core.counts();
         for args in [
             vec!["resume", ROOT],
             vec!["exec", "resume", ROOT],
@@ -684,22 +855,54 @@ impl Fixture {
             let diagnostic = self.spawn(&self.launch_args(&args), None).failure();
             assert!(
                 diagnostic.contains("복구") || diagnostic.contains("recover"),
-                "wrong refusal"
+                "wrong refusal: {diagnostic}"
             );
             assert!(!sentinel.exists());
             assert!(
                 self.protected_state() == before,
                 "ID refusal changed session state"
             );
+            assert_eq!(
+                self.core.counts(),
+                calls,
+                "journal refusal reached issuance"
+            );
         }
-        for args in [
-            vec![],
-            vec!["resume", "--last"],
-            vec!["resume"],
-            vec!["app-server"],
-            vec!["fresh synthetic prompt"],
+        // Redirected picker and unresolved --last are R11 selection refusals,
+        // not successful fresh launches. These fixtures intentionally have no
+        // selectable native metadata for the affected ROOT.
+        for (args, reason) in [
+            (
+                vec!["resume"],
+                "대화 선택은 입력과 출력이 모두 터미널일 때만 가능합니다",
+            ),
+            (
+                vec!["resume", "--last"],
+                "이 재개 방식의 대화를 안전하게 선택하지 못했습니다",
+            ),
         ] {
+            let diagnostic = self.spawn(&self.launch_args(&args), None).failure();
+            assert!(diagnostic.contains(reason), "{diagnostic}");
+            assert!(
+                diagnostic.contains("codex-qb resume <UUID>"),
+                "{diagnostic}"
+            );
+            assert!(!self.root.path().join("launched.txt").exists());
+            assert_eq!(
+                self.core.counts(),
+                calls,
+                "selection refusal reached issuance"
+            );
+            assert!(
+                self.protected_state() == before,
+                "selection refusal changed session state"
+            );
+        }
+        self.assert_app_server_unsupported();
+        for args in [vec![], vec!["fresh synthetic prompt"]] {
+            let calls = self.core.counts();
             self.run(&self.launch_args(&args));
+            self.core.assert_launch(calls, None);
             let sentinel = self.root.path().join("launched.txt");
             assert!(
                 sentinel.exists(),
@@ -713,11 +916,66 @@ impl Fixture {
         }
     }
 
+    fn assert_app_server_unsupported(&self) {
+        let before = self.protected_state();
+        let calls = self.core.counts();
+        let sentinel = self.root.path().join("launched.txt");
+        assert!(!sentinel.exists());
+        let journal_path = self.qb.join(format!("journal/session-moves/{ROOT}.json"));
+        let journal = || {
+            journal_path
+                .try_exists()
+                .unwrap()
+                .then(|| fs::read(&journal_path).unwrap())
+        };
+        let journal_before = journal();
+        let process = self.spawn(&self.launch_args(&["app-server"]), None);
+        let stderr = process.stderr.clone();
+        let diagnostic = process.failure();
+        assert_eq!(
+            fs::read_to_string(stderr).unwrap().trim(),
+            "실패했습니다: 실행 옵션을 안전하게 해석할 수 없습니다. QB 옵션은 프롬프트 앞에 두고, 프로필·사용자 라우팅 설정 없이 실행해 주세요.",
+            "{diagnostic}"
+        );
+        assert!(!sentinel.exists(), "unsupported grammar launched a child");
+        assert_eq!(
+            self.core.counts(),
+            calls,
+            "unsupported grammar reached issuance"
+        );
+        assert!(
+            self.protected_state() == before,
+            "grammar refusal changed session state"
+        );
+        assert_eq!(
+            journal(),
+            journal_before,
+            "grammar refusal changed move journal"
+        );
+    }
+
     fn assert_launcher_control(&self) {
+        // Fresh fixtures exercise this boundary without any move journal;
+        // assert_managed_admission repeats it with an actual open journal.
+        self.assert_app_server_unsupported();
         self.run(&self.launch_args(&["--help"]));
         let sentinel = self.root.path().join("launched.txt");
         assert!(sentinel.exists(), "client marker control did not launch");
         fs::remove_file(sentinel).unwrap();
+        let before = self.protected_state();
+        let calls = self.core.counts();
+        self.run(&self.launch_args(&[]));
+        self.core.assert_launch(calls, None);
+        let sentinel = self.root.path().join("launched.txt");
+        assert!(
+            sentinel.exists(),
+            "managed client marker control did not launch"
+        );
+        fs::remove_file(sentinel).unwrap();
+        assert!(
+            self.protected_state() == before,
+            "managed launch control changed session state"
+        );
     }
 
     fn protected_state(&self) -> ProtectedState {
@@ -1014,6 +1272,116 @@ fn recover_reverse_after_kill(label: &str, undo: bool) {
         fixture.run(&fixture.recover_args());
         fixture.assert_owner(!post_decision(label), current_goal(), 0, &contents);
     }
+}
+
+#[test]
+fn open_move_journal_allows_known_unrelated_resume_and_last() {
+    let fixture = Fixture::new();
+    fixture.assert_launcher_control();
+    let known = write_rollout(&fixture.target, KNOWN, KNOWN, None);
+    {
+        let db = Connection::open(fixture.source.join("state_5.sqlite")).unwrap();
+        // Only this native-selection case needs these columns. R9 requires
+        // matching source/destination column maps even when defaults exist.
+        db.execute_batch("ALTER TABLE threads ADD COLUMN source TEXT NOT NULL DEFAULT ''; ALTER TABLE threads ADD COLUMN cwd TEXT NOT NULL DEFAULT ''; ALTER TABLE threads ADD COLUMN preview TEXT NOT NULL DEFAULT ''; ALTER TABLE threads ADD COLUMN updated_at_ms INTEGER NOT NULL DEFAULT 0;").unwrap();
+        let selectable: i64 = db
+            .query_row(
+                "SELECT count(*) FROM threads WHERE preview<>''",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(selectable, 0, "legacy rows became selection candidates");
+    }
+    {
+        let db = Connection::open(fixture.target.join("state_5.sqlite")).unwrap();
+        // Match the source columns; default-empty native metadata keeps ROOT
+        // unselected while KNOWN supplies real positive selection evidence.
+        db.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE threads(id TEXT PRIMARY KEY,rollout_path TEXT NOT NULL,model_provider TEXT NOT NULL,archived INTEGER DEFAULT 0,source TEXT NOT NULL DEFAULT '',cwd TEXT NOT NULL DEFAULT '',preview TEXT NOT NULL DEFAULT '',updated_at_ms INTEGER NOT NULL DEFAULT 0);").unwrap();
+        db.execute(
+            "INSERT INTO threads VALUES(?1,?2,'openai',0,'cli',?3,'synthetic known session',1000)",
+            params![
+                KNOWN,
+                known.to_str().unwrap(),
+                fixture.root.path().to_str().unwrap()
+            ],
+        )
+        .unwrap();
+    }
+    fn thread_columns(home: &Path) -> Vec<(String, bool)> {
+        let db = Connection::open_with_flags(
+            home.join("state_5.sqlite"),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let mut statement = db.prepare("PRAGMA table_xinfo(threads)").unwrap();
+        let mut columns = statement
+            .query_map([], |row| Ok((row.get(1)?, row.get::<_, i64>(6)? == 0)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<(String, bool)>>>()
+            .unwrap();
+        columns.sort();
+        columns
+    }
+    // Give a precise testkit-only schema diagnostic before the CLI's generic
+    // error. Only column names/writability are printed, never row contents.
+    assert_eq!(
+        thread_columns(&fixture.source),
+        thread_columns(&fixture.target),
+        "synthetic threads column mismatch would refuse import before stage:prepared"
+    );
+    fixture.kill_at(&fixture.import_args(), "stage:prepared", || {
+        fixture.assert_boundary_state("stage:prepared", false)
+    });
+    assert_eq!(move_journal(&fixture.qb)["open"], true);
+    let before = fixture.protected_state();
+    let known_bytes = fs::read(&known).unwrap();
+    let known_identity = physical_id(&known);
+    let known_row = thread_row(&fixture.target, KNOWN).unwrap();
+    let database_bytes = fs::read(fixture.target.join("state_5.sqlite")).unwrap();
+    let journal_path = fixture
+        .qb
+        .join(format!("journal/session-moves/{ROOT}.json"));
+    let journal = fs::read(&journal_path).unwrap();
+    for args in [vec!["resume", KNOWN], vec!["resume", "--last"]] {
+        let calls = fixture.core.counts();
+        fixture.run(&fixture.launch_args(&args));
+        fixture.core.assert_launch(calls, Some(KNOWN));
+        let sentinel = fixture.root.path().join("launched.txt");
+        assert!(
+            sentinel.exists(),
+            "known unrelated selection did not run the real child"
+        );
+        // Check the real child's argv as well as the authenticated issue body;
+        // forwarding raw --last to the stub cannot satisfy this regression.
+        let child_args = fs::read_to_string(&sentinel).unwrap();
+        let words = child_args
+            .split_whitespace()
+            .map(|arg| arg.trim_matches('"'))
+            .collect::<Vec<_>>();
+        assert!(
+            words.windows(2).any(|pair| pair == ["resume", KNOWN]),
+            "child did not receive the resolved known UUID"
+        );
+        assert!(
+            !words.contains(&"--last"),
+            "child received unresolved --last"
+        );
+        fs::remove_file(sentinel).unwrap();
+        assert!(fixture.protected_state() == before);
+        assert_eq!(fs::read(&known).unwrap(), known_bytes);
+        assert_eq!(physical_id(&known), known_identity);
+        assert_eq!(thread_row(&fixture.target, KNOWN).unwrap(), known_row);
+        assert_eq!(
+            fs::read(fixture.target.join("state_5.sqlite")).unwrap(),
+            database_bytes
+        );
+        assert_eq!(fs::read(&journal_path).unwrap(), journal);
+    }
+    fixture.run(&fixture.recover_args());
+    fixture.assert_owner(false, original_goal(), 0, &fixture.contents);
+    assert_eq!(thread_row(&fixture.target, KNOWN).unwrap(), known_row);
+    assert_eq!(fs::read(known).unwrap(), known_bytes);
 }
 
 macro_rules! crash_case {

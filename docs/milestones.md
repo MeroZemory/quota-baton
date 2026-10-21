@@ -7,9 +7,9 @@ This file names the verification for each unit and each row. The row list and th
 <!-- status:begin -->
 현재 마일스톤: R11 (실행별 계정·모델 목록 마무리)
 목표: R11의 모델 배정과 실행 검증을 마무리한다
-핵심 지표: 새 경로 출시 1/2 · 모델 전환 표시 회귀 통과, 복구 fixture·native 관문 남음
-사용자 대기: 없음 (R2 Part B만 사용자 결정 대기)
-갱신: 2026-10-22 07:59 KST (단독 코어705·CLI29 통과; 복구 fixture 보완)
+핵심 지표: 새 경로 출시 1/2 · 전체 기능 코어1213·CLI29 통과; 복구50/54 보완 중
+사용자 대기: 없음 (R2 Part B: CPA 종료·복원 작업만 보류)
+갱신: 2026-10-22 08:22 KST (병렬 import 기한 초과4건 단계 추적; 창·native 독립 검증)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -97,6 +97,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-22 07:07 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | 실행·세션 fixture20/20, 명시적 제외3; 독립 정적 검수 통과, R11 미출시 |
 | 2026-10-22 07:49 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | 모델 배정 표시 수정 전1실패→수정 후1통과; 전체 기능 실패 fixture 보완 중, 미출시 |
 | 2026-10-22 07:59 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | 단독 코어705·CLI29 통과; 복구 fixture33실패 원인 보완 중, 미출시 |
+| 2026-10-22 08:22 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | 전체 기능 코어1213·복구50/54; 병렬 지연4건 미해결, 미출시 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -178,12 +179,15 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-22 07:49 | R11 실제 HTTP 모델 배정 표시 반례 | 수정 전0/1 → 수정 후1/1 | 원인 회귀 증명 | 초기 배정과 동의한 모델 전환, 실제 admin/detail/activity/inference |
 | 2026-10-22 07:49 | R11 모델 배정·제목 집중 단위 | 코어591·트레이223·제목1 통과; fmt·기본 strict clippy exit0 | 관련 전 검사 통과 | actual HWND 캡처와 native 5경우는 아직 미완료 |
 | 2026-10-22 07:59 | R11 단독 코어·CLI 집중 실행 | 코어705/705·CLI29/29; 복구21통과/33실패 | 실패0 | 기한 초과 재발 없음; app-server의 기존 명시적 거부32·신규 양성 fixture 스키마1 보완 |
+| 2026-10-22 08:05 | R11 복구 실패 분류 정정 (07:59 행) | grammar27·스키마1·import기한초과5 | 실패0 | 이전 기한초과0 기록은 오류; 원본 로그·정적 분류 JSON 보존, 시간 제한 유지 |
+| 2026-10-22 08:22 | R11 변경 코어 전체 기능 crate | 1213통과·0실패·4제외 | 실패0 | core-allfeatures-repair; 입력 aa13cf7d…, 981.7초 |
+| 2026-10-22 08:22 | R11 복구 fixture 두 번째 focused 실행 | 개별3/3, 병렬50통과·4실패 | 병렬54/54 | 문법·스키마 보완 통과; 4건 모두 초기 import20초 기한 초과, 기한 유지 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 행동 |
 |---|---|---|---|
-| R11 실행별 계정 | HTTP33·WS15, 코어591·트레이223·기본 clippy 통과 | native·최종 관문 통과 | CLI29·standalone705 통과; 복구33 보완 후 실제 창·Codex 5경우 검증 |
+| R11 실행별 계정 | HTTP33·WS15, 코어591·트레이223·기본 clippy 통과 | native·최종 관문 통과 | CLI29·standalone705·전체 기능 코어1213 통과; 병렬 복구4건 추적, 실제 창·Codex 5경우 검증 |
 | 대시보드 지연 (R12.10) | 합성 실제 창 성능·최종 scoped gate 통과 | 실제 설치 확인 | 설계 세션이 설치하고 사용자 환경 확인 |
 | R13 소진 예측·아이콘·차트·캐시 보류 | 설계 완료, 병합 0/3 단위 | 3/3 단위 병합과 설치 | R11 뒤 B+B2+D, A, C+E 순서 |
 <!-- gaps:end -->
