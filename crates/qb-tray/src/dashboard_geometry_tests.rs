@@ -3,6 +3,62 @@ use crate::dashboard_fixtures as fixtures;
 fn view(state: &mut DashboardState) -> m::DashboardView {
     m::project(&fixtures::snapshot(), state, &fixtures::clock())
 }
+
+#[test]
+fn r10_flat_account_chip_fits_its_column_and_leaves_the_session_id_visible() {
+    for size in [[1024., 640.], [1180., 960.], [1320., 960.]] {
+        let mut state = DashboardState {
+            grouped: false,
+            ..Default::default()
+        };
+        let mut v = view(&mut state);
+        v.flat.truncate(1);
+        v.flat[0].account = "very-long-synthetic-account-name".into();
+        v.flat[0].account_provider = "Claude".into();
+        v.flat[0].account_chip = Some(v2::Chip {
+            text: "한도 도달".into(),
+            tone: v2::Tone::Limit,
+        });
+        let scene = Scene::build(&v, &state, size, &Metrics::default());
+        let accessible = scene
+            .accessibility
+            .iter()
+            .find(|node| node.target == Some(Target::Session(v.flat[0].id.clone())))
+            .unwrap();
+        assert!(accessible.name.contains("Claude · 한도 도달"));
+        let row = scene.session_rows[0].rect;
+        let labels: Vec<_> = scene
+            .draw
+            .iter()
+            .filter_map(|draw| match draw {
+                Draw::Text { rect, measure, .. }
+                    if rect.top >= row.top && rect.bottom <= row.bottom =>
+                {
+                    Some((*rect, measure.text.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        let (name, _) = labels
+            .iter()
+            .find(|(_, text)| *text == v.flat[0].account)
+            .unwrap();
+        let (provider, _) = labels
+            .iter()
+            .find(|(_, text)| *text == " · Claude")
+            .unwrap();
+        let (status, _) = labels
+            .iter()
+            .find(|(_, text)| *text == "한도 도달")
+            .unwrap();
+        assert!(name.right <= provider.left);
+        assert!(provider.right + 6. <= status.left + 0.01);
+        assert_eq!(height(*status), 16.);
+        let suffix = format!(" · {}", v.flat[0].short_id);
+        let (id, _) = labels.iter().find(|(_, text)| *text == suffix).unwrap();
+        assert!(status.right <= id.left && id.right <= row.right);
+    }
+}
 #[test]
 fn r7_popup_targets_are_measured_modal_and_keyboard_order_excludes_underlay() {
     let mut state = DashboardState::default();

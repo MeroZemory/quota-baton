@@ -2082,8 +2082,19 @@ fn session(
         parent.or_else(|| Some("sessions:table".into())),
         Role::Row,
         format!(
-            "{}, {} · {}, 계정 {}, 모델 {}, {}, 오늘 요청 {}",
-            row.label, row.client, row.short_id, row.account, row.model, row.dot, row.requests
+            "{}, {} · {}, 계정 {} · {}{}, 모델 {}, {}, 오늘 요청 {}",
+            row.label,
+            row.client,
+            row.short_id,
+            row.account,
+            row.account_provider,
+            row.account_chip
+                .as_ref()
+                .map(|chip| format!(" · {}", chip.text))
+                .unwrap_or_default(),
+            row.model,
+            row.dot,
+            row.requests
         ),
         r,
         Some(Target::Session(row.id.clone())),
@@ -2144,9 +2155,48 @@ fn session(
                     false,
                 );
             }
+            SortKey::Account => {
+                let chip_width = row.account_chip.as_ref().map_or(0., |chip| {
+                    (b.measured_width(&chip.text, 12., true) + 12.).min(*cw - 40.)
+                });
+                let text_right = cr.right - if chip_width > 0. { chip_width + 6. } else { 0. };
+                let provider = format!(" · {}", row.account_provider);
+                let provider_width = b
+                    .measured_width(&provider, 12., false)
+                    .min((text_right - cr.left).max(0.));
+                b.text(
+                    rect(
+                        cr.left,
+                        cr.top,
+                        (text_right - cr.left - provider_width).max(0.),
+                        20.,
+                    ),
+                    row.account.clone(),
+                    12.,
+                    false,
+                    Color::Text,
+                    false,
+                );
+                b.text(
+                    rect(text_right - provider_width, cr.top, provider_width, 20.),
+                    provider,
+                    12.,
+                    false,
+                    Color::Secondary,
+                    false,
+                );
+                if let Some(status) = &row.account_chip {
+                    chip(
+                        b,
+                        &status.text,
+                        status.tone,
+                        rect(cr.right - chip_width, r.top + 9.5, chip_width, 16.),
+                        8.,
+                    );
+                }
+            }
             _ => {
                 let text = match key {
-                    SortKey::Account => &row.account,
                     SortKey::Model => &row.model,
                     SortKey::Start => &row.start,
                     SortKey::LastActivity => &row.activity,

@@ -364,6 +364,8 @@ impl DashboardSnapshot {
 pub struct SessionRow {
     pub id: String,
     pub account: String,
+    pub account_provider: String,
+    pub account_chip: Option<v2::Chip>,
     pub label: String,
     pub client: String,
     pub short_id: String,
@@ -734,6 +736,9 @@ fn session_row(
     clock: &Clock,
     selected: Option<&str>,
 ) -> SessionRow {
+    let account = account_rows(accounts)
+        .into_iter()
+        .find(|a| a.raw.id == s.account);
     let mut notes = vec![];
     if let Some(p) = &s.pacing_wait
         && p.waiting.unwrap_or(0) > 0
@@ -811,6 +816,10 @@ fn session_row(
     SessionRow {
         id: s.id.clone(),
         account: account_name(accounts, &s.account),
+        account_provider: v2::provider_label(&s.provider).into(),
+        account_chip: account
+            .filter(|a| a.state != v2::DisplayState::InUse)
+            .and_then(|a| a.chip.clone()),
         label: label(s),
         client: client(s),
         short_id: s.id.chars().take(6).collect(),
