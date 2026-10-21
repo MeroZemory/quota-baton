@@ -1154,14 +1154,23 @@ fn r10_dashboard_native() {
     }
     let _cleanup = Cleanup;
     let (send, recv) = mpsc::sync_channel(256);
-    let snapshot = Arc::new(match edge {
+    let mut snapshot = match edge {
         Some(edge) => fixture::edge_snapshot(edge),
         None => fixture::snapshot(state),
-    });
+    };
+    if std::env::var_os("R101_RESTART").is_some() {
+        for row in &mut snapshot.sessions.sessions {
+            row.counters_complete = false;
+            row.requests_today = None;
+            row.failures_today = None;
+            row.rate_wait_today = Default::default();
+        }
+    }
+    let snapshot = Arc::new(snapshot);
     let dark = theme == "dark";
     let size = if let Some(edge) = edge {
         edge.size()
-    } else if matches!(state, 7 | 15) {
+    } else if matches!(state, 7 | 15) || std::env::var_os("R101_NARROW").is_some() {
         [1024., 640.]
     } else {
         [1320., 960.]
