@@ -229,6 +229,11 @@ impl Run {
 
     fn edge_click(&mut self, hwnd: HWND, target: Target) {
         assert_owned(hwnd);
+        // Synthetic input also runs when the owned window is occluded. Make
+        // the previous production redraw complete before the next hit test.
+        unsafe {
+            SendMessageW(hwnd, WM_PAINT, None, None);
+        }
         let scene = self.scene();
         let hit = scene
             .targets
