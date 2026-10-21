@@ -609,6 +609,7 @@ async fn run() -> anyhow::Result<()> {
             println_utf8!("프록시를 시작했습니다.");
             let polling = relay.quota.start();
             let refreshing = relay.start_refresh_scheduler();
+            let catalogs = relay.start_catalog_scheduler();
             let memory_guard = relay.start_memory_guard();
             tokio::select! {
                 result = tokio::signal::ctrl_c() => { result?; }
@@ -616,9 +617,11 @@ async fn run() -> anyhow::Result<()> {
             }
             polling.abort();
             refreshing.abort();
+            catalogs.abort();
             memory_guard.abort();
             let _ = polling.await;
             let _ = refreshing.await;
+            let _ = catalogs.await;
             let _ = memory_guard.await;
             // Stop accepting new connections before handing the credential
             // lease to the successor. Existing handlers remain alive under

@@ -732,7 +732,12 @@ async fn upgrade_inner(
         .key
         .as_deref()
         .and_then(|key| state.observability.dashboard().socket(key));
+    let launch_pin = parts
+        .extensions
+        .get::<super::launch::LaunchIngress>()
+        .and_then(|ingress| ingress.pin.clone());
     tokio::spawn(async move {
+        let _launch_pin = launch_pin;
         let _activity = activity;
         let _dashboard_socket = dashboard_socket;
         let _socket_pin = socket_pin;

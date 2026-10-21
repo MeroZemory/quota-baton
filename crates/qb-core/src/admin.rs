@@ -206,6 +206,10 @@ pub fn runtime_routes_with_adoption_probe(
 fn runtime_router(state: RuntimeAdmin) -> Router {
     Router::new()
         .route(
+            "/admin/v1/launches",
+            post(issue_launch).layer(axum::extract::DefaultBodyLimit::max(8192)),
+        )
+        .route(
             "/admin/v1/routing",
             axum::routing::get(routing_view).post(routing_update),
         )
@@ -230,6 +234,32 @@ fn runtime_router(state: RuntimeAdmin) -> Router {
         .route("/admin/v1/lifecycle/drain", post(lifecycle_drain))
         .route("/admin/v1/lifecycle/shutdown", post(lifecycle_shutdown))
         .with_state(state)
+}
+
+async fn issue_launch(
+    State(state): State<RuntimeAdmin>,
+    Json(request): Json<crate::relay::LaunchRequest>,
+) -> Response {
+    match state.relay.issue_launch(request, state.data_port).await {
+        Ok(reply) => {
+            let mut response = Json(reply).into_response();
+            response.headers_mut().insert(
+                "cache-control",
+                axum::http::HeaderValue::from_static("no-store"),
+            );
+            response
+                .headers_mut()
+                .insert("pragma", axum::http::HeaderValue::from_static("no-cache"));
+            response
+        }
+        Err(error) => (
+            error.status(),
+            Json(serde_json::json!({"error":{
+                "code":error.code(),"message":error.message(),
+            }})),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(serde::Deserialize)]

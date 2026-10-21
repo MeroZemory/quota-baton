@@ -1,6 +1,7 @@
 pub(crate) mod credentials;
 mod headers;
 mod hold;
+mod launch;
 mod ledger;
 pub(crate) mod notices;
 mod outcome;
@@ -40,6 +41,7 @@ use crate::{
 use credentials::TokenGates;
 pub use credentials::{ManualRefreshError, ManualRefreshResult, ManualRefreshTerminal};
 pub use hold::CommitDecision;
+pub use launch::{LaunchError, LaunchReply, LaunchRequest};
 use ledger::Completion;
 
 pub(crate) fn poll_revoked(provider: Provider, body: &[u8]) -> bool {
@@ -58,6 +60,10 @@ pub struct RelayState {
     pub accounts: Arc<crate::account_runtime::AccountRuntime>,
     pub quota: Arc<crate::quota::UsagePoller>,
     pub bindings: Arc<crate::bindings::BindingTable>,
+    pub(crate) launch_tokens: crate::launch_tokens::LaunchTokenRegistry,
+    pub(crate) catalogs: crate::catalog::CatalogCache,
+    catalog_slots: tokio::sync::Semaphore,
+    catalog_changed: Notify,
     burst: Mutex<crate::burst::BurstTracker>,
     rate_hold_secs: u64,
     rate_hold_max_retries: u32,
@@ -467,6 +473,10 @@ impl RelayState {
             accounts,
             quota,
             bindings,
+            launch_tokens: crate::launch_tokens::LaunchTokenRegistry::default(),
+            catalogs: crate::catalog::CatalogCache::default(),
+            catalog_slots: tokio::sync::Semaphore::new(4),
+            catalog_changed: Notify::new(),
             rate_hold_secs: config.routing.rate_hold_secs,
             rate_hold_max_retries: config.routing.rate_hold_max_retries,
             ws_upgrade_hold_secs: config.routing.ws_upgrade_hold_secs,
@@ -1428,6 +1438,37 @@ async fn precommit_timeout<T>(
     }
 }
 async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Response {
+    // Strip routing handles before deadlines, ledger, capture, upstream URLs or
+    // error construction. Authentication has already run on the local port.
+    let normalized = match crate::launch_path::normalize(request.uri()) {
+        Ok(path) => path,
+        Err(()) => {
+            return native_error(
+                StatusCode::BAD_REQUEST,
+                Provider::Codex,
+                "invalid_launch",
+                "실행 경로가 올바르지 않습니다. codex-qb를 다시 실행해 주세요.",
+            );
+        }
+    };
+    *request.uri_mut() = normalized.uri;
+    // D22 checkpoint: never let an incomplete scoped launch fall through to
+    // the ordinary account selector. Remove when canonical resolution lands.
+    if normalized.token.is_some() {
+        return native_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            Provider::Codex,
+            "launch_unavailable",
+            "계정 지정 실행 기능을 준비 중입니다. 일반 codex-qb를 사용해 주세요.",
+        );
+    }
+    let launch_pin = normalized.token.and_then(|token| {
+        let pin = state.launch_tokens.get_or_pin(&token).ok().map(Arc::new);
+        request
+            .extensions_mut()
+            .insert(launch::LaunchIngress { pin: pin.clone() });
+        pin
+    });
     let provider = if request.uri().path().starts_with("/v1/messages") {
         Provider::Claude
     } else {
@@ -1449,7 +1490,7 @@ async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Re
         .insert(RequestDeadline(Instant::now() + timeout));
     let (commit, committed) = tokio::sync::watch::channel(false);
     request.extensions_mut().insert(CommitSignal(commit));
-    precommit_timeout(timeout, committed, relay_inner(state, request))
+    let response = precommit_timeout(timeout, committed, relay_inner(state, request))
         .await
         .unwrap_or_else(|| {
             native_error(
@@ -1458,7 +1499,8 @@ async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Re
                 "request_timeout",
                 "계정 선택·대기·재시도의 전체 시간 한도를 초과했습니다.",
             )
-        })
+        });
+    launch::pin_body(response, launch_pin)
 }
 
 async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
@@ -1487,6 +1529,18 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
             launcher_label.clone(),
         ));
     if state.is_draining() {
+        if request
+            .extensions()
+            .get::<launch::LaunchIngress>()
+            .is_some()
+        {
+            return native_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                Provider::Codex,
+                "launch_handover",
+                "코어를 교체하고 있습니다. 잠시 후 다시 요청해 주세요.",
+            );
+        }
         if request.method() != Method::GET || !request.headers().contains_key("upgrade") {
             return handover_http(state, request).await;
         }

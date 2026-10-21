@@ -21,6 +21,10 @@ use std::{
 };
 
 const CAPACITY: usize = 20_000;
+mod launch;
+pub use launch::{
+    LaunchEntitlements, LaunchError, LaunchInfo, LaunchPlacement, LaunchPolicyMove, LaunchRequest,
+};
 #[cfg(test)]
 #[path = "bindings/routing_safety_tests.rs"]
 mod routing_safety_tests;
@@ -334,6 +338,12 @@ struct Binding {
 struct Snapshot {
     schema: u32,
     bindings: Vec<Binding>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    launches: BTreeMap<String, launch::Metadata>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    launch_anchors: BTreeMap<String, launch::Anchor>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    launch_aliases: BTreeMap<String, String>,
 }
 #[derive(Clone)]
 struct Group {
@@ -356,6 +366,11 @@ struct AccountIndex {
 #[derive(Clone, Default)]
 struct Data {
     bindings: BTreeMap<String, Binding>,
+    launches: BTreeMap<String, launch::Metadata>,
+    launch_anchors: BTreeMap<String, launch::Anchor>,
+    launch_aliases: BTreeMap<String, String>,
+    launch_retention: BTreeMap<String, DateTime<Utc>>,
+    launch_weight: usize,
     active: BTreeMap<String, usize>,
     pins: BTreeMap<String, usize>,
     pending: BTreeMap<String, usize>,
@@ -506,6 +521,7 @@ impl Drop for SocketPin {
         if let Some(group) = &self.group {
             let mut d = self.table.data.lock().unwrap_or_else(|e| e.into_inner());
             decrement(&mut d.pins, group);
+            launch::touch(&mut d, group, Utc::now());
             release_group(&mut d, group);
         }
     }
@@ -567,6 +583,7 @@ fn protect_group(d: &mut Data, g: &str) {
     }
 }
 fn touch_group(d: &mut Data, g: &str, now: DateTime<Utc>) {
+    launch::touch(d, g, now);
     if let Some(mut entry) = unindex_group(d, g) {
         entry.last_used = entry.last_used.max(now);
         for key in &entry.keys {
@@ -596,6 +613,7 @@ fn rebuild_indexes(d: &mut Data) {
         .values()
         .map(|b| binding_bound(&b.key, &b.account))
         .fold(0usize, usize::saturating_add);
+    launch::rebuild(d);
     let mut groups = BTreeMap::<String, Group>::new();
     for b in d.bindings.values() {
         let entry = groups
@@ -616,6 +634,9 @@ fn snapshot(d: &Data) -> Snapshot {
     Snapshot {
         schema: 1,
         bindings: d.bindings.values().cloned().collect(),
+        launches: d.launches.clone(),
+        launch_anchors: d.launch_anchors.clone(),
+        launch_aliases: d.launch_aliases.clone(),
     }
 }
 const SNAPSHOT_MAX_BYTES: u64 = 16 * 1024 * 1024;
@@ -712,6 +733,10 @@ fn decode_scoped(value: Value, strict: bool) -> Result<Data> {
         }
         d.bindings.insert(b.key.clone(), b);
     }
+    d.launches = state.launches;
+    d.launch_anchors = state.launch_anchors;
+    d.launch_aliases = state.launch_aliases;
+    launch::validate(&d)?;
     if !inconsistent.is_empty() {
         if strict {
             bail!("strict binding group has conflicting accounts");
@@ -722,6 +747,7 @@ fn decode_scoped(value: Value, strict: bool) -> Result<Data> {
         );
         d.bindings
             .retain(|key, _| !inconsistent.contains(group(key)));
+        launch::remove_missing(&mut d);
         d.changed();
     }
     rebuild_indexes(&mut d);
@@ -753,20 +779,17 @@ impl BindingTable {
     }
     pub fn associate_project(&self, key: &str, project: &str) -> Result<()> {
         let _mutation = self.mutations.lock().unwrap_or_else(|e| e.into_inner());
-        let anchor = self
-            .data
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .groups
-            .get(group(key))
-            .map(|g| g.account.clone());
+        let d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        let anchor = d.groups.get(group(key)).map(|g| g.account.clone());
+        let policy_key = launch::policy_key(&d, Some(key)).unwrap().to_owned();
+        drop(d);
         self.policies
-            .associate_with_anchor(key, project, anchor.as_deref())
+            .associate_with_anchor(&policy_key, project, anchor.as_deref())
     }
     pub fn routing_view(&self) -> Value {
         let d = self.data.lock().unwrap_or_else(|e| e.into_inner());
         let mut view = self.policies.list();
-        view["observed_sessions"]=serde_json::to_value(d.groups.iter().map(|(key,g)|serde_json::json!({"id":crate::routing::session_id(key),"account":g.account,"policy":self.policies.plan(Some(key))})).collect::<Vec<_>>()).unwrap_or_default();
+        view["observed_sessions"]=serde_json::to_value(d.groups.iter().map(|(key,g)|serde_json::json!({"id":crate::routing::session_id(key),"account":g.account,"policy":self.policies.plan(launch::policy_key(&d, Some(key)))})).collect::<Vec<_>>()).unwrap_or_default();
         view
     }
     pub fn set_routing_session(
@@ -782,10 +805,18 @@ impl BindingTable {
             .groups
             .iter()
             .find(|(key, _)| crate::routing::session_id(key) == id)
-            .map(|(key, g)| (key.clone(), g.account.clone()));
+            .map(|(key, g)| {
+                (
+                    launch::policy_key(&d, Some(key)).unwrap().to_owned(),
+                    g.account.clone(),
+                )
+            });
         drop(d);
+        let policy_id = binding
+            .as_ref()
+            .map(|(key, _)| crate::routing::session_id(key));
         self.policies.edit_session_for_key(
-            id,
+            policy_id.as_deref().unwrap_or(id),
             settings,
             project,
             binding.as_ref().map(|(_, a)| a.as_str()),
@@ -835,11 +866,12 @@ impl BindingTable {
         };
         // Validate/capture before constructing an auto-flushing table. A failed
         // legacy alias recovery must not prune or overwrite the source on Drop.
-        policies.capture_strict_anchors(
-            data.groups
-                .iter()
-                .map(|(key, g)| (key.as_str(), g.account.as_str())),
-        )?;
+        policies.capture_strict_anchors(data.groups.iter().map(|(key, g)| {
+            (
+                launch::policy_key(&data, Some(key)).unwrap(),
+                g.account.as_str(),
+            )
+        }))?;
         let table = Arc::new(Self {
             policies,
             path,
@@ -873,7 +905,13 @@ impl BindingTable {
         Ok(table)
     }
     fn prune(&self, d: &mut Data, now: DateTime<Utc>) {
-        while let Some((time, g)) = d.lru.first().cloned() {
+        launch::prune(d, now);
+        while let Some((time, g)) = d
+            .lru
+            .iter()
+            .find(|(_, g)| !launch::retained(d, g, now))
+            .cloned()
+        {
             if d.bindings.len() <= CAPACITY
                 && idle(now, time) < self.config.session_binding_max_secs
             {
@@ -895,6 +933,7 @@ impl BindingTable {
                 for hits in d.rate_hits.values_mut() {
                     hits.remove(&g);
                 }
+                launch::remove_group(d, &g);
                 d.changed();
             }
         }
@@ -922,8 +961,9 @@ impl BindingTable {
             first_seen_at: metadata.and_then(|b| b.first_seen_at),
             bound_since: metadata.and_then(|b| b.bound_since),
             last_used_at: entry.last_used,
-            active: entry.last_used
+            active: (entry.last_used
                 >= now - chrono::Duration::seconds(self.config.active_window_secs as i64)
+                && !launch::idle_placement(d, g))
                 || d.active.contains_key(g),
             marked_for_move: d.overload_marks.contains_key(g),
             client_kind: metadata.and_then(|b| b.client_kind),
@@ -1023,7 +1063,10 @@ impl BindingTable {
         account
             .recent
             .iter()
-            .filter(|(last, group)| *last >= cutoff || d.active.contains_key(group))
+            .filter(|(last, group)| {
+                (*last >= cutoff && !launch::idle_placement(d, group))
+                    || d.active.contains_key(group)
+            })
             .count()
     }
 
@@ -1148,7 +1191,11 @@ impl BindingTable {
                     && d.last_request_bytes.get(*g).is_some_and(|bytes| {
                         *bytes > 0 && *bytes <= self.config.churn.max_move_bytes
                     })
-                    && self.policies.discretionary_allowed(g, Some(&target), now)
+                    && self.policies.discretionary_allowed(
+                        launch::policy_key(&d, Some(g)).unwrap(),
+                        Some(&target),
+                        now,
+                    )
             })
             .map(|(g, entry)| {
                 (
@@ -1495,6 +1542,9 @@ impl BindingTable {
         *d.pending.entry(account.into()).or_default() += 1;
         d.traffic.insert(account.into(), Utc::now());
         let g = key.map(|k| group(k).to_owned());
+        if let Some(g) = &g {
+            launch::request_started(d, g, Utc::now());
+        }
         let after_move = if let Some(g) = &g {
             *d.active.entry(g.clone()).or_default() += 1;
             protect_group(d, g);
@@ -1690,10 +1740,17 @@ impl BindingTable {
         let previous = key
             .and_then(|key| d.groups.get(group(key)))
             .map(|g| g.account.clone());
+        let policy_key = launch::policy_key(&d, key).map(str::to_owned);
         drop(d);
         if self
             .policies
-            .dispatch(key, &account, previous.as_deref(), reason, now)
+            .dispatch(
+                policy_key.as_deref(),
+                &account,
+                previous.as_deref(),
+                reason,
+                now,
+            )
             .is_err()
         {
             tracing::warn!(
@@ -1703,18 +1760,55 @@ impl BindingTable {
             return Decision::Blocked;
         }
         let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        let moves = self.commit_binding(
+            &mut d,
+            provider,
+            key,
+            parent,
+            candidates,
+            pinned,
+            request_bytes,
+            hold_timed_out,
+            now,
+            &account,
+            reason,
+        );
+        let lease = self.reserve(&mut d, key, &account);
+        self.prune(&mut d, now);
+        Decision::Selected {
+            account,
+            lease,
+            moves,
+        }
+    }
+    // Shared commit: launch placement deliberately stops before reserve().
+    #[allow(clippy::too_many_arguments)]
+    fn commit_binding(
+        &self,
+        d: &mut Data,
+        provider: Provider,
+        key: Option<&str>,
+        parent: Option<&str>,
+        candidates: &[Candidate],
+        pinned: Option<&str>,
+        request_bytes: u64,
+        hold_timed_out: bool,
+        now: DateTime<Utc>,
+        account: &str,
+        reason: &str,
+    ) -> Vec<MoveEvent> {
         let mut moves = Vec::new();
         if let Some(k) = key {
             let g = group(k);
-            let accepted = Self::accepted_in(&d, Some(k), &account);
+            let accepted = Self::accepted_in(d, Some(k), account);
             let selected_reason = reason;
             let reason = if hold_timed_out {
                 "reset_hold_timeout"
             } else {
                 reason
             };
-            let previous = unindex_group(&mut d, g);
-            let from = previous.as_ref().map(|entry| entry.account.clone());
+            let previous = unindex_group(d, g);
+            let from = previous.as_ref().map(|entry| entry.account.to_owned());
             let last_used = previous.as_ref().map_or(now, |entry| entry.last_used);
             let mut keys = previous.map_or_else(BTreeSet::new, |entry| entry.keys);
             keys.insert(k.into());
@@ -1724,22 +1818,21 @@ impl BindingTable {
             {
                 keys.insert(p.into());
             }
-            if from.as_deref() != Some(&account) {
+            if from.as_deref() != Some(account) {
                 let candidate = candidates
                     .iter()
                     .find(|c| c.account.id == account)
                     .expect("selection came from candidates");
-                let (evidence, placed_since_obs) = placement_evidence(candidate, &d, now);
+                let (evidence, placed_since_obs) = placement_evidence(candidate, d, now);
                 let capped = evidence == PlacementEvidence::Weak
                     && placed_since_obs >= self.config.weak_evidence_new_sessions;
                 // C5 recovery is a placement; step-1 debug pins and step-2
                 // inheritance remain exempt even when the account changes.
-                let is_placement =
-                    selected_reason != "inherited" && pinned != Some(account.as_str());
+                let is_placement = selected_reason != "inherited" && pinned != Some(account);
                 if is_placement {
                     let seq = self.begin_usage_observation();
                     d.placements
-                        .entry(account.clone())
+                        .entry(account.to_owned())
                         .or_default()
                         .placed(now, seq);
                 }
@@ -1747,7 +1840,7 @@ impl BindingTable {
                 moves.push(MoveEvent {
                     key: g.to_owned(),
                     from: from.clone(),
-                    to: account.clone(),
+                    to: account.to_owned(),
                     reason: if from.is_none() && selected_reason == "new" {
                         "new"
                     } else {
@@ -1756,7 +1849,7 @@ impl BindingTable {
                     .into(),
                     bytes: request_bytes,
                     keys: keys.len(),
-                    debug_pin: pinned == Some(account.as_str()),
+                    debug_pin: pinned == Some(account),
                     evidence,
                     placement_charge_pct: if is_placement {
                         self.config.placement_allowance_pct
@@ -1778,16 +1871,16 @@ impl BindingTable {
                         .snapshot_weight
                         .saturating_sub(binding_bound(&previous.key, &previous.account));
                 }
-                d.snapshot_weight = d.snapshot_weight.saturating_add(binding_bound(k, &account));
+                d.snapshot_weight = d.snapshot_weight.saturating_add(binding_bound(k, account));
                 d.bindings.insert(
                     k.clone(),
                     Binding {
                         key: k.clone(),
-                        account: account.clone(),
+                        account: account.to_owned(),
                         last_used,
                         accepted: Some(accepted),
                         first_seen_at: previous.as_ref().map_or(Some(now), |b| b.first_seen_at),
-                        bound_since: if from.as_deref() != Some(account.as_str()) {
+                        bound_since: if from.as_deref() != Some(account) {
                             Some(now)
                         } else {
                             previous.as_ref().and_then(|b| b.bound_since)
@@ -1798,11 +1891,11 @@ impl BindingTable {
                 );
             }
             index_group(
-                &mut d,
+                d,
                 g.to_owned(),
                 Group {
                     keys,
-                    account: account.clone(),
+                    account: account.to_owned(),
                     last_used,
                 },
             );
@@ -1817,19 +1910,15 @@ impl BindingTable {
                 d.overload_marks.remove(g);
             }
             d.changed();
-        } else if let Some(old) = d.sticky.insert(provider.as_str().into(), account.clone())
+        } else if let Some(old) = d
+            .sticky
+            .insert(provider.as_str().into(), account.to_owned())
             && old != account
         {
             d.accepted_unbound.remove(&old);
             d.epochs.remove(&format!("unbound:{old}"));
         }
-        let lease = self.reserve(&mut d, key, &account);
-        self.prune(&mut d, now);
-        Decision::Selected {
-            account,
-            lease,
-            moves,
-        }
+        moves
     }
     /// Read-only counterpart of prune for selection previews. Ordinary lookups
     /// visit one group; only outstanding capacity eviction walks the LRU prefix.
@@ -1841,13 +1930,16 @@ impl BindingTable {
     ) -> Option<&'a Binding> {
         let g = group(key);
         let entry = d.groups.get(g)?;
-        if !protected(d, g) {
+        if !protected(d, g) && !launch::retained(d, g, now) {
             if idle(now, entry.last_used) >= self.config.session_binding_max_secs {
                 return None;
             }
             if d.bindings.len() > CAPACITY {
                 let mut size = d.bindings.len();
                 for (_, oldest) in &d.lru {
+                    if launch::retained(d, oldest, now) {
+                        continue;
+                    }
                     if size <= CAPACITY {
                         break;
                     }
@@ -1875,7 +1967,36 @@ impl BindingTable {
         now: DateTime<Utc>,
         hold_allowed: bool,
     ) -> (PreviewDecision, &'static str) {
-        let plan = self.policies.plan(key);
+        self.select_ordered(
+            d,
+            provider,
+            key,
+            parent,
+            model,
+            candidates,
+            pinned,
+            now,
+            hold_allowed,
+            None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn select_ordered(
+        &self,
+        d: &Data,
+        provider: Provider,
+        key: Option<&str>,
+        parent: Option<&str>,
+        model: Option<&str>,
+        candidates: &[Candidate],
+        pinned: Option<&str>,
+        now: DateTime<Utc>,
+        hold_allowed: bool,
+        preference: Option<&launch::SelectionPreference<'_>>,
+    ) -> (PreviewDecision, &'static str) {
+        let policy_key = launch::policy_key(d, key);
+        let plan = self.policies.plan(policy_key);
+        let model_move = preference.is_some_and(|p| p.model_move);
         let strict_anchor = plan.anchor.clone().or_else(|| {
             key.and_then(|k| self.retained_binding(d, k, now))
                 .map(|b| b.account.clone())
@@ -1884,7 +2005,8 @@ impl BindingTable {
             .iter()
             .filter(|c| c.account.provider == provider)
             .filter(|c| {
-                plan.settings.mode != crate::routing::Mode::Strict
+                model_move
+                    || plan.settings.mode != crate::routing::Mode::Strict
                     || strict_anchor
                         .as_ref()
                         .is_none_or(|anchor| anchor == &c.account.id)
@@ -1903,9 +2025,12 @@ impl BindingTable {
         {
             return (PreviewDecision::Selected { account: id.into() }, "forced");
         }
-        let mut bound = key.and_then(|k| self.retained_binding(d, k, now)).cloned();
+        let mut bound = key
+            .filter(|_| !model_move)
+            .and_then(|k| self.retained_binding(d, k, now))
+            .cloned();
         // A synchronously saved anchor wins over an older write-behind binding.
-        if let (Some(anchor), Some(key)) = (&plan.anchor, key) {
+        if let (Some(anchor), Some(key)) = (&plan.anchor, key.filter(|_| !model_move)) {
             let b = bound.get_or_insert_with(|| Binding {
                 key: key.to_owned(),
                 account: anchor.clone(),
@@ -2003,7 +2128,7 @@ impl BindingTable {
                                     now,
                                 )
                                 && self.policies.discretionary_allowed(
-                                    &b.key,
+                                    policy_key.unwrap_or(&b.key),
                                     Some(&candidate.account.id),
                                     now,
                                 )
@@ -2012,7 +2137,11 @@ impl BindingTable {
                     // particular, fresh/uncapped targets must not erase a mark
                     // while group, revisit, pool or cost guards are active.
                     let guard_waiting = !known_cost
-                        || !self.policies.discretionary_allowed(&b.key, None, now)
+                        || !self.policies.discretionary_allowed(
+                            policy_key.unwrap_or(&b.key),
+                            None,
+                            now,
+                        )
                         || entries.iter().any(|(candidate, eligible)| {
                             *eligible
                                 && candidate.account.id != b.account
@@ -2025,7 +2154,7 @@ impl BindingTable {
                                 )
                                 && (placement_capped(candidate, d, &self.config, now)
                                     || !self.policies.discretionary_allowed(
-                                        &b.key,
+                                        policy_key.unwrap_or(&b.key),
                                         Some(&candidate.account.id),
                                         now,
                                     ))
@@ -2067,7 +2196,11 @@ impl BindingTable {
                     let cold =
                         !protected(d, g) && idle(now, last) >= self.config.rebalance_idle_secs;
                     if !cold
-                        || !self.policies.discretionary_allowed(&b.key, None, now)
+                        || !self.policies.discretionary_allowed(
+                            policy_key.unwrap_or(&b.key),
+                            None,
+                            now,
+                        )
                         || d.unknown_cost.contains(group(&b.key))
                         || d.last_request_bytes.get(group(&b.key)).is_none_or(|bytes| {
                             *bytes == 0 || *bytes > self.config.churn.max_move_bytes
@@ -2126,8 +2259,11 @@ impl BindingTable {
                     source != &c.account.id
                         && self.rebalance_target_base(d, source, c, key.map(group), now)
                 }) && key.is_some_and(|key| {
-                    self.policies
-                        .discretionary_allowed(key, Some(&c.account.id), now)
+                    self.policies.discretionary_allowed(
+                        policy_key.unwrap_or(key),
+                        Some(&c.account.id),
+                        now,
+                    )
                 })
             })
             .collect();
@@ -2160,7 +2296,7 @@ impl BindingTable {
                                 && self.rebalance_target_base(d, &mark.from, c, key.map(group), now)
                                 && key.is_some_and(|key| {
                                     self.policies.discretionary_allowed(
-                                        key,
+                                        policy_key.unwrap_or(key),
                                         Some(&c.account.id),
                                         now,
                                     )
@@ -2174,8 +2310,11 @@ impl BindingTable {
                     source != &c.account.id
                         && self.rebalance_target_base(d, source, c, key.map(group), now)
                 }) && key.is_some_and(|key| {
-                    self.policies
-                        .discretionary_allowed(key, Some(&c.account.id), now)
+                    self.policies.discretionary_allowed(
+                        policy_key.unwrap_or(key),
+                        Some(&c.account.id),
+                        now,
+                    )
                 })
             });
         }
@@ -2224,6 +2363,7 @@ impl BindingTable {
             .collect();
         let chosen = if !gated.is_empty() {
             prefer_pacing_and_evidence(&mut gated, d, &self.config, now);
+            launch::prefer(&mut gated, preference);
             // Approximate reset cohorts require one fixed anchor.
             let anchor = gated
                 .iter()
@@ -2237,6 +2377,7 @@ impl BindingTable {
             // pacing/cap ordering and then choose the most headroom.
             let mut fallback: Vec<_> = partition.iter().map(|entry| (entry.0, &entry.1)).collect();
             prefer_pacing_and_evidence(&mut fallback, d, &self.config, now);
+            launch::prefer(&mut fallback, preference);
             fallback
                 .iter()
                 .min_by(|(a, x), (b, y)| {
@@ -2268,11 +2409,13 @@ impl BindingTable {
         self.policies.begin_recovery();
         self.policies.reload()?;
         let mut next = decode_scoped(value, self.policies.requires_strict_recovery())?;
-        self.policies.capture_strict_anchors(
-            next.groups
-                .iter()
-                .map(|(key, g)| (key.as_str(), g.account.as_str())),
-        )?;
+        self.policies
+            .capture_strict_anchors(next.groups.iter().map(|(key, g)| {
+                (
+                    launch::policy_key(&next, Some(key)).unwrap(),
+                    g.account.as_str(),
+                )
+            }))?;
         let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
         self.prune(&mut next, Utc::now());
         // Import must advance the existing table's revision, rather than use
@@ -2320,12 +2463,7 @@ impl BindingTable {
             (snapshot(&d), d.revision)
         };
         if state.bindings.len() > CAPACITY * 2
-            || state
-                .bindings
-                .iter()
-                .map(|b| binding_bound(&b.key, &b.account))
-                .fold(64usize, usize::saturating_add) as u64
-                > SNAPSHOT_MAX_BYTES
+            || launch::snapshot_bound(&state) as u64 > SNAPSHOT_MAX_BYTES
         {
             bail!("binding snapshot cannot be restored within its bounds");
         }
