@@ -962,7 +962,7 @@ fn codex_title(folder: &str, account_short: Option<&str>) -> String {
     let account_short = account_short
         .filter(|short| short.len() == 2 && short.bytes().all(|b| b.is_ascii_lowercase()));
     match account_short {
-        Some(short) => format!("codex-qb-{short} · {folder}"),
+        Some(short) => format!("codex-qb · {short} · {folder}"),
         None => format!("codex-qb · {folder}"),
     }
 }
@@ -1079,7 +1079,10 @@ mod tests {
     use super::*;
     #[test]
     fn r11_title_uses_only_a_configured_two_letter_short() {
-        assert_eq!(codex_title("project", Some("ab")), "codex-qb-ab · project");
+        assert_eq!(
+            codex_title("project", Some("ab")),
+            "codex-qb · ab · project"
+        );
         assert_eq!(codex_title("project", None), "codex-qb · project");
         for value in [
             "http://127.0.0.1/l/private",
