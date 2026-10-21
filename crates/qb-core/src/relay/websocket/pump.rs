@@ -1237,6 +1237,7 @@ async fn run_with_read_timeout(
                             };
                             active.model = model.clone();
                             active.completion.record.model = model.clone();
+                            active.completion.dashboard_model(model.as_deref());
                             request = Some(next_request);
                             current.insert(next_request, active);
                             if let Some(active) = current.get_mut(&next_request) {

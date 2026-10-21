@@ -232,8 +232,12 @@ async fn r10_relay_quota_extension_keeps_one_activity_and_persists_raw_health_ch
         .collect();
     assert_eq!(reached.len(), 1);
     assert!(!events.iter().any(|e| e["kind"] == "quota_reset"));
-    // Health.scope is account, not the causing window. Do not invent a window.
-    assert!(reached[0]["data"]["window"].is_null());
+    // Carry the actual persisted C5 window, rather than the health scope.
+    assert_eq!(reached[0]["data"]["window"], "5h");
+    let activity_reset =
+        chrono::DateTime::parse_from_rfc3339(reached[0]["data"]["reset_at"].as_str().unwrap())
+            .unwrap();
+    assert_eq!(activity_reset.timestamp(), reset);
     h.obs.flush().unwrap();
     let mut changes = Vec::new();
     for entry in fs::read_dir(h.home.join("ledger")).unwrap() {
@@ -256,6 +260,33 @@ async fn r10_relay_quota_extension_keeps_one_activity_and_persists_raw_health_ch
         let until = chrono::DateTime::parse_from_rfc3339(row["until"].as_str().unwrap()).unwrap();
         assert_eq!(until.timestamp(), expected);
     }
+    // Exercise the store observer after recovery clears the current C5 evidence.
+    let store = h.store.clone();
+    let id = account.id.clone();
+    tokio::task::spawn_blocking(move || {
+        store
+            .update_metadata(&id, |a| {
+                a.apply_health_signal(qb_core::accounts::HealthSignal::Ready, chrono::Utc::now());
+            })
+            .unwrap();
+    })
+    .await
+    .unwrap();
+    let activity = h.get("activity").await;
+    let resets: Vec<_> = activity["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "quota_reset")
+        .collect();
+    assert_eq!(resets.len(), 1);
+    assert_eq!(resets[0]["data"]["window"], "5h");
+    assert_eq!(
+        chrono::DateTime::parse_from_rfc3339(resets[0]["data"]["reset_at"].as_str().unwrap(),)
+            .unwrap()
+            .timestamp(),
+        reset + 1
+    );
     h.stop().await;
     upstream.abort();
 }
@@ -492,7 +523,7 @@ async fn r7_websocket_socket_is_not_request_and_duplicate_labels_never_reach_fak
     .unwrap();
     assert!(created);
     let completed = h.settled(1).await;
-    assert_eq!(completed["model"], "ws-header-model");
+    assert_eq!(completed["model"], "body-model");
     assert_eq!(completed["inflight"]["ws_open"], 1);
     assert_eq!(completed["recent_requests"].as_array().unwrap().len(), 1);
     assert_eq!(completed["recent_requests"][0]["outcome"], "ok");

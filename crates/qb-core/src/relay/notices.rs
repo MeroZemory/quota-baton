@@ -190,3 +190,49 @@ impl RelayState {
         );
     }
 }
+
+#[cfg(test)]
+mod r101_tests {
+    use super::*;
+
+    #[test]
+    fn r101_notice_uses_persisted_c5_window_without_relabeling_long_windows() {
+        let mut account = crate::accounts::health::tests::fixture();
+        let reset = Utc::now() + chrono::Duration::hours(2);
+        account.quota_cooling = Some(crate::accounts::QuotaCooling {
+            window: "43200m".into(),
+            reset_at: reset,
+            started_at: Utc::now() - chrono::Duration::hours(1),
+        });
+        // The persisted blocking evidence survives a stale or empty snapshot.
+        assert_eq!(
+            limiting_window(&account, &json!({})),
+            (Some("43200m".into()), Some(reset))
+        );
+    }
+
+    #[test]
+    fn r101_notice_fresh_evidence_and_unknown_are_not_guessed() {
+        let account = crate::accounts::health::tests::fixture();
+        let now = Utc::now();
+        let reset = now + chrono::Duration::hours(2);
+        for name in ["5h", "7d", "43200m", "primary"] {
+            let snapshot = json!({"windows":[{"name":name,"used_pct":100.0,
+                "observed_at":now,"reset_at":reset}]});
+            assert_eq!(
+                limiting_window(&account, &snapshot),
+                (Some(name.into()), Some(reset))
+            );
+        }
+        for snapshot in [
+            json!({}),
+            json!({"signals":{"limit_reached":true}}),
+            json!({"windows":[{"name":"5h","used_pct":100.0,
+                "observed_at":now-chrono::Duration::seconds(301),"reset_at":reset}]}),
+            json!({"windows":[{"name":"7d","used_pct":100.0,
+                "observed_at":now+chrono::Duration::seconds(60),"reset_at":reset}]}),
+        ] {
+            assert_eq!(limiting_window(&account, &snapshot), (None, None));
+        }
+    }
+}

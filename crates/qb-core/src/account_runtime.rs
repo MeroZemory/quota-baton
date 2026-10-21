@@ -256,7 +256,7 @@ impl AccountRuntime {
                 && pending.get(&account.id).is_some_and(|entry| entry.state != notice_state(account)) {
                 pending.remove(&account.id);
             }
-            if previous != &account.health {writer.record_health(&account.id,previous,&account.health);}
+            if previous != &account.health {writer.record_account_health(account,previous);}
             writer.record_account(account);
             let _=changes.send(json!({"event":"account_changed","data":{"id":account.id,"health":account.health,"user_state":account.user_state,"plan":account.plan,"generation":account.generation}}));
         }));

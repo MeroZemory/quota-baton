@@ -158,7 +158,7 @@ impl ClientView {
             .map_or((token, None), |(a, b)| (a, Some(b)));
         let origin = originator.filter(|v| v.len() <= 100).unwrap_or("");
         let kind = match origin {
-            "codex_cli_rs" => ClientKind::CodexCli,
+            "codex_cli_rs" | "codex-tui" => ClientKind::CodexCli,
             "codex_vscode" => ClientKind::CodexVscode,
             "codex_exec" => ClientKind::CodexExec,
             "Codex Desktop" => ClientKind::CodexDesktop,
@@ -1288,6 +1288,22 @@ mod tests {
         assert_eq!(s.session.subagents_today, 256);
         assert!(s.session.truncated);
         assert_eq!(s.session.model.as_deref(), Some("gpt-5.5"));
+    }
+    #[test]
+    fn r101_known_codex_originators_and_unknown_are_classified_exactly() {
+        for (origin, kind) in [
+            ("codex-tui", ClientKind::CodexCli),
+            ("codex_cli_rs", ClientKind::CodexCli),
+            ("codex_vscode", ClientKind::CodexVscode),
+            ("codex_exec", ClientKind::CodexExec),
+            ("Codex Desktop", ClientKind::CodexDesktop),
+            ("codex_desktop_macos", ClientKind::CodexDesktop),
+            ("codex-tui-unrecognized", ClientKind::Unknown),
+        ] {
+            let client = ClientView::from_headers(Some(origin), Some("codex/0.1"), None);
+            assert_eq!(client.kind, kind, "{origin}");
+            assert_eq!(client.version.as_deref(), Some("0.1"));
+        }
     }
     #[test]
     fn client_classification_keeps_only_safe_product_version() {
