@@ -54,8 +54,9 @@ pub struct Style {
 }
 
 const FORMAT_CACHE_CAPACITY: usize = 64;
-const LAYOUT_CACHE_CAPACITY: usize = 1_024;
-const LAYOUT_CACHE_LINE_LIMIT: usize = 2_048;
+// Retain the measured cross-tab working set within the same text-byte budget.
+const LAYOUT_CACHE_CAPACITY: usize = 4_096;
+const LAYOUT_CACHE_LINE_LIMIT: usize = 8_192;
 const LAYOUT_CACHE_TEXT_LIMIT: usize = 1024 * 1024;
 const LAYOUT_CACHE_INPUT_LIMIT: usize = 16 * 1024;
 const LAYOUT_CACHE_ENTRY_LINE_LIMIT: usize = 256;
@@ -941,6 +942,86 @@ mod tests {
             }
         }
         assert!(Rc::ptr_eq(&cached, &text.cached_layout(value, bounds, s)?));
+        Ok(())
+    }
+
+    #[cfg(any(debug_assertions, feature = "testkit"))]
+    #[test]
+    fn r1210_cross_tab_working_set_stays_warm_within_retention_bounds() -> Result<()> {
+        const ROWS_PER_TAB: usize = 600;
+        let text = Text::new()?;
+        text.set_phase_stats_enabled(true);
+        let styles = [
+            style(Wrap::KeepAll),
+            Style {
+                size: 12.,
+                weight: DWRITE_FONT_WEIGHT_NORMAL,
+                align: Align::Center,
+                ..style(Wrap::KeepAll)
+            },
+            Style {
+                face: Face::Mono,
+                align: Align::Trailing,
+                ..style(Wrap::KeepAll)
+            },
+        ];
+        // Geometry's full-height measurement and finite-height paint are
+        // separate keys. Keep metrics alone so no test-held Rc pins an entry.
+        let heights = [65536., 48.];
+        let mut tabs = Vec::new();
+        for (tab, style) in styles.iter().copied().enumerate() {
+            let width = 240. + tab as f32 * 32.;
+            let mut rows = Vec::new();
+            for row in 0..ROWS_PER_TAB {
+                let value = format!("계정 {tab}:{row:03} 😀\n상태");
+                let mut metrics = [Metrics::default(); 2];
+                for (index, height) in heights.iter().copied().enumerate() {
+                    metrics[index] = text.measure(&value, rect(width, height), style)?;
+                    assert_eq!(metrics[index].total_lines, 2);
+                    assert_eq!(metrics[index].visible_lines, 2);
+                    if row == 0 {
+                        assert_eq!(
+                            metrics[index],
+                            text.layout(&value, rect(width, height), style)?.metrics
+                        );
+                    }
+                }
+                rows.push((value, metrics));
+            }
+            tabs.push(rows);
+        }
+        assert!(text.phase_stats().layout_creations > 0);
+        assert!(text.phase_stats().format_creations > 0);
+
+        for tab in [0, 1, 2, 0, 2, 1] {
+            text.reset_phase_stats();
+            let width = 240. + tab as f32 * 32.;
+            for (value, expected) in &tabs[tab] {
+                for (index, height) in heights.iter().copied().enumerate() {
+                    // Moving the same geometry must not create another key.
+                    let shifted = D2D_RECT_F {
+                        left: 32.,
+                        top: -64.,
+                        right: 32. + width,
+                        bottom: -64. + height,
+                    };
+                    assert_eq!(text.measure(value, shifted, styles[tab])?, expected[index]);
+                }
+            }
+            let stats = text.phase_stats();
+            assert_eq!(stats.layout_creations, 0, "warm tab {tab}");
+            assert_eq!(stats.format_creations, 0, "warm tab {tab}");
+            let cache = text.cache.borrow();
+            assert_eq!(
+                cache.layouts.len(),
+                styles.len() * ROWS_PER_TAB * heights.len()
+            );
+            assert_eq!(cache.line_count, cache.layouts.len() * 2);
+            assert!(cache.layouts.len() <= LAYOUT_CACHE_CAPACITY);
+            assert!(cache.line_count <= LAYOUT_CACHE_LINE_LIMIT);
+            assert!(cache.text_bytes <= LAYOUT_CACHE_TEXT_LIMIT);
+            assert!(cache.formats.len() <= FORMAT_CACHE_CAPACITY);
+        }
         Ok(())
     }
 

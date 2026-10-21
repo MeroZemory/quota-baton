@@ -225,6 +225,187 @@ pub struct Scene {
     pub tooltips: Vec<TooltipRegion>,
     pub session_rows: Vec<SessionGeometry>,
 }
+
+// A section covers an entire card, including its viewport-dependent controls
+// and sticky header. Keep every parallel Scene vector in the same paint order.
+#[derive(Clone, Copy, Debug, Default)]
+struct SceneCursor([usize; 8]);
+impl SceneCursor {
+    fn at(scene: &Scene) -> Self {
+        Self([
+            scene.content.len(),
+            scene.targets.len(),
+            scene.accessibility.len(),
+            scene.draw.len(),
+            scene.measurements.len(),
+            scene.charts.len(),
+            scene.tooltips.len(),
+            scene.session_rows.len(),
+        ])
+    }
+    fn truncate(self, scene: &mut Scene) {
+        scene.content.truncate(self.0[0]);
+        scene.targets.truncate(self.0[1]);
+        scene.accessibility.truncate(self.0[2]);
+        scene.draw.truncate(self.0[3]);
+        scene.measurements.truncate(self.0[4]);
+        scene.charts.truncate(self.0[5]);
+        scene.tooltips.truncate(self.0[6]);
+        scene.session_rows.truncate(self.0[7]);
+    }
+    fn append_suffix(self, previous: &Scene, scene: &mut Scene) {
+        scene
+            .content
+            .extend_from_slice(&previous.content[self.0[0]..]);
+        scene
+            .targets
+            .extend_from_slice(&previous.targets[self.0[1]..]);
+        scene
+            .accessibility
+            .extend_from_slice(&previous.accessibility[self.0[2]..]);
+        scene.draw.extend_from_slice(&previous.draw[self.0[3]..]);
+        scene
+            .measurements
+            .extend_from_slice(&previous.measurements[self.0[4]..]);
+        scene
+            .charts
+            .extend_from_slice(&previous.charts[self.0[5]..]);
+        scene
+            .tooltips
+            .extend_from_slice(&previous.tooltips[self.0[6]..]);
+        scene
+            .session_rows
+            .extend_from_slice(&previous.session_rows[self.0[7]..]);
+    }
+    fn shifted(self, old_end: Self, new_end: Self) -> Self {
+        Self(std::array::from_fn(|i| {
+            self.0[i] - old_end.0[i] + new_end.0[i]
+        }))
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SectionKind {
+    Table,
+    Recent,
+    Detail,
+    DetailOverlay,
+    Events,
+    Usage,
+}
+impl SectionKind {
+    fn region(self) -> ScrollRegion {
+        match self {
+            Self::Table => ScrollRegion::Table,
+            Self::Recent | Self::Detail | Self::DetailOverlay => ScrollRegion::Side,
+            Self::Events => ScrollRegion::Events,
+            Self::Usage => ScrollRegion::Usage,
+        }
+    }
+    fn build(self, b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card: Rect) {
+        match self {
+            Self::Table => sessions(b, v, s, card),
+            Self::Recent => recent(b, v, s, card),
+            Self::Detail => {
+                if let Some(d) = &v.detail {
+                    detail(b, v, s, card, d);
+                }
+            }
+            Self::DetailOverlay => detail_overlay(b, v, s, card),
+            Self::Events => events(b, v, s, card),
+            Self::Usage => usage(b, v, s, card),
+        }
+    }
+}
+#[derive(Clone, Debug)]
+struct SceneSection {
+    kind: SectionKind,
+    card: Rect,
+    clip: Rect,
+    scope: String,
+    start: SceneCursor,
+    end: SceneCursor,
+}
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SceneSections(Vec<SceneSection>);
+impl SceneSections {
+    fn build(
+        &mut self,
+        kind: SectionKind,
+        b: &mut Builder<'_>,
+        v: &m::DashboardView,
+        s: &DashboardState,
+        card: Rect,
+    ) {
+        let mut section = SceneSection {
+            kind,
+            card,
+            clip: b.clip,
+            scope: b.scope.clone(),
+            start: SceneCursor::at(&b.scene),
+            end: SceneCursor::default(),
+        };
+        kind.build(b, v, s, card);
+        section.end = SceneCursor::at(&b.scene);
+        self.0.push(section);
+    }
+
+    /// Caller retains the same immutable view and validates non-scroll inputs.
+    pub(crate) fn rebuild(
+        &self,
+        view: &m::DashboardView,
+        state: &DashboardState,
+        previous: &Scene,
+        region: ScrollRegion,
+        metrics: &Metrics,
+    ) -> Option<(Scene, Self)> {
+        if previous.modal || state.popup.is_some() {
+            return None;
+        }
+        let index = self
+            .0
+            .iter()
+            .position(|section| section.kind.region() == region)?;
+        let section = &self.0[index];
+        let mut scene = previous.clone();
+        section.start.truncate(&mut scene);
+        let mut b = Builder {
+            scene,
+            metrics,
+            clip: section.clip,
+            scope: section.scope.clone(),
+            enabled: view.connection.core_ok,
+        };
+        section.kind.build(&mut b, view, state, section.card);
+        if !view.connection.core_ok {
+            for target in &mut b.scene.targets[section.start.0[1]..] {
+                target.enabled = false;
+            }
+            for node in &mut b.scene.accessibility[section.start.0[2]..] {
+                if node.target.is_some() {
+                    node.enabled = false;
+                }
+            }
+        }
+        let end = SceneCursor::at(&b.scene);
+        section.end.append_suffix(previous, &mut b.scene);
+        let mut sections = self.clone();
+        sections.0[index].end = end;
+        for suffix in &mut sections.0[index + 1..] {
+            suffix.start = suffix.start.shifted(section.end, end);
+            suffix.end = suffix.end.shifted(section.end, end);
+        }
+        Some((b.scene, sections))
+    }
+
+    pub(crate) fn measurements(&self, region: ScrollRegion) -> Option<std::ops::Range<usize>> {
+        let section = self
+            .0
+            .iter()
+            .find(|section| section.kind.region() == region)?;
+        Some(section.start.0[4]..section.end.0[4])
+    }
+}
 pub fn rect(x: f32, y: f32, w: f32, h: f32) -> Rect {
     Rect {
         left: x,
@@ -627,6 +808,14 @@ impl Scene {
         size: [f32; 2],
         metrics: &Metrics,
     ) -> Self {
+        Self::build_sections(view, state, size, metrics).0
+    }
+    pub(crate) fn build_sections(
+        view: &m::DashboardView,
+        state: &DashboardState,
+        size: [f32; 2],
+        metrics: &Metrics,
+    ) -> (Self, SceneSections) {
         let w = if size[0].is_finite() {
             size[0].max(1.)
         } else {
@@ -638,6 +827,7 @@ impl Scene {
             960.
         };
         let outer = rect(0., 0., w, h);
+        let mut sections = SceneSections::default();
         let mut b = Builder {
             scene: Scene {
                 modal: state.popup.is_some(),
@@ -719,9 +909,9 @@ impl Scene {
             );
         } else {
             match state.tab {
-                Tab::Overview => overview(&mut b, view, state, body),
-                Tab::Events => events(&mut b, view, state, body),
-                Tab::Usage => usage(&mut b, view, state, body),
+                Tab::Overview => overview(&mut b, view, state, body, &mut sections),
+                Tab::Events => sections.build(SectionKind::Events, &mut b, view, state, body),
+                Tab::Usage => sections.build(SectionKind::Usage, &mut b, view, state, body),
             }
         }
         if !view.connection.core_ok {
@@ -740,7 +930,7 @@ impl Scene {
                 }
             }
         }
-        b.scene
+        (b.scene, sections)
     }
     /// Table offset that reveals this row. Native rebuilds before publishing UIA bounds.
     pub fn reveal_session(&self, id: &str) -> Option<f32> {
@@ -1068,7 +1258,13 @@ fn dropdown(b: &mut Builder<'_>, popup: Popup) {
     }
 }
 
-fn overview(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, body: Rect) {
+fn overview(
+    b: &mut Builder<'_>,
+    v: &m::DashboardView,
+    s: &DashboardState,
+    body: Rect,
+    sections: &mut SceneSections,
+) {
     let narrow = width(body) < 1140.;
     let (table, side) = if narrow {
         (
@@ -1086,37 +1282,42 @@ fn overview(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, body:
             rect(body.right - 360., body.top, 360., height(body)),
         )
     };
-    sessions(b, v, s, table);
+    sections.build(SectionKind::Table, b, v, s, table);
     if narrow {
         recent_strip(b, v, side);
-        if let Some(d) = &v.detail {
+        if v.detail.is_some() {
             let overlay = rect(
                 body.right - 360.,
                 body.top + 16.,
                 360.,
                 (height(body) - 16.).max(0.),
             );
-            b.scene.draw.push(Draw::Alpha(0.03));
-            for spread in 1..=8 {
-                let spread = spread as f32;
-                b.fill(
-                    rect(
-                        overlay.left - spread,
-                        overlay.top + 8. - spread,
-                        width(overlay) + 2. * spread,
-                        height(overlay) + 2. * spread,
-                    ),
-                    Color::Text,
-                    8. + spread,
-                );
-            }
-            b.scene.draw.push(Draw::Alpha(1.));
-            detail(b, v, s, overlay, d);
+            sections.build(SectionKind::DetailOverlay, b, v, s, overlay);
         }
-    } else if let Some(d) = &v.detail {
-        detail(b, v, s, side, d);
+    } else if v.detail.is_some() {
+        sections.build(SectionKind::Detail, b, v, s, side);
     } else {
-        recent(b, v, s, side);
+        sections.build(SectionKind::Recent, b, v, s, side);
+    }
+}
+fn detail_overlay(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, overlay: Rect) {
+    b.scene.draw.push(Draw::Alpha(0.03));
+    for spread in 1..=8 {
+        let spread = spread as f32;
+        b.fill(
+            rect(
+                overlay.left - spread,
+                overlay.top + 8. - spread,
+                width(overlay) + 2. * spread,
+                height(overlay) + 2. * spread,
+            ),
+            Color::Text,
+            8. + spread,
+        );
+    }
+    b.scene.draw.push(Draw::Alpha(1.));
+    if let Some(d) = &v.detail {
+        detail(b, v, s, overlay, d);
     }
 }
 fn recent_strip(b: &mut Builder<'_>, v: &m::DashboardView, r: Rect) {
