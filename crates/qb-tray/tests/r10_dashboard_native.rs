@@ -5,8 +5,10 @@
 #[path = "../src/accessibility.rs"]
 mod accessibility;
 #[path = "../src/dashboard_persistence.rs"]
+#[allow(dead_code)] // Only Geometry is used; this synthetic host never loads/saves a profile.
 mod dashboard_persistence;
 #[path = "../src/dashboard_window.rs"]
+#[allow(dead_code)] // The FakeBridge intentionally uses a subset of the product bridge API.
 mod dashboard_window;
 #[path = "support/r10_fixtures.rs"]
 mod fixture;
