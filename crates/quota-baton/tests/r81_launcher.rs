@@ -1,6 +1,15 @@
 #![cfg(windows)]
 
-use std::{fs, path::PathBuf, process::Command, time::Duration};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 use windows::{
     Win32::{
         Foundation::{CloseHandle, WAIT_OBJECT_0},
@@ -34,6 +43,92 @@ fn set_title(s: &str) {
     assert_ne!(unsafe { SetConsoleTitleW(s.as_ptr()) }, 0);
 }
 
+struct LaunchCore {
+    _runtime: tokio::runtime::Runtime,
+    issued: Arc<AtomicUsize>,
+    catalogs: Arc<AtomicUsize>,
+    base_url: String,
+}
+impl LaunchCore {
+    fn new(home: &Path, codex_home: &Path) -> Self {
+        use axum::{
+            Json, Router,
+            http::HeaderMap,
+            routing::{get, post},
+        };
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(!matches!(port, 10100 | 10101));
+        let admin = URL_SAFE_NO_PAD.encode([1u8; 32]);
+        let client = URL_SAFE_NO_PAD.encode([2u8; 32]);
+        let handle = URL_SAFE_NO_PAD.encode([3u8; 32]);
+        fs::write(home.join("admin.token"), &admin).unwrap();
+        fs::write(home.join("client.key"), &client).unwrap();
+        fs::write(
+            home.join("config.toml"),
+            format!("[server]\ndata_port={port}\nadmin_port={port}\n"),
+        )
+        .unwrap();
+        fs::write(
+            codex_home.join("config.toml"),
+            "model = \"synthetic-model\"\nmodel_provider = \"openai\"\n",
+        )
+        .unwrap();
+        let issued = Arc::new(AtomicUsize::new(0));
+        let catalogs = Arc::new(AtomicUsize::new(0));
+        let issue_count = issued.clone();
+        let catalog_count = catalogs.clone();
+        let base = format!("http://127.0.0.1:{port}/l/{handle}/v1");
+        let base_url = base.clone();
+        let app = Router::new()
+            .route("/admin/v1/launches", post(move |headers: HeaderMap, Json(request): Json<serde_json::Value>| {
+                let (admin, base, count) = (admin.clone(), base.clone(), issue_count.clone());
+                async move {
+                    assert_eq!(headers.get("authorization").unwrap(), format!("Bearer {admin}").as_str());
+                    assert_eq!(request["model"], "synthetic-model");
+                    assert_eq!(request["model_is_explicit"], false);
+                    assert_eq!(request["move_for_model"], false);
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({"base_url":base,"catalog_url":format!("{base}/models"),
+                        "account":"synthetic-launch-account","model":request["model"]}))
+                }
+            }))
+            .route(&format!("/l/{handle}/v1/models"), get(move |headers: HeaderMap| {
+                let (client, count) = (client.clone(), catalog_count.clone());
+                async move {
+                    assert_eq!(headers.get("authorization").unwrap(), format!("Bearer {client}").as_str());
+                    assert_eq!(headers.get("accept-encoding").unwrap(), "identity");
+                    count.fetch_add(1, Ordering::SeqCst);
+                    ([ ("x-quota-baton-account", "synthetic-launch-account") ],
+                        Json(serde_json::json!({"models":[{"slug":"synthetic-model"}]})))
+                }
+            }));
+        runtime.spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        Self {
+            _runtime: runtime,
+            issued,
+            catalogs,
+            base_url,
+        }
+    }
+    fn counts(&self) -> (usize, usize) {
+        (
+            self.issued.load(Ordering::SeqCst),
+            self.catalogs.load(Ordering::SeqCst),
+        )
+    }
+}
+
 const EXISTING_ID: &str = "11111111-1111-1111-1111-111111111111";
 
 fn native_args(mode: &str) -> Vec<&'static str> {
@@ -46,20 +141,22 @@ fn native_args(mode: &str) -> Vec<&'static str> {
         vec!["fix X"]
     };
     args.extend([
-        "--profile",
-        "work",
-        "--oss",
         "--enable",
         "new_feature",
-        "-c",
-        "openai_base_url='http://synthetic.invalid/v1'",
-        "-c",
-        "model_catalog_url='http://synthetic.invalid/catalog'",
         "-i",
         "one.png",
         "-i",
         "two.png",
         "--",
+        // Preserve these transport/quoting operands as literal prompt values;
+        // managed R11 launches reject actual profile/OSS/routing overrides.
+        "--profile",
+        "work",
+        "--oss",
+        "-c",
+        "openai_base_url='http://synthetic.invalid/v1'",
+        "-c",
+        "model_catalog_url='http://synthetic.invalid/catalog'",
         "--skip",
         "two words",
         "--skip",
@@ -88,6 +185,19 @@ fn r81_console_probe() {
     assert_eq!(args[5], "--");
     args.remove(5);
     fs::write(root.join("args.json"), serde_json::to_vec(&args).unwrap()).unwrap();
+    let native = &args[5..];
+    assert_eq!(native[0], "-c");
+    assert_eq!(native[2], "-c");
+    assert_eq!(&native[4..6], ["--model", "synthetic-model"]);
+    let snapshot = native[3].parse::<toml_edit::DocumentMut>().unwrap();
+    let snapshot = PathBuf::from(snapshot["model_catalog_json"].as_str().unwrap());
+    assert!(snapshot.is_file(), "catalog must live through the child");
+    let catalog: serde_json::Value = serde_json::from_slice(&fs::read(snapshot).unwrap()).unwrap();
+    assert_eq!(
+        catalog,
+        serde_json::json!({"models":[{"slug":"synthetic-model"}]})
+    );
+    fs::write(root.join("catalog-checked"), "checked").unwrap();
     if mode == "own-script" {
         set_title(&format!(
             "{}\\npm\\codex.cmd - my-session",
@@ -170,7 +280,7 @@ fn r81_console_host() {
         )
         .env("SYNTHETIC_LABEL", "retained-label")
         .env("QB_R81_LITERAL", "must-not-expand")
-        // Admission reads this synthetic dedicated wiring; no core is started.
+        // Admission and R11 issuance use the parent's authenticated fixture core.
         .env("QB_HOME", root.join("qb"))
         .status()
         .unwrap();
@@ -217,6 +327,7 @@ fn r81_title_after_child_start_in_hidden_console() {
         fs::write(root.join("qb/journal/wiring.json"), serde_json::to_vec(
             &serde_json::json!({"schema":3,"mode":"dedicated","install_completed":true,"home":root.join("profile/.codex-acct/qb")})
         ).unwrap()).unwrap();
+        let core = LaunchCore::new(&root.join("qb"), &root.join("profile/.codex-acct/qb"));
         if mode == "existing-resume" {
             let home = root.join("profile/.codex-acct/qb");
             let rollout = home
@@ -323,7 +434,17 @@ process.exit(result.status ?? 1);
             CloseHandle(process.hProcess).unwrap();
             assert_eq!(wait, WAIT_OBJECT_0, "hidden host timed out");
         }
-        assert!(root.join("started").exists(), "child never started");
+        assert!(
+            root.join("started").exists(),
+            "child never started: {mode}; status {:?}",
+            fs::read_to_string(root.join("status"))
+        );
+        assert_eq!(
+            core.counts(),
+            (1, 1),
+            "one authenticated issue and account-guarded catalog"
+        );
+        assert!(root.join("catalog-checked").exists());
         assert_eq!(
             root.join("shim-ran").exists(),
             mode != "actual-node",
@@ -365,7 +486,29 @@ process.exit(result.status ?? 1);
         );
         let args: Vec<String> =
             serde_json::from_slice(&fs::read(root.join("args.json")).unwrap()).unwrap();
-        assert_eq!(&args[5..], native_args(mode));
+        let native = &args[5..];
+        assert_eq!(native[0], "-c");
+        assert_eq!(native[2], "-c");
+        assert_eq!(&native[4..6], ["--model", "synthetic-model"]);
+        let routing = native[1].parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(routing.len(), 1);
+        assert_eq!(
+            routing["openai_base_url"].as_str(),
+            Some(core.base_url.as_str())
+        );
+        let snapshot = native[3].parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(snapshot.len(), 1);
+        let snapshot = PathBuf::from(snapshot["model_catalog_json"].as_str().unwrap());
+        let catalog_directory = root
+            .join("qb/state/launch-catalogs")
+            .canonicalize()
+            .unwrap();
+        assert_eq!(snapshot.parent(), Some(catalog_directory.as_path()));
+        assert!(
+            !snapshot.exists(),
+            "catalog must be released after the child exits"
+        );
+        assert_eq!(&native[6..], native_args(mode));
         assert!(
             !root.join("version-probed").exists(),
             "ordinary launch probed version"
