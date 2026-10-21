@@ -348,6 +348,7 @@ pub struct MenuInfo {
     pub show_refresh_usage: bool,
     pub show_relogin: bool,
     pub show_refresh_token: bool,
+    pub show_release_hold: bool,
     /// Always use this guard for a menu off->on transition too.
     pub credits_enable_confirmation: Option<Confirmation>,
 }
@@ -1297,6 +1298,14 @@ fn menu_info(
         sessions_line,
         show_refresh_usage: a.user_state != "disabled" && a.health.kind != "needs_relogin",
         show_relogin: a.source.owned_or_adopted(),
+        show_release_hold: quota(a)
+            && a.credits.as_ref().is_some_and(|c| {
+                c.has_credits == Some(true)
+                    || c.balance
+                        .as_ref()
+                        .and_then(|n| n.as_f64())
+                        .is_some_and(|n| n > 0.)
+            }),
         show_refresh_token: a.source.owned_or_adopted()
             && !a.drain
             && a.health.kind != "needs_relogin"
@@ -1443,6 +1452,48 @@ mod tests {
     }
     fn codex(v: &View) -> &Section {
         &v.sections[1]
+    }
+
+    #[test]
+    fn release_hold_projection_requires_quota_cooling_and_available_credits() {
+        for (credits, expected) in [
+            (json!({"has_credits":true}), true),
+            (json!({"has_credits":true,"balance":0}), true),
+            (json!({"has_credits":false,"balance":12.5}), true),
+            (json!({"balance":0.01}), true),
+            (json!({"has_credits":false,"balance":0}), false),
+            (json!({"balance":-1}), false),
+            (json!({"unlimited":true}), false),
+            (json!(null), false),
+        ] {
+            for allow_credits in [false, true] {
+                let mut a = base("a");
+                a["health"] = json!({"kind":"cooling","reason":"quota","scope":"account"});
+                a["credits"] = credits.clone();
+                a["allow_credits"] = json!(allow_credits);
+                // Old hard holds must remain available for an explicit operator probe.
+                a["quota_credit_releasable"] = json!(false);
+                assert_eq!(
+                    codex(&view(vec![a.clone()], 0)).rows[0]
+                        .menu
+                        .show_release_hold,
+                    expected
+                );
+                for health in [
+                    json!({"kind":"ready"}),
+                    json!({"kind":"needs_relogin"}),
+                    json!({"kind":"cooling","reason":"rate_limit","scope":"account"}),
+                    json!({"kind":"cooling","reason":"quota","scope":"model"}),
+                ] {
+                    a["health"] = health;
+                    assert!(
+                        !codex(&view(vec![a.clone()], 0)).rows[0]
+                            .menu
+                            .show_release_hold
+                    );
+                }
+            }
+        }
     }
     fn summary(v: &View) -> &Summary {
         &v.summaries[1]

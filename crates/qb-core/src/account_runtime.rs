@@ -897,6 +897,40 @@ impl AccountRuntime {
         let _=self.events.send(json!({"event":"account_changed","data":{"id":account.id,"health":account.health,"user_state":account.user_state}}));
     }
 
+    /// Explicit operator probe. Only quota cooling is cleared; credentials,
+    /// payment/auth restrictions and user choices remain unchanged.
+    pub async fn release_quota_hold(&self, id: &str) -> Result<Account, ()> {
+        let store = self.store.clone();
+        let id = id.to_owned();
+        let account = tokio::task::spawn_blocking(move || {
+            let _guard = store.transaction().map_err(|_| ())?;
+            let account = store.read_account_unlocked(&id).map_err(|_| ())?;
+            if store.writes_stopped() {
+                return Err(());
+            }
+            if !matches!(
+                account.health,
+                Health::Cooling {
+                    reason: HealthReason::Quota,
+                    ..
+                }
+            ) {
+                return Err(());
+            }
+            store
+                .update_metadata_unlocked(&id, |account| {
+                    account.health = Health::Ready;
+                    account.quota_cooling = None;
+                    account.quota_credit_releasable = false;
+                })
+                .map_err(|_| ())
+        })
+        .await
+        .map_err(|_| ())??;
+        self.clear_memory_health(&account);
+        Ok(account)
+    }
+
     pub async fn transition(&self, id: &str, signal: HealthSignal) -> Result<Account, ()> {
         let store = self.store.clone();
         let id = id.to_owned();

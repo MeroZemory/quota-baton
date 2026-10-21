@@ -505,6 +505,7 @@ async fn account_action(
     }
     use crate::accounts::UserState;
     let user_state = match action.as_str() {
+        "release-hold" => return release_hold(state, id, request).await,
         "refresh-usage" => return refresh_usage(state, id).await,
         "adopt" => return adopt_account(state, id, request).await,
         "refresh" => return refresh_account(state, id, request).await,
@@ -514,6 +515,41 @@ async fn account_action(
         _ => return error(StatusCode::NOT_FOUND, "Unknown account action"),
     };
     change_account(state, id, Some(user_state), AccountPatch::default()).await
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReleaseHoldRequest {
+    confirm: String,
+}
+
+async fn release_hold(
+    state: RuntimeAdmin,
+    id: String,
+    request: Result<Json<serde_json::Value>, JsonRejection>,
+) -> Response {
+    let Ok(Json(value)) = request else {
+        return error(StatusCode::BAD_REQUEST, "해제할 계정 ID를 확인해 주세요.");
+    };
+    let Ok(request) = serde_json::from_value::<ReleaseHoldRequest>(value) else {
+        return error(StatusCode::BAD_REQUEST, "해제할 계정 ID를 확인해 주세요.");
+    };
+    if request.confirm != id {
+        return error(StatusCode::BAD_REQUEST, "계정 ID 확인이 일치하지 않습니다.");
+    }
+    match state.relay.accounts.release_quota_hold(&id).await {
+        Ok(account) => Json(serde_json::json!({
+            "id":account.id,"released":true,"provider":account.provider,
+            "label":account.label,"email":account.email,"plan":account.plan,
+            "user_state":account.user_state,"health":account.health,"drain":account.drain,
+            "allow_credits":account.allow_credits
+        }))
+        .into_response(),
+        Err(()) => error(
+            StatusCode::CONFLICT,
+            "해제할 사용량 한도가 없거나 저장하지 못했습니다.",
+        ),
+    }
 }
 
 async fn takeover_account(
@@ -588,13 +624,13 @@ async fn adopt_account(
     #[cfg(feature = "testkit")]
     let probe = state.adoption_probe;
     let result = tokio::task::spawn_blocking(move || {
-        let result = (|| {
-            #[cfg(feature = "testkit")]
-            if let Some(probe) = probe {
-                return crate::accounts::adopt::run_with_probe(&store, &id, request, probe);
-            }
-            crate::accounts::adopt::run(&store, &id, request)
-        })()?;
+        #[cfg(feature = "testkit")]
+        let result = match probe {
+            Some(probe) => crate::accounts::adopt::run_with_probe(&store, &id, request, probe),
+            None => crate::accounts::adopt::run(&store, &id, request),
+        }?;
+        #[cfg(not(feature = "testkit"))]
+        let result = crate::accounts::adopt::run(&store, &id, request)?;
         if let Ok(account) = store.load(&result.id) {
             poller.queue_profile(&account);
         }

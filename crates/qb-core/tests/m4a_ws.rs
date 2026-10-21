@@ -554,6 +554,137 @@ async fn c6_3_ws_connection_limit_frame_not_held() {
 }
 
 #[tokio::test]
+async fn r12_9_upgrade_connection_limit_spreads_while_old_socket_stays_live() {
+    let h = Harness::new(2).await;
+    h.fake.state.keep_old_connections();
+    let (mut first, original) = h.connect().await;
+    h.fake.state.push_handshake(
+        StatusCode::BAD_REQUEST,
+        r#"{"error":{"code":"websocket_connection_limit_reached","message":"never-ledger-capacity-payload"}}"#,
+        HeaderMap::new(),
+    );
+    // This session is sticky on the first account, so the injected rejection
+    // must be learned before its upgrade can spread to the other account.
+    let (mut second, destination) = h.connect().await;
+    assert_ne!(destination, original);
+    let mut request = h.request();
+    request
+        .headers_mut()
+        .insert("session-id", "synthetic-capacity-new".parse().unwrap());
+    let (mut third, response) = connect_async(request).await.unwrap();
+    assert_eq!(
+        response.headers()["x-quota-baton-account"],
+        destination.as_str()
+    );
+    let requests = h.fake.state.requests();
+    assert_eq!(
+        requests.len(),
+        4,
+        "one rejection, then no further dial to capped account"
+    );
+    assert_eq!(
+        requests[0].headers["authorization"],
+        requests[1].headers["authorization"]
+    );
+    assert_ne!(
+        requests[1].headers["authorization"],
+        requests[2].headers["authorization"]
+    );
+    assert_eq!(
+        requests[2].headers["authorization"],
+        requests[3].headers["authorization"]
+    );
+    for id in &h.ids {
+        let account = h.store.load(id).unwrap();
+        assert_eq!(account.health, Health::Ready);
+        assert_eq!(account.auth_failures, 0);
+        assert_eq!(account.payment_failures, 0);
+    }
+    let rows = h.ledger();
+    assert!(rows.iter().any(
+        |row| row["attempt_details"].as_array().is_some_and(|attempts| {
+            attempts
+                .iter()
+                .any(|attempt| attempt["failover_reason"] == "ws_connection_limit")
+        })
+    ));
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row.to_string().contains("never-ledger-capacity-payload"))
+    );
+    first.close(None).await.unwrap();
+    second.close(None).await.unwrap();
+    third.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn r12_9_all_capped_upgrades_expire_without_redial_or_account_failure() {
+    let h = Harness::new_with_deadlines(30, 1).await;
+    h.fake.state.keep_old_connections();
+    let (mut first, account) = h.connect().await;
+    h.fake.state.push_handshake(
+        StatusCode::BAD_REQUEST,
+        r#"{"error":{"code":"websocket_connection_limit_reached"}}"#,
+        HeaderMap::new(),
+    );
+    let started = std::time::Instant::now();
+    let (status, body) = h.error().await;
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(body["error"]["type"], "request_timeout");
+    assert!(started.elapsed() >= Duration::from_millis(800));
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert_eq!(
+        h.fake.state.requests().len(),
+        2,
+        "full account must not be redialed"
+    );
+    assert_eq!(h.store.load(&account).unwrap().health, Health::Ready);
+    first.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn r12_9_capacity_wait_resumes_when_live_socket_drops() {
+    let h = Harness::new_with_deadlines(30, 5).await;
+    h.fake.state.keep_old_connections();
+    let (mut first, original) = h.connect().await;
+    h.fake.state.push_handshake(
+        StatusCode::BAD_REQUEST,
+        r#"{"error":{"code":"websocket_connection_limit_reached"}}"#,
+        HeaderMap::new(),
+    );
+    let request = h.request();
+    let pending = tokio::spawn(async move { connect_async(request).await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while h.fake.state.requests().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !pending.is_finished(),
+        "upgrade should wait while the only slot is live"
+    );
+    assert_eq!(h.fake.state.requests().len(), 2);
+    first.close(None).await.unwrap();
+    drop(first);
+    let (mut replacement, response) = tokio::time::timeout(Duration::from_secs(4), pending)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        response.headers()["x-quota-baton-account"],
+        original.as_str()
+    );
+    assert_eq!(h.fake.state.requests().len(), 3);
+    assert_eq!(h.store.load(&original).unwrap().health, Health::Ready);
+    replacement.close(None).await.unwrap();
+}
+
+#[tokio::test]
 async fn c7_upgrade_move_then_reset_retry_preserves_first_turn_marker() {
     let h = Harness::new(2).await;
     let (mut first, original) = h.connect().await;

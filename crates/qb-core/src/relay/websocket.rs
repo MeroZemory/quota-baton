@@ -1,3 +1,4 @@
+pub(super) mod capacity;
 mod pump;
 
 use super::*;
@@ -262,7 +263,7 @@ async fn upgrade_inner(
         .checked_sub(Duration::from_millis(100))
         .unwrap_or(deadline);
     let mut quota_source: Option<String> = None;
-    let (upstream, upstream_headers, account, tokens) = 'accounts: loop {
+    let (upstream, upstream_headers, account, tokens, capacity_permit) = 'accounts: loop {
         if tried.len() == 4 {
             if let Some(id) = quota_source.take() {
                 state.notice_quota(&id, None, None).await;
@@ -276,8 +277,14 @@ async fn upgrade_inner(
                 }
             };
         }
+        // Preserve ordinary sticky selection while there is room. Capacity is
+        // a WS-only exclusion: normal routing may move to another eligible
+        // account; strict anchors stay anchored and wait for their slot.
+        let capped = state.ws_capacity.capped();
+        let excluded = tried.union(&capped).cloned().collect();
+        completion.policy_blocked = false;
         let selected = state
-            .select_request(Provider::Codex, &session, completion, None, &tried)
+            .select_request(Provider::Codex, &session, completion, None, &excluded)
             .await;
         if let Some(id) = quota_source.take()
             && let Ok(next) = &selected
@@ -287,6 +294,26 @@ async fn upgrade_inner(
         let account = match selected {
             Ok(Some(account)) => account,
             Ok(None) => {
+                // Do not turn capacity exhaustion into quota/account failure.
+                // Check unexcluded candidates so unrelated unavailable accounts
+                // do not cause a wait merely because some other account is full.
+                if !capped.is_empty()
+                    && state
+                        .candidates(Provider::Codex, session.key.as_deref(), None, &tried)
+                        .await
+                        .is_ok_and(|candidates| {
+                            candidates.iter().any(|candidate| {
+                                capped.contains(&candidate.account.id)
+                                    && candidate.account.eligible_at(None, chrono::Utc::now())
+                            })
+                        })
+                {
+                    completion.end_attempt();
+                    if state.ws_capacity.wait_until(deadline).await {
+                        continue;
+                    }
+                    return capacity_timeout();
+                }
                 if completion.policy_blocked {
                     return state
                         .unavailable(completion, Provider::Codex, true, None)
@@ -302,6 +329,16 @@ async fn upgrade_inner(
                 };
             }
             Err(_) => return network_failure(),
+        };
+        // Selection awaits disk/routing work, so its snapshot is not a slot.
+        // Reserve atomically before refresh/dial and reselect if another
+        // upgrade took the final slot in the meantime.
+        let Some(capacity_permit) = state.ws_capacity.reserve(&account.id) else {
+            completion.end_attempt();
+            if state.ws_capacity.wait_until(deadline).await {
+                continue;
+            }
+            return capacity_timeout();
         };
         tried.insert(account.id.clone());
         let (mut account, mut tokens) = match state
@@ -443,6 +480,7 @@ async fn upgrade_inner(
                     headers,
                     account,
                     tokens,
+                    capacity_permit,
                 );
             }
             let error = match read_error(response).await {
@@ -455,6 +493,20 @@ async fn upgrade_inner(
                 }
                 Err(_) => return network_failure(),
             };
+            completion.record.upstream_error_code =
+                super::hold::error_code(&error.headers, &error.raw);
+            if error.status == StatusCode::BAD_REQUEST
+                && completion.record.upstream_error_code.as_deref()
+                    == Some("websocket_connection_limit_reached")
+            {
+                capacity_permit.connection_limit();
+                // Capacity is independent of health and does not consume the
+                // four-account failure budget. RAII releases this rejected dial
+                // before the next selection; the learned cap remains.
+                tried.remove(&account.id);
+                completion.failover("ws_connection_limit");
+                continue 'accounts;
+            }
             let current_token = if error.status == StatusCode::UNAUTHORIZED {
                 match state
                     .tokens
@@ -733,6 +785,10 @@ async fn upgrade_inner(
         .as_deref()
         .and_then(|key| state.observability.dashboard().socket(key));
     tokio::spawn(async move {
+        // The slot survives the HTTP 101 and is released on client-upgrade
+        // cancellation, pump termination or task abort. Same-account redials
+        // retain this logical socket's slot while replacing its closed leg.
+        let _capacity_permit = capacity_permit;
         let _activity = activity;
         let _dashboard_socket = dashboard_socket;
         let _socket_pin = socket_pin;
@@ -767,6 +823,15 @@ async fn upgrade_inner(
             .insert("x-quota-baton-account", value);
     }
     response
+}
+
+fn capacity_timeout() -> Response {
+    native_error(
+        StatusCode::GATEWAY_TIMEOUT,
+        Provider::Codex,
+        "request_timeout",
+        "WebSocket 연결 용량 대기 한도를 초과했습니다.",
+    )
 }
 
 fn network_failure() -> Response {

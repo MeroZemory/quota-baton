@@ -125,7 +125,9 @@ impl CurrentCompletion {
         let kind = event
             .and_then(|value| value.get("type"))
             .and_then(Value::as_str);
-        let error = matches!(kind, Some("error" | "response.failed"));
+        let error = matches!(kind, Some("error" | "response.failed"))
+            || (matches!(kind, Some("response.done" | "response.completed"))
+                && event.is_some_and(|event| event["response"]["status"] == "failed"));
         if error {
             self.completion.record.upstream_error_code = event.and_then(safe_error_code);
             if let Some(status) = event
@@ -141,8 +143,8 @@ impl CurrentCompletion {
             self.last_create = None;
         }
         match kind {
+            _ if error => Some("upstream_error"),
             Some("response.completed" | "response.done") => Some("ok"),
-            Some("error" | "response.failed") => Some("upstream_error"),
             _ => None,
         }
     }
@@ -1313,6 +1315,12 @@ async fn run_with_read_timeout(
                                 context.observability.observe_codex_event(&context.account, event);
                             }
                             if matches!(event.get("type").and_then(Value::as_str), Some("error" | "response.failed")) {
+                                if event.get("status").and_then(Value::as_u64) == Some(400)
+                                    && safe_error_code(event).as_deref() == Some("websocket_connection_limit_reached")
+                                    && let Some(relay) = &context.relay
+                                {
+                                    relay.ws_capacity.stream_connection_limit(&context.account);
+                                }
                                 let active_model = request.and_then(|id| current.get(&id)).and_then(|active| active.model.as_deref());
                                 // During takeover, relay the current turn's error unchanged:
                                 // no auth refresh, health transition, failover, or rate retry.
