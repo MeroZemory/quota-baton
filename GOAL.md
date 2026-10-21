@@ -65,7 +65,7 @@ Implement quota-baton exactly as specified, milestone by milestone, until M8 is 
 | R9.1 | merged (fd7a8dc), but the live install was ROLLED BACK: every codex-qb launch failed on the real profile → R9.2 |
 | R9.2 | merged and INSTALLED (6caf65a); live move and return work, but are slow → R9.3 |
 | R9.3 | single-id move/return speed (382 s + about 9 min today; target ≤ 10 s / ≤ 20 s) and herdr map path format; right after R10's gate; brief `R9.3-live-move-findings.md` |
-| R10 | dashboard v2 + chip-limit colour in the dashboard and tray (user-approved, O1=A); O2 duplicate quota_reached; O3 default labels; after R9; brief `R10-dashboard-v2.md` |
+| R10 | merged after its full gate (product `3bbd6ce`; default 1723/0/15, full 1844/0/27, standalone core 573/0/0; strict default/full clippy, fmt and build passed). Native: 42 owned HWNDs, 48 external UIA checkpoints, 0 forced cleanup. Sol source/pixel/harness closeouts; bounded extreme-T pip presentation disclosed as a nonblocking clarification. Report: `.sandbox/reports/R10.md`. Actual installation remains with design |
 | R11 | launch-scoped account and per-account model catalog (D22, resolves O13: /daybreak through codex-qb); after R10; brief `R11-launch-account.md` |
 | R8.1 | merged (round 2 39345fd, dev 6dbbfae); installed and verified live: the herdr pane title shows `codex-qb · quota-baton` from 1 s to 19 s, and a codex-qb exec request returned ok |
 
