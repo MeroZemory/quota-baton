@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 mod usage_geometry;
 use usage_geometry::usage;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Target {
     DismissPopup,
     Tab(Tab),

@@ -18,7 +18,7 @@ use qb_tray::{
 };
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     ffi::c_void,
     mem::size_of,
     rc::Rc,
@@ -107,7 +107,19 @@ pub struct FrameTiming {
     pub nodes: usize,
     pub rebuilt: bool,
     pub full_scene_build: bool,
+    pub retained_target: bool,
+    pub partial_scroll: bool,
+    pub paint_clip: Option<[f32; 4]>,
+    pub draw_commands: usize,
+    pub uia: PublicationTiming,
     pub phases: render::PhaseStats,
+}
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct PublicationTiming {
+    pub ids_us: u64,
+    pub elements_us: u64,
+    pub validate_us: u64,
+    pub swap_us: u64,
 }
 fn micros(start: Instant) -> u64 {
     start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
@@ -1016,6 +1028,7 @@ unsafe fn paint(hwnd: HWND) -> Result<()> {
         paint_decorated(&h, &mut frame.scene, &target, clip)?;
         let paint_us = part.map_or(0, micros);
         let part = profile.then(Instant::now);
+        let mut uia = PublicationTiming::default();
         if rebuilt
             || republished
             || frame.focus != h.input.focus
@@ -1032,7 +1045,7 @@ unsafe fn paint(hwnd: HWND) -> Result<()> {
             frame.focus = h.input.focus.clone();
             frame.keyboard_focus = h.input.keyboard_focus;
             frame.focused = h.focused;
-            publish_accessibility(&mut h, &mut frame, reuse)?;
+            uia = publish_accessibility(&mut h, &mut frame, reuse)?;
             h.life.painted(frame.stamp);
         }
         let publish_us = part.map_or(0, micros);
@@ -1071,6 +1084,11 @@ unsafe fn paint(hwnd: HWND) -> Result<()> {
                 nodes: frame.scene.accessibility.len(),
                 rebuilt,
                 full_scene_build: rebuilt && frame.scene.rebuilt_region().is_none(),
+                retained_target,
+                partial_scroll: scroll_damage.is_some(),
+                paint_clip: clip.map(|r| [r.left, r.top, r.right, r.bottom]),
+                draw_commands: frame.scene.draw.len(),
+                uia,
                 phases,
             };
             if h.timings.len() < 4096 {
@@ -1231,13 +1249,33 @@ fn physical(rect: qb_tray::Rect, origin: POINT, scale: f64) -> [f64; 4] {
         (rect.bottom - rect.top).max(0.) as f64 * scale,
     ]
 }
-fn publish_accessibility(h: &mut Host, frame: &mut Frame, reuse: bool) -> Result<()> {
+fn accessibility_interactive(
+    node: &geometry::AccessibleNode,
+    enabled_hits: &BTreeSet<&Target>,
+) -> bool {
+    !node.hidden
+        && node.enabled
+        && geometry::width(node.rect) > 0.
+        && geometry::height(node.rect) > 0.
+        && node
+            .target
+            .as_ref()
+            .is_some_and(|t| enabled_hits.contains(t))
+}
+fn publish_accessibility(
+    h: &mut Host,
+    frame: &mut Frame,
+    reuse: bool,
+) -> Result<PublicationTiming> {
+    let mut timing = PublicationTiming::default();
+    let started = h.profiling.then(Instant::now);
     if reuse && let Some(prepared) = &frame.prepared {
-        return h
-            .root
+        h.root
             .as_ref()
             .ok_or_else(invalid)?
-            .publish_prepared(prepared, frame.stamp.epoch);
+            .publish_prepared(prepared, frame.stamp.epoch)?;
+        timing.swap_us = started.map_or(0, micros);
+        return Ok(timing);
     }
     // A focus-only publication replaces its map just like a new scene.
     frame.actions.clear();
@@ -1290,7 +1328,16 @@ fn publish_accessibility(h: &mut Host, frame: &mut Frame, reuse: bool) -> Result
         };
         node_ids.push(id);
     }
+    let enabled_hits: BTreeSet<_> = frame
+        .scene
+        .targets
+        .iter()
+        .filter(|hit| hit.enabled)
+        .map(|hit| &hit.target)
+        .collect();
     let mut elements = Vec::with_capacity(frame.scene.accessibility.len());
+    timing.ids_us = started.map_or(0, micros);
+    let started = h.profiling.then(Instant::now);
     let mut focused = false;
     for (node, id) in frame.scene.accessibility.iter().zip(node_ids) {
         let parent = match node.parent.as_ref() {
@@ -1315,17 +1362,7 @@ fn publish_accessibility(h: &mut Host, frame: &mut Frame, reuse: bool) -> Result
             geometry::Role::Chart => accessibility::Kind::Chart,
             geometry::Role::Group => accessibility::Kind::Group,
         };
-        let interactive = !node.hidden
-            && node.enabled
-            && geometry::width(node.rect) > 0.
-            && geometry::height(node.rect) > 0.
-            && node.target.as_ref().is_some_and(|t| {
-                frame
-                    .scene
-                    .targets
-                    .iter()
-                    .any(|hit| hit.enabled && &hit.target == t)
-            });
+        let interactive = accessibility_interactive(node, &enabled_hits);
         let text = kind == accessibility::Kind::Text;
         let action = if interactive && !text {
             node.target.as_ref().map(|t| {
@@ -1362,15 +1399,19 @@ fn publish_accessibility(h: &mut Host, frame: &mut Frame, reuse: bool) -> Result
             expanded: node.expanded,
         });
     }
+    timing.elements_us = started.map_or(0, micros);
     if let Some(root) = h.root.as_ref() {
         #[cfg(all(test, feature = "testkit"))]
         let count = elements.len();
+        let started = h.profiling.then(Instant::now);
         let prepared = accessibility::prepare_snapshot(accessibility::Snapshot {
             automation_id: "quota-baton.dashboard",
             name: "quota-baton 대시보드".into(),
             bounds: physical(frame.scene.rect, origin, frame.stamp.dpi as f64 / 96.),
             elements,
         })?;
+        timing.validate_us = started.map_or(0, micros);
+        let started = h.profiling.then(Instant::now);
         let result = root.publish_prepared(&prepared, frame.stamp.epoch);
         if result.is_ok() {
             frame.prepared = Some(prepared);
@@ -1382,7 +1423,8 @@ fn publish_accessibility(h: &mut Host, frame: &mut Frame, reuse: bool) -> Result
                 frame.stamp.epoch, count
             );
         }
-        result
+        timing.swap_us = started.map_or(0, micros);
+        result.map(|()| timing)
     } else {
         Err(failure("dashboard UIA provider unavailable"))
     }
@@ -2420,4 +2462,206 @@ unsafe extern "system" fn wndproc(
         _ => {}
     }
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+}
+
+#[cfg(test)]
+mod r1210_uia_hit_index_tests {
+    use super::*;
+    use qb_tray::{
+        Rect,
+        geometry::{AccessibleNode, HitTarget, Role},
+        state::{EventFilter, ProviderFilter, Range, SortKey},
+    };
+
+    fn hit(target: Target, enabled: bool) -> HitTarget {
+        HitTarget {
+            // The old predicate checks enabled and target, not hit geometry.
+            rect: Rect {
+                left: 0.,
+                top: 0.,
+                right: 0.,
+                bottom: 0.,
+            },
+            target,
+            enabled,
+            tooltip: None,
+        }
+    }
+
+    fn node(target: Option<Target>) -> AccessibleNode {
+        AccessibleNode {
+            key: "test".into(),
+            parent: None,
+            role: Role::Button,
+            name: "test".into(),
+            rect: Rect {
+                left: 2.,
+                top: 3.,
+                right: 12.,
+                bottom: 13.,
+            },
+            target,
+            enabled: true,
+            selected: false,
+            expanded: None,
+            value: None,
+            hidden: false,
+        }
+    }
+
+    fn old_interactive(node: &AccessibleNode, hits: &[HitTarget]) -> bool {
+        !node.hidden
+            && node.enabled
+            && geometry::width(node.rect) > 0.
+            && geometry::height(node.rect) > 0.
+            && node
+                .target
+                .as_ref()
+                .is_some_and(|t| hits.iter().any(|hit| hit.enabled && &hit.target == t))
+    }
+
+    #[test]
+    fn r1210_uia_hit_index_matches_legacy_predicate() {
+        let mut targets = vec![
+            Target::DismissPopup,
+            Target::RangeMenu,
+            Target::ToggleGrouping,
+            Target::Search,
+            Target::EventSearch,
+            Target::CloseDetail,
+            Target::DetailSurface,
+            Target::EventDaysMenu,
+            Target::AllEvents,
+            Target::OpenTrayAdd,
+            Target::Today,
+        ];
+        targets.extend([Tab::Overview, Tab::Events, Tab::Usage].map(Target::Tab));
+        targets.extend(
+            [
+                ProviderFilter::All,
+                ProviderFilter::Claude,
+                ProviderFilter::Codex,
+            ]
+            .map(Target::Provider),
+        );
+        targets.extend(Range::ALL.map(Target::Range));
+        targets.extend(
+            [
+                SortKey::Status,
+                SortKey::Session,
+                SortKey::Client,
+                SortKey::Account,
+                SortKey::Model,
+                SortKey::Start,
+                SortKey::LastActivity,
+                SortKey::Requests,
+                SortKey::Memo,
+            ]
+            .map(Target::Sort),
+        );
+        targets.extend(EventFilter::ALL.map(Target::EventFilter));
+        targets.extend([0, 1, 255].map(Target::EventDays));
+        for value in ["", "same", "계정🦀"] {
+            targets.extend([
+                Target::Group(value.into()),
+                Target::Session(value.into()),
+                Target::SessionLink(value.into()),
+                Target::AccountLink(value.into()),
+                Target::OpenTrayAccount(value.into()),
+                Target::Chart(value.into()),
+            ]);
+        }
+        let mixed: Vec<_> = targets
+            .iter()
+            .enumerate()
+            .flat_map(|(i, t)| {
+                [
+                    hit(t.clone(), false),
+                    hit(t.clone(), i % 3 == 0),
+                    hit(t.clone(), i % 5 == 0),
+                ]
+            })
+            .collect();
+        let reversed = mixed.iter().rev().cloned().collect();
+        let cases = [
+            Vec::new(),
+            targets.iter().cloned().map(|t| hit(t, false)).collect(),
+            mixed,
+            reversed,
+        ];
+        let queries: Vec<_> = targets
+            .into_iter()
+            .map(Some)
+            .chain([None, Some(Target::Chart("missing".into()))])
+            .collect();
+        for hits in &cases {
+            let enabled_hits = hits
+                .iter()
+                .filter(|hit| hit.enabled)
+                .map(|hit| &hit.target)
+                .collect();
+            for target in &queries {
+                for hidden in [false, true] {
+                    for enabled in [false, true] {
+                        for (width, height) in
+                            [(10., 10.), (0., 10.), (10., 0.), (-1., 10.), (10., -1.)]
+                        {
+                            let mut node = node(target.clone());
+                            node.hidden = hidden;
+                            node.enabled = enabled;
+                            node.rect.right = node.rect.left + width;
+                            node.rect.bottom = node.rect.top + height;
+                            assert_eq!(
+                                accessibility_interactive(&node, &enabled_hits),
+                                old_interactive(&node, hits),
+                                "target={target:?}, hidden={hidden}, enabled={enabled}, size={width}x{height}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn r1210_uia_hit_index_keeps_duplicate_disabled_and_missing_semantics() {
+        for hits in [
+            vec![
+                hit(Target::Search, false),
+                hit(Target::Group("same".into()), false),
+                hit(Target::Group("same".into()), true),
+                hit(Target::Session("same".into()), false),
+            ],
+            vec![
+                hit(Target::Session("same".into()), false),
+                hit(Target::Group("same".into()), true),
+                hit(Target::Group("same".into()), false),
+                hit(Target::Search, false),
+            ],
+        ] {
+            let enabled_hits: BTreeSet<_> = hits
+                .iter()
+                .filter(|hit| hit.enabled)
+                .map(|hit| &hit.target)
+                .collect();
+            assert_eq!(enabled_hits.len(), 1);
+            assert!(accessibility_interactive(
+                &node(Some(Target::Group("same".into()))),
+                &enabled_hits
+            ));
+            for target in [
+                None,
+                Some(Target::Search),
+                Some(Target::Session("same".into())),
+                Some(Target::Chart("missing".into())),
+            ] {
+                assert!(!accessibility_interactive(&node(target), &enabled_hits));
+            }
+            // Text still passes this membership predicate; the unchanged
+            // publication code separately excludes its actions and focus.
+            let mut text = node(Some(Target::Group("same".into())));
+            text.role = Role::Text;
+            assert!(accessibility_interactive(&text, &enabled_hits));
+        }
+    }
 }
