@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: R12.1 (이미지 실행 검사와 사용자 설정 옵션 보완)
-목표: 이미지 생성을 qb로 쓸 수 있게 출시하고 이미지 작업 세션 전체에 명령을 공지한다
-핵심 지표: 새 경로 출시 1/2 (R12 이미지 출시 완료, R11 실행별 계정) · 2026-10-21 23:04 KST
+현재 마일스톤: R11 (실행별 계정 지정과 계정별 모델 목록, codex-rh 같은 계정 별칭)
+목표: codex-qb를 실행할 때 쓸 계정을 지정할 수 있게 하고, 계정별 별칭 명령을 제공한다
+핵심 지표: 새 경로 출시 1/2 (R12 이미지 출시 완료, R11 실행별 계정 진행 중) · 2026-10-22 01:04 KST
 사용자 대기: 없음 (R2 Part B만 사용자 결정 대기)
-갱신: 2026-10-21 23:04 KST
+갱신: 2026-10-22 01:04 KST (R12.9 dev c899b6a 설치 완료)
 <!-- status:end -->
 
 Only the design session edits this block, when priority, approval or the core metric changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
