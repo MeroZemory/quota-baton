@@ -699,7 +699,7 @@ fn r10_repeats_keep_newest_and_show_three_local_times_then_overflow() {
 }
 
 #[test]
-fn r10_folding_requires_every_key_known_equal_no_moves_and_eligible() {
+fn r10_folding_keeps_distinct_cycles_windows_moves_and_no_eligible_alerts() {
     let old = r10_quota(1, 2);
     for case in 0..15 {
         let mut new = r10_quota(2, 1);
@@ -1219,9 +1219,84 @@ fn r101_mixed_legacy_new_windows_fold_only_when_unambiguous() {
     );
     assert!(rows.iter().any(|r| r.seq == 2));
     assert!(rows.iter().any(|r| r.seq == 4));
+    assert!(
+        rows.iter()
+            .find(|r| r.seq == 3)
+            .unwrap()
+            .title
+            .ends_with(" · 한도 도달")
+    );
     // Another cycle's known value cannot supply the missing window.
     weekly.data.reset_at = weekly.data.reset_at.map(|t| t + chrono::Duration::hours(1));
     assert_eq!(r10_fold(&[legacy, current, weekly]).len(), 2);
+}
+
+#[test]
+fn r101_folded_legacy_alert_keeps_supplied_window_and_newest_identity_in_both_views() {
+    for window in [None, Some(""), Some("   ")] {
+        let mut data = snapshot();
+        let mut older_legacy = r10_quota(1, 47);
+        older_legacy.data.window = None;
+        older_legacy.data.moved_groups = None;
+        let known = r10_quota(2, 2);
+        let mut newest = r10_quota(3, 1);
+        newest.data.window = window.map(str::to_owned);
+        newest.data.moved_groups = None;
+        let expected_title = event_row(&known, &data.accounts, &clock()).unwrap().title;
+        let newest_row = event_row(&newest, &data.accounts, &clock()).unwrap();
+        let expected_body = format!(
+            "{}\n같은 알림 2번 더 · {}, {}",
+            newest_row.body,
+            clock().time(known.ts),
+            clock().time(older_legacy.ts)
+        );
+        data.activity = vec![older_legacy, known, newest.clone()];
+        let view = project(&data, &mut DashboardState::default(), &clock());
+        assert_eq!(view.events.len(), 1);
+        assert_eq!(view.recent.len(), 1);
+        for row in view.events.iter().chain(&view.recent) {
+            assert_eq!(row.title, expected_title);
+            assert_eq!(row.seq, newest.seq);
+            assert_eq!(row.at, newest.ts);
+            assert_eq!(row.day, newest_row.day);
+            assert_eq!(row.time, newest_row.time);
+            assert_eq!(row.body, expected_body);
+        }
+        assert_eq!(data.activity[2].data.window.as_deref(), window);
+    }
+}
+
+#[test]
+fn r101_folded_legacy_title_does_not_borrow_a_window_across_a_barrier() {
+    for kind in ["move", "quota_reset", "quota_reached"] {
+        let mut data = snapshot();
+        let known = r10_quota(1, 3);
+        let mut barrier = r10_quota(2, 2);
+        barrier.kind = kind.into();
+        barrier.data.moved_groups = Some(1);
+        barrier.notable = false;
+        let mut legacy = r10_quota(3, 1);
+        legacy.data.window = None;
+        legacy.data.moved_groups = None;
+        let mut newest = legacy.clone();
+        newest.seq = 4;
+        newest.ts = Some(clock().utc());
+        let expected_title = event_row(&newest, &data.accounts, &clock()).unwrap().title;
+        data.activity = vec![known, barrier, legacy, newest];
+        let view = project(&data, &mut DashboardState::default(), &clock());
+        for rows in [&view.events, &view.recent] {
+            let retained = rows.iter().find(|row| row.seq == 4).unwrap();
+            assert_eq!(retained.title, expected_title);
+            assert!(retained.body.contains("같은 알림 1번 더"));
+            assert!(
+                rows.iter()
+                    .find(|row| row.seq == 1)
+                    .unwrap()
+                    .title
+                    .ends_with(" · 5시간 한도 도달")
+            );
+        }
+    }
 }
 
 #[test]

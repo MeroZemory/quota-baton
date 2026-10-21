@@ -766,6 +766,16 @@ fn folded_events(source: &[&ActivityEvent], accounts: &v2::View, clock: &Clock) 
             );
             if let Some(&index) = seen.get(&key) {
                 repeats.entry(index).or_default().push(e.ts.unwrap());
+                // Preserve supplied window text from a folded row without
+                // replacing the newest event's identity, time or body.
+                if e.data
+                    .window
+                    .as_deref()
+                    .is_some_and(|window| !window.trim().is_empty())
+                    && let Some(row) = event_row(e, accounts, clock)
+                {
+                    rows[index].title = row.title;
+                }
                 continue;
             }
             seen.insert(key, rows.len());
