@@ -101,17 +101,19 @@ pub(super) fn snapshot(provider: Provider, body: &[u8], now: DateTime<Utc>) -> O
             let rate = &root["rate_limit"];
             for slot in ["primary", "secondary"] {
                 let value = &rate[format!("{slot}_window")];
-                let Some(duration) = value["limit_window_seconds"].as_u64().filter(|n| *n > 0)
-                else {
-                    // CPA has emitted both a zero-minute placeholder and an
-                    // old secondary shape. They are not usage windows.
-                    continue;
-                };
-                let name = match duration {
-                    18_000 => "5h".to_owned(),
-                    604_800 => "7d".to_owned(),
-                    n if n % 60 == 0 => format!("{}m", n / 60),
-                    n => format!("{n}s"),
+                let name = match value.get("limit_window_seconds") {
+                    // Provider bucket identity is evidence even when its display
+                    // duration is absent. Never infer a 5h/7d duration from it.
+                    None => slot.to_owned(),
+                    Some(duration) => match duration.as_u64() {
+                        Some(18_000) => "5h".to_owned(),
+                        Some(604_800) => "7d".to_owned(),
+                        Some(n) if n > 0 && n % 60 == 0 => format!("{}m", n / 60),
+                        Some(n) if n > 0 => format!("{n}s"),
+                        // An explicit invalid/zero duration is a placeholder,
+                        // unlike an omitted duration on a named provider bucket.
+                        _ => continue,
+                    },
                 };
                 if let Some(w) = window(&name, value, false, now) {
                     windows.push(w);

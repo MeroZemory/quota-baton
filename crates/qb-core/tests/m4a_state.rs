@@ -709,7 +709,7 @@ mod runtime_regressions {
             if hard {
                 f.runtime.apply_quota_snapshot(id, json!({
                     "windows":[window("5h",100.0,reset,Utc::now())],
-                    "signals":{"limit_reached":true}, "credits":{"has_credits":true,"balance":12.5}
+                    "signals":{"unified_status":"rejected"}, "credits":{"has_credits":true,"balance":12.5}
                 }), None).await.unwrap();
             }
             let account = f

@@ -80,6 +80,7 @@ pub struct RelayState {
     #[cfg(all(feature = "testkit", debug_assertions))]
     takeover_test_dependencies: Option<crate::accounts::takeover::Dependencies>,
     websocket: crate::config::WebsocketConfig,
+    ws_capacity: Arc<websocket::capacity::Capacity>,
     reconnect_exclusions: Mutex<BTreeMap<(String, String), Instant>>,
     draining: AtomicBool,
     drain_started: AtomicBool,
@@ -495,6 +496,7 @@ impl RelayState {
             #[cfg(all(feature = "testkit", debug_assertions))]
             takeover_test_dependencies: None,
             websocket: config.websocket.clone(),
+            ws_capacity: Arc::new(websocket::capacity::Capacity::default()),
             reconnect_exclusions: Mutex::new(BTreeMap::new()),
             draining: AtomicBool::new(false),
             drain_started: AtomicBool::new(false),
@@ -658,7 +660,7 @@ impl RelayState {
                             || pacing.waiting > 0,
                     );
                     Ok(crate::bindings::Candidate {
-                        quota: obs.quota_snapshot(&account.id),
+                        quota: runtime.selection_quota(&account, obs.quota_snapshot(&account.id)),
                         // Every production attempt reserves the live table;
                         // a runtime count sampled before completion can be stale.
                         inflight: 0,
@@ -765,6 +767,7 @@ impl RelayState {
         let owned_id = id.to_owned();
         let owned_model = model.map(str::to_owned);
         let owned_key = key.map(str::to_owned);
+        let runtime = self.accounts.clone();
         let eligible = tokio::task::spawn_blocking(move || {
             if !store.takeover_fenced(&owned_id).is_ok_and(|fenced| !fenced) {
                 return false;
@@ -778,7 +781,7 @@ impl RelayState {
             }
             bindings.account_dispatch_eligible(
                 &crate::bindings::Candidate {
-                    quota: obs.quota_snapshot(&owned_id),
+                    quota: runtime.selection_quota(&account, obs.quota_snapshot(&owned_id)),
                     account,
                     inflight: 0,
                 },
@@ -806,6 +809,19 @@ impl RelayState {
         completion: &mut Completion,
         model: Option<&str>,
         tried: &BTreeSet<String>,
+    ) -> Result<Option<Account>, ()> {
+        self.select_request_admitted(provider, session, completion, model, tried, None)
+            .await
+    }
+
+    async fn select_request_admitted(
+        &self,
+        provider: Provider,
+        session: &session::Session,
+        completion: &mut Completion,
+        model: Option<&str>,
+        tried: &BTreeSet<String>,
+        admit: Option<websocket::capacity::Admission>,
     ) -> Result<Option<Account>, ()> {
         if session.key.is_none()
             && self.bindings.policies.plan(None).settings.mode == crate::routing::Mode::Strict
@@ -851,6 +867,10 @@ impl RelayState {
             let candidates = self
                 .candidates(provider, session.key.as_deref(), model, &excluded)
                 .await?;
+            #[cfg(feature = "testkit")]
+            if admit.is_some() {
+                self.ws_capacity.before_selection().await;
+            }
             let pinned = self.pins.get(provider, session.key.as_deref());
             let bytes = completion.selection_cost.unwrap_or(0);
             // Strict anchors/moves are durable before dispatch. Disk I/O must
@@ -862,8 +882,11 @@ impl RelayState {
             let choices = candidates.clone();
             let hold_allowed = !completion.reset_hold_used;
             let hold_timed_out = completion.reset_hold_timed_out;
+            let admit = admit.clone();
+            let denied = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let denied_choice = denied.clone();
             let choice = tokio::task::spawn_blocking(move || {
-                table.choose_with_hold(
+                table.choose_with_hold_at_admitted(
                     provider,
                     key.as_deref(),
                     parent.as_deref(),
@@ -873,11 +896,20 @@ impl RelayState {
                     bytes,
                     hold_allowed,
                     hold_timed_out,
+                    chrono::Utc::now(),
+                    |account| {
+                        let allowed = admit.as_ref().is_none_or(|admit| admit(account));
+                        denied_choice.store(!allowed, Ordering::Release);
+                        allowed
+                    },
                 )
             })
             .await
             .map_err(|_| ())?;
             match choice {
+                crate::bindings::Decision::None if denied.load(Ordering::Acquire) => {
+                    return Ok(None);
+                }
                 crate::bindings::Decision::Blocked => {
                     completion.policy_blocked = true;
                     return Ok(None);
