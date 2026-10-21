@@ -193,6 +193,7 @@ impl Run {
             // The owned window can be occluded by the collector. Complete its
             // pending production paint before dispatching the next input.
             unsafe {
+                let _ = SetFocus(Some(hwnd));
                 SendMessageW(hwnd, WM_PAINT, None, None);
             }
         }
@@ -329,6 +330,11 @@ impl Run {
 
     fn edge_checkpoint(&mut self, hwnd: HWND, stage: &str, mut facts: Value, focus: Option<&str>) {
         assert_owned(hwnd);
+        // Reset elapsed wall time as well as the timer. The synthetic fixture
+        // is at :50, so otherwise a lengthy UIA traversal crosses a minute and
+        // changes duration text despite an unchanged expected fixture clock.
+        assert!(self.port.as_ref().unwrap().clock(fixture::clock()));
+        self.pump(80);
         // Keep the synthetic clock fixed while external UIA traverses one frame.
         // A timer repaint republishes epoch-bound providers during traversal.
         // Input and admin messages still flow through the production window.
