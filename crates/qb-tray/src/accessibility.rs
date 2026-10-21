@@ -633,6 +633,7 @@ impl Node {
                 }
                 .as_str(),
             )?,
+            UIA_ProcessIdPropertyId => VARIANT::from(std::process::id() as i32),
             UIA_FrameworkIdPropertyId => string_variant("Win32")?,
             UIA_LocalizedControlTypePropertyId
                 if element.is_some_and(|e| e.kind == Kind::Chart) =>
@@ -2325,6 +2326,20 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn r10_root_and_fragment_process_ids_identify_the_provider_owner() -> Result<()> {
+        let owner = create_root_provider(1)?;
+        owner.publish(scene(), 1)?;
+        let child = owner.root.navigate(NavigateDirection_FirstChild)?.unwrap();
+        for node in [owner.root.as_ref(), child.as_ref()] {
+            assert_eq!(
+                i32::try_from(&node.property(UIA_ProcessIdPropertyId)?)?,
+                std::process::id() as i32,
+            );
+        }
+        Ok(())
     }
 
     // Fake HWND integer is NEVER passed to a Win32
