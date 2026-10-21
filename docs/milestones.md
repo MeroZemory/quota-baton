@@ -2,6 +2,18 @@
 
 This file names the verification for each unit and each row. The row list and the order live in `GOAL.md`; this file does not repeat them. Commands run in `C:/_projects/SampleUser/quota-baton-impl`, one after another, in the default target with `CARGO_INCREMENTAL=0`.
 
+## Status (single source for every report head)
+
+<!-- status:begin -->
+현재 마일스톤: R12 (codex-qb 이미지 생성: 새 이미지 세션과 `codex-qb --images exec`)
+목표: 이미지 생성을 qb로 쓸 수 있게 출시하고 이미지 작업 세션 전체에 명령을 공지한다
+핵심 지표: 새 경로 출시 0/2 (R12 이미지, R11 실행별 계정) · 2026-10-21 22:30 KST
+사용자 대기: 없음 (R2 Part B만 사용자 결정 대기)
+갱신: 2026-10-21 22:30 KST
+<!-- status:end -->
+
+Only the design session edits this block, when priority, approval or the core metric changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
+
 ## Unit check (closes a unit)
 
 - The focused tests covering the change: `cargo test -p <crate> <filter>`. Use the test names that the unit added or touched.
@@ -27,7 +39,7 @@ This file names the verification for each unit and each row. The row list and th
 | Lane | Item | Owner | Start command / trigger | Done when |
 |---|---|---|---|---|
 | A1 | R12, new-Qi image sessions (`codex-qb --images`, new sessions only) | Codex main `<pane>` | brief `.sandbox/briefs/R12-images.md` plus the D23 amendment; continue `impl/r12` from d58e630 | gate check passes, `launch-client --check` passes, self-merged |
-| A2 | R11, launch-scoped account and per-account catalog (D22), plus per-account aliases | Codex main `<pane>`, right after A1 | brief `.sandbox/briefs/R11-launch-account.md` | gate passes, alternation release gate passes, self-merged |
+| A2 | R11, launch-scoped account and per-account catalog (D22), plus per-account aliases. Integration preparation runs **now**, independent of the frozen R12 source, in `.sandbox/r11-prep/`: no shared target, no builds that touch the impl worktree. The integration lands right after A1 | prep: a background `codex-qb exec` worker started by the main (one completion signal). Integration: Codex main `<pane>` | brief `.sandbox/briefs/R11-launch-account.md` | gate passes, alternation release gate passes, self-merged |
 | B | Probe: does a native `-c model_provider=qb resume` keep provider `qb`? | Codex main runs it as a **background** job during A1/A2 | the synthetic temp-home script from the D23 amendment, started in the background; one completion signal (exit code + result json) | result json written; the design session rules on resume into Qi |
 | C | Install, live image generation (TUI and `codex-qb --images exec`), then **broadcast the exact command to every image-generating session**: sample-proj-a `<pane>`, sample-prj-opus `<pane>`, and any other session found running image work | design session `<pane>` | when A1 merges: build a release in a temp worktree, pre-check, install, and run one `codex-qb --images` generation | the image is produced through qb and sample-proj-a is told |
 | D | Full gates and independent reviews | whoever starts them | always in the background with one completion signal, checked once at unit close | — |
@@ -36,10 +48,14 @@ This file names the verification for each unit and each row. The row list and th
 
 **No polling.** Nobody polls a running job or a pane in a loop. Every wait has the next ready node from this table.
 
-## Fingerprint and reuse
+## Fingerprint and reuse (dependency-aware)
 
-- Record each check once: the commit, the command, the exit code, the scope and the totals. Put this in `.sandbox/reports/<M>-evidence/` and link it from the report.
-- A result is reused while its fingerprint is unchanged. The design session reuses the gate for the same commit and re-runs only a merge result that differs.
+- A fingerprint is keyed to the **inputs of that check**, not to the commit. For executable checks, the inputs are the touched crates' sources, `Cargo.lock` and the toolchain. For doc checks, they are the docs.
+  - A docs-only change never invalidates a passed executable check.
+  - A change to crate X invalidates only checks that depend on X.
+- While a row is open, repair failing tests with **focused** re-runs of those tests and of their crate only.
+- Run the **full matrix once**, as the final gate of the row. A failure outside the row's scope that also occurs on dev is recorded as pre-existing and fixed in its own unit; it does not block the row.
+- Record each result once in `.sandbox/reports/<M>-evidence/`: inputs hash, command, exit code, scope and totals.
 
 ## Completion
 
