@@ -665,3 +665,61 @@ New Qi sessions passed a real built-in image generation and a local PNG edit thr
    - **If it works:** re-enable resume and move into Qi through the launcher, with that override, under all D21 guarantees.
    - **If it does not:** existing sessions stay out of Qi.
 3. **Copying stays prohibited** (D21).
+
+## D24. Per-account burn rate and projected exhaustion, display only; the dashboard window uses the tray icon — Accepted (user direction, 2026-10-22)
+
+**User direction.** "계정별 소진속도랑(시간기준을 어떻게할지가 중요) 예상소진까지 걸리는 시간, 예상소진시각 등을 알수있으면 좋겠네요" and "대시보드창의 아이콘도 트레이아이콘처럼 일관성있게".
+
+**Facts.**
+- Providers report usage per window (5h, 7d; Codex gives `used_percent` with `limit_window_seconds` and a reset time). Inside one window the value only rises, then falls at the reset.
+- Codex reports whole percents, so a short span can show no change even under load. Polls run at most every 5 min per account (`poll_min_interval_secs = 300`); response headers add samples between polls.
+- `routing/forecast.rs` is an opt-in shadow diagnostic with a 15-min horizon. It is never shown and never used for placement.
+- The dashboard window class registers no icon, so Windows shows its default. The tray icon is drawn in code (`tray_icon/win_icon.rs`).
+
+**Decision: the time basis.**
+1. **Wall-clock time, not active time.** A window resets on the clock, so exhaustion has to be predicted in clock time. Idle minutes inside the measuring span correctly lower the rate.
+2. **The recent rate** is the change in used percent over the **last 30 minutes** of wall-clock time, divided by 30 minutes. The start value is the sample at or interpolated just before now − 30 min.
+   - 30 minutes is 10% of a 5h window and covers at least 6 polls.
+   - Shorter spans are dominated by the whole-percent steps. Longer spans react too slowly when qb moves sessions between accounts.
+   - Inside the first 30 minutes of a window, or after a restart, the span starts at the first sample instead. It needs at least 10 minutes and a change of at least 2 steps; until then the value is "측정 중".
+3. **The window average** is used percent divided by the time elapsed since the window started (reset time − window length). It needs no history.
+4. **Which basis gives the projection.**
+   - **5h windows** project with the recent rate. The window average is a fallback only while the recent rate is unavailable.
+   - **7d windows** project with the window average. Extrapolating 30 minutes of work over days ignores nights and idle days. The recent-rate projection is shown beside it as a second figure ("지금 속도면").
+5. **Low confidence.** When the number of sessions bound to the account changed inside the measuring span, the estimate is marked as changing. That happens when qb placed sessions on the account or moved them away.
+
+**Decision: outputs.** For each account and window:
+- the rate in %/h;
+- the time to exhaustion;
+- the projected exhaustion clock time in local time (with the date when it is not today).
+
+When the projection falls at or after the reset, it shows "초기화 전 소진 없음" with the reset time. An exhausted window shows "소진됨" with the reset time. Per account, the window that runs out first is named. For accounts serving from permitted credits, the line says that service continues on credits after exhaustion. If the credit balance is observed over time, the same method gives a credit burn rate and a projected credit exhaustion time.
+
+**Boundaries.**
+- **Display only.** Placement, health and D20 anti-herding are unchanged; feeding these numbers into routing would need its own decision.
+- The numbers are estimates, labelled as such, never promises.
+- They are computed once in qb-core and exposed through the existing status API, so the dashboard and CLI show the same values.
+
+**Decision: icon.**
+- The dashboard window uses the same generated icon as the tray for its title bar, taskbar and Alt-Tab (big and small sizes). It follows the theme and the current state badge, and is updated when the tray icon changes.
+- Both executables embed an `.ico` resource made by the same pixel generator, so Explorer and shortcuts show the same glyph. A test checks that the embedded icon matches the generator.
+
+**Order.** R13, right after R11 lands. The frozen dashboard-polish backlog stays frozen apart from these two user-directed items.
+
+## D25. Hold instead of moving when the limit resets within the prompt-cache lifetime — Accepted (design owner, 2026-10-22; prompted by a user question)
+
+**User question.** "클로드 5시간한도 도달했다고 다른계정으로 옮겨서처리하면 캐시미적중으로 비용엄청나오지 않을지? 긴급세션개념 도입해서 긴급세션아니면 기본적으로 5h한도같은건 기다리게하면 안되나요". Also: "codex, claude 둘다 세션관리방법이 다르다면 다르게 동작해야합니다", and the prompt cache is isolated per account and cannot be migrated.
+
+**Facts.**
+- The prompt cache belongs to the account (organization) on both providers and cannot be moved. Our V2 evidence: the first turn after a move is cache-cold.
+- The cache does not survive a long wait either. Claude's cache lives 5 min (1 h with the extended-TTL marker), and Codex's cache retention is short and not published. A 5h limit usually resets tens of minutes to hours later. After such a wait, the first turn on the **same** account is cold as well. Moving and waiting then cost the same single cold turn, and waiting adds idle time.
+- Waiting saves the cold turn only when the reset falls inside the cache lifetime. C7 holds a request only when the limit resets within 60 s.
+- **Codex differs from Claude.** A cross-account hop also drops earlier hidden reasoning (D22, V2), so a Codex move costs some quality on top of the cold turn. A project or root session that should never move already has the D20 `strict` policy.
+
+**Decision.**
+1. Replace the 60 s hold with a **cache-lifetime hold**. When a live session's account hits a limit that resets within the hold bound, qb holds the request until the reset instead of moving.
+   - **Claude:** the bound is 5 min, or 60 min when the request body uses 1-hour cache markers.
+   - **Codex:** the bound stays 60 s until the ledger shows how long Codex caches survive. Measure `cached_tokens` on the first turn after idle gaps of 1, 5, 15, 30 and 60 min on the same account, then set the bound to the longest gap that still hits.
+2. A hold must not break the client. Before raising any bound, test how long Claude Code and Codex wait for a held request (response headers or the first stream event). Cap every bound below the shortest client timeout found, with a margin. A hold that would exceed it moves instead.
+3. **Long waits.** No change: a session moves when forced (C7). The cost of moving equals the cost of waiting, and qb spreads forced moves (D15/D20) so one exhausted account does not cascade onto another.
+4. **The "urgent session" idea** does not pay off for the cache, for the reason in the facts. It does pay off for **money**: an account serving from paid credits. That choice is the user's and is asked separately; until answered, `allow_credits` stays per account as it is.
