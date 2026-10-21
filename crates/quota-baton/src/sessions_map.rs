@@ -558,11 +558,103 @@ fn write(plan: &MapPlan, original: &mut Document, value: &Value) -> Result<()> {
     Ok(())
 }
 
+// Format only new map intent; filesystem checks retain the caller's native path.
+// Persisted Change values must never be reformatted during replay or comparison.
+fn map_home_value(path: &Path) -> Result<String> {
+    let value = path.to_str().ok_or_else(|| anyhow!(FORMAT))?;
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        let value = match path.components().next() {
+            Some(Component::Prefix(prefix)) => match prefix.kind() {
+                Prefix::VerbatimDisk(_) => &value[4..],
+                Prefix::VerbatimUNC(_, _) => {
+                    return Ok(format!("//{}", value[8..].replace('\\', "/")));
+                }
+                Prefix::Disk(_) | Prefix::UNC(_, _) => value,
+                _ => return Err(anyhow!(FORMAT)),
+            },
+            _ => return Err(anyhow!(FORMAT)),
+        };
+        Ok(value.replace('\\', "/"))
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(value.to_owned())
+    }
+}
+
+#[cfg(windows)]
+fn check_map_home_directory(destination: &Path, formatted: &Path) -> Result<()> {
+    use std::os::windows::{
+        ffi::OsStrExt,
+        io::{AsRawHandle, FromRawHandle},
+    };
+    use windows::{
+        Win32::{
+            Foundation::HANDLE,
+            Storage::FileSystem::{
+                BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY,
+                FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+                FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+                FILE_SHARE_WRITE, GetFileInformationByHandle, OPEN_EXISTING,
+            },
+        },
+        core::PCWSTR,
+    };
+    fn directory(path: &Path) -> Result<(File, crate::sessions_guard::FileIdentity)> {
+        let mut name: Vec<u16> = path.as_os_str().encode_wide().collect();
+        ensure!(!name.contains(&0), "{FORMAT}");
+        name.push(0);
+        // SAFETY: name is NUL-terminated and lives through this read-only open.
+        // Pass the formatted spelling directly to Win32, without adding \\?\.
+        let handle = unsafe {
+            CreateFileW(
+                PCWSTR(name.as_ptr()),
+                FILE_READ_ATTRIBUTES.0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                None,
+            )
+        }
+        .map_err(|_| anyhow!(FORMAT))?;
+        // SAFETY: successful CreateFileW transfers one owned handle.
+        let file = unsafe { File::from_raw_handle(handle.0) };
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: file owns the live handle; info is a writable initialized buffer.
+        unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info) }
+            .map_err(|_| anyhow!(FORMAT))?;
+        ensure!(
+            info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY.0 | FILE_ATTRIBUTE_REPARSE_POINT.0)
+                == FILE_ATTRIBUTE_DIRECTORY.0,
+            "{FORMAT}"
+        );
+        Ok((
+            file,
+            crate::sessions_guard::FileIdentity {
+                volume: info.dwVolumeSerialNumber,
+                index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+            },
+        ))
+    }
+    // Keep both directory handles alive through the comparison. This is an
+    // admission check, not a reservation for future map apply or recovery.
+    let (_native_file, native) = directory(destination)?;
+    let (_formatted_file, mapped) = directory(formatted)?;
+    ensure!(native == mapped, "{FORMAT}");
+    Ok(())
+}
+
 /// Pure planning: no map, directory, or backup is created. Existing files must
 /// use {"sessions": {uuid: path}}; unknown sibling fields/entries are retained.
 pub(crate) fn plan(path: &Path, id: &str, destination: &Path, backupdir: &Path) -> Result<MapPlan> {
     ensure!(uuid(id), "대화 ID는 UUID여야 합니다");
     explicit(destination)?;
+    let after = map_home_value(destination)?;
+    #[cfg(windows)]
+    check_map_home_directory(destination, Path::new(&after))?;
     explicit(backupdir)?;
     let document = read(path)?;
     let before = entry(&document.value, id)?.map(str::to_owned);
@@ -572,10 +664,7 @@ pub(crate) fn plan(path: &Path, id: &str, destination: &Path, backupdir: &Path) 
             path: path.to_path_buf(),
             id: id.to_owned(),
             before,
-            after: destination
-                .to_str()
-                .ok_or_else(|| anyhow!(FORMAT))?
-                .to_owned(),
+            after,
             map_was_missing: document.bytes.is_none(),
         },
         backup_dir: backupdir.to_path_buf(),
@@ -732,6 +821,8 @@ pub(crate) fn replan_resolution(old: &MapPlan) -> Result<MapPlan> {
             Path::new(&old.change.after),
             &directory,
         )?;
+        // Continue the exact persisted intent, including a legacy path spelling.
+        new.change.after.clone_from(&old.change.after);
         new.resolution = Some(Box::new(old.clone()));
         validate(&new)?;
         return Ok(new);
@@ -1047,6 +1138,17 @@ pub(crate) fn verify(plan: &MapPlan) -> Result<()> {
     unchanged(plan, &document)
 }
 
+#[cfg(all(test, not(windows)))]
+mod non_windows_tests {
+    use super::*;
+
+    #[test]
+    fn map_value_preserves_literal_backslashes_on_non_windows() {
+        let value = r"/synthetic/literal\component/합성";
+        assert_eq!(map_home_value(Path::new(value)).unwrap(), value);
+    }
+}
+
 #[cfg(all(test, windows))]
 #[path = "sessions_map_resolve_tests.rs"]
 mod resolve_tests;
@@ -1076,6 +1178,7 @@ mod tests {
             let path = root.path().join("appdata/herdr/session-homes.json");
             let backup = root.path().join("journal/map-backups");
             let destination = root.path().join("qb-home");
+            fs::create_dir(&destination).unwrap();
             let original_home = root.path().join("source-home").to_str().unwrap().to_owned();
             Self {
                 _root: root,
@@ -1125,6 +1228,186 @@ mod tests {
     }
 
     #[test]
+    fn new_map_values_use_forward_slashes_without_losing_unc_roots() {
+        for (native, expected) in [
+            (
+                r"\\?\C:\Users\synthetic\.codex-acct\qb",
+                "C:/Users/synthetic/.codex-acct/qb",
+            ),
+            (
+                r"C:\Users\synthetic\.codex-acct\qb",
+                "C:/Users/synthetic/.codex-acct/qb",
+            ),
+            (
+                "C:/Users/synthetic/.codex-acct/qb",
+                "C:/Users/synthetic/.codex-acct/qb",
+            ),
+            (
+                r"\\?\C:\Users\합성\.codex-acct\qb",
+                "C:/Users/합성/.codex-acct/qb",
+            ),
+            (r"\\?\C:\", "C:/"),
+            (r"\\server\share\합성\qb", "//server/share/합성/qb"),
+            (r"\\?\UNC\server\share\합성\qb", "//server/share/합성/qb"),
+            (r"\\?\UNC\server\share\", "//server/share/"),
+        ] {
+            assert_eq!(map_home_value(Path::new(native)).unwrap(), expected);
+        }
+        // This formatter does not admit network/device paths into filesystem work.
+        for rejected in [
+            r"\\server\share\qb",
+            r"\\?\UNC\server\share\qb",
+            r"\\.\C:\qb",
+        ] {
+            assert!(explicit(Path::new(rejected)).is_err());
+        }
+    }
+
+    #[test]
+    fn new_map_values_refuse_non_unicode_instead_of_lossy_replacement() {
+        use std::os::windows::ffi::OsStringExt;
+        let mut units = r"\\?\C:\synthetic\".encode_utf16().collect::<Vec<_>>();
+        units.push(0xd800);
+        let path = PathBuf::from(std::ffi::OsString::from_wide(&units));
+        assert!(map_home_value(&path).is_err());
+    }
+
+    #[test]
+    fn plan_refuses_verbatim_names_that_change_win32_resolution_without_writes() {
+        let f = Fixture::new();
+        f.write(&f.original());
+        let before = fs::read(&f.path).unwrap();
+        let ordinary_alias = f._root.path().join("synthetic-home");
+        fs::create_dir(&ordinary_alias).unwrap();
+        for name in ["synthetic-home.", "synthetic-home ", "NUL"] {
+            let native = f._root.path().join(name);
+            assert!(native.to_str().unwrap().starts_with(r"\\?\"));
+            // The extended root creates the literal NTFS name, including its
+            // trailing dot/space or DOS-reserved component. Never use real homes.
+            fs::create_dir(&native).unwrap();
+            assert!(fs::metadata(&native).unwrap().is_dir());
+            assert_ne!(
+                fs::canonicalize(&native).unwrap(),
+                fs::canonicalize(&ordinary_alias).unwrap()
+            );
+            let formatted = map_home_value(&native).unwrap();
+            let error = check_map_home_directory(&native, Path::new(&formatted)).unwrap_err();
+            assert_eq!(format!("{error:#}"), FORMAT);
+            let error = plan(&f.path, A, &native, &f.backup)
+                .err()
+                .expect("unsafe ordinary spelling must not produce map intent");
+            let message = format!("{error:#}");
+            assert!(!message.contains(native.to_str().unwrap()));
+            assert!(!message.contains(name));
+            assert_eq!(fs::read(&f.path).unwrap(), before);
+            assert!(!f.backup.exists());
+        }
+    }
+
+    #[test]
+    fn plan_requires_an_existing_directory_and_matching_map_identity() {
+        let f = Fixture::new();
+        f.write(&f.original());
+        let before = fs::read(&f.path).unwrap();
+        let other = f._root.path().join("synthetic-other-directory");
+        fs::create_dir(&other).unwrap();
+        let other_value = map_home_value(&other).unwrap();
+        assert_eq!(
+            check_map_home_directory(&f.destination, Path::new(&other_value))
+                .unwrap_err()
+                .to_string(),
+            FORMAT
+        );
+        let file = f._root.path().join("synthetic-file-home");
+        fs::write(&file, b"synthetic").unwrap();
+        let missing = f._root.path().join("synthetic-missing-home");
+        for rejected in [&file, &missing] {
+            let error = plan(&f.path, A, rejected, &f.backup)
+                .err()
+                .expect("destination must be an existing directory");
+            assert_eq!(format!("{error:#}"), FORMAT);
+            assert_eq!(fs::read(&f.path).unwrap(), before);
+            assert!(!f.backup.exists());
+        }
+        // Both spellings of the real synthetic destination must still plan.
+        let after = f.plan().change.after;
+        let ordinary = plan(&f.path, A, Path::new(&after), &f.backup).unwrap();
+        assert_eq!(ordinary.change.after, after);
+        assert_eq!(fs::read(&f.path).unwrap(), before);
+        assert!(!f.backup.exists());
+    }
+
+    #[test]
+    fn legacy_extended_journal_and_delta_backup_replay_and_restore_exact_values() {
+        let f = Fixture::new();
+        f.write(&f.original());
+        let native_after = f.destination.to_str().unwrap();
+        assert!(native_after.starts_with(r"\\?\"));
+        assert!(f.original_home.starts_with(r"\\?\"));
+        let mut stored = serde_json::to_value(f.plan()).unwrap();
+        stored["change"]["after"] = json!(native_after);
+        let journal = serde_json::to_vec(&stored).unwrap();
+        let legacy: MapPlan = serde_json::from_slice(&journal).unwrap();
+        assert_eq!(serde_json::to_value(&legacy).unwrap(), stored);
+        save_backup(&legacy).unwrap();
+        let backup = backup_path(&legacy).unwrap();
+        let protected = fs::read(&backup).unwrap();
+        let delta = crate::cutover::unprotect(std::str::from_utf8(&protected).unwrap()).unwrap();
+        let saved: Value = serde_json::from_slice(&delta).unwrap();
+        assert_eq!(saved["after"], native_after);
+        assert_eq!(saved["before"], f.original_home);
+        assert!(
+            !std::str::from_utf8(&delta)
+                .unwrap()
+                .contains("SYNTHETIC_UNRELATED_PRIVATE_HOME")
+        );
+        apply(&legacy).unwrap();
+        apply(&serde_json::from_slice(&journal).unwrap()).unwrap();
+        verify(&legacy).unwrap();
+        assert_eq!(f.value()["sessions"][A], native_after);
+        assert_eq!(fs::read(&backup).unwrap(), protected);
+        let mut latest = f.value();
+        latest["sessions"][B] = json!("synthetic-latest-other-home");
+        latest["future"]["new"] = json!(true);
+        f.write(&latest);
+        restore(&serde_json::from_slice(&journal).unwrap()).unwrap();
+        latest["sessions"][A] = json!(f.original_home);
+        assert_eq!(f.value(), latest);
+        restore(&legacy).unwrap();
+        assert_eq!(serde_json::to_value(&legacy).unwrap(), stored);
+        assert_eq!(fs::read(backup).unwrap(), protected);
+    }
+
+    #[test]
+    fn equivalent_path_spellings_do_not_relax_raw_transaction_conflicts() {
+        let f = Fixture::new();
+        let original = f.original();
+        f.write(&original);
+        let p = f.plan();
+        assert!(f.original_home.starts_with(r"\\?\"));
+        let mut equivalent = original.clone();
+        equivalent["sessions"][A] = json!(map_home_value(Path::new(&f.original_home)).unwrap());
+        f.write(&equivalent);
+        let before = fs::read(&f.path).unwrap();
+        assert!(apply(&p).is_err());
+        assert!(restore(&p).is_err());
+        assert_eq!(fs::read(&f.path).unwrap(), before);
+        assert!(!f.backup.exists());
+        f.write(&original);
+        apply(&p).unwrap();
+        let mut equivalent = f.value();
+        equivalent["sessions"][A] = json!(f.destination.to_str().unwrap());
+        f.write(&equivalent);
+        let before = fs::read(&f.path).unwrap();
+        let backup = fs::read(backup_path(&p).unwrap()).unwrap();
+        assert!(apply(&p).is_err());
+        assert!(restore(&p).is_err());
+        assert!(verify(&p).is_err());
+        assert_eq!(fs::read(&f.path).unwrap(), before);
+        assert_eq!(fs::read(backup_path(&p).unwrap()).unwrap(), backup);
+    }
+
+    #[test]
     fn existing_map_accepts_nonverbatim_windows_paths() {
         use std::os::windows::ffi::{OsStrExt, OsStringExt};
         let mut f = Fixture::new();
@@ -1136,9 +1419,25 @@ mod tests {
         f.path = normal(&f.path);
         f.backup = normal(&f.backup).join("synthetic-nested-backup-directory".repeat(3));
         f.destination = normal(&f.destination);
-        f.write(&f.original());
+        f.original_home = normal(Path::new(&f.original_home))
+            .to_str()
+            .unwrap()
+            .replace('\\', "/");
+        let original = f.original();
+        f.write(&original);
+        let before = fs::read(&f.path).unwrap();
+        let destination = f.destination.clone();
         let p = f.plan();
+        assert_eq!(p.change.before.as_deref(), Some(f.original_home.as_str()));
+        assert_eq!(
+            p.change.after,
+            destination.to_str().unwrap().replace('\\', "/")
+        );
+        assert_eq!(f.destination, destination);
+        assert_eq!(fs::read(&f.path).unwrap(), before);
+        assert!(!f.backup.exists());
         apply(&p).unwrap();
+        assert_eq!(f.value()["sessions"][A], p.change.after);
         verify(&p).unwrap();
         restore(&p).unwrap();
         assert_eq!(f.value(), f.original());
@@ -1151,12 +1450,23 @@ mod tests {
         f.write(&original);
         let before = fs::read(&f.path).unwrap();
         let plan = f.plan();
+        let expected = f
+            .destination
+            .to_str()
+            .unwrap()
+            .strip_prefix(r"\\?\")
+            .unwrap()
+            .replace('\\', "/");
+        assert_eq!(
+            serde_json::to_value(&plan).unwrap()["change"]["after"],
+            expected
+        );
         assert_eq!(fs::read(&f.path).unwrap(), before);
         assert!(!f.backup.exists());
         apply(&plan).unwrap();
         verify(&plan).unwrap();
         let applied = f.value();
-        assert_eq!(applied["sessions"][A], f.destination.to_str().unwrap());
+        assert_eq!(applied["sessions"][A], expected);
         assert_eq!(applied["sessions"][B], original["sessions"][B]);
         assert_eq!(applied["future"], original["future"]);
         let protected = fs::read_to_string(backup_path(&plan).unwrap()).unwrap();
@@ -1186,10 +1496,7 @@ mod tests {
         restore(&plan).unwrap();
         assert!(!f.path.exists());
         apply(&plan).unwrap();
-        assert_eq!(
-            f.value(),
-            json!({"sessions": {A: f.destination.to_str().unwrap()}})
-        );
+        assert_eq!(f.value(), json!({"sessions": {A: plan.change.after}}));
         restore(&plan).unwrap();
         assert!(!f.path.exists());
         restore(&plan).unwrap();
@@ -1496,7 +1803,7 @@ mod tests {
     fn already_correct_mapping_is_not_rewritten_on_apply_or_restore() {
         let f = Fixture::new();
         f.write(
-            &json!({"sessions": {A: f.destination.to_str().unwrap(), B: "keep"}, "future": true}),
+            &json!({"sessions": {A: map_home_value(&f.destination).unwrap(), B: "keep"}, "future": true}),
         );
         let before = fs::read(&f.path).unwrap();
         let identity = crate::sessions_guard::identity(&f.path).unwrap();
