@@ -248,13 +248,13 @@ fn usage_tile(
                 * width(plot)
     };
     let y = |pct: f64| plot.bottom - (pct.clamp(0., 100.) as f32 / 100.) * height(plot);
-    if t.unconfirmed {
-        if let Some(last) = t.last_observed.filter(|last| *last < v.clock.utc()) {
-            hatch(
-                b,
-                rect(x(last), plot.top, x(v.clock.utc()) - x(last), height(plot)),
-            );
-        }
+    if t.unconfirmed
+        && let Some(last) = t.last_observed.filter(|last| *last < v.clock.utc())
+    {
+        hatch(
+            b,
+            rect(x(last), plot.top, x(v.clock.utc()) - x(last), height(plot)),
+        );
     }
     for (start, end) in &t.credits_spans {
         b.fill(
