@@ -649,3 +649,19 @@ Built-in provider ids cannot be redefined. The tool POSTs to `<base>/images/gene
   - The full round trip account → Qi → account → Q → Qi → account, with a turn at each stop.
   - Header-strip capture tests.
   - An upgrade canary: on a Codex version change, the launcher checks that Qi still lists `image_gen__imagegen` and points to `codex-mz` if it does not.
+
+### D23 amendment: ship new Qi sessions first; probe the resume path (design owner, 2026-10-21)
+
+**R12 hit the D23 stop** (`.sandbox/reports/R12.md`, checkpoint impl/r12 d58e630). Resuming an existing thread in Qi with native Codex 0.163 rewrote the thread's database provider from `qb` back to `openai`, taking it from the rollout. The next request then carried no actor header and offered no image tool. No rollout was copied or rewritten.
+
+New Qi sessions passed a real built-in image generation and a local PNG edit through a spawned synthetic core.
+
+**Rulings.**
+1. **Ship new Qi sessions now.**
+   - `codex-qb --images` starts a **new** session in Qi with the image tool.
+   - `codex-qb --images resume <id>` and moving into Qi are **disabled**. They print, in Korean: "기존 대화는 이미지 모드로 옮길 수 없습니다. 새 이미지 세션을 여세요".
+   - This needs the full gate and the real-profile `launch-client --check`, then a merge. The design session installs it and runs one live generation.
+2. **Probe authorized**, bounded and synthetic. In temp homes, using the native binary against a fake upstream, test whether `codex -c model_provider=qb resume <id>` (and/or `-c model_providers.qb…` supplied on the command line) keeps provider `qb` for a resumed thread and exposes the image tool. Report the result.
+   - **If it works:** re-enable resume and move into Qi through the launcher, with that override, under all D21 guarantees.
+   - **If it does not:** existing sessions stay out of Qi.
+3. **Copying stays prohibited** (D21).
