@@ -5,12 +5,15 @@ pub mod bindings;
 mod burst;
 #[cfg(feature = "shape-capture")]
 pub mod capture;
+pub mod catalog;
 pub mod config;
 pub mod credits;
 pub mod dashboard;
 pub mod debug_pin;
 pub mod guard;
 mod json_unique;
+pub(crate) mod launch_path;
+pub mod launch_tokens;
 pub mod oauth;
 pub mod observability;
 #[cfg(all(feature = "phase0", debug_assertions))]
