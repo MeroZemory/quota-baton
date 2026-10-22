@@ -1,5 +1,6 @@
 //! C7 placement and schema-1 affinity persistence. Callers filter tried accounts,
 //! credentials, probes and volatile failures, but retain quota cooling for holds.
+//! Move evidence is carried separately from those eligibility exclusions.
 use crate::{
     accounts::{Account, Health, HealthReason, HealthSignal, Provider, UserState},
     config::RoutingConfig,
@@ -549,15 +550,40 @@ impl BindingTable {
         proposed_reason: &str,
         now: DateTime<Utc>,
     ) -> Result<Option<move_guard::Permit>, move_guard::Denied> {
+        self.prepare_move_with_source(
+            d,
+            key,
+            from,
+            to,
+            from.and_then(|id| candidates.iter().find(|c| c.account.id == id)),
+            candidates,
+            model,
+            proposed_reason,
+            now,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_move_with_source(
+        &self,
+        d: &Data,
+        key: &str,
+        from: Option<&str>,
+        to: &str,
+        source: Option<&Candidate>,
+        candidates: &[Candidate],
+        model: Option<&str>,
+        proposed_reason: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<move_guard::Permit>, move_guard::Denied> {
         let Some(from) = from.filter(|from| *from != to) else {
             return Ok(None);
         };
-        let source = candidates.iter().find(|c| c.account.id == from);
         let target = candidates.iter().find(|c| c.account.id == to);
         let source_account = source.map(|c| effective_account(c, d, &self.config, model, now));
         let target_account = target.map(|c| effective_account(c, d, &self.config, model, now));
-        // Missing source evidence (e.g. request-local exclusions) cannot grant
-        // the fresh-unusable exception. A health poll timestamp is not proof.
+        // Genuinely missing source evidence cannot grant the fresh-unusable
+        // exception. A health poll timestamp is not proof.
         let usable = source.is_some_and(|c| self.move_source_usable(d, key, c, model, now));
         let unusable = source.is_some() && !usable;
         let result = self
@@ -2065,6 +2091,42 @@ impl BindingTable {
         coverage: Option<&BTreeSet<String>>,
         admit: impl FnOnce(&str) -> bool,
     ) -> Decision {
+        self.choose_with_hold_at_admitted_evidence(
+            provider,
+            key,
+            parent,
+            model,
+            candidates,
+            candidates,
+            pinned,
+            request_bytes,
+            hold_allowed,
+            hold_timed_out,
+            now,
+            coverage,
+            admit,
+        )
+    }
+
+    /// Evidence may include excluded accounts, but only candidates can be sent.
+    /// Resolve the actual source under mutations, never an earlier relay lookup.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn choose_with_hold_at_admitted_evidence(
+        self: &Arc<Self>,
+        provider: Provider,
+        key: Option<&str>,
+        parent: Option<&str>,
+        model: Option<&str>,
+        candidates: &[Candidate],
+        move_evidence: &[Candidate],
+        pinned: Option<&str>,
+        request_bytes: u64,
+        hold_allowed: bool,
+        hold_timed_out: bool,
+        now: DateTime<Utc>,
+        coverage: Option<&BTreeSet<String>>,
+        admit: impl FnOnce(&str) -> bool,
+    ) -> Decision {
         let _mutation = self.mutations.lock().unwrap_or_else(|e| e.into_inner());
         let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
         for c in candidates {
@@ -2158,8 +2220,16 @@ impl BindingTable {
                 .flatten()
                 .map(String::as_str)
         });
-        let permit = match self.prepare_move(
-            &d, &guard_key, guard_from, &account, candidates, model, reason, now,
+        let permit = match self.prepare_move_with_source(
+            &d,
+            &guard_key,
+            guard_from,
+            &account,
+            guard_from.and_then(|id| move_evidence.iter().find(|c| c.account.id == id)),
+            candidates,
+            model,
+            reason,
+            now,
         ) {
             Ok(permit) => permit,
             Err(denied) => {

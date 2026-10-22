@@ -16,12 +16,7 @@ use qb_core::{
 use qb_testkit::{ScriptedResponse, ScriptedUpstream};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{
-    fs,
-    path::PathBuf,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 
 const DEADLINE: Duration = Duration::from_secs(8);
 const MODEL: &str = "claude-sonnet-4-5";
@@ -707,7 +702,7 @@ async fn real_http_move_cost_reaches_admin_and_ledger_with_known_unknown_coverag
 }
 
 #[tokio::test]
-async fn real_http_pingpong_is_refused_before_return_dispatch_and_ends_typed_429() {
+async fn real_http_changed_payment_recovery_permits_return_with_default_move_budget() {
     let h = Harness::new(1).await;
     h.fake.state.push(usage_reply(10, Some(0)));
     let initial = h.turn("r14-pingpong-session").await;
@@ -721,8 +716,8 @@ async fn real_http_pingpong_is_refused_before_return_dispatch_and_ends_typed_429
     assert_ne!(a, b);
     h.sessions(1, 0).await;
 
-    // Fixture-only recovery makes A a real candidate again. The first move's source
-    // was excluded by that HTTP failure: missing departure evidence is NOT return proof.
+    // The first move records A's actual Payment evidence despite retry exclusion.
+    // Recovery to Ready is changed evidence, so a later forced return is valid.
     let recovered = h
         .store
         .update_metadata(&a, |account| {
@@ -740,63 +735,39 @@ async fn real_http_pingpong_is_refused_before_return_dispatch_and_ends_typed_429
         Some(b.clone())
     );
     h.fake.state.push(payment_reply()); // B now fails; A is the only usable target.
-    // A must never consume this reply. If it does, count/typed-response assertions fail.
     h.fake.state.push(usage_reply(9999, Some(0)));
-    let started = Instant::now();
-    let refused = h.turn("r14-pingpong-session").await;
-    let elapsed = started.elapsed();
-    assert_eq!(
-        refused.status, 429,
-        "move guard must end with a typed limit, not generic timeout"
-    );
-    assert_eq!(refused.body["type"], "error");
-    assert_eq!(refused.body["error"]["type"], "account_move_guard");
-    assert!(refused.headers.get("retry-after").is_some());
-    assert!(
-        elapsed >= Duration::from_millis(700),
-        "forced refusal skipped its bounded hold"
-    );
-    assert!(
-        elapsed < Duration::from_secs(4),
-        "hold exceeded the request budget"
-    );
+    let returned = h.turn("r14-pingpong-session").await;
+    assert_eq!(returned.status, 200);
+    assert_eq!(returned.account, a);
+    assert!(returned.headers.get("retry-after").is_none());
+    assert_eq!(returned.body["usage"]["input_tokens"], 9999);
     assert_eq!(
         h.state
             .bindings
             .current(Some("claude:r14-pingpong-session")),
-        Some(b.clone())
+        Some(a.clone())
     );
-    h.assert_upstream_accounts(&[&a, &a, &b, &b]);
+    h.assert_upstream_accounts(&[&a, &a, &b, &b, &a]);
 
     let rows = h.ledger();
     let hash = session_hash("r14-pingpong-session");
-    let refusal = rows
-        .iter()
-        .find(|row| {
-            row["event"] == "binding_move_refused"
-                && row["session"] == hash
-                && row["from"] == b
-                && row["to"] == a
-        })
-        .expect("actual attempted return must be ledgered");
-    assert_eq!(refusal["reason"], "ping_pong");
-    assert_eq!(refusal["forced"], true);
-    let until = DateTime::parse_from_rfc3339(refusal["until"].as_str().unwrap())
-        .unwrap()
-        .with_timezone(&Utc);
-    assert!(until > Utc::now() + ChronoDuration::minutes(20));
+    assert!(rows.iter().any(|row| row["event"] == "binding_move"
+        && row["session"] == hash
+        && row["from"] == b
+        && row["to"] == a));
     assert!(
-        !rows
-            .iter()
-            .any(|row| row["event"] == "binding_move" && row["from"] == b && row["to"] == a)
+        !rows.iter().any(|row| row["event"] == "binding_move_refused"
+            && row["session"] == hash
+            && row["from"] == b
+            && row["to"] == a)
     );
     assert_eq!(
         rows.iter()
             .filter(|row| row["event"] == "binding_move_cost" && row["measurement"] == "pending")
             .count(),
-        1,
-        "refusal must not register another move"
+        2,
+        "both permitted moves must register their cost"
     );
-    let view = h.sessions(1, 0).await;
-    assert_eq!(view["move_cost"]["hour"]["tokens"], 1090);
+    // B's only successful turn was cold, so it has no normal baseline yet.
+    h.sessions(1, 1).await;
 }

@@ -627,9 +627,27 @@ impl RelayState {
         &self,
         provider: Provider,
         key: Option<&str>,
-        _model: Option<&str>,
+        model: Option<&str>,
         tried: &BTreeSet<String>,
     ) -> Result<Vec<crate::bindings::Candidate>, ()> {
+        self.candidates_with_evidence(provider, key, model, tried)
+            .await
+            .map(|(candidates, _)| candidates)
+    }
+
+    async fn candidates_with_evidence(
+        &self,
+        provider: Provider,
+        key: Option<&str>,
+        _model: Option<&str>,
+        tried: &BTreeSet<String>,
+    ) -> Result<
+        (
+            Vec<crate::bindings::Candidate>,
+            Vec<crate::bindings::Candidate>,
+        ),
+        (),
+    > {
         let store = self.store.clone();
         let mut tried = tried.clone();
         if let Some(key) = key
@@ -670,25 +688,33 @@ impl RelayState {
         let obs = self.observability.clone();
         let bindings = self.bindings.clone();
         tokio::task::spawn_blocking(move || {
-            accounts
-                .into_iter()
-                .filter(|a| {
-                    a.provider == provider
-                        && !tried.contains(&a.id)
-                        && !runtime.probing(&a.id)
-                        && !runtime.blocked_in_memory(&a.id)
-                        && store.tokens(a).is_ok_and(|t| !t.access_token.is_empty())
-                })
-                .map(|mut account| {
-                    if account.quota_cooling.is_none()
-                        && let Some(reset) = runtime.observed_quota_reset(&account)
-                    {
-                        account.quota_cooling = Some(crate::accounts::QuotaCooling {
-                            window: "observed".into(),
-                            reset_at: reset,
-                            started_at: chrono::Utc::now(),
-                        });
-                    }
+            let mut candidates = Vec::new();
+            let mut evidence = Vec::new();
+            for mut account in accounts.into_iter().filter(|a| a.provider == provider) {
+                if account.quota_cooling.is_none()
+                    && let Some(reset) = runtime.observed_quota_reset(&account)
+                {
+                    account.quota_cooling = Some(crate::accounts::QuotaCooling {
+                        window: "observed".into(),
+                        reset_at: reset,
+                        started_at: chrono::Utc::now(),
+                    });
+                }
+                let candidate = crate::bindings::Candidate {
+                    quota: runtime.selection_quota(&account, obs.quota_snapshot(&account.id)),
+                    // Every production attempt reserves the live table;
+                    // a runtime count sampled before completion can be stale.
+                    inflight: 0,
+                    account,
+                };
+                let account = &candidate.account;
+                if !tried.contains(&account.id)
+                    && !runtime.probing(&account.id)
+                    && !runtime.blocked_in_memory(&account.id)
+                    && store
+                        .tokens(account)
+                        .is_ok_and(|t| !t.access_token.is_empty())
+                {
                     obs.forecast_load(
                         &account.id,
                         bindings.active_sessions(&account.id, chrono::Utc::now()),
@@ -700,15 +726,13 @@ impl RelayState {
                             || pacing.rate_backoff_until.is_some()
                             || pacing.waiting > 0,
                     );
-                    Ok(crate::bindings::Candidate {
-                        quota: runtime.selection_quota(&account, obs.quota_snapshot(&account.id)),
-                        // Every production attempt reserves the live table;
-                        // a runtime count sampled before completion can be stale.
-                        inflight: 0,
-                        account,
-                    })
-                })
-                .collect::<Result<Vec<_>, ()>>()
+                    candidates.push(candidate.clone());
+                }
+                // A retry exclusion is not a health fact. Preserve normalized
+                // source evidence even when this account cannot be selected.
+                evidence.push(candidate);
+            }
+            Ok((candidates, evidence))
         })
         .await
         .map_err(|_| ())?
@@ -939,12 +963,20 @@ impl RelayState {
                 &self.bindings.policies.changed,
                 self.accounts.subscribe(),
             );
-            let candidates = self
-                .candidates(provider, session.key.as_deref(), model, &excluded)
+            let (candidates, mut move_evidence) = self
+                .candidates_with_evidence(provider, session.key.as_deref(), model, &excluded)
                 .await?;
             let (candidates, coverage) = if let Some(launch) = launch {
-                self.launch_candidates(launch, candidates, &excluded, deadline)
+                let selected = self
+                    .launch_candidates(launch, candidates, &excluded, deadline)
+                    .await?;
+                // Catalog I/O can outlive a recovery or rejection of an excluded
+                // source. Refresh evidence without changing launch eligibility.
+                move_evidence = self
+                    .candidates_with_evidence(provider, session.key.as_deref(), model, &excluded)
                     .await?
+                    .1;
+                selected
             } else {
                 (candidates, None)
             };
@@ -961,6 +993,7 @@ impl RelayState {
             let parent = session.parent.clone();
             let owned_model = model.map(str::to_owned);
             let choices = candidates.clone();
+            let evidence = move_evidence.clone();
             let hold_allowed = !completion.reset_hold_used;
             let hold_timed_out = completion.reset_hold_timed_out;
             let admit = admit.clone();
@@ -970,12 +1003,13 @@ impl RelayState {
             let selection_operation = operation.clone();
             let choice = tokio::task::spawn_blocking(move || {
                 let choose = |eligible: &dyn Fn(&str, bool) -> bool| {
-                    table.choose_with_hold_at_admitted_coverage(
+                    table.choose_with_hold_at_admitted_evidence(
                         provider,
                         key.as_deref(),
                         parent.as_deref(),
                         owned_model.as_deref(),
                         &choices,
+                        &evidence,
                         pinned.as_deref(),
                         bytes,
                         hold_allowed,
@@ -1016,7 +1050,7 @@ impl RelayState {
                     let now = chrono::Utc::now();
                     let until = selection_guard::recovery_deadline(
                         until,
-                        &candidates,
+                        &move_evidence,
                         current.as_deref(),
                         now,
                     );

@@ -195,9 +195,9 @@ async fn r14_move_hold_rate_cooling_expiry_reselects_before_breaker_timeout() {
 
 #[test]
 fn r14_move_hold_recovers_on_payment_and_observed_quota_without_expired_timer_loops() {
-    let (_home, _table, mut cs) = fixture();
+    let (_home, table, mut cs) = fixture();
     let now = Utc::now();
-    let guard_until = now + chrono::Duration::seconds(600);
+    prime_global(&table, &cs, now);
     cs[0].account.payment_until = Some(now + chrono::Duration::seconds(1));
     cs[1].account.payment_until = Some(now + chrono::Duration::seconds(20));
     cs[1].account.quota_cooling = Some(crate::accounts::QuotaCooling {
@@ -209,6 +209,24 @@ fn r14_move_hold_recovers_on_payment_and_observed_quota_without_expired_timer_lo
         {"used_pct":100,"reset_at":now + chrono::Duration::seconds(10)},
         {"used_pct":99,"reset_at":now + chrono::Duration::seconds(2)}
     ]}));
+    let guard_until = match table.choose_with_hold_at_admitted_evidence(
+        Provider::Codex,
+        Some(KEY),
+        None,
+        None,
+        &cs[2..], // The held source is evidence, never an eligible retry target.
+        &cs,
+        Some(&cs[2].account.id),
+        100,
+        false,
+        false,
+        now,
+        None,
+        |_| panic!("a global refusal must not admit the target"),
+    ) {
+        Decision::MoveHeld { until } => until,
+        other => panic!("expected forced hold: {other:?}"),
+    };
     let source = Some(cs[1].account.id.as_str());
     assert_eq!(
         recovery_deadline(guard_until, &cs, source, now),

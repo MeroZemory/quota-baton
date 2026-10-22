@@ -186,6 +186,69 @@ fn r14_observed_limit_is_fresh_unusable_evidence_not_guard_keep() {
 }
 
 #[test]
+fn r14_excluded_source_needs_fresh_unusable_evidence() {
+    for state in ["unknown", "ready", "payment", "quota"] {
+        let root = fixture_dir();
+        let table = BindingTable::new(root.path(), RoutingConfig::default()).unwrap();
+        let now = Utc::now();
+        let mut cs = [
+            candidate("cl-111111", 10., 10, 2),
+            candidate("cl-222222", 20., 20, 3),
+            candidate("cl-333333", 30., 30, 4),
+        ];
+        let key = "claude:excluded-evidence";
+        selected(pick(&table, key, &cs, &cs[0].account.id, now, |_| true));
+        selected(pick(&table, key, &cs, &cs[1].account.id, now, |_| true));
+        match state {
+            "payment" => {
+                cs[1].account.apply_health_signal(
+                    HealthSignal::Cooling {
+                        reason: HealthReason::Payment,
+                        until: now + chrono::Duration::hours(6),
+                        scope: "account".into(),
+                    },
+                    now,
+                );
+            }
+            "quota" => {
+                cs[1].quota.as_mut().unwrap()["windows"][0]["used_pct"] = serde_json::json!(100);
+            }
+            _ => {}
+        }
+        let evidence = if state == "unknown" { &[][..] } else { &cs[..] };
+        assert_eq!(semantic_evidence(None), 0);
+        let calls = AtomicUsize::new(0);
+        let choice = table.choose_with_hold_at_admitted_evidence(
+            Provider::Claude,
+            Some(key),
+            None,
+            None,
+            &cs[2..], // The actual source B remains excluded from eligibility.
+            evidence,
+            Some(&cs[2].account.id),
+            100,
+            false,
+            false,
+            now,
+            None,
+            |id| {
+                assert_eq!(id, cs[2].account.id);
+                calls.fetch_add(1, Ordering::SeqCst);
+                true
+            },
+        );
+        if matches!(state, "payment" | "quota") {
+            assert_eq!(selected(choice), cs[2].account.id, "{state}");
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        } else {
+            assert!(matches!(choice, Decision::MoveHeld { .. }), "{state}");
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(table.current(Some(key)), Some(cs[1].account.id.clone()));
+        }
+    }
+}
+
+#[test]
 fn r14_global_refusal_does_not_keep_effectively_exhausted_source() {
     let root = fixture_dir();
     let mut cfg = RoutingConfig::default();
