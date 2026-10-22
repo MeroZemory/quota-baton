@@ -797,7 +797,7 @@ The cost is that the session pauses until the reset.
 
    Prompted by the 12:01 ping-pong, where WebSocket capacity pushed sessions onto sample-acct, which hit its weekly limit a minute later.
 
-**Order.** R14, after R13. Item 4 applies from now on.
+**Order.** R15, after R13 Part F (renumbered by D29). Item 4 applies from now on.
 
 ## D28. Provider-wide exhaustion forecast from measured accounts, labelled with its coverage — Accepted (user direction, design owner on the coverage rule, 2026-10-22)
 
@@ -829,3 +829,42 @@ The cost is that the session pauses until the reset.
 3. **Backtest before display.** Replay the last 24 h of ledger and quota observations, and report the error of the predicted per-account percent changes and of the pooled runway at 1 h and 3 h. Show the pooled runway only if the 1 h error is within a bound the report justifies; otherwise ship part 1 alone and say so.
 
 **Boundaries.** Display only, like D24. Placement and D20 are unchanged.
+
+## D29. Guard against qb's own logic errors burning tokens through needless account moves — Accepted (user direction, design owner on the mechanism, 2026-10-22)
+
+**User direction.** The concern behind D27's question: "우리 로직실수로 (패치 등의 과정에서) 토큰을 녹이는 (계정스위치 등으로 캐시날아가거나) 문제가 생겨버릴때". A patch with a routing mistake can move sessions needlessly. Every move makes the next turn re-read the whole context uncached; at 100–350k tokens per session (D15 incident) that is real money and quota. Tests alone cannot be trusted to catch every such mistake.
+
+**Facts.**
+- Move reasons are free strings (`"forced"` in `bindings.rs`), and a binding's account is assigned at several sites (`b.account = …`).
+- Nothing at run time limits how often qb moves sessions; only the per-decision rules do.
+- 2026-10-22 12:01: a WebSocket capacity rejection moved sessions from acct-d to sample-acct, which hit its weekly limit a minute later, and the sessions came back. That is two cold re-reads with no benefit. It did not come from a patch, but a patch could cause the same thing at scale.
+
+**Decision: four independent layers, so that no single mistake can burn tokens unnoticed.**
+1. **One choke point, proof-carrying (compile time).**
+   - A binding's account field becomes private. The only way to change it is `Bindings::rebind(session, to, MoveReason)`.
+   - `MoveReason` is an enum whose variants carry evidence values. The evidence can be constructed only by the module that owns the fact:
+     - `Forced { unusable: UnusableEvidence }` comes from health;
+     - `Capacity { rejection: WsCapacityEvidence }` comes from the WS capacity tracker;
+     - `UserMove`, `ColdPoint { idle }`, `Overload { mark }`, `Urgent { policy }`.
+   - A patch that moves a session without evidence does not compile. A static check in the gate refuses any other write to the field.
+2. **Run-time circuit breaker (last line, independent of the logic that decided).** `rebind` enforces budgets before it acts:
+   - **Per session:** at most 1 move in 10 minutes and 3 in an hour, unless the current account is unusable with fresh evidence.
+   - **Ping-pong:** never back to an account the session left in the last 30 minutes, unless that account's evidence changed (for example a reset).
+   - **Global:** more than N moves in 10 minutes (default 6; tuned from the ledger) trips the breaker. When it trips:
+     - non-forced moves stop;
+     - forced moves wait for the D26 hold path instead of moving;
+     - the tray raises a notice with the move list;
+     - the breaker stays tripped until the user or a timeout clears it.
+   - Every refusal is ledgered with the reason the logic gave.
+3. **Cost accounting and alarm.** The ledger attributes each move's cost: the next turn's uncached input tokens minus the session's typical uncached input.
+   - The dashboard shows "계정 이동으로 다시 읽은 토큰" per hour and per day.
+   - Crossing a threshold raises a tray notice. This makes a burn visible within minutes even when every move was individually allowed.
+4. **Differential replay gate before merge (catches patch mistakes before install).**
+   - A deterministic replay harness feeds the last 24 h of real traces (ledger, activity, quota observations; bodies are never needed) through the router of the candidate build and of the installed build.
+   - It compares the number of moves, ping-pongs and estimated re-read tokens.
+   - Any routing change that increases them by more than a set margin fails the gate unless the brief declares the increase intended.
+   - The replay also runs the D27 property invariants on the real traces.
+
+**Why not a general AST "logic = code" checker.** It cannot decide whether a move was needed. Layers 1 and 4 cover what a checker can cover: structure, and behaviour compared with a known-good build. Layer 2 bounds the damage of whatever slips through.
+
+**Order.** R14 (this guard) runs right after R13 C+E, before R13 Part F, because it protects money. D27's contract work becomes R15.
