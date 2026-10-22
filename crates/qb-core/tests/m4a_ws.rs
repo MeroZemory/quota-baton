@@ -85,6 +85,17 @@ impl Harness {
         deadlines: Option<(u64, u64)>,
         budget: Option<u64>,
     ) -> Self {
+        Self::new_configured(count, owned, fail_first, rate, deadlines, budget, |_| {}).await
+    }
+    async fn new_configured(
+        count: usize,
+        owned: bool,
+        fail_first: bool,
+        rate: Option<(u64, u32)>,
+        deadlines: Option<(u64, u64)>,
+        budget: Option<u64>,
+        configure: impl FnOnce(&mut Config),
+    ) -> Self {
         let serial = SERIAL.lock().await;
         let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/m4a-ws-tests");
         fs::create_dir_all(&base).unwrap();
@@ -147,6 +158,7 @@ impl Harness {
             config.routing.request_timeout_secs = http;
             config.routing.ws_upgrade_hold_secs = ws;
         }
+        configure(&mut config);
         let mut retry_proxy = None;
         config.upstream.codex_base = if fail_first {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1105,21 +1117,18 @@ async fn r12_9_capped_upgrade_cancels_while_drain_waits_for_detached_refresh() {
         r#"{"error":{"code":"token_expired"}}"#,
         HeaderMap::new(),
     );
-    let mut refresh_response = ScriptedResponse::json(
+    let refresh_response = ScriptedResponse::json(
         StatusCode::OK,
         r#"{"access_token":"synthetic-after-drain","refresh_token":"synthetic-drain-rotation","expires_in":3600}"#,
     );
-    refresh_response.chunks[0].0 = Duration::from_secs(3);
+    let (refresh_arrived, refresh_release) = h.token_fake.state.pause_next_response();
     h.token_fake.state.push(refresh_response);
     let refresh_request = session_request(&h, "synthetic-refresh-owner");
     let refreshing = tokio::spawn(async move { connect_async(refresh_request).await });
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while h.token_fake.state.requests().is_empty() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("detached synthetic refresh started");
+    tokio::time::timeout(Duration::from_secs(2), refresh_arrived)
+        .await
+        .expect("detached synthetic refresh started")
+        .unwrap();
     h.pins.clear();
     let (collected, resume) = h.state.pause_next_ws_selection();
     let request = h.request();
@@ -1149,6 +1158,7 @@ async fn r12_9_capped_upgrade_cancels_while_drain_waits_for_detached_refresh() {
         !drain.is_finished(),
         "response does not wait for binding freeze"
     );
+    refresh_release.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(5), drain)
         .await
         .unwrap()
@@ -2218,7 +2228,12 @@ async fn c6_row_13a_owned_transient_refresh_cools_without_auth_failure_then_reco
 
 #[tokio::test]
 async fn c6_row_13a_unknown_model_403_multiple_reconnects_exclude_every_previous_account() {
-    let h = Harness::new(4).await;
+    // Isolate three permission-exclusion moves; Ready health supplies no R14
+    // fresh-unusable exception. Default budgets remain covered independently.
+    let h = Harness::new_configured(4, false, false, None, None, None, |config| {
+        config.routing.move_guard.session_ten_minutes = 3;
+    })
+    .await;
     let raw = r#"{"type":"error","status":403,"error":{"type":"permission_error"}}"#;
     // json! sorts input before type, which puts type outside the bounded
     // peek for a large message. Match Codex's type-first wire shape instead.
