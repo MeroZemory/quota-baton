@@ -182,12 +182,13 @@ impl Track {
             if sample.at <= start {
                 baseline = Some(sample.value);
             }
-            if let Some(prev) = previous {
-                if prev.at < start && sample.at > start {
-                    let fraction =
-                        seconds_between(prev.at, start)? / seconds_between(prev.at, sample.at)?;
-                    baseline = Some(prev.value + (sample.value - prev.value) * fraction);
-                }
+            if let Some(prev) = previous
+                && prev.at < start
+                && sample.at > start
+            {
+                let fraction =
+                    seconds_between(prev.at, start)? / seconds_between(prev.at, sample.at)?;
+                baseline = Some(prev.value + (sample.value - prev.value) * fraction);
             }
             previous = Some(sample);
         }
