@@ -868,3 +868,16 @@ The cost is that the session pauses until the reset.
 **Why not a general AST "logic = code" checker.** It cannot decide whether a move was needed. Layers 1 and 4 cover what a checker can cover: structure, and behaviour compared with a known-good build. Layer 2 bounds the damage of whatever slips through.
 
 **Order.** R14 (this guard) runs right after R13 C+E, before R13 Part F, because it protects money. D27's contract work becomes R15.
+
+**D29 amendment (design owner, 2026-10-22, R14 runtime gate review).**
+1. **The global budget counts incidents, not sessions.**
+   - Problem: one account becoming unusable can force many moves at once (12 sessions sat on acct-d at 12:25). Counting each session, the seventh legitimate move trips the breaker.
+   - Within the 300 s request deadline the remaining sessions then wait and fail, recreating the mass stoppage this project fixed on 10-21. The 6.2-day inventory already shows 9 moves in 10 minutes.
+   - Rule: moves that share one source account and one piece of evidence (the same unusable observation) count as **one** global incident. Per-session limits and the 30-minute return guard still apply to each session.
+   - A flapping or buggy health signal still trips the breaker after six distinct incidents.
+2. **Waiting requests wake at trip expiry,** not only on recovery, clear or drain.
+3. **The trip lasts less than the request deadline,** with a margin (default 240 s against 300 s). A request blocked by a trip therefore re-evaluates before it fails.
+4. **Replay input.** The opt-in, body-free metadata recorder proposed at the gate (`.sandbox/r14-prep/replay-capture-inputs.md`) is accepted.
+   - It records pseudonymous owner metadata, the initial-state reconciliation and loss manifests, keeps a bounded 7-day rolling window and has an off switch.
+   - The design session reviews its schema, enables it on the real install and supplies the sanitized 24 h export.
+   - The real-24 h replay gate of delivery 2 waits for that export; nothing synthetic substitutes for it.
