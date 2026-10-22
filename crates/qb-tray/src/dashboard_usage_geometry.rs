@@ -268,29 +268,26 @@ fn usage_tile(
     }
     plot.top += caption_rights.len().saturating_sub(1) as f32 * 20.;
     if !overflow.is_empty() {
-        // One bounded overflow row; all dashed markers remain in the plot.
+        // One bounded overflow row; in-domain markers remain in the plot.
         plot.top += 20.;
         let note = format!("초기화 {}개 더", overflow.len());
+        let detail = format!("{note}: {}", overflow.join(" · "));
         let bounds = rect(plot.left, r.top + 104., width(plot), 16.);
         b.text(bounds, note.clone(), 11., false, Color::Secondary, false);
+        b.tooltip(bounds, detail.clone());
         b.semantic(
             format!("usage:{}:reset-overflow", t.id),
             None,
             Role::Text,
-            format!("{note}: {}", overflow.join(" · ")),
+            detail,
             bounds,
             None,
         );
     }
     for (label, left, w, lane) in captions {
-        b.text(
-            rect(left, r.top + 64. + lane as f32 * 20., w, 16.),
-            label,
-            11.,
-            false,
-            Color::Secondary,
-            false,
-        );
+        let bounds = rect(left, r.top + 64. + lane as f32 * 20., w, 16.);
+        b.tooltip(bounds, label.clone());
+        b.text(bounds, label, 11., false, Color::Secondary, false);
     }
     let x = |at: DateTime<Utc>| {
         plot.left
@@ -333,12 +330,27 @@ fn usage_tile(
     let mut tick_labels = Vec::new();
     for at in ticks {
         let xx = x(at);
-        b.line([xx, plot.bottom], [xx, plot.bottom + 4.], Color::Border, 1., None);
+        b.line(
+            [xx, plot.bottom],
+            [xx, plot.bottom + 4.],
+            Color::Border,
+            1.,
+            None,
+        );
         let local = at.with_timezone(v.clock.now.offset());
-        let label = local.format(if local.hour() == 0 { "%m/%d 00:00" } else { "%H:%M" }).to_string();
+        let label = local
+            .format(if local.hour() == 0 {
+                "%m/%d 00:00"
+            } else {
+                "%H:%M"
+            })
+            .to_string();
         let w = (b.measured_width(&label, 11., false) + 4.).min(width(plot));
         let left = (xx - w / 2.).clamp(plot.left, plot.right - w);
-        if tick_labels.iter().any(|&(l, r)| left < r + 4. && left + w + 4. > l) {
+        if tick_labels
+            .iter()
+            .any(|&(l, r)| left < r + 4. && left + w + 4. > l)
+        {
             continue;
         }
         tick_labels.push((left, left + w));
@@ -424,7 +436,11 @@ fn usage_tile(
                     Some([1., 3.]),
                 );
             }
-            for reset in series.future_resets.iter().filter(|at| **at >= from && **at <= to) {
+            for reset in series
+                .future_resets
+                .iter()
+                .filter(|at| **at >= from && **at <= to)
+            {
                 b.line(
                     [x(*reset), plot.top],
                     [x(*reset), plot.bottom],
@@ -494,7 +510,12 @@ fn usage_tile(
             let w = b.measured_width(&text, 11., false) + 4.;
             backed_text(
                 b,
-                rect((nowx + 8.).min(plot.right - w).max(plot.left), plot.top + 2., w, 16.),
+                rect(
+                    (nowx + 8.).min(plot.right - w).max(plot.left),
+                    plot.top + 2.,
+                    w,
+                    16.,
+                ),
                 &text,
                 false,
                 Color::Bad,
@@ -663,7 +684,13 @@ fn usage_ticks(clock: &m::Clock) -> Vec<DateTime<Utc>> {
     use chrono::{Duration, Timelike};
     let (from, to) = m::usage_domain(clock);
     let local = from.with_timezone(clock.now.offset());
-    let floor = local.with_minute(0).unwrap().with_second(0).unwrap().with_nanosecond(0).unwrap();
+    let floor = local
+        .with_minute(0)
+        .unwrap()
+        .with_second(0)
+        .unwrap()
+        .with_nanosecond(0)
+        .unwrap();
     let mut at = floor.with_timezone(&Utc);
     if at < from {
         at += Duration::hours(1);

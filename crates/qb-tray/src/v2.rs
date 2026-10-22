@@ -345,6 +345,7 @@ pub struct MenuInfo {
     pub model_cooling_line: Option<String>,
     pub credits_line: Option<String>,
     pub sessions_line: String,
+    pub sessions_tooltip: Option<String>,
     pub show_refresh_usage: bool,
     pub show_relogin: bool,
     pub show_refresh_token: bool,
@@ -1254,14 +1255,15 @@ fn menu_info(
         .as_deref()
         .and_then(timestamp)
         .map(|t| t.with_timezone(&Local).format("%H:%M").to_string());
+    let crowded_threshold = a
+        .extra
+        .get("spread_threshold")
+        .and_then(Value::as_u64)
+        .filter(|&t| t > 0 && a.active_sessions >= t);
     let sessions_line = format!(
         "활성 {}{} · 연결된 대화 {}개 · {}",
         a.active_sessions,
-        if a.extra
-            .get("spread_threshold")
-            .and_then(Value::as_u64)
-            .is_some_and(|t| t > 0 && a.active_sessions >= t)
-        {
+        if crowded_threshold.is_some() {
             " · 몰림"
         } else {
             ""
@@ -1306,6 +1308,7 @@ fn menu_info(
         model_cooling_line,
         credits_line: menu_credits.map(|c| format!("크레딧 {}", c.exact_amount)),
         sessions_line,
+        sessions_tooltip: crowded_threshold.map(|t| format!("분산 기준 {t}개에 도달해 새 세션은 다른 계정을 우선합니다. 제한이 아니며 세션은 계속 받습니다.")),
         show_refresh_usage: a.user_state != "disabled" && a.health.kind != "needs_relogin",
         show_relogin: a.source.owned_or_adopted(),
         show_release_hold: quota(a)
@@ -2107,6 +2110,22 @@ mod tests {
             timestamp("2026-10-19T00:00:00Z")
         );
         assert!(summary(&v).tooltip.contains("새 요청은 오류로 끝납니다"));
+    }
+    #[test]
+    fn r13_menu_shows_plain_active_count_and_explains_crowding() {
+        for threshold in [5, 21, u64::MAX] {
+            for count in [0, 1, threshold - 1, threshold] {
+                let mut a = base("active-count");
+                a["active_sessions"] = json!(count);
+                a["spread_threshold"] = json!(threshold);
+                let v = view(vec![a], 1);
+                let m = &codex(&v).rows[0].menu;
+                assert!(m.sessions_line.starts_with(&format!("활성 {count}")));
+                assert!(!m.sessions_line.contains('/'));
+                assert_eq!(m.sessions_line.contains("몰림"), count >= threshold);
+                assert_eq!(m.sessions_tooltip, (count >= threshold).then(|| format!("분산 기준 {threshold}개에 도달해 새 세션은 다른 계정을 우선합니다. 제한이 아니며 세션은 계속 받습니다.")));
+            }
+        }
     }
     #[test]
     fn menu_sources_attention_expiry_and_observed_timestamp() {

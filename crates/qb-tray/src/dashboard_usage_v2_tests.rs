@@ -192,7 +192,8 @@ fn r10_usage_end_labels_separate_symmetrically_clamp_and_have_backings() {
                         .utc()
                         .signed_duration_since(m::usage_domain(&v.clock).0)
                         .num_milliseconds() as f32
-                    / m::usage_domain(&v.clock).1
+                    / m::usage_domain(&v.clock)
+                        .1
                         .signed_duration_since(m::usage_domain(&v.clock).0)
                         .num_milliseconds() as f32;
             assert!((ar.left - now_x - 6.).abs() < 0.01);
@@ -357,7 +358,8 @@ fn r10_usage_relogin_stops_at_observation_and_hatches_only_the_unknown_span() {
             + width(plot)
                 * at.signed_duration_since(m::usage_domain(&v.clock).0)
                     .num_milliseconds() as f32
-                / m::usage_domain(&v.clock).1
+                / m::usage_domain(&v.clock)
+                    .1
                     .signed_duration_since(m::usage_domain(&v.clock).0)
                     .num_milliseconds() as f32
     };
@@ -613,7 +615,8 @@ fn r101_crowded_resets_bound_captions_keep_markers_and_expose_overflow() {
                 let fraction = (at
                     .signed_duration_since(m::usage_domain(&v.clock).0)
                     .num_milliseconds() as f64
-                    / m::usage_domain(&v.clock).1
+                    / m::usage_domain(&v.clock)
+                        .1
                         .signed_duration_since(m::usage_domain(&v.clock).0)
                         .num_milliseconds() as f64)
                     .clamp(0., 1.);
@@ -654,7 +657,8 @@ fn r101_each_reset_caption_tracks_its_own_dashed_marker() {
                 let fraction = at
                     .signed_duration_since(m::usage_domain(&v.clock).0)
                     .num_milliseconds() as f32
-                    / m::usage_domain(&v.clock).1
+                    / m::usage_domain(&v.clock)
+                        .1
                         .signed_duration_since(m::usage_domain(&v.clock).0)
                         .num_milliseconds() as f32;
                 let marker = plot.left + width(plot) * fraction;
@@ -694,20 +698,40 @@ fn r13_usage_future_midnight_ticks_and_reset_edges_share_the_rolling_domain() {
         // Crowded edge captions may move to the bounded overflow semantics,
         // but their actual reset time must remain available.
         let edge_time = v.clock.time(Some(to + Duration::days(6)));
-        assert!(s.draw.iter().any(|d| matches!(d, Draw::Text { measure, .. }
+        assert!(
+            s.draw.iter().any(|d| matches!(d, Draw::Text { measure, .. }
             if measure.text.contains("범위 밖") && measure.text.contains(&edge_time)))
-            || s.accessibility.iter().any(|n| n.name.contains("범위 밖") && n.name.contains(&edge_time)));
-        let markers: Vec<_> = s.draw.iter().filter_map(|d| match d {
-            Draw::Line { from, to, dash: Some([1., 3.]), .. }
-                if from[1] == plot.top && to[1] == plot.bottom => Some(from[0]),
-            _ => None,
-        }).collect();
-        assert_eq!(markers.len(), 3, "outside reset must not create a false edge marker");
+                || s.accessibility
+                    .iter()
+                    .any(|n| n.name.contains("범위 밖") && n.name.contains(&edge_time))
+        );
+        let markers: Vec<_> = s
+            .draw
+            .iter()
+            .filter_map(|d| match d {
+                Draw::Line {
+                    from,
+                    to,
+                    dash: Some([1., 3.]),
+                    ..
+                } if from[1] == plot.top && to[1] == plot.bottom => Some(from[0]),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            markers.len(),
+            3,
+            "outside reset must not create a false edge marker"
+        );
         assert_eq!(markers[0], plot.left);
-        let expected = plot.left + width(plot) * (reset - from).num_seconds() as f32 / (24. * 3600.);
+        let expected =
+            plot.left + width(plot) * (reset - from).num_seconds() as f32 / (24. * 3600.);
         assert!((markers[1] - expected).abs() < 0.01);
         assert_eq!(markers[2], plot.right);
-        assert!(series_lines(&s).is_empty(), "empty history must not invent a line");
+        assert!(
+            series_lines(&s).is_empty(),
+            "empty history must not invent a line"
+        );
         text(&s, "64% 남음");
         let (_, empty, _) = text(&s, "아직 관측한 값이 없습니다");
         assert!(empty.left >= plot.left && empty.right <= plot.right);
@@ -725,17 +749,86 @@ fn r13_usage_previous_day_uia_pointer_and_gaps_use_the_same_domain() {
     t.series[0].points = vec![(from, Some(90.)), (gap, None), (observed, Some(64.))];
     let s = scene(&v, &t);
     let chart = &s.charts[0];
-    let x = |at: DateTime<Utc>| chart.rect.left + width(chart.rect)
-        * (at - from).num_seconds() as f32 / (to - from).num_seconds() as f32;
+    let x = |at: DateTime<Utc>| {
+        chart.rect.left
+            + width(chart.rect) * (at - from).num_seconds() as f32
+                / (to - from).num_seconds() as f32
+    };
     assert!(series_lines(&s).is_empty());
-    assert_eq!(s.hit_test(x(observed), chart.rect.top + 1.), Some(&Target::Chart(t.id.clone())));
-    assert!(s.chart_tooltip(&t.id, x(observed + Duration::seconds(1))).unwrap().text.contains("64%"));
-    assert!(s.chart_tooltip(&t.id, x(gap + Duration::seconds(1))).unwrap().text.contains(&m::unknown()));
-    assert!(s.chart_tooltip(&t.id, x(v.clock.utc() + Duration::minutes(1))).is_none());
-    assert!(s.accessibility.iter().any(|n| n.role == Role::Row && n.name.contains("10/19 23:50:00") && n.name.contains("64%")));
+    assert_eq!(
+        s.hit_test(x(observed), chart.rect.top + 1.),
+        Some(&Target::Chart(t.id.clone()))
+    );
+    assert!(
+        s.chart_tooltip(&t.id, x(observed + Duration::seconds(1)))
+            .unwrap()
+            .text
+            .contains("64%")
+    );
+    assert!(
+        s.chart_tooltip(&t.id, x(gap + Duration::seconds(1)))
+            .unwrap()
+            .text
+            .contains(&m::unknown())
+    );
+    assert!(
+        s.chart_tooltip(&t.id, x(v.clock.utc() + Duration::minutes(1)))
+            .is_none()
+    );
+    assert!(s.accessibility.iter().any(|n| n.role == Role::Row
+        && n.name.contains("10/19 23:50:00")
+        && n.name.contains("64%")));
     let table = history::project(&t, 512);
     assert_eq!(table.rows.len(), 3);
     assert_eq!(table.rows[0].at, from);
     assert_eq!(table.rows[1].values, vec![None]);
     assert_eq!(chart.series[0].points, t.series[0].points);
+}
+
+#[test]
+fn r13_usage_outside_resets_keep_bounded_labels_and_pointer_details() {
+    let (v, mut t) = fixture();
+    let (_, to) = m::usage_domain(&v.clock);
+    t.series.truncate(1);
+    t.series[0].points.clear();
+    t.series[0].resets.clear();
+    t.series[0].future_resets = (1..=40).map(|days| to + Duration::days(days)).collect();
+    for tile_width in [406., 476.] {
+        let s = scene_at_width(&v, &t, tile_width);
+        let chart = &s.charts[0];
+        assert_eq!(chart.series[0].future_resets.len(), 40);
+        assert!(height(chart.rect) >= 90.);
+        assert!(!s.draw.iter().any(|d| matches!(
+            d,
+            Draw::Line {
+                dash: Some([1., 3.]),
+                ..
+            }
+        )));
+        let overflow = s
+            .accessibility
+            .iter()
+            .find(|n| n.key.ends_with(":reset-overflow"))
+            .unwrap();
+        let tip = s
+            .tooltip_at(overflow.rect.left + 1., overflow.rect.top + 1.)
+            .unwrap();
+        assert_eq!(tip, overflow.name);
+        assert!(tip.contains(&v.clock.time(t.series[0].future_resets.last().copied())));
+        let captions: Vec<_> = s
+            .draw
+            .iter()
+            .filter_map(|d| match d {
+                Draw::Text { rect, measure, .. } if measure.text.starts_with("범위 밖") => {
+                    Some(*rect)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(captions.len(), 2);
+        assert!(intersection(captions[0], captions[1]).is_none());
+        assert!(captions.iter().all(|r| r.left >= chart.rect.left
+            && r.right <= chart.rect.right
+            && r.bottom <= chart.rect.top - 22.));
+    }
 }
