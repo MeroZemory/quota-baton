@@ -758,3 +758,43 @@ The cost is that the session pauses until the reset.
 6. **Visibility.** The dashboard shows waiting sessions with "초기화 HH:MM까지 대기" and a one-click "지금 옮기기" that marks the session urgent.
 
 **D24 amendment 3 (design owner, 2026-10-22; question collected by the main at the Part A gate).** The 7d-only rule generalizes by window length. A window **longer than one day** (7d, Free 30d and any other) projects with the window average and shows the recent-rate projection beside it. Windows of one day or less project with the recent rate (fallback: average). The reason is D24's: extrapolating 30 minutes of work over days ignores nights and idle days. Durations of 24 h or more read "n일 m시간" instead of "60시간 0분".
+
+## D27. Make the server-to-client contract a compiled type, and accept UI only through the real path — Accepted (design owner, 2026-10-22; prompted by a user question)
+
+**User question.** "프로그램의 로직버그로인한 실수를 막기위한 하드게이트가 필요할까요 아니면 그런 로직버그를 ast 등으로 논리적으로 검사하는 … 검사기를 두는방법은 없을까요?"
+
+**The incident (R13.A1).**
+- The server computed `usage_forecast`, and the CLI printed it. The tray's hand-copied admin DTO (`qb-tray/src/client.rs`) had no such field, so serde dropped it silently, and the installed dashboard showed nothing.
+- The gate passed because its UI captures fed the view model through FakeBridge, which bypasses the HTTP client.
+
+**Facts.**
+- Admin responses are built with untyped `json!` literals (about 65 in qb-core). The tray re-declares them by hand with 56 `#[serde(default)]` fields, and the CLI reads raw `Value`s.
+- A field added on one side and missing on the other is therefore invisible to the compiler, and `serde(default)` turns the gap into silent data loss.
+- `qb-proto`, the crate meant for shared wire types, holds four small types and is not used for the admin state.
+
+**What a checker can and cannot do.**
+- No AST checker can prove in general that code matches intent.
+- What works is making whole bug classes impossible by construction, then checking the remaining rules as executable invariants:
+  - **Types** for contracts between processes.
+  - **Real-path acceptance** for anything a user sees.
+  - **Property tests** for rules such as routing.
+
+**Decision.**
+1. **One compiled contract.**
+   - The admin state and accounts responses become `qb-proto` structs.
+   - The server serializes those structs instead of `json!` literals, and the tray and CLI deserialize the same structs.
+   - The hand-copied tray DTO is removed.
+   - A field added to the contract then fails to compile wherever it is not handled.
+2. **Contract test.** For every admin route, take a real server body through the client type and serialize it back, then assert that no key was dropped. In tests the client types use `deny_unknown_fields`.
+3. **Static guard (a small AST/grep check run in the gate).** It refuses:
+   - new `json!` response construction in admin handlers;
+   - new `#[serde(default)]` on contract fields unless the field is listed as optional in the contract.
+4. **Hard gate rule for UI.** A user-visible change is accepted only with at least one capture through the real path: spawned core, real AdminClient, real tray process. FakeBridge captures remain useful but do not count alone. This goes into the gate check in `docs/milestones.md`.
+5. **Post-install smoke (design session).** After each install, open the live dashboard and compare one value per new feature with `quota-baton accounts list`. A mismatch rolls back.
+6. **Routing invariants as property tests.** Examples:
+   - a forced move never targets an account whose projected window is past the gate;
+   - one capacity rejection does not move a session twice in a minute.
+
+   Prompted by the 12:01 ping-pong, where WebSocket capacity pushed sessions onto sample-acct, which hit its weekly limit a minute later.
+
+**Order.** R14, after R13. Item 4 applies from now on.
