@@ -881,3 +881,19 @@ The cost is that the session pauses until the reset.
    - It records pseudonymous owner metadata, the initial-state reconciliation and loss manifests, keeps a bounded 7-day rolling window and has an off switch.
    - The design session reviews its schema, enables it on the real install and supplies the sanitized 24 h export.
    - The real-24 h replay gate of delivery 2 waits for that export; nothing synthetic substitutes for it.
+
+**D24 amendment 4 and D28 schedule (user, 2026-10-23): forecasts are too dense, and the provider view is missing.** "예측메시지가 너무 과하고 (밀도높음) 프로바이더별 예측정보는 정작 없거나 안보여서 고쳐야함".
+1. **One line per account, outcome first.**
+   - The card face shows only the window that limits the account, as one of four short states:
+     - "Runs out ~12:05 (weekly)";
+     - "Lasts until reset 07:16";
+     - "Out until Oct 26 21:00";
+     - "Measuring".
+   - Korean: "약 12:05 소진 (주간)", "초기화(07:16)까지 충분", "10/26 21:00까지 소진", "측정 중".
+   - Rates (%/h), the basis (recent rate or window average), the second window, the "지금 속도면" projection and the "changing" flag move to the hover tooltip and to `quota-baton accounts list --detail`. The default CLI list uses the same one line.
+   - Emphasis (warning colour plus text) appears only when the account runs out before its reset within the next 5 hours.
+2. **Provider summary, visible.** D28 part 1 (the lines that need no calibration) ships now, ahead of R13 C+E. Each provider gets one line in the dashboard top bar and the tray flyout header:
+   - "Codex · 2 of 4 usable · next runs out ~12:05 (max) · earliest recovery 04:13";
+   - Korean: "Codex · 4개 중 2개 사용 가능 · 다음 소진 약 12:05 (max) · 가장 빠른 회복 04:13".
+   
+   When credits keep an account serving, it adds "credits continue on max". The pooled runway (D28 part 2) still waits for its backtest.
