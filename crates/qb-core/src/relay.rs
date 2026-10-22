@@ -632,7 +632,7 @@ impl RelayState {
     ) -> Result<Vec<crate::bindings::Candidate>, ()> {
         self.candidates_with_evidence(provider, key, model, tried)
             .await
-            .map(|(candidates, _)| candidates)
+            .map(|(candidates, _, _)| candidates)
     }
 
     async fn candidates_with_evidence(
@@ -645,9 +645,11 @@ impl RelayState {
         (
             Vec<crate::bindings::Candidate>,
             Vec<crate::bindings::Candidate>,
+            crate::bindings::MoveObservation,
         ),
         (),
     > {
+        let observed = crate::bindings::MoveObservation::before_collection();
         let store = self.store.clone();
         let mut tried = tried.clone();
         if let Some(key) = key
@@ -732,7 +734,7 @@ impl RelayState {
                 // source evidence even when this account cannot be selected.
                 evidence.push(candidate);
             }
-            Ok((candidates, evidence))
+            Ok((candidates, evidence, observed))
         })
         .await
         .map_err(|_| ())?
@@ -963,19 +965,23 @@ impl RelayState {
                 &self.bindings.policies.changed,
                 self.accounts.subscribe(),
             );
-            let (candidates, mut move_evidence) = self
+            let (candidates, mut move_evidence, target_observed) = self
                 .candidates_with_evidence(provider, session.key.as_deref(), model, &excluded)
                 .await?;
+            // Retain this conservative target bound through any launch refresh;
+            // a later source read cannot make an older destination snapshot fresh.
+            let mut source_observed = target_observed;
             let (candidates, coverage) = if let Some(launch) = launch {
                 let selected = self
                     .launch_candidates(launch, candidates, &excluded, deadline)
                     .await?;
                 // Catalog I/O can outlive a recovery or rejection of an excluded
                 // source. Refresh evidence without changing launch eligibility.
-                move_evidence = self
+                let (_, refreshed_evidence, observed) = self
                     .candidates_with_evidence(provider, session.key.as_deref(), model, &excluded)
-                    .await?
-                    .1;
+                    .await?;
+                move_evidence = refreshed_evidence;
+                source_observed = observed;
                 selected
             } else {
                 (candidates, None)
@@ -1010,6 +1016,10 @@ impl RelayState {
                         owned_model.as_deref(),
                         &choices,
                         &evidence,
+                        crate::bindings::MoveObservations {
+                            source: source_observed,
+                            target: target_observed,
+                        },
                         pinned.as_deref(),
                         bytes,
                         hold_allowed,
