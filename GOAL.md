@@ -62,18 +62,21 @@ The current plan, with lanes, owners and start commands, is the "Plan" section o
 | R9.1 | merged (fd7a8dc), but the live install was ROLLED BACK: every codex-qb launch failed on the real profile → R9.2 |
 | R9.2 | merged and INSTALLED (6caf65a); live move and return work, but are slow → R9.3 |
 | R9.3 | merged and INSTALLED (5ce0afe). Live on the real profile: codex-qb resume preview 21 s and commit 8 s (before: 382 s and about 9 min); return prompt 6 s and commit 7 s; the map is written as C:/Users/... |
+| R9.4 | 완료: 정규 .jsonl DB 경로의 압축 형제 탐색·하드링크 이동·재개·doctor 복구. 집중 관문 통과, self-merge 후 설계 세션 설치. 보고서 `.sandbox/reports/R9.4.md` |
 | R10 | merged and INSTALLED (a35be74); live acceptance 13 pass / 3 partial, no must-fix |
 | R10.1 | merged and INSTALLED (dev 14938b4, 10-21) |
 | R12 | merged and INSTALLED (dev 63805ac, 10-21 22:47): `codex-qb --images` and `--images exec` generate images live; image sessions notified |
 | R12.1 | merged and INSTALLED (c6a304e, 10-21 23:14): image canary stage diagnostics and retry, user `-c` passthrough |
 | R12.9 | merged and INSTALLED (c899b6a, 10-22 01:02): outage follow-ups (credit hold fix kept, WS capacity spreading, release-hold, Q-owned CPA resume) |
 | R12.10 | merged (성능 조건·qb-tray scoped 관문 통과; `.sandbox/reports/R12.10.md`); 설치는 설계 세션 |
-| R13 | 진행 중: B+B2+D·A·A1 merged 및 설치 수용. C+E 긴급 등록 단위 f39e504·926793f 커밋, 전체 wait/move 실행 통합은 미출시. 다음: R16.1 완료 → C+E → R14.2·Part F; R12.11 제안은 우선순위에 따라 보존; brief `R13-burn-icon-hold.md` |
+| R13 | 진행 중: B+B2+D·A·A1 merged 및 설치 수용. C+E 긴급 등록 단위 f39e504·926793f 커밋, 전체 wait/move 실행 통합은 미출시. 다음: R9.4·R16.2·R16.3 → C+E → R14.2·Part F; R12.11 제안은 우선순위에 따라 보존; brief `R13-burn-icon-hold.md` |
 | R14 | 진행 중: 1차 실행 보호 관문 완료·설치 보류. R14.1 사건 단위 예산·240초 만료만 우선 전달하며 수집기는 설치 조건에서 분리. 2차 근거형 rebind·정적 검사·실제24시간 재생은 별도 미완료 |
 | R14.1 | 설치 수용: dev249a14c (01:12 KST). guard21·R1419·HTTP12·WS123, strict lint 통과. takeover 연결 거절0/1,717·일반/이미지 exec·실제 dashboard 지표 확인 |
 | R12.11 | 보류: 영문 UI 우선. version probe 15초·1회 재시도·24시간 pass cache fallback 제안 보존, 실행 관문 미수행 |
 | R16 | 완료: 코드19b8d22, 영문 UI·snapshot·PNG·Claude 프로젝트명. 집중438통과·strict lint·실제 core/AdminClient/tray 3HWND·최종 CLI20 PNG 통과. 설치 수용 dev006449a·02:26 KST·takeover 거절0/1,811. brief `R16-readme-assets.md` |
 | R16.1 | 완료3737fe2·집중405·strict lint·D27 3HWND·KO PNG4개 동일: 영어 탭·표 제목·사용량 요약 폭 보완. 한국어 출력 보존, 1024×640·1320×900 scale2 실제 renderer 회귀·D27 경로 통과, self-merge 후 설계 세션 설치 |
+| R16.2 | 진행 중: 계정 한 줄 예측·제공자 요약 WIP029b380 보존. R9.4 우선 복구 후 실행·실제 경로 관문 재개 |
+| R16.3 | 대기: R16.2와 별도 병합. Usage 제공자별 주간/30일 계정분 잔여·권장선·음영·전후 판단(D28), 이후 C+E |
 | R14.2 | 대기: R16·R13 C+E 다음 기본 꺼짐 수집기(schema/off/7일 bounded retention). 기존 구현은 impl/r14.2 db6baac에 보존; 실제24시간 replay보다 먼저 전달 |
 | R15 | 대기: R13 Part F 후 공유 admin 응답형·계약 왕복·라우팅 속성 검사(D27). brief `R15-contract.md` |
 | R11.1 | merged: 공유 AGENTS/hook 편집 보존·rh 별칭, 회귀5·cutover141·strict lint·실제 preview/launch 점검 통과. 설치·apply는 설계 세션. 보고서 `.sandbox/reports/R11.1.md` |

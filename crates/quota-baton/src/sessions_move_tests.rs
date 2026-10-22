@@ -2743,3 +2743,217 @@ fn r91_authorized_readonly_inventory() -> Result<()> {
     )?;
     Ok(())
 }
+
+// R9.4: native SQLite retains the logical .jsonl path after compression.
+// All homes, metadata and compressed bytes below are synthetic fixture data.
+fn r94_compress_keep_canonical_row(f: &Fixture) -> Result<(PathBuf, Vec<u8>)> {
+    let compressed = f.original.with_extension("jsonl.zst");
+    let bytes = zstd::stream::encode_all(fs::read(&f.original)?.as_slice(), 1)?;
+    fs::write(&compressed, &bytes)?;
+    fs::remove_file(&f.original)?;
+    age(&compressed)?;
+    assert_eq!(db::thread_path(&f.source, ROOT)?, Some(f.original.clone()));
+    assert!(!f.original.exists());
+    Ok((compressed, bytes))
+}
+
+fn r94_assert_resume_and_doctor(f: &Fixture) -> Result<()> {
+    // Exercise the launcher's actual argument plan, then its local ownership /
+    // decoded writer-probe path. Never launch Codex or consult environment homes.
+    fs::write(
+        f.store.target.join("config.toml"),
+        "model='synthetic-model'\n",
+    )?;
+    let args = vec![std::ffi::OsString::from("resume"), ROOT.into()];
+    let plan = crate::launch_client::parse(&args, &f.store.target)?;
+    assert_eq!(plan.resume_id.as_deref(), Some(ROOT));
+    assert_eq!(plan.native_args, args);
+    assert!(super::super::resume_in_target(&f.store, ROOT, None)?);
+    let before = tree(f.root.path(), true)?;
+    let diagnostics = super::super::doctor_impl::check(&f.store)?;
+    assert!(
+        !diagnostics.iter().any(|d| d.code == "대화_경로_불일치"),
+        "canonical compressed row must not be reported as a path mismatch: {diagnostics:?}"
+    );
+    assert_eq!(
+        tree(f.root.path(), true)?,
+        before,
+        "doctor must stay read-only"
+    );
+    Ok(())
+}
+
+#[test]
+fn r94_canonical_jsonl_row_compressed_only_move_keeps_inode_and_canonical_q_row() -> Result<()> {
+    // Also preserve legacy direct-.zst input compatibility; both write canonical
+    // Q metadata while retaining the actual compressed file without decoding it.
+    for legacy_direct_zst in [false, true] {
+        let f = Fixture::new()?;
+        let (compressed, bytes) = r94_compress_keep_canonical_row(&f)?;
+        if legacy_direct_zst {
+            Connection::open(f.source.join("state_5.sqlite"))?.execute(
+                "UPDATE threads SET rollout_path=?1 WHERE id=?2",
+                params![
+                    compressed.to_str().context("synthetic compressed path")?,
+                    ROOT
+                ],
+            )?;
+        }
+        let identity = guard::identity(&compressed)?;
+        command_import(&f.store, &f.source, false)?;
+        let canonical = db::thread_path(&f.store.target, ROOT)?.context("Q row")?;
+        assert_eq!(
+            canonical.extension().and_then(|s| s.to_str()),
+            Some("jsonl")
+        );
+        assert!(
+            !canonical.exists(),
+            "do not fabricate a decompressed rollout"
+        );
+        let physical = discovery::resolve_rollout_path(&f.store.target, &canonical)?;
+        assert_eq!(
+            physical,
+            fs::canonicalize(canonical.with_extension("jsonl.zst"))?
+        );
+        assert_eq!(fs::read(&physical)?, bytes);
+        assert_eq!(
+            guard::identity(&physical)?,
+            identity,
+            "move must retain the hardlinked inode"
+        );
+        assert_eq!(guard::hardlink_count(&physical)?, 1);
+        assert!(!compressed.exists());
+        assert!(db::thread_path(&f.source, ROOT)?.is_none());
+        r94_assert_resume_and_doctor(&f)?;
+        return_current(&f.store, ROOT, None, true, true)?;
+        let returned = db::thread_path(&f.source, ROOT)?.context("returned canonical row")?;
+        assert_eq!(returned.extension().and_then(|s| s.to_str()), Some("jsonl"));
+        assert!(!returned.exists());
+        let restored = discovery::resolve_rollout_path(&f.source, &returned)?;
+        assert_eq!(guard::identity(&restored)?, identity);
+        assert_eq!(fs::read(&restored)?, bytes);
+        assert_eq!(guard::hardlink_count(&restored)?, 1);
+        assert!(db::thread_path(&f.store.target, ROOT)?.is_none());
+    }
+    Ok(())
+}
+
+#[test]
+fn r94_canonical_jsonl_row_compressed_only_share_resumes_and_unimports() -> Result<()> {
+    let f = Fixture::new()?;
+    let (compressed, bytes) = r94_compress_keep_canonical_row(&f)?;
+    let identity = guard::identity(&compressed)?;
+    command_import(&f.store, &f.source, true)?;
+    let canonical = db::thread_path(&f.store.target, ROOT)?.context("shared Q row")?;
+    assert_eq!(
+        canonical.extension().and_then(|s| s.to_str()),
+        Some("jsonl")
+    );
+    assert!(!canonical.exists());
+    let physical = discovery::resolve_rollout_path(&f.store.target, &canonical)?;
+    assert_eq!(guard::identity(&physical)?, identity);
+    assert_eq!(fs::read(&physical)?, bytes);
+    assert_eq!(guard::hardlink_count(&compressed)?, 2);
+    assert_eq!(db::thread_path(&f.source, ROOT)?, Some(f.original.clone()));
+    r94_assert_resume_and_doctor(&f)?;
+    command_unimport(&f.store)?;
+    assert!(!physical.exists());
+    assert_eq!(fs::read(&compressed)?, bytes);
+    assert_eq!(guard::identity(&compressed)?, identity);
+    assert_eq!(guard::hardlink_count(&compressed)?, 1);
+    Ok(())
+}
+
+#[test]
+fn r94_plain_plus_zst_stays_refused_without_moving_or_sharing() -> Result<()> {
+    for keep_source in [false, true] {
+        let f = Fixture::new()?;
+        let original = fs::read(&f.original)?;
+        let compressed = f.original.with_extension("jsonl.zst");
+        let bytes = zstd::stream::encode_all(original.as_slice(), 1)?;
+        fs::write(&compressed, &bytes)?;
+        age(&compressed)?;
+        assert!(discovery::resolve_rollout_path(&f.source, &f.original).is_err());
+        let error = command_import(&f.store, &f.source, keep_source)
+            .expect_err("two physical names must not be silently selected");
+        assert!(super::super::friendly_error(&error).is_some());
+        assert_eq!(fs::read(&f.original)?, original);
+        assert_eq!(fs::read(&compressed)?, bytes);
+        assert_eq!(db::thread_path(&f.source, ROOT)?, Some(f.original.clone()));
+        assert!(db::thread_path(&f.store.target, ROOT)?.is_none());
+        assert!(!pending(&f.store)?);
+        assert!(!f.store.path().exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn r94_corrupt_canonical_compressed_sibling_has_specific_friendly_korean_error() -> Result<()> {
+    for keep_source in [false, true] {
+        let f = Fixture::new()?;
+        let compressed = f.original.with_extension("jsonl.zst");
+        fs::remove_file(&f.original)?;
+        let bytes = b"SYNTHETIC PRIVATE INVALID ZSTD";
+        fs::write(&compressed, bytes)?;
+        age(&compressed)?;
+        let error = command_import(&f.store, &f.source, keep_source)
+            .expect_err("corrupt compressed metadata must refuse before mutation");
+        let friendly = super::super::friendly_error(&error).context("fixed friendly diagnostic")?;
+        assert_eq!(
+            friendly,
+            "관련된 압축 대화 기록을 읽을 수 없습니다. doctor로 확인하세요"
+        );
+        assert!(!friendly.contains("SYNTHETIC"));
+        assert_eq!(fs::read(&compressed)?, bytes);
+        assert_eq!(db::thread_path(&f.source, ROOT)?, Some(f.original.clone()));
+        assert!(db::thread_path(&f.store.target, ROOT)?.is_none());
+        assert!(!pending(&f.store)?);
+        assert!(!f.store.path().exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn r94_case_varied_database_home_spelling_moves_and_shares_plain_and_compressed() -> Result<()> {
+    for compressed in [false, true] {
+        for keep_source in [false, true] {
+            let f = Fixture::new()?;
+            let physical = if compressed {
+                r94_compress_keep_canonical_row(&f)?.0
+            } else {
+                f.original.clone()
+            };
+            let identity = guard::identity(&physical)?;
+            let stored = f
+                .source
+                .parent()
+                .context("synthetic parent")?
+                .join("SoUrCe")
+                .join(f.original.strip_prefix(&f.source)?);
+            assert_eq!(
+                fs::canonicalize(stored.parent().context("parent")?)?,
+                fs::canonicalize(f.original.parent().context("parent")?)?
+            );
+            Connection::open(f.source.join("state_5.sqlite"))?.execute(
+                "UPDATE threads SET rollout_path=?1 WHERE id=?2",
+                params![stored.to_str().context("synthetic stored path")?, ROOT],
+            )?;
+            command_import(&f.store, &f.source, keep_source)?;
+            let canonical = db::thread_path(&f.store.target, ROOT)?.context("destination row")?;
+            assert_eq!(
+                canonical.extension().and_then(|e| e.to_str()),
+                Some("jsonl")
+            );
+            let target = discovery::resolve_rollout_path(&f.store.target, &canonical)?;
+            assert_eq!(guard::identity(&target)?, identity);
+            assert_eq!(physical.exists(), keep_source);
+            if keep_source {
+                assert_eq!(db::thread_path(&f.source, ROOT)?, Some(stored));
+            } else {
+                assert!(db::thread_path(&f.source, ROOT)?.is_none());
+            }
+            r94_assert_resume_and_doctor(&f)?;
+        }
+    }
+    Ok(())
+}

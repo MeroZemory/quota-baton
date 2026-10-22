@@ -20,6 +20,8 @@ pub(crate) fn friendly_error(error: &anyhow::Error) -> Option<String> {
         ));
     }
     const FIXED: &[&str] = &[
+        discovery::ROLLOUT_PATH_ERROR,
+        "대화 상태와 기록 경로가 다릅니다",
         "전용 Codex 홈 연결이 없습니다. 먼저 wire를 실행하세요",
         "전용 Codex 홈 연결을 먼저 완료하세요",
         "전용 Codex 홈이 없습니다",
@@ -931,7 +933,7 @@ fn verify_links(entry: &Import, growth: bool) -> Result<()> {
         );
         let source = db::thread_path(&entry.source_home, id)?;
         let target = match db::thread_path(&entry.target_home, id)? {
-            Some(path) => path,
+            Some(path) => discovery::resolve_rollout_path(&entry.target_home, &path)?,
             None if id != &entry.root => continue,
             None => bail!("가져온 대화의 메타데이터가 없습니다"),
         };
@@ -946,6 +948,7 @@ fn verify_links(entry: &Import, growth: bool) -> Result<()> {
             "활성 대화 기록이 분기되었습니다. sessions unimport 후 다시 가져오세요"
         );
         if let Some(source) = source {
+            let source = discovery::resolve_rollout_path(&entry.source_home, &source)?;
             ensure!(
                 source.file_name() == target.file_name(),
                 "활성 대화 기록이 분기되었습니다. sessions unimport 후 다시 가져오세요"
