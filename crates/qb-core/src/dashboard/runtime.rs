@@ -16,6 +16,7 @@ struct State {
     model: Dashboard,
     activity: ActivityLog,
     usage: UsageHistory,
+    usage_forecasts: crate::usage_forecast::Forecasts,
     accounts: BTreeMap<AccountId, AccountFacts>,
     credits: BTreeMap<AccountId, bool>,
     incomplete: BTreeSet<SessionId>,
@@ -156,6 +157,7 @@ impl Runtime {
                 model: Dashboard::new(Local::now().offset().fix(), 300),
                 activity: ActivityLog::default(),
                 usage: UsageHistory::default(),
+                usage_forecasts: crate::usage_forecast::Forecasts::default(),
                 accounts: BTreeMap::new(),
                 credits: BTreeMap::new(),
                 incomplete: BTreeSet::new(),
@@ -732,6 +734,62 @@ impl Runtime {
             self.emit("activity", serde_json::json!({"event":event}));
         }
     }
+    /// Display-only input before chart deduplication; never replay persisted quota.
+    pub fn observe_usage_forecast(
+        &self,
+        id: &str,
+        name: &str,
+        used_pct: f64,
+        reset_at: Option<DateTime<Utc>>,
+        observed_at: DateTime<Utc>,
+    ) {
+        if observed_at > Utc::now() || AccountId::try_from(id.to_owned()).is_err() {
+            return;
+        }
+        if let Some(mut state) = self.writable() {
+            state
+                .usage_forecasts
+                .observe(id, name, used_pct, reset_at, observed_at);
+        }
+    }
+    pub fn usage_forecast(
+        &self,
+        id: &str,
+        now: DateTime<Utc>,
+        count_changed_at: Option<DateTime<Utc>>,
+    ) -> crate::usage_forecast::AccountUsageForecast {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .usage_forecasts
+            .view(id, now, count_changed_at)
+    }
+    pub fn observe_forecast_reset(
+        &self,
+        id: &str,
+        name: &str,
+        reset_at: DateTime<Utc>,
+        observed_at: DateTime<Utc>,
+    ) {
+        if observed_at > Utc::now() || AccountId::try_from(id.to_owned()).is_err() {
+            return;
+        }
+        if let Some(mut state) = self.writable() {
+            state
+                .usage_forecasts
+                .observe_reset(id, name, reset_at, observed_at);
+        }
+    }
+    pub fn observe_credit_forecast(&self, id: &str, balance: f64, observed_at: DateTime<Utc>) {
+        if observed_at > Utc::now() || AccountId::try_from(id.to_owned()).is_err() {
+            return;
+        }
+        if let Some(mut state) = self.writable() {
+            state
+                .usage_forecasts
+                .observe_credit(id, balance, observed_at);
+        }
+    }
     pub fn usage(&self, input: UsageObservation) {
         if self.frozen.load(Ordering::Acquire) {
             return;
@@ -905,6 +963,41 @@ pub fn request_outcome(outcome: &str) -> RequestOutcome {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn r13_forecast_runtime_rejects_future_and_restarts_cold() {
+        let runtime = super::Runtime::new();
+        let now = chrono::Utc::now();
+        let start = now - chrono::Duration::minutes(10);
+        for (minutes, used) in [(0, 10.0), (5, 12.0), (10, 14.0)] {
+            runtime.observe_usage_forecast(
+                "cx-123abc",
+                "5h",
+                used,
+                Some(now + chrono::Duration::hours(2)),
+                start + chrono::Duration::minutes(minutes),
+            );
+        }
+        let forecast = runtime.usage_forecast("cx-123abc", now, Some(start));
+        assert_eq!(forecast.windows[0].recent_pct_per_hour, Some(24.0));
+        assert!(forecast.windows[0].changing);
+        runtime.observe_usage_forecast(
+            "cx-123abc",
+            "5h",
+            99.,
+            None,
+            now + chrono::Duration::hours(1),
+        );
+        assert_eq!(
+            runtime.usage_forecast("cx-123abc", now, None).windows[0].used_pct,
+            14.0
+        );
+        assert!(
+            super::Runtime::new()
+                .usage_forecast("cx-123abc", now, None)
+                .windows
+                .is_empty()
+        );
+    }
     use super::*;
     #[test]
     fn r101_activity_carries_c5_window_through_reached_extension_and_reset() {

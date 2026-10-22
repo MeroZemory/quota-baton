@@ -67,3 +67,8 @@ OS/보안/네트워크 계층의 담당 확인과 점검을 감독 세션에서 
 감독 세션은 OS System 로그로 원인을 확인했습니다. 보고된 타임라인: 04:38:53 nProtect Online Security (PFS), INCA nossvc 설치 및 TKFWFV/TKFWVT/TkIdsVt 로드; 04:39:04 TKFsFtM; 04:40:19 Hyper-V VmSwitch의 WSL/Default Switch 재구성; 04:50–04:51 trustlet 시작/종료. 약04:49 bind 중단은 이 구간에 있었으며 QB·포트 고갈 결함이 아닌 일시적 보안 소프트웨어 설치 영향으로 판정됐습니다. 이후 새 이름 exe를 포함한 loopback bind는1–3ms였습니다. 제품 우회 코드는 추가하지 않았습니다.
 
 감독 지시에 따라 멈췄던 HTTP6건을 각각 한 번만 재실행했고 모두 exit0/1 passed였습니다. 이 판정으로 관문을 인정합니다. 원본 aggregate는 interrupted로 보존합니다(라이브러리222통과; 완료된 전체 합계는 주장하지 않음). fmt·strict clippy·정상 제품 build exit0. 근거: `R12.10-evidence/gate-stall/retry-six/completion.json`, `normal-build.json`, `final-fingerprint.json`.
+
+
+## R13 A gate: non-blocking forecast policy
+
+D24 explicitly chooses average-first for 7d and recent-first for5h. Current other explicit window lengths (including30d Free) use recent with average fallback. Independent source review recommends considering average-first for all >1d windows. No current normative violation or gate blocker; keep existing implementation pending a later policy choice.

@@ -21,7 +21,11 @@ pub(super) fn usage(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardStat
         Color::Secondary,
         false,
     );
-    let legend = "━ 5시간 (Free는 30일)  ┄ 주간  ⋮ 초기화  ▧ 크레딧으로 처리";
+    let legend = if v.usage.iter().any(|t| !t.projections.is_empty()) {
+        "━ 5시간 (Free는 30일)  ┄ 주간 / 향후 예측  ⋮ 초기화  ▧ 크레딧으로 처리"
+    } else {
+        "━ 5시간 (Free는 30일)  ┄ 주간  ⋮ 초기화  ▧ 크레딧으로 처리"
+    };
     let legend_width = b.measured_width(legend, 12., false) + 4.;
     let legend_left = card.right - 16. - legend_width;
     let legend_wrap = legend_left < card.left + 144. + summary_width + 16.;
@@ -47,19 +51,37 @@ pub(super) fn usage(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardStat
     );
     let columns = if width(card) < 1140. { 2 } else { 3 };
     let tw = (width(viewport) - (columns - 1) as f32 * 12.) / columns as f32;
-    let rows = v.usage.len().div_ceil(columns);
-    let content = rows as f32 * 300.;
+    let tile_heights: Vec<_> = v
+        .usage
+        .iter()
+        .map(|tile| {
+            288. + tile
+                .forecast_lines
+                .iter()
+                .map(|line| b.measured_height(line, (tw - 24.).max(1.), 12., false) + 4.)
+                .sum::<f32>()
+        })
+        .collect();
+    let row_heights: Vec<_> = tile_heights
+        .chunks(columns)
+        .map(|row| row.iter().copied().fold(288., f32::max) + 12.)
+        .collect();
+    let content = row_heights.iter().sum();
     let (old, offset) = b.begin_region(ScrollRegion::Usage, viewport, content, s.usage_offset);
     let available_nodes = history::SCENE_NODE_BUDGET.saturating_sub(b.scene.accessibility.len());
     // All account charts share this frame's clock. Format each sampled instant
     // once, rather than twice per row in every account's hidden UIA table.
     let mut stamps = BTreeMap::new();
+    let mut row_y = viewport.top - offset;
     for (i, tile) in v.usage.iter().enumerate() {
+        if i > 0 && i % columns == 0 {
+            row_y += row_heights[i / columns - 1];
+        }
         let r = rect(
             viewport.left + (i % columns) as f32 * (tw + 12.),
-            viewport.top + (i / columns) as f32 * 300. - offset,
+            row_y,
             tw,
-            288.,
+            tile_heights[i],
         );
         let table = history::project(
             tile,
@@ -296,6 +318,27 @@ fn usage_tile(
                 * width(plot)
     };
     let y = |pct: f64| plot.bottom - (pct.clamp(0., 100.) as f32 / 100.) * height(plot);
+    if tile_clip.is_some() && !t.unconfirmed {
+        // Projection strokes have their own model data, never observed points.
+        // Their ends are already clipped to the reset/exhaustion/domain edge.
+        for projection in &t.projections {
+            let [(start, remaining), (end, end_remaining)] = projection.points;
+            let color = if projection.name == "주간" || projection.name == "7d" {
+                Color::Series7d
+            } else if t.paused {
+                Color::BarPaused
+            } else {
+                Color::BarOk
+            };
+            b.line(
+                [x(start), y(remaining)],
+                [x(end), y(end_remaining)],
+                color,
+                2.,
+                Some([3., 3.]),
+            );
+        }
+    }
     if t.unconfirmed
         && let Some(last) = t.last_observed.filter(|last| *last < v.clock.utc())
     {
@@ -488,7 +531,7 @@ fn usage_tile(
     // Keep state sentences readable: the future band is only five hours wide.
     if let Some(clip) = intersection(plot, b.clip) {
         b.scene.draw.push(Draw::Clip(clip));
-        if !has_observation {
+        if !has_observation && t.projections.is_empty() {
             let text = "아직 관측한 값이 없습니다";
             let w = (b.measured_width(text, 12., false) + 4.).min(width(plot));
             let left = plot.left + (width(plot) - w) / 2.;
@@ -548,12 +591,12 @@ fn usage_tile(
             None,
             Role::Text,
             note.clone(),
-            rect(r.left + 12., r.bottom - 24., width(r) - 24., 18.),
+            rect(r.left + 12., r.top + 264., width(r) - 24., 18.),
             None,
         );
         if t.truncated || !table.complete {
             b.text(
-                rect(r.left + 12., r.bottom - 20., width(r) - 24., 18.),
+                rect(r.left + 12., r.top + 268., width(r) - 24., 18.),
                 note,
                 11.,
                 false,
@@ -675,6 +718,21 @@ fn usage_tile(
         unconfirmed: t.unconfirmed,
         offset: *v.clock.now.offset(),
     });
+    let mut forecast_y = r.top + 288.;
+    for (index, line) in t.forecast_lines.iter().enumerate() {
+        let h = b.measured_height(line, (width(r) - 24.).max(1.), 12., false);
+        let bounds = rect(r.left + 12., forecast_y, (width(r) - 24.).max(1.), h);
+        b.text(bounds, line, 12., false, Color::Secondary, true);
+        b.semantic(
+            format!("chart:{}:forecast:{index}", t.id),
+            Some(chartkey.clone()),
+            Role::Text,
+            line.clone(),
+            bounds,
+            None,
+        );
+        forecast_y += h + 4.;
+    }
     if tile_clip.is_some() {
         b.scene.draw.push(Draw::Unclip);
     }

@@ -1334,7 +1334,8 @@ fn r10_account_boxes_gap_group_children_and_header_height_are_shared_geometry() 
         assert_eq!(pair[1].top - pair[0].bottom, gap);
     }
     for group in &v.groups {
-        assert_eq!(group_header_height(group, 900.), 60.);
+        assert!(group.forecast_lines.is_empty());
+        assert_eq!(group_usage_height(group, 900.), 60.);
     }
 }
 #[test]

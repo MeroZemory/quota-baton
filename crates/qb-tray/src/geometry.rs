@@ -1782,7 +1782,7 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
                 total += if provider.is_empty() { 24. } else { 28. };
                 provider = &g.provider;
             }
-            total += group_header_height(g, width(viewport) - 22.) + 2. + 10.;
+            total += group_header_height(b, g, width(viewport) - 22.) + 2. + 10.;
             if !g.collapsed {
                 total += if g.rows.is_empty() {
                     32.
@@ -1946,7 +1946,7 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
                         ry += ph;
                         provider = &group.provider;
                     }
-                    let header_height = group_header_height(group, width(viewport) - 22.);
+                    let header_height = group_header_height(b, group, width(viewport) - 22.);
                     let rows_height = if group.collapsed {
                         0.
                     } else if group.rows.is_empty() {
@@ -2134,9 +2134,16 @@ pub fn columns(available: f32, flat: bool) -> Vec<(SortKey, &'static str, f32)> 
     }
     cols
 }
-fn group_header_height(g: &m::AccountGroup, available: f32) -> f32 {
+fn group_usage_height(g: &m::AccountGroup, available: f32) -> f32 {
     let slots = ((available - 40. + 24.) / 320.).floor().max(1.) as usize;
     60. + g.windows.len().max(1).div_ceil(slots).saturating_sub(1) as f32 * 24.
+}
+fn group_header_height(b: &mut Builder<'_>, g: &m::AccountGroup, available: f32) -> f32 {
+    group_usage_height(g, available)
+        + g.forecast_lines
+            .iter()
+            .map(|line| b.measured_height(line, (available - 46.).max(1.), 12., false) + 4.)
+            .sum::<f32>()
 }
 fn chip(b: &mut Builder<'_>, text: &str, tone: v2::Tone, r: Rect, radius: f32) {
     if text.is_empty() {
@@ -2403,6 +2410,21 @@ fn group_header(b: &mut Builder<'_>, g: &m::AccountGroup, r: Rect, sticky: bool)
                 None,
             );
         }
+    }
+    let mut forecast_y = r.top + group_usage_height(g, width(r) + 2.) - 4.;
+    for (index, line) in g.forecast_lines.iter().enumerate() {
+        let h = b.measured_height(line, (width(r) - 44.).max(1.), 12., false);
+        let bounds = rect(r.left + 32., forecast_y, (width(r) - 44.).max(1.), h);
+        b.text(bounds, line, 12., false, Color::Secondary, true);
+        b.semantic(
+            format!("{}:forecast:{}:{index}", b.scope, g.id),
+            Some(format!("group:{}", g.id)),
+            Role::Text,
+            line.clone(),
+            bounds,
+            None,
+        );
+        forecast_y += h + 4.;
     }
     b.scope = prior_scope;
 }
