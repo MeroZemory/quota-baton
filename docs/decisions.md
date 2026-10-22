@@ -798,3 +798,34 @@ The cost is that the session pauses until the reset.
    Prompted by the 12:01 ping-pong, where WebSocket capacity pushed sessions onto sample-acct, which hit its weekly limit a minute later.
 
 **Order.** R14, after R13. Item 4 applies from now on.
+
+## D28. Provider-wide exhaustion forecast from measured accounts, labelled with its coverage — Accepted (user direction, design owner on the coverage rule, 2026-10-22)
+
+**User direction.** "프로바이더별 통합 소진예측도 필요해 (얘는 전계정 예측이 가능할때만 제공할지 가능한계정정보만 취합해서 제공할지 고민하고 적용)".
+
+**Facts.**
+- Percent used is relative to each account's plan (Free, Plus, Pro, Max 20x), so percentages cannot be added across accounts.
+- When one account runs out, qb moves its load onto the others, so the provider runs out sooner than the latest single-account projection.
+- The ledger records per-request input and cached tokens (2,964 of 12,892 rows today carry usage). That is enough to estimate how many tokens one percent of each account's window is worth, but not for every route.
+- After a restart, and for a new or idle account, the recent rate is "측정 중" for at least 10 minutes. Requiring every account to be measured would hide the provider figure most of the time.
+
+**Decision: coverage.** Aggregate the accounts that can be measured, and always label the result with its coverage ("측정 n/m 계정"). Do not wait for every account.
+- Accounts that are paused, drained or exhausted are not counted as capacity. Each exhausted one contributes its reset time to the recovery line.
+- The pooled figure counts **all observed load** but only the **measured capacity**. A partial result can therefore only be early, never late, and it reads "최소 약 …".
+
+**Decision: what is shown per provider.**
+1. **Always available**, using only per-account forecasts (D24):
+   - the number of accounts usable now;
+   - the next account to run out and when;
+   - the earliest recovery (soonest reset of an exhausted account, or of the account that runs out next);
+   - whether permitted credits keep service going after the subscription windows.
+2. **Pooled runway** ("Codex 전체 소진 예상 HH:MM"). It requires a common unit:
+   - **Unit:** per account and window, tokens per percent, calibrated from ledger token usage against observed percent changes (bounded history, regime-aware like D24).
+   - **Load:** the provider's total token rate over the last 30 minutes.
+   - **Simulation:** run the measured capacity down under that load, moving load to the remaining accounts as each runs out and adding capacity back at each reset inside the horizon.
+   - **Result:** either "모든 계정 소진 HH:MM", or "초기화로 회복되어 소진 없음 (다음 회복 HH:MM)".
+   - **Credits:** when credits are permitted, the line adds credit runway separately (credits are money, not capacity).
+   - **When to omit it:** when no account is calibrated, or token coverage of the load is too low to trust (the threshold comes from the backtest). It then reads "보정 중".
+3. **Backtest before display.** Replay the last 24 h of ledger and quota observations, and report the error of the predicted per-account percent changes and of the pooled runway at 1 h and 3 h. Show the pooled runway only if the 1 h error is within a bound the report justifies; otherwise ship part 1 alone and say so.
+
+**Boundaries.** Display only, like D24. Placement and D20 are unchanged.
