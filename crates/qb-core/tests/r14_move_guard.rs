@@ -51,6 +51,14 @@ impl Harness {
     }
 
     async fn new_provider(request_timeout_secs: u64, provider: Provider) -> Self {
+        Self::new_provider_configured(request_timeout_secs, provider, |_| {}).await
+    }
+
+    async fn new_provider_configured(
+        request_timeout_secs: u64,
+        provider: Provider,
+        configure_routing: impl FnOnce(&mut qb_core::config::RoutingConfig),
+    ) -> Self {
         let serial = tokio::time::timeout(Duration::from_secs(30), SERIAL.lock())
             .await
             .unwrap();
@@ -98,7 +106,14 @@ impl Harness {
         let mut config = Config::default();
         config.server.data_port = 0;
         config.server.admin_port = 0;
-        config.routing.request_timeout_secs = request_timeout_secs;
+        // The runtime now requires a positive trip strictly below the deadline.
+        config.routing.request_timeout_secs = request_timeout_secs.max(2);
+        config.routing.move_guard.trip_seconds = config
+            .routing
+            .request_timeout_secs
+            .saturating_sub(1)
+            .min(240);
+        configure_routing(&mut config.routing);
         config.upstream.anthropic_base = fake.url.clone();
         config.upstream.codex_base = fake.url.clone();
         let started_at = Utc::now();
@@ -770,4 +785,160 @@ async fn real_http_changed_payment_recovery_permits_return_with_default_move_bud
     );
     // B's only successful turn was cold, so it has no normal baseline yet.
     h.sessions(1, 1).await;
+}
+
+#[tokio::test]
+async fn r141_real_http_twelve_sessions_share_one_failure_incident_then_distinct_failure_trips() {
+    use qb_core::accounts::UserState;
+
+    // Tighten only the global incident limit. Session and return limits remain
+    // the real defaults. This short trip is strictly below the request timeout.
+    let h = Harness::new_provider_configured(5, Provider::Claude, |routing| {
+        routing.move_guard.global_ten_minutes = 1;
+        routing.move_guard.trip_seconds = 2;
+    })
+    .await;
+    let ids: Vec<_> = h.store.list().unwrap().into_iter().map(|a| a.id).collect();
+    let (a, b) = (&ids[0], &ids[1]);
+    h.state
+        .accounts
+        .change(b, Some(UserState::Paused), None, None, None)
+        .await
+        .unwrap();
+    let sessions: Vec<_> = (0..12).map(|i| format!("r141-shared-outage-{i}")).collect();
+    for session in &sessions {
+        h.fake.state.push(usage_reply(10, Some(0)));
+        let reply = h.turn(session).await;
+        assert_eq!(reply.status, 200);
+        assert_eq!(&reply.account, a);
+        assert_eq!(
+            h.state
+                .bindings
+                .current(Some(&format!("claude:{session}")))
+                .as_ref(),
+            Some(a)
+        );
+    }
+    h.state
+        .accounts
+        .change(b, Some(UserState::Active), None, None, None)
+        .await
+        .unwrap();
+
+    // A becomes unusable exactly once, via the actual transport's 402 path.
+    // Subsequent sessions observe that same stored failure, without re-failing A.
+    h.fake.state.push(payment_reply());
+    let mut shared_failure = None;
+    for session in &sessions {
+        h.fake.state.push(usage_reply(1000, Some(0)));
+        let reply = h.turn(session).await;
+        assert_eq!(reply.status, 200, "all twelve sessions must migrate");
+        assert_eq!(&reply.account, b);
+        assert_eq!(
+            h.state
+                .bindings
+                .current(Some(&format!("claude:{session}")))
+                .as_ref(),
+            Some(b)
+        );
+        let source = h.store.load(a).unwrap();
+        assert!(!source.eligible(Some(MODEL)));
+        let evidence = json!({
+            "health":source.health,
+            "payment_until":source.payment_until,
+            "payment_failures":source.payment_failures,
+            "quota_cooling":source.quota_cooling,
+        });
+        if let Some(first) = &shared_failure {
+            assert_eq!(&evidence, first, "the source failure must remain unchanged");
+        } else {
+            shared_failure = Some(evidence);
+        }
+        let rows = h.ledger();
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row["event"] == "binding_move_refused"),
+            "one source failure must permit all twelve session moves; rows={rows:?}"
+        );
+        assert!(h.state.bindings.move_guard_until().is_none());
+    }
+    let rows = h.ledger();
+    for session in &sessions {
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["event"] == "binding_move"
+                    && row["session"] == session_hash(session)
+                    && row["from"] == *a
+                    && row["to"] == *b)
+                .count(),
+            1
+        );
+    }
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row["event"] == "binding_move" && !row["from"].is_null())
+            .count(),
+        12
+    );
+    let mut expected = vec![a.as_str(); 13]; // Twelve initial turns and A's one 402.
+    expected.extend(vec![b.as_str(); 12]);
+    h.assert_upstream_accounts(&expected);
+
+    // A new session has no return/session history that could mask the global
+    // check. B's different source failure must be the next distinct incident.
+    let next_session = "r141-distinct-source-failure";
+    h.fake.state.push(usage_reply(10, Some(0)));
+    let initial = h.turn(next_session).await;
+    assert_eq!(initial.status, 200);
+    assert_eq!(&initial.account, b);
+    let recovered = h
+        .store
+        .update_metadata(a, |account| {
+            account.health = Health::Ready;
+            account.payment_until = None;
+            account.payment_failures = 0;
+            account.quota_cooling = None;
+        })
+        .unwrap();
+    assert!(recovered.eligible(Some(MODEL)));
+    h.fake.state.push(payment_reply());
+    h.fake.state.push(usage_reply(1000, Some(0)));
+    // The short real trip may expire before this request completes. The ledger
+    // must still prove it tripped; success after expiry cannot erase the event.
+    let after_trip = h.turn(next_session).await;
+    assert_eq!(after_trip.status, 200);
+    assert_eq!(&after_trip.account, a);
+    let rows = h.ledger();
+    let trips: Vec<_> = rows
+        .iter()
+        .filter(|row| row["event"] == "binding_move_refused" && row["newly_tripped"] == true)
+        .collect();
+    assert_eq!(
+        trips.len(),
+        1,
+        "the next distinct incident must trip global one"
+    );
+    assert_eq!(trips[0]["reason"], "global_trip");
+    assert_eq!(trips[0]["session"], session_hash(next_session));
+    assert_eq!(trips[0]["from"], *b);
+    assert_eq!(trips[0]["to"], *a);
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row["event"] == "binding_move_refused")
+            .filter(|row| row["session"] != session_hash(next_session))
+            .count(),
+        0
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row["event"] == "binding_move"
+                && row["session"] == session_hash(next_session)
+                && row["from"] == *b
+                && row["to"] == *a)
+            .count(),
+        1
+    );
+    expected.extend([b.as_str(), b.as_str(), a.as_str()]);
+    h.assert_upstream_accounts(&expected);
 }

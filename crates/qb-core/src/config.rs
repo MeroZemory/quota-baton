@@ -250,6 +250,10 @@ impl RoutingConfig {
             "routing request timeout must be 1..600 seconds"
         );
         anyhow::ensure!(
+            self.move_guard.clone().bounded().trip_seconds < self.request_timeout_secs,
+            "routing move guard trip must be shorter than the request timeout"
+        );
+        anyhow::ensure!(
             (1..=600).contains(&self.rate_hold_secs)
                 && (1..=14).contains(&self.ws_upgrade_hold_secs),
             "rate hold must be 1..600 seconds; WebSocket upgrade must be below 15 seconds"
@@ -904,5 +908,45 @@ mod account_alias_tests {
             );
         }
         assert!(config.validate_account_aliases().is_err());
+    }
+}
+
+#[cfg(test)]
+mod r141_trip_validation_tests {
+    use super::RoutingConfig;
+
+    #[test]
+    fn r141_default_trip_has_a_margin_before_the_request_deadline() {
+        let config = RoutingConfig::default();
+        assert_eq!(config.move_guard.trip_seconds, 240);
+        assert_eq!(config.request_timeout_secs, 300);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn r141_trip_equal_or_longer_than_request_deadline_is_rejected() {
+        let mut config = RoutingConfig::default();
+        for trip in [240, 241, u64::MAX] {
+            config.request_timeout_secs = 240;
+            config.move_guard.trip_seconds = trip;
+            assert!(
+                config
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("move guard trip")
+            );
+        }
+        config.move_guard.trip_seconds = 239;
+        config.validate().unwrap();
+        config.request_timeout_secs = 1;
+        config.move_guard.trip_seconds = 0;
+        assert!(
+            config.validate().is_err(),
+            "bounded minimum trip is one second"
+        );
+        config.request_timeout_secs = 2;
+        config.move_guard.trip_seconds = 1;
+        config.validate().unwrap();
     }
 }
