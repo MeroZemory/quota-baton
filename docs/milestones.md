@@ -103,7 +103,7 @@ The goal stays open while any row in `GOAL.md` is open. Before marking it comple
 
 ## 진전 장부 (source of the "진전 한눈에" block)
 
-Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-interim-report.md` §3 item 1-1). `.sandbox/scripts/status_head.py` renders these tables, plus the done / in progress / remaining count from the `GOAL.md` milestone table, right under every report head. Append a row at every measurement, flat ones included; never edit old rows. When a metric's definition or denominator changes, start a new 계열 name.
+Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-interim-report.md` §3 item 1-1). `.sandbox/scripts/status_head.py` renders these tables, plus the done / in progress / remaining count from the `GOAL.md` milestone table, right under every report head. Metric rows are written only when the delivery state can change: a gate pass, a merge or an install (flat results included). Unit progress belongs in the report body, not here, and a unit whose only output is new records is not a unit (GOAL rule). Every metric row has all four cells; side measurements go to the support table. Never edit old rows. When a metric's definition or denominator changes, start a new 계열 name.
 
 <!-- metric:begin -->
 | 측정 시각 (KST) | 계열 | 값 | 비고 |
