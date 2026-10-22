@@ -18,6 +18,7 @@ pub mod geometry;
 #[cfg(windows)]
 pub mod render;
 pub mod state;
+pub mod tray_icon;
 pub mod v2;
 pub mod v2_colors;
 pub mod v2_geometry;
@@ -1159,12 +1160,15 @@ pub fn row(account: &Account, now: SystemTime) -> Row {
         allow_credits: account.allow_credits,
         drain: account.drain,
         bound_sessions: account.bound_sessions,
-        session_text: (account.spread_threshold > 0).then(|| {
-            format!(
-                "세션 {}/{}",
-                account.active_sessions, account.spread_threshold
-            )
-        }),
+        session_text: Some(format!(
+            "활성 {}{}",
+            account.active_sessions,
+            if account.spread_threshold > 0 && account.active_sessions >= account.spread_threshold {
+                " · 몰림"
+            } else {
+                ""
+            }
+        )),
         pacing_until: account
             .pacing
             .backoff_secs

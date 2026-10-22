@@ -32,7 +32,7 @@ fn fixture() -> (m::DashboardView, m::UsageTile) {
         .map(|(name, pct)| m::Series {
             name: name.into(),
             points: vec![
-                (v.clock.day_start + Duration::hours(1), Some(100.)),
+                (m::usage_domain(&v.clock).0 + Duration::hours(1), Some(100.)),
                 (v.clock.utc(), Some(pct)),
             ],
             resets: vec![],
@@ -190,11 +190,10 @@ fn r10_usage_end_labels_separate_symmetrically_clamp_and_have_backings() {
                 + width(plot)
                     * v.clock
                         .utc()
-                        .signed_duration_since(v.clock.day_start)
+                        .signed_duration_since(m::usage_domain(&v.clock).0)
                         .num_milliseconds() as f32
-                    / v.clock
-                        .day_end
-                        .signed_duration_since(v.clock.day_start)
+                    / m::usage_domain(&v.clock).1
+                        .signed_duration_since(m::usage_domain(&v.clock).0)
                         .num_milliseconds() as f32;
             assert!((ar.left - now_x - 6.).abs() < 0.01);
         }
@@ -256,10 +255,7 @@ fn r10_usage_full_legend_is_measured_contained_and_clear_of_header_and_tiles() {
         ..Default::default()
     };
     let legend = "━ 5시간 (Free는 30일)  ┄ 주간  ⋮ 초기화  ▧ 크레딧으로 처리";
-    let summary = format!(
-        "남은 양 · 00:00–24:00 · {}",
-        v.clock.day_label(v.clock.utc())
-    );
+    let summary = "남은 양 · 최근 19시간 / 앞으로 5시간".to_string();
     for size in [[1320., 960.], [1024., 640.]] {
         for measured_legend_width in [500., 600.] {
             let mut metrics = Metrics::default();
@@ -286,7 +282,7 @@ fn r10_usage_full_legend_is_measured_contained_and_clear_of_header_and_tiles() {
             let (_, bounds, _) = text(&s, legend);
             assert_eq!(width(bounds), measured_legend_width + 4.);
             assert!(bounds.left >= 36. && bounds.right <= size[0] - 36.);
-            for value in ["오늘 사용량", summary.as_str()] {
+            for value in ["사용량", summary.as_str()] {
                 assert!(intersection(bounds, text(&s, value).1).is_none());
             }
             assert!(
@@ -328,7 +324,7 @@ fn r10_usage_equal_values_emit_one_neutral_endpoint_label() {
 }
 
 #[test]
-fn r10_usage_no_observation_copy_is_backed_at_midpoint_right_of_now() {
+fn r13_usage_no_observation_copy_is_backed_and_centered_inside_plot() {
     let (v, mut t) = fixture();
     for series in &mut t.series {
         series.points.clear();
@@ -336,21 +332,9 @@ fn r10_usage_no_observation_copy_is_backed_at_midpoint_right_of_now() {
     let s = scene(&v, &t);
     assert!(series_lines(&s).is_empty());
     let plot = s.charts[0].rect;
-    let now_x = s
-        .draw
-        .iter()
-        .find_map(|d| match d {
-            Draw::Line {
-                from,
-                to,
-                color: Color::Text,
-                ..
-            } if from[1] == plot.top && to[1] == plot.bottom => Some(from[0]),
-            _ => None,
-        })
-        .unwrap();
-    let (i, r, _) = text(&s, "오늘은 아직 관측한 값이 없습니다");
-    assert_eq!(r.left, now_x + 12.);
+    let (i, r, _) = text(&s, "아직 관측한 값이 없습니다");
+    assert!(r.left >= plot.left && r.right <= plot.right);
+    assert_eq!((r.left + r.right) / 2., (plot.left + plot.right) / 2.);
     assert_eq!((r.top + r.bottom) / 2., (plot.top + plot.bottom) / 2.);
     backed(&s, i, r);
 }
@@ -371,11 +355,10 @@ fn r10_usage_relogin_stops_at_observation_and_hatches_only_the_unknown_span() {
     let x = |at: DateTime<Utc>| {
         plot.left
             + width(plot)
-                * at.signed_duration_since(v.clock.day_start)
+                * at.signed_duration_since(m::usage_domain(&v.clock).0)
                     .num_milliseconds() as f32
-                / v.clock
-                    .day_end
-                    .signed_duration_since(v.clock.day_start)
+                / m::usage_domain(&v.clock).1
+                    .signed_duration_since(m::usage_domain(&v.clock).0)
                     .num_milliseconds() as f32
     };
     for (from, to, _, _) in series_lines(&s) {
@@ -428,7 +411,7 @@ fn r10_usage_relogin_stops_at_observation_and_hatches_only_the_unknown_span() {
     ));
     let (i, r, color) = text(&s, &format!("{stamp} 이후 확인 못 함"));
     assert!(matches!(color, Color::Bad));
-    assert!((r.left - x(v.clock.utc()) - 8.).abs() < 0.01);
+    assert!(r.left >= plot.left && r.right <= plot.right);
     backed(&s, i, r);
 }
 
@@ -473,7 +456,7 @@ fn r10_usage_unknown_sample_breaks_line_without_invented_endpoint() {
     t.series.truncate(1);
     t.series[0]
         .points
-        .insert(1, (v.clock.day_start + Duration::hours(2), None));
+        .insert(1, (m::usage_domain(&v.clock).0 + Duration::hours(2), None));
     let s = scene(&v, &t);
     assert!(series_lines(&s).is_empty());
     t.series[0].points.last_mut().unwrap().1 = None;
@@ -493,7 +476,7 @@ fn r10_usage_future_annotation_and_bounded_accessible_history_survive() {
     t.series[0].points = (0..2000)
         .map(|i| {
             (
-                v.clock.day_start + Duration::seconds(i),
+                m::usage_domain(&v.clock).0 + Duration::seconds(i),
                 Some((i % 100) as f64),
             )
         })
@@ -567,7 +550,7 @@ fn r101_crowded_resets_bound_captions_keep_markers_and_expose_overflow() {
     let (v, mut t) = fixture();
     for at_end in [false, true] {
         let start = if at_end {
-            v.clock.day_end - Duration::minutes(12)
+            m::usage_domain(&v.clock).1 - Duration::minutes(39)
         } else {
             v.clock.utc() + Duration::hours(1)
         };
@@ -628,11 +611,10 @@ fn r101_crowded_resets_bound_captions_keep_markers_and_expose_overflow() {
             assert_eq!(markers.len(), resets.len());
             for (marker, at) in markers.iter().zip(&resets) {
                 let fraction = (at
-                    .signed_duration_since(v.clock.day_start)
+                    .signed_duration_since(m::usage_domain(&v.clock).0)
                     .num_milliseconds() as f64
-                    / v.clock
-                        .day_end
-                        .signed_duration_since(v.clock.day_start)
+                    / m::usage_domain(&v.clock).1
+                        .signed_duration_since(m::usage_domain(&v.clock).0)
                         .num_milliseconds() as f64)
                     .clamp(0., 1.);
                 let expected = plot.left + fraction as f32 * width(plot);
@@ -650,8 +632,8 @@ fn r101_each_reset_caption_tracks_its_own_dashed_marker() {
     let (v, mut t) = fixture();
     for close in [false, true] {
         let resets = [
-            v.clock.day_start + Duration::hours(1),
-            v.clock.day_start + Duration::hours(23),
+            v.clock.utc() + Duration::minutes(10),
+            m::usage_domain(&v.clock).1 - Duration::minutes(10),
         ];
         let resets = if close {
             [resets[0], resets[0] + Duration::minutes(1)]
@@ -670,11 +652,10 @@ fn r101_each_reset_caption_tracks_its_own_dashed_marker() {
             for at in resets {
                 let (_, label, _) = text(&s, &format!("{} 초기화", v.clock.time(Some(at))));
                 let fraction = at
-                    .signed_duration_since(v.clock.day_start)
+                    .signed_duration_since(m::usage_domain(&v.clock).0)
                     .num_milliseconds() as f32
-                    / v.clock
-                        .day_end
-                        .signed_duration_since(v.clock.day_start)
+                    / m::usage_domain(&v.clock).1
+                        .signed_duration_since(m::usage_domain(&v.clock).0)
                         .num_milliseconds() as f32;
                 let marker = plot.left + width(plot) * fraction;
                 assert!(label.left <= marker && marker <= label.right);
@@ -686,4 +667,75 @@ fn r101_each_reset_caption_tracks_its_own_dashed_marker() {
             }
         }
     }
+}
+
+#[test]
+fn r13_usage_future_midnight_ticks_and_reset_edges_share_the_rolling_domain() {
+    let (mut v, mut t) = fixture();
+    v.clock.now = DateTime::parse_from_rfc3339("2026-10-19T23:40:00+09:00").unwrap();
+    let (from, to) = m::usage_domain(&v.clock);
+    let midnight = fixtures::at("2026-10-20T00:00:00+09:00");
+    let reset = midnight + Duration::minutes(10);
+    t.series.truncate(1);
+    t.series[0].points.clear();
+    t.series[0].resets = vec![from];
+    t.series[0].future_resets = vec![reset, to, to + Duration::days(6)];
+    let ticks = usage_ticks(&v.clock);
+    assert_eq!(ticks.len(), 24);
+    assert!(ticks.contains(&midnight));
+    assert!(ticks.windows(2).all(|w| w[1] - w[0] == Duration::hours(1)));
+    for tile_width in [406., 476.] {
+        let s = scene_at_width(&v, &t, tile_width);
+        let chart = &s.charts[0];
+        assert_eq!((chart.from, chart.to), (from, to));
+        let plot = chart.rect;
+        text(&s, "10/20 00:00");
+        text(&s, "지금");
+        // Crowded edge captions may move to the bounded overflow semantics,
+        // but their actual reset time must remain available.
+        let edge_time = v.clock.time(Some(to + Duration::days(6)));
+        assert!(s.draw.iter().any(|d| matches!(d, Draw::Text { measure, .. }
+            if measure.text.contains("범위 밖") && measure.text.contains(&edge_time)))
+            || s.accessibility.iter().any(|n| n.name.contains("범위 밖") && n.name.contains(&edge_time)));
+        let markers: Vec<_> = s.draw.iter().filter_map(|d| match d {
+            Draw::Line { from, to, dash: Some([1., 3.]), .. }
+                if from[1] == plot.top && to[1] == plot.bottom => Some(from[0]),
+            _ => None,
+        }).collect();
+        assert_eq!(markers.len(), 3, "outside reset must not create a false edge marker");
+        assert_eq!(markers[0], plot.left);
+        let expected = plot.left + width(plot) * (reset - from).num_seconds() as f32 / (24. * 3600.);
+        assert!((markers[1] - expected).abs() < 0.01);
+        assert_eq!(markers[2], plot.right);
+        assert!(series_lines(&s).is_empty(), "empty history must not invent a line");
+        text(&s, "64% 남음");
+        let (_, empty, _) = text(&s, "아직 관측한 값이 없습니다");
+        assert!(empty.left >= plot.left && empty.right <= plot.right);
+    }
+}
+
+#[test]
+fn r13_usage_previous_day_uia_pointer_and_gaps_use_the_same_domain() {
+    let (mut v, mut t) = fixture();
+    v.clock.now = DateTime::parse_from_rfc3339("2026-10-20T00:20:00+09:00").unwrap();
+    let (from, to) = m::usage_domain(&v.clock);
+    let observed = fixtures::at("2026-10-19T23:50:00+09:00");
+    let gap = observed - Duration::minutes(10);
+    t.series.truncate(1);
+    t.series[0].points = vec![(from, Some(90.)), (gap, None), (observed, Some(64.))];
+    let s = scene(&v, &t);
+    let chart = &s.charts[0];
+    let x = |at: DateTime<Utc>| chart.rect.left + width(chart.rect)
+        * (at - from).num_seconds() as f32 / (to - from).num_seconds() as f32;
+    assert!(series_lines(&s).is_empty());
+    assert_eq!(s.hit_test(x(observed), chart.rect.top + 1.), Some(&Target::Chart(t.id.clone())));
+    assert!(s.chart_tooltip(&t.id, x(observed + Duration::seconds(1))).unwrap().text.contains("64%"));
+    assert!(s.chart_tooltip(&t.id, x(gap + Duration::seconds(1))).unwrap().text.contains(&m::unknown()));
+    assert!(s.chart_tooltip(&t.id, x(v.clock.utc() + Duration::minutes(1))).is_none());
+    assert!(s.accessibility.iter().any(|n| n.role == Role::Row && n.name.contains("10/19 23:50:00") && n.name.contains("64%")));
+    let table = history::project(&t, 512);
+    assert_eq!(table.rows.len(), 3);
+    assert_eq!(table.rows[0].at, from);
+    assert_eq!(table.rows[1].values, vec![None]);
+    assert_eq!(chart.series[0].points, t.series[0].points);
 }

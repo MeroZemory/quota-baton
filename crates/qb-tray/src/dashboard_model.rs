@@ -1957,7 +1957,16 @@ fn detail_view(d: &SessionDetail, accounts: &v2::View, clock: &Clock, expired: b
         expired,
     }
 }
+/// Usage alone rolls with the visible local minute; calendar-day filters stay separate.
+pub fn usage_domain(clock: &Clock) -> (DateTime<Utc>, DateTime<Utc>) {
+    use chrono::{Duration, Timelike};
+    let minute = clock.now.with_second(0).unwrap().with_nanosecond(0).unwrap();
+    let now = minute.with_timezone(&Utc);
+    (now - Duration::hours(19), now + Duration::hours(5))
+}
+
 fn usage_tiles(snapshot: &DashboardSnapshot, clock: &Clock) -> Vec<UsageTile> {
+    let (from, _) = usage_domain(clock);
     account_rows(&snapshot.accounts)
         .into_iter()
         .filter(|a| a.raw.user_state != "disabled")
@@ -1972,7 +1981,7 @@ fn usage_tiles(snapshot: &DashboardSnapshot, clock: &Clock) -> Vec<UsageTile> {
                 {
                     let mut normalized = BTreeMap::new();
                     for (t, p) in &w.points {
-                        if *t >= clock.day_start && *t < clock.day_end && *t <= clock.utc() {
+                        if *t >= from && *t <= clock.utc() {
                             normalized.insert(
                                 *t,
                                 p.filter(|n| n.is_finite() && *n >= 0.)
@@ -1991,7 +2000,7 @@ fn usage_tiles(snapshot: &DashboardSnapshot, clock: &Clock) -> Vec<UsageTile> {
                         .iter()
                         .filter(|m| m.raw.name == w.name)
                         .filter_map(|m| m.reset)
-                        .filter(|t| *t > clock.utc() && *t < clock.day_end)
+                        .filter(|t| *t > clock.utc())
                         .collect();
                     series.push(Series {
                         name: v2::window_label(&w.name),
@@ -2000,7 +2009,7 @@ fn usage_tiles(snapshot: &DashboardSnapshot, clock: &Clock) -> Vec<UsageTile> {
                             .resets
                             .iter()
                             .copied()
-                            .filter(|t| *t >= clock.day_start && *t <= clock.utc())
+                            .filter(|t| *t >= from && *t <= clock.utc())
                             .collect(),
                         future_resets,
                         remaining,
@@ -2017,7 +2026,7 @@ fn usage_tiles(snapshot: &DashboardSnapshot, clock: &Clock) -> Vec<UsageTile> {
                         future_resets: metric
                             .reset
                             .into_iter()
-                            .filter(|t| *t > clock.utc() && *t < clock.day_end)
+                            .filter(|t| *t > clock.utc())
                             .collect(),
                         remaining: metric.remaining,
                     });
@@ -2034,8 +2043,8 @@ fn usage_tiles(snapshot: &DashboardSnapshot, clock: &Clock) -> Vec<UsageTile> {
                     h.credits_spans
                         .iter()
                         .filter_map(|(a, b)| {
-                            let start = (*a).max(clock.day_start);
-                            let end = b.unwrap_or(clock.utc()).min(clock.utc()).min(clock.day_end);
+                            let start = (*a).max(from);
+                            let end = b.unwrap_or(clock.utc()).min(clock.utc());
                             (start < end).then_some((start, end))
                         })
                         .collect()

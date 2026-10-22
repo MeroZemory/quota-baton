@@ -91,7 +91,7 @@ pub(super) fn next_visible_time_change(
     state: &DashboardState,
     scene: &Scene,
     clock: &Clock,
-    dpi: u32,
+    _dpi: u32,
 ) -> Option<DateTime<Utc>> {
     if scene.accessibility.is_empty() && scene.draw.is_empty() {
         return None;
@@ -203,29 +203,10 @@ pub(super) fn next_visible_time_change(
                     due.add(Some(*at));
                 }
             }
-            let pixels = f64::from(chart.rect.right - chart.rect.left) * f64::from(dpi) / 96.;
-            if pixels.is_finite() && pixels > 0. && now >= chart.from && now < chart.to {
-                // Grid anchored at plot.left, one physical pixel maximum drift.
-                // Use ms because chart geometry uses num_milliseconds too.
-                let span = chart
-                    .to
-                    .signed_duration_since(chart.from)
-                    .num_milliseconds();
-                if span > 0 {
-                    let elapsed = now.signed_duration_since(chart.from).num_milliseconds() as f64;
-                    let column = (elapsed * pixels / span as f64).floor() + 1.;
-                    let next_ms = (column * span as f64 / pixels).ceil();
-                    if next_ms.is_finite() && next_ms < i64::MAX as f64 {
-                        due.add(
-                            chart
-                                .from
-                                .checked_add_signed(Duration::milliseconds(next_ms as i64)),
-                        );
-                    }
-                }
-            } else if now < chart.from {
-                due.add(Some(chart.from));
-            }
+            // The rolling domain changes once per visible local minute. This
+            // deadline is independent of DPI and the old calendar-day width.
+            let (_, end) = qb_tray::dashboard_model::usage_domain(clock);
+            due.add(Some(end - Duration::hours(5) + Duration::minutes(1)));
             if let Some(h) = snapshot.usage.accounts.iter().find(|h| h.id == chart.id) {
                 for w in &h.windows {
                     if w.name.starts_with("7d_") || w.name.contains("model:") {
@@ -463,7 +444,7 @@ mod tests {
         );
     }
     #[test]
-    fn chart_pixel_budget_and_hidden_plot() {
+    fn r13_usage_minute_deadline_reset_and_hidden_plot() {
         let (snap, mut state, mut scene, c) = empty();
         state.tab = Tab::Usage;
         scene.content[0].region = ScrollRegion::Usage;
@@ -479,11 +460,11 @@ mod tests {
         });
         assert_eq!(
             next_visible_time_change(&snap, &state, &scene, &c, 96),
-            Some(c.utc() + Duration::seconds(180))
+            Some(c.utc() + Duration::minutes(1))
         );
         assert_eq!(
             next_visible_time_change(&snap, &state, &scene, &c, 192),
-            Some(c.utc() + Duration::seconds(90))
+            Some(c.utc() + Duration::minutes(1))
         );
         scene.charts[0].series.push(m::Series {
             name: "fixture".into(),
@@ -579,7 +560,7 @@ mod tests {
             c.day_end = c.day_start + Duration::hours(hours);
             state.tab = Tab::Usage;
             scene.content[0].region = ScrollRegion::Usage;
-            // At 12h after day_start, this width places now exactly at pixel 120.
+            // Even a supplied short/long calendar day cannot change usage cadence.
             scene.charts.push(g::ChartData {
                 id: "fixture".into(),
                 rect: g::rect(0., 100., hours as f32 * 10., 200.),
@@ -592,7 +573,7 @@ mod tests {
             });
             assert_eq!(
                 next_visible_time_change(&snap, &state, &scene, &c, 96),
-                Some(c.utc() + Duration::minutes(6))
+                Some(c.utc() + Duration::minutes(1))
             );
             scene.charts[0].rect.right = f32::NAN;
             assert_eq!(

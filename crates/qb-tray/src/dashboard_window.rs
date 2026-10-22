@@ -10,6 +10,7 @@ mod window_logic;
 use super::accessibility;
 use crate::dashboard_persistence::Geometry;
 pub use dashboard_bridge::{Bridge, Event, UiPort};
+use qb_tray::tray_icon::{pixels::Badge, win_icon::NotifyIcon};
 use qb_tray::{
     dashboard_model as model,
     geometry::{self, Scene, Target},
@@ -75,6 +76,65 @@ static UI_THREAD: OnceLock<u32> = OnceLock::new();
 thread_local! {
     static HOST:RefCell<Option<Rc<RefCell<Host>>>>=const{RefCell::new(None)};
     static PREFERENCES:RefCell<Option<DashboardState>>=const{RefCell::new(None)};
+    // Class icons outlive every HWND that may borrow them as a default.
+    static CLASS_ICONS: RefCell<Option<WindowIcons>> = const { RefCell::new(None) };
+    static ICON_STATE: RefCell<(bool, Badge)> = const { RefCell::new((false, Badge::Normal)) };
+}
+
+struct WindowIcons {
+    small: NotifyIcon,
+    big: NotifyIcon,
+    key: (u32, bool, Badge),
+}
+impl WindowIcons {
+    fn new(size: u32, dark: bool, badge: Badge) -> Result<Self> {
+        Ok(Self {
+            small: NotifyIcon::new(size, dark, badge).map_err(|_| invalid())?,
+            big: NotifyIcon::new(32, dark, badge).map_err(|_| invalid())?,
+            key: (size, dark, badge),
+        })
+    }
+}
+/// UI-thread-only publication, sharing the tray's exact theme/badge generator.
+/// No TLS or Host borrow crosses SendMessage's reentrant WndProc dispatch.
+pub fn set_icon_presentation(dark: bool, badge: Badge) {
+    ICON_STATE.with(|s| *s.borrow_mut() = (dark, badge));
+    let host = HOST.with(|s| s.borrow().clone());
+    let Some(host) = host else { return };
+    let hwnd = host.borrow().hwnd;
+    let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+    let size = match dpi {
+        0..=108 => 16,
+        109..=132 => 20,
+        133..=168 => 24,
+        _ => 32,
+    };
+    if host
+        .borrow()
+        .icons
+        .as_ref()
+        .is_some_and(|icons| icons.key == (size, dark, badge))
+    {
+        return;
+    }
+    let Ok(icons) = WindowIcons::new(size, dark, badge) else {
+        return;
+    };
+    unsafe {
+        SendMessageW(
+            hwnd,
+            WM_SETICON,
+            WPARAM(ICON_SMALL as usize),
+            LPARAM(icons.small.as_raw() as isize),
+        );
+        SendMessageW(
+            hwnd,
+            WM_SETICON,
+            WPARAM(ICON_BIG as usize),
+            LPARAM(icons.big.as_raw() as isize),
+        );
+    }
+    host.borrow_mut().icons = Some(icons);
 }
 
 struct Frame {
@@ -242,6 +302,7 @@ struct Host {
     projected: Option<Arc<model::DashboardView>>,
     next_clock: Option<chrono::DateTime<chrono::Utc>>,
     target_metrics: Option<([u32; 2], u32)>,
+    icons: Option<WindowIcons>,
 }
 fn current(hwnd: HWND) -> Option<Rc<RefCell<Host>>> {
     HOST.with(|slot| {
@@ -372,17 +433,28 @@ pub fn open_or_focus(
         }
     }
     let module = unsafe { GetModuleHandleW(None) }?;
-    let registered = *CLASS_REGISTERED.get_or_init(|| unsafe {
-        RegisterClassW(&WNDCLASSW {
-            style: CS_HREDRAW | CS_VREDRAW,
-            lpfnWndProc: Some(wndproc),
-            hInstance: HINSTANCE(module.0),
-            lpszClassName: CLASS,
-            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
-            ..Default::default()
-        }) != 0
-    });
-    if !registered {
+    let badge = ICON_STATE.with(|s| s.borrow().1);
+    if CLASS_REGISTERED.get().is_none() {
+        let icons = WindowIcons::new(16, dark, badge)?;
+        let registered = unsafe {
+            RegisterClassExW(&WNDCLASSEXW {
+                cbSize: size_of::<WNDCLASSEXW>() as u32,
+                style: CS_HREDRAW | CS_VREDRAW,
+                lpfnWndProc: Some(wndproc),
+                hInstance: HINSTANCE(module.0),
+                lpszClassName: CLASS,
+                hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+                hIcon: HICON(icons.big.as_raw()),
+                hIconSm: HICON(icons.small.as_raw()),
+                ..Default::default()
+            }) != 0
+        };
+        let _ = CLASS_REGISTERED.set(registered);
+        if registered {
+            CLASS_ICONS.with(|s| *s.borrow_mut() = Some(icons));
+        }
+    }
+    if CLASS_REGISTERED.get() != Some(&true) {
         return Err(invalid());
     }
     let token = owner().ok_or_else(invalid)?;
@@ -456,8 +528,10 @@ pub fn open_or_focus(
             projected: None,
             next_clock: None,
             target_metrics: None,
+            icons: None,
         })))
     });
+    set_icon_presentation(dark, badge);
     bridge.enqueue(Event::Opened { port });
     for command in startup_commands {
         bridge.enqueue(Event::Command {
@@ -729,6 +803,9 @@ fn apply_mail(hwnd: HWND) {
             placement = h.life.load(token, saved);
         }
     }
+    let icon_dark = host.borrow().dark;
+    let badge = ICON_STATE.with(|s| s.borrow().1);
+    set_icon_presentation(icon_dark, badge);
     if let Some(saved) = placement {
         let saved_rect = RECT {
             left: saved.left,
@@ -2151,6 +2228,8 @@ unsafe extern "system" fn wndproc(
             return LRESULT(0);
         }
         WM_DPICHANGED => {
+            let (dark, badge) = ICON_STATE.with(|s| *s.borrow());
+            set_icon_presentation(dark, badge);
             redraw(hwnd);
             if lparam.0 != 0 {
                 let r = unsafe { *(lparam.0 as *const RECT) };

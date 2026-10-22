@@ -1255,7 +1255,17 @@ fn menu_info(
         .and_then(timestamp)
         .map(|t| t.with_timezone(&Local).format("%H:%M").to_string());
     let sessions_line = format!(
-        "연결된 대화 {}개 · {}",
+        "활성 {}{} · 연결된 대화 {}개 · {}",
+        a.active_sessions,
+        if a.extra
+            .get("spread_threshold")
+            .and_then(Value::as_u64)
+            .is_some_and(|t| t > 0 && a.active_sessions >= t)
+        {
+            " · 몰림"
+        } else {
+            ""
+        },
         a.bound_sessions,
         observed
             .map(|s| format!("{s} 기준"))

@@ -316,6 +316,7 @@ fn refresh_shell(hwnd: HWND) {
         .unwrap_or_else(|e| e.into_inner())
         .presentation();
     let dark = DARK.load(Ordering::Acquire);
+    dashboard_window::set_icon_presentation(dark, presentation.badge);
     let size = icon_size(hwnd);
     let changed = SHELL_ICON.with(|slot| {
         slot.borrow()

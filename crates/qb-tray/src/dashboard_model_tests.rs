@@ -508,12 +508,101 @@ fn r7_usage_is_remaining_observed_only_with_reset_and_unknown_gaps() {
         series
             .points
             .iter()
-            .all(|(t, _)| *t >= c.day_start && *t <= c.utc())
+            .all(|(t, _)| *t >= usage_domain(&c).0 && *t <= c.utc())
     );
     assert!(series.points.iter().any(|(_, p)| *p == Some(90.)));
-    assert_eq!(series.points[0].1, None);
+    assert_eq!(series.points[0].1, Some(20.));
+    assert!(series.points.iter().any(|(_, p)| p.is_none()));
     assert_eq!(tile.credits_spans.len(), 1);
     assert!(!tiles.iter().any(|t| t.id == "cx-disabled"));
+}
+
+#[test]
+fn r13_usage_midnight_keeps_previous_day_observations_but_today_filters_do_not() {
+    use chrono::Duration;
+    let mut c = clock();
+    c.now = DateTime::parse_from_rfc3339("2026-10-20T00:20:45+09:00").unwrap();
+    c.day_start = at("2026-10-20T00:00:00+09:00");
+    c.day_end = c.day_start + Duration::days(1);
+    let (from, to) = usage_domain(&c);
+    assert_eq!(from, at("2026-10-19T05:20:00+09:00"));
+    assert_eq!(to, at("2026-10-20T05:20:00+09:00"));
+    let yesterday = at("2026-10-19T23:50:00+09:00");
+    let gap = yesterday - Duration::minutes(10);
+    let mut data = snapshot();
+    data.usage.accounts[0].windows = vec![HistoryWindow {
+        name: "5h".into(),
+        points: vec![
+            (from - Duration::seconds(1), Some(99.)),
+            (from, Some(10.)),
+            (gap, None),
+            (yesterday, Some(30.)),
+            (c.utc(), Some(40.)),
+            (c.utc() + Duration::seconds(1), Some(50.)),
+        ],
+        resets: vec![from - Duration::seconds(1), from, yesterday, to],
+        ..Default::default()
+    }];
+    data.usage.accounts[0].credits_spans = vec![(from - Duration::hours(1), None)];
+    data.activity = [yesterday, c.day_start].into_iter().enumerate().map(|(i, ts)| {
+        let mut e = r10_quota(i as u64 + 1, 0);
+        e.ts = Some(ts);
+        e
+    }).collect();
+    data.sessions.sessions.truncate(2);
+    for (session, ts) in data.sessions.sessions.iter_mut().zip([yesterday, c.day_start]) {
+        session.last_used_at = Some(ts);
+        session.inflight = Default::default();
+    }
+    let view = project(&data, &mut DashboardState {
+        range: Range::Today, event_days: 1, ..Default::default()
+    }, &c);
+    let tile = view.usage.iter().find(|t| t.id == "cx-a").unwrap();
+    assert_eq!(tile.series[0].points, vec![(from, Some(90.)), (gap, None), (yesterday, Some(70.)), (c.utc(), Some(60.))]);
+    assert_eq!(tile.series[0].resets, vec![from, yesterday]);
+    assert_eq!(tile.credits_spans, vec![(from, c.utc())]);
+    assert_eq!(view.flat.len(), 1);
+    assert_eq!(view.flat[0].id, "000000000001");
+    assert_eq!(view.events.len(), 1);
+    assert_eq!(view.events[0].seq, 2);
+}
+
+#[test]
+fn r13_usage_domain_is_minute_anchored_and_recovers_from_clock_reversal() {
+    use chrono::Duration;
+    let mut c = clock();
+    let initial = usage_domain(&c);
+    for ms in [0, 500, 51_999] {
+        c.now = clock().now + Duration::milliseconds(ms);
+        assert_eq!(usage_domain(&c), initial);
+    }
+    c.now = clock().now + Duration::seconds(52);
+    assert_eq!(usage_domain(&c).0, initial.0 + Duration::minutes(1));
+    c.now = clock().now - Duration::seconds(9);
+    assert_eq!(usage_domain(&c).0, initial.0 - Duration::minutes(1));
+    assert_eq!(usage_domain(&c).1 - usage_domain(&c).0, Duration::hours(24));
+}
+
+#[test]
+fn r13_usage_empty_history_keeps_all_real_windows_and_resets_beyond_domain() {
+    use chrono::Duration;
+    let c = clock();
+    let (_, to) = usage_domain(&c);
+    let data = r10_accounts(serde_json::json!([
+        {"id":"free","provider":"codex","user_state":"active","health":{"kind":"ready"},"windows":[
+            {"name":"5h","used_pct":20,"reset_at":to},
+            {"name":"7d","used_pct":30,"reset_at":to + Duration::seconds(1)},
+            {"name":"43200m","used_pct":40,"reset_at":to + Duration::days(20)}
+        ]}
+    ]));
+    let tiles = usage_tiles(&data, &c);
+    let tile = &tiles[0];
+    assert_eq!(tile.windows.len(), 3);
+    assert_eq!(tile.series.len(), 3);
+    assert!(tile.series.iter().all(|s| s.points.is_empty() && s.resets.is_empty()));
+    assert_eq!(tile.series.iter().map(|s| s.remaining).collect::<Vec<_>>(), vec![Some(80), Some(70), Some(60)]);
+    assert_eq!(tile.series.iter().flat_map(|s| s.future_resets.clone()).collect::<Vec<_>>(), vec![to, to + Duration::seconds(1), to + Duration::days(20)]);
+    assert!(!tile.series.iter().any(|s| s.name == "0m"));
 }
 #[test]
 fn r84_dashboard_group_header_keeps_each_usage_window_and_binding_chip() {

@@ -8,7 +8,7 @@ mod notices;
 #[cfg(windows)]
 mod theme;
 #[cfg(windows)]
-mod tray_icon;
+use qb_tray::tray_icon;
 #[cfg(windows)]
 mod viewport;
 use qb_tray::{parse_state_at, render_png};
