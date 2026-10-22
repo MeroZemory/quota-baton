@@ -68,8 +68,12 @@ The current plan, with lanes, owners and start commands, is the "Plan" section o
 | R12.1 | merged and INSTALLED (c6a304e, 10-21 23:14): image canary stage diagnostics and retry, user `-c` passthrough |
 | R12.9 | merged and INSTALLED (c899b6a, 10-22 01:02): outage follow-ups (credit hold fix kept, WS capacity spreading, release-hold, Q-owned CPA resume) |
 | R12.10 | merged (성능 조건·qb-tray scoped 관문 통과; `.sandbox/reports/R12.10.md`); 설치는 설계 세션 |
-| R13 | 진행 중: B+B2+D·A·A1 merged 및 설치 수용. C+E 긴급 등록 단위 f39e504·926793f 커밋, 전체 wait/move 실행 통합은 미출시. 다음: R14 후 Part F; brief `R13-burn-icon-hold.md` |
-| R14 | 진행 중: 1차 breaker·재읽기 비용·실제 UI 관문 완료, self-merge 전달. 2차 근거형 rebind·정적 검사·실제24시간 차등 재생은 미완료. brief `R14-token-guard.md`; 설치는 설계 세션 |
+| R13 | 진행 중: B+B2+D·A·A1 merged 및 설치 수용. C+E 긴급 등록 단위 f39e504·926793f 커밋, 전체 wait/move 실행 통합은 미출시. 다음: R14.1 → R12.11 → R16 → C+E → R14.2·Part F; brief `R13-burn-icon-hold.md` |
+| R14 | 진행 중: 1차 실행 보호 관문 완료·설치 보류. R14.1 사건 단위 예산·240초 만료만 우선 전달하며 수집기는 설치 조건에서 분리. 2차 근거형 rebind·정적 검사·실제24시간 재생은 별도 미완료 |
+| R14.1 | merged: 보호 전용 8c3a974 집중 관문 통과 (guard21·R1419·HTTP12·WS123, strict lint). 사건 합산·240초 만료·request deadline 검증. 설치·live 확인은 설계 세션 |
+| R12.11 | 대기: R14.1 다음 이미지 version probe 15초·1회 재시도·24시간 pass cache fallback. 구현 준비 중, focused gate 후 self-merge |
+| R16 | 대기: R14.1 다음 영문 UI·읽기 전용 snapshot·production renderer PNG. brief `R16-readme-assets.md` |
+| R14.2 | 대기: R16·R13 C+E 다음 기본 꺼짐 수집기(schema/off/7일 bounded retention). 기존 구현은 impl/r14.2 db6baac에 보존; 실제24시간 replay보다 먼저 전달 |
 | R15 | 대기: R13 Part F 후 공유 admin 응답형·계약 왕복·라우팅 속성 검사(D27). brief `R15-contract.md` |
 | R11.1 | merged: 공유 AGENTS/hook 편집 보존·rh 별칭, 회귀5·cutover141·strict lint·실제 preview/launch 점검 통과. 설치·apply는 설계 세션. 보고서 `.sandbox/reports/R11.1.md` |
 | R11 | merged (실제 native5/5·HTTP33·WS15·코어1213·복구54·창4, focused repair gate 통과). 0106c0e 설치·live 계정 지정 확인. 보고서 `.sandbox/reports/R11.md` |
