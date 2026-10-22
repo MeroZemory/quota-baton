@@ -22,6 +22,50 @@ pub(crate) fn short_quota_reset(
     model: Option<&str>,
     now: DateTime<Utc>,
 ) -> Option<DateTime<Utc>> {
+    classify(account, quota, model, now, false)
+}
+
+/// Classify the first report that created a hold in the owner's transaction.
+/// Both accounts must be read under that transaction, immediately before and
+/// after applying this exact raw report at `applied_at`. Reproduce the native
+/// reducer without changing timestamps in either the report or persisted state.
+/// This still supplies no authority: pre-send origin and ordering validation are
+/// mandatory at the caller before minting a wait proof.
+pub(crate) fn newly_applied_short_quota_reset(
+    before: &Account,
+    after: &Account,
+    raw: &Value,
+    model: Option<&str>,
+    applied_at: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let mut expected = before.clone();
+    expected.apply_health_signal(
+        crate::accounts::HealthSignal::UsageSnapshot {
+            snapshot: raw.clone(),
+            model: model.map(str::to_owned),
+            projected_allowance: 0.0,
+        },
+        applied_at,
+    );
+    if &expected != after
+        || expected.quota_cooling == before.quota_cooling
+        || expected
+            .quota_cooling
+            .as_ref()
+            .is_none_or(|hold| hold.started_at != applied_at)
+    {
+        return None;
+    }
+    classify(after, Some(raw), model, applied_at, true)
+}
+
+fn classify(
+    account: &Account,
+    quota: Option<&Value>,
+    model: Option<&str>,
+    now: DateTime<Utc>,
+    newly_applied: bool,
+) -> Option<DateTime<Utc>> {
     if account.user_state != UserState::Active
         || account.drain
         || account.auth_probe_pending
@@ -66,7 +110,7 @@ pub(crate) fn short_quota_reset(
     let observed = timestamp(&quota["observed_at"])?;
     if observed > now
         || now.signed_duration_since(observed) > Duration::seconds(300)
-        || observed < evidence.started_at
+        || (!newly_applied && observed < evidence.started_at)
     {
         return None;
     }
@@ -403,5 +447,91 @@ mod tests {
         // Retain the donor's rejection filter. Do not backdate either timestamp
         // to make a causally valid but delayed report pass this narrow slice.
         assert_eq!(short_quota_reset(&account, Some(&quota), None, now), None);
+    }
+
+    fn apply_raw(before: &Account, raw: &Value, at: DateTime<Utc>) -> Account {
+        let mut after = before.clone();
+        after.apply_health_signal(
+            crate::accounts::HealthSignal::UsageSnapshot {
+                snapshot: raw.clone(),
+                model: None,
+                projected_allowance: 0.0,
+            },
+            at,
+        );
+        after
+    }
+
+    #[test]
+    fn r13_quota_wait_first_report_uses_exact_native_transition_without_backdating() {
+        for provider in [Provider::Claude, Provider::Codex] {
+            let (mut before, raw, observed) = fixture();
+            before.provider = provider;
+            before.health = Health::Ready;
+            before.quota_cooling = None;
+            let applied = observed + Duration::milliseconds(250);
+            let after = apply_raw(&before, &raw, applied);
+            let reset = after.quota_cooling.as_ref().unwrap().reset_at;
+            assert_eq!(after.quota_cooling.as_ref().unwrap().started_at, applied);
+            assert_eq!(short_quota_reset(&after, Some(&raw), None, applied), None);
+            let original_raw = raw.clone();
+            let original_after = after.clone();
+            assert_eq!(
+                newly_applied_short_quota_reset(&before, &after, &raw, None, applied),
+                Some(reset)
+            );
+            assert_eq!(raw, original_raw);
+            assert_eq!(after, original_after);
+        }
+    }
+
+    #[test]
+    fn r13_quota_wait_first_report_rejects_unrelated_mutation_and_wrong_apply_time() {
+        let (mut before, raw, observed) = fixture();
+        before.health = Health::Ready;
+        before.quota_cooling = None;
+        let applied = observed + Duration::milliseconds(250);
+        let after = apply_raw(&before, &raw, applied);
+        assert!(newly_applied_short_quota_reset(&before, &after, &raw, None, applied).is_some());
+        let mut unrelated = after.clone();
+        unrelated.label = "sample-changed".into();
+        assert_eq!(
+            newly_applied_short_quota_reset(&before, &unrelated, &raw, None, applied),
+            None
+        );
+        assert_eq!(
+            newly_applied_short_quota_reset(
+                &before,
+                &after,
+                &raw,
+                None,
+                applied + Duration::nanoseconds(1),
+            ),
+            None
+        );
+        assert_eq!(
+            newly_applied_short_quota_reset(&after, &after, &raw, None, applied),
+            None
+        );
+    }
+
+    #[test]
+    fn r13_quota_wait_first_report_still_rejects_partial_and_long_window_limits() {
+        let (mut before, raw, observed) = fixture();
+        before.health = Health::Ready;
+        before.quota_cooling = None;
+        let applied = observed + Duration::milliseconds(250);
+        for (index, mut rejected) in [raw.clone(), raw].into_iter().enumerate() {
+            if index == 0 {
+                rejected["windows"].as_array_mut().unwrap().pop();
+            } else {
+                rejected["windows"][1]["used_pct"] = json!(100.);
+            }
+            let after = apply_raw(&before, &rejected, applied);
+            assert_eq!(
+                newly_applied_short_quota_reset(&before, &after, &rejected, None, applied),
+                None
+            );
+        }
     }
 }
