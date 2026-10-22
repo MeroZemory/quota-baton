@@ -1445,6 +1445,8 @@ fn install_entry_range(
             install_existing(paths, m, i)?;
         } else if exists(&e.path)? {
             // Recover the precise file installed before its completion write.
+            // Only completed shared hardlinks tolerate content edits; their
+            // journal identity and source relationship must still match.
             if e.kind == Kind::Junction
                 && !reparse(&e.path)?
                 && e.path.is_dir()
@@ -1455,7 +1457,7 @@ fn install_entry_range(
                     &e.path,
                     e.target.as_deref().context("링크 대상이 없습니다")?,
                 )?;
-            } else if !matches_entry(e, false)? {
+            } else if !matches_entry(e, e.done && e.kind == Kind::Hardlink)? {
                 bail!("생성 경로 충돌 또는 변경: {}", e.path.display());
             }
         } else {
@@ -1553,7 +1555,7 @@ fn finish_alias_install(paths: &CutoverPaths, m: &mut Manifest) -> Result<()> {
             observed.hash = hash_bytes(&bytes);
         }
         anyhow::ensure!(
-            matches_entry(&observed, false)?,
+            matches_entry(&observed, e.kind == Kind::Hardlink)?,
             "original path changed during alias extension"
         );
     }
@@ -1586,7 +1588,7 @@ fn finish_image_install(paths: &CutoverPaths, m: &mut Manifest, start: usize) ->
             // Read-only observation does not grant unwire deletion ownership.
             observed.hash = hash_bytes(&bytes);
         }
-        if !matches_entry(&observed, false)? {
+        if !matches_entry(&observed, e.kind == Kind::Hardlink)? {
             bail!("Qi 확장 중 원본 경로가 변경되었습니다");
         }
     }
@@ -1766,256 +1768,286 @@ fn upgrade_completed(
     command_update: Option<CommandRecord>,
     aliases: &[account_alias::Planned],
 ) -> Result<Report> {
-    account_alias::preflight_saved(m, false)?;
-    account_alias::preflight_new(aliases)?;
-    upgrade_directories(m)?;
-    // Title upgrades do not reinstall the other objects, but still enforce
-    // their existing ownership/content boundaries before any upgrade write.
-    for e in &m.entries {
-        if !upgrade_path(m, &e.path)? && !matches_entry(e, false)? {
-            bail!("생성 경로 충돌 또는 변경: {}", e.path.display());
-        }
-    }
-    if m.claude_mode == ClaudeMode::Default && hash_file(&m.claude)? != m.claude_after {
-        bail!("Claude 설정이 변경되어 적용을 중단했습니다");
-    }
-    let mut report = Report {
-        summary: vec!["요약: 별도 홈 제목 설정 업그레이드를 확인합니다".into()],
-        ..Report::default()
-    };
-    let mut plans: Vec<(Entry, Vec<u8>, Vec<u8>)> = Vec::new();
-    let mut secrets = Vec::new();
-    let mut publication_scratch = Vec::new();
-    // R3 could journal done before unlinking its publication hardlink. Prove
-    // every such leftover before any cleanup or title replacement, even force.
-    for (i, e) in m.entries.iter().enumerate() {
-        if e.kind == Kind::File
-            && e.upgrade.is_none()
-            && let Some(tmp) = &e.pending
-            && exists(tmp)?
-        {
-            if e.identity.is_none()
-                || e.pending_identity != e.identity
-                || !matches_entry(e, false)?
-                || !pending_matches(e, false)?
-            {
-                bail!("기존 임시 파일을 먼저 확인하세요");
-            }
-            publication_scratch.push(i);
-            report
-                .warnings
-                .push(format!("게시 임시 파일을 정리합니다: {}", tmp.display()));
-        }
-    }
-    // Preflight all candidates before mutation. No default source/key reads.
-    for e in &m.entries {
-        if !upgrade_path(m, &e.path)? {
-            continue;
-        }
-        let mut observed = e.clone();
-        let merge_config = m.mode == CodexMode::Dedicated
-            && (e.path == m.home.join("config.toml")
-                || m.image_home
-                    .as_ref()
-                    .is_some_and(|h| e.path == h.join("config.toml")))
-            && e.identity.is_some();
-        if e.upgrade.is_some() {
-            upgrade_state(e)?;
-        } else {
-            ancestors_safe(&e.path)?;
-            // Codex atomically rewrites its config when recording project trust.
-            // Merge current content at this validated path; other files and
-            // in-flight intents still require their exact journaled identities.
-            if merge_config {
-                observed.identity = Some(identity(&e.path)?);
-            }
-            if !matches_entry(&observed, force || merge_config)? {
-                bail!(
-                    "전용 파일이 변경되었습니다. 같은 파일의 내용 변경만 --force로 허용할 수 있습니다"
-                );
+    let mut stage = "upgrade-alias-preflight";
+    let result = (|| -> Result<Report> {
+        account_alias::preflight_saved(m, false)?;
+        account_alias::preflight_new(aliases)?;
+        stage = "upgrade-directories";
+        upgrade_directories(m)?;
+        // Title upgrades do not reinstall the other objects, but still enforce
+        // their existing ownership/content boundaries before any upgrade write.
+        for e in &m.entries {
+            stage = match e.path.file_name().and_then(|s| s.to_str()) {
+                Some("AGENTS.md") => "upgrade-shared-agents",
+                Some("hooks.json") => "upgrade-shared-hooks",
+                Some("auth.json") => "upgrade-auth",
+                _ => "upgrade-owned-object",
+            };
+            // Shared instructions/hooks are editable user data. Only waive their
+            // historical content hash: journal identity, normal-file type and the
+            // exact source hardlink relationship must still match. No adoption or
+            // write to either shared name occurs during a launcher/alias upgrade.
+            let shared_content = e.kind == Kind::Hardlink;
+            if !upgrade_path(m, &e.path)? && !matches_entry(e, shared_content)? {
+                bail!("생성 경로 충돌 또는 변경: {}", e.path.display());
             }
         }
-        let before = fs::read(&e.path)?;
-        if e.upgrade.is_none() {
-            if !force && !merge_config && hash_bytes(&before) != e.hash {
-                bail!("업그레이드 교체 대상이 변경되었습니다");
-            }
-            observed.hash = hash_bytes(&before);
-            if !matches_entry(&observed, false)? {
-                bail!("업그레이드 교체 대상이 변경되었습니다");
-            }
+        stage = "upgrade-claude-settings";
+        if m.claude_mode == ClaudeMode::Default && hash_file(&m.claude)? != m.claude_after {
+            bail!("Claude 설정이 변경되어 적용을 중단했습니다");
         }
-        let after = if let Some(u) = &e.upgrade {
-            unprotect(&u.payload)?
-        } else if m
-            .image_home
-            .as_ref()
-            .is_some_and(|h| e.path == h.join("config.toml"))
-        {
-            let (_, _, config) = plans
-                .iter()
-                .find(|(q, _, _)| q.path == m.home.join("config.toml"))
-                .context("Q config 업그레이드 계획이 없습니다")?;
-            let saved = unprotect(
-                e.image_base
-                    .as_deref()
-                    .or(e.payload.as_deref())
-                    .context("Qi config 기준 payload가 없습니다")?,
-            )?;
-            let generated = image_home::config_bytes(config, &m.home)?;
-            if apply && saved != generated {
-                observed.image_base = Some(protect(&generated)?);
-            }
-            image_home::sync_config(config, &before, &saved, &m.home)?
-        } else if e.path == m.home.join("config.toml") {
-            dedicated_codex_title_bytes(&before)?
-        } else if e.path.file_name().is_some_and(|n| n == "settings.json") {
-            dedicated_claude_title_bytes(&before)?
-        } else if e.path == m.npm.join("codex-qb.cmd") {
-            launcher()?
-        } else if let Some(bytes) =
-            account_alias::upgrade_bytes(&m.npm, &m.account_aliases, &e.path)?
-        {
-            bytes
-        } else {
-            claude_launcher(
-                &m.command
-                    .as_ref()
-                    .context("Claude 실행 파일 journal이 없습니다")?
-                    .path,
-            )?
+        let mut report = Report {
+            summary: vec!["요약: 별도 홈 제목 설정 업그레이드를 확인합니다".into()],
+            ..Report::default()
         };
-        validate_upgrade_connection(m, e, &before)?;
-        validate_upgrade_connection(m, e, &after)?;
-        for bytes in [&before, &after] {
-            if let Ok(doc) = std::str::from_utf8(strip_utf8_bom(bytes))
-                .unwrap_or("")
-                .parse::<DocumentMut>()
+        let mut plans: Vec<(Entry, Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut secrets = Vec::new();
+        let mut publication_scratch = Vec::new();
+        // R3 could journal done before unlinking its publication hardlink. Prove
+        // every such leftover before any cleanup or title replacement, even force.
+        stage = "upgrade-publication-scratch";
+        for (i, e) in m.entries.iter().enumerate() {
+            if e.kind == Kind::File
+                && e.upgrade.is_none()
+                && let Some(tmp) = &e.pending
+                && exists(tmp)?
             {
-                toml_strings(doc.as_item(), &mut secrets);
-            }
-            if let Ok(json) = serde_json::from_slice::<Value>(strip_utf8_bom(bytes)) {
-                json_strings(&json, &mut secrets);
-            }
-        }
-        plans.push((observed, before, after));
-    }
-    // Qi must derive from the very same observed Q snapshot used by the
-    // upgrade, not a second source read that could race with native trust writes.
-    let image_addition = if m.mode == CodexMode::Dedicated && m.image_home.is_none() {
-        let (_, _, config) = plans
-            .iter()
-            .find(|(e, _, _)| e.path == m.home.join("config.toml"))
-            .context("Q config 업그레이드 계획이 없습니다")?;
-        Some(image_home::plan(paths, &m.entries, config, apply)?)
-    } else {
-        None
-    };
-    let alias_entries = account_alias::entries_for_new(aliases, apply)?;
-    // Known journal credentials are redacted wherever values recur in the diff.
-    for e in &m.entries {
-        if let Some(payload) = &e.payload {
-            let bytes = unprotect(payload)?;
-            if let Ok(json) = serde_json::from_slice::<Value>(strip_utf8_bom(&bytes)) {
-                json_strings(&json, &mut secrets);
-            }
-        }
-    }
-    if let Some(command) = command_update {
-        report.summary.push(CLAUDE_UPDATED.into());
-        if apply {
-            // Persist only after every upgrade preflight succeeds, even when
-            // all owned launcher/settings bytes are already current.
-            m.command = Some(command);
-            atomic_json(&paths.journal(), m)?;
-        }
-    }
-    if apply {
-        for i in publication_scratch {
-            cleanup_publication_scratch(&m.entries[i])?;
-        }
-    }
-    for (observed, before, after) in plans {
-        let path = observed.path.clone();
-        let i = m.entries.iter().position(|e| e.path == path).unwrap();
-        if before != after || m.entries[i].upgrade.is_some() {
-            report.changed.push(path.display().to_string());
-            report
-                .diff
-                .extend(safe_diff(&path, &before, &after, &secrets));
-            if !apply {
-                continue;
-            }
-            if m.entries[i].upgrade.is_none() {
-                let e = &mut m.entries[i];
-                if !matches_entry(&observed, false)? {
-                    bail!("업그레이드 교체 대상이 변경되었습니다");
-                }
-                if let Some(tmp) = &e.pending
-                    && exists(tmp)?
+                if e.identity.is_none()
+                    || e.pending_identity != e.identity
+                    || !matches_entry(e, false)?
+                    || !pending_matches(e, false)?
                 {
                     bail!("기존 임시 파일을 먼저 확인하세요");
                 }
-                // Bind recovery to the observed input, never to a later rewrite.
-                e.identity = observed.identity;
-                e.image_base = observed.image_base;
-                e.upgrade = Some(Upgrade {
-                    old_hash: hash_bytes(&before),
-                    old_identity: e
-                        .identity
-                        .clone()
-                        .context("업그레이드 identity가 없습니다")?,
-                    hash: hash_bytes(&after),
-                    payload: protect(&after)?,
-                });
-                e.pending = None;
-                e.pending_identity = None;
+                publication_scratch.push(i);
+                report
+                    .warnings
+                    .push(format!("게시 임시 파일을 정리합니다: {}", tmp.display()));
+            }
+        }
+        // Preflight all candidates before mutation. No default source/key reads.
+        for e in &m.entries {
+            if !upgrade_path(m, &e.path)? {
+                continue;
+            }
+            stage = "upgrade-file-preflight";
+            let mut observed = e.clone();
+            let merge_config = m.mode == CodexMode::Dedicated
+                && (e.path == m.home.join("config.toml")
+                    || m.image_home
+                        .as_ref()
+                        .is_some_and(|h| e.path == h.join("config.toml")))
+                && e.identity.is_some();
+            if e.upgrade.is_some() {
+                upgrade_state(e)?;
+            } else {
+                ancestors_safe(&e.path)?;
+                // Codex atomically rewrites its config when recording project trust.
+                // Merge current content at this validated path; other files and
+                // in-flight intents still require their exact journaled identities.
+                if merge_config {
+                    observed.identity = Some(identity(&e.path)?);
+                }
+                if !matches_entry(&observed, force || merge_config)? {
+                    bail!(
+                        "전용 파일이 변경되었습니다. 같은 파일의 내용 변경만 --force로 허용할 수 있습니다"
+                    );
+                }
+            }
+            let before = fs::read(&e.path)?;
+            if e.upgrade.is_none() {
+                if !force && !merge_config && hash_bytes(&before) != e.hash {
+                    bail!("업그레이드 교체 대상이 변경되었습니다");
+                }
+                observed.hash = hash_bytes(&before);
+                if !matches_entry(&observed, false)? {
+                    bail!("업그레이드 교체 대상이 변경되었습니다");
+                }
+            }
+            stage = "upgrade-generate";
+            let after = if let Some(u) = &e.upgrade {
+                unprotect(&u.payload)?
+            } else if m
+                .image_home
+                .as_ref()
+                .is_some_and(|h| e.path == h.join("config.toml"))
+            {
+                stage = "image-q-plan";
+                let (_, _, config) = plans
+                    .iter()
+                    .find(|(q, _, _)| q.path == m.home.join("config.toml"))
+                    .context("Q config 업그레이드 계획이 없습니다")?;
+                stage = "image-saved-config";
+                let saved = unprotect(
+                    e.image_base
+                        .as_deref()
+                        .or(e.payload.as_deref())
+                        .context("Qi config 기준 payload가 없습니다")?,
+                )?;
+                stage = "image-generate";
+                let generated = image_home::config_bytes(config, &m.home)?;
+                if apply && saved != generated {
+                    observed.image_base = Some(protect(&generated)?);
+                }
+                stage = "image-sync";
+                image_home::sync_config(config, &before, &saved, &m.home)?
+            } else if e.path == m.home.join("config.toml") {
+                dedicated_codex_title_bytes(&before)?
+            } else if e.path.file_name().is_some_and(|n| n == "settings.json") {
+                dedicated_claude_title_bytes(&before)?
+            } else if e.path == m.npm.join("codex-qb.cmd") {
+                launcher()?
+            } else if let Some(bytes) =
+                account_alias::upgrade_bytes(&m.npm, &m.account_aliases, &e.path)?
+            {
+                bytes
+            } else {
+                claude_launcher(
+                    &m.command
+                        .as_ref()
+                        .context("Claude 실행 파일 journal이 없습니다")?
+                        .path,
+                )?
+            };
+            stage = "upgrade-connection-before";
+            validate_upgrade_connection(m, e, &before)?;
+            stage = "upgrade-connection-after";
+            validate_upgrade_connection(m, e, &after)?;
+            for bytes in [&before, &after] {
+                if let Ok(doc) = std::str::from_utf8(strip_utf8_bom(bytes))
+                    .unwrap_or("")
+                    .parse::<DocumentMut>()
+                {
+                    toml_strings(doc.as_item(), &mut secrets);
+                }
+                if let Ok(json) = serde_json::from_slice::<Value>(strip_utf8_bom(bytes)) {
+                    json_strings(&json, &mut secrets);
+                }
+            }
+            plans.push((observed, before, after));
+        }
+        // Qi must derive from the very same observed Q snapshot used by the
+        // upgrade, not a second source read that could race with native trust writes.
+        stage = "image-addition-plan";
+        let image_addition = if m.mode == CodexMode::Dedicated && m.image_home.is_none() {
+            let (_, _, config) = plans
+                .iter()
+                .find(|(e, _, _)| e.path == m.home.join("config.toml"))
+                .context("Q config 업그레이드 계획이 없습니다")?;
+            Some(image_home::plan(paths, &m.entries, config, apply)?)
+        } else {
+            None
+        };
+        stage = "alias-entry-plan";
+        let alias_entries = account_alias::entries_for_new(aliases, apply)?;
+        // Known journal credentials are redacted wherever values recur in the diff.
+        stage = "upgrade-diff-secrets";
+        for e in &m.entries {
+            if let Some(payload) = &e.payload {
+                let bytes = unprotect(payload)?;
+                if let Ok(json) = serde_json::from_slice::<Value>(strip_utf8_bom(&bytes)) {
+                    json_strings(&json, &mut secrets);
+                }
+            }
+        }
+        if let Some(command) = command_update {
+            report.summary.push(CLAUDE_UPDATED.into());
+            if apply {
+                // Persist only after every upgrade preflight succeeds, even when
+                // all owned launcher/settings bytes are already current.
+                m.command = Some(command);
                 atomic_json(&paths.journal(), m)?;
             }
-            resume_upgrade(paths, m, i)?;
-        } else if apply && observed.image_base != m.entries[i].image_base {
-            // Updating the generated baseline never transfers deletion ownership.
-            if !matches_entry(&observed, false)? {
-                bail!("Qi 기준 config 관찰 대상이 변경되었습니다");
-            }
-            m.entries[i].image_base = observed.image_base;
-            atomic_json(&paths.journal(), m)?;
         }
-    }
-    if let Some((home, entries)) = image_addition {
+        stage = "upgrade-publication";
+        if apply {
+            for i in publication_scratch {
+                cleanup_publication_scratch(&m.entries[i])?;
+            }
+        }
+        for (observed, before, after) in plans {
+            let path = observed.path.clone();
+            let i = m.entries.iter().position(|e| e.path == path).unwrap();
+            if before != after || m.entries[i].upgrade.is_some() {
+                report.changed.push(path.display().to_string());
+                report
+                    .diff
+                    .extend(safe_diff(&path, &before, &after, &secrets));
+                if !apply {
+                    continue;
+                }
+                if m.entries[i].upgrade.is_none() {
+                    let e = &mut m.entries[i];
+                    if !matches_entry(&observed, false)? {
+                        bail!("업그레이드 교체 대상이 변경되었습니다");
+                    }
+                    if let Some(tmp) = &e.pending
+                        && exists(tmp)?
+                    {
+                        bail!("기존 임시 파일을 먼저 확인하세요");
+                    }
+                    // Bind recovery to the observed input, never to a later rewrite.
+                    e.identity = observed.identity;
+                    e.image_base = observed.image_base;
+                    e.upgrade = Some(Upgrade {
+                        old_hash: hash_bytes(&before),
+                        old_identity: e
+                            .identity
+                            .clone()
+                            .context("업그레이드 identity가 없습니다")?,
+                        hash: hash_bytes(&after),
+                        payload: protect(&after)?,
+                    });
+                    e.pending = None;
+                    e.pending_identity = None;
+                    atomic_json(&paths.journal(), m)?;
+                }
+                resume_upgrade(paths, m, i)?;
+            } else if apply && observed.image_base != m.entries[i].image_base {
+                // Updating the generated baseline never transfers deletion ownership.
+                if !matches_entry(&observed, false)? {
+                    bail!("Qi 기준 config 관찰 대상이 변경되었습니다");
+                }
+                m.entries[i].image_base = observed.image_base;
+                atomic_json(&paths.journal(), m)?;
+            }
+        }
+        if let Some((home, entries)) = image_addition {
+            report
+                .changed
+                .extend(entries.iter().map(|e| e.path.display().to_string()));
+            report
+                .summary
+                .push(format!("이미지 전용 홈: {}", home.display()));
+            if apply {
+                let start = m.entries.len();
+                m.image_home = Some(home);
+                m.image_install_pending = true;
+                m.install_completed = Some(false);
+                m.entries.extend(entries);
+                validate_manifest(paths, m)?;
+                atomic_json(&paths.journal(), m)?;
+                finish_image_install(paths, m, start)?;
+            }
+        }
         report
             .changed
-            .extend(entries.iter().map(|e| e.path.display().to_string()));
-        report
-            .summary
-            .push(format!("이미지 전용 홈: {}", home.display()));
-        if apply {
-            let start = m.entries.len();
-            m.image_home = Some(home);
-            m.image_install_pending = true;
+            .extend(aliases.iter().map(|p| p.path.display().to_string()));
+        if apply && !aliases.is_empty() {
+            account_alias::preflight_new(aliases)?;
+            m.account_aliases
+                .extend(aliases.iter().map(|p| p.record.clone()));
+            m.entries.extend(alias_entries);
+            m.alias_install_pending = true;
             m.install_completed = Some(false);
-            m.entries.extend(entries);
             validate_manifest(paths, m)?;
             atomic_json(&paths.journal(), m)?;
-            finish_image_install(paths, m, start)?;
+            finish_alias_install(paths, m)?;
         }
-    }
-    report
-        .changed
-        .extend(aliases.iter().map(|p| p.path.display().to_string()));
-    if apply && !aliases.is_empty() {
-        account_alias::preflight_new(aliases)?;
-        m.account_aliases
-            .extend(aliases.iter().map(|p| p.record.clone()));
-        m.entries.extend(alias_entries);
-        m.alias_install_pending = true;
-        m.install_completed = Some(false);
-        validate_manifest(paths, m)?;
-        atomic_json(&paths.journal(), m)?;
-        finish_alias_install(paths, m)?;
-    }
-    report.warnings.extend(scratch_warnings(m));
-    Ok(report)
+        report.warnings.extend(scratch_warnings(m));
+        Ok(report)
+    })();
+    result.context(WireStage(stage))
 }
 
 fn cleanup_publication_scratch(e: &Entry) -> Result<()> {
@@ -4066,6 +4098,312 @@ mod tests {
             .map(|(id, short)| format!("[accounts.'{id}']\nshort = '{short}'\n"))
             .collect::<String>();
         fs::write(p.qb_home.join("config.toml"), text).unwrap();
+    }
+
+    fn r111_shared_files(
+        p: &CutoverPaths,
+    ) -> Vec<(PathBuf, Vec<u8>, Identity, std::time::SystemTime)> {
+        manifest(p)
+            .entries
+            .into_iter()
+            .filter(|e| e.kind == Kind::Hardlink)
+            .flat_map(|e| [e.path, e.target.unwrap()])
+            .map(|path| {
+                let bytes = fs::read(&path).unwrap();
+                let id = identity(&path).unwrap();
+                let modified = fs::metadata(&path).unwrap().modified().unwrap();
+                (path, bytes, id, modified)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn r111_alias_upgrade_preserves_in_place_shared_agents_and_hooks_edits() {
+        for name in ["AGENTS.md", "hooks.json"] {
+            let (_dir, p) = fixture();
+            run(&p, true, Some(CodexMode::Dedicated)).unwrap();
+            let source = p.codex_config.parent().unwrap().join(name);
+            let original_id = identity(&source).unwrap();
+            let edited = if name == "AGENTS.md" {
+                b"synthetic instructions edited after installation\n".as_slice()
+            } else {
+                b"{\"synthetic_local_edit\":true}\n".as_slice()
+            };
+            fs::write(&source, edited).unwrap();
+            assert_eq!(identity(&source).unwrap(), original_id);
+            let id = r11_account(&p, "shared-edit", false);
+            r11_config(&p, &[(&id, "rh")]);
+            let alias = p.npm_dir.join("codex-rh.cmd");
+            let sources = snapshot(&p);
+            let shared = r111_shared_files(&p);
+            let owned = r32_owned(&p);
+            let shared_records = |m: Manifest| {
+                m.entries
+                    .iter()
+                    .filter(|e| e.kind == Kind::Hardlink)
+                    .map(|e| serde_json::to_value(e).unwrap())
+                    .collect::<Vec<_>>()
+            };
+            let records = shared_records(manifest(&p));
+            let journal = fs::read(p.journal()).unwrap();
+
+            let preview = run(&p, false, Some(CodexMode::Dedicated)).unwrap();
+            assert_eq!(preview.changed, vec![alias.display().to_string()]);
+            assert!(!alias.exists());
+            assert_eq!(fs::read(p.journal()).unwrap(), journal);
+            assert_eq!(snapshot(&p), sources);
+            assert_eq!(r111_shared_files(&p), shared);
+            assert_eq!(r32_owned(&p), owned);
+
+            let applied = run(&p, true, Some(CodexMode::Dedicated)).unwrap();
+            assert_eq!(applied.changed, vec![alias.display().to_string()]);
+            let expected = format!(
+                concat!(
+                    "@echo off\r\nsetlocal DisableDelayedExpansion\r\n",
+                    "rem quota-baton account preference alias\r\n",
+                    "\"%~dp0codex-qb.cmd\" --account \"{}\" %*\r\n",
+                ),
+                id
+            );
+            assert_eq!(fs::read(&alias).unwrap(), expected.as_bytes());
+            let m = manifest(&p);
+            assert_eq!(m.account_aliases.len(), 1);
+            assert_eq!(m.account_aliases[0].short, "rh");
+            assert_eq!(m.account_aliases[0].account_id, id);
+            assert_eq!(m.install_completed, Some(true));
+            // Content-hash tolerance must not refresh shared ownership records.
+            assert_eq!(shared_records(m), records);
+            assert_eq!(snapshot(&p), sources);
+            assert_eq!(r111_shared_files(&p), shared);
+            assert_eq!(fs::read(&source).unwrap(), edited);
+            let journal = fs::read(p.journal()).unwrap();
+            let owned = r32_owned(&p);
+            for apply in [false, true] {
+                assert!(
+                    run(&p, apply, Some(CodexMode::Dedicated))
+                        .unwrap()
+                        .changed
+                        .is_empty()
+                );
+                assert_eq!(fs::read(p.journal()).unwrap(), journal);
+                assert_eq!(snapshot(&p), sources);
+                assert_eq!(r111_shared_files(&p), shared);
+                assert_eq!(r32_owned(&p), owned);
+                assert_eq!(fs::read(&alias).unwrap(), expected.as_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn r111_alias_upgrade_rejects_same_byte_shared_hardlink_substitutes_even_force() {
+        for name in ["AGENTS.md", "hooks.json"] {
+            for replace_source in [false, true] {
+                let (dir, p) = fixture();
+                run(&p, true, Some(CodexMode::Dedicated)).unwrap();
+                let source = p.codex_config.parent().unwrap().join(name);
+                let q_link = p.codex_qb_home.join(name);
+                let original_id = identity(&source).unwrap();
+                assert_eq!(identity(&q_link).unwrap(), original_id);
+                let replaced = if replace_source { &source } else { &q_link };
+                let bytes = fs::read(replaced).unwrap();
+                // Keep the old object alive; install a genuine foreign hardlink
+                // with identical bytes, not merely an edited owned object.
+                let held = dir.path().join("held-original-shared");
+                fs::rename(replaced, &held).unwrap();
+                let foreign = dir.path().join("foreign-shared");
+                fs::write(&foreign, &bytes).unwrap();
+                fs::hard_link(&foreign, replaced).unwrap();
+                assert_ne!(identity(replaced).unwrap(), original_id);
+                assert_eq!(identity(replaced).unwrap(), identity(&foreign).unwrap());
+                assert_eq!(fs::read(replaced).unwrap(), bytes);
+                let id = r11_account(&p, "shared-substitute", false);
+                r11_config(&p, &[(&id, "rh")]);
+                let alias = p.npm_dir.join("codex-rh.cmd");
+                let journal = fs::read(p.journal()).unwrap();
+                let sources = snapshot(&p);
+                let shared = r111_shared_files(&p);
+                let owned = r32_owned(&p);
+                let held_id = identity(&held).unwrap();
+                let foreign_id = identity(&foreign).unwrap();
+
+                for force in [false, true] {
+                    for apply in [false, true] {
+                        let mut options = opts(Some(CodexMode::Dedicated));
+                        options.force = force;
+                        assert!(
+                            wire_with_task_query(&p, apply, options, &|_| {
+                                panic!("unrequested task backend")
+                            })
+                            .is_err(),
+                            "{name}, replace_source={replace_source}, apply={apply}, force={force}"
+                        );
+                        assert!(!alias.exists());
+                        assert!(!alias.with_extension("qb-pending").exists());
+                        assert_eq!(fs::read(p.journal()).unwrap(), journal);
+                        assert_eq!(snapshot(&p), sources);
+                        assert_eq!(r111_shared_files(&p), shared);
+                        assert_eq!(r32_owned(&p), owned);
+                        assert_eq!(fs::read(&held).unwrap(), bytes);
+                        assert_eq!(identity(&held).unwrap(), held_id);
+                        assert_eq!(fs::read(&foreign).unwrap(), bytes);
+                        assert_eq!(identity(&foreign).unwrap(), foreign_id);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn r111_interrupted_alias_addition_recovers_with_edited_shared_files() {
+        for stage in ["after-create", "after-publish"] {
+            let (_dir, p) = fixture();
+            run(&p, true, Some(CodexMode::Dedicated)).unwrap();
+            let source = p.codex_config.parent().unwrap();
+            fs::write(source.join("AGENTS.md"), "synthetic edited instructions\n").unwrap();
+            fs::write(source.join("hooks.json"), "{\"synthetic_edit\":true}\n").unwrap();
+            let id = r11_account(&p, "shared-recovery", false);
+            r11_config(&p, &[(&id, "rh")]);
+            let alias = p.npm_dir.join("codex-rh.cmd");
+            let sources = snapshot(&p);
+            let shared = r111_shared_files(&p);
+            let shared_records = |m: Manifest| {
+                m.entries
+                    .iter()
+                    .filter(|e| e.kind == Kind::Hardlink)
+                    .map(|e| serde_json::to_value(e).unwrap())
+                    .collect::<Vec<_>>()
+            };
+            let records = shared_records(manifest(&p));
+            INTERRUPT.with(|slot| *slot.borrow_mut() = Some((alias.clone(), stage)));
+            assert!(run(&p, true, Some(CodexMode::Dedicated)).is_err());
+            let pending = manifest(&p);
+            assert!(pending.alias_install_pending, "{stage}");
+            assert_eq!(pending.install_completed, Some(false));
+            assert_eq!(shared_records(pending), records);
+            assert_eq!(snapshot(&p), sources);
+            assert_eq!(r111_shared_files(&p), shared);
+
+            let journal = fs::read(p.journal()).unwrap();
+            let preview = run(&p, false, Some(CodexMode::Dedicated)).unwrap();
+            assert_eq!(preview.changed, vec![alias.display().to_string()]);
+            assert_eq!(fs::read(p.journal()).unwrap(), journal);
+            assert_eq!(snapshot(&p), sources);
+            assert_eq!(r111_shared_files(&p), shared);
+            run(&p, true, Some(CodexMode::Dedicated)).unwrap();
+            let complete = manifest(&p);
+            assert!(!complete.alias_install_pending);
+            assert_eq!(complete.install_completed, Some(true));
+            assert!(complete.entries.iter().all(|e| e.done));
+            assert_eq!(complete.account_aliases.len(), 1);
+            assert_eq!(complete.account_aliases[0].short, "rh");
+            assert_eq!(complete.account_aliases[0].account_id, id);
+            assert_eq!(shared_records(complete), records);
+            let expected = format!(
+                concat!(
+                    "@echo off\r\nsetlocal DisableDelayedExpansion\r\n",
+                    "rem quota-baton account preference alias\r\n",
+                    "\"%~dp0codex-qb.cmd\" --account \"{}\" %*\r\n",
+                ),
+                id
+            );
+            assert_eq!(fs::read(&alias).unwrap(), expected.as_bytes());
+            let journal = fs::read(p.journal()).unwrap();
+            for apply in [false, true] {
+                assert!(
+                    run(&p, apply, Some(CodexMode::Dedicated))
+                        .unwrap()
+                        .changed
+                        .is_empty()
+                );
+                assert_eq!(fs::read(p.journal()).unwrap(), journal);
+                assert_eq!(snapshot(&p), sources);
+                assert_eq!(r111_shared_files(&p), shared);
+                assert_eq!(fs::read(&alias).unwrap(), expected.as_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn r111_legacy_qi_extension_preserves_edited_shared_files_and_owned_records() {
+        let (_dir, p) = fixture();
+        run(&p, true, Some(CodexMode::Dedicated)).unwrap();
+        r12_remove_image_home(&p);
+        let source = p.codex_config.parent().unwrap();
+        fs::write(
+            source.join("AGENTS.md"),
+            "synthetic legacy instructions edited\n",
+        )
+        .unwrap();
+        fs::write(
+            source.join("hooks.json"),
+            "{\"synthetic_legacy_edit\":true}\n",
+        )
+        .unwrap();
+        let sources = snapshot(&p);
+        let shared = r111_shared_files(&p);
+        let old = manifest(&p);
+        assert_eq!(old.install_completed, Some(true));
+        assert!(old.image_home.is_none());
+        let records: Vec<_> = old
+            .entries
+            .iter()
+            .filter(|e| e.kind == Kind::Hardlink)
+            .map(|e| (e.path.clone(), serde_json::to_value(e).unwrap()))
+            .collect();
+        let qi = image_home::path(&p.codex_qb_home).unwrap();
+        let journal = fs::read(p.journal()).unwrap();
+        let owned = r32_owned(&p);
+        assert!(
+            !run(&p, false, Some(CodexMode::Dedicated))
+                .unwrap()
+                .changed
+                .is_empty()
+        );
+        assert!(!qi.exists());
+        assert_eq!(fs::read(p.journal()).unwrap(), journal);
+        assert_eq!(snapshot(&p), sources);
+        assert_eq!(r111_shared_files(&p), shared);
+        assert_eq!(r32_owned(&p), owned);
+        run(&p, true, Some(CodexMode::Dedicated)).unwrap();
+        let complete = manifest(&p);
+        assert_eq!(complete.image_home.as_ref(), Some(&qi));
+        assert!(!complete.image_install_pending);
+        assert_eq!(complete.install_completed, Some(true));
+        assert!(complete.entries.iter().all(|e| e.done));
+        for (path, record) in records {
+            let entry = complete.entries.iter().find(|e| e.path == path).unwrap();
+            assert_eq!(serde_json::to_value(entry).unwrap(), record);
+        }
+        for (path, bytes, id, modified) in shared {
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert_eq!(identity(&path).unwrap(), id);
+            assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+        }
+        for name in ["AGENTS.md", "hooks.json"] {
+            assert_eq!(
+                identity(&qi.join(name)).unwrap(),
+                identity(&source.join(name)).unwrap()
+            );
+            assert_eq!(
+                fs::read(qi.join(name)).unwrap(),
+                fs::read(source.join(name)).unwrap()
+            );
+        }
+        image_home::validate_config(&complete, &fs::read(qi.join("config.toml")).unwrap()).unwrap();
+        assert_eq!(snapshot(&p), sources);
+        let shared = r111_shared_files(&p);
+        let journal = fs::read(p.journal()).unwrap();
+        for apply in [false, true] {
+            assert!(
+                run(&p, apply, Some(CodexMode::Dedicated))
+                    .unwrap()
+                    .changed
+                    .is_empty()
+            );
+            assert_eq!(fs::read(p.journal()).unwrap(), journal);
+            assert_eq!(snapshot(&p), sources);
+            assert_eq!(r111_shared_files(&p), shared);
+        }
     }
 
     #[test]
@@ -6624,6 +6962,7 @@ trusted_hash = "synthetic-hook-hash"
         assert!(
             r32_run(&p, true, false)
                 .unwrap_err()
+                .root_cause()
                 .to_string()
                 .contains("synthetic creation interruption")
         );
@@ -6713,6 +7052,7 @@ trusted_hash = "synthetic-hook-hash"
                 assert!(
                     r32_run(&p, true, false)
                         .unwrap_err()
+                        .root_cause()
                         .to_string()
                         .contains("synthetic creation interruption")
                 );
@@ -6923,7 +7263,12 @@ trusted_hash = "synthetic-hook-hash"
             let edited = fs::read(&path).unwrap();
             for apply in [false, true] {
                 let error = r32_run(&p, apply, true).unwrap_err();
-                assert!(error.to_string().contains("기존 연결의 포트/키"));
+                assert!(
+                    error
+                        .root_cause()
+                        .to_string()
+                        .contains("기존 연결의 포트/키")
+                );
                 assert_eq!(fs::read(&path).unwrap(), edited);
                 assert_eq!(fs::read(p.journal()).unwrap(), journal);
                 assert_eq!(resume_snapshot(&p), before);
