@@ -7,9 +7,9 @@ This file names the verification for each unit and each row. The row list and th
 <!-- status:begin -->
 현재 마일스톤: R14 1차 보호 장치
 목표: 불필요한 계정 전환의 피해를 차단하고 토큰 재읽기 비용을 계측한다
-핵심 지표: 새 경로 출시 2/2 · 원장12·스트림20·실제HTTP7·WS4·트레이3·strict lint 통과, 실제 HWND 비용180 확인
+핵심 지표: 새 경로 출시 2/2 · 기존 실제 HWND 비용180 확인; Sol 지적 재시도 증거 누락 수정1eb26ce, 실행 재검증 대기
 사용자 대기: 없음 (R2 Part B 보류; 장시간 측정은 독립 실행)
-갱신: 2026-10-22 14:33 KST (실제 core/AdminClient/tray 화면 통과·SSE 경계 보완 중)
+갱신: 2026-10-22 15:35 KST (R14 수정본 검증·2차 라우팅 재생 관문 기준 명시)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -34,6 +34,39 @@ The Codex main updates this block at each unit and gate close; the design sessio
 8. **Launch or wiring changes only:** run `target/debug/quota-baton.exe launch-client --check` against the real `%LOCALAPPDATA%\quota-baton` journal, read-only, and record the result.
 9. **UI changes (D27, hard rule):** at least one capture through the real path (spawned core, real AdminClient, real tray process). FakeBridge captures alone do not pass.
 10. **Independent review**, where the brief asks for one: a different model family from the implementer.
+11. **Routing changes (D29):** replay at least 24 complete hours of real, body-free decision inputs through the candidate and the installed router. Follow the evidence rules below. Missing inputs or incomplete coverage do not pass. The explicitly requested R14 first delivery ships its runtime protection before this second-delivery replay gate; its report must retain that outstanding requirement.
+
+### Routing replay evidence (D29)
+
+The replay gate compares the production selection paths, not a replacement model
+of the breaker. Record the exact source, configuration, toolchain and adapter
+fingerprints for both routers, the input hash, the initial-state hash, and a
+totally ordered interval of at least 24 hours. Document gaps, dropped events,
+caps and warm-up. Include canonical session/alias state, routing policy, account
+health/quota evidence, capacity/admission events and the injected decision time.
+Persist only allowlisted metadata; never prompts, bodies or credentials.
+
+Compare committed moves, returns within 30 minutes, and comparable estimated
+re-read tokens. The default margin is zero for each counter. Any intentional
+increase must be named and justified before running the comparison. Report
+measured costs separately from estimates and show known/unknown counts for both
+routers. A candidate cannot pass by dropping cost coverage.
+Also report dispatch, hold and refusal deltas: silently refusing work must not
+pass merely because it produces fewer moves. Identify intended guard holds
+before comparison and keep their allowance separate from token-cost margins.
+
+A recorded response from account A is not an observed response from a
+counterfactual account B. Unsupported branch-dependent usage or outcomes remain
+unknown. Missing initial state, decision inputs or comparable costs produces
+**insufficient evidence**, never a pass or a zero-cost assumption. A move-only
+ledger playback, synthetic fixture or manifest declaration alone does not prove
+the real-trace gate. Record these narrower results separately.
+
+Include the reported 2026-10-22 12:01 account-return sequence as a regression.
+Preserve which facts were observed and which were supplied synthetically; an
+enriched fixture is not a reconstruction of missing historical inputs. Run the
+same adapter twice to verify determinism, and compare identical router revisions
+as an identity control before accepting a candidate comparison.
 
 ## Plan (re-planned 2026-10-21 19:xx KST, after the root audit)
 
@@ -119,6 +152,9 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-22 12:41 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 2/2 | A1 설치 수용; C+E 기반 회귀74+3+3·예산8·Claude인자11 통과, 실행 통합 미출시 |
 | 2026-10-22 13:13 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 2/2 | C+E 긴급 등록 단위 커밋; 전체 wait/move 실행은 미출시, R14 보호 장치 시작 |
 | 2026-10-22 13:57 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 2/2 | R14 보호17·집계20·원장9 통과; 실제 HTTP1통과·1실패 수정 중, 미출시 |
+| 2026-10-22 14:43 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 2/2 | R14 미출시; 스트림23·HTTP11·strict lint·새 HWND 통과, 전체 관문 대기 |
+| 2026-10-22 15:30 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 2/2 | R14 Sol P1 소스 증거 누락 수정1eb26ce; 코드 동결, 실행 관문 미완료 |
+| 2026-10-22 15:35 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 2/2 | 공통 의존성 빌드 성공; R14 수정본 검증과 2차 재생 관문 기준 보완, 미출시 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -255,12 +291,18 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-22 14:04 | R14 실제 HTTP·트레이 집중 회귀 | HTTP2/2·트레이3/3 통과; 실제WS0/2 | WS 전송순서·재시도 집계·실제 화면 | WS fixture 식별자와 실제 전송 전 claim·재시도 계승 지적 보완 중; full gate 아님 |
 | 2026-10-22 14:23 | R14 전송·실패 claim 집중 회귀 | 원장12·스트림20·실제HTTP7·실제WS4·트레이3 통과; strict lint1건 | 실제 HWND·full gate | 입력 변화0; 논리 동등한 불리언 단순화 뒤 원장·lint·화면 실행 중 |
 | 2026-10-22 14:33 | R14 실제 HWND 비용 전달 | 개요·사용량180토큰, 측정1/미측정0; 인증·기록보존 통과 | 최종 SSE 경계·full gate | 실제 core/AdminClient/tray; PNG3개 직접 확인, 초기 하네스 import 오류 보존 |
+| 2026-10-22 14:43 | R14 최종 SSE 경계 집중 단위 | 스트림23·실제HTTP11, strict lint·fmt·diff·build·새 실제 HWND exit0 | 실제 차단 알림·전체 matrix | inputs 변화0; 9ea0466와 동일 소스, 성공 경계·oversized/malformed unknown·바이트 보존 |
+| 2026-10-22 14:46 | R14 실제 코어 전체 차단·알림 | MoveBreaker 실제 balloon·대상 전송0, 소유 PID/fixture 정리 | 최종 matrix·clear 후 비용 보존 재확인 | 별도 clear 보존은 기존 real-path로 증명; 추가 하네스 assertion 순서 보완 후 재실행 예정 |
+| 2026-10-22 15:30 | R14 재시도 증거 독립 검수 | P1 1건 확인·수정; rustfmt·diff 통과 | 기본 예산 그대로 quota4·payment3 회귀 | 코드1eb26ce; 성공 테스트 수는 미주장 |
+| 2026-10-22 15:30 | R14 2차 준비 합성 검사 | 재생 커널34·변경 표면13 통과 | 실제24시간 재생·컴파일 소유권 검사 | ignored prototype, 제품 수용과 별도 |
+| 2026-10-22 15:35 | R14 공통 의존성 재빌드 | qb-testkit offline build exit0, 259.8초 | 수정본 제품 회귀·전체 관문 | 공통 의존성만, 제품 수용 합계와 별도 |
+| 2026-10-22 15:35 | R14 D29 재생 관문 명세 | item11·coverage/unknown/서비스 유지 기준·diff 점검 완료 | 실제24시간 production router 재생 | 실행 통과 주장은 없음; 1차/2차 전달 구분 유지 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 행동 |
 |---|---|---|---|
-| R14 1차 실행 보호 | strict lint·실제 HWND 비용180 확인 | 최종 SSE 경계·full gate | 큰/잘못된 SSE 미측정 회귀→최종 관문 |
+| R14 1차 실행 보호 | Sol P1 수정1eb26ce·rustfmt/diff 통과, 이전 HWND180 | 집중 회귀·나머지 전체 matrix·수정 후 HWND | 공통 의존성 뒤 동결 소스 순차 검사→실제 알림→병합 |
 | R13 C+E 실행·측정 | 긴급 등록·정책 상속 단위 통과, 전체 실행 미연결 | 대기/취소/초기화 뒤 정확히 한 번 재개와 D27 관문 | 현재 단위 보존; 장기 시험은 완료 신호 때만 확인 |
 | 후속 안전장치·예측 | R14 2차·Part F·R15 대기 | 증거형 이동 choke point·재생 관문·coverage 예측·typed contract | 사용자 지시대로 R14를 Part F보다 먼저 전달 |
 
