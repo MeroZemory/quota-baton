@@ -72,3 +72,14 @@ OS/보안/네트워크 계층의 담당 확인과 점검을 감독 세션에서 
 ## R13 A gate: non-blocking forecast policy
 
 D24 explicitly chooses average-first for 7d and recent-first for5h. Current other explicit window lengths (including30d Free) use recent with average fallback. Independent source review recommends considering average-first for all >1d windows. No current normative violation or gate blocker; keep existing implementation pending a later policy choice.
+
+
+## R14 second delivery: authoritative 24-hour replay input
+
+Non-blocking question for the runtime-delivery gate; no unit message is sent.
+
+The available 6.1978-day move inventory is not a complete decision tape. It does not contain a coherent initial router state, every candidate/owner observation, or branch-dependent lifecycle and accounting facts. The synthetic replay kernel and source review cannot recover that missing history or satisfy D29's real 24-hour gate.
+
+Recommendation: implement a bounded, opt-in metadata recorder with explicit owner DTOs, pseudonymous identities, initial-state reconciliation and loss manifests. The design session enables it after reviewing the schema and operator controls, and supplies the sanitized export. The main never reads the live profile. The proposed input contract is in `.sandbox/r14-prep/replay-capture-inputs.md` in the implementation worktree.
+
+At the gate, please confirm whether an existing complete sanitized tape is available. Otherwise, please settle the installation/capture step needed before the final structural/replay acceptance. The requested runtime-first delivery can ship independently; owner separation, proof producers and synthetic/static checks continue while capture is arranged. No waiver of the 24-hour gate or acceptance of a move-only replay is requested.
