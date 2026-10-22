@@ -27,7 +27,7 @@ impl Default for Limits {
             session_ten_minutes: 1,
             session_hour: 3,
             global_ten_minutes: 6,
-            trip_seconds: 600,
+            trip_seconds: 240,
             reread_notice_tokens: 100_000,
         }
     }
@@ -126,10 +126,18 @@ struct Movement {
     destination_evidence: u64,
 }
 
+// A shared failure moves many sessions, but consumes only one global incident.
+// Unknown or usable-source moves are independent; never merge missing evidence.
+#[derive(Clone, Debug)]
+struct Incident {
+    at: DateTime<Utc>,
+    shared: Option<(String, u64)>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Breaker {
     sessions: BTreeMap<String, VecDeque<Movement>>,
-    global: VecDeque<DateTime<Utc>>,
+    global: VecDeque<Incident>,
     tripped_until: Option<DateTime<Utc>>,
     last_now: Option<DateTime<Utc>>,
     revision: u64,
@@ -139,6 +147,7 @@ pub(crate) struct Breaker {
 #[must_use]
 pub(crate) struct Permit {
     revision: u64,
+    shared_incident: Option<(String, u64)>,
     key: String,
     at: DateTime<Utc>,
     from: String,
@@ -151,7 +160,8 @@ impl Breaker {
     fn prune(&mut self, now: DateTime<Utc>) -> DateTime<Utc> {
         let now = self.last_now.map_or(now, |prior| now.max(prior));
         self.last_now = Some(now);
-        self.global.retain(|at| *at + Duration::minutes(10) > now);
+        self.global
+            .retain(|incident| incident.at + Duration::minutes(10) > now);
         self.sessions.retain(|_, history| {
             history.retain(|m| m.at + Duration::hours(1) > now);
             !history.is_empty()
@@ -199,7 +209,15 @@ impl Breaker {
         if let Some(until) = self.tripped_until {
             return Err(denial(Refusal::GlobalTrip, until));
         }
-        if self.global.len() >= limits.global_ten_minutes {
+        let shared_incident =
+            (source_unusable && departure_evidence != 0 && observations.source.started.is_some())
+                .then(|| (from.to_owned(), departure_evidence));
+        let shares_incident = shared_incident.as_ref().is_some_and(|key| {
+            self.global
+                .iter()
+                .any(|incident| incident.shared.as_ref() == Some(key))
+        });
+        if !shares_incident && self.global.len() >= limits.global_ten_minutes {
             let until = now + Duration::seconds(limits.trip_seconds as i64);
             self.tripped_until = Some(until);
             self.revision = self.revision.saturating_add(1);
@@ -209,7 +227,7 @@ impl Breaker {
                 newly_tripped: true,
             });
         }
-        if self.global.len() >= GLOBAL_RECORDS
+        if (!shares_incident && self.global.len() >= GLOBAL_RECORDS)
             || self.revision == u64::MAX
             || (!self.sessions.contains_key(key) && self.sessions.len() >= SESSIONS)
         {
@@ -265,6 +283,7 @@ impl Breaker {
         }
         Ok(Permit {
             revision: self.revision,
+            shared_incident,
             key: key.into(),
             at: now,
             from: from.into(),
@@ -281,7 +300,17 @@ impl Breaker {
             return Err(Refusal::StalePermit);
         }
         self.revision += 1;
-        self.global.push_back(permit.at);
+        let already_counted = permit.shared_incident.as_ref().is_some_and(|key| {
+            self.global
+                .iter()
+                .any(|incident| incident.shared.as_ref() == Some(key))
+        });
+        if !already_counted {
+            self.global.push_back(Incident {
+                at: permit.at,
+                shared: permit.shared_incident,
+            });
+        }
         self.sessions
             .entry(permit.key)
             .or_default()
@@ -567,5 +596,320 @@ mod tests {
                 .unwrap();
             drop(permit); // A fresh observation permits, but never charges, preparation.
         }
+    }
+    #[test]
+    fn r141_twelve_sessions_share_one_failure_incident_without_sliding_expiry() {
+        let mut breaker = Breaker::default();
+        for i in 0..12 {
+            let permit = breaker
+                .prepare(
+                    &Limits::default(),
+                    &format!("session-{i}"),
+                    "a",
+                    "b",
+                    900,
+                    1,
+                    true,
+                    Observations::same(Observation::before_collection()),
+                    now() + Duration::seconds(i),
+                )
+                .unwrap();
+            breaker.commit(permit, "b").unwrap();
+        }
+        assert_eq!(breaker.sessions.len(), 12);
+        assert_eq!(breaker.global.len(), 1);
+        assert_eq!(breaker.global[0].at, now());
+        assert!(breaker.state(now() + Duration::seconds(599)).is_none());
+        assert_eq!(breaker.global.len(), 1);
+        assert!(breaker.state(now() + Duration::seconds(600)).is_none());
+        assert!(breaker.global.is_empty());
+    }
+
+    #[test]
+    fn r141_six_distinct_flapping_incidents_trip_and_expire_at_240_seconds() {
+        let mut breaker = Breaker::default();
+        for i in 0..6 {
+            let permit = breaker
+                .prepare(
+                    &Limits::default(),
+                    &format!("session-{i}"),
+                    "a",
+                    "b",
+                    900 + i,
+                    1,
+                    true,
+                    Observations::same(Observation::before_collection()),
+                    now(),
+                )
+                .unwrap();
+            breaker.commit(permit, "b").unwrap();
+        }
+        assert_eq!(breaker.global.len(), 6);
+        let denial = breaker
+            .prepare(
+                &Limits::default(),
+                "seventh",
+                "a",
+                "b",
+                999,
+                1,
+                true,
+                Observations::same(Observation::before_collection()),
+                now(),
+            )
+            .unwrap_err();
+        assert!(denial.newly_tripped);
+        assert_eq!(denial.reason, Refusal::GlobalTrip);
+        assert_eq!(denial.until, now() + Duration::seconds(240));
+        assert!(breaker.state(now() + Duration::seconds(239)).is_some());
+        assert!(breaker.state(now() + Duration::seconds(240)).is_none());
+        assert!(breaker.global.is_empty());
+    }
+
+    #[test]
+    fn r141_unknown_or_usable_source_moves_do_not_share_an_incident() {
+        for (unusable, evidence, observations) in [
+            (
+                false,
+                900,
+                Observations::same(Observation::before_collection()),
+            ),
+            (
+                true,
+                0,
+                Observations::same(Observation::before_collection()),
+            ),
+            (true, 900, Observations::untracked()),
+        ] {
+            let mut breaker = Breaker::default();
+            for i in 0..6 {
+                let permit = breaker
+                    .prepare(
+                        &Limits::default(),
+                        &format!("s-{i}"),
+                        "a",
+                        "b",
+                        evidence,
+                        1,
+                        unusable,
+                        observations,
+                        now(),
+                    )
+                    .unwrap();
+                breaker.commit(permit, "b").unwrap();
+            }
+            assert_eq!(breaker.global.len(), 6);
+            assert_eq!(
+                breaker
+                    .prepare(
+                        &Limits::default(),
+                        "seventh",
+                        "a",
+                        "b",
+                        evidence,
+                        1,
+                        unusable,
+                        observations,
+                        now(),
+                    )
+                    .unwrap_err()
+                    .reason,
+                Refusal::GlobalTrip
+            );
+        }
+    }
+    #[test]
+    fn r141_full_incident_budget_admits_only_existing_cohort_until_trip() {
+        let mut breaker = Breaker::default();
+        for i in 0..6 {
+            let permit = breaker
+                .prepare(
+                    &Limits::default(),
+                    &format!("cohort-{i}"),
+                    "a",
+                    "b",
+                    900 + i,
+                    1,
+                    true,
+                    Observations::same(Observation::before_collection()),
+                    now(),
+                )
+                .unwrap();
+            breaker.commit(permit, "b").unwrap();
+        }
+        let dropped = breaker
+            .prepare(
+                &Limits::default(),
+                "dropped",
+                "a",
+                "c",
+                900,
+                1,
+                true,
+                Observations::same(Observation::before_collection()),
+                now(),
+            )
+            .unwrap();
+        drop(dropped);
+        assert_eq!(breaker.global.len(), 6);
+        assert!(!breaker.sessions.contains_key("dropped"));
+        let shared = breaker
+            .prepare(
+                &Limits::default(),
+                "shared",
+                "a",
+                "c",
+                900,
+                1,
+                true,
+                Observations::same(Observation::before_collection()),
+                now(),
+            )
+            .unwrap();
+        breaker.commit(shared, "c").unwrap();
+        assert_eq!(breaker.global.len(), 6);
+        assert_eq!(breaker.sessions["shared"].len(), 1);
+        let trip = breaker
+            .prepare(
+                &Limits::default(),
+                "new-incident",
+                "a",
+                "b",
+                999,
+                1,
+                true,
+                Observations::same(Observation::before_collection()),
+                now(),
+            )
+            .unwrap_err();
+        assert_eq!(trip.reason, Refusal::GlobalTrip);
+        assert!(trip.newly_tripped);
+        assert_eq!(
+            breaker
+                .prepare(
+                    &Limits::default(),
+                    "shared-after-trip",
+                    "a",
+                    "c",
+                    900,
+                    1,
+                    true,
+                    Observations::same(Observation::before_collection()),
+                    now(),
+                )
+                .unwrap_err()
+                .reason,
+            Refusal::GlobalTrip
+        );
+        assert!(!breaker.sessions.contains_key("shared-after-trip"));
+    }
+
+    #[test]
+    fn r141_stale_shared_permit_cannot_recreate_cleared_incident() {
+        let mut breaker = Breaker::default();
+        let first = breaker
+            .prepare(
+                &Limits::default(),
+                "first",
+                "a",
+                "b",
+                900,
+                1,
+                true,
+                Observations::same(Observation::before_collection()),
+                now(),
+            )
+            .unwrap();
+        breaker.commit(first, "b").unwrap();
+        let shared = breaker
+            .prepare(
+                &Limits::default(),
+                "second",
+                "a",
+                "c",
+                900,
+                1,
+                true,
+                Observations::same(Observation::before_collection()),
+                now(),
+            )
+            .unwrap();
+        breaker.clear();
+        assert_eq!(breaker.commit(shared, "c"), Err(Refusal::StalePermit));
+        assert!(breaker.global.is_empty());
+        assert!(!breaker.sessions.contains_key("second"));
+        assert_eq!(breaker.sessions["first"].len(), 1);
+    }
+
+    #[test]
+    fn r141_shared_incident_never_exempts_session_or_unchanged_return_evidence() {
+        let mut breaker = Breaker::default();
+        let first = breaker
+            .prepare(
+                &Limits::default(),
+                "session",
+                "a",
+                "b",
+                700,
+                800,
+                true,
+                Observations::same(Observation::before_collection()),
+                now(),
+            )
+            .unwrap();
+        breaker.commit(first, "b").unwrap();
+        let other = breaker
+            .prepare(
+                &Limits::default(),
+                "other",
+                "b",
+                "c",
+                800,
+                900,
+                true,
+                Observations::same(Observation::before_collection()),
+                now(),
+            )
+            .unwrap();
+        breaker.commit(other, "c").unwrap();
+        assert_eq!(breaker.global.len(), 2);
+        // The same global incident does not make unchanged source semantics fresh.
+        assert_eq!(
+            breaker
+                .prepare(
+                    &Limits::default(),
+                    "session",
+                    "b",
+                    "c",
+                    800,
+                    900,
+                    true,
+                    Observations::same(Observation::before_collection()),
+                    now(),
+                )
+                .unwrap_err()
+                .reason,
+            Refusal::SessionTenMinutes
+        );
+        // Nor does it authorize a return to A without changed destination evidence.
+        assert_eq!(
+            breaker
+                .prepare(
+                    &Limits::default(),
+                    "session",
+                    "b",
+                    "a",
+                    800,
+                    700,
+                    true,
+                    Observations::same(Observation::before_collection()),
+                    now(),
+                )
+                .unwrap_err()
+                .reason,
+            Refusal::PingPong
+        );
+        assert_eq!(breaker.global.len(), 2);
+        assert_eq!(breaker.sessions["session"].len(), 1);
     }
 }

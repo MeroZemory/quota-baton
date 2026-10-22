@@ -137,6 +137,7 @@ mod r11_actual {
             config.server.admin_port = 0;
             config.upstream.codex_base = base;
             config.routing.request_timeout_secs = 5;
+            config.routing.move_guard.trip_seconds = 4;
             config.routing.ws_upgrade_hold_secs = 2;
             config.routing.rate_hold_secs = 2;
             config.routing.rate_hold_max_retries = 3;

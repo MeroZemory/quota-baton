@@ -156,6 +156,7 @@ impl Harness {
         }
         if let Some((http, ws)) = deadlines {
             config.routing.request_timeout_secs = http;
+            config.routing.move_guard.trip_seconds = http.saturating_sub(1).min(240);
             config.routing.ws_upgrade_hold_secs = ws;
         }
         configure(&mut config);

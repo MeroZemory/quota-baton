@@ -143,24 +143,26 @@ async fn large_model_first_payload_cannot_escape_old_socket_after_strict_move() 
 
 #[tokio::test]
 async fn upgrade_uses_its_own_ingress_deadline_independent_of_http_timeout() {
+    // The one-second minimum breaker trip must be shorter than the HTTP
+    // deadline. Keep the delayed handshake strictly between the two budgets.
     for (http, ws, expected) in [
-        (1, 3, StatusCode::BAD_REQUEST),
-        (3, 1, StatusCode::GATEWAY_TIMEOUT),
+        (2, 4, StatusCode::BAD_REQUEST),
+        (4, 2, StatusCode::GATEWAY_TIMEOUT),
     ] {
         let h = Harness::new_with_deadlines(http, ws).await;
         h.fake.state.push_handshake_delayed(
             StatusCode::BAD_REQUEST,
             r#"{"error":{"type":"invalid_request_error","message":"synthetic delayed handshake"}}"#,
             HeaderMap::new(),
-            Duration::from_secs(2),
+            Duration::from_secs(3),
         );
         let start = std::time::Instant::now();
         assert_eq!(h.error().await.0, expected);
-        assert!(start.elapsed() < Duration::from_secs(4));
-        if http == 1 {
-            assert!(start.elapsed() >= Duration::from_millis(1800));
+        assert!(start.elapsed() < Duration::from_secs(5));
+        if http == 2 {
+            assert!(start.elapsed() >= Duration::from_millis(2800));
         } else {
-            assert!(start.elapsed() < Duration::from_millis(1800));
+            assert!(start.elapsed() < Duration::from_millis(2800));
         }
     }
 }

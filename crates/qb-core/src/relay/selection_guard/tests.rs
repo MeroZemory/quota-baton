@@ -119,7 +119,12 @@ async fn r14_move_hold_account_recovery_between_choice_and_wait_is_not_lost() {
             .await
     );
     assert_eq!(Instant::now(), start);
-    assert_eq!(until, now + chrono::Duration::seconds(600));
+    assert_eq!(
+        until,
+        now + chrono::Duration::seconds(
+            crate::bindings::MoveGuardLimits::default().trip_seconds as i64
+        )
+    );
     assert_eq!(
         selected(choose(&table, KEY, &cs, &cs[1].account.id, now, |_| true)),
         cs[1].account.id
@@ -351,4 +356,60 @@ async fn r14_ordinary_selection_caller_drop_during_admission_never_commits() {
 #[tokio::test(start_paused = true)]
 async fn r14_ordinary_selection_deadline_during_admission_never_commits() {
     abandoned_selection(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn r141_move_hold_trip_expiry_without_notifications_reselects_at_240_before_300() {
+    let (_home, table, mut cs) = fixture();
+    let now = Utc::now();
+    prime_global(&table, &cs, now);
+    cs[1].account.user_state = UserState::Paused;
+    // Subscribe after setup. Keep the sender alive but never publish an event;
+    // no clear/recovery/drain notification can supply the wake in this test.
+    let (events, _) = broadcast::channel(8);
+    let mut changes = Changes::new(&table.policies.changed, events.subscribe());
+    let guard_until = forced_hold(&table, &cs, now);
+    assert_eq!(guard_until - now, chrono::Duration::seconds(240));
+    let until = recovery_deadline(guard_until, &cs, Some(&cs[1].account.id), now);
+    assert_eq!(
+        until, guard_until,
+        "no earlier account recovery is available"
+    );
+    assert_eq!(table.current(Some(KEY)).as_ref(), Some(&cs[1].account.id));
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(300);
+    {
+        let wait = changes.wait(
+            Some(&cs[1].account.id),
+            start + (until - now).to_std().unwrap(),
+            deadline,
+            std::future::pending(),
+        );
+        tokio::pin!(wait);
+        assert!(futures_util::poll!(wait.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_secs(239)).await;
+        assert!(futures_util::poll!(wait.as_mut()).is_pending());
+        assert_eq!(table.current(Some(KEY)).as_ref(), Some(&cs[1].account.id));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(
+            !wait.await,
+            "trip expiry must reselect, not end the request hold"
+        );
+    }
+    assert_eq!(Instant::now() - start, Duration::from_secs(240));
+    assert!(Instant::now() < deadline);
+    // The breaker uses UTC and observation chronology uses std::Instant;
+    // paused Tokio does not advance either. Supply the explicitly corresponding
+    // UTC selection time instead of restamping evidence or granting an exception.
+    let after = now + chrono::Duration::seconds(240);
+    assert_eq!(
+        selected(choose(&table, KEY, &cs, &cs[2].account.id, after, |_| true)),
+        cs[2].account.id
+    );
+    assert_eq!(table.current(Some(KEY)).as_ref(), Some(&cs[2].account.id));
+    assert!(table.move_guard_until().is_none());
+    assert!(matches!(
+        changes.accounts.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    ));
 }
