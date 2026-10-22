@@ -206,3 +206,9 @@ milestones. Live upstream validation remains gated by the design-session G1 chec
 
 Implementation milestones and pending protocol gates are recorded in
 [the architecture](docs/architecture.md) and [the decision log](docs/decisions.md).
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option. The vendored `vendor/tungstenite`
+keeps its own MIT and Apache-2.0 licenses.
