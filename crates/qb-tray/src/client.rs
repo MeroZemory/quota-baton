@@ -671,6 +671,8 @@ pub struct TrayAccount {
     #[serde(default)]
     pub windows: Vec<QuotaWindow>,
     #[serde(default)]
+    pub usage_forecast: Option<qb_core::usage_forecast::AccountUsageForecast>,
+    #[serde(default)]
     pub credits: Option<serde_json::Value>,
     #[serde(default)]
     pub credits_in_use: Option<bool>,
