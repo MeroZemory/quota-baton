@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: R12.11 이미지 버전 확인 안정화
-목표: 빌드 부하로 이미지 실행이 막히지 않게 버전 확인 재시도와 제한된 캐시 대체를 검증한다
+현재 마일스톤: R16 영문 UI·snapshot·Claude 프로젝트명
+목표: R16 집중 관문 통과·설치 인계 후 R13 C+E 대기·이동·재개 실행을 통합한다
 핵심 지표: 남은 출시 1/3 (R14 보호 설치, R13 C+E 실행, R13 F 통합 예측); 이전 계열 2/2 종료
-사용자 대기: 없음 (R14.1 설치·live 확인 완료; R2 Part B 보류)
-갱신: 2026-10-23 01:12 KST (R14.1 설치 수용; 다음 R12.11 → R16)
+사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
+갱신: 2026-10-23 02:21 KST (R16 집중 관문·실제 경로 통과; 설치는 설계 세션, 다음 R13 C+E)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -165,6 +165,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-22 17:28 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 2/2 | R14 1차 전체 관문·실제 차단 확인 완료; 설치 전이므로 출시 수 유지 |
 | 2026-10-23 01:08 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 0/3 | 이전 새 경로 계열은 2/2로 종료. R14.1 보호 관문 통과·self-merge 전달; 설치 전이므로 0/3 |
 | 2026-10-23 01:12 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | 설계 세션이 dev249a14c 설치 수용. takeover 1,717회 중 연결 거절0, 일반·이미지 exec 통과, 실제 dashboard 재독 토큰 지표 확인 |
+| 2026-10-23 02:21 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | R16 집중438통과·실제 core/AdminClient/tray 3HWND·20CLI PNG 통과, 코드19b8d22. 영어 UI는 이 계열 분모 밖이며 설치는 미실행 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -322,14 +323,16 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-22 17:28 | R14 2차 준비 검사 | 변경면 inventory 합성18통과; carrier/owner/회계 제안 독립 검수 | 제품 적용·실제 경로·음성 대조·구조 관문 | ignored 준비물이며 제품 실행 수용 수에 합산하지 않음 |
 | 2026-10-23 01:08 | R14.1 보호만 분리한 집중 관문 | guard21·R1419·실제HTTP12·실제WS123 통과, strict core all-target testkit lint·fmt·diff exit0; 소스8c3a974 | 설치·live 확인은 설계 세션 | 최초HTTP8통과/4실패는 공유SERIAL잠금30초 대기; 실행스레드1에서12통과, 제품 기한·내부 경합 유지. Sol 소스 PASS, 수집기 제외 |
 | 2026-10-23 01:12 | R14.1 설치 수용 (설계 세션 측정) | takeover 1,717회 중 연결 거절0; codex-qb exec·images exec 통과; 실제 dashboard 재독 토큰 지표 표시 | 보호 설치 | dev249a14c; .sandbox/reports/R14.1-evidence/live-dashboard.png, 관측 시작10/23 01:12·관측된 이동 없음 |
+| 2026-10-23 02:21 | R16 한국어 보존·영문·snapshot 집중 검사 | core6·tray274+127·통합29·CLI2 통과, strict all-target lint·fmt·testkit build exit0 | brief 집중 관문 | R16-evidence/delivery-fingerprint.json에 명령별 입력·재사용 범위 |
+| 2026-10-23 02:21 | R16 실제 경로·오프라인 렌더 | 실제 core/AdminClient/tray 3HWND 및 export, 최종 CLI20 PNG 통과 | D27·영문 light/dark 각5뷰 | 합성 loopback, fixture 정리 완료. 코드19b8d22, 실제 설치 미실행 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 행동 |
 |---|---|---|---|
-| 이미지 버전 확인 | 부하 중 5초 버전 확인 실패; R14 보호는 설치 완료 | 15초 확인·제한 재시도·24시간 검증 캐시와 집중 관문 | R12.11 뒤 R16 영문 UI·snapshot |
-| R13 C+E 실행 | 긴급 등록·대기 측정 기반 준비, 전체 실행 미연결 | 초기화 뒤 재개·긴급 이동·취소와 실제 client 경로 관문 | 보호 관문 중 병렬 통합 준비, R16 후 실행 통합 |
+| R13 C+E 실행 | 긴급 등록·대기 측정 기반 준비, 전체 실행 미연결 | 초기화 뒤 재개·긴급 이동·취소와 실제 client 경로 관문 | R16 인계 뒤 HTTP 대기/재개부터 통합 |
 | R13 F 통합 예측 | 미출시; 수집기와 실제 재생도 별도 남음 | coverage 명시 통합 예측·24시간 backtest | C+E 및 R14.2 후 Part F; R15 공유 계약은 이후 |
+| 이미지 버전 확인 | 부하 중 5초 버전 확인 실패, R12.11 제안 보존 | 15초 확인·제한 재시도·24시간 검증 캐시와 집중 관문 | 사용자 우선순위에 따라 별도 보존 |
 <!-- gaps:end -->
 
 R11 Windows process/crash focused verification uses `cargo test -p quota-baton --all-features --test r9_crash --no-fail-fast -- --test-threads=4`. It still runs cases concurrently and preserves every in-case race, kill checkpoint, 20-second command deadline and five-second reap deadline. Default high-concurrency deadline failures and diagnostic traces remain cited; the bounded run is not a claim that the default-load timing issue was fixed. No product timing or ownership workaround was added.

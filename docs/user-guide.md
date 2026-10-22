@@ -54,6 +54,22 @@ quota-baton-tray.exe
 
 기본은 밝은 테마입니다. `config.toml`의 `[tray]`에서 `theme = "dark"`로 어둡게, `theme = "system"`으로 시스템 설정을 따르게 바꿀 수 있습니다. 다음에 플라이아웃을 열면 적용됩니다.
 
+영어 화면은 `config.toml`에 아래 설정을 넣고 트레이를 다시 시작하면 됩니다. 기본값은 `ko`입니다. 알 수 없는 값도 한국어로 표시합니다. 계정과 프로젝트 이름은 바꾸지 않습니다.
+
+```toml
+[ui]
+language = "en"
+```
+
+화면에 쓰는 데이터를 파일로 저장할 수도 있습니다. 코어가 실행 중이어야 합니다. 기존 파일은 덮어쓰지 않습니다.
+
+```powershell
+quota-baton debug snapshot --out snapshot.json
+quota-baton-tray --render-snapshot snapshot.json --lang en --theme light --view overview --size 1280x900 --scale 1 --out overview.png
+```
+
+`--view`는 `overview`, `usage`, `events`, `flyout`, `menu`를 받습니다. PNG 렌더에는 코어나 네트워크 연결이 필요 없습니다. 기본 시각은 파일을 저장한 시각입니다. `--now`로 RFC3339 시각을 지정할 수 있습니다. 인증 정보는 내보내지 않지만 계정 이름, 이메일과 프로젝트 이름은 포함됩니다. 공유하기 전에 확인하세요.
+
 위쪽 요약은 Claude와 Codex를 지금 쓸 수 있는지 알려 줍니다. 계정마다 남은 양이 가장 적은 창을 막대 하나로 보여 줍니다. `주간 38% 남음`은 주간 한도의 38%를 더 쓸 수 있다는 뜻입니다. 다른 창과 정확한 잔액은 툴팁이나 행 메뉴에서 봅니다.
 
 파란 칩은 사용 중, 빨간 칩은 다시 로그인 같은 조치 필요, 주황 칩은 크레딧 사용 중입니다. 회색은 기다림이나 일시정지입니다. 준비된 계정에는 칩이 없습니다. 꺼진 계정은 접어 두지만 제공자가 막히면 펼쳐서 `켜기`를 보여 줍니다.
