@@ -1,6 +1,9 @@
 //! Runtime move budgets. Call prepare/commit under the binding mutation gate.
 //! A failed policy/admission drops the permit without consuming a move.
-use std::collections::{BTreeMap, VecDeque};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    time::Instant,
+};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -71,9 +74,50 @@ pub(crate) struct Denied {
     pub newly_tripped: bool,
 }
 
+/// A lower bound captured before reading any part of a candidate snapshot.
+/// This orders observations; it is never part of the semantic fingerprint.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Observation {
+    started: Option<Instant>,
+}
+
+impl Observation {
+    pub(crate) fn before_collection() -> Self {
+        Self {
+            started: Some(Instant::now()),
+        }
+    }
+
+    fn after(self, committed: Instant) -> bool {
+        self.started.is_some_and(|started| started > committed)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Observations {
+    pub source: Observation,
+    pub target: Observation,
+}
+
+impl Observations {
+    pub(crate) fn same(observation: Observation) -> Self {
+        Self {
+            source: observation,
+            target: observation,
+        }
+    }
+
+    /// Legacy snapshot APIs cannot establish chronology. They fail closed for
+    /// evidence exceptions in every build, including unit tests.
+    pub(crate) fn untracked() -> Self {
+        Self::same(Observation::default())
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Movement {
     at: DateTime<Utc>,
+    committed: Instant,
     from: String,
     // Semantic capacity/reset fingerprint, never a poll timestamp or metadata
     // generation. A new poll of identical evidence does not authorize return.
@@ -132,6 +176,7 @@ impl Breaker {
         departure_evidence: u64,
         destination_evidence: u64,
         source_unusable: bool,
+        observations: Observations,
         now: DateTime<Utc>,
     ) -> Result<Permit, Denied> {
         let limits = limits.clone().bounded();
@@ -183,13 +228,17 @@ impl Breaker {
                 .find(|m| m.from == to && m.at + Duration::minutes(30) > now)
                 && (left.departure_evidence == 0
                     || destination_evidence == 0
-                    || left.departure_evidence == destination_evidence)
+                    || left.departure_evidence == destination_evidence
+                    || !observations.target.after(left.committed))
             {
                 return Err(denial(Refusal::PingPong, left.at + Duration::minutes(30)));
             }
+            // A differing old snapshot is not a failure since arrival. Stale,
+            // equal or untracked observations keep the ordinary budget/hold.
             let fresh_unusable = source_unusable
                 && history.back().is_some_and(|last| {
                     last.to == from
+                        && observations.source.after(last.committed)
                         && departure_evidence != 0
                         && last.destination_evidence != 0
                         && last.destination_evidence != departure_evidence
@@ -238,6 +287,7 @@ impl Breaker {
             .or_default()
             .push_back(Movement {
                 at: permit.at,
+                committed: Instant::now(),
                 from: permit.from,
                 departure_evidence: permit.departure_evidence,
                 to: permit.to,
@@ -321,6 +371,7 @@ mod tests {
             if fresh { 2 } else { 1 },
             1,
             fresh,
+            Observations::same(Observation::before_collection()),
             now() + Duration::seconds(seconds),
         )?;
         b.commit(p, to).unwrap();
@@ -363,6 +414,7 @@ mod tests {
                 2,
                 2,
                 true,
+                Observations::same(Observation::before_collection()),
                 now() + Duration::seconds(2),
             )
             .unwrap();
@@ -384,11 +436,31 @@ mod tests {
         let mut b = Breaker::default();
         let limits = Limits::default();
         drop(
-            b.prepare(&limits, "s", "a", "b", 1, 1, false, now())
-                .unwrap(),
+            b.prepare(
+                &limits,
+                "s",
+                "a",
+                "b",
+                1,
+                1,
+                false,
+                Observations::same(Observation::before_collection()),
+                now(),
+            )
+            .unwrap(),
         );
         let p = b
-            .prepare(&limits, "s", "a", "b", 1, 1, false, now())
+            .prepare(
+                &limits,
+                "s",
+                "a",
+                "b",
+                1,
+                1,
+                false,
+                Observations::same(Observation::before_collection()),
+                now(),
+            )
             .unwrap();
         b.clear();
         assert_eq!(b.commit(p, "b"), Err(Refusal::StalePermit));
@@ -429,5 +501,71 @@ mod tests {
             ),
             (1, 64, 1, 3600)
         );
+    }
+
+    #[test]
+    fn r14_observation_must_follow_commit_for_both_exceptions() {
+        let mut b = Breaker::default();
+        move_at(&mut b, "s", "a", "b", false, 0).unwrap();
+        let committed = b.sessions["s"].back().unwrap().committed;
+        let at = |started| Observation {
+            started: Some(started),
+        };
+        for observation in [
+            Observation::default(),
+            at(committed - std::time::Duration::from_nanos(1)),
+            at(committed),
+        ] {
+            let observations = Observations::same(observation);
+            assert_eq!(
+                b.prepare(
+                    &Limits::default(),
+                    "s",
+                    "b",
+                    "c",
+                    2,
+                    1,
+                    true,
+                    observations,
+                    now() + Duration::seconds(1),
+                )
+                .unwrap_err()
+                .reason,
+                Refusal::SessionTenMinutes
+            );
+            assert_eq!(
+                b.prepare(
+                    &Limits::default(),
+                    "s",
+                    "b",
+                    "a",
+                    2,
+                    2,
+                    true,
+                    observations,
+                    now() + Duration::seconds(1),
+                )
+                .unwrap_err()
+                .reason,
+                Refusal::PingPong
+            );
+        }
+        let observations = Observations::same(at(committed + std::time::Duration::from_nanos(1)));
+        for (to, destination) in [("c", 1), ("a", 2)] {
+            let permit = b
+                .prepare(
+                    &Limits::default(),
+                    "s",
+                    "b",
+                    to,
+                    2,
+                    destination,
+                    true,
+                    observations,
+                    now() + Duration::seconds(1),
+                )
+                .unwrap();
+            drop(permit); // A fresh observation permits, but never charges, preparation.
+        }
     }
 }

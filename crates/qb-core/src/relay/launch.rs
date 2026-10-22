@@ -1647,8 +1647,8 @@ impl RelayState {
         .await?
         .into_iter()
         .collect();
-        candidates = self
-            .candidates(
+        let (refreshed, _, observed) = self
+            .candidates_with_evidence(
                 Provider::Codex,
                 resume_key.as_deref(),
                 request.model.as_deref(),
@@ -1656,6 +1656,7 @@ impl RelayState {
             )
             .await
             .map_err(|_| LaunchError::Store)?;
+        candidates = refreshed;
         // Even a model-less selection must have a known catalog. Keep the bound
         // account for authoritative resume handling, never silently force it away.
         candidates.retain(|c| {
@@ -1735,6 +1736,7 @@ impl RelayState {
                                     allow_move_for_model: request.move_for_model,
                                 },
                                 &candidates,
+                                crate::bindings::MoveObservations::same(observed),
                                 &entitlements,
                                 chrono::Utc::now(),
                                 Some(&operation),

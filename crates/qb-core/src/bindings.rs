@@ -29,6 +29,7 @@ pub use launch::{
     LaunchEntitlements, LaunchError, LaunchInfo, LaunchPlacement, LaunchPolicyMove, LaunchRequest,
 };
 pub use move_guard::Limits as MoveGuardLimits;
+pub(crate) use move_guard::{Observation as MoveObservation, Observations as MoveObservations};
 #[cfg(test)]
 #[path = "bindings/move_guard_tests.rs"]
 mod move_guard_tests;
@@ -546,6 +547,7 @@ impl BindingTable {
         from: Option<&str>,
         to: &str,
         candidates: &[Candidate],
+        observations: MoveObservations,
         model: Option<&str>,
         proposed_reason: &str,
         now: DateTime<Utc>,
@@ -557,6 +559,7 @@ impl BindingTable {
             to,
             from.and_then(|id| candidates.iter().find(|c| c.account.id == id)),
             candidates,
+            observations,
             model,
             proposed_reason,
             now,
@@ -572,6 +575,7 @@ impl BindingTable {
         to: &str,
         source: Option<&Candidate>,
         candidates: &[Candidate],
+        observations: MoveObservations,
         model: Option<&str>,
         proposed_reason: &str,
         now: DateTime<Utc>,
@@ -598,6 +602,7 @@ impl BindingTable {
                 semantic_evidence(source_account.as_ref()),
                 semantic_evidence(target_account.as_ref()),
                 unusable,
+                observations,
                 now,
             );
         match result {
@@ -2098,6 +2103,7 @@ impl BindingTable {
             model,
             candidates,
             candidates,
+            MoveObservations::untracked(),
             pinned,
             request_bytes,
             hold_allowed,
@@ -2119,6 +2125,7 @@ impl BindingTable {
         model: Option<&str>,
         candidates: &[Candidate],
         move_evidence: &[Candidate],
+        observations: MoveObservations,
         pinned: Option<&str>,
         request_bytes: u64,
         hold_allowed: bool,
@@ -2227,6 +2234,7 @@ impl BindingTable {
             &account,
             guard_from.and_then(|id| move_evidence.iter().find(|c| c.account.id == id)),
             candidates,
+            observations,
             model,
             reason,
             now,

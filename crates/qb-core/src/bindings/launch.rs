@@ -464,6 +464,7 @@ impl BindingTable {
         self.place_launch_for_issue_admitted(
             request,
             candidates,
+            MoveObservations::untracked(),
             entitlements,
             now,
             operation,
@@ -479,6 +480,7 @@ impl BindingTable {
         &self,
         request: LaunchRequest<'_>,
         candidates: &[Candidate],
+        observations: MoveObservations,
         entitlements: &LaunchEntitlements,
         now: DateTime<Utc>,
         operation: Option<&crate::issue_operation::IssueOperation>,
@@ -718,6 +720,7 @@ impl BindingTable {
                 previous.as_deref(),
                 &account,
                 candidates,
+                observations,
                 model.as_deref(),
                 reason,
                 now,
