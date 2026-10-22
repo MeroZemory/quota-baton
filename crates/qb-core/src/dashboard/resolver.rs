@@ -1,37 +1,69 @@
 //! Filename-only production lookup, invoked by the existing writer, never ingress.
 use super::labels::{MemoryLabel, claude_project_label};
 use std::{
-    fs,
+    collections::VecDeque,
+    ffi::OsString,
+    fs, io,
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
 };
 
 const SLUG_BYTES: usize = 1024;
-const SLUG_PARTS: usize = 64;
 const ROOT_DEPTH: usize = 32;
+const WALK_TIME: Duration = Duration::from_millis(25);
+const CACHE_TIME: Duration = Duration::from_secs(30);
+const CACHE_ENTRIES: usize = 128;
 #[derive(Clone, Copy)]
 struct Limits {
-    queries: usize,
+    entries: usize,
+    per_level: usize,
     depth: usize,
-    pending: usize,
 }
 const LIMITS: Limits = Limits {
-    queries: 256,
+    entries: 4096,
+    per_level: 1024,
     depth: 16,
-    pending: 64,
 };
 struct Decode {
     basename: Option<String>,
-    queries: usize,
+    matched: usize,
+    entries: usize,
     exhausted: bool,
     ambiguous: bool,
 }
 impl Decode {
-    fn resolved(self) -> Option<String> {
-        if self.exhausted || self.ambiguous {
-            None
-        } else {
-            self.basename
+    fn label(self, slug: &str) -> Option<String> {
+        if !self.exhausted && !self.ambiguous && self.matched == slug.len() {
+            return self.basename;
         }
+        slug.get(self.matched..)
+            .filter(|tail| !tail.is_empty())
+            .map(str::to_owned)
+    }
+}
+
+#[derive(Default)]
+struct DecodeCache(VecDeque<(String, Option<String>, Instant)>);
+impl DecodeCache {
+    fn get(&self, slug: &str, now: Instant) -> Option<Option<String>> {
+        self.0.iter().find_map(|(key, value, at)| {
+            (key == slug
+                && now
+                    .checked_duration_since(*at)
+                    .is_some_and(|age| age < CACHE_TIME))
+            .then(|| value.clone())
+        })
+    }
+    fn insert(&mut self, slug: &str, label: Option<String>, now: Instant) {
+        if slug.len() > SLUG_BYTES {
+            return;
+        }
+        self.0.retain(|(key, _, _)| key != slug);
+        while self.0.len() >= CACHE_ENTRIES {
+            self.0.pop_front();
+        }
+        self.0.push_back((slug.to_owned(), label, now));
     }
 }
 
@@ -85,18 +117,32 @@ fn local_scan_root(path: &Path) -> bool {
     }
 }
 
-/// Partition ambiguous '-' separators, pruning solely on directory metadata.
-/// Injecting both drive root and metadata predicate keeps tests inside their
-/// own synthetic directory. No directory enumeration or content read occurs.
-fn decode_with(
+fn encode_name(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+fn directory_names(path: &Path) -> io::Result<impl Iterator<Item = io::Result<OsString>> + use<>> {
+    Ok(fs::read_dir(path)?.map(|entry| entry.map(|entry| entry.file_name())))
+}
+
+/// Walk ordinary directories by their encoded names, never file contents.
+/// The longest prefix wins; a literal full name breaks encoding collisions.
+/// Every OS operation is preceded by a cooperative deadline check: a local
+/// filesystem call already in progress cannot be interrupted here.
+fn decode_with<I: Iterator<Item = io::Result<OsString>>>(
     slug: &str,
     limits: Limits,
     root_for_drive: impl FnOnce(u8) -> Option<PathBuf>,
     mut directory: impl FnMut(&Path) -> bool,
+    mut names: impl FnMut(&Path) -> io::Result<I>,
+    mut expired: impl FnMut() -> bool,
 ) -> Decode {
     let mut result = Decode {
         basename: None,
-        queries: 0,
+        matched: 0,
+        entries: 0,
         exhausted: false,
         ambiguous: false,
     };
@@ -115,8 +161,7 @@ fn decode_with(
     {
         return result;
     }
-    let pieces: Vec<_> = tail.split('-').take(SLUG_PARTS + 1).collect();
-    if pieces.len() > SLUG_PARTS {
+    if expired() || limits.entries == 0 || limits.per_level == 0 || limits.depth == 0 {
         result.exhausted = true;
         return result;
     }
@@ -126,62 +171,137 @@ fn decode_with(
     if !root.is_absolute() {
         return result;
     }
-    if limits.queries == 0 || limits.pending == 0 {
+    if expired() {
         result.exhausted = true;
         return result;
     }
-    result.queries += 1;
     if !directory(&root) {
         return result;
     }
-    let mut pending = vec![(root, 0usize, 0usize)];
-    let mut solutions = 0usize;
-    while let Some((parent, start, depth)) = pending.pop() {
-        if depth >= limits.depth {
+    result.matched = 3;
+    let mut parent = root;
+    for _ in 0..limits.depth {
+        if expired() {
             result.exhausted = true;
-            continue;
+            return result;
         }
-        for end in (start + 1..=pieces.len()).rev() {
-            let name = pieces[start..end].join("-");
-            if name.is_empty()
-                || matches!(name.as_str(), "." | "..")
-                || name.encode_utf16().count() > 255
-            {
-                continue;
-            }
-            if result.queries >= limits.queries {
+        let Ok(mut entries) = names(&parent) else {
+            return result;
+        };
+        let remaining = &slug[result.matched..];
+        let mut best: Option<(String, usize, bool)> = None;
+        let mut ambiguous = false;
+        let mut level = 0;
+        loop {
+            if expired() {
                 result.exhausted = true;
                 return result;
             }
-            let candidate = parent.join(&name);
-            result.queries += 1;
-            // Every prefix must itself be ordinary before any child is tested.
-            if !directory(&candidate) {
+            let Some(entry) = entries.next() else {
+                break;
+            };
+            // One lookahead distinguishes a complete listing from truncation.
+            // Never select an apparent unique match from an incomplete listing.
+            if level >= limits.per_level || result.entries >= limits.entries {
+                result.exhausted = true;
+                return result;
+            }
+            level += 1;
+            result.entries += 1;
+            let Ok(name) = entry.and_then(|name| {
+                name.into_string()
+                    .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))
+            }) else {
+                return result;
+            };
+            if name.is_empty() || matches!(name.as_str(), "." | "..") {
                 continue;
             }
-            if end == pieces.len() {
-                solutions += 1;
-                result.basename = Some(name);
-                if solutions > 1 {
-                    result.ambiguous = true;
-                    result.basename = None;
-                    return result;
-                }
-            } else {
-                if pending.len() >= limits.pending {
-                    result.exhausted = true;
-                    return result;
-                }
-                pending.push((candidate, end, depth + 1));
+            let encoded = encode_name(&name);
+            let Some(rest) = remaining
+                .get(..encoded.len())
+                .filter(|prefix| prefix.eq_ignore_ascii_case(&encoded))
+                .and_then(|_| remaining.get(encoded.len()..))
+            else {
+                continue;
+            };
+            if !rest.is_empty() && !rest.starts_with('-') {
+                continue;
+            }
+            if expired() {
+                result.exhausted = true;
+                return result;
+            }
+            if !directory(&parent.join(&name)) {
+                continue;
+            }
+            let exact = name == remaining;
+            let rank = (encoded.len(), exact);
+            if best
+                .as_ref()
+                .is_none_or(|(_, len, exact)| rank > (*len, *exact))
+            {
+                best = Some((name, encoded.len(), exact));
+                ambiguous = false;
+            } else if best
+                .as_ref()
+                .is_some_and(|(_, len, exact)| rank == (*len, *exact))
+            {
+                ambiguous = true;
             }
         }
+        if ambiguous {
+            result.ambiguous = true;
+            return result;
+        }
+        let Some((name, len, _)) = best else {
+            return result;
+        };
+        if expired() {
+            result.exhausted = true;
+            return result;
+        }
+        parent.push(&name);
+        result.matched += len;
+        if result.matched == slug.len() {
+            result.basename = Some(name);
+            return result;
+        }
+        // Consume only the verified directory and its one path separator.
+        result.matched += 1;
     }
+    result.exhausted = true;
     result
 }
 fn decoded_basename(slug: &str) -> Option<String> {
-    let decoded = decode_with(slug, LIMITS, local_drive, |path| ordinary(path, true));
-    debug_assert!(decoded.queries <= LIMITS.queries);
-    decoded.resolved()
+    if slug.len() > SLUG_BYTES {
+        return None;
+    }
+    static CACHE: OnceLock<Mutex<DecodeCache>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Mutex::default);
+    let now = Instant::now();
+    if let Some(label) = cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(slug, now)
+    {
+        return label;
+    }
+    let decoded = decode_with(
+        slug,
+        LIMITS,
+        local_drive,
+        |path| ordinary(path, true),
+        directory_names,
+        || now.elapsed() >= WALK_TIME,
+    );
+    debug_assert!(decoded.entries <= LIMITS.entries);
+    let label = decoded.label(slug);
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(slug, label.clone(), Instant::now());
+    label
 }
 fn ordinary(path: &Path, directory: bool) -> bool {
     let Ok(meta) = fs::symlink_metadata(path) else {
@@ -270,7 +390,19 @@ mod tests {
                 assert!(candidate.starts_with(root));
                 ordinary(candidate, true)
             },
+            |parent| {
+                assert!(parent.starts_with(root));
+                directory_names(parent)
+            },
+            || false,
         )
+    }
+    fn synthetic_label(slug: &str, root: &Path) -> super::super::labels::LabelView {
+        claude_project_label("fixture", [(slug, "fixture.jsonl")], |value| {
+            synthetic_decode(value, root).label(value)
+        })
+        .unwrap()
+        .view()
     }
     #[test]
     fn r7_slug_decode_preserves_existing_hyphenated_parent_and_repo_basename() {
@@ -281,13 +413,13 @@ mod tests {
         let decoded = synthetic_decode(slug, &base);
         assert!(!decoded.exhausted);
         assert!(!decoded.ambiguous);
-        assert!(decoded.queries <= LIMITS.queries);
-        assert_eq!(decoded.resolved().as_deref(), Some("quota-baton-impl"));
+        assert!(decoded.entries <= LIMITS.entries);
+        assert_eq!(decoded.label(slug).as_deref(), Some("quota-baton-impl"));
         let projects = temp.path().join("projects");
         fs::create_dir_all(projects.join(slug)).unwrap();
         fs::write(projects.join(slug).join("fixture.jsonl"), [0xff, 0xfe]).unwrap();
         let label = scan_with(&projects, "fixture", |value| {
-            synthetic_decode(value, &base).resolved()
+            synthetic_decode(value, &base).label(value)
         })
         .unwrap()
         .view();
@@ -299,76 +431,159 @@ mod tests {
         assert!(!wire.contains("C--"));
     }
     #[test]
-    fn r7_ambiguous_or_missing_slug_uses_advisory_fallback_without_claiming_reconstruction() {
+    fn r16_directory_names_decode_punctuation_spaces_and_mixed_case() {
         let temp = fixture();
-        let base = temp.path().join("synthetic-drive");
-        fs::create_dir_all(base.join("parent/x-y")).unwrap();
-        fs::create_dir_all(base.join("parent/x/y")).unwrap();
-        let decoded = synthetic_decode("C--parent-x-y", &base);
-        assert!(decoded.ambiguous);
-        assert!(decoded.resolved().is_none());
-        let label = claude_project_label("fixture", [("C--parent-x-y", "fixture.jsonl")], |slug| {
-            synthetic_decode(slug, &base).resolved()
-        })
-        .unwrap()
-        .view();
-        assert_eq!(label.text, "y");
-        assert!(label.best_effort);
-        let missing = synthetic_decode("C--parent-repo", &base.join("missing"));
-        assert_eq!(missing.queries, 1);
-        assert!(missing.resolved().is_none());
-        let label = claude_project_label(
-            "fixture",
-            [("C--parent-quota-baton-impl", "fixture.jsonl")],
-            |slug| synthetic_decode(slug, &base.join("missing")).resolved(),
-        )
-        .unwrap()
-        .view();
-        assert_eq!(label.text, "impl");
-        assert!(label.best_effort);
+        let parent = temp.path().join("_projects/SyntheticOwner");
+        for (name, encoded) in [
+            ("sample-proj-a", "sample-proj-a"),
+            ("under_score", "under-score"),
+            ("with.dot", "with-dot"),
+            ("two words", "two-words"),
+            ("MiXeD-Name", "mixed-name"),
+        ] {
+            fs::create_dir_all(parent.join(name)).unwrap();
+            let slug = format!("c---PROJECTS-syntheticowner-{encoded}");
+            let label = synthetic_label(&slug, temp.path());
+            assert_eq!(label.text, name);
+            assert!(label.best_effort);
+        }
     }
     #[test]
-    fn r7_slug_decode_caps_queries_depth_and_candidate_states() {
+    fn r16_full_literal_name_wins_but_colliding_encoded_prefixes_are_not_guessed() {
         let temp = fixture();
         let base = temp.path();
-        let mut queries = 0;
+        fs::create_dir_all(base.join("parent/same_name")).unwrap();
+        fs::create_dir_all(base.join("parent/same.name")).unwrap();
+        let slug = "C--parent-same-name";
+        let decoded = synthetic_decode(slug, base);
+        assert!(decoded.ambiguous);
+        assert_eq!(decoded.label(slug).as_deref(), Some("same-name"));
+        fs::create_dir_all(base.join("parent/same-name/child")).unwrap();
+        assert_eq!(synthetic_label(slug, base).text, "same-name");
+        let slug = "C--parent-same-name-child";
+        let decoded = synthetic_decode(slug, base);
+        assert!(decoded.ambiguous);
+        assert_eq!(decoded.label(slug).as_deref(), Some("same-name-child"));
+        fs::create_dir_all(base.join("parent/x-y")).unwrap();
+        fs::create_dir_all(base.join("parent/x/y")).unwrap();
+        assert_eq!(synthetic_label("C--parent-x-y", base).text, "x-y");
+    }
+    #[test]
+    fn r16_missing_path_keeps_the_entire_unresolved_suffix() {
+        let temp = fixture();
+        fs::create_dir_all(temp.path().join("parent-with-hyphens")).unwrap();
+        let slug = "C--parent-with-hyphens-missing-project-name";
+        let label = synthetic_label(slug, temp.path());
+        assert_eq!(label.text, "missing-project-name");
+        assert!(label.best_effort);
+        let slug = "C--unknown-parent-project-name";
+        assert_eq!(
+            synthetic_label(slug, temp.path()).text,
+            "unknown-parent-project-name"
+        );
+        assert_eq!(
+            synthetic_label(slug, &temp.path().join("missing-drive")).text,
+            slug
+        );
+        fs::create_dir_all(temp.path().join("short")).unwrap();
+        assert_eq!(
+            synthetic_label("C--shorter-project-name", temp.path()).text,
+            "shorter-project-name"
+        );
+    }
+    #[test]
+    fn r16_slug_walk_caps_total_entries_each_level_depth_and_time() {
+        let temp = fixture();
+        let root = temp.path();
+        let slug = "C--a-b-c-d";
         let decoded = decode_with(
-            "C--a-b-c-d-e",
+            slug,
             Limits {
-                queries: 6,
+                entries: 6,
                 ..LIMITS
             },
-            |_| Some(base.to_owned()),
-            |path| {
-                assert!(path.starts_with(base));
-                queries += 1;
-                true
-            },
-        );
-        assert_eq!(queries, 6);
-        assert_eq!(decoded.queries, 6);
-        assert!(decoded.exhausted);
-        assert!(decoded.resolved().is_none());
-        let decoded = decode_with(
-            "C--a-b-c-d",
-            Limits { depth: 2, ..LIMITS },
-            |_| Some(base.to_owned()),
-            |path| path == base || !path.file_name().unwrap().to_string_lossy().contains('-'),
-        );
-        assert!(decoded.exhausted);
-        assert!(decoded.resolved().is_none());
-        let decoded = decode_with(
-            "C--a-b-c-d",
-            Limits {
-                pending: 1,
-                ..LIMITS
-            },
-            |_| Some(base.to_owned()),
+            |_| Some(root.to_owned()),
             |_| true,
+            |_| Ok(std::iter::repeat_with(|| Ok(OsString::from("a")))),
+            || false,
+        );
+        assert_eq!(decoded.entries, 6);
+        assert!(decoded.exhausted);
+        assert_eq!(decoded.label(slug).as_deref(), Some("a-b-c-d"));
+        let decoded = decode_with(
+            slug,
+            Limits {
+                per_level: 2,
+                ..LIMITS
+            },
+            |_| Some(root.to_owned()),
+            |_| true,
+            |_| {
+                Ok(["a", "b", "c"]
+                    .into_iter()
+                    .map(|name| Ok(OsString::from(name))))
+            },
+            || false,
+        );
+        assert_eq!(decoded.entries, 2);
+        assert!(decoded.exhausted);
+        let slug = "C--a-a-a-a";
+        let decoded = decode_with(
+            slug,
+            Limits { depth: 2, ..LIMITS },
+            |_| Some(root.to_owned()),
+            |_| true,
+            |_| Ok(std::iter::once(Ok(OsString::from("a")))),
+            || false,
         );
         assert!(decoded.exhausted);
-        assert!(decoded.queries <= LIMITS.queries);
-        assert!(decoded.resolved().is_none());
+        assert_eq!(decoded.label(slug).as_deref(), Some("a-a"));
+        let decoded = decode_with(
+            "C--a",
+            LIMITS,
+            |_| panic!("expired walk must not select a drive"),
+            |_| panic!("expired walk must not read metadata"),
+            |_| -> io::Result<std::iter::Empty<io::Result<OsString>>> {
+                panic!("expired walk must not enumerate")
+            },
+            || true,
+        );
+        assert!(decoded.exhausted);
+        assert_eq!(decoded.entries, 0);
+        let stop = std::cell::Cell::new(false);
+        let slug = "C--parent-leaf-name";
+        let decoded = decode_with(
+            slug,
+            LIMITS,
+            |_| Some(root.to_owned()),
+            |_| true,
+            |path| {
+                if path != root {
+                    stop.set(true);
+                }
+                Ok(std::iter::once(Ok(OsString::from("parent"))))
+            },
+            || stop.get(),
+        );
+        assert!(decoded.exhausted);
+        assert_eq!(decoded.label(slug).as_deref(), Some("leaf-name"));
+        // A partial listing cannot prove a unique full match.
+        let decoded = decode_with(
+            "C--a",
+            LIMITS,
+            |_| Some(root.to_owned()),
+            |_| true,
+            |_| {
+                Ok([
+                    Ok(OsString::from("a")),
+                    Err(io::ErrorKind::PermissionDenied.into()),
+                ]
+                .into_iter())
+            },
+            || false,
+        );
+        assert!(decoded.basename.is_none());
+        assert_eq!(decoded.label("C--a").as_deref(), Some("a"));
     }
     #[test]
     fn r7_slug_decode_rejects_remote_roots_unsafe_components_and_detected_reparse_prefixes() {
@@ -385,37 +600,63 @@ mod tests {
                 LIMITS,
                 |_| panic!("invalid slug must not select a drive"),
                 |_| panic!("invalid slug must not read metadata"),
+                |_| -> io::Result<std::iter::Empty<io::Result<OsString>>> {
+                    panic!("invalid slug must not enumerate")
+                },
+                || false,
             );
-            assert_eq!(decoded.queries, 0);
-            assert!(decoded.resolved().is_none());
+            assert_eq!(decoded.entries, 0);
+            assert!(decoded.basename.is_none());
         }
         let decoded = decode_with(
             "Z--remote-repo",
             LIMITS,
             |_| None,
             |_| panic!("remote drive must not read metadata"),
+            |_| -> io::Result<std::iter::Empty<io::Result<OsString>>> {
+                panic!("remote drive must not enumerate")
+            },
+            || false,
         );
-        assert_eq!(decoded.queries, 0);
-        assert!(decoded.resolved().is_none());
+        assert_eq!(decoded.entries, 0);
         let blocked = base.join("blocked");
         let decoded = decode_with(
             "C--blocked-child",
             LIMITS,
             |_| Some(base.to_owned()),
+            |path| path == base,
             |path| {
-                assert!(!path.starts_with(blocked.join("child")));
-                path == base
+                assert!(!path.starts_with(&blocked));
+                Ok(std::iter::once(Ok(OsString::from("blocked"))))
             },
+            || false,
         );
-        assert!(decoded.resolved().is_none());
+        assert!(decoded.basename.is_none());
         assert!(!local_scan_root(Path::new(r"\\server\share\projects")));
     }
     #[test]
+    fn r16_slug_cache_is_bounded_expires_and_keeps_negative_results() {
+        let mut cache = DecodeCache::default();
+        let now = Instant::now();
+        cache.insert("C--missing", None, now);
+        assert_eq!(cache.get("C--missing", now), Some(None));
+        cache.insert("C--repo", Some("repo-name".into()), now);
+        assert_eq!(cache.get("C--repo", now), Some(Some("repo-name".into())));
+        assert!(cache.get("C--repo", now + CACHE_TIME).is_none());
+        for i in 0..CACHE_ENTRIES + 1 {
+            cache.insert(&format!("C--repo-{i}"), Some("repo".into()), now);
+        }
+        assert_eq!(cache.0.len(), CACHE_ENTRIES);
+        assert!(cache.get("C--repo-0", now).is_none());
+        assert!(
+            cache
+                .get(&format!("C--repo-{CACHE_ENTRIES}"), now)
+                .is_some()
+        );
+    }
+    #[test]
     fn synthetic_filename_lookup_ignores_contents_and_rejects_traversal() {
-        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.sandbox/r7-filename-tests");
-        fs::create_dir_all(&base).unwrap();
-        let temp = tempfile::tempdir_in(fs::canonicalize(base).unwrap()).unwrap();
+        let temp = fixture();
         let root = temp.path().join("projects");
         fs::create_dir_all(root.join("fixture-private-folder")).unwrap();
         // Invalid transcript bytes: opening/parsing content is neither needed nor allowed.
@@ -424,7 +665,10 @@ mod tests {
             [0xff, 0xfe],
         )
         .unwrap();
-        assert_eq!(scan(&root, "fixture").unwrap().view().text, "folder");
+        assert_eq!(
+            scan(&root, "fixture").unwrap().view().text,
+            "fixture-private-folder"
+        );
         assert!(scan(&root, "../fixture").is_none());
         assert!(scan(&root, "missing").is_none());
     }

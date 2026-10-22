@@ -13,7 +13,33 @@ pub struct Config {
     pub websocket: WebsocketConfig,
     pub quota: QuotaConfig,
     pub dashboard: DashboardConfig,
+    pub ui: UiConfig,
     pub accounts: BTreeMap<String, AccountConfig>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct UiConfig {
+    pub language: UiLanguage,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UiLanguage {
+    #[default]
+    Ko,
+    En,
+}
+
+impl<'de> Deserialize<'de> for UiLanguage {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Ok(if value.as_str() == Some("en") {
+            Self::En
+        } else {
+            Self::Ko
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -809,6 +835,32 @@ mod upstream_tests {
                 .is_err()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod ui_language_tests {
+    use super::*;
+
+    #[test]
+    fn r16_language_roundtrip_and_unknown_values_keep_korean_default() {
+        assert_eq!(Config::default().ui.language, UiLanguage::Ko);
+        for (value, expected) in [
+            ("\"ko\"", UiLanguage::Ko),
+            ("\"en\"", UiLanguage::En),
+            ("\"future\"", UiLanguage::Ko),
+            ("true", UiLanguage::Ko),
+            ("42", UiLanguage::Ko),
+        ] {
+            let config: Config = toml::from_str(&format!("[ui]\nlanguage = {value}\n")).unwrap();
+            assert_eq!(config.ui.language, expected);
+            let roundtrip: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+            assert_eq!(roundtrip.ui.language, expected);
+        }
+        assert_eq!(
+            toml::from_str::<Config>("").unwrap().ui.language,
+            UiLanguage::Ko
+        );
     }
 }
 
