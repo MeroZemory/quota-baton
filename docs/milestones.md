@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: R13 첫 배포 완료 (B+B2+D), A 소진 예측 준비
-목표: 아이콘·활성 수·rolling 차트를 먼저 제공하고 소진 예측을 잇는다
-핵심 지표: 새 경로 출시 2/2 · R13 첫 배포 집중 관문 통과, 설치는 설계 세션
+현재 마일스톤: R13 C 측정 준비 (A 표시용 예측 집중 관문 완료)
+목표: 캐시 유지·클라이언트 대기 허용 시간을 측정한 뒤 C+E 정책을 구현한다
+핵심 지표: 새 경로 출시 2/2 · R13 B+B2+D 및 A 배포분 완료, C+E 남음
 사용자 대기: 없음 (R2 Part B: CPA 종료·복원 작업만 보류)
-갱신: 2026-10-22 10:02 KST (코드 d895684, 실제 설치·apply 없음)
+갱신: 2026-10-22 10:53 KST (A 실제 HWND8·strict lint·launch 점검 통과; 설치는 설계 세션)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -105,6 +105,9 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-22 09:38 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 2/2 | R11.1 focused 관문 완료, 실제 별칭 적용은 설계 세션 |
 | 2026-10-22 09:51 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 2/2 | R13 B+B2+D 초기 회귀12·실제 HWND 아이콘1통과, 관문 미완료 |
 | 2026-10-22 10:02 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 2/2 | R13 첫 배포 B+B2+D 관문 완료; 설치 전이므로 변화 없음 |
+| 2026-10-22 10:23 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 2/2 | R13 A 초기 코어25·CLI1 통과, 고빈도 표본·차트 보완 중; 미출시 |
+| 2026-10-22 10:46 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 2/2 | R13 A 회귀 보완·원자 커밋87ef2bc, 설치 수 변화 없음 |
+| 2026-10-22 10:53 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 2/2 | R13 A 집중 관문 완료, 출시 수 변화 없음 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -211,14 +214,17 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-22 09:38 | R11.1 최종 focused 관문 | 회귀5·cutover141통과·1제외, strict lint·fmt·build exit0 | 전 검사 통과 | source90b397e5…; 실제 preview2/2·launch 점검exit0·관측파일 불변 |
 | 2026-10-22 09:49 | R13 B+B2+D 초기 focused 회귀 | lib9·bin3 통과 | scoped 관문 완료 | 실제 HWND·PE 검증은 별도 진행, 전체 관문 아님 |
 | 2026-10-22 10:02 | R13 B+B2+D 최종 집중 관문 | tray673통과·19제외, 이력1·core PE4·수동 HWND2 통과, strict lint·fmt·build·launch exit0 | 첫 배포 관문 통과 | input13972ef1…; 실제 차트12·개요2·아이콘6 및 shell crop 확인 |
+| 2026-10-22 10:23 | R13 A 초기 집중 단위 | 코어25/25·CLI1/1 통과 | A 최종 관문 | 후속 표본 요약·reset-only·cached 예측 보완 전 입력, 최종 통과 주장 아님 |
+| 2026-10-22 10:46 | R13 A 후속 집중 보완 | 코어35·트레이6 통과 | A 최종 관문 | countdown jitter·고정 헤더 실제 overflow 검증; CLI·lint·HWND 미완료 |
+| 2026-10-22 10:53 | R13 A 최종 집중 관문 | core35·tray6·CLI511 통과, 기존tray673 재사용·실제 HWND8 확인, strict lint·fmt·build·launch exit0 | A 표시용 배포 수용 | inputdd6d853c…; 최초core623은 이전입력이며 latest full matrix로 주장하지 않음 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
-| 남은 차이 | 지금 | 넘어야 할 값 | 다음 행동 |
+| 공백 | 현재 값 | 필요한 값 | 다음 행동 |
 |---|---|---|---|
-| R13 첫 배포 설치 | 아이콘·활성 수·rolling 차트 관문 완료 | 실제 설치·사용 확인 | 설계 세션이 설치 |
-| R13 burn rate·예측 | 준비 문서 작성, 미구현 | A 관문·설치 | 기존 관측 경계에서 독립 표시용 계산 구현 |
-| R13 캐시 보류·긴급 세션 | 미구현 | C 측정 후 C+E 관문·설치 | 클라이언트 대기·캐시 생존 측정을 백그라운드 진행 |
+| R13 C 캐시 유지·클라이언트 대기 측정 | 로컬 하네스 준비, 실제 수용 시간 미측정 | Codex 1/5/15/30/60분 cached_tokens 및 client hold 표 | 로컬 control부터 실행, 한 계정의 bounded 실측 시작 |
+| R13 C+E 대기·긴급 세션 | 기존60초 hold·기존 정책 | 측정 기반 cache bound 및5h wait/move·reset 후 재개 | 측정 근거로 구현·합성 회귀 |
+| R13 A 실제 설치 | 집중 관문·HWND8 확인 완료 | 설계 세션 설치·live 확인 | 게이트 보고·설계 설치 |
 <!-- gaps:end -->
 
 R11 Windows process/crash focused verification uses `cargo test -p quota-baton --all-features --test r9_crash --no-fail-fast -- --test-threads=4`. It still runs cases concurrently and preserves every in-case race, kill checkpoint, 20-second command deadline and five-second reap deadline. Default high-concurrency deadline failures and diagnostic traces remain cited; the bounded run is not a claim that the default-load timing issue was fixed. No product timing or ownership workaround was added.
