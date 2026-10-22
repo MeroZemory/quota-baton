@@ -1,3 +1,6 @@
+#[cfg(test)]
+mod wait_proof;
+
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{
