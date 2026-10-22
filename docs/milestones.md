@@ -7,9 +7,9 @@ This file names the verification for each unit and each row. The row list and th
 <!-- status:begin -->
 현재 마일스톤: R14 1차 보호 장치
 목표: 불필요한 계정 전환의 피해를 차단하고 토큰 재읽기 비용을 계측한다
-핵심 지표: 새 경로 출시 2/2 · R14 집중 회귀34·기본/전체 기능 strict lint 통과, 전체 테스트 진행
+핵심 지표: 새 경로 출시 2/2 · R14 보완 집중697통과·기본 strict lint 통과; 최종 matrix 실행
 사용자 대기: 없음 (R2 Part B 보류; 장시간 측정은 독립 실행)
-갱신: 2026-10-22 16:00 KST (집중 단위 닫기; 전체 테스트·실제 차단 재확인 진행, 병합·설치 미실시)
+갱신: 2026-10-22 16:31 KST (코어690·실제HTTP1·CLI2·실제WS4 통과; 전체 관문과 새 실제 화면 확인 진행)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -158,6 +158,10 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-22 15:48 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 2/2 | R14 오래된 관측 경합 보완 중; 재생 서비스 거절 우회 합성 회귀 추가, 미출시 |
 | 2026-10-22 15:50 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 2/2 | R14 관측 순서 보완c5a8bec 커밋·실행 관문 시작; 미출시 |
 | 2026-10-22 16:00 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 2/2 | R14 c5a8bec 집중34·기본/전체 기능 lint 통과; 전체 관문 진행, 미출시 |
+| 2026-10-22 16:10 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 2/2 | R14 전체 기본 코어681통과·8실패 확인; 원인 독립 대조, 미출시 |
+| 2026-10-22 16:19 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 2/2 | R14 기본 전체2292통과·13실패·17제외; 병합 alias 결함·fixture 보완 집중 실행, 미출시 |
+| 2026-10-22 16:27 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 2/2 | R14 보완 집중693통과·원자 커밋4개; 최종 WS/matrix 진행, 미출시 |
+| 2026-10-22 16:31 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 2/2 | R14 집중697통과·기본 strict lint 통과; 최종 matrix 진행, 미출시 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -304,12 +308,18 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-22 15:48 | R14 증거 관측 순서 독립 검수 | pre-arrival Cooling 경합1건 확인·보완 중 | stale/equal 거절·fresh 허용·제품 회귀 | 이전 compile 중단 기록 보존; 관측 시점은 의미 증거와 별도 |
 | 2026-10-22 15:50 | R14 관측 순서 수정본 동결 | c5a8bec·rustfmt/diff 통과 | 과거/동시각 거절·새 관측 허용·실제 경로 | 실제 commit Instant와 source/target 관측 분리; 테스트 전용 우회 없음 |
 | 2026-10-22 16:00 | R14 관측 순서 집중 단위 | lib21·quota4 WS1·payment3 WS1·실제HTTP11, fmt·양쪽 strict lint 통과 | 전체 matrix·새 실제 차단/clear 보존 | c5a8bec; 기본 예산 그대로, 독립 Sol source closeout 완료; gate 전체 통과 아님 |
+| 2026-10-22 16:10 | R14 전체 기본 코어 첫 결과 | 681통과·8실패·0제외 | fixture/제품 원인 분리 후 재검증 | command는 no-fail-fast로 나머지 workspace 실행 중; 원본 실패 진단 보존, 기본 예산 완화 없음 |
+| 2026-10-22 16:19 | R14 기본 전체 첫 관문 | 2292통과·13실패·17제외, exit101·1225.11초 | 보완 후 집중 회귀·최종 관문 | source c5a8bec 바이너리; 변경 입력4개 별도 보존, 수정본 통과로 재사용하지 않음 |
+| 2026-10-22 16:19 | R14 임시 실행 병합 원인 | unused source ID를 먼저 생성해 기존 canonical과 AliasConflict | 실제 동시 진입 한 binding·표준 집계 보존 | 없는 source명만 기존 target ID에 연결; 양쪽 기존 ID 충돌은 계속 거절, 회귀 추가·실행 중 |
+| 2026-10-22 16:27 | R14 보완 집중 실행 | 코어690·실제 동시 진입HTTP1·CLI2 통과, 입력 변화0 | WS2건·strict lint·최종 matrix·새 실제 차단 | 원자 커밋2610f6f/a82a348/2c67a94/fd45f82; 원래 실패 보존, 기본 예산 변경 없음 |
+| 2026-10-22 16:27 | R14 보완 독립 Sol closeout | alias 제품 수정·WS fixture delta에서 추가 확정 결함 없음 | WS 실제 실행·최종 관문 | 정적 범위 검수; 실행 수용과 분리, full gate 통과 미주장 |
+| 2026-10-22 16:31 | R14 실제 WS 보완·기본 예산 회귀 | unknown403·drain·기본quota4·payment3 각1통과, 기본 all-target strict lint 통과 | 전체 기능 lint·양쪽 workspace·standalone·새 실제 경로 | 합산 집중697; 전체 관문 완료 아님, 기본 guard/전송/cancel 조건 보존 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 행동 |
 |---|---|---|---|
-| R14 1차 실행 보호 | c5a8bec 집중34·양쪽 strict lint 통과 | 나머지 matrix·새 실제 차단/clear 보존 | 전체 실행 관문→실제 화면 확인→병합 |
+| R14 1차 실행 보호 | alias/fixture 보완 집중697통과·기본 strict lint 통과 | 최종 matrix·새 실제 차단/clear 보존 | fd45f82 동결 검사→실제 화면 확인→병합 |
 | R13 C+E 실행·측정 | 긴급 등록·정책 상속 단위 통과, 전체 실행 미연결 | 대기/취소/초기화 뒤 정확히 한 번 재개와 D27 관문 | 현재 단위 보존; 장기 시험은 완료 신호 때만 확인 |
 | 후속 안전장치·예측 | R14 2차·Part F·R15 대기 | 증거형 이동 choke point·재생 관문·coverage 예측·typed contract | 사용자 지시대로 R14를 Part F보다 먼저 전달 |
 
