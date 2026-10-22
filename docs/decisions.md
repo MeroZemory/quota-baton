@@ -897,3 +897,10 @@ The cost is that the session pauses until the reset.
    - Korean: "Codex · 4개 중 2개 사용 가능 · 다음 소진 약 12:05 (max) · 가장 빠른 회복 04:13".
    
    When credits keep an account serving, it adds "credits continue on max". The pooled runway (D28 part 2) still waits for its backtest.
+
+**D24 amendment 5 (user, 2026-10-23): show the time left first.** "소진까지 몇일 몇시간 몇분남았는지도 간단하게 보여주면 좋을듯". The one-line forecast leads with the remaining time, then the clock time and the window:
+- "9h 38m left · runs out 12:05 (weekly)" / "9시간 38분 남음 · 12:05 소진 (주간)";
+- over a day: "2d 3h left · runs out Oct 25 14:20" / "2일 3시간 남음 · 10/25 14:20 소진";
+- under an hour: "42m left · …" / "42분 남음 · …".
+
+Minutes are dropped once the remainder is a day or more. The provider summary uses the same form for "next runs out".
