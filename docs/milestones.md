@@ -7,9 +7,9 @@ This file names the verification for each unit and each row. The row list and th
 <!-- status:begin -->
 현재 마일스톤: R14 1차 보호 장치
 목표: 불필요한 계정 전환의 피해를 차단하고 토큰 재읽기 비용을 계측한다
-핵심 지표: 새 경로 출시 2/2 · 기존 실제 HWND 비용180 확인; Sol 지적 재시도 증거 누락 수정1eb26ce, 실행 재검증 대기
+핵심 지표: 새 경로 출시 2/2 · R14 집중 회귀34·기본/전체 기능 strict lint 통과, 전체 테스트 진행
 사용자 대기: 없음 (R2 Part B 보류; 장시간 측정은 독립 실행)
-갱신: 2026-10-22 15:35 KST (R14 수정본 검증·2차 라우팅 재생 관문 기준 명시)
+갱신: 2026-10-22 16:00 KST (집중 단위 닫기; 전체 테스트·실제 차단 재확인 진행, 병합·설치 미실시)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -155,6 +155,9 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-22 14:43 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 2/2 | R14 미출시; 스트림23·HTTP11·strict lint·새 HWND 통과, 전체 관문 대기 |
 | 2026-10-22 15:30 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 2/2 | R14 Sol P1 소스 증거 누락 수정1eb26ce; 코드 동결, 실행 관문 미완료 |
 | 2026-10-22 15:35 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 2/2 | 공통 의존성 빌드 성공; R14 수정본 검증과 2차 재생 관문 기준 보완, 미출시 |
+| 2026-10-22 15:48 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 2/2 | R14 오래된 관측 경합 보완 중; 재생 서비스 거절 우회 합성 회귀 추가, 미출시 |
+| 2026-10-22 15:50 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 2/2 | R14 관측 순서 보완c5a8bec 커밋·실행 관문 시작; 미출시 |
+| 2026-10-22 16:00 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 2/2 | R14 c5a8bec 집중34·기본/전체 기능 lint 통과; 전체 관문 진행, 미출시 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -297,12 +300,16 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-22 15:30 | R14 2차 준비 합성 검사 | 재생 커널34·변경 표면13 통과 | 실제24시간 재생·컴파일 소유권 검사 | ignored prototype, 제품 수용과 별도 |
 | 2026-10-22 15:35 | R14 공통 의존성 재빌드 | qb-testkit offline build exit0, 259.8초 | 수정본 제품 회귀·전체 관문 | 공통 의존성만, 제품 수용 합계와 별도 |
 | 2026-10-22 15:35 | R14 D29 재생 관문 명세 | item11·coverage/unknown/서비스 유지 기준·diff 점검 완료 | 실제24시간 production router 재생 | 실행 통과 주장은 없음; 1차/2차 전달 구분 유지 |
+| 2026-10-22 15:48 | R14 재생 서비스 유지 비교 | v2 합성47 통과 (기존34+추가13) | 실제24시간 production router 재생 | 무승인 deny-all/hold 통과 금지·건별 사전 허용 검증; 실제 trace 수용 아님 |
+| 2026-10-22 15:48 | R14 증거 관측 순서 독립 검수 | pre-arrival Cooling 경합1건 확인·보완 중 | stale/equal 거절·fresh 허용·제품 회귀 | 이전 compile 중단 기록 보존; 관측 시점은 의미 증거와 별도 |
+| 2026-10-22 15:50 | R14 관측 순서 수정본 동결 | c5a8bec·rustfmt/diff 통과 | 과거/동시각 거절·새 관측 허용·실제 경로 | 실제 commit Instant와 source/target 관측 분리; 테스트 전용 우회 없음 |
+| 2026-10-22 16:00 | R14 관측 순서 집중 단위 | lib21·quota4 WS1·payment3 WS1·실제HTTP11, fmt·양쪽 strict lint 통과 | 전체 matrix·새 실제 차단/clear 보존 | c5a8bec; 기본 예산 그대로, 독립 Sol source closeout 완료; gate 전체 통과 아님 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 행동 |
 |---|---|---|---|
-| R14 1차 실행 보호 | Sol P1 수정1eb26ce·rustfmt/diff 통과, 이전 HWND180 | 집중 회귀·나머지 전체 matrix·수정 후 HWND | 공통 의존성 뒤 동결 소스 순차 검사→실제 알림→병합 |
+| R14 1차 실행 보호 | c5a8bec 집중34·양쪽 strict lint 통과 | 나머지 matrix·새 실제 차단/clear 보존 | 전체 실행 관문→실제 화면 확인→병합 |
 | R13 C+E 실행·측정 | 긴급 등록·정책 상속 단위 통과, 전체 실행 미연결 | 대기/취소/초기화 뒤 정확히 한 번 재개와 D27 관문 | 현재 단위 보존; 장기 시험은 완료 신호 때만 확인 |
 | 후속 안전장치·예측 | R14 2차·Part F·R15 대기 | 증거형 이동 choke point·재생 관문·coverage 예측·typed contract | 사용자 지시대로 R14를 Part F보다 먼저 전달 |
 
