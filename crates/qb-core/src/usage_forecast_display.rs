@@ -35,7 +35,7 @@ pub fn limiting_window(forecast: &AccountUsageForecast) -> Option<&WindowUsageFo
             || w.window_seconds <= 0
             || !w.used_pct.is_finite()
             || !(0.0..=100.0).contains(&w.used_pct)
-            || !w.reset_at.is_some_and(|at| at > forecast.as_of)
+            || w.reset_at.is_none_or(|at| at <= forecast.as_of)
         {
             return None;
         }

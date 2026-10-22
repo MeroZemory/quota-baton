@@ -54,6 +54,11 @@ pub(super) fn line(
             && a.health.kind == "ready"
             && !a.probe_pending
             && !a.refresh_attention;
+        let forecast = summary_forecast(a, now);
+        let window = limiting_window(&forecast);
+        // Coverage describes the measured subscription forecast even when
+        // permitted credits keep that account serving after it runs out.
+        measured += usize::from(window.is_some());
         if usable && actual_credits(a) && a.allow_credits {
             credit_count += 1;
             if credit_first.is_none_or(|first| (&row.name, &a.id) < (&first.name, &first.raw.id)) {
@@ -64,11 +69,9 @@ pub(super) fn line(
             // remains separate detail, not invented subscription capacity.
             continue;
         }
-        let forecast = summary_forecast(a, now);
-        let Some(window) = limiting_window(&forecast) else {
+        let Some(window) = window else {
             continue;
         };
-        measured += 1;
         if !usable {
             continue;
         }
@@ -348,6 +351,62 @@ mod tests {
     }
 
     #[test]
+    fn r162_provider_recovery_uses_exhausted_or_next_account_only() {
+        let mut next_window = window("5h", Some(10));
+        next_window.reset_at = Some(now() + Duration::hours(6));
+        let next = account("next", vec![next_window]);
+        let mut later_window = window("5h", Some(20));
+        later_window.reset_at = Some(now() + Duration::hours(1));
+        let later = account("later", vec![later_window]);
+        let mut exhausted = window("5h", None);
+        exhausted.used_pct = 100.;
+        exhausted.outcome = ForecastOutcome::Exhausted;
+        exhausted.reset_at = Some(now() + Duration::minutes(30));
+        let mut cooling = account("cooling", vec![exhausted]);
+        cooling["health"] = json!({"kind":"cooling","scope":"account","reason":"quota","until":now()+Duration::minutes(30)});
+        cooling["pool_eligible"] = json!(false);
+        for language in [UiLanguage::En, UiLanguage::Ko] {
+            let english = language == UiLanguage::En;
+            for with_cooling in [false, true] {
+                let mut accounts = vec![next.clone(), later.clone()];
+                if with_cooling {
+                    accounts.push(cooling.clone());
+                }
+                let recovery = if with_cooling {
+                    now() + Duration::minutes(30)
+                } else {
+                    now() + Duration::hours(6)
+                };
+                let expected_recovery = format!(
+                    "{} {}",
+                    if english {
+                        "earliest recovery"
+                    } else {
+                        "가장 빠른 회복"
+                    },
+                    forecast_clock(now(), recovery, english)
+                );
+                let expected_next = format!(
+                    "{} {} (next)",
+                    if english {
+                        "next runs out"
+                    } else {
+                        "다음 소진"
+                    },
+                    forecast_clock(now(), now() + Duration::minutes(10), english)
+                );
+                let forward = project(accounts.clone(), Some(2), language, now());
+                accounts.reverse();
+                let reverse = project(accounts, Some(2), language, now());
+                let text = &forward.summaries[1].forecast_line;
+                assert!(text.contains(&expected_next));
+                assert_eq!(text.rsplit(" · ").next(), Some(expected_recovery.as_str()));
+                assert_eq!(text, &reverse.summaries[1].forecast_line);
+            }
+        }
+    }
+
+    #[test]
     fn r162_provider_credit_permission_is_not_actual_continuation() {
         let mut paid = account("paid", vec![window("5h", Some(10))]);
         paid["allow_credits"] = json!(true);
@@ -356,6 +415,11 @@ mod tests {
             let english = language == UiLanguage::En;
             let v = project(vec![paid.clone()], Some(1), language, now());
             let text = &v.summaries[1].forecast_line;
+            assert!(text.contains(if english {
+                "measured 1/1 accounts"
+            } else {
+                "측정 1/1 계정"
+            }));
             assert!(!text.contains(if english {
                 "credits continue"
             } else {
@@ -364,8 +428,13 @@ mod tests {
             assert!(text.contains(if english { "10m left" } else { "10분 남음" }));
             let mut actual = paid.clone();
             actual["credits_in_use"] = json!(true);
-            let v = project(vec![actual], Some(1), language, now());
+            let v = project(vec![actual.clone()], Some(1), language, now());
             let text = &v.summaries[1].forecast_line;
+            assert!(text.contains(if english {
+                "measured 1/1 accounts"
+            } else {
+                "측정 1/1 계정"
+            }));
             assert!(text.contains(if english {
                 "credits continue on paid"
             } else {
@@ -377,6 +446,24 @@ mod tests {
                 "다음 소진 "
             }));
             assert!(!text.contains("10m left"));
+            actual.as_object_mut().unwrap().remove("usage_forecast");
+            let v = project(vec![actual], Some(1), language, now());
+            let text = &v.summaries[1].forecast_line;
+            assert!(text.contains(if english {
+                "measured 0/1 accounts"
+            } else {
+                "측정 0/1 계정"
+            }));
+            assert!(text.contains(if english {
+                "credits continue on paid"
+            } else {
+                "paid 크레딧으로 계속 사용"
+            }));
+            assert!(!text.contains(if english {
+                "next runs out"
+            } else {
+                "다음 소진 "
+            }));
         }
     }
 

@@ -655,9 +655,12 @@ impl Scene {
 }
 
 fn paragraph_height(p: &Presentation, text: &str, width: f32) -> f32 {
-    p.subtitle_lines.get(text).copied().unwrap_or_else(|| {
-        (advance(p, text, 12, false) / width).ceil().max(1.) as usize
-    }).max(1) as f32 * 16.
+    p.subtitle_lines
+        .get(text)
+        .copied()
+        .unwrap_or_else(|| (advance(p, text, 12, false) / width).ceil().max(1.) as usize)
+        .max(1) as f32
+        * 16.
 }
 
 fn header(view: &v2::View, p: &Presentation) -> HeaderBox {
@@ -825,10 +828,11 @@ pub fn row_height(row: &v2::AccountRow, disabled_slot: bool) -> f32 {
         return 44. + if row.reason.is_some() { 24. } else { 0. };
     }
     let action = row.action.as_ref().map(|a| a.kind);
-    44. + forecast_height(row, &Presentation::default()) + row
-        .usage
-        .as_ref()
-        .map_or(0., |u| 30. + u.lines.len().saturating_sub(1) as f32 * 26.)
+    44. + forecast_height(row, &Presentation::default())
+        + row
+            .usage
+            .as_ref()
+            .map_or(0., |u| 30. + u.lines.len().saturating_sub(1) as f32 * 26.)
         + if row.credits.is_some() {
             6. + if matches!(
                 action,
@@ -855,13 +859,18 @@ pub fn row_height(row: &v2::AccountRow, disabled_slot: bool) -> f32 {
         }
 }
 fn forecast_height(row: &v2::AccountRow, p: &Presentation) -> f32 {
-    row.forecast_lines.first().map_or(0., |text| 6. + paragraph_height(p, text, 328.))
+    row.forecast_lines
+        .first()
+        .map_or(0., |text| 6. + paragraph_height(p, text, 328.))
 }
 fn row_box(row: &v2::AccountRow, disabled_slot: bool, y: f32, p: &Presentation) -> RowBox {
     let enabled = p.core_ok && !p.pending_ids.contains(&row.raw.id);
-    let height = row_height(row, disabled_slot) + if disabled_slot { 0. } else {
-        forecast_height(row, p) - forecast_height(row, &Presentation::default())
-    };
+    let height = row_height(row, disabled_slot)
+        + if disabled_slot {
+            0.
+        } else {
+            forecast_height(row, p) - forecast_height(row, &Presentation::default())
+        };
     let rect = r(0., y, WIDTH, y + height);
     let line1 = r(16., y + 10., 352., y + 34.);
     let more = r(324., line1.top, 352., line1.bottom);
@@ -1936,11 +1945,33 @@ mod tests {
         }
         let scene = Scene::build(&ready_view(), Presentation::default(), 1000.);
         assert_eq!(scene.header.forecasts.len(), 2);
-        assert_eq!(h(scene.header.rect), 105. + scene.header.forecasts.iter().map(|area| h(*area) + 6.).sum::<f32>());
-        assert!(scene.header.forecasts.iter().all(|area| inside(*area, scene.header.rect)));
+        assert_eq!(
+            h(scene.header.rect),
+            105. + scene
+                .header
+                .forecasts
+                .iter()
+                .map(|area| h(*area) + 6.)
+                .sum::<f32>()
+        );
+        assert!(
+            scene
+                .header
+                .forecasts
+                .iter()
+                .all(|area| inside(*area, scene.header.rect))
+        );
         assert_eq!(scene.header.summaries.len(), 2);
         let scene = Scene::build(&view(vec![relogin()], 0), Presentation::default(), 1000.);
-        assert_eq!(h(scene.header.rect), 125. + scene.header.forecasts.iter().map(|area| h(*area) + 6.).sum::<f32>());
+        assert_eq!(
+            h(scene.header.rect),
+            125. + scene
+                .header
+                .forecasts
+                .iter()
+                .map(|area| h(*area) + 6.)
+                .sum::<f32>()
+        );
         let scene = Scene::build(
             &ready_view(),
             Presentation {
@@ -1980,7 +2011,7 @@ mod tests {
         let v = view(vec![credits()], 0);
         let scene = Scene::build(&v, Presentation::default(), 1000.);
         let row = scene.row("a").unwrap();
-        assert_eq!(h(row.rect), 104.);
+        assert_eq!(h(row.rect), 126.);
         assert_eq!(h(row.button.as_ref().unwrap().visual), 24.);
         assert!(row.credits.is_some());
     }
@@ -1993,7 +2024,7 @@ mod tests {
         ]);
         let scene = Scene::build(&view(vec![a], 1), Presentation::default(), 1000.);
         let row = scene.row("a").unwrap();
-        assert_eq!(h(row.rect), 100.);
+        assert_eq!(h(row.rect), 122.);
         assert_eq!(row.usage_lines.len(), 2);
         assert_eq!(row.usage_lines[0].line.top, row.usage.unwrap().top);
         assert_eq!(
@@ -2194,7 +2225,25 @@ mod tests {
         );
         let popup = scene.popup.as_ref().unwrap();
         assert_eq!(popup.rect.right - popup.rect.left, 264.);
-        assert!(scene.rect.bottom > base.rect.bottom);
+        // The provider summary may already make the list tall enough.
+        assert!(scene.rect.bottom >= base.rect.bottom);
+        let mut compact = v.clone();
+        compact.summaries.clear();
+        for section in &mut compact.sections {
+            for row in &mut section.rows {
+                row.forecast_lines.clear();
+            }
+        }
+        let compact_base = Scene::build(&compact, Presentation::default(), 1000.);
+        let compact_menu = Scene::build(
+            &compact,
+            Presentation {
+                overlay: Overlay::RowMenu("a".into()),
+                ..Presentation::default()
+            },
+            1000.,
+        );
+        assert!(compact_menu.rect.bottom > compact_base.rect.bottom);
         assert!(inside(popup.rect, scene.rect));
         assert!(popup.rect.top >= 8.);
         assert!(popup.rect.bottom <= scene.footer.rect.top);

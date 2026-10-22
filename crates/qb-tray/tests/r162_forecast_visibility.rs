@@ -147,6 +147,7 @@ async fn poll(payload: &Value) -> client::TraySnapshot {
                 Err(e) => panic!("synthetic accept: {e}"),
             }
         };
+        stream.set_nonblocking(false).unwrap();
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();
@@ -255,8 +256,11 @@ fn account_contract(view: &v2::View, id: &str, case: Case, language: UiLanguage)
     assert!(text.contains(expected), "{case:?}/{language:?}: {text}");
     assert_eq!(
         r.forecast_warning,
-        matches!(case, Case::Near | Case::JustUnderFiveHours),
-        "only finite exhaustion strictly under five hours warns: {case:?}"
+        matches!(
+            case,
+            Case::Near | Case::ExactlyFiveHours | Case::JustUnderFiveHours
+        ),
+        "only finite exhaustion within five hours warns: {case:?}"
     );
     assert!(!r.forecast_tooltip.is_empty(), "detail tooltip disappeared");
     if !matches!(case, Case::Measuring) {
@@ -282,7 +286,7 @@ fn account_contract(view: &v2::View, id: &str, case: Case, language: UiLanguage)
 }
 
 #[tokio::test]
-async fn r162_admin_dto_compact_forecasts_preserve_tooltips_and_strict_warning_boundary() {
+async fn r162_admin_dto_compact_forecasts_preserve_tooltips_and_inclusive_warning_boundary() {
     let cases = [
         Case::Near,
         Case::Long,
@@ -379,7 +383,11 @@ fn measured_fits(engine: &v2_text::Text, text: &str, rect: Rect, style: v2_text:
         "summary height {text:?}: {metrics:?} in {rect:?}"
     );
     assert!(
-        metrics.natural_width <= rect.right - rect.left + EPS,
+        // DirectWrite advances can round fractionally past the wrap edge.
+        // Permit at most one output pixel at scale 2. ink_overflow also
+        // flags ordinary glyph overhang; the production engine deliberately
+        // does not clip it to the line box. Outer clips are checked below.
+        metrics.natural_width <= rect.right - rect.left + 0.5,
         "summary width {text:?}: {metrics:?} in {rect:?}"
     );
     format!("{text:?}: {metrics:?}, rect={rect:?}\n")
@@ -420,7 +428,15 @@ fn audit_dashboard(data: &model::DashboardSnapshot, options: &Options) -> String
     assert_eq!(
         account_nodes.len(),
         1,
-        "missing/duplicated painted account forecast"
+        "missing/duplicated painted account forecast {:?}/{:?}: keys={:?}; sessions={:?}",
+        options.view,
+        options.size,
+        scene
+            .accessibility
+            .iter()
+            .map(|n| &n.key)
+            .collect::<Vec<_>>(),
+        data.sessions
     );
     assert_eq!(account_nodes[0].name, *expected);
     let provider_nodes: Vec<_> = scene
@@ -546,7 +562,11 @@ fn audit_flyout(view: &v2::View, height: u32) -> String {
 }
 
 fn output() -> PathBuf {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r162/visibility");
+    let root = std::env::var_os("R162_RENDER_OUTPUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r162/visibility")
+        });
     std::fs::create_dir_all(&root).unwrap();
     root
 }
@@ -560,29 +580,41 @@ async fn r162_ko_en_overview_usage_flyout_summaries_fit_actual_directwrite_at_bo
             i18n::with_language(language, || {
                 let accounts = project(&snapshot);
                 account_contract(&accounts, "visible", case, language);
-                let data = model::DashboardSnapshot::new(accounts);
+                let mut data = model::DashboardSnapshot::new(accounts);
+                data.sessions = serde_json::from_value(json!({"sessions":[{
+                    "id":"0123456789ab","provider":"codex","account":"visible",
+                    "last_used_at":AT,"first_seen_at":AT,"active":true,
+                    "client":{"kind":"codex"}
+                }]}))
+                .unwrap();
                 for size in [[1024, 640], [1320, 900]] {
-                    for view in [View::Overview, View::Usage, View::Flyout] {
-                        let options = Options {
-                            view,
-                            size,
-                            scale: 1,
-                            dark: false,
-                            now: AT.parse::<DateTime<FixedOffset>>().unwrap(),
-                        };
-                        let stem =
-                            format!("{case:?}-{language:?}-{view:?}-{}x{}", size[0], size[1]);
-                        // Keep the actual rendered failure for the single batched visual review.
-                        let png = out.join(format!("{stem}.png"));
-                        snapshot_render::save(&data, &options, &png).unwrap();
-                        let bytes = std::fs::read(png).unwrap();
-                        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
-                        let metrics = if view == View::Flyout {
-                            audit_flyout(&data.accounts, size[1])
-                        } else {
-                            audit_dashboard(&data, &options)
-                        };
-                        std::fs::write(out.join(format!("{stem}.txt")), metrics).unwrap();
+                    for dark in [false, true] {
+                        for view in [View::Overview, View::Usage, View::Flyout] {
+                            let options = Options {
+                                view,
+                                size,
+                                scale: 2,
+                                dark,
+                                now: AT.parse::<DateTime<FixedOffset>>().unwrap(),
+                            };
+                            let stem = format!(
+                                "{case:?}-{language:?}-{view:?}-{}x{}-{}",
+                                size[0],
+                                size[1],
+                                if dark { "dark" } else { "light" }
+                            );
+                            // Keep the actual rendered failure for the single batched visual review.
+                            let png = out.join(format!("{stem}.png"));
+                            snapshot_render::save(&data, &options, &png).unwrap();
+                            let bytes = std::fs::read(png).unwrap();
+                            assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+                            let metrics = if view == View::Flyout {
+                                audit_flyout(&data.accounts, size[1])
+                            } else {
+                                audit_dashboard(&data, &options)
+                            };
+                            std::fs::write(out.join(format!("{stem}.txt")), metrics).unwrap();
+                        }
                     }
                 }
             });
@@ -592,8 +624,8 @@ async fn r162_ko_en_overview_usage_flyout_summaries_fit_actual_directwrite_at_bo
 
 #[tokio::test]
 async fn r162_provider_lines_keep_usable_next_recovery_and_actual_credit_evidence() {
-    let mut active = account("current", "codex", Case::Near);
-    let mut next = account("next", "codex", Case::Long);
+    let mut active = account("current", "codex", Case::Long);
+    let mut next = account("next", "codex", Case::Near);
     next["active_sessions"] = json!(0);
     let ready = poll(&state(vec![active.clone(), next.clone()])).await;
     active["health"] = json!({"kind":"cooling","reason":"quota","scope":"account",

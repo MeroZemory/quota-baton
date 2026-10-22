@@ -545,10 +545,26 @@ fn r10_narrow_recent_strip_preserves_list_height_and_wide_side_scroll() {
                 .find(|h| h.target == Target::AllEvents)
                 .unwrap();
             assert!(link.rect.top > table.viewport.bottom);
-            assert!(
-                height(table.viewport) / 35. >= 10.,
-                "the 640 DIP window must retain ten full session rows"
+            let mut without_provider = v.clone();
+            without_provider.provider_summaries.clear();
+            let baseline = Scene::build(&without_provider, &state, size, &Metrics::default());
+            let baseline_table = baseline
+                .content
+                .iter()
+                .find(|r| r.region == ScrollRegion::Table)
+                .unwrap();
+            let added = scene
+                .accessibility
+                .iter()
+                .filter(|node| node.key.starts_with("provider:") && node.key.ends_with(":forecast"))
+                .map(|node| height(node.rect) + 6.)
+                .sum::<f32>();
+            assert_eq!(
+                height(baseline_table.viewport) - height(table.viewport),
+                added
             );
+            assert!(height(baseline_table.viewport) / 35. >= 10.);
+            assert!(height(table.viewport) / 35. >= 8.);
             assert_eq!(height(link.rect), 28.);
         } else {
             let side = scene
@@ -668,7 +684,14 @@ fn r7_event_toolbar_measures_full_counts_and_wraps_without_overlapping_controls(
             .iter()
             .find(|r| r.region == ScrollRegion::Events)
             .unwrap();
-        assert_eq!(region.viewport.top, 64. + toolbar_height);
+        let provider_height = scene
+            .accessibility
+            .iter()
+            .filter(|node| node.key.starts_with("provider:") && node.key.ends_with(":forecast"))
+            .map(|node| height(node.rect) + 6.)
+            .sum::<f32>()
+            + 6.;
+        assert_eq!(region.viewport.top, 64. + provider_height + toolbar_height);
     }
 }
 #[test]
@@ -1362,7 +1385,8 @@ fn r10_account_boxes_gap_group_children_and_header_height_are_shared_geometry() 
         assert_eq!(pair[1].top - pair[0].bottom, gap);
     }
     for group in &v.groups {
-        assert!(group.forecast_lines.is_empty());
+        assert_eq!(group.forecast_lines.len(), 1);
+        assert!(!group.forecast_tooltip.is_empty());
         assert_eq!(group_usage_height(group, 900.), 60.);
     }
 }

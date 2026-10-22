@@ -344,8 +344,19 @@ mod tests {
     fn review_height_uses_v2_scene_and_spec_empty_and_login_dimensions() {
         assert_eq!(state_height(&[], false, None), 298.);
         let rows=crate::parse_state(r#"{"accounts":[{"id":"cl","provider":"claude","user_state":"disabled"},{"id":"cx","provider":"codex","user_state":"disabled"}]}"#).unwrap();
-        assert_eq!(state_height(&rows, false, None), 419.);
-        assert_eq!(state_height(&rows, false, Some("login:claude")), 337.);
+        let (_, _, list) = prepared(&rows, false, SystemTime::now(), false, true, None).unwrap();
+        assert_eq!(state_height(&rows, false, None), list.rect.bottom);
+        assert_eq!(list.header.forecasts.len(), 2);
+        assert_eq!(
+            list.header
+                .forecasts
+                .iter()
+                .map(|r| r.bottom - r.top + 6.)
+                .sum::<f32>(),
+            76.
+        );
+        assert_eq!(list.rect.bottom, 419. + 76.);
+        assert_eq!(state_height(&rows, false, Some("login:claude")), 337. + 76.);
         let (_, _, scene) = prepared(
             &rows,
             false,
