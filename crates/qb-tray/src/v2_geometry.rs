@@ -265,6 +265,7 @@ pub struct InfoLine {
     pub rect: Rect,
     pub text: String,
     pub emphasized: bool,
+    pub tooltip: Option<String>,
 }
 #[derive(Debug, Clone)]
 pub struct MenuItemBox {
@@ -1042,6 +1043,7 @@ fn row_box(row: &v2::AccountRow, disabled_slot: bool, y: f32, p: &Presentation) 
 #[derive(Clone)]
 enum Part {
     Info(String, bool, f32),
+    HintInfo(String, Option<String>, f32),
     Gap(f32),
     Separator,
     Item(String, Option<String>, Option<bool>, bool, Target, bool),
@@ -1072,7 +1074,11 @@ fn row_parts(row: &v2::AccountRow, core_ok: bool) -> Vec<Part> {
         parts.push(Part::Info(s.clone(), false, 16.));
     }
     parts.push(Part::Gap(6.));
-    parts.push(Part::Info(row.menu.sessions_line.clone(), false, 16.));
+    parts.push(Part::HintInfo(
+        row.menu.sessions_line.clone(),
+        row.menu.sessions_tooltip.clone(),
+        16.,
+    ));
     parts.push(Part::Gap(8.));
     parts.push(Part::Separator);
     let mut groups: Vec<Vec<(MenuAction, &str, Option<bool>)>> = vec![vec![], vec![], vec![]];
@@ -1245,7 +1251,7 @@ fn parts_height(parts: &[Part], p: &Presentation) -> f32 {
     8. + parts
         .iter()
         .map(|part| match part {
-            Part::Info(_, _, height) | Part::Gap(height) => *height,
+            Part::Info(_, _, height) | Part::HintInfo(_, _, height) | Part::Gap(height) => *height,
             Part::Separator => 9.,
             Part::Item(_, subtitle, _, _, _, _) => {
                 if let Some(detail) = subtitle {
@@ -1336,6 +1342,16 @@ fn build_popup(view: &v2::View, scene: &Scene, p: &Presentation) -> Option<Popup
                     rect: r(rect.left + 17., y, rect.right - 17., y + height),
                     text,
                     emphasized,
+                    tooltip: None,
+                });
+                y += height;
+            }
+            Part::HintInfo(text, tooltip, height) => {
+                info.push(InfoLine {
+                    rect: r(rect.left + 17., y, rect.right - 17., y + height),
+                    text,
+                    emphasized: false,
+                    tooltip,
                 });
                 y += height;
             }

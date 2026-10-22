@@ -1892,8 +1892,18 @@ fn tooltip_content(
     x: f32,
     y: f32,
 ) -> Option<(String, qb_tray::Rect)> {
-    if scene.popup.is_some() || scene.dialog.is_some() {
+    if scene.dialog.is_some() {
         return None;
+    }
+    if let Some(popup) = &scene.popup {
+        if !contains(popup.clip, x, y) {
+            return None;
+        }
+        return popup.info.iter().find_map(|line| {
+            (contains(line.rect, x, y))
+                .then(|| line.tooltip.clone().map(|text| (text, line.rect)))
+                .flatten()
+        });
     }
     for (r, summary) in scene.header.summaries.iter().zip(&view.summaries) {
         if contains(*r, x, y) {
@@ -3227,6 +3237,38 @@ mod tests {
                 .unwrap();
             assert_eq!(item.text, expected);
         }
+    }
+    #[test]
+    fn r13_crowded_menu_hint_uses_visible_info_rect() {
+        let view = v2::project(
+            &serde_json::json!({"accounts":[{
+                "id":"crowded", "provider":"codex", "user_state":"active",
+                "active_sessions":5, "spread_threshold":5
+            }]})
+            .to_string(),
+            SystemTime::now(),
+        )
+        .unwrap();
+        let scene = geometry::Scene::build(
+            &view,
+            geometry::Presentation {
+                overlay: geometry::Overlay::RowMenu("crowded".into()),
+                ..Default::default()
+            },
+            900.,
+        );
+        let popup = scene.popup.as_ref().unwrap();
+        let line = popup.info.iter().find(|i| i.tooltip.is_some()).unwrap();
+        let x = line.rect.right - 1.;
+        let y = (line.rect.top + line.rect.bottom) / 2.;
+        let hint = tooltip_content(&view, &scene, x, y).unwrap();
+        assert_eq!(
+            hint.0,
+            "분산 기준 5개에 도달해 새 세션은 다른 계정을 우선합니다. 제한이 아니며 세션은 계속 받습니다."
+        );
+        assert_eq!(hint.1, line.rect);
+        assert!(tooltip_content(&view, &scene, x, popup.clip.bottom + 1.).is_none());
+        assert!(tooltip_content(&view, &scene, x, line.rect.bottom).is_none());
     }
     #[test]
     fn stationary_and_focused_tooltips_read_the_latest_snapshot() {

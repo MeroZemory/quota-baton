@@ -1960,7 +1960,12 @@ fn detail_view(d: &SessionDetail, accounts: &v2::View, clock: &Clock, expired: b
 /// Usage alone rolls with the visible local minute; calendar-day filters stay separate.
 pub fn usage_domain(clock: &Clock) -> (DateTime<Utc>, DateTime<Utc>) {
     use chrono::{Duration, Timelike};
-    let minute = clock.now.with_second(0).unwrap().with_nanosecond(0).unwrap();
+    let minute = clock
+        .now
+        .with_second(0)
+        .unwrap()
+        .with_nanosecond(0)
+        .unwrap();
     let now = minute.with_timezone(&Utc);
     (now - Duration::hours(19), now + Duration::hours(5))
 }

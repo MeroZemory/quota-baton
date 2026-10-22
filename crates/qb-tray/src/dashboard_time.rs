@@ -492,6 +492,54 @@ mod tests {
     }
 
     #[test]
+    fn r13_usage_nonminute_deadline_stays_fixed_across_halfsecond_ticks() {
+        let (snap, mut state, mut scene, mut c) = empty();
+        state.tab = Tab::Usage;
+        scene.content[0].region = ScrollRegion::Usage;
+        let base = c.now + Duration::milliseconds(17_250);
+        let deadline = c.utc() + Duration::minutes(1);
+        scene.charts.push(g::ChartData {
+            id: "fixture".into(),
+            rect: g::rect(0., 100., 480., 200.),
+            from: m::usage_domain(&c).0,
+            to: m::usage_domain(&c).1,
+            now: c.utc(),
+            series: vec![],
+            unconfirmed: false,
+            offset: *c.now.offset(),
+        });
+        for ms in [0, 500, 1_000, 20_000, 42_500] {
+            c.now = base + Duration::milliseconds(ms);
+            // Each completed frame, even after an unrelated input, must retain
+            // the same wall-clock deadline rather than scheduling now + 60s.
+            scene.charts[0].now = c.utc();
+            for dpi in [96, 144, 192] {
+                assert_eq!(
+                    next_visible_time_change(&snap, &state, &scene, &c, dpi),
+                    Some(deadline)
+                );
+                assert!(c.utc() < deadline);
+            }
+        }
+        for ms in [42_750, 70_000, -20_000] {
+            c.now = base + Duration::milliseconds(ms);
+            scene.charts[0].now = c.utc();
+            let (from, to) = m::usage_domain(&c);
+            scene.charts[0].from = from;
+            scene.charts[0].to = to;
+            assert_eq!(
+                next_visible_time_change(&snap, &state, &scene, &c, 96),
+                Some(to - Duration::hours(5) + Duration::minutes(1))
+            );
+        }
+        scene.charts[0].rect = g::rect(0., 700., 480., 200.);
+        assert_eq!(
+            next_visible_time_change(&snap, &state, &scene, &c, 96),
+            Some(c.day_end)
+        );
+    }
+
+    #[test]
     fn rendered_clock_and_rollover_are_explicit() {
         let (mut snap, state, mut scene, mut c) = empty();
         row(&mut snap, &mut scene, &c);

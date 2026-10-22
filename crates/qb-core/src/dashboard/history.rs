@@ -1190,6 +1190,36 @@ mod tests {
         assert!(serde_json::from_value::<DiskActivityEvent>(forbidden).is_err());
     }
     #[test]
+    fn r13_usage_roundtrip_retains_nineteen_hours_across_midnight() {
+        let end = DateTime::parse_from_rfc3339("2026-10-22T00:20:00+09:00")
+            .unwrap()
+            .to_utc();
+        let start = end - Duration::hours(19);
+        let mut h = UsageHistory::default();
+        for minute in 0..=19 * 60 {
+            let at = start + Duration::minutes(minute);
+            let mut o = observation(at, minute as f64 / 20.);
+            o.window.as_mut().unwrap().reset_at = None;
+            h.observe(o, at).unwrap();
+        }
+        let restored = UsageHistory::restore_json(&h.snapshot_json().unwrap(), end).unwrap();
+        let history = restored.query(48, end).unwrap();
+        let w = &history.accounts[0].windows[0];
+        assert_eq!(w.points.len(), 19 * 60 + 1);
+        assert_eq!(w.points.first().unwrap().0, start);
+        assert_eq!(w.points.last().unwrap().0, end);
+        assert!(
+            w.points
+                .iter()
+                .any(|(at, _)| *at == end - Duration::minutes(30))
+        );
+        assert!(!history.truncated && !w.truncated && !history.accounts[0].truncated);
+        assert_eq!(
+            restored.query(19, end).unwrap().accounts[0].windows[0].points,
+            w.points
+        );
+    }
+    #[test]
     fn usage_deduplicates_unchanged_observation_excludes_model_and_keeps_dynamic_windows() {
         let mut h = UsageHistory::default();
         h.observe(observation(now(), 10.0), now()).unwrap();

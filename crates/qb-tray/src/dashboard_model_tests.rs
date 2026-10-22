@@ -544,21 +544,44 @@ fn r13_usage_midnight_keeps_previous_day_observations_but_today_filters_do_not()
         ..Default::default()
     }];
     data.usage.accounts[0].credits_spans = vec![(from - Duration::hours(1), None)];
-    data.activity = [yesterday, c.day_start].into_iter().enumerate().map(|(i, ts)| {
-        let mut e = r10_quota(i as u64 + 1, 0);
-        e.ts = Some(ts);
-        e
-    }).collect();
+    data.activity = [yesterday, c.day_start]
+        .into_iter()
+        .enumerate()
+        .map(|(i, ts)| {
+            let mut e = r10_quota(i as u64 + 1, 0);
+            e.ts = Some(ts);
+            e
+        })
+        .collect();
     data.sessions.sessions.truncate(2);
-    for (session, ts) in data.sessions.sessions.iter_mut().zip([yesterday, c.day_start]) {
+    for (session, ts) in data
+        .sessions
+        .sessions
+        .iter_mut()
+        .zip([yesterday, c.day_start])
+    {
         session.last_used_at = Some(ts);
         session.inflight = Default::default();
     }
-    let view = project(&data, &mut DashboardState {
-        range: Range::Today, event_days: 1, ..Default::default()
-    }, &c);
+    let view = project(
+        &data,
+        &mut DashboardState {
+            range: Range::Today,
+            event_days: 1,
+            ..Default::default()
+        },
+        &c,
+    );
     let tile = view.usage.iter().find(|t| t.id == "cx-a").unwrap();
-    assert_eq!(tile.series[0].points, vec![(from, Some(90.)), (gap, None), (yesterday, Some(70.)), (c.utc(), Some(60.))]);
+    assert_eq!(
+        tile.series[0].points,
+        vec![
+            (from, Some(90.)),
+            (gap, None),
+            (yesterday, Some(70.)),
+            (c.utc(), Some(60.))
+        ]
+    );
     assert_eq!(tile.series[0].resets, vec![from, yesterday]);
     assert_eq!(tile.credits_spans, vec![(from, c.utc())]);
     assert_eq!(view.flat.len(), 1);
@@ -599,9 +622,22 @@ fn r13_usage_empty_history_keeps_all_real_windows_and_resets_beyond_domain() {
     let tile = &tiles[0];
     assert_eq!(tile.windows.len(), 3);
     assert_eq!(tile.series.len(), 3);
-    assert!(tile.series.iter().all(|s| s.points.is_empty() && s.resets.is_empty()));
-    assert_eq!(tile.series.iter().map(|s| s.remaining).collect::<Vec<_>>(), vec![Some(80), Some(70), Some(60)]);
-    assert_eq!(tile.series.iter().flat_map(|s| s.future_resets.clone()).collect::<Vec<_>>(), vec![to, to + Duration::seconds(1), to + Duration::days(20)]);
+    assert!(
+        tile.series
+            .iter()
+            .all(|s| s.points.is_empty() && s.resets.is_empty())
+    );
+    assert_eq!(
+        tile.series.iter().map(|s| s.remaining).collect::<Vec<_>>(),
+        vec![Some(80), Some(70), Some(60)]
+    );
+    assert_eq!(
+        tile.series
+            .iter()
+            .flat_map(|s| s.future_resets.clone())
+            .collect::<Vec<_>>(),
+        vec![to, to + Duration::seconds(1), to + Duration::days(20)]
+    );
     assert!(!tile.series.iter().any(|s| s.name == "0m"));
 }
 #[test]

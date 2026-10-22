@@ -124,14 +124,14 @@ pub fn set_icon_presentation(dark: bool, badge: Badge) {
         SendMessageW(
             hwnd,
             WM_SETICON,
-            WPARAM(ICON_SMALL as usize),
-            LPARAM(icons.small.as_raw() as isize),
+            Some(WPARAM(ICON_SMALL as usize)),
+            Some(LPARAM(icons.small.as_raw() as isize)),
         );
         SendMessageW(
             hwnd,
             WM_SETICON,
-            WPARAM(ICON_BIG as usize),
-            LPARAM(icons.big.as_raw() as isize),
+            Some(WPARAM(ICON_BIG as usize)),
+            Some(LPARAM(icons.big.as_raw() as isize)),
         );
     }
     host.borrow_mut().icons = Some(icons);
