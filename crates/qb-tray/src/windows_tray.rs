@@ -1961,9 +1961,15 @@ fn focus_tooltip(
         return None;
     };
     let row = row_view(view, id)?;
-    let mut text = row.usage.as_ref().map(|usage| usage.tooltip.clone()).unwrap_or_default();
+    let mut text = row
+        .usage
+        .as_ref()
+        .map(|usage| usage.tooltip.clone())
+        .unwrap_or_default();
     if !row.forecast_tooltip.is_empty() {
-        if !text.is_empty() { text.push('\n'); }
+        if !text.is_empty() {
+            text.push('\n');
+        }
         text.push_str(&row.forecast_tooltip);
     }
     (!text.is_empty()).then_some((text, scene.row(id)?.forecast.or(scene.row(id)?.usage)?))

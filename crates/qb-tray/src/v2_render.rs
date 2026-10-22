@@ -202,8 +202,13 @@ impl Renderer {
         for summary in &view.summaries {
             let mut s = style(12., false, 16.);
             s.wrap = Wrap::KeepAll;
-            let lines = self.text.layout(&summary.forecast_line, bounds(r(0., 0., 312., 65536.)), s)?.metrics.total_lines;
-            p.subtitle_lines.insert(summary.forecast_line.clone(), lines.max(1));
+            let lines = self
+                .text
+                .layout(&summary.forecast_line, bounds(r(0., 0., 312., 65536.)), s)?
+                .metrics
+                .total_lines;
+            p.subtitle_lines
+                .insert(summary.forecast_line.clone(), lines.max(1));
         }
         for row in view
             .sections
@@ -213,7 +218,11 @@ impl Renderer {
             if let Some(line) = row.forecast_lines.first() {
                 let mut s = style(12., row.forecast_warning, 16.);
                 s.wrap = Wrap::KeepAll;
-                let lines = self.text.layout(line, bounds(r(0., 0., 328., 65536.)), s)?.metrics.total_lines;
+                let lines = self
+                    .text
+                    .layout(line, bounds(r(0., 0., 328., 65536.)), s)?
+                    .metrics
+                    .total_lines;
                 p.subtitle_lines.insert(line.clone(), lines.max(1));
             }
             let mut labels = vec![row.name.as_str()];
@@ -971,7 +980,18 @@ impl Renderer {
         if let (Some(line), Some(area)) = (row.forecast_lines.first(), b.forecast) {
             let mut s = style(12., row.forecast_warning, 16.);
             s.wrap = Wrap::KeepAll;
-            self.text(target, area, line, s, if row.forecast_warning { p.warning } else { p.secondary }, alpha)?;
+            self.text(
+                target,
+                area,
+                line,
+                s,
+                if row.forecast_warning {
+                    p.warning
+                } else {
+                    p.secondary
+                },
+                alpha,
+            )?;
         }
         if let (Some(credits), Some(rect)) = (&row.credits, b.credits) {
             self.text(

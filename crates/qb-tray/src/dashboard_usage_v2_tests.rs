@@ -300,7 +300,17 @@ fn r10_usage_full_legend_is_measured_contained_and_clear_of_header_and_tiles() {
                 } if *radius == 6. => bounds.bottom + 8. <= rect.top,
                 _ => true,
             }));
-            assert_eq!(bounds.top, if size[0] == 1024. { 104. } else { 80. });
+            let provider_height = s
+                .accessibility
+                .iter()
+                .filter(|node| node.key.starts_with("provider:") && node.key.ends_with(":forecast"))
+                .map(|node| height(node.rect) + 6.)
+                .sum::<f32>()
+                + 6.;
+            assert_eq!(
+                bounds.top,
+                provider_height + if size[0] == 1024. { 104. } else { 80. }
+            );
         }
     }
 }
@@ -540,7 +550,9 @@ fn r10_usage_tiles_share_row_height_at_wide_and_narrow_widths() {
             })
             .collect();
         assert!(tiles.len() >= 2);
-        assert!(tiles.iter().all(|r| height(**r) == 288.));
+        // Every fixture account now has one 16-DIP compact summary plus its gap.
+        assert!(v.usage.iter().all(|tile| tile.forecast_lines.len() == 1));
+        assert!(tiles.iter().all(|r| height(**r) == 308.));
         assert_eq!(tiles[0].top, tiles[1].top);
         assert_eq!(s.charts.len(), 4);
         assert!(s.accessibility.len() <= history::SCENE_NODE_BUDGET);

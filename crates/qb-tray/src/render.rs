@@ -2545,7 +2545,10 @@ mod scroll_damage_tests {
         // The old-frame proposal is clipped to client bounds; it is not
         // permission to reuse pixels after an actual target/size change.
         changed = previous.clone();
-        changed.scene.rect = rect(30., 100., 50., 80.);
+        let damage = previous.table_scroll_damage().expect("table damage");
+        // Keep the synthetic client inside measured damage even when the
+        // provider and move-accounting headers change the table's origin.
+        changed.scene.rect = rect(damage.left + 8., damage.top + 8., 50., 60.);
         assert_eq!(changed.table_scroll_damage(), Some(changed.scene.rect));
         changed.scene.rect.right = f32::NAN;
         assert!(changed.table_scroll_damage().is_none());

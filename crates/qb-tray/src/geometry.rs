@@ -905,7 +905,14 @@ impl Scene {
             for summary in &view.provider_summaries {
                 let h = b.measured_height(&summary.forecast_line, w - 40., 12., false);
                 let area = rect(20., top, w - 40., h);
-                b.text(area, &summary.forecast_line, 12., false, Color::Secondary, true);
+                b.text(
+                    area,
+                    &summary.forecast_line,
+                    12.,
+                    false,
+                    Color::Secondary,
+                    true,
+                );
                 b.semantic(
                     format!("provider:{}:forecast", summary.provider),
                     None,
@@ -2263,7 +2270,9 @@ fn group_header_height(b: &mut Builder<'_>, g: &m::AccountGroup, available: f32)
     group_usage_height(g, available)
         + g.forecast_lines
             .iter()
-            .map(|line| b.measured_height(line, (available - 46.).max(1.), 12., g.forecast_warning) + 4.)
+            .map(|line| {
+                b.measured_height(line, (available - 46.).max(1.), 12., g.forecast_warning) + 4.
+            })
             .sum::<f32>()
 }
 fn chip(b: &mut Builder<'_>, text: &str, tone: v2::Tone, r: Rect, radius: f32) {
@@ -2548,7 +2557,18 @@ fn group_header(b: &mut Builder<'_>, g: &m::AccountGroup, r: Rect, sticky: bool)
     for (index, line) in g.forecast_lines.iter().enumerate() {
         let h = b.measured_height(line, (width(r) - 44.).max(1.), 12., g.forecast_warning);
         let bounds = rect(r.left + 32., forecast_y, (width(r) - 44.).max(1.), h);
-        b.text(bounds, line, 12., g.forecast_warning, if g.forecast_warning { Color::Warn } else { Color::Secondary }, true);
+        b.text(
+            bounds,
+            line,
+            12.,
+            g.forecast_warning,
+            if g.forecast_warning {
+                Color::Warn
+            } else {
+                Color::Secondary
+            },
+            true,
+        );
         b.tooltip(bounds, g.forecast_tooltip.clone());
         b.semantic(
             format!("{}:forecast:{}:{index}", b.scope, g.id),
