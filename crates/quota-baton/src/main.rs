@@ -700,7 +700,9 @@ async fn run() -> anyhow::Result<()> {
                 if relay.is_draining() {
                     observability.record_takeover("exited");
                 }
-                relay.bindings.flush()?;
+                let binding_flush = relay.bindings.flush();
+                observability.shutdown_replay();
+                binding_flush?;
                 observability.flush()
             })
             .await??;

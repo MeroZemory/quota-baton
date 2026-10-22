@@ -7,6 +7,7 @@
 | [contract.md](contract.md) | Normative externally observable behaviour: routes, headers, body invariance, state machine, error mapping, selection, and file formats | Before implementing or testing any behaviour |
 | [user-guide.md](user-guide.md) | Korean user guide: install, tray, dashboard, accounts, cutover with `wire`, troubleshooting. Non-normative. | Before using quota-baton day to day or running the cutover |
 | [account-routing-design.md](account-routing-design.md) | D20 project/session routing and churn rationale; implemented controls are normative in contract C7–C7.2 and C12. Forecast remains observation-only. | When evaluating cache preservation, reset waits or new-session placement changes |
+| [routing-recorder.md](routing-recorder.md) | Optional default-off metadata capture, its bounds and incomplete replay coverage. Non-normative operator notes. | Before enabling capture or interpreting an export |
 | [tray-v2.md](tray-v2.md) | Approved R5 tray visuals and interactions, including the later every-time credits confirmation decision. Supersedes the old tray layout in architecture §10. | Before changing tray presentation, input, theme or notification wording |
 | [architecture-overview.html](architecture-overview.html) | Korean visual overview of the three documents above, for the owner. It is non-normative: where it differs, the documents above win. | To grasp the design quickly; open it in a browser |
 

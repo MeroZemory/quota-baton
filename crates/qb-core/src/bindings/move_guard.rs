@@ -82,6 +82,10 @@ pub(crate) struct Observation {
 }
 
 impl Observation {
+    pub(crate) fn lower_bound(self) -> Option<Instant> {
+        self.started
+    }
+
     pub(crate) fn before_collection() -> Self {
         Self {
             started: Some(Instant::now()),

@@ -1,4 +1,7 @@
 use crate::accounts::Provider;
+mod replay_projection;
+pub mod replay_recorder;
+mod replay_runtime;
 pub mod reread_accounting;
 use axum::http::HeaderMap;
 use chrono::{DateTime, Duration, NaiveDate, Utc};
@@ -243,6 +246,7 @@ enum Command {
 }
 
 pub struct Observability {
+    replay: std::sync::Mutex<Option<Arc<replay_runtime::Runtime>>>,
     dashboard: Arc<crate::dashboard::runtime::Runtime>,
     accounting: std::sync::Mutex<reread_accounting::Registry>,
     move_warnings: std::sync::Mutex<VecDeque<(Instant, serde_json::Value)>>,
@@ -261,6 +265,59 @@ pub struct Observability {
 }
 
 impl Observability {
+    pub(crate) fn replay(&self) -> Option<Arc<replay_runtime::Runtime>> {
+        self.replay
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Optional metadata capture must never prevent ordinary relay startup.
+    pub(crate) fn configure_replay(
+        &self,
+        home: &Path,
+        config: &crate::config::RoutingReplayConfig,
+    ) -> anyhow::Result<()> {
+        config.validate()?;
+        if !config.enabled {
+            return Ok(());
+        }
+        let mut slot = self.replay.lock().unwrap_or_else(|e| e.into_inner());
+        anyhow::ensure!(slot.is_none(), "routing_replay_already_configured");
+        match replay_runtime::Runtime::start(
+            &home.join("state/routing-replay"),
+            config.disk_limit_mib,
+        ) {
+            Ok(runtime) => *slot = Some(Arc::new(runtime)),
+            Err(_) => tracing::warn!(
+                code = "routing_replay_start_failed",
+                "Optional routing metadata capture unavailable"
+            ),
+        }
+        Ok(())
+    }
+
+    /// Blocking close for drain or normal process shutdown; call off the async worker.
+    pub fn shutdown_replay(&self) {
+        if let Some(runtime) = self.replay() {
+            runtime.shutdown();
+        }
+    }
+
+    pub(crate) fn replay_account(
+        &self,
+        account: &crate::accounts::Account,
+        rank: Option<u32>,
+        credential: Option<bool>,
+    ) -> Option<u64> {
+        let runtime = self.replay()?;
+        let facts = replay_projection::account(&runtime, account, rank, credential)?;
+        runtime.record(
+            replay_recorder::Owner::Runtime,
+            None,
+            replay_recorder::Event::AccountState { facts },
+        )
+    }
     /// Record exactly once, at committed real move, before another request can start.
     pub fn committed_move(
         &self,
@@ -584,6 +641,7 @@ impl Observability {
             .name("qb-observability".into())
             .spawn(move || run(home, state, rx, worker_dropped, worker_dashboard))?;
         Ok(Self {
+            replay: std::sync::Mutex::new(None),
             dashboard,
             accounting: std::sync::Mutex::new(reread_accounting::Registry::new(Utc::now())),
             move_warnings: std::sync::Mutex::new(VecDeque::new()),
@@ -1041,6 +1099,7 @@ impl Observability {
     }
 
     pub(crate) fn record_account(&self, account: &crate::accounts::Account) {
+        self.replay_account(account, None, None);
         self.dashboard.account_changed(account);
         // Only canonical subscription names enter the account ledger.
         let plan = account.plan.as_deref().filter(|plan| {
@@ -1072,6 +1131,7 @@ impl Observability {
         account: &crate::accounts::Account,
         from: &crate::accounts::Health,
     ) {
+        self.replay_account(account, None, None);
         self.dashboard.account_health(account, from);
         self.record_health_ledger(&account.id, from, &account.health);
     }
@@ -2324,6 +2384,7 @@ mod tests {
     fn retained_burst_is_bounded_fresh_and_expires_without_persistence() {
         let (tx, rx) = mpsc::sync_channel(16);
         let obs = Observability {
+            replay: std::sync::Mutex::new(None),
             dashboard: crate::dashboard::runtime::Runtime::new(),
             accounting: std::sync::Mutex::new(reread_accounting::Registry::new(Utc::now())),
             move_warnings: std::sync::Mutex::new(VecDeque::new()),
@@ -2363,6 +2424,7 @@ mod tests {
         // 작성자가 멈춘 큐로 느린 디스크를 결정적으로 재현한다.
         let (tx, rx) = mpsc::sync_channel(2);
         let obs = Observability {
+            replay: std::sync::Mutex::new(None),
             dashboard: crate::dashboard::runtime::Runtime::new(),
             accounting: std::sync::Mutex::new(reread_accounting::Registry::new(Utc::now())),
             move_warnings: std::sync::Mutex::new(VecDeque::new()),
@@ -2502,6 +2564,7 @@ mod tests {
             let _ = done_tx.send(drained);
         });
         let obs = Observability {
+            replay: std::sync::Mutex::new(None),
             dashboard: crate::dashboard::runtime::Runtime::new(),
             accounting: std::sync::Mutex::new(reread_accounting::Registry::new(Utc::now())),
             move_warnings: std::sync::Mutex::new(VecDeque::new()),
