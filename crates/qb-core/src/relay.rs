@@ -2204,6 +2204,7 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
         {
             return http_data::error(&mut completion, error);
         }
+        let wait_origin = state.accounts.capture_http_origin(&account.id).await;
         if !state
             .dispatch_allowed(
                 session.key.as_deref(),
@@ -2298,12 +2299,13 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
         let credit_observation = if status.is_success() || status == StatusCode::TOO_MANY_REQUESTS {
             state
                 .accounts
-                .observe_headers_asof(
+                .observe_headers_asof_origin(
                     &account.id,
                     provider,
                     &response_headers,
                     request_model.as_deref(),
                     (&state.bindings, observation_asof),
+                    wait_origin,
                 )
                 .await
         } else {
@@ -2383,6 +2385,9 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
             request_model.as_deref(),
         );
         decision.reconcile_quota(&credit_observation);
+        if decision.kind == outcome::Kind::Quota {
+            state.accounts.invalidate_quota_rejection(&account.id).await;
+        }
         completion.record.upstream_error_code = hold::error_code(&response_headers, &held.prefix);
         if let Some(model) = decision.model.take().filter(|_| managed_http.is_none()) {
             request_model = Some(model);

@@ -1,5 +1,7 @@
-#[cfg(test)]
+mod wait_owner;
 mod wait_proof;
+
+pub(crate) use wait_proof::ReportOrigin;
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -881,6 +883,7 @@ pub struct QuotaObservation {
 
 pub struct AccountRuntime {
     pub store: Arc<AccountStore>,
+    wait_owner: Arc<wait_owner::WaitOwner>,
     obs: Arc<Observability>,
     events: broadcast::Sender<Value>,
     limits: Mutex<BTreeMap<String, LimitResponse>>,
@@ -1047,16 +1050,23 @@ impl AccountRuntime {
         let notices = quota_notices.clone();
         let pending_quota = Arc::new(Mutex::new(PendingQuota::new()));
         let pending = pending_quota.clone();
+        let wait_owner = Arc::new(wait_owner::WaitOwner::new());
         {
             // Account callbacks run under this same gate. Seed the pre-mutation
             // settings before installing the callback; no await/network is involved.
             let transaction = store.transaction();
             match transaction.as_ref() {
-                Ok(_) => match store.list_unlocked() {
-                    Ok(existing) => obs.dashboard().baseline_accounts(&existing),
-                    Err(_) => tracing::warn!("Account observer baseline unavailable"),
-                },
-                Err(_) => tracing::warn!("Account observer transaction unavailable"),
+                Ok(_) => {
+                    wait_owner.attach_unlocked(&store);
+                    match store.list_unlocked() {
+                        Ok(existing) => obs.dashboard().baseline_accounts(&existing),
+                        Err(_) => tracing::warn!("Account observer baseline unavailable"),
+                    }
+                }
+                Err(_) => {
+                    wait_owner.close();
+                    tracing::warn!("Account observer transaction unavailable");
+                }
             }
             store.set_observer(Arc::new(move |account,previous| {
             if let Ok(mut notices) = notices.lock()
@@ -1074,6 +1084,7 @@ impl AccountRuntime {
         }
         Arc::new(Self {
             store,
+            wait_owner,
             obs,
             events,
             limits: Mutex::new(BTreeMap::new()),
@@ -1777,11 +1788,17 @@ impl AccountRuntime {
             // lock. Cancellation cannot leave Ready without its probe marker.
             let released_at = Utc::now();
             let account = store
-                .update_metadata_unlocked(&id, |account| {
-                    account.health = Health::Ready;
-                    account.quota_cooling = None;
-                    account.quota_credit_releasable = false;
-                })
+                .update_metadata_with_cause_unlocked(
+                    &id,
+                    crate::accounts::MetadataCause::Mutation(
+                        crate::accounts::MetadataMutation::Release,
+                    ),
+                    |account| {
+                        account.health = Health::Ready;
+                        account.quota_cooling = None;
+                        account.quota_credit_releasable = false;
+                    },
+                )
                 .map_err(|_| ())?;
             runtime.released_quota.lock().map_err(|_| ())?.insert(
                 account.id.clone(),
@@ -1894,25 +1911,41 @@ impl AccountRuntime {
         let store = self.store.clone();
         let id = id.to_owned();
         let account = tokio::task::spawn_blocking(move || {
+            let _guard = store.transaction().map_err(|_| ())?;
+            let cause = if matches!(
+                &signal,
+                HealthSignal::Cooling {
+                    reason: HealthReason::Quota,
+                    ..
+                }
+            ) {
+                crate::accounts::MetadataMutation::QuotaRejected
+            } else {
+                crate::accounts::MetadataMutation::Ordinary
+            };
             let updated = store
-                .update_metadata(&id, |account| {
-                    use crate::accounts::HealthSignal as Signal;
-                    let signal = match signal {
-                        HealthSignal::Cooling {
-                            reason,
-                            until,
-                            scope,
-                        } => Signal::Cooling {
-                            reason,
-                            until,
-                            scope,
-                        },
-                        HealthSignal::Revoked(reason) => Signal::Revoked { reason },
-                        HealthSignal::AuthFailure => Signal::AuthAfterRefresh,
-                        HealthSignal::Ready => Signal::Ready,
-                    };
-                    account.apply_health_signal(signal, Utc::now());
-                })
+                .update_metadata_with_cause_unlocked(
+                    &id,
+                    crate::accounts::MetadataCause::Mutation(cause),
+                    |account| {
+                        use crate::accounts::HealthSignal as Signal;
+                        let signal = match signal {
+                            HealthSignal::Cooling {
+                                reason,
+                                until,
+                                scope,
+                            } => Signal::Cooling {
+                                reason,
+                                until,
+                                scope,
+                            },
+                            HealthSignal::Revoked(reason) => Signal::Revoked { reason },
+                            HealthSignal::AuthFailure => Signal::AuthAfterRefresh,
+                            HealthSignal::Ready => Signal::Ready,
+                        };
+                        account.apply_health_signal(signal, Utc::now());
+                    },
+                )
                 .map_err(|_| ())?;
             Ok::<_, ()>(updated)
         })
@@ -2277,7 +2310,7 @@ impl AccountRuntime {
         headers: &HeaderMap,
         model: Option<&str>,
     ) -> QuotaObservation {
-        self.observe_headers_inner(id, provider, headers, model, None)
+        self.observe_headers_inner(id, provider, headers, model, None, None)
             .await
     }
 
@@ -2292,7 +2325,23 @@ impl AccountRuntime {
             crate::bindings::UsageObservationAsOf,
         ),
     ) -> QuotaObservation {
-        self.observe_headers_inner(id, provider, headers, model, Some(evidence))
+        self.observe_headers_inner(id, provider, headers, model, Some(evidence), None)
+            .await
+    }
+
+    pub(crate) async fn observe_headers_asof_origin(
+        &self,
+        id: &str,
+        provider: Provider,
+        headers: &HeaderMap,
+        model: Option<&str>,
+        evidence: (
+            &crate::bindings::BindingTable,
+            crate::bindings::UsageObservationAsOf,
+        ),
+        origin: Option<ReportOrigin>,
+    ) -> QuotaObservation {
+        self.observe_headers_inner(id, provider, headers, model, Some(evidence), origin)
             .await
     }
 
@@ -2306,9 +2355,11 @@ impl AccountRuntime {
             &crate::bindings::BindingTable,
             crate::bindings::UsageObservationAsOf,
         )>,
+        origin: Option<ReportOrigin>,
     ) -> QuotaObservation {
         let Some((snapshot, reported)) = self.obs.observe_headers_reported(id, provider, headers)
         else {
+            self.discard_report_origin(id, origin).await;
             return QuotaObservation::default();
         };
         if let Some((bindings, asof)) = evidence {
@@ -2316,7 +2367,7 @@ impl AccountRuntime {
         }
         let observed_at = snapshot["observed_at"].clone();
         let quota_until = self
-            .apply_quota_snapshot_reported(id, snapshot, &reported, model)
+            .apply_quota_snapshot_reported_origin(id, snapshot, &reported, model, origin)
             .await
             .ok()
             .and_then(|account| match account.health {
@@ -2421,8 +2472,21 @@ impl AccountRuntime {
         reported: &Value,
         model: Option<&str>,
     ) -> Result<Account, ()> {
+        self.apply_quota_snapshot_reported_origin(id, snapshot, reported, model, None)
+            .await
+    }
+
+    pub(crate) async fn apply_quota_snapshot_reported_origin(
+        &self,
+        id: &str,
+        snapshot: Value,
+        reported: &Value,
+        model: Option<&str>,
+        origin: Option<ReportOrigin>,
+    ) -> Result<Account, ()> {
         let reported = reported.clone();
         let store = self.store.clone();
+        let wait_owner = self.wait_owner.clone();
         let obs = self.obs.clone();
         let notices = self.quota_notices.clone();
         let account_id = id.to_owned();
@@ -2430,6 +2494,10 @@ impl AccountRuntime {
         let released_quota = self.released_quota.clone();
         let (account, snapshot) = tokio::task::spawn_blocking(move || -> Result<_, ()> {
             let _guard = store.transaction().map_err(|_| ())?;
+            // Consume the pre-send ordinal before classification, even for a
+            // partial or nonqualifying raw report. Never capture on receipt.
+            let mut application = origin.and_then(|origin| wait_owner.accept(&account_id, origin));
+            let report_model = model.clone();
             let time = |v: &Value| v.as_str().and_then(|s| s.parse::<DateTime<Utc>>().ok());
             let mut snapshot = snapshot;
             let mut model = model;
@@ -2448,24 +2516,53 @@ impl AccountRuntime {
             {
                 release.observe(&reported, &snapshot);
             }
+            let attributed = application.is_some();
+            let cause = match application.as_mut() {
+                Some(report) => crate::accounts::MetadataCause::UsageReport(report),
+                None => crate::accounts::MetadataCause::Mutation(
+                    crate::accounts::MetadataMutation::Ordinary,
+                ),
+            };
+            let mut ran = false;
+            let mut candidate = None;
             let account = store
-                .update_metadata_unlocked(&account_id, |account| {
+                .update_metadata_with_cause_unlocked(&account_id, cause, |account| {
+                    ran = true;
+                    let before = attributed.then(|| account.clone());
                     let mut health_snapshot = snapshot.clone();
                     if let Ok(released) = released_quota.lock()
                         && let Some(release) = released.get(&account_id)
                     {
                         filter_released_quota(account, &mut health_snapshot, release);
                     }
+                    let applied_at = Utc::now();
                     account.apply_health_signal(
                         crate::accounts::HealthSignal::UsageSnapshot {
                             snapshot: health_snapshot,
                             model: model.clone(),
                             projected_allowance: 0.0,
                         },
-                        Utc::now(),
+                        applied_at,
                     );
+                    if let Some(before) = before {
+                        candidate = wait_owner::classify(
+                            &before,
+                            account,
+                            &reported,
+                            report_model.as_deref(),
+                            applied_at,
+                        );
+                    }
                 })
                 .map_err(|_| ())?;
+            // Stopped updates may return Ok without running the reducer. The
+            // registry also rejects an independently expired/released permit.
+            if ran
+                && !store.writes_stopped()
+                && let Some(application) = application
+            {
+                application.finish(candidate);
+            }
             apply_snapshot_notices(
                 &obs,
                 &notices,

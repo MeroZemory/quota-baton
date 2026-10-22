@@ -593,6 +593,11 @@ async fn apply_error(
         &raw,
         model,
     );
+    if decision.kind == Kind::Quota
+        && let Some(runtime) = &context.runtime
+    {
+        runtime.invalidate_quota_rejection(&context.account).await;
+    }
     if decision.kind == Kind::Revoked
         && context
             .credentials

@@ -710,6 +710,9 @@ async fn upgrade_inner(
                 session.model.as_deref(),
             );
             decision.reconcile_quota(&credit_observation);
+            if decision.kind == super::outcome::Kind::Quota {
+                state.accounts.invalidate_quota_rejection(&account.id).await;
+            }
             if super::credentials::is_linked(&account)
                 && decision.kind == super::outcome::Kind::Revoked
             {

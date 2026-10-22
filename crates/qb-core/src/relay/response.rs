@@ -169,6 +169,9 @@ pub(in crate::relay) fn body(
                         event,
                         model.as_deref(),
                     );
+                    if decision.kind == crate::relay::outcome::Kind::Quota {
+                        runtime.invalidate_quota_rejection(account).await;
+                    }
                     if decision.kind == crate::relay::outcome::Kind::Revoked
                         && let Some(failed) = &failed_access
                     {

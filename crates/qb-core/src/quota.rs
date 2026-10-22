@@ -472,6 +472,7 @@ impl UsagePoller {
             if account.provider == Provider::Claude {
                 request = request.header("anthropic-beta", "oauth-2025-04-20");
             }
+            let wait_origin = self.runtime.capture_poll_origin(id).await;
             let mut response = request.send().await.map_err(|_| PollError::Unavailable)?;
             let status = response.status();
             let mut body = Vec::new();
@@ -535,7 +536,7 @@ impl UsagePoller {
             }
             let account = self
                 .runtime
-                .apply_quota_snapshot_reported(id, snapshot, &reported, None)
+                .apply_quota_snapshot_reported_origin(id, snapshot, &reported, None, wait_origin)
                 .await
                 .map_err(|_| PollError::Unavailable)?;
             reservation.succeeded = true;
