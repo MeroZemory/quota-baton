@@ -766,11 +766,20 @@ impl BindingTable {
             &account,
             reason,
         );
+        let authority_changed = old_metadata.as_ref().is_none_or(|old| {
+            old.current_model != metadata.current_model || old.policy_key != metadata.policy_key
+        }) || d
+            .launch_anchors
+            .get(request.anchor_key)
+            .is_none_or(|old| old.canonical_key != key);
         d.launches.insert(key.clone(), metadata);
         d.launch_anchors
             .insert(request.anchor_key.to_owned(), anchor);
         reweight(&mut d);
         d.changed();
+        if authority_changed {
+            self.policies.changed.notify_waiters();
+        }
         Ok(LaunchPlacement {
             canonical_key: key,
             account,
@@ -942,6 +951,7 @@ impl BindingTable {
                 index_group(&mut d, request_key.to_owned(), entry);
                 reweight(&mut d);
                 d.changed();
+                self.policies.changed.notify_waiters();
                 key = request_key.to_owned();
             } else {
                 if d.launch_aliases.len() >= CAPACITY * 2 {
@@ -954,6 +964,7 @@ impl BindingTable {
                 d.launch_aliases.insert(request_key.to_owned(), source);
                 reweight(&mut d);
                 d.changed();
+                self.policies.changed.notify_waiters();
             }
         }
         touch(&mut d, &key, now);
@@ -1005,6 +1016,7 @@ impl BindingTable {
         d.launches.insert(target.to_owned(), metadata);
         reweight(d);
         d.changed();
+        self.policies.changed.notify_waiters();
         Ok(())
     }
 
@@ -1134,10 +1146,14 @@ impl BindingTable {
                 .saturating_sub(metadata_bound(&key, old))
                 .saturating_add(metadata_bound(&key, &next)),
         )?;
+        let model_changed = old.current_model != next.current_model;
         d.launches.insert(key.clone(), next);
         reweight(&mut d);
         touch(&mut d, &key, now);
         d.changed();
+        if model_changed {
+            self.policies.changed.notify_waiters();
+        }
         info(&d, &key)
     }
 }
@@ -1150,6 +1166,174 @@ mod r11_active_adoption_tests {
 
     const SOURCE: &str = "launch:active-adoption";
     const REAL: &str = "codex:active-adoption";
+
+    fn n5a_authority_ready(
+        future: std::pin::Pin<&mut impl std::future::Future<Output = ()>>,
+    ) -> bool {
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        std::future::Future::poll(future, &mut context).is_ready()
+    }
+
+    #[test]
+    fn n5a_authority_wake_model_setter_skips_repeat_advertising_and_rejected_account() {
+        let (_root, table, candidates, entitlements) = fixture(Mode::Recover);
+        place(&table, &candidates, &entitlements);
+        let now = Utc::now();
+        let mut first = Box::pin(table.policies.changed.notified());
+        let mut second = Box::pin(table.policies.changed.notified());
+        first.as_mut().enable();
+        second.as_mut().enable();
+        table.record_launch_model(SOURCE, "a", "m1", now).unwrap();
+        table
+            .record_launch_advertised(SOURCE, "a", &BTreeSet::from(["m2".into()]), now)
+            .unwrap();
+        assert_eq!(
+            table.record_launch_model(SOURCE, "b", "m2", now),
+            Err(LaunchError::BindingChanged)
+        );
+        assert!(!n5a_authority_ready(first.as_mut()));
+        assert!(!n5a_authority_ready(second.as_mut()));
+        let current = table.record_launch_model(SOURCE, "a", "m2", now).unwrap();
+        assert_eq!(current.current_model.as_deref(), Some("m2"));
+        assert_eq!(
+            table.models_launch_snapshot(None, Some(SOURCE)).unwrap(),
+            current
+        );
+        assert!(n5a_authority_ready(first.as_mut()));
+        assert!(n5a_authority_ready(second.as_mut()));
+    }
+
+    #[test]
+    fn n5a_authority_wake_adoption_alias_publish_and_reuse_is_inert() {
+        let (_root, table, candidates, entitlements) = fixture(Mode::Recover);
+        place(&table, &candidates, &entitlements);
+        let now = Utc::now();
+        let mut adopted = Box::pin(table.policies.changed.notified());
+        adopted.as_mut().enable();
+        let current = table.resolve_launch(Some(SOURCE), Some(REAL), now).unwrap();
+        assert_eq!(current.canonical_key, REAL);
+        {
+            let data = table.data.lock().unwrap();
+            assert!(!data.groups.contains_key(SOURCE));
+            assert_eq!(data.launch_anchors[SOURCE].canonical_key, REAL);
+            assert_eq!(data.groups[REAL].account, current.account);
+        }
+        assert!(n5a_authority_ready(adopted.as_mut()));
+        let alias = "codex:authority-wake-alias";
+        let mut aliased = Box::pin(table.policies.changed.notified());
+        aliased.as_mut().enable();
+        assert_eq!(
+            table
+                .resolve_launch(Some(SOURCE), Some(alias), now)
+                .unwrap(),
+            current
+        );
+        assert_eq!(table.data.lock().unwrap().launch_aliases[alias], REAL);
+        assert!(n5a_authority_ready(aliased.as_mut()));
+        let mut reused = Box::pin(table.policies.changed.notified());
+        reused.as_mut().enable();
+        table
+            .resolve_launch(Some(SOURCE), Some(alias), now)
+            .unwrap();
+        table.launch_info(alias, now).unwrap();
+        assert!(
+            !n5a_authority_ready(reused.as_mut()),
+            "alias reuse and last-used changes are inert"
+        );
+    }
+
+    #[test]
+    fn n5a_authority_wake_merge_publishes_winner_and_discards_provisional() {
+        let (_root, table, candidates, entitlements) = fixture(Mode::Recover);
+        place(&table, &candidates, &entitlements);
+        let Decision::Selected { account, lease, .. } = table.choose(
+            Provider::Codex,
+            Some(REAL),
+            None,
+            Some("m1"),
+            &candidates,
+            Some("b"),
+            0,
+        ) else {
+            panic!("native winner placement");
+        };
+        assert_eq!(account, "b");
+        lease.dispatched();
+        let mut merged = Box::pin(table.policies.changed.notified());
+        merged.as_mut().enable();
+        let current = table
+            .resolve_launch(Some(SOURCE), Some(REAL), Utc::now())
+            .unwrap();
+        assert_eq!(current.account, "b");
+        assert_eq!(current.canonical_key, REAL);
+        assert!(current.managed);
+        {
+            let data = table.data.lock().unwrap();
+            assert!(!data.groups.contains_key(SOURCE));
+            assert!(!data.launches.contains_key(SOURCE));
+            assert_eq!(data.launch_anchors[SOURCE].canonical_key, REAL);
+            assert!(data.launches.contains_key(REAL));
+        }
+        assert!(n5a_authority_ready(merged.as_mut()));
+        let mut repeated = Box::pin(table.policies.changed.notified());
+        repeated.as_mut().enable();
+        table
+            .resolve_launch(Some(SOURCE), Some(REAL), Utc::now())
+            .unwrap();
+        assert!(!n5a_authority_ready(repeated.as_mut()));
+    }
+
+    #[test]
+    fn n5a_authority_wake_resumed_model_and_new_anchor_publish_without_source_move() {
+        let (_root, table, candidates, mut entitlements) = fixture(Mode::Recover);
+        entitlements.get_mut("a").unwrap().insert("m2".into());
+        place(&table, &candidates, &entitlements);
+        table
+            .resolve_launch(Some(SOURCE), Some(REAL), Utc::now())
+            .unwrap();
+        let mut changed = Box::pin(table.policies.changed.notified());
+        changed.as_mut().enable();
+        // An existing anchor deliberately returns its original metadata.
+        // A distinct native launch can resume the same real key with a model.
+        let mut resumed = request("launch:authority-wake-model");
+        resumed.resume_key = Some(REAL);
+        resumed.model = Some("m2");
+        let current = table
+            .place_launch(resumed, &candidates, &entitlements, Utc::now())
+            .unwrap();
+        assert_eq!(current.account, "a");
+        assert!(current.moves.is_empty());
+        assert_eq!(current.effective_model.as_deref(), Some("m2"));
+        assert_eq!(
+            table
+                .launch_info(REAL, Utc::now())
+                .unwrap()
+                .current_model
+                .as_deref(),
+            Some("m2")
+        );
+        assert!(n5a_authority_ready(changed.as_mut()));
+        let new_anchor = "launch:authority-wake-resume";
+        let mut attached = Box::pin(table.policies.changed.notified());
+        attached.as_mut().enable();
+        resumed.anchor_key = new_anchor;
+        let current = table
+            .place_launch(resumed, &candidates, &entitlements, Utc::now())
+            .unwrap();
+        assert_eq!(current.account, "a");
+        assert!(current.moves.is_empty());
+        assert_eq!(
+            table.data.lock().unwrap().launch_anchors[new_anchor].canonical_key,
+            REAL
+        );
+        assert!(n5a_authority_ready(attached.as_mut()));
+        let mut repeated = Box::pin(table.policies.changed.notified());
+        repeated.as_mut().enable();
+        table
+            .place_launch(resumed, &candidates, &entitlements, Utc::now())
+            .unwrap();
+        assert!(!n5a_authority_ready(repeated.as_mut()));
+    }
 
     fn fixture(
         mode: Mode,

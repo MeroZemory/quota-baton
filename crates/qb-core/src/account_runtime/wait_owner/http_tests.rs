@@ -3,8 +3,8 @@
 //! headers immediately; finish_http_429_report cuts/applies/mints only after the
 //! bounded complete body is classified and reconciled. The empty-body positive
 //! reconciles Rate -> Quota with signal None, preserving the whole Account.
-//! Known matching quota JSON is a negative: native body application hardens
-//! quota_credit_releasable true -> false, so the narrow no-op rule declines it.
+//! Known matching quota JSON composes the sealed raw header evidence with the
+//! actual native body hardening, without changing either native transition.
 //! They intentionally fail
 //! against the earlier header-time mint/unconditional quota invalidation path.
 //!
@@ -385,8 +385,8 @@ async fn n5a_http_429_newer_partial_report_while_body_held_fences_pending_mint()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn n5a_http_429_matching_known_body_hardens_native_hold_and_declines_proof() {
-    run_gated_case(matching_body, false, false, 0, false).await;
+async fn n5a_http_429_matching_known_body_hardens_native_hold_and_composes_proof() {
+    run_gated_case(matching_body, false, true, 0, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -76,6 +76,59 @@ pub struct Candidate {
     pub quota: Option<Value>,
     pub inflight: usize,
 }
+/// Proof-free inputs to the optional HTTP wait inspection seam.
+/// The request keeps its caller guard alive; this operation is never admitted here.
+pub(crate) struct HttpWaitRequest<'a> {
+    pub(crate) provider: Provider,
+    pub(crate) key: Option<&'a str>,
+    pub(crate) model: Option<&'a str>,
+    pub(crate) expected_source: Option<&'a str>,
+    pub(crate) operation: &'a crate::issue_operation::IssueOperation,
+}
+
+/// A coherent binding/policy view, not quota evidence or dispatch authority.
+/// Only BindingTable constructs it. It cannot escape the inspection callback.
+pub(crate) struct WaitIntent<'a> {
+    provider: Provider,
+    key: &'a str,
+    account: &'a str,
+    model: Option<&'a str>,
+    policy_key: &'a str,
+    existing_placement: bool,
+    plan: &'a crate::routing::Plan,
+    operation: &'a crate::issue_operation::IssueOperation,
+}
+
+impl WaitIntent<'_> {
+    pub(crate) fn provider(&self) -> Provider {
+        self.provider
+    }
+    pub(crate) fn key(&self) -> &str {
+        self.key
+    }
+    pub(crate) fn account(&self) -> &str {
+        self.account
+    }
+    pub(crate) fn model(&self) -> Option<&str> {
+        self.model
+    }
+    pub(crate) fn policy_key(&self) -> &str {
+        self.policy_key
+    }
+    pub(crate) fn existing_placement(&self) -> bool {
+        self.existing_placement
+    }
+    pub(crate) fn plan(&self) -> &crate::routing::Plan {
+        self.plan
+    }
+    pub(crate) fn deadline(&self) -> tokio::time::Instant {
+        self.operation.deadline()
+    }
+    pub(crate) fn caller_current(&self) -> bool {
+        self.operation.can_reply()
+    }
+}
+
 #[derive(Debug)]
 pub enum Decision {
     Blocked,
@@ -475,6 +528,13 @@ pub struct BindingTable {
     data: Mutex<Data>,
     writer: Mutex<()>,
     mutations: Mutex<()>,
+    #[cfg(test)]
+    wait_before_publication: Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
     move_guard: Mutex<move_guard::Breaker>,
     move_guard_observer: Mutex<Option<MoveGuardObserver>>,
     move_accounting: Mutex<Option<std::sync::Weak<crate::observability::Observability>>>,
@@ -1227,6 +1287,8 @@ impl BindingTable {
             data: Mutex::new(data),
             writer: Mutex::new(()),
             mutations: Mutex::new(()),
+            #[cfg(test)]
+            wait_before_publication: Mutex::new(None),
             move_guard: Mutex::new(move_guard::Breaker::default()),
             move_guard_observer: Mutex::new(None),
             move_accounting: Mutex::new(None),
@@ -1856,6 +1918,137 @@ impl BindingTable {
         })
         .map(|b| b.account.clone())
     }
+    /// Inspect a current bound HTTP source without changing routing or C7.
+    ///
+    /// The runtime caller holds Store -> released -> probes -> volatile throughout
+    /// this call. We hold mutations, release Data, then hold policy publication
+    /// read access through inspect. inspect must not reacquire those gates, edit
+    /// policy, or await. Its result is optional data, never dispatch permission.
+    pub(crate) fn try_current_quota_wait<T>(
+        &self,
+        request: HttpWaitRequest<'_>,
+        inspect: impl FnOnce(&WaitIntent<'_>) -> Option<T>,
+    ) -> Option<T> {
+        // An uncalled closure and rejected result are dropped after our gates.
+        let mut inspect = Some(inspect);
+        // Keep a rejected T outside publication, mutations and final Data scopes.
+        let mut result = None;
+        let current = {
+            let _mutation = self.mutations.lock().ok()?;
+            if self.writes_stopped.load(Ordering::Acquire) || !request.operation.can_reply() {
+                return None;
+            }
+            let requested = group(request.key?);
+            // Existing read-only owner projection exposes private launch metadata.
+            // mutations keeps its model stable; Data below verifies the same live
+            // identity and retention, including pruning by read-like native APIs.
+            let source = self.models_launch_snapshot(Some(requested), None).ok()?;
+            if request
+                .expected_source
+                .is_some_and(|id| id != source.account)
+                || (source.managed
+                    && (request.model.is_none()
+                        || source.current_model.as_deref() != request.model))
+            {
+                return None;
+            }
+            let (policy_key, existing_placement) = {
+                let data = self.data.lock().ok()?;
+                let canonical = if data.groups.contains_key(requested) {
+                    requested
+                } else {
+                    data.launch_aliases
+                        .get(requested)
+                        .map_or_else(|| launch::ownership_group(&data, requested), String::as_str)
+                };
+                let provider = if canonical.starts_with("claude:") {
+                    Provider::Claude
+                } else if canonical.starts_with("codex:")
+                    || (source.managed && canonical.starts_with("launch:"))
+                {
+                    Provider::Codex
+                } else {
+                    return None;
+                };
+                if provider != request.provider
+                    || canonical != source.canonical_key
+                    || data.groups.get(canonical)?.account != source.account
+                    || data.launches.contains_key(canonical) != source.managed
+                    || self.retained_binding(&data, canonical, Utc::now())?.account
+                        != source.account
+                {
+                    return None;
+                }
+                (
+                    launch::policy_key(&data, Some(canonical))?.to_owned(),
+                    Self::accepted_in(&data, Some(canonical), &source.account),
+                )
+            };
+            #[cfg(test)]
+            if let Some((entered, release)) =
+                { self.wait_before_publication.lock().unwrap().take() }
+            {
+                entered.try_send(()).unwrap();
+                release
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("wait publication gate timed out");
+            }
+            let inspected = self
+                .policies
+                .with_wait_plan(&policy_key, &source.account, |plan| {
+                    if !request.operation.can_reply() {
+                        return None;
+                    }
+                    let intent = WaitIntent {
+                        provider: request.provider,
+                        key: &source.canonical_key,
+                        account: &source.account,
+                        model: request.model,
+                        policy_key: &policy_key,
+                        existing_placement,
+                        plan,
+                        operation: request.operation,
+                    };
+                    result = inspect.take()?(&intent);
+                    result.as_ref()?;
+                    // Native read-like APIs can prune without mutations. Keep
+                    // publication held through the final coherent identity check.
+                    // Other readers may take Data -> publication: never block in
+                    // the reverse order just to grant optional wait authority.
+                    let data = self.data.try_lock().ok()?;
+                    let canonical = if data.groups.contains_key(requested) {
+                        requested
+                    } else {
+                        data.launch_aliases.get(requested).map_or_else(
+                            || launch::ownership_group(&data, requested),
+                            String::as_str,
+                        )
+                    };
+                    if canonical != source.canonical_key
+                        || data.groups.get(canonical)?.account != source.account
+                        || data.launches.contains_key(canonical) != source.managed
+                        // All current-model writers take mutations; a surviving
+                        // managed group therefore retains this protected model.
+                        || (source.managed && source.current_model.as_deref() != request.model)
+                        || launch::policy_key(&data, Some(canonical))? != policy_key
+                        || Self::accepted_in(&data, Some(canonical), &source.account)
+                            != existing_placement
+                        || self.retained_binding(&data, canonical, Utc::now())?.account
+                            != source.account
+                        || self.writes_stopped.load(Ordering::Acquire)
+                        || !request.operation.can_reply()
+                    {
+                        return None;
+                    }
+                    Some(())
+                });
+            inspected.is_some()
+                && !self.writes_stopped.load(Ordering::Acquire)
+                && request.operation.can_reply()
+        };
+        if current { result } else { None }
+    }
+
     pub fn touch(&self, key: Option<&str>) {
         if let Some(k) = key {
             touch_group(
@@ -2336,6 +2529,7 @@ impl BindingTable {
             };
             let previous = unindex_group(d, g);
             let from = previous.as_ref().map(|entry| entry.account.to_owned());
+            let source_changed = from.as_deref() != Some(account);
             let last_used = previous.as_ref().map_or(now, |entry| entry.last_used);
             let mut keys = previous.map_or_else(BTreeSet::new, |entry| entry.keys);
             keys.insert(k.into());
@@ -2437,6 +2631,10 @@ impl BindingTable {
                 d.overload_marks.remove(g);
             }
             d.changed();
+            // Publish every member and the group index before waking readers.
+            if source_changed {
+                self.policies.changed.notify_waiters();
+            }
         } else if let Some(old) = d
             .sticky
             .insert(provider.as_str().into(), account.to_owned())
@@ -3362,6 +3560,612 @@ mod tests {
     use crate::accounts::{Identity, Source, TokenMeta};
     use chrono::Duration as Delta;
     use serde_json::json;
+
+    fn n5a_authority_ready(
+        future: std::pin::Pin<&mut impl std::future::Future<Output = ()>>,
+    ) -> bool {
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        std::future::Future::poll(future, &mut context).is_ready()
+    }
+
+    #[test]
+    fn n5a_authority_wake_source_commit_publishes_members_and_skips_same_source() {
+        let (_root, table) = table();
+        let candidates = [
+            candidate("wake-a", 0.0, 168, 5),
+            candidate("wake-b", 0.0, 168, 5),
+        ];
+        let root = "claude:authority-wake";
+        let key = "claude:authority-wake:agent:child";
+        let now = Utc::now();
+        let mut first = Box::pin(table.policies.changed.notified());
+        let mut second = Box::pin(table.policies.changed.notified());
+        first.as_mut().enable();
+        second.as_mut().enable();
+        {
+            // Exercise the actual publication setter, without PolicyStore's
+            // earlier dispatch notification masking this binding-only wake.
+            let _mutation = table.mutations.lock().unwrap();
+            let mut data = table.data.lock().unwrap();
+            let moves = table.commit_binding(
+                &mut data,
+                Provider::Claude,
+                Some(key),
+                Some(root),
+                &candidates,
+                None,
+                7,
+                false,
+                now,
+                "wake-a",
+                "new",
+            );
+            assert_eq!(moves.len(), 1);
+            assert_eq!(data.groups[root].account, "wake-a");
+            assert_eq!(data.groups[root].keys.len(), 2);
+            assert!(
+                data.groups[root]
+                    .keys
+                    .iter()
+                    .all(|member| data.bindings[member].account == "wake-a")
+            );
+        }
+        assert!(n5a_authority_ready(first.as_mut()));
+        assert!(
+            n5a_authority_ready(second.as_mut()),
+            "wake every enabled waiter"
+        );
+        let mut changed = Box::pin(table.policies.changed.notified());
+        changed.as_mut().enable();
+        {
+            let _mutation = table.mutations.lock().unwrap();
+            let mut data = table.data.lock().unwrap();
+            let moves = table.commit_binding(
+                &mut data,
+                Provider::Claude,
+                Some(key),
+                Some(root),
+                &candidates,
+                None,
+                9,
+                false,
+                now,
+                "wake-a",
+                "keep",
+            );
+            assert!(moves.is_empty());
+        }
+        table.touch(Some(key));
+        assert!(
+            !n5a_authority_ready(changed.as_mut()),
+            "reindex/cost/touch are not new source authority"
+        );
+        {
+            let _mutation = table.mutations.lock().unwrap();
+            let mut data = table.data.lock().unwrap();
+            let moves = table.commit_binding(
+                &mut data,
+                Provider::Claude,
+                Some(key),
+                Some(root),
+                &candidates,
+                None,
+                9,
+                false,
+                now,
+                "wake-b",
+                "forced",
+            );
+            assert_eq!(moves.len(), 1);
+            assert_eq!(data.groups[root].account, "wake-b");
+            assert_eq!(data.groups[root].keys.len(), 2);
+            assert!(
+                data.groups[root]
+                    .keys
+                    .iter()
+                    .all(|member| data.bindings[member].account == "wake-b")
+            );
+        }
+        assert!(n5a_authority_ready(changed.as_mut()));
+    }
+
+    #[test]
+    fn n5a_authority_wake_table_freeze_publishes_retirement_once() {
+        let (_root, table) = table();
+        let mut first = Box::pin(table.policies.changed.notified());
+        let mut second = Box::pin(table.policies.changed.notified());
+        first.as_mut().enable();
+        second.as_mut().enable();
+        table.freeze().unwrap();
+        assert!(table.writes_stopped.load(Ordering::Acquire));
+        assert!(!table.policies.permits_dispatch(None, "wake-a"));
+        assert!(n5a_authority_ready(first.as_mut()));
+        assert!(n5a_authority_ready(second.as_mut()));
+        let mut repeated = Box::pin(table.policies.changed.notified());
+        repeated.as_mut().enable();
+        table.freeze().unwrap();
+        assert!(!n5a_authority_ready(repeated.as_mut()));
+    }
+
+    fn n5a_wait_fixture() -> (tempfile::TempDir, Arc<BindingTable>) {
+        let root = fixture_dir();
+        let table = BindingTable::new(root.path(), RoutingConfig::default()).unwrap();
+        let mut c = candidate("cx-synthetic-wait", 0.0, 168, 5);
+        c.account.provider = Provider::Codex;
+        c.account.identity = Identity::Codex {
+            user_id: None,
+            account_id: "synthetic-wait-account".into(),
+            email: "synthetic@example.invalid".into(),
+        };
+        table
+            .place_launch(
+                LaunchRequest {
+                    anchor_key: "launch:synthetic-wait",
+                    resume_key: None,
+                    model: Some("synthetic-model-1"),
+                    model_is_explicit: true,
+                    account_pref: Some(&c.account.id),
+                    allow_move_for_model: false,
+                },
+                std::slice::from_ref(&c),
+                &BTreeMap::from([(
+                    c.account.id.clone(),
+                    BTreeSet::from(["synthetic-model-1".into(), "synthetic-model-2".into()]),
+                )]),
+                Utc::now(),
+            )
+            .unwrap();
+        table
+            .resolve_launch(
+                Some("launch:synthetic-wait"),
+                Some("codex:synthetic-wait"),
+                Utc::now(),
+            )
+            .unwrap();
+        // Placement alone is provisional; exercise the actual native dispatch
+        // receipt before asking for an existing-session wait intent.
+        table
+            .begin_request(Some("codex:synthetic-wait"), "cx-synthetic-wait")
+            .dispatched();
+        (root, table)
+    }
+
+    fn n5a_wait_operation() -> crate::issue_operation::IssueOperation {
+        crate::issue_operation::IssueOperation::new(
+            tokio::time::Instant::now() + Duration::from_secs(60),
+        )
+    }
+
+    fn n5a_wait_request(operation: &crate::issue_operation::IssueOperation) -> HttpWaitRequest<'_> {
+        HttpWaitRequest {
+            provider: Provider::Codex,
+            key: Some("codex:synthetic-wait"),
+            model: Some("synthetic-model-1"),
+            expected_source: Some("cx-synthetic-wait"),
+            operation,
+        }
+    }
+
+    #[test]
+    fn n5a_wait_intent_projects_managed_identity_and_releases_data() {
+        let (_root, table) = n5a_wait_fixture();
+        let operation = n5a_wait_operation();
+        let before = table.routing_view();
+        let revision = table.data.lock().unwrap().revision;
+        let result = table.try_current_quota_wait(n5a_wait_request(&operation), |intent| {
+            assert!(
+                table.mutations.try_lock().is_err(),
+                "wait inspection must hold mutations"
+            );
+            assert!(
+                table.data.try_lock().is_ok(),
+                "wait inspection must release Data"
+            );
+            assert_eq!(intent.provider(), Provider::Codex);
+            assert_eq!(intent.key(), "codex:synthetic-wait");
+            assert_eq!(intent.account(), "cx-synthetic-wait");
+            assert_eq!(intent.model(), Some("synthetic-model-1"));
+            assert_eq!(intent.policy_key(), "launch:synthetic-wait");
+            assert!(intent.existing_placement());
+            assert_eq!(intent.plan().settings.reset_wait_secs, 60);
+            assert_eq!(intent.deadline(), operation.deadline());
+            assert!(intent.caller_current());
+            Some(intent.account().to_owned())
+        });
+        assert_eq!(result.as_deref(), Some("cx-synthetic-wait"));
+        assert_eq!(table.routing_view(), before);
+        assert_eq!(table.data.lock().unwrap().revision, revision);
+        assert_eq!(table.pending_count("cx-synthetic-wait"), 0);
+    }
+
+    #[test]
+    fn n5a_wait_intent_rejects_missing_provider_source_and_model_mismatches() {
+        let (_root, table) = n5a_wait_fixture();
+        let operation = n5a_wait_operation();
+        for case in 0..6 {
+            let mut request = n5a_wait_request(&operation);
+            match case {
+                0 => request.key = None,
+                1 => request.key = Some("codex:synthetic-unknown"),
+                2 => request.provider = Provider::Claude,
+                3 => request.expected_source = Some("cx-synthetic-other"),
+                4 => request.model = Some("synthetic-model-2"),
+                _ => request.model = None,
+            }
+            assert!(
+                table
+                    .try_current_quota_wait(request, |_| -> Option<()> {
+                        panic!("mismatched wait input must not reach inspection")
+                    })
+                    .is_none(),
+                "case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn n5a_wait_intent_reads_new_model_and_strict_permission() {
+        let (_root, table) = n5a_wait_fixture();
+        let operation = n5a_wait_operation();
+        table
+            .record_launch_model(
+                "codex:synthetic-wait",
+                "cx-synthetic-wait",
+                "synthetic-model-2",
+                Utc::now(),
+            )
+            .unwrap();
+        assert!(
+            table
+                .try_current_quota_wait(n5a_wait_request(&operation), |_| Some(()))
+                .is_none()
+        );
+        let mut request = n5a_wait_request(&operation);
+        request.model = Some("synthetic-model-2");
+        assert_eq!(
+            table
+                .try_current_quota_wait(request, |intent| {
+                    Some(intent.model().unwrap().to_owned())
+                })
+                .as_deref(),
+            Some("synthetic-model-2")
+        );
+        let id = crate::routing::session_id("codex:synthetic-wait");
+        table
+            .set_routing_session(
+                &id,
+                Some(crate::routing::Settings {
+                    mode: crate::routing::Mode::Strict,
+                    reset_wait_secs: 60,
+                }),
+                None,
+                false,
+            )
+            .unwrap();
+        let mut request = n5a_wait_request(&operation);
+        request.model = Some("synthetic-model-2");
+        assert_eq!(
+            table.try_current_quota_wait(request, |intent| {
+                assert_eq!(intent.plan().anchor.as_deref(), Some(intent.account()));
+                Some(intent.plan().settings.mode)
+            }),
+            Some(crate::routing::Mode::Strict)
+        );
+        table
+            .set_routing_session(
+                &id,
+                Some(crate::routing::Settings {
+                    mode: crate::routing::Mode::Strict,
+                    reset_wait_secs: 0,
+                }),
+                None,
+                false,
+            )
+            .unwrap();
+        let mut request = n5a_wait_request(&operation);
+        request.model = Some("synthetic-model-2");
+        assert!(
+            table
+                .try_current_quota_wait(request, |_| -> Option<()> {
+                    panic!("current zero wait policy must refuse inspection")
+                })
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn n5a_wait_intent_never_changes_c7_or_cooling_dispatch_eligibility() {
+        let root = fixture_dir();
+        let table = BindingTable::new(root.path(), RoutingConfig::default()).unwrap();
+        let key = "claude:synthetic-c7-wait";
+        let mut c = candidate("cl-synthetic-wait", 0.0, 168, 5);
+        match table.choose(
+            Provider::Claude,
+            Some(key),
+            None,
+            None,
+            std::slice::from_ref(&c),
+            None,
+            0,
+        ) {
+            Decision::Selected { lease, .. } => {
+                lease.dispatched();
+                drop(lease);
+            }
+            other => panic!("initial synthetic binding: {other:?}"),
+        }
+        let now = Utc::now();
+        let reset = now + Delta::seconds(30);
+        c.account.health = Health::Cooling {
+            reason: HealthReason::Quota,
+            until: reset,
+            scope: "account".into(),
+        };
+        c.account.quota_cooling = Some(crate::accounts::QuotaCooling {
+            window: "5h".into(),
+            reset_at: reset,
+            started_at: now,
+        });
+        let operation = n5a_wait_operation();
+        let before = table.routing_view();
+        assert_eq!(
+            table
+                .try_current_quota_wait(
+                    HttpWaitRequest {
+                        provider: Provider::Claude,
+                        key: Some(key),
+                        model: None,
+                        expected_source: Some(&c.account.id),
+                        operation: &operation,
+                    },
+                    |intent| Some(intent.account().to_owned())
+                )
+                .as_deref(),
+            Some(c.account.id.as_str())
+        );
+        assert!(!table.account_dispatch_eligible(&c, None));
+        let called = std::cell::Cell::new(false);
+        let choice = table.choose_with_hold_at_admitted(
+            Provider::Claude,
+            Some(key),
+            None,
+            None,
+            &[c],
+            None,
+            0,
+            true,
+            false,
+            now,
+            |_| {
+                called.set(true);
+                true
+            },
+        );
+        assert!(matches!(choice, Decision::Hold { until } if until == reset));
+        assert!(
+            !called.get(),
+            "legacy C7 must still precede dispatch admission"
+        );
+        assert_eq!(table.routing_view(), before);
+        assert_eq!(table.pending_count("cl-synthetic-wait"), 0);
+    }
+
+    #[test]
+    fn n5a_wait_intent_checks_caller_and_drops_rejected_result_after_gates() {
+        struct Rejected<'a> {
+            table: &'a BindingTable,
+            dropped: &'a std::cell::Cell<bool>,
+        }
+        impl Drop for Rejected<'_> {
+            fn drop(&mut self) {
+                assert!(
+                    self.table.mutations.try_lock().is_ok(),
+                    "rejected result must drop after mutations"
+                );
+                assert!(self.table.data.try_lock().is_ok());
+                self.dropped.set(true);
+            }
+        }
+        let (_root, table) = n5a_wait_fixture();
+        let expired = crate::issue_operation::IssueOperation::new(
+            tokio::time::Instant::now() - Duration::from_secs(1),
+        );
+        assert!(
+            table
+                .try_current_quota_wait(n5a_wait_request(&expired), |_| -> Option<()> {
+                    panic!("expired caller must not reach wait inspection")
+                })
+                .is_none()
+        );
+        let cancelled = n5a_wait_operation();
+        drop(cancelled.caller_guard());
+        assert!(
+            table
+                .try_current_quota_wait(n5a_wait_request(&cancelled), |_| -> Option<()> {
+                    panic!("cancelled caller must not reach wait inspection")
+                })
+                .is_none()
+        );
+        let operation = n5a_wait_operation();
+        let caller = operation.caller_guard();
+        let dropped = std::cell::Cell::new(false);
+        assert!(
+            table
+                .try_current_quota_wait(n5a_wait_request(&operation), |_| {
+                    drop(caller);
+                    Some(Rejected {
+                        table: &table,
+                        dropped: &dropped,
+                    })
+                })
+                .is_none()
+        );
+        assert!(dropped.get());
+    }
+
+    struct N5aPruneRejected {
+        table: Arc<BindingTable>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Drop for N5aPruneRejected {
+        fn drop(&mut self) {
+            assert!(self.table.mutations.try_lock().is_ok());
+            assert!(self.table.data.try_lock().is_ok());
+            // An actual policy writer must finish before this destructor returns:
+            // a retained publication read guard would make this bounded check fail.
+            let table = self.table.clone();
+            let (done, finished) = std::sync::mpsc::sync_channel(1);
+            let writer = std::thread::spawn(move || {
+                let result = table.policies.put_project(
+                    Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                    crate::routing::Project {
+                        name: "synthetic drop witness".into(),
+                        settings: crate::routing::Settings::default(),
+                    },
+                );
+                done.send(result.is_ok()).unwrap();
+            });
+            assert!(finished.recv_timeout(Duration::from_secs(5)).unwrap());
+            writer.join().unwrap();
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+
+    fn n5a_prune_publish_policy(table: &BindingTable, wait_secs: u64) {
+        table
+            .policies
+            .set_session(
+                &crate::routing::session_id("launch:synthetic-wait"),
+                Some(crate::routing::Settings {
+                    mode: crate::routing::Mode::Rebalance,
+                    reset_wait_secs: wait_secs,
+                }),
+                None,
+                None,
+            )
+            .unwrap();
+    }
+
+    fn n5a_prune_actual_reader(table: &BindingTable) {
+        // Public native read-like path: no direct test deletion, fake receipt or
+        // elapsed sleep. Past both launch24h and ordinary7d retention thresholds.
+        assert!(
+            table
+                .launch_info("codex:synthetic-wait", Utc::now() + Delta::days(8),)
+                .is_err()
+        );
+        assert!(
+            !table
+                .data
+                .lock()
+                .unwrap()
+                .groups
+                .contains_key("codex:synthetic-wait")
+        );
+    }
+
+    #[test]
+    fn n5a_wait_prune_before_new_policy_publication_rejects_result_after_gates() {
+        let (_root, table) = n5a_wait_fixture();
+        n5a_prune_publish_policy(&table, 60);
+        let operation = n5a_wait_operation();
+        assert_eq!(
+            table.try_current_quota_wait(n5a_wait_request(&operation), |intent| {
+                Some(intent.plan().settings.reset_wait_secs)
+            }),
+            Some(60)
+        );
+
+        let (entered, at_gate) = std::sync::mpsc::sync_channel(1);
+        let (release, resume) = std::sync::mpsc::sync_channel(1);
+        *table.wait_before_publication.lock().unwrap() = Some((entered, resume));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let called = Arc::new(AtomicBool::new(false));
+        let (done, finished) = std::sync::mpsc::sync_channel(1);
+        let worker = {
+            let table = table.clone();
+            let dropped = dropped.clone();
+            let called = called.clone();
+            std::thread::spawn(move || {
+                let operation = n5a_wait_operation();
+                let result = table.try_current_quota_wait(n5a_wait_request(&operation), |intent| {
+                    assert_eq!(intent.plan().settings.reset_wait_secs, 17);
+                    called.store(true, Ordering::Release);
+                    Some(N5aPruneRejected {
+                        table: table.clone(),
+                        dropped,
+                    })
+                });
+                done.send(result.is_none()).unwrap();
+            })
+        };
+        at_gate.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(table.mutations.try_lock().is_err());
+        n5a_prune_actual_reader(&table);
+        // Actual PolicyStore writer publishes between the old Data snapshot and
+        // publication acquisition, independently of binding mutations. Project
+        // edits freeze existing session baselines, so use an effective session edit.
+        n5a_prune_publish_policy(&table, 17);
+        release.send(()).unwrap();
+        assert!(finished.recv_timeout(Duration::from_secs(5)).unwrap());
+        worker.join().unwrap();
+        assert!(called.load(Ordering::Acquire));
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn n5a_wait_prune_during_inspect_rejects_result_after_gates() {
+        let (_root, table) = n5a_wait_fixture();
+        let operation = n5a_wait_operation();
+        let dropped = Arc::new(AtomicBool::new(false));
+        assert!(
+            table
+                .try_current_quota_wait(n5a_wait_request(&operation), |_| {
+                    n5a_prune_actual_reader(&table);
+                    Some(N5aPruneRejected {
+                        table: table.clone(),
+                        dropped: dropped.clone(),
+                    })
+                })
+                .is_none()
+        );
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn n5a_wait_final_data_contention_declines_without_blocking() {
+        let (_root, table) = n5a_wait_fixture();
+        let operation = n5a_wait_operation();
+        let (lock_now, start) = std::sync::mpsc::sync_channel(1);
+        let (locked, is_locked) = std::sync::mpsc::sync_channel(1);
+        let (release, resume) = std::sync::mpsc::sync_channel(1);
+        let holder = {
+            let table = table.clone();
+            std::thread::spawn(move || {
+                start.recv_timeout(Duration::from_secs(5)).unwrap();
+                let _data = table.data.lock().unwrap();
+                locked.send(()).unwrap();
+                resume
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("optional wait blocked on Data");
+            })
+        };
+        let result = table.try_current_quota_wait(n5a_wait_request(&operation), |_| {
+            lock_now.send(()).unwrap();
+            is_locked.recv_timeout(Duration::from_secs(5)).unwrap();
+            Some(())
+        });
+        // Only the completed method can release the holder: a blocking reverse
+        // lock would trip its timeout instead of completing this causal sequence.
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        assert!(result.is_none());
+        assert_eq!(
+            table.try_current_quota_wait(n5a_wait_request(&operation), |_| Some(())),
+            Some(())
+        );
+    }
 
     pub(super) fn candidate(id: &str, used: f64, weekly_hours: i64, five_hours: i64) -> Candidate {
         let now = Utc::now();

@@ -20,7 +20,6 @@ pub(crate) enum FenceError {
     Capacity,
     Missing,
     Stale,
-    #[cfg(test)]
     NoProof,
     Rejected,
     Exhausted,
@@ -84,7 +83,6 @@ pub(crate) struct SealedHttpReport {
 }
 
 /// Fences a proof, not exactly-once dispatch or an unrevocable native permission.
-#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct WaitTicket {
     process: Identity,
@@ -94,10 +92,15 @@ pub(crate) struct WaitTicket {
     proof: Identity,
 }
 
+impl WaitTicket {
+    pub(crate) fn account_id(&self) -> &str {
+        &self.id
+    }
+}
+
 struct Proof<E> {
-    #[cfg(test)]
     identity: Identity,
-    _evidence: Arc<E>,
+    evidence: Arc<E>,
 }
 struct Entry<E> {
     identity: Identity,
@@ -345,9 +348,8 @@ impl<E> WaitProofs<E> {
     pub(crate) fn mint(&self, permit: AcceptPermit, evidence: E) -> Result<(), FenceError> {
         // Declared before the lock so E is also dropped unlocked on rejection.
         let proof = Proof {
-            #[cfg(test)]
             identity: Identity::new(),
-            _evidence: Arc::new(evidence),
+            evidence: Arc::new(evidence),
         };
         let retired;
         {
@@ -386,7 +388,6 @@ impl<E> WaitProofs<E> {
 
     /// The returned immutable evidence can outlive invalidation; it is DATA, not
     /// authority. Hold the outer transaction through eligibility and final check.
-    #[cfg(test)]
     pub(crate) fn acquire(&self, id: &str) -> Result<(WaitTicket, Arc<E>), FenceError> {
         let state = self.open()?;
         let entries = &state.entries;
@@ -401,11 +402,10 @@ impl<E> WaitProofs<E> {
                 epoch,
                 proof: proof.identity.clone(),
             },
-            Arc::clone(&proof._evidence),
+            Arc::clone(&proof.evidence),
         ))
     }
 
-    #[cfg(test)]
     pub(crate) fn admit(&self, ticket: &WaitTicket) -> Result<Arc<E>, FenceError> {
         let state = self.open()?;
         let entries = &state.entries;
@@ -420,7 +420,7 @@ impl<E> WaitProofs<E> {
         if !proof.identity.same(&ticket.proof) {
             return Err(FenceError::Stale);
         }
-        Ok(Arc::clone(&proof._evidence))
+        Ok(Arc::clone(&proof.evidence))
     }
 
     pub(crate) fn retire(&self, id: &str) -> Result<bool, FenceError> {
