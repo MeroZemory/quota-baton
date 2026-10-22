@@ -788,15 +788,39 @@ fn account_name(view: &v2::View, id: &str) -> String {
         .map(|r| folder(&r.name))
         .unwrap_or_else(|| crate::i18n::static_text("알 수 없는 계정").into())
 }
-fn account_windows(a: &v2::AccountRow) -> Vec<AccountUsageWindow> {
+fn account_windows(a: &v2::AccountRow, clock: &Clock) -> Vec<AccountUsageWindow> {
     a.windows
         .iter()
         .filter(|w| w.account_scoped)
         .filter_map(|w| {
             w.remaining.map(|pct| AccountUsageWindow {
-                label: w.label.clone(),
-                remaining: crate::i18n::format("{0}% 남음", &[pct.to_string()]),
-                reset: w.reset_text.clone().unwrap_or_default(),
+                label: if crate::i18n::language() == crate::i18n::UiLanguage::En {
+                    w.raw.name.clone()
+                } else {
+                    w.label.clone()
+                },
+                remaining: if crate::i18n::language() == crate::i18n::UiLanguage::En {
+                    format!("{pct}% left")
+                } else {
+                    crate::i18n::format("{0}% 남음", &[pct.to_string()])
+                },
+                reset: if crate::i18n::language() == crate::i18n::UiLanguage::En {
+                    w.reset
+                        .map(|at| {
+                            let at = at.with_timezone(clock.now.offset());
+                            format!(
+                                "resets {}",
+                                at.format(if at.date_naive() == clock.now.date_naive() {
+                                    "%H:%M"
+                                } else {
+                                    "%b %-d %H:%M"
+                                })
+                            )
+                        })
+                        .unwrap_or_default()
+                } else {
+                    w.reset_text.clone().unwrap_or_default()
+                },
                 remaining_pct: pct,
             })
         })
@@ -1187,7 +1211,7 @@ pub fn project(
             continue;
         }
         let remaining = a.usage.as_ref().and_then(|u| u.binding.as_ref());
-        let windows = account_windows(a);
+        let windows = account_windows(a, clock);
         let blocked = a.raw.drain
             || a.raw.user_state != "active"
             || matches!(a.group, v2::Group::NeedsAction | v2::Group::Waiting)
@@ -2008,7 +2032,7 @@ fn detail_view(d: &SessionDetail, accounts: &v2::View, clock: &Clock, expired: b
         .unwrap_or_else(unknown);
     let remaining = account
         .map(|a| {
-            let windows = account_windows(a);
+            let windows = account_windows(a, clock);
             let values = windows
                 .iter()
                 .map(|w| format!("{} {}%", w.label, w.remaining_pct))
@@ -2468,7 +2492,7 @@ fn usage_tiles(snapshot: &DashboardSnapshot, clock: &Clock) -> Vec<UsageTile> {
                 plan: a.plan.clone().unwrap_or_else(unknown),
                 chip: a.chip.as_ref().map(|c| c.text.clone()).unwrap_or_default(),
                 tone: a.chip.as_ref().map_or(v2::Tone::Off, |c| c.tone),
-                windows: account_windows(a),
+                windows: account_windows(a, clock),
                 forecast_lines: a.forecast_lines.clone(),
                 projections: usage_projections(a, clock),
                 last_observed: observed_at(a, clock)
