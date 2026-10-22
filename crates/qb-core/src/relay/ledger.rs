@@ -425,7 +425,9 @@ impl Drop for Completion {
 mod accounting_tests {
     use super::*;
     use crate::{
-        bindings::{BindingLease, BindingTable, Candidate, Decision},
+        bindings::{
+            BindingLease, BindingTable, Candidate, Decision, MoveObservation, MoveObservations,
+        },
         observability::CacheUsage,
     };
 
@@ -463,6 +465,38 @@ mod accounting_tests {
                 None,
                 42,
             ) else {
+                panic!("synthetic binding selection must succeed");
+            };
+            assert_eq!(account, expected);
+            lease
+        }
+        fn choose_observed(
+            &self,
+            key: &str,
+            build: impl FnOnce() -> Vec<Candidate>,
+            expected: &str,
+        ) -> BindingLease {
+            // Model a new authoritative observation, rather than restamp a retained slice.
+            let observed = MoveObservation::before_collection();
+            let candidates = build();
+            let Decision::Selected { account, lease, .. } =
+                self.table.choose_with_hold_at_admitted_evidence(
+                    Provider::Claude,
+                    Some(key),
+                    (key == CHILD).then_some(ROOT),
+                    Some("m"),
+                    &candidates,
+                    &candidates,
+                    MoveObservations::same(observed),
+                    None,
+                    42,
+                    true,
+                    false,
+                    chrono::Utc::now(),
+                    None,
+                    |_| true,
+                )
+            else {
                 panic!("synthetic binding selection must succeed");
             };
             assert_eq!(account, expected);
@@ -608,9 +642,15 @@ mod accounting_tests {
         drop(f.move_to_b(ROOT));
         // Real semantic changes permit this fixture return: A recovered from
         // paused; B became paused after being ready at its placement.
-        let mut b = candidate("b");
-        b.account.user_state = crate::accounts::UserState::Paused;
-        let returned = f.choose(ROOT, &[candidate("a"), b], "a");
+        let returned = f.choose_observed(
+            ROOT,
+            || {
+                let mut b = candidate("b");
+                b.account.user_state = crate::accounts::UserState::Paused;
+                vec![candidate("a"), b]
+            },
+            "a",
+        );
         old.accounting_attempt("a");
         assert!(old.accounting_ticket.is_none());
         let mut current = f.request(returned, "a", ROOT);
@@ -727,9 +767,15 @@ mod accounting_tests {
             normal.record.cache_usage = Some(usage(30));
             normal.finish("ok");
         }
-        let mut b = candidate("b");
-        b.account.user_state = crate::accounts::UserState::Paused;
-        let lease = f.choose(ROOT, &[b, candidate("c")], "c");
+        let lease = f.choose_observed(
+            ROOT,
+            || {
+                let mut b = candidate("b");
+                b.account.user_state = crate::accounts::UserState::Paused;
+                vec![b, candidate("c")]
+            },
+            "c",
+        );
         let mut next = f.request(lease, "c", ROOT);
         next.attempt("c");
         next.record.cache_usage = Some(usage(100));

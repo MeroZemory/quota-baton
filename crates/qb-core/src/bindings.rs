@@ -3598,14 +3598,29 @@ mod tests {
         for key in [Some("claude:aba"), None] {
             let (_dir, t) = table();
             let cs = [candidate("a", 10.0, 8, 1), candidate("b", 10.0, 30, 2)];
-            let choose_raw =
-                |id| match t.choose(Provider::Claude, key, None, None, &cs, Some(id), 42) {
-                    Decision::Selected { lease, .. } => lease,
-                    other => panic!("{other:?}"),
-                };
-            let old_a = choose_raw("a");
-            let b = choose_raw("b");
-            let new_a = choose_raw("a");
+            let now = Utc::now();
+            // Keep the actual ABA moves outside R14's unchanged-account return window.
+            let choose_raw = |id, at| match t.choose_with_hold_at(
+                Provider::Claude,
+                key,
+                None,
+                None,
+                &cs,
+                Some(id),
+                42,
+                true,
+                false,
+                at,
+            ) {
+                Decision::Selected { account, lease, .. } => {
+                    assert_eq!(account, id);
+                    lease
+                }
+                other => panic!("{other:?}"),
+            };
+            let old_a = choose_raw("a", now);
+            let b = choose_raw("b", now + Delta::seconds(1));
+            let new_a = choose_raw("a", now + Delta::minutes(31) + Delta::seconds(1));
             old_a.dispatched();
             b.dispatched();
             assert!(
@@ -4617,13 +4632,18 @@ mod tests {
         assert_eq!(moves[0].reason, "cold_rebalance");
         drop(lease);
         a.account.drain = false;
-        drop(choose(&t, Some("claude:s"), std::slice::from_ref(&a)));
+        // The high-usage phase is an independent placement, not an immediate return to A.
+        drop(choose(
+            &t,
+            Some("claude:drain-high"),
+            std::slice::from_ref(&a),
+        ));
         a.account.drain = true;
         assert_eq!(
             choose(&t, Some("claude:new"), &[a.clone(), b.clone()]).0,
             "b"
         );
-        age(&t, "claude:s", 3601);
+        age(&t, "claude:drain-high", 3601);
         for w in a.quota.as_mut().unwrap()["windows"].as_array_mut().unwrap() {
             w["used_pct"] = json!(91);
         }
@@ -4632,7 +4652,7 @@ mod tests {
         // the separate D20 cap-wait rule, so refresh B after that placement.
         let asof = t.begin_usage_observation_for("b");
         t.note_usage_observation_asof_token("b", b.quota.as_ref().unwrap(), asof);
-        let (account, _, moves) = choose(&t, Some("claude:s"), &[a, b]);
+        let (account, _, moves) = choose(&t, Some("claude:drain-high"), &[a, b]);
         assert_eq!(account, "b");
         assert_eq!(moves[0].reason, "cold_rebalance");
     }
@@ -5214,21 +5234,22 @@ mod tests {
         assert_eq!(t.account_count_changed_at("a"), None);
         count_change_place(&t, "claude:count", "a", now);
         assert_eq!(t.account_count_changed_at("a"), Some(now));
-        let moved = now + Delta::seconds(1);
+        // These historical returns respect R14 without changing the count-publication test.
+        let moved = now + Delta::minutes(31);
         count_change_place(&t, "claude:count", "b", moved);
         assert_eq!(t.account_count_changed_at("a"), Some(moved));
         assert_eq!(t.account_count_changed_at("b"), Some(moved));
-        let back = now + Delta::seconds(2);
+        let back = now + Delta::minutes(62);
         count_change_place(&t, "claude:count", "a", back);
         // No timestamp API poll between the two committed moves below.
-        count_change_place(&t, "claude:count", "b", back + Delta::seconds(1));
-        count_change_place(&t, "claude:count", "a", back + Delta::seconds(2));
+        count_change_place(&t, "claude:count", "b", back + Delta::minutes(31));
+        count_change_place(&t, "claude:count", "a", back + Delta::minutes(62));
         assert_eq!(t.account_stats("a").0, 1);
         assert_eq!(t.account_stats("b").0, 0);
         for id in ["a", "b"] {
             assert_eq!(
                 t.account_count_changed_at(id),
-                Some(back + Delta::seconds(2))
+                Some(back + Delta::minutes(62))
             );
         }
     }
