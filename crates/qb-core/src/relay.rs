@@ -330,7 +330,9 @@ impl RelayState {
             store.stop_writes();
             obs.freeze_quota()?;
             bindings.freeze()?;
-            bindings.export()
+            let exported = bindings.export()?;
+            obs.shutdown_replay();
+            Ok::<_, anyhow::Error>(exported)
         })
         .await
         .ok()
@@ -464,6 +466,7 @@ impl RelayState {
         config.websocket.validate()?;
         config.routing.validate()?;
         config.quota.validate()?;
+        config.routing_replay.validate()?;
         let client = upstream_client()?;
         let accounts = crate::account_runtime::AccountRuntime::new(
             store.clone(),
@@ -504,6 +507,7 @@ impl RelayState {
         for (id, settings) in &config.accounts {
             bindings.set_account_threshold(id, settings.spread_threshold);
         }
+        observability.configure_replay(store.home(), &config.routing_replay)?;
         Ok(Self {
             accounts,
             quota,
@@ -692,7 +696,29 @@ impl RelayState {
         tokio::task::spawn_blocking(move || {
             let mut candidates = Vec::new();
             let mut evidence = Vec::new();
-            for mut account in accounts.into_iter().filter(|a| a.provider == provider) {
+            use crate::observability::replay_recorder as tape;
+            let recording = obs.replay();
+            let collection = recording.as_ref().and_then(|r| r.next_id());
+            let started = recording
+                .as_ref()
+                .and_then(|r| observed.lower_bound().and_then(|at| r.stamp_at(at)));
+            if let (Some(r), Some(collection)) = (&recording, collection) {
+                r.record(
+                    tape::Owner::Collector,
+                    None,
+                    tape::Event::CollectionBoundary {
+                        collection,
+                        started,
+                        rows: 0,
+                        complete: false,
+                    },
+                );
+            }
+            for (rank, mut account) in accounts
+                .into_iter()
+                .filter(|a| a.provider == provider)
+                .enumerate()
+            {
                 if account.quota_cooling.is_none()
                     && let Some(reset) = runtime.observed_quota_reset(&account)
                 {
@@ -710,13 +736,48 @@ impl RelayState {
                     account,
                 };
                 let account = &candidate.account;
-                if !tried.contains(&account.id)
-                    && !runtime.probing(&account.id)
-                    && !runtime.blocked_in_memory(&account.id)
-                    && store
-                        .tokens(account)
-                        .is_ok_and(|t| !t.access_token.is_empty())
+                // Preserve the original short-circuit order and credential reads.
+                let retry_excluded = tried.contains(&account.id);
+                let runtime_excluded = !retry_excluded
+                    && (runtime.probing(&account.id) || runtime.blocked_in_memory(&account.id));
+                let credential = if !retry_excluded && !runtime_excluded {
+                    Some(
+                        store
+                            .tokens(account)
+                            .is_ok_and(|t| !t.access_token.is_empty()),
+                    )
+                } else {
+                    None
+                };
+                let fact_sequence =
+                    obs.replay_account(account, u32::try_from(rank).ok(), credential);
+                if let (Some(r), Some(collection), Some(started)) =
+                    (&recording, collection, started)
+                    && let Some(account) = r.identity(tape::IdentityDomain::Account, &account.id)
                 {
+                    r.record(
+                        tape::Owner::Collector,
+                        fact_sequence,
+                        tape::Event::CollectionMember {
+                            collection,
+                            account,
+                            side: tape::CollectionSide::SourceAndTarget,
+                            started,
+                            fact_revision: None,
+                            order_rank: u32::try_from(rank).unwrap_or(u32::MAX),
+                            exclusion: if retry_excluded {
+                                tape::Exclusion::Tried
+                            } else if runtime_excluded {
+                                tape::Exclusion::Health
+                            } else if credential == Some(false) {
+                                tape::Exclusion::Unknown
+                            } else {
+                                tape::Exclusion::None
+                            },
+                        },
+                    );
+                }
+                if credential == Some(true) {
                     obs.forecast_load(
                         &account.id,
                         bindings.active_sessions(&account.id, chrono::Utc::now()),
@@ -733,6 +794,18 @@ impl RelayState {
                 // A retry exclusion is not a health fact. Preserve normalized
                 // source evidence even when this account cannot be selected.
                 evidence.push(candidate);
+            }
+            if let (Some(r), Some(collection)) = (&recording, collection) {
+                r.record(
+                    tape::Owner::Collector,
+                    None,
+                    tape::Event::CollectionBoundary {
+                        collection,
+                        started,
+                        rows: u32::try_from(evidence.len()).unwrap_or(u32::MAX),
+                        complete: true,
+                    },
+                );
             }
             Ok((candidates, evidence, observed))
         })
