@@ -1,3 +1,6 @@
+#[path = "../../build-support/windows_icon.rs"]
+mod windows_icon;
+
 fn main() {
     println!("cargo:rerun-if-changed=native/plain_header_seh.c");
     println!("cargo:rerun-if-changed=native/plain_header_seh.h");
@@ -11,4 +14,5 @@ fn main() {
             .warnings(true)
             .compile("qb_plain_header_seh");
     }
+    windows_icon::embed("quota-baton");
 }

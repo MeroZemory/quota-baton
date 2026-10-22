@@ -1961,19 +1961,15 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
                         header_height + rows_height + 2.,
                     );
                     let description = format!(
-                        "{} 계정, {}, {}, 활성 세션 {} / {}{}, {}",
+                        "{} 계정, {}, {}, 활성 {}{}, {}",
                         group.name,
                         group.plan,
                         group.chip,
                         group.active,
-                        group.threshold.unwrap_or(5),
-                        if group.active > group.threshold.unwrap_or(5) {
-                            format!(
-                                ", 기준보다 {}개 많음",
-                                group.active - group.threshold.unwrap_or(5)
-                            )
+                        if group.active >= group.threshold.unwrap_or(5).max(1) {
+                            " · 몰림"
                         } else {
-                            String::new()
+                            ""
                         },
                         if group.relogin_reason.is_empty() {
                             group
@@ -2212,16 +2208,11 @@ fn group_header(b: &mut Builder<'_>, g: &m::AccountGroup, r: Rect, sticky: bool)
     );
     b.end_control_paint();
     let threshold = g.threshold.unwrap_or(5).max(1);
-    let over = g.active.saturating_sub(threshold);
-    let count_text = format!("{} / {threshold}", g.active);
+    let crowded = g.active >= threshold;
+    let count_text = format!("활성 {}", g.active);
     let count_width = b.measured_width(&count_text, 12., true).max(34.);
-    let over_width = if over > 0 {
-        b.measured_width(&format!("기준보다 {over}개 많음"), 12., false) + 8.
-    } else {
-        0.
-    };
-    let extra_width = if over > 0 {
-        (b.measured_width(&format!("+{over}"), 12., true) + 6.).max(30.)
+    let crowded_width = if crowded {
+        b.measured_width("몰림", 12., true) + 16.
     } else {
         0.
     };
@@ -2249,32 +2240,7 @@ fn group_header(b: &mut Builder<'_>, g: &m::AccountGroup, r: Rect, sticky: bool)
     let name_left = r.left + 32. + prefix_width;
     let measured_name = b.measured_width(&g.name, 13., true);
     let action_gap = if g.relogin { button_width + 24. } else { 12. };
-    // Bound work by header space, never by the (potentially i64::MAX) threshold.
-    // Keep some name visible before spending the remaining space on pips.
-    let pip_space = (r.right
-        - 12.
-        - name_left
-        - measured_name.min(32.)
-        - plan_width
-        - chip_width
-        - 20.
-        - action_gap
-        - 64.
-        - 8.
-        - extra_width
-        - count_width
-        - over_width)
-        .max(0.);
-    let capacity = (pip_space / 11.).floor() as u64;
-    let omitted = threshold > capacity;
-    let omission_width = if omitted {
-        b.measured_width("…", 12., false) + 3.
-    } else {
-        0.
-    };
-    let pip_count = threshold.min(((pip_space - omission_width).max(0.) / 11.).floor() as u64);
-    let load_width =
-        64. + pip_count as f32 * 11. + omission_width + 8. + extra_width + count_width + over_width;
+    let load_width = count_width + if crowded { crowded_width + 8. } else { 0. };
     let load_left = r.right - 12. - load_width;
     let content_right = load_left - action_gap;
     if sticky {
@@ -2329,91 +2295,46 @@ fn group_header(b: &mut Builder<'_>, g: &m::AccountGroup, r: Rect, sticky: bool)
         );
     }
     b.text(
-        rect(load_left, r.top + 12., 64., 16.),
-        "활성 세션",
-        12.,
-        false,
-        Color::Secondary,
-        false,
-    );
-    let pip_left = load_left + 64.;
-    for i in 0..pip_count {
-        let pr = rect(pip_left + i as f32 * 11., r.top + 16., 8., 8.);
-        if i < g.active {
-            b.fill(pr, Color::Accent, 2.);
-        } else {
-            b.stroke(pr, Color::PipOutline, 1., 2.);
-        }
-    }
-    let mut count_left = pip_left + pip_count as f32 * 11. + 8.;
-    if omitted {
-        b.text(
-            rect(count_left - 8., r.top + 12., omission_width, 16.),
-            "…",
-            12.,
-            false,
-            Color::Secondary,
-            false,
-        );
-        count_left += omission_width;
-    }
-    if over > 0 {
-        b.text(
-            rect(count_left - 6., r.top + 12., extra_width, 16.),
-            format!("+{over}"),
-            12.,
-            true,
-            Color::Accent,
-            false,
-        );
-        count_left += extra_width;
-    }
-    b.text(
-        rect(count_left, r.top + 12., count_width, 16.),
-        count_text,
+        rect(load_left, r.top + 12., count_width, 16.),
+        count_text.clone(),
         12.,
         true,
         Color::Text,
         false,
     );
-    if over > 0 {
-        b.text(
+    if crowded {
+        chip(
+            b,
+            "몰림",
+            v2::Tone::Warn,
             rect(
-                count_left + count_width + 8.,
-                r.top + 12.,
-                over_width - 8.,
-                16.,
+                load_left + count_width + 8.,
+                r.top + 10.,
+                crowded_width,
+                20.,
             ),
-            format!("기준보다 {over}개 많음"),
             12.,
-            false,
-            Color::Secondary,
-            false,
         );
     }
-    let omission = if omitted {
+    let load_rect = rect(load_left, r.top + 8., load_width, 24.);
+    let load_description = if crowded {
         format!(
-            " 공간 부족으로 기준 표시 {pip_count}개만 표시, {}개 생략.",
-            threshold - pip_count
+            "분산 기준 {threshold}개에 도달해 새 세션은 다른 계정을 우선합니다. 제한이 아니며 세션은 계속 받습니다."
         )
     } else {
-        String::new()
+        format!("활성 {} · 연결된 대화 {}개", g.active, g.bound)
     };
-    let load_rect = rect(load_left, r.top + 8., load_width, 24.);
-    let load_description = format!(
-        "활성 세션 {}개 / 기준 {}개. 기준을 넘으면 새 세션은 여유 있는 다른 계정에 먼저 배정합니다. 연결된 세션 {}개.{omission}",
-        g.active, threshold, g.bound
+    b.semantic(
+        format!("{}:load:{}", b.scope, g.id),
+        Some(format!("group:{}", g.id)),
+        Role::Text,
+        format!(
+            "{count_text}{}. {load_description}",
+            if crowded { " · 몰림" } else { "" }
+        ),
+        load_rect,
+        None,
     );
-    if omitted {
-        b.semantic(
-            format!("{}:load:{}", b.scope, g.id),
-            Some(format!("group:{}", g.id)),
-            Role::Text,
-            load_description.clone(),
-            load_rect,
-            None,
-        );
-    }
     b.tooltip(load_rect, load_description);
     if !g.relogin_reason.is_empty() {
         b.text(

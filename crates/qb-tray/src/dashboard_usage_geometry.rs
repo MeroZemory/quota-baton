@@ -5,17 +5,14 @@ pub(super) fn usage(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardStat
     b.card(card);
     b.text(
         rect(card.left + 16., card.top + 14., 120., 24.),
-        "오늘 사용량",
+        "사용량",
         14.,
         true,
         Color::Text,
         false,
     );
-    let summary = format!(
-        "남은 양 · 00:00–24:00 · {}",
-        v.clock.day_label(v.clock.utc())
-    );
-    let summary_width = b.measured_width(&summary, 12., false) + 4.;
+    let summary = "남은 양 · 최근 19시간 / 앞으로 5시간";
+    let summary_width = b.measured_width(summary, 12., false) + 4.;
     b.text(
         rect(card.left + 144., card.top + 16., summary_width, 20.),
         summary,
@@ -236,15 +233,18 @@ fn usage_tile(
         width(r) - 64.,
         170. - annotation_space - notice_space,
     );
-    let from = v.clock.day_start;
-    let to = v.clock.day_end;
+    let (from, to) = m::usage_domain(&v.clock);
     let total = to.signed_duration_since(from).num_milliseconds().max(1) as f64;
     // Keep close reset captions in separate rows while retaining their own x anchor.
     let mut caption_rights: Vec<f32> = Vec::new();
     let mut captions = Vec::new();
     let mut overflow = Vec::new();
     for at in future_resets {
-        let label = format!("{} 초기화", v.clock.time(Some(at)));
+        let label = format!(
+            "{}{} 초기화",
+            if at > to { "범위 밖 · " } else { "" },
+            v.clock.time(Some(at))
+        );
         let w = (b.measured_width(&label, 11., false) + 4.).min(width(plot));
         let marker = plot.left
             + (at.signed_duration_since(from).num_milliseconds() as f64 / total).clamp(0., 1.)
@@ -326,11 +326,25 @@ fn usage_tile(
             false,
         );
     }
-    for hour in [0, 6, 12, 18, 24] {
-        let xx = plot.left + width(plot) * hour as f32 / 24.;
+    // Keep every hourly mark; reserve midnight's date before culling captions.
+    use chrono::Timelike;
+    let mut ticks = usage_ticks(&v.clock);
+    ticks.sort_by_key(|at| at.with_timezone(v.clock.now.offset()).hour() != 0);
+    let mut tick_labels = Vec::new();
+    for at in ticks {
+        let xx = x(at);
+        b.line([xx, plot.bottom], [xx, plot.bottom + 4.], Color::Border, 1., None);
+        let local = at.with_timezone(v.clock.now.offset());
+        let label = local.format(if local.hour() == 0 { "%m/%d 00:00" } else { "%H:%M" }).to_string();
+        let w = (b.measured_width(&label, 11., false) + 4.).min(width(plot));
+        let left = (xx - w / 2.).clamp(plot.left, plot.right - w);
+        if tick_labels.iter().any(|&(l, r)| left < r + 4. && left + w + 4. > l) {
+            continue;
+        }
+        tick_labels.push((left, left + w));
         b.text(
-            rect(xx - 10., plot.bottom + 8., 36., 16.),
-            format!("{hour}:00"),
+            rect(left, plot.bottom + 8., w, 16.),
+            label,
             11.,
             false,
             Color::Secondary,
@@ -410,7 +424,7 @@ fn usage_tile(
                     Some([1., 3.]),
                 );
             }
-            for reset in &series.future_resets {
+            for reset in series.future_resets.iter().filter(|at| **at >= from && **at <= to) {
                 b.line(
                     [x(*reset), plot.top],
                     [x(*reset), plot.bottom],
@@ -455,15 +469,16 @@ fn usage_tile(
             color,
         );
     }
-    // Keep the specified right-of-now anchors even late in the day.
+    // Keep state sentences readable: the future band is only five hours wide.
     if let Some(clip) = intersection(plot, b.clip) {
         b.scene.draw.push(Draw::Clip(clip));
         if !has_observation {
-            let text = "오늘은 아직 관측한 값이 없습니다";
-            let w = b.measured_width(text, 12., false) + 4.;
-            b.fill(rect(nowx + 12., y(50.) - 8., w, 16.), Color::Surface, 0.);
+            let text = "아직 관측한 값이 없습니다";
+            let w = (b.measured_width(text, 12., false) + 4.).min(width(plot));
+            let left = plot.left + (width(plot) - w) / 2.;
+            b.fill(rect(left, y(50.) - 8., w, 16.), Color::Surface, 0.);
             b.text(
-                rect(nowx + 12., y(50.) - 8., w, 16.),
+                rect(left, y(50.) - 8., w, 16.),
                 text,
                 12.,
                 false,
@@ -479,7 +494,7 @@ fn usage_tile(
             let w = b.measured_width(&text, 11., false) + 4.;
             backed_text(
                 b,
-                rect(nowx + 8., plot.top + 2., w, 16.),
+                rect((nowx + 8.).min(plot.right - w).max(plot.left), plot.top + 2., w, 16.),
                 &text,
                 false,
                 Color::Bad,
@@ -539,7 +554,7 @@ fn usage_tile(
         chartkey.clone(),
         None,
         Role::Chart,
-        format!("{} 오늘 남은 양", t.name),
+        format!("{} 남은 양 · 최근 19시간 / 앞으로 5시간", t.name),
         plot,
         Some(Target::Chart(t.id.clone())),
     );
@@ -584,7 +599,11 @@ fn usage_tile(
     }
     for row in &table.rows {
         let at = row.at;
-        let stamp = stamps.entry(at).or_insert_with(|| v.clock.stamp(Some(at)));
+        let stamp = stamps.entry(at).or_insert_with(|| {
+            at.with_timezone(v.clock.now.offset())
+                .format("%m/%d %H:%M:%S")
+                .to_string()
+        });
         let values: Vec<_> = t
             .series
             .iter()
@@ -638,6 +657,23 @@ fn usage_tile(
     if tile_clip.is_some() {
         b.scene.draw.push(Draw::Unclip);
     }
+}
+
+fn usage_ticks(clock: &m::Clock) -> Vec<DateTime<Utc>> {
+    use chrono::{Duration, Timelike};
+    let (from, to) = m::usage_domain(clock);
+    let local = from.with_timezone(clock.now.offset());
+    let floor = local.with_minute(0).unwrap().with_second(0).unwrap().with_nanosecond(0).unwrap();
+    let mut at = floor.with_timezone(&Utc);
+    if at < from {
+        at += Duration::hours(1);
+    }
+    let mut ticks = Vec::new();
+    while at <= to {
+        ticks.push(at);
+        at += Duration::hours(1);
+    }
+    ticks
 }
 
 // §7: symmetric separation projected into the plot's feasible bounds.
