@@ -1601,6 +1601,35 @@ async fn c6_row_13_four_distinct_accounts_maximum() {
 }
 
 #[tokio::test]
+async fn r14_ws_repeated_payment_rejections_reach_third_account_with_default_move_budget() {
+    let h = Harness::new_with_options(3, false, false, None, Some((3, 1))).await;
+    let body = r#"{"error":{"message":"synthetic payment required"}}"#;
+    for _ in 0..2 {
+        h.fake
+            .state
+            .push_handshake(StatusCode::PAYMENT_REQUIRED, body, HeaderMap::new());
+    }
+    let (mut client, served) = h.connect().await;
+    assert_eq!(served, h.ids[2]);
+    assert_eq!(h.fake.state.requests().len(), 3);
+    for id in &h.ids[..2] {
+        assert!(matches!(
+            h.store.load(id).unwrap().health,
+            Health::Cooling {
+                reason: HealthReason::Payment,
+                ..
+            }
+        ));
+    }
+    assert_eq!(h.store.load(&served).unwrap().health, Health::Ready);
+    assert_eq!(
+        h.state.bindings.current(Some("codex:synthetic-ws-session")),
+        Some(served)
+    );
+    client.close(None).await.unwrap();
+}
+
+#[tokio::test]
 async fn c6_4_402_websocket_upgrade_cools_account_then_moves_binding() {
     let h = Harness::new(2).await;
     let body = r#"{"error":{"message":"synthetic payment required"}}"#;
