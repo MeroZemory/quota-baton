@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: R16 영문 UI·snapshot·Claude 프로젝트명
-목표: R16 집중 관문 통과·설치 인계 후 R13 C+E 대기·이동·재개 실행을 통합한다
+현재 마일스톤: R13 C+E 대기·이동·재개 실행 통합
+목표: R16.1 영어 화면 보완 완료 후 R13 C+E 실행을 통합한다
 핵심 지표: 남은 출시 1/3 (R14 보호 설치, R13 C+E 실행, R13 F 통합 예측); 이전 계열 2/2 종료
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-23 02:21 KST (R16 집중 관문·실제 경로 통과; 설치는 설계 세션, 다음 R13 C+E)
+갱신: 2026-10-23 02:52 KST (R16.1 집중405·실제 경로 통과, 다음 C+E)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -166,6 +166,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-23 01:08 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 0/3 | 이전 새 경로 계열은 2/2로 종료. R14.1 보호 관문 통과·self-merge 전달; 설치 전이므로 0/3 |
 | 2026-10-23 01:12 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | 설계 세션이 dev249a14c 설치 수용. takeover 1,717회 중 연결 거절0, 일반·이미지 exec 통과, 실제 dashboard 재독 토큰 지표 확인 |
 | 2026-10-23 02:21 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | R16 집중438통과·실제 core/AdminClient/tray 3HWND·20CLI PNG 통과, 코드19b8d22. 영어 UI는 이 계열 분모 밖이며 설치는 미실행 |
+| 2026-10-23 02:52 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | R16 설치 수용006449a 및 R16.1 집중405·실제 경로 통과3737fe2. 영어 폭 보완은 분모 밖 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -325,12 +326,15 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-23 01:12 | R14.1 설치 수용 (설계 세션 측정) | takeover 1,717회 중 연결 거절0; codex-qb exec·images exec 통과; 실제 dashboard 재독 토큰 지표 표시 | 보호 설치 | dev249a14c; .sandbox/reports/R14.1-evidence/live-dashboard.png, 관측 시작10/23 01:12·관측된 이동 없음 |
 | 2026-10-23 02:21 | R16 한국어 보존·영문·snapshot 집중 검사 | core6·tray274+127·통합29·CLI2 통과, strict all-target lint·fmt·testkit build exit0 | brief 집중 관문 | R16-evidence/delivery-fingerprint.json에 명령별 입력·재사용 범위 |
 | 2026-10-23 02:21 | R16 실제 경로·오프라인 렌더 | 실제 core/AdminClient/tray 3HWND 및 export, 최종 CLI20 PNG 통과 | D27·영문 light/dark 각5뷰 | 합성 loopback, fixture 정리 완료. 코드19b8d22, 실제 설치 미실행 |
+| 2026-10-23 02:26 | R16 설치 수용 (설계 세션 측정) | dev006449a·takeover 거절0/1,811; 실제 debug snapshot·render-snapshot 통과 | README용 영문 화면·도구 | R16.1로 영어 폭 보완, 설치는 설계 세션 실행 |
+| 2026-10-23 02:52 | R16.1 영어 고정 문구·한국어 보존 | 집중405통과, strict lint·fmt·build exit0; 한국어 전후 PNG4개 바이트 동일 | 요청1024×640·1320×900, scale2·두 테마 | 3737fe2; R16.1-evidence/delivery-fingerprint.json, 수정 전 실패·수정 후 통과 |
+| 2026-10-23 02:52 | R16.1 D27 실제 경로 | spawned core·AdminClient·tray 3HWND 및 snapshot CLI5뷰, 종료·fixture 정리 통과 | 실제 전달·렌더 경로 수용 | R16.1-evidence/real-path-final/completion.json, 실제 설치·실프로필 변경 없음 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 행동 |
 |---|---|---|---|
-| R13 C+E 실행 | 긴급 등록·대기 측정 기반 준비, 전체 실행 미연결 | 초기화 뒤 재개·긴급 이동·취소와 실제 client 경로 관문 | R16 인계 뒤 HTTP 대기/재개부터 통합 |
+| R13 C+E 실행 | 긴급 등록·대기 측정 기반 준비, 전체 실행 미연결 | 초기화 뒤 재개·긴급 이동·취소와 실제 client 경로 관문 | R16.1 완료 후 HTTP 대기/재개부터 통합 |
 | R13 F 통합 예측 | 미출시; 수집기와 실제 재생도 별도 남음 | coverage 명시 통합 예측·24시간 backtest | C+E 및 R14.2 후 Part F; R15 공유 계약은 이후 |
 | 이미지 버전 확인 | 부하 중 5초 버전 확인 실패, R12.11 제안 보존 | 15초 확인·제한 재시도·24시간 검증 캐시와 집중 관문 | 사용자 우선순위에 따라 별도 보존 |
 <!-- gaps:end -->
