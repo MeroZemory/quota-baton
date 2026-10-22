@@ -508,6 +508,8 @@ pub struct AccountGroup {
     pub remaining_pct: Option<u8>,
     pub windows: Vec<AccountUsageWindow>,
     pub forecast_lines: Vec<String>,
+    pub forecast_tooltip: String,
+    pub forecast_warning: bool,
     pub relogin: bool,
     /// Shared tray reason; nonempty only for re-login, including linked accounts.
     pub relogin_reason: String,
@@ -576,6 +578,8 @@ pub struct UsageTile {
     pub tone: v2::Tone,
     pub windows: Vec<AccountUsageWindow>,
     pub forecast_lines: Vec<String>,
+    pub forecast_tooltip: String,
+    pub forecast_warning: bool,
     /// Display-only future lines; never included in observed history or hit tables.
     pub projections: Vec<UsageForecastSeries>,
     /// Latest valid account/window timestamp or known history point, never a null/future point.
@@ -1266,6 +1270,8 @@ pub fn project(
             remaining_pct: remaining.and_then(|w| w.remaining),
             windows,
             forecast_lines: a.forecast_lines.clone(),
+            forecast_tooltip: a.forecast_tooltip.clone(),
+            forecast_warning: a.forecast_warning,
             relogin: a.raw.health.kind == "needs_relogin" && a.menu.show_relogin,
             relogin_reason: if a.state == v2::DisplayState::Relogin {
                 a.reason
@@ -2494,6 +2500,8 @@ fn usage_tiles(snapshot: &DashboardSnapshot, clock: &Clock) -> Vec<UsageTile> {
                 tone: a.chip.as_ref().map_or(v2::Tone::Off, |c| c.tone),
                 windows: account_windows(a, clock),
                 forecast_lines: a.forecast_lines.clone(),
+                forecast_tooltip: a.forecast_tooltip.clone(),
+                forecast_warning: a.forecast_warning,
                 projections: usage_projections(a, clock),
                 last_observed: observed_at(a, clock)
                     .into_iter()

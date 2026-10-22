@@ -1912,6 +1912,11 @@ fn tooltip_content(
             return Some((summary.tooltip.clone(), *r));
         }
     }
+    for (r, summary) in scene.header.forecasts.iter().zip(&view.summaries) {
+        if contains(*r, x, y) {
+            return Some((summary.forecast_line.clone(), *r));
+        }
+    }
     if !contains(scene.list, x, y) {
         return None;
     }
@@ -1930,6 +1935,7 @@ fn tooltip_content(
                 row.credits.as_ref().map(|c| c.tooltip.clone()),
             ),
             (boxrow.plan, row.plan_tooltip.clone()),
+            (boxrow.forecast, Some(row.forecast_tooltip.clone())),
             (Some(boxrow.name), row.name_tooltip.clone()),
             (boxrow.usage, row.usage.as_ref().map(|u| u.tooltip.clone())),
             (boxrow.bar, row.usage.as_ref().map(|u| u.tooltip.clone())),
@@ -1954,10 +1960,13 @@ fn focus_tooltip(
     let HitTarget::Row(id) = focus? else {
         return None;
     };
-    Some((
-        row_view(view, id)?.usage.as_ref()?.tooltip.clone(),
-        scene.row(id)?.usage?,
-    ))
+    let row = row_view(view, id)?;
+    let mut text = row.usage.as_ref().map(|usage| usage.tooltip.clone()).unwrap_or_default();
+    if !row.forecast_tooltip.is_empty() {
+        if !text.is_empty() { text.push('\n'); }
+        text.push_str(&row.forecast_tooltip);
+    }
+    (!text.is_empty()).then_some((text, scene.row(id)?.forecast.or(scene.row(id)?.usage)?))
 }
 fn hover_pointer(hwnd: HWND, x: f32, y: f32) {
     let Some(frame) = painted_frame(hwnd) else {

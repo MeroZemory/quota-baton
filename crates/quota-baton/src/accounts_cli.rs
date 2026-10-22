@@ -58,7 +58,10 @@ pub enum AccountsCommand {
         yes: bool,
     },
     #[command(about = "계정 목록을 확인합니다")]
-    List,
+    List {
+        #[arg(long, help = "사용량 예측의 속도·근거·모든 구간을 자세히 표시합니다")]
+        detail: bool,
+    },
     #[command(about = "계정 사용을 일시 중지합니다")]
     Pause { id: String },
     #[command(about = "계정 사용을 재개합니다")]
@@ -153,7 +156,7 @@ pub async fn run(command: AccountsCommand, home: &Path, config: &Config) -> anyh
         AccountsCommand::Resume { id } => action(home, config, &id, "resume").await?,
         AccountsCommand::Disable { id } => action(home, config, &id, "disable").await?,
         AccountsCommand::Enable { id } => action(home, config, &id, "enable").await?,
-        AccountsCommand::List => {
+        AccountsCommand::List { detail } => {
             let accounts = AccountStore::list_metadata(home)?;
             let forecasts = live_account_views(home, config).await?;
             println_utf8!(
@@ -176,7 +179,12 @@ pub async fn run(command: AccountsCommand, home: &Path, config: &Config) -> anyh
                 let live = forecasts
                     .as_ref()
                     .and_then(|rows| rows.iter().find(|row| row["id"] == value["id"]));
-                for line in forecast_lines(live, forecasts.is_some()) {
+                for line in list_forecast_lines(
+                    live,
+                    forecasts.is_some(),
+                    detail,
+                    config.ui.language == qb_core::config::UiLanguage::En,
+                ) {
                     println_utf8!("  {line}");
                 }
             }
@@ -1112,6 +1120,35 @@ async fn live_account_views(
     ))
 }
 
+fn list_forecast_lines(
+    account: Option<&serde_json::Value>,
+    running: bool,
+    detail: bool,
+    english: bool,
+) -> Vec<String> {
+    if detail {
+        return forecast_lines(account, running);
+    }
+    let forecast = running.then_some(account).flatten().and_then(|account| {
+        serde_json::from_value::<qb_core::usage_forecast::AccountUsageForecast>(
+            account["usage_forecast"].clone(),
+        )
+        .ok()
+    });
+    vec![
+        forecast
+            .as_ref()
+            .map(|forecast| qb_core::usage_forecast_display::summary(forecast, english).text)
+            .unwrap_or_else(|| {
+                if english {
+                    "Measuring".into()
+                } else {
+                    "측정 중".into()
+                }
+            }),
+    ]
+}
+
 fn forecast_lines(account: Option<&serde_json::Value>, running: bool) -> Vec<String> {
     if !running {
         return vec!["소진 예측: 코어가 꺼져 있어 측정할 수 없음".into()];
@@ -1529,6 +1566,68 @@ mod r1_cpa_status_tests {
     use super::*;
     use crate::cutover::cpa_dependency_tests::{account, scratch};
     use serde_json::json;
+
+    #[test]
+    fn r162_accounts_list_detail_flag_defaults_off() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Args {
+            #[command(subcommand)]
+            command: AccountsCommand,
+        }
+        assert!(matches!(
+            Args::try_parse_from(["synthetic", "list"]).unwrap().command,
+            AccountsCommand::List { detail: false }
+        ));
+        assert!(matches!(
+            Args::try_parse_from(["synthetic", "list", "--detail"])
+                .unwrap()
+                .command,
+            AccountsCommand::List { detail: true }
+        ));
+    }
+
+    #[test]
+    fn r162_accounts_list_summary_shared_and_detail_legacy_preserved() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-23T00:00:00Z")
+            .unwrap()
+            .to_utc();
+        let mut samples = qb_core::usage_forecast::Forecasts::default();
+        samples.observe(
+            "synthetic",
+            "5h",
+            50.,
+            Some(now + chrono::Duration::hours(3)),
+            now,
+        );
+        let forecast = samples.view("synthetic", now, None);
+        let account = json!({"usage_forecast":forecast,"credits_in_use":true});
+        for english in [false, true] {
+            assert_eq!(
+                list_forecast_lines(Some(&account), true, false, english),
+                vec![qb_core::usage_forecast_display::summary(&forecast, english).text]
+            );
+        }
+        let detail = list_forecast_lines(Some(&account), true, true, false);
+        assert_eq!(detail, forecast_lines(Some(&account), true));
+        assert_eq!(
+            detail,
+            qb_core::usage_forecast_display::lines(&forecast, true)
+        );
+        assert!(detail.iter().any(|line| line.contains("25.0%/시간")));
+        assert!(detail.iter().any(|line| line.contains("크레딧")));
+        for account in [None, Some(&json!({}))] {
+            assert_eq!(
+                list_forecast_lines(account, true, false, false),
+                vec!["측정 중"]
+            );
+            assert_eq!(
+                list_forecast_lines(account, false, false, true),
+                vec!["Measuring"]
+            );
+        }
+        assert!(list_forecast_lines(None, false, true, false)[0].contains("코어가 꺼져"));
+    }
 
     #[test]
     fn r13_forecast_cli_handles_old_core_offline_and_shared_text() {

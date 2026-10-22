@@ -271,7 +271,13 @@ mod tests {
             let row = &view.sections[1].rows[0];
             assert_eq!(row.name, "사용자 {0}");
             no_hangul(&row.forecast_lines);
-            let output = row.forecast_lines.join("\n");
+            assert_eq!(row.forecast_lines.len(), 1);
+            assert_eq!(
+                row.forecast_lines,
+                [qb_core::usage_forecast_display::summary(&forecast, true).text]
+            );
+            assert!(!row.forecast_warning);
+            let output = &row.forecast_tooltip;
             assert!(output.contains("5h Recent rate: 24.0%/h"));
             assert!(output.contains("No exhaustion before reset"));
             assert!(output.contains("Recent credit rate: 24.0/h"));
@@ -293,7 +299,11 @@ mod tests {
             let view = crate::v2::project(&input, at.into()).unwrap();
             assert_eq!(
                 view.sections[1].rows[0].forecast_lines,
-                qb_core::usage_forecast_display::lines(&forecast, true)
+                [qb_core::usage_forecast_display::summary(&forecast, false).text]
+            );
+            assert_eq!(
+                view.sections[1].rows[0].forecast_tooltip,
+                qb_core::usage_forecast_display::lines(&forecast, true).join("\n")
             );
         });
     }

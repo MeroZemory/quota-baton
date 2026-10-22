@@ -61,7 +61,7 @@ pub(super) fn usage(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardStat
                 + tile
                     .forecast_lines
                     .iter()
-                    .map(|line| b.measured_height(line, (tw - 24.).max(1.), 12., false) + 4.)
+                    .map(|line| b.measured_height(line, (tw - 24.).max(1.), 12., tile.forecast_warning) + 4.)
                     .sum::<f32>()
         })
         .collect();
@@ -798,9 +798,10 @@ fn usage_tile(
     });
     let mut forecast_y = r.top + 288.;
     for (index, line) in t.forecast_lines.iter().enumerate() {
-        let h = b.measured_height(line, (width(r) - 24.).max(1.), 12., false);
+        let h = b.measured_height(line, (width(r) - 24.).max(1.), 12., t.forecast_warning);
         let bounds = rect(r.left + 12., forecast_y, (width(r) - 24.).max(1.), h);
-        b.text(bounds, line, 12., false, Color::Secondary, true);
+        b.text(bounds, line, 12., t.forecast_warning, if t.forecast_warning { Color::Warn } else { Color::Secondary }, true);
+        b.tooltip(bounds, t.forecast_tooltip.clone());
         b.semantic(
             format!("chart:{}:forecast:{index}", t.id),
             Some(chartkey.clone()),
