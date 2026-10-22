@@ -79,7 +79,7 @@ The current plan, with lanes, owners and start commands, is the "Plan" section o
 | R9.5 | 대기(N3): 이동 진행·안전한 중단·재개·읽기 쉬운 확인. ready-node S1 순서에 따라 N5a-d 뒤 |
 | R16.3 | 완료·설치 수용(41cb129, 05:26 KST, takeover 거절0/1,889): 집중464·strict lint·KO/EN 실제10HWND·합성8PNG 통과. 제공자 주간/30일 계정분·권장선·음영·소진 사실 표시. 설치는 설계 세션 |
 | R16.4 | 완료: 현재 스냅샷 잔여량은 속도·이력과 독립 집계, 소진 0은 리셋까지 유지; 집중 관문·실제 KO/EN HWND 검수. 설치는 설계 세션 |
-| R14.2 | 진행 중(N6): 기본 꺼짐 수집기(schema/off/7일 bounded retention) 최소 전달. 기존 impl/r14.2 db6baac 보존; 초기 상태·전체 replay 수용은 별도 |
+| R14.2 | 완료(N6 최소): 기본 꺼짐·schema3·bounded 7일 보존·off switch·실제 합성 HTTP/종료 집중 관문. 초기 cut/전체 owner/실제24시간 replay는 N6t/N6r 별도; 설치·켜기는 설계 세션 |
 | R15 | 대기: R13 Part F 후 공유 admin 응답형·계약 왕복·라우팅 속성 검사(D27). brief `R15-contract.md` |
 | R11.1 | merged: 공유 AGENTS/hook 편집 보존·rh 별칭, 회귀5·cutover141·strict lint·실제 preview/launch 점검 통과. 설치·apply는 설계 세션. 보고서 `.sandbox/reports/R11.1.md` |
 | R11 | merged (실제 native5/5·HTTP33·WS15·코어1213·복구54·창4, focused repair gate 통과). 0106c0e 설치·live 계정 지정 확인. 보고서 `.sandbox/reports/R11.md` |
