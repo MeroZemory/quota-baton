@@ -199,6 +199,8 @@ pub fn codex_workspace(headers: &HeaderMap) -> Option<MemoryLabel> {
 }
 
 /// A production scanner supplies filenames only. This reducer never opens a file.
+/// The callback returns a basename or the suffix after verified parent names;
+/// without that evidence, preserve the whole slug rather than splitting it.
 pub fn claude_project_label<'a>(
     sid: &str,
     entries: impl IntoIterator<Item = (&'a str, &'a str)>,
@@ -218,7 +220,7 @@ pub fn claude_project_label<'a>(
             continue;
         }
         let decoded = decoded_existing_basename(slug);
-        let text = decoded.as_deref().or_else(|| slug.rsplit('-').next())?;
+        let text = decoded.as_deref().unwrap_or(slug);
         return MemoryLabel::new(text, LabelSource::ClaudeProject);
     }
     None
