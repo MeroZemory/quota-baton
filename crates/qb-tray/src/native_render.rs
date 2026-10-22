@@ -353,10 +353,10 @@ mod tests {
                 .iter()
                 .map(|r| r.bottom - r.top + 6.)
                 .sum::<f32>(),
-            76.
+            44.
         );
-        assert_eq!(list.rect.bottom, 419. + 76.);
-        assert_eq!(state_height(&rows, false, Some("login:claude")), 337. + 76.);
+        assert_eq!(list.rect.bottom, 419. + 44.);
+        assert_eq!(state_height(&rows, false, Some("login:claude")), 337. + 44.);
         let (_, _, scene) = prepared(
             &rows,
             false,

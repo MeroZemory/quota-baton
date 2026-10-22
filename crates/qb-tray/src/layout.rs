@@ -20,6 +20,7 @@ pub mod geometry;
 pub mod i18n;
 mod i18n_client_strings;
 mod i18n_shell_strings;
+pub mod provider_usage;
 #[cfg(windows)]
 pub mod render;
 #[cfg(windows)]

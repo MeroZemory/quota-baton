@@ -611,6 +611,7 @@ pub struct DashboardView {
     pub connection: Connection,
     pub summaries: Vec<String>,
     pub provider_summaries: Vec<v2::Summary>,
+    pub provider_usage: Vec<crate::provider_usage::Projection>,
     pub todo: usize,
     pub session_count: usize,
     pub active_count: usize,
@@ -1401,6 +1402,7 @@ pub fn project(
             .map(|s| s.accessible_name.clone())
             .collect(),
         provider_summaries: snapshot.accounts.summaries.clone(),
+        provider_usage: crate::provider_usage::project_snapshot(snapshot, clock),
         todo: snapshot.accounts.summaries.iter().map(|s| s.todo).sum(),
         session_count: sessions.len(),
         active_count: sessions.iter().filter(|s| s.active).count(),

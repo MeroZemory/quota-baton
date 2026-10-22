@@ -71,13 +71,39 @@ pub(super) fn usage(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardStat
         .chunks(columns)
         .map(|row| row.iter().copied().fold(288., f32::max) + 12.)
         .collect();
-    let content = row_heights.iter().sum();
+    let provider_columns = if width(viewport) >= 852. { 2 } else { 1 };
+    let provider_width =
+        (width(viewport) - (provider_columns - 1) as f32 * 12.) / provider_columns as f32;
+    let provider_heights: Vec<_> = v
+        .provider_usage
+        .iter()
+        .map(|p| provider_geometry::height_for(b, p, provider_width))
+        .collect();
+    let provider_rows: Vec<_> = provider_heights
+        .chunks(provider_columns)
+        .map(|row| row.iter().copied().fold(0., f32::max) + 12.)
+        .collect();
+    let provider_band: f32 = provider_rows.iter().sum();
+    let content = row_heights.iter().sum::<f32>() + provider_band;
     let (old, offset) = b.begin_region(ScrollRegion::Usage, viewport, content, s.usage_offset);
+    let mut provider_y = viewport.top - offset;
+    for (i, projection) in v.provider_usage.iter().enumerate() {
+        if i > 0 && i % provider_columns == 0 {
+            provider_y += provider_rows[i / provider_columns - 1];
+        }
+        let bounds = rect(
+            viewport.left + (i % provider_columns) as f32 * (provider_width + 12.),
+            provider_y,
+            provider_width,
+            provider_heights[i],
+        );
+        provider_geometry::panel(b, v, projection, bounds);
+    }
     let available_nodes = history::SCENE_NODE_BUDGET.saturating_sub(b.scene.accessibility.len());
     // All account charts share this frame's clock. Format each sampled instant
     // once, rather than twice per row in every account's hidden UIA table.
     let mut stamps = BTreeMap::new();
-    let mut row_y = viewport.top - offset;
+    let mut row_y = viewport.top - offset + provider_band;
     for (i, tile) in v.usage.iter().enumerate() {
         if i > 0 && i % columns == 0 {
             row_y += row_heights[i / columns - 1];
@@ -103,7 +129,7 @@ pub(super) fn usage(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardStat
         b.text(
             rect(
                 viewport.left + 24.,
-                viewport.top + 24.,
+                viewport.top - offset + provider_band + 24.,
                 width(viewport) - 48.,
                 40.,
             ),
@@ -797,6 +823,7 @@ fn usage_tile(
         series: t.series.clone(),
         unconfirmed: t.unconfirmed,
         offset: *v.clock.now.offset(),
+        provider_summary: None,
     });
     let mut forecast_y = r.top + 288.;
     for (index, line) in t.forecast_lines.iter().enumerate() {

@@ -38,6 +38,7 @@ pub(super) fn line(
             continue;
         }
         enabled += 1;
+        let mut account_recovery: Option<DateTime<Utc>> = None;
         if account_cooling(a)
             && let Some(at) = a
                 .health
@@ -46,7 +47,7 @@ pub(super) fn line(
                 .and_then(timestamp)
                 .filter(|at| *at > now)
         {
-            recovery = Some(recovery.map_or(at, |previous: DateTime<Utc>| previous.min(at)));
+            account_recovery = Some(at);
         }
         // The pool count is authoritative; per-account pool membership is
         // required to attach a future exhaustion or credit label to a name.
@@ -59,6 +60,18 @@ pub(super) fn line(
         // Coverage describes the measured subscription forecast even when
         // permitted credits keep that account serving after it runs out.
         measured += usize::from(window.is_some());
+        if let Some(at) = window
+            .filter(|w| w.outcome == ForecastOutcome::Exhausted)
+            .and_then(|w| w.reset_at)
+            .filter(|at| *at > now)
+        {
+            account_recovery = Some(account_recovery.map_or(at, |previous| previous.max(at)));
+        }
+        // Every known blocker of this account must clear; different accounts
+        // can recover independently, so only then take the provider minimum.
+        if let Some(at) = account_recovery {
+            recovery = Some(recovery.map_or(at, |previous: DateTime<Utc>| previous.min(at)));
+        }
         if usable && actual_credits(a) && a.allow_credits {
             credit_count += 1;
             if credit_first.is_none_or(|first| (&row.name, &a.id) < (&first.name, &first.raw.id)) {
@@ -98,12 +111,7 @@ pub(super) fn line(
         (true, None) => format!("Usable unknown / {total} accounts"),
         (false, None) => format!("전체 {total}개 · 사용 가능 확인 전"),
     };
-    let coverage = if english {
-        format!("measured {measured}/{enabled} accounts")
-    } else {
-        format!("측정 {measured}/{enabled} 계정")
-    };
-    let mut result = format!("{} · {count} · {coverage}", provider_label(provider));
+    let mut result = format!("{} · {count}", provider_label(provider));
     if let Some(next) = next {
         // The known reset of the next account that will actually run out is
         // relevant recovery; unrelated healthy-window resets are not.
@@ -111,9 +119,17 @@ pub(super) fn line(
         let left = time_left(now, next.at, english).expect("core selected future exhaustion");
         let clock = forecast_clock(now, next.at, english);
         result.push_str(&if english {
-            format!(" · {left} · next runs out {clock} ({})", next.row.name)
+            format!(
+                " · next out: {} in {} ({clock})",
+                next.row.name,
+                left.strip_suffix(" left").unwrap_or(&left)
+            )
         } else {
-            format!(" · {left} · 다음 소진 {clock} ({})", next.row.name)
+            format!(
+                " · 다음 소진 {} {} 후 ({clock})",
+                next.row.name,
+                left.strip_suffix(" 남음").unwrap_or(&left)
+            )
         });
     } else if eligible.is_some_and(|n| n > 0 && n == safe_usable) {
         result.push_str(if english {
@@ -142,6 +158,17 @@ pub(super) fn line(
             (true, n) => format!(" · credits continue on {} +{}", row.name, n - 1),
             (false, 1) => format!(" · {} 크레딧으로 계속 사용", row.name),
             (false, n) => format!(" · {} 외 {}개 크레딧으로 계속 사용", row.name, n - 1),
+        });
+    }
+    if measured < enabled {
+        result.push_str(&if english {
+            let missing = enabled - measured;
+            format!(
+                " ({missing} account{} measuring)",
+                if missing == 1 { "" } else { "s" }
+            )
+        } else {
+            format!(" ({}개 계정 측정 중)", enabled - measured)
         });
     }
     result
@@ -257,17 +284,16 @@ mod tests {
             } else {
                 "4개 중 2개 사용 가능"
             }));
-            assert!(text.contains(if english {
-                "measured 3/3 accounts"
+            assert!(!text.contains(if english {
+                "accounts measuring"
             } else {
-                "측정 3/3 계정"
+                "개 계정 측정 중"
             }));
             assert!(text.contains(&format!(
-                "{} ({})",
-                forecast_clock(now(), now() + Duration::minutes(35), english),
-                "max"
+                "({})",
+                forecast_clock(now(), now() + Duration::minutes(35), english)
             )));
-            assert!(text.contains(if english { "35m left" } else { "35분 남음" }));
+            assert!(text.contains(if english { "in 35m" } else { "35분 후" }));
             assert!(text.contains(&forecast_clock(
                 now(),
                 now() + Duration::minutes(15),
@@ -326,13 +352,13 @@ mod tests {
                 "전체 4개 · 사용 가능 확인 전"
             }));
             assert!(text.contains(if english {
-                "measured 0/2 accounts"
+                "2 accounts measuring"
             } else {
-                "측정 0/2 계정"
+                "2개 계정 측정 중"
             }));
             assert!(text.contains(if english { "Measuring" } else { "측정 중" }));
             assert!(!text.contains(if english {
-                "next runs out"
+                "next out:"
             } else {
                 "다음 소진 "
             }));
@@ -386,15 +412,12 @@ mod tests {
                     },
                     forecast_clock(now(), recovery, english)
                 );
-                let expected_next = format!(
-                    "{} {} (next)",
-                    if english {
-                        "next runs out"
-                    } else {
-                        "다음 소진"
-                    },
-                    forecast_clock(now(), now() + Duration::minutes(10), english)
-                );
+                let clock = forecast_clock(now(), now() + Duration::minutes(10), english);
+                let expected_next = if english {
+                    format!("next out: next in 10m ({clock})")
+                } else {
+                    format!("다음 소진 next 10분 후 ({clock})")
+                };
                 let forward = project(accounts.clone(), Some(2), language, now());
                 accounts.reverse();
                 let reverse = project(accounts, Some(2), language, now());
@@ -415,25 +438,25 @@ mod tests {
             let english = language == UiLanguage::En;
             let v = project(vec![paid.clone()], Some(1), language, now());
             let text = &v.summaries[1].forecast_line;
-            assert!(text.contains(if english {
-                "measured 1/1 accounts"
+            assert!(!text.contains(if english {
+                "accounts measuring"
             } else {
-                "측정 1/1 계정"
+                "개 계정 측정 중"
             }));
             assert!(!text.contains(if english {
                 "credits continue"
             } else {
                 "크레딧으로 계속"
             }));
-            assert!(text.contains(if english { "10m left" } else { "10분 남음" }));
+            assert!(text.contains(if english { "in 10m" } else { "10분 후" }));
             let mut actual = paid.clone();
             actual["credits_in_use"] = json!(true);
             let v = project(vec![actual.clone()], Some(1), language, now());
             let text = &v.summaries[1].forecast_line;
-            assert!(text.contains(if english {
-                "measured 1/1 accounts"
+            assert!(!text.contains(if english {
+                "accounts measuring"
             } else {
-                "측정 1/1 계정"
+                "개 계정 측정 중"
             }));
             assert!(text.contains(if english {
                 "credits continue on paid"
@@ -441,18 +464,18 @@ mod tests {
                 "paid 크레딧으로 계속 사용"
             }));
             assert!(!text.contains(if english {
-                "next runs out"
+                "next out:"
             } else {
                 "다음 소진 "
             }));
-            assert!(!text.contains("10m left"));
+            assert!(!text.contains("in 10m"));
             actual.as_object_mut().unwrap().remove("usage_forecast");
             let v = project(vec![actual], Some(1), language, now());
             let text = &v.summaries[1].forecast_line;
             assert!(text.contains(if english {
-                "measured 0/1 accounts"
+                "1 account measuring"
             } else {
-                "측정 0/1 계정"
+                "1개 계정 측정 중"
             }));
             assert!(text.contains(if english {
                 "credits continue on paid"
@@ -460,7 +483,7 @@ mod tests {
                 "paid 크레딧으로 계속 사용"
             }));
             assert!(!text.contains(if english {
-                "next runs out"
+                "next out:"
             } else {
                 "다음 소진 "
             }));
@@ -478,8 +501,12 @@ mod tests {
             forward.summaries[1].forecast_line,
             reverse.summaries[1].forecast_line
         );
-        assert!(forward.summaries[1].forecast_line.contains("1h 30m left"));
-        assert!(forward.summaries[1].forecast_line.contains("(a)"));
+        assert!(forward.summaries[1].forecast_line.contains("in 1h 30m"));
+        assert!(
+            forward.summaries[1]
+                .forecast_line
+                .contains("next out: a in")
+        );
         let aged = project(
             vec![a],
             Some(1),
@@ -489,8 +516,90 @@ mod tests {
         assert!(
             aged.summaries[1]
                 .forecast_line
-                .contains("measured 0/1 accounts")
+                .contains("1 account measuring")
         );
         assert_eq!(aged.sections[1].rows[0].forecast_lines, ["Measuring"]);
+    }
+
+    #[test]
+    fn r163_exhausted_account_needs_no_rate_samples_and_counts_as_measured() {
+        let mut exhausted = window("7d", None);
+        exhausted.used_pct = 100.;
+        exhausted.outcome = ForecastOutcome::Exhausted;
+        exhausted.observed_at = now() - Duration::hours(2);
+        exhausted.reset_at = Some(now() + Duration::days(2));
+        let mut unknown = window("5h", None);
+        unknown.outcome = ForecastOutcome::Measuring;
+        let spent = account("sample-spent", vec![unknown, exhausted]);
+        for language in [UiLanguage::Ko, UiLanguage::En] {
+            let english = language == UiLanguage::En;
+            let view = project(vec![spent.clone()], Some(0), language, now());
+            let row = &view.sections[1].rows[0];
+            assert!(row.forecast_lines[0].contains(if english {
+                "Out until"
+            } else {
+                "까지 소진"
+            }));
+            let provider = &view.summaries[1].forecast_line;
+            assert!(!provider.contains(if english {
+                "account measuring"
+            } else {
+                "계정 측정 중"
+            }));
+            assert!(provider.contains(&forecast_clock(now(), now() + Duration::days(2), english)));
+        }
+    }
+
+    #[test]
+    fn r163_provider_recovery_uses_latest_blocker_per_account_then_earliest_account() {
+        let short_reset = now() + Duration::hours(1);
+        let weekly_reset = now() + Duration::days(2);
+        let mut short = window("5h", None);
+        short.used_pct = 100.;
+        short.outcome = ForecastOutcome::Exhausted;
+        short.reset_at = Some(short_reset);
+        let mut weekly = window("7d", None);
+        weekly.used_pct = 100.;
+        weekly.outcome = ForecastOutcome::Exhausted;
+        weekly.reset_at = Some(weekly_reset);
+        let mut blocked = account("sample-mixed", vec![short.clone(), weekly]);
+        blocked["health"] =
+            json!({"kind":"cooling","scope":"account","reason":"quota","until":short_reset});
+        blocked["pool_eligible"] = json!(false);
+
+        let other_reset = now() + Duration::hours(3);
+        short.reset_at = Some(other_reset);
+        let mut other = account("sample-other", vec![short]);
+        other["health"] =
+            json!({"kind":"cooling","scope":"account","reason":"quota","until":other_reset});
+        other["pool_eligible"] = json!(false);
+        let longer_health = now() + Duration::days(3);
+        let mut longer = blocked.clone();
+        longer["health"]["until"] = json!(longer_health);
+
+        for language in [UiLanguage::Ko, UiLanguage::En] {
+            let english = language == UiLanguage::En;
+            for (mut accounts, expected) in [
+                (vec![blocked.clone()], weekly_reset),
+                (vec![blocked.clone(), other.clone()], other_reset),
+                (vec![longer.clone()], longer_health),
+            ] {
+                let forward = project(accounts.clone(), Some(0), language, now());
+                accounts.reverse();
+                let reverse = project(accounts, Some(0), language, now());
+                let text = &forward.summaries[1].forecast_line;
+                assert_eq!(text, &reverse.summaries[1].forecast_line);
+                let expected = format!(
+                    "{} {}",
+                    if english {
+                        "earliest recovery"
+                    } else {
+                        "가장 빠른 회복"
+                    },
+                    forecast_clock(now(), expected, english),
+                );
+                assert!(text.ends_with(&expected), "{text}; expected {expected}");
+            }
+        }
     }
 }
