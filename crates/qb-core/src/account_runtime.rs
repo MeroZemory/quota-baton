@@ -1,6 +1,7 @@
 mod wait_owner;
 mod wait_proof;
 
+pub(crate) use wait_owner::PendingHttp429;
 pub(crate) use wait_proof::ReportOrigin;
 
 use std::{
@@ -2345,6 +2346,31 @@ impl AccountRuntime {
             .await
     }
 
+    /// Native header application remains immediate; only optional wait proof is
+    /// deferred until the caller finishes the actual bounded HTTP 429 outcome.
+    pub(crate) async fn observe_http_429_headers_pending(
+        &self,
+        id: &str,
+        provider: Provider,
+        headers: &HeaderMap,
+        model: Option<&str>,
+        evidence: (
+            &crate::bindings::BindingTable,
+            crate::bindings::UsageObservationAsOf,
+        ),
+        origin: Option<ReportOrigin>,
+    ) -> (QuotaObservation, Option<PendingHttp429>) {
+        self.observe_headers_reported_inner(
+            id,
+            provider,
+            headers,
+            model,
+            Some(evidence),
+            (origin, wait_owner::ReportPublication::DeferredHttp429),
+        )
+        .await
+    }
+
     async fn observe_headers_inner(
         &self,
         id: &str,
@@ -2357,36 +2383,73 @@ impl AccountRuntime {
         )>,
         origin: Option<ReportOrigin>,
     ) -> QuotaObservation {
+        self.observe_headers_reported_inner(
+            id,
+            provider,
+            headers,
+            model,
+            evidence,
+            (origin, wait_owner::ReportPublication::Immediate),
+        )
+        .await
+        .0
+    }
+
+    async fn observe_headers_reported_inner(
+        &self,
+        id: &str,
+        provider: Provider,
+        headers: &HeaderMap,
+        model: Option<&str>,
+        evidence: Option<(
+            &crate::bindings::BindingTable,
+            crate::bindings::UsageObservationAsOf,
+        )>,
+        publication: (Option<ReportOrigin>, wait_owner::ReportPublication),
+    ) -> (QuotaObservation, Option<PendingHttp429>) {
+        let (origin, publication) = publication;
         let Some((snapshot, reported)) = self.obs.observe_headers_reported(id, provider, headers)
         else {
             self.discard_report_origin(id, origin).await;
-            return QuotaObservation::default();
+            return (QuotaObservation::default(), None);
         };
         if let Some((bindings, asof)) = evidence {
             bindings.note_usage_observation_asof_token(id, &reported, asof);
         }
         let observed_at = snapshot["observed_at"].clone();
-        let quota_until = self
-            .apply_quota_snapshot_reported_origin(id, snapshot, &reported, model, origin)
+        let applied = self
+            .apply_quota_snapshot_reported_inner(
+                id,
+                snapshot,
+                &reported,
+                model,
+                (origin, publication),
+            )
             .await
-            .ok()
-            .and_then(|account| match account.health {
-                Health::Cooling {
-                    reason: HealthReason::Quota,
-                    until,
-                    scope,
-                } if until > Utc::now()
-                    && (scope == "account"
-                        || model.is_some_and(|m| scope == format!("model:{m}"))) =>
-                {
-                    Some(until)
-                }
-                _ => None,
-            });
-        QuotaObservation {
-            observed_at,
-            quota_until,
-        }
+            .ok();
+        let (account, pending) = match applied {
+            Some((account, pending)) => (Some(account), pending),
+            None => (None, None),
+        };
+        let quota_until = account.and_then(|account| match account.health {
+            Health::Cooling {
+                reason: HealthReason::Quota,
+                until,
+                scope,
+            } if until > Utc::now()
+                && (scope == "account" || model.is_some_and(|m| scope == format!("model:{m}"))) =>
+            {
+                Some(until)
+            }
+            _ => None,
+        });
+        (
+            QuotaObservation {
+                observed_at,
+                quota_until,
+            },
+            pending,
+        )
     }
 
     pub async fn observe_codex_event(&self, id: &str, event: &Value) {
@@ -2484,6 +2547,26 @@ impl AccountRuntime {
         model: Option<&str>,
         origin: Option<ReportOrigin>,
     ) -> Result<Account, ()> {
+        self.apply_quota_snapshot_reported_inner(
+            id,
+            snapshot,
+            reported,
+            model,
+            (origin, wait_owner::ReportPublication::Immediate),
+        )
+        .await
+        .map(|(account, _)| account)
+    }
+
+    async fn apply_quota_snapshot_reported_inner(
+        &self,
+        id: &str,
+        snapshot: Value,
+        reported: &Value,
+        model: Option<&str>,
+        publication: (Option<ReportOrigin>, wait_owner::ReportPublication),
+    ) -> Result<(Account, Option<PendingHttp429>), ()> {
+        let (origin, publication) = publication;
         let reported = reported.clone();
         let store = self.store.clone();
         let wait_owner = self.wait_owner.clone();
@@ -2492,7 +2575,7 @@ impl AccountRuntime {
         let account_id = id.to_owned();
         let model = model.map(str::to_owned);
         let released_quota = self.released_quota.clone();
-        let (account, snapshot) = tokio::task::spawn_blocking(move || -> Result<_, ()> {
+        let (account, snapshot, pending) = tokio::task::spawn_blocking(move || -> Result<_, ()> {
             let _guard = store.transaction().map_err(|_| ())?;
             // Consume the pre-send ordinal before classification, even for a
             // partial or nonqualifying raw report. Never capture on receipt.
@@ -2557,12 +2640,22 @@ impl AccountRuntime {
                 .map_err(|_| ())?;
             // Stopped updates may return Ok without running the reducer. The
             // registry also rejects an independently expired/released permit.
-            if ran
+            let pending = if ran
                 && !store.writes_stopped()
                 && let Some(application) = application
             {
-                application.finish(candidate);
-            }
+                match publication {
+                    wait_owner::ReportPublication::Immediate => {
+                        application.finish(candidate);
+                        None
+                    }
+                    wait_owner::ReportPublication::DeferredHttp429 => {
+                        application.seal_http(candidate, &account)
+                    }
+                }
+            } else {
+                None
+            };
             apply_snapshot_notices(
                 &obs,
                 &notices,
@@ -2571,14 +2664,14 @@ impl AccountRuntime {
                 &snapshot,
                 model.as_deref(),
             );
-            Ok((account, snapshot))
+            Ok((account, snapshot, pending))
         })
         .await
         .map_err(|_| ())??;
         let _ = self
             .events
             .send(json!({"event":"quota_updated","data":{"id":id,"snapshot":snapshot}}));
-        Ok(account)
+        Ok((account, pending))
     }
 
     pub fn cache_limit(&self, id: &str, status: StatusCode, headers: &HeaderMap, raw: &[u8]) {

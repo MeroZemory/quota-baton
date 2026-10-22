@@ -2296,10 +2296,10 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
                 .get("openai-model")
                 .and_then(|v| v.to_str().ok()),
         );
-        let credit_observation = if status.is_success() || status == StatusCode::TOO_MANY_REQUESTS {
+        let (credit_observation, pending_http_429) = if status == StatusCode::TOO_MANY_REQUESTS {
             state
                 .accounts
-                .observe_headers_asof_origin(
+                .observe_http_429_headers_pending(
                     &account.id,
                     provider,
                     &response_headers,
@@ -2308,8 +2308,23 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
                     wait_origin,
                 )
                 .await
+        } else if status.is_success() {
+            (
+                state
+                    .accounts
+                    .observe_headers_asof_origin(
+                        &account.id,
+                        provider,
+                        &response_headers,
+                        request_model.as_deref(),
+                        (&state.bindings, observation_asof),
+                        wait_origin,
+                    )
+                    .await,
+                None,
+            )
         } else {
-            Default::default()
+            (Default::default(), None)
         };
         #[cfg(all(feature = "shape-capture", debug_assertions))]
         state
@@ -2385,10 +2400,42 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
             request_model.as_deref(),
         );
         decision.reconcile_quota(&credit_observation);
-        if decision.kind == outcome::Kind::Quota {
-            state.accounts.invalidate_quota_rejection(&account.id).await;
-        }
         completion.record.upstream_error_code = hold::error_code(&response_headers, &held.prefix);
+        if decision.kind == outcome::Kind::Quota {
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                // The bounded side copy only supplies optional wait authority.
+                // Native classification and downstream bytes remain unchanged.
+                let body_qualified = held.complete
+                    && held.terminal.is_none()
+                    && hold::decoded_side(&response_headers, &held.prefix).is_some_and(|decoded| {
+                        decoded.is_empty()
+                            || serde_json::from_slice::<serde_json::Value>(&decoded)
+                                .is_ok_and(|value| value.is_object())
+                    });
+                if state
+                    .accounts
+                    .finish_http_429_report(
+                        &account.id,
+                        pending_http_429,
+                        decision.quota_reset,
+                        decision.signal.take(),
+                        body_qualified,
+                    )
+                    .await
+                    .is_err()
+                {
+                    return failure(
+                        &mut completion,
+                        StatusCode::BAD_GATEWAY,
+                        provider,
+                        "store_error",
+                        "Could not persist account health",
+                    );
+                }
+            } else {
+                state.accounts.invalidate_quota_rejection(&account.id).await;
+            }
+        }
         if let Some(model) = decision.model.take().filter(|_| managed_http.is_none()) {
             request_model = Some(model);
         }

@@ -54,7 +54,6 @@ pub(crate) struct ReportOrigin {
     id: String,
     epoch: u64,
     ordinal: u64,
-    #[cfg(test)]
     source: ReportSource,
 }
 
@@ -65,7 +64,23 @@ pub(crate) struct AcceptPermit {
     origin: ReportOrigin,
     epoch: u64,
     acceptance: Identity,
-    rotated: bool,
+    phase: Phase,
+}
+
+/// Finite owner protocol, not evidence of successful native persistence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Phase {
+    Fresh,
+    Applied,
+    HttpFinalPending,
+    HttpFinalApplied,
+}
+
+/// Unpublished header continuation. Only an own-rotated HTTP acceptance can
+/// create it. Dropping cancels final publication; no Clone or public fields.
+#[derive(Debug)]
+pub(crate) struct SealedHttpReport {
+    permit: AcceptPermit,
 }
 
 /// Fences a proof, not exactly-once dispatch or an unrevocable native permission.
@@ -141,7 +156,7 @@ impl<E> WaitProofs<E> {
     pub(crate) fn capture(
         &self,
         id: &str,
-        _source: ReportSource,
+        source: ReportSource,
     ) -> Result<ReportOrigin, FenceError> {
         if id.is_empty() || id.len() > MAX_ID_BYTES {
             return Err(FenceError::InvalidId);
@@ -177,8 +192,7 @@ impl<E> WaitProofs<E> {
                     id: id.to_owned(),
                     epoch,
                     ordinal,
-                    #[cfg(test)]
-                    source: _source,
+                    source,
                 })
             } else {
                 entry.epoch = None;
@@ -246,7 +260,7 @@ impl<E> WaitProofs<E> {
                 epoch: origin.epoch,
                 origin,
                 acceptance,
-                rotated: false,
+                phase: Phase::Fresh,
             }
         };
         drop(retired);
@@ -256,7 +270,8 @@ impl<E> WaitProofs<E> {
     /// Rotate only THIS accepted report across its own required invalidation.
     /// Call before native mutation. Other captured origins retain the old epoch.
     /// External release/rejection uses invalidate(), which revokes this permit.
-    /// One rotation maximum; this is not permission to bypass later invalidations.
+    /// Generic reports rotate once. A sealed HTTP continuation gets exactly one
+    /// final rotation; this never bypasses independent invalidations.
     pub(crate) fn invalidate_accepted(
         &self,
         mut permit: AcceptPermit,
@@ -269,14 +284,16 @@ impl<E> WaitProofs<E> {
                 .get_mut(&permit.origin.id)
                 .ok_or(FenceError::Missing)?;
             self.check_permit(&permit, entry)?;
-            if permit.rotated {
-                return Err(FenceError::Rejected);
-            }
+            let next_phase = match permit.phase {
+                Phase::Fresh => Phase::Applied,
+                Phase::HttpFinalPending => Phase::HttpFinalApplied,
+                Phase::Applied | Phase::HttpFinalApplied => return Err(FenceError::Rejected),
+            };
             retired = entry.proof.take();
             entry.epoch = permit.epoch.checked_add(1);
             if let Some(epoch) = entry.epoch {
                 permit.epoch = epoch;
-                permit.rotated = true;
+                permit.phase = next_phase;
                 Ok(permit)
             } else {
                 entry.active = None;
@@ -285,6 +302,42 @@ impl<E> WaitProofs<E> {
         };
         drop(retired);
         result
+    }
+
+    /// Call only after the header's native persistence/closure succeeded. The
+    /// registry checks provenance and phase, not persistence or raw classification.
+    pub(crate) fn seal_http(&self, permit: AcceptPermit) -> Result<SealedHttpReport, FenceError> {
+        let state = self.open()?;
+        let entry = state
+            .entries
+            .get(&permit.origin.id)
+            .ok_or(FenceError::Missing)?;
+        self.check_permit(&permit, entry)?;
+        if permit.phase != Phase::Applied || permit.origin.source != ReportSource::HttpAttempt {
+            return Err(FenceError::Rejected);
+        }
+        Ok(SealedHttpReport { permit })
+    }
+
+    /// Consume the header continuation once under the final outer transaction.
+    /// Caller MUST call invalidate_accepted even if there is no body signal;
+    /// HttpFinalPending cannot mint. No receive-time origin is captured here.
+    pub(crate) fn continue_http(
+        &self,
+        sealed: SealedHttpReport,
+    ) -> Result<AcceptPermit, FenceError> {
+        let mut permit = sealed.permit;
+        let state = self.open()?;
+        let entry = state
+            .entries
+            .get(&permit.origin.id)
+            .ok_or(FenceError::Missing)?;
+        self.check_permit(&permit, entry)?;
+        if permit.phase != Phase::Applied || permit.origin.source != ReportSource::HttpAttempt {
+            return Err(FenceError::Rejected);
+        }
+        permit.phase = Phase::HttpFinalPending;
+        Ok(permit)
     }
 
     /// Publish compact classified evidence only AFTER successful native persistence,
@@ -304,6 +357,9 @@ impl<E> WaitProofs<E> {
                 .get_mut(&permit.origin.id)
                 .ok_or(FenceError::Missing)?;
             self.check_permit(&permit, entry)?;
+            if permit.phase == Phase::HttpFinalPending {
+                return Err(FenceError::Rejected);
+            }
             entry.active = None;
             retired = entry.proof.replace(proof);
         }
@@ -1029,5 +1085,227 @@ mod tests {
             );
             assert_eq!(drops.load(Ordering::SeqCst), 1);
         }
+    }
+    fn applied_http<E>(fence: &WaitProofs<E>) -> AcceptPermit {
+        let origin = fence.capture("a", ReportSource::HttpAttempt).unwrap();
+        let permit = fence.accept("a", origin).unwrap();
+        fence.invalidate_accepted(permit).unwrap()
+    }
+
+    #[test]
+    fn n5a_http_phase_legal_continuation_cuts_interposed_origins() {
+        let fence = WaitProofs::new(1);
+        let previous = proven(&fence);
+        let header = applied_http(&fence);
+        let ordinal = header.origin.ordinal;
+        let captured_epoch = header.origin.epoch;
+        let header_epoch = header.epoch;
+        let duplicate = header.origin.clone();
+        let sealed = fence.seal_http(header).unwrap();
+        assert_eq!(fence.acquire("a").unwrap_err(), FenceError::NoProof);
+        let interposed = fence.capture("a", ReportSource::UsagePoll).unwrap();
+        let body = fence.continue_http(sealed).unwrap();
+        assert_eq!(body.phase, Phase::HttpFinalPending);
+        let final_permit = fence.invalidate_accepted(body).unwrap();
+        assert_eq!(final_permit.phase, Phase::HttpFinalApplied);
+        assert_eq!(final_permit.origin.ordinal, ordinal);
+        assert_eq!(final_permit.origin.epoch, captured_epoch);
+        assert_eq!(final_permit.epoch, header_epoch + 1);
+        fence.mint(final_permit, (100, "account")).unwrap();
+        let current = fence.acquire("a").unwrap().0;
+        for origin in [duplicate, interposed] {
+            assert_eq!(fence.accept("a", origin).unwrap_err(), FenceError::Stale);
+        }
+        assert_eq!(fence.admit(&previous).unwrap_err(), FenceError::Stale);
+        assert_eq!(*fence.admit(&current).unwrap(), (100, "account"));
+        let fresh = fence.capture("a", ReportSource::HttpAttempt).unwrap();
+        assert!(fence.accept("a", fresh).is_ok());
+    }
+
+    #[test]
+    fn n5a_http_phase_only_applied_http_can_seal() {
+        for (source, rotate) in [
+            (ReportSource::HttpAttempt, false),
+            (ReportSource::UsagePoll, false),
+            (ReportSource::UsagePoll, true),
+        ] {
+            let fence = WaitProofs::<Evidence>::new(1);
+            let origin = fence.capture("a", source).unwrap();
+            let permit = fence.accept("a", origin).unwrap();
+            let permit = if rotate {
+                fence.invalidate_accepted(permit).unwrap()
+            } else {
+                permit
+            };
+            assert_eq!(fence.seal_http(permit).unwrap_err(), FenceError::Rejected);
+            assert_eq!(fence.acquire("a").unwrap_err(), FenceError::NoProof);
+        }
+    }
+
+    #[test]
+    fn n5a_http_phase_pending_cannot_mint_and_body_permits_cannot_reseal() {
+        for step in [
+            "pending-mint",
+            "pending-reseal",
+            "applied-reseal",
+            "third-rotation",
+        ] {
+            let fence = WaitProofs::<Evidence>::new(1);
+            let header = applied_http(&fence);
+            let sealed = fence.seal_http(header).unwrap();
+            let body = fence.continue_http(sealed).unwrap();
+            match step {
+                "pending-mint" => assert_eq!(
+                    fence.mint(body, (100, "account")),
+                    Err(FenceError::Rejected)
+                ),
+                "pending-reseal" => {
+                    assert_eq!(fence.seal_http(body).unwrap_err(), FenceError::Rejected)
+                }
+                "applied-reseal" => {
+                    let final_permit = fence.invalidate_accepted(body).unwrap();
+                    assert_eq!(
+                        fence.seal_http(final_permit).unwrap_err(),
+                        FenceError::Rejected
+                    );
+                }
+                "third-rotation" => {
+                    let final_permit = fence.invalidate_accepted(body).unwrap();
+                    assert_eq!(
+                        fence.invalidate_accepted(final_permit).unwrap_err(),
+                        FenceError::Rejected
+                    );
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(fence.acquire("a").unwrap_err(), FenceError::NoProof);
+        }
+    }
+
+    #[test]
+    fn n5a_http_phase_sealed_continuation_revoked_by_owner_changes() {
+        for event in ["invalidate", "partial", "close", "retire"] {
+            let fence = WaitProofs::<Evidence>::new(1);
+            let header = applied_http(&fence);
+            let sealed = fence.seal_http(header).unwrap();
+            let expected = match event {
+                "invalidate" => {
+                    fence.invalidate("a").unwrap();
+                    FenceError::Stale
+                }
+                "partial" => {
+                    let newer = fence.capture("a", ReportSource::UsagePoll).unwrap();
+                    drop(fence.accept("a", newer).unwrap());
+                    FenceError::Stale
+                }
+                "close" => {
+                    fence.close().unwrap();
+                    FenceError::Closed
+                }
+                "retire" => {
+                    fence.retire("a").unwrap();
+                    fence.capture("a", ReportSource::HttpAttempt).unwrap();
+                    FenceError::Stale
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(fence.continue_http(sealed).unwrap_err(), expected);
+        }
+    }
+
+    #[test]
+    fn n5a_http_phase_resumed_permit_revoked_before_final_rotation_or_mint() {
+        for after_rotation in [false, true] {
+            let fence = WaitProofs::<Evidence>::new(1);
+            let header = applied_http(&fence);
+            let sealed = fence.seal_http(header).unwrap();
+            let body = fence.continue_http(sealed).unwrap();
+            let permit = if after_rotation {
+                fence.invalidate_accepted(body).unwrap()
+            } else {
+                body
+            };
+            fence.invalidate("a").unwrap();
+            if after_rotation {
+                assert_eq!(fence.mint(permit, (100, "account")), Err(FenceError::Stale));
+            } else {
+                assert_eq!(
+                    fence.invalidate_accepted(permit).unwrap_err(),
+                    FenceError::Stale
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn n5a_http_phase_final_epoch_exhaustion_never_wraps_or_mints() {
+        let fence = WaitProofs::<Evidence>::new(1);
+        fence.capture("a", ReportSource::HttpAttempt).unwrap();
+        fence
+            .state
+            .lock()
+            .unwrap()
+            .entries
+            .get_mut("a")
+            .unwrap()
+            .epoch = Some(u64::MAX - 1);
+        let header = applied_http(&fence);
+        assert_eq!(header.epoch, u64::MAX);
+        let sealed = fence.seal_http(header).unwrap();
+        let interposed = fence.capture("a", ReportSource::UsagePoll).unwrap();
+        let body = fence.continue_http(sealed).unwrap();
+        assert_eq!(
+            fence.invalidate_accepted(body).unwrap_err(),
+            FenceError::Exhausted
+        );
+        assert_eq!(fence.acquire("a").unwrap_err(), FenceError::Exhausted);
+        assert_eq!(
+            fence.accept("a", interposed).unwrap_err(),
+            FenceError::Stale
+        );
+        assert_eq!(
+            fence.capture("a", ReportSource::HttpAttempt).unwrap_err(),
+            FenceError::Exhausted
+        );
+    }
+
+    #[test]
+    fn n5a_http_phase_foreign_continuation_cannot_touch_resident_proof() {
+        let source = WaitProofs::<Evidence>::new(1);
+        let header = applied_http(&source);
+        let sealed = source.seal_http(header).unwrap();
+        let target = WaitProofs::new(1);
+        let resident = proven(&target);
+        assert_eq!(target.continue_http(sealed).unwrap_err(), FenceError::Stale);
+        assert_eq!(*target.admit(&resident).unwrap(), (100, "account"));
+    }
+
+    #[test]
+    fn n5a_http_phase_drop_cancels_and_rejected_pending_mint_drops_unlocked() {
+        let fence = Arc::new(WaitProofs::<DropProbe>::new(1));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let header = applied_http(&fence);
+        let duplicate = header.origin.clone();
+        drop(fence.seal_http(header).unwrap());
+        assert_eq!(fence.accept("a", duplicate).unwrap_err(), FenceError::Stale);
+        assert!(matches!(fence.acquire("a"), Err(FenceError::NoProof)));
+        let header = applied_http(&fence);
+        let sealed = fence.seal_http(header).unwrap();
+        let body = fence.continue_http(sealed).unwrap();
+        assert_eq!(
+            fence.mint(
+                body,
+                DropProbe {
+                    owner: Arc::downgrade(&fence),
+                    drops: Arc::clone(&drops),
+                }
+            ),
+            Err(FenceError::Rejected)
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        let header = applied_http(&fence);
+        let sealed = fence.seal_http(header).unwrap();
+        drop(fence.continue_http(sealed).unwrap());
+        assert!(matches!(fence.acquire("a"), Err(FenceError::NoProof)));
     }
 }
