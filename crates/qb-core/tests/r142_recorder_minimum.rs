@@ -97,7 +97,7 @@ async fn n6_replay_actual_http_off_on_nonfatal_storage_and_drained_archive() {
         )
         .await
         .unwrap();
-        let response = reqwest::Client::builder().timeout(DEADLINE).build().unwrap()
+        let response = reqwest::Client::builder().no_proxy().timeout(DEADLINE).build().unwrap()
             .post(format!("http://{}/v1/messages", servers.data_addr))
             .bearer_auth("sample-client-secret")
             .header("anthropic-version", "2023-06-01")
@@ -177,12 +177,26 @@ async fn n6_replay_actual_http_off_on_nonfatal_storage_and_drained_archive() {
                 assert_eq!(manifest["retention_ns"], 7_u64 * 24 * 3600 * 1_000_000_000);
                 assert_eq!(manifest["queued_records"], 0);
                 assert!(manifest["persisted_through"].as_u64().unwrap() >= 3);
+                if let Some(output) = std::env::var_os("QB_RECORDER_SAMPLE_OUT") {
+                    let output = Path::new(&output);
+                    fs::create_dir_all(output).unwrap();
+                    fs::write(
+                        output.join("synthetic-events.json"),
+                        serde_json::to_vec_pretty(&events).unwrap(),
+                    )
+                    .unwrap();
+                    fs::write(
+                        output.join("synthetic-manifest.json"),
+                        serde_json::to_vec_pretty(manifest).unwrap(),
+                    )
+                    .unwrap();
+                }
             }
         }
         drop(servers);
         drop(state);
         drop(store);
-        tokio::task::spawn_blocking(move || drop(obs))
+        tokio::task::spawn_blocking(move || std::thread::spawn(move || drop(obs)).join().unwrap())
             .await
             .unwrap();
         root.close().unwrap();
