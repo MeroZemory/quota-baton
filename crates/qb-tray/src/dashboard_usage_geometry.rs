@@ -57,11 +57,12 @@ pub(super) fn usage(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardStat
         .usage
         .iter()
         .map(|tile| {
-            288. + tile
-                .forecast_lines
-                .iter()
-                .map(|line| b.measured_height(line, (tw - 24.).max(1.), 12., false) + 4.)
-                .sum::<f32>()
+            288. + english_window_extra(tile)
+                + tile
+                    .forecast_lines
+                    .iter()
+                    .map(|line| b.measured_height(line, (tw - 24.).max(1.), 12., false) + 4.)
+                    .sum::<f32>()
         })
         .collect();
     let row_heights: Vec<_> = tile_heights
@@ -113,6 +114,14 @@ pub(super) fn usage(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardStat
     }
     b.end_region(old);
 }
+fn english_window_extra(tile: &m::UsageTile) -> f32 {
+    if crate::i18n::language() == crate::i18n::UiLanguage::En && !tile.unconfirmed {
+        tile.windows.len().saturating_sub(1) as f32 * 18.
+    } else {
+        0.
+    }
+}
+
 fn usage_tile(
     b: &mut Builder<'_>,
     v: &m::DashboardView,
@@ -126,12 +135,21 @@ fn usage_tile(
         b.scene.draw.push(Draw::Clip(clip));
     }
     b.fill(r, Color::Surface, 6.);
-    b.fill(rect(r.left, r.top, width(r), 60.), Color::Footer, 6.);
-    b.fill(rect(r.left, r.top + 30., width(r), 30.), Color::Footer, 0.);
+    let header_height = 60. + english_window_extra(t);
+    b.fill(
+        rect(r.left, r.top, width(r), header_height),
+        Color::Footer,
+        6.,
+    );
+    b.fill(
+        rect(r.left, r.top + 30., width(r), header_height - 30.),
+        Color::Footer,
+        0.,
+    );
     b.stroke(r, Color::GroupBorder, 1., 6.);
     b.line(
-        [r.left, r.top + 60.],
-        [r.right, r.top + 60.],
+        [r.left, r.top + header_height],
+        [r.right, r.top + header_height],
         Color::Border,
         1.,
         None,
@@ -208,6 +226,18 @@ fn usage_tile(
             Color::Secondary,
             false,
         );
+    } else if crate::i18n::language() == crate::i18n::UiLanguage::En {
+        for (i, window) in t.windows.iter().enumerate() {
+            let text = format!("{} · {} · {}", window.label, window.remaining, window.reset);
+            let bounds = rect(
+                r.left + 12.,
+                r.top + 36. + i as f32 * 18.,
+                width(r) - 24.,
+                16.,
+            );
+            b.text(bounds, &text, 11., false, Color::Secondary, false);
+            b.tooltip(bounds, text);
+        }
     } else {
         let mut left = r.left + 12.;
         for window in &t.windows {
@@ -245,6 +275,11 @@ fn usage_tile(
             left += reset_width + 16.;
         }
     }
+    // English windows each own a line; move all chart annotations with them.
+    let r = Rect {
+        top: r.top + english_window_extra(t),
+        ..r
+    };
     let future_resets: BTreeSet<_> = t
         .series
         .iter()

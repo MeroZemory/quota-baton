@@ -106,6 +106,134 @@ fn flyout_presentation(
     Ok(presentation)
 }
 
+/// A production scene plus unellipsized DirectWrite metrics for its single-line text.
+/// All coordinates and advances are logical DIPs, including at output scale 2.
+/// Wrapped paragraphs are deliberately excluded: their renderer token splitting
+/// is a separate contract. This helper does not alter the scene or paint path.
+#[derive(Debug)]
+pub struct MeasuredDashboard {
+    pub scene: crate::geometry::Scene,
+    pub text: Vec<MeasuredText>,
+}
+
+#[derive(Debug)]
+pub struct MeasuredText {
+    pub draw_index: usize,
+    pub rect: crate::Rect,
+    /// Intersection of the client rectangle and active production draw clips.
+    pub clip: crate::Rect,
+    pub natural_width: f32,
+    pub required_height: f32,
+    pub trimmed: bool,
+}
+
+/// Build through the same project -> Renderer::scene path used by `save`.
+/// Metrics use the production text engine/fonts/style, not character estimates
+/// or the already-trimmed displayed width. No file or live client is opened.
+pub fn measure_dashboard(
+    data: &model::DashboardSnapshot,
+    options: &Options,
+) -> anyhow::Result<MeasuredDashboard> {
+    use crate::{
+        geometry::{Draw, Face, TextAlign},
+        v2_text,
+    };
+    use windows::Win32::Graphics::{
+        Direct2D::Common::D2D_RECT_F,
+        DirectWrite::{DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD},
+    };
+    anyhow::ensure!(
+        matches!(options.view, View::Overview | View::Usage | View::Events),
+        "dashboard view required"
+    );
+    anyhow::ensure!([1, 2].contains(&options.scale), "scale must be 1 or 2");
+    anyhow::ensure!(
+        options.size.iter().all(|n| (240..=4096).contains(n)),
+        "snapshot dimensions must be between 240 and 4096"
+    );
+    let _apartment = Apartment(unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok());
+    let mut state = dashboard_state(options.view);
+    let start = options
+        .now
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight")
+        .and_local_timezone(*options.now.offset())
+        .single()
+        .expect("fixed offset");
+    let clock = model::Clock {
+        now: options.now,
+        day_start: start.to_utc(),
+        day_end: (start + chrono::Duration::days(1)).to_utc(),
+    };
+    let view = model::project(data, &mut state, &clock);
+    let renderer = render::Renderer::new(options.dark)?;
+    let scene = renderer.scene(&view, &state, options.size.map(|n| n as f32))?;
+    let text_engine = v2_text::Text::new()?;
+    let mut clips = vec![scene.rect];
+    let mut text = Vec::new();
+    for (draw_index, draw) in scene.draw.iter().enumerate() {
+        match draw {
+            Draw::Clip(r) => {
+                let prior = *clips.last().expect("client clip");
+                clips.push(crate::Rect {
+                    left: prior.left.max(r.left),
+                    top: prior.top.max(r.top),
+                    right: prior.right.min(r.right),
+                    bottom: prior.bottom.min(r.bottom),
+                });
+            }
+            Draw::Unclip => {
+                anyhow::ensure!(clips.len() > 1, "unbalanced scene clip");
+                clips.pop();
+            }
+            Draw::Text {
+                rect, measure: m, ..
+            } if !m.wrap => {
+                let metrics = text_engine.measure(
+                    &m.text,
+                    D2D_RECT_F {
+                        left: rect.left,
+                        top: rect.top,
+                        right: rect.right.max(rect.left + 1.),
+                        bottom: rect.bottom.max(rect.top),
+                    },
+                    v2_text::Style {
+                        face: match m.face {
+                            Face::Text => v2_text::Face::Text,
+                            Face::Mono => v2_text::Face::Mono,
+                            Face::Icon => v2_text::Face::Icon,
+                        },
+                        size: m.size,
+                        line_height: m.line_height,
+                        weight: if m.bold {
+                            DWRITE_FONT_WEIGHT_SEMI_BOLD
+                        } else {
+                            DWRITE_FONT_WEIGHT_NORMAL
+                        },
+                        align: match m.align {
+                            TextAlign::Leading => v2_text::Align::Leading,
+                            TextAlign::Center => v2_text::Align::Center,
+                        },
+                        wrap: v2_text::Wrap::SingleLine,
+                    },
+                )?;
+                text.push(MeasuredText {
+                    draw_index,
+                    rect: *rect,
+                    clip: *clips.last().expect("client clip"),
+                    natural_width: metrics.natural_width,
+                    required_height: metrics.required_height,
+                    trimmed: metrics.trimmed,
+                });
+            }
+            _ => {}
+        }
+    }
+    anyhow::ensure!(clips.len() == 1, "unbalanced scene clip");
+    Ok(MeasuredDashboard { scene, text })
+}
+
 pub fn save(data: &model::DashboardSnapshot, options: &Options, path: &Path) -> anyhow::Result<()> {
     anyhow::ensure!([1, 2].contains(&options.scale), "scale must be 1 or 2");
     anyhow::ensure!(

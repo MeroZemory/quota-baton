@@ -1077,10 +1077,15 @@ fn app_header(b: &mut Builder<'_>, v: &m::DashboardView, state: &DashboardState,
         (Tab::Events, crate::i18n::static_text("기록")),
         (Tab::Usage, crate::i18n::static_text("사용량")),
     ] {
-        let tw = if tab == Tab::Events && v.todo > 0 {
+        let base_width: f32 = if tab == Tab::Events && v.todo > 0 {
             100.
         } else {
             72.
+        };
+        let tw = if crate::i18n::language() == crate::i18n::UiLanguage::En {
+            base_width.max(b.measured_width(label, 13., state.tab == tab) + 24.)
+        } else {
+            base_width
         };
         let r = rect(x, 8., tw, 40.);
         b.target(
@@ -1092,7 +1097,16 @@ fn app_header(b: &mut Builder<'_>, v: &m::DashboardView, state: &DashboardState,
             None,
         );
         b.text(
-            rect(x + 12., 19., 48., 20.),
+            rect(
+                x + 12.,
+                19.,
+                if crate::i18n::language() == crate::i18n::UiLanguage::En {
+                    tw - 24.
+                } else {
+                    48.
+                },
+                20.,
+            ),
             label,
             13.,
             state.tab == tab,
@@ -1507,15 +1521,25 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
         None,
     );
     let y = card.top + 12.;
+    let title_width = if crate::i18n::language() == crate::i18n::UiLanguage::En {
+        b.measured_width(crate::i18n::static_text("세션"), 14., true) + 4.
+    } else {
+        42.
+    };
     b.text(
-        rect(card.left + 16., y + 5., 42., 20.),
+        rect(card.left + 16., y + 5., title_width, 20.),
         crate::i18n::static_text("세션"),
         14.,
         true,
         Color::Text,
         false,
     );
-    let start = card.left + 64.;
+    let start = card.left
+        + if crate::i18n::language() == crate::i18n::UiLanguage::En {
+            16. + title_width + 12.
+        } else {
+            64.
+        };
     let segment = rect(start, y, 192., 28.);
     b.begin_control_paint();
     b.stroke(segment, Color::Border, 1., 4.);
@@ -2177,7 +2201,11 @@ pub fn columns(available: f32, flat: bool) -> Vec<(SortKey, &'static str, f32)> 
         (
             SortKey::Requests,
             crate::i18n::static_text("오늘 요청"),
-            64.,
+            if crate::i18n::language() == crate::i18n::UiLanguage::En {
+                84.
+            } else {
+                64.
+            },
         ),
     ]);
     let used = cols.iter().map(|c| c.2).sum::<f32>();
