@@ -68,23 +68,44 @@ enriched fixture is not a reconstruction of missing historical inputs. Run the
 same adapter twice to verify determinism, and compare identical router revisions
 as an identity control before accepting a candidate comparison.
 
-## Plan (re-planned 2026-10-21 19:xx KST, after the root audit)
+## Plan (re-planned 2026-10-23 after the root false-dependency audit)
 
-**Priority.** One usable new-image path first, then account and model selection chosen at launch. Dashboard and tray refinement is **frozen** until both ship; new UI findings go to a backlog row and do not get worked.
+**Ordering rule.** A node is ready when the inputs listed for it exist. Only two shared resources are serialized:
+- **S1, the implementation worktree:** one branch checked out and one cargo process at a time. The Codex main owns it.
+- **S2, the live install:** one swap at a time. The design session owns it.
 
-| Lane | Item | Owner | Start command / trigger | Done when |
+Nothing else orders work. Among ready nodes, the Codex main picks by importance:
+1. user-blocking bugs;
+2. money and safety, and nodes that start a long wait;
+3. user requests;
+4. small fixes;
+5. structure.
+
+Long waits and work that needs no build run as background lanes (W) with one completion signal. Minor items are not parallelized; usage limits apply. User-set safety and authorization rules are unchanged, and R2 Part B stays held.
+
+| Node | Lane | Inputs (real data only) | Start | Pass signal |
 |---|---|---|---|---|
-| A1 | R12, new-Qi image sessions (`codex-qb --images`, new sessions only) | Codex main `<pane>` | brief `.sandbox/briefs/R12-images.md` plus the D23 amendment; continue `impl/r12` from d58e630 | gate check passes, `launch-client --check` passes, self-merged |
-| A2 | R11, launch-scoped account and per-account catalog (D22), plus per-account aliases. Integration preparation runs **now**, independent of the frozen R12 source, in `.sandbox/r11-prep/`: no shared target, no builds that touch the impl worktree. The integration lands right after A1 | prep: a background `codex-qb exec` worker started by the main (one completion signal). Integration: Codex main `<pane>` | brief `.sandbox/briefs/R11-launch-account.md` | gate passes, alternation release gate passes, self-merged |
-| A2.5 | R12.10: dashboard lag (urgent, user). Frame rebuilt on every paint and every 500 ms tick, ~300 ms per frame, 60 % CPU idle | Codex main `<pane>` | brief `.sandbox/briefs/R12.10-dashboard-perf.md`; starts when the current R11 unit closes, before R13 | idle CPU < 2 %, interaction p95 < 16 ms, focused gate, self-merged; design session installs |
-| A3 | R13: burn rate and projected exhaustion, dashboard icon (D24), cache-lifetime hold (D25), urgent sessions (D26), provider-wide forecast (D28, Part F after C+E) | Codex main `<pane>` | brief `.sandbox/briefs/R13-burn-icon-hold.md`; starts when R11 merges | gate passes, `launch-client --check` passes, self-merged; design session installs |
-| A3.5 | R14: token-burn guard (D29): single proof-carrying rebind, run-time move breaker, re-read cost accounting, differential replay gate | Codex main `<pane>` | brief `.sandbox/briefs/R14-token-guard.md`; right after R13 C+E, before R13 Part F | gate passes, self-merged; design session installs |
-| A4 | R15: compiled admin contract in qb-proto, contract round-trip tests, static guard, routing property tests (D27) | Codex main `<pane>` | brief `.sandbox/briefs/R15-contract.md`; after R13 Part F | gate passes, self-merged; design session installs |
-| B | Probe: does a native `-c model_provider=qb resume` keep provider `qb`? | Codex main runs it as a **background** job during A1/A2 | the synthetic temp-home script from the D23 amendment, started in the background; one completion signal (exit code + result json) | result json written; the design session rules on resume into Qi |
-| C | Install, live image generation (TUI and `codex-qb --images exec`), then **broadcast the exact command to every image-generating session**: sample-proj-a `<pane>`, sample-prj-opus `<pane>`, and any other session found running image work | design session `<pane>` | when A1 merges: build a release in a temp worktree, pre-check, install, and run one `codex-qb --images` generation | the image is produced through qb and sample-proj-a is told |
-| D | Full gates and independent reviews | whoever starts them | always in the background with one completion signal, checked once at unit close | — |
-| Held | R2 Part B (retire-cpa) | user decision (D9) | — | — |
-| Backlog | further dashboard and tray polish; launcher move of a session whose ancestor chain lives only in the source home (refused today as "조상 전용 대화"; done by hand with `.sandbox/codex-migrate/move_one.py` for inside main on 10-22). Needs a design ruling on blocking the ancestor's resume paths (D21 panel 2) | — | not before A1 and A2 ship | — |
+| N1 R16.2 one-line forecasts and provider summary | S1 | none (in progress) | `impl/r16.2`, brief R16-readme-assets.md D24 amendments 4-5 | focused gate and real-path capture (D27) |
+| N2 R16.3 provider charts and pace line | S1 | none | `impl/r16.3` from dev, brief section R16.3 | focused gate, real-path capture, regressions for differing resets and a paused account |
+| N6 R14.2 recorder, minimum delivery | S1 | none | `impl/r14.2` (keep db6baac), brief R14 plus D29 amendment 4 | schema, off switch, default off, 7-day bound, tests; then S2 install and enable; the 24 h capture starts at install |
+| N6t R14 typed rebind and static write check | S1 | none | `impl/r14-rebind` | compile-time choke point, static check failing on a planted write, existing tests |
+| N6r R14 differential replay gate | S1 | N6 installed plus 24 h captured export | `impl/r14-replay` | candidate vs installed replay report on the real export, margin 0 |
+| N5m R13 C measurement: Codex cache survival by idle gap; client hold tolerance against a fake upstream | W | none | background `codex-qb exec` worker in `.sandbox/r13-measure/`; no cargo in S1 | measurement table in the R13 report |
+| N5a R13 E HTTP wait and reset-resume for non-urgent sessions at 5h limits | S1 | none (bound is a setting; N5m only tunes its default) | `impl/r13-wait` | hold then serve on the same account after reset; bound exceeded falls back; cancellation releases |
+| N5b R13 E WS/SSE cancellation and keepalive during a hold | S1 | none | `impl/r13-ws-hold` | cancelled held WS/SSE releases its slot and binding; no orphaned upstream |
+| N5c R13 E urgent policy (`on_5h_limit`, `--urgent`, CLI and dashboard toggle; 7d always moves) | S1 | none | `impl/r13-urgent` | policy tests, CLI tests, real-path capture |
+| N5d R13 E native-client resume after reset (Codex `/goal resume` only for a live goal; Claude continue) | S1 | none | `impl/r13-native-resume` | synthetic native test, exactly-once resume |
+| N5i R13 C+E integration and defaults | S1 | N5a-d merged, N5m table | `impl/r13-ce` | full gate; then S2 install |
+| N3 R9.5 move progress, interruption safety, readable preview | S1 | none | `impl/r9.5`, brief R9.5-move-progress.md | golden ko/en output, Ctrl+C tests per step, finish/rollback after a kill |
+| N4 R12.11 canary version timeout | S1 | none | `impl/r12.11` (proposal kept) | slow-version, timeout-to-cache and unparseable regressions |
+| N7 Part F pooled runway: calibration and 24 h backtest | W, then S1 | none for the backtest; the UI after N1 | backtest worker in `.sandbox/r13f-backtest/` | backtest error at 1 h and 3 h against a stated bound |
+| N8 R15 compiled admin contract | S1 | none | `impl/r15`, brief R15-contract.md | contract round trips, static guard, property tests |
+| N9 README final and v0.2.0 release | S2 and design | N1 and N2 installed | design session | public export scan clean, release assets built from the export |
+| Held | R2 Part B (retire-cpa) | user decision | — | — |
+
+**Current S1 order** (importance; change it only when importance changes): N1, N2, N6, N5a, N5b, N5c, N5d, N3, N4, N6t, N5i (when its inputs exist), N7 UI, N8, N6r (when its inputs exist).
+
+**Start now in W:** N5m and the N7 backtest.
 
 **No polling.** Nobody polls a running job or a pane in a loop. Every wait has the next ready node from this table.
 
