@@ -34,6 +34,17 @@ mod dedicated;
 
 const JOURNAL_ENTROPY: &[u8] = b"quota-baton/v1/wiring-journal";
 
+/// Only fixed stages cross the CLI error boundary; underlying values stay private.
+#[derive(Debug)]
+pub(crate) struct WireStage(pub(crate) &'static str);
+
+impl std::fmt::Display for WireStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "연결 계획을 확인하지 못했습니다 (wire:{}).", self.0)
+    }
+}
+impl std::error::Error for WireStage {}
+
 #[derive(Clone, Debug)]
 pub struct CutoverPaths {
     pub qb_home: PathBuf,
