@@ -166,8 +166,9 @@ fn paint_prepared(
 ) -> Result<()> {
     let errors = BTreeSet::new();
     let login = scene.login.as_ref().map(|_| LoginStatus {
-        message: "브라우저에서 로그인을 마치면 자동으로 완료됩니다.".into(),
-        countdown: Some("남은 시간 9:55".into()),
+        message: crate::i18n::static_text("브라우저에서 로그인을 마치면 자동으로 완료됩니다.")
+            .into(),
+        countdown: Some(crate::i18n::format("남은 시간 {}", &["9:55".into()])),
         copy_ready: true,
         retry: false,
     });

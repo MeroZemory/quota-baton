@@ -6,6 +6,7 @@ use crate::{
         signals::{self, Kind, Signal, Subject},
     },
 };
+use qb_tray::i18n;
 use std::{
     collections::{HashSet, VecDeque},
     time::{Duration, SystemTime},
@@ -73,7 +74,7 @@ impl Default for Controller {
 fn presentation(badge: Badge, _count: usize) -> Presentation {
     Presentation {
         badge,
-        tooltip: "quota-baton · 코어에 연결할 수 없음".into(),
+        tooltip: i18n::text("quota-baton · 코어에 연결할 수 없음").into_owned(),
     }
 }
 
@@ -127,7 +128,10 @@ fn account_message(
         kind,
     }
     .message();
-    (title.into(), text.into())
+    (
+        i18n::text(title).into_owned(),
+        i18n::text(text).into_owned(),
+    )
 }
 
 impl Controller {
@@ -176,6 +180,10 @@ impl Controller {
                         kind,
                     };
                     let (title, text) = signal.message();
+                    let (title, text) = (
+                        i18n::text(title).into_owned(),
+                        i18n::text(text).into_owned(),
+                    );
                     let account_name = |id: &str| {
                         snapshot
                             .accounts
@@ -204,7 +212,7 @@ impl Controller {
                     } else {
                         warning
                             .reread_tokens
-                            .map(|n| format!("최근 1시간 최소 {n} 토큰"))
+                            .map(|n| i18n::format("최근 1시간 최소 {} 토큰", &[n.to_string()]))
                             .unwrap_or_default()
                     };
                     found.push((signal, (title.to_owned(), format!("{text} {detail}"))));
@@ -300,11 +308,15 @@ impl Controller {
                 })
             {
                 let (title, text) = signal.message();
+                let (title, text) = (
+                    i18n::text(title).into_owned(),
+                    i18n::text(text).into_owned(),
+                );
                 found.push((
                     signal,
                     (
                         format!("{} · {title}", qb_tray::provider_name(provider)),
-                        text.into(),
+                        text,
                     ),
                 ));
             }
@@ -350,7 +362,11 @@ impl Controller {
 
     fn enqueue(&mut self, signal: Signal<'_>, elapsed: Duration) {
         let (title, text) = signal.message();
-        self.enqueue_message(signal, (title.into(), text.into()), elapsed);
+        let (title, text) = (
+            i18n::text(title).into_owned(),
+            i18n::text(text).into_owned(),
+        );
+        self.enqueue_message(signal, (title, text), elapsed);
     }
 
     fn enqueue_message(

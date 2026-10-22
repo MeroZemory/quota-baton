@@ -66,7 +66,12 @@ use windows::{
 use windows_numerics::Matrix3x2;
 
 const CLASS: PCWSTR = w!("QuotaBatonDashboard");
-const TITLE: PCWSTR = w!("quota-baton 대시보드");
+fn title() -> Vec<u16> {
+    qb_tray::i18n::text("quota-baton 대시보드")
+        .encode_utf16()
+        .chain([0])
+        .collect()
+}
 const TIMER: usize = 0x71;
 const WM_MOUSELEAVE_MESSAGE: u32 = 0x02A3;
 static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
@@ -465,11 +470,12 @@ pub fn open_or_focus(
     let m = unsafe { monitor(anchor) };
     let dpi = unsafe { GetDpiForWindow(anchor) }.max(96);
     let r = window_logic::default_rect(edges(m.rcWork), dpi);
+    let title = title();
     let hwnd = unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             CLASS,
-            TITLE,
+            PCWSTR(title.as_ptr()),
             WS_OVERLAPPEDWINDOW,
             r[0],
             r[1],
@@ -1483,7 +1489,7 @@ fn publish_accessibility(
         let started = h.profiling.then(Instant::now);
         let prepared = accessibility::prepare_snapshot(accessibility::Snapshot {
             automation_id: "quota-baton.dashboard",
-            name: "quota-baton 대시보드".into(),
+            name: qb_tray::i18n::text("quota-baton 대시보드").into_owned(),
             bounds: physical(frame.scene.rect, origin, frame.stamp.dpi as f64 / 96.),
             elements,
         })?;

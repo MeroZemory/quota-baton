@@ -1,10 +1,10 @@
 //! Pure dashboard DTOs/projection. Clock, data and preferences are explicit inputs.
 use crate::{state::*, v2};
 use chrono::{DateTime, Datelike, FixedOffset, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SessionsResponse {
     pub now: Option<DateTime<Utc>>,
@@ -13,7 +13,7 @@ pub struct SessionsResponse {
     pub truncated: bool,
     pub move_cost: Option<MoveCost>,
 }
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct MoveCostAggregate {
     pub tokens: u64,
@@ -23,7 +23,7 @@ pub struct MoveCostAggregate {
     pub recording_complete: bool,
     pub tokens_saturated: bool,
 }
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct MoveCost {
     pub hour: MoveCostAggregate,
@@ -32,66 +32,91 @@ pub struct MoveCost {
 }
 impl MoveCost {
     pub fn lines(&self) -> [String; 2] {
+        self.lines_with_offset(None)
+    }
+    pub fn lines_at(&self, offset: FixedOffset) -> [String; 2] {
+        self.lines_with_offset(Some(offset))
+    }
+    fn lines_with_offset(&self, offset: Option<FixedOffset>) -> [String; 2] {
         let value = |a: &MoveCostAggregate| {
             if a.known_count == 0 && a.unknown_count > 0 {
-                return "미측정".to_owned();
+                return crate::i18n::static_text("미측정").to_owned();
             }
             if a.known_count == 0 {
-                return "관측된 이동 없음".to_owned();
+                return crate::i18n::static_text("관측된 이동 없음").to_owned();
             }
-            format!(
-                "{}{} 토큰",
-                if a.unknown_count > 0 || !a.recording_complete || a.tokens_saturated {
-                    "최소 "
-                } else {
-                    ""
-                },
-                a.tokens
+            crate::i18n::format(
+                "{0}{1} 토큰",
+                &[
+                    (if a.unknown_count > 0 || !a.recording_complete || a.tokens_saturated {
+                        crate::i18n::static_text("최소 ")
+                    } else {
+                        ""
+                    })
+                    .to_string(),
+                    (a.tokens).to_string(),
+                ],
             )
         };
         let a = &self.rolling24h;
         [
-            format!(
-                "계정 이동으로 다시 읽은 토큰 · 1시간 {} · 24시간 {}",
-                value(&self.hour),
-                value(a)
+            crate::i18n::format(
+                "계정 이동으로 다시 읽은 토큰 · 1시간 {0} · 24시간 {1}",
+                &[(value(&self.hour)).to_string(), (value(a)).to_string()],
             ),
-            format!(
-                "측정 {}회 · 미측정 {}회 · {}{}",
-                a.known_count,
-                a.unknown_count,
-                a.observed_since
-                    .map(|t| format!(
-                        "{}부터 관측",
-                        t.with_timezone(&chrono::Local).format("%m/%d %H:%M")
-                    ))
-                    .unwrap_or_else(|| "관측 시작 시각 확인 전".into()),
-                if !a.recording_complete {
-                    " · 일부 기록 누락"
-                } else if self.clock_adjusted {
-                    " · 시각 보정 포함"
-                } else {
-                    ""
-                }
+            crate::i18n::format(
+                "측정 {0}회 · 미측정 {1}회 · {2}{3}",
+                &[
+                    (a.known_count).to_string(),
+                    (a.unknown_count).to_string(),
+                    (a.observed_since
+                        .map(|t| {
+                            crate::i18n::format(
+                                "{0}부터 관측",
+                                &[match offset {
+                                    Some(offset) => crate::i18n::date_time(
+                                        &t.with_timezone(&offset),
+                                        "%m/%d %H:%M",
+                                    ),
+                                    None => crate::i18n::date_time(
+                                        &t.with_timezone(&chrono::Local),
+                                        "%m/%d %H:%M",
+                                    ),
+                                }],
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            crate::i18n::static_text("관측 시작 시각 확인 전").into()
+                        }))
+                    .to_string(),
+                    (if !a.recording_complete {
+                        crate::i18n::static_text(" · 일부 기록 누락")
+                    } else if self.clock_adjusted {
+                        crate::i18n::static_text(" · 시각 보정 포함")
+                    } else {
+                        ""
+                    })
+                    .to_string(),
+                ],
             ),
         ]
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Client {
     pub kind: String,
     pub product: Option<String>,
     pub version: Option<String>,
 }
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Label {
     pub text: String,
     pub source: String,
 }
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Inflight {
     pub requests: Option<u64>,
@@ -99,19 +124,19 @@ pub struct Inflight {
     pub ws_open: Option<u64>,
     pub ws_response_in_flight: bool,
 }
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct PacingWait {
     pub waiting: Option<u64>,
     pub since: Option<DateTime<Utc>>,
 }
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct RateWait {
     pub count: Option<u64>,
     pub total_ms: Option<u64>,
 }
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Move {
     pub at: Option<DateTime<Utc>>,
@@ -120,7 +145,7 @@ pub struct Move {
     pub reason: String,
     pub next_turn_cache: Option<String>,
 }
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Session {
     pub id: String,
@@ -223,7 +248,7 @@ pub struct RequestSummary {
     pub rate_retries: Option<u64>,
     pub failover: Option<Failover>,
 }
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ActivityEvent {
     pub seq: u64,
@@ -235,7 +260,7 @@ pub struct ActivityEvent {
     pub notable: bool,
     pub data: ActivityData,
 }
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ActivityData {
     pub window: Option<String>,
@@ -284,13 +309,13 @@ pub struct ActivityData {
     #[serde(skip)]
     pub balance_stop: Option<serde_json::Number>,
 }
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct UsageHistory {
     pub accounts: Vec<AccountHistory>,
     pub truncated: bool,
 }
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AccountHistory {
     pub id: String,
@@ -298,7 +323,7 @@ pub struct AccountHistory {
     pub credits_spans: Vec<(DateTime<Utc>, Option<DateTime<Utc>>)>,
     pub truncated: bool,
 }
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct HistoryWindow {
     pub name: String,
@@ -307,7 +332,7 @@ pub struct HistoryWindow {
     pub truncated: bool,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ActivityResponse {
     pub events: Vec<ActivityEvent>,
@@ -345,14 +370,17 @@ impl Clock {
             return unknown();
         };
         let local = at.with_timezone(self.now.offset());
+        if crate::i18n::language() == crate::i18n::UiLanguage::En {
+            return crate::i18n::date_time(&local, "%H:%M");
+        }
         let delta = local
             .date_naive()
             .signed_duration_since(self.now.date_naive())
             .num_days();
         match delta {
             0 => local.format("%H:%M").to_string(),
-            -1 => format!("어제 {}", local.format("%H:%M")),
-            1 => format!("내일 {}", local.format("%H:%M")),
+            -1 => crate::i18n::format("어제 {0}", &[(local.format("%H:%M")).to_string()]),
+            1 => crate::i18n::format("내일 {0}", &[(local.format("%H:%M")).to_string()]),
             _ => format!(
                 "{}/{} {}",
                 local.month(),
@@ -367,9 +395,9 @@ impl Clock {
         };
         let secs = self.utc().signed_duration_since(at).num_seconds().max(0);
         match secs {
-            0..=59 => "방금".into(),
-            60..=3599 => format!("{}분 전", secs / 60),
-            3600..=86399 => format!("{}시간 전", secs / 3600),
+            0..=59 => crate::i18n::static_text("방금").into(),
+            60..=3599 => crate::i18n::format("{0}분 전", &[(secs / 60).to_string()]),
+            3600..=86399 => crate::i18n::format("{0}시간 전", &[(secs / 3600).to_string()]),
             _ => self.time(Some(at)),
         }
     }
@@ -377,14 +405,25 @@ impl Clock {
         let local = at.with_timezone(self.now.offset());
         let day = local.date_naive();
         let prefix = match self.now.date_naive().signed_duration_since(day).num_days() {
-            0 => "오늘 · ",
+            0 => crate::i18n::static_text("오늘 · "),
             -1 => "",
-            1 => "어제 · ",
+            1 => crate::i18n::static_text("어제 · "),
             _ => "",
         };
-        let weekday = ["월", "화", "수", "목", "금", "토", "일"]
-            [local.weekday().num_days_from_monday() as usize];
-        format!("{prefix}{}/{}({weekday})", local.month(), local.day())
+        let weekday = [
+            crate::i18n::static_text("월"),
+            crate::i18n::static_text("화"),
+            crate::i18n::static_text("수"),
+            crate::i18n::static_text("목"),
+            crate::i18n::static_text("금"),
+            crate::i18n::static_text("토"),
+            crate::i18n::static_text("일"),
+        ][local.weekday().num_days_from_monday() as usize];
+        if crate::i18n::language() == crate::i18n::UiLanguage::En {
+            format!("{prefix}{}({weekday})", local.format("%b %-d"))
+        } else {
+            format!("{prefix}{}/{}({weekday})", local.month(), local.day())
+        }
     }
 }
 #[derive(Clone, Debug)]
@@ -636,6 +675,17 @@ fn count(value: Option<u64>) -> String {
         .unwrap_or_else(unknown)
 }
 pub fn duration(ms: Option<u64>) -> String {
+    if crate::i18n::language() == crate::i18n::UiLanguage::En {
+        return ms
+            .map(|v| {
+                if v < 1000 {
+                    format!("{v}ms")
+                } else {
+                    crate::i18n::duration(v / 1000)
+                }
+            })
+            .unwrap_or_else(unknown);
+    }
     ms.map(|v| format!("{}:{:02}", v / 60000, v / 1000 % 60))
         .unwrap_or_else(unknown)
 }
@@ -657,12 +707,12 @@ fn client(s: &Session) -> String {
                 Some("Codex Desktop" | "codex_desktop")
             ) =>
         {
-            "Codex 앱".into()
+            crate::i18n::static_text("Codex 앱").into()
         }
         "codex_cli" | "codex_cli_rs" => "Codex CLI".into(),
         "codex_vscode" => "Codex VS Code".into(),
         "codex_exec" => "Codex exec".into(),
-        "codex_desktop" => "Codex 앱".into(),
+        "codex_desktop" => crate::i18n::static_text("Codex 앱").into(),
         "claude_cli" => "Claude Code CLI".into(),
         "claude_vscode" => "Claude Code VS Code".into(),
         "claude_sdk" => "Claude Agent SDK".into(),
@@ -682,23 +732,28 @@ fn label(s: &Session) -> String {
         .map(|l| folder(&l.text))
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| {
-            format!(
-                "{} 세션 {}",
-                client(s),
-                hash(&s.id)
-                    .unwrap_or_default()
-                    .chars()
-                    .take(6)
-                    .collect::<String>()
+            crate::i18n::format(
+                "{0} 세션 {1}",
+                &[
+                    (client(s)).to_string(),
+                    (hash(&s.id)
+                        .unwrap_or_default()
+                        .chars()
+                        .take(6)
+                        .collect::<String>())
+                    .to_string(),
+                ],
             )
         })
 }
 fn source(s: &Session) -> String {
     match s.label.as_ref().map(|l| l.source.as_str()) {
-        Some("launcher") => "codex-qb/claude-qb가 알려 준 작업 폴더 이름",
-        Some("codex_workspace") => "Codex가 보낸 작업 폴더(git 저장소) 이름",
-        Some("claude_project") => "Claude Code 대화 기록 폴더 이름",
-        _ => "이름을 알 수 없어 클라이언트와 세션 번호로 표시합니다",
+        Some("launcher") => crate::i18n::static_text("codex-qb/claude-qb가 알려 준 작업 폴더 이름"),
+        Some("codex_workspace") => {
+            crate::i18n::static_text("Codex가 보낸 작업 폴더(git 저장소) 이름")
+        }
+        Some("claude_project") => crate::i18n::static_text("Claude Code 대화 기록 폴더 이름"),
+        _ => crate::i18n::static_text("이름을 알 수 없어 클라이언트와 세션 번호로 표시합니다"),
     }
     .into()
 }
@@ -731,7 +786,7 @@ fn account_name(view: &v2::View, id: &str) -> String {
         .iter()
         .find(|r| r.raw.id == id)
         .map(|r| folder(&r.name))
-        .unwrap_or_else(|| "알 수 없는 계정".into())
+        .unwrap_or_else(|| crate::i18n::static_text("알 수 없는 계정").into())
 }
 fn account_windows(a: &v2::AccountRow) -> Vec<AccountUsageWindow> {
     a.windows
@@ -740,7 +795,7 @@ fn account_windows(a: &v2::AccountRow) -> Vec<AccountUsageWindow> {
         .filter_map(|w| {
             w.remaining.map(|pct| AccountUsageWindow {
                 label: w.label.clone(),
-                remaining: format!("{pct}% 남음"),
+                remaining: crate::i18n::format("{0}% 남음", &[pct.to_string()]),
                 reset: w.reset_text.clone().unwrap_or_default(),
                 remaining_pct: pct,
             })
@@ -870,13 +925,15 @@ fn folded_events(source: &[&ActivityEvent], accounts: &v2::View, clock: &Clock) 
             .map(|t| clock.time(Some(*t)))
             .collect::<Vec<_>>()
             .join(", ");
-        rows[index]
-            .body
-            .push_str(&format!("\n같은 알림 {}번 더 · {clocks}", times.len()));
+        rows[index].body.push_str(&crate::i18n::format(
+            "\n같은 알림 {0}번 더 · {1}",
+            &[(times.len()).to_string(), clocks.to_string()],
+        ));
         if times.len() > 3 {
-            rows[index]
-                .body
-                .push_str(&format!(" 외 {}번", times.len() - 3));
+            rows[index].body.push_str(&crate::i18n::format(
+                " 외 {0}번",
+                &[(times.len() - 3).to_string()],
+            ));
         }
     }
     rows
@@ -906,10 +963,16 @@ fn session_row(
                     .to_string()
             })
             .unwrap_or_else(unknown);
-        notes.push(format!("속도 조절 대기 {elapsed}초"));
+        notes.push(crate::i18n::format(
+            "속도 조절 대기 {0}초",
+            &[elapsed.to_string()],
+        ));
     }
     if s.subagents_known && s.subagents_today.unwrap_or(0) > 0 {
-        notes.push(format!("하위 에이전트 {}", count(s.subagents_today)));
+        notes.push(crate::i18n::format(
+            "하위 에이전트 {0}",
+            &[(count(s.subagents_today)).to_string()],
+        ));
     }
     if let Some(m) = s
         .moves_today
@@ -919,45 +982,52 @@ fn session_row(
         })
         .max_by_key(|m| m.at)
     {
-        notes.push(format!("{} 옮겨짐", clock.time(m.at)));
+        notes.push(crate::i18n::format(
+            "{0} 옮겨짐",
+            &[(clock.time(m.at)).to_string()],
+        ));
     }
     if s.provider == "codex" && s.outside_git == Some(true) {
-        notes.push("git 저장소 밖에서 실행".into());
+        notes.push(crate::i18n::static_text("git 저장소 밖에서 실행").into());
     }
     if account_rows(accounts)
         .iter()
         .any(|a| a.raw.id == s.account && a.raw.credits_in_use == Some(true))
     {
-        notes.push("크레딧으로 처리 중".into());
+        notes.push(crate::i18n::static_text("크레딧으로 처리 중").into());
     }
     if !s.moves_known {
-        notes.push("계정 이력 일부 확인 전".into());
+        notes.push(crate::i18n::static_text("계정 이력 일부 확인 전").into());
     }
     let inflight = flying(s);
     let dot = if !s.inflight_known {
-        "— · 요청 상태 확인 전".into()
+        crate::i18n::static_text("— · 요청 상태 확인 전").into()
     } else if inflight {
-        format!("요청 중 · {}건", count(s.inflight.requests))
+        crate::i18n::format(
+            "요청 중 · {0}건",
+            &[(count(s.inflight.requests)).to_string()],
+        )
     } else if s.active {
-        "5분 안에 활동".into()
+        crate::i18n::static_text("5분 안에 활동").into()
     } else {
-        "쉬는 중 · 5분 넘게 요청 없음".into()
+        crate::i18n::static_text("쉬는 중 · 5분 넘게 요청 없음").into()
     };
     let activity = if !s.inflight_known {
-        format!(
-            "요청 상태 확인 전 · 마지막 활동 {}",
-            clock.age(s.last_used_at)
+        crate::i18n::format(
+            "요청 상태 확인 전 · 마지막 활동 {0}",
+            &[(clock.age(s.last_used_at)).to_string()],
         )
     } else if inflight {
-        format!(
-            "요청 중 {}",
-            duration(s.inflight.oldest_started_at.map(|t| {
+        crate::i18n::format(
+            "요청 중 {0}",
+            &[(duration(s.inflight.oldest_started_at.map(|t| {
                 clock
                     .utc()
                     .signed_duration_since(t)
                     .num_milliseconds()
                     .max(0) as u64
-            }))
+            })))
+            .to_string()],
         )
     } else {
         clock.age(s.last_used_at)
@@ -981,7 +1051,7 @@ fn session_row(
         start: s
             .first_seen_at
             .map(|v| clock.time(Some(v)))
-            .unwrap_or_else(|| "이전 실행부터".into()),
+            .unwrap_or_else(|| crate::i18n::static_text("이전 실행부터").into()),
         activity,
         requests: count(s.requests_today.filter(|_| s.counters_complete)),
         memo: notes.join(" · "),
@@ -1133,15 +1203,17 @@ pub fn project(
             })
             .max_by_key(|m| m.at);
         let reason = if blocked {
-            "새 세션을 배정하지 않습니다".into()
+            crate::i18n::static_text("새 세션을 배정하지 않습니다").into()
         } else if let Some(m) = away {
-            format!(
-                "{}에 세션을 {}로 옮겼습니다",
-                clock.time(m.at),
-                account_name(&snapshot.accounts, m.to.as_deref().unwrap_or(""))
+            crate::i18n::format(
+                "{0}에 세션을 {1}로 옮겼습니다",
+                &[
+                    (clock.time(m.at)).to_string(),
+                    (account_name(&snapshot.accounts, m.to.as_deref().unwrap_or(""))).to_string(),
+                ],
             )
         } else {
-            "새 세션 배정 가능".into()
+            crate::i18n::static_text("새 세션 배정 가능").into()
         };
         groups.push(AccountGroup {
             id: a.raw.id.clone(),
@@ -1154,11 +1226,18 @@ pub fn project(
             threshold: a.raw.extra.get("spread_threshold").and_then(|v| v.as_u64()),
             bound: a.raw.bound_sessions,
             remaining: remaining
-                .and_then(|w| w.remaining.map(|pct| format!("{} {pct}% 남음", w.label)))
-                .unwrap_or_else(|| "사용량 확인 전".into()),
+                .and_then(|w| {
+                    w.remaining.map(|pct| {
+                        crate::i18n::format(
+                            "{0} {1}% 남음",
+                            &[(w.label).to_string(), pct.to_string()],
+                        )
+                    })
+                })
+                .unwrap_or_else(|| crate::i18n::static_text("사용량 확인 전").into()),
             reset: remaining
                 .and_then(|w| w.reset)
-                .map(|v| format!("{} 초기화", clock.time(Some(v))))
+                .map(|v| crate::i18n::format("{0} 초기화", &[(clock.time(Some(v))).to_string()]))
                 .unwrap_or_default(),
             remaining_pct: remaining.and_then(|w| w.remaining),
             windows,
@@ -1167,7 +1246,7 @@ pub fn project(
             relogin_reason: if a.state == v2::DisplayState::Relogin {
                 a.reason
                     .clone()
-                    .unwrap_or_else(|| "다시 로그인 필요".into())
+                    .unwrap_or_else(|| crate::i18n::static_text("다시 로그인 필요").into())
             } else {
                 String::new()
             },
@@ -1175,9 +1254,9 @@ pub fn project(
             disabled: a.raw.user_state == "disabled",
             collapsed: state.collapsed.contains(&a.raw.id),
             no_sessions: if reason.is_empty() {
-                "연결된 세션 없음".into()
+                crate::i18n::static_text("연결된 세션 없음").into()
             } else {
-                format!("연결된 세션 없음 · {reason}")
+                crate::i18n::format("연결된 세션 없음 · {0}", &[reason.to_string()])
             },
             rows,
         });
@@ -1256,10 +1335,10 @@ pub fn project(
                 .and_then(hash)
                 .map(|id| DetailView {
                     id: id.clone(),
-                    title: format!("세션 {}", &id[..6]),
-                    subtitle: format!("세션 {id}"),
+                    title: crate::i18n::format("세션 {0}", &[id[..6].to_string()]),
+                    subtitle: crate::i18n::format("세션 {0}", &[id.to_string()]),
                     raw_prefix: None,
-                    status: "세션 정보를 확인하고 있습니다.".into(),
+                    status: crate::i18n::static_text("세션 정보를 확인하고 있습니다.").into(),
                     status_tone: v2::Tone::Off,
                     account_status: String::new(),
                     facts: vec![],
@@ -1269,13 +1348,15 @@ pub fn project(
                 })
         });
     let last_session = all.iter().max_by_key(|s| s.last_used_at).map(|s| {
-        format!(
-            "마지막 세션: {} ({} · {}) · {} · {}",
-            label(s),
-            client(s),
-            s.id.chars().take(6).collect::<String>(),
-            account_name(&snapshot.accounts, &s.account),
-            clock.age(s.last_used_at)
+        crate::i18n::format(
+            "마지막 세션: {0} ({1} · {2}) · {3} · {4}",
+            &[
+                (label(s)).to_string(),
+                (client(s)).to_string(),
+                (s.id.chars().take(6).collect::<String>()).to_string(),
+                (account_name(&snapshot.accounts, &s.account)).to_string(),
+                (clock.age(s.last_used_at)).to_string(),
+            ],
         )
     });
     DashboardView {
@@ -1297,7 +1378,11 @@ pub fn project(
         inflight_count_known: !snapshot.sessions.truncated
             && sessions.iter().all(|s| s.inflight_known),
         counters_unknown: sessions.iter().any(|s| !s.counters_complete),
-        move_cost_lines: snapshot.sessions.move_cost.as_ref().map(MoveCost::lines),
+        move_cost_lines: snapshot
+            .sessions
+            .move_cost
+            .as_ref()
+            .map(|cost| cost.lines_at(*clock.now.offset())),
         provider_counts,
         groups,
         flat,
@@ -1309,7 +1394,7 @@ pub fn project(
         empty,
         last_session,
         truncated: snapshot.sessions.truncated,
-        event_empty: "이 기간에는 기록할 만한 일이 없었습니다.".into(),
+        event_empty: crate::i18n::static_text("이 기간에는 기록할 만한 일이 없었습니다.").into(),
         activity_truncated: snapshot.activity_truncated,
     }
 }
@@ -1327,28 +1412,28 @@ pub fn upsert_activity(events: &mut Vec<ActivityEvent>, incoming: ActivityEvent)
 }
 pub fn reason(word: &str) -> &str {
     match word {
-        "quota" => "한도 도달",
-        "needs_relogin" => "다시 로그인 필요",
-        "paused" => "일시정지",
-        "link_stale" => "CPA 갱신 멈춤",
-        "payment" => "결제 거절",
-        "permission" => "접근 거부",
-        "auth" => "인증 확인 대기",
-        "store_error" => "저장 오류",
-        "overload" => "몰린 세션 나눔",
-        "forced" => "쓸 수 없는 계정에서 전환",
-        "cold_rebalance" => "오래 쉬어 다시 배치",
-        "reset_hold_timeout" => "초기화를 기다렸지만 풀리지 않음",
-        "new" => "처음 배정",
-        "launch_model" => "시작 모델에 맞춰 처음 배정",
-        "model_choice" => "선택한 모델에 맞춰 계정 전환",
-        _ => "사용 불가",
+        "quota" => crate::i18n::static_text("한도 도달"),
+        "needs_relogin" => crate::i18n::static_text("다시 로그인 필요"),
+        "paused" => crate::i18n::static_text("일시정지"),
+        "link_stale" => crate::i18n::static_text("CPA 갱신 멈춤"),
+        "payment" => crate::i18n::static_text("결제 거절"),
+        "permission" => crate::i18n::static_text("접근 거부"),
+        "auth" => crate::i18n::static_text("인증 확인 대기"),
+        "store_error" => crate::i18n::static_text("저장 오류"),
+        "overload" => crate::i18n::static_text("몰린 세션 나눔"),
+        "forced" => crate::i18n::static_text("쓸 수 없는 계정에서 전환"),
+        "cold_rebalance" => crate::i18n::static_text("오래 쉬어 다시 배치"),
+        "reset_hold_timeout" => crate::i18n::static_text("초기화를 기다렸지만 풀리지 않음"),
+        "new" => crate::i18n::static_text("처음 배정"),
+        "launch_model" => crate::i18n::static_text("시작 모델에 맞춰 처음 배정"),
+        "model_choice" => crate::i18n::static_text("선택한 모델에 맞춰 계정 전환"),
+        _ => crate::i18n::static_text("사용 불가"),
     }
 }
 fn cache_sentence(value: Option<&str>) -> &'static str {
     match value {
-        Some("miss") => "다음 요청은 캐시 없이 문맥을 다시 보냈습니다",
-        Some("hit") => "다음 요청도 캐시를 썼습니다",
+        Some("miss") => crate::i18n::static_text("다음 요청은 캐시 없이 문맥을 다시 보냈습니다"),
+        Some("hit") => crate::i18n::static_text("다음 요청도 캐시를 썼습니다"),
         _ => "",
     }
 }
@@ -1432,7 +1517,7 @@ fn event_row(e: &ActivityEvent, accounts: &v2::View, clock: &Clock) -> Option<Ev
                 .map(|s| s[..6].to_string())
                 .unwrap_or_else(unknown)
         });
-    let mut tag = "정보";
+    let mut tag = crate::i18n::static_text("정보");
     let mut tone = v2::Tone::Off;
     let mut category = EventFilter::All;
     let (title, body) = match e.kind.as_str() {
@@ -1440,85 +1525,121 @@ fn event_row(e: &ActivityEvent, accounts: &v2::View, clock: &Clock) -> Option<Ev
             category = EventFilter::Moves;
             if d.no_eligible {
                 if d.actionable || d.allow_credits || d.disabled_accounts.unwrap_or(0) > 0 {
-                    tag = "할 일";
+                    tag = crate::i18n::static_text("할 일");
                     tone = v2::Tone::Bad;
                     category = EventFilter::Tasks;
                 }
                 let body = if d.allow_credits {
-                    "유료 크레딧 사용 허용을 확인하세요.".into()
+                    crate::i18n::static_text("유료 크레딧 사용 허용을 확인하세요.").into()
                 } else if d.disabled_accounts.unwrap_or(0) > 0 {
-                    format!(
-                        "꺼진 계정 {}개를 켜면 이어서 처리할 수 있습니다.",
-                        count(d.disabled_accounts)
+                    crate::i18n::format(
+                        "꺼진 계정 {0}개를 켜면 이어서 처리할 수 있습니다.",
+                        &[(count(d.disabled_accounts)).to_string()],
                     )
                 } else {
-                    format!("{reset} 초기화. 그때까지 새 요청은 오류로 끝납니다.")
+                    crate::i18n::format(
+                        "{0} 초기화. 그때까지 새 요청은 오류로 끝납니다.",
+                        &[reset.to_string()],
+                    )
                 };
-                (format!("{p} 계정 모두 한도 도달"), body)
+                (
+                    crate::i18n::format("{0} 계정 모두 한도 도달", &[p.to_string()]),
+                    body,
+                )
             } else {
-                tag = "한도 도달";
+                tag = crate::i18n::static_text("한도 도달");
                 tone = v2::Tone::Limit;
                 (
-                    format!(
-                        "{p} {a} · {}한도 도달",
-                        if win.is_empty() {
-                            String::new()
-                        } else {
-                            format!("{win} ")
-                        }
+                    crate::i18n::format(
+                        "{0} {1} · {2}한도 도달",
+                        &[
+                            p.to_string(),
+                            a.to_string(),
+                            (if win.is_empty() {
+                                String::new()
+                            } else {
+                                format!("{win} ")
+                            })
+                            .to_string(),
+                        ],
                     ),
                     if d.moved_groups.unwrap_or(0) > 0 {
-                        format!(
-                            "연결된 세션 {}개를 {b}로 옮겨 이어서 처리합니다. {a}는 {reset}에 초기화됩니다.",
-                            count(d.moved_groups)
+                        crate::i18n::format(
+                            "연결된 세션 {0}개를 {1}로 옮겨 이어서 처리합니다. {2}는 {3}에 초기화됩니다.",
+                            &[
+                                (count(d.moved_groups)).to_string(),
+                                b.to_string(),
+                                a.to_string(),
+                                reset.to_string(),
+                            ],
                         )
                     } else {
-                        format!("새 세션은 다른 계정에 배정합니다. {reset}에 초기화됩니다.")
+                        crate::i18n::format(
+                            "새 세션은 다른 계정에 배정합니다. {0}에 초기화됩니다.",
+                            &[reset.to_string()],
+                        )
                     },
                 )
             }
         }
         "credits_started" => {
-            tag = "크레딧";
+            tag = crate::i18n::static_text("크레딧");
             tone = v2::Tone::Warn;
             category = EventFilter::Credits;
             (
-                format!("{p} {a} · 크레딧으로 처리 시작"),
-                format!("{win} 한도에 도달해 유료 크레딧으로 계속 처리합니다."),
+                crate::i18n::format(
+                    "{0} {1} · 크레딧으로 처리 시작",
+                    &[p.to_string(), a.to_string()],
+                ),
+                crate::i18n::format(
+                    "{0} 한도에 도달해 유료 크레딧으로 계속 처리합니다.",
+                    &[win.to_string()],
+                ),
             )
         }
         "credits_stopped" => {
-            tag = "초기화";
+            tag = crate::i18n::static_text("초기화");
             category = EventFilter::Credits;
-            let mut text = "크레딧 대신 구독 한도로 다시 처리합니다.".to_string();
+            let mut text =
+                crate::i18n::static_text("크레딧 대신 구독 한도로 다시 처리합니다.").to_string();
             if let Some(spent) = d
                 .credits_used
                 .as_ref()
                 .and_then(|n| n.as_f64())
                 .filter(|n| n.is_finite() && *n >= 0.)
             {
-                text.push_str(&format!(
-                    " 크레딧으로 처리한 동안 {} 크레딧을 썼습니다.",
-                    v2::group_number(&format!("{:.0}", spent.floor()))
+                text.push_str(&crate::i18n::format(
+                    " 크레딧으로 처리한 동안 {0} 크레딧을 썼습니다.",
+                    &[(v2::group_number(&format!("{:.0}", spent.floor()))).to_string()],
                 ));
             } else if let (Some(start), Some(stop)) = (&d.balance_start, &d.balance_stop)
                 && let Some(spent) = decimal_spent(start, stop)
             {
-                text.push_str(&format!(
-                    " 크레딧으로 처리한 동안 {spent} 크레딧을 썼습니다."
+                text.push_str(&crate::i18n::format(
+                    " 크레딧으로 처리한 동안 {0} 크레딧을 썼습니다.",
+                    &[spent.to_string()],
                 ));
             }
-            (format!("{p} {a} · {win} 한도 초기화"), text)
+            (
+                crate::i18n::format(
+                    "{0} {1} · {2} 한도 초기화",
+                    &[p.to_string(), a.to_string(), win.to_string()],
+                ),
+                text,
+            )
         }
         "quota_reset" => {
-            tag = "초기화";
+            tag = crate::i18n::static_text("초기화");
             (
-                format!("{p} {a} · {win} 한도 초기화"),
-                "다시 새 세션을 받을 수 있습니다.".into(),
+                crate::i18n::format(
+                    "{0} {1} · {2} 한도 초기화",
+                    &[p.to_string(), a.to_string(), win.to_string()],
+                ),
+                crate::i18n::static_text("다시 새 세션을 받을 수 있습니다.").into(),
             )
         }
         "needs_relogin" | "link_stale" | "payment" | "permission" | "store_error" => {
-            tag = "할 일";
+            tag = crate::i18n::static_text("할 일");
             tone = v2::Tone::Bad;
             category = EventFilter::Tasks;
             let until = account_rows(accounts)
@@ -1527,19 +1648,19 @@ fn event_row(e: &ActivityEvent, accounts: &v2::View, clock: &Clock) -> Option<Ev
                 .and_then(|row| row.raw.health.until.as_deref())
                 .and_then(v2::timestamp)
                 .map(|at| clock.time(Some(at)))
-                .unwrap_or_else(|| "상태를 다시 확인할 때".into());
+                .unwrap_or_else(|| crate::i18n::static_text("상태를 다시 확인할 때").into());
             let body = match e.kind.as_str() {
-                "needs_relogin" => "트레이에서 이 계정의 \"다시 로그인\"을 누르세요. 처리할 다른 계정 상태도 확인하세요.".into(),
+                "needs_relogin" => crate::i18n::static_text("트레이에서 이 계정의 \"다시 로그인\"을 누르세요. 처리할 다른 계정 상태도 확인하세요.").into(),
                 "link_stale" => {
-                    "CPA가 이 계정의 토큰을 갱신하지 않습니다. CPA 실행을 확인하거나 계정 인수를 고려하세요.".into()
+                    crate::i18n::static_text("CPA가 이 계정의 토큰을 갱신하지 않습니다. CPA 실행을 확인하거나 계정 인수를 고려하세요.").into()
                 }
-                "payment" => format!("{until}까지 이 계정을 쉽니다."),
-                "permission" => format!("이 계정은 {until}까지 이 모델을 쉽니다."),
-                _ => "토큰을 저장하지 못해 다시 시도하고 있습니다. 로그를 확인하세요.".into(),
+                "payment" => crate::i18n::format("{0}까지 이 계정을 쉽니다.", &[until.to_string()]),
+                "permission" => crate::i18n::format("이 계정은 {0}까지 이 모델을 쉽니다.", &[until.to_string()]),
+                _ => crate::i18n::static_text("토큰을 저장하지 못해 다시 시도하고 있습니다. 로그를 확인하세요.").into(),
             };
             let title = match e.kind.as_str() {
-                "store_error" => "토큰 저장 실패",
-                "permission" => "조직 접근 거부",
+                "store_error" => crate::i18n::static_text("토큰 저장 실패"),
+                "permission" => crate::i18n::static_text("조직 접근 거부"),
                 _ => reason(&e.kind),
             };
             (format!("{p} {a} · {title}"), body)
@@ -1548,92 +1669,139 @@ fn event_row(e: &ActivityEvent, accounts: &v2::View, clock: &Clock) -> Option<Ev
             if matches!(d.reason.as_deref(), Some("new" | "launch_model")) {
                 return None;
             }
-            tag = "계정 전환";
+            tag = crate::i18n::static_text("계정 전환");
             tone = v2::Tone::Use;
             category = EventFilter::Moves;
             match d.reason.as_deref() {
                 Some("model_choice") => (
-                    format!("{p} · {name} 세션을 {b}로 옮김"),
-                    format!("선택한 모델을 지원하는 {b}로 계정을 전환했습니다."),
+                    crate::i18n::format(
+                        "{0} · {1} 세션을 {2}로 옮김",
+                        &[p.to_string(), name.to_string(), b.to_string()],
+                    ),
+                    crate::i18n::format(
+                        "선택한 모델을 지원하는 {0}로 계정을 전환했습니다.",
+                        &[b.to_string()],
+                    ),
                 ),
                 Some("overload") => (
-                    format!(
-                        "{p} · 몰린 세션 {}개를 나눔",
-                        count(d.moved_groups.or(d.count))
+                    crate::i18n::format(
+                        "{0} · 몰린 세션 {1}개를 나눔",
+                        &[
+                            p.to_string(),
+                            (count(d.moved_groups.or(d.count))).to_string(),
+                        ],
                     ),
-                    format!(
-                        "{a}에 활성 세션이 {}개(기준 {}개)로 몰리고 속도 제한이 반복되어, {}를 {b}로 옮겼습니다. {}",
-                        count(d.active_sessions),
-                        count(d.threshold),
-                        if d.labels.is_empty() {
-                            name.clone()
-                        } else {
-                            d.labels
-                                .iter()
-                                .map(|s| folder(s))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        },
-                        cache_sentence(d.next_turn_cache.as_deref())
+                    crate::i18n::format(
+                        "{0}에 활성 세션이 {1}개(기준 {2}개)로 몰리고 속도 제한이 반복되어, {3}를 {4}로 옮겼습니다. {5}",
+                        &[
+                            a.to_string(),
+                            (count(d.active_sessions)).to_string(),
+                            (count(d.threshold)).to_string(),
+                            (if d.labels.is_empty() {
+                                name.clone()
+                            } else {
+                                d.labels
+                                    .iter()
+                                    .map(|s| folder(s))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            })
+                            .to_string(),
+                            b.to_string(),
+                            (cache_sentence(d.next_turn_cache.as_deref())).to_string(),
+                        ],
                     ),
                 ),
                 Some("cold_rebalance") => (
-                    format!("{p} · 오래 쉬던 {name} 세션을 {b}로 다시 배치"),
-                    "캐시가 이미 식어 있어 옮겨도 손해가 없습니다.".into(),
+                    crate::i18n::format(
+                        "{0} · 오래 쉬던 {1} 세션을 {2}로 다시 배치",
+                        &[p.to_string(), name.to_string(), b.to_string()],
+                    ),
+                    crate::i18n::static_text("캐시가 이미 식어 있어 옮겨도 손해가 없습니다.")
+                        .into(),
                 ),
                 Some("reset_hold_timeout") => (
-                    format!("{p} · {name} 세션을 {b}로 옮김"),
-                    format!("{a}의 한도 초기화를 기다렸지만 제때 풀리지 않아 옮겼습니다."),
+                    crate::i18n::format(
+                        "{0} · {1} 세션을 {2}로 옮김",
+                        &[p.to_string(), name.to_string(), b.to_string()],
+                    ),
+                    crate::i18n::format(
+                        "{0}의 한도 초기화를 기다렸지만 제때 풀리지 않아 옮겼습니다.",
+                        &[a.to_string()],
+                    ),
                 ),
                 _ => (
-                    format!("{p} · {name} 세션을 {b}로 옮김"),
-                    format!(
-                        "{a}를 쓸 수 없게 되어({}) 다음 요청부터 {b}에서 처리합니다.",
-                        reason(d.attention.as_deref().or(d.reason.as_deref()).unwrap_or(""))
+                    crate::i18n::format(
+                        "{0} · {1} 세션을 {2}로 옮김",
+                        &[p.to_string(), name.to_string(), b.to_string()],
+                    ),
+                    crate::i18n::format(
+                        "{0}를 쓸 수 없게 되어({1}) 다음 요청부터 {2}에서 처리합니다.",
+                        &[
+                            a.to_string(),
+                            (reason(d.attention.as_deref().or(d.reason.as_deref()).unwrap_or("")))
+                                .to_string(),
+                            b.to_string(),
+                        ],
                     ),
                 ),
             }
         }
         "overload_detected" => {
-            tag = "분산 안 함";
+            tag = crate::i18n::static_text("분산 안 함");
             category = EventFilter::Moves;
-            (format!("{p} {a} · 세션이 고르게 퍼져 있어 옮기지 않음"),"속도 제한이 반복됐지만 여유 있는 다른 계정이 없어 세션을 그대로 두고 요청 속도만 낮췄습니다.".into())
+            (crate::i18n::format("{0} {1} · 세션이 고르게 퍼져 있어 옮기지 않음", &[p.to_string(), a.to_string()]),crate::i18n::static_text("속도 제한이 반복됐지만 여유 있는 다른 계정이 없어 세션을 그대로 두고 요청 속도만 낮췄습니다.").into())
         }
         "rate_hold" => {
-            tag = "속도 조절";
+            tag = crate::i18n::static_text("속도 조절");
             category = EventFilter::Pacing;
             let max = d.max_wait_ms.map(|v| v.div_ceil(1000));
             let body = if d.relayed.unwrap_or(0) > 0 {
-                format!(
-                    "{}부터 요청 {}건이 속도 제한에 걸렸고, 같은 계정에서 최대 {}초 기다렸습니다. {}건은 처리했고 {}건은 속도 제한 오류를 클라이언트에 그대로 전달했습니다.",
-                    clock.time(e.ts),
-                    count(d.count),
-                    count(max),
-                    count(d.count.zip(d.relayed).map(|(n, r)| n.saturating_sub(r))),
-                    count(d.relayed)
+                crate::i18n::format(
+                    "{0}부터 요청 {1}건이 속도 제한에 걸렸고, 같은 계정에서 최대 {2}초 기다렸습니다. {3}건은 처리했고 {4}건은 속도 제한 오류를 클라이언트에 그대로 전달했습니다.",
+                    &[
+                        (clock.time(e.ts)).to_string(),
+                        (count(d.count)).to_string(),
+                        (count(max)).to_string(),
+                        (count(d.count.zip(d.relayed).map(|(n, r)| n.saturating_sub(r))))
+                            .to_string(),
+                        (count(d.relayed)).to_string(),
+                    ],
                 )
             } else {
-                format!(
-                    "{}부터 요청 {}건이 속도 제한에 걸렸고, 같은 계정에서 최대 {}초 기다린 뒤 모두 처리했습니다. 세션은 옮기지 않았습니다.",
-                    clock.time(e.ts),
-                    count(d.count),
-                    count(max)
+                crate::i18n::format(
+                    "{0}부터 요청 {1}건이 속도 제한에 걸렸고, 같은 계정에서 최대 {2}초 기다린 뒤 모두 처리했습니다. 세션은 옮기지 않았습니다.",
+                    &[
+                        (clock.time(e.ts)).to_string(),
+                        (count(d.count)).to_string(),
+                        (count(max)).to_string(),
+                    ],
                 )
             };
-            (format!("{p} {a} · 속도 제한을 기다려서 처리"), body)
+            (
+                crate::i18n::format(
+                    "{0} {1} · 속도 제한을 기다려서 처리",
+                    &[p.to_string(), a.to_string()],
+                ),
+                body,
+            )
         }
         "burst" => {
-            tag = "할 일";
+            tag = crate::i18n::static_text("할 일");
             tone = v2::Tone::Bad;
             category = EventFilter::Tasks;
             (
-                "새 대화 급증".into(),
-                "클라이언트의 반복 실행을 확인하세요. 10분 동안 새 대화가 설정 한도를 넘었습니다."
+                crate::i18n::static_text("새 대화 급증").into(),
+                crate::i18n::static_text("클라이언트의 반복 실행을 확인하세요. 10분 동안 새 대화가 설정 한도를 넘었습니다.")
                     .into(),
             )
         }
         "token_refresh" | "linked_reload" => {
-            tag = if d.needs_relogin { "할 일" } else { "토큰" };
+            tag = if d.needs_relogin {
+                crate::i18n::static_text("할 일")
+            } else {
+                crate::i18n::static_text("토큰")
+            };
             tone = if d.needs_relogin {
                 v2::Tone::Bad
             } else {
@@ -1646,56 +1814,95 @@ fn event_row(e: &ActivityEvent, accounts: &v2::View, clock: &Clock) -> Option<Ev
             };
             if d.ok == Some(false) {
                 (
-                    format!("{p} {a} · 토큰 갱신 실패"),
-                    "다음 갱신 시각에 다시 시도합니다.".into(),
+                    crate::i18n::format(
+                        "{0} {1} · 토큰 갱신 실패",
+                        &[p.to_string(), a.to_string()],
+                    ),
+                    crate::i18n::static_text("다음 갱신 시각에 다시 시도합니다.").into(),
                 )
             } else if d.after_failure {
                 (
-                    format!("{p} {a} · 토큰 갱신을 다시 시도해 성공"),
-                    format!("새 토큰은 {}까지 유효합니다.", clock.time(d.expires_at)),
+                    crate::i18n::format(
+                        "{0} {1} · 토큰 갱신을 다시 시도해 성공",
+                        &[p.to_string(), a.to_string()],
+                    ),
+                    crate::i18n::format(
+                        "새 토큰은 {0}까지 유효합니다.",
+                        &[(clock.time(d.expires_at)).to_string()],
+                    ),
                 )
             } else {
                 (
-                    format!("{p} {a} · 토큰 갱신 완료"),
-                    format!("새 토큰은 {}까지 유효합니다.", clock.time(d.expires_at)),
+                    crate::i18n::format(
+                        "{0} {1} · 토큰 갱신 완료",
+                        &[p.to_string(), a.to_string()],
+                    ),
+                    crate::i18n::format(
+                        "새 토큰은 {0}까지 유효합니다.",
+                        &[(clock.time(d.expires_at)).to_string()],
+                    ),
                 )
             }
         }
         "login" => {
-            tag = "토큰";
+            tag = crate::i18n::static_text("토큰");
             category = EventFilter::Tokens;
             (
-                format!("{p} {a} · 로그인 완료"),
-                "계정 로그인을 마쳤습니다.".into(),
+                crate::i18n::format("{0} {1} · 로그인 완료", &[p.to_string(), a.to_string()]),
+                crate::i18n::static_text("계정 로그인을 마쳤습니다.").into(),
             )
         }
         "account_changed" | "pause" | "resume" | "drain" | "allow_credits" | "enable"
         | "disable" => {
-            tag = "설정";
+            tag = crate::i18n::static_text("설정");
             let action = d.action.as_deref().unwrap_or(&e.kind);
             let (title, body) = match action {
-                "pause" => ("일시정지", "새 세션을 배정하지 않습니다."),
-                "resume" => ("재개", "다시 새 세션을 받을 수 있습니다."),
-                "drain" | "drain_on" => (
-                    "새 대화 받지 않음",
-                    "기존 세션은 유지하고 새 세션을 배정하지 않습니다.",
+                "pause" => (
+                    crate::i18n::static_text("일시정지"),
+                    crate::i18n::static_text("새 세션을 배정하지 않습니다."),
                 ),
-                "drain_off" => ("새 대화 받기", "다시 새 세션을 받을 수 있습니다."),
+                "resume" => (
+                    crate::i18n::static_text("재개"),
+                    crate::i18n::static_text("다시 새 세션을 받을 수 있습니다."),
+                ),
+                "drain" | "drain_on" => (
+                    crate::i18n::static_text("새 대화 받지 않음"),
+                    crate::i18n::static_text("기존 세션은 유지하고 새 세션을 배정하지 않습니다."),
+                ),
+                "drain_off" => (
+                    crate::i18n::static_text("새 대화 받기"),
+                    crate::i18n::static_text("다시 새 세션을 받을 수 있습니다."),
+                ),
                 "credits_on" => (
-                    "유료 크레딧 사용 허용 켜짐",
-                    "한도에 도달하면 유료 크레딧으로 계속 처리할 수 있습니다.",
+                    crate::i18n::static_text("유료 크레딧 사용 허용 켜짐"),
+                    crate::i18n::static_text(
+                        "한도에 도달하면 유료 크레딧으로 계속 처리할 수 있습니다.",
+                    ),
                 ),
                 "allow_credits" if d.allow_credits => (
-                    "유료 크레딧 사용 허용 켜짐",
-                    "한도에 도달하면 유료 크레딧으로 계속 처리할 수 있습니다.",
+                    crate::i18n::static_text("유료 크레딧 사용 허용 켜짐"),
+                    crate::i18n::static_text(
+                        "한도에 도달하면 유료 크레딧으로 계속 처리할 수 있습니다.",
+                    ),
                 ),
                 "allow_credits" | "credits_off" => (
-                    "유료 크레딧 사용 허용 꺼짐",
-                    "이제 한도에 도달하면 크레딧을 쓰지 않고 다른 계정으로 넘깁니다.",
+                    crate::i18n::static_text("유료 크레딧 사용 허용 꺼짐"),
+                    crate::i18n::static_text(
+                        "이제 한도에 도달하면 크레딧을 쓰지 않고 다른 계정으로 넘깁니다.",
+                    ),
                 ),
-                "disable" => ("계정 꺼짐", "이 계정에 요청을 배정하지 않습니다."),
-                "enable" => ("계정 켜짐", "계정 상태를 확인해 요청을 배정합니다."),
-                _ => ("계정 설정 변경", "계정 설정을 반영했습니다."),
+                "disable" => (
+                    crate::i18n::static_text("계정 꺼짐"),
+                    crate::i18n::static_text("이 계정에 요청을 배정하지 않습니다."),
+                ),
+                "enable" => (
+                    crate::i18n::static_text("계정 켜짐"),
+                    crate::i18n::static_text("계정 상태를 확인해 요청을 배정합니다."),
+                ),
+                _ => (
+                    crate::i18n::static_text("계정 설정 변경"),
+                    crate::i18n::static_text("계정 설정을 반영했습니다."),
+                ),
             };
             (format!("{p} {a} · {title}"), body.into())
         }
@@ -1759,27 +1966,34 @@ pub fn outcome(r: &RequestSummary, accounts: &v2::View) -> String {
     if let Some(f) = &r.failover
         && matches!(r.outcome.as_str(), "ok" | "rate_hold_ok")
     {
-        return format!(
-            "성공 · {}에서 {}로 넘겨 처리",
-            account_name(accounts, &f.from),
-            account_name(accounts, &f.to)
+        return crate::i18n::format(
+            "성공 · {0}에서 {1}로 넘겨 처리",
+            &[
+                (account_name(accounts, &f.from)).to_string(),
+                (account_name(accounts, &f.to)).to_string(),
+            ],
         );
     }
     match r.outcome.as_str() {
-        "ok" => "성공".into(),
-        "rate_hold_ok" => format!("성공 · 속도 제한 {}번 기다림", count(r.rate_retries)),
-        "waiting" => format!(
-            "진행 중 · {}초 기다린 뒤 보냄",
-            count(r.rate_wait_ms.map(|v| v / 1000))
+        "ok" => crate::i18n::static_text("성공").into(),
+        "rate_hold_ok" => crate::i18n::format(
+            "성공 · 속도 제한 {0}번 기다림",
+            &[(count(r.rate_retries)).to_string()],
         ),
-        "inflight" => "진행 중".into(),
-        "relayed_rate_429" | "relayed_rate429" => "실패 · 속도 제한 오류를 그대로 전달".into(),
-        "network_error" => "실패 · 상류에 연결하지 못함".into(),
-        "upstream_error" => format!(
-            "실패 · 상류 오류 {}",
-            r.status.map(|n| n.to_string()).unwrap_or_else(unknown)
+        "waiting" => crate::i18n::format(
+            "진행 중 · {0}초 기다린 뒤 보냄",
+            &[(count(r.rate_wait_ms.map(|v| v / 1000))).to_string()],
         ),
-        "client_drop" => "클라이언트가 중단".into(),
+        "inflight" => crate::i18n::static_text("진행 중").into(),
+        "relayed_rate_429" | "relayed_rate429" => {
+            crate::i18n::static_text("실패 · 속도 제한 오류를 그대로 전달").into()
+        }
+        "network_error" => crate::i18n::static_text("실패 · 상류에 연결하지 못함").into(),
+        "upstream_error" => crate::i18n::format(
+            "실패 · 상류 오류 {0}",
+            &[(r.status.map(|n| n.to_string()).unwrap_or_else(unknown)).to_string()],
+        ),
+        "client_drop" => crate::i18n::static_text("클라이언트가 중단").into(),
         _ => unknown(),
     }
 }
@@ -1802,101 +2016,125 @@ fn detail_view(d: &SessionDetail, accounts: &v2::View, clock: &Clock, expired: b
                 .join(" · ");
             if a.state == v2::DisplayState::Relogin {
                 if values.is_empty() {
-                    "확인 불가 · 사용량 확인 전".into()
+                    crate::i18n::static_text("확인 불가 · 사용량 확인 전").into()
                 } else {
                     let observed = observed_at(a, clock)
-                        .map(|t| format!("{} 기준", clock.time(Some(t))))
-                        .unwrap_or_else(|| "기준 시각 확인 전".into());
-                    format!("확인 불가 · {observed} {values}")
+                        .map(|t| {
+                            crate::i18n::format("{0} 기준", &[(clock.time(Some(t))).to_string()])
+                        })
+                        .unwrap_or_else(|| crate::i18n::static_text("기준 시각 확인 전").into());
+                    crate::i18n::format(
+                        "확인 불가 · {0} {1}",
+                        &[observed.to_string(), values.to_string()],
+                    )
                 }
             } else if values.is_empty() {
-                "사용량 확인 전".into()
+                crate::i18n::static_text("사용량 확인 전").into()
             } else {
                 values
             }
         })
-        .unwrap_or_else(|| "사용량 확인 전".into());
+        .unwrap_or_else(|| crate::i18n::static_text("사용량 확인 전").into());
     let observed_failures = d
         .recent_requests
         .iter()
         .filter(|r| {
             r.ts.is_some_and(|t| t >= clock.day_start && t < clock.day_end && t <= clock.utc())
-                && outcome(r, accounts).starts_with("실패")
+                && matches!(
+                    r.outcome.as_str(),
+                    "relayed_rate_429" | "relayed_rate429" | "network_error" | "upstream_error"
+                )
         })
         .count() as u64;
     let known_failures = s.failures_today.unwrap_or(0).max(observed_failures);
     let mut facts: Vec<(String, String)> = vec![
-        ("계정".into(), account_text),
-        ("남은 양".into(), remaining),
-        ("모델".into(), row.model),
+        (crate::i18n::static_text("계정").into(), account_text),
+        (crate::i18n::static_text("남은 양").into(), remaining),
+        (crate::i18n::static_text("모델").into(), row.model),
         (
-            "시작".into(),
+            crate::i18n::static_text("시작").into(),
             format!(
                 "{} ({})",
                 row.start,
                 s.first_seen_at
-                    .map(|t| format!(
-                        "{}분째",
-                        clock.utc().signed_duration_since(t).num_minutes().max(0)
+                    .map(|t| crate::i18n::format(
+                        "{0}분째",
+                        &[(clock.utc().signed_duration_since(t).num_minutes().max(0)).to_string()]
                     ))
                     .unwrap_or_else(unknown)
             ),
         ),
-        ("마지막 활동".into(), clock.age(s.last_used_at)),
         (
-            "연결".into(),
+            crate::i18n::static_text("마지막 활동").into(),
+            clock.age(s.last_used_at),
+        ),
+        (
+            crate::i18n::static_text("연결").into(),
             if !s.inflight_known {
-                "— · 연결 정보 확인 전".into()
+                crate::i18n::static_text("— · 연결 정보 확인 전").into()
             } else if s.inflight.ws_open.unwrap_or(0) > 0 {
-                format!("WebSocket {}개 열림", count(s.inflight.ws_open))
+                crate::i18n::format(
+                    "WebSocket {0}개 열림",
+                    &[(count(s.inflight.ws_open)).to_string()],
+                )
             } else {
                 "HTTP".into()
             },
         ),
         (
-            "하위 에이전트".into(),
+            crate::i18n::static_text("하위 에이전트").into(),
             match s.subagents_today.filter(|_| s.subagents_known) {
-                Some(0) => "없음".into(),
-                Some(n) => format!("{n}개"),
+                Some(0) => crate::i18n::static_text("없음").into(),
+                Some(n) => crate::i18n::format("{0}개", &[n.to_string()]),
                 None => unknown(),
             },
         ),
         (
-            "오늘 요청".into(),
+            crate::i18n::static_text("오늘 요청").into(),
             if s.counters_complete && s.requests_today.is_some() {
                 let failures = s
                     .failures_today
-                    .map(|n| format!("{}건", count(Some(n.max(observed_failures)))))
+                    .map(|n| {
+                        crate::i18n::format(
+                            "{0}건",
+                            &[(count(Some(n.max(observed_failures)))).to_string()],
+                        )
+                    })
                     .unwrap_or_else(|| {
                         if observed_failures > 0 {
-                            format!("최소 {observed_failures}건")
+                            crate::i18n::format("최소 {0}건", &[observed_failures.to_string()])
                         } else {
-                            "—건".into()
+                            crate::i18n::static_text("—건").into()
                         }
                     });
                 if s.failures_today.is_none() && observed_failures == 0 {
-                    format!("{}건", count(s.requests_today))
+                    crate::i18n::format("{0}건", &[(count(s.requests_today)).to_string()])
                 } else {
-                    format!("{}건 · 실패 {failures}", count(s.requests_today))
+                    crate::i18n::format(
+                        "{0}건 · 실패 {1}",
+                        &[(count(s.requests_today)).to_string(), failures.to_string()],
+                    )
                 }
             } else if known_failures > 0 {
-                format!("실패 최소 {known_failures}건")
+                crate::i18n::format("실패 최소 {0}건", &[known_failures.to_string()])
             } else {
-                "— · 실패 — · 이전 실행 기록 확인 전".into()
+                crate::i18n::static_text("— · 실패 — · 이전 실행 기록 확인 전").into()
             },
         ),
     ];
     facts.retain(|(key, _)| match key.as_str() {
-        "하위 에이전트" => s.subagents_known && s.subagents_today.is_some(),
-        "오늘 요청" => {
+        value if value == crate::i18n::static_text("하위 에이전트") => {
+            s.subagents_known && s.subagents_today.is_some()
+        }
+        value if value == crate::i18n::static_text("오늘 요청") => {
             (s.counters_complete && s.requests_today.is_some()) || known_failures > 0
         }
         _ => true,
     });
     if s.truncated || s.metadata_truncated {
         facts.push((
-            "기록 범위".into(),
-            "버퍼 한도로 일부 기록만 표시합니다.".into(),
+            crate::i18n::static_text("기록 범위").into(),
+            crate::i18n::static_text("버퍼 한도로 일부 기록만 표시합니다.").into(),
         ));
     }
     let active_wait = s
@@ -1908,36 +2146,49 @@ fn detail_view(d: &SessionDetail, accounts: &v2::View, clock: &Clock, expired: b
         wait_facts.push(
             p.since
                 .map(|t| {
-                    format!(
-                        "지금 {}초째",
-                        clock.utc().signed_duration_since(t).num_seconds().max(0)
+                    crate::i18n::format(
+                        "지금 {0}초째",
+                        &[(clock.utc().signed_duration_since(t).num_seconds().max(0)).to_string()],
                     )
                 })
-                .unwrap_or_else(|| "지금 대기 중".into()),
+                .unwrap_or_else(|| crate::i18n::static_text("지금 대기 중").into()),
         );
     }
     if s.counters_complete && s.rate_wait_today.count.unwrap_or(0) > 0 {
         if let Some(n) = s.rate_wait_today.count {
-            wait_facts.push(format!("오늘 {}번", count(Some(n))));
+            wait_facts.push(crate::i18n::format(
+                "오늘 {0}번",
+                &[(count(Some(n))).to_string()],
+            ));
         }
         if let Some(ms) = s.rate_wait_today.total_ms {
-            wait_facts.push(format!("합계 {}초", count(Some(ms / 1000))));
+            wait_facts.push(crate::i18n::format(
+                "합계 {0}초",
+                &[(count(Some(ms / 1000))).to_string()],
+            ));
         }
     }
     if !wait_facts.is_empty() {
-        facts.push(("속도 조절 대기".into(), wait_facts.join(" · ")));
+        facts.push((
+            crate::i18n::static_text("속도 조절 대기").into(),
+            wait_facts.join(" · "),
+        ));
     }
-    facts.push(("이름 출처".into(), source(s)));
+    facts.push((crate::i18n::static_text("이름 출처").into(), source(s)));
     if !d.recent_requests_known {
         facts.push((
-            "최근 요청 범위".into(),
-            "— · 이전 실행 또는 버퍼 한도로 일부 관측만 표시합니다.".into(),
+            crate::i18n::static_text("최근 요청 범위").into(),
+            crate::i18n::static_text("— · 이전 실행 또는 버퍼 한도로 일부 관측만 표시합니다.")
+                .into(),
         ));
     }
     if !d.timeline_known {
         facts.push((
-            "계정 이력 범위".into(),
-            "— · 이전 실행 또는 버퍼 한도로 전체 이력을 확인하지 못했습니다.".into(),
+            crate::i18n::static_text("계정 이력 범위").into(),
+            crate::i18n::static_text(
+                "— · 이전 실행 또는 버퍼 한도로 전체 이력을 확인하지 못했습니다.",
+            )
+            .into(),
         ));
     }
     let mut placements: Vec<_> = d
@@ -1956,12 +2207,12 @@ fn detail_view(d: &SessionDetail, accounts: &v2::View, clock: &Clock, expired: b
                 clock.time(p.at),
                 account_name(accounts, &p.account),
                 if p.account == s.account {
-                    " (현재)"
+                    crate::i18n::static_text(" (현재)")
                 } else {
                     ""
                 },
                 if p.kind == "placed" && p.reason.as_deref() != Some("launch_model") {
-                    "처음 배정"
+                    crate::i18n::static_text("처음 배정")
                 } else {
                     reason(p.reason.as_deref().unwrap_or(""))
                 },
@@ -1975,31 +2226,42 @@ fn detail_view(d: &SessionDetail, accounts: &v2::View, clock: &Clock, expired: b
     let requests = requests
         .into_iter()
         .map(|r| {
-            format!(
-                "{} · {} · 첫 응답 {} · 걸린 시간 {}",
-                clock.stamp(r.ts),
-                outcome(r, accounts),
-                r.ttfb_ms
-                    .map(|n| format!("{}.{:01}초", n / 1000, n % 1000 / 100))
-                    .unwrap_or_else(unknown),
-                duration(r.dur_ms)
+            crate::i18n::format(
+                "{0} · {1} · 첫 응답 {2} · 걸린 시간 {3}",
+                &[
+                    (clock.stamp(r.ts)).to_string(),
+                    (outcome(r, accounts)).to_string(),
+                    (r.ttfb_ms
+                        .map(|n| {
+                            crate::i18n::format(
+                                "{0}.{1}초",
+                                &[(n / 1000).to_string(), format!("{:01}", n % 1000 / 100)],
+                            )
+                        })
+                        .unwrap_or_else(unknown))
+                    .to_string(),
+                    (duration(r.dur_ms)).to_string(),
+                ],
             )
         })
         .collect();
     DetailView {
         id: s.id.clone(),
         title: row.label,
-        subtitle: format!(
-            "{} · 세션 {}",
-            [
-                row.client,
-                s.client.version.as_deref().map(clean).unwrap_or_default()
-            ]
-            .into_iter()
-            .filter(|part| !part.trim().is_empty())
-            .collect::<Vec<_>>()
-            .join(" "),
-            s.id
+        subtitle: crate::i18n::format(
+            "{0} · 세션 {1}",
+            &[
+                ([
+                    row.client,
+                    s.client.version.as_deref().map(clean).unwrap_or_default(),
+                ]
+                .into_iter()
+                .filter(|part| !part.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join(" "))
+                .to_string(),
+                (s.id).to_string(),
+            ],
         ),
         raw_prefix: d
             .original_short_id
@@ -2007,13 +2269,13 @@ fn detail_view(d: &SessionDetail, accounts: &v2::View, clock: &Clock, expired: b
             .map(|s| clean(s).chars().take(8).collect::<String>())
             .filter(|s| !s.is_empty()),
         status: if !s.inflight_known {
-            "요청 상태 확인 전".into()
+            crate::i18n::static_text("요청 상태 확인 전").into()
         } else if row.inflight {
             row.activity
         } else if s.active {
-            "5분 안에 활동".into()
+            crate::i18n::static_text("5분 안에 활동").into()
         } else {
-            "쉬는 중".into()
+            crate::i18n::static_text("쉬는 중").into()
         },
         status_tone: if row.inflight {
             v2::Tone::Use
@@ -2025,9 +2287,9 @@ fn detail_view(d: &SessionDetail, accounts: &v2::View, clock: &Clock, expired: b
             account_name(accounts, &s.account),
             v2::provider_label(&s.provider),
             if row.inflight {
-                "에서 처리 중"
+                crate::i18n::static_text("에서 처리 중")
             } else {
-                "에 배정됨"
+                crate::i18n::static_text("에 배정됨")
             }
         ),
         facts,
@@ -2255,5 +2517,73 @@ mod r14_move_cost_transport_tests {
         assert!(!unknown.lines()[0].contains("24시간 0 토큰"));
         let old: SessionsResponse = serde_json::from_str("{}").unwrap();
         assert!(old.move_cost.is_none());
+    }
+}
+
+#[cfg(test)]
+mod r16_localization_tests {
+    use super::*;
+    use crate::i18n::{UiLanguage, with_language};
+
+    #[test]
+    fn english_clock_and_duration_keep_numeric_meaning() {
+        let now = DateTime::parse_from_rfc3339("2026-10-23T12:00:00+09:00").unwrap();
+        let clock = Clock {
+            now,
+            day_start: now.with_timezone(&Utc),
+            day_end: now.with_timezone(&Utc),
+        };
+        with_language(UiLanguage::En, || {
+            assert_eq!(
+                clock.age(Some(clock.utc() - chrono::Duration::minutes(2))),
+                "2 minutes ago"
+            );
+            assert_eq!(
+                clock.time(Some(clock.utc() + chrono::Duration::days(1))),
+                "Oct 24 12:00"
+            );
+            assert_eq!(duration(Some(125000)), "2m 5s");
+            assert_eq!(duration(Some(9_300_000)), "2h 35m");
+            assert!(clock.day_label(clock.utc()).contains("Fri"));
+        });
+        assert_eq!(
+            clock.age(Some(clock.utc() - chrono::Duration::minutes(2))),
+            "2분 전"
+        );
+    }
+
+    #[test]
+    fn snapshot_wire_serialization_preserves_aliases_and_skips_enrichment() {
+        let mut activity: ActivityResponse = serde_json::from_value(serde_json::json!({
+            "events":[{"seq":7,"kind":"session_move","data":{"active":12,"recovered":true}}],
+            "next_seq":8,"truncated":true
+        }))
+        .unwrap();
+        activity.events[0].data.label = Some("private presentation enrichment".into());
+        activity.events[0].data.no_eligible = true;
+        let wire = serde_json::to_value(&activity).unwrap();
+        assert_eq!(wire["events"][0]["data"]["active"], 12);
+        assert_eq!(wire["events"][0]["data"]["recovered"], true);
+        assert!(wire["events"][0]["data"].get("active_sessions").is_none());
+        assert!(wire["events"][0]["data"].get("label").is_none());
+        assert!(wire["events"][0]["data"].get("no_eligible").is_none());
+        let restored: ActivityResponse = serde_json::from_value(wire).unwrap();
+        assert_eq!(restored.events[0].data.active_sessions, Some(12));
+        assert!(restored.events[0].data.after_failure);
+        assert!(restored.truncated);
+        let sessions: SessionsResponse = serde_json::from_value(serde_json::json!({
+            "sessions":[{"id":"s","inflight_known":false,"moves_known":true}],
+            "move_cost":{"hour":{"tokens":123,"known_count":1,"unknown_count":2},"rolling24h":{"unknown_count":3},"clock_adjusted":true}
+        })).unwrap();
+        let restored: SessionsResponse =
+            serde_json::from_slice(&serde_json::to_vec(&sessions).unwrap()).unwrap();
+        assert!(!restored.sessions[0].inflight_known);
+        assert!(restored.sessions[0].moves_known);
+        assert_eq!(restored.move_cost.unwrap().hour.tokens, 123);
+        let history: UsageHistory = serde_json::from_value(serde_json::json!({"accounts":[{"id":"a","windows":[{"name":"5h","points":[["2026-10-23T03:00:00Z",null]],"truncated":true}]}],"truncated":true})).unwrap();
+        let restored: UsageHistory =
+            serde_json::from_slice(&serde_json::to_vec(&history).unwrap()).unwrap();
+        assert_eq!(restored.accounts[0].windows[0].points[0].1, None);
+        assert!(restored.truncated);
     }
 }

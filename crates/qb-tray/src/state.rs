@@ -39,19 +39,21 @@ pub enum Range {
 impl Range {
     pub fn empty_title(self) -> &'static str {
         match self {
-            Self::Active => "현재 활성 세션이 없습니다",
-            Self::Hour => "최근 1시간 동안 quota-baton을 거친 세션이 없습니다",
-            Self::Today => "오늘 quota-baton을 거친 세션이 없습니다",
-            Self::All => "연결된 세션이 없습니다",
+            Self::Active => crate::i18n::static_text("현재 활성 세션이 없습니다"),
+            Self::Hour => {
+                crate::i18n::static_text("최근 1시간 동안 quota-baton을 거친 세션이 없습니다")
+            }
+            Self::Today => crate::i18n::static_text("오늘 quota-baton을 거친 세션이 없습니다"),
+            Self::All => crate::i18n::static_text("연결된 세션이 없습니다"),
         }
     }
     pub const ALL: [Self; 4] = [Self::Active, Self::Hour, Self::Today, Self::All];
     pub fn label(self) -> &'static str {
         match self {
-            Self::Active => "활성만",
-            Self::Hour => "최근 1시간",
-            Self::Today => "오늘",
-            Self::All => "연결된 전체",
+            Self::Active => crate::i18n::static_text("활성만"),
+            Self::Hour => crate::i18n::static_text("최근 1시간"),
+            Self::Today => crate::i18n::static_text("오늘"),
+            Self::All => crate::i18n::static_text("연결된 전체"),
         }
     }
     pub fn query(self) -> &'static str {
@@ -99,13 +101,13 @@ impl EventFilter {
     ];
     pub fn label(self) -> &'static str {
         match self {
-            Self::Notable => "중요한 일",
-            Self::Tasks => "할 일",
-            Self::Moves => "한도·계정 전환",
-            Self::Pacing => "속도 조절",
-            Self::Credits => "크레딧",
-            Self::Tokens => "토큰·로그인",
-            Self::All => "모든 일",
+            Self::Notable => crate::i18n::static_text("중요한 일"),
+            Self::Tasks => crate::i18n::static_text("할 일"),
+            Self::Moves => crate::i18n::static_text("한도·계정 전환"),
+            Self::Pacing => crate::i18n::static_text("속도 조절"),
+            Self::Credits => crate::i18n::static_text("크레딧"),
+            Self::Tokens => crate::i18n::static_text("토큰·로그인"),
+            Self::All => crate::i18n::static_text("모든 일"),
         }
     }
     pub fn matches(self, e: &EventRow) -> bool {

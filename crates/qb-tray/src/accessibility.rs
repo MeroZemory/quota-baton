@@ -673,7 +673,7 @@ impl Node {
             UIA_LocalizedControlTypePropertyId
                 if element.is_some_and(|e| e.kind == Kind::Chart) =>
             {
-                string_variant("차트")?
+                string_variant(qb_tray::i18n::static_text("차트"))?
             }
             UIA_ValueValuePropertyId if patterns.value => {
                 string_variant(element.and_then(|e| e.value.as_deref()).unwrap_or(""))?

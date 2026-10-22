@@ -27,18 +27,18 @@ pub enum MenuItem {
 }
 
 impl MenuItem {
-    pub const fn label(self, _row: &Row) -> &'static str {
+    pub fn label(self, _row: &Row) -> &'static str {
         match self {
-            Self::Relogin => "다시 로그인",
-            Self::Pause => "일시정지",
-            Self::Resume => "재개",
-            Self::Disable => "비활성화",
-            Self::Enable => "활성화",
-            Self::ToggleDrain => "새 대화 받지 않기",
-            Self::ToggleCredits => "유료 크레딧 사용 허용",
-            Self::RefreshUsage => "사용량 새로고침",
-            Self::RefreshTokens => "지금 갱신",
-            Self::Delete => "계정 삭제…",
+            Self::Relogin => crate::i18n::static_text("다시 로그인"),
+            Self::Pause => crate::i18n::static_text("일시정지"),
+            Self::Resume => crate::i18n::static_text("재개"),
+            Self::Disable => crate::i18n::static_text("비활성화"),
+            Self::Enable => crate::i18n::static_text("활성화"),
+            Self::ToggleDrain => crate::i18n::static_text("새 대화 받지 않기"),
+            Self::ToggleCredits => crate::i18n::static_text("유료 크레딧 사용 허용"),
+            Self::RefreshUsage => crate::i18n::static_text("사용량 새로고침"),
+            Self::RefreshTokens => crate::i18n::static_text("지금 갱신"),
+            Self::Delete => crate::i18n::static_text("계정 삭제…"),
         }
     }
 
@@ -82,17 +82,23 @@ pub fn admin_operation(item: MenuItem, row: &Row) -> Option<AdminOperation> {
 
 pub fn menu_items(row: &Row) -> Vec<MenuItem> {
     let mut items = Vec::new();
-    let linked_stale = row.source == "linked" && row.health_chip.starts_with("대기");
+    let linked_stale = row.source == "linked"
+        && row
+            .health_chip
+            .starts_with(crate::i18n::static_text("대기"));
     if !linked_stale
-        && row.user_chip != "비활성"
-        && (row.health_chip == "재로그인 필요" || row.health_chip.starts_with("대기"))
+        && row.user_chip != crate::i18n::static_text("비활성")
+        && (row.health_chip == crate::i18n::static_text("재로그인 필요")
+            || row
+                .health_chip
+                .starts_with(crate::i18n::static_text("대기")))
         && row.source != "linked"
     {
         items.push(MenuItem::Relogin);
     }
     match row.user_chip.as_str() {
-        "일시정지" => items.push(MenuItem::Resume),
-        "비활성" => items.push(MenuItem::Enable),
+        value if value == crate::i18n::static_text("일시정지") => items.push(MenuItem::Resume),
+        value if value == crate::i18n::static_text("비활성") => items.push(MenuItem::Enable),
         _ => {
             items.push(MenuItem::Pause);
             items.push(MenuItem::Disable);
@@ -104,7 +110,7 @@ pub fn menu_items(row: &Row) -> Vec<MenuItem> {
     }
     if matches!(row.source.as_str(), "oauth" | "adopted")
         && !row.drain
-        && row.health_chip != "재로그인 필요"
+        && row.health_chip != crate::i18n::static_text("재로그인 필요")
     {
         items.push(MenuItem::RefreshTokens);
     }
@@ -145,9 +151,11 @@ impl LoginPhase {
 
     pub fn title(&self) -> Option<String> {
         match self {
-            Self::Pending { provider, .. } => Some(format!("{provider} 로그인")),
+            Self::Pending { provider, .. } => {
+                Some(crate::i18n::format("{0} 로그인", &[provider.to_string()]))
+            }
             Self::Completed { message } | Self::Failed { message } => Some(message.clone()),
-            Self::Expired => Some("시간이 지났습니다".into()),
+            Self::Expired => Some(crate::i18n::static_text("시간이 지났습니다").into()),
             Self::Cancelled | Self::Idle => None,
         }
     }
@@ -324,5 +332,30 @@ mod tests {
             admin_operation(MenuItem::Delete, &value),
             Some(AdminOperation::Delete)
         );
+    }
+}
+
+#[cfg(test)]
+mod r16_localization_tests {
+    use super::*;
+    use crate::i18n::{UiLanguage, with_language};
+    #[test]
+    fn translated_menu_labels_keep_operations_and_login_values() {
+        with_language(UiLanguage::En, || {
+            let row = crate::parse_state(r#"{"accounts":[{"id":"a","provider":"codex","user_state":"paused","health":{"kind":"ready"},"source":{"kind":"oauth"}}]}"#).unwrap().remove(0);
+            assert!(menu_items(&row).contains(&MenuItem::Resume));
+            assert_eq!(MenuItem::Resume.label(&row), "Resume");
+            assert_eq!(
+                admin_operation(MenuItem::Resume, &row),
+                Some(AdminOperation::Account("resume"))
+            );
+            let login = LoginPhase::Pending {
+                login_id: "opaque".into(),
+                provider: "사용 중 {0}".into(),
+                auth_url: "not inspected".into(),
+                remaining_secs: 3,
+            };
+            assert_eq!(login.title().as_deref(), Some("Sign in to 사용 중 {0}"));
+        });
     }
 }

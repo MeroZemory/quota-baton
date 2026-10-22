@@ -364,7 +364,7 @@ impl Scene {
             let add_button = empty_message.map(|_| {
                 button(
                     r(260., y + 10., 344., y + 34.),
-                    "계정 추가",
+                    crate::i18n::static_text("계정 추가"),
                     Target::AddProvider(section.provider.clone()),
                     p.core_ok,
                 )
@@ -483,12 +483,12 @@ impl Scene {
                     .clamp(0., (d.body_height - h(d.body)).max(0.));
                 d.buttons[0].label = if *confirming {
                     if *replace {
-                        "교체하고 가져오기"
+                        crate::i18n::static_text("교체하고 가져오기")
                     } else {
-                        "가져오기"
+                        crate::i18n::static_text("가져오기")
                     }
                 } else {
-                    "경고 확인"
+                    crate::i18n::static_text("경고 확인")
                 }
                 .into();
                 d.buttons[0].target = if *confirming {
@@ -686,9 +686,9 @@ fn header(view: &v2::View, core_ok: bool) -> HeaderBox {
 fn footer(height: f32, p: &Presentation) -> FooterBox {
     let top = (height - FOOTER).max(0.);
     let by = top + 8.;
-    let add_width = 36. + advance(p, "계정 추가", 13, false);
-    let settings_width = 36. + advance(p, "설정", 13, false);
-    let quit_width = 36. + advance(p, "종료", 13, false);
+    let add_width = 36. + advance(p, crate::i18n::static_text("계정 추가"), 13, false);
+    let settings_width = 36. + advance(p, crate::i18n::static_text("설정"), 13, false);
+    let quit_width = 36. + advance(p, crate::i18n::static_text("종료"), 13, false);
     let quit = r(352. - quit_width, by, 352., by + 32.);
     let settings = r(
         quit.left - 2. - settings_width,
@@ -702,17 +702,22 @@ fn footer(height: f32, p: &Presentation) -> FooterBox {
         buttons: vec![
             button(
                 add,
-                "계정 추가",
+                crate::i18n::static_text("계정 추가"),
                 Target::Footer(FooterAction::Add),
                 p.core_ok && !matches!(p.overlay, Overlay::Login(_)),
             ),
             button(
                 settings,
-                "설정",
+                crate::i18n::static_text("설정"),
                 Target::Footer(FooterAction::Settings),
                 true,
             ),
-            button(quit, "종료", Target::Footer(FooterAction::Quit), true),
+            button(
+                quit,
+                crate::i18n::static_text("종료"),
+                Target::Footer(FooterAction::Quit),
+                true,
+            ),
         ],
         stale_space: r(add.right + 4., by, settings.left - 4., by + 32.),
     }
@@ -730,13 +735,13 @@ fn login_box(provider: &str, y: f32) -> LoginBox {
         buttons: vec![
             button(
                 r(16., y + 124., 176., y + 156.),
-                "주소 복사",
+                crate::i18n::static_text("주소 복사"),
                 Target::LoginCopy,
                 true,
             ),
             button(
                 r(184., y + 124., 344., y + 156.),
-                "취소",
+                crate::i18n::static_text("취소"),
                 Target::LoginCancel,
                 true,
             ),
@@ -750,13 +755,13 @@ fn empty_box(y: f32, enabled: bool) -> EmptyBox {
         buttons: vec![
             button(
                 r(16., y + 104., 176., y + 136.),
-                "Claude 계정 추가",
+                crate::i18n::static_text("Claude 계정 추가"),
                 Target::AddProvider("claude".into()),
                 enabled,
             ),
             button(
                 r(184., y + 104., 344., y + 136.),
-                "Codex 계정 추가",
+                crate::i18n::static_text("Codex 계정 추가"),
                 Target::AddProvider("codex".into()),
                 enabled,
             ),
@@ -845,10 +850,16 @@ fn row_box(row: &v2::AccountRow, disabled_slot: bool, y: f32, p: &Presentation) 
     let mut right = 320.;
     let mut inline = None;
     if disabled_slot && row.raw.user_state == "disabled" {
-        let width = 20. + advance(p, "켜기", 12, row.action.as_ref().is_some_and(|a| a.accent));
+        let width = 20.
+            + advance(
+                p,
+                crate::i18n::static_text("켜기"),
+                12,
+                row.action.as_ref().is_some_and(|a| a.accent),
+            );
         inline = Some(button(
             r(right - width, line1.top, right, line1.bottom),
-            "켜기",
+            crate::i18n::static_text("켜기"),
             Target::Inline {
                 id: row.raw.id.clone(),
                 action: v2::ActionKind::Enable,
@@ -1083,43 +1094,67 @@ fn row_parts(row: &v2::AccountRow, core_ok: bool) -> Vec<Part> {
     parts.push(Part::Separator);
     let mut groups: Vec<Vec<(MenuAction, &str, Option<bool>)>> = vec![vec![], vec![], vec![]];
     if row.menu.show_refresh_usage {
-        groups[0].push((MenuAction::RefreshUsage, "사용량 새로고침", None));
+        groups[0].push((
+            MenuAction::RefreshUsage,
+            crate::i18n::static_text("사용량 새로고침"),
+            None,
+        ));
     }
     if row.menu.show_release_hold {
-        groups[0].push((MenuAction::ReleaseHold, "한도 해제 후 다시 시도", None));
+        groups[0].push((
+            MenuAction::ReleaseHold,
+            crate::i18n::static_text("한도 해제 후 다시 시도"),
+            None,
+        ));
     }
     if row.menu.show_relogin {
-        groups[0].push((MenuAction::Relogin, "다시 로그인", None));
+        groups[0].push((
+            MenuAction::Relogin,
+            crate::i18n::static_text("다시 로그인"),
+            None,
+        ));
     }
     if row.menu.show_refresh_token {
-        groups[0].push((MenuAction::RefreshToken, "토큰 지금 갱신", None));
+        groups[0].push((
+            MenuAction::RefreshToken,
+            crate::i18n::static_text("토큰 지금 갱신"),
+            None,
+        ));
     }
     if row.raw.provider == "codex" {
         groups[1].push((
             MenuAction::ToggleCredits,
-            "유료 크레딧 사용 허용",
+            crate::i18n::static_text("유료 크레딧 사용 허용"),
             Some(row.raw.allow_credits),
         ));
     }
     if matches!(row.raw.user_state.as_str(), "active" | "paused") {
         groups[1].push((
             MenuAction::ToggleDrain,
-            "새 대화 받지 않기",
+            crate::i18n::static_text("새 대화 받지 않기"),
             Some(row.raw.drain),
         ));
     }
     if row.raw.user_state == "active" {
-        groups[2].push((MenuAction::Pause, "일시정지", None));
+        groups[2].push((
+            MenuAction::Pause,
+            crate::i18n::static_text("일시정지"),
+            None,
+        ));
     }
     if row.raw.user_state == "paused" {
-        groups[2].push((MenuAction::Resume, "재개", None));
+        groups[2].push((MenuAction::Resume, crate::i18n::static_text("재개"), None));
     }
     groups[2].push(if row.raw.user_state == "disabled" {
-        (MenuAction::Enable, "켜기", None)
+        (MenuAction::Enable, crate::i18n::static_text("켜기"), None)
     } else {
-        (MenuAction::Disable, "끄기", None)
+        (MenuAction::Disable, crate::i18n::static_text("끄기"), None)
     });
-    groups[2].push((MenuAction::Delete, "계정 삭제…", None));
+    groups[2].push((
+        MenuAction::Delete,
+        crate::i18n::static_text("계정 삭제…"),
+        None,
+    ));
     let mut first = true;
     for group in groups.into_iter().filter(|g| !g.is_empty()) {
         if !first {
@@ -1164,9 +1199,21 @@ fn menu_parts(view: &v2::View, p: &Presentation) -> Option<(f32, Vec<Part>)> {
         Overlay::Settings => (
             240.,
             vec![
-                item("대시보드 열기", MenuAction::OpenDashboard, true),
-                item("설정 파일 열기", MenuAction::OpenConfig, true),
-                item("로그 폴더 열기", MenuAction::OpenLogs, true),
+                item(
+                    crate::i18n::static_text("대시보드 열기"),
+                    MenuAction::OpenDashboard,
+                    true,
+                ),
+                item(
+                    crate::i18n::static_text("설정 파일 열기"),
+                    MenuAction::OpenConfig,
+                    true,
+                ),
+                item(
+                    crate::i18n::static_text("로그 폴더 열기"),
+                    MenuAction::OpenLogs,
+                    true,
+                ),
                 Part::Separator,
                 Part::Gap(8.),
                 Part::Info(
@@ -1174,36 +1221,52 @@ fn menu_parts(view: &v2::View, p: &Presentation) -> Option<(f32, Vec<Part>)> {
                         "quota-baton {} · {}",
                         view.raw.version,
                         if p.core_ok {
-                            "코어 실행 중"
+                            crate::i18n::static_text("코어 실행 중")
                         } else {
-                            "코어 연결 끊김"
+                            crate::i18n::static_text("코어 연결 끊김")
                         }
                     ),
                     false,
                     16.,
                 ),
-                Part::Info("설정 파일: config.toml".into(), false, 16.),
+                Part::Info(
+                    crate::i18n::static_text("설정 파일: config.toml").into(),
+                    false,
+                    16.,
+                ),
                 Part::Gap(8.),
             ],
         ),
         Overlay::Add => (
             300.,
             vec![
-                item("Claude 계정 로그인", MenuAction::AddClaude, p.core_ok),
-                item("Codex 계정 로그인", MenuAction::AddCodex, p.core_ok),
-                item("다른 앱에서 계정 가져오기", MenuAction::Takeover, p.core_ok),
+                item(
+                    crate::i18n::static_text("Claude 계정 로그인"),
+                    MenuAction::AddClaude,
+                    p.core_ok,
+                ),
+                item(
+                    crate::i18n::static_text("Codex 계정 로그인"),
+                    MenuAction::AddCodex,
+                    p.core_ok,
+                ),
+                item(
+                    crate::i18n::static_text("다른 앱에서 계정 가져오기"),
+                    MenuAction::Takeover,
+                    p.core_ok,
+                ),
             ],
         ),
         Overlay::TakeoverProviders => (
             300.,
             vec![
                 item(
-                    "Codex 폴더에서 가져오기",
+                    crate::i18n::static_text("Codex 폴더에서 가져오기"),
                     MenuAction::TakeoverCodex,
                     p.core_ok,
                 ),
                 item(
-                    "Claude 폴더에서 가져오기",
+                    crate::i18n::static_text("Claude 폴더에서 가져오기"),
                     MenuAction::TakeoverClaude,
                     p.core_ok,
                 ),
@@ -1213,8 +1276,8 @@ fn menu_parts(view: &v2::View, p: &Presentation) -> Option<(f32, Vec<Part>)> {
             300.,
             vec![
                 Part::Item(
-                    "트레이만 닫기".into(),
-                    Some(QUIT_DETAILS[0].into()),
+                    crate::i18n::static_text("트레이만 닫기").into(),
+                    Some(crate::i18n::static_text(QUIT_DETAILS[0]).into()),
                     None,
                     false,
                     Target::Menu {
@@ -1224,8 +1287,8 @@ fn menu_parts(view: &v2::View, p: &Presentation) -> Option<(f32, Vec<Part>)> {
                     true,
                 ),
                 Part::Item(
-                    "트레이와 프록시 종료".into(),
-                    Some(QUIT_DETAILS[1].into()),
+                    crate::i18n::static_text("트레이와 프록시 종료").into(),
+                    Some(crate::i18n::static_text(QUIT_DETAILS[1]).into()),
                     None,
                     false,
                     Target::Menu {
@@ -1444,13 +1507,17 @@ fn dialog_box(scene: Rect, id: &str, delete: bool, p: &Presentation) -> DialogBo
         buttons: vec![
             button(
                 r(36., by, 176., by + 32.),
-                if delete { "삭제" } else { "크레딧 사용" },
+                if delete {
+                    crate::i18n::static_text("삭제")
+                } else {
+                    crate::i18n::static_text("크레딧 사용")
+                },
                 confirm,
                 p.core_ok && !p.pending_ids.contains(id),
             ),
             button(
                 r(184., by, 324., by + 32.),
-                "취소",
+                crate::i18n::static_text("취소"),
                 Target::CancelDialog,
                 true,
             ),

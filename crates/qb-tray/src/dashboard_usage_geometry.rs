@@ -5,13 +5,13 @@ pub(super) fn usage(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardStat
     b.card(card);
     b.text(
         rect(card.left + 16., card.top + 14., 120., 24.),
-        "사용량",
+        crate::i18n::static_text("사용량"),
         14.,
         true,
         Color::Text,
         false,
     );
-    let summary = "남은 양 · 최근 19시간 / 앞으로 5시간";
+    let summary = crate::i18n::static_text("남은 양 · 최근 19시간 / 앞으로 5시간");
     let summary_width = b.measured_width(summary, 12., false) + 4.;
     b.text(
         rect(card.left + 144., card.top + 16., summary_width, 20.),
@@ -22,9 +22,11 @@ pub(super) fn usage(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardStat
         false,
     );
     let legend = if v.usage.iter().any(|t| !t.projections.is_empty()) {
-        "━ 5시간 (Free는 30일)  ┄ 주간 / 향후 예측  ⋮ 초기화  ▧ 크레딧으로 처리"
+        crate::i18n::static_text(
+            "━ 5시간 (Free는 30일)  ┄ 주간 / 향후 예측  ⋮ 초기화  ▧ 크레딧으로 처리",
+        )
     } else {
-        "━ 5시간 (Free는 30일)  ┄ 주간  ⋮ 초기화  ▧ 크레딧으로 처리"
+        crate::i18n::static_text("━ 5시간 (Free는 30일)  ┄ 주간  ⋮ 초기화  ▧ 크레딧으로 처리")
     };
     let legend_width = b.measured_width(legend, 12., false) + 4.;
     let legend_left = card.right - 16. - legend_width;
@@ -102,7 +104,7 @@ pub(super) fn usage(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardStat
                 width(viewport) - 48.,
                 40.,
             ),
-            "사용량 확인 전",
+            crate::i18n::static_text("사용량 확인 전"),
             14.,
             false,
             Color::Secondary,
@@ -182,11 +184,16 @@ fn usage_tile(
     if t.unconfirmed {
         let since = t
             .last_observed
-            .map(|at| format!("{} 이후 확인하지 못함 · ", v.clock.time(Some(at))))
+            .map(|at| {
+                crate::i18n::format(
+                    "{0} 이후 확인하지 못함 · ",
+                    &[(v.clock.time(Some(at))).to_string()],
+                )
+            })
             .unwrap_or_default();
         b.text(
             rect(r.left + 12., r.top + 36., width(r) - 24., 16.),
-            format!("{since}다시 로그인 필요"),
+            crate::i18n::format("{0}다시 로그인 필요", &[since.to_string()]),
             12.,
             false,
             Color::Bad,
@@ -195,7 +202,7 @@ fn usage_tile(
     } else if t.windows.is_empty() {
         b.text(
             rect(r.left + 12., r.top + 36., width(r) - 24., 16.),
-            "사용량 확인 전",
+            crate::i18n::static_text("사용량 확인 전"),
             12.,
             false,
             Color::Secondary,
@@ -262,10 +269,17 @@ fn usage_tile(
     let mut captions = Vec::new();
     let mut overflow = Vec::new();
     for at in future_resets {
-        let label = format!(
-            "{}{} 초기화",
-            if at > to { "범위 밖 · " } else { "" },
-            v.clock.time(Some(at))
+        let label = crate::i18n::format(
+            "{0}{1} 초기화",
+            &[
+                (if at > to {
+                    crate::i18n::static_text("범위 밖 · ")
+                } else {
+                    ""
+                })
+                .to_string(),
+                (v.clock.time(Some(at))).to_string(),
+            ],
         );
         let w = (b.measured_width(&label, 11., false) + 4.).min(width(plot));
         let marker = plot.left
@@ -292,7 +306,7 @@ fn usage_tile(
     if !overflow.is_empty() {
         // One bounded overflow row; in-domain markers remain in the plot.
         plot.top += 20.;
-        let note = format!("초기화 {}개 더", overflow.len());
+        let note = crate::i18n::format("초기화 {0}개 더", &[(overflow.len()).to_string()]);
         let detail = format!("{note}: {}", overflow.join(" · "));
         let bounds = rect(plot.left, r.top + 104., width(plot), 16.);
         b.text(bounds, note.clone(), 11., false, Color::Secondary, false);
@@ -323,7 +337,9 @@ fn usage_tile(
         // Their ends are already clipped to the reset/exhaustion/domain edge.
         for projection in &t.projections {
             let [(start, remaining), (end, end_remaining)] = projection.points;
-            let color = if projection.name == "주간" || projection.name == "7d" {
+            let color = if projection.name == crate::i18n::static_text("주간")
+                || projection.name == "7d"
+            {
                 Color::Series7d
             } else if t.paused {
                 Color::BarPaused
@@ -383,7 +399,11 @@ fn usage_tile(
         let local = at.with_timezone(v.clock.now.offset());
         let label = local
             .format(if local.hour() == 0 {
-                "%m/%d 00:00"
+                if crate::i18n::language() == crate::i18n::UiLanguage::En {
+                    "%b %-d 00:00"
+                } else {
+                    "%m/%d 00:00"
+                }
             } else {
                 "%H:%M"
             })
@@ -409,7 +429,7 @@ fn usage_tile(
     let nowx = x(v.clock.utc());
     b.line([nowx, plot.top], [nowx, plot.bottom], Color::Text, 1., None);
     // Reserve a separate caption row below future-reset text and above the plot.
-    let now_width = b.measured_width("지금", 11., true) + 4.;
+    let now_width = b.measured_width(crate::i18n::static_text("지금"), 11., true) + 4.;
     b.text(
         rect(
             (nowx - now_width / 2.).clamp(plot.left, plot.right - now_width),
@@ -417,7 +437,7 @@ fn usage_tile(
             now_width,
             16.,
         ),
-        "지금",
+        crate::i18n::static_text("지금"),
         11.,
         true,
         Color::Text,
@@ -437,7 +457,7 @@ fn usage_tile(
     });
     let mut endpoints = Vec::new();
     for (series_index, series) in t.series.iter().enumerate() {
-        let weekly = series.name == "주간" || series.name == "7d";
+        let weekly = series.name == crate::i18n::static_text("주간") || series.name == "7d";
         let color = if weekly {
             Color::Series7d
         } else if t.paused {
@@ -532,7 +552,7 @@ fn usage_tile(
     if let Some(clip) = intersection(plot, b.clip) {
         b.scene.draw.push(Draw::Clip(clip));
         if !has_observation && t.projections.is_empty() {
-            let text = "아직 관측한 값이 없습니다";
+            let text = crate::i18n::static_text("아직 관측한 값이 없습니다");
             let w = (b.measured_width(text, 12., false) + 4.).min(width(plot));
             let left = plot.left + (width(plot) - w) / 2.;
             b.fill(rect(left, y(50.) - 8., w, 16.), Color::Surface, 0.);
@@ -548,8 +568,13 @@ fn usage_tile(
         if t.unconfirmed {
             let text = t
                 .last_observed
-                .map(|at| format!("{} 이후 확인 못 함", v.clock.time(Some(at))))
-                .unwrap_or_else(|| "이후 확인 못 함".into());
+                .map(|at| {
+                    crate::i18n::format(
+                        "{0} 이후 확인 못 함",
+                        &[(v.clock.time(Some(at))).to_string()],
+                    )
+                })
+                .unwrap_or_else(|| crate::i18n::static_text("이후 확인 못 함").into());
             let w = b.measured_width(&text, 11., false) + 4.;
             backed_text(
                 b,
@@ -568,21 +593,24 @@ fn usage_tile(
     }
     if t.unconfirmed || t.truncated || !table.complete {
         let note = if table.rows.len() < table.total_rows {
-            format!(
-                "접근성 표: 대표 {}/{}행 · 일부만 표시{}",
-                table.rows.len(),
-                table.total_rows,
-                if t.unconfirmed {
-                    " · 이후 확인 못 함"
-                } else {
-                    ""
-                }
+            crate::i18n::format(
+                "접근성 표: 대표 {0}/{1}행 · 일부만 표시{2}",
+                &[
+                    (table.rows.len()).to_string(),
+                    (table.total_rows).to_string(),
+                    (if t.unconfirmed {
+                        crate::i18n::static_text(" · 이후 확인 못 함")
+                    } else {
+                        ""
+                    })
+                    .to_string(),
+                ],
             )
         } else {
             match (t.unconfirmed, t.truncated) {
-                (true, true) => "이후 확인 못 함 · 일부 관측만 표시",
-                (true, false) => "이후 확인 못 함",
-                _ => "일부 관측만 표시",
+                (true, true) => crate::i18n::static_text("이후 확인 못 함 · 일부 관측만 표시"),
+                (true, false) => crate::i18n::static_text("이후 확인 못 함"),
+                _ => crate::i18n::static_text("일부 관측만 표시"),
             }
             .into()
         };
@@ -618,7 +646,10 @@ fn usage_tile(
         chartkey.clone(),
         None,
         Role::Chart,
-        format!("{} 남은 양 · 최근 19시간 / 앞으로 5시간", t.name),
+        crate::i18n::format(
+            "{0} 남은 양 · 최근 19시간 / 앞으로 5시간",
+            &[(t.name).to_string()],
+        ),
         plot,
         Some(Target::Chart(t.id.clone())),
     );
@@ -628,12 +659,14 @@ fn usage_tile(
         Some(chartkey.clone()),
         Role::Table,
         if table.complete {
-            "시각과 남은 양".into()
+            crate::i18n::static_text("시각과 남은 양").into()
         } else {
-            format!(
-                "시각과 남은 양 · 일부 기록 · 대표 {}/{}행",
-                table.rows.len(),
-                table.total_rows
+            crate::i18n::format(
+                "시각과 남은 양 · 일부 기록 · 대표 {0}/{1}행",
+                &[
+                    (table.rows.len()).to_string(),
+                    (table.total_rows).to_string(),
+                ],
             )
         },
         plot,
@@ -648,8 +681,11 @@ fn usage_tile(
         }
         .into(),
     );
-    let headers = std::iter::once("시각".to_string())
-        .chain(t.series.iter().map(|s| format!("{} 남은 양", s.name)));
+    let headers = std::iter::once(crate::i18n::static_text("시각").to_string()).chain(
+        t.series
+            .iter()
+            .map(|s| crate::i18n::format("{0} 남은 양", &[(s.name).to_string()])),
+    );
     for (i, name) in headers.enumerate() {
         let idx = b.semantic(
             format!("{tablekey}:header:{i}"),
@@ -665,7 +701,11 @@ fn usage_tile(
         let at = row.at;
         let stamp = stamps.entry(at).or_insert_with(|| {
             at.with_timezone(v.clock.now.offset())
-                .format("%m/%d %H:%M:%S")
+                .format(if crate::i18n::language() == crate::i18n::UiLanguage::En {
+                    "%b %-d %H:%M:%S"
+                } else {
+                    "%m/%d %H:%M:%S"
+                })
                 .to_string()
         });
         let values: Vec<_> = t
@@ -673,12 +713,15 @@ fn usage_tile(
             .iter()
             .zip(&row.values)
             .map(|(series, value)| {
-                format!(
-                    "{} {} 남음",
-                    series.name,
-                    value
-                        .map(|n| format!("{}%", n.round() as u8))
-                        .unwrap_or_else(m::unknown)
+                crate::i18n::format(
+                    "{0} {1} 남음",
+                    &[
+                        (series.name).to_string(),
+                        (value
+                            .map(|n| format!("{}%", n.round() as u8))
+                            .unwrap_or_else(m::unknown))
+                        .to_string(),
+                    ],
                 )
             })
             .collect();

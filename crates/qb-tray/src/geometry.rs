@@ -728,17 +728,19 @@ impl Builder<'_> {
             if role == Role::ColumnHeader {
                 self.scene.accessibility[idx].parent = Some("sessions:table".into());
                 if label.is_empty() {
-                    self.scene.accessibility[idx].name = "상태 정렬".into();
+                    self.scene.accessibility[idx].name =
+                        crate::i18n::static_text("상태 정렬").into();
                 }
             }
             if target == Target::CloseDetail {
-                self.scene.accessibility[idx].name = "세션 상세 닫기".into();
+                self.scene.accessibility[idx].name =
+                    crate::i18n::static_text("세션 상세 닫기").into();
             }
             if target == Target::Search {
-                self.scene.accessibility[idx].name = "세션 검색".into();
+                self.scene.accessibility[idx].name = crate::i18n::static_text("세션 검색").into();
             }
             if target == Target::EventSearch {
-                self.scene.accessibility[idx].name = "기록 검색".into();
+                self.scene.accessibility[idx].name = crate::i18n::static_text("기록 검색").into();
             }
             if matches!(role, Role::Edit | Role::ComboBox) {
                 self.scene.accessibility[idx].value = Some(label.into());
@@ -877,17 +879,20 @@ impl Scene {
             );
             b.text(
                 rect(32., 68., w - 64., 20.),
-                format!(
-                    "{}초 후 다시 연결합니다 · {}",
-                    view.connection.retry_seconds,
-                    if view.data_at.is_some() {
-                        format!(
-                            "아래는 {}의 마지막 값입니다",
-                            view.clock.stamp(view.data_at)
-                        )
-                    } else {
-                        "마지막 갱신 시각 확인 전".into()
-                    }
+                crate::i18n::format(
+                    "{0}초 후 다시 연결합니다 · {1}",
+                    &[
+                        (view.connection.retry_seconds).to_string(),
+                        (if view.data_at.is_some() {
+                            crate::i18n::format(
+                                "아래는 {0}의 마지막 값입니다",
+                                &[(view.clock.stamp(view.data_at)).to_string()],
+                            )
+                        } else {
+                            crate::i18n::static_text("마지막 갱신 시각 확인 전").into()
+                        })
+                        .to_string(),
+                    ],
                 ),
                 12.,
                 false,
@@ -929,23 +934,23 @@ impl Scene {
                 "empty:accounts:title".into(),
                 None,
                 Role::Text,
-                "아직 계정이 없습니다".into(),
+                crate::i18n::static_text("아직 계정이 없습니다").into(),
                 rect(body.left + 24., body.top + 40., width(body) - 48., 28.),
                 None,
             );
-            b.semantic("empty:accounts:help".into(),None,Role::Text,"Claude나 Codex 계정을 추가하세요. 한 계정이 한도에 도달하면 다른 계정으로 이어서 처리합니다.".into(),rect(body.left+24.,body.top+80.,width(body)-48.,48.),None);
+            b.semantic("empty:accounts:help".into(),None,Role::Text,crate::i18n::static_text("Claude나 Codex 계정을 추가하세요. 한 계정이 한도에 도달하면 다른 계정으로 이어서 처리합니다.").into(),rect(body.left+24.,body.top+80.,width(body)-48.,48.),None);
             b.text(
                 rect(body.left + 24., body.top + 40., width(body) - 48., 28.),
-                "아직 계정이 없습니다",
+                crate::i18n::static_text("아직 계정이 없습니다"),
                 16.,
                 true,
                 Color::Text,
                 false,
             );
-            b.text(rect(body.left+24.,body.top+80.,width(body)-48.,48.),"Claude나 Codex 계정을 추가하세요. 한 계정이 한도에 도달하면 다른 계정으로 이어서 처리합니다.",13.,false,Color::Secondary,true);
+            b.text(rect(body.left+24.,body.top+80.,width(body)-48.,48.),crate::i18n::static_text("Claude나 Codex 계정을 추가하세요. 한 계정이 한도에 도달하면 다른 계정으로 이어서 처리합니다."),13.,false,Color::Secondary,true);
             b.control(
                 rect(body.left + 24., body.top + 148., 200., 32.),
-                "트레이에서 계정 추가",
+                crate::i18n::static_text("트레이에서 계정 추가"),
                 Target::OpenTrayAdd,
                 Role::Button,
                 false,
@@ -1042,18 +1047,21 @@ impl Scene {
         for s in &chart.series {
             let mut comparisons = 0;
             let value = history::value_at(s, at, chart.unconfirmed, &mut comparisons);
-            parts.push(format!(
-                "{} {} 남음",
-                s.name,
-                value
-                    .map(|n| format!("{}%", n.round() as u8))
-                    .unwrap_or_else(m::unknown)
+            parts.push(crate::i18n::format(
+                "{0} {1} 남음",
+                &[
+                    (s.name).to_string(),
+                    (value
+                        .map(|n| format!("{}%", n.round() as u8))
+                        .unwrap_or_else(m::unknown))
+                    .to_string(),
+                ],
             ));
         }
         Some(ChartTooltip {
             text: format!(
                 "{} · {}",
-                at.with_timezone(&chart.offset).format("%H:%M"),
+                crate::i18n::date_time(&at.with_timezone(&chart.offset), "%H:%M"),
                 parts.join(" · ")
             ),
             position: [x.clamp(chart.rect.left, chart.rect.right), chart.rect.top],
@@ -1065,9 +1073,9 @@ fn app_header(b: &mut Builder<'_>, v: &m::DashboardView, state: &DashboardState,
     let mut x = 20.;
     b.begin_control_paint();
     for (tab, label) in [
-        (Tab::Overview, "개요"),
-        (Tab::Events, "기록"),
-        (Tab::Usage, "사용량"),
+        (Tab::Overview, crate::i18n::static_text("개요")),
+        (Tab::Events, crate::i18n::static_text("기록")),
+        (Tab::Usage, crate::i18n::static_text("사용량")),
     ] {
         let tw = if tab == Tab::Events && v.todo > 0 {
             100.
@@ -1094,7 +1102,7 @@ fn app_header(b: &mut Builder<'_>, v: &m::DashboardView, state: &DashboardState,
         if tab == Tab::Events && v.todo > 0 {
             b.text(
                 rect(x + 48., 19., 52., 20.),
-                format!("할 일 {}", v.todo),
+                crate::i18n::format("할 일 {0}", &[(v.todo).to_string()]),
                 12.,
                 true,
                 Color::Bad,
@@ -1110,7 +1118,7 @@ fn app_header(b: &mut Builder<'_>, v: &m::DashboardView, state: &DashboardState,
     if !v.connection.core_ok {
         b.text(
             rect((w - 330.).max(x + 16.), 16., 310., 22.),
-            "코어에 연결할 수 없습니다",
+            crate::i18n::static_text("코어에 연결할 수 없습니다"),
             13.,
             true,
             Color::Bad,
@@ -1118,11 +1126,13 @@ fn app_header(b: &mut Builder<'_>, v: &m::DashboardView, state: &DashboardState,
         );
         return;
     }
-    let counts = format!(
-        "세션 {}개    활성 {}개    요청 중 {}개",
-        v.session_count,
-        v.active_count,
-        v.inflight_text()
+    let counts = crate::i18n::format(
+        "세션 {0}개    활성 {1}개    요청 중 {2}개",
+        &[
+            (v.session_count).to_string(),
+            (v.active_count).to_string(),
+            (v.inflight_text()).to_string(),
+        ],
     );
     let cw = if w >= 1180. {
         b.measured_width(&counts, 12., false)
@@ -1153,7 +1163,7 @@ fn app_header(b: &mut Builder<'_>, v: &m::DashboardView, state: &DashboardState,
             let provider_w = b.measured_width(&summary.provider_label, 12., true);
             let verdict_w = b.measured_width(summary.verdict.text(), 12., false);
             let todo = if summary.todo > 0 {
-                format!(" · 할 일 {}", summary.todo)
+                crate::i18n::format(" · 할 일 {0}", &[(summary.todo).to_string()])
             } else {
                 String::new()
             };
@@ -1265,10 +1275,14 @@ fn dropdown(b: &mut Builder<'_>, popup: Popup) {
             .iter()
             .map(|range| (range.label().into(), Target::Range(*range)))
             .collect(),
-        Popup::EventDays => [(1, "오늘"), (2, "최근 2일"), (7, "최근 7일")]
-            .into_iter()
-            .map(|(days, label)| (label.into(), Target::EventDays(days)))
-            .collect(),
+        Popup::EventDays => [
+            (1, crate::i18n::static_text("오늘")),
+            (2, crate::i18n::static_text("최근 2일")),
+            (7, crate::i18n::static_text("최근 7일")),
+        ]
+        .into_iter()
+        .map(|(days, label)| (label.into(), Target::EventDays(days)))
+        .collect(),
     };
     let h = items.len() as f32 * 32. + 8.;
     let w = 180.;
@@ -1368,7 +1382,7 @@ fn recent_strip(b: &mut Builder<'_>, v: &m::DashboardView, r: Rect) {
     b.card(r);
     b.text(
         rect(r.left + 16., r.top + 12., 58., 20.),
-        "최근 일",
+        crate::i18n::static_text("최근 일"),
         13.,
         true,
         Color::Text,
@@ -1377,7 +1391,7 @@ fn recent_strip(b: &mut Builder<'_>, v: &m::DashboardView, r: Rect) {
     let link = rect(r.right - 130., r.top + 8., 114., 28.);
     b.target(
         link,
-        "기록 모두 보기",
+        crate::i18n::static_text("기록 모두 보기"),
         Target::AllEvents,
         Role::Button,
         false,
@@ -1386,7 +1400,7 @@ fn recent_strip(b: &mut Builder<'_>, v: &m::DashboardView, r: Rect) {
     b.begin_control_paint();
     b.text(
         rect(link.left, link.top + 5., width(link), 18.),
-        "기록 모두 보기 ›",
+        crate::i18n::static_text("기록 모두 보기 ›"),
         12.,
         false,
         Color::Accent,
@@ -1447,7 +1461,7 @@ struct EmptyHelpRun {
 fn empty_help_lines(b: &mut Builder<'_>, available: f32, gap: f32) -> Vec<Vec<EmptyHelpRun>> {
     let mut lines = vec![Vec::new()];
     let mut line_width = 0.;
-    for token in EMPTY_SESSION_HELP.split_whitespace() {
+    for token in crate::i18n::static_text(EMPTY_SESSION_HELP).split_whitespace() {
         let command = ["codex-qb", "claude-qb", "codex", "claude"]
             .into_iter()
             .find(|command| token.starts_with(*command))
@@ -1488,14 +1502,14 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
         "sessions:table".into(),
         None,
         Role::Table,
-        "세션".into(),
+        crate::i18n::static_text("세션").into(),
         card,
         None,
     );
     let y = card.top + 12.;
     b.text(
         rect(card.left + 16., y + 5., 42., 20.),
-        "세션",
+        crate::i18n::static_text("세션"),
         14.,
         true,
         Color::Text,
@@ -1506,7 +1520,7 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
     b.begin_control_paint();
     b.stroke(segment, Color::Border, 1., 4.);
     for (i, (filter, label)) in [
-        (ProviderFilter::All, "전체"),
+        (ProviderFilter::All, crate::i18n::static_text("전체")),
         (ProviderFilter::Claude, "Claude"),
         (ProviderFilter::Codex, "Codex"),
     ]
@@ -1552,7 +1566,7 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
     b.begin_control_paint();
     b.target(
         check,
-        "계정별로 묶기",
+        crate::i18n::static_text("계정별로 묶기"),
         Target::ToggleGrouping,
         Role::Checkbox,
         s.grouped,
@@ -1576,7 +1590,7 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
     }
     b.text(
         rect(check.left + 24., y + 5., 110., 18.),
-        "계정별로 묶기",
+        crate::i18n::static_text("계정별로 묶기"),
         12.,
         false,
         Color::Text,
@@ -1588,11 +1602,18 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
     b.begin_control_paint();
     b.fill(search, Color::Surface, 4.);
     b.stroke(search, Color::Border, 1., 4.);
-    b.target(search, "세션 검색", Target::Search, Role::Edit, false, None);
+    b.target(
+        search,
+        crate::i18n::static_text("세션 검색"),
+        Target::Search,
+        Role::Edit,
+        false,
+        None,
+    );
     b.text(
         rect(search.left + 30., y + 5., search_w - 38., 18.),
         if s.search.is_empty() {
-            "폴더, 세션 번호, 계정 검색"
+            crate::i18n::static_text("폴더, 세션 번호, 계정 검색")
         } else {
             &s.search
         },
@@ -1656,12 +1677,12 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
                     Some(
                         if s.sort == *key {
                             if s.descending {
-                                "내림차순"
+                                crate::i18n::static_text("내림차순")
                             } else {
-                                "오름차순"
+                                crate::i18n::static_text("오름차순")
                             }
                         } else {
-                            "정렬"
+                            crate::i18n::static_text("정렬")
                         }
                         .into(),
                     ),
@@ -1680,7 +1701,9 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
     b.fill(foot, Color::Footer, 0.);
     if v.counters_unknown {
         let bounds = rect(foot.left + 12., foot.top + 30., width(foot) - 24., 18.);
-        let notice = "오늘 요청 수 확인 전 · 이전 실행의 집계는 확인할 수 없습니다.";
+        let notice = crate::i18n::static_text(
+            "오늘 요청 수 확인 전 · 이전 실행의 집계는 확인할 수 없습니다.",
+        );
         b.text(bounds, notice, 12., false, Color::Secondary, false);
         b.semantic(
             "sessions:counters-unknown".into(),
@@ -1692,7 +1715,11 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
         );
     }
     let mut fx = foot.left + 12.;
-    for (kind, label) in [(0, "요청 중"), (1, "5분 안에 활동"), (2, "쉬는 중")] {
+    for (kind, label) in [
+        (0, crate::i18n::static_text("요청 중")),
+        (1, crate::i18n::static_text("5분 안에 활동")),
+        (2, crate::i18n::static_text("쉬는 중")),
+    ] {
         let dot = rect(fx, foot.top + 13., 7., 7.);
         match kind {
             0 => {
@@ -1716,17 +1743,17 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
     let time = format!(
         "{} · {}{}",
         if v.data_at.is_some() {
-            format!("{} 기준", v.clock.stamp(v.data_at))
+            crate::i18n::format("{0} 기준", &[(v.clock.stamp(v.data_at)).to_string()])
         } else {
-            "갱신 시각 확인 전".into()
+            crate::i18n::static_text("갱신 시각 확인 전").into()
         },
         if v.connection.stream_ok {
-            "바뀌면 바로 반영"
+            crate::i18n::static_text("바뀌면 바로 반영")
         } else {
-            "다시 연결 중"
+            crate::i18n::static_text("다시 연결 중")
         },
         if v.truncated {
-            " · 최근 2,000개"
+            crate::i18n::static_text(" · 최근 2,000개")
         } else {
             ""
         }
@@ -1746,7 +1773,7 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
     );
     b.text(
         rect(fx, foot.top + 8., (foot.right - 24. - tw - fx).max(0.), 18.),
-        "활성 세션 = 요청 중 + 5분 안에 활동",
+        crate::i18n::static_text("활성 세션 = 요청 중 + 5분 안에 활동"),
         12.,
         false,
         Color::Secondary,
@@ -1861,7 +1888,7 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
                 "empty:sessions:help".into(),
                 Some("empty:sessions".into()),
                 Role::Text,
-                EMPTY_SESSION_HELP.into(),
+                crate::i18n::static_text(EMPTY_SESSION_HELP).into(),
                 rect(left, ry, empty_width, empty_help_height),
                 None,
             );
@@ -1906,7 +1933,7 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
             if empty_button {
                 b.control(
                     rect(cx - 75., ry, 150., 32.),
-                    "오늘 전체 보기",
+                    crate::i18n::static_text("오늘 전체 보기"),
                     Target::Today,
                     Role::Button,
                     false,
@@ -1927,7 +1954,7 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
             }
         }
         m::EmptyState::NoMatch(text) => {
-            let message = format!("“{text}”와 맞는 세션이 없습니다");
+            let message = crate::i18n::format("“{0}”와 맞는 세션이 없습니다", &[text.to_string()]);
             let available = (width(viewport) - 80.).max(1.);
             let message_height = b
                 .measured_height(&message, available, 14., false)
@@ -1986,27 +2013,31 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
                         width(viewport) - 22.,
                         header_height + rows_height + 2.,
                     );
-                    let description = format!(
-                        "{} 계정, {}, {}, 활성 {}{}, {}",
-                        group.name,
-                        group.plan,
-                        group.chip,
-                        group.active,
-                        if group.active >= group.threshold.unwrap_or(5).max(1) {
-                            " · 몰림"
-                        } else {
-                            ""
-                        },
-                        if group.relogin_reason.is_empty() {
-                            group
-                                .windows
-                                .iter()
-                                .map(|w| format!("{} {} {}", w.label, w.remaining, w.reset))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        } else {
-                            group.relogin_reason.clone()
-                        }
+                    let description = crate::i18n::format(
+                        "{0} 계정, {1}, {2}, 활성 {3}{4}, {5}",
+                        &[
+                            (group.name).to_string(),
+                            (group.plan).to_string(),
+                            (group.chip).to_string(),
+                            (group.active).to_string(),
+                            (if group.active >= group.threshold.unwrap_or(5).max(1) {
+                                crate::i18n::static_text(" · 몰림")
+                            } else {
+                                ""
+                            })
+                            .to_string(),
+                            (if group.relogin_reason.is_empty() {
+                                group
+                                    .windows
+                                    .iter()
+                                    .map(|w| format!("{} {} {}", w.label, w.remaining, w.reset))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            } else {
+                                group.relogin_reason.clone()
+                            })
+                            .to_string(),
+                        ],
                     );
                     b.semantic(
                         format!("group:{}", group.id),
@@ -2123,20 +2154,39 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
     b.end_region(old);
 }
 pub fn columns(available: f32, flat: bool) -> Vec<(SortKey, &'static str, f32)> {
-    let mut cols = vec![(SortKey::Status, "", 20.), (SortKey::Session, "세션", 188.)];
+    let mut cols = vec![
+        (SortKey::Status, "", 20.),
+        (SortKey::Session, crate::i18n::static_text("세션"), 188.),
+    ];
     if flat {
-        cols.push((SortKey::Account, "계정", 160.));
+        cols.push((SortKey::Account, crate::i18n::static_text("계정"), 160.));
     }
     cols.extend([
-        (SortKey::Client, "클라이언트 · 번호", 172.),
-        (SortKey::Model, "모델", 116.),
-        (SortKey::Start, "시작", 64.),
-        (SortKey::LastActivity, "마지막 활동", 96.),
-        (SortKey::Requests, "오늘 요청", 64.),
+        (
+            SortKey::Client,
+            crate::i18n::static_text("클라이언트 · 번호"),
+            172.,
+        ),
+        (SortKey::Model, crate::i18n::static_text("모델"), 116.),
+        (SortKey::Start, crate::i18n::static_text("시작"), 64.),
+        (
+            SortKey::LastActivity,
+            crate::i18n::static_text("마지막 활동"),
+            96.,
+        ),
+        (
+            SortKey::Requests,
+            crate::i18n::static_text("오늘 요청"),
+            64.,
+        ),
     ]);
     let used = cols.iter().map(|c| c.2).sum::<f32>();
     if available - used >= 96. {
-        cols.push((SortKey::Memo, "메모", available - used));
+        cols.push((
+            SortKey::Memo,
+            crate::i18n::static_text("메모"),
+            available - used,
+        ));
     } else {
         if let Some(column) = cols.iter_mut().find(|column| column.0 == SortKey::Session) {
             column.2 = (column.2 - (used - available).max(0.)).clamp(160., 188.);
@@ -2214,7 +2264,7 @@ fn group_header(b: &mut Builder<'_>, g: &m::AccountGroup, r: Rect, sticky: bool)
     let target = Target::Group(g.id.clone());
     b.target(
         r,
-        &format!("{} 계정 접기/펼치기", g.name),
+        &crate::i18n::format("{0} 계정 접기/펼치기", &[(g.name).to_string()]),
         target.clone(),
         Role::Button,
         false,
@@ -2242,15 +2292,19 @@ fn group_header(b: &mut Builder<'_>, g: &m::AccountGroup, r: Rect, sticky: bool)
     b.end_control_paint();
     let threshold = g.threshold.unwrap_or(5).max(1);
     let crowded = g.active >= threshold;
-    let count_text = format!("활성 {}", g.active);
+    let count_text = crate::i18n::format("활성 {0}", &[(g.active).to_string()]);
     let count_width = b.measured_width(&count_text, 12., true).max(34.);
     let crowded_width = if crowded {
-        b.measured_width("몰림", 12., true) + 16.
+        b.measured_width(crate::i18n::static_text("몰림"), 12., true) + 16.
     } else {
         0.
     };
     let button_width = if g.relogin {
-        b.measured_width("트레이에서 다시 로그인", 13., false) + 20.
+        b.measured_width(
+            crate::i18n::static_text("트레이에서 다시 로그인"),
+            13.,
+            false,
+        ) + 20.
     } else {
         0.
     };
@@ -2320,7 +2374,7 @@ fn group_header(b: &mut Builder<'_>, g: &m::AccountGroup, r: Rect, sticky: bool)
                 button_width,
                 24.,
             ),
-            "트레이에서 다시 로그인",
+            crate::i18n::static_text("트레이에서 다시 로그인"),
             Target::OpenTrayAccount(g.id.clone()),
             Role::Button,
             false,
@@ -2338,7 +2392,7 @@ fn group_header(b: &mut Builder<'_>, g: &m::AccountGroup, r: Rect, sticky: bool)
     if crowded {
         chip(
             b,
-            "몰림",
+            crate::i18n::static_text("몰림"),
             v2::Tone::Warn,
             rect(
                 load_left + count_width + 8.,
@@ -2351,11 +2405,15 @@ fn group_header(b: &mut Builder<'_>, g: &m::AccountGroup, r: Rect, sticky: bool)
     }
     let load_rect = rect(load_left, r.top + 8., load_width, 24.);
     let load_description = if crowded {
-        format!(
-            "분산 기준 {threshold}개에 도달해 새 세션은 다른 계정을 우선합니다. 제한이 아니며 세션은 계속 받습니다."
+        crate::i18n::format(
+            "분산 기준 {0}개에 도달해 새 세션은 다른 계정을 우선합니다. 제한이 아니며 세션은 계속 받습니다.",
+            &[threshold.to_string()],
         )
     } else {
-        format!("활성 {} · 연결된 대화 {}개", g.active, g.bound)
+        crate::i18n::format(
+            "활성 {0} · 연결된 대화 {1}개",
+            &[(g.active).to_string(), (g.bound).to_string()],
+        )
     };
     b.semantic(
         format!("{}:load:{}", b.scope, g.id),
@@ -2363,7 +2421,11 @@ fn group_header(b: &mut Builder<'_>, g: &m::AccountGroup, r: Rect, sticky: bool)
         Role::Text,
         format!(
             "{count_text}{}. {load_description}",
-            if crowded { " · 몰림" } else { "" }
+            if crowded {
+                crate::i18n::static_text(" · 몰림")
+            } else {
+                ""
+            }
         ),
         load_rect,
         None,
@@ -2381,7 +2443,7 @@ fn group_header(b: &mut Builder<'_>, g: &m::AccountGroup, r: Rect, sticky: bool)
     } else if g.windows.is_empty() {
         b.text(
             rect(r.left + 32., r.top + 36., 112., 16.),
-            "사용량 확인 전",
+            crate::i18n::static_text("사용량 확인 전"),
             12.,
             false,
             Color::Secondary,
@@ -2488,20 +2550,23 @@ fn session(
         key.clone(),
         parent.or_else(|| Some("sessions:table".into())),
         Role::Row,
-        format!(
-            "{}, {} · {}, 계정 {} · {}{}, 모델 {}, {}, 오늘 요청 {}",
-            row.label,
-            row.client,
-            row.short_id,
-            row.account,
-            row.account_provider,
-            row.account_chip
-                .as_ref()
-                .map(|chip| format!(" · {}", chip.text))
-                .unwrap_or_default(),
-            row.model,
-            row.dot,
-            row.requests
+        crate::i18n::format(
+            "{0}, {1} · {2}, 계정 {3} · {4}{5}, 모델 {6}, {7}, 오늘 요청 {8}",
+            &[
+                (row.label).to_string(),
+                (row.client).to_string(),
+                (row.short_id).to_string(),
+                (row.account).to_string(),
+                (row.account_provider).to_string(),
+                (row.account_chip
+                    .as_ref()
+                    .map(|chip| format!(" · {}", chip.text))
+                    .unwrap_or_default())
+                .to_string(),
+                (row.model).to_string(),
+                (row.dot).to_string(),
+                (row.requests).to_string(),
+            ],
         ),
         r,
         Some(Target::Session(row.id.clone())),
@@ -2537,7 +2602,9 @@ fn session(
                     cr,
                     row.label.clone(),
                     13.,
-                    row.label_source.contains("사용자") || !row.label.contains(" 세션 "),
+                    row.label_source
+                        .contains(crate::i18n::static_text("사용자"))
+                        || !row.label.contains(crate::i18n::static_text(" 세션 ")),
                     Color::Text,
                     false,
                 );
@@ -2618,7 +2685,9 @@ fn session(
                     text.clone(),
                     if *key == SortKey::Memo { 12. } else { 13. },
                     false,
-                    if *key == SortKey::Memo && row.memo.contains("크레딧") {
+                    if *key == SortKey::Memo
+                        && row.memo.contains(crate::i18n::static_text("크레딧"))
+                    {
                         Color::Warn
                     } else {
                         Color::Text
@@ -2634,7 +2703,7 @@ fn recent(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card: R
     b.card(card);
     b.text(
         rect(card.left + 16., card.top + 14., 100., 22.),
-        "최근 일",
+        crate::i18n::static_text("최근 일"),
         14.,
         true,
         Color::Text,
@@ -2642,7 +2711,7 @@ fn recent(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card: R
     );
     b.control(
         rect(card.right - 140., card.top + 8., 128., 30.),
-        "기록 모두 보기 ›",
+        crate::i18n::static_text("기록 모두 보기 ›"),
         Target::AllEvents,
         Role::Button,
         false,
@@ -2734,7 +2803,7 @@ fn event_card(b: &mut Builder<'_>, e: &m::EventRow, r: Rect, recent: bool) {
     {
         b.control(
             rect(x, r.bottom - 36., 200., 28.),
-            "트레이에서 다시 로그인",
+            crate::i18n::static_text("트레이에서 다시 로그인"),
             Target::OpenTrayAccount(account.clone()),
             Role::Button,
             false,
@@ -2779,7 +2848,7 @@ fn detail(
         Target::CloseDetail,
         Role::Button,
         false,
-        Some("세션 상세 닫기".into()),
+        Some(crate::i18n::static_text("세션 상세 닫기").into()),
     );
     b.text(
         rect(card.left + 16., card.top + 50., width(card) - 32., 20.),
@@ -2792,7 +2861,7 @@ fn detail(
     if let Some(prefix) = &d.raw_prefix {
         b.text(
             rect(card.left + 16., card.top + 72., width(card) - 32., 20.),
-            format!("원래 세션 번호 앞 8자: {prefix}"),
+            crate::i18n::format("원래 세션 번호 앞 8자: {0}", &[prefix.to_string()]),
             12.,
             false,
             Color::Secondary,
@@ -2856,7 +2925,7 @@ fn detail(
     if d.expired {
         b.text(
             rect(viewport.left + 16., y, width(viewport) - 32., 44.),
-            "이 세션은 더 이상 연결되어 있지 않습니다",
+            crate::i18n::static_text("이 세션은 더 이상 연결되어 있지 않습니다"),
             13.,
             true,
             Color::Secondary,
@@ -2882,7 +2951,7 @@ fn detail(
             true,
         );
         b.semantic(
-            format!("detail:{}:fact:{key}", d.id),
+            format!("detail:{}:fact:{}", d.id, detail_fact_key(key)),
             None,
             Role::Text,
             format!("{key}: {value}"),
@@ -2892,7 +2961,8 @@ fn detail(
         y += h + 4.;
     }
     let mut index = 0;
-    for (title, items) in [("계정 이력", &d.timeline), ("최근 요청", &d.requests)] {
+    for (source_title, items) in [("계정 이력", &d.timeline), ("최근 요청", &d.requests)] {
+        let title = crate::i18n::static_text(source_title);
         b.text(
             rect(viewport.left + 16., y + 8., width(viewport) - 32., 24.),
             title,
@@ -2905,10 +2975,10 @@ fn detail(
         for (i, text) in items.iter().enumerate() {
             let h = lines[index];
             index += 1;
-            if title == "계정 이력" {
+            if title == crate::i18n::static_text("계정 이력") {
                 b.fill(
                     rect(viewport.left + 17., y + 5., 6., 6.),
-                    if text.contains("(현재)") {
+                    if text.contains(crate::i18n::static_text("(현재)")) {
                         Color::Accent
                     } else {
                         Color::Secondary
@@ -2921,7 +2991,7 @@ fn detail(
                 text.clone(),
                 12.,
                 false,
-                if text.contains("실패") {
+                if text.contains(crate::i18n::static_text("실패")) {
                     Color::Bad
                 } else {
                     Color::Text
@@ -2929,7 +2999,7 @@ fn detail(
                 true,
             );
             b.semantic(
-                format!("detail:{}:{title}:{i}", d.id),
+                format!("detail:{}:{source_title}:{i}", d.id),
                 None,
                 Role::Text,
                 text.clone(),
@@ -2941,7 +3011,9 @@ fn detail(
     }
     b.text(
         rect(viewport.left + 16., y + 12., width(viewport) - 32., 64.),
-        "대화 내용은 보지도 기록하지도 않습니다. 세션 번호는 ledger의 session 값과 같습니다.",
+        crate::i18n::static_text(
+            "대화 내용은 보지도 기록하지도 않습니다. 세션 번호는 ledger의 session 값과 같습니다.",
+        ),
         12.,
         false,
         Color::Secondary,
@@ -2955,20 +3027,24 @@ fn event_refs(e: &m::EventRow) -> Vec<(Target, String)> {
     if let Some(id) = &e.account {
         refs.push((
             Target::AccountLink(id.clone()),
-            format!(
-                "계정 {} ›",
-                e.account_label.as_deref().unwrap_or("이름 없음")
+            crate::i18n::format(
+                "계정 {0} ›",
+                &[(e.account_label
+                    .as_deref()
+                    .unwrap_or(crate::i18n::static_text("이름 없음")))
+                .to_string()],
             ),
         ));
     }
     if let Some(id) = &e.session {
         refs.push((
             Target::SessionLink(id.clone()),
-            format!(
-                "세션 {} ›",
-                e.session_label
+            crate::i18n::format(
+                "세션 {0} ›",
+                &[(e.session_label
                     .as_deref()
-                    .unwrap_or_else(|| id.get(..6).unwrap_or(id))
+                    .unwrap_or_else(|| id.get(..6).unwrap_or(id)))
+                .to_string()],
             ),
         ));
     }
@@ -3010,9 +3086,9 @@ fn events(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card: R
     b.control(
         rect(x + 4., toolbar_y, 104., 28.),
         match s.event_days {
-            1 => "오늘",
-            2 => "최근 2일",
-            _ => "최근 7일",
+            1 => crate::i18n::static_text("오늘"),
+            2 => crate::i18n::static_text("최근 2일"),
+            _ => crate::i18n::static_text("최근 7일"),
         },
         Target::EventDaysMenu,
         Role::ComboBox,
@@ -3024,7 +3100,7 @@ fn events(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card: R
     b.control(
         rect(card.right - sw - 12., toolbar_y, sw, 28.),
         if s.event_search.is_empty() {
-            "기록 검색"
+            crate::i18n::static_text("기록 검색")
         } else {
             &s.event_search
         },
@@ -3044,7 +3120,7 @@ fn events(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card: R
         );
         b.text(
             r,
-            "보관 한도로 일부 기록만 표시합니다.",
+            crate::i18n::static_text("보관 한도로 일부 기록만 표시합니다."),
             12.,
             false,
             Color::Warn,
@@ -3054,7 +3130,7 @@ fn events(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card: R
             "events:truncated".into(),
             None,
             Role::Text,
-            "보관 한도로 일부 기록만 표시합니다.".into(),
+            crate::i18n::static_text("보관 한도로 일부 기록만 표시합니다.").into(),
             r,
             None,
         );
@@ -3183,7 +3259,7 @@ fn events(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card: R
         {
             b.control(
                 rect(tx, y + h - 34., 200., 28.),
-                "트레이에서 다시 로그인",
+                crate::i18n::static_text("트레이에서 다시 로그인"),
                 Target::OpenTrayAccount(id.clone()),
                 Role::Button,
                 false,
@@ -3213,3 +3289,41 @@ fn events(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card: R
 #[cfg(test)]
 #[path = "dashboard_geometry_tests.rs"]
 mod tests;
+
+// Domain-limited mapping of model-owned fact labels to their incumbent UIA keys.
+// Never use this for caller-supplied account/project/session names.
+fn detail_fact_key(label: &str) -> &str {
+    for ko in [
+        "계정",
+        "남은 양",
+        "모델",
+        "시작",
+        "마지막 활동",
+        "연결",
+        "하위 에이전트",
+        "오늘 요청",
+        "기록 범위",
+        "속도 조절 대기",
+        "이름 출처",
+        "최근 요청 범위",
+        "계정 이력 범위",
+    ] {
+        if label == ko || label == crate::i18n::static_text(ko) {
+            return ko;
+        }
+    }
+    label
+}
+
+#[cfg(test)]
+mod r16_stable_key_tests {
+    use super::*;
+    #[test]
+    fn translated_detail_facts_keep_existing_scheduler_keys() {
+        crate::i18n::with_language(crate::i18n::UiLanguage::En, || {
+            assert_eq!(detail_fact_key("Started"), "시작");
+            assert_eq!(detail_fact_key("Last activity"), "마지막 활동");
+            assert_eq!(detail_fact_key("Rate-limit wait"), "속도 조절 대기");
+        });
+    }
+}

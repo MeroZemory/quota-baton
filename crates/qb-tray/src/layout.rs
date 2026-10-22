@@ -1,22 +1,29 @@
 //! Pure tray layout model. Rendering is implemented by the shared Windows
 //! Direct2D/DirectWrite backend in `native_render.rs`.
 //!
-//! This module intentionally knows nothing about Win32, HTTP, or credentials.  The
-//! JSON shape is the read-only `/admin/v1/state` shape, so fixture and UI tests can
-//! exercise it without starting the core.
+//! Layout projection is independent of IO. The `client` adapter owns local admin
+//! transport; the JSON shape is the read-only `/admin/v1/state` shape, so fixture
+//! and UI tests can exercise projection without starting the core.
 
 use chrono::{DateTime, Datelike, FixedOffset, Local, Timelike};
 use serde::{Deserialize, Deserializer};
 use std::time::{Duration, SystemTime};
 
+extern crate self as qb_tray;
 pub mod actions;
+pub mod client;
 #[cfg(test)]
 mod dashboard_fixtures;
 pub mod dashboard_history;
 pub mod dashboard_model;
 pub mod geometry;
+pub mod i18n;
+mod i18n_client_strings;
+mod i18n_shell_strings;
 #[cfg(windows)]
 pub mod render;
+#[cfg(windows)]
+pub mod snapshot_render;
 pub mod state;
 pub mod tray_icon;
 pub mod v2;
@@ -183,12 +190,17 @@ pub fn quota_message(
         return None;
     }
     let window = match notice.window.as_deref() {
-        Some("5h") => "5시간 한도",
-        Some(name) if name == "7d" || name.starts_with("7d_") => "주간 한도",
-        _ => "한도",
+        Some("5h") => crate::i18n::static_text("5시간 한도"),
+        Some(name) if name == "7d" || name.starts_with("7d_") => {
+            crate::i18n::static_text("주간 한도")
+        }
+        _ => crate::i18n::static_text("한도"),
     };
     let reset = notice.reset_at.map(|at| {
         let local = at.with_timezone(&Local);
+        if crate::i18n::language() == crate::i18n::UiLanguage::En {
+            return crate::i18n::date_time(&local, "%H:%M");
+        }
         if at.signed_duration_since(DateTime::<chrono::Utc>::from(now))
             < chrono::Duration::hours(24)
         {
@@ -203,41 +215,44 @@ pub fn quota_message(
         }
     });
     let reset_text = reset.as_ref().map_or_else(
-        || "초기화 시간 확인 중입니다.".into(),
-        |at| format!("{at} 초기화."),
+        || crate::i18n::static_text("초기화 시간 확인 중입니다.").into(),
+        |at| crate::i18n::format("{0} 초기화.", &[at.to_string()]),
     );
     let scope = if notice.model_limited {
-        "이 모델 "
+        crate::i18n::static_text("이 모델 ")
     } else {
         ""
     };
     let requests = if notice.model_limited {
-        "이 모델의 새 요청"
+        crate::i18n::static_text("이 모델의 새 요청")
     } else {
-        "새 요청"
+        crate::i18n::static_text("새 요청")
     };
     let (action, short): (String, String) = match notice.action {
         QuotaAction::Credits => (
-            "유료 크레딧으로 계속 사용합니다.".into(),
-            "크레딧 사용 중".into(),
+            crate::i18n::static_text("유료 크레딧으로 계속 사용합니다.").into(),
+            crate::i18n::static_text("크레딧 사용 중").into(),
         ),
         QuotaAction::Failover => next_name.map_or_else(
             || {
                 (
-                    "다른 계정으로 이어서 처리합니다.".into(),
-                    "다른 계정이 처리".into(),
+                    crate::i18n::static_text("다른 계정으로 이어서 처리합니다.").into(),
+                    crate::i18n::static_text("다른 계정이 처리").into(),
                 )
             },
             |next| {
                 (
-                    format!("{next} 계정으로 이어서 처리합니다."),
-                    format!("{next}가 처리"),
+                    crate::i18n::format("{0} 계정으로 이어서 처리합니다.", &[next.to_string()]),
+                    crate::i18n::format("{0}가 처리", &[next.to_string()]),
                 )
             },
         ),
         QuotaAction::Exhausted => (
-            format!("처리할 다른 계정이 없습니다. {requests}은 한도 오류가 납니다."),
-            "처리할 다른 계정 없음".into(),
+            crate::i18n::format(
+                "처리할 다른 계정이 없습니다. {0}은 한도 오류가 납니다.",
+                &[requests.to_string()],
+            ),
+            crate::i18n::static_text("처리할 다른 계정 없음").into(),
         ),
     };
     Some(QuotaMessage {
@@ -245,16 +260,19 @@ pub fn quota_message(
             if notice.model_limited {
                 fit_account_title(
                     name,
-                    &format!(
-                        "{} · 이 모델 처리 계정 모두 한도 도달 · ",
-                        provider_name(provider)
+                    &crate::i18n::format(
+                        "{0} · 이 모델 처리 계정 모두 한도 도달 · ",
+                        &[(provider_name(provider)).to_string()],
                     ),
                     "",
                 )
             } else {
                 fit_account_title(
                     name,
-                    &format!("{} 계정 모두 한도 도달 · ", provider_name(provider)),
+                    &crate::i18n::format(
+                        "{0} 계정 모두 한도 도달 · ",
+                        &[(provider_name(provider)).to_string()],
+                    ),
                     "",
                 )
             }
@@ -262,24 +280,30 @@ pub fn quota_message(
             account_notice_title(
                 name,
                 provider,
-                &format!(
-                    "{}{window} 도달",
-                    if notice.model_limited {
-                        "이 모델의 "
-                    } else {
-                        ""
-                    }
+                &crate::i18n::format(
+                    "{0}{1} 도달",
+                    &[
+                        (if notice.model_limited {
+                            crate::i18n::static_text("이 모델의 ")
+                        } else {
+                            ""
+                        })
+                        .to_string(),
+                        window.to_string(),
+                    ],
                 ),
             )
         },
         text: if notice.action == QuotaAction::Exhausted {
             match (&reset, earliest_name) {
-                (Some(at), Some(earliest)) => format!(
-                    "가장 빠른 초기화: {earliest} {at}. 그때까지 {requests}은 한도 오류가 납니다."
+                (Some(at), Some(earliest)) => crate::i18n::format(
+                    "가장 빠른 초기화: {0} {1}. 그때까지 {2}은 한도 오류가 납니다.",
+                    &[earliest.to_string(), at.to_string(), requests.to_string()],
                 ),
-                (Some(at), None) => {
-                    format!("가장 빠른 초기화: {at}. 그때까지 {requests}은 한도 오류가 납니다.")
-                }
+                (Some(at), None) => crate::i18n::format(
+                    "가장 빠른 초기화: {0}. 그때까지 {1}은 한도 오류가 납니다.",
+                    &[at.to_string(), requests.to_string()],
+                ),
                 (None, _) => format!("{action} {reset_text}"),
             }
         } else {
@@ -287,7 +311,7 @@ pub fn quota_message(
         },
         short: format!(
             "{scope}{window} · {} · {short}",
-            reset.unwrap_or_else(|| "초기화 시간 확인 중".into())
+            reset.unwrap_or_else(|| crate::i18n::static_text("초기화 시간 확인 중").into())
         ),
     })
 }
@@ -589,7 +613,8 @@ pub fn disabled_expanded(
     let menu_disabled = state
         .and_then(|state| menu_target(rows, state))
         .is_some_and(|(row, _)| {
-            row.provider == provider_name(provider) && row.user_chip == "비활성"
+            row.provider == provider_name(provider)
+                && row.user_chip == crate::i18n::static_text("비활성")
         });
     menu_disabled || ((expand_disabled || state == Some("expanded")) && provider == "codex")
 }
@@ -599,11 +624,11 @@ fn row_anchor(rows: &[Row], expand_disabled: bool, state: Option<&str>, id: &str
     for provider in ["Claude", "Codex"] {
         let active = rows
             .iter()
-            .filter(|r| r.provider == provider && r.user_chip != "비활성")
+            .filter(|r| r.provider == provider && r.user_chip != crate::i18n::static_text("비활성"))
             .collect::<Vec<_>>();
         let disabled = rows
             .iter()
-            .filter(|r| r.provider == provider && r.user_chip == "비활성")
+            .filter(|r| r.provider == provider && r.user_chip == crate::i18n::static_text("비활성"))
             .collect::<Vec<_>>();
         if active.is_empty() && disabled.is_empty() {
             continue;
@@ -637,17 +662,23 @@ pub fn account_menu_metadata(row: &Row) -> [String; 3] {
     let time = |value: Option<&str>| {
         value
             .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-            .map(|time| time.with_timezone(&Local).format("%m/%d %H:%M").to_string())
-            .unwrap_or_else(|| "확인 불가".into())
+            .map(|time| crate::i18n::date_time(&time.with_timezone(&Local), "%m/%d %H:%M"))
+            .unwrap_or_else(|| crate::i18n::static_text("확인 불가").into())
     };
     [
         match row.source.as_str() {
-            "linked" => "CPA 갱신".into(),
-            "oauth" | "adopted" => "직접 갱신".into(),
-            _ => "갱신 방식 확인 불가".into(),
+            "linked" => crate::i18n::static_text("CPA 갱신").into(),
+            "oauth" | "adopted" => crate::i18n::static_text("직접 갱신").into(),
+            _ => crate::i18n::static_text("갱신 방식 확인 불가").into(),
         },
-        format!("만료 {}", time(row.token_expires_at.as_deref())),
-        format!("최근 갱신 {}", time(row.last_refresh_at.as_deref())),
+        crate::i18n::format(
+            "만료 {0}",
+            &[(time(row.token_expires_at.as_deref())).to_string()],
+        ),
+        crate::i18n::format(
+            "최근 갱신 {0}",
+            &[(time(row.last_refresh_at.as_deref())).to_string()],
+        ),
     ]
 }
 
@@ -834,11 +865,17 @@ pub fn layout_targets(rows: &[Row], expand_disabled: bool, state: Option<&str>) 
         for provider in ["claude", "codex"] {
             let active = rows
                 .iter()
-                .filter(|r| r.provider == provider_name(provider) && r.user_chip != "비활성")
+                .filter(|r| {
+                    r.provider == provider_name(provider)
+                        && r.user_chip != crate::i18n::static_text("비활성")
+                })
                 .collect::<Vec<_>>();
             let disabled = rows
                 .iter()
-                .filter(|r| r.provider == provider_name(provider) && r.user_chip == "비활성")
+                .filter(|r| {
+                    r.provider == provider_name(provider)
+                        && r.user_chip == crate::i18n::static_text("비활성")
+                })
                 .collect::<Vec<_>>();
             if active.is_empty() && disabled.is_empty() {
                 continue;
@@ -865,7 +902,7 @@ pub fn layout_targets(rows: &[Row], expand_disabled: bool, state: Option<&str>) 
                     id: row.id.clone(),
                     rect: Rect::new(324.0, y + 10.0, 352.0, y + 34.0),
                 });
-                if row.reason_button && row.user_chip != "비활성" {
+                if row.reason_button && row.user_chip != crate::i18n::static_text("비활성") {
                     targets.push(HitTarget::RowRelogin {
                         id: row.id.clone(),
                         rect: Rect::new(
@@ -996,11 +1033,11 @@ fn layout_content_height(rows: &[Row], expand_disabled: bool, state: Option<&str
     for provider in ["Claude", "Codex"] {
         let active = rows
             .iter()
-            .filter(|r| r.provider == provider && r.user_chip != "비활성")
+            .filter(|r| r.provider == provider && r.user_chip != crate::i18n::static_text("비활성"))
             .count();
         let disabled = rows
             .iter()
-            .filter(|r| r.provider == provider && r.user_chip == "비활성")
+            .filter(|r| r.provider == provider && r.user_chip == crate::i18n::static_text("비활성"))
             .count();
         if active + disabled == 0 {
             continue;
@@ -1009,7 +1046,9 @@ fn layout_content_height(rows: &[Row], expand_disabled: bool, state: Option<&str
         height += 36.0
             + rows
                 .iter()
-                .filter(|r| r.provider == provider && r.user_chip != "비활성")
+                .filter(|r| {
+                    r.provider == provider && r.user_chip != crate::i18n::static_text("비활성")
+                })
                 .map(row_height)
                 .sum::<f32>();
         if disabled_expanded(rows, expand_disabled, state, provider) {
@@ -1018,7 +1057,9 @@ fn layout_content_height(rows: &[Row], expand_disabled: bool, state: Option<&str
             }
             height += rows
                 .iter()
-                .filter(|r| r.provider == provider && r.user_chip == "비활성")
+                .filter(|r| {
+                    r.provider == provider && r.user_chip == crate::i18n::static_text("비활성")
+                })
                 .map(row_height)
                 .sum::<f32>();
             if disabled > 0 {
@@ -1088,7 +1129,7 @@ pub fn row(account: &Account, now: SystemTime) -> Row {
     let name = email
         .clone()
         .or_else(|| account.label.clone())
-        .unwrap_or_else(|| "이름 없는 계정".into());
+        .unwrap_or_else(|| crate::i18n::static_text("이름 없는 계정").into());
     let health_chip = health_chip(account, now);
     let pacing = account
         .pacing
@@ -1138,7 +1179,7 @@ pub fn row(account: &Account, now: SystemTime) -> Row {
         email,
         plan: account.plan.clone(),
         user_chip: if account.user_state == "active" && account.bound_sessions > 0 {
-            "사용 중".into()
+            crate::i18n::static_text("사용 중").into()
         } else {
             user_chip(&account.user_state)
         },
@@ -1160,14 +1201,18 @@ pub fn row(account: &Account, now: SystemTime) -> Row {
         allow_credits: account.allow_credits,
         drain: account.drain,
         bound_sessions: account.bound_sessions,
-        session_text: Some(format!(
+        session_text: Some(crate::i18n::format(
             "활성 {}{}",
-            account.active_sessions,
-            if account.spread_threshold > 0 && account.active_sessions >= account.spread_threshold {
-                " · 몰림"
-            } else {
-                ""
-            }
+            &[
+                account.active_sessions.to_string(),
+                if account.spread_threshold > 0
+                    && account.active_sessions >= account.spread_threshold
+                {
+                    crate::i18n::static_text(" · 몰림").into()
+                } else {
+                    String::new()
+                },
+            ],
         )),
         pacing_until: account
             .pacing
@@ -1177,7 +1222,7 @@ pub fn row(account: &Account, now: SystemTime) -> Row {
 }
 
 pub fn row_height(row: &Row) -> f32 {
-    if row.user_chip == "비활성" {
+    if row.user_chip == crate::i18n::static_text("비활성") {
         return 44.0;
     }
     let has_windows = !row.meter_windows.is_empty();
@@ -1194,20 +1239,20 @@ pub fn row_height(row: &Row) -> f32 {
 
 pub fn user_chip(state: &str) -> String {
     match state {
-        "active" => "활성",
-        "paused" => "일시정지",
-        "disabled" => "비활성",
-        _ => "알 수 없음",
+        "active" => crate::i18n::static_text("활성"),
+        "paused" => crate::i18n::static_text("일시정지"),
+        "disabled" => crate::i18n::static_text("비활성"),
+        _ => crate::i18n::static_text("알 수 없음"),
     }
     .into()
 }
 
 pub fn health_chip(account: &Account, now: SystemTime) -> String {
     if account.user_state == "disabled" {
-        return "비활성".into();
+        return crate::i18n::static_text("비활성").into();
     }
     if account.user_state == "paused" {
-        return "일시정지".into();
+        return crate::i18n::static_text("일시정지").into();
     }
     if let Some(notice) = account
         .quota_notice
@@ -1225,39 +1270,50 @@ pub fn health_chip(account: &Account, now: SystemTime) -> String {
         }
     }
     if account.probe_pending {
-        return "인증 확인 대기".into();
+        return crate::i18n::static_text("인증 확인 대기").into();
     }
     if account.drain {
-        return "전환 대기".into();
+        return crate::i18n::static_text("전환 대기").into();
     }
     if let Some(seconds) = account.pacing.backoff_secs.filter(|seconds| *seconds > 0) {
-        return format!("속도 조절 중 · {seconds}초");
+        return crate::i18n::format("속도 조절 중 · {0}초", &[seconds.to_string()]);
     }
     match account.health.kind.as_str() {
-        "ready" => "준비됨".into(),
+        "ready" => crate::i18n::static_text("준비됨").into(),
         "cooling" => {
             let label = match account.health.reason.as_deref() {
-                Some("quota") => "한도",
-                Some("rate") | Some("auth") | Some("link_stale") => "대기",
-                Some("permission") | Some("payment") | Some("store_error") => "확인 필요",
-                _ => "대기",
+                Some("quota") => crate::i18n::static_text("한도"),
+                Some("rate") | Some("auth") | Some("link_stale") => {
+                    crate::i18n::static_text("대기")
+                }
+                Some("permission") | Some("payment") | Some("store_error") => {
+                    crate::i18n::static_text("확인 필요")
+                }
+                _ => crate::i18n::static_text("대기"),
             };
             account.health.until.as_deref().map_or_else(
                 || label.into(),
                 |until| format!("{label} · {}", short_time(until, now)),
             )
         }
-        "needs_relogin" => "재로그인 필요".into(),
-        _ => "알 수 없음".into(),
+        "needs_relogin" => crate::i18n::static_text("재로그인 필요").into(),
+        _ => crate::i18n::static_text("알 수 없음").into(),
     }
 }
 
 fn short_time(value: &str, now: SystemTime) -> String {
     let rendered = format_reset(value, now);
-    rendered
-        .strip_suffix(" 초기화")
-        .unwrap_or(&rendered)
-        .to_string()
+    if crate::i18n::language() == crate::i18n::UiLanguage::En {
+        rendered
+            .strip_prefix("Resets ")
+            .unwrap_or(&rendered)
+            .to_string()
+    } else {
+        rendered
+            .strip_suffix(" 초기화")
+            .unwrap_or(&rendered)
+            .to_string()
+    }
 }
 
 pub fn health_tone(account: &Account) -> Tone {
@@ -1324,40 +1380,47 @@ pub fn format_reset(value: &str, now: SystemTime) -> String {
         return value.into();
     };
     if at <= now {
-        return "리셋됨".into();
+        return crate::i18n::static_text("리셋됨").into();
     }
     let remaining = at.duration_since(now).unwrap_or_default();
     let local = value
         .parse::<DateTime<FixedOffset>>()
         .ok()
         .map(|timestamp| timestamp.with_timezone(&Local));
+    if crate::i18n::language() == crate::i18n::UiLanguage::En {
+        return local
+            .map(|at| format!("Resets {}", crate::i18n::date_time(&at, "%H:%M")))
+            .unwrap_or_else(|| value.into());
+    }
     if remaining > Duration::from_secs(24 * 3600)
         && let Some(local) = local
     {
-        return format!(
-            "{}/{} {:02}:{:02} 초기화",
-            local.month(),
-            local.day(),
-            local.hour(),
-            local.minute()
+        return crate::i18n::format(
+            "{0}/{1} {2}:{3} 초기화",
+            &[
+                (local.month()).to_string(),
+                (local.day()).to_string(),
+                format!("{:02}", local.hour()),
+                format!("{:02}", local.minute()),
+            ],
         );
     }
     local.map_or_else(
         || value.into(),
-        |local| format!("{} 초기화", local.format("%H:%M")),
+        |local| crate::i18n::format("{0} 초기화", &[(local.format("%H:%M")).to_string()]),
     )
 }
 
 fn window_label(name: &str) -> String {
     match name {
-        "5h" => "5시간".into(),
-        "7d" => "주간".into(),
+        "5h" => crate::i18n::static_text("5시간").into(),
+        "7d" => crate::i18n::static_text("주간").into(),
         value if value.ends_with('m') => value
             .trim_end_matches('m')
             .parse::<u64>()
-            .map(|minutes| format!("{}일", minutes / (24 * 60)))
-            .unwrap_or_else(|_| "기타".into()),
-        _ => "기타".into(),
+            .map(|minutes| crate::i18n::format("{0}일", &[(minutes / (24 * 60)).to_string()]))
+            .unwrap_or_else(|_| crate::i18n::static_text("기타").into()),
+        _ => crate::i18n::static_text("기타").into(),
     }
 }
 
@@ -1374,11 +1437,14 @@ fn drawable_window_name(name: &str) -> bool {
 
 pub fn tooltip(rows: &[Row], core_ok: bool) -> String {
     let badge = match badge(rows, core_ok) {
-        Badge::Error => "코어 연결 끊김",
-        Badge::Attention => "주의 필요",
-        Badge::Normal => "정상",
+        Badge::Error => crate::i18n::static_text("코어 연결 끊김"),
+        Badge::Attention => crate::i18n::static_text("주의 필요"),
+        Badge::Normal => crate::i18n::static_text("정상"),
     };
-    let text = format!("quota-baton · {badge} · 계정 {}개", rows.len());
+    let text = crate::i18n::format(
+        "quota-baton · {0} · 계정 {1}개",
+        &[badge.to_string(), (rows.len()).to_string()],
+    );
     text.chars().take(127).collect()
 }
 
