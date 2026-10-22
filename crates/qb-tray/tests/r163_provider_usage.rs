@@ -206,3 +206,145 @@ async fn r163_real_dto_capture_retains_provider_values_and_measured_layouts() {
         });
     }
 }
+
+// Keep one ordinary account, but make the other active accounts rely only on
+// current quota snapshots. No rate or forecast is fabricated for those accounts.
+fn r164_measured_bundle(with_normal_history: bool) -> Value {
+    let mut wire = bundle();
+    wire["state"]["accounts"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|a| {
+            matches!(
+                a["id"].as_str().unwrap(),
+                "sample-a" | "sample-b" | "sample-free" | "sample-paused"
+            )
+        });
+    for account in wire["state"]["accounts"].as_array_mut().unwrap() {
+        account.as_object_mut().unwrap().remove("observed_at");
+        for window in account["windows"].as_array_mut().unwrap() {
+            window.as_object_mut().unwrap().remove("observed_at");
+        }
+        if account["id"] == "sample-a" {
+            account["windows"][0]["used_pct"] = json!(100.);
+        }
+        if !with_normal_history || account["id"] != "sample-free" {
+            account.as_object_mut().unwrap().remove("usage_forecast");
+        }
+    }
+    wire["usage_history"]["accounts"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|a| with_normal_history && a["id"] == "sample-free");
+    wire["state"]["pools"] = json!({"codex":{"eligible":3}});
+    wire
+}
+
+#[tokio::test]
+async fn r164_current_snapshots_draw_measured_remaining_without_forecast_or_history() {
+    for with_normal_history in [true, false] {
+        let captured = transport(&r164_measured_bundle(with_normal_history)).await;
+        i18n::with_language(UiLanguage::En, || {
+            let data = captured.project(now().into()).unwrap();
+            let clock = dashboard_model::Clock {
+                now: now().with_timezone(&FixedOffset::east_opt(32400).unwrap()),
+                day_start: now() - Duration::hours(12),
+                day_end: now() + Duration::hours(12),
+            };
+            let mut state = DashboardState::default();
+            state.tab = Tab::Usage;
+            let view = dashboard_model::project(&data, &mut state, &clock);
+            let codex = &view.provider_usage[1];
+            assert_eq!((codex.cohort, codex.excluded_paused), (3, 1));
+            assert_eq!((codex.excluded_disabled, codex.excluded_other), (0, 0));
+            assert_eq!(
+                (codex.current.remaining.known, codex.current.remaining.total),
+                (3, 3)
+            );
+            // Exhausted 0 + snapshot-only 0.6 + ordinary 0.4; paused is excluded.
+            assert!((codex.current.remaining.value.unwrap() - 1.).abs() < 1e-9);
+            for size in [[1024, 640], [1320, 900]] {
+                let options = Options {
+                    view: View::Usage,
+                    size,
+                    scale: 2,
+                    dark: false,
+                    now: clock.now,
+                };
+                let measured = snapshot_render::measure_dashboard(&data, &options).unwrap();
+                let chart = measured
+                    .scene
+                    .charts
+                    .iter()
+                    .find(|c| c.id == "provider-usage:codex")
+                    .unwrap();
+                assert!(chart.provider_summary.is_some());
+                let inside = |point: &[f32; 2]| {
+                    point[0] >= chart.rect.left
+                        && point[0] <= chart.rect.right
+                        && point[1] >= chart.rect.top
+                        && point[1] <= chart.rect.bottom
+                };
+                assert!(
+                    measured.scene.draw.iter().any(|draw| matches!(
+                        draw,
+                        geometry::Draw::Line {
+                            from, to, color: geometry::Color::BarOk, width, dash: None,
+                        } if ((*width == 2. && to[0] > from[0])
+                            || (*width == 3. && (to[0] - from[0] - 4.).abs() < 0.01))
+                            && inside(from) && inside(to)
+                    )),
+                    "remaining must have an actual solid chart primitive"
+                );
+                let text: Vec<_> = measured
+                    .scene
+                    .draw
+                    .iter()
+                    .filter_map(|draw| match draw {
+                        geometry::Draw::Text { measure, .. } => Some(measure.text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                assert!(text.contains(&"1.0 of 3 account-equivalents left"));
+                assert!(text.iter().any(|s| {
+                    s.contains("measured 3/3 · paused 1 / disabled 0 / other 0 excluded")
+                }));
+            }
+        });
+    }
+}
+
+#[tokio::test]
+async fn r164_exhausted_snapshot_without_forecast_or_history_is_zero_until_reset() {
+    let mut wire = r164_measured_bundle(false);
+    wire["state"]["accounts"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|a| a["id"] == "sample-a");
+    wire["state"]["pools"] = json!({"codex":{"eligible":1}});
+    let captured = transport(&wire).await;
+    let reset = now() + Duration::hours(60);
+    for (at, expected) in [
+        (now(), Some(0.)),
+        (reset - Duration::seconds(1), Some(0.)),
+        (reset, None),
+    ] {
+        let data = captured.project(at.into()).unwrap();
+        let clock = dashboard_model::Clock {
+            now: at.with_timezone(&FixedOffset::east_opt(32400).unwrap()),
+            day_start: at - Duration::hours(12),
+            day_end: at + Duration::hours(12),
+        };
+        let mut state = DashboardState::default();
+        state.tab = Tab::Usage;
+        let view = dashboard_model::project(&data, &mut state, &clock);
+        let codex = &view.provider_usage[1];
+        assert_eq!(codex.cohort, 1);
+        assert_eq!(codex.current.remaining.value, expected, "at {at}");
+        assert_eq!(codex.current.remaining.total, 1);
+        assert_eq!(
+            codex.current.remaining.known,
+            usize::from(expected.is_some())
+        );
+    }
+}

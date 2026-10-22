@@ -311,6 +311,15 @@ pub(super) fn panel(b: &mut Builder<'_>, v: &m::DashboardView, p: &Projection, r
                     );
                 }
             }
+            if let Some(value) = p.current.remaining.value {
+                b.line(
+                    [(x(p.now) - 2.).max(plot.left), y(value)],
+                    [(x(p.now) + 2.).min(plot.right), y(value)],
+                    Color::BarOk,
+                    3.,
+                    None,
+                );
+            }
             b.line(
                 [x(p.now), plot.top],
                 [x(p.now), plot.bottom],
