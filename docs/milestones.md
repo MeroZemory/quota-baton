@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: R16.3 제공자 사용량 차트
-목표: R16.3 집중 관문 완료·설치 인계, 다음 N6 기본 꺼짐 기록기 최소 전달
+현재 마일스톤: R16.4 현재 스냅샷 잔여량 집계
+목표: R16.4 집중 관문 완료·설치 인계, 다음 N6 기본 꺼짐 기록기 최소 전달
 핵심 지표: 남은 출시 1/3 (R14 보호 설치, R13 C+E 실행, R13 F 통합 예측); 이전 계열 2/2 종료
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-23 05:19 KST (R16.3 집중 관문 완료; 다음 N6)
+갱신: 2026-10-23 06:00 KST (R16.4 집중 관문 완료; 다음 N6)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -192,6 +192,8 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-23 04:26 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | R16.2 집중428·실제8HWND 수용, 분모 밖 표시 개선; 실제 설치 전 |
 | 2026-10-23 04:34 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | R16.2 설치 수용 ddf8d87; takeover 거절0/1,959·실제 dashboard 확인. 이 표시 개선은 분모 밖 |
 | 2026-10-23 05:19 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | R16.3 집중464·실제10HWND 수용·설치 인계; 제공자 차트는 분모 밖. 다음 N6 |
+| 2026-10-23 05:26 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | R16.3 설치 수용41cb129·takeover 거절0/1,889; 잔여량 집계 R16.4 보완 |
+| 2026-10-23 06:00 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | R16.4 집중 관문·실제 경로 검수 완료; 분모 밖 표시 수정, 다음 N6 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -358,6 +360,8 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-23 04:26 | R16.2 실제·합성 렌더 | KO/EN 실제8HWND·합성120PNG | D27 실제 core/AdminClient/tray 및 두 크기·테마 | 직접 시각 검수 수용; fixture·자식 프로세스 정리 |
 | 2026-10-23 05:19 | R16.3 집중 검증 | 고유464통과·strict clippy 3crate·fmt·build exit0 | 집중 관문·기존 R16.1/R16.2 회귀 | delivery-fingerprint.json에 명령별 입력SHA·exit·합계; 전체 workspace 재실행 미주장 |
 | 2026-10-23 05:19 | R16.3 실제·합성 렌더 | KO/EN 실제10HWND·합성8PNG 직접 확인 | D27 실제 core/AdminClient/tray·두 크기·테마 | fixture 정리·소스/바이너리 parity; 최초 실패와 exhausted baseline red 보존 |
+| 2026-10-23 06:00 | R16.4 잔여량 집중 검증 | 453통과·strict tray all-target lint·fmt·testkit build exit0 | 현재 snapshot/소진0/paused 제외/이력 갭·기존 영어 배치 | R16.4-evidence/delivery-fingerprint.json에 명령·exit·입력SHA; 전체 matrix 미주장 |
+| 2026-10-23 06:00 | R16.4 실제 경로 | KO/EN core→AdminClient→tray 10HWND 확인 | D27·snapshot 실제 전달 | fixture 정리·소스/바이너리 parity; visual-review.json |
 <!-- support:end -->
 
 <!-- gaps:begin -->

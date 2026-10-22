@@ -77,7 +77,8 @@ The current plan, with lanes, owners and start commands, is the "Plan" section o
 | R16.1 | 완료3737fe2·집중405·strict lint·D27 3HWND·KO PNG4개 동일: 영어 탭·표 제목·사용량 요약 폭 보완. 한국어 출력 보존, 1024×640·1320×900 scale2 실제 renderer 회귀·D27 경로 통과, self-merge 후 설계 세션 설치 |
 | R16.2 | 완료·설치 수용: dev ddf8d87, 04:34 KST; 실제 dashboard 확인·takeover 연결 거절0/1,959 |
 | R9.5 | 대기(N3): 이동 진행·안전한 중단·재개·읽기 쉬운 확인. ready-node S1 순서에 따라 N5a-d 뒤 |
-| R16.3 | 완료: 집중464·strict lint·KO/EN 실제10HWND·합성8PNG 통과. 제공자 주간/30일 계정분·권장선·음영·소진 사실 표시. 설치는 설계 세션 |
+| R16.3 | 완료·설치 수용(41cb129, 05:26 KST, takeover 거절0/1,889): 집중464·strict lint·KO/EN 실제10HWND·합성8PNG 통과. 제공자 주간/30일 계정분·권장선·음영·소진 사실 표시. 설치는 설계 세션 |
+| R16.4 | 완료: 현재 스냅샷 잔여량은 속도·이력과 독립 집계, 소진 0은 리셋까지 유지; 집중 관문·실제 KO/EN HWND 검수. 설치는 설계 세션 |
 | R14.2 | 진행 중(N6): 기본 꺼짐 수집기(schema/off/7일 bounded retention) 최소 전달. 기존 impl/r14.2 db6baac 보존; 초기 상태·전체 replay 수용은 별도 |
 | R15 | 대기: R13 Part F 후 공유 admin 응답형·계약 왕복·라우팅 속성 검사(D27). brief `R15-contract.md` |
 | R11.1 | merged: 공유 AGENTS/hook 편집 보존·rh 별칭, 회귀5·cutover141·strict lint·실제 preview/launch 점검 통과. 설치·apply는 설계 세션. 보고서 `.sandbox/reports/R11.1.md` |
