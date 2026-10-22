@@ -23,9 +23,14 @@ use std::{
 const CAPACITY: usize = 20_000;
 const COUNT_CHANGE_CAPACITY: usize = CAPACITY * 2;
 mod launch;
+mod move_guard;
 pub use launch::{
     LaunchEntitlements, LaunchError, LaunchInfo, LaunchPlacement, LaunchPolicyMove, LaunchRequest,
 };
+pub use move_guard::Limits as MoveGuardLimits;
+#[cfg(test)]
+#[path = "bindings/move_guard_tests.rs"]
+mod move_guard_tests;
 #[cfg(test)]
 #[path = "bindings/routing_safety_tests.rs"]
 mod routing_safety_tests;
@@ -71,6 +76,9 @@ pub struct Candidate {
 #[derive(Debug)]
 pub enum Decision {
     Blocked,
+    MoveHeld {
+        until: DateTime<Utc>,
+    },
     Selected {
         account: String,
         lease: BindingLease,
@@ -102,6 +110,26 @@ pub struct MoveEvent {
     pub placed_since_obs: usize,
     pub is_placement: bool,
 }
+/// Body-free refusal recorded before any admission or policy side effect.
+#[derive(Clone, Debug, Serialize)]
+pub struct MoveGuardPair {
+    pub from: String,
+    pub to: String,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct MoveGuardEvent {
+    pub proposed_reason: String,
+    pub move_list: Vec<MoveGuardPair>,
+    pub key: String,
+    pub from: String,
+    pub to: String,
+    pub reason: String,
+    pub until: DateTime<Utc>,
+    pub newly_tripped: bool,
+    pub forced: bool,
+}
+type MoveGuardObserver = Arc<dyn Fn(&MoveGuardEvent) + Send + Sync>;
+
 /// Evidence at selection time, before this placement adds its charge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -444,9 +472,197 @@ pub struct BindingTable {
     data: Mutex<Data>,
     writer: Mutex<()>,
     mutations: Mutex<()>,
+    move_guard: Mutex<move_guard::Breaker>,
+    move_guard_observer: Mutex<Option<MoveGuardObserver>>,
+    move_accounting: Mutex<Option<std::sync::Weak<crate::observability::Observability>>>,
     writes_stopped: AtomicBool,
     unknown_cost_skips: AtomicUsize,
     usage_sequence: AtomicU64,
+}
+
+impl BindingTable {
+    pub fn attach_move_accounting(&self, observability: &Arc<crate::observability::Observability>) {
+        *self
+            .move_accounting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(observability));
+    }
+    fn move_observability(&self) -> Option<Arc<crate::observability::Observability>> {
+        self.move_accounting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+    }
+    fn rename_move_state(
+        &self,
+        source: &str,
+        target: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), LaunchError> {
+        let mut guard = self.move_guard.lock().unwrap_or_else(|e| e.into_inner());
+        let mut proposed = guard.clone();
+        proposed
+            .rename(source, target)
+            .map_err(|_| LaunchError::Capacity)?;
+        if let Some(obs) = self.move_observability() {
+            obs.accounting_alias(Provider::Codex, source, target, now)
+                .map_err(|_| LaunchError::Capacity)?;
+        }
+        *guard = proposed;
+        Ok(())
+    }
+    pub fn clear_move_guard(&self) {
+        let _mutation = self.mutations.lock().unwrap_or_else(|e| e.into_inner());
+        self.move_guard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.policies.changed.notify_waiters();
+    }
+
+    pub fn move_guard_until(&self) -> Option<DateTime<Utc>> {
+        let _mutation = self.mutations.lock().unwrap_or_else(|e| e.into_inner());
+        self.move_guard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .state(Utc::now())
+    }
+
+    pub fn set_move_guard_observer(&self, observer: MoveGuardObserver) {
+        *self
+            .move_guard_observer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(observer);
+    }
+
+    /// All calls occur under mutations, before external admission/dispatch.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_move(
+        &self,
+        d: &Data,
+        key: &str,
+        from: Option<&str>,
+        to: &str,
+        candidates: &[Candidate],
+        model: Option<&str>,
+        proposed_reason: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<move_guard::Permit>, move_guard::Denied> {
+        let Some(from) = from.filter(|from| *from != to) else {
+            return Ok(None);
+        };
+        let source = candidates.iter().find(|c| c.account.id == from);
+        let target = candidates.iter().find(|c| c.account.id == to);
+        let source_account = source.map(|c| effective_account(c, d, &self.config, model, now));
+        let target_account = target.map(|c| effective_account(c, d, &self.config, model, now));
+        // Missing source evidence (e.g. request-local exclusions) cannot grant
+        // the fresh-unusable exception. A health poll timestamp is not proof.
+        let usable = source.is_some_and(|c| self.move_source_usable(d, key, c, model, now));
+        let unusable = source.is_some() && !usable;
+        let result = self
+            .move_guard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .prepare(
+                &self.config.move_guard,
+                key,
+                from,
+                to,
+                semantic_evidence(source_account.as_ref()),
+                semantic_evidence(target_account.as_ref()),
+                unusable,
+                now,
+            );
+        match result {
+            Ok(permit) => Ok(Some(permit)),
+            Err(denied) => {
+                let event = MoveGuardEvent {
+                    proposed_reason: proposed_reason.into(),
+                    move_list: self
+                        .move_guard
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .recent_moves(now),
+                    key: key.into(),
+                    from: from.into(),
+                    to: to.into(),
+                    reason: denied.reason.code().into(),
+                    until: denied.until,
+                    newly_tripped: denied.newly_tripped,
+                    forced: !usable,
+                };
+                let observer = self
+                    .move_guard_observer
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                if let Some(observer) = observer {
+                    observer(&event);
+                }
+                tracing::warn!(code="binding_move_refused", reason=?denied.reason, from, to, "Account move refused by token guard");
+                Err(denied)
+            }
+        }
+    }
+    fn move_source_usable(
+        &self,
+        d: &Data,
+        key: &str,
+        candidate: &Candidate,
+        model: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> bool {
+        effective_account(candidate, d, &self.config, model, now).eligible_at(model, now)
+            && (!candidate.account.drain || Self::accepted_in(d, Some(key), &candidate.account.id))
+    }
+    fn commit_move(
+        &self,
+        permit: Option<move_guard::Permit>,
+        to: &str,
+        provider: Provider,
+        key: &str,
+        model: Option<&str>,
+        now: DateTime<Utc>,
+    ) {
+        if let Some(permit) = permit {
+            // Internal invariant: neither clear nor rename can interleave under
+            // mutations. A stale permit never changes a binding.
+            self.move_guard
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .commit(permit, to)
+                .expect("move permit serialized by mutations");
+            if let Some(obs) = self.move_observability()
+                && let Err(error) = obs.committed_move(provider, key, to, model, now)
+            {
+                tracing::warn!(
+                    ?error,
+                    "move cost observation rejected; coverage incomplete"
+                );
+            }
+        }
+    }
+}
+
+fn semantic_evidence(candidate: Option<&Account>) -> u64 {
+    use sha2::{Digest, Sha256};
+    let Some(c) = candidate else {
+        return 0;
+    };
+    // Only stable usability/reset facts; exclude token generation, poll time,
+    // utilization noise and quota started_at.
+    let reset = c.quota_cooling.as_ref().map(|q| (&q.window, q.reset_at));
+    let value = serde_json::to_vec(&(
+        &c.user_state,
+        &c.health,
+        c.payment_until,
+        c.drain,
+        c.allow_credits,
+        reset,
+    ))
+    .expect("account health serializes");
+    u64::from_be_bytes(Sha256::digest(value)[..8].try_into().unwrap())
 }
 
 /// A reservation belongs to the actual upstream account, even after a forced
@@ -469,6 +685,52 @@ impl std::fmt::Debug for BindingLease {
     }
 }
 impl BindingLease {
+    /// Linearize accounting with move commits and resolve the live canonical owner.
+    /// A reservation selected before a move cannot claim that move's next turn.
+    pub(crate) fn accounting_begin(
+        &self,
+        provider: Provider,
+        account: &str,
+        model: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> Result<
+        Option<crate::observability::reread_accounting::RequestTicket>,
+        crate::observability::reread_accounting::Error,
+    > {
+        let _mutation = self
+            .table
+            .mutations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let d = self.table.data.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(key) = self.group.as_deref() else {
+            return Ok(None);
+        };
+        let canonical = launch::ownership_group(&d, group(key));
+        let epoch_key = launch::ownership_group(&d, &self.epoch_key);
+        if account != self.account
+            || canonical != epoch_key
+            || !canonical.starts_with(match provider {
+                Provider::Claude => "claude:",
+                Provider::Codex => "codex:",
+            })
+            || !d
+                .epochs
+                .get(epoch_key)
+                .is_some_and(|epoch| Arc::ptr_eq(epoch, &self.epoch))
+            || d.groups
+                .get(canonical)
+                .is_none_or(|entry| entry.account != self.account)
+        {
+            return Ok(None);
+        }
+        let Some(obs) = self.table.move_observability() else {
+            return Ok(None);
+        };
+        obs.accounting_begin(provider, canonical, account, model, at)
+            .map(Some)
+    }
+
     /// Final admission is separate from attempt/ledger accounting.
     pub fn receipt(&self) -> DispatchReceipt {
         DispatchReceipt {
@@ -933,6 +1195,9 @@ impl BindingTable {
             data: Mutex::new(data),
             writer: Mutex::new(()),
             mutations: Mutex::new(()),
+            move_guard: Mutex::new(move_guard::Breaker::default()),
+            move_guard_observer: Mutex::new(None),
+            move_accounting: Mutex::new(None),
             writes_stopped: AtomicBool::new(false),
             unknown_cost_skips: AtomicUsize::new(0),
             usage_sequence: AtomicU64::new(0),
@@ -1829,7 +2094,7 @@ impl BindingTable {
             coverage: Some(coverage),
             model_move: false,
         });
-        let (choice, reason) = self.select_ordered(
+        let (choice, mut reason) = self.select_ordered(
             &d,
             provider,
             key,
@@ -1841,7 +2106,7 @@ impl BindingTable {
             hold_allowed,
             preference.as_ref(),
         );
-        let account = match choice {
+        let mut account = match choice {
             PreviewDecision::Hold { until } => return Decision::Hold { until },
             PreviewDecision::None => return Decision::None,
             PreviewDecision::Selected { account } => account,
@@ -1882,6 +2147,36 @@ impl BindingTable {
         let previous = key
             .and_then(|key| d.groups.get(group(key)))
             .map(|g| g.account.clone());
+        let guard_key = key
+            .map(group)
+            .map(|key| launch::ownership_group(&d, key))
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("unidentified:{}", provider.as_str()));
+        let guard_from = previous.as_deref().or_else(|| {
+            key.is_none()
+                .then(|| d.sticky.get(provider.as_str()))
+                .flatten()
+                .map(String::as_str)
+        });
+        let permit = match self.prepare_move(
+            &d, &guard_key, guard_from, &account, candidates, model, reason, now,
+        ) {
+            Ok(permit) => permit,
+            Err(denied) => {
+                if let Some(old) =
+                    guard_from.and_then(|id| candidates.iter().find(|c| c.account.id == id))
+                    && self.move_source_usable(&d, &guard_key, old, model, now)
+                {
+                    account = old.account.id.clone();
+                    reason = "guard_keep";
+                    None
+                } else {
+                    return Decision::MoveHeld {
+                        until: denied.until,
+                    };
+                }
+            }
+        };
         let policy_key = launch::policy_key(&d, key).map(str::to_owned);
         drop(d);
         if !admit(&account) {
@@ -1904,6 +2199,9 @@ impl BindingTable {
             );
             return Decision::Blocked;
         }
+        // The mutation gate remains held: a prepared move cannot go stale
+        // between policy publication and this charge.
+        self.commit_move(permit, &account, provider, &guard_key, model, now);
         let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
         // Placement plus capacity eviction is one visible count mutation.
         d.defer_count_changes = true;
@@ -2056,7 +2354,7 @@ impl BindingTable {
                 let known = d.last_request_bytes.entry(g.to_owned()).or_default();
                 *known = (*known).max(request_bytes);
             }
-            if selected_reason != "mark_wait" {
+            if !matches!(selected_reason, "mark_wait" | "guard_keep") {
                 d.overload_marks.remove(g);
             }
             d.changed();

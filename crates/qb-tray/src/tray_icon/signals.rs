@@ -19,6 +19,8 @@ pub enum Kind {
     OrganisationDenied,
     Burst,
     CoreRestart,
+    MoveBreaker,
+    MoveReread,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -69,6 +71,14 @@ impl Signal<'_> {
             Kind::CoreRestart => (
                 "코어 다시 시작",
                 "예기치 않게 종료된 코어를 다시 시작했습니다. 계정 상태를 확인하세요.",
+            ),
+            Kind::MoveBreaker => (
+                "반복 계정 이동 차단",
+                "기존 계정에서 대기합니다. 대시보드에서 이동 기록을 확인하세요.",
+            ),
+            Kind::MoveReread => (
+                "계정 이동 토큰 비용 증가",
+                "계정 이동으로 문맥을 다시 읽는 비용이 늘었습니다. 대시보드의 측정값과 미측정 건수를 확인하세요.",
             ),
             Kind::Burst => (
                 "새 대화 급증",

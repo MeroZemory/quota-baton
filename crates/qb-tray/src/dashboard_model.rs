@@ -11,7 +11,73 @@ pub struct SessionsResponse {
     pub active_window_secs: Option<u64>,
     pub sessions: Vec<Session>,
     pub truncated: bool,
+    pub move_cost: Option<MoveCost>,
 }
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct MoveCostAggregate {
+    pub tokens: u64,
+    pub known_count: u64,
+    pub unknown_count: u64,
+    pub observed_since: Option<DateTime<Utc>>,
+    pub recording_complete: bool,
+    pub tokens_saturated: bool,
+}
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct MoveCost {
+    pub hour: MoveCostAggregate,
+    pub rolling24h: MoveCostAggregate,
+    pub clock_adjusted: bool,
+}
+impl MoveCost {
+    pub fn lines(&self) -> [String; 2] {
+        let value = |a: &MoveCostAggregate| {
+            if a.known_count == 0 && a.unknown_count > 0 {
+                return "미측정".to_owned();
+            }
+            if a.known_count == 0 {
+                return "관측된 이동 없음".to_owned();
+            }
+            format!(
+                "{}{} 토큰",
+                if a.unknown_count > 0 || !a.recording_complete || a.tokens_saturated {
+                    "최소 "
+                } else {
+                    ""
+                },
+                a.tokens
+            )
+        };
+        let a = &self.rolling24h;
+        [
+            format!(
+                "계정 이동으로 다시 읽은 토큰 · 1시간 {} · 24시간 {}",
+                value(&self.hour),
+                value(a)
+            ),
+            format!(
+                "측정 {}회 · 미측정 {}회 · {}{}",
+                a.known_count,
+                a.unknown_count,
+                a.observed_since
+                    .map(|t| format!(
+                        "{}부터 관측",
+                        t.with_timezone(&chrono::Local).format("%m/%d %H:%M")
+                    ))
+                    .unwrap_or_else(|| "관측 시작 시각 확인 전".into()),
+                if !a.recording_complete {
+                    " · 일부 기록 누락"
+                } else if self.clock_adjusted {
+                    " · 시각 보정 포함"
+                } else {
+                    ""
+                }
+            ),
+        ]
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct Client {
@@ -508,6 +574,7 @@ pub struct DashboardView {
     pub inflight_count: usize,
     pub inflight_count_known: bool,
     pub counters_unknown: bool,
+    pub move_cost_lines: Option<[String; 2]>,
     pub provider_counts: [usize; 3],
     pub groups: Vec<AccountGroup>,
     pub flat: Vec<SessionRow>,
@@ -1230,6 +1297,7 @@ pub fn project(
         inflight_count_known: !snapshot.sessions.truncated
             && sessions.iter().all(|s| s.inflight_known),
         counters_unknown: sessions.iter().any(|s| !s.counters_complete),
+        move_cost_lines: snapshot.sessions.move_cost.as_ref().map(MoveCost::lines),
         provider_counts,
         groups,
         flat,
@@ -2165,3 +2233,27 @@ fn usage_tiles(snapshot: &DashboardSnapshot, clock: &Clock) -> Vec<UsageTile> {
 #[cfg(test)]
 #[path = "dashboard_model_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod r14_move_cost_transport_tests {
+    use super::*;
+    #[test]
+    fn r14_admin_transport_retains_cost_and_unknown_coverage() {
+        let response: SessionsResponse = serde_json::from_value(serde_json::json!({
+            "now":"2026-10-22T04:00:00Z", "sessions":[],
+            "move_cost":{"hour":{"tokens":120,"known_count":1,"unknown_count":0,"recording_complete":true},
+            "rolling24h":{"tokens":300,"known_count":2,"unknown_count":1,"recording_complete":true,
+            "observed_since":"2026-10-22T00:00:00Z"},"clock_adjusted":false}
+        })).unwrap();
+        let lines = response.move_cost.unwrap().lines();
+        assert!(lines[0].contains("1시간 120 토큰"));
+        assert!(lines[0].contains("24시간 최소 300 토큰"));
+        assert!(lines[1].contains("측정 2회 · 미측정 1회"));
+        let mut unknown = MoveCost::default();
+        unknown.rolling24h.unknown_count = 1;
+        assert!(unknown.lines()[0].contains("미측정"));
+        assert!(!unknown.lines()[0].contains("24시간 0 토큰"));
+        let old: SessionsResponse = serde_json::from_str("{}").unwrap();
+        assert!(old.move_cost.is_none());
+    }
+}

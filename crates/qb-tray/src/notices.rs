@@ -164,6 +164,53 @@ impl Controller {
                 continue;
             };
             let age = now.signed_duration_since(observed_at);
+            if age >= chrono::Duration::zero() && age < chrono::Duration::minutes(10) {
+                let kind = match warning.kind.as_str() {
+                    "move_breaker" => Some(Kind::MoveBreaker),
+                    "move_reread" => Some(Kind::MoveReread),
+                    _ => None,
+                };
+                if let Some(kind) = kind {
+                    let signal = Signal {
+                        subject: Subject::Core,
+                        kind,
+                    };
+                    let (title, text) = signal.message();
+                    let account_name = |id: &str| {
+                        snapshot
+                            .accounts
+                            .iter()
+                            .find(|a| a.id == id)
+                            .and_then(|a| {
+                                a.label
+                                    .as_deref()
+                                    .filter(|s| !s.is_empty())
+                                    .or(a.email.as_deref())
+                            })
+                            .unwrap_or(id)
+                            .chars()
+                            .filter(|ch| !ch.is_control())
+                            .take(36)
+                            .collect::<String>()
+                    };
+                    let detail = if kind == Kind::MoveBreaker {
+                        warning
+                            .move_list
+                            .iter()
+                            .take(6)
+                            .map(|m| format!("{} → {}", account_name(&m.from), account_name(&m.to)))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    } else {
+                        warning
+                            .reread_tokens
+                            .map(|n| format!("최근 1시간 최소 {n} 토큰"))
+                            .unwrap_or_default()
+                    };
+                    found.push((signal, (title.to_owned(), format!("{text} {detail}"))));
+                }
+            }
+
             if age >= chrono::Duration::zero()
                 && age < chrono::Duration::minutes(10)
                 && let Some(signal) =
@@ -654,6 +701,8 @@ mod tests {
             model_limited: false,
             kind: "burst".into(),
             burst_new_sessions: Some(31),
+            move_list: Vec::new(),
+            reread_tokens: None,
             observed_at: Some(chrono::Utc::now() - chrono::Duration::seconds(1)),
             account: None,
             window: None,
@@ -672,6 +721,40 @@ mod tests {
         let mut fresh = Controller::default();
         observe(&mut fresh, &s, 0);
         assert!(fresh.next(Duration::ZERO).is_none());
+    }
+
+    #[test]
+    fn r14_runtime_warnings_decode_name_moves_and_expire_without_repeat() {
+        for (kind, expected) in [
+            ("move_breaker", Kind::MoveBreaker),
+            ("move_reread", Kind::MoveReread),
+        ] {
+            let mut s = snapshot(json!({"kind":"ready"}), "active", Some(1));
+            s.accounts[0].label = Some("테스트 계정".into());
+            s.warnings = vec![
+                serde_json::from_value(json!({
+                    "kind":kind,"observed_at":chrono::Utc::now()-chrono::Duration::seconds(1),
+                    "move_list":[{"from":"cx-synthetic","to":"cx-other"}],"reread_tokens":1234
+                }))
+                .unwrap(),
+            ];
+            let mut controller = Controller::default();
+            observe(&mut controller, &s, 0);
+            let notice = controller.next(Duration::ZERO).unwrap();
+            assert_eq!(notice.kind, expected);
+            assert!(notice.text.contains(if kind == "move_breaker" {
+                "테스트 계정 → cx-other"
+            } else {
+                "최소 1234 토큰"
+            }));
+            controller.finish();
+            observe(&mut controller, &s, 1);
+            assert!(controller.next(Duration::from_secs(1)).is_none());
+            s.warnings[0].observed_at = Some(chrono::Utc::now() - chrono::Duration::minutes(11));
+            let mut fresh = Controller::default();
+            observe(&mut fresh, &s, 0);
+            assert!(fresh.next(Duration::ZERO).is_none());
+        }
     }
 
     #[test]

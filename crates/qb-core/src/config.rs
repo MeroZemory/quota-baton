@@ -178,6 +178,7 @@ impl Default for ServerConfig {
 pub struct RoutingConfig {
     pub mode: crate::routing::Mode,
     pub churn: crate::routing::ChurnLimits,
+    pub move_guard: crate::bindings::MoveGuardLimits,
     pub gate_5h_pct: f64,
     pub gate_weekly_pct: f64,
     pub gate_weekly_near_reset_pct: f64,
@@ -204,6 +205,7 @@ impl Default for RoutingConfig {
         Self {
             mode: crate::routing::Mode::Rebalance,
             churn: crate::routing::ChurnLimits::default(),
+            move_guard: crate::bindings::MoveGuardLimits::default(),
             gate_5h_pct: 90.0,
             gate_weekly_pct: 90.0,
             gate_weekly_near_reset_pct: 98.0,

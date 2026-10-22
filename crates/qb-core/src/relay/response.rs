@@ -103,6 +103,7 @@ pub(in crate::relay) fn body(
                         if matches!(stream.next().now_or_never(), Some(None))
                             && let Some(mut completion) = completion.take()
                         {
+                            completion.accounting_cancel();
                             json_cache_usage(&mut completion, &response_headers, json_body.as_deref());
                             completion.finish(&success_outcome);
                         }
@@ -113,6 +114,11 @@ pub(in crate::relay) fn body(
             };
             let Some(chunk) = next else {
                 if let Some(mut completion) = completion.take() {
+                    // SSE requires a successful terminal chunk delivered through Receiver.
+                    // A clean transport EOF is not proof that a provider turn completed.
+                    if observer.sse {
+                        completion.accounting_cancel();
+                    }
                     json_cache_usage(&mut completion, &response_headers, json_body.as_deref());
                     completion.finish(&success_outcome);
                 }
@@ -145,7 +151,7 @@ pub(in crate::relay) fn body(
                 && let Some(usage) = observer
                     .decoder
                     .as_ref()
-                    .and_then(|decoder| decoder.sink().cache_usage.clone())
+                    .and_then(|decoder| decoder.sink().cache_usage)
             {
                 record.record.cache_usage = Some(usage);
             }
@@ -213,6 +219,9 @@ pub(in crate::relay) fn body(
             }
             let terminal = if observer.terminal() {
                 completion.take().map(|mut completion| {
+                    if !observer.accounting_success() {
+                        completion.accounting_cancel();
+                    }
                     completion.record.bytes_out += len;
                     let outcome = if observer.failed() {
                         "upstream_error".to_owned()
@@ -258,6 +267,7 @@ fn stream_error() -> io::Error {
 }
 
 struct Observer {
+    sse: bool,
     decoder: Option<Decoder>,
     error_body: Option<Vec<u8>>,
 }
@@ -285,6 +295,7 @@ impl Observer {
             None
         };
         Self {
+            sse,
             decoder,
             error_body: None,
         }
@@ -316,6 +327,13 @@ impl Observer {
             .as_ref()
             .is_some_and(|decoder| decoder.sink().terminal)
     }
+
+    fn accounting_success(&self) -> bool {
+        self.decoder.as_ref().is_some_and(|decoder| {
+            let sink = decoder.sink();
+            sink.terminal && !sink.failed && !sink.accounting_failed
+        })
+    }
 }
 
 #[derive(Default)]
@@ -326,6 +344,7 @@ struct EventSink {
     oversized: bool,
     terminal: bool,
     failed: bool,
+    accounting_failed: bool,
     error_code: Option<String>,
     error_event: Option<Vec<u8>>,
     error_sequence: u64,
@@ -339,8 +358,18 @@ impl EventSink {
             if let Some(value) = line.strip_prefix(b"event:") {
                 self.terminal |= terminal_kind(value.trim_ascii());
                 self.failed |= value.trim_ascii() == b"response.failed";
+                self.accounting_failed |= matches!(
+                    value.trim_ascii(),
+                    b"error"
+                        | b"response.error"
+                        | b"response.incomplete"
+                        | b"response.cancelled"
+                        | b"response.canceled"
+                );
             }
         }
+        // An unclassified event cannot prove accounting success at a later stop.
+        self.accounting_failed |= self.oversized;
         if !self.oversized {
             let mut data = Vec::new();
             for line in self.event.split(|b| matches!(b, b'\r' | b'\n')) {
@@ -352,8 +381,33 @@ impl EventSink {
                 }
             }
             if let Ok(event) = serde_json::from_slice::<serde_json::Value>(&data) {
+                self.accounting_failed |= !event.is_object()
+                    || event.get("type").is_some_and(|kind| !kind.is_string())
+                    || !event["error"].is_null()
+                    || !event["response"]["error"].is_null()
+                    || matches!(
+                        event["type"].as_str(),
+                        Some(
+                            "error"
+                                | "response.error"
+                                | "response.failed"
+                                | "response.incomplete"
+                                | "response.cancelled"
+                                | "response.canceled"
+                        )
+                    )
+                    || matches!(
+                        event["response"]["status"].as_str(),
+                        Some("failed" | "incomplete" | "cancelled" | "canceled")
+                    );
+                if matches!(
+                    event.get("type").and_then(serde_json::Value::as_str),
+                    Some("message_start" | "response.created")
+                ) {
+                    self.cache_usage = None;
+                }
                 if let Some(usage) = crate::observability::cache_usage(&event) {
-                    self.cache_usage = Some(usage);
+                    crate::observability::merge_cache_usage(&mut self.cache_usage, usage);
                 }
                 if let Some(kind) = event.get("type").and_then(serde_json::Value::as_str) {
                     self.terminal |= terminal_kind(kind.as_bytes());
@@ -370,6 +424,12 @@ impl EventSink {
                     self.error_event = Some(data);
                     self.error_sequence = self.error_sequence.saturating_add(1);
                 }
+            } else if self
+                .event
+                .split(|b| matches!(b, b'\r' | b'\n'))
+                .any(|line| line == b"data" || line.starts_with(b"data:"))
+            {
+                self.accounting_failed = true;
             }
         }
         self.event.clear();
@@ -506,6 +566,7 @@ impl Decoder {
                     oversized: false,
                     terminal: false,
                     failed: false,
+                    accounting_failed: false,
                     error_code: None,
                     error_event: None,
                     error_sequence: 0,
@@ -520,6 +581,149 @@ impl Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn accounting_requires_successful_terminal_without_prior_stream_error() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "text/event-stream".parse().unwrap());
+        for (stream, success) in [
+            ("data: {\"type\":\"message_start\"}\n\n", false),
+            ("data: {\"type\":\"message_stop\"}\n\n", true),
+            (
+                "data: {\"type\":\"response.completed\",\"error\":null,\"response\":{\"status\":\"completed\",\"error\":null}}\n\n",
+                true,
+            ),
+            (
+                "data: {\"type\":\"response.completed\",\"response\":{\"error\":{\"code\":\"server_error\"}}}\n\n",
+                false,
+            ),
+            (
+                "event: error\ndata: {\"type\":\"error\"}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+                false,
+            ),
+            (
+                "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"incomplete\"}}\n\n",
+                false,
+            ),
+        ] {
+            let mut observer = Observer::new(&headers);
+            observer.feed(stream.as_bytes());
+            assert_eq!(observer.accounting_success(), success, "{stream}");
+        }
+    }
+
+    #[test]
+    fn accounting_event_limit_is_conservative_across_chunks() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "text/event-stream".parse().unwrap());
+        for len in [HOLD_LIMIT - 1, HOLD_LIMIT, HOLD_LIMIT + 1] {
+            let mut event = b"data: {\"type\":\"message_delta\",\"padding\":\"".to_vec();
+            let suffix = b"\"}\n\n";
+            event.resize(len - suffix.len(), b'x');
+            event.extend_from_slice(suffix);
+            assert_eq!(event.len(), len);
+            for chunk_size in [1, 257, HOLD_LIMIT + 1] {
+                let mut observer = Observer::new(&headers);
+                observer.feed(b"data: {\"type\":\"message_start\"}\n\n");
+                for chunk in event.chunks(chunk_size) {
+                    observer.feed(chunk);
+                }
+                observer.feed(b"data: {\"type\":\"message_stop\"}\n\n");
+                assert!(observer.terminal());
+                assert!(!observer.failed());
+                assert_eq!(
+                    observer.accounting_success(),
+                    len <= HOLD_LIMIT,
+                    "event length {len}, chunk size {chunk_size}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn accounting_malformed_data_stays_unknown_after_new_start_and_stop() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "text/event-stream".parse().unwrap());
+        for malformed in [
+            b"data: {\"type\":\"error\"\n\n".as_slice(),
+            b"data: not-json\n\n",
+            b"data:\n\n",
+            b"data\n\n",
+            b"data: null\n\n",
+            b"data: []\n\n",
+            b"data: {\"type\":0}\n\n",
+        ] {
+            let mut observer = Observer::new(&headers);
+            observer.feed(b"data: {\"type\":\"message_start\"}\n\n");
+            observer.feed(malformed);
+            observer.feed(
+                b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":0}}}\n\n",
+            );
+            observer.feed(b"data: {\"type\":\"message_stop\"}\n\n");
+            assert!(observer.terminal());
+            assert!(!observer.failed());
+            assert!(!observer.accounting_success(), "{malformed:?}");
+        }
+    }
+
+    #[test]
+    fn accounting_comment_and_empty_frames_do_not_taint_success() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "text/event-stream".parse().unwrap());
+        let mut observer = Observer::new(&headers);
+        observer.feed(b": keepalive\n\n\nevent: ping\n\n");
+        observer.feed(b"data: {\"type\":\"message_stop\"}\n\n");
+        assert!(observer.terminal());
+        assert!(!observer.failed());
+        assert!(observer.accounting_success());
+    }
+
+    #[test]
+    fn claude_split_sse_usage_merges_and_new_message_resets() {
+        let mut sink = EventSink::default();
+        sink.write_all(b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":100,\"cache_creation_input_tokens\":20}}}\n\n").unwrap();
+        sink.write_all(b"data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":12,\"output_tokens\":1}}\n\n").unwrap();
+        sink.write_all(b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":2}}\n\n")
+            .unwrap();
+        let usage = sink.cache_usage.unwrap();
+        assert_eq!(
+            (
+                usage.input_tokens,
+                usage.cached_tokens,
+                usage.cache_creation_input_tokens
+            ),
+            (Some(12), Some(100), Some(20))
+        );
+        assert_eq!(
+            crate::observability::reread_accounting::uncached(
+                crate::accounts::Provider::Claude,
+                usage
+            ),
+            Some(32)
+        );
+        sink.write_all(
+            b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":30}}}\n\n",
+        )
+        .unwrap();
+        let next = sink.cache_usage.unwrap();
+        assert_eq!(next.input_tokens, Some(30));
+        assert_eq!(next.cached_tokens, None);
+        assert_eq!(next.cache_creation_input_tokens, None);
+    }
+
+    #[test]
+    fn sse_input_only_usage_is_preserved_as_unknown_uncached() {
+        let mut sink = EventSink::default();
+        sink.write_all(b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":123}}}\n\n").unwrap();
+        let usage = sink.cache_usage.unwrap();
+        assert_eq!(usage.input_tokens, Some(123));
+        assert_eq!(
+            crate::observability::reread_accounting::uncached(
+                crate::accounts::Provider::Codex,
+                usage
+            ),
+            None
+        );
+    }
     use crate::{
         accounts::Provider,
         observability::Observability,

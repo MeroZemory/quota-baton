@@ -550,6 +550,11 @@ pub fn layout_rows(
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MovePair {
+    pub from: String,
+    pub to: String,
+}
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TrayWarning {
     #[serde(default)]
     pub model_limited: bool,
@@ -557,6 +562,10 @@ pub struct TrayWarning {
     pub kind: String,
     #[serde(default)]
     pub burst_new_sessions: Option<u64>,
+    #[serde(default)]
+    pub move_list: Vec<MovePair>,
+    #[serde(default)]
+    pub reread_tokens: Option<u64>,
     #[serde(default)]
     pub observed_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default)]

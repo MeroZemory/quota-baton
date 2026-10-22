@@ -37,6 +37,11 @@ pub(in crate::relay) struct Completion {
     observability: Arc<Observability>,
     inflight: Option<Arc<AtomicU64>>,
     account_inflight: Option<(String, crate::account_runtime::InflightGuard)>,
+    accounting_ticket: Option<crate::observability::reread_accounting::RequestTicket>,
+    accounting_regime: Option<(String, Option<String>)>,
+    accounting_model_hint: Option<String>,
+    // Retries within one logical cold turn must never become typical samples.
+    accounting_cold_consumed: bool,
 }
 
 impl Completion {
@@ -76,6 +81,10 @@ impl Completion {
             observability,
             inflight: None,
             account_inflight: None,
+            accounting_ticket: None,
+            accounting_regime: None,
+            accounting_model_hint: None,
+            accounting_cold_consumed: false,
             record: RequestRecord {
                 ts: chrono::Utc::now().to_rfc3339(),
                 req: format!("{:032x}", rand::random::<u128>()),
@@ -179,6 +188,11 @@ impl Completion {
     }
 
     pub fn attempt(&mut self, account: &str) {
+        // WS calls this for handshake/queued-turn/retry bookkeeping too. Its actual
+        // turn writer must call accounting_attempt immediately before dispatch.
+        if self.record.transport != "ws" {
+            self.accounting_attempt(account);
+        }
         self.dashboard_begin();
         if self
             .account_inflight
@@ -201,8 +215,96 @@ impl Completion {
     }
 
     pub fn end_attempt(&mut self) {
+        self.accounting_finish(false);
         self.account_inflight = None;
         self.binding = None;
+    }
+
+    /// Bounded request metadata for accounting only: never changes routing/admission.
+    pub fn accounting_http_model(&mut self, headers: &HeaderMap, prefix: &[u8]) {
+        self.accounting_model_hint = (self.record.family == "codex"
+            && self.record.transport == "http"
+            && matches!(
+                self.record.route.as_str(),
+                "POST /v1/responses" | "POST /v1/responses/compact"
+            ))
+        .then(|| super::launch::request_model(headers, prefix).ok())
+        .flatten()
+        .filter(|model| model.len() <= 256);
+    }
+
+    fn accounting_model(&self) -> Option<&str> {
+        self.record
+            .model
+            .as_deref()
+            .or(self.accounting_model_hint.as_deref())
+    }
+
+    /// Actual provider turn dispatch only; never ingress, handshake or queued WS turn.
+    pub fn accounting_attempt(&mut self, account: &str) {
+        self.accounting_finish(false);
+        self.record.cache_usage = None; // Never let a retry inherit another attempt's usage.
+        let Some(binding) = self.binding.as_ref() else {
+            return;
+        };
+        let provider = if self.record.family == "claude" {
+            Provider::Claude
+        } else {
+            Provider::Codex
+        };
+        match binding.accounting_begin(
+            provider,
+            account,
+            self.accounting_model(),
+            chrono::Utc::now(),
+        ) {
+            Ok(Some(ticket)) => {
+                self.accounting_ticket = Some(ticket);
+                self.accounting_regime = Some((
+                    account.to_owned(),
+                    self.accounting_model().map(str::to_owned),
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(?error, "move cost accounting begin rejected"),
+        }
+    }
+
+    /// Merge only observations belonging to this turn. WS observers may use this too.
+    pub fn observe_usage(&mut self, event: &serde_json::Value) {
+        if let Some(usage) = crate::observability::cache_usage(event) {
+            crate::observability::merge_cache_usage(&mut self.record.cache_usage, usage);
+        }
+    }
+
+    /// Explicit cancellation even if transport bookkeeping subsequently reports EOF/ok.
+    pub fn accounting_cancel(&mut self) {
+        self.accounting_finish(false);
+    }
+
+    fn accounting_finish(&mut self, success: bool) {
+        let Some(ticket) = self.accounting_ticket.take() else {
+            return;
+        };
+        let same_regime = self
+            .accounting_regime
+            .take()
+            .is_some_and(|(account, model)| {
+                self.record.account.as_deref() == Some(account.as_str())
+                    && self.accounting_model() == model.as_deref()
+            });
+        match self.observability.accounting_end(
+            ticket,
+            success && same_regime && !self.accounting_cold_consumed,
+            self.record.cache_usage.as_ref(),
+            chrono::Utc::now(),
+        ) {
+            Ok(crate::observability::reread_accounting::Completion::Move { .. }) => {
+                self.accounting_cold_consumed = true;
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(?error, "move cost accounting completion rejected"),
+        }
     }
     pub fn failover(&mut self, reason: &str) {
         if let Some(attempt) = self.record.attempt_details.last_mut() {
@@ -243,6 +345,11 @@ impl Drop for Completion {
             self.record.status = 504;
             self.record.outcome = "request_timeout".into();
         }
+        self.accounting_finish(
+            matches!(self.record.outcome.as_str(), "ok" | "rate_hold_ok")
+                && ((200..300).contains(&self.record.status)
+                    || (self.record.transport == "ws" && self.record.status == 101)),
+        );
         if matches!(self.record.outcome.as_str(), "ok" | "rate_hold_ok")
             && ((200..300).contains(&self.record.status)
                 || (self.record.transport == "ws" && self.record.status == 101))
@@ -314,6 +421,343 @@ impl Drop for Completion {
     }
 }
 
+#[cfg(test)]
+mod accounting_tests {
+    use super::*;
+    use crate::{
+        bindings::{BindingLease, BindingTable, Candidate, Decision},
+        observability::CacheUsage,
+    };
+
+    const ROOT: &str = "claude:canonical";
+    const CHILD: &str = "claude:canonical:agent:child";
+
+    struct Fixture {
+        table: Arc<BindingTable>,
+        obs: Arc<Observability>,
+        _home: tempfile::TempDir,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../.sandbox/r14-ledger-tests");
+            std::fs::create_dir_all(&root).unwrap();
+            let home = tempfile::tempdir_in(root).unwrap();
+            let obs = Arc::new(Observability::new(home.path(), None).unwrap());
+            let table =
+                BindingTable::new(home.path(), crate::config::RoutingConfig::default()).unwrap();
+            table.attach_move_accounting(&obs);
+            Self {
+                table,
+                obs,
+                _home: home,
+            }
+        }
+        fn choose(&self, key: &str, candidates: &[Candidate], expected: &str) -> BindingLease {
+            let Decision::Selected { account, lease, .. } = self.table.choose(
+                Provider::Claude,
+                Some(key),
+                (key == CHILD).then_some(ROOT),
+                Some("m"),
+                candidates,
+                None,
+                42,
+            ) else {
+                panic!("synthetic binding selection must succeed");
+            };
+            assert_eq!(account, expected);
+            lease
+        }
+        fn request(&self, lease: BindingLease, account: &str, raw_key: &str) -> Completion {
+            let mut c = Completion::new(
+                self.obs.clone(),
+                &Method::POST,
+                "/v1/messages",
+                Provider::Claude,
+                &HeaderMap::new(),
+            );
+            c.dashboard_key = Some(raw_key.into());
+            c.record.account = Some(account.into());
+            c.record.model = Some("m".into());
+            c.record.status = 200;
+            c.binding = Some(lease);
+            c
+        }
+        fn baseline(&self) {
+            let lease = self.choose(ROOT, &[candidate("a")], "a");
+            let mut c = self.request(lease, "a", ROOT);
+            c.binding.as_ref().unwrap().dispatched();
+            c.attempt("a");
+            assert!(c.accounting_ticket.is_some());
+            c.record.cache_usage = Some(usage(10));
+            c.finish("ok");
+        }
+        fn move_to_b(&self, key: &str) -> BindingLease {
+            let mut a = candidate("a");
+            a.account.user_state = crate::accounts::UserState::Paused;
+            self.choose(key, &[a, candidate("b")], "b")
+        }
+        fn finish_b(&self, lease: BindingLease, raw_key: &str) {
+            let mut c = self.request(lease, "b", raw_key);
+            c.attempt("b");
+            assert!(c.accounting_ticket.is_some());
+            c.record.cache_usage = Some(usage(100));
+            c.finish("ok");
+            let totals = self.obs.accounting_snapshot(chrono::Utc::now()).hour;
+            assert_eq!(
+                (totals.tokens, totals.known_count, totals.unknown_count),
+                (90, 1, 0)
+            );
+        }
+    }
+    fn candidate(id: &str) -> Candidate {
+        let mut account = crate::accounts::health::tests::fixture();
+        account.id = id.into();
+        account.provider = Provider::Claude;
+        account.identity = crate::accounts::Identity::Claude {
+            account_uuid: id.into(),
+            organization_uuid: None,
+            email: account.email.clone(),
+        };
+        let now = chrono::Utc::now();
+        Candidate {
+            account,
+            quota: Some(serde_json::json!({"observed_at":now,"windows":[
+                {"name":"5h","used_pct":10.0,"reset_at":now+chrono::Duration::hours(4),"observed_at":now},
+                {"name":"7d","used_pct":10.0,"reset_at":now+chrono::Duration::days(4),"observed_at":now}
+            ]})),
+            inflight: 0,
+        }
+    }
+    fn usage(value: u64) -> CacheUsage {
+        CacheUsage {
+            input_tokens: Some(value),
+            cached_tokens: Some(500),
+            cache_creation_input_tokens: Some(0),
+        }
+    }
+
+    #[test]
+    fn ingress_and_ws_handshake_never_claim_but_actual_turn_does() {
+        let f = Fixture::new();
+        f.baseline();
+        let lease = f.move_to_b(ROOT);
+        let mut c = f.request(lease, "b", ROOT);
+        assert!(c.accounting_ticket.is_none());
+        c.record.transport = "ws".into();
+        c.record.status = 101;
+        c.attempt("b");
+        assert!(c.accounting_ticket.is_none());
+        c.accounting_attempt("b");
+        assert!(c.accounting_ticket.is_some());
+        c.accounting_cancel();
+        c.finish("ok");
+        assert_eq!(
+            f.obs
+                .accounting_snapshot(chrono::Utc::now())
+                .hour
+                .unknown_count,
+            1
+        );
+    }
+    #[test]
+    fn stale_inflight_completion_cannot_consume_next_move() {
+        let f = Fixture::new();
+        f.baseline();
+        let mut old = f.request(f.table.begin_request(Some(ROOT), "a"), "a", ROOT);
+        old.attempt("a");
+        assert!(old.accounting_ticket.is_some());
+        let lease = f.move_to_b(ROOT);
+        old.record.cache_usage = Some(usage(999));
+        old.finish("ok");
+        assert_eq!(
+            f.obs
+                .accounting_snapshot(chrono::Utc::now())
+                .hour
+                .unknown_count,
+            1
+        );
+        f.finish_b(lease, ROOT);
+    }
+    #[test]
+    fn stale_selected_lease_start_after_move_cannot_reset_pending_destination() {
+        let f = Fixture::new();
+        f.baseline();
+        let mut old = f.request(f.table.begin_request(Some(ROOT), "a"), "a", ROOT);
+        let destination = f.move_to_b(ROOT);
+        old.attempt("a"); // The race: A was selected, then B committed, then A started.
+        assert!(old.accounting_ticket.is_none());
+        old.record.cache_usage = Some(usage(999));
+        old.finish("ok");
+        assert_eq!(f.table.current(Some(ROOT)).as_deref(), Some("b"));
+        f.finish_b(destination, ROOT);
+    }
+    #[test]
+    fn raw_child_key_uses_lease_canonical_group_baseline_and_pending_move() {
+        let f = Fixture::new();
+        f.baseline();
+        let lease = f.move_to_b(CHILD);
+        assert_eq!(f.table.current(Some(CHILD)).as_deref(), Some("b"));
+        f.finish_b(lease, CHILD);
+    }
+    #[test]
+    fn stale_epoch_is_rejected_even_if_group_has_returned_to_same_account() {
+        let f = Fixture::new();
+        f.baseline();
+        let mut old = f.request(f.table.begin_request(Some(ROOT), "a"), "a", ROOT);
+        drop(f.move_to_b(ROOT));
+        // Real semantic changes permit this fixture return: A recovered from
+        // paused; B became paused after being ready at its placement.
+        let mut b = candidate("b");
+        b.account.user_state = crate::accounts::UserState::Paused;
+        let returned = f.choose(ROOT, &[candidate("a"), b], "a");
+        old.accounting_attempt("a");
+        assert!(old.accounting_ticket.is_none());
+        let mut current = f.request(returned, "a", ROOT);
+        current.accounting_attempt("a");
+        assert!(current.accounting_ticket.is_some());
+        current.accounting_cancel();
+        assert_eq!(
+            f.obs
+                .accounting_snapshot(chrono::Utc::now())
+                .hour
+                .unknown_count,
+            2
+        );
+    }
+    #[test]
+    fn mismatched_attempt_account_cannot_claim_current_lease() {
+        let f = Fixture::new();
+        f.baseline();
+        let lease = f.move_to_b(ROOT);
+        let mut c = f.request(lease, "b", ROOT);
+        c.accounting_attempt("a");
+        assert!(c.accounting_ticket.is_none());
+        c.accounting_attempt("b");
+        assert!(c.accounting_ticket.is_some());
+        c.record.cache_usage = Some(usage(100));
+        c.finish("ok");
+        assert_eq!(
+            f.obs.accounting_snapshot(chrono::Utc::now()).hour.tokens,
+            90
+        );
+    }
+    #[test]
+    fn cancellation_and_retry_do_not_reuse_usage() {
+        let f = Fixture::new();
+        f.baseline();
+        let lease = f.move_to_b(ROOT);
+        let mut c = f.request(lease, "b", ROOT);
+        c.attempt("b");
+        c.record.cache_usage = Some(usage(100));
+        c.accounting_cancel();
+        c.attempt("b");
+        assert_eq!(c.record.cache_usage, None);
+        c.finish("ok");
+        let totals = f.obs.accounting_snapshot(chrono::Utc::now()).hour;
+        assert_eq!((totals.known_count, totals.unknown_count), (0, 1));
+    }
+    #[test]
+    fn changed_response_model_invalidates_measurement() {
+        let f = Fixture::new();
+        f.baseline();
+        let lease = f.move_to_b(ROOT);
+        let mut c = f.request(lease, "b", ROOT);
+        c.attempt("b");
+        c.record.model = Some("different-model".into());
+        c.record.cache_usage = Some(usage(100));
+        c.finish("ok");
+        let totals = f.obs.accounting_snapshot(chrono::Utc::now()).hour;
+        assert_eq!((totals.known_count, totals.unknown_count), (0, 1));
+    }
+
+    #[test]
+    fn accounting_http_hint_is_bounded_separate_and_never_overrides_authority() {
+        let f = Fixture::new();
+        let mut c = Completion::new(
+            f.obs.clone(),
+            &Method::POST,
+            "/v1/responses",
+            Provider::Codex,
+            &HeaderMap::new(),
+        );
+        c.accounting_http_model(
+            &HeaderMap::new(),
+            br#"{"model":"ordinary-model","input":[]}"#,
+        );
+        assert_eq!(c.accounting_model(), Some("ordinary-model"));
+        assert_eq!(c.record.model, None);
+        c.record.model = Some("authoritative-model".into());
+        assert_eq!(c.accounting_model(), Some("authoritative-model"));
+        c.record.model = None;
+        for body in [
+            br#"{"model":"a","model":"b"}"#.as_slice(),
+            br#"{"model":0}"#,
+            br#"{"model":"a"}garbage"#,
+        ] {
+            c.accounting_http_model(&HeaderMap::new(), body);
+            assert_eq!(c.accounting_model(), None);
+        }
+        let mut headers = HeaderMap::new();
+        headers.append("content-encoding", "identity".parse().unwrap());
+        headers.append("content-encoding", "gzip".parse().unwrap());
+        c.accounting_http_model(&headers, br#"{"model":"a"}"#);
+        assert_eq!(c.accounting_model(), None);
+        c.record.transport = "ws".into();
+        c.accounting_http_model(&HeaderMap::new(), br#"{"model":"a"}"#);
+        assert_eq!(c.accounting_model(), None);
+    }
+
+    fn cold_retry_baseline(independent_normal: bool) {
+        let f = Fixture::new();
+        f.baseline();
+        let lease = f.move_to_b(ROOT);
+        let mut cold = f.request(lease, "b", ROOT);
+        cold.attempt("b");
+        cold.record.cache_usage = Some(usage(1000));
+        cold.accounting_cancel();
+        assert!(cold.accounting_cold_consumed);
+        cold.attempt("b");
+        cold.record.cache_usage = Some(usage(10));
+        cold.finish("ok");
+        if independent_normal {
+            let lease = f.choose(ROOT, &[candidate("b")], "b");
+            let mut normal = f.request(lease, "b", ROOT);
+            normal.attempt("b");
+            normal.record.cache_usage = Some(usage(30));
+            normal.finish("ok");
+        }
+        let mut b = candidate("b");
+        b.account.user_state = crate::accounts::UserState::Paused;
+        let lease = f.choose(ROOT, &[b, candidate("c")], "c");
+        let mut next = f.request(lease, "c", ROOT);
+        next.attempt("c");
+        next.record.cache_usage = Some(usage(100));
+        next.finish("ok");
+        let totals = f.obs.accounting_snapshot(chrono::Utc::now()).hour;
+        if independent_normal {
+            assert_eq!(
+                (totals.tokens, totals.known_count, totals.unknown_count),
+                (70, 1, 1)
+            );
+        } else {
+            assert_eq!(
+                (totals.tokens, totals.known_count, totals.unknown_count),
+                (0, 0, 2)
+            );
+        }
+    }
+
+    #[test]
+    fn failed_cold_turn_successful_retry_cannot_train_next_move_baseline() {
+        cold_retry_baseline(false);
+    }
+
+    #[test]
+    fn independent_turn_after_cold_retry_can_train_next_move_baseline() {
+        cold_retry_baseline(true);
+    }
+}
 #[cfg(test)]
 mod admission_tests {
     use super::*;

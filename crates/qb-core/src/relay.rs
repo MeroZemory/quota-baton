@@ -9,6 +9,7 @@ mod models;
 pub(crate) mod notices;
 mod outcome;
 mod response;
+mod selection_guard;
 mod upload;
 mod websocket;
 mod wire_metadata;
@@ -197,6 +198,9 @@ impl RelayState {
 
     pub(crate) fn recent_warnings(&self) -> Vec<serde_json::Value> {
         self.observability.recent_warnings()
+    }
+    pub fn move_cost_snapshot(&self) -> crate::observability::reread_accounting::Snapshot {
+        self.observability.accounting_snapshot(chrono::Utc::now())
     }
     pub fn dashboard(&self) -> &Arc<crate::dashboard::runtime::Runtime> {
         self.observability.dashboard()
@@ -398,6 +402,18 @@ impl RelayState {
         websocket: bool,
         model: Option<&str>,
     ) -> Response {
+        if completion.record.outcome == "move_guard_hold" {
+            let mut response = native_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                provider,
+                "account_move_guard",
+                "계정 이동 안전장치가 반복 이동을 막았습니다. 기존 계정에서 대기 중입니다. 잠시 후 다시 요청하세요.",
+            );
+            response
+                .headers_mut()
+                .insert("retry-after", HeaderValue::from_static("60"));
+            return response;
+        }
         if completion.policy_blocked {
             return native_error(
                 StatusCode::CONFLICT,
@@ -468,6 +484,19 @@ impl RelayState {
         // The lease is held and account expiry/reconciliation precedes affinity restore.
         store.list()?;
         let bindings = crate::bindings::BindingTable::new(store.home(), config.routing.clone())?;
+        observability.configure_move_notice(
+            config
+                .routing
+                .move_guard
+                .clone()
+                .bounded()
+                .reread_notice_tokens,
+        );
+        bindings.attach_move_accounting(&observability);
+        let guard_observability = observability.clone();
+        bindings.set_move_guard_observer(Arc::new(move |event| {
+            guard_observability.record_move_guard(event)
+        }));
         bindings.policies.attach_observability(&observability);
         quota.set_bindings(&bindings);
         observability.configure_forecast(config.routing.forecast_shadow);
@@ -856,6 +885,19 @@ impl RelayState {
             completion.policy_blocked = true;
             return Ok(None);
         }
+        let deadline = completion
+            .precommit_deadline
+            .map(tokio::time::Instant::from_std)
+            .unwrap_or_else(|| {
+                tokio::time::Instant::now()
+                    + Duration::from_secs(if completion.record.transport == "ws" {
+                        self.ws_upgrade_hold_secs
+                    } else {
+                        self.request_timeout_secs
+                    })
+            });
+        let operation = crate::issue_operation::IssueOperation::new(deadline);
+        let _caller = operation.caller_guard();
         // Post-commit/nonreplayable quota errors cannot retry the old body.
         // On its next request, resolve C7 before publishing any context.
         let prior = self.bindings.current(session.key.as_deref());
@@ -891,23 +933,18 @@ impl RelayState {
         let excluded = tried.clone();
         let mut held_account = None;
         loop {
+            // Register before reading candidates or choosing: recovery/clear
+            // between the decision and its wait must remain observable.
+            let mut changes = selection_guard::Changes::new(
+                &self.bindings.policies.changed,
+                self.accounts.subscribe(),
+            );
             let candidates = self
                 .candidates(provider, session.key.as_deref(), model, &excluded)
                 .await?;
             let (candidates, coverage) = if let Some(launch) = launch {
-                self.launch_candidates(
-                    launch,
-                    candidates,
-                    &excluded,
-                    completion
-                        .precommit_deadline
-                        .map(tokio::time::Instant::from_std)
-                        .unwrap_or_else(|| {
-                            tokio::time::Instant::now()
-                                + Duration::from_secs(self.request_timeout_secs)
-                        }),
-                )
-                .await?
+                self.launch_candidates(launch, candidates, &excluded, deadline)
+                    .await?
             } else {
                 (candidates, None)
             };
@@ -930,6 +967,7 @@ impl RelayState {
             let denied = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let denied_choice = denied.clone();
             let admission_runtime = launch.map(|_| self.accounts.clone());
+            let selection_operation = operation.clone();
             let choice = tokio::task::spawn_blocking(move || {
                 let choose = |eligible: &dyn Fn(&str, bool) -> bool| {
                     table.choose_with_hold_at_admitted_coverage(
@@ -945,10 +983,12 @@ impl RelayState {
                         chrono::Utc::now(),
                         coverage.as_ref(),
                         |account| {
-                            let allowed = eligible(
-                                account,
-                                table.existing_placement(key.as_deref(), account),
-                            ) && admit.as_ref().is_none_or(|admit| admit(account));
+                            // BindingTable holds mutations through this
+                            // admission and publication, including ordinary HTTP.
+                            let allowed = selection_guard::admit(&selection_operation, || {
+                                eligible(account, table.existing_placement(key.as_deref(), account))
+                                    && admit.as_ref().is_none_or(|admit| admit(account))
+                            });
                             denied_choice.store(!allowed, Ordering::Release);
                             allowed
                         },
@@ -970,6 +1010,32 @@ impl RelayState {
             match choice {
                 crate::bindings::Decision::None if denied.load(Ordering::Acquire) => {
                     return Ok(None);
+                }
+                crate::bindings::Decision::MoveHeld { until } => {
+                    let current = self.bindings.current(session.key.as_deref());
+                    let now = chrono::Utc::now();
+                    let until = selection_guard::recovery_deadline(
+                        until,
+                        &candidates,
+                        current.as_deref(),
+                        now,
+                    );
+                    let wait = (until - now).to_std().unwrap_or_default();
+                    let wake = tokio::time::Instant::now() + wait;
+                    // A wake only retries the guarded choice; it never grants
+                    // a move or renews this request's transport budget.
+                    if changes
+                        .wait(
+                            current.as_deref(),
+                            wake,
+                            deadline,
+                            self.wait_for_drain_start(),
+                        )
+                        .await
+                    {
+                        completion.record.outcome = "move_guard_hold".into();
+                        return Ok(None);
+                    }
                 }
                 crate::bindings::Decision::Blocked => {
                     completion.policy_blocked = true;
@@ -1792,6 +1858,7 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
     }
     completion.dashboard_label = launcher_label.or(completion.dashboard_label.take());
     completion.session(&session);
+    completion.accounting_http_model(&parts.headers, &upload.prefix);
     let mut tried = BTreeSet::new();
     let mut request_model = session.model.clone();
     #[cfg(all(feature = "shape-capture", debug_assertions))]
@@ -2559,6 +2626,13 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
                     .await
                     .expect("retained body completed")
                     .retry_body();
+            }
+            Ok(None) if completion.record.outcome == "move_guard_hold" => {
+                let response = state
+                    .unavailable(&mut completion, provider, false, request_model.as_deref())
+                    .await;
+                completion.outcome(response.status().as_u16(), "move_guard_hold");
+                return response;
             }
             Ok(None) if completion.policy_blocked => {
                 let response = state

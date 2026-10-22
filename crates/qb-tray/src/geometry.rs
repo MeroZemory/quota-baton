@@ -896,6 +896,32 @@ impl Scene {
             );
             top += 40.;
         }
+        if let Some(lines) = &view.move_cost_lines {
+            for (i, line) in lines.iter().enumerate() {
+                let area = rect(20., top + i as f32 * 22., w - 40., 22.);
+                b.text(
+                    area,
+                    line,
+                    12.,
+                    i == 0,
+                    if i == 0 {
+                        Color::Text
+                    } else {
+                        Color::Secondary
+                    },
+                    false,
+                );
+                b.semantic(
+                    format!("move-cost:{i}"),
+                    None,
+                    Role::Text,
+                    line.clone(),
+                    area,
+                    None,
+                );
+            }
+            top += 52.;
+        }
         let body = rect(20., top, w - 40., (h - top - 20.).max(0.));
         if view.empty == m::EmptyState::NoAccounts {
             b.card(body);

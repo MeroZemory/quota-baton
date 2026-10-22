@@ -3528,3 +3528,380 @@ async fn tray2_ws_passive_usage_waits_for_actual_reconnect_or_no_eligible() {
 }
 
 include!("support/m4a_ws_r11.inc.rs");
+
+const R14_WS_MODEL: &str = "r14-ws-model";
+const R14_WS_KEY: &str = "codex:synthetic-ws-session";
+
+fn r14_ws_reply(id: &str, input: u64, cached: u64) -> [Message; 2] {
+    [
+        Message::text(json!({"type":"response.created","response":{"id":id}}).to_string()),
+        Message::text(json!({
+            "type":"response.completed","response":{"id":id,"status":"completed",
+            "usage":{"input_tokens":input,"input_tokens_details":{"cached_tokens":cached},"output_tokens":1}}
+        }).to_string()),
+    ]
+}
+
+async fn r14_ws_receive_turn(client: &mut Client, id: &str) {
+    for kind in ["response.created", "response.completed"] {
+        let Message::Text(text) = receive(client).await else {
+            panic!("expected {kind} for {id}");
+        };
+        let event: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(event["type"], kind);
+        assert_eq!(event["response"]["id"], id);
+    }
+}
+
+async fn r14_ws_wait_turns(h: &Harness, count: usize) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while h
+            .ledger()
+            .iter()
+            .filter(|row| {
+                row["transport"] == "ws"
+                    && row["model"] == R14_WS_MODEL
+                    && matches!(row["outcome"].as_str(), Some("ok" | "rate_hold_ok"))
+            })
+            .count()
+            < count
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("actual turns reached terminal ledger/accounting");
+}
+
+async fn r14_ws_wait_cost(h: &Harness, expected: (u64, u64, u64)) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let cost = h.obs.accounting_snapshot(Utc::now()).hour;
+            if (cost.tokens, cost.known_count, cost.unknown_count) == expected {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("expected move cost reached");
+}
+
+#[tokio::test]
+async fn r14_ws_upgrade_unknown_model_claims_cost_only_on_actual_create() {
+    let h = Harness::new(2).await;
+    h.fake.state.set_echo(false);
+    let (mut client, original) = h.connect().await;
+    h.fake
+        .state
+        .push_reply(r14_ws_reply("r14-baseline", 100, 80));
+    create(&mut client, R14_WS_MODEL).await;
+    r14_ws_receive_turn(&mut client, "r14-baseline").await;
+    r14_ws_wait_turns(&h, 1).await;
+    client.close(None).await.unwrap();
+    h.state
+        .accounts
+        .change(&original, Some(UserState::Paused), None, None, None)
+        .await
+        .unwrap();
+    let (mut next, replacement) = h.connect().await;
+    assert_ne!(replacement, original);
+    let pending = h.obs.accounting_snapshot(Utc::now()).hour;
+    assert_eq!(
+        (pending.known_count, pending.unknown_count),
+        (0, 1),
+        "101 must not consume a usage claim"
+    );
+    h.fake.state.push_reply(r14_ws_reply("r14-cold", 200, 0));
+    create(&mut next, R14_WS_MODEL).await;
+    r14_ws_receive_turn(&mut next, "r14-cold").await;
+    r14_ws_wait_cost(&h, (180, 1, 0)).await;
+    let measured = h.obs.accounting_snapshot(Utc::now()).hour;
+    assert_eq!(
+        (
+            measured.tokens,
+            measured.known_count,
+            measured.unknown_count
+        ),
+        (180, 1, 0)
+    );
+    h.fake.state.push_reply(r14_ws_reply("r14-normal", 50, 20));
+    create(&mut next, R14_WS_MODEL).await;
+    r14_ws_receive_turn(&mut next, "r14-normal").await;
+    r14_ws_wait_turns(&h, 3).await;
+    next.close(None).await.unwrap();
+    let rows = h.ledger();
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r["event"] == "binding_move_cost" && r["measurement"] == "known")
+            .count(),
+        1
+    );
+    assert_eq!(h.fake.state.requests().len(), 2, "real 101 on each account");
+    assert_eq!(
+        h.fake
+            .state
+            .messages()
+            .iter()
+            .filter(|m| matches!(m, Message::Text(_)))
+            .count(),
+        3
+    );
+}
+
+#[tokio::test]
+async fn r14_ws_breaker_refuses_return_before_third_upgrade() {
+    let h = Harness::new_with_budget_options(2, false, false, None, Some((3, 1)), None).await;
+    let (mut first, original) = h.connect().await;
+    first.close(None).await.unwrap();
+    drop(first);
+    capacity_count(&h, &original, 0).await;
+    // Leave a healthy A without changing its semantic evidence. Resuming a
+    // paused A would correctly authorize a return with changed evidence.
+    let replacement = h.ids.iter().find(|id| **id != original).unwrap().clone();
+    h.pins.set(Provider::Codex, None, replacement.clone());
+    let (mut second, selected) = h.connect().await;
+    assert_eq!(selected, replacement);
+    h.pins.clear();
+    second.close(None).await.unwrap();
+    drop(second);
+    capacity_count(&h, &replacement, 0).await;
+    assert_eq!(h.store.load(&original).unwrap().health, Health::Ready);
+    h.state
+        .accounts
+        .change(&replacement, Some(UserState::Paused), None, None, None)
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let (status, error) = h.error().await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(error["error"]["type"], "account_move_guard");
+    assert!(started.elapsed() >= Duration::from_millis(700));
+    assert!(started.elapsed() < Duration::from_secs(4));
+    assert_eq!(
+        h.fake.state.requests().len(),
+        2,
+        "refused return must never reach upstream upgrade"
+    );
+    assert_eq!(
+        h.state.bindings.current(Some(R14_WS_KEY)),
+        Some(replacement.clone())
+    );
+    let rows = h.ledger();
+    assert!(rows.iter().any(|row| row["event"] == "binding_move_refused"
+        && row["from"] == replacement
+        && row["to"] == original
+        && row["reason"] == "ping_pong"));
+    assert!(!rows.iter().any(|row| row["event"] == "binding_move"
+        && row["from"] == replacement
+        && row["to"] == original));
+}
+
+#[tokio::test]
+async fn r14_ws_cost_claim_follows_dispatch_order_and_ignores_unsent_veto() {
+    for veto in [false, true] {
+        let h = Harness::new(2).await;
+        h.fake.state.keep_old_connections();
+        let (mut source, original) = h.connect().await;
+        h.fake
+            .state
+            .push_reply(r14_ws_reply("r14-order-baseline", 100, 80));
+        create(&mut source, R14_WS_MODEL).await;
+        r14_ws_receive_turn(&mut source, "r14-order-baseline").await;
+        r14_ws_wait_turns(&h, 1).await;
+        source.close(None).await.unwrap();
+        drop(source);
+        capacity_count(&h, &original, 0).await;
+        h.state
+            .accounts
+            .change(&original, Some(UserState::Paused), None, None, None)
+            .await
+            .unwrap();
+        let (mut delayed, replacement) = h.connect().await;
+        let (mut first_sent, same_account) = h.connect().await;
+        assert_eq!(same_account, replacement);
+        assert_ne!(replacement, original);
+        r14_ws_wait_cost(&h, (0, 0, 1)).await;
+
+        let raw = json!({"type":"response.create","model":R14_WS_MODEL,"input":[],
+            "fixture_marker":"r14-delayed-create"})
+        .to_string();
+        let (arrived, release) = h
+            .state
+            .pause_ws_ordinary_before_write(R14_WS_KEY, raw.as_bytes());
+        let mut release = Some(release);
+        delayed.send(Message::text(raw)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), arrived)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            h.fake
+                .state
+                .messages()
+                .iter()
+                .filter(|m| matches!(m, Message::Text(_)))
+                .count(),
+            1,
+            "only the baseline was dispatched before the final write gate"
+        );
+
+        if veto {
+            // Closing the admission gate rejects this unsent create. The pump
+            // must keep the move pending for another socket's actual dispatch.
+            drop(release.take());
+            assert_close(receive(&mut delayed).await, 1001);
+            capacity_count(&h, &replacement, 1).await;
+            assert!(
+                !h.ledger()
+                    .iter()
+                    .any(|row| row["event"] == "binding_move_cost"
+                        && row["measurement"] == "unknown")
+            );
+        }
+
+        h.fake
+            .state
+            .push_reply(r14_ws_reply("r14-first-dispatched", 200, 0));
+        create(&mut first_sent, R14_WS_MODEL).await;
+        r14_ws_receive_turn(&mut first_sent, "r14-first-dispatched").await;
+        r14_ws_wait_turns(&h, 2).await;
+        r14_ws_wait_cost(&h, (180, 1, 0)).await;
+
+        if !veto {
+            h.fake
+                .state
+                .push_reply(r14_ws_reply("r14-dispatched-later", 30, 0));
+            release.take().unwrap().send(()).unwrap();
+            r14_ws_receive_turn(&mut delayed, "r14-dispatched-later").await;
+            r14_ws_wait_turns(&h, 3).await;
+            delayed.close(None).await.unwrap();
+        }
+        first_sent.close(None).await.unwrap();
+        let cost = h.obs.accounting_snapshot(Utc::now()).hour;
+        assert_eq!(
+            (cost.tokens, cost.known_count, cost.unknown_count),
+            (180, 1, 0)
+        );
+        let creates: Vec<Value> = h
+            .fake
+            .state
+            .messages()
+            .iter()
+            .filter_map(|message| {
+                if let Message::Text(text) = message {
+                    serde_json::from_str(text).ok()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(creates.len(), if veto { 2 } else { 3 });
+        assert!(
+            creates[1]["fixture_marker"].is_null(),
+            "winner dispatched before the gated create"
+        );
+        if !veto {
+            assert_eq!(creates[2]["fixture_marker"], "r14-delayed-create");
+        }
+        assert_eq!(
+            h.fake.state.requests().len(),
+            3,
+            "two destination sockets, one committed move"
+        );
+        assert_eq!(
+            h.ledger()
+                .iter()
+                .filter(|row| row["event"] == "binding_move_cost" && row["measurement"] == "known")
+                .count(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn r14_ws_failed_cold_rate_attempt_stays_unknown_after_resend_and_redial() {
+    for redial in [false, true] {
+        let h = Harness::new_with_rate_options(2, false, false, Some((1, 3))).await;
+        let (mut source, original) = h.connect().await;
+        h.fake
+            .state
+            .push_reply(r14_ws_reply("r14-rate-baseline", 100, 80));
+        create(&mut source, R14_WS_MODEL).await;
+        r14_ws_receive_turn(&mut source, "r14-rate-baseline").await;
+        r14_ws_wait_turns(&h, 1).await;
+        source.close(None).await.unwrap();
+        drop(source);
+        capacity_count(&h, &original, 0).await;
+        h.state
+            .accounts
+            .change(&original, Some(UserState::Paused), None, None, None)
+            .await
+            .unwrap();
+        let (mut destination, replacement) = h.connect().await;
+        assert_ne!(replacement, original);
+        r14_ws_wait_cost(&h, (0, 0, 1)).await;
+
+        let mut failed = vec![Message::text(
+            r#"{"type":"error","status":429,"error":{"code":"rate_limit_exceeded"}}"#,
+        )];
+        if redial {
+            failed.push(Message::Close(Some(
+                tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                    code: 1012.into(),
+                    reason: "synthetic rate redial".into(),
+                },
+            )));
+        }
+        h.fake.state.push_reply(failed);
+        h.fake
+            .state
+            .push_reply(r14_ws_reply("r14-rate-replayed", 200, 0));
+        create(&mut destination, R14_WS_MODEL).await;
+        r14_ws_receive_turn(&mut destination, "r14-rate-replayed").await;
+        r14_ws_wait_turns(&h, 2).await;
+        r14_ws_wait_cost(&h, (0, 0, 1)).await;
+        let rows = h.ledger();
+        assert!(rows.iter().any(|row| row["transport"] == "ws"
+            && row["outcome"] == "rate_hold_ok"
+            && row["rate_retries"] == 1
+            && row["cache_usage"]["input_tokens"] == 200));
+        assert_eq!(rows.iter().filter(|row| row["event"] == "binding_move_cost"
+            && row["measurement"] == "unknown").count(), 1);
+        assert_eq!(h.fake.state.requests().len(), if redial { 3 } else { 2 });
+
+        // A fresh normal turn is the only B baseline. The cold replay's 200
+        // must not train it; the next committed move should cost 130 - 30.
+        h.fake
+            .state
+            .push_reply(r14_ws_reply("r14-rate-normal", 60, 30));
+        create(&mut destination, R14_WS_MODEL).await;
+        r14_ws_receive_turn(&mut destination, "r14-rate-normal").await;
+        r14_ws_wait_turns(&h, 3).await;
+        destination.close(None).await.unwrap();
+        drop(destination);
+        capacity_count(&h, &replacement, 0).await;
+        h.state
+            .accounts
+            .change(&original, Some(UserState::Active), None, None, None)
+            .await
+            .unwrap();
+        h.state
+            .accounts
+            .change(&replacement, Some(UserState::Paused), None, None, None)
+            .await
+            .unwrap();
+        let (mut returned, selected) = h.connect().await;
+        assert_eq!(
+            selected, original,
+            "changed evidence legitimately permits this return"
+        );
+        h.fake
+            .state
+            .push_reply(r14_ws_reply("r14-after-rate-move", 130, 0));
+        create(&mut returned, R14_WS_MODEL).await;
+        r14_ws_receive_turn(&mut returned, "r14-after-rate-move").await;
+        r14_ws_wait_cost(&h, (100, 1, 1)).await;
+        returned.close(None).await.unwrap();
+    }
+}
