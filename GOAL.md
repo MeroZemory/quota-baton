@@ -70,7 +70,7 @@ The current plan, with lanes, owners and start commands, is the "Plan" section o
 | R12.10 | merged (성능 조건·qb-tray scoped 관문 통과; `.sandbox/reports/R12.10.md`); 설치는 설계 세션 |
 | R13 | 진행 중: B+B2+D·A·A1 merged 및 설치 수용. C+E 긴급 등록 단위 f39e504·926793f 커밋, 전체 wait/move 실행 통합은 미출시. 다음: R14.1 → R12.11 → R16 → C+E → R14.2·Part F; brief `R13-burn-icon-hold.md` |
 | R14 | 진행 중: 1차 실행 보호 관문 완료·설치 보류. R14.1 사건 단위 예산·240초 만료만 우선 전달하며 수집기는 설치 조건에서 분리. 2차 근거형 rebind·정적 검사·실제24시간 재생은 별도 미완료 |
-| R14.1 | merged: 보호 전용 8c3a974 집중 관문 통과 (guard21·R1419·HTTP12·WS123, strict lint). 사건 합산·240초 만료·request deadline 검증. 설치·live 확인은 설계 세션 |
+| R14.1 | 설치 수용: dev249a14c (01:12 KST). guard21·R1419·HTTP12·WS123, strict lint 통과. takeover 연결 거절0/1,717·일반/이미지 exec·실제 dashboard 지표 확인 |
 | R12.11 | 대기: R14.1 다음 이미지 version probe 15초·1회 재시도·24시간 pass cache fallback. 구현 준비 중, focused gate 후 self-merge |
 | R16 | 대기: R14.1 다음 영문 UI·읽기 전용 snapshot·production renderer PNG. brief `R16-readme-assets.md` |
 | R14.2 | 대기: R16·R13 C+E 다음 기본 꺼짐 수집기(schema/off/7일 bounded retention). 기존 구현은 impl/r14.2 db6baac에 보존; 실제24시간 replay보다 먼저 전달 |
