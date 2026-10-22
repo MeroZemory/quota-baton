@@ -195,6 +195,9 @@ async fn main() {
 }
 
 fn friendly_error(error: &anyhow::Error) -> String {
+    if let Some(stage) = error.downcast_ref::<cutover::WireStage>() {
+        return stage.to_string();
+    }
     if let Some(message) = launch_client::friendly_error(error) {
         return message;
     }
@@ -845,6 +848,19 @@ async fn run() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod r1_cpa_error_tests {
+    #[test]
+    fn r111_wire_stage_hides_paths_values_and_error_chain() {
+        let error = anyhow::anyhow!("synthetic-private-token C:/private/config")
+            .context(crate::cutover::WireStage("upgrade-shared-agents"));
+        let text = super::friendly_error(&error);
+        assert!(text.contains("wire:upgrade-shared-agents"));
+        assert!(!text.contains("synthetic-private"));
+        assert!(!text.contains("C:/private"));
+        // A textual lookalike cannot bypass the typed diagnostic boundary.
+        let forged = anyhow::anyhow!("wire:upgrade-shared-agents synthetic-private-token");
+        assert!(!super::friendly_error(&forged).contains("synthetic-private"));
+    }
+
     #[test]
     fn r3_wire_prerequisites_are_actionable_but_never_echo_appended_details() {
         for message in [

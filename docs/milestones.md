@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: R11 (관문 완료·병합, 실제 설치는 설계 세션)
-목표: 실행별 계정·모델 목록을 출시하고 R13 첫 단위로 이어간다
-핵심 지표: 새 경로 출시 1/2 · R11 native5·HTTP33·WS15·복구54 통과, 설치 대기
+현재 마일스톤: R11.1 (집중 관문 완료·dev 병합, 설치·별칭 적용은 설계 세션)
+목표: codex-rh 별칭을 안전하게 연결하고 R13 첫 단위로 이어간다
+핵심 지표: 새 경로 출시 2/2 · R11.1 회귀5·cutover141·strict lint·실제 읽기 전용 점검 통과
 사용자 대기: 없음 (R2 Part B: CPA 종료·복원 작업만 보류)
-갱신: 2026-10-22 09:01 KST (R11 실제 캐시 잔존·동시 실행까지 통과, 관문 지문 결합 완료)
+갱신: 2026-10-22 09:38 KST (실제 미리보기2/2·launch 점검 성공, 실제 apply 없음)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -101,6 +101,8 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-22 08:34 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | 복구54/54 병렬4로 통과, native 미완료; 미출시 |
 | 2026-10-22 08:49 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R11 native 제목 보조 요청 형식 확인; 첫 종료 확인 실패, 미출시 |
 | 2026-10-22 09:01 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 1/2 | R11 관문 통과·self-merge; 실제 설치 전이므로 출시 수 유지 |
+| 2026-10-22 09:21 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 2/2 | 설계 세션 R11 0106c0e 설치·계정 지정 live 통과 확인 |
+| 2026-10-22 09:38 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 2/2 | R11.1 focused 관문 완료, 실제 별칭 적용은 설계 세션 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -199,14 +201,20 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-22 09:01 | R11 외부 캐시 잔존 최종 native | 5/5 통과·제목5·종료0·snapshot5 | 5/5 | 실제 admin조회200 ×4, seeded 외부캐시; native 캐시 hit 주장은 안 함 |
 | 2026-10-22 09:01 | R11 최종 기본 workspace strict clippy | exit0 | exit0 | 최신 고정코드, 명령은workspace; runner기록digest범위core는 전체코드별도확인으로 보완 |
 | 2026-10-22 09:01 | R11 최종 하네스 순수·정적 경계 | 26+10+16 통과, 독립 정적 closeout | 전 검사 통과 | runtime5/5와 별도; source hash62eacf, 모든CONNECT403 |
+| 2026-10-22 09:21 | R11.1 실제 wire 미리보기 | 수정 전 0/2, 수정 후 2/2 | 2/2 | plain·dedicated, rh 계획 포함, 실제 apply 없음·관측 파일 불변 |
+| 2026-10-22 09:28 | R11.1 합성 적용 첫 회귀 | 미리보기 성공 뒤 적용 1건 실패 | 별칭 적용·복구 통과 | alias-extension의 두 번째 해시 검사 발견·수정 |
+| 2026-10-22 09:28 | R11.1 확장 회귀 | 4통과·1실패 | 5/5 | legacy Qi가 오래된 공유 해시를 복사하는 경로 발견; 신규 Qi 기록만 현재 원본 해시로 검증 |
+| 2026-10-22 09:33 | R11.1 수정 전·후 회귀 | red 2통과·3실패, green 5통과 | green 5/5 | 유효한 red 실행; 별칭 적용·중단 복구·legacy Qi·교체 거부·진단 비공개 |
+| 2026-10-22 09:33 | R11.1 기존 cutover 첫 실행 | 138통과·3실패·1제외 | 전체 경계 통과 | 3건은 stage 외곽 추가로 원인 assertion 위치 변경; 원래 원인·불변 검사는 유지 |
+| 2026-10-22 09:38 | R11.1 최종 focused 관문 | 회귀5·cutover141통과·1제외, strict lint·fmt·build exit0 | 전 검사 통과 | source90b397e5…; 실제 preview2/2·launch 점검exit0·관측파일 불변 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 행동 |
 |---|---|---|---|
-| R11 실행별 계정 설치 | 관문 통과·dev 병합, native5·HTTP33·WS15 | 실제 설치·사용자 환경 확인 | 설계 세션이 검수 후 설치 |
-| 대시보드 지연 (R12.10) | 합성 실제 창 성능·최종 scoped gate 통과 | 실제 설치 확인 | 설계 세션이 설치하고 사용자 환경 확인 |
-| R13 소진 예측·아이콘·차트·캐시 보류 | 설계 완료, 병합 0/3 단위 | 3/3 단위 병합과 설치 | B+B2+D, A, C+E 순서로 구현 |
+| R11.1 계정 별칭 연결 | 관문 완료·실제 미리보기2/2·launch 점검 성공 | 실제 설치·별칭 적용 | 설계 세션이 설치 후 wire dedicated apply |
+| R13 첫 단위 | 아이콘·활성 수·rolling 차트 WIP 커밋 4169923 | B+B2+D 관문·설치 | R11.1 후 impl/r13 재개 |
+| R13 예측·캐시 보류·긴급 세션 | 미구현, 사용자 판단 대기 없음 | A 및 C+E 관문·설치 | 첫 단위 후 순차 진행 |
 <!-- gaps:end -->
 
 R11 Windows process/crash focused verification uses `cargo test -p quota-baton --all-features --test r9_crash --no-fail-fast -- --test-threads=4`. It still runs cases concurrently and preserves every in-case race, kill checkpoint, 20-second command deadline and five-second reap deadline. Default high-concurrency deadline failures and diagnostic traces remain cited; the bounded run is not a claim that the default-load timing issue was fixed. No product timing or ownership workaround was added.
