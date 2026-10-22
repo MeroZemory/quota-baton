@@ -731,6 +731,15 @@ fn mapped_path(source_home: &Path, target_home: &Path, source: &Path) -> Result<
     let relative = if candidate.try_exists()? {
         let home = home.canonicalize()?;
         candidate.canonicalize()?.strip_prefix(home)?.to_owned()
+    } else if let Some(parent) = candidate.parent().filter(|p| p.is_dir()) {
+        // A missing canonical .jsonl may have a compressed sibling. Normalize
+        // its existing parent, including NTFS case spelling, without opening
+        // or decompressing that sibling; source snapshots stay byte-exact.
+        parent
+            .canonicalize()?
+            .join(candidate.file_name().context("missing rollout filename")?)
+            .strip_prefix(home.canonicalize()?)?
+            .to_owned()
     } else {
         candidate.strip_prefix(&home)?.to_owned()
     };
@@ -747,7 +756,14 @@ fn mapped_path(source_home: &Path, target_home: &Path, source: &Path) -> Result<
                 .all(|c| matches!(c, Component::Normal(_))),
         "unsafe rollout_path suffix"
     );
-    Ok(target_home.join("sessions").join(suffix))
+    let destination = target_home.join("sessions").join(suffix);
+    // Native Codex records the canonical name even when only its .zst sibling
+    // exists. The physical hardlink retains the compressed suffix.
+    Ok(if destination.to_string_lossy().ends_with(".jsonl.zst") {
+        destination.with_extension("")
+    } else {
+        destination
+    })
 }
 
 fn latest_index(

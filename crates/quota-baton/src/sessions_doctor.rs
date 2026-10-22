@@ -242,8 +242,8 @@ fn analyze(q: &Path, homes: &[Home], operations: &[Operation]) -> Vec<Diagnostic
         for (id, path) in &home.threads {
             // Canonicalize the stored path: native Codex often stores ordinary
             // C:\ paths while discovery uses Windows verbatim canonical paths.
-            let selected = guard::safe_path(&home.catalog.home, path)
-                .and_then(|()| Ok(fs::canonicalize(path)?));
+            let selected =
+                crate::sessions_discovery::resolve_rollout_path(&home.catalog.home, path);
             if !selected.is_ok_and(|path| {
                 home.catalog
                     .all()
@@ -507,6 +507,36 @@ mod tests {
         let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r9-doctor-tests");
         fs::create_dir_all(&base).unwrap();
         tempfile::tempdir_in(fs::canonicalize(base).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn r94_canonical_database_path_accepts_compressed_sibling() {
+        let root = fixture();
+        let q = root.path().join("q");
+        let plain = write(&q, A, A, None, None);
+        let compressed = plain.with_extension("jsonl.zst");
+        fs::write(
+            &compressed,
+            zstd::stream::encode_all(fs::read(&plain).unwrap().as_slice(), 1).unwrap(),
+        )
+        .unwrap();
+        fs::remove_file(&plain).unwrap();
+        let connection = rusqlite::Connection::open(q.join("state_5.sqlite")).unwrap();
+        connection.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, model_provider TEXT NOT NULL);").unwrap();
+        connection
+            .execute(
+                "INSERT INTO threads VALUES(?1, ?2, 'openai')",
+                rusqlite::params![A, plain.to_str().unwrap()],
+            )
+            .unwrap();
+        drop(connection);
+        let store = Store {
+            home: root.path().join("qb"),
+            target: canonical(&q).unwrap(),
+            search_homes: Vec::new(),
+            map_path: root.path().join("map.json"),
+        };
+        assert!(check_records(&store, Vec::new()).unwrap().is_empty());
     }
 
     #[test]
