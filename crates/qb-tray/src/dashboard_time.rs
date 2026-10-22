@@ -457,6 +457,7 @@ mod tests {
             series: vec![],
             unconfirmed: false,
             offset: *c.now.offset(),
+            provider_summary: None,
         });
         assert_eq!(
             next_visible_time_change(&snap, &state, &scene, &c, 96),
@@ -507,6 +508,7 @@ mod tests {
             series: vec![],
             unconfirmed: false,
             offset: *c.now.offset(),
+            provider_summary: None,
         });
         for ms in [0, 500, 1_000, 20_000, 42_500] {
             c.now = base + Duration::milliseconds(ms);
@@ -618,6 +620,7 @@ mod tests {
                 series: vec![],
                 unconfirmed: false,
                 offset: *c.now.offset(),
+                provider_summary: None,
             });
             assert_eq!(
                 next_visible_time_change(&snap, &state, &scene, &c, 96),

@@ -75,10 +75,10 @@ The current plan, with lanes, owners and start commands, is the "Plan" section o
 | R12.11 | 보류: 영문 UI 우선. version probe 15초·1회 재시도·24시간 pass cache fallback 제안 보존, 실행 관문 미수행 |
 | R16 | 완료: 코드19b8d22, 영문 UI·snapshot·PNG·Claude 프로젝트명. 집중438통과·strict lint·실제 core/AdminClient/tray 3HWND·최종 CLI20 PNG 통과. 설치 수용 dev006449a·02:26 KST·takeover 거절0/1,811. brief `R16-readme-assets.md` |
 | R16.1 | 완료3737fe2·집중405·strict lint·D27 3HWND·KO PNG4개 동일: 영어 탭·표 제목·사용량 요약 폭 보완. 한국어 출력 보존, 1024×640·1320×900 scale2 실제 renderer 회귀·D27 경로 통과, self-merge 후 설계 세션 설치 |
-| R16.2 | 완료: 한 줄 계정 예측·제공자 요약 집중428·합성120PNG·실제8HWND 통과. 설치는 설계 세션 |
+| R16.2 | 완료·설치 수용: dev ddf8d87, 04:34 KST; 실제 dashboard 확인·takeover 연결 거절0/1,959 |
 | R9.5 | 대기(N3): 이동 진행·안전한 중단·재개·읽기 쉬운 확인. ready-node S1 순서에 따라 N5a-d 뒤 |
-| R16.3 | 진행 예정(N2): R16.2와 별도 병합. Usage 제공자별 주간/30일 계정분 잔여·권장선·음영·전후 판단(D28) |
-| R14.2 | 대기(N6): R16.3 다음 기본 꺼짐 수집기(schema/off/7일 bounded retention). 기존 구현은 impl/r14.2 db6baac에 보존; 실제24시간 replay보다 먼저 전달 |
+| R16.3 | 완료: 집중464·strict lint·KO/EN 실제10HWND·합성8PNG 통과. 제공자 주간/30일 계정분·권장선·음영·소진 사실 표시. 설치는 설계 세션 |
+| R14.2 | 진행 중(N6): 기본 꺼짐 수집기(schema/off/7일 bounded retention) 최소 전달. 기존 impl/r14.2 db6baac 보존; 초기 상태·전체 replay 수용은 별도 |
 | R15 | 대기: R13 Part F 후 공유 admin 응답형·계약 왕복·라우팅 속성 검사(D27). brief `R15-contract.md` |
 | R11.1 | merged: 공유 AGENTS/hook 편집 보존·rh 별칭, 회귀5·cutover141·strict lint·실제 preview/launch 점검 통과. 설치·apply는 설계 세션. 보고서 `.sandbox/reports/R11.1.md` |
 | R11 | merged (실제 native5/5·HTTP33·WS15·코어1213·복구54·창4, focused repair gate 통과). 0106c0e 설치·live 계정 지정 확인. 보고서 `.sandbox/reports/R11.md` |

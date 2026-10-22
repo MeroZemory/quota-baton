@@ -5,6 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 #[path = "dashboard_usage_geometry.rs"]
 mod usage_geometry;
 use usage_geometry::usage;
+#[path = "dashboard_provider_geometry.rs"]
+mod provider_geometry;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Target {
@@ -200,6 +202,8 @@ pub struct ChartData {
     pub series: Vec<m::Series>,
     pub unconfirmed: bool,
     pub offset: chrono::FixedOffset,
+    /// Account-equivalent plots have their own explicitly labelled summary.
+    pub provider_summary: Option<String>,
 }
 #[derive(Clone, Debug)]
 pub struct ChartTooltip {
@@ -1058,6 +1062,12 @@ impl Scene {
             return None;
         }
         let chart = self.charts.iter().find(|c| c.id == account)?;
+        if let Some(summary) = &chart.provider_summary {
+            return Some(ChartTooltip {
+                text: summary.clone(),
+                position: [x.clamp(chart.rect.left, chart.rect.right), chart.rect.top],
+            });
+        }
         let ratio = ((x - chart.rect.left) / width(chart.rect).max(1.)).clamp(0., 1.);
         let millis = chart
             .to

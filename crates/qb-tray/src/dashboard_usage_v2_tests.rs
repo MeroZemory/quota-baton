@@ -554,7 +554,14 @@ fn r10_usage_tiles_share_row_height_at_wide_and_narrow_widths() {
         assert!(v.usage.iter().all(|tile| tile.forecast_lines.len() == 1));
         assert!(tiles.iter().all(|r| height(**r) == 308.));
         assert_eq!(tiles[0].top, tiles[1].top);
-        assert_eq!(s.charts.len(), 4);
+        assert_eq!(s.charts.len(), 6);
+        assert_eq!(
+            s.charts
+                .iter()
+                .filter(|c| c.provider_summary.is_none())
+                .count(),
+            4
+        );
         assert!(s.accessibility.len() <= history::SCENE_NODE_BUDGET);
     }
 }

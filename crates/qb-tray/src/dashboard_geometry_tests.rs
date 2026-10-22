@@ -701,6 +701,9 @@ fn r7_future_reset_now_and_high_remaining_annotations_do_not_overlap() {
         ..Default::default()
     };
     let mut v = view(&mut state);
+    // This regression exercises the account tile's annotation lanes. Provider
+    // panels have their own plot/label containment regressions.
+    v.provider_usage.clear();
     let mut tile = v.usage.remove(0);
     let now = v.clock.utc();
     tile.series = [("5시간", 88.), ("주간", 69.)]
@@ -795,7 +798,15 @@ fn r7_usage_maximum_accounts_windows_and_points_stay_within_global_node_budget()
         let scene = Scene::build(&v, &state, size, &Metrics::default());
         assert!(scene.accessibility.len() <= history::SCENE_NODE_BUDGET);
         assert!(scene.accessibility.len() < 16_384);
-        assert_eq!(scene.charts.len(), 128);
+        assert_eq!(scene.charts.len(), 130);
+        assert_eq!(
+            scene
+                .charts
+                .iter()
+                .filter(|c| c.provider_summary.is_none())
+                .count(),
+            128
+        );
         assert_eq!(
             scene
                 .charts
@@ -808,7 +819,7 @@ fn r7_usage_maximum_accounts_windows_and_points_stay_within_global_node_budget()
         let tables: Vec<_> = scene
             .accessibility
             .iter()
-            .filter(|node| node.role == Role::Table)
+            .filter(|node| node.role == Role::Table && !node.key.starts_with("provider-usage:"))
             .collect();
         assert_eq!(tables.len(), 128);
         let rows = scene

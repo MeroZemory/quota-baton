@@ -17,11 +17,35 @@ pub struct ForecastSummary {
 const SUMMARY_FRESH_SECONDS: i64 = 300;
 
 /// Select the limiting typed window without trusting the cached earliest name.
-/// Unknown/stale/reset-pending windows make the account summary unknown. Of
+/// Unknown/stale/reset-pending estimates make the summary unknown unless an
+/// observed exhausted window already proves it cannot serve before a reset. Of
 /// observed exhausted windows, the latest reset controls recovery; otherwise
 /// choose the earliest finite exhaustion, then the earliest safe reset. Ties
 /// are duration/name ordered, independent of the incoming vector order.
 pub fn limiting_window(forecast: &AccountUsageForecast) -> Option<&WindowUsageForecast> {
+    // Exhaustion is an observed fact, not a rate estimate. It stays relevant
+    // until its explicit reset, even while another window has too few samples.
+    // Never carry the fact across a reset or accept a future-stamped sample.
+    if let Some(window) = forecast
+        .windows
+        .iter()
+        .filter(|w| {
+            w.outcome == ForecastOutcome::Exhausted
+                && w.used_pct == 100.0
+                && w.window_seconds > 0
+                && !w.awaiting_usage
+                && w.observed_at <= forecast.as_of
+                && w.reset_at.is_some_and(|reset| reset > forecast.as_of)
+        })
+        .max_by(|a, b| {
+            a.reset_at
+                .cmp(&b.reset_at)
+                .then_with(|| b.window_seconds.cmp(&a.window_seconds))
+                .then_with(|| b.name.cmp(&a.name))
+        })
+    {
+        return Some(window);
+    }
     let fresh = |at: DateTime<Utc>| {
         let age = forecast.as_of.signed_duration_since(at);
         age >= chrono::Duration::zero() && age <= chrono::Duration::seconds(SUMMARY_FRESH_SECONDS)
@@ -738,5 +762,66 @@ mod tests {
         assert!(detail.contains("구간 평균"));
         assert!(detail.contains("25.0%/시간"));
         assert!(detail.contains("허용된 유료 크레딧으로 계속 처리 중"));
+    }
+    #[test]
+    fn r163_exhausted_fact_survives_unknown_rate_and_stale_sample_until_reset() {
+        let mut spent = summary_window("7d", 604800, ForecastOutcome::Exhausted);
+        spent.reset_at = Some(summary_now() + Duration::days(2));
+        spent.observed_at = summary_now() - Duration::hours(2);
+        let unknown = summary_window("5h", 18000, ForecastOutcome::Measuring);
+        let mut forecast = summary_forecast(vec![unknown, spent]);
+        forecast.observed_at = None;
+        for english in [false, true] {
+            let text = summary(&forecast, english).text;
+            assert!(text.contains(if english {
+                "Out until"
+            } else {
+                "까지 소진"
+            }));
+        }
+        forecast.as_of += Duration::days(2);
+        assert_eq!(summary(&forecast, true).text, "Measuring");
+    }
+
+    #[test]
+    fn r163_first_actual_observation_proves_exhaustion_without_either_rate() {
+        let now = summary_now();
+        let mut samples = Forecasts::default();
+        samples.observe(
+            "sample-acct",
+            "7d",
+            100.,
+            Some(now + Duration::days(7)),
+            now,
+        );
+        samples.observe(
+            "sample-acct",
+            "5h",
+            25.,
+            Some(now + Duration::hours(5)),
+            now,
+        );
+        let forecast = samples.view("sample-acct", now, None);
+        let spent = forecast.windows.iter().find(|w| w.name == "7d").unwrap();
+        assert_eq!(spent.outcome, ForecastOutcome::Exhausted);
+        assert_eq!(spent.recent_pct_per_hour, None);
+        assert_eq!(spent.average_pct_per_hour, None);
+        assert_eq!(
+            forecast
+                .windows
+                .iter()
+                .find(|w| w.name == "5h")
+                .unwrap()
+                .outcome,
+            ForecastOutcome::Measuring
+        );
+        for english in [false, true] {
+            let text = summary(&forecast, english).text;
+            assert!(text.contains(if english {
+                "Out until"
+            } else {
+                "까지 소진"
+            }));
+        }
     }
 }

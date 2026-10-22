@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: R16.2 한 줄 계정 예측·제공자 요약
-목표: R16.2 집중 관문 완료·설치 인계, 다음 N2 제공자 차트 구현
+현재 마일스톤: R16.3 제공자 사용량 차트
+목표: R16.3 집중 관문 완료·설치 인계, 다음 N6 기본 꺼짐 기록기 최소 전달
 핵심 지표: 남은 출시 1/3 (R14 보호 설치, R13 C+E 실행, R13 F 통합 예측); 이전 계열 2/2 종료
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-23 04:26 KST (R16.2 집중 관문 완료; 다음 N2)
+갱신: 2026-10-23 05:19 KST (R16.3 집중 관문 완료; 다음 N6)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -190,6 +190,8 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-23 02:52 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | R16 설치 수용006449a 및 R16.1 집중405·실제 경로 통과3737fe2. 영어 폭 보완은 분모 밖 |
 | 2026-10-23 03:48 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | R9.4 압축 세션 집중 관문 통과: 압축38·신규7·DB31·재개14(중복 포함), strict lint·빌드 통과. 분모 밖 복구이며 설치는 설계 세션 |
 | 2026-10-23 04:26 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | R16.2 집중428·실제8HWND 수용, 분모 밖 표시 개선; 실제 설치 전 |
+| 2026-10-23 04:34 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | R16.2 설치 수용 ddf8d87; takeover 거절0/1,959·실제 dashboard 확인. 이 표시 개선은 분모 밖 |
+| 2026-10-23 05:19 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | R16.3 집중464·실제10HWND 수용·설치 인계; 제공자 차트는 분모 밖. 다음 N6 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -354,14 +356,16 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-23 02:52 | R16.1 D27 실제 경로 | spawned core·AdminClient·tray 3HWND 및 snapshot CLI5뷰, 종료·fixture 정리 통과 | 실제 전달·렌더 경로 수용 | R16.1-evidence/real-path-final/completion.json, 실제 설치·실프로필 변경 없음 |
 | 2026-10-23 04:26 | R16.2 집중 검증 | 고유428통과·strict clippy 3crate·fmt·build exit0 | 한 줄 예측·상세 보존·경고 경계·기존 배치 회귀 | fingerprint에 명령·exit·입력SHA 보존; full matrix 재실행 주장 아님 |
 | 2026-10-23 04:26 | R16.2 실제·합성 렌더 | KO/EN 실제8HWND·합성120PNG | D27 실제 core/AdminClient/tray 및 두 크기·테마 | 직접 시각 검수 수용; fixture·자식 프로세스 정리 |
+| 2026-10-23 05:19 | R16.3 집중 검증 | 고유464통과·strict clippy 3crate·fmt·build exit0 | 집중 관문·기존 R16.1/R16.2 회귀 | delivery-fingerprint.json에 명령별 입력SHA·exit·합계; 전체 workspace 재실행 미주장 |
+| 2026-10-23 05:19 | R16.3 실제·합성 렌더 | KO/EN 실제10HWND·합성8PNG 직접 확인 | D27 실제 core/AdminClient/tray·두 크기·테마 | fixture 정리·소스/바이너리 parity; 최초 실패와 exhausted baseline red 보존 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 행동 |
 |---|---|---|---|
-| 제공자 사용량 차트 N2 | 순수 모델·기하 초안 준비 | 실제 DTO·렌더·KO/EN 집중 관문 | R16.3 통합 |
-| 기록기 N6 | 미출시; 보호 장치는 설치됨 | 기본 꺼짐·스키마·7일 보존 최소 전달 | N2 뒤 집중 관문·설치 인계 |
-| 대기·재개 N5a-d | 정책·측정 기반 준비, 실행 미연결 | HTTP/WS 취소·초기화 재개·긴급 이동 | 측정 lane 병행, S1에서 개별 실행 노드 통합 |
+| 기록기 N6 | 보호 설치됨; 수집기 미출시 | 기본 꺼짐·스키마·7일 보존 최소 전달 | 보존 브랜치에서 최소 slice 통합·집중 관문 |
+| 대기·재개 N5a-d | 정책·측정 기반 준비, 실행 미연결 | HTTP/WS 취소·초기화 재개·긴급 이동 | 측정 lane 병행, 개별 실행 노드 통합 |
+| 통합 예측 N7 | 검증 가능한 24시간 입력 부족 | 명시한 오차 범위의 backtest | body-free 입력·훈련/후속 관측 검증, 풀 예측 표시는 보류 |
 <!-- gaps:end -->
 
 R11 Windows process/crash focused verification uses `cargo test -p quota-baton --all-features --test r9_crash --no-fail-fast -- --test-threads=4`. It still runs cases concurrently and preserves every in-case race, kill checkpoint, 20-second command deadline and five-second reap deadline. Default high-concurrency deadline failures and diagnostic traces remain cited; the bounded run is not a claim that the default-load timing issue was fixed. No product timing or ownership workaround was added.

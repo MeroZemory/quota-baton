@@ -382,12 +382,29 @@ fn measured_fits(engine: &v2_text::Text, text: &str, rect: Rect, style: v2_text:
         metrics.required_height <= rect.bottom - rect.top + EPS,
         "summary height {text:?}: {metrics:?} in {rect:?}"
     );
+    let mut space_style = style;
+    space_style.wrap = v2_text::Wrap::SingleLine;
+    let space = engine
+        .layout(
+            " ",
+            D2D_RECT_F {
+                left: 0.,
+                top: 0.,
+                right: 100.,
+                bottom: style.line_height,
+            },
+            space_style,
+        )
+        .unwrap()
+        .metrics
+        .natural_width;
     assert!(
-        // DirectWrite advances can round fractionally past the wrap edge.
-        // Permit at most one output pixel at scale 2. ink_overflow also
-        // flags ordinary glyph overhang; the production engine deliberately
-        // does not clip it to the line box. Outer clips are checked below.
-        metrics.natural_width <= rect.right - rect.left + 0.5,
+        // KeepAll retains a trailing separator after wrapping on trimmed ink.
+        // Permit that one measured space only when actual ink does not overflow;
+        // omitted lines, trimming and outer scroll clips are still checked.
+        metrics.natural_width <= rect.right - rect.left + 0.5
+            || (!metrics.ink_overflow
+                && metrics.natural_width <= rect.right - rect.left + space + 0.5),
         "summary width {text:?}: {metrics:?} in {rect:?}"
     );
     format!("{text:?}: {metrics:?}, rect={rect:?}\n")
@@ -417,7 +434,39 @@ fn text_style(m: &geometry::Measure) -> v2_text::Style {
 
 fn audit_dashboard(data: &model::DashboardSnapshot, options: &Options) -> String {
     let audit = snapshot_render::measure_dashboard(data, options).unwrap();
-    let scene = &audit.scene;
+    let mut scene = audit.scene;
+    if options.view == View::Usage {
+        // Provider charts precede the account grid. Audit the account summary
+        // after a real production scroll rather than requiring offscreen ink.
+        let max_offset = scene
+            .content
+            .iter()
+            .find(|r| r.region == qb_tray::state::ScrollRegion::Usage)
+            .unwrap()
+            .max_offset;
+        let mut state = DashboardState::default();
+        state.tab = Tab::Usage;
+        state.usage_offset = max_offset;
+        let start = options
+            .now
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_local_timezone(*options.now.offset())
+            .single()
+            .unwrap();
+        let clock = model::Clock {
+            now: options.now,
+            day_start: start.to_utc(),
+            day_end: (start + Duration::days(1)).to_utc(),
+        };
+        let view = model::project(data, &mut state, &clock);
+        scene = qb_tray::render::Renderer::new(options.dark)
+            .unwrap()
+            .scene(&view, &state, options.size.map(|n| n as f32))
+            .unwrap();
+    }
+    let scene = &scene;
     let engine = v2_text::Text::new().unwrap();
     let expected = &row(&data.accounts, "visible").forecast_lines[0];
     let account_nodes: Vec<_> = scene
@@ -497,9 +546,20 @@ fn audit_dashboard(data: &model::DashboardSnapshot, options: &Options) -> String
             }
         }
         assert_eq!(
-            matches, 1,
-            "semantic summary has no unique actual Draw::Text: {}",
-            node.key
+            matches,
+            1,
+            "semantic summary has no unique actual Draw::Text: {} {:?}; content={:?}; texts={:?}",
+            node.key,
+            node.rect,
+            scene.content,
+            scene
+                .draw
+                .iter()
+                .filter_map(|d| match d {
+                    Draw::Text { rect, measure, .. } if measure.text == node.name => Some(rect),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
         );
     }
     assert!(
