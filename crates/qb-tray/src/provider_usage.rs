@@ -173,11 +173,46 @@ pub fn project_snapshot(
                 .and_then(|accounts| project_in_minute(provider, accounts, now, minute).ok())
                 .map(|mut projection| {
                     projection.history_truncated |= snapshot.usage.truncated;
+                    projection.next_change = projection
+                        .next_change
+                        .into_iter()
+                        .chain(snapshot_history_deadline(snapshot, provider, now))
+                        .min();
                     projection
                 })
                 .unwrap_or_else(|| unknown_projection(provider, snapshot, now, minute))
         })
         .collect()
+}
+
+// A dated source point can stop covering history while current capacity remains
+// known. Preserve that exact repaint deadline independently of the current point.
+fn snapshot_history_deadline(
+    snapshot: &crate::dashboard_model::DashboardSnapshot,
+    selected: Provider,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    snapshot
+        .accounts
+        .raw
+        .accounts
+        .iter()
+        .filter(|a| provider(&a.provider) == Some(selected) && a.user_state == "active" && !a.drain)
+        .flat_map(|a| {
+            a.windows.iter().filter_map(move |w| {
+                long_kind(a, w)?;
+                w.used_pct.filter(|v| v.is_finite() && *v >= 0.)?;
+                let observed = timestamp(w.observed_at.as_deref())
+                    .or_else(|| timestamp(a.observed_at.as_deref()))
+                    .or(snapshot.data_at)?;
+                let expiry = observed.checked_add_signed(Duration::seconds(FRESH_SECONDS))?;
+                (observed <= now
+                    && expiry > now
+                    && timestamp(w.reset_at.as_deref()).is_none_or(|reset| expiry < reset))
+                .then_some(expiry)
+            })
+        })
+        .min()
 }
 
 fn provider(value: &str) -> Option<Provider> {
@@ -297,7 +332,7 @@ fn snapshot_inputs(
     if raw.len() > MAX_ACCOUNTS || history.len() > MAX_ACCOUNTS {
         return Err(Error::Capacity);
     }
-    let mut points = raw.len(); // Reserve room for at most one current point per account.
+    let mut points = raw.len() * 2; // At most one dated point plus one current snapshot per account.
     let mut resets = raw.len();
     let mut history_ids = BTreeSet::new();
     for account in history {
@@ -375,19 +410,45 @@ fn snapshot_inputs(
                 .copied()
                 .filter(|at| *at <= now)
                 .collect();
-            let observed = timestamp(current.observed_at.as_deref());
             let reset = timestamp(current.reset_at.as_deref());
-            if let Some(at) = observed {
-                if let Some(existing) = observations.iter().find(|o| o.at == at) {
+            // Capacity is an observed snapshot, not a rate estimate. Keep the
+            // latest value until its reset; absence of rate/history cannot erase
+            // it. An undated snapshot starts at receipt, never backfills history.
+            let observed = timestamp(current.observed_at.as_deref())
+                .or_else(|| timestamp(account.observed_at.as_deref()))
+                .or(snapshot.data_at)
+                .unwrap_or(now);
+            if observed <= now && reset.is_none_or(|at| at > now) {
+                let bound = reset.unwrap_or(DateTime::<Utc>::MAX_UTC);
+                if let Some(existing) = observations.iter_mut().find(|o| o.at == observed) {
                     if existing.used_pct != current.used_pct {
                         return Err(Error::DuplicateObservation);
                     }
+                    existing.valid_until =
+                        observed.checked_add_signed(Duration::seconds(FRESH_SECONDS));
                 } else {
                     observations.push(Observation {
-                        at,
+                        at: observed,
                         used_pct: current.used_pct,
-                        valid_until: at.checked_add_signed(Duration::seconds(FRESH_SECONDS)),
+                        valid_until: observed.checked_add_signed(Duration::seconds(FRESH_SECONDS)),
                     });
+                }
+                // Current capacity is not a historical sample. An old source
+                // value remains authoritative now, but cannot bridge an
+                // unobserved historical gap between its timestamp and now.
+                if !resets.iter().any(|at| observed < *at && *at <= now) {
+                    if let Some(existing) = observations.iter_mut().find(|o| o.at == now) {
+                        if existing.used_pct != current.used_pct {
+                            return Err(Error::DuplicateObservation);
+                        }
+                        existing.valid_until = Some(bound);
+                    } else {
+                        observations.push(Observation {
+                            at: now,
+                            used_pct: current.used_pct,
+                            valid_until: Some(bound),
+                        });
+                    }
                 }
             }
             // Past reset markers are actual boundaries. Only two adjacent
@@ -404,14 +465,14 @@ fn snapshot_inputs(
                     })
                 })
                 .collect();
-            if let Some(reset) = reset.filter(|_| observed.is_some_and(|at| at <= now)) {
+            if let Some(reset) = reset.filter(|_| observed <= now) {
                 resets.push(reset);
                 // This is ONE explicit current cycle, not repeated earlier or
                 // future cycles. A future-stamped observation cannot establish it.
-                if let (Some(start), Some(at)) = (reset.checked_sub_signed(duration), observed)
-                    && at <= now
-                    && start <= at
-                    && at < reset
+                if let Some(start) = reset.checked_sub_signed(duration)
+                    && observed <= now
+                    && start <= observed
+                    && observed < reset
                     // A real intervening reset contradicts this inferred
                     // start. Keep measured usage, but leave pace unknown.
                     && !resets.iter().any(|at| start < *at && *at < reset)
@@ -1314,28 +1375,47 @@ mod snapshot_tests {
     }
 
     #[test]
-    fn snapshot_adapter_freshness_uses_each_source_timestamp_not_publication() {
+    fn snapshot_capacity_survives_rate_freshness_and_missing_history() {
         let mut current = row("sample", "codex", "Plus", 20., 84);
-        current["windows"][0]["observed_at"] = json!(clock().utc() - Duration::seconds(299));
+        current["windows"][0]["observed_at"] = json!(clock().utc() - Duration::days(1));
         let mut data = snapshot(vec![current]);
-        close(codex(&data).current.remaining.value.unwrap(), 0.8);
-        let mut later = clock();
-        later.now += Duration::seconds(1);
-        data.data_at = Some(later.utc());
-        let result = project_snapshot(&data, &later);
-        assert_eq!(result[1].current.remaining.value, None);
-        assert_eq!(result[1].verdict, None);
-
-        data.accounts.raw.accounts[0].windows[0].observed_at = None;
-        history(
-            &mut data,
-            vec![(clock().utc() - Duration::seconds(301), Some(50.))],
-            vec![],
+        let projected = codex(&data);
+        close(projected.current.remaining.value.unwrap(), 0.8);
+        assert!(
+            projected
+                .knots
+                .iter()
+                .filter(|k| k.at < clock().utc())
+                .all(|k| k.left.remaining.value.is_none() && k.right.remaining.value.is_none()),
+            "a day-old snapshot cannot fill the unobserved preceding 19 hours"
         );
-        assert_eq!(codex(&data).current.remaining.value, None);
-        data.usage.accounts[0].windows[0].points[0].0 = clock().utc() - Duration::seconds(299);
-        close(codex(&data).current.remaining.value.unwrap(), 0.5);
-        data.usage.accounts[0].windows[0].points[0].0 = clock().utc() + Duration::seconds(1);
+        assert_eq!(
+            projected
+                .knots
+                .iter()
+                .find(|k| k.at == clock().utc())
+                .unwrap()
+                .left
+                .remaining
+                .value,
+            None
+        );
+        let mut later = clock();
+        later.now += Duration::hours(1);
+        close(
+            project_snapshot(&data, &later)[1]
+                .current
+                .remaining
+                .value
+                .unwrap(),
+            0.8,
+        );
+        data.accounts.raw.accounts[0].windows[0].observed_at = None;
+        close(codex(&data).current.remaining.value.unwrap(), 0.8);
+        data.accounts.raw.accounts[0].windows[0].used_pct = Some(100.);
+        close(codex(&data).current.remaining.value.unwrap(), 0.);
+        data.accounts.raw.accounts[0].windows[0].observed_at =
+            Some((clock().utc() + Duration::seconds(1)).to_rfc3339());
         assert_eq!(codex(&data).current.remaining.value, None);
     }
 
@@ -1356,7 +1436,7 @@ mod snapshot_tests {
     }
 
     #[test]
-    fn snapshot_adapter_missing_current_forecast_and_other_rates_cannot_date_weekly_usage() {
+    fn snapshot_capacity_does_not_require_forecast_or_window_timestamp() {
         let mut current = row("sample", "codex", "Plus", 20., 84);
         current["windows"][0]["observed_at"] = Value::Null;
         current["observed_at"] = json!(clock().utc());
@@ -1376,9 +1456,9 @@ mod snapshot_tests {
             current["usage_forecast"] = forecast;
             let data = snapshot(vec![current.clone()]);
             let p = codex(&data);
-            assert_eq!(p.current.remaining.value, None);
-            assert_eq!(p.current.pace.value, None);
-            assert_eq!(p.verdict, None);
+            close(p.current.remaining.value.unwrap(), 0.8);
+            assert!(p.current.pace.value.is_some());
+            assert!(p.verdict.is_some());
         }
         // Fresh measured quota does not require a rate estimate to exist.
         current["usage_forecast"] = Value::Null;
@@ -1519,28 +1599,38 @@ mod snapshot_tests {
     }
 
     #[test]
-    fn snapshot_deadline_freshness_299_to_300_without_snapshot_update() {
+    fn snapshot_history_expiry_keeps_current_capacity_and_exact_deadline() {
         let mut current = row("sample", "codex", "Plus", 20., 84);
         current["windows"][0]["observed_at"] = json!(clock().utc() - Duration::seconds(299));
         let data = snapshot(vec![current]);
-        let before = codex(&data);
-        assert_eq!(
-            before.next_change,
-            Some(clock().utc() + Duration::seconds(1))
-        );
-        assert_chart_deadline(&data, &clock(), clock().utc() + Duration::seconds(1));
-        assert!(before.current.remaining.value.is_some());
-        assert!(before.verdict.is_some());
+        let expiry = clock().utc() + Duration::seconds(1);
+        assert_eq!(codex(&data).next_change, Some(expiry));
+        assert_chart_deadline(&data, &clock(), expiry);
         let mut at = clock();
-        at.now += Duration::seconds(1);
+        at.now += Duration::seconds(2);
         let after = project_snapshot(&data, &at);
-        assert_eq!(after[1].current.remaining.value, None);
-        assert_eq!(after[1].verdict, None);
-        assert!(after[1].current.pace.value.is_some());
+        close(after[1].current.remaining.value.unwrap(), 0.8);
+        let gap = after[1].knots.iter().find(|k| k.at == expiry).unwrap();
+        close(gap.left.remaining.value.unwrap(), 0.8);
+        assert_eq!(gap.right.remaining.value, None);
+        assert!(after[1].verdict.is_some());
         assert_eq!(
             after[1].next_change,
             Some(clock().utc() + Duration::hours(84))
         );
+    }
+
+    #[test]
+    fn current_snapshot_cannot_cross_a_verified_reset_without_a_new_observation() {
+        let mut current = row("sample", "codex", "Plus", 100., 84);
+        let observed = clock().utc() - Duration::hours(2);
+        current["windows"][0]["observed_at"] = json!(observed);
+        let mut data = snapshot(vec![current]);
+        history(&mut data, vec![], vec![clock().utc() - Duration::hours(1)]);
+        assert_eq!(codex(&data).current.remaining.value, None);
+        data.accounts.raw.accounts[0].windows[0].observed_at =
+            Some((clock().utc() - Duration::hours(1)).to_rfc3339());
+        close(codex(&data).current.remaining.value.unwrap(), 0.);
     }
 
     #[test]
