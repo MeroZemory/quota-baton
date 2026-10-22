@@ -1,214 +1,181 @@
 # quota-baton
 
-A local Windows proxy for subscription accounts used by Claude Code and Codex CLI.
-The implementation follows [the behavioural contract](docs/contract.md).
+quota-baton is a local proxy and tray app for Windows that runs Claude Code and Codex CLI sessions across several of your own subscription accounts.
 
-## 권장 사용 방식: 기존 환경은 그대로 두고 전용 명령을 추가합니다
+**Each session stays on one account, so its prompt cache keeps working.** It moves only when that account can no longer serve it, and the move happens before the first byte of a response reaches the client.
 
-quota-baton은 기존 `codex`·`claude` 설정을 바꾸지 않고 **전용 실행 명령**을 추가해서 쓰는 방식을 권장합니다.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/ui-overview-dark.png">
+  <img alt="Dashboard overview: provider summary lines, sessions grouped by account, and a one-line forecast per account" src="docs/assets/ui-overview-light.png">
+</picture>
 
-```powershell
-quota-baton.exe wire --codex-mode dedicated --claude-mode dedicated          # 미리보기
-quota-baton.exe wire --codex-mode dedicated --claude-mode dedicated --apply  # 적용
-```
+One week on the author's machine (Oct 16 to Oct 22, 2026):
 
-적용하면 `codex-qb`와 `claude-qb` 명령이 생깁니다. 이 두 명령으로 시작한 세션만 quota-baton을 거칩니다. 기존 `codex`, `claude`, 계정별 실행 명령(예: `codex-mz`)과 설정 파일은 그대로 남습니다.
+| Requests relayed | Sessions | Accounts | Codex input served from cache | Account moves |
+|---:|---:|---:|---:|---:|
+| 116,611 | 720 | 12 | 96.5% | 45 |
 
-기존 환경을 그대로 두는 이유는 다음과 같습니다.
+## What sets it apart
 
-- **프록시 장애에 대비할 수 있습니다.** quota-baton 코어가 꺼지거나, 업데이트 중이거나, 오류가 나면 그 경로를 쓰는 세션은 모두 요청을 보내지 못합니다. 기존 명령이 살아 있으면 바로 그 명령으로 작업을 이어갈 수 있습니다.
-- **문제의 원인을 가를 수 있습니다.** 같은 작업을 기존 명령과 `-qb` 명령으로 각각 실행해 보면, 문제가 계정이나 서비스에 있는지 quota-baton에 있는지 바로 확인할 수 있습니다.
-- **되돌리기가 간단합니다.** `quota-baton.exe unwire --apply`는 quota-baton이 만든 전용 파일만 지웁니다. 기존 설정은 처음부터 바뀌지 않았으므로 따로 복구할 것이 없습니다.
-- **실행 중인 세션에 영향을 주지 않습니다.** 이미 열려 있는 세션, herdr 자동 재개, 다른 도구가 부르는 `codex`·`claude` 명령은 하나도 바뀌지 않습니다.
+1. **Sessions keep their account.** Usage thresholds only decide where a *new* session goes. A running session changes account only when its account is out of quota, logged out or paused, so its prompt cache is not thrown away to chase a slightly emptier account.
+2. **It knows how much is left, and when it will run out.** Usage comes from response headers and from each provider's usage endpoint. Every account shows one line such as `5h 47m left · runs out 11:27 (weekly)`, and each provider gets a summary line and a weekly chart against an even-pace line.
+3. **It does not touch what your client sends.** Request and response bodies from the real Claude Code and Codex CLI are relayed byte for byte; only the headers that carry credentials and routing are replaced. There is no client impersonation, no injected tools and no forced flags.
+4. **It stays small.** quota-baton never stores conversations. It keeps one copy of each request body only until the response starts, so memory does not grow with conversation length or with the number of idle connections.
+5. **It installs next to your setup, not over it.** `wire` adds `codex-qb` and `claude-qb`; plain `codex` and `claude` keep working exactly as before, as a fallback if the proxy is down.
 
-**기존 Codex 대화 이어가기:** `codex-qb`는 전용 폴더 `~/.codex-acct/qb`를 씁니다. 기존 `codex`나 `codex-mz` 같은 계정별 명령으로 하던 대화도 `codex-qb resume <ID>`로 열 수 있습니다. 대화가 다른 폴더에 있으면 무엇이 바뀌는지 먼저 보여 주고, `move`를 직접 입력해야 qb 폴더로 옮깁니다. 복사하지 않고 하드링크로 옮기며, 원래 폴더에서는 빠집니다. 되돌릴 때는 `quota-baton sessions return <ID> --to <폴더>`를 씁니다. 다른 곳에서 실행 중인 대화나, 그 대화에서 갈라져 나온 대화가 원래 폴더에 남아 있는 경우는 옮기지 않습니다. Claude는 다릅니다. `claude-qb`는 기존 `claude`와 대화 기록 폴더를 같이 쓰므로 `claude-qb --resume <ID>`로 그대로 이어갈 수 있습니다.
+## Problems it fixes
 
-기본 설정 자체를 quota-baton으로 바꾸는 `--codex-mode default`, `--claude-mode default`는 전용 명령으로 충분히 써 본 뒤에만 고려하십시오. 자세한 설명은 [사용자 안내서의 클라이언트 설정 전환](docs/user-guide.md#클라이언트-설정-전환)에 있습니다.
+Before writing quota-baton, the author ran two popular multi-account proxies on this machine for daily work. These are the failures we traced in their logs and code, and what quota-baton does instead.
+
+| What went wrong | What quota-baton does |
+|---|---|
+| Memory grew to 3.6-7 GB. One proxy kept a full transcript for every open connection; the other stalled all traffic. | Stores no conversation history. Each in-flight request holds at most one copy of its body, released when the response starts. |
+| A live conversation bounced between accounts 407 times, because limits were re-checked on every turn. | Limits only steer new sessions. A running session moves only when its account cannot serve it. |
+| Accounts that had been logged out stayed in rotation for days, because health was judged from the token's expiry time. | Health follows the provider's own error codes. A login is marked for re-login as soon as the provider reports it revoked. |
+| A single-use refresh token was retried three times after the provider had rejected it. | Refresh errors are typed. A terminal error is never retried, and only one refresh per account runs at a time. |
+| One 404 put a model on a 12-hour cooldown. | A 404 never changes an account's state. |
+| Rotation happened only after a 429, and paid credits were spent without asking. | Usage drives the choice of account before any limit is hit. Paid credits are off until you turn them on per account. |
+| The proxy answered rate-limited requests with an instant 429, and clients gave up; dozens of sessions sat stopped for hours. | A rate-limited request waits up to 60 seconds and is then sent once; the provider's own answer is passed through. quota-baton never makes up a 429. |
+| Subscription logins and pay-per-token API keys shared one pool, and large sessions quietly moved to a paid key. | Supports subscription logins only. API keys cannot be added. |
+| Request bodies from the real clients were rewritten through one translation path. | Bodies pass through unchanged. |
+| One self-updating process carried all traffic, with a chain of launcher scripts and no status outside a web page. | A separate core and tray. The core upgrades in place (`serve --takeover`); status is in the tray, a native dashboard and the CLI. |
+
+## How it works
+
+`claude-qb` and `codex-qb` point Claude Code and Codex CLI at the core on 127.0.0.1. The core reads each account's 5-hour and weekly usage and gives every new session the account with the most room. An account that has just taken a session gets no other new session until fresh usage data arrives, so a burst of launches does not pile onto one account. From then on the session keeps that account. When the account runs out, gets logged out or is paused, the next request of that session goes to another account.
+
+This is what that looked like for four Codex accounts over two days. As each Plus account reached its weekly limit, new work went to the next one:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/codex-weekly-dark.png">
+  <img alt="Weekly usage of four Codex accounts over Oct 21 to 22, 2026. Each Plus account climbs to 100% at a different time." src="docs/assets/codex-weekly-light.png">
+</picture>
+
+And for three Claude accounts, whose 5-hour windows fill and reset on their own schedules:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/claude-5h-dark.png">
+  <img alt="5-hour usage of three Claude accounts over Oct 21 to 23, 2026, rising and resetting every five hours." src="docs/assets/claude-5h-light.png">
+</picture>
+
+Both charts are drawn from quota-baton's own usage history on the author's machine. Only the account names were changed. The [architecture document](docs/architecture.md) covers the components and the rules in detail.
+
+## Codex extras
+
+- `codex-qb resume <id>` brings an existing Codex conversation from another Codex home into quota-baton. The rollout files are hardlinked rather than copied, and you confirm by typing `move`.
+- `codex-qb --account <id>` prefers one account for a launch and shows that account's own model list in the picker.
+- `codex-qb --images` starts a session with Codex's image tool, routed to an account that allows it.
+
+## Upgrades without dropping sessions
+
+`quota-baton serve --takeover` hands the listener to a new binary while the old one finishes its open streams. During one upgrade, a probe connecting every 10 ms for 25 seconds saw **0 refused connections out of 1,890**.
+
+## Requirements
+
+- Windows 11. Tested on build 26200; Windows 10 is untested.
+- Claude Code and/or Codex CLI. Moving existing Codex conversations requires Codex CLI 0.163.0.
+- Prebuilt x64 binaries are on the [Releases](https://github.com/MeroZemory/quota-baton/releases) page. Building from source needs Rust 1.93 with the MSVC toolchain.
+
+## Setup
+
+1. Download the zip from [Releases](https://github.com/MeroZemory/quota-baton/releases) and unpack it, or build it yourself. `quota-baton.exe` is the core and CLI; `quota-baton-tray.exe` is the tray app.
+
+   ```powershell
+   cargo build --release --workspace
+   ```
+
+2. Start the core. The tray can also start it and restart it if it exits.
+
+   ```powershell
+   quota-baton serve
+   ```
+
+3. Log in to each account. This opens the browser for OAuth.
+
+   ```powershell
+   quota-baton accounts login claude
+   quota-baton accounts login codex
+   ```
+
+4. Create the `codex-qb` and `claude-qb` commands. Run it once without `--apply` to see the exact changes first.
+
+   ```powershell
+   quota-baton wire --codex-mode dedicated --claude-mode dedicated --apply
+   ```
+
+Start sessions with `codex-qb` or `claude-qb`. `quota-baton unwire --apply` removes everything `wire` created.
+
+Accounts already logged in through another app's Codex or Claude home can be taken over with `quota-baton accounts takeover codex <home>`. quota-baton then owns the refresh token, and the original credential file is renamed so the two apps never refresh the same token.
+
+## The dashboard
+
+Double-click the tray icon to open it.
+
+![A short tour of the dashboard: overview, usage and activity](docs/assets/dashboard-tour.gif)
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/ui-usage-dark.png">
+  <img alt="Usage tab: provider charts with a pace line, then each account from 19 hours ago to 5 hours ahead with reset markers and a dashed projection" src="docs/assets/ui-usage-light.png">
+</picture>
+
+| Tab | Shows |
+|---|---|
+| Overview | Sessions grouped by account: model, last activity, requests today, and each account's forecast |
+| Usage | One weekly chart per provider against an even-pace line, then each account from 19 hours ago to 5 hours ahead, so the next 5-hour reset is always on the chart |
+| Events | Every account change and limit, with the reason |
+
+The tray flyout shows the same accounts in a smaller view, with pause, credits and re-login actions.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/ui-flyout-dark.png">
+  <img alt="Tray flyout listing accounts with their 5-hour and weekly remaining usage" src="docs/assets/ui-flyout-light.png">
+</picture>
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `quota-baton status` | Core, ports and account summary |
+| `quota-baton accounts list` | Accounts, usage windows and exhaustion forecasts |
+| `quota-baton accounts pause <id>` | Stop placing sessions on an account |
+| `quota-baton accounts release-hold <id>` | Clear a quota hold after you have checked the account |
+| `quota-baton routing ...` | Per-project or per-session policy: `strict`, `recover` or `rebalance` |
+| `codex-qb resume <id>` | Bring a Codex conversation from another home into quota-baton |
+| `codex-qb --account <id>` | Prefer one account for this launch |
+| `codex-qb --images` | New session with the image tool |
+
+For a two-letter shortcut such as `codex-ab` (= `codex-qb --account <id>`), set `short = "ab"` under that account in `config.toml` and run `wire` again.
+
+## Configuration
+
+Settings live in `%LOCALAPPDATA%\quota-baton\config.toml`; set `QB_HOME` to use another folder. The core listens on **127.0.0.1 only**: port 10200 for client traffic and 10201 for the admin API, each with its own key. Tokens are stored with DPAPI in the same folder.
+
+## Limits
+
+- **Windows only.** The core is portable Rust, but the tray, credential storage and launchers are Windows-specific.
+- **Two providers.** Claude subscriptions (Claude Code) and ChatGPT subscriptions (Codex CLI).
+- **A move costs one uncached turn.** Prompt caches belong to an account and cannot follow a session. Codex also drops hidden reasoning from the old account.
+- **Korean by default.** The tray and dashboard switch to English with `[ui] language = "en"` in `config.toml`. Most CLI messages are still Korean.
+- **Forecasts are estimates** from recent usage, not figures from the provider.
+- **Your accounts, your terms.** Use it only with accounts you own, and check each provider's terms for your plan.
+
+## Documentation
+
+- [Architecture](docs/architecture.md): components, memory bounds, routing and verification
+- [Behaviour contract](docs/contract.md): the rules the code is tested against
+- [Decision log](docs/decisions.md): what was decided, why, and what was rejected
+- [User guide (Korean)](docs/user-guide.md)
 
 ## Development
-
-Build and verify with Rust 1.93:
 
 ```powershell
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cargo build --workspace
 ```
 
-Use an isolated data directory for development:
-
-```powershell
-$env:QB_HOME = "$PWD/.sandbox/dev-home"
-cargo run -p quota-baton -- serve
-cargo run -p quota-baton -- status
-```
-
-The default data and admin ports are 10200 and 10201. `QB_HOME` overrides
-`%LOCALAPPDATA%/quota-baton`. Configuration is read from `config.toml` in that directory.
-The data and admin listeners require separate keys from `client.key` and `admin.token`.
-HTTP routes now forward to one linked account per provider. Unknown routes return
-404; a family with no active account returns a native 400 error.
-
-M1a imports CPA accounts in linked mode. Use a synthetic fixture directory during
-development:
-
-```powershell
-cargo run -p quota-baton -- accounts import cpa --dir .sandbox/fixtures/cpa --dry-run
-cargo run -p quota-baton -- accounts import cpa --dir .sandbox/fixtures/cpa --activate codex:synthetic@example.invalid
-cargo run -p quota-baton -- accounts list
-```
-
-Imports start disabled unless explicitly activated. A running core owns the
-credential lease, so the CLI sends imports through its authenticated admin API.
-Otherwise the CLI acquires the lease for the write. Dry runs do not create account
-or lock files. Tokens are protected using CurrentUser DPAPI and application entropy.
-Linked accounts read rotated tokens from CPA by identity; they make no token-endpoint
-calls. Older tokens are skipped, including on re-import; explicit activation still
-applies. `--adopt` is reserved for M8 and currently refuses.
-
-The upstream defaults are `https://api.anthropic.com` and
-`https://chatgpt.com/backend-api/codex`. The normal build accepts only those exact
-bases; the explicit `testkit` feature in debug builds also accepts
-`http://127.0.0.1:<port>` for fake upstreams. Redirects and automatic decompression are disabled. Request and response
-bytes pass through unchanged. Uploads buffer at most the per-request retention cap;
-larger uploads stream the buffered prefix followed by the remaining client body.
-Only complete bodies within the cap and shared budget can be retried after a
-linked-token reload. Expiry reloads run at most once per account per minute;
-401-triggered reloads bypass that throttle. There is no account failover yet.
-
-The core acquires its credential lease and loads accounts and passive quota state
-before opening listeners. It runs at above-normal process priority. Passive quota
-headers persist under `state/quota.json`; request metadata and linked-reload events
-persist under `ledger/`. No bodies or credentials are logged. Request retention is
-released at the bounded commit decision (first data/error, 64 KiB, or 10 seconds).
-SSE classification uses an incremental side decoder for gzip, deflate, Brotli and
-zstd. Unknown or stacked encodings commit immediately; relayed bytes stay raw.
-The accepted C3 limitation remains: reqwest inserts `Accept: */*` when a client
-omits `Accept`; genuine clients supply that header themselves.
-Observability uses a bounded non-blocking queue and batches disk synchronization
-once per second. Queue overflow drops events and reports counts once per minute.
-Corrupt quota caches are moved aside and ledger pruning failures are warnings.
-Successful streams are recorded when their terminal event is delivered, even if
-the client closes before upstream EOF. Failed terminal events record an error.
-A bounded observer recognizes Claude and Codex terminal SSE events, including
-compressed streams; disconnects before a terminal event remain `client_drop`.
-Logs default to `info` for file and stderr. `QB_LOG` overrides `RUST_LOG` when set.
-
-Codex WebSocket upgrades dial upstream before answering the client. Each socket
-pair stays on its selected account, shares the HTTP linked-token gates and uses
-the existing TLS client. Handshake headers are generated independently per hop.
-The loopback leg declines compression. `[websocket] upstream_deflate=true` fails
-startup because tungstenite 0.28.0 has no deflate support; adopting a deflate fork
-and the live D12 A/B test remain design decisions.
-
-Both legs allow 192 MiB messages and frames by default. Text/binary payloads and
-control messages pass through verbatim; large outgoing messages are fragmented
-into 64 KiB frames so pongs can run between writes. The shared in-flight budget
-pauses client reads and counts complete messages until writes finish. A small
-local patch to crates.io tungstenite releases large socket buffers after use;
-its source, licenses and regression are in `vendor/tungstenite`.
-
-Only upstream text messages of at most 1 MiB are inspected, for response tracking,
-quota and error identifiers. No transcript or previous-response state is retained.
-The ledger includes response and connection records plus bounded
-`upstream_error_code` identifiers on HTTP and WebSocket responses. Socket pairs
-close normally after `idle_close_secs` (default 1800); upstream reads time out
-after 600 seconds, reset by upstream pings. Debug `phase0` builds add
-`serve --phase0-close-after-response` to close normally after each completion.
-
-For a synthetic manual check, run `cargo run -p qb-testkit --example ws_fakes`;
-its `--client ws://127.0.0.1:<port>/v1/responses` mode prints only a sanitized
-transcript. Use the matching synthetic fixture key specified in the example,
-an isolated `QB_HOME`, ephemeral ports and a `testkit` build for the local base.
-
-Phase 0 account pins use the authenticated admin API:
-`POST /admin/v1/debug/pin` with `{account_id, session_key?}` and
-`DELETE /admin/v1/debug/pin`. The account determines the provider family;
-`session_key` uses the internal prefixed form (`codex:<id>` or `claude:<id>`).
-Session pins override that family's global pin; pins clear on
-restart. Pins prefer an eligible account; they never bypass paused/disabled state,
-health or credential gates.
-
-M4a persists account health and user state under the credential lease. HTTP retries
-use the retained, unchanged body only before commit. A request tries at most four
-accounts, with one token retry and one independent network retry per account. Selection currently
-prefers the provider pin, then eligible account IDs in order; M4b supplies bindings
-and the full selection policy. A matching pre-commit WebSocket error is suppressed
-after its health transition is saved, followed by close 1012. An idle connection
-whose account becomes ineligible closes with 1000. Post-commit errors stay verbatim.
-
-Passive headers and Codex rate-limit events update quota health, including the
-credits hold and early reset. Exhausted HTTP accounts replay a bounded cached limit
-response with its original encoding; WebSocket upgrades return native terminal 429.
-The admin API adds `/state`, `/events`, account pause/resume/disable/enable and
-settings PATCH. `quota-baton status` renders a Korean account table; account actions
-use the running core, or acquire the lease directly while it is stopped. Settings
-PATCH preserves TOML comments and other fields and persists account metadata.
-
-`cargo run -p qb-testkit --example m4a_fakes` starts local synthetic HTTP and
-WebSocket fault servers. Its `--client ws://127.0.0.1:<port>/v1/responses` mode checks
-1012, reconnect on another account and normal completion, without printing bodies
-or credentials. Use an isolated synthetic `QB_HOME` and a debug `testkit` core.
-
-Shape capture needs an explicit debug feature build and an existing directory whose
-canonical path contains a `.sandbox` component:
-
-```powershell
-cargo build -p quota-baton --features shape-capture
-target/debug/quota-baton.exe serve --capture-dir .sandbox/captures --capture-limit 50
-```
-
-It is off unless requested, expires after the request limit, and records only header
-names, approved header values, and JSON key names. The release build refuses the
-`shape-capture` feature. Capture files are independent of `QB_HOME`.
-Key scanning is bounded to 64 MiB of decoded input, depth 3, and 4096 keys;
-capture records explicitly mark unavailable or truncated key observations.
-For a captured request, a separate response record includes limit header names
-and values (`anthropic-ratelimit-*`, `x-codex-*`, `retry-after`, `x-request-id`).
-
-The `phase0` debug feature adds body capture and replay for synthetic portability
-checks. These captures contain conversation content; use synthetic conversations
-and delete the files after verification. A release build enabling `phase0` fails.
-
-```powershell
-cargo build -p quota-baton --features phase0
-target/debug/quota-baton.exe serve --capture-bodies-dir .sandbox/body-captures --capture-bodies-limit 20
-target/debug/quota-baton.exe phase0 replay --capture .sandbox/body-captures/body-example.json --account cx-example --strip reasoning
-```
-
-The capture directory must already exist inside a canonical `.sandbox` path.
-Only complete `/v1/messages` and `/v1/responses` bodies within the upload cap are
-captured. Authorization, API key, cookie and host headers are excluded. Captures
-store raw base64 bytes and decoded JSON for zstd. Bodies and decoded input are
-bounded to 64 MiB; capture files are bounded to 192 MiB including base64 overhead.
-
-Replay requires a running core and its admin token. The authenticated debug route
-`POST /admin/v1/phase0/replay` accepts `capture_path`, `account_id`,
-`strip_encrypted` (`none`, `reasoning`, `all`; default `none`) and
-`tamper_encrypted` (default `false`). It calls the same relay, credential gates and
-linked-reload path as product traffic, without changing account pins.
-`--strip reasoning` preserves the narrower legacy diagnostic mode; `--strip all` is a diagnostic
-control removing every encrypted Codex input item or every Claude thinking block.
-`--tamper-encrypted` changes the first encrypted value or signature across types.
-The CLI prints presence counts before sending and one summary line afterward:
-status, error fields, usage, serving account, applied mode, removal counts and
-tampered type. It prints no body or credentials. Unchanged replay preserves raw
-bytes; transformations retain the original supported content encoding.
-
-The synthetic HTTP harness can be started with
-`cargo run -p qb-testkit --example http_fakes`. Full fake-upstream integration tests
-run with `cargo test --workspace`; isolated core integration runs need
-`cargo test -p qb-core --features testkit`.
-
-OAuth login, active polling, full selection/bindings and tray UI remain later
-milestones. Live upstream validation remains gated by the design-session G1 checks.
-
-Implementation milestones and pending protocol gates are recorded in
-[the architecture](docs/architecture.md) and [the decision log](docs/decisions.md).
+Set `QB_HOME` to a scratch folder when you run a development core, so it never touches your real accounts.
 
 ## License
 
-Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
-[MIT license](LICENSE-MIT) at your option. The vendored `vendor/tungstenite`
-keeps its own MIT and Apache-2.0 licenses.
+MIT or Apache-2.0, at your option. See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE). The vendored `vendor/tungstenite` keeps its own licenses.
