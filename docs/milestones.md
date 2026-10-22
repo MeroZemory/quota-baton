@@ -5,8 +5,8 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: R13 C+E 대기·이동·재개 실행 통합
-목표: R16.1 영어 화면 보완 완료 후 R13 C+E 실행을 통합한다
+현재 마일스톤: R16.2 계정 예측 한 줄·제공자 요약
+목표: R16.2를 실제 코어 경로·한국어·영어로 검증하고 전달한다. 다음은 R16.3 제공자 차트다
 핵심 지표: 남은 출시 1/3 (R14 보호 설치, R13 C+E 실행, R13 F 통합 예측); 이전 계열 2/2 종료
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
 갱신: 2026-10-23 02:52 KST (R16.1 집중405·실제 경로 통과, 다음 C+E)

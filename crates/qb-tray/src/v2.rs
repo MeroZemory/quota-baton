@@ -6,6 +6,8 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::{collections::BTreeMap, time::SystemTime};
 
+mod provider_forecast;
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct State {
@@ -232,6 +234,8 @@ pub struct Summary {
     pub serving_mode: ServingMode,
     pub tone: Tone,
     pub detail: String,
+    /// D28 measured-account summary; never pooled runway or placement advice.
+    pub forecast_line: String,
     pub todo: usize,
     pub eligible: Option<u64>,
     pub earliest_until: Option<DateTime<Utc>>,
@@ -263,7 +267,10 @@ pub struct AccountRow {
     pub usage: Option<Usage>,
     pub windows: Vec<WindowMetric>,
     pub credits: Option<CreditsLine>,
+    /// Exactly one compact shared core summary; detail is hover-only.
     pub forecast_lines: Vec<String>,
+    pub forecast_tooltip: String,
+    pub forecast_warning: bool,
     pub reason: Option<String>,
     /// The only inline action; menu controls are not row buttons.
     pub action: Option<RowAction>,
@@ -810,6 +817,20 @@ fn project_row(a: &Account, name: String, now: DateTime<Utc>) -> AccountRow {
     };
     let plan = plan_label(&a.provider, a.plan.as_deref()).map(str::to_owned);
     let menu = menu_info(a, &name, plan.as_deref(), &windows, credits.as_ref(), now);
+    let english = crate::i18n::language() == crate::i18n::UiLanguage::En;
+    let forecast_summary =
+        qb_core::usage_forecast_display::summary(&summary_forecast(a, now), english);
+    let forecast_tooltip = a.usage_forecast.as_ref().map_or_else(
+        || forecast_summary.text.clone(),
+        |forecast| {
+            if english {
+                crate::i18n::forecast::lines(forecast, actual_credits(a))
+            } else {
+                qb_core::usage_forecast_display::lines(forecast, actual_credits(a))
+            }
+            .join("\n")
+        },
+    );
     AccountRow {
         raw: a.clone(),
         plan_tooltip: plan
@@ -824,23 +845,67 @@ fn project_row(a: &Account, name: String, now: DateTime<Utc>) -> AccountRow {
         usage,
         windows,
         credits,
-        forecast_lines: a
-            .usage_forecast
-            .as_ref()
-            .map(|forecast| {
-                if crate::i18n::language() == crate::i18n::UiLanguage::En {
-                    crate::i18n::forecast::lines(forecast, actual_credits(a))
-                } else {
-                    qb_core::usage_forecast_display::lines(forecast, actual_credits(a))
-                }
-            })
-            .unwrap_or_default(),
+        forecast_lines: vec![forecast_summary.text],
+        forecast_tooltip,
+        forecast_warning: forecast_summary.warning,
         reason: None,
         action: None,
         menu,
         chip_tooltip: None,
         accessible_name: String::new(),
     }
+}
+
+/// Re-evaluate the typed display at the projection clock, honoring explicit
+/// model scope. Hidden/blocked rows retain their original detail in the tooltip.
+fn summary_forecast(
+    a: &Account,
+    now: DateTime<Utc>,
+) -> qb_core::usage_forecast::AccountUsageForecast {
+    let mut forecast =
+        a.usage_forecast
+            .clone()
+            .unwrap_or_else(|| qb_core::usage_forecast::AccountUsageForecast {
+                as_of: now,
+                observed_at: None,
+                windows: Vec::new(),
+                earliest_window: None,
+                credit: None,
+                truncated: false,
+            });
+    if a.user_state != "active"
+        || a.health.kind == "needs_relogin"
+        || forecast.as_of > now
+        || matches!(
+            display_state(a),
+            DisplayState::LinkStale
+                | DisplayState::StoreError
+                | DisplayState::Payment
+                | DisplayState::Permission
+                | DisplayState::Auth
+        )
+    {
+        forecast.windows.clear();
+        forecast.credit = None;
+        forecast.observed_at = None;
+    } else {
+        forecast.windows.retain(|window| {
+            a.windows
+                .iter()
+                .find(|w| w.name == window.name)
+                .map_or_else(
+                    || {
+                        account_window(&Window {
+                            name: window.name.clone(),
+                            ..Window::default()
+                        })
+                    },
+                    account_window,
+                )
+        });
+    }
+    forecast.as_of = now;
+    forecast
 }
 
 fn summarize(
@@ -1027,6 +1092,13 @@ fn summarize(
             _ => Tone::Off,
         },
         detail,
+        forecast_line: provider_forecast::line(
+            provider,
+            rows,
+            eligible,
+            now,
+            crate::i18n::language() == crate::i18n::UiLanguage::En,
+        ),
         todo,
         eligible,
         earliest_until,
@@ -1223,6 +1295,7 @@ fn finish_row(row: &mut AccountRow, summary: &Summary, serving: Option<&str>, no
         row.plan.clone(),
         row.chip.as_ref().map(|c| c.text.clone()),
         usage_accessibility,
+        row.forecast_lines.first().cloned(),
     ]
     .into_iter()
     .flatten()

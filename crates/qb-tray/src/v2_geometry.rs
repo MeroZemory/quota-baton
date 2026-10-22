@@ -189,6 +189,7 @@ pub struct HeaderBox {
     pub rect: Rect,
     pub title: Rect,
     pub summaries: Vec<Rect>,
+    pub forecasts: Vec<Rect>,
     pub banner: Option<Rect>,
     pub note: Option<Rect>,
     pub divider: Rect,
@@ -213,6 +214,7 @@ pub struct RowBox {
     pub chip: Option<Rect>,
     pub usage: Option<Rect>,
     pub usage_lines: Vec<UsageLineBox>,
+    pub forecast: Option<Rect>,
     pub reset: Option<Rect>,
     pub bar: Option<Rect>,
     pub bar_fill: Option<Rect>,
@@ -329,7 +331,7 @@ pub struct Scene {
 impl Scene {
     pub fn build(view: &v2::View, p: Presentation, max_height: f32) -> Self {
         let is_login = matches!(p.overlay, Overlay::Login(_));
-        let header = header(view, p.core_ok);
+        let header = header(view, &p);
         let mut sections = Vec::new();
         let mut y = 0.;
         let mut resolved_order = BTreeMap::new();
@@ -652,21 +654,31 @@ impl Scene {
     }
 }
 
-fn header(view: &v2::View, core_ok: bool) -> HeaderBox {
+fn paragraph_height(p: &Presentation, text: &str, width: f32) -> f32 {
+    p.subtitle_lines.get(text).copied().unwrap_or_else(|| {
+        (advance(p, text, 12, false) / width).ceil().max(1.) as usize
+    }).max(1) as f32 * 16.
+}
+
+fn header(view: &v2::View, p: &Presentation) -> HeaderBox {
     let mut y = 40.;
     let mut summaries = vec![];
+    let mut forecasts = vec![];
     let mut banner = None;
     let mut note = None;
-    if !core_ok {
+    if !p.core_ok {
         banner = Some(r(16., y, 344., y + 28.));
         y += 28.;
         note = Some(r(16., y, 344., y + 20.));
         y += 20.;
         y += 8.;
     } else if !view.empty {
-        for _ in 0..2 {
+        for summary in &view.summaries {
             summaries.push(r(16., y, 344., y + 28.));
             y += 28.;
+            let height = paragraph_height(p, &summary.forecast_line, 312.);
+            forecasts.push(r(32., y, 344., y + height));
+            y += height + 6.;
         }
         if view.note.is_some() {
             note = Some(r(32., y, 344., y + 20.));
@@ -678,6 +690,7 @@ fn header(view: &v2::View, core_ok: bool) -> HeaderBox {
         rect: r(0., 0., WIDTH, y + 1.),
         title: r(16., 12., 344., 32.),
         summaries,
+        forecasts,
         banner,
         note,
         divider: r(0., y, WIDTH, y + 1.),
@@ -812,7 +825,7 @@ pub fn row_height(row: &v2::AccountRow, disabled_slot: bool) -> f32 {
         return 44. + if row.reason.is_some() { 24. } else { 0. };
     }
     let action = row.action.as_ref().map(|a| a.kind);
-    44. + row
+    44. + forecast_height(row, &Presentation::default()) + row
         .usage
         .as_ref()
         .map_or(0., |u| 30. + u.lines.len().saturating_sub(1) as f32 * 26.)
@@ -841,9 +854,14 @@ pub fn row_height(row: &v2::AccountRow, disabled_slot: bool) -> f32 {
             0.
         }
 }
+fn forecast_height(row: &v2::AccountRow, p: &Presentation) -> f32 {
+    row.forecast_lines.first().map_or(0., |text| 6. + paragraph_height(p, text, 328.))
+}
 fn row_box(row: &v2::AccountRow, disabled_slot: bool, y: f32, p: &Presentation) -> RowBox {
     let enabled = p.core_ok && !p.pending_ids.contains(&row.raw.id);
-    let height = row_height(row, disabled_slot);
+    let height = row_height(row, disabled_slot) + if disabled_slot { 0. } else {
+        forecast_height(row, p) - forecast_height(row, &Presentation::default())
+    };
     let rect = r(0., y, WIDTH, y + height);
     let line1 = r(16., y + 10., 352., y + 34.);
     let more = r(324., line1.top, 352., line1.bottom);
@@ -903,6 +921,7 @@ fn row_box(row: &v2::AccountRow, disabled_slot: bool, y: f32, p: &Presentation) 
     let mut bar_fill = None;
     let mut credits = None;
     let mut reason = None;
+    let mut forecast = None;
     if !disabled_slot {
         if let Some(u) = &row.usage {
             next += 6.;
@@ -963,6 +982,12 @@ fn row_box(row: &v2::AccountRow, disabled_slot: bool, y: f32, p: &Presentation) 
                 });
             }
             next += 24. + lines.saturating_sub(1) as f32 * 26.;
+        }
+        if let Some(text) = row.forecast_lines.first() {
+            next += 6.;
+            let height = paragraph_height(p, text, 328.);
+            forecast = Some(r(16., next, 344., next + height));
+            next += height;
         }
         let action = row.action.as_ref();
         if row.credits.is_some() {
@@ -1042,6 +1067,7 @@ fn row_box(row: &v2::AccountRow, disabled_slot: bool, y: f32, p: &Presentation) 
         chip,
         usage,
         usage_lines,
+        forecast,
         reset,
         bar,
         bar_fill,
@@ -1741,6 +1767,7 @@ fn shift_row(row: &mut RowBox, dy: f32) {
         &mut row.bar_fill,
         &mut row.credits,
         &mut row.reason,
+        &mut row.forecast,
     ]
     .into_iter()
     .flatten()
@@ -1908,10 +1935,12 @@ mod tests {
             assert_eq!(scene.hit_test(x, y), Some(&b.target));
         }
         let scene = Scene::build(&ready_view(), Presentation::default(), 1000.);
-        assert_eq!(h(scene.header.rect), 105.);
+        assert_eq!(scene.header.forecasts.len(), 2);
+        assert_eq!(h(scene.header.rect), 105. + scene.header.forecasts.iter().map(|area| h(*area) + 6.).sum::<f32>());
+        assert!(scene.header.forecasts.iter().all(|area| inside(*area, scene.header.rect)));
         assert_eq!(scene.header.summaries.len(), 2);
         let scene = Scene::build(&view(vec![relogin()], 0), Presentation::default(), 1000.);
-        assert_eq!(h(scene.header.rect), 125.);
+        assert_eq!(h(scene.header.rect), 125. + scene.header.forecasts.iter().map(|area| h(*area) + 6.).sum::<f32>());
         let scene = Scene::build(
             &ready_view(),
             Presentation {
@@ -1929,7 +1958,9 @@ mod tests {
         let v = ready_view();
         let scene = Scene::build(&v, Presentation::default(), 1000.);
         let row = scene.row("a").unwrap();
-        assert_eq!(h(row.rect), 74.);
+        assert_eq!(h(row.rect), 96.);
+        assert_eq!(h(row.forecast.unwrap()), 16.);
+        assert!(inside(row.forecast.unwrap(), row.rect));
         assert_eq!(row.hover.left, 4.);
         assert_eq!(row.hover.right, 356.);
         assert_eq!(row.more.left, 324.);
@@ -1942,7 +1973,7 @@ mod tests {
         let v = view(vec![relogin()], 0);
         let scene = Scene::build(&v, Presentation::default(), 1000.);
         let row = scene.row("a").unwrap();
-        assert_eq!(h(row.rect), 76.);
+        assert_eq!(h(row.rect), 98.);
         assert!(row.usage.is_none());
         assert_eq!(h(row.reason.unwrap()), 16.);
         assert_eq!(h(row.button.as_ref().unwrap().visual), 24.);
