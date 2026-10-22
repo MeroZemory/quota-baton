@@ -22,19 +22,19 @@ fn verdict(p: &Projection) -> String {
     match v.direction {
         Direction::Ahead => {
             if en() {
-                format!("{n} accounts ahead of pace")
+                format!("Ahead of even pace by {n} · may go unused at reset")
             } else {
-                format!("권장선보다 {n}계정분 여유")
+                format!("균등 속도보다 {n}개 분량 여유 · 초기화 때 남을 수 있음")
             }
         }
         Direction::Behind => {
             if en() {
-                format!("{n} accounts behind pace")
+                format!("Short of even pace by {n} · runs out early")
             } else {
-                format!("권장선보다 {n}계정분 부족")
+                format!("균등 속도보다 {n}개 분량 부족 · 일찍 소진")
             }
         }
-        Direction::OnPace => copy("권장선과 비슷함", "On pace"),
+        Direction::OnPace => copy("균등 속도", "On pace"),
     }
 }
 fn note(p: &Projection) -> String {
@@ -788,5 +788,37 @@ mod tests {
         let empty = p::project(Provider::Claude, &[], clock.utc()).unwrap();
         assert!(verdict(&empty).contains("측정") || verdict(&empty).contains("Measuring"));
         assert_eq!(quantity(empty.current.remaining.value), "—");
+    }
+
+    #[test]
+    fn r165_verdict_names_the_consequence_in_both_languages() {
+        use crate::i18n::{UiLanguage, with_language};
+        let mut panel = projection(Provider::Claude, crate::dashboard_fixtures::clock().utc());
+        for (direction, tenths, ko, english) in [
+            (
+                Direction::Behind,
+                13,
+                "균등 속도보다 1.3개 분량 부족 · 일찍 소진",
+                "Short of even pace by 1.3 · runs out early",
+            ),
+            (
+                Direction::Ahead,
+                6,
+                "균등 속도보다 0.6개 분량 여유 · 초기화 때 남을 수 있음",
+                "Ahead of even pace by 0.6 · may go unused at reset",
+            ),
+            (Direction::OnPace, 0, "균등 속도", "On pace"),
+        ] {
+            panel.verdict = Some(p::Verdict {
+                direction,
+                tenths,
+                difference: match direction {
+                    Direction::Behind => -(tenths as f64) / 10.,
+                    _ => tenths as f64 / 10.,
+                },
+            });
+            with_language(UiLanguage::Ko, || assert_eq!(verdict(&panel), ko));
+            with_language(UiLanguage::En, || assert_eq!(verdict(&panel), english));
+        }
     }
 }
