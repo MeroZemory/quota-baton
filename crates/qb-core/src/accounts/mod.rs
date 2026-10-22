@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 pub use store::{AccountObserver, AccountStore, StoreError};
+pub(crate) use store::{BeforeAccountMutation, MetadataCause, MetadataMutation, ReportMutation};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

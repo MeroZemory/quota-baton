@@ -1,15 +1,14 @@
-//! Restart-cold provenance fence, deliberately independent of Account and persistence.
+//! Process-local causal report provenance; native wait admission is not activated.
 //!
-//! `E` is the runtime classifier's compact proof (including reset/scope/evidence).
-//! Capture an origin BEFORE network IO; cached/restored snapshots cannot construct
-//! one. This module cannot enforce that call-site ordering or classify raw reports.
-//! Callbacks run under the same gate as invalidation: validate protected runtime
-//! state and publish admission there, without network IO, waiting or reentry.
-//! Integration must establish a consistent order with any outer account-store lock.
+//! The runtime MUST serialize capture/accept/invalidation/native persistence/final
+//! publication with its existing outer account transaction. No registry lock is
+//! held across native work, callbacks or awaits. This registry cannot enforce that
+//! external order, raw-report classification, caller memory bounds or actual send.
+//! Restart is cold; nothing here is serializable or constructible from wall time.
 
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 const MAX_ENTRIES: usize = 4096;
@@ -21,609 +20,1014 @@ pub(crate) enum FenceError {
     Capacity,
     Missing,
     Stale,
+    #[cfg(test)]
     NoProof,
     Rejected,
     Exhausted,
     Poisoned,
+    Closed,
 }
 
-// Old tokens retain these allocations, preventing address-reuse ABA. They are
-// neither serializable nor derived from a PID, account ID or wall-clock timestamp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReportSource {
+    HttpAttempt,
+    UsagePoll,
+}
+
 #[derive(Clone, Debug)]
 struct Identity(Arc<()>);
-
 impl Identity {
     fn new() -> Self {
         Self(Arc::new(()))
     }
-
     fn same(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
 }
 
-/// Immutable pre-network invalidation fence; cloning never recaptures state.
-/// A WS producer may use clones for multiple reports. Every accepted `mint`
-/// creates an independent proof/receipt identity, even for identical evidence.
+/// Allocate BEFORE a physical send. Clone preserves the same ordinal and epoch;
+/// it cannot recapture an old report or admit it twice. HTTP/poll share one clock.
 #[derive(Clone, Debug)]
 pub(crate) struct ReportOrigin {
     process: Identity,
     entry: Identity,
     id: String,
-    generation: u64,
+    epoch: u64,
+    ordinal: u64,
+    #[cfg(test)]
+    source: ReportSource,
 }
 
+/// Single accepted raw report, consumed by publication or its own invalidation.
+/// Dropping cancels publication, but NEVER rewinds the accepted watermark.
+#[derive(Debug)]
+pub(crate) struct AcceptPermit {
+    origin: ReportOrigin,
+    epoch: u64,
+    acceptance: Identity,
+    rotated: bool,
+}
+
+/// Fences a proof, not exactly-once dispatch or an unrevocable native permission.
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct WaitTicket {
-    origin: ReportOrigin,
+    process: Identity,
+    entry: Identity,
+    id: String,
+    epoch: u64,
     proof: Identity,
 }
 
 struct Proof<E> {
+    #[cfg(test)]
     identity: Identity,
-    evidence: E,
+    _evidence: Arc<E>,
 }
-
 struct Entry<E> {
     identity: Identity,
-    generation: Option<u64>,
+    epoch: Option<u64>,
+    issued: u64,
+    accepted: u64,
+    active: Option<Identity>,
     proof: Option<Proof<E>>,
+}
+
+struct State<E> {
+    closed: bool,
+    entries: BTreeMap<String, Entry<E>>,
 }
 
 pub(crate) struct WaitProofs<E> {
     process: Identity,
     capacity: usize,
-    entries: Mutex<BTreeMap<String, Entry<E>>>,
+    state: Mutex<State<E>>,
 }
 
 impl<E> WaitProofs<E> {
-    /// Capacity is capped; zero denies all new entries. No automatic eviction.
     pub(crate) fn new(capacity: usize) -> Self {
         Self {
             process: Identity::new(),
             capacity: capacity.min(MAX_ENTRIES),
-            entries: Mutex::new(BTreeMap::new()),
+            state: Mutex::new(State {
+                closed: false,
+                entries: BTreeMap::new(),
+            }),
         }
     }
 
-    /// Only the raw-report producer should call this, before starting network IO.
-    /// Capturing does not establish proof or refresh an existing proof.
-    pub(crate) fn capture(&self, id: &str) -> Result<ReportOrigin, FenceError> {
+    fn open(&self) -> Result<MutexGuard<'_, State<E>>, FenceError> {
+        let state = self.state.lock().map_err(|_| FenceError::Poisoned)?;
+        if state.closed {
+            return Err(FenceError::Closed);
+        }
+        Ok(state)
+    }
+
+    /// Sticky process-local closure. Caller still holds the outer account gate
+    /// through native Stop; this mutex does not serialize external publication.
+    /// Previously returned evidence remains data, never admission authority.
+    pub(crate) fn close(&self) -> Result<(), FenceError> {
+        let retired = {
+            let mut state = self.state.lock().map_err(|_| FenceError::Poisoned)?;
+            state.closed = true;
+            std::mem::take(&mut state.entries)
+        };
+        // Arbitrary evidence destructors must never run under the registry lock.
+        drop(retired);
+        Ok(())
+    }
+
+    pub(crate) fn capture(
+        &self,
+        id: &str,
+        _source: ReportSource,
+    ) -> Result<ReportOrigin, FenceError> {
         if id.is_empty() || id.len() > MAX_ID_BYTES {
             return Err(FenceError::InvalidId);
         }
-        let mut entries = self.entries.lock().map_err(|_| FenceError::Poisoned)?;
-        if !entries.contains_key(id) {
-            if entries.len() >= self.capacity {
-                return Err(FenceError::Capacity);
+        // Retire payloads outside the mutex, including their arbitrary E::drop.
+        let mut retired = None;
+        let result = {
+            let mut state = self.open()?;
+            let entries = &mut state.entries;
+            if !entries.contains_key(id) {
+                if entries.len() >= self.capacity {
+                    return Err(FenceError::Capacity);
+                }
+                entries.insert(
+                    id.to_owned(),
+                    Entry {
+                        identity: Identity::new(),
+                        epoch: Some(0),
+                        issued: 0,
+                        accepted: 0,
+                        active: None,
+                        proof: None,
+                    },
+                );
             }
-            entries.insert(
-                id.to_owned(),
-                Entry {
-                    identity: Identity::new(),
-                    generation: Some(0),
-                    proof: None,
-                },
-            );
-        }
-        let entry = &entries[id];
-        Ok(ReportOrigin {
-            process: self.process.clone(),
-            entry: entry.identity.clone(),
-            id: id.to_owned(),
-            generation: entry.generation.ok_or(FenceError::Exhausted)?,
-        })
+            let entry = entries.get_mut(id).ok_or(FenceError::Missing)?;
+            let epoch = entry.epoch.ok_or(FenceError::Exhausted)?;
+            if let Some(ordinal) = entry.issued.checked_add(1) {
+                entry.issued = ordinal;
+                Ok(ReportOrigin {
+                    process: self.process.clone(),
+                    entry: entry.identity.clone(),
+                    id: id.to_owned(),
+                    epoch,
+                    ordinal,
+                    #[cfg(test)]
+                    source: _source,
+                })
+            } else {
+                entry.epoch = None;
+                entry.active = None;
+                retired = entry.proof.take();
+                Err(FenceError::Exhausted)
+            }
+        };
+        drop(retired);
+        result
     }
 
-    fn check(&self, origin: &ReportOrigin, entry: &Entry<E>) -> Result<(), FenceError> {
+    fn check_origin(&self, origin: &ReportOrigin, entry: &Entry<E>) -> Result<(), FenceError> {
         if !self.process.same(&origin.process)
             || !entry.identity.same(&origin.entry)
-            || entry.generation != Some(origin.generation)
+            || entry.epoch != Some(origin.epoch)
+            || origin.ordinal == 0
+            || origin.ordinal > entry.issued
         {
             return Err(FenceError::Stale);
         }
         Ok(())
     }
 
-    /// Consume one handle to a raw origin and store already-classified evidence.
-    /// A producer may clone its immutable origin for repeated WS receipts. Each
-    /// successful call creates a new proof identity; origin equality, evidence
-    /// equality and equal timestamps never preserve a previous ticket.
-    /// This is not a classifier, freshness check or out-of-order report filter.
-    /// The caller must reject older/contradictory reports under the outer gate.
-    /// A replacement
-    /// gets a fresh proof identity, so previously acquired tickets fail closed.
-    pub(crate) fn mint(&self, origin: ReportOrigin, evidence: E) -> Result<(), FenceError> {
-        let mut entries = self.entries.lock().map_err(|_| FenceError::Poisoned)?;
-        let entry = entries.get_mut(&origin.id).ok_or(FenceError::Missing)?;
-        self.check(&origin, entry)?;
-        entry.proof = Some(Proof {
-            identity: Identity::new(),
-            evidence,
-        });
+    fn check_permit(&self, permit: &AcceptPermit, entry: &Entry<E>) -> Result<(), FenceError> {
+        if !self.process.same(&permit.origin.process)
+            || !entry.identity.same(&permit.origin.entry)
+            || entry.epoch != Some(permit.epoch)
+            || entry.accepted != permit.origin.ordinal
+            || !entry
+                .active
+                .as_ref()
+                .is_some_and(|active| active.same(&permit.acceptance))
+        {
+            return Err(FenceError::Stale);
+        }
         Ok(())
     }
 
-    /// Check runtime state and publish acquisition while invalidation is excluded.
-    /// A rejected callback cannot create a ticket. No evidence clone is required.
-    pub(crate) fn acquire<T>(
+    /// Accept BEFORE classification, including partial/nonqualifying reports.
+    /// Newer accepted reports revoke the old proof and every older pending permit.
+    /// Missing raw origin is never accepted by a receive-time recapture fallback.
+    pub(crate) fn accept(
         &self,
         id: &str,
-        validate_and_publish: impl FnOnce(&E) -> Option<T>,
-    ) -> Result<(WaitTicket, T), FenceError> {
-        let entries = self.entries.lock().map_err(|_| FenceError::Poisoned)?;
+        origin: ReportOrigin,
+    ) -> Result<AcceptPermit, FenceError> {
+        if id != origin.id {
+            return Err(FenceError::Stale);
+        }
+        let retired;
+        let permit = {
+            let mut state = self.open()?;
+            let entries = &mut state.entries;
+            let entry = entries.get_mut(id).ok_or(FenceError::Missing)?;
+            self.check_origin(&origin, entry)?;
+            if origin.ordinal <= entry.accepted {
+                return Err(FenceError::Stale);
+            }
+            let acceptance = Identity::new();
+            entry.accepted = origin.ordinal;
+            retired = entry.proof.take();
+            entry.active = Some(acceptance.clone());
+            AcceptPermit {
+                epoch: origin.epoch,
+                origin,
+                acceptance,
+                rotated: false,
+            }
+        };
+        drop(retired);
+        Ok(permit)
+    }
+
+    /// Rotate only THIS accepted report across its own required invalidation.
+    /// Call before native mutation. Other captured origins retain the old epoch.
+    /// External release/rejection uses invalidate(), which revokes this permit.
+    /// One rotation maximum; this is not permission to bypass later invalidations.
+    pub(crate) fn invalidate_accepted(
+        &self,
+        mut permit: AcceptPermit,
+    ) -> Result<AcceptPermit, FenceError> {
+        let retired;
+        let result = {
+            let mut state = self.open()?;
+            let entries = &mut state.entries;
+            let entry = entries
+                .get_mut(&permit.origin.id)
+                .ok_or(FenceError::Missing)?;
+            self.check_permit(&permit, entry)?;
+            if permit.rotated {
+                return Err(FenceError::Rejected);
+            }
+            retired = entry.proof.take();
+            entry.epoch = permit.epoch.checked_add(1);
+            if let Some(epoch) = entry.epoch {
+                permit.epoch = epoch;
+                permit.rotated = true;
+                Ok(permit)
+            } else {
+                entry.active = None;
+                Err(FenceError::Exhausted)
+            }
+        };
+        drop(retired);
+        result
+    }
+
+    /// Publish compact classified evidence only AFTER successful native persistence,
+    /// while the external transaction is still held. No native callback is invoked.
+    pub(crate) fn mint(&self, permit: AcceptPermit, evidence: E) -> Result<(), FenceError> {
+        // Declared before the lock so E is also dropped unlocked on rejection.
+        let proof = Proof {
+            #[cfg(test)]
+            identity: Identity::new(),
+            _evidence: Arc::new(evidence),
+        };
+        let retired;
+        {
+            let mut state = self.open()?;
+            let entries = &mut state.entries;
+            let entry = entries
+                .get_mut(&permit.origin.id)
+                .ok_or(FenceError::Missing)?;
+            self.check_permit(&permit, entry)?;
+            entry.active = None;
+            retired = entry.proof.replace(proof);
+        }
+        drop(retired);
+        Ok(())
+    }
+
+    /// Revoke before native publication; ALWAYS execute native release/rejection
+    /// separately even if this returns Missing/Exhausted/Poisoned. No callback API.
+    pub(crate) fn invalidate(&self, id: &str) -> Result<(), FenceError> {
+        let retired;
+        let result = {
+            let mut state = self.open()?;
+            let entries = &mut state.entries;
+            let entry = entries.get_mut(id).ok_or(FenceError::Missing)?;
+            retired = entry.proof.take();
+            entry.active = None;
+            entry.epoch = entry.epoch.and_then(|epoch| epoch.checked_add(1));
+            entry.epoch.map(|_| ()).ok_or(FenceError::Exhausted)
+        };
+        drop(retired);
+        result
+    }
+
+    /// The returned immutable evidence can outlive invalidation; it is DATA, not
+    /// authority. Hold the outer transaction through eligibility and final check.
+    #[cfg(test)]
+    pub(crate) fn acquire(&self, id: &str) -> Result<(WaitTicket, Arc<E>), FenceError> {
+        let state = self.open()?;
+        let entries = &state.entries;
         let entry = entries.get(id).ok_or(FenceError::Missing)?;
-        let generation = entry.generation.ok_or(FenceError::Exhausted)?;
+        let epoch = entry.epoch.ok_or(FenceError::Exhausted)?;
         let proof = entry.proof.as_ref().ok_or(FenceError::NoProof)?;
-        let value = validate_and_publish(&proof.evidence).ok_or(FenceError::Rejected)?;
         Ok((
             WaitTicket {
-                origin: ReportOrigin {
-                    process: self.process.clone(),
-                    entry: entry.identity.clone(),
-                    id: id.to_owned(),
-                    generation,
-                },
+                process: self.process.clone(),
+                entry: entry.identity.clone(),
+                id: id.to_owned(),
+                epoch,
                 proof: proof.identity.clone(),
             },
-            value,
+            Arc::clone(&proof._evidence),
         ))
     }
 
-    /// Revalidate and publish continuation/dispatch under the common gate.
-    /// Tickets are fencing capabilities, not an exactly-once dispatch mechanism.
-    pub(crate) fn admit<T>(
-        &self,
-        ticket: &WaitTicket,
-        validate_and_publish: impl FnOnce(&E) -> Option<T>,
-    ) -> Result<T, FenceError> {
-        let entries = self.entries.lock().map_err(|_| FenceError::Poisoned)?;
-        let entry = entries.get(&ticket.origin.id).ok_or(FenceError::Missing)?;
-        self.check(&ticket.origin, entry)?;
+    #[cfg(test)]
+    pub(crate) fn admit(&self, ticket: &WaitTicket) -> Result<Arc<E>, FenceError> {
+        let state = self.open()?;
+        let entries = &state.entries;
+        let entry = entries.get(&ticket.id).ok_or(FenceError::Missing)?;
+        if !self.process.same(&ticket.process)
+            || !entry.identity.same(&ticket.entry)
+            || entry.epoch != Some(ticket.epoch)
+        {
+            return Err(FenceError::Stale);
+        }
         let proof = entry.proof.as_ref().ok_or(FenceError::NoProof)?;
         if !proof.identity.same(&ticket.proof) {
             return Err(FenceError::Stale);
         }
-        validate_and_publish(&proof.evidence).ok_or(FenceError::Rejected)
+        Ok(Arc::clone(&proof._evidence))
     }
 
-    /// Invalidate BEFORE attempting a synchronous write/publication. An operation
-    /// returning Err never rolls back invalidation. Overflow clears proof and
-    /// permanently fences the entry; the operation is not called in that case.
-    /// Missing/poisoned entries also do not call it. Integration must preserve
-    /// native health operations separately on these errors while denying proof;
-    /// this primitive is not permission to skip a native mutation.
-    pub(crate) fn invalidate<T>(
-        &self,
-        id: &str,
-        operation: impl FnOnce() -> T,
-    ) -> Result<T, FenceError> {
-        let mut entries = self.entries.lock().map_err(|_| FenceError::Poisoned)?;
-        let entry = entries.get_mut(id).ok_or(FenceError::Missing)?;
-        entry.proof = None;
-        entry.generation = entry.generation.and_then(|value| value.checked_add(1));
-        entry.generation.ok_or(FenceError::Exhausted)?;
-        Ok(operation())
-    }
-
-    /// Explicit lifecycle retirement is the only way to reclaim capacity. A later
-    /// capture for the same ID receives a new, non-reusable entry incarnation.
     pub(crate) fn retire(&self, id: &str) -> Result<bool, FenceError> {
-        Ok(self
-            .entries
-            .lock()
-            .map_err(|_| FenceError::Poisoned)?
-            .remove(id)
-            .is_some())
+        let removed = { self.open()?.entries.remove(id) };
+        let existed = removed.is_some();
+        drop(removed);
+        Ok(existed)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Barrier, TryLockError};
+    use std::sync::{
+        Weak,
+        atomic::{AtomicUsize, Ordering},
+    };
 
-    // The tuple represents classifier-owned reset/scope/evidence; the fence
-    // deliberately does not reinterpret it, compare wall time or inspect Account.
-    type Evidence = (u64, &'static str, u64);
-
+    type Evidence = (u64, &'static str);
     fn proven(fence: &WaitProofs<Evidence>) -> WaitTicket {
-        let origin = fence.capture("a").unwrap();
-        fence.mint(origin, (100, "account", 7)).unwrap();
-        fence.acquire("a", |_| Some(())).unwrap().0
+        let origin = fence.capture("a", ReportSource::UsagePoll).unwrap();
+        let permit = fence.accept("a", origin).unwrap();
+        fence.mint(permit, (100, "account")).unwrap();
+        fence.acquire("a").unwrap().0
     }
 
     #[test]
-    fn r13_wait_proof_equal_walltime_release_fences_old_origin() {
-        let fence = WaitProofs::new(2);
-        let old = fence.capture("a").unwrap();
-        let walltime = 100;
-        fence.invalidate("a", || walltime).unwrap();
+    fn n5a_origin_http_poll_share_checked_pre_send_order() {
+        let fence = WaitProofs::<Evidence>::new(1);
+        let first = fence.capture("a", ReportSource::HttpAttempt).unwrap();
+        let second = fence.capture("a", ReportSource::UsagePoll).unwrap();
+        let retry = fence.capture("a", ReportSource::HttpAttempt).unwrap();
+        assert_eq!((first.ordinal, second.ordinal, retry.ordinal), (1, 2, 3));
+        assert_eq!(first.source, ReportSource::HttpAttempt);
+        assert_eq!(second.source, ReportSource::UsagePoll);
+        assert_eq!(first.clone().ordinal, first.ordinal);
+        assert!(matches!(fence.acquire("a"), Err(FenceError::NoProof)));
+    }
+
+    #[test]
+    fn n5a_origin_newer_partial_blocks_older_full_and_revokes_previous_proof() {
+        let fence = WaitProofs::new(1);
+        let prior = proven(&fence);
+        let a = fence.capture("a", ReportSource::HttpAttempt).unwrap();
+        let b = fence.capture("a", ReportSource::UsagePoll).unwrap();
+        let partial = fence.accept("a", b).unwrap();
+        drop(partial); // Native partial classification returns no compact proof.
+        assert!(matches!(fence.accept("a", a), Err(FenceError::Stale)));
+        assert!(matches!(fence.acquire("a"), Err(FenceError::NoProof)));
+        assert!(fence.admit(&prior).is_err());
+    }
+
+    #[test]
+    fn n5a_origin_newer_full_survives_older_completion() {
+        let fence = WaitProofs::new(1);
+        let a = fence.capture("a", ReportSource::HttpAttempt).unwrap();
+        let b = fence.capture("a", ReportSource::UsagePoll).unwrap();
+        let permit = fence.accept("a", b).unwrap();
+        fence.mint(permit, (100, "account")).unwrap();
+        let ticket = fence.acquire("a").unwrap().0;
+        assert!(matches!(fence.accept("a", a), Err(FenceError::Stale)));
+        assert_eq!(*fence.admit(&ticket).unwrap(), (100, "account"));
+    }
+
+    #[test]
+    fn n5a_origin_newer_partial_revokes_an_older_unpublished_permit() {
+        let fence = WaitProofs::new(1);
+        let a = fence.capture("a", ReportSource::HttpAttempt).unwrap();
+        let b = fence.capture("a", ReportSource::UsagePoll).unwrap();
+        let earlier = fence.accept("a", a).unwrap();
+        drop(fence.accept("a", b).unwrap());
         assert_eq!(
-            fence.mint(old, (walltime, "account", 7)),
+            fence.mint(earlier, (100, "account")),
             Err(FenceError::Stale)
         );
+        assert!(matches!(fence.acquire("a"), Err(FenceError::NoProof)));
+    }
+
+    #[test]
+    fn n5a_origin_permit_crosses_only_its_own_epoch_without_recapture() {
+        let fence = WaitProofs::new(1);
+        let previous = proven(&fence);
+        let unrelated = fence.capture("a", ReportSource::HttpAttempt).unwrap();
+        let introducing = fence.capture("a", ReportSource::UsagePoll).unwrap();
+        let duplicate = introducing.clone();
+        let ordinal = introducing.ordinal;
+        let epoch = introducing.epoch;
+        let permit = fence.accept("a", introducing).unwrap();
+        let permit = fence.invalidate_accepted(permit).unwrap();
+        assert_eq!(permit.origin.ordinal, ordinal);
+        assert_eq!(permit.origin.epoch, epoch);
+        assert_eq!(permit.epoch, epoch + 1);
+        fence.mint(permit, (100, "account")).unwrap();
         assert!(matches!(
-            fence.acquire("a", |_| Some(())),
-            Err(FenceError::NoProof)
+            fence.accept("a", unrelated),
+            Err(FenceError::Stale)
         ));
-        proven(&fence);
-    }
-
-    #[test]
-    fn r13_wait_proof_unknown_rejection_invalidates_same_tuple() {
-        let fence = WaitProofs::new(1);
-        let ticket = proven(&fence);
-        let delayed = fence.capture("a").unwrap();
-        fence.invalidate("a", || ()).unwrap();
-        assert_eq!(fence.admit(&ticket, |_| Some(())), Err(FenceError::Stale));
-        assert_eq!(
-            fence.mint(delayed, (100, "account", 7)),
-            Err(FenceError::Stale)
-        );
-    }
-
-    #[test]
-    fn r13_wait_proof_failed_write_keeps_invalidation() {
-        let fence = WaitProofs::new(1);
-        let ticket = proven(&fence);
-        let old = fence.capture("a").unwrap();
-        assert_eq!(
-            fence.invalidate("a", || Err::<(), _>("write failed")),
-            Ok(Err("write failed"))
-        );
-        assert_eq!(fence.admit(&ticket, |_| Some(())), Err(FenceError::Stale));
-        assert_eq!(fence.mint(old, (100, "account", 7)), Err(FenceError::Stale));
-    }
-
-    #[test]
-    fn r13_wait_proof_process_restart_rejects_old_origin_and_ticket() {
-        let previous = WaitProofs::new(1);
-        let ticket = proven(&previous);
-        let old = previous.capture("a").unwrap();
-        drop(previous);
-        let restarted = WaitProofs::new(1);
-        let current = restarted.capture("a").unwrap();
         assert!(matches!(
-            restarted.acquire("a", |_| Some(())),
-            Err(FenceError::NoProof)
+            fence.accept("a", duplicate),
+            Err(FenceError::Stale)
         ));
-        assert_eq!(
-            restarted.mint(old, (100, "account", 7)),
-            Err(FenceError::Stale)
-        );
-        restarted.mint(current, (100, "account", 7)).unwrap();
-        assert_eq!(
-            restarted.admit(&ticket, |_| Some(())),
-            Err(FenceError::Stale)
-        );
+        assert_eq!(fence.admit(&previous).unwrap_err(), FenceError::Stale);
+        assert_eq!(fence.state.lock().unwrap().entries["a"].issued, ordinal);
+        let ticket = fence.acquire("a").unwrap().0;
+        assert_eq!(*fence.admit(&ticket).unwrap(), (100, "account"));
     }
 
     #[test]
-    fn r13_wait_proof_retire_readd_rejects_old_incarnation() {
+    fn n5a_origin_external_release_after_own_rotation_revokes_permit() {
         let fence = WaitProofs::new(1);
-        let ticket = proven(&fence);
-        let old = fence.capture("a").unwrap();
-        assert_eq!(fence.retire("a"), Ok(true));
-        proven(&fence);
-        assert_eq!(fence.mint(old, (100, "account", 7)), Err(FenceError::Stale));
-        assert_eq!(fence.admit(&ticket, |_| Some(())), Err(FenceError::Stale));
+        let origin = fence.capture("a", ReportSource::UsagePoll).unwrap();
+        let permit = fence.accept("a", origin).unwrap();
+        let permit = fence.invalidate_accepted(permit).unwrap();
+        fence.invalidate("a").unwrap();
+        assert_eq!(fence.mint(permit, (100, "account")), Err(FenceError::Stale));
+        assert!(matches!(fence.acquire("a"), Err(FenceError::NoProof)));
+        proven(&fence); // A genuinely new post-release send is the positive control.
     }
 
     #[test]
-    fn r13_wait_proof_capacity_never_evicts_live_proof() {
-        let fence = WaitProofs::new(1);
-        let ticket = proven(&fence);
-        assert!(matches!(fence.capture("b"), Err(FenceError::Capacity)));
-        assert_eq!(fence.admit(&ticket, |e| Some(*e)), Ok((100, "account", 7)));
-        fence.retire("a").unwrap();
-        assert!(fence.capture("b").is_ok());
+    fn n5a_origin_cancelled_failed_write_and_duplicate_do_not_rewind_watermark() {
+        let fence = WaitProofs::<Evidence>::new(1);
+        let origin = fence.capture("a", ReportSource::UsagePoll).unwrap();
+        let repeated = origin.clone();
+        let permit = fence.accept("a", origin).unwrap();
+        let permit = fence.invalidate_accepted(permit).unwrap();
+        drop(permit); // Native persistence failed; publication is skipped.
         assert!(matches!(
-            WaitProofs::<()>::new(0).capture("a"),
+            fence.accept("a", repeated),
+            Err(FenceError::Stale)
+        ));
+        assert!(matches!(fence.acquire("a"), Err(FenceError::NoProof)));
+        assert_eq!(fence.state.lock().unwrap().entries["a"].accepted, 1);
+    }
+
+    #[test]
+    fn n5a_origin_equal_walltime_never_resurrects_pre_release_report() {
+        let fence = WaitProofs::new(1);
+        let old = fence.capture("a", ReportSource::HttpAttempt).unwrap();
+        let walltime_and_payload = (100, "account");
+        fence.invalidate("a").unwrap();
+        assert!(matches!(fence.accept("a", old), Err(FenceError::Stale)));
+        let fresh = fence.capture("a", ReportSource::HttpAttempt).unwrap();
+        let permit = fence.accept("a", fresh).unwrap();
+        fence.mint(permit, walltime_and_payload).unwrap();
+        assert_eq!(*fence.acquire("a").unwrap().1, walltime_and_payload);
+    }
+
+    #[test]
+    fn n5a_origin_restart_retire_and_wrong_account_are_fail_closed() {
+        let old = WaitProofs::new(1);
+        let old_ticket = proven(&old);
+        let old_origin = old.capture("a", ReportSource::UsagePoll).unwrap();
+        let foreign = old.capture("a", ReportSource::UsagePoll).unwrap();
+        let current = WaitProofs::new(1);
+        let current_ticket = proven(&current);
+        assert!(matches!(
+            current.accept("a", foreign),
+            Err(FenceError::Stale)
+        ));
+        assert_eq!(*current.admit(&current_ticket).unwrap(), (100, "account"));
+        assert_eq!(current.admit(&old_ticket).unwrap_err(), FenceError::Stale);
+        old.retire("a").unwrap();
+        proven(&old);
+        assert!(matches!(
+            old.accept("a", old_origin),
+            Err(FenceError::Stale)
+        ));
+        assert_eq!(old.admit(&old_ticket).unwrap_err(), FenceError::Stale);
+        let origin = current.capture("a", ReportSource::HttpAttempt).unwrap();
+        assert!(matches!(
+            current.accept("b", origin.clone()),
+            Err(FenceError::Stale)
+        ));
+        assert!(current.accept("a", origin).is_ok());
+    }
+
+    #[test]
+    fn n5a_origin_counter_exhaustion_revokes_without_wrap_or_eviction() {
+        let fence = WaitProofs::new(1);
+        fence.capture("a", ReportSource::UsagePoll).unwrap();
+        fence
+            .state
+            .lock()
+            .unwrap()
+            .entries
+            .get_mut("a")
+            .unwrap()
+            .issued = u64::MAX - 1;
+        let last = fence.capture("a", ReportSource::HttpAttempt).unwrap();
+        assert_eq!(last.ordinal, u64::MAX);
+        let permit = fence.accept("a", last).unwrap();
+        fence.mint(permit, (100, "account")).unwrap();
+        let ticket = fence.acquire("a").unwrap().0;
+        assert!(matches!(
+            fence.capture("a", ReportSource::UsagePoll),
+            Err(FenceError::Exhausted)
+        ));
+        assert_eq!(fence.admit(&ticket).unwrap_err(), FenceError::Stale);
+        assert!(matches!(fence.acquire("a"), Err(FenceError::Exhausted)));
+        assert!(matches!(
+            fence.capture("b", ReportSource::UsagePoll),
             Err(FenceError::Capacity)
         ));
-        assert!(matches!(fence.capture(""), Err(FenceError::InvalidId)));
-        assert!(matches!(
-            fence.capture(&"a".repeat(MAX_ID_BYTES + 1)),
-            Err(FenceError::InvalidId)
-        ));
-    }
-
-    #[test]
-    fn r13_wait_proof_generation_overflow_fails_closed() {
-        let fence = WaitProofs::new(1);
-        proven(&fence);
-        fence
-            .entries
-            .lock()
-            .unwrap()
-            .get_mut("a")
-            .unwrap()
-            .generation = Some(u64::MAX);
-        let old = fence.capture("a").unwrap();
-        assert_eq!(
-            fence.invalidate("a", || -> () { panic!("must not publish") }),
-            Err(FenceError::Exhausted)
-        );
-        assert_eq!(fence.mint(old, (100, "account", 7)), Err(FenceError::Stale));
-        assert!(matches!(fence.capture("a"), Err(FenceError::Exhausted)));
-        assert!(matches!(
-            fence.acquire("a", |_| Some(())),
-            Err(FenceError::Exhausted)
-        ));
-    }
-
-    #[test]
-    fn r13_wait_proof_replacement_and_runtime_validator_are_checked() {
-        let fence = WaitProofs::new(1);
-        let ticket = proven(&fence);
-        assert_eq!(
-            fence.admit(&ticket, |_| None::<()>),
-            Err(FenceError::Rejected)
-        );
-        assert!(matches!(
-            fence.acquire("a", |_| None::<()>),
-            Err(FenceError::Rejected)
-        ));
-        proven(&fence);
-        assert_eq!(
-            fence.admit(&ticket, |_| -> Option<()> { panic!("stale callback") }),
-            Err(FenceError::Stale)
-        );
-    }
-
-    #[test]
-    fn r13_wait_proof_check_and_admission_are_linearized_with_invalidation() {
-        let fence = WaitProofs::new(1);
-        let ticket = proven(&fence);
-        let checked = Barrier::new(2);
-        let publish = Barrier::new(2);
-        let invalidate_started = Barrier::new(2);
-        std::thread::scope(|scope| {
-            let admission = scope.spawn(|| {
-                fence.admit(&ticket, |_| {
-                    checked.wait();
-                    publish.wait();
-                    Some("published before invalidation")
-                })
-            });
-            checked.wait();
-            let invalidation = scope.spawn(|| {
-                invalidate_started.wait();
-                fence.invalidate("a", || ())
-            });
-            invalidate_started.wait();
-            assert!(matches!(
-                fence.entries.try_lock(),
-                Err(TryLockError::WouldBlock)
-            ));
-            publish.wait();
-            assert_eq!(
-                admission.join().unwrap(),
-                Ok("published before invalidation")
-            );
-            assert_eq!(invalidation.join().unwrap(), Ok(()));
-        });
-        assert_eq!(
-            fence.admit(&ticket, |_| -> Option<()> {
-                panic!("must not publish after invalidation")
-            }),
-            Err(FenceError::Stale)
-        );
-    }
-
-    #[test]
-    fn r13_wait_proof_pre_release_inflight_origin_stale_at_identical_walltime() {
-        let fence = WaitProofs::new(1);
-        let evidence = (100, "account", 7);
-        let old = fence.capture("a").unwrap();
-        fence.mint(old.clone(), evidence).unwrap();
-        let old_ticket = fence.acquire("a", |_| Some(())).unwrap().0;
-        let in_flight = Barrier::new(2);
-        let release_committed = Barrier::new(2);
-        std::thread::scope(|scope| {
-            let report = scope.spawn(|| {
-                // Origin was captured before this simulated operation begins.
-                in_flight.wait();
-                release_committed.wait();
-                fence.mint(old, evidence)
-            });
-            in_flight.wait();
-            // Release/application/report timestamps and evidence are identical.
-            assert_eq!(fence.invalidate("a", || evidence.0), Ok(100));
-            release_committed.wait();
-            assert_eq!(report.join().unwrap(), Err(FenceError::Stale));
-        });
-        assert_eq!(
-            fence.admit(&old_ticket, |_| Some(())),
-            Err(FenceError::Stale)
-        );
-        let fresh = fence.capture("a").unwrap();
-        fence.mint(fresh, evidence).unwrap();
-        let new_ticket = fence.acquire("a", |_| Some(())).unwrap().0;
-        assert_eq!(fence.admit(&new_ticket, |e| Some(*e)), Ok(evidence));
-        assert_eq!(
-            fence.admit(&old_ticket, |_| Some(())),
-            Err(FenceError::Stale)
-        );
-    }
-
-    #[test]
-    fn r13_wait_proof_cloned_ws_origin_gets_independent_receipts_and_tickets() {
-        let fence = WaitProofs::new(1);
-        let origin = fence.capture("a").unwrap();
-        let repeated = origin.clone();
-        let evidence = (100, "account", 7);
-        fence.mint(origin.clone(), evidence).unwrap();
-        let first = fence.acquire("a", |_| Some(())).unwrap().0;
-        // Merely cloning/capturing never refreshes or replaces a proof.
-        let another_capture = fence.capture("a").unwrap();
-        assert_eq!(fence.admit(&first, |e| Some(*e)), Ok(evidence));
-        fence.mint(repeated.clone(), evidence).unwrap();
-        let second = fence.acquire("a", |_| Some(())).unwrap().0;
-        assert!(!first.proof.same(&second.proof));
-        assert_eq!(
-            fence.admit(&first, |_| panic!("old receipt callback")),
-            Err::<(), _>(FenceError::Stale)
-        );
-        assert_eq!(fence.admit(&second, |e| Some(*e)), Ok(evidence));
-        // Even another clone of the exact same pre-network operation yields
-        // a new receipt. No pointer/evidence/timestamp equality grants reuse.
-        fence.mint(origin, evidence).unwrap();
-        let third = fence.acquire("a", |_| Some(())).unwrap().0;
-        assert!(!second.proof.same(&third.proof));
-        assert_eq!(fence.admit(&second, |_| Some(())), Err(FenceError::Stale));
-        assert_eq!(fence.admit(&third, |e| Some(*e)), Ok(evidence));
-        fence.invalidate("a", || ()).unwrap();
-        assert_eq!(fence.mint(repeated, evidence), Err(FenceError::Stale));
-        assert_eq!(
-            fence.mint(another_capture, evidence),
-            Err(FenceError::Stale)
-        );
-    }
-
-    #[test]
-    fn r13_wait_proof_other_runtime_cannot_replace_current_same_account_proof() {
-        let first_runtime = WaitProofs::new(1);
-        let other_runtime = WaitProofs::new(1);
-        let first_ticket = proven(&first_runtime);
-        let other_ticket = proven(&other_runtime);
-        let foreign = first_runtime.capture("a").unwrap();
-        assert_eq!(
-            other_runtime.mint(foreign, (100, "account", 7)),
-            Err(FenceError::Stale)
-        );
-        assert_eq!(
-            other_runtime.admit(&first_ticket, |_| Some(())),
-            Err(FenceError::Stale)
-        );
-        assert_eq!(
-            first_runtime.admit(&other_ticket, |_| Some(())),
-            Err(FenceError::Stale)
-        );
-        // A rejected cross-owner mint cannot replace the rightful receipt.
-        assert_eq!(
-            other_runtime.admit(&other_ticket, |e| Some(*e)),
-            Ok((100, "account", 7))
-        );
-    }
-
-    #[test]
-    fn r13_wait_proof_last_generation_then_exhaustion_never_wraps_or_publishes() {
-        let fence = WaitProofs::new(1);
-        fence.capture("a").unwrap();
-        fence
-            .entries
-            .lock()
-            .unwrap()
-            .get_mut("a")
-            .unwrap()
-            .generation = Some(u64::MAX - 1);
-        let prior = fence.capture("a").unwrap();
-        assert_eq!(
-            fence.invalidate("a", || "last generation"),
-            Ok("last generation")
-        );
-        assert_eq!(
-            fence.mint(prior, (100, "account", 7)),
-            Err(FenceError::Stale)
-        );
-        let last = fence.capture("a").unwrap();
-        assert_eq!(last.generation, u64::MAX);
-        fence.mint(last.clone(), (100, "account", 7)).unwrap();
-        let ticket = fence.acquire("a", |_| Some(())).unwrap().0;
-        assert_eq!(
-            fence.invalidate("a", || panic!("overflow must not publish")),
-            Err::<(), _>(FenceError::Exhausted)
-        );
-        assert!(fence.entries.lock().unwrap()["a"].proof.is_none());
-        assert!(matches!(fence.capture("a"), Err(FenceError::Exhausted)));
-        assert_eq!(
-            fence.mint(last.clone(), (100, "account", 7)),
-            Err(FenceError::Stale)
-        );
-        assert_eq!(fence.admit(&ticket, |_| Some(())), Err(FenceError::Stale));
-        assert_eq!(fence.invalidate("a", || ()), Err(FenceError::Exhausted));
-        // Lifecycle retirement restores capacity, never the old incarnation.
         fence.retire("a").unwrap();
-        proven(&fence);
-        assert_eq!(
-            fence.mint(last, (100, "account", 7)),
-            Err(FenceError::Stale)
-        );
+        let first_new_incarnation = fence.capture("a", ReportSource::UsagePoll).unwrap();
+        assert_eq!(first_new_incarnation.ordinal, 1);
     }
 
     #[test]
-    fn r13_wait_proof_capacity_and_missing_errors_do_not_mutate_other_proof() {
+    fn n5a_origin_epoch_exhaustion_and_second_own_rotation_deny_authority() {
+        let fence = WaitProofs::<Evidence>::new(1);
+        fence.capture("a", ReportSource::UsagePoll).unwrap();
+        fence
+            .state
+            .lock()
+            .unwrap()
+            .entries
+            .get_mut("a")
+            .unwrap()
+            .epoch = Some(u64::MAX);
+        let last = fence.capture("a", ReportSource::UsagePoll).unwrap();
+        let permit = fence.accept("a", last).unwrap();
+        assert!(matches!(
+            fence.invalidate_accepted(permit),
+            Err(FenceError::Exhausted)
+        ));
+        assert!(matches!(fence.acquire("a"), Err(FenceError::Exhausted)));
+        fence.retire("a").unwrap();
+        let origin = fence.capture("a", ReportSource::UsagePoll).unwrap();
+        let permit = fence.accept("a", origin).unwrap();
+        let permit = fence.invalidate_accepted(permit).unwrap();
+        assert!(matches!(
+            fence.invalidate_accepted(permit),
+            Err(FenceError::Rejected)
+        ));
+        assert!(matches!(fence.acquire("a"), Err(FenceError::NoProof)));
+    }
+
+    #[test]
+    fn n5a_origin_bounds_missing_and_poison_never_create_authority() {
         let fence = WaitProofs::<Evidence>::new(usize::MAX);
         assert_eq!(fence.capacity, MAX_ENTRIES);
-        let tiny = WaitProofs::new(1);
-        let ticket = proven(&tiny);
-        assert_eq!(
-            tiny.invalidate("absent", || panic!("missing must not publish")),
-            Err::<(), _>(FenceError::Missing)
-        );
-        assert!(matches!(tiny.capture("b"), Err(FenceError::Capacity)));
-        assert_eq!(tiny.admit(&ticket, |e| Some(*e)), Ok((100, "account", 7)));
-        assert_eq!(tiny.retire("absent"), Ok(false));
-        assert_eq!(tiny.retire("a"), Ok(true));
-        let next = tiny.capture("b").unwrap();
-        tiny.mint(next, (100, "account", 7)).unwrap();
-        assert_eq!(tiny.admit(&ticket, |_| Some(())), Err(FenceError::Missing));
-    }
-
-    #[test]
-    fn r13_wait_proof_panicking_publication_poison_fails_closed() {
-        let fence = WaitProofs::new(1);
+        for bad in [String::new(), "\u{00e9}".repeat(MAX_ID_BYTES / 2 + 1)] {
+            assert!(matches!(
+                fence.capture(&bad, ReportSource::UsagePoll),
+                Err(FenceError::InvalidId)
+            ));
+        }
+        assert!(fence.state.lock().unwrap().entries.is_empty());
+        assert_eq!(fence.invalidate("missing"), Err(FenceError::Missing));
+        assert_eq!(fence.retire("missing"), Ok(false));
+        assert!(matches!(
+            WaitProofs::<Evidence>::new(0).capture("a", ReportSource::UsagePoll),
+            Err(FenceError::Capacity)
+        ));
         let ticket = proven(&fence);
-        let pending = fence.capture("a").unwrap();
+        let origin = fence.capture("a", ReportSource::UsagePoll).unwrap();
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = fence.invalidate("a", || panic!("synthetic publication panic"));
+            let _guard = fence.state.lock().unwrap();
+            panic!("synthetic registry poison");
         }));
         assert!(panic.is_err());
-        assert!(matches!(fence.capture("a"), Err(FenceError::Poisoned)));
-        assert_eq!(
-            fence.mint(pending, (100, "account", 7)),
-            Err(FenceError::Poisoned)
-        );
-        assert_eq!(
-            fence.admit(&ticket, |_| Some(())),
-            Err(FenceError::Poisoned)
-        );
         assert!(matches!(
-            fence.acquire("a", |_| Some(())),
+            fence.accept("a", origin),
             Err(FenceError::Poisoned)
         ));
+        assert_eq!(fence.admit(&ticket).unwrap_err(), FenceError::Poisoned);
+        assert_eq!(fence.invalidate("a"), Err(FenceError::Poisoned));
+    }
+
+    struct DropProbe {
+        owner: Weak<WaitProofs<DropProbe>>,
+        drops: Arc<AtomicUsize>,
+    }
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            if let Some(owner) = self.owner.upgrade() {
+                assert!(
+                    !matches!(
+                        owner.state.try_lock(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    ),
+                    "payload drop held registry mutex"
+                );
+            }
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    fn publish_probe(fence: &Arc<WaitProofs<DropProbe>>, drops: &Arc<AtomicUsize>) {
+        let origin = fence.capture("a", ReportSource::UsagePoll).unwrap();
+        let permit = fence.accept("a", origin).unwrap();
+        fence
+            .mint(
+                permit,
+                DropProbe {
+                    owner: Arc::downgrade(fence),
+                    drops: Arc::clone(drops),
+                },
+            )
+            .unwrap();
     }
 
     #[test]
-    fn r13_wait_proof_oversized_utf8_identifier_does_not_consume_capacity() {
+    fn n5a_origin_payload_destruction_never_runs_under_registry_mutex() {
+        let fence = Arc::new(WaitProofs::new(1));
+        let drops = Arc::new(AtomicUsize::new(0));
+        publish_probe(&fence, &drops);
+        fence.invalidate("a").unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        publish_probe(&fence, &drops);
+        let next = fence.capture("a", ReportSource::HttpAttempt).unwrap();
+        drop(fence.accept("a", next).unwrap());
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+        publish_probe(&fence, &drops);
+        fence.retire("a").unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 3);
+        publish_probe(&fence, &drops);
+        fence
+            .state
+            .lock()
+            .unwrap()
+            .entries
+            .get_mut("a")
+            .unwrap()
+            .issued = u64::MAX;
+        assert!(matches!(
+            fence.capture("a", ReportSource::UsagePoll),
+            Err(FenceError::Exhausted)
+        ));
+        assert_eq!(drops.load(Ordering::SeqCst), 4);
+        fence.retire("a").unwrap();
+        let origin = fence.capture("a", ReportSource::UsagePoll).unwrap();
+        let permit = fence.accept("a", origin).unwrap();
+        fence.invalidate("a").unwrap();
+        assert_eq!(
+            fence.mint(
+                permit,
+                DropProbe {
+                    owner: Arc::downgrade(&fence),
+                    drops: Arc::clone(&drops)
+                }
+            ),
+            Err(FenceError::Stale)
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 5);
+    }
+    #[test]
+    fn n5a_origin_close_is_sticky_for_origins_tickets_and_permits() {
+        let fence = WaitProofs::new(3);
+        let ticket = proven(&fence);
+        let evidence = fence.admit(&ticket).unwrap();
+        let origin = fence.capture("a", ReportSource::HttpAttempt).unwrap();
+        let b = fence.capture("b", ReportSource::UsagePoll).unwrap();
+        let mint = fence.accept("b", b).unwrap();
+        let c = fence.capture("c", ReportSource::UsagePoll).unwrap();
+        let rotate = fence.accept("c", c).unwrap();
+        fence.close().unwrap();
+        assert!(fence.state.lock().unwrap().entries.is_empty());
+        assert_eq!(*evidence, (100, "account"));
+        assert_eq!(fence.admit(&ticket).unwrap_err(), FenceError::Closed);
+        assert_eq!(fence.accept("a", origin).unwrap_err(), FenceError::Closed);
+        assert_eq!(fence.mint(mint, (100, "account")), Err(FenceError::Closed));
+        assert_eq!(
+            fence.invalidate_accepted(rotate).unwrap_err(),
+            FenceError::Closed
+        );
+        assert_eq!(fence.acquire("a").unwrap_err(), FenceError::Closed);
+        assert_eq!(fence.invalidate("a"), Err(FenceError::Closed));
+        assert_eq!(fence.retire("a"), Err(FenceError::Closed));
+        fence.close().unwrap();
+        assert_eq!(
+            fence.capture("fresh", ReportSource::UsagePoll).unwrap_err(),
+            FenceError::Closed
+        );
+    }
+
+    #[test]
+    fn n5a_origin_close_drops_evidence_outside_mutex() {
+        let fence = Arc::new(WaitProofs::new(1));
+        let drops = Arc::new(AtomicUsize::new(0));
+        publish_probe(&fence, &drops);
+        fence.close().unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        fence.close().unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn n5a_origin_unknown_rejection_and_failed_write_keep_old_authority_revoked() {
+        for failed_write in [false, true] {
+            let fence = WaitProofs::new(1);
+            let ticket = proven(&fence);
+            let origin = fence.capture("a", ReportSource::HttpAttempt).unwrap();
+            let same_payload = (100, "account");
+            fence.invalidate("a").unwrap();
+            // Either an unknown quota rejection or a native failure AFTER
+            // pre-invalidation. Neither can restore the old report or ticket.
+            let native_result: Result<(), ()> = if failed_write { Err(()) } else { Ok(()) };
+            assert_eq!(native_result.is_err(), failed_write);
+            assert_eq!(fence.accept("a", origin).unwrap_err(), FenceError::Stale);
+            assert_eq!(fence.admit(&ticket).unwrap_err(), FenceError::Stale);
+            assert_eq!(fence.acquire("a").unwrap_err(), FenceError::NoProof);
+            let fresh = fence.capture("a", ReportSource::HttpAttempt).unwrap();
+            let permit = fence.accept("a", fresh).unwrap();
+            fence.mint(permit, same_payload).unwrap();
+            assert_eq!(*fence.acquire("a").unwrap().1, same_payload);
+        }
+    }
+
+    #[test]
+    fn n5a_origin_capacity_and_missing_operations_preserve_live_resident() {
+        let fence = WaitProofs::new(1);
+        let resident = proven(&fence);
+        assert_eq!(
+            fence.capture("b", ReportSource::UsagePoll).unwrap_err(),
+            FenceError::Capacity
+        );
+        assert_eq!(fence.invalidate("missing"), Err(FenceError::Missing));
+        assert_eq!(fence.retire("missing"), Ok(false));
+        assert_eq!(*fence.admit(&resident).unwrap(), (100, "account"));
+        assert_eq!(fence.state.lock().unwrap().entries.len(), 1);
+        assert_eq!(fence.retire("a"), Ok(true));
+        let b = fence.capture("b", ReportSource::UsagePoll).unwrap();
+        let permit = fence.accept("b", b).unwrap();
+        fence.mint(permit, (100, "account")).unwrap();
+        assert!(fence.admit(&resident).is_err());
+        assert!(fence.acquire("b").is_ok());
+    }
+
+    #[test]
+    fn n5a_origin_equal_evidence_replacement_changes_ticket_without_epoch_rotation() {
+        let fence = WaitProofs::new(1);
+        let prior = proven(&fence);
+        let origin = fence.capture("a", ReportSource::UsagePoll).unwrap();
+        assert!(fence.admit(&prior).is_ok()); // Capture alone preserves proof.
+        let duplicate_before = origin.clone();
+        let duplicate_after = origin.clone();
+        let permit = fence.accept("a", origin).unwrap();
+        assert_eq!(
+            fence.accept("a", duplicate_before).unwrap_err(),
+            FenceError::Stale
+        );
+        fence.mint(permit, (100, "account")).unwrap();
+        let current = fence.acquire("a").unwrap().0;
+        assert_eq!(prior.epoch, current.epoch);
+        assert_eq!(
+            fence.accept("a", duplicate_after).unwrap_err(),
+            FenceError::Stale
+        );
+        assert_eq!(fence.admit(&prior).unwrap_err(), FenceError::Stale);
+        assert_eq!(*fence.admit(&current).unwrap(), (100, "account"));
+        let next = fence.capture("a", ReportSource::HttpAttempt).unwrap();
+        assert!(fence.admit(&current).is_ok());
+        let permit = fence.accept("a", next).unwrap();
+        fence.mint(permit, (100, "account")).unwrap();
+        assert_eq!(fence.admit(&current).unwrap_err(), FenceError::Stale);
+        assert!(fence.acquire("a").is_ok());
+    }
+
+    #[test]
+    fn n5a_origin_foreign_accepted_permits_cannot_rotate_or_mint() {
+        let rightful = WaitProofs::new(1);
+        let ticket = proven(&rightful);
+        let foreign = WaitProofs::<Evidence>::new(1);
+        let origin = foreign.capture("a", ReportSource::UsagePoll).unwrap();
+        let rotate = foreign.accept("a", origin).unwrap();
+        assert_eq!(
+            rightful.invalidate_accepted(rotate).unwrap_err(),
+            FenceError::Stale
+        );
+        let origin = foreign.capture("a", ReportSource::UsagePoll).unwrap();
+        let mint = foreign.accept("a", origin).unwrap();
+        assert_eq!(
+            rightful.mint(mint, (100, "account")),
+            Err(FenceError::Stale)
+        );
+        assert_eq!(*rightful.admit(&ticket).unwrap(), (100, "account"));
+    }
+
+    #[test]
+    fn n5a_origin_external_epoch_last_value_exhaustion_and_readd() {
+        let fence = WaitProofs::new(1);
+        fence.capture("a", ReportSource::UsagePoll).unwrap();
+        fence
+            .state
+            .lock()
+            .unwrap()
+            .entries
+            .get_mut("a")
+            .unwrap()
+            .epoch = Some(u64::MAX - 1);
+        let before = proven(&fence);
+        let old_origin = fence.capture("a", ReportSource::HttpAttempt).unwrap();
+        fence.invalidate("a").unwrap();
+        assert_eq!(
+            fence.state.lock().unwrap().entries["a"].epoch,
+            Some(u64::MAX)
+        );
+        let last = proven(&fence);
+        let last_origin = fence.capture("a", ReportSource::UsagePoll).unwrap();
+        assert_eq!(last.epoch, u64::MAX);
+        assert_eq!(fence.invalidate("a"), Err(FenceError::Exhausted));
+        assert_eq!(fence.invalidate("a"), Err(FenceError::Exhausted));
+        assert_eq!(fence.acquire("a").unwrap_err(), FenceError::Exhausted);
+        for ticket in [&before, &last] {
+            assert_eq!(fence.admit(ticket).unwrap_err(), FenceError::Stale);
+        }
+        assert_eq!(
+            fence.accept("a", old_origin.clone()).unwrap_err(),
+            FenceError::Stale
+        );
+        fence.retire("a").unwrap();
+        let current = proven(&fence);
+        for origin in [old_origin, last_origin] {
+            assert_eq!(fence.accept("a", origin).unwrap_err(), FenceError::Stale);
+        }
+        assert_eq!(fence.admit(&last).unwrap_err(), FenceError::Stale);
+        assert!(fence.admit(&current).is_ok());
+    }
+
+    #[test]
+    fn n5a_origin_exact_utf8_boundary_and_zero_capacity() {
+        let fence = WaitProofs::new(1);
+        let id = "\u{00e9}".repeat(MAX_ID_BYTES / 2);
+        assert_eq!(id.len(), MAX_ID_BYTES);
+        let origin = fence.capture(&id, ReportSource::UsagePoll).unwrap();
+        let permit = fence.accept(&id, origin).unwrap();
+        fence.mint(permit, (100, "account")).unwrap();
+        let ticket = fence.acquire(&id).unwrap().0;
+        assert_eq!(
+            fence.capture("other", ReportSource::UsagePoll).unwrap_err(),
+            FenceError::Capacity
+        );
+        assert_eq!(*fence.admit(&ticket).unwrap(), (100, "account"));
+        let zero = WaitProofs::<Evidence>::new(0);
+        assert_eq!(
+            zero.capture("a", ReportSource::UsagePoll).unwrap_err(),
+            FenceError::Capacity
+        );
+        assert_eq!(zero.acquire("a").unwrap_err(), FenceError::Missing);
+        assert_eq!(zero.retire("a"), Ok(false));
+        assert!(zero.state.lock().unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn n5a_origin_inflight_release_barrier_rejects_delayed_completion() {
+        use std::{sync::mpsc, thread, time::Duration};
+        let fence = Arc::new(WaitProofs::new(1));
+        let prior = proven(&fence);
+        let (sent, captured) = mpsc::sync_channel(0);
+        let (released, resume) = mpsc::sync_channel(0);
+        let worker = Arc::clone(&fence);
+        let inflight = thread::spawn(move || {
+            let origin = worker.capture("a", ReportSource::HttpAttempt).unwrap();
+            sent.send(()).unwrap(); // Pre-send origin captured, completion delayed.
+            resume.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(worker.accept("a", origin).unwrap_err(), FenceError::Stale);
+            let fresh = worker.capture("a", ReportSource::HttpAttempt).unwrap();
+            let permit = worker.accept("a", fresh).unwrap();
+            worker.mint(permit, (100, "account")).unwrap();
+        });
+        captured.recv_timeout(Duration::from_secs(5)).unwrap();
+        fence.invalidate("a").unwrap();
+        assert_eq!(fence.admit(&prior).unwrap_err(), FenceError::Stale);
+        released.send(()).unwrap();
+        inflight.join().unwrap();
+        assert_eq!(*fence.acquire("a").unwrap().1, (100, "account"));
+    }
+
+    #[test]
+    fn n5a_origin_close_before_delayed_registry_admission_is_observed() {
+        use std::{sync::mpsc, thread, time::Duration};
+        let fence = Arc::new(WaitProofs::new(1));
+        let ticket = proven(&fence);
+        let (ready, waiting) = mpsc::sync_channel(0);
+        let (closed, resume) = mpsc::sync_channel(0);
+        let worker = Arc::clone(&fence);
+        let admission = thread::spawn(move || {
+            ready.send(()).unwrap();
+            resume.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(worker.admit(&ticket).unwrap_err(), FenceError::Closed);
+        });
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        fence.close().unwrap();
+        closed.send(()).unwrap();
+        admission.join().unwrap();
+        // This is the registry barrier only, NOT native outer-store publication.
+    }
+
+    #[test]
+    fn n5a_origin_poison_rejects_capture_mint_acquire_and_close() {
         let fence = WaitProofs::<Evidence>::new(1);
-        // The identifier bound is bytes, not Unicode scalar count.
-        let exact = "\u{00e9}".repeat(MAX_ID_BYTES / 2);
-        let too_long = format!("{exact}x");
-        assert!(matches!(fence.capture(""), Err(FenceError::InvalidId)));
-        assert!(matches!(
-            fence.capture(&too_long),
-            Err(FenceError::InvalidId)
-        ));
-        assert!(fence.entries.lock().unwrap().is_empty());
-        let origin = fence.capture(&exact).unwrap();
-        fence.mint(origin, (100, "account", 7)).unwrap();
-        assert!(matches!(fence.capture("b"), Err(FenceError::Capacity)));
-        let ticket = fence.acquire(&exact, |_| Some(())).unwrap().0;
-        assert_eq!(fence.admit(&ticket, |e| Some(*e)), Ok((100, "account", 7)));
+        let origin = fence.capture("a", ReportSource::UsagePoll).unwrap();
+        let permit = fence.accept("a", origin).unwrap();
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = fence.state.lock().unwrap();
+                panic!("synthetic poison");
+            }))
+            .is_err()
+        );
+        assert_eq!(
+            fence.capture("a", ReportSource::UsagePoll).unwrap_err(),
+            FenceError::Poisoned
+        );
+        assert_eq!(
+            fence.mint(permit, (100, "account")),
+            Err(FenceError::Poisoned)
+        );
+        assert_eq!(fence.acquire("a").unwrap_err(), FenceError::Poisoned);
+        assert_eq!(fence.close(), Err(FenceError::Poisoned));
     }
 
     #[test]
-    fn r13_wait_proof_zero_capacity_never_creates_authority() {
-        let fence = WaitProofs::<Evidence>::new(0);
-        assert!(matches!(fence.capture("a"), Err(FenceError::Capacity)));
-        assert!(matches!(
-            fence.acquire("a", |_| Some(())),
-            Err(FenceError::Missing)
-        ));
-        assert_eq!(fence.retire("a"), Ok(false));
-        assert!(fence.entries.lock().unwrap().is_empty());
+    fn n5a_origin_rejected_mint_payload_drop_is_unlocked_including_poison() {
+        for scenario in ["missing", "foreign", "poison", "closed"] {
+            let source = Arc::new(WaitProofs::<DropProbe>::new(1));
+            let foreign = Arc::new(WaitProofs::<DropProbe>::new(1));
+            let origin = source.capture("a", ReportSource::UsagePoll).unwrap();
+            let permit = source.accept("a", origin).unwrap();
+            let target = if scenario == "foreign" {
+                &foreign
+            } else {
+                &source
+            };
+            let expected = match scenario {
+                "missing" => {
+                    source.retire("a").unwrap();
+                    FenceError::Missing
+                }
+                "foreign" => {
+                    foreign.capture("a", ReportSource::UsagePoll).unwrap();
+                    FenceError::Stale
+                }
+                "closed" => {
+                    source.close().unwrap();
+                    FenceError::Closed
+                }
+                "poison" => {
+                    assert!(
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let _guard = source.state.lock().unwrap();
+                            panic!("synthetic poison");
+                        }))
+                        .is_err()
+                    );
+                    FenceError::Poisoned
+                }
+                _ => unreachable!(),
+            };
+            let drops = Arc::new(AtomicUsize::new(0));
+            assert_eq!(
+                target.mint(
+                    permit,
+                    DropProbe {
+                        owner: Arc::downgrade(target),
+                        drops: Arc::clone(&drops),
+                    }
+                ),
+                Err(expected)
+            );
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+        }
     }
 }

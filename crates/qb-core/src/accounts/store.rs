@@ -60,11 +60,56 @@ pub struct AccountStore {
     dir: PathBuf,
     gate: Mutex<()>,
     observer: Mutex<Option<AccountObserver>>,
+    pre_mutation: Mutex<Option<PreMutationHook>>,
     lease: Mutex<Option<Lease>>,
     writes_stopped: AtomicBool,
 }
 
 pub type AccountObserver = Arc<dyn Fn(&Account, &Health) + Send + Sync>;
+
+/// Internal revocation notification, never permission to publish a proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MetadataMutation {
+    Ordinary,
+    Release,
+    QuotaRejected,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BeforeAccountMutation<'a> {
+    Metadata {
+        id: &'a str,
+        cause: MetadataMutation,
+    },
+    HealthExpiry {
+        id: &'a str,
+    },
+    Settings {
+        id: &'a str,
+    },
+    FullSave {
+        id: &'a str,
+    },
+    Retire {
+        id: &'a str,
+    },
+    Stop,
+}
+
+/// The runtime adapter owns an Option<AcceptPermit> plus a weak proof owner.
+/// Consume/replace only that permit through its own invalidation; failure must
+/// leave it empty. No store access, I/O, awaits, panics, or retained references.
+/// This callback conveys no success authority to the store.
+pub(crate) trait ReportMutation {
+    fn before_store_mutation(&mut self, id: &str);
+}
+
+pub(crate) enum MetadataCause<'a> {
+    Mutation(MetadataMutation),
+    UsageReport(&'a mut dyn ReportMutation),
+}
+
+pub(crate) type PreMutationHook = Arc<dyn for<'a> Fn(BeforeAccountMutation<'a>) + Send + Sync>;
 
 impl AccountStore {
     pub fn home(&self) -> &Path {
@@ -125,6 +170,7 @@ impl AccountStore {
             dir,
             gate: Mutex::new(()),
             observer: Mutex::new(None),
+            pre_mutation: Mutex::new(None),
             lease: Mutex::new(Some(lease)),
             writes_stopped: AtomicBool::new(false),
         };
@@ -151,6 +197,7 @@ impl AccountStore {
     /// Serialize the final write boundary with all account transactions.
     pub fn stop_writes(&self) {
         let _guard = self.gate.lock().unwrap_or_else(|error| error.into_inner());
+        self.before_mutation(BeforeAccountMutation::Stop);
         self.writes_stopped.store(true, Ordering::Release);
     }
 
@@ -165,6 +212,39 @@ impl AccountStore {
             .observer
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(observer);
+    }
+
+    /// Caller holds transaction(), before any runtime producer is published.
+    /// Capture only Weak proof-owner state; replacing a live hook is unsupported.
+    pub(crate) fn set_pre_mutation_hook_unlocked(&self, hook: PreMutationHook) {
+        *self
+            .pre_mutation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(hook);
+    }
+
+    fn before_mutation(&self, mutation: BeforeAccountMutation<'_>) {
+        // Bound identifiers without moving any native error/return boundary.
+        let id = match mutation {
+            BeforeAccountMutation::Metadata { id, .. }
+            | BeforeAccountMutation::HealthExpiry { id }
+            | BeforeAccountMutation::Settings { id }
+            | BeforeAccountMutation::FullSave { id }
+            | BeforeAccountMutation::Retire { id } => Some(id),
+            BeforeAccountMutation::Stop => None,
+        };
+        if id.is_some_and(|id| self.path(id).is_err()) {
+            return;
+        }
+        let hook = self
+            .pre_mutation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        // The registration lock is released before invoking a leaf callback.
+        if let Some(hook) = hook {
+            hook(mutation);
+        }
     }
 
     fn notify(&self, account: &Account, previous: &Health) {
@@ -231,6 +311,7 @@ impl AccountStore {
     fn load_unlocked(&self, id: &str) -> Result<Account, StoreError> {
         let mut record = self.read(id)?;
         if !self.writes_stopped() && record.account.expire_health(chrono::Utc::now()) {
+            self.before_mutation(BeforeAccountMutation::HealthExpiry { id });
             let generation = record.account.generation;
             self.write_metadata_record(record, generation)
         } else {
@@ -258,6 +339,10 @@ impl AccountStore {
         update: impl FnOnce(&mut Account),
     ) -> Result<Account, StoreError> {
         let _guard = self.transaction()?;
+        self.before_mutation(BeforeAccountMutation::Metadata {
+            id,
+            cause: MetadataMutation::Ordinary,
+        });
         // Expire even when a stale token suppresses the requested transition.
         self.load_unlocked(id)?;
         let record = self.read(id)?;
@@ -276,6 +361,7 @@ impl AccountStore {
         update: impl FnOnce(&mut Account),
     ) -> Result<Account, StoreError> {
         let _guard = self.transaction()?;
+        self.before_mutation(BeforeAccountMutation::Settings { id });
         self.read(id)?;
         if drain.is_some() || allow_credits.is_some() {
             self.write_settings_unlocked(id, drain, allow_credits)?;
@@ -288,12 +374,38 @@ impl AccountStore {
         id: &str,
         update: impl FnOnce(&mut Account),
     ) -> Result<Account, StoreError> {
+        self.update_metadata_with_cause_unlocked(
+            id,
+            MetadataCause::Mutation(MetadataMutation::Ordinary),
+            update,
+        )
+    }
+
+    /// Caller holds transaction() through classification, persistence and mint.
+    pub(crate) fn update_metadata_with_cause_unlocked(
+        &self,
+        id: &str,
+        cause: MetadataCause<'_>,
+        update: impl FnOnce(&mut Account),
+    ) -> Result<Account, StoreError> {
+        match cause {
+            MetadataCause::Mutation(cause) => {
+                self.before_mutation(BeforeAccountMutation::Metadata { id, cause });
+            }
+            MetadataCause::UsageReport(report) => {
+                if self.path(id).is_ok() {
+                    report.before_store_mutation(id);
+                }
+            }
+        }
         let mut record = self.read(id)?;
         if self.writes_stopped() {
             return Ok(record.account);
         }
         let current = record.account.clone();
-        record.account.expire_health(chrono::Utc::now());
+        if record.account.expire_health(chrono::Utc::now()) {
+            self.before_mutation(BeforeAccountMutation::HealthExpiry { id });
+        }
         update(&mut record.account);
         Self::validate(&record.account)?;
         if record.account.id != current.id
@@ -368,6 +480,7 @@ impl AccountStore {
         expected: Option<u64>,
     ) -> Result<Account, StoreError> {
         use super::takeover::{Receipt, ReceiptState};
+        self.before_mutation(BeforeAccountMutation::FullSave { id: &account.id });
         let previous = match self.read(&account.id) {
             Ok(record) => record.takeover_receipt,
             Err(StoreError::NotFound) => None,
@@ -483,10 +596,16 @@ impl AccountStore {
     ) -> Result<super::takeover::Journal, super::takeover::TakeoverError> {
         use super::takeover::{Receipt, ReceiptState, TakeoverError};
         let _guard = self.transaction()?;
+        self.before_mutation(BeforeAccountMutation::Retire {
+            id: &supplied.account.id,
+        });
         if self.writes_stopped() {
             return Err(TakeoverError::Unavailable);
         }
         let mut journal = self.read_takeover_unlocked(&supplied.operation)?;
+        self.before_mutation(BeforeAccountMutation::Retire {
+            id: &journal.account.id,
+        });
         let record = self.read(&journal.account.id)?;
         let receipt = record
             .takeover_receipt
@@ -538,6 +657,7 @@ impl AccountStore {
         expected: Option<u64>,
         receipt_change: Option<(Option<&super::takeover::Receipt>, &super::takeover::Receipt)>,
     ) -> Result<Account, StoreError> {
+        self.before_mutation(BeforeAccountMutation::FullSave { id: &account.id });
         Self::validate(account)?;
         let old = match self.read(&account.id) {
             Ok(record) => Some(record),
@@ -676,6 +796,7 @@ impl AccountStore {
     }
 
     pub(crate) fn remove_login_record_unlocked(&self, id: &str) -> Result<(), StoreError> {
+        self.before_mutation(BeforeAccountMutation::Retire { id });
         if self.writes_stopped() {
             return Err(StoreError::LeaseUnavailable);
         }
@@ -694,6 +815,10 @@ impl AccountStore {
         new: &str,
         resolved_identity: &super::Identity,
     ) -> Result<(), StoreError> {
+        // Revoke both even if preparation fails before either save/remove.
+        for id in [old, new] {
+            self.before_mutation(BeforeAccountMutation::Retire { id });
+        }
         self.check_login_migration_clear()?;
         for id in [old, new] {
             match self.read(id) {
@@ -1055,6 +1180,7 @@ macro_rules! takeover_store_api {
     $visibility fn publish_takeover(&self, journal: &super::takeover::Journal) -> Result<Account, StoreError> {
         use super::takeover::{Receipt, ReceiptState};
         let _guard = self.transaction()?;
+        self.before_mutation(BeforeAccountMutation::FullSave { id: &journal.account.id });
         journal.validate()?;
         let old = match self.read(&journal.account.id) {
             Ok(record) => Some(record), Err(StoreError::NotFound) => None, Err(e) => return Err(e),
@@ -1100,6 +1226,7 @@ macro_rules! takeover_store_api {
     ) -> Result<Account, StoreError> {
         use super::takeover::{Receipt, ReceiptState};
         let _guard = self.transaction()?;
+        self.before_mutation(BeforeAccountMutation::FullSave { id });
         let record = self.read(id)?;
         let before = record.takeover_receipt.as_ref().ok_or(StoreError::InvalidData)?;
         if before.operation != operation || before.state != ReceiptState::Started {
@@ -1206,6 +1333,281 @@ mod tests {
     use super::super::{HealthReason, HealthSignal};
     use super::*;
     use chrono::{Duration, Utc};
+
+    // No credentials or native secret operations are needed for these failed
+    // store transitions. Runtime authority/persistence tests remain integration work.
+    fn n5a_hook_store() -> (tempfile::TempDir, AccountStore, Arc<Mutex<Vec<String>>>) {
+        let sandbox =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/n5a-store-fixtures");
+        fs::create_dir_all(&sandbox).unwrap();
+        let root = tempfile::tempdir_in(sandbox).unwrap();
+        let store = AccountStore {
+            dir: root.path().join("accounts"),
+            gate: Mutex::new(()),
+            observer: Mutex::new(None),
+            pre_mutation: Mutex::new(None),
+            lease: Mutex::new(None),
+            writes_stopped: AtomicBool::new(false),
+        };
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let output = Arc::clone(&events);
+        {
+            let _gate = store.transaction().unwrap();
+            store.set_pre_mutation_hook_unlocked(Arc::new(move |event| {
+                output.lock().unwrap().push(format!("{event:?}"));
+            }));
+        }
+        (root, store, events)
+    }
+
+    #[test]
+    fn n5a_prehook_precedes_missing_metadata_and_keeps_native_error() {
+        let (_root, store, events) = n5a_hook_store();
+        store.set_observer(Arc::new(|_, _| panic!("failed write must not notify")));
+        let result = store.update_metadata("cx-000001", |_| panic!("missing account"));
+        assert!(matches!(result, Err(StoreError::NotFound)));
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].starts_with("Metadata"));
+        assert!(events[0].contains("cx-000001"));
+        assert!(events[0].contains("Ordinary"));
+    }
+
+    #[test]
+    fn n5a_settings_and_retire_failures_revoke_before_native_return() {
+        let (_root, store, events) = n5a_hook_store();
+        assert!(matches!(
+            store.update_settings("cx-000001", Some(true), None, |_| panic!("missing account")),
+            Err(StoreError::NotFound)
+        ));
+        assert!(!store.home().join("config.toml").exists());
+        store.stop_writes();
+        {
+            let _gate = store.transaction().unwrap();
+            assert!(matches!(
+                store.remove_login_record_unlocked("cx-000001"),
+                Err(StoreError::LeaseUnavailable)
+            ));
+        }
+        let events = events.lock().unwrap();
+        assert!(events[0].starts_with("Settings"));
+        assert_eq!(events[1], "Stop");
+        assert!(events[2].starts_with("Retire"));
+    }
+
+    #[test]
+    fn n5a_migration_revokes_both_ids_before_missing_old_failure() {
+        let (_root, store, events) = n5a_hook_store();
+        let account = super::super::health::tests::fixture();
+        let _gate = store.transaction().unwrap();
+        assert!(matches!(
+            store.begin_login_migration("cx-000001", "cx-000002", &account.identity),
+            Err(StoreError::NotFound)
+        ));
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(events[0].contains("cx-000001"));
+        assert!(events[1].contains("cx-000002"));
+        assert!(events.iter().all(|event| event.starts_with("Retire")));
+    }
+
+    #[test]
+    fn n5a_fullsave_revokes_before_invalid_account_without_encrypting() {
+        let (_root, store, events) = n5a_hook_store();
+        let mut account = super::super::health::tests::fixture();
+        account.schema = 0;
+        let tokens = Tokens {
+            access_token: "synthetic".into(),
+            refresh_token: "synthetic".into(),
+            id_token: None,
+        };
+        assert!(matches!(
+            store.save(&account, &tokens, None),
+            Err(StoreError::InvalidData)
+        ));
+        assert_eq!(events.lock().unwrap().len(), 1);
+        assert!(events.lock().unwrap()[0].starts_with("FullSave"));
+    }
+
+    #[test]
+    fn n5a_report_adapter_is_per_call_and_not_a_transaction_exemption() {
+        struct Report<'a>(&'a mut bool);
+        impl ReportMutation for Report<'_> {
+            fn before_store_mutation(&mut self, id: &str) {
+                assert_eq!(id, "cx-000001");
+                assert!(!*self.0);
+                *self.0 = true;
+            }
+        }
+        let (_root, store, events) = n5a_hook_store();
+        let _gate = store.transaction().unwrap();
+        let mut used = false;
+        assert!(matches!(
+            store.update_metadata_with_cause_unlocked(
+                "cx-000001",
+                MetadataCause::UsageReport(&mut Report(&mut used)),
+                |_| panic!("missing")
+            ),
+            Err(StoreError::NotFound)
+        ));
+        assert!(used);
+        assert!(events.lock().unwrap().is_empty());
+        assert!(matches!(
+            store.update_metadata_with_cause_unlocked(
+                "cx-000001",
+                MetadataCause::Mutation(MetadataMutation::Release),
+                |_| panic!("missing")
+            ),
+            Err(StoreError::NotFound)
+        ));
+        assert!(events.lock().unwrap()[0].contains("Release"));
+    }
+
+    fn n5a_seed_metadata(store: &AccountStore, account: &Account) {
+        // Metadata-only tests never decrypt or use this synthetic placeholder.
+        fs::create_dir_all(&store.dir).unwrap();
+        let record = Record {
+            account: account.clone(),
+            secret_dpapi_b64: "synthetic-unused-secret".into(),
+            takeover_receipt: None,
+        };
+        fs::write(
+            store.path(&account.id).unwrap(),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn n5a_noop_and_stopped_metadata_revoke_without_changing_native_result() {
+        let (_root, store, events) = n5a_hook_store();
+        let account = super::super::health::tests::fixture();
+        n5a_seed_metadata(&store, &account);
+        assert_eq!(store.update_metadata(&account.id, |_| {}).unwrap(), account);
+        assert_eq!(events.lock().unwrap().len(), 1);
+        store.stop_writes();
+        assert_eq!(
+            store
+                .update_metadata(&account.id, |_| panic!("stopped closure"))
+                .unwrap(),
+            account
+        );
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[1], "Stop");
+        assert!(events[2].starts_with("Metadata"));
+        assert_eq!(store.read(&account.id).unwrap().account, account);
+    }
+
+    #[test]
+    fn n5a_lazy_expiry_revokes_before_persist_and_post_observer() {
+        let (_root, store, events) = n5a_hook_store();
+        let mut account = super::super::health::tests::fixture();
+        account.health = Health::Cooling {
+            reason: HealthReason::Quota,
+            until: Utc::now() - Duration::seconds(1),
+            scope: "account".into(),
+        };
+        n5a_seed_metadata(&store, &account);
+        let output = events.clone();
+        store.set_observer(Arc::new(move |current, _| {
+            let mut events = output.lock().unwrap();
+            assert!(events.last().unwrap().starts_with("HealthExpiry"));
+            assert_eq!(current.health, Health::Ready);
+            events.push("PostObserver".into());
+        }));
+        let loaded = store.load(&account.id).unwrap();
+        assert_eq!(loaded.health, Health::Ready);
+        assert_eq!(loaded.generation, account.generation + 1);
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1], "PostObserver");
+    }
+
+    #[test]
+    fn n5a_settings_config_success_does_not_hide_metadata_failure() {
+        let (_root, store, events) = n5a_hook_store();
+        let account = super::super::health::tests::fixture();
+        n5a_seed_metadata(&store, &account);
+        let result = store.update_settings(&account.id, None, Some(true), |a| a.schema = 0);
+        assert!(matches!(result, Err(StoreError::InvalidData)));
+        let config: toml_edit::DocumentMut = fs::read_to_string(store.home().join("config.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            config["accounts"][&account.id]["allow_credits"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(store.read(&account.id).unwrap().account, account);
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(events[0].starts_with("Settings"));
+        assert!(events[1].starts_with("Metadata"));
+    }
+
+    #[test]
+    fn n5a_takeover_and_login_wrapper_failures_revoke_before_shared_save() {
+        use super::super::takeover::{Journal, SourceProof, Verification};
+        let (_root, store, events) = n5a_hook_store();
+        let account = super::super::health::tests::fixture();
+        n5a_seed_metadata(&store, &account);
+        let journal = Journal {
+            schema: 0,
+            operation: "invalid-synthetic-operation".into(),
+            inspect_digest: String::new(),
+            provider: account.provider,
+            requested_path: store.home().join("synthetic-source/auth.json"),
+            source: SourceProof {
+                path: store.home().join("synthetic-source/auth.json"),
+                volume: 0,
+                index: 0,
+                modified: Utc::now(),
+                sha256: String::new(),
+            },
+            replace: false,
+            keep_source: true,
+            destination: store.home().join("synthetic-destination"),
+            account: account.clone(),
+            expected: None,
+            protected_tokens: None,
+            retired: false,
+            retirement_started: false,
+            superseded: false,
+            result: None,
+        };
+        assert!(matches!(
+            store.publish_takeover(&journal),
+            Err(StoreError::InvalidData)
+        ));
+        assert!(matches!(
+            store.finish_takeover_attempt(
+                &account.id,
+                "synthetic-operation",
+                Verification {
+                    ok: false,
+                    token_expires_at: None
+                },
+                None
+            ),
+            Err(StoreError::InvalidData)
+        ));
+        // A corrupt synthetic metadata row fails before login reaches shared save.
+        fs::write(store.path(&account.id).unwrap(), b"{").unwrap();
+        let tokens = Tokens {
+            access_token: "synthetic".into(),
+            refresh_token: "synthetic".into(),
+            id_token: None,
+        };
+        let _gate = store.transaction().unwrap();
+        assert!(matches!(
+            store.save_login_unlocked(&account, &tokens, None),
+            Err(StoreError::InvalidData)
+        ));
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 3);
+        assert!(events.iter().all(|event| event.starts_with("FullSave")));
+    }
 
     #[test]
     fn r1_metadata_and_token_guarded_transitions_expire_before_read() {

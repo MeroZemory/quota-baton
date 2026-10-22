@@ -25,8 +25,7 @@ const CAPACITY: usize = 20_000;
 const COUNT_CHANGE_CAPACITY: usize = CAPACITY * 2;
 mod launch;
 mod move_guard;
-#[cfg(test)]
-mod quota_wait;
+pub(crate) mod quota_wait;
 pub use launch::{
     LaunchEntitlements, LaunchError, LaunchInfo, LaunchPlacement, LaunchPolicyMove, LaunchRequest,
 };
