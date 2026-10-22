@@ -756,3 +756,5 @@ The cost is that the session pauses until the reset.
 
    Which path each client gets is decided by the R13 Part C measurement of hold tolerance. A session must never stay stopped after its reset without a resume.
 6. **Visibility.** The dashboard shows waiting sessions with "초기화 HH:MM까지 대기" and a one-click "지금 옮기기" that marks the session urgent.
+
+**D24 amendment 3 (design owner, 2026-10-22; question collected by the main at the Part A gate).** The 7d-only rule generalizes by window length. A window **longer than one day** (7d, Free 30d and any other) projects with the window average and shows the recent-rate projection beside it. Windows of one day or less project with the recent rate (fallback: average). The reason is D24's: extrapolating 30 minutes of work over days ignores nights and idle days. Durations of 24 h or more read "n일 m시간" instead of "60시간 0분".
