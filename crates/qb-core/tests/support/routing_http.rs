@@ -577,6 +577,114 @@ async fn policy_edit_interrupts_reset_hold_instead_of_waiting_for_obsolete_deadl
 }
 
 #[tokio::test]
+async fn n5a_current_c7_preheader_tcp_close_releases_request_and_never_sends_later() {
+    use std::{net::Shutdown, sync::atomic::Ordering};
+    use tokio::{io::AsyncWriteExt, net::TcpStream};
+
+    // The ordinary request deadline must not cause the observed early release.
+    let h = Harness::with_limits_and_config(Provider::Codex, 60, 30, 60, |config| {
+        config.routing.move_guard.trip_seconds = 20;
+    })
+    .await;
+    let session = "synthetic-disconnect-c7";
+    let key = "codex:synthetic-disconnect-c7";
+    let first = h
+        .turn("/v1/responses", &[("session-id", session)], RAW)
+        .await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while h.state.inflight_requests.load(Ordering::Relaxed) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let budget_before = h.state.budget.used();
+    let upstream_before = h.fake.state.requests().len();
+    let now = Utc::now();
+    let reset_at = now + ChronoDuration::seconds(8);
+    let after_reset = tokio::time::Instant::now() + Duration::from_secs(9);
+    // Same CURRENT C7 setup as policy_edit_interrupts_reset_hold... .
+    // This is synthetic persisted cooling, not a new D26 proof claim.
+    h.store
+        .update_metadata(&first, |account| {
+            account.health = Health::Cooling {
+                reason: HealthReason::Quota,
+                until: reset_at,
+                scope: "account".into(),
+            };
+            account.quota_cooling = Some(QuotaCooling {
+                window: "5h".into(),
+                reset_at,
+                started_at: now,
+            });
+        })
+        .unwrap();
+    let mut socket = TcpStream::connect(h.servers.data_addr).await.unwrap();
+    let request = format!(
+        "POST /v1/responses HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer synthetic-client\r\nContent-Type: application/json\r\nsession-id: {session}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{RAW}",
+        h.servers.data_addr,
+        RAW.len(),
+    );
+    socket.write_all(request.as_bytes()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while h.state.inflight_requests.load(Ordering::Relaxed) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut byte = [0_u8; 1];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), socket.peek(&mut byte))
+            .await
+            .is_err(),
+        "response/EOF arrived before the disconnect stimulus"
+    );
+    assert_eq!(h.fake.state.requests().len(), upstream_before);
+    assert!(
+        Utc::now() < reset_at - ChronoDuration::seconds(3),
+        "fixture lost the pre-reset cleanup measurement window"
+    );
+
+    // Explicit OS socket shutdown of BOTH directions, followed by handle close.
+    // AsyncWriteExt::shutdown alone would only half-close the upload direction.
+    let socket = socket.into_std().unwrap();
+    socket.shutdown(Shutdown::Both).unwrap();
+    drop(socket);
+    let released_before_reset = tokio::time::timeout(Duration::from_secs(1), async {
+        while h.state.inflight_requests.load(Ordering::Relaxed) != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .is_ok();
+    let budget_after_close = h.state.budget.used();
+    // Do not panic on release failure until the late-send observation completes.
+    // Leave the actual server, account and policy alive and unchanged throughout.
+    tokio::time::sleep_until(after_reset).await;
+    let upstream_after_reset = h.fake.state.requests().len();
+    assert_eq!(
+        upstream_after_reset, upstream_before,
+        "disconnected preheader request dispatched after reset"
+    );
+    assert!(
+        released_before_reset,
+        "actual TCP close did not release request lifecycle within 1s"
+    );
+    assert_eq!(
+        budget_after_close, budget_before,
+        "retained-body budget leaked"
+    );
+    assert_eq!(h.state.inflight_requests.load(Ordering::Relaxed), 0);
+    assert_eq!(h.state.budget.used(), budget_before);
+    assert_eq!(h.state.accounts.inflight_count(&first), 0);
+    assert_eq!(
+        h.state.bindings.current(Some(key)).as_deref(),
+        Some(first.as_str())
+    );
+}
+
+#[tokio::test]
 async fn full_discretionary_pool_budget_preserves_healthy_credential_but_allows_forced_move() {
     let h = Harness::new(Provider::Codex).await;
     let headers = [("session-id", "full-move-budget")];
