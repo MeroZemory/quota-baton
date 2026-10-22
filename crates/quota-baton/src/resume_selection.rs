@@ -228,10 +228,11 @@ fn selected_args(
     if !crate::sessions_discovery::valid_id(&row.id) {
         return Err(refused());
     }
-    // No rollout contents are read. Missing/compressed-only/stale/escaping paths
-    // need the explicit-ID native path, not our own scan-and-repair fallback.
-    crate::sessions_guard::safe_path(home, &row.rollout_path).map_err(|_| refused())?;
-    if !row.rollout_path.is_file() {
+    // Resolve Codex's canonical compressed sibling without reading contents.
+    // Missing, ambiguous or escaping paths still refuse selection.
+    let physical = crate::sessions_discovery::resolve_rollout_path(home, &row.rollout_path)
+        .map_err(|_| refused())?;
+    if !physical.is_file() {
         return Err(refused());
     }
     Ok(request.rewrite(&row.id))
@@ -709,6 +710,32 @@ mod tests {
             .unwrap();
         assert!(resume_page(home.path(), None, false, None, 10).is_err());
     }
+    #[cfg(windows)]
+    #[test]
+    fn r94_last_accepts_only_compressed_sibling_of_canonical_database_path() {
+        let root = fixture();
+        let home = root.path();
+        let cwd = home.canonicalize().unwrap();
+        row(home, FIRST, 30, "openai", "cli", &cwd);
+        let path = crate::sessions_db::thread_path(home, FIRST)
+            .unwrap()
+            .unwrap();
+        let compressed = path.with_extension("jsonl.zst");
+        std::fs::write(
+            &compressed,
+            zstd::stream::encode_all(std::fs::read(&path).unwrap().as_slice(), 1).unwrap(),
+        )
+        .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let request = requested(&["resume", "--last"]);
+        assert_eq!(
+            last_args(home, &request, None).unwrap(),
+            argv(&["resume", FIRST])
+        );
+        std::fs::write(&path, b"synthetic duplicate").unwrap();
+        assert!(last_args(home, &request, None).is_err());
+    }
+
     #[cfg(windows)]
     #[test]
     fn last_prompt_utf16_is_preserved_losslessly() {

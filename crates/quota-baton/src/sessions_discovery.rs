@@ -15,6 +15,43 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+pub(crate) const ROLLOUT_PATH_ERROR: &str =
+    "대화 기록 경로와 압축 파일을 확인할 수 없습니다. doctor로 확인하세요";
+
+/// Codex keeps the canonical .jsonl name in SQLite after compression. Resolve
+/// only its compressed sibling; never select between two existing names.
+pub(crate) fn resolve_rollout_path(home: &Path, path: &Path) -> Result<PathBuf> {
+    let path = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        home.join(path)
+    };
+    crate::sessions_guard::safe_path(home, home)?;
+    // The database may use a different spelling of the same NTFS home.
+    // Walk every component without reparses, then check canonical containment.
+    crate::sessions_guard::safe_path(path.parent().context(ROLLOUT_PATH_ERROR)?, &path)?;
+    let selected = if path.extension().is_some_and(|ext| ext == "jsonl") {
+        let compressed = path.with_extension("jsonl.zst");
+        crate::sessions_guard::safe_path(
+            compressed.parent().context(ROLLOUT_PATH_ERROR)?,
+            &compressed,
+        )?;
+        match (path.try_exists()?, compressed.try_exists()?) {
+            (true, false) => path,
+            (false, true) => compressed,
+            _ => bail!(ROLLOUT_PATH_ERROR),
+        }
+    } else {
+        path
+    };
+    let selected = fs::canonicalize(selected).context(ROLLOUT_PATH_ERROR)?;
+    ensure!(
+        selected.starts_with(fs::canonicalize(home)?),
+        "{ROLLOUT_PATH_ERROR}"
+    );
+    Ok(selected)
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Rollout {
     pub path: PathBuf,
@@ -662,22 +699,25 @@ impl Catalog {
 
     pub(crate) fn active(&self, id: &str) -> Result<&Rollout> {
         self.ensure_readable_for(&BTreeSet::from([id.to_owned()]))?;
-        let choices = self
-            .threads
-            .get(id)
-            .context("원본에서 대화를 찾지 못했습니다")?;
         if let Some(path) = crate::sessions_db::thread_path(&self.home, id)? {
-            let path = fs::canonicalize(path).context("대화 기록 경로를 확인할 수 없습니다")?;
+            let path = resolve_rollout_path(&self.home, &path)?;
             ensure!(
                 path.starts_with(&self.home),
                 "대화 경로가 원본 홈 밖에 있습니다"
             );
             let physical = physical_id(&path).context("대화 기록 경로 형식이 올바르지 않습니다")?;
+            // A failed header cannot connect its physical UUID to the logical
+            // thread. The authoritative row supplies that relationship.
+            self.ensure_readable_for(&BTreeSet::from([id.to_owned(), physical.clone()]))?;
             return self
                 .all()
                 .find(|r| r.physical == physical && r.path == path && r.thread == id)
                 .context("대화 상태와 기록 경로가 다릅니다");
         }
+        let choices = self
+            .threads
+            .get(id)
+            .context("원본에서 대화를 찾지 못했습니다")?;
         ensure!(
             choices.len() == 1,
             "여러 대화 기록 중 활성 파일을 확인할 수 없습니다"
