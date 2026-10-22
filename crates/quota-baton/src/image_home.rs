@@ -295,6 +295,19 @@ pub(super) fn plan(
             apply,
         )?;
         entry.hash = source.hash.clone();
+        if source.kind == Kind::Hardlink {
+            // The existing Q record keeps its original ownership evidence.
+            // A newly created Qi link must instead verify today's shared bytes.
+            let target = source.target.as_deref().context("공유 원본이 없습니다")?;
+            ancestors_safe(target)?;
+            anyhow::ensure!(
+                target.is_file()
+                    && !reparse(target)?
+                    && source.identity.as_ref() == Some(&identity(target)?),
+                "공유 파일 원본 identity가 변경되었습니다"
+            );
+            entry.hash = hash_file(target)?;
+        }
         entry.identity = source.identity.clone();
         entries.push(entry);
     }
