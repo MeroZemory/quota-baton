@@ -2164,7 +2164,8 @@ fn online_status_unknown_health_is_utf8_safe_and_omits_secret_fields() {
     assert!(status.contains("알 수 없음"));
     assert!(status.contains("합성 🧪 계정"));
     assert!(!status.contains('\u{1b}'));
-    assert_eq!(status.lines().count(), 5);
+    assert_eq!(status.lines().count(), 6);
+    assert_eq!(status.lines().last(), Some("  소진 예측: 측정 중"));
     for secret in [
         "synthetic-admin-secret",
         "synthetic-access-secret",
@@ -2226,9 +2227,13 @@ fn online_status_piped_and_file_stdout_are_utf8_with_expired_windows_and_probe_p
         "codex: 사용 가능 2 · 대기 [인증 오류 1] · 사용 불가 1\n",
         "계정 ID\t제공자\t라벨\t사용 상태\t계정 상태\t5시간 남음\t5시간 초기화\t7일 남음\t7일 초기화\t30일 남음\t30일 초기화\t상태 이유\t대기 종료\n",
         "cx-expired-five\tcodex\t합성 🧪\t활성\t인증 확인 대기\t리셋됨\t2000-01-01T09:00:00.123+09:00\t62.5%\t2099-01-07T00:00:00Z\t-\t-\t-\t-\n",
+        "  소진 예측: 측정 중\n",
         "cx-expired-seven\tcodex\t합성 계정\t활성\t준비됨\t9%\t2099-01-01T05:00:00Z\t리셋됨\t2000-01-07T00:00:00Z\t-\t-\t-\t-\n",
+        "  소진 예측: 측정 중\n",
         "cx-missing-reset\tcodex\t-\t활성\t준비됨\t88%\t-\t-\t-\t-\t-\t-\t-\n",
+        "  소진 예측: 측정 중\n",
         "cx-invalid-reset\tcodex\t-\t활성\t대기 중\t-\t-\t75%\tinvalid\t98%\t2099-02-01T00:00:00Z\t인증 오류\t2099-01-01T00:00:00Z\n",
+        "  소진 예측: 측정 중\n",
     );
     let piped = command(home.path()).arg("status").bounded_output().unwrap();
     let output_path = home.path().join("status.stdout");
