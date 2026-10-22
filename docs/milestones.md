@@ -6,10 +6,10 @@ This file names the verification for each unit and each row. The row list and th
 
 <!-- status:begin -->
 현재 마일스톤: R13 N5a HTTP 대기·초기화 재개
-목표: HTTP429 완료·저장소 근거72검사 통과; 실제 대기 허가·무효화 알림·초기화 재개 연결
+목표: 실제 HTTP 대기·같은 계정 재개·취소 연결; 계정 전체 poll 교체·정책 변경 수용과 최종 회귀 검증
 핵심 지표: 남은 출시 1/3 (R14 보호 설치, R13 C+E 실행, R13 F 통합 예측); 이전 계열 2/2 종료
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-23 08:07 KST (N5a HTTP429 근거 단위 ce351c2·집중91통과·대조 검사 통과; 대기 실행 미완료)
+갱신: 2026-10-23 08:53 KST (대기 허가 집중133·실제 HTTP 재개/취소·승인 경로 음성 대조 통과; 최종 N5a 관문 진행)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -374,13 +374,14 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-23 07:00 | N5a 실제 HTTP 취소 정리 | 실제 TCP close 검사1·strict core/testkit all-target clippy exit0 | preheader 대기 후 소켓 양방향 종료·초기화 후 upstream0건 | 1초 이내 lifecycle·본문 예산 반환, n5a-tcp-close-fixture/n5a-tcp-lint 증거; 전체 N5a 완료 아님 |
 | 2026-10-23 07:27 | N5a 실제 관측 근거·저장소 무효화 | registry25·실제 Store/runtime10·Store 경계9, 합계44통과·exit0 | 전송 전 origin·공유 순서·부분 응답·실패/종료 시 권한 취소 | 7cc9d0f 단위; 조기 실패3경로 독립 지적 보완·source recheck PASS. dev18d93dc 병합 후 집중 검사 진행, 대기 실행 수용 아님 |
 | 2026-10-23 08:07 | N5a HTTP429 근거 완료 | N5a72·판정18·실제 TCP1, 총91통과; strict core/testkit all-target lint exit0 | 헤더 즉시 적용·본문 완료 후 최종 근거·새 보고 무효화 | ce351c2; 이전 코드 실제 조기 mint 대조 exit101·정확 복원 exit0. 실제 대기/재개 승인 아님 |
+| 2026-10-23 08:53 | N5a HTTP 대기 허가·초기화 재개 | 고정 입력129 N5a+3 helper+1 실제 drain=133통과, strict core/testkit lint·fmt exit0; 실제 재개/취소2 및 native renewal2 별도 통과 | 원래 wake/deadline·현재 모델/정책·취소 정리 | n5a-model-drain-gate/n5a-http-wait-actual 증거. 승인 hook 제거 exit101·정확 복원 exit0; 후속 policy/poll/전체 영향 회귀 전이며 전체 C+E 수용 아님 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 행동 |
 |---|---|---|---|
 | 기록기 N6t/N6r | 최소 기록기 설치·수집 중, 초기 cut/전체 owner/실제 replay 미수용 | 완전성 증명·24시간 차등 재생 | 10/24 06:58 이후 e01 단일 epoch export 검증; takeover listener/writer 순서 점검 |
-| 대기·재개 N5a-d | HTTP429 근거72·판정18·TCP 종료1 통과, 최종 대기 허가 미연결 | HTTP/WS 취소·초기화 재개·긴급 이동 | 본문 네이티브 전이 합성·실제 대기 승인·무효화 알림과 HTTP 재개 연결 |
+| 대기·재개 N5a-d | HTTP 대기 허가133·실제 재개/취소·승인 hook 대조 통과, 최종 수용 미완료 | HTTP/WS 취소·초기화 재개·긴급 이동 | 실제 poll/정책 무효화와 최종 HTTP 회귀, N5b-d 실행 연결 |
 | 통합 예측 N7 | 검증 가능한 24시간 입력 부족 | 명시한 오차 범위의 backtest | body-free 입력·훈련/후속 관측 검증, 풀 예측 표시는 보류 |
 <!-- gaps:end -->
 

@@ -1155,9 +1155,15 @@ impl PolicyStore {
     pub fn freeze(&self) {
         let _writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let mut next = (*self.snapshot()).clone();
+        let newly_frozen = !next.frozen;
         next.frozen = true;
-        let _publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
-        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(next);
+        {
+            let _publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
+            *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(next);
+        }
+        if newly_frozen {
+            self.changed.notify_waiters();
+        }
     }
     pub(crate) fn requires_strict_recovery(&self) -> bool {
         let _publication = self.publication.read().unwrap_or_else(|e| e.into_inner());
@@ -1314,6 +1320,10 @@ impl PolicyStore {
     /// A queued request cannot use an obsolete account after policy changes.
     pub fn permits_dispatch(&self, key: Option<&str>, account: &str) -> bool {
         let _publication = self.publication.read().unwrap_or_else(|e| e.into_inner());
+        self.permits_dispatch_published(key, account)
+    }
+    // Caller already holds publication read/write access.
+    fn permits_dispatch_published(&self, key: Option<&str>, account: &str) -> bool {
         let state = self.snapshot();
         if state.frozen {
             return false;
@@ -1325,6 +1335,26 @@ impl PolicyStore {
         plan.settings.mode != Mode::Strict
             || (!self.strict_dispatch_blocked() && plan.anchor.as_deref() == Some(account))
     }
+    /// Keep the native permission and exact wait plan coherent through inspect.
+    /// This supplies policy data only, never quota or dispatch authority. inspect
+    /// must not edit policy or reacquire publication (even for plan/permission).
+    pub(crate) fn with_wait_plan<T>(
+        &self,
+        key: &str,
+        account: &str,
+        inspect: impl FnOnce(&Plan) -> Option<T>,
+    ) -> Option<T> {
+        let _publication = self.publication.read().ok()?;
+        if !self.permits_dispatch_published(Some(key), account) {
+            return None;
+        }
+        let plan = self.plan_published(Some(key));
+        if plan.settings.reset_wait_secs == 0 {
+            return None;
+        }
+        inspect(&plan)
+    }
+
     fn resolve(&self, state: &State, id: &str) -> Plan {
         let witness = self
             .recovery_intent
@@ -1959,6 +1989,136 @@ mod tests {
             expected_revision: plan.revision,
             at: clock(),
         }
+    }
+
+    #[test]
+    fn n5a_authority_wake_policy_freeze_publishes_once_to_enabled_waiters() {
+        fn ready(future: std::pin::Pin<&mut impl std::future::Future<Output = ()>>) -> bool {
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            std::future::Future::poll(future, &mut context).is_ready()
+        }
+        let root = home();
+        let store = PolicyStore::new(root.path(), Settings::default()).unwrap();
+        let mut first = Box::pin(store.changed.notified());
+        let mut second = Box::pin(store.changed.notified());
+        first.as_mut().enable();
+        second.as_mut().enable();
+        assert!(!ready(first.as_mut()));
+        store.freeze();
+        assert!(store.snapshot().frozen);
+        assert!(!store.permits_dispatch(None, "wake-a"));
+        assert!(ready(first.as_mut()));
+        assert!(ready(second.as_mut()));
+        let mut repeated = Box::pin(store.changed.notified());
+        repeated.as_mut().enable();
+        store.freeze();
+        assert!(!ready(repeated.as_mut()));
+    }
+
+    #[test]
+    fn n5a_wait_plan_holds_publication_for_coherent_strict_permission() {
+        let root = home();
+        let store = PolicyStore::new(root.path(), Settings::default()).unwrap();
+        let key = "codex:synthetic-wait-policy";
+        store
+            .set_session(
+                &session_id(key),
+                Some(settings(Mode::Strict)),
+                None,
+                Some("cx-synthetic-a"),
+            )
+            .unwrap();
+        let result = store.with_wait_plan(key, "cx-synthetic-a", |plan| {
+            assert!(
+                store.publication.try_write().is_err(),
+                "wait inspection must hold policy publication read guard"
+            );
+            assert_eq!(plan.settings.mode, Mode::Strict);
+            assert_eq!(plan.anchor.as_deref(), Some("cx-synthetic-a"));
+            Some(plan.revision)
+        });
+        assert_eq!(result, Some(store.plan(Some(key)).revision));
+        assert!(
+            store
+                .with_wait_plan(key, "cx-synthetic-b", |_| -> Option<()> {
+                    panic!("wrong Strict anchor must not reach wait inspection")
+                })
+                .is_none()
+        );
+        store.begin_recovery();
+        assert!(
+            store
+                .with_wait_plan(key, "cx-synthetic-a", |_| Some(()))
+                .is_none()
+        );
+        store.finish_recovery();
+        store
+            .set_session(
+                &session_id(key),
+                Some(Settings {
+                    mode: Mode::Recover,
+                    reset_wait_secs: 0,
+                }),
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(
+            store
+                .with_wait_plan(key, "cx-synthetic-a", |_| Some(()))
+                .is_none()
+        );
+        store.freeze();
+        assert!(
+            store
+                .with_wait_plan(key, "cx-synthetic-a", |_| Some(()))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn n5a_wait_plan_observes_failed_write_only_after_actual_publication() {
+        let root = home();
+        let store = Arc::new(PolicyStore::new(root.path(), Settings::default()).unwrap());
+        let key = "codex:synthetic-wait-publication";
+        store
+            .set_session(
+                &session_id(key),
+                Some(settings(Mode::Recover)),
+                None,
+                Some("cx-synthetic-a"),
+            )
+            .unwrap();
+        fs::remove_file(&store.path).unwrap();
+        fs::create_dir(&store.path).unwrap();
+        let (entered, release) = publication_pause(&store);
+        let writer_store = store.clone();
+        let writer = std::thread::spawn(move || {
+            writer_store.set_session(
+                &session_id(key),
+                Some(settings(Mode::Strict)),
+                None,
+                Some("cx-synthetic-a"),
+            )
+        });
+        entered
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(
+            store.publication.try_read().is_err(),
+            "actual split publication must exclude readers"
+        );
+        let reader_store = store.clone();
+        let reader = std::thread::spawn(move || {
+            reader_store.with_wait_plan(key, "cx-synthetic-a", |_| Some(()))
+        });
+        release.send(()).unwrap();
+        assert!(writer.join().unwrap().is_err());
+        assert!(
+            reader.join().unwrap().is_none(),
+            "failed Strict publication must not admit wait inspection"
+        );
+        *store.publication_hook.lock().unwrap() = None;
     }
 
     #[test]

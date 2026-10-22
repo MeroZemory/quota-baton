@@ -1,3 +1,4 @@
+mod wait_admission;
 mod wait_owner;
 mod wait_proof;
 

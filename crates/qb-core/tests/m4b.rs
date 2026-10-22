@@ -1,6 +1,9 @@
 //! C7/C8 regressions through loopback HTTP and the runtime admin router.
 #[path = "support/routing_http.rs"]
 mod routing_http;
+#[cfg(feature = "testkit")]
+#[path = "support/routing_wait_http.rs"]
+mod routing_wait_http;
 use axum::http::{HeaderMap, StatusCode};
 use chrono::{Duration as ChronoDuration, Utc};
 use qb_core::{

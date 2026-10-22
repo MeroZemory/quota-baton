@@ -8,6 +8,7 @@ mod ledger;
 mod models;
 pub(crate) mod notices;
 mod outcome;
+mod quota_wait;
 mod response;
 mod selection_guard;
 mod upload;
@@ -60,6 +61,13 @@ pub(crate) fn poll_revoked(provider: Provider, body: &[u8]) -> bool {
         == outcome::Kind::Revoked
 }
 
+#[cfg(feature = "testkit")]
+#[derive(Clone, Debug)]
+pub struct HttpQuotaWaitEvent {
+    pub stage: &'static str,
+    pub source: String,
+}
+
 pub struct RelayState {
     pub accounts: Arc<crate::account_runtime::AccountRuntime>,
     pub quota: Arc<crate::quota::UsagePoller>,
@@ -91,6 +99,8 @@ pub struct RelayState {
     websocket: crate::config::WebsocketConfig,
     ws_capacity: Arc<websocket::capacity::Capacity>,
     reconnect_exclusions: Mutex<BTreeMap<(String, String), Instant>>,
+    #[cfg(feature = "testkit")]
+    http_quota_wait_events: tokio::sync::broadcast::Sender<HttpQuotaWaitEvent>,
     draining: AtomicBool,
     drain_started: AtomicBool,
     drain_ready: AtomicBool,
@@ -394,6 +404,29 @@ impl RelayState {
         Duration::from_secs(self.drain_timeout_secs.load(Ordering::Acquire))
     }
 
+    #[cfg(feature = "testkit")]
+    pub fn subscribe_http_quota_wait(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<HttpQuotaWaitEvent> {
+        self.http_quota_wait_events.subscribe()
+    }
+
+    #[cfg(feature = "testkit")]
+    fn observe_http_quota_wait(&self, stage: &'static str, source: &str) {
+        let _ = self.http_quota_wait_events.send(HttpQuotaWaitEvent {
+            stage,
+            source: source.to_owned(),
+        });
+    }
+
+    fn http_wait_reset_source_current(&self, key: &str, source: &str, model: Option<&str>) -> bool {
+        self.bindings
+            .models_launch_snapshot(Some(key), None)
+            .is_ok_and(|info| {
+                info.account == source && (!info.managed || info.current_model.as_deref() == model)
+            })
+    }
+
     pub fn is_draining(&self) -> bool {
         self.draining.load(Ordering::Acquire)
     }
@@ -543,6 +576,8 @@ impl RelayState {
             websocket: config.websocket.clone(),
             ws_capacity: Arc::new(websocket::capacity::Capacity::default()),
             reconnect_exclusions: Mutex::new(BTreeMap::new()),
+            #[cfg(feature = "testkit")]
+            http_quota_wait_events: tokio::sync::broadcast::channel(32).0,
             draining: AtomicBool::new(false),
             drain_started: AtomicBool::new(false),
             drain_ready: AtomicBool::new(false),
@@ -898,7 +933,7 @@ impl RelayState {
         model: Option<&str>,
         data: bool,
     ) -> bool {
-        if self.accounts.blocked_in_memory(id) {
+        if self.is_draining() || self.accounts.blocked_in_memory(id) {
             return false;
         }
         let store = self.store.clone();
@@ -940,6 +975,7 @@ impl RelayState {
                     .current(Some(key))
                     .is_none_or(|current| current == id)
             })
+            && !self.is_draining()
     }
 
     async fn select_request(
@@ -1000,6 +1036,33 @@ impl RelayState {
         // Post-commit/nonreplayable quota errors cannot retry the old body.
         // On its next request, resolve C7 before publishing any context.
         let prior = self.bindings.current(session.key.as_deref());
+        let mut proof_reset_source = None;
+        if completion.record.transport == "http"
+            && !completion.reset_hold_used
+            && self.pins.get(provider, session.key.as_deref()).is_none()
+            && let (Some(key), Some(source)) = (session.key.as_deref(), prior.as_deref())
+        {
+            completion.end_attempt();
+            if let Some(waited) = quota_wait::wait_http_quota(
+                self, provider, key, model, source, &operation, &_caller,
+            )
+            .await
+            {
+                completion.reset_hold_used = true;
+                completion.reset_hold_timed_out = waited.end != quota_wait::WaitEnd::Reset;
+                if self.is_draining() || waited.end == quota_wait::WaitEnd::WallResetPending {
+                    return Ok(None);
+                }
+                if waited.end == quota_wait::WaitEnd::Reset
+                    && self.http_wait_reset_source_current(key, &waited.source, model)
+                {
+                    proof_reset_source = Some(waited.source);
+                }
+            }
+        }
+        if self.is_draining() {
+            return Ok(None);
+        }
         let passive_sources = if prior.is_some() || session.key.is_none() {
             self.accounts.quota_observations(provider, prior.as_deref())
         } else {
@@ -1029,7 +1092,14 @@ impl RelayState {
         }
         // A failed pre-commit attempt is finished before reserving its successor.
         completion.end_attempt();
-        let excluded = tried.clone();
+        let mut excluded = tried.clone();
+        if let Some(source) = proof_reset_source {
+            // A reset is only a hint for ordinary selection. Clear this one
+            // local retry exclusion; current native gates still own dispatch.
+            excluded.remove(&source);
+            #[cfg(feature = "testkit")]
+            self.observe_http_quota_wait("reselect", &source);
+        }
         let mut held_account = None;
         loop {
             // Register before reading candidates or choosing: recovery/clear
@@ -2405,21 +2475,21 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
             if status == StatusCode::TOO_MANY_REQUESTS {
                 // The bounded side copy only supplies optional wait authority.
                 // Native classification and downstream bytes remain unchanged.
-                let body_qualified = held.complete
-                    && held.terminal.is_none()
-                    && hold::decoded_side(&response_headers, &held.prefix).is_some_and(|decoded| {
-                        decoded.is_empty()
-                            || serde_json::from_slice::<serde_json::Value>(&decoded)
-                                .is_ok_and(|value| value.is_object())
-                    });
+                let decoded_body = (held.complete && held.terminal.is_none())
+                    .then(|| hold::decoded_side(&response_headers, &held.prefix))
+                    .flatten();
+                let body = crate::account_runtime::AccountRuntime::qualify_http_429_body(
+                    decoded_body.as_deref(),
+                    request_model.as_deref(),
+                );
                 if state
                     .accounts
-                    .finish_http_429_report(
+                    .finish_http_429_report_with_body(
                         &account.id,
                         pending_http_429,
                         decision.quota_reset,
                         decision.signal.take(),
-                        body_qualified,
+                        body,
                     )
                     .await
                     .is_err()
@@ -2651,68 +2721,113 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
         {
             break (status, response_headers, held);
         }
+        let mut proof_reset_source = None;
         if decision.kind == outcome::Kind::Quota {
             if let Some(ticket) = &quota_pending {
                 state.accounts.take_pending_quota(ticket);
             }
             drop(probe.take());
-            match state
-                .retry_after_reset(
-                    &session,
-                    &mut completion,
-                    &account.id,
-                    request_model.as_deref(),
-                )
-                .await
+            let mut proof_wait = None;
+            if !forced_send
+                && !completion.reset_hold_used
+                && let Some(key) = session.key.as_deref()
+                && let Some(deadline) = completion.precommit_deadline
             {
-                Ok(true) => {
-                    drop(probe.take());
-                    match state
-                        .tokens
-                        .before_request(
-                            state.store.clone(),
-                            state.observability.clone(),
-                            account.id.clone(),
-                        )
-                        .await
-                    {
-                        Ok((updated, refreshed)) => {
-                            account = updated;
-                            tokens = refreshed;
-                        }
-                        Err(()) => {
-                            return failure(
-                                &mut completion,
-                                StatusCode::BAD_GATEWAY,
-                                provider,
-                                "store_error",
-                                "Could not read account tokens",
-                            );
-                        }
-                    }
-                    probe = state.claim_probe(&mut account).await;
-                    body_to_send = retained
-                        .as_ref()
-                        .expect("retained reset retry")
-                        .complete()
-                        .await
-                        .expect("retained body completed")
-                        .retry_body();
-                    continue;
+                let operation = crate::issue_operation::IssueOperation::new(
+                    tokio::time::Instant::from_std(deadline),
+                );
+                let caller = operation.caller_guard();
+                completion.end_attempt();
+                proof_wait = quota_wait::wait_http_quota(
+                    &state,
+                    provider,
+                    key,
+                    request_model.as_deref(),
+                    &account.id,
+                    &operation,
+                    &caller,
+                )
+                .await;
+            }
+            if state.is_draining() {
+                break (status, response_headers, held);
+            }
+            if let Some(waited) = proof_wait {
+                completion.reset_hold_used = true;
+                completion.reset_hold_timed_out = waited.end != quota_wait::WaitEnd::Reset;
+                if waited.end == quota_wait::WaitEnd::WallResetPending {
+                    break (status, response_headers, held);
                 }
-                Ok(false) => {}
-                Err(()) => {
-                    return failure(
+                if waited.end == quota_wait::WaitEnd::Reset
+                    && session.key.as_deref().is_some_and(|key| {
+                        state.http_wait_reset_source_current(
+                            key,
+                            &waited.source,
+                            request_model.as_deref(),
+                        )
+                    })
+                {
+                    proof_reset_source = Some(waited.source);
+                }
+            } else {
+                match state
+                    .retry_after_reset(
+                        &session,
                         &mut completion,
-                        StatusCode::BAD_GATEWAY,
-                        provider,
-                        "store_error",
-                        "Could not check account reset",
-                    );
+                        &account.id,
+                        request_model.as_deref(),
+                    )
+                    .await
+                {
+                    Ok(true) => {
+                        drop(probe.take());
+                        match state
+                            .tokens
+                            .before_request(
+                                state.store.clone(),
+                                state.observability.clone(),
+                                account.id.clone(),
+                            )
+                            .await
+                        {
+                            Ok((updated, refreshed)) => {
+                                account = updated;
+                                tokens = refreshed;
+                            }
+                            Err(()) => {
+                                return failure(
+                                    &mut completion,
+                                    StatusCode::BAD_GATEWAY,
+                                    provider,
+                                    "store_error",
+                                    "Could not read account tokens",
+                                );
+                            }
+                        }
+                        probe = state.claim_probe(&mut account).await;
+                        body_to_send = retained
+                            .as_ref()
+                            .expect("retained reset retry")
+                            .complete()
+                            .await
+                            .expect("retained body completed")
+                            .retry_body();
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(()) => {
+                        return failure(
+                            &mut completion,
+                            StatusCode::BAD_GATEWAY,
+                            provider,
+                            "store_error",
+                            "Could not check account reset",
+                        );
+                    }
                 }
             }
         }
-        if tried.len() >= 4 {
+        if tried.len() >= 4 && proof_reset_source.is_none() {
             if decision.kind == outcome::Kind::Quota {
                 state
                     .notice_quota(&account.id, None, request_model.as_deref())
@@ -2745,13 +2860,19 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
             break (status, response_headers, held);
         }
         completion.failover(decision.reason());
+        let mut selection_tried = tried.clone();
+        if let Some(source) = proof_reset_source {
+            selection_tried.remove(&source);
+            #[cfg(feature = "testkit")]
+            state.observe_http_quota_wait("reselect", &source);
+        }
         let next = state
             .select_http_request(
                 provider,
                 &session,
                 &mut completion,
                 request_model.as_deref(),
-                &tried,
+                &selection_tried,
                 managed_http.as_ref(),
             )
             .await;
