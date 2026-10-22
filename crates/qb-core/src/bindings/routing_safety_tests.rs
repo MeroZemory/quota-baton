@@ -789,7 +789,7 @@ fn round2_debug_pin_is_exempt_but_new_and_unmatched_pin_recovery_take_charge() {
     assert!(new.is_placement);
     assert_eq!(new.placement_charge_pct, 2.);
     let before_pin = t.usage_sequence.load(Ordering::Relaxed);
-    let pinned_choice = |key: &str, cs: &[Candidate]| match t.choose_with_hold_at(
+    let pinned_choice = |key: &str, cs: &[Candidate], at| match t.choose_with_hold_at(
         Provider::Claude,
         Some(key),
         None,
@@ -799,7 +799,7 @@ fn round2_debug_pin_is_exempt_but_new_and_unmatched_pin_recovery_take_charge() {
         100,
         true,
         false,
-        now,
+        at,
     ) {
         Decision::Selected {
             account,
@@ -815,7 +815,7 @@ fn round2_debug_pin_is_exempt_but_new_and_unmatched_pin_recovery_take_charge() {
     };
     // Cover both a pinned first binding and a pin overriding an existing one.
     for key in ["claude:pinned-new", "claude:normal"] {
-        let (account, event) = pinned_choice(key, &cs);
+        let (account, event) = pinned_choice(key, &cs, now);
         assert_eq!(account, "cl-b");
         assert!(event.debug_pin);
         assert!(!event.is_placement);
@@ -827,7 +827,7 @@ fn round2_debug_pin_is_exempt_but_new_and_unmatched_pin_recovery_take_charge() {
     }
     // A pin naming an ineligible candidate must not exempt real C5 recovery.
     cs[1].account.user_state = UserState::Paused;
-    let (account, event) = pinned_choice("claude:normal", &cs);
+    let (account, event) = pinned_choice("claude:normal", &cs, now + chrono::Duration::minutes(31));
     assert_eq!(account, "cl-a");
     assert_eq!(event.reason, "forced");
     assert!(!event.debug_pin);
@@ -1458,7 +1458,16 @@ fn round2_default_limits_move_both_marked_groups_with_fresh_target_in_first_wind
 #[test]
 fn round2_forced_burst_takes_charge_and_cap_but_never_refuses() {
     for targets in [1usize, 2] {
-        let (_root, t, mut cs, now) = placement_fixture();
+        let root = fixture_dir();
+        let mut config = RoutingConfig {
+            spread_threshold: 100,
+            ..RoutingConfig::default()
+        };
+        // Isolate ten distinct D20 placements; the default R14 global fence is tested separately.
+        config.move_guard.global_ten_minutes = 10;
+        let t = BindingTable::new(root.path(), config).unwrap();
+        let now = Utc::now();
+        let mut cs = vec![candidate("cl-a", 0., 8, 1), candidate("cl-b", 30., 30, 2)];
         cs.push(candidate("cl-c", 30., 40, 3));
         observed_at(&mut cs, now);
         for n in 0..10 {
