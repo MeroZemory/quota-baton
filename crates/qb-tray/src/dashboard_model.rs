@@ -402,6 +402,7 @@ pub struct AccountGroup {
     pub reset: String,
     pub remaining_pct: Option<u8>,
     pub windows: Vec<AccountUsageWindow>,
+    pub forecast_lines: Vec<String>,
     pub relogin: bool,
     /// Shared tray reason; nonempty only for re-login, including linked accounts.
     pub relogin_reason: String,
@@ -469,6 +470,9 @@ pub struct UsageTile {
     pub chip: String,
     pub tone: v2::Tone,
     pub windows: Vec<AccountUsageWindow>,
+    pub forecast_lines: Vec<String>,
+    /// Display-only future lines; never included in observed history or hit tables.
+    pub projections: Vec<UsageForecastSeries>,
     /// Latest valid account/window timestamp or known history point, never a null/future point.
     pub last_observed: Option<DateTime<Utc>>,
     pub paused: bool,
@@ -476,6 +480,12 @@ pub struct UsageTile {
     pub credits_spans: Vec<(DateTime<Utc>, DateTime<Utc>)>,
     pub unconfirmed: bool,
     pub truncated: bool,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct UsageForecastSeries {
+    pub name: String,
+    /// Remaining percent, projected using the core's selected rate and used_pct.
+    pub points: [(DateTime<Utc>, f64); 2],
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EmptyState {
@@ -1085,6 +1095,7 @@ pub fn project(
                 .unwrap_or_default(),
             remaining_pct: remaining.and_then(|w| w.remaining),
             windows,
+            forecast_lines: a.forecast_lines.clone(),
             relogin: a.raw.health.kind == "needs_relogin" && a.menu.show_relogin,
             relogin_reason: if a.state == v2::DisplayState::Relogin {
                 a.reason
@@ -1970,6 +1981,71 @@ pub fn usage_domain(clock: &Clock) -> (DateTime<Utc>, DateTime<Utc>) {
     (now - Duration::hours(19), now + Duration::hours(5))
 }
 
+fn usage_projections(a: &v2::AccountRow, clock: &Clock) -> Vec<UsageForecastSeries> {
+    use qb_core::usage_forecast::{ForecastBasis, ForecastOutcome};
+    let Some(forecast) = a.raw.usage_forecast.as_ref() else {
+        return vec![];
+    };
+    if a.raw.health.kind == "needs_relogin" || forecast.as_of > clock.utc() {
+        return vec![];
+    }
+    let (_, edge) = usage_domain(clock);
+    let start = (edge - chrono::Duration::hours(5)).max(forecast.as_of);
+    forecast
+        .windows
+        .iter()
+        .filter(|w| !w.name.starts_with("7d_") && !w.name.contains("model:"))
+        .filter_map(|w| {
+            if !w.used_pct.is_finite()
+                || !(0.0..100.0).contains(&w.used_pct)
+                || w.observed_at > forecast.as_of
+                || w.awaiting_usage
+                || matches!(
+                    w.outcome,
+                    ForecastOutcome::Measuring
+                        | ForecastOutcome::ResetPending
+                        | ForecastOutcome::Exhausted
+                )
+            {
+                return None;
+            }
+            let rate = match w.basis? {
+                ForecastBasis::Recent => w.recent_pct_per_hour?,
+                ForecastBasis::Average => w.average_pct_per_hour?,
+            };
+            if !rate.is_finite() || rate < 0.0 {
+                return None;
+            }
+            let end = w
+                .reset_at
+                .into_iter()
+                .chain(w.exhaustion_at)
+                .fold(edge, |a, b| a.min(b));
+            if end <= start {
+                return None;
+            }
+            // The DTO's value belongs to as_of. Advance with its selected rate,
+            // preserving slope when a cached DTO is clipped by a later minute.
+            let hours_since_as_of = |at: DateTime<Utc>| {
+                at.signed_duration_since(forecast.as_of)
+                    .num_microseconds()
+                    .map(|micros| micros as f64 / 3_600_000_000.)
+            };
+            let remaining =
+                (100.0 - w.used_pct - rate * hours_since_as_of(start)?).clamp(0.0, 100.0);
+            if remaining <= 0.0 {
+                return None;
+            }
+            let end_remaining =
+                (100.0 - w.used_pct - rate * hours_since_as_of(end)?).clamp(0.0, 100.0);
+            Some(UsageForecastSeries {
+                name: v2::window_label(&w.name),
+                points: [(start, remaining), (end, end_remaining)],
+            })
+        })
+        .collect()
+}
+
 fn usage_tiles(snapshot: &DashboardSnapshot, clock: &Clock) -> Vec<UsageTile> {
     let (from, _) = usage_domain(clock);
     account_rows(&snapshot.accounts)
@@ -2063,6 +2139,8 @@ fn usage_tiles(snapshot: &DashboardSnapshot, clock: &Clock) -> Vec<UsageTile> {
                 chip: a.chip.as_ref().map(|c| c.text.clone()).unwrap_or_default(),
                 tone: a.chip.as_ref().map_or(v2::Tone::Off, |c| c.tone),
                 windows: account_windows(a),
+                forecast_lines: a.forecast_lines.clone(),
+                projections: usage_projections(a, clock),
                 last_observed: observed_at(a, clock)
                     .into_iter()
                     .chain(

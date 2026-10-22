@@ -23,6 +23,8 @@ pub mod quota;
 pub mod relay;
 pub mod routing;
 pub mod session;
+pub mod usage_forecast;
+pub mod usage_forecast_display;
 
 pub fn set_console_utf8() {
     // 콘솔에 연결된 CLI 출력은 한국어를 UTF-8로 표시한다. 리디렉션은 원래 UTF-8 바이트를 쓴다.

@@ -47,6 +47,7 @@ pub struct Account {
     pub credits: Option<Credits>,
     /// Authoritative actual paid-serving signal, including explicit false.
     pub credits_in_use: Option<bool>,
+    pub usage_forecast: Option<qb_core::usage_forecast::AccountUsageForecast>,
     pub pool_eligible: Option<bool>,
     pub eligible_for_new_session: Option<bool>,
     pub quota_cooling: Option<QuotaCooling>,
@@ -262,6 +263,7 @@ pub struct AccountRow {
     pub usage: Option<Usage>,
     pub windows: Vec<WindowMetric>,
     pub credits: Option<CreditsLine>,
+    pub forecast_lines: Vec<String>,
     pub reason: Option<String>,
     /// The only inline action; menu controls are not row buttons.
     pub action: Option<RowAction>,
@@ -773,6 +775,11 @@ fn project_row(a: &Account, name: String, now: DateTime<Utc>) -> AccountRow {
         usage,
         windows,
         credits,
+        forecast_lines: a
+            .usage_forecast
+            .as_ref()
+            .map(|forecast| qb_core::usage_forecast_display::lines(forecast, actual_credits(a)))
+            .unwrap_or_default(),
         reason: None,
         action: None,
         menu,

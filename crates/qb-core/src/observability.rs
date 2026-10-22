@@ -754,8 +754,28 @@ impl Observability {
         preserve_missing_windows: bool,
     ) -> Option<serde_json::Value> {
         use crate::dashboard::history::*;
+        if let Some(balance) = next.credits.as_ref().and_then(|c| c.balance) {
+            self.dashboard
+                .observe_credit_forecast(id, balance, next.observed_at);
+        }
         if let Ok(account) = crate::dashboard::AccountId::try_from(id.to_owned()) {
             for window in &next.windows {
+                if let Some(used_pct) = window.used_pct {
+                    self.dashboard.observe_usage_forecast(
+                        id,
+                        &window.name,
+                        used_pct,
+                        window.reset_at,
+                        window.observed_at.unwrap_or(next.observed_at),
+                    );
+                } else if let Some(reset) = window.reset_at {
+                    self.dashboard.observe_forecast_reset(
+                        id,
+                        &window.name,
+                        reset,
+                        window.observed_at.unwrap_or(next.observed_at),
+                    );
+                }
                 if let Ok(name) = window.name.clone().try_into() {
                     self.dashboard.usage(UsageObservation {
                         account: account.clone(),
@@ -1652,6 +1672,33 @@ fn retain(dir: &Path, today: NaiveDate, cap: u64) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+
+    #[test]
+    fn r13_forecast_observation_uses_fresh_values_and_stays_cold_after_restore() {
+        let dir = directory();
+        let obs = Observability::new(dir.path(), None).unwrap();
+        let now = Utc::now();
+        let start = now - chrono::Duration::minutes(20);
+        let reset = now + chrono::Duration::hours(2);
+        for (minute, used) in [(0, 10.), (5, 12.), (10, 14.)] {
+            obs.observe_poll("cx-123abc", json!({"windows":[{"name":"5h","used_pct":used,"reset_at":reset}],"source":"poll","observed_at":start + chrono::Duration::minutes(minute),"signals":{}}), false).unwrap();
+        }
+        // A partial poll must not replay the cached primary value at a new time.
+        obs.observe_poll("cx-123abc", json!({"windows":[{"name":"7d","used_pct":20.,"reset_at":now+chrono::Duration::days(2)}],"source":"poll","observed_at":now,"signals":{}}), false).unwrap();
+        let forecast = obs.dashboard().usage_forecast("cx-123abc", now, None);
+        let window = forecast.windows.iter().find(|w| w.name == "5h").unwrap();
+        assert_eq!(window.observed_at, start + chrono::Duration::minutes(10));
+        assert_eq!(window.recent_pct_per_hour, Some(12.));
+        obs.flush().unwrap();
+        let restored = Observability::new(dir.path(), None).unwrap();
+        assert!(
+            restored
+                .dashboard()
+                .usage_forecast("cx-123abc", now, None)
+                .windows
+                .is_empty()
+        );
+    }
 
     #[test]
     fn binding_moves_hash_identity_and_cache_usage_only_keeps_numbers() {

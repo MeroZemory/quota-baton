@@ -21,6 +21,7 @@ use std::{
 };
 
 const CAPACITY: usize = 20_000;
+const COUNT_CHANGE_CAPACITY: usize = CAPACITY * 2;
 mod launch;
 pub use launch::{
     LaunchEntitlements, LaunchError, LaunchInfo, LaunchPlacement, LaunchPolicyMove, LaunchRequest,
@@ -392,11 +393,45 @@ struct Data {
     groups: BTreeMap<String, Group>,
     lru: BTreeSet<(DateTime<Utc>, String)>,
     accounts: BTreeMap<String, AccountIndex>,
+    // Memory-only history, including accounts whose last binding was removed.
+    count_changes: BTreeMap<String, DateTime<Utc>>,
+    count_change_order: BTreeSet<(DateTime<Utc>, String)>,
+    count_before: BTreeMap<String, usize>,
+    // prune starts launch mutations; commit_binding also supplies its own clock.
+    count_change_clock: Option<DateTime<Utc>>,
+    defer_count_changes: bool,
     dirty: bool,
     revision: u64,
 }
 impl Data {
+    fn count_before_change(&mut self, id: &str) {
+        let count = self.accounts.get(id).map_or(0, |a| a.count);
+        self.count_before.entry(id.to_owned()).or_insert(count);
+    }
+
+    fn commit_count_changes(&mut self) {
+        if self.defer_count_changes || self.count_before.is_empty() {
+            return;
+        }
+        let now = self.count_change_clock.unwrap_or_else(Utc::now);
+        for (id, before) in std::mem::take(&mut self.count_before) {
+            if before == self.accounts.get(&id).map_or(0, |a| a.count) {
+                continue;
+            }
+            if let Some(old) = self.count_changes.insert(id.clone(), now) {
+                self.count_change_order.remove(&(old, id.clone()));
+            }
+            self.count_change_order.insert((now, id));
+        }
+        while self.count_changes.len() > COUNT_CHANGE_CAPACITY {
+            if let Some((_, id)) = self.count_change_order.pop_first() {
+                self.count_changes.remove(&id);
+            }
+        }
+    }
+
     fn changed(&mut self) {
+        self.commit_count_changes();
         self.dirty = true;
         self.revision = self.revision.wrapping_add(1);
     }
@@ -561,6 +596,7 @@ fn protected(d: &Data, g: &str) -> bool {
 // Index changes visit only the affected group, never the binding table.
 fn unindex_group(d: &mut Data, g: &str) -> Option<Group> {
     let entry = d.groups.remove(g)?;
+    d.count_before_change(&entry.account);
     d.lru.remove(&(entry.last_used, g.to_owned()));
     if let Some(account) = d.accounts.get_mut(&entry.account) {
         account.count -= entry.keys.len();
@@ -575,6 +611,7 @@ fn unindex_group(d: &mut Data, g: &str) -> Option<Group> {
     Some(entry)
 }
 fn index_group(d: &mut Data, g: String, entry: Group) {
+    d.count_before_change(&entry.account);
     if !protected(d, &g) {
         d.lru.insert((entry.last_used, g.clone()));
     }
@@ -643,6 +680,8 @@ fn rebuild_indexes(d: &mut Data) {
     for (g, entry) in groups {
         index_group(d, g, entry);
     }
+    // Recovery reconstructs indexes, rather than committing live mutations.
+    d.count_before.clear();
 }
 fn snapshot(d: &Data) -> Snapshot {
     Snapshot {
@@ -919,6 +958,9 @@ impl BindingTable {
         Ok(table)
     }
     fn prune(&self, d: &mut Data, now: DateTime<Utc>) {
+        d.count_change_clock = Some(now);
+        let deferred = d.defer_count_changes;
+        d.defer_count_changes = true;
         launch::prune(d, now);
         while let Some((time, g)) = d
             .lru
@@ -951,6 +993,8 @@ impl BindingTable {
                 d.changed();
             }
         }
+        d.defer_count_changes = deferred;
+        d.commit_count_changes();
     }
     fn dashboard_row(
         &self,
@@ -1062,6 +1106,18 @@ impl BindingTable {
         d.accounts.get(id).map_or((0, None), |a| {
             (a.count, a.recent.last().map(|(time, _)| *time))
         })
+    }
+
+    /// Last committed change to account_stats(id).0, including changes back to
+    /// an earlier count. Read-only: does not prune or acknowledge the change.
+    /// History starts cold on restart and retains the latest bounded records.
+    pub fn account_count_changed_at(&self, id: &str) -> Option<DateTime<Utc>> {
+        self.data
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .count_changes
+            .get(id)
+            .copied()
     }
 
     pub fn active_sessions(&self, id: &str, now: DateTime<Utc>) -> usize {
@@ -1849,6 +1905,8 @@ impl BindingTable {
             return Decision::Blocked;
         }
         let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        // Placement plus capacity eviction is one visible count mutation.
+        d.defer_count_changes = true;
         let moves = self.commit_binding(
             &mut d,
             provider,
@@ -1864,6 +1922,8 @@ impl BindingTable {
         );
         let lease = self.reserve(&mut d, key, &account);
         self.prune(&mut d, now);
+        d.defer_count_changes = false;
+        d.commit_count_changes();
         Decision::Selected {
             account,
             lease,
@@ -1886,6 +1946,7 @@ impl BindingTable {
         account: &str,
         reason: &str,
     ) -> Vec<MoveEvent> {
+        d.count_change_clock = Some(now);
         let mut moves = Vec::new();
         if let Some(k) = key {
             let g = group(k);
@@ -2506,10 +2567,19 @@ impl BindingTable {
                 )
             }))?;
         let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
-        self.prune(&mut next, Utc::now());
+        let now = Utc::now();
+        self.prune(&mut next, now);
         // Import must advance the existing table's revision, rather than use
         // the decoded default: a flush may already own an older snapshot.
         next.revision = d.revision;
+        next.count_changes = std::mem::take(&mut d.count_changes);
+        next.count_change_order = std::mem::take(&mut d.count_change_order);
+        next.count_before = d
+            .accounts
+            .keys()
+            .chain(next.accounts.keys())
+            .map(|id| (id.clone(), d.accounts.get(id).map_or(0, |a| a.count)))
+            .collect();
         next.changed();
         *d = next;
         self.policies.finish_recovery();
@@ -4738,6 +4808,196 @@ mod tests {
             assert_eq!(entry.count, expected.accounts[id].count);
             assert_eq!(entry.recent, expected.accounts[id].recent);
         }
+    }
+
+    fn count_change_place(t: &Arc<BindingTable>, key: &str, id: &str, now: DateTime<Utc>) {
+        let c = candidate(id, 10.0, 8, 1);
+        let decision = t.choose_with_hold_at(
+            Provider::Claude,
+            Some(key),
+            None,
+            None,
+            &[c],
+            Some(id),
+            0,
+            false,
+            false,
+            now,
+        );
+        let Decision::Selected { account, lease, .. } = decision else {
+            panic!("{decision:?}");
+        };
+        assert_eq!(account, id);
+        drop(lease);
+    }
+
+    #[test]
+    fn r13_count_change_move_records_both_accounts_and_change_back_between_polls() {
+        let (_dir, t) = table();
+        let now = Utc::now();
+        assert_eq!(t.account_count_changed_at("a"), None);
+        count_change_place(&t, "claude:count", "a", now);
+        assert_eq!(t.account_count_changed_at("a"), Some(now));
+        let moved = now + Delta::seconds(1);
+        count_change_place(&t, "claude:count", "b", moved);
+        assert_eq!(t.account_count_changed_at("a"), Some(moved));
+        assert_eq!(t.account_count_changed_at("b"), Some(moved));
+        let back = now + Delta::seconds(2);
+        count_change_place(&t, "claude:count", "a", back);
+        // No timestamp API poll between the two committed moves below.
+        count_change_place(&t, "claude:count", "b", back + Delta::seconds(1));
+        count_change_place(&t, "claude:count", "a", back + Delta::seconds(2));
+        assert_eq!(t.account_stats("a").0, 1);
+        assert_eq!(t.account_stats("b").0, 0);
+        for id in ["a", "b"] {
+            assert_eq!(
+                t.account_count_changed_at(id),
+                Some(back + Delta::seconds(2))
+            );
+        }
+    }
+
+    #[test]
+    fn r13_count_change_launch_adoption_merge_and_abandonment_use_mutation_clock() {
+        let (_dir, t) = table();
+        let now = Utc::now();
+        let mut c = candidate("a", 10.0, 8, 1);
+        c.account.provider = Provider::Codex;
+        c.account.identity = Identity::Codex {
+            user_id: None,
+            account_id: "a".into(),
+            email: "synthetic@example.invalid".into(),
+        };
+        let entitlements = BTreeMap::from([("a".into(), BTreeSet::from(["m1".into()]))]);
+        for (anchor, at) in [
+            ("launch:first", now),
+            ("launch:second", now + Delta::seconds(1)),
+        ] {
+            t.place_launch(
+                LaunchRequest {
+                    anchor_key: anchor,
+                    resume_key: None,
+                    model: Some("m1"),
+                    model_is_explicit: true,
+                    account_pref: Some("a"),
+                    allow_move_for_model: false,
+                },
+                std::slice::from_ref(&c),
+                &entitlements,
+                at,
+            )
+            .unwrap();
+        }
+        assert_eq!(t.account_stats("a").0, 2);
+        let placed = now + Delta::seconds(1);
+        assert_eq!(t.account_count_changed_at("a"), Some(placed));
+        t.resolve_launch(
+            Some("launch:first"),
+            Some("codex:real"),
+            now + Delta::seconds(2),
+        )
+        .unwrap();
+        assert_eq!(t.account_count_changed_at("a"), Some(placed));
+        let merged = now + Delta::seconds(3);
+        t.resolve_launch(Some("launch:second"), Some("codex:real"), merged)
+            .unwrap();
+        assert_eq!(t.account_stats("a").0, 1);
+        assert_eq!(t.account_count_changed_at("a"), Some(merged));
+        let expired = now + Delta::days(10);
+        {
+            let mut d = t.data.lock().unwrap();
+            t.prune(&mut d, expired);
+            assert!(d.bindings.is_empty());
+        }
+        assert_eq!(t.account_count_changed_at("a"), Some(expired));
+    }
+
+    #[test]
+    fn r13_count_change_expiry_and_import_clear_retain_zero_count_history() {
+        let (_dir, t) = table();
+        let now = Utc::now();
+        count_change_place(&t, "claude:expire", "a", now);
+        let expired = now + Delta::seconds(t.config.session_binding_max_secs as i64 + 1);
+        {
+            let mut d = t.data.lock().unwrap();
+            t.prune(&mut d, expired);
+            assert!(d.bindings.is_empty());
+        }
+        assert_eq!(t.account_count_changed_at("a"), Some(expired));
+        count_change_place(&t, "claude:clear", "b", now);
+        let before = Utc::now();
+        t.import(json!({"schema":1,"bindings":[]})).unwrap();
+        let removed = t.account_count_changed_at("b").unwrap();
+        assert!(removed >= before && removed <= Utc::now());
+        assert_eq!(t.account_stats("b").0, 0);
+        assert_eq!(t.account_count_changed_at("a"), Some(expired));
+    }
+
+    #[test]
+    fn r13_count_change_touch_and_same_count_membership_replacement_are_unchanged() {
+        let (_dir, t) = table();
+        let now = Utc::now();
+        count_change_place(&t, "claude:old", "a", now);
+        count_change_place(&t, "claude:old", "a", now + Delta::seconds(1));
+        t.touch(Some("claude:old"));
+        {
+            let mut d = t.data.lock().unwrap();
+            touch_group(&mut d, "claude:old", now + Delta::seconds(2));
+        }
+        let mut state = t.export().unwrap();
+        state["bindings"][0]["key"] = json!("claude:replacement");
+        t.import(state).unwrap();
+        assert_eq!(t.account_stats("a").0, 1);
+        assert_eq!(t.account_count_changed_at("a"), Some(now));
+        let d = t.data.lock().unwrap();
+        assert!(d.bindings.contains_key("claude:replacement"));
+        assert!(d.count_before.is_empty());
+        let revision = d.revision;
+        let dirty = d.dirty;
+        drop(d);
+        assert_eq!(t.account_count_changed_at("unknown"), None);
+        assert_eq!(t.account_count_changed_at("a"), Some(now));
+        let d = t.data.lock().unwrap();
+        assert_eq!((d.revision, d.dirty), (revision, dirty));
+    }
+
+    #[test]
+    fn r13_count_change_history_is_bounded_and_restart_starts_cold() {
+        let (_dir, t) = table();
+        let now = Utc::now();
+        count_change_place(&t, "claude:cold", "a", now);
+        let recovered = decode(t.export().unwrap()).unwrap();
+        assert!(recovered.count_changes.is_empty());
+        assert!(recovered.count_change_order.is_empty());
+        assert!(recovered.count_before.is_empty());
+
+        // Exercise the shared index/commit hooks without retaining bindings.
+        let mut d = Data::default();
+        for n in 0..COUNT_CHANGE_CAPACITY + 2 {
+            let id = format!("account-{n:06}");
+            let at = now + Delta::seconds(n as i64);
+            d.count_change_clock = Some(at);
+            index_group(
+                &mut d,
+                "claude:one".into(),
+                Group {
+                    keys: BTreeSet::from(["claude:one".into()]),
+                    account: id.clone(),
+                    last_used: at,
+                },
+            );
+            d.changed();
+            unindex_group(&mut d, "claude:one").unwrap();
+            d.changed();
+            assert_eq!(d.count_changes.get(&id), Some(&at));
+            assert!(d.count_changes.len() <= COUNT_CHANGE_CAPACITY);
+            assert_eq!(d.count_changes.len(), d.count_change_order.len());
+            assert!(d.count_before.is_empty());
+        }
+        assert_eq!(d.count_changes.len(), COUNT_CHANGE_CAPACITY);
+        assert!(!d.count_changes.contains_key("account-000000"));
+        assert!(!d.count_changes.contains_key("account-000001"));
+        assert!(d.accounts.is_empty());
     }
 
     #[test]

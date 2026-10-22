@@ -11,6 +11,8 @@ mod dashboard_persistence;
 #[allow(dead_code)]
 #[path = "../src/dashboard_window.rs"]
 mod dashboard_window;
+#[path = "support/r13_usage_forecast_fixture.rs"]
+mod forecast_fixture;
 
 use dashboard_window::{Bridge, Event, UiPort};
 use qb_tray::{
@@ -311,5 +313,146 @@ fn r13_rolling_chart_native_capture() {
     assert!(
         !bridge_fault.load(Ordering::Acquire),
         "synthetic bridge overflow/disconnect during capture or cleanup"
+    );
+}
+
+#[test]
+#[ignore = "manual synthetic forecast HWND capture; set project-local R13_CHART_OUTPUT"]
+fn r13_usage_forecast_native_capture() {
+    let output = PathBuf::from(std::env::var_os("R13_CHART_OUTPUT").expect("R13_CHART_OUTPUT"));
+    let sandbox = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.sandbox")
+        .canonicalize()
+        .unwrap();
+    assert!(output.is_absolute() && output.is_dir());
+    assert!(output.canonicalize().unwrap().starts_with(sandbox));
+    let previous =
+        unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+    assert!(!previous.is_invalid());
+    unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().unwrap() };
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let (send, inbox) = mpsc::sync_channel(256);
+    let mut port = None;
+    let fault = Arc::new(AtomicBool::new(false));
+    let cleanup = Cleanup(previous);
+    let (clock, snapshot) = forecast_fixture::fixture();
+    let expected = qb_core::usage_forecast_display::lines(
+        &forecast_fixture::forecast(clock.utc(), false),
+        true,
+    );
+    let snapshot = Arc::new(snapshot);
+    dashboard_window::open_or_focus(
+        HWND::default(),
+        Arc::new(FakeBridge(send, fault.clone())),
+        snapshot.clone(),
+        clock.clone(),
+        false,
+    )
+    .unwrap();
+    pump(&inbox, &mut port, deadline);
+    let hwnd = owned_dashboard();
+    let mut records = Vec::new();
+    for dark in [false, true] {
+        for size in [[1024, 640], [1320, 960]] {
+            for tab in [Tab::Overview, Tab::Usage] {
+                assert!(
+                    port.as_ref()
+                        .unwrap()
+                        .snapshot(snapshot.clone(), clock.clone())
+                );
+                assert!(port.as_ref().unwrap().theme(dark));
+                let dpi = unsafe { GetDpiForWindow(hwnd) };
+                let mut client = RECT::default();
+                let mut window = RECT::default();
+                unsafe {
+                    GetClientRect(hwnd, &mut client).unwrap();
+                    GetWindowRect(hwnd, &mut window).unwrap();
+                    SetWindowPos(
+                        hwnd,
+                        None,
+                        0,
+                        0,
+                        size[0] * dpi as i32 / 96 + window.right - window.left - client.right,
+                        size[1] * dpi as i32 / 96 + window.bottom - window.top - client.bottom,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    )
+                    .unwrap();
+                }
+                pump(&inbox, &mut port, deadline);
+                let scene = dashboard_window::perf_scene(hwnd).unwrap();
+                let tab_rect = scene
+                    .targets
+                    .iter()
+                    .find(|t| t.target == Target::Tab(tab))
+                    .unwrap()
+                    .rect;
+                let scale = dpi as f32 / 96.;
+                let position = LPARAM(
+                    ((((tab_rect.top + tab_rect.bottom) / 2. * scale).round() as u32) << 16
+                        | ((tab_rect.left + tab_rect.right) / 2. * scale).round() as u32)
+                        as isize,
+                );
+                unsafe {
+                    SendMessageW(hwnd, WM_LBUTTONDOWN, Some(WPARAM(1)), Some(position));
+                    SendMessageW(hwnd, WM_LBUTTONUP, Some(WPARAM(0)), Some(position));
+                }
+                pump(&inbox, &mut port, deadline);
+                let scene = dashboard_window::perf_scene(hwnd).unwrap();
+                for line in &expected {
+                    assert!(scene.draw.iter().any(|d| matches!(d,
+                        Draw::Text { measure,.. } if measure.text == *line && measure.wrap)));
+                }
+                assert!(scene.draw.iter().any(|d| matches!(d,
+                    Draw::Text { measure,.. } if measure.text == "소진 예측: 측정 중")));
+                if tab == Tab::Usage {
+                    let chart = scene.charts.iter().find(|c| c.id == "steady").unwrap();
+                    assert!(scene.chart_tooltip("steady", chart.rect.right).is_none());
+                    assert!(
+                        chart
+                            .series
+                            .iter()
+                            .flat_map(|s| &s.points)
+                            .all(|(t, _)| *t <= clock.utc())
+                    );
+                    assert_eq!(
+                        scene
+                            .draw
+                            .iter()
+                            .filter(|d| matches!(
+                                d,
+                                Draw::Line {
+                                    dash: Some([3., 3.]),
+                                    ..
+                                }
+                            ))
+                            .count(),
+                        2
+                    );
+                }
+                let name = format!(
+                    "forecast-{}-{}-{}x{}",
+                    if tab == Tab::Usage { "usage" } else { "cards" },
+                    if dark { "dark" } else { "light" },
+                    size[0],
+                    size[1]
+                );
+                capture::save(hwnd, &output.join(format!("{name}.bgra"))).unwrap();
+                unsafe { GetClientRect(hwnd, &mut client).unwrap() };
+                records.push(json!({"file":format!("{name}.bgra"),"pixel_format":"BGRA8-top-down",
+                    "width":client.right,"height":client.bottom,"dpi":dpi,"dark":dark,
+                    "tab":format!("{tab:?}"),"forecast_lines":expected,
+                    "scope":"actual owned production HWND WM_PRINTCLIENT; synthetic forecast DTOs"}));
+            }
+        }
+    }
+    std::fs::write(
+        output.join("forecast-captures.json"),
+        serde_json::to_vec_pretty(&records).unwrap(),
+    )
+    .unwrap();
+    drop(cleanup);
+    assert!(
+        !fault.load(Ordering::Acquire),
+        "synthetic bridge fault during capture or cleanup"
     );
 }

@@ -155,6 +155,7 @@ pub async fn run(command: AccountsCommand, home: &Path, config: &Config) -> anyh
         AccountsCommand::Enable { id } => action(home, config, &id, "enable").await?,
         AccountsCommand::List => {
             let accounts = AccountStore::list_metadata(home)?;
+            let forecasts = live_account_views(home, config).await?;
             println_utf8!(
                 "계정 ID\t제공자\t이메일\t요금제\t출처\t연결 방식\t사용 상태\t계정 상태\t만료 시각"
             );
@@ -172,6 +173,12 @@ pub async fn run(command: AccountsCommand, home: &Path, config: &Config) -> anyh
                     health_label(&value["health"]),
                     cell(&value["token_meta"]["expires_at"])
                 );
+                let live = forecasts
+                    .as_ref()
+                    .and_then(|rows| rows.iter().find(|row| row["id"] == value["id"]));
+                for line in forecast_lines(live, forecasts.is_some()) {
+                    println_utf8!("  {line}");
+                }
             }
         }
         AccountsCommand::Import {
@@ -957,27 +964,7 @@ fn status_heading(home: &Path, running: bool) -> anyhow::Result<Vec<String>> {
 }
 
 pub async fn status(home: &Path, config: &Config) -> anyhow::Result<()> {
-    let (running, accounts) = if let Some((client, base, token)) =
-        running_admin(home, config).await?
-    {
-        let state: serde_json::Value = admin_route_response(
-            client
-                .get(format!("{base}/state"))
-                .bearer_auth(token.trim())
-                .send()
-                .await?,
-            &client,
-            &base,
-            &token,
-        )
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-        let accounts = state["accounts"]
-            .as_array()
-            .ok_or_else(|| anyhow::anyhow!("Invalid account state"))?
-            .clone();
+    let (running, accounts) = if let Some(accounts) = live_account_views(home, config).await? {
         (true, accounts)
     } else {
         let home = home.to_owned();
@@ -1089,8 +1076,58 @@ pub async fn status(home: &Path, config: &Config) -> anyhow::Result<()> {
             translated(&account["health"]["reason"]),
             cell(&account["health"]["until"])
         );
+        for line in forecast_lines(Some(&account), running) {
+            println_utf8!("  {line}");
+        }
     }
     Ok(())
+}
+
+async fn live_account_views(
+    home: &Path,
+    config: &Config,
+) -> anyhow::Result<Option<Vec<serde_json::Value>>> {
+    let Some((client, base, token)) = running_admin(home, config).await? else {
+        return Ok(None);
+    };
+    let state: serde_json::Value = admin_route_response(
+        client
+            .get(format!("{base}/state"))
+            .bearer_auth(token.trim())
+            .send()
+            .await?,
+        &client,
+        &base,
+        &token,
+    )
+    .await?
+    .error_for_status()?
+    .json()
+    .await?;
+    Ok(Some(
+        state["accounts"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("Invalid account state"))?
+            .clone(),
+    ))
+}
+
+fn forecast_lines(account: Option<&serde_json::Value>, running: bool) -> Vec<String> {
+    if !running {
+        return vec!["소진 예측: 코어가 꺼져 있어 측정할 수 없음".into()];
+    }
+    let Some(account) = account else {
+        return vec!["소진 예측: 측정 중".into()];
+    };
+    match serde_json::from_value::<qb_core::usage_forecast::AccountUsageForecast>(
+        account["usage_forecast"].clone(),
+    ) {
+        Ok(forecast) => qb_core::usage_forecast_display::lines(
+            &forecast,
+            account["credits_in_use"].as_bool() == Some(true),
+        ),
+        Err(_) => vec!["소진 예측: 측정 중".into()],
+    }
 }
 
 fn status_window_label(name: &str) -> String {
@@ -1492,6 +1529,25 @@ mod r1_cpa_status_tests {
     use super::*;
     use crate::cutover::cpa_dependency_tests::{account, scratch};
     use serde_json::json;
+
+    #[test]
+    fn r13_forecast_cli_handles_old_core_offline_and_shared_text() {
+        assert!(forecast_lines(None, false)[0].contains("코어가 꺼져"));
+        assert_eq!(
+            forecast_lines(Some(&json!({})), true),
+            vec!["소진 예측: 측정 중"]
+        );
+        let dto = qb_core::usage_forecast::Forecasts::default().view(
+            "cx-123abc",
+            std::time::SystemTime::now().into(),
+            None,
+        );
+        let account = json!({"usage_forecast":dto,"credits_in_use":true});
+        assert_eq!(
+            forecast_lines(Some(&account), true),
+            qb_core::usage_forecast_display::lines(&dto, true)
+        );
+    }
 
     #[test]
     fn r1_cpa_status_heading_shares_wire_note_online_and_offline() {
