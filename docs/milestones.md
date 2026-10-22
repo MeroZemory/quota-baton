@@ -32,7 +32,8 @@ The Codex main updates this block at each unit and gate close; the design sessio
 6. `cargo test -p qb-core --no-fail-fast`
 7. `cargo build -p quota-baton`
 8. **Launch or wiring changes only:** run `target/debug/quota-baton.exe launch-client --check` against the real `%LOCALAPPDATA%\quota-baton` journal, read-only, and record the result.
-9. **Independent review**, where the brief asks for one: a different model family from the implementer.
+9. **UI changes (D27, hard rule):** at least one capture through the real path (spawned core, real AdminClient, real tray process). FakeBridge captures alone do not pass.
+10. **Independent review**, where the brief asks for one: a different model family from the implementer.
 
 ## Plan (re-planned 2026-10-21 19:xx KST, after the root audit)
 
@@ -44,6 +45,7 @@ The Codex main updates this block at each unit and gate close; the design sessio
 | A2 | R11, launch-scoped account and per-account catalog (D22), plus per-account aliases. Integration preparation runs **now**, independent of the frozen R12 source, in `.sandbox/r11-prep/`: no shared target, no builds that touch the impl worktree. The integration lands right after A1 | prep: a background `codex-qb exec` worker started by the main (one completion signal). Integration: Codex main `<pane>` | brief `.sandbox/briefs/R11-launch-account.md` | gate passes, alternation release gate passes, self-merged |
 | A2.5 | R12.10: dashboard lag (urgent, user). Frame rebuilt on every paint and every 500 ms tick, ~300 ms per frame, 60 % CPU idle | Codex main `<pane>` | brief `.sandbox/briefs/R12.10-dashboard-perf.md`; starts when the current R11 unit closes, before R13 | idle CPU < 2 %, interaction p95 < 16 ms, focused gate, self-merged; design session installs |
 | A3 | R13: burn rate and projected exhaustion, dashboard icon (D24), cache-lifetime hold (D25) | Codex main `<pane>` | brief `.sandbox/briefs/R13-burn-icon-hold.md`; starts when R11 merges | gate passes, `launch-client --check` passes, self-merged; design session installs |
+| A4 | R14: compiled admin contract in qb-proto, contract round-trip tests, static guard, routing property tests (D27) | Codex main `<pane>` | brief `.sandbox/briefs/R14-contract.md`; after R13 | gate passes, self-merged; design session installs |
 | B | Probe: does a native `-c model_provider=qb resume` keep provider `qb`? | Codex main runs it as a **background** job during A1/A2 | the synthetic temp-home script from the D23 amendment, started in the background; one completion signal (exit code + result json) | result json written; the design session rules on resume into Qi |
 | C | Install, live image generation (TUI and `codex-qb --images exec`), then **broadcast the exact command to every image-generating session**: sample-proj-a `<pane>`, sample-prj-opus `<pane>`, and any other session found running image work | design session `<pane>` | when A1 merges: build a release in a temp worktree, pre-check, install, and run one `codex-qb --images` generation | the image is produced through qb and sample-proj-a is told |
 | D | Full gates and independent reviews | whoever starts them | always in the background with one completion signal, checked once at unit close | — |
