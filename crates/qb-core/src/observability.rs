@@ -1,9 +1,10 @@
 use crate::accounts::Provider;
+pub mod reread_accounting;
 use axum::http::HeaderMap;
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -97,7 +98,7 @@ pub struct RequestRecord {
     pub after_move: bool,
 }
 
-#[derive(Clone, Default, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct CacheUsage {
     pub input_tokens: Option<u64>,
     pub cached_tokens: Option<u64>,
@@ -117,8 +118,21 @@ pub fn cache_usage(event: &serde_json::Value) -> Option<CacheUsage> {
             .or_else(|| usage["input_tokens_details"]["cached_tokens"].as_u64()),
         cache_creation_input_tokens: usage["cache_creation_input_tokens"].as_u64(),
     };
-    (result.cached_tokens.is_some() || result.cache_creation_input_tokens.is_some())
-        .then_some(result)
+    (result.input_tokens.is_some()
+        || result.cached_tokens.is_some()
+        || result.cache_creation_input_tokens.is_some())
+    .then_some(result)
+}
+
+/// Merge cumulative numeric fields from ONE turn, replacing present fields, never adding.
+/// Claude message_start and message_delta may expose disjoint usage fields.
+pub fn merge_cache_usage(target: &mut Option<CacheUsage>, incoming: CacheUsage) {
+    let current = target.get_or_insert_with(CacheUsage::default);
+    current.input_tokens = incoming.input_tokens.or(current.input_tokens);
+    current.cached_tokens = incoming.cached_tokens.or(current.cached_tokens);
+    current.cache_creation_input_tokens = incoming
+        .cache_creation_input_tokens
+        .or(current.cache_creation_input_tokens);
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -230,6 +244,10 @@ enum Command {
 
 pub struct Observability {
     dashboard: Arc<crate::dashboard::runtime::Runtime>,
+    accounting: std::sync::Mutex<reread_accounting::Registry>,
+    move_warnings: std::sync::Mutex<VecDeque<(Instant, serde_json::Value)>>,
+    reread_notice_tokens: AtomicU64,
+    reread_alerted: std::sync::atomic::AtomicBool,
     // One recent aggregate only; hidden trays recover transient broadcast loss.
     recent_burst: std::sync::Mutex<Option<(std::time::Instant, DateTime<Utc>, u32)>>,
     events: std::sync::Mutex<Option<tokio::sync::broadcast::Sender<serde_json::Value>>>,
@@ -243,6 +261,128 @@ pub struct Observability {
 }
 
 impl Observability {
+    /// Record exactly once, at committed real move, before another request can start.
+    pub fn committed_move(
+        &self,
+        provider: Provider,
+        canonical_key: &str,
+        to_account: &str,
+        model: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> Result<reread_accounting::MoveId, reread_accounting::Error> {
+        let id = self
+            .accounting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .moved(provider, canonical_key, to_account, model, at)?;
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(canonical_key.as_bytes());
+        let session: String = digest[..6].iter().map(|b| format!("{b:02x}")).collect();
+        self.enqueue(Command::Ledger(
+            serde_json::json!({"ts":at, "event":"binding_move_cost",
+            "move_id":id, "session":session, "provider":provider, "reread_tokens":null,
+            "measurement":"pending"}),
+        ));
+        Ok(id)
+    }
+    /// Alias adoption preserves baseline, outstanding tickets and move attribution.
+    /// Conflicting existing canonical identities are rejected rather than silently merged.
+    pub fn accounting_alias(
+        &self,
+        provider: Provider,
+        existing_key: &str,
+        alias_key: &str,
+        at: DateTime<Utc>,
+    ) -> Result<(), reread_accounting::Error> {
+        self.accounting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .alias(provider, existing_key, alias_key, at)
+    }
+    pub fn accounting_begin(
+        &self,
+        provider: Provider,
+        canonical_key: &str,
+        account: &str,
+        model: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> Result<reread_accounting::RequestTicket, reread_accounting::Error> {
+        self.accounting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .begin(provider, canonical_key, account, model, at)
+    }
+    pub fn accounting_end(
+        &self,
+        ticket: reread_accounting::RequestTicket,
+        success: bool,
+        usage: Option<&CacheUsage>,
+        at: DateTime<Utc>,
+    ) -> Result<reread_accounting::Completion, reread_accounting::Error> {
+        let result = self
+            .accounting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .finish(ticket, success, usage, at)?;
+        if let reread_accounting::Completion::Move { id, reread_tokens } = result {
+            self.enqueue(Command::Ledger(
+                serde_json::json!({"ts":at, "event":"binding_move_cost",
+                "move_id":id, "reread_tokens":reread_tokens,
+                "measurement":if reread_tokens.is_some() { "known" } else { "unknown" }}),
+            ));
+        }
+        let snapshot = self.accounting_snapshot(at);
+        let above = snapshot.hour.tokens >= self.reread_notice_tokens.load(Ordering::Acquire);
+        let was_above = self.reread_alerted.swap(above, Ordering::AcqRel);
+        if above && !was_above {
+            self.move_warning(serde_json::json!({"kind":"move_reread", "observed_at":at,
+                "reread_tokens":snapshot.hour.tokens,
+                "known_count":snapshot.hour.known_count, "unknown_count":snapshot.hour.unknown_count}));
+        }
+        Ok(result)
+    }
+    pub fn accounting_snapshot(&self, at: DateTime<Utc>) -> reread_accounting::Snapshot {
+        self.accounting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .snapshot(at)
+    }
+    pub fn record_move_guard(&self, event: &crate::bindings::MoveGuardEvent) {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(event.key.as_bytes());
+        let session: String = digest[..6].iter().map(|b| format!("{b:02x}")).collect();
+        self.enqueue(Command::Ledger(
+            serde_json::json!({"ts":Utc::now(), "event":"binding_move_refused",
+            "session":session, "from":event.from, "to":event.to, "reason":event.reason,
+            "proposed_reason":event.proposed_reason,
+            "until":event.until, "newly_tripped":event.newly_tripped, "forced":event.forced}),
+        ));
+        if event.newly_tripped {
+            self.move_warning(serde_json::json!({
+                "kind":"move_breaker", "observed_at":Utc::now(),
+                "move_list":event.move_list, "until":event.until,
+                "session":session, "from":event.from, "to":event.to,
+                "reason":event.reason, "forced":event.forced}));
+        }
+    }
+    pub fn configure_move_notice(&self, threshold: u64) {
+        self.reread_notice_tokens
+            .store(threshold.clamp(1, 1_000_000_000), Ordering::Release);
+    }
+    fn move_warning(&self, value: serde_json::Value) {
+        let mut warnings = self.move_warnings.lock().unwrap_or_else(|e| e.into_inner());
+        warnings.retain(|(at, _)| at.elapsed() < StdDuration::from_secs(600));
+        if warnings.len() >= 32 {
+            warnings.pop_front();
+        }
+        warnings.push_back((Instant::now(), value.clone()));
+        drop(warnings);
+        self.enqueue(Command::Ledger(
+            serde_json::json!({"ts":Utc::now(), "event":"core_warning", "data":value}),
+        ));
+        self.progress(serde_json::json!({"event":"core_warning", "data":value}));
+    }
+
     pub fn configure_forecast(&self, enabled: bool) {
         self.shadow
             .lock()
@@ -332,9 +472,13 @@ impl Observability {
         {
             *recent = None;
         }
-        recent.as_ref().map(|(_, ts, count)| {
+        let mut values: Vec<_> = recent.as_ref().map(|(_, ts, count)| {
             serde_json::json!({"kind":"burst", "burst_new_sessions":count, "observed_at":ts})
-        }).into_iter().collect()
+        }).into_iter().collect();
+        let mut warnings = self.move_warnings.lock().unwrap_or_else(|e| e.into_inner());
+        warnings.retain(|(at, _)| at.elapsed() < StdDuration::from_secs(600));
+        values.extend(warnings.iter().map(|(_, value)| value.clone()));
+        values
     }
     pub(crate) fn remember_burst(&self, observed_count: u32) {
         *self.recent_burst.lock().unwrap_or_else(|e| e.into_inner()) =
@@ -441,6 +585,10 @@ impl Observability {
             .spawn(move || run(home, state, rx, worker_dropped, worker_dashboard))?;
         Ok(Self {
             dashboard,
+            accounting: std::sync::Mutex::new(reread_accounting::Registry::new(Utc::now())),
+            move_warnings: std::sync::Mutex::new(VecDeque::new()),
+            reread_notice_tokens: AtomicU64::new(100_000),
+            reread_alerted: std::sync::atomic::AtomicBool::new(false),
             recent_burst: std::sync::Mutex::new(None),
             events: std::sync::Mutex::new(None),
             shadow: std::sync::Mutex::new(crate::routing::forecast::Shadow::default()),
@@ -732,12 +880,7 @@ impl Observability {
     ) {
         self.dashboard.placement(key, from, to, reason);
         use sha2::{Digest, Sha256};
-        if !matches!(
-            reason,
-            "forced" | "cold_rebalance" | "reset_hold_timeout" | "overload" | "new"
-        ) {
-            return;
-        }
+        let reason = safe_identifier(reason).unwrap_or_else(|| "unknown".into());
         let digest = Sha256::digest(key.as_bytes());
         let session: String = digest[..6].iter().map(|b| format!("{b:02x}")).collect();
         self.enqueue(Command::Ledger(serde_json::json!({
@@ -1705,6 +1848,13 @@ mod tests {
         let dir = directory();
         let obs = Observability::new(dir.path(), None).unwrap();
         obs.record_move("claude:private-session", Some("old"), "new", "forced", 123);
+        obs.record_move(
+            "claude:private-session",
+            Some("new"),
+            "next",
+            "launch_model",
+            123,
+        );
         let usage = cache_usage(&json!({"response":{"usage":{"input_tokens":100,
             "input_tokens_details":{"cached_tokens":80},"private":"conversation-secret"}}}))
         .unwrap();
@@ -1720,6 +1870,140 @@ mod tests {
         assert!(!text.contains("private-session"));
         assert!(!text.contains("conversation-secret"));
         assert!(text.contains("binding_move") && text.contains("cached_tokens"));
+        assert!(text.contains("launch_model"));
+    }
+
+    #[test]
+    fn input_only_and_split_claude_usage_are_retained_without_summing() {
+        let input_only = cache_usage(&json!({"usage":{"input_tokens":100}})).unwrap();
+        assert_eq!(input_only.input_tokens, Some(100));
+        assert_eq!(input_only.cached_tokens, None);
+        assert_eq!(
+            reread_accounting::uncached(Provider::Codex, input_only),
+            None
+        );
+        let mut merged = cache_usage(&json!({"message":{"usage":{
+            "input_tokens":10,"cache_read_input_tokens":100,"cache_creation_input_tokens":20}}}));
+        let delta = cache_usage(&json!({"usage":{"input_tokens":12}})).unwrap();
+        merge_cache_usage(&mut merged, delta);
+        merge_cache_usage(&mut merged, delta); // Repeated cumulative update is idempotent.
+        let usage = merged.unwrap();
+        assert_eq!(
+            (
+                usage.input_tokens,
+                usage.cached_tokens,
+                usage.cache_creation_input_tokens
+            ),
+            (Some(12), Some(100), Some(20))
+        );
+        assert_eq!(
+            reread_accounting::uncached(Provider::Claude, usage),
+            Some(32)
+        );
+        assert!(
+            cache_usage(&json!({"usage":{"input_tokens":-1,"cached_tokens":"private"}})).is_none()
+        );
+    }
+
+    #[test]
+    fn move_guard_refusals_hash_key_and_only_new_trip_broadcasts() {
+        let dir = directory();
+        let obs = Observability::new(dir.path(), None).unwrap();
+        let (events, mut receiver) = tokio::sync::broadcast::channel(16);
+        obs.set_events(events);
+        let mut event = crate::bindings::MoveGuardEvent {
+            proposed_reason: "forced".into(),
+            move_list: Vec::new(),
+            key: "codex:private-move-guard-session".into(),
+            from: "a".into(),
+            to: "b".into(),
+            reason: "global_move_budget".into(),
+            until: Utc::now() + Duration::minutes(10),
+            newly_tripped: false,
+            forced: true,
+        };
+        obs.record_move_guard(&event);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        event.newly_tripped = true;
+        obs.record_move_guard(&event);
+        let warning = receiver.try_recv().unwrap();
+        assert_eq!(warning["event"], "core_warning");
+        assert_eq!(warning["data"]["kind"], "move_breaker");
+        assert_eq!(warning["data"]["forced"], true);
+        assert!(!warning.to_string().contains(&event.key));
+        obs.flush().unwrap();
+        let text = fs::read_dir(dir.path().join("ledger"))
+            .unwrap()
+            .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect::<String>();
+        assert_eq!(text.matches("binding_move_refused").count(), 2);
+        assert!(!text.contains(&event.key));
+    }
+
+    #[test]
+    fn accounting_hooks_measure_once_and_ledger_association_has_no_raw_key() {
+        let dir = directory();
+        let obs = Observability::new(dir.path(), None).unwrap();
+        let at = Utc::now();
+        let usage = CacheUsage {
+            input_tokens: Some(10),
+            cached_tokens: Some(0),
+            cache_creation_input_tokens: None,
+        };
+        let baseline = obs
+            .accounting_begin(Provider::Codex, "private-canonical-key", "a", Some("m"), at)
+            .unwrap();
+        obs.accounting_end(baseline, true, Some(&usage), at)
+            .unwrap();
+        obs.accounting_alias(
+            Provider::Codex,
+            "private-canonical-key",
+            "private-alias-key",
+            at,
+        )
+        .unwrap();
+        let id = obs
+            .committed_move(Provider::Codex, "private-alias-key", "b", Some("m"), at)
+            .unwrap();
+        let ticket = obs
+            .accounting_begin(Provider::Codex, "private-canonical-key", "b", Some("m"), at)
+            .unwrap();
+        assert_eq!(
+            obs.accounting_end(
+                ticket,
+                true,
+                Some(&CacheUsage {
+                    input_tokens: Some(100),
+                    ..usage
+                }),
+                at
+            )
+            .unwrap(),
+            reread_accounting::Completion::Move {
+                id,
+                reread_tokens: Some(90)
+            }
+        );
+        let snapshot = obs.accounting_snapshot(at);
+        assert_eq!(
+            (
+                snapshot.hour.tokens,
+                snapshot.hour.known_count,
+                snapshot.hour.unknown_count
+            ),
+            (90, 1, 0)
+        );
+        obs.flush().unwrap();
+        let text = fs::read_dir(dir.path().join("ledger"))
+            .unwrap()
+            .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect::<String>();
+        assert!(!text.contains("private-canonical-key") && !text.contains("private-alias-key"));
+        assert_eq!(text.matches("binding_move_cost").count(), 2);
+        assert!(text.contains("\"reread_tokens\":90"));
     }
 
     fn directory() -> tempfile::TempDir {
@@ -2041,6 +2325,10 @@ mod tests {
         let (tx, rx) = mpsc::sync_channel(16);
         let obs = Observability {
             dashboard: crate::dashboard::runtime::Runtime::new(),
+            accounting: std::sync::Mutex::new(reread_accounting::Registry::new(Utc::now())),
+            move_warnings: std::sync::Mutex::new(VecDeque::new()),
+            reread_notice_tokens: AtomicU64::new(100_000),
+            reread_alerted: std::sync::atomic::AtomicBool::new(false),
             recent_burst: std::sync::Mutex::new(None),
             events: std::sync::Mutex::new(None),
             shadow: std::sync::Mutex::new(crate::routing::forecast::Shadow::default()),
@@ -2076,6 +2364,10 @@ mod tests {
         let (tx, rx) = mpsc::sync_channel(2);
         let obs = Observability {
             dashboard: crate::dashboard::runtime::Runtime::new(),
+            accounting: std::sync::Mutex::new(reread_accounting::Registry::new(Utc::now())),
+            move_warnings: std::sync::Mutex::new(VecDeque::new()),
+            reread_notice_tokens: AtomicU64::new(100_000),
+            reread_alerted: std::sync::atomic::AtomicBool::new(false),
             recent_burst: std::sync::Mutex::new(None),
             events: std::sync::Mutex::new(None),
             shadow: std::sync::Mutex::new(crate::routing::forecast::Shadow::default()),
@@ -2211,6 +2503,10 @@ mod tests {
         });
         let obs = Observability {
             dashboard: crate::dashboard::runtime::Runtime::new(),
+            accounting: std::sync::Mutex::new(reread_accounting::Registry::new(Utc::now())),
+            move_warnings: std::sync::Mutex::new(VecDeque::new()),
+            reread_notice_tokens: AtomicU64::new(100_000),
+            reread_alerted: std::sync::atomic::AtomicBool::new(false),
             recent_burst: std::sync::Mutex::new(None),
             events: std::sync::Mutex::new(None),
             shadow: std::sync::Mutex::new(crate::routing::forecast::Shadow::default()),

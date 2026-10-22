@@ -431,6 +431,7 @@ pub struct SessionDetail {
 }
 #[derive(Serialize)]
 pub struct SessionsView {
+    pub move_cost: Option<crate::observability::reread_accounting::Snapshot>,
     pub now: DateTime<Utc>,
     pub active_window_secs: u64,
     pub sessions: Vec<SessionSummary>,
@@ -1009,6 +1010,7 @@ impl Dashboard {
         let truncated = sessions.len() > LIST_CAP;
         sessions.truncate(LIST_CAP);
         SessionsView {
+            move_cost: None,
             now,
             active_window_secs: self.active_window_secs,
             sessions,

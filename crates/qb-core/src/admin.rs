@@ -215,6 +215,7 @@ fn runtime_router(state: RuntimeAdmin) -> Router {
             "/admin/v1/routing",
             axum::routing::get(routing_view).post(routing_update),
         )
+        .route("/admin/v1/routing/move-guard/clear", post(clear_move_guard))
         .route("/admin/v1/sessions", axum::routing::get(dashboard_sessions))
         .route(
             "/admin/v1/sessions/{id}",
@@ -445,6 +446,17 @@ type DashboardParameters =
 fn dashboard_invalid() -> Response {
     error(StatusCode::BAD_REQUEST, "Invalid dashboard query")
 }
+async fn clear_move_guard(State(state): State<RuntimeAdmin>) -> Response {
+    let bindings = state.relay.bindings.clone();
+    match tokio::task::spawn_blocking(move || bindings.clear_move_guard()).await {
+        Ok(()) => Json(serde_json::json!({"cleared":true})).into_response(),
+        Err(_) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "이동 안전장치를 해제하지 못했습니다.",
+        ),
+    }
+}
+
 async fn dashboard_sessions(
     State(state): State<RuntimeAdmin>,
     query: DashboardParameters,
@@ -455,7 +467,9 @@ async fn dashboard_sessions(
     let Ok(range) = crate::dashboard::SessionRange::parse(query.range.as_deref()) else {
         return dashboard_invalid();
     };
-    Json(state.relay.dashboard().sessions(range)).into_response()
+    let mut view = state.relay.dashboard().sessions(range);
+    view.move_cost = Some(state.relay.move_cost_snapshot());
+    Json(view).into_response()
 }
 async fn dashboard_detail(
     State(state): State<RuntimeAdmin>,

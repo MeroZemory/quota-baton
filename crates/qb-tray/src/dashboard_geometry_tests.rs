@@ -5,6 +5,34 @@ fn view(state: &mut DashboardState) -> m::DashboardView {
 }
 
 #[test]
+fn r14_move_cost_is_accessible_on_overview_and_usage_at_minimum_size() {
+    for tab in [Tab::Overview, Tab::Usage] {
+        let mut state = DashboardState {
+            tab,
+            ..Default::default()
+        };
+        let mut v = view(&mut state);
+        v.move_cost_lines = Some([
+            "계정 이동으로 다시 읽은 토큰 · 1시간 최소 1234 토큰 · 24시간 미측정".into(),
+            "측정 1회 · 미측정 2회 · 10/22 13:00부터 관측".into(),
+        ]);
+        let scene = Scene::build(&v, &state, [1024., 640.], &Metrics::default());
+        for (i, text) in v.move_cost_lines.as_ref().unwrap().iter().enumerate() {
+            let node = scene
+                .accessibility
+                .iter()
+                .find(|n| n.key == format!("move-cost:{i}"))
+                .unwrap();
+            assert_eq!(&node.name, text);
+            assert_eq!(node.role, Role::Text);
+            assert!(node.rect.left >= 0. && node.rect.right <= 1024.);
+            assert!(node.rect.top >= 0. && node.rect.bottom <= 640.);
+            assert!(!node.hidden);
+        }
+    }
+}
+
+#[test]
 fn r10_disconnected_manual_controls_are_dimmed_but_account_data_is_not() {
     let mut state = DashboardState::default();
     let mut v = view(&mut state);

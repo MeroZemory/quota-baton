@@ -68,7 +68,9 @@ The current plan, with lanes, owners and start commands, is the "Plan" section o
 | R12.1 | merged and INSTALLED (c6a304e, 10-21 23:14): image canary stage diagnostics and retry, user `-c` passthrough |
 | R12.9 | merged and INSTALLED (c899b6a, 10-22 01:02): outage follow-ups (credit hold fix kept, WS capacity spreading, release-hold, Q-owned CPA resume) |
 | R12.10 | merged (성능 조건·qb-tray scoped 관문 통과; `.sandbox/reports/R12.10.md`); 설치는 설계 세션 |
-| R13 | 진행 중: B+B2+D 및 A 배포분 merged (A 코드87ef2bc·9efde3f, 집중 관문·실제 HWND8 통과; 설치는 설계 세션). 남은 C 측정→C+E; brief `R13-burn-icon-hold.md` |
+| R13 | 진행 중: B+B2+D·A·A1 merged 및 설치 수용. C+E 긴급 등록 단위 f39e504·926793f 커밋, 전체 wait/move 실행 통합은 미출시. 다음: R14 후 Part F; brief `R13-burn-icon-hold.md` |
+| R14 | 진행 중: D29 토큰 낭비 보호. 1차 실행 중 전환 차단·재읽기 비용·대시보드·트레이 알림, 2차 근거형 rebind·정적 검사·24시간 차등 재생. brief `R14-token-guard.md`; 설치는 설계 세션 |
+| R15 | 대기: R13 Part F 후 공유 admin 응답형·계약 왕복·라우팅 속성 검사(D27). brief `R15-contract.md` |
 | R11.1 | merged: 공유 AGENTS/hook 편집 보존·rh 별칭, 회귀5·cutover141·strict lint·실제 preview/launch 점검 통과. 설치·apply는 설계 세션. 보고서 `.sandbox/reports/R11.1.md` |
 | R11 | merged (실제 native5/5·HTTP33·WS15·코어1213·복구54·창4, focused repair gate 통과). 0106c0e 설치·live 계정 지정 확인. 보고서 `.sandbox/reports/R11.md` |
 | R8.1 | merged (round 2 39345fd, dev 6dbbfae); installed and verified live: the herdr pane title shows `codex-qb · quota-baton` from 1 s to 19 s, and a codex-qb exec request returned ok |

@@ -82,6 +82,8 @@ pub enum LaunchError {
     Capacity,
     #[error("routing policy did not authorize the launch or move")]
     PolicyBlocked,
+    #[error("자동 계정 이동 안전장치가 작동했습니다. 잠시 후 다시 실행하세요.")]
+    MoveGuard,
     #[error("binding changed before model metadata could be recorded")]
     BindingChanged,
     #[error("binding writer retired")]
@@ -709,6 +711,18 @@ impl BindingTable {
             expected_revision: plan.revision,
             at: now,
         };
+        let permit = self
+            .prepare_move(
+                &d,
+                &key,
+                previous.as_deref(),
+                &account,
+                candidates,
+                model.as_deref(),
+                reason,
+                now,
+            )
+            .map_err(|_| LaunchError::MoveGuard)?;
         let existing = Self::accepted_in(&d, Some(&key), &account);
         drop(d);
         if admit.is_some_and(|admit| !admit(&account, existing, model.as_deref())) {
@@ -727,6 +741,14 @@ impl BindingTable {
                 operation,
             )
             .map_err(|_| LaunchError::PolicyBlocked)?;
+        self.commit_move(
+            permit,
+            &account,
+            Provider::Codex,
+            &key,
+            model.as_deref(),
+            now,
+        );
         let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
         let moves = self.commit_binding(
             &mut d,
@@ -865,6 +887,7 @@ impl BindingTable {
                     .saturating_add(metadata_bound(request_key, &metadata))
                     .saturating_add(d.launch_anchors.len().saturating_mul(KEY_BYTES));
                 room(weight)?;
+                self.rename_move_state(&source, request_key, now)?;
                 let mut entry = unindex_group(&mut d, &source).unwrap();
                 let mut binding = d
                     .bindings
@@ -964,6 +987,9 @@ impl BindingTable {
                 .saturating_sub(old.as_ref().map_or(0, |m| metadata_bound(target, m)))
                 .saturating_add(d.launch_anchors.len().saturating_mul(KEY_BYTES)),
         )?;
+        // Merge budgets before discarding the provisional name; a new anchor
+        // never replenishes the session's damage allowance.
+        self.rename_move_state(source, target, Utc::now())?;
         // Remap before discard so the winner keeps every valid losing handle.
         for a in d
             .launch_anchors

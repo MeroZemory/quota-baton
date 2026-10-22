@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: R13 C+E (A1 실제 HTTP 예측 누락 집중 관문 완료)
-목표: 예측 표시 수정을 전달하고 측정 기반 hold·5시간 wait/move 구현을 계속한다
-핵심 지표: 새 경로 출시 2/2 · A1 회귀22·strict lint·build 통과, C+E 남음
-사용자 대기: 없음 (A1 설치·실제 화면 수용은 설계 세션; R2 Part B만 보류)
-갱신: 2026-10-22 12:19 KST (A1 code 2b83ed3; scoped gate 완료)
+현재 마일스톤: R14 1차 보호 장치
+목표: 불필요한 계정 전환의 피해를 차단하고 토큰 재읽기 비용을 계측한다
+핵심 지표: 새 경로 출시 2/2 · 원장12·스트림20·실제HTTP7·WS4·트레이3·strict lint 통과, 실제 HWND 비용180 확인
+사용자 대기: 없음 (R2 Part B 보류; 장시간 측정은 독립 실행)
+갱신: 2026-10-22 14:33 KST (실제 core/AdminClient/tray 화면 통과·SSE 경계 보완 중)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -111,8 +111,14 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-22 10:23 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 2/2 | R13 A 초기 코어25·CLI1 통과, 고빈도 표본·차트 보완 중; 미출시 |
 | 2026-10-22 10:46 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 2/2 | R13 A 회귀 보완·원자 커밋87ef2bc, 설치 수 변화 없음 |
 | 2026-10-22 10:53 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 2/2 | R13 A 집중 관문 완료, 출시 수 변화 없음 |
+| 2026-10-22 11:09 | 2/2 | D24 장기창 보완32·로컬 native 기본4건 통과; C+E 기능은 미출시 |
+| 2026-10-22 11:37 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 2/2 | R13 C 실측·정책 기반 단위; C+E 미출시, 출시 수 변화 없음 |
+| 2026-10-22 11:52 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 2/2 | R13 C 대기·정책 기반9건 추가 검증; C+E 미출시, 출시 수 변화 없음 |
 | 2026-10-22 12:17 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 2/2 | R13.A1 HTTP 예측 누락 수정; 출시 수 변화 없음 |
 | 2026-10-22 12:19 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 2/2 | R13.A1 집중 관문22 통과·코드2b83ed3; 출시 수 변화 없음 |
+| 2026-10-22 12:41 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 2/2 | A1 설치 수용; C+E 기반 회귀74+3+3·예산8·Claude인자11 통과, 실행 통합 미출시 |
+| 2026-10-22 13:13 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 2/2 | C+E 긴급 등록 단위 커밋; 전체 wait/move 실행은 미출시, R14 보호 장치 시작 |
+| 2026-10-22 13:57 | 새 경로 출시 (분모 2: R12 이미지, R11 실행별 계정) | 2/2 | R14 보호17·집계20·원장9 통과; 실제 HTTP1통과·1실패 수정 중, 미출시 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -222,16 +228,42 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-22 10:23 | R13 A 초기 집중 단위 | 코어25/25·CLI1/1 통과 | A 최종 관문 | 후속 표본 요약·reset-only·cached 예측 보완 전 입력, 최종 통과 주장 아님 |
 | 2026-10-22 10:46 | R13 A 후속 집중 보완 | 코어35·트레이6 통과 | A 최종 관문 | countdown jitter·고정 헤더 실제 overflow 검증; CLI·lint·HWND 미완료 |
 | 2026-10-22 10:53 | R13 A 최종 집중 관문 | core35·tray6·CLI511 통과, 기존tray673 재사용·실제 HWND8 확인, strict lint·fmt·build·launch exit0 | A 표시용 배포 수용 | inputdd6d853c…; 최초core623은 이전입력이며 latest full matrix로 주장하지 않음 |
+| 2026-10-22 11:09 | R13 C 로컬 native 무지연 control | Codex HTTP·Claude SSE 4/4 통과, 소유 job 종료·홈 삭제 4/4 | 지연 허용 표 | 기본 동작만 확인; timeout 최댓값 미측정 |
+| 2026-10-22 11:09 | D24 amendment3 장기창 표시 | 집중32/32 통과 | C+E 배포에 포함 | 코드1f75213; 24h 경계·30d 평균/최근·일시간 표시 |
+| 2026-10-22 11:37 | R13 C HTTP 로컬 native 지연 | 20/20 통과 | hold 허용 표 | 0/5/30/60/120초, 두 클라이언트·preheaders/firstevent; 전부 정리 |
+| 2026-10-22 11:37 | R13 C WS/SSE 확장 무지연 | 7/7 통과 | 실제 WS 증거·heartbeat 기반 | 101·실제 response.create·completed 확인; 긴 대기 증명 아님 |
+| 2026-10-22 11:37 | R13 C WS 지연 경계 | upgrade 약15초 재시도·firsttext 60초 통과/300초 종료 | keepalive 영향 별도 실측 | native 기본값; long sweep 중단 근거 보존, 제품 실패로 분류하지 않음 |
+| 2026-10-22 11:37 | R13 C 실제 Codex 캐시 선행 검사 | 2회 불완전·idle probe 0건 | 같은 계정 첫 요청의1/5/15/30/60분 표 | 계정 선호가 실제 계정과 달라 거부; bound 증가 근거 없음 |
+| 2026-10-22 11:37 | R13 C+E 저장·관리·CLI 기반 | core46/46·CLI3/3·strict lint exit0 | 실행 정책까지 연결 | 7d9e60a; 대기/전환 의미 아직 미연결 |
+| 2026-10-22 11:52 | R13 C+E 실제 코어 긴급 관리 API | 3/3 통과 | 실행 정책 통합 | strict/anchor/시간 보존·무인증 거부·미관측 거부;0a2ca78 |
+| 2026-10-22 11:52 | R13 C 순수 cache bound·표식 검출 | 6/6 통과 | 실측 뒤 실행에 연결 | 287c0ca·테스트 전용 등록; unknown/압축/중복키는5분 기본값 |
+| 2026-10-22 11:52 | R13 C native Codex timeout 설정 실험 | HTTP·WS 각6회가 약2초에서 종료 | 변수 효과 확인 | provider stream_idle_timeout_ms=2000; 무지연 성공,5초 지연 종료; native_failed는 성공으로 세지 않음 |
+| 2026-10-22 11:52 | R13 C 실제 캐시 세 번째 선행 검사 | idle probe0건·native/ledger 사용량 불일치 | 요청별 정확한 카운터 | native 누적 후보는 기존 관측값 차분과 ledger가 유일하게 일치할 때만 허용하도록 보완 |
+| 2026-10-22 11:52 | R13 C 캐시 하네스 자체 회귀 | 51/51 통과 | 실제 측정과 구분 | 누적/요청별·모호성·첫요청·음수·warm단계/TTL 분리; 제품 수용 아님 |
 | 2026-10-22 12:17 | R13.A1 실제 HTTP DTO 예측 전달 | 수정 전0/1 → 수정 후1/1, 이전 응답 호환1/1 | 개요·사용량의 예측 텍스트·projection | 실제 AdminClient와 두 직렬화 경로, 설치 수용은 별도 |
 | 2026-10-22 12:19 | R13.A1 집중 전달 관문 | 22/22·strict lint·fmt·제품 build exit0 | HTTP 경계 누락 수정 전달 | inputs unchanged=true; 기존 전체 관문 반복하지 않음, 설치 화면 수용 별도 |
+| 2026-10-22 12:41 | R13 C+E 호환·원자 편집 기반 | 코어74·CLI3·실제HTTP3 통과, core+CLI testkit all-target strict lint exit0 | 실행 정책까지 통합 | legacy fence·동시 urgency 보존; testkit 누락 명령1건은 미실행 실패로 별도 기록 |
+| 2026-10-22 12:41 | R13 C+E 대기 예산·Claude 인자 계획 | 예산8/8·인자11/11, strict lint exit0 | 실제 요청과 native 의도 연결 | 둘 다 테스트 전용 등록; 동작 활성화 아님 |
+| 2026-10-22 12:41 | R13 C Codex 6h 설정·600초 실측 | HTTP·WS 각0/600초, 4/4 통과·재시도0·정리4/4 | 5시간 대기·초기 upgrade 별도 | 실제 600초; 5시간 증명 아님, extended timeout은 합성 홈에만 설정 |
+| 2026-10-22 12:41 | R13 C 기본 keepalive 실측 | WS ping60초 통과·300초 종료; HTTP comment Codex300초 종료·Claude600초 통과; typed ping 두 클라이언트600초 통과 | 전송별 안전한 대기 | 18경우·모든 소유 job 종료/home 삭제, 중복 glob 결과 제외 |
+| 2026-10-22 12:41 | R13 C 실제 캐시 네 번째 측정 | 1/5분 input20908·cached20736, aux선행으로 unknown;15분 native실패·30/60분 미측정 | 유효한 첫 요청 캐시 수명 | 60초 bound 유지; 다섯 번째 무작정 반복 없음 |
+| 2026-10-22 12:41 | R13 C 5시간 WS 하네스 첫 실행 | 무지연1통과·18000초 worker 거부1, cleanup완료 | 실제 장기 대기 | 상속 worker의600초 허용범위 수정·실제 admission6회귀 통과 후 별도 백그라운드 재실행 |
+| 2026-10-22 13:13 | R13 C+E 긴급 등록 집중 단위 | core96·실제HTTP9·CLI14 통과, strict lint·fmt·diff exit0 | 단위 닫기 | 입력 변화0; 81536cf·f39e504, C+E 전체 관문 아님 |
+| 2026-10-22 13:13 | R13 C Claude UUID 합성 native 증명 | 1/1 통과, 8.19초·정리 완료 | C8 정확한 세션 식별자 | 대문자 UUID가 실제 요청 metadata에 그대로 전달됨; core/UI 경로 증명 아님 |
+| 2026-10-22 13:13 | R14 이동 기록 사전 조사 | 6.1978일·실제 이동53·10분 최대9·30분 내 복귀15 | D29 기본값 정당화·실행 차단 | 본문 없는 allowlist; 7일 전체 관측이나 권위 재생 입력이라고 주장하지 않음 |
+| 2026-10-22 13:57 | R14 실행 보호 집중 단위 | guard/selection17·reducer20·ledger9 통과; 실제 HTTP1/2 | 강제 거절 typed429·WS·실제 화면 관문 | 입력 해시 불변; HTTP 비용 전달은 통과, 결제 오류 분기 우선순위 수정 뒤 집중 재검증 중 |
+| 2026-10-22 14:04 | R14 실제 HTTP·트레이 집중 회귀 | HTTP2/2·트레이3/3 통과; 실제WS0/2 | WS 전송순서·재시도 집계·실제 화면 | WS fixture 식별자와 실제 전송 전 claim·재시도 계승 지적 보완 중; full gate 아님 |
+| 2026-10-22 14:23 | R14 전송·실패 claim 집중 회귀 | 원장12·스트림20·실제HTTP7·실제WS4·트레이3 통과; strict lint1건 | 실제 HWND·full gate | 입력 변화0; 논리 동등한 불리언 단순화 뒤 원장·lint·화면 실행 중 |
+| 2026-10-22 14:33 | R14 실제 HWND 비용 전달 | 개요·사용량180토큰, 측정1/미측정0; 인증·기록보존 통과 | 최종 SSE 경계·full gate | 실제 core/AdminClient/tray; PNG3개 직접 확인, 초기 하네스 import 오류 보존 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 행동 |
 |---|---|---|---|
-| R13.A1 설치된 예측 표시 | 집중 관문22·lint·build 통과, 설치본은 필드 누락 | 설치 후 실제 화면 수용 | self-merge 전달, 설계 세션 설치·재캡처 |
-| R13 C 실측 | HTTP/WS 경계와 캐시 보조 요청 혼입 관측 | 유효한 idle 표·전송별 대기 범위 | 종료 측정 증거 보존·판단 후 C 재개 |
-| R13 C+E 실행 정책 | 저장/API/CLI와 Codex urgent 체크포인트 | 측정 기반 hold·wait/move·reset 뒤 재개 | A1 뒤 호환 패치 검증·실행 통합 |
+| R14 1차 실행 보호 | strict lint·실제 HWND 비용180 확인 | 최종 SSE 경계·full gate | 큰/잘못된 SSE 미측정 회귀→최종 관문 |
+| R13 C+E 실행·측정 | 긴급 등록·정책 상속 단위 통과, 전체 실행 미연결 | 대기/취소/초기화 뒤 정확히 한 번 재개와 D27 관문 | 현재 단위 보존; 장기 시험은 완료 신호 때만 확인 |
+| 후속 안전장치·예측 | R14 2차·Part F·R15 대기 | 증거형 이동 choke point·재생 관문·coverage 예측·typed contract | 사용자 지시대로 R14를 Part F보다 먼저 전달 |
+
 <!-- gaps:end -->
 
 R11 Windows process/crash focused verification uses `cargo test -p quota-baton --all-features --test r9_crash --no-fail-fast -- --test-threads=4`. It still runs cases concurrently and preserves every in-case race, kill checkpoint, 20-second command deadline and five-second reap deadline. Default high-concurrency deadline failures and diagnostic traces remain cited; the bounded run is not a claim that the default-load timing issue was fixed. No product timing or ownership workaround was added.

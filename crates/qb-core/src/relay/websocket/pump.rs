@@ -207,8 +207,8 @@ impl CurrentCompletion {
     }
 
     fn upstream(&mut self, event: Option<&Value>) -> Option<&'static str> {
-        if let Some(usage) = event.and_then(crate::observability::cache_usage) {
-            self.completion.record.cache_usage = Some(usage);
+        if let Some(event) = event {
+            self.completion.observe_usage(event);
         }
         if self.first_message {
             self.completion.record.ttfb_ms = self.completion.elapsed_ms();
@@ -461,6 +461,7 @@ impl Drop for CurrentCompletion {
         // Keep the accepted request's inflight guard while queued, but do not
         // ledger an upstream attempt if its initial write was never polled.
         if !state.initial_sent {
+            self.completion.accounting_cancel();
             self.completion.record.attempts = self.completion.record.attempts.saturating_sub(1);
             if !self.completion.record.attempt_details.is_empty() {
                 self.completion.record.attempt_details.remove(0);
@@ -1459,6 +1460,7 @@ async fn run_with_read_timeout(
     let mut pending_initial: Option<PendingInitial> = None;
     let mut initial_admission: Option<BoxFuture<'static, bool>> = None;
     let mut create_admission: Option<CreateAdmission> = None;
+    let mut initial_write_admission: Option<BoxFuture<'static, Result<(), &'static str>>> = None;
     let mut initial_ready = false;
     let mut current = BTreeMap::<u64, CurrentCompletion>::new();
     let mut next_request = 0;
@@ -1533,6 +1535,7 @@ async fn run_with_read_timeout(
         if draining && let Some(pending) = pending_initial.take() {
             initial_admission = None;
             create_admission = None;
+            initial_write_admission = None;
             initial_ready = false;
             deferred_client = None;
             current.remove(&pending.request);
@@ -1552,6 +1555,7 @@ async fn run_with_read_timeout(
             pending_launch_create = None;
             initial_admission = None;
             create_admission = None;
+            initial_write_admission = None;
             pending_initial = None;
             initial_ready = false;
             rate_redial = None;
@@ -1765,55 +1769,74 @@ async fn run_with_read_timeout(
             }
             result = async {
                 if initial_ready && to_upstream.is_none() {
+                    // Retain the payload and sink in cancellable slots while the
+                    // final policy check awaits. A queued create must not claim
+                    // a move before another socket actually dispatches its turn.
+                    let admission = if managed_socket {
+                        Ok(())
+                    } else {
+                        let admission = initial_write_admission.get_or_insert_with(|| {
+                            let context = context.clone();
+                            let dispatch_model = pending_initial.as_ref()
+                                .and_then(|pending| current.get(&pending.request))
+                                .and_then(|active| active.model.clone());
+                            #[cfg(feature = "testkit")]
+                            let message = pending_initial.as_ref().expect("ready initial payload").message.clone();
+                            Box::pin(async move {
+                                if let (Some(relay), Some(_)) = (&context.relay, &context.runtime)
+                                    && !relay.dispatch_data_allowed(context.session.key.as_deref(), &context.account, dispatch_model.as_deref()).await {
+                                    return Err("routing_policy_blocked");
+                                }
+                                #[cfg(feature = "testkit")]
+                                if !wait_ordinary_dispatch(&context, &message, OrdinaryDispatchStage::BeforeWrite).await {
+                                    return Err("takeover_drain");
+                                }
+                                Ok(())
+                            })
+                        });
+                        admission.await
+                    };
+                    initial_write_admission = None;
                     let pending = pending_initial.take().expect("ready initial payload");
                     initial_ready = false;
                     let sink = upstream_sink.take().expect("initial admission retains upstream sink");
                     let bytes = pending.message.len();
-                    let context = context.clone();
                     let managed = managed_socket;
-                    let dispatch_model = current.get(&pending.request).and_then(|active| active.model.clone());
-                    let dispatch_receipt = current.get(&pending.request).and_then(|active| active.completion.binding.as_ref()).map(|binding| binding.receipt());
-                    to_upstream = Some(Box::pin(async move {
-                        if !managed && let (Some(relay), Some(_)) = (&context.relay, &context.runtime)
-                            && !relay.dispatch_data_allowed(context.session.key.as_deref(), &context.account, dispatch_model.as_deref()).await {
+                    if let Err(reason) = admission {
+                        return (sink, false, Delivered { bytes: 0, request: Some(pending.request), terminal: Some(reason), completed: false });
+                    }
+                    // No await from these final vetoes through accounting and
+                    // the first write poll. Ordinary model metadata is not admission.
+                    if context.relay.as_ref().is_some_and(|relay| relay.is_draining()) {
+                        return (sink, false, Delivered { bytes: 0, request: Some(pending.request), terminal: Some("takeover_drain"), completed: false });
+                    }
+                    if !managed && context.has_managed_binding() {
+                        return (sink, false, Delivered { bytes: 0, request: Some(pending.request), terminal: Some(PROMOTED_BEFORE_WRITE), completed: false });
+                    }
+                    if managed && let Some(relay) = &context.relay {
+                        // A live provisional pin can redirect to its adopted C8 key.
+                        let dispatch_info = context.session.key.as_deref()
+                            .and_then(|key| relay.bindings.launch_info(key, chrono::Utc::now()).ok());
+                        if !dispatch_info.as_ref().is_some_and(|info| info.managed
+                            && info.account == context.account
+                            && relay.bindings.permits_dispatch(Some(&info.canonical_key), &context.account)) {
                             return (sink, false, Delivered { bytes: 0, request: Some(pending.request), terminal: Some("routing_policy_blocked"), completed: false });
                         }
-                        #[cfg(feature = "testkit")]
-                        if !managed && !wait_ordinary_dispatch(&context, &pending.message, OrdinaryDispatchStage::BeforeWrite).await {
-                            return (sink, false, Delivered { bytes: 0, request: Some(pending.request), terminal: Some("takeover_drain"), completed: false });
+                    }
+                    if !pending.rate.can_send() {
+                        return (sink, false, Delivered {bytes:0,request:Some(pending.request),terminal:Some("rate_wait_timeout"),completed:false});
+                    }
+                    if let Some(active) = current.get_mut(&pending.request) {
+                        active.completion.accounting_attempt(&context.account);
+                        if let Some(binding) = &active.completion.binding {
+                            binding.dispatched();
                         }
-                        // No await from this fresh classification through the first
-                        // write poll. Ordinary model metadata is not admission.
-                        if !managed && context.has_managed_binding() {
-                            return (sink, false, Delivered { bytes: 0, request: Some(pending.request), terminal: Some(PROMOTED_BEFORE_WRITE), completed: false });
-                        }
-                        if managed && let Some(relay) = &context.relay {
-                            // No await between this final authority/drain check
-                            // and the first write poll. The awaited gate retained
-                            // the sink and payload in cancellable slots above.
-                            if relay.is_draining() {
-                                return (sink, false, Delivered { bytes: 0, request: Some(pending.request), terminal: Some("takeover_drain"), completed: false });
-                            }
-                            // A live provisional pin can redirect to its adopted C8 key.
-                            // Resolve that current account before checking its durable policy.
-                            let dispatch_info = context.session.key.as_deref()
-                                .and_then(|key| relay.bindings.launch_info(key, chrono::Utc::now()).ok());
-                            if !dispatch_info.as_ref().is_some_and(|info| info.managed
-                                && info.account == context.account
-                                && relay.bindings.permits_dispatch(Some(&info.canonical_key), &context.account)) {
-                                return (sink, false, Delivered { bytes: 0, request: Some(pending.request), terminal: Some("routing_policy_blocked"), completed: false });
-                            }
-                        }
-                        if !pending.rate.can_send() {
-                            return (sink, false, Delivered {bytes:0,request:Some(pending.request),terminal:Some("rate_wait_timeout"),completed:false});
-                        }
-                        if let Some(receipt) = dispatch_receipt { receipt.dispatched(); }
-                        pending.rate.note_usage_send(&context);
-                        pending.rate.initial_dispatch();
-                        pending.rate.record_forced_send(context.runtime.as_ref(), &context.account);
-                        write(sink, pending.message, pending.reservation, Delivered {
-                            bytes, request: Some(pending.request), terminal: None, completed: false,
-                        }).await
+                    }
+                    pending.rate.note_usage_send(&context);
+                    pending.rate.initial_dispatch();
+                    pending.rate.record_forced_send(context.runtime.as_ref(), &context.account);
+                    to_upstream = Some(write(sink, pending.message, pending.reservation, Delivered {
+                        bytes, request: Some(pending.request), terminal: None, completed: false,
                     }));
                 }
                 to_upstream.as_mut().unwrap().await
@@ -1893,6 +1916,7 @@ async fn run_with_read_timeout(
                     pending_launch_create = None;
                     initial_admission = None;
                     create_admission = None;
+                    initial_write_admission = None;
                     pending_initial = None;
                     rate_redial = None;
                     pending_rate_redial = None;
@@ -2062,6 +2086,13 @@ async fn run_with_read_timeout(
                                     }
                                 };
                                 if decision.as_ref().is_some_and(|decision| decision.kind == crate::relay::outcome::Kind::Rate) {
+                                    if let Some(active) = request.and_then(|id| current.get_mut(&id)) {
+                                        // This dispatched attempt failed. A replay is
+                                        // not a normal baseline turn and cannot replace
+                                        // its move claim with later successful usage.
+                                        active.completion.accounting_cancel();
+                                        active.completion.record.cache_usage = None;
+                                    }
                                     if let Some(runtime) = &context.runtime {
                                         let sent_at = request.and_then(|id| current.get(&id)).map_or_else(
                                             std::time::Instant::now,
@@ -2258,6 +2289,7 @@ async fn run_with_read_timeout(
     drop(pending_launch_create);
     drop(initial_admission);
     drop(create_admission);
+    drop(initial_write_admission);
     drop(pending_initial);
     drop(rate_redial);
     drop(pending_rate_redial);

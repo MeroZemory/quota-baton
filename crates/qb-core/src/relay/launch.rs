@@ -200,6 +200,7 @@ fn issue_binding_error(error: crate::bindings::LaunchError) -> LaunchError {
         | B::NoEligibleAccount
         | B::EntitlementsUnknown
         | B::Busy
+        | B::MoveGuard
         | B::PolicyBlocked
         | B::BindingChanged => LaunchError::Unavailable,
     }
@@ -2047,7 +2048,7 @@ fn data_binding_error(error: crate::bindings::LaunchError) -> DataLaunchError {
         E::ModelUnsupported | E::ConsentRequired => DataLaunchError::UnsupportedModel,
         E::PolicyBlocked => DataLaunchError::PolicyBlocked,
         E::BindingChanged => DataLaunchError::Changed,
-        E::NoEligibleAccount | E::EntitlementsUnknown | E::Capacity | E::Retired => {
+        E::NoEligibleAccount | E::EntitlementsUnknown | E::Capacity | E::Retired | E::MoveGuard => {
             DataLaunchError::Unavailable
         }
     }
