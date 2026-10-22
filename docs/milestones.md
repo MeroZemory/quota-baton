@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: R16.2 계정 예측 한 줄·제공자 요약
-목표: R16.2를 실제 코어 경로·한국어·영어로 검증하고 전달한다. 다음은 R16.3 제공자 차트다
+현재 마일스톤: R16.2 한 줄 계정 예측·제공자 요약
+목표: R16.2 요약 표시를 실제 경로로 검증하고 R16.3 제공자 차트로 이어간다
 핵심 지표: 남은 출시 1/3 (R14 보호 설치, R13 C+E 실행, R13 F 통합 예측); 이전 계열 2/2 종료
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-23 02:52 KST (R16.1 집중405·실제 경로 통과, 다음 C+E)
+갱신: 2026-10-23 03:48 KST (R9.4 압축 경로 집중 관문 통과·설치 인계)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -167,6 +167,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-23 01:12 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | 설계 세션이 dev249a14c 설치 수용. takeover 1,717회 중 연결 거절0, 일반·이미지 exec 통과, 실제 dashboard 재독 토큰 지표 확인 |
 | 2026-10-23 02:21 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | R16 집중438통과·실제 core/AdminClient/tray 3HWND·20CLI PNG 통과, 코드19b8d22. 영어 UI는 이 계열 분모 밖이며 설치는 미실행 |
 | 2026-10-23 02:52 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | R16 설치 수용006449a 및 R16.1 집중405·실제 경로 통과3737fe2. 영어 폭 보완은 분모 밖 |
+| 2026-10-23 03:48 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | R9.4 압축 세션 집중 관문 통과: 압축38·신규7·DB31·재개14(중복 포함), strict lint·빌드 통과. 분모 밖 복구이며 설치는 설계 세션 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -334,7 +335,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 행동 |
 |---|---|---|---|
-| R13 C+E 실행 | 긴급 등록·대기 측정 기반 준비, 전체 실행 미연결 | 초기화 뒤 재개·긴급 이동·취소와 실제 client 경로 관문 | R16.1 완료 후 HTTP 대기/재개부터 통합 |
+| R13 C+E 실행 | 긴급 등록·대기 측정 기반 준비, 전체 실행 미연결 | 초기화 뒤 재개·긴급 이동·취소와 실제 client 경로 관문 | R9.4·R16.2·R16.3 완료 후 HTTP 대기/재개부터 통합 |
 | R13 F 통합 예측 | 미출시; 수집기와 실제 재생도 별도 남음 | coverage 명시 통합 예측·24시간 backtest | C+E 및 R14.2 후 Part F; R15 공유 계약은 이후 |
 | 이미지 버전 확인 | 부하 중 5초 버전 확인 실패, R12.11 제안 보존 | 15초 확인·제한 재시도·24시간 검증 캐시와 집중 관문 | 사용자 우선순위에 따라 별도 보존 |
 <!-- gaps:end -->

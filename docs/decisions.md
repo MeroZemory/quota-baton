@@ -904,3 +904,11 @@ The cost is that the session pauses until the reset.
 - under an hour: "42m left · …" / "42분 남음 · …".
 
 Minutes are dropped once the remainder is a day or more. The provider summary uses the same form for "next runs out".
+
+**D28 amendment (user, 2026-10-23): provider usage charts with a pace line.** "사용량에 claude통합, codex통합 (프로바이더별) 그래프도 있었으면좋겠음 (전체사용그래프는 권장선도 같이 표시)".
+- **Where.** The Usage tab gets one chart per provider above the per-account cards, on the same rolling 19 h + 5 h axis (D24 amendment 2).
+- **Unit, until D28 part 2 calibration exists.** Remaining capacity counts account-equivalents: the sum over accounts of each account's remaining share of its weekly (or Free 30-day) window. The chart is labelled, for example, "2.4 of 4 accounts' weekly quota left (not weighted by plan)". Paused and disabled accounts are excluded and listed in a footnote. When calibration ships, a toggle adds a token-weighted view; the account-equivalent view stays the default until the backtest bound holds.
+- **Pace line.** For each account, the ideal remaining share falls linearly from 100% at its window start to 0% at its reset. The provider pace line is the sum of those lines, piecewise linear with a jump back up at each reset. Being above the line means quota will expire unused at the reset; being below it means the provider runs out before the reset.
+  - The chart shades the gap between the actual line and the pace line.
+  - A one-line verdict sits beside it, e.g. "0.6 accounts ahead of pace" or "running 0.4 accounts behind", using the D24 amendment 5 wording style.
+- **5-hour windows.** They are not aggregated: they reset too often for a pace line to inform a decision. They stay on the account cards.
