@@ -570,11 +570,29 @@ impl Registry {
     ) -> Result<(), Error> {
         let now = self.clock(now);
         let namespace = Self::namespace(provider);
-        let id = self.intern(namespace, existing, now)?;
-        if alias.is_empty() || alias.len() > MAX_IDENTITY_BYTES {
+        if existing.is_empty()
+            || existing.len() > MAX_IDENTITY_BYTES
+            || alias.is_empty()
+            || alias.len() > MAX_IDENTITY_BYTES
+        {
             return self.core.reject(Error::InvalidIdentity);
         }
         let key = (namespace, alias.to_owned());
+        let source = (namespace, existing.to_owned());
+        // A losing launch may never have started accounting. Attach that new
+        // name to the existing winner, rather than minting a conflicting ID.
+        // Two already-interned identities still cannot merge histories.
+        if !self.identities.contains_key(&source)
+            && let Some(id) = self.identities.get(&key).map(|identity| identity.id)
+        {
+            if self.identities.len() == MAX_IDENTITIES {
+                return self.core.reject(Error::Capacity);
+            }
+            self.identities
+                .insert(source, Identity { id, touched: now });
+            return Ok(());
+        }
+        let id = self.intern(namespace, existing, now)?;
         if let Some(other) = self.identities.get(&key) {
             return if other.id == id {
                 Ok(())
@@ -1216,6 +1234,35 @@ mod tests {
     }
 
     #[test]
+    fn registry_unseen_launch_alias_keeps_winners_ticket_and_baseline() {
+        let mut r = Registry::new(t(0));
+        let pending = r
+            .begin(Provider::Codex, "canonical", "a", Some("m"), t(0))
+            .unwrap();
+        let next_identity = r.next_identity;
+        r.alias(Provider::Codex, "launch:unused", "canonical", t(0))
+            .unwrap();
+        assert_eq!(r.next_identity, next_identity);
+        assert_eq!(
+            r.finish(pending, true, Some(&usage(10)), t(1)).unwrap(),
+            Completion::Normal
+        );
+        r.moved(Provider::Codex, "launch:unused", "b", Some("m"), t(2))
+            .unwrap();
+        let cold = r
+            .begin(Provider::Codex, "canonical", "b", Some("m"), t(3))
+            .unwrap();
+        assert!(matches!(
+            r.finish(cold, true, Some(&usage(100)), t(4)).unwrap(),
+            Completion::Move {
+                reread_tokens: Some(90),
+                ..
+            }
+        ));
+        assert_eq!(r.snapshot(t(4)).hour.known_count, 1);
+    }
+
+    #[test]
     fn registry_identity_bounds_namespace_conflicts_and_pruning() {
         let mut r = Registry::new(t(0));
         let codex = r.intern(0, "s", t(0)).unwrap();
@@ -1234,6 +1281,13 @@ mod tests {
             r.intern(4, &format!("m{i}"), t(0)).unwrap();
         }
         assert_eq!(r.intern(4, "overflow", t(0)), Err(Error::Capacity));
+        let next_identity = r.next_identity;
+        assert_eq!(
+            r.alias(Provider::Codex, "unseen-launch", "s", t(0)),
+            Err(Error::Capacity)
+        );
+        assert_eq!(r.next_identity, next_identity);
+        assert!(!r.identities.contains_key(&(0, "unseen-launch".into())));
         assert_eq!(r.identities.len(), MAX_IDENTITIES);
         assert!(!r.snapshot(t(0)).hour.recording_complete);
         r.snapshot(t(86400));
