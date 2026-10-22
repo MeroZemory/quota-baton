@@ -11,6 +11,9 @@ use serde::{
     de::{DeserializeOwned, Deserializer},
 };
 
+#[path = "client/snapshot.rs"]
+pub mod snapshot;
+
 #[derive(Debug, Clone)]
 pub struct AdminClient {
     http: reqwest::Client,
@@ -130,6 +133,30 @@ impl AdminClient {
         path: &str,
         required: &str,
     ) -> Result<T, ClientError> {
+        Self::decode_dashboard(self.dashboard_value(path).await?, required)
+    }
+
+    pub(crate) fn decode_dashboard<T: DeserializeOwned>(
+        value: serde_json::Value,
+        required: &str,
+    ) -> Result<T, ClientError> {
+        let invalid = || ClientError::AccountAction("대시보드 응답 형식이 올바르지 않습니다");
+        if !value.get(required).is_some_and(|field| {
+            if required == "id" {
+                field.is_string()
+            } else {
+                field.is_array()
+            }
+        }) {
+            return Err(invalid());
+        }
+        serde_json::from_value(value).map_err(|_| invalid())
+    }
+
+    pub(crate) async fn dashboard_value(
+        &self,
+        path: &str,
+    ) -> Result<serde_json::Value, ClientError> {
         const MAX: usize = 8 * 1024 * 1024;
         test_response_delay().await;
         let response = self
@@ -150,17 +177,7 @@ impl AdminClient {
             bytes.extend_from_slice(&chunk);
         }
         let invalid = || ClientError::AccountAction("대시보드 응답 형식이 올바르지 않습니다");
-        let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
-        if !value.get(required).is_some_and(|field| {
-            if required == "id" {
-                field.is_string()
-            } else {
-                field.is_array()
-            }
-        }) {
-            return Err(invalid());
-        }
-        serde_json::from_value(value).map_err(|_| invalid())
+        serde_json::from_slice(&bytes).map_err(|_| invalid())
     }
 
     pub async fn snapshot(&self) -> Result<TraySnapshot, ClientError> {
@@ -414,7 +431,7 @@ impl AccountAction {
     }
 
     #[cfg(test)]
-    pub fn from_str(value: &str) -> Option<Self> {
+    fn from_str(value: &str) -> Option<Self> {
         match value {
             "release-hold" => Some(Self::ReleaseHold),
             "pause" => Some(Self::Pause),
@@ -461,7 +478,7 @@ pub enum ClientError {
     Transport(#[source] reqwest::Error),
     #[error("admin API returned HTTP {0}")]
     Http(StatusCode),
-    #[error("{0}")]
+    #[error("{}", qb_tray::i18n::static_text(.0))]
     AccountAction(&'static str),
     #[error("admin API returned invalid JSON: {0}")]
     Decode(#[source] reqwest::Error),
@@ -498,14 +515,14 @@ fn refresh_result(status: StatusCode, value: &serde_json::Value) -> Result<(), C
 
 #[allow(dead_code)]
 pub fn short_error(error: &ClientError) -> &'static str {
-    match error {
+    qb_tray::i18n::static_text(match error {
         ClientError::AccountAction(message) => message,
         ClientError::Transport(_) => "코어에 연결할 수 없습니다",
         ClientError::Http(StatusCode::TOO_MANY_REQUESTS) => "잠시 후 다시 시도해 주세요",
         ClientError::Http(StatusCode::NOT_FOUND) => "계정을 찾을 수 없습니다",
         ClientError::Http(_) => "요청을 처리하지 못했습니다",
         ClientError::Decode(_) => "코어 응답을 읽지 못했습니다",
-    }
+    })
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -528,7 +545,7 @@ pub fn classify_health(health: HealthResponse) -> CoreHealth {
         CoreHealth::Healthy(health)
     } else {
         CoreHealth::Unhealthy {
-            reason: format!("코어 health가 false입니다 ({})", health.version),
+            reason: qb_tray::i18n::format("코어 health가 false입니다 ({})", &[health.version]),
         }
     }
 }
@@ -1132,36 +1149,43 @@ impl TakeoverInspect {
     }
     pub fn identity(&self, provider: &str) -> String {
         fn field(value: Option<&str>) -> String {
-            display_field(value.unwrap_or("알 수 없음"))
+            value
+                .map(display_field)
+                .unwrap_or_else(|| qb_tray::i18n::text("알 수 없음").into_owned())
         }
-        format!(
+        qb_tray::i18n::format(
             "제공자: {}\n이메일: {}\n요금제: {}\n제공자 계정 ID: {}\n원본 경로: {}\n마지막 갱신: {}\n파일 수정 시각: {}\n원래 앱 실행 중: {}{}",
-            field(Some(provider)),
-            field(self.email.as_deref()),
-            field(self.plan.as_deref()),
-            field(self.provider_account_id.as_deref()),
-            field(Some(&self.source_path)),
-            field(self.source_last_refresh.as_deref()),
-            field(self.source_mtime.as_deref()),
-            if self.owner_alive {
-                "예 · 먼저 종료하고 다시 검사하세요"
-            } else {
-                "감지되지 않음 (최선의 확인)"
-            },
-            self.existing_id
-                .as_ref()
-                .map(|id| format!(
-                    "\n기존 계정: {} · 다음 단계에서 교체 확인이 필요합니다",
-                    field(Some(id))
-                ))
-                .unwrap_or_default()
+            &[
+                field(Some(provider)),
+                field(self.email.as_deref()),
+                field(self.plan.as_deref()),
+                field(self.provider_account_id.as_deref()),
+                field(Some(&self.source_path)),
+                field(self.source_last_refresh.as_deref()),
+                field(self.source_mtime.as_deref()),
+                qb_tray::i18n::text(if self.owner_alive {
+                    "예 · 먼저 종료하고 다시 검사하세요"
+                } else {
+                    "감지되지 않음 (최선의 확인)"
+                })
+                .into_owned(),
+                self.existing_id
+                    .as_ref()
+                    .map(|id| {
+                        qb_tray::i18n::format(
+                            "\n기존 계정: {} · 다음 단계에서 교체 확인이 필요합니다",
+                            &[field(Some(id))],
+                        )
+                    })
+                    .unwrap_or_default(),
+            ],
         )
     }
     pub fn warning(&self) -> String {
         // D18 exact Korean wording. No CLI keep-source option is exposed here.
-        format!(
+        qb_tray::i18n::format(
             "가져오면 quota-baton이 이 계정의 토큰을 관리합니다. 원래 앱({})은 로그아웃되며, 다시 쓰려면 그 앱에서 새로 로그인해야 합니다. 원래 앱이 켜져 있으면 먼저 종료하세요.",
-            display_field(&self.source_path)
+            &[display_field(&self.source_path)],
         )
     }
 }

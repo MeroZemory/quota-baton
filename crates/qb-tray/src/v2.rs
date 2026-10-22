@@ -193,12 +193,12 @@ pub enum Verdict {
 impl Verdict {
     pub fn text(self) -> &'static str {
         match self {
-            Self::NoAccounts => "계정 없음",
-            Self::Off => "꺼짐",
-            Self::Available => "사용 가능",
-            Self::Credits => "크레딧으로 사용 중",
-            Self::Unavailable => "사용 불가",
-            Self::Unknown => "상태 확인 전",
+            Self::NoAccounts => crate::i18n::static_text("계정 없음"),
+            Self::Off => crate::i18n::static_text("꺼짐"),
+            Self::Available => crate::i18n::static_text("사용 가능"),
+            Self::Credits => crate::i18n::static_text("크레딧으로 사용 중"),
+            Self::Unavailable => crate::i18n::static_text("사용 불가"),
+            Self::Unknown => crate::i18n::static_text("상태 확인 전"),
         }
     }
 }
@@ -418,15 +418,20 @@ pub fn project(json: &str, now: SystemTime) -> serde_json::Result<View> {
         sections.push(Section {
             provider: provider.into(),
             label: provider_label(provider).into(),
-            empty_message: accounts
-                .is_empty()
-                .then(|| format!("{} 계정이 없습니다", provider_label(provider))),
+            empty_message: accounts.is_empty().then(|| {
+                crate::i18n::format(
+                    "{0} 계정이 없습니다",
+                    &[(provider_label(provider)).to_string()],
+                )
+            }),
             rows,
             disabled_rows,
             auto_expand_recommended: expand && disabled_count > 0,
-            disclosure: (disabled_count > 0).then(|| format!("꺼진 계정 {disabled_count}개")),
-            expansion_hint: (expand && disabled_count > 0)
-                .then(|| "켜면 사용량을 확인한 뒤 바로 이어서 처리합니다.".into()),
+            disclosure: (disabled_count > 0)
+                .then(|| crate::i18n::format("꺼진 계정 {0}개", &[disabled_count.to_string()])),
+            expansion_hint: (expand && disabled_count > 0).then(|| {
+                crate::i18n::static_text("켜면 사용량을 확인한 뒤 바로 이어서 처리합니다.").into()
+            }),
         });
         summaries.push(summary);
     }
@@ -458,7 +463,9 @@ pub fn project(json: &str, now: SystemTime) -> serde_json::Result<View> {
         summaries: if empty { vec![] } else { summaries },
         sections: if empty { vec![] } else { sections },
         empty,
-        note: blocked.then(|| "사용 불가인 동안 새 요청은 오류로 끝납니다.".into()),
+        note: blocked.then(|| {
+            crate::i18n::static_text("사용 불가인 동안 새 요청은 오류로 끝납니다.").into()
+        }),
         tray_tooltip: truncate_utf16(&tooltip, 127),
         badge,
     })
@@ -499,7 +506,7 @@ fn account_name(a: &Account, accounts: &[&Account]) -> String {
         return clean(label);
     }
     let Some(email) = nonempty(a.email.as_deref()) else {
-        return "이름 없는 계정".into();
+        return crate::i18n::static_text("이름 없는 계정").into();
     };
     let local = email.split('@').next().unwrap_or(email);
     let collisions = accounts
@@ -576,17 +583,57 @@ fn display_state(a: &Account) -> DisplayState {
 fn state_style(s: DisplayState) -> (Group, Option<Chip>) {
     use DisplayState::*;
     let (group, text, tone) = match s {
-        Relogin => (Group::NeedsAction, "다시 로그인 필요", Tone::Bad),
-        LinkStale => (Group::NeedsAction, "CPA 갱신 멈춤", Tone::Bad),
-        StoreError => (Group::NeedsAction, "저장 오류", Tone::Bad),
-        Payment => (Group::NeedsAction, "결제 거절", Tone::Bad),
-        Permission => (Group::NeedsAction, "접근 거부", Tone::Bad),
-        Credits => (Group::InUse, "크레딧 사용 중", Tone::Warn),
-        Paused => (Group::Paused, "일시정지", Tone::Off),
-        Quota => (Group::Waiting, "한도 도달", Tone::Limit),
-        Auth => (Group::Waiting, "인증 확인 대기", Tone::Off),
-        InUse => (Group::InUse, "사용 중", Tone::Use),
-        Drain => (Group::Ready, "새 대화 안 받음", Tone::Off),
+        Relogin => (
+            Group::NeedsAction,
+            crate::i18n::static_text("다시 로그인 필요"),
+            Tone::Bad,
+        ),
+        LinkStale => (
+            Group::NeedsAction,
+            crate::i18n::static_text("CPA 갱신 멈춤"),
+            Tone::Bad,
+        ),
+        StoreError => (
+            Group::NeedsAction,
+            crate::i18n::static_text("저장 오류"),
+            Tone::Bad,
+        ),
+        Payment => (
+            Group::NeedsAction,
+            crate::i18n::static_text("결제 거절"),
+            Tone::Bad,
+        ),
+        Permission => (
+            Group::NeedsAction,
+            crate::i18n::static_text("접근 거부"),
+            Tone::Bad,
+        ),
+        Credits => (
+            Group::InUse,
+            crate::i18n::static_text("크레딧 사용 중"),
+            Tone::Warn,
+        ),
+        Paused => (
+            Group::Paused,
+            crate::i18n::static_text("일시정지"),
+            Tone::Off,
+        ),
+        Quota => (
+            Group::Waiting,
+            crate::i18n::static_text("한도 도달"),
+            Tone::Limit,
+        ),
+        Auth => (
+            Group::Waiting,
+            crate::i18n::static_text("인증 확인 대기"),
+            Tone::Off,
+        ),
+        InUse => (Group::InUse, crate::i18n::static_text("사용 중"), Tone::Use),
+        Drain => (
+            Group::Ready,
+            crate::i18n::static_text("새 대화 안 받음"),
+            Tone::Off,
+        ),
         Ready => return (Group::Ready, None),
         Disabled => return (Group::Disabled, None),
     };
@@ -615,17 +662,17 @@ pub fn account_window(w: &Window) -> bool {
 }
 pub fn window_label(name: &str) -> String {
     match name {
-        "5h" | "primary" => "5시간".into(),
-        "7d" | "secondary" => "주간".into(),
-        "7d_oi" => "모델 주간 (7d_oi)".into(),
-        "seven_day_opus" => "Opus 주간".into(),
-        "seven_day_sonnet" => "Sonnet 주간".into(),
+        "5h" | "primary" => crate::i18n::static_text("5시간").into(),
+        "7d" | "secondary" => crate::i18n::static_text("주간").into(),
+        "7d_oi" => crate::i18n::static_text("모델 주간 (7d_oi)").into(),
+        "seven_day_opus" => crate::i18n::static_text("Opus 주간").into(),
+        "seven_day_sonnet" => crate::i18n::static_text("Sonnet 주간").into(),
         _ => {
             if let Some(n) = name.strip_suffix('m').and_then(|n| n.parse::<u64>().ok()) {
                 if n > 0 && n % 1440 == 0 {
-                    format!("{}일", n / 1440)
+                    crate::i18n::format("{0}일", &[(n / 1440).to_string()])
                 } else {
-                    format!("{n}분")
+                    crate::i18n::format("{0}분", &[n.to_string()])
                 }
             } else {
                 clean(name)
@@ -738,7 +785,7 @@ fn project_row(a: &Account, name: String, now: DateTime<Utc>) -> AccountRow {
         None
     } else {
         let chosen = binding(a, &windows, now);
-        let text = "사용량 확인 전".into();
+        let text = crate::i18n::static_text("사용량 확인 전").into();
         let lines = windows
             .iter()
             .filter(|w| w.account_scoped && w.used.is_some())
@@ -765,7 +812,9 @@ fn project_row(a: &Account, name: String, now: DateTime<Utc>) -> AccountRow {
     let menu = menu_info(a, &name, plan.as_deref(), &windows, credits.as_ref(), now);
     AccountRow {
         raw: a.clone(),
-        plan_tooltip: plan.as_ref().map(|p| format!("요금제: {p}")),
+        plan_tooltip: plan
+            .as_ref()
+            .map(|p| crate::i18n::format("요금제: {0}", &[p.to_string()])),
         name_tooltip: nonempty(a.email.as_deref()).map(clean),
         name,
         plan,
@@ -778,7 +827,13 @@ fn project_row(a: &Account, name: String, now: DateTime<Utc>) -> AccountRow {
         forecast_lines: a
             .usage_forecast
             .as_ref()
-            .map(|forecast| qb_core::usage_forecast_display::lines(forecast, actual_credits(a)))
+            .map(|forecast| {
+                if crate::i18n::language() == crate::i18n::UiLanguage::En {
+                    crate::i18n::forecast::lines(forecast, actual_credits(a))
+                } else {
+                    qb_core::usage_forecast_display::lines(forecast, actual_credits(a))
+                }
+            })
             .unwrap_or_default(),
         reason: None,
         action: None,
@@ -870,23 +925,40 @@ fn summarize(
     });
     let detail = match verdict {
         Verdict::NoAccounts => String::new(),
-        Verdict::Off => "켜진 계정 없음".into(),
-        Verdict::Unknown => "계정 풀 정보 확인 전".into(),
+        Verdict::Off => crate::i18n::static_text("켜진 계정 없음").into(),
+        Verdict::Unknown => crate::i18n::static_text("계정 풀 정보 확인 전").into(),
         Verdict::Available => match in_use.first() {
-            Some(r) if in_use.len() == 1 => format!("{} 사용 중", r.name),
-            Some(r) => format!("{} 외 {}개 사용 중", r.name, in_use.len() - 1),
-            None => format!("계정 {}개 준비됨", eligible.unwrap_or(0)),
+            Some(r) if in_use.len() == 1 => {
+                crate::i18n::format("{0} 사용 중", &[(r.name).to_string()])
+            }
+            Some(r) => crate::i18n::format(
+                "{0} 외 {1}개 사용 중",
+                &[(r.name).to_string(), (in_use.len() - 1).to_string()],
+            ),
+            None => {
+                crate::i18n::format("계정 {0}개 준비됨", &[(eligible.unwrap_or(0)).to_string()])
+            }
         },
         Verdict::Credits => earliest_quota
-            .map(|t| format!("{} 한도 초기화", local_time(t, now, false)))
-            .unwrap_or_else(|| "한도 초기화 시간 확인 전".into()),
+            .map(|t| {
+                crate::i18n::format(
+                    "{0} 한도 초기화",
+                    &[(local_time(t, now, false)).to_string()],
+                )
+            })
+            .unwrap_or_else(|| crate::i18n::static_text("한도 초기화 시간 확인 전").into()),
         Verdict::Unavailable => earliest_until
-            .map(|t| format!("{}부터 사용 가능", local_time(t, now, false)))
+            .map(|t| {
+                crate::i18n::format(
+                    "{0}부터 사용 가능",
+                    &[(local_time(t, now, false)).to_string()],
+                )
+            })
             .unwrap_or_else(|| {
                 if rows.iter().any(|r| r.state == DisplayState::Relogin) {
-                    "다시 로그인 필요"
+                    crate::i18n::static_text("다시 로그인 필요")
                 } else {
-                    "사용할 수 있는 계정 없음"
+                    crate::i18n::static_text("사용할 수 있는 계정 없음")
                 }
                 .into()
             }),
@@ -896,13 +968,17 @@ fn summarize(
         .filter(|r| r.group == Group::NeedsAction)
         .count();
     let provider_name = provider_label(provider);
-    let mut tooltip = format!(
-        "{provider_name} 계정 {}개 · 켜짐 {}개 · 지금 사용 가능 {}.",
-        rows.len(),
-        active.len(),
-        eligible
-            .map(|n| format!("{n}개"))
-            .unwrap_or_else(|| "확인 전".into())
+    let mut tooltip = crate::i18n::format(
+        "{0} 계정 {1}개 · 켜짐 {2}개 · 지금 사용 가능 {3}.",
+        &[
+            provider_name.to_string(),
+            (rows.len()).to_string(),
+            (active.len()).to_string(),
+            (eligible
+                .map(|n| crate::i18n::format("{0}개", &[n.to_string()]))
+                .unwrap_or_else(|| crate::i18n::static_text("확인 전").into()))
+            .to_string(),
+        ],
     );
     if verdict == Verdict::Unavailable {
         if let Some(t) = earliest_until {
@@ -911,16 +987,18 @@ fn summarize(
                 .find(|r| r.raw.health.until.as_deref().and_then(timestamp) == Some(t))
                 .map(|r| r.name.as_str())
                 .unwrap_or("");
-            tooltip.push_str(&format!(
-                " 가장 빠른 초기화: {name} {}.",
-                local_time(t, now, true)
+            tooltip.push_str(&crate::i18n::format(
+                " 가장 빠른 초기화: {0} {1}.",
+                &[name.to_string(), (local_time(t, now, true)).to_string()],
             ));
         }
-        tooltip.push_str(" 그때까지 새 요청은 오류로 끝납니다.");
+        tooltip.push_str(crate::i18n::static_text(
+            " 그때까지 새 요청은 오류로 끝납니다.",
+        ));
     } else if let Some(r) = in_use.first() {
-        tooltip.push_str(&format!(
-            " {}가 대화 {}개를 처리 중입니다.",
-            r.name, r.raw.active_sessions
+        tooltip.push_str(&crate::i18n::format(
+            " {0}가 대화 {1}개를 처리 중입니다.",
+            &[(r.name).to_string(), (r.raw.active_sessions).to_string()],
         ));
     }
     let accessible_name = format!(
@@ -932,7 +1010,7 @@ fn summarize(
             format!(" · {detail}")
         },
         if todo > 0 {
-            format!(" · 할 일 {todo}")
+            crate::i18n::format(" · 할 일 {0}", &[todo.to_string()])
         } else {
             String::new()
         }
@@ -970,31 +1048,44 @@ fn finish_row(row: &mut AccountRow, summary: &Summary, serving: Option<&str>, no
         Relogin => Some(
             if matches!(summary.verdict, Verdict::Available | Verdict::Credits) {
                 serving
-                    .map(|n| format!("그동안 {n}가 처리합니다."))
-                    .unwrap_or_else(|| "그동안 다른 계정이 처리합니다.".into())
+                    .map(|n| crate::i18n::format("그동안 {0}가 처리합니다.", &[n.to_string()]))
+                    .unwrap_or_else(|| {
+                        crate::i18n::static_text("그동안 다른 계정이 처리합니다.").into()
+                    })
             } else {
-                "토큰이 만료되어 이 계정을 쓸 수 없습니다.".into()
+                crate::i18n::static_text("토큰이 만료되어 이 계정을 쓸 수 없습니다.").into()
             },
         ),
-        LinkStale => Some("CPA가 토큰을 갱신하지 않습니다. CPA 실행을 확인하세요.".into()),
-        StoreError => Some("토큰을 저장하지 못해 다시 시도하는 중입니다.".into()),
+        LinkStale => Some(
+            crate::i18n::static_text("CPA가 토큰을 갱신하지 않습니다. CPA 실행을 확인하세요.")
+                .into(),
+        ),
+        StoreError => {
+            Some(crate::i18n::static_text("토큰을 저장하지 못해 다시 시도하는 중입니다.").into())
+        }
         Payment => Some(
             until
                 .as_ref()
-                .map(|t| format!("결제가 거절되어 {t}까지 쉽니다."))
-                .unwrap_or_else(|| "결제가 거절되어 이 계정을 쉽니다.".into()),
+                .map(|t| crate::i18n::format("결제가 거절되어 {0}까지 쉽니다.", &[t.to_string()]))
+                .unwrap_or_else(|| {
+                    crate::i18n::static_text("결제가 거절되어 이 계정을 쉽니다.").into()
+                }),
         ),
         Permission => Some(
             until
                 .as_ref()
-                .map(|t| format!("조직 접근이 거부되어 {t}까지 쉽니다."))
-                .unwrap_or_else(|| "조직 접근이 거부되어 이 계정을 쉽니다.".into()),
+                .map(|t| {
+                    crate::i18n::format("조직 접근이 거부되어 {0}까지 쉽니다.", &[t.to_string()])
+                })
+                .unwrap_or_else(|| {
+                    crate::i18n::static_text("조직 접근이 거부되어 이 계정을 쉽니다.").into()
+                }),
         ),
         Auth => Some(
             until
                 .as_ref()
-                .map(|t| format!("인증을 {t}에 다시 확인합니다."))
-                .unwrap_or_else(|| "인증을 다시 확인합니다.".into()),
+                .map(|t| crate::i18n::format("인증을 {0}에 다시 확인합니다.", &[t.to_string()]))
+                .unwrap_or_else(|| crate::i18n::static_text("인증을 다시 확인합니다.").into()),
         ),
         _ => None,
     };
@@ -1011,18 +1102,26 @@ fn finish_row(row: &mut AccountRow, summary: &Summary, serving: Option<&str>, no
             .unwrap_or(0);
         if seconds > 0 || a.pacing.waiting > 0 {
             row.reason = Some(if seconds > 0 {
-                format!("요청 속도 조절 중 · {seconds}초")
+                crate::i18n::format("요청 속도 조절 중 · {0}초", &[seconds.to_string()])
             } else {
-                "요청 속도 조절 중".into()
+                crate::i18n::static_text("요청 속도 조절 중").into()
             });
         }
     }
     row.action = match row.state {
-        Relogin if !a.source.linked() => Some(action(ActionKind::Relogin, "다시 로그인", true)),
-        StoreError => Some(action(ActionKind::OpenLogs, "로그 열기", false)),
+        Relogin if !a.source.linked() => Some(action(
+            ActionKind::Relogin,
+            crate::i18n::static_text("다시 로그인"),
+            true,
+        )),
+        StoreError => Some(action(
+            ActionKind::OpenLogs,
+            crate::i18n::static_text("로그 열기"),
+            false,
+        )),
         Disabled => Some(action(
             ActionKind::Enable,
-            "켜기",
+            crate::i18n::static_text("켜기"),
             matches!(summary.verdict, Verdict::Unavailable | Verdict::Off),
         )),
         _ if row.group != Group::NeedsAction
@@ -1030,7 +1129,7 @@ fn finish_row(row: &mut AccountRow, summary: &Summary, serving: Option<&str>, no
         {
             Some(action(
                 ActionKind::DisableCredits,
-                "크레딧 사용 끄기",
+                crate::i18n::static_text("크레딧 사용 끄기"),
                 false,
             ))
         }
@@ -1038,35 +1137,58 @@ fn finish_row(row: &mut AccountRow, summary: &Summary, serving: Option<&str>, no
             && credits_eligible_for_resume(a)
             && summary.verdict == Verdict::Unavailable =>
         {
-            let mut result = action(ActionKind::AllowCredits, "크레딧으로 계속", false);
+            let mut result = action(
+                ActionKind::AllowCredits,
+                crate::i18n::static_text("크레딧으로 계속"),
+                false,
+            );
             result.confirmation = row.menu.credits_enable_confirmation.clone();
             Some(result)
         }
         _ => None,
     };
     row.chip_tooltip = match row.state {
-        InUse => Some(format!(
-            "이 계정에서 최근 5분 안에 요청한 대화 {}개 · 연결된 대화 {}개",
-            a.active_sessions, a.bound_sessions
+        InUse => Some(crate::i18n::format(
+            "이 계정에서 최근 5분 안에 요청한 대화 {0}개 · 연결된 대화 {1}개",
+            &[
+                (a.active_sessions).to_string(),
+                (a.bound_sessions).to_string(),
+            ],
         )),
         Quota => Some(
             row.usage
                 .as_ref()
                 .and_then(|u| u.binding.as_ref())
                 .map(|w| {
-                    format!(
-                        "{} 한도에 도달했습니다. {}에 초기화되면 다시 사용합니다.",
-                        w.label,
-                        w.reset
-                            .map(|t| local_time(t, now, true))
-                            .unwrap_or_else(|| "확인된 시간".into())
+                    crate::i18n::format(
+                        "{0} 한도에 도달했습니다. {1}에 초기화되면 다시 사용합니다.",
+                        &[
+                            (w.label).to_string(),
+                            (w.reset
+                                .map(|t| local_time(t, now, true))
+                                .unwrap_or_else(|| crate::i18n::static_text("확인된 시간").into()))
+                            .to_string(),
+                        ],
                     )
                 })
-                .unwrap_or_else(|| "한도에 도달했습니다. 초기화 시간을 확인하고 있습니다.".into()),
+                .unwrap_or_else(|| {
+                    crate::i18n::static_text(
+                        "한도에 도달했습니다. 초기화 시간을 확인하고 있습니다.",
+                    )
+                    .into()
+                }),
         ),
-        Credits => Some("구독 한도에 도달해 유료 크레딧으로 처리하고 있습니다.".into()),
-        Paused => Some("새 대화를 이 계정에 배정하지 않습니다. 사용량은 계속 확인합니다.".into()),
-        Drain => Some("이미 연결된 대화만 계속 처리합니다.".into()),
+        Credits => Some(
+            crate::i18n::static_text("구독 한도에 도달해 유료 크레딧으로 처리하고 있습니다.")
+                .into(),
+        ),
+        Paused => Some(
+            crate::i18n::static_text(
+                "새 대화를 이 계정에 배정하지 않습니다. 사용량은 계속 확인합니다.",
+            )
+            .into(),
+        ),
+        Drain => Some(crate::i18n::static_text("이미 연결된 대화만 계속 처리합니다.").into()),
         _ => None,
     };
     let usage_accessibility = row.usage.as_ref().map(|usage| {
@@ -1077,15 +1199,19 @@ fn finish_row(row: &mut AccountRow, summary: &Summary, serving: Option<&str>, no
                 .lines
                 .iter()
                 .map(|line| {
-                    format!(
-                        "{} {}% 남음{}",
-                        line.window.label,
-                        line.window.remaining.unwrap_or_default(),
-                        line.window
-                            .reset_text
-                            .as_ref()
-                            .map(|reset| format!(", {reset}"))
-                            .unwrap_or_default()
+                    crate::i18n::format(
+                        "{0} {1}% 남음{2}",
+                        &[
+                            (line.window.label).to_string(),
+                            (line.window.remaining.unwrap_or_default()).to_string(),
+                            (line
+                                .window
+                                .reset_text
+                                .as_ref()
+                                .map(|reset| format!(", {reset}"))
+                                .unwrap_or_default())
+                            .to_string(),
+                        ],
                     )
                 })
                 .collect::<Vec<_>>()
@@ -1128,15 +1254,19 @@ fn credits_line(a: &Account) -> Option<CreditsLine> {
     let exact_amount = credit_amount(c, true);
     let actually_serving = actual_credits(a);
     Some(CreditsLine {
-        text: format!(
-            "크레딧 {amount} · {}",
-            if actually_serving {
-                "지금 사용 중"
-            } else if a.allow_credits {
-                "한도 도달 시 사용"
-            } else {
-                "한도 도달 시 사용 안 함"
-            }
+        text: crate::i18n::format(
+            "크레딧 {0} · {1}",
+            &[
+                amount.to_string(),
+                (if actually_serving {
+                    crate::i18n::static_text("지금 사용 중")
+                } else if a.allow_credits {
+                    crate::i18n::static_text("한도 도달 시 사용")
+                } else {
+                    crate::i18n::static_text("한도 도달 시 사용 안 함")
+                })
+                .to_string(),
+            ],
         ),
         amount,
         exact_amount: exact_amount.clone(),
@@ -1146,25 +1276,33 @@ fn credits_line(a: &Account) -> Option<CreditsLine> {
             Tone::Secondary
         },
         actually_serving,
-        tooltip: format!(
-            "크레딧 잔액 {exact_amount} · 유료 크레딧 사용 허용: {}. 켜면 구독 한도에 도달해도 크레딧으로 계속 처리합니다.",
-            if a.allow_credits { "켜짐" } else { "꺼짐" }
+        tooltip: crate::i18n::format(
+            "크레딧 잔액 {0} · 유료 크레딧 사용 허용: {1}. 켜면 구독 한도에 도달해도 크레딧으로 계속 처리합니다.",
+            &[
+                exact_amount.to_string(),
+                (if a.allow_credits {
+                    crate::i18n::static_text("켜짐")
+                } else {
+                    crate::i18n::static_text("꺼짐")
+                })
+                .to_string(),
+            ],
         ),
     })
 }
 /// Group the JSON number's decimal representation, without rounding it to cents.
 fn credit_amount(c: &Credits, exact: bool) -> String {
     if c.unlimited == Some(true) {
-        return "무제한".into();
+        return crate::i18n::static_text("무제한").into();
     }
     if c.has_credits == Some(false) {
-        return "없음".into();
+        return crate::i18n::static_text("없음").into();
     }
     let Some(balance) = &c.balance else {
         return match c.has_credits {
-            Some(true) => "있음",
-            Some(false) => "없음",
-            None => "확인 전",
+            Some(true) => crate::i18n::static_text("있음"),
+            Some(false) => crate::i18n::static_text("없음"),
+            None => crate::i18n::static_text("확인 전"),
         }
         .into();
     };
@@ -1180,7 +1318,7 @@ fn credit_amount(c: &Credits, exact: bool) -> String {
                 .as_f64()
                 .filter(|n| n.is_finite())
                 .map(|n| group_number(&format!("{:.0}", n.floor())))
-                .unwrap_or_else(|| "있음".into())
+                .unwrap_or_else(|| crate::i18n::static_text("있음").into())
         }
     }
 }
@@ -1216,11 +1354,11 @@ fn menu_info(
     now: DateTime<Utc>,
 ) -> MenuInfo {
     let source = if a.source.linked() {
-        "CPA가 토큰 갱신"
+        crate::i18n::static_text("CPA가 토큰 갱신")
     } else if a.source.owned_or_adopted() {
-        "토큰 직접 갱신"
+        crate::i18n::static_text("토큰 직접 갱신")
     } else {
-        "토큰 갱신 방식 확인 전"
+        crate::i18n::static_text("토큰 갱신 방식 확인 전")
     };
     let identity_line = [Some(provider_label(&a.provider)), plan, Some(source)]
         .into_iter()
@@ -1231,8 +1369,13 @@ fn menu_info(
         a.token_expires_at
             .as_deref()
             .and_then(timestamp)
-            .map(|t| format!("토큰 갱신 확인 필요 · {} 만료", local_time(t, now, false)))
-            .unwrap_or_else(|| "토큰 갱신 확인 필요".into())
+            .map(|t| {
+                crate::i18n::format(
+                    "토큰 갱신 확인 필요 · {0} 만료",
+                    &[(local_time(t, now, false)).to_string()],
+                )
+            })
+            .unwrap_or_else(|| crate::i18n::static_text("토큰 갱신 확인 필요").into())
     });
     let window_lines = windows
         .iter()
@@ -1240,8 +1383,8 @@ fn menu_info(
         .map(|w| {
             let value = w
                 .remaining
-                .map(|n| format!("{n}% 남음"))
-                .unwrap_or_else(|| "사용량 확인 전".into());
+                .map(|n| crate::i18n::format("{0}% 남음", &[n.to_string()]))
+                .unwrap_or_else(|| crate::i18n::static_text("사용량 확인 전").into());
             format!(
                 "{} {value}{}{}",
                 w.label,
@@ -1250,7 +1393,7 @@ fn menu_info(
                     .map(|s| format!(" · {s}"))
                     .unwrap_or_default(),
                 if w.model_limited {
-                    " · 사용 제한"
+                    crate::i18n::static_text(" · 사용 제한")
                 } else {
                     ""
                 }
@@ -1261,49 +1404,65 @@ fn menu_info(
         .observed_at
         .as_deref()
         .and_then(timestamp)
-        .map(|t| t.with_timezone(&Local).format("%H:%M").to_string());
+        .map(|t| crate::i18n::date_time(&t.with_timezone(&Local), "%H:%M"));
     let crowded_threshold = a
         .extra
         .get("spread_threshold")
         .and_then(Value::as_u64)
         .filter(|&t| t > 0 && a.active_sessions >= t);
-    let sessions_line = format!(
-        "활성 {}{} · 연결된 대화 {}개 · {}",
-        a.active_sessions,
-        if crowded_threshold.is_some() {
-            " · 몰림"
-        } else {
-            ""
-        },
-        a.bound_sessions,
-        observed
-            .map(|s| format!("{s} 기준"))
-            .unwrap_or_else(|| "기준 시각 확인 전".into())
+    let sessions_line = crate::i18n::format(
+        "활성 {0}{1} · 연결된 대화 {2}개 · {3}",
+        &[
+            (a.active_sessions).to_string(),
+            (if crowded_threshold.is_some() {
+                crate::i18n::static_text(" · 몰림")
+            } else {
+                ""
+            })
+            .to_string(),
+            (a.bound_sessions).to_string(),
+            (observed
+                .map(|s| crate::i18n::format("{0} 기준", &[s.to_string()]))
+                .unwrap_or_else(|| crate::i18n::static_text("기준 시각 확인 전").into()))
+            .to_string(),
+        ],
     );
     let credits_enable_confirmation = (a.provider == "codex").then(|| Confirmation {
-        title: "유료 크레딧 사용",
-        body: format!(
-            "{name}가 한도에 도달한 뒤, 잔액이 있을 때 유료 크레딧 사용을 허용할까요? (현재 잔액 {})",
-            a.credits
-                .as_ref()
-                .map(|c| credit_amount(c, false))
-                .unwrap_or_else(|| "확인 전".into())
+        title: crate::i18n::static_text("유료 크레딧 사용"),
+        body: crate::i18n::format(
+            "{0}가 한도에 도달한 뒤, 잔액이 있을 때 유료 크레딧 사용을 허용할까요? (현재 잔액 {1})",
+            &[
+                name.to_string(),
+                (a.credits
+                    .as_ref()
+                    .map(|c| credit_amount(c, false))
+                    .unwrap_or_else(|| crate::i18n::static_text("확인 전").into()))
+                .to_string(),
+            ],
         ),
-        confirm: "크레딧 사용",
-        cancel: "취소",
+        confirm: crate::i18n::static_text("크레딧 사용"),
+        cancel: crate::i18n::static_text("취소"),
     });
     let model_cooling_line = (a.health.kind == "cooling"
         && a.health.scope.as_deref().is_some_and(|s| s != "account"))
     .then(|| {
-        format!(
-            "{} · 사용 제한{}",
-            clean(a.health.scope.as_deref().unwrap_or("")),
-            a.health
-                .until
-                .as_deref()
-                .and_then(timestamp)
-                .map(|t| format!(" · {}까지", local_time(t, now, false)))
-                .unwrap_or_default()
+        crate::i18n::format(
+            "{0} · 사용 제한{1}",
+            &[
+                (clean(a.health.scope.as_deref().unwrap_or(""))).to_string(),
+                (a.health
+                    .until
+                    .as_deref()
+                    .and_then(timestamp)
+                    .map(|t| {
+                        crate::i18n::format(
+                            " · {0}까지",
+                            &[(local_time(t, now, false)).to_string()],
+                        )
+                    })
+                    .unwrap_or_default())
+                .to_string(),
+            ],
         )
     });
     let menu_credits = credits.cloned().or_else(|| credits_line(a));
@@ -1313,9 +1472,9 @@ fn menu_info(
         refresh_warning,
         window_lines,
         model_cooling_line,
-        credits_line: menu_credits.map(|c| format!("크레딧 {}", c.exact_amount)),
+        credits_line: menu_credits.map(|c| crate::i18n::format("크레딧 {0}", &[(c.exact_amount).to_string()])),
         sessions_line,
-        sessions_tooltip: crowded_threshold.map(|t| format!("분산 기준 {t}개에 도달해 새 세션은 다른 계정을 우선합니다. 제한이 아니며 세션은 계속 받습니다.")),
+        sessions_tooltip: crowded_threshold.map(|t| crate::i18n::format("분산 기준 {0}개에 도달해 새 세션은 다른 계정을 우선합니다. 제한이 아니며 세션은 계속 받습니다.", &[t.to_string()])),
         show_refresh_usage: a.user_state != "disabled" && a.health.kind != "needs_relogin",
         show_relogin: a.source.owned_or_adopted(),
         show_release_hold: quota(a)
@@ -1346,50 +1505,73 @@ fn usage_tooltip(
     let mut lines = Vec::new();
     if let Some(w) = binding {
         if let (Some(used), Some(remaining)) = (w.used, w.remaining) {
-            lines.push(format!(
-                "{} 사용량: {used}% 사용, {remaining}% 남음",
-                w.label
+            lines.push(crate::i18n::format(
+                "{0} 사용량: {1}% 사용, {2}% 남음",
+                &[
+                    (w.label).to_string(),
+                    used.to_string(),
+                    remaining.to_string(),
+                ],
             ));
         } else {
-            lines.push("사용량 확인 전".into());
+            lines.push(crate::i18n::static_text("사용량 확인 전").into());
         }
         if let Some(t) = w.reset {
             lines.push(if t <= now {
-                "초기화됨".into()
+                crate::i18n::static_text("초기화됨").into()
             } else {
-                format!("{}에 초기화됩니다.", local_time(t, now, true))
+                crate::i18n::format(
+                    "{0}에 초기화됩니다.",
+                    &[(local_time(t, now, true)).to_string()],
+                )
             });
         }
     } else {
-        lines.push("사용량 확인 전".into());
+        lines.push(crate::i18n::static_text("사용량 확인 전").into());
     }
     for w in windows
         .iter()
         .filter(|w| binding.is_none_or(|b| b.raw.name != w.raw.name))
     {
         if let (Some(used), Some(remaining)) = (w.used, w.remaining) {
-            lines.push(format!(
-                "{}: {used}% 사용, {remaining}% 남음{}",
-                w.label,
-                w.reset
-                    .map(|t| format!(
-                        " · {}",
-                        if t <= now {
-                            "초기화됨".into()
-                        } else {
-                            format!("{} 초기화", local_time(t, now, true))
-                        }
-                    ))
-                    .unwrap_or_default()
+            lines.push(crate::i18n::format(
+                "{0}: {1}% 사용, {2}% 남음{3}",
+                &[
+                    (w.label).to_string(),
+                    used.to_string(),
+                    remaining.to_string(),
+                    (w.reset
+                        .map(|t| {
+                            format!(
+                                " · {}",
+                                if t <= now {
+                                    crate::i18n::static_text("초기화됨").into()
+                                } else {
+                                    crate::i18n::format(
+                                        "{0} 초기화",
+                                        &[(local_time(t, now, true)).to_string()],
+                                    )
+                                }
+                            )
+                        })
+                        .unwrap_or_default())
+                    .to_string(),
+                ],
             ));
         }
     }
     let observed = observed
         .and_then(timestamp)
-        .map(|t| format!(" {} 기준.", t.with_timezone(&Local).format("%H:%M")))
-        .unwrap_or_else(|| " 기준 시각 확인 전.".into());
-    lines.push(format!(
-        "각 막대는 해당 사용량 창의 남은 양입니다.{observed}"
+        .map(|t| {
+            crate::i18n::format(
+                " {0} 기준.",
+                &[crate::i18n::date_time(&t.with_timezone(&Local), "%H:%M")],
+            )
+        })
+        .unwrap_or_else(|| crate::i18n::static_text(" 기준 시각 확인 전.").into());
+    lines.push(crate::i18n::format(
+        "각 막대는 해당 사용량 창의 남은 양입니다.{0}",
+        &[observed.to_string()],
     ));
     lines.join("\n")
 }
@@ -1403,16 +1585,32 @@ pub fn calendar_time<T: TimeZone>(at: DateTime<T>, now: DateTime<T>, tooltip: bo
 where
     T::Offset: std::fmt::Display,
 {
+    if crate::i18n::language() == crate::i18n::UiLanguage::En {
+        return at
+            .format(if tooltip {
+                "%b %-d (%a) %H:%M"
+            } else {
+                "%b %-d %H:%M"
+            })
+            .to_string();
+    }
     let clock = at.format("%H:%M");
     if at.date_naive() == now.date_naive() {
         return clock.to_string();
     }
     if now.date_naive().succ_opt() == Some(at.date_naive()) {
-        return format!("내일 {clock}");
+        return crate::i18n::format("내일 {0}", &[clock.to_string()]);
     }
     if tooltip {
-        let day = ["월", "화", "수", "목", "금", "토", "일"]
-            [at.weekday().num_days_from_monday() as usize];
+        let day = [
+            crate::i18n::static_text("월"),
+            crate::i18n::static_text("화"),
+            crate::i18n::static_text("수"),
+            crate::i18n::static_text("목"),
+            crate::i18n::static_text("금"),
+            crate::i18n::static_text("토"),
+            crate::i18n::static_text("일"),
+        ][at.weekday().num_days_from_monday() as usize];
         format!("{}/{}({day}) {clock}", at.month(), at.day())
     } else {
         format!("{}/{} {clock}", at.month(), at.day())
@@ -1423,15 +1621,15 @@ fn local_time(at: DateTime<Utc>, now: DateTime<Utc>, tooltip: bool) -> String {
 }
 fn reset_label(at: DateTime<Utc>, now: DateTime<Utc>) -> String {
     if at <= now {
-        "초기화됨".into()
+        crate::i18n::static_text("초기화됨").into()
     } else {
-        format!("{} 초기화", local_time(at, now, false))
+        crate::i18n::format("{0} 초기화", &[(local_time(at, now, false)).to_string()])
     }
 }
 /// Footer uses receipt time of last successful state, never provider observed_at.
 pub fn stale_notice(last_success: SystemTime, now: SystemTime) -> Option<String> {
     let age = now.duration_since(last_success).ok()?.as_secs();
-    (age > 60).then(|| format!("{}분 전 정보", (age / 60).max(1)))
+    (age > 60).then(|| crate::i18n::format("{0}분 전 정보", &[((age / 60).max(1)).to_string()]))
 }
 fn truncate_utf16(s: &str, max: usize) -> String {
     if s.encode_utf16().count() <= max {
@@ -2220,5 +2418,28 @@ mod tests {
                 .count()
                 <= 127
         );
+    }
+}
+
+#[cfg(test)]
+mod r16_localization_tests {
+    use super::*;
+    use crate::i18n::{UiLanguage, with_language};
+    #[test]
+    fn english_projection_translates_chrome_without_translating_account_names() {
+        let input = serde_json::json!({"accounts":[{"id":"a","provider":"codex","label":"사용 중 {0}","user_state":"active","health":{"kind":"ready"},"source":{"kind":"oauth"},"pool_eligible":true}],"pools":{"codex":{"eligible":1}}});
+        let now = timestamp("2026-10-23T03:00:00Z").unwrap();
+        with_language(UiLanguage::En, || {
+            let view = project(&input.to_string(), now.into()).unwrap();
+            assert_eq!(view.sections[1].rows[0].name, "사용 중 {0}");
+            assert_eq!(view.summaries[1].verdict.text(), "Available");
+            assert!(view.summaries[1].detail.contains("accounts ready"));
+            assert_eq!(window_label("5h"), "5 hours");
+            assert_eq!(window_label("300m"), "300 minutes");
+            assert_eq!(reset_label(now, now), "Reset");
+            let tomorrow = now + chrono::Duration::days(1);
+            assert_eq!(calendar_time(tomorrow, now, false), "Oct 24 03:00");
+        });
+        assert_eq!(window_label("5h"), "5시간");
     }
 }

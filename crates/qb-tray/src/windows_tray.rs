@@ -5,6 +5,7 @@ use crate::{
 };
 use anyhow::Result;
 use geometry::{FooterAction, MenuAction, Overlay, Target as HitTarget};
+use qb_tray::i18n;
 use qb_tray::{
     v2, v2_geometry as geometry,
     v2_render::{LoginStatus, RenderOptions, Renderer},
@@ -778,7 +779,7 @@ fn pending_toggle_labels(scene: &mut geometry::Scene, pending: &Session) {
                 && let Some(key) = toggle_key(action)
                 && pending.pending_action(id) == Some(key)
             {
-                item.text = "변경 중…".into();
+                item.text = i18n::text("변경 중…").into_owned();
             }
         }
     }
@@ -1031,14 +1032,14 @@ fn paint_window(hwnd: HWND) -> Result<()> {
             .as_deref()
             .filter(|s| s.starts_with("login:"))
             .map(|s| LoginStatus {
-                message: if s.ends_with(":expired") {
+                message: i18n::text(if s.ends_with(":expired") {
                     "로그인 시간이 만료되었습니다"
                 } else if s.ends_with(":failed") {
                     "로그인하지 못했습니다"
                 } else {
                     "브라우저에서 로그인을 마치세요"
-                }
-                .into(),
+                })
+                .into_owned(),
                 countdown: LOGIN_DEADLINE
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -1055,6 +1056,7 @@ fn paint_window(hwnd: HWND) -> Result<()> {
         let last_success = *LAST_SUCCESS.lock().unwrap_or_else(|e| e.into_inner());
         #[cfg(all(debug_assertions, feature = "testkit"))]
         let draw_started = Instant::now();
+        let core_note = (!scene.core_ok).then(|| i18n::text("코어 상태를 읽지 못했습니다"));
         let result = renderer.paint(
             &target,
             &view,
@@ -1065,7 +1067,7 @@ fn paint_window(hwnd: HWND) -> Result<()> {
                 hover: hover.as_ref(),
                 pressed: INPUT.with(|i| i.borrow().pressed.clone()).as_ref(),
                 focus: focus.as_ref().filter(|_| keyboard_focus),
-                core_note: (!scene.core_ok).then_some("코어 상태를 읽지 못했습니다"),
+                core_note: core_note.as_deref(),
                 last_success,
                 errors: &errors,
                 login: login.as_ref(),
@@ -2234,13 +2236,15 @@ fn element_name(frame: &PaintedFrame, target: &HitTarget) -> String {
             .find(|s| &s.provider == p)
             .and_then(|s| s.disclosure.clone())
             .unwrap_or_default(),
-        HitTarget::Footer(a) => match a {
+        HitTarget::Footer(a) => i18n::text(match a {
             FooterAction::Add => "계정 추가",
             FooterAction::Settings => "설정",
             FooterAction::Quit => "종료",
+        })
+        .into_owned(),
+        HitTarget::AddProvider(p) => {
+            i18n::format("{} 계정 추가", &[v2::provider_label(p).to_owned()])
         }
-        .into(),
-        HitTarget::AddProvider(p) => format!("{} 계정 추가", v2::provider_label(p)),
         HitTarget::Menu { .. } => frame
             .scene
             .popup
@@ -2251,8 +2255,8 @@ fn element_name(frame: &PaintedFrame, target: &HitTarget) -> String {
                     "{}{}{}",
                     i.text,
                     i.checked
-                        .map(|b| if b { " · 켜짐" } else { " · 꺼짐" })
-                        .unwrap_or(""),
+                        .map(|b| i18n::text(if b { " · 켜짐" } else { " · 꺼짐" }))
+                        .unwrap_or_default(),
                     i.detail
                         .as_ref()
                         .map(|s| format!(" · {s}"))
@@ -2267,10 +2271,10 @@ fn element_name(frame: &PaintedFrame, target: &HitTarget) -> String {
             .and_then(|d| d.buttons.iter().find(|b| &b.target == target))
             .map(|b| b.label.clone())
             .unwrap_or_default(),
-        HitTarget::ConfirmCredits(_) => "크레딧 사용".into(),
-        HitTarget::ConfirmDelete(_) => "계정 삭제".into(),
-        HitTarget::CancelDialog | HitTarget::LoginCancel => "취소".into(),
-        HitTarget::LoginCopy => "주소 복사".into(),
+        HitTarget::ConfirmCredits(_) => i18n::text("크레딧 사용").into_owned(),
+        HitTarget::ConfirmDelete(_) => i18n::text("계정 삭제").into_owned(),
+        HitTarget::CancelDialog | HitTarget::LoginCancel => i18n::text("취소").into_owned(),
+        HitTarget::LoginCopy => i18n::text("주소 복사").into_owned(),
         _ => String::new(),
     }
 }
@@ -2731,9 +2735,14 @@ unsafe extern "system" fn window_proc(
                 set_view(Some("quit".into()));
             }
             // Fixed local copy only; no transport details, credentials, or bodies.
+            let message: Vec<_> =
+                i18n::text("코어를 종료하지 못했습니다. 트레이를 유지합니다. 다시 시도하세요.")
+                    .encode_utf16()
+                    .chain([0])
+                    .collect();
             let _ = windows::Win32::UI::WindowsAndMessaging::MessageBoxW(
                 Some(hwnd),
-                w!("코어를 종료하지 못했습니다. 트레이를 유지합니다. 다시 시도하세요."),
+                PCWSTR(message.as_ptr()),
                 w!("quota-baton"),
                 windows::Win32::UI::WindowsAndMessaging::MB_OK
                     | windows::Win32::UI::WindowsAndMessaging::MB_ICONERROR,

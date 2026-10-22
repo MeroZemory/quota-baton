@@ -189,6 +189,7 @@ impl Renderer {
                 .max(1);
         }
         for detail in g::QUIT_DETAILS {
+            let detail = crate::i18n::static_text(detail);
             let mut text_style = style(12., false, 16.);
             text_style.wrap = Wrap::KeepAll;
             let lines = self
@@ -226,7 +227,7 @@ impl Renderer {
                 }
                 for line in &usage.lines {
                     if let Some(remaining) = line.window.remaining {
-                        let text = format!("{remaining}% 남음");
+                        let text = crate::i18n::format("{0}% 남음", &[remaining.to_string()]);
                         for (size, bold) in [(12, true), (13, true)] {
                             p.text_widths.insert(
                                 g::text_key(&text, size, bold),
@@ -256,12 +257,12 @@ impl Renderer {
             }
         }
         for text in [
-            "켜기",
-            "다시 로그인",
-            "크레딧으로 계속",
-            "크레딧 사용 끄기",
-            "로그 열기",
-            "계정 추가",
+            crate::i18n::static_text("켜기"),
+            crate::i18n::static_text("다시 로그인"),
+            crate::i18n::static_text("크레딧으로 계속"),
+            crate::i18n::static_text("크레딧 사용 끄기"),
+            crate::i18n::static_text("로그 열기"),
+            crate::i18n::static_text("계정 추가"),
         ] {
             for bold in [false, true] {
                 p.text_widths
@@ -419,7 +420,9 @@ impl Renderer {
         let width = self.width(&b.label, font as u8, bold)?;
         let glyph = match &b.target {
             g::Target::AddProvider(_) if !small => Some("\u{e710}"),
-            g::Target::LoginCopy if b.label == "주소 복사" => Some("\u{e8c8}"),
+            g::Target::LoginCopy if b.label == crate::i18n::static_text("주소 복사") => {
+                Some("\u{e8c8}")
+            }
             _ => None,
         };
         let total_width = width + if glyph.is_some() { 22. } else { 0. };
@@ -576,7 +579,7 @@ impl Renderer {
             self.text(
                 target,
                 b,
-                "코어에 연결할 수 없습니다",
+                crate::i18n::static_text("코어에 연결할 수 없습니다"),
                 style(13., false, 28.),
                 p.bad,
                 1.,
@@ -626,7 +629,7 @@ impl Renderer {
                 )?;
                 let detail_left = x + verdict_width + 12.;
                 let todo = if summary.todo > 0 {
-                    format!("할 일 {}", summary.todo)
+                    crate::i18n::format("할 일 {0}", &[(summary.todo).to_string()])
                 } else {
                     String::new()
                 };
@@ -678,7 +681,8 @@ impl Renderer {
                 if scene.core_ok {
                     view.note.as_deref().unwrap_or("")
                 } else {
-                    o.core_note.unwrap_or("코어 상태를 읽지 못했습니다")
+                    o.core_note
+                        .unwrap_or(crate::i18n::static_text("코어 상태를 읽지 못했습니다"))
                 },
                 style(12., false, 16.),
                 p.secondary,
@@ -703,21 +707,21 @@ impl Renderer {
             self.text(
                 target,
                 empty.title,
-                "아직 계정이 없습니다",
+                crate::i18n::static_text("아직 계정이 없습니다"),
                 style(15., true, 20.),
                 p.text,
                 1.,
             )?;
             let mut s = style(13., false, 20.);
             s.wrap = Wrap::KeepAll;
-            self.text(target,empty.body,"Claude나 Codex 계정을 추가하세요. 한 계정이 한도에 도달하면 다른 계정으로 이어서 처리합니다.",s,p.secondary,1.)?;
+            self.text(target,empty.body,crate::i18n::static_text("Claude나 Codex 계정을 추가하세요. 한 계정이 한도에 도달하면 다른 계정으로 이어서 처리합니다."),s,p.secondary,1.)?;
             for button in &empty.buttons {
                 self.button(target, button, true, false, o)?;
             }
             self.text(
                 target,
                 r(empty.cli.left, empty.cli.top, 328., 16.),
-                "CPA 계정을 가져오려면 명령줄에서",
+                crate::i18n::static_text("CPA 계정을 가져오려면 명령줄에서"),
                 style(12., false, 16.),
                 p.secondary,
                 1.,
@@ -762,7 +766,7 @@ impl Renderer {
                 }
                 let text = model
                     .and_then(|s| s.disclosure.as_deref())
-                    .unwrap_or("꺼진 계정");
+                    .unwrap_or(crate::i18n::static_text("꺼진 계정"));
                 let width = self.width(text, 12, false)?;
                 self.text(
                     target,
@@ -789,7 +793,7 @@ impl Renderer {
                 self.text(
                     target,
                     b,
-                    "켜면 사용량을 확인한 뒤 바로 이어서 처리합니다.",
+                    crate::i18n::static_text("켜면 사용량을 확인한 뒤 바로 이어서 처리합니다."),
                     style(12., false, 16.),
                     p.secondary,
                     alpha,
@@ -801,7 +805,7 @@ impl Renderer {
                     b,
                     model
                         .and_then(|s| s.empty_message.as_deref())
-                        .unwrap_or("계정이 없습니다"),
+                        .unwrap_or(crate::i18n::static_text("계정이 없습니다")),
                     style(12., false, 16.),
                     p.secondary,
                     alpha,
@@ -871,7 +875,7 @@ impl Renderer {
                 self.text(
                     target,
                     rect,
-                    "사용량 확인 전",
+                    crate::i18n::static_text("사용량 확인 전"),
                     style(12., false, 16.),
                     p.secondary,
                     alpha,
@@ -892,10 +896,10 @@ impl Renderer {
                         p.secondary,
                         alpha,
                     )?;
-                    let rest = line
-                        .window
-                        .remaining
-                        .map_or_else(|| "확인 전".into(), |n| format!("{n}% 남음"));
+                    let rest = line.window.remaining.map_or_else(
+                        || crate::i18n::static_text("확인 전").into(),
+                        |n| crate::i18n::format("{0}% 남음", &[n.to_string()]),
+                    );
                     self.text(
                         target,
                         r(
@@ -1091,15 +1095,16 @@ impl Renderer {
                             .filter(|w| w.account_scoped || w.remaining.is_some())
                             .nth(index)
                     {
-                        let value = window
-                            .remaining
-                            .map_or_else(|| "사용량 확인 전".into(), |n| format!("{n}% 남음"));
+                        let value = window.remaining.map_or_else(
+                            || crate::i18n::static_text("사용량 확인 전").into(),
+                            |n| crate::i18n::format("{0}% 남음", &[n.to_string()]),
+                        );
                         let rest = window
                             .reset_text
                             .as_deref()
                             .map_or(String::new(), |s| format!(" · {s}"))
                             + if window.model_limited {
-                                " · 사용 제한"
+                                crate::i18n::static_text(" · 사용 제한")
                             } else {
                                 ""
                             };
@@ -1117,8 +1122,10 @@ impl Renderer {
                         self.value_line(
                             target,
                             line.rect,
-                            "크레딧",
-                            line.text.strip_prefix("크레딧 ").unwrap_or("확인 전"),
+                            crate::i18n::static_text("크레딧"),
+                            line.text
+                                .strip_prefix(crate::i18n::static_text("크레딧 "))
+                                .unwrap_or(crate::i18n::static_text("확인 전")),
                             "",
                             true,
                         )?;
@@ -1251,19 +1258,22 @@ impl Renderer {
                 s,
             )?;
             let mut emphasis = Vec::new();
-            if let Some((label, _)) = paragraph.split_once(" 사용량:") {
-                emphasis.push(format!("{label} 사용량"));
+            if let Some((label, _)) = paragraph.split_once(crate::i18n::static_text(" 사용량:"))
+            {
+                emphasis.push(crate::i18n::format("{0} 사용량", &[label.to_string()]));
             }
-            for (end, _) in paragraph.match_indices("% 남음") {
+            for (end, _) in paragraph.match_indices(crate::i18n::static_text("% 남음")) {
                 let start = paragraph[..end]
                     .char_indices()
                     .rev()
                     .find(|(_, c)| c.is_whitespace())
                     .map_or(0, |(i, c)| i + c.len_utf8());
-                emphasis.push(paragraph[start..end + "% 남음".len()].to_owned());
+                emphasis.push(
+                    paragraph[start..end + crate::i18n::static_text("% 남음").len()].to_owned(),
+                );
             }
             if let Some(amount) = paragraph
-                .strip_prefix("크레딧 잔액 ")
+                .strip_prefix(crate::i18n::static_text("크레딧 잔액 "))
                 .and_then(|s| s.split_whitespace().next())
             {
                 emphasis.push(amount.into());
@@ -1273,7 +1283,8 @@ impl Renderer {
             layout.draw(
                 target,
                 rgb(
-                    if paragraph.ends_with("에 초기화됩니다.") || paragraph.starts_with("막대는 ")
+                    if paragraph.ends_with(crate::i18n::static_text("에 초기화됩니다."))
+                        || paragraph.starts_with(crate::i18n::static_text("막대는 "))
                     {
                         self.palette.secondary
                     } else {
@@ -1322,12 +1333,12 @@ impl Renderer {
             .and_then(|row| row.menu.credits_enable_confirmation.as_ref());
         let title = if d.takeover_body.is_some() {
             if d.buttons[0].target == g::Target::TakeoverCommit {
-                "가져오기 확인"
+                crate::i18n::static_text("가져오기 확인")
             } else {
-                "다른 앱에서 계정 가져오기"
+                crate::i18n::static_text("다른 앱에서 계정 가져오기")
             }
         } else {
-            credit.map_or("계정 삭제", |c| c.title)
+            credit.map_or(crate::i18n::static_text("계정 삭제"), |c| c.title)
         };
         self.text(target, d.title, title, style(14., true, 20.), p.text, 1.)?;
         self.clip(target, d.body, || {
@@ -1368,7 +1379,7 @@ impl Renderer {
                         d.body.right - d.body.left,
                         20.,
                     ),
-                    "계정을 quota-baton에서 삭제할까요?",
+                    crate::i18n::static_text("계정을 quota-baton에서 삭제할까요?"),
                     style(13., false, 20.),
                     p.text,
                     1.,
@@ -1381,7 +1392,7 @@ impl Renderer {
                         d.body.right - d.body.left,
                         16.,
                     ),
-                    "제공자 쪽 로그인은 취소되지 않습니다.",
+                    crate::i18n::static_text("제공자 쪽 로그인은 취소되지 않습니다."),
                     style(12., false, 16.),
                     p.secondary,
                     1.,
@@ -1409,10 +1420,13 @@ impl Renderer {
         o: &RenderOptions<'_>,
     ) -> Result<()> {
         let p = self.palette;
-        let title = format!("{} 로그인", v2::provider_label(&b.provider));
+        let title = crate::i18n::format(
+            "{0} 로그인",
+            &[(v2::provider_label(&b.provider)).to_string()],
+        );
         self.text(target, b.title, &title, style(15., true, 20.), p.text, 1.)?;
         let message = o.login.map_or(
-            "브라우저에서 로그인을 마치면 자동으로 완료됩니다.",
+            crate::i18n::static_text("브라우저에서 로그인을 마치면 자동으로 완료됩니다."),
             |l| l.message.as_str(),
         );
         let mut s = style(13., false, 20.);
@@ -1476,7 +1490,7 @@ impl Renderer {
             if matches!(button.target, g::Target::LoginCopy) {
                 button.enabled = o.login.is_some_and(|l| l.copy_ready || l.retry);
                 if o.login.is_some_and(|l| l.retry) {
-                    button.label = "다시 시도".into();
+                    button.label = crate::i18n::static_text("다시 시도").into();
                 }
             }
             self.button(target, &button, false, false, o)?;
@@ -1554,5 +1568,25 @@ mod r6_render_tests {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod r16_locale_measurement_tests {
+    #[test]
+    fn r16_quit_subtitles_use_the_same_translated_measurement_keys() -> windows::core::Result<()> {
+        crate::i18n::with_language(crate::i18n::UiLanguage::En, || {
+            let view =
+                crate::v2::project(r#"{"accounts":[]}"#, std::time::SystemTime::now()).unwrap();
+            let mut presentation = crate::v2_geometry::Presentation::default();
+            super::Renderer::new(false)?.measure(&view, &mut presentation)?;
+            for source in crate::v2_geometry::QUIT_DETAILS {
+                let translated = crate::i18n::static_text(source);
+                assert_ne!(translated, source);
+                assert!(presentation.subtitle_lines.contains_key(translated));
+                assert!(!presentation.subtitle_lines.contains_key(source));
+            }
+            Ok(())
+        })
     }
 }

@@ -36,31 +36,34 @@ pub fn quota_message(
     let name = &row.name;
     let provider_name = v2::provider_label(provider);
     let window = match notice.window.as_deref() {
-        Some("5h" | "primary") => "5시간",
-        Some("7d" | "secondary") => "주간",
-        Some(name) if name.starts_with("7d_") => "주간",
+        Some("5h" | "primary") => crate::i18n::static_text("5시간"),
+        Some("7d" | "secondary") => crate::i18n::static_text("주간"),
+        Some(name) if name.starts_with("7d_") => crate::i18n::static_text("주간"),
         _ => "",
     };
     let limit = if window.is_empty() {
-        "한도 도달".into()
+        crate::i18n::static_text("한도 도달").into()
     } else {
-        format!("{window} 한도 도달")
+        crate::i18n::format("{0} 한도 도달", &[window.to_string()])
     };
     let limit = if notice.model_limited {
-        format!("이 모델의 {limit}")
+        crate::i18n::format("이 모델의 {0}", &[limit.to_string()])
     } else {
         limit
     };
     let reset = notice.reset_at.map(|at| time(at, now));
     let reset_sentence = reset.as_ref().map_or_else(
-        || "초기화 시간 확인 중입니다.".into(),
-        |at| format!("{at} 초기화."),
+        || crate::i18n::static_text("초기화 시간 확인 중입니다.").into(),
+        |at| crate::i18n::format("{0} 초기화.", &[at.to_string()]),
     );
     let (title, text, short) = match notice.action {
         QuotaAction::Credits => (
             crate::account_notice_title(name, provider, &limit),
-            format!("유료 크레딧으로 계속 처리합니다. {reset_sentence}"),
-            "크레딧 사용 중".into(),
+            crate::i18n::format(
+                "유료 크레딧으로 계속 처리합니다. {0}",
+                &[reset_sentence.to_string()],
+            ),
+            crate::i18n::static_text("크레딧 사용 중").into(),
         ),
         QuotaAction::Failover => {
             let next = notice
@@ -68,13 +71,13 @@ pub fn quota_message(
                 .as_deref()
                 .and_then(|id| account_row(view, provider, id));
             let action = next.map_or_else(
-                || "다른 계정으로 이어서 처리합니다.".into(),
-                |r| format!("{} 계정으로 이어서 처리합니다.", r.name),
+                || crate::i18n::static_text("다른 계정으로 이어서 처리합니다.").into(),
+                |r| crate::i18n::format("{0} 계정으로 이어서 처리합니다.", &[(r.name).to_string()]),
             );
             (
                 crate::account_notice_title(name, provider, &limit),
                 format!("{action} {reset_sentence}"),
-                "다른 계정이 처리".into(),
+                crate::i18n::static_text("다른 계정이 처리").into(),
             )
         }
         QuotaAction::Exhausted => {
@@ -83,18 +86,23 @@ pub fn quota_message(
                 .as_deref()
                 .and_then(|id| account_row(view, provider, id));
             let prefix = match (reset.as_deref(), earliest) {
-                (Some(at), Some(r)) => format!("가장 빠른 초기화: {} {at}.", r.name),
-                (Some(at), None) => format!("가장 빠른 초기화: {at}."),
-                (None, _) => "초기화 시간 확인 중입니다.".into(),
+                (Some(at), Some(r)) => crate::i18n::format(
+                    "가장 빠른 초기화: {0} {1}.",
+                    &[(r.name).to_string(), at.to_string()],
+                ),
+                (Some(at), None) => {
+                    crate::i18n::format("가장 빠른 초기화: {0}.", &[at.to_string()])
+                }
+                (None, _) => crate::i18n::static_text("초기화 시간 확인 중입니다.").into(),
             };
             // A model rejection cannot offer account-wide paid recovery or
             // announce that every account of the provider is exhausted.
             let suffix = if notice.model_limited {
-                "그때까지 이 모델의 새 요청은 오류로 끝납니다.".into()
+                crate::i18n::static_text("그때까지 이 모델의 새 요청은 오류로 끝납니다.").into()
             } else if let Some(candidate) = credit_candidate(view, provider, now) {
-                format!(
-                    "{}의 유료 크레딧을 허용하면 바로 이어서 처리합니다.",
-                    candidate.name
+                crate::i18n::format(
+                    "{0}의 유료 크레딧을 허용하면 바로 이어서 처리합니다.",
+                    &[(candidate.name).to_string()],
                 )
             } else {
                 let disabled = view
@@ -103,19 +111,25 @@ pub fn quota_message(
                     .find(|s| s.provider == provider)
                     .map_or(0, |s| s.disabled_rows.len());
                 if disabled > 0 {
-                    format!("꺼진 계정 {disabled}개를 켜면 이어서 처리할 수 있습니다.")
+                    crate::i18n::format(
+                        "꺼진 계정 {0}개를 켜면 이어서 처리할 수 있습니다.",
+                        &[disabled.to_string()],
+                    )
                 } else {
-                    "그때까지 새 요청은 오류로 끝납니다.".into()
+                    crate::i18n::static_text("그때까지 새 요청은 오류로 끝납니다.").into()
                 }
             };
             (
                 if notice.model_limited {
-                    format!("{provider_name} 이 모델의 계정 모두 한도 도달")
+                    crate::i18n::format(
+                        "{0} 이 모델의 계정 모두 한도 도달",
+                        &[provider_name.to_string()],
+                    )
                 } else {
-                    format!("{provider_name} 계정 모두 한도 도달")
+                    crate::i18n::format("{0} 계정 모두 한도 도달", &[provider_name.to_string()])
                 },
                 format!("{prefix} {suffix}"),
-                "처리할 다른 계정 없음".into(),
+                crate::i18n::static_text("처리할 다른 계정 없음").into(),
             )
         }
     };
@@ -200,20 +214,18 @@ pub fn account_message(
         .and_then(v2::timestamp)
         .map(|at| time(at, now));
     Some(match kind {
-        AccountKind::Relogin => (title("다시 로그인 필요"), format!(
-            "트레이에서 이 계정의 \"다시 로그인\"을 누르세요. {}",
-            if has_alternative { serving.map_or_else(|| "그동안 다른 계정이 처리합니다.".into(),
-                |r| format!("그동안 {}가 처리합니다.", r.name)) }
-            else { "처리할 다른 계정이 없습니다.".into() })),
-        AccountKind::LinkStale => (title("CPA 갱신 멈춤"), "CPA가 이 계정의 토큰을 갱신하지 않습니다. CPA 실행을 확인하거나 계정 인수를 고려하세요.".into()),
-        AccountKind::StoreError => (title("토큰 저장 실패"), "토큰을 저장하지 못해 다시 시도하고 있습니다. 로그를 확인하세요.".into()),
-        AccountKind::Billing => (title("결제 거절"), until.map_or_else(
-            || "결제 상태를 확인하는 동안 이 계정을 쉽니다.".into(),
-            |at| if has_alternative { format!("{at}까지 이 계정을 쉬고 다른 계정이 처리합니다.") }
-                else { format!("{at}까지 이 계정을 쉽니다.") })),
-        AccountKind::OrganisationDenied => (title("조직 접근 거부"), until.map_or_else(
-            || "조직 접근 상태를 확인하는 동안 이 계정을 쉽니다.".into(),
-            |at| format!("이 계정은 {at}까지 쉽니다."))),
+        AccountKind::Relogin => (title(crate::i18n::static_text("다시 로그인 필요")), crate::i18n::format("트레이에서 이 계정의 \"다시 로그인\"을 누르세요. {0}", &[(if has_alternative { serving.map_or_else(|| crate::i18n::static_text("그동안 다른 계정이 처리합니다.").into(),
+                |r| crate::i18n::format("그동안 {0}가 처리합니다.", &[(r.name).to_string()])) }
+            else { crate::i18n::static_text("처리할 다른 계정이 없습니다.").into() }).to_string()])),
+        AccountKind::LinkStale => (title(crate::i18n::static_text("CPA 갱신 멈춤")), crate::i18n::static_text("CPA가 이 계정의 토큰을 갱신하지 않습니다. CPA 실행을 확인하거나 계정 인수를 고려하세요.").into()),
+        AccountKind::StoreError => (title(crate::i18n::static_text("토큰 저장 실패")), crate::i18n::static_text("토큰을 저장하지 못해 다시 시도하고 있습니다. 로그를 확인하세요.").into()),
+        AccountKind::Billing => (title(crate::i18n::static_text("결제 거절")), until.map_or_else(
+            || crate::i18n::static_text("결제 상태를 확인하는 동안 이 계정을 쉽니다.").into(),
+            |at| if has_alternative { crate::i18n::format("{0}까지 이 계정을 쉬고 다른 계정이 처리합니다.", &[at.to_string()]) }
+                else { crate::i18n::format("{0}까지 이 계정을 쉽니다.", &[at.to_string()]) })),
+        AccountKind::OrganisationDenied => (title(crate::i18n::static_text("조직 접근 거부")), until.map_or_else(
+            || crate::i18n::static_text("조직 접근 상태를 확인하는 동안 이 계정을 쉽니다.").into(),
+            |at| crate::i18n::format("이 계정은 {0}까지 쉽니다.", &[at.to_string()]))),
     })
 }
 

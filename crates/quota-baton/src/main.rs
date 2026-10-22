@@ -9,6 +9,7 @@ macro_rules! println_utf8 {
 mod accounts_cli;
 mod catalog_snapshot;
 mod cutover;
+mod debug_snapshot;
 mod image_canary;
 mod image_launch;
 mod launch_client;
@@ -55,6 +56,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    #[command(about = "Export diagnostic display data")]
+    Debug {
+        #[command(subcommand)]
+        command: debug_snapshot::DebugCommand,
+    },
     #[command(about = "대화 이동 기록과 홈의 상태를 검사합니다")]
     Doctor,
     #[command(about = "기존 Codex 대화를 가져오거나 되돌립니다")]
@@ -447,6 +453,7 @@ async fn run() -> anyhow::Result<()> {
     }
     let home = qb_core::home()?;
     match cli.command {
+        Command::Debug { command } => debug_snapshot::run(&home, command).await?,
         Command::Doctor => sessions::doctor(&home)?,
         Command::Sessions { command } => sessions::run(&home, command)?,
         Command::LaunchClient { .. } => {

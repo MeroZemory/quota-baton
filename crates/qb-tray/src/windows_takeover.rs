@@ -42,9 +42,9 @@ pub(super) fn card(state: &str) -> Overlay {
     let Some(data) = data.as_ref().filter(|d| d.ticket == view.owner()) else {
         return Overlay::TakeoverCard {
             body: if state == "takeover-pending" {
-                "가져오는 중입니다. 원본 파일을 정리하고 토큰 갱신을 확인합니다."
+                i18n::static_text("가져오는 중입니다. 원본 파일을 정리하고 토큰 갱신을 확인합니다.")
             } else {
-                "계정 정보를 확인하고 있습니다. 잠시 기다리세요."
+                i18n::static_text("계정 정보를 확인하고 있습니다. 잠시 기다리세요.")
             }
             .into(),
             confirming: false,
@@ -58,7 +58,7 @@ pub(super) fn card(state: &str) -> Overlay {
             "{}{}\n\n{}",
             data.inspect.warning(),
             if data.inspect.existing_id.is_some() {
-                "\n기존 계정을 교체합니다. 계정 ID, 연결 및 기록은 유지됩니다."
+                i18n::static_text("\n기존 계정을 교체합니다. 계정 ID, 연결 및 기록은 유지됩니다.")
             } else {
                 ""
             },
@@ -125,7 +125,11 @@ fn folder(hwnd: HWND) -> Result<Option<String>> {
                 | FOS_PATHMUSTEXIST
                 | FOS_DONTADDTORECENT,
         )?;
-        dialog.SetTitle(w!("가져올 계정의 홈 폴더 선택"))?;
+        let title: Vec<u16> = i18n::text("가져올 계정의 홈 폴더 선택")
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        dialog.SetTitle(PCWSTR(title.as_ptr()))?;
         if let Err(error) = dialog.Show(Some(hwnd)) {
             if error.code() == windows::core::HRESULT(0x800704c7u32 as i32) {
                 return Ok(None);
@@ -276,11 +280,15 @@ pub(super) fn commit(hwnd: HWND) {
         // Commit may finish after dismissal, but cannot change the newer UI.
         // Never retry: a lost response may already have retired the source.
         let message = match result {
-            Ok(result) if result.refresh.ok => "가져오기를 마쳤고 토큰 갱신을 확인했습니다.",
-            Ok(_) => "가져왔지만 토큰 갱신을 확인하지 못했습니다. 계정 상태를 확인하세요.",
-            Err(_) => {
-                "가져오기를 확인하지 못했습니다. 계정 목록과 원본 폴더를 확인하세요. 앱 실행, 최근 파일 변경 또는 기존 계정 충돌이면 다시 검사하세요. 자동 재시도하지 않습니다."
+            Ok(result) if result.refresh.ok => {
+                i18n::static_text("가져오기를 마쳤고 토큰 갱신을 확인했습니다.")
             }
+            Ok(_) => i18n::static_text(
+                "가져왔지만 토큰 갱신을 확인하지 못했습니다. 계정 상태를 확인하세요.",
+            ),
+            Err(_) => i18n::static_text(
+                "가져오기를 확인하지 못했습니다. 계정 목록과 원본 폴더를 확인하세요. 앱 실행, 최근 파일 변경 또는 기존 계정 충돌이면 다시 검사하세요. 자동 재시도하지 않습니다.",
+            ),
         };
         let mut view = view_state().lock().unwrap_or_else(|e| e.into_inner());
         view.publish(ticket, Some(format!("takeover-result:{message}")));

@@ -176,7 +176,7 @@ impl Session {
         self.errors
             .get(id)
             .is_some_and(|until| *until > now)
-            .then_some("요청을 처리하지 못했습니다")
+            .then_some(crate::i18n::static_text("요청을 처리하지 못했습니다"))
     }
     /// Opening a confirmation never yields a mutation; no remembered consent.
     pub fn ask_credits(&mut self, view: &v2::View, id: &str, return_to: ReturnTo) -> bool {
@@ -293,5 +293,22 @@ mod tests {
         assert!(s.tag_action(&next, "drain"));
         assert!(!s.tag_action(&first, "credits"));
         assert_eq!(s.pending_action("id"), Some("drain"));
+    }
+    #[test]
+    fn r16_failed_action_reason_localizes_without_changing_expiry() {
+        let mut session = Session::default();
+        let ticket = session.begin("sample-acct").unwrap();
+        assert!(session.complete(&ticket, true, Duration::ZERO));
+        crate::i18n::with_language(crate::i18n::UiLanguage::En, || {
+            assert_eq!(
+                session.error("sample-acct", Duration::from_secs(9)),
+                Some("Request failed")
+            );
+            assert_eq!(session.error("sample-acct", Duration::from_secs(10)), None);
+        });
+        assert_eq!(
+            session.error("sample-acct", Duration::from_secs(9)),
+            Some("요청을 처리하지 못했습니다")
+        );
     }
 }

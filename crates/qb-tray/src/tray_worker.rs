@@ -72,6 +72,7 @@ pub(super) struct Worker {
 
 impl Worker {
     pub(super) fn start(hwnd: isize, supervise: bool) -> anyhow::Result<Self> {
+        let language = qb_tray::i18n::language();
         let dashboard = super::dashboard_io::Coordinator::new(hwnd);
         let dashboard_io = dashboard.clone();
         let (jobs, mut job_rx) = AdmissionLane::new(ORDINARY_BUDGET);
@@ -85,6 +86,7 @@ impl Worker {
         // Runtime construction failure is reported to the UI asynchronously; no global
         // refresh latch exists that could strand future updates after a spawn failure.
         let thread = std::thread::Builder::new().name("quota-baton-tray-io".into()).spawn(move || {
+            qb_tray::i18n::set_language(language);
             let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
                 Ok(runtime) => runtime,
                 Err(_) => { unavailable(hwnd); return; }
