@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: R14.2 기본 꺼짐 기록기 최소 전달
-목표: N6 최소 관문 완료·설치 인계, 다음 N5a HTTP 대기·초기화 재개 실행
+현재 마일스톤: R16.5 제공자 잔여량 이력 보완
+목표: R16.5 관문 완료·설치 인계, 다음 N5a HTTP 대기·초기화 재개 실행
 핵심 지표: 남은 출시 1/3 (R14 보호 설치, R13 C+E 실행, R13 F 통합 예측); 이전 계열 2/2 종료
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-23 06:12 KST (N6 최소 전달 완료; 다음 N5a)
+갱신: 2026-10-23 06:52 KST (R16.5 전달 완료; 다음 N5a)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -195,6 +195,8 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-23 05:26 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | R16.3 설치 수용41cb129·takeover 거절0/1,889; 잔여량 집계 R16.4 보완 |
 | 2026-10-23 06:00 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | R16.4 집중 관문·실제 경로 검수 완료; 분모 밖 표시 수정, 다음 N6 |
 | 2026-10-23 06:12 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | N6 최소 기록기 관문 완료·설치 인계; 분모 밖 준비 기능, 다음 N5a |
+| 2026-10-23 06:31 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | N6 최소 기록기 설치·128 MiB로 활성화; 실제24시간 입력은 10/24 06:31 이후 설계 세션 export |
+| 2026-10-23 06:52 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | R16.5 잔여량 이력 관문 완료·설치 인계; 출시 분모 밖 표시 보완 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -364,13 +366,16 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-23 06:00 | R16.4 잔여량 집중 검증 | 453통과·strict tray all-target lint·fmt·testkit build exit0 | 현재 snapshot/소진0/paused 제외/이력 갭·기존 영어 배치 | R16.4-evidence/delivery-fingerprint.json에 명령·exit·입력SHA; 전체 matrix 미주장 |
 | 2026-10-23 06:00 | R16.4 실제 경로 | KO/EN core→AdminClient→tray 10HWND 확인 | D27·snapshot 실제 전달 | fixture 정리·소스/바이너리 parity; visual-review.json |
 | 2026-10-23 06:12 | N6 최소 기록기 집중 관문 | replay45·config20·실제 HTTP1·12세션 cohort1·takeover3 검사, strict lint·fmt exit0 | schema/off/7일 bounds·기본 동작 보존 | minimum-delivery-fingerprint.json의 중복 제거 합계·명령별 입력SHA·exit; 전체 replay 수용 아님 |
+| 2026-10-23 06:31 | N6 최소 설치 | epoch e00·첫 segment 363 KB, 연결 timeout1/1,779·refusal0 | 설계 세션 실제 takeover probe·ledger 오류0 | listener admission과 writer join 순서는 N6t/N6r 후속 점검 |
+| 2026-10-23 06:52 | R16.5 집중 관문 | 고유466통과·strict tray all-target clippy·fmt·testkit build exit0 | 희소 이력·소진0·리셋100·명시적 unknown 갭·한영 문구 | R16.5-evidence/delivery-fingerprint.json; baseline red 예상 실패·정확한 소스 복원·독립 소스 PASS |
+| 2026-10-23 06:52 | R16.5 실제 경로·렌더 | 실제 KO/EN10HWND·동일 export2PNG·합성 전체이력4PNG 확인 | core 정상 이력복구→실제 AdminClient→tray·production renderer | 실제 Claude19시간 선·문구 확인, fixture 삭제·소스/바이너리 parity |
 <!-- support:end -->
 
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 행동 |
 |---|---|---|---|
-| 기록기 N6t/N6r | 최소 기록기 전달, 초기 cut/전체 owner/실제 replay 미수용 | 완전성 증명·24시간 차등 재생 | 설치·운영 수집 뒤 owner 통합과 export 검증 |
-| 대기·재개 N5a-d | 정책·측정 기반 준비, 실행 미연결 | HTTP/WS 취소·초기화 재개·긴급 이동 | 측정 lane 병행, 개별 실행 노드 통합 |
+| 기록기 N6t/N6r | 최소 기록기 설치·수집 중, 초기 cut/전체 owner/실제 replay 미수용 | 완전성 증명·24시간 차등 재생 | 10/24 06:31 이후 export 검증; takeover listener/writer 순서 점검 |
+| 대기·재개 N5a-d | 원시 검사·최초 보고 분류 통과, 실행 미연결 | HTTP/WS 취소·초기화 재개·긴급 이동 | N5a의 pre-send origin·순서·무효화와 실제 HTTP 통합 |
 | 통합 예측 N7 | 검증 가능한 24시간 입력 부족 | 명시한 오차 범위의 backtest | body-free 입력·훈련/후속 관측 검증, 풀 예측 표시는 보류 |
 <!-- gaps:end -->
 

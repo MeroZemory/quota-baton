@@ -1,7 +1,7 @@
 //! Provider account-equivalents, using the current cohort throughout history.
 //! Inputs are owner-verified, current-cohort facts, not translated display labels.
-//! `valid_until` is an exclusive observation coverage bound, chosen by the adapter
-//! from source freshness/reset knowledge. This module cannot certify that bound.
+//! `valid_until` is an exclusive capacity-regime bound, never rate freshness.
+//! Known resets restore capacity once reached; inferred phase starts only cut coverage.
 //! Phases are explicit verified cycles: never derive older/new cycles from one
 //! current deadline. Future pace is an ideal schedule, not observed capacity.
 
@@ -46,7 +46,7 @@ pub struct Observation {
     pub at: DateTime<Utc>,
     /// None explicitly interrupts known history. Never substitute zero.
     pub used_pct: Option<f64>,
-    /// Required to carry a point forward; None means unknown coverage.
+    /// Hard capacity-regime bound; None means unknown coverage, not rate expiry.
     pub valid_until: Option<DateTime<Utc>>,
 }
 #[derive(Clone, Copy, Debug)]
@@ -61,7 +61,7 @@ pub struct WindowInput {
     pub kind: WindowKind,
     pub observations: Vec<Observation>,
     pub phases: Vec<Phase>,
-    /// Observed reset markers can interrupt actual history without a known phase.
+    /// Observed or already-known scheduled resets restore capacity once reached.
     pub resets: Vec<DateTime<Utc>>,
     pub truncated: bool,
 }
@@ -145,7 +145,6 @@ pub enum Error {
     ClockBounds,
 }
 
-const FRESH_SECONDS: i64 = 300;
 const MAX_WINDOWS_PER_ACCOUNT: usize = 32;
 
 /// Adapts actual dashboard DTOs, never translated labels or plan weights.
@@ -173,46 +172,11 @@ pub fn project_snapshot(
                 .and_then(|accounts| project_in_minute(provider, accounts, now, minute).ok())
                 .map(|mut projection| {
                     projection.history_truncated |= snapshot.usage.truncated;
-                    projection.next_change = projection
-                        .next_change
-                        .into_iter()
-                        .chain(snapshot_history_deadline(snapshot, provider, now))
-                        .min();
                     projection
                 })
                 .unwrap_or_else(|| unknown_projection(provider, snapshot, now, minute))
         })
         .collect()
-}
-
-// A dated source point can stop covering history while current capacity remains
-// known. Preserve that exact repaint deadline independently of the current point.
-fn snapshot_history_deadline(
-    snapshot: &crate::dashboard_model::DashboardSnapshot,
-    selected: Provider,
-    now: DateTime<Utc>,
-) -> Option<DateTime<Utc>> {
-    snapshot
-        .accounts
-        .raw
-        .accounts
-        .iter()
-        .filter(|a| provider(&a.provider) == Some(selected) && a.user_state == "active" && !a.drain)
-        .flat_map(|a| {
-            a.windows.iter().filter_map(move |w| {
-                long_kind(a, w)?;
-                w.used_pct.filter(|v| v.is_finite() && *v >= 0.)?;
-                let observed = timestamp(w.observed_at.as_deref())
-                    .or_else(|| timestamp(a.observed_at.as_deref()))
-                    .or(snapshot.data_at)?;
-                let expiry = observed.checked_add_signed(Duration::seconds(FRESH_SECONDS))?;
-                (observed <= now
-                    && expiry > now
-                    && timestamp(w.reset_at.as_deref()).is_none_or(|reset| expiry < reset))
-                .then_some(expiry)
-            })
-        })
-        .min()
 }
 
 fn provider(value: &str) -> Option<Provider> {
@@ -401,7 +365,7 @@ fn snapshot_inputs(
                 .map(|(at, used_pct)| Observation {
                     at: *at,
                     used_pct: *used_pct,
-                    valid_until: at.checked_add_signed(Duration::seconds(FRESH_SECONDS)),
+                    valid_until: Some(DateTime::<Utc>::MAX_UTC),
                 })
                 .collect();
             let mut resets: Vec<_> = series
@@ -411,51 +375,88 @@ fn snapshot_inputs(
                 .filter(|at| *at <= now)
                 .collect();
             let reset = timestamp(current.reset_at.as_deref());
-            // Capacity is an observed snapshot, not a rate estimate. Keep the
-            // latest value until its reset; absence of rate/history cannot erase
-            // it. An undated snapshot starts at receipt, never backfills history.
-            let observed = timestamp(current.observed_at.as_deref())
-                .or_else(|| timestamp(account.observed_at.as_deref()))
-                .or(snapshot.data_at)
-                .unwrap_or(now);
-            if observed <= now && reset.is_none_or(|at| at > now) {
+            // Capacity holds until a real change/reset, not rate freshness. A dated
+            // snapshot is one source sample, never a newly observed value at `now`.
+            let source_at = timestamp(current.observed_at.as_deref())
+                .or_else(|| timestamp(account.observed_at.as_deref()));
+            let observed = source_at.or(snapshot.data_at).unwrap_or(now);
+            let duration = Duration::seconds(kind.seconds().ok_or(Error::InvalidPhase)?);
+            let mut at = observed;
+            // A latest poll's timestamp is NOT exhaustion onset. Prefer matching
+            // hold/history evidence, otherwise use this known window's start.
+            // Positive/unknown samples and actual resets forbid backward fill.
+            if observed <= now && current.used_pct.is_some_and(|u| u.is_finite() && u >= 100.) {
+                let start = reset.and_then(|r| r.checked_sub_signed(duration));
+                let floor = start.unwrap_or(DateTime::<Utc>::MIN_UTC);
+                let barrier = observations
+                    .iter()
+                    .filter(|o| floor <= o.at && o.at <= observed)
+                    .filter(|o| o.used_pct.is_none_or(|u| !u.is_finite() || u < 100.))
+                    .map(|o| o.at)
+                    .chain(
+                        resets
+                            .iter()
+                            .copied()
+                            .filter(|r| floor <= *r && *r <= observed),
+                    )
+                    .max();
+                let applicable = |at: &DateTime<Utc>| {
+                    floor <= *at && *at <= observed && barrier.is_none_or(|b| b < *at)
+                };
+                let history_start = observations
+                    .iter()
+                    .filter(|o| o.used_pct.is_some_and(|u| u.is_finite() && u >= 100.))
+                    .map(|o| o.at)
+                    .filter(applicable)
+                    .min();
+                let hold_start = account
+                    .quota_cooling
+                    .as_ref()
+                    .filter(|q| {
+                        q.window == current.name
+                            && reset.is_some()
+                            && timestamp(q.reset_at.as_deref()) == reset
+                            && account.health.kind == "cooling"
+                            && account.health.reason.as_deref() == Some("quota")
+                            && account.health.scope.as_deref() == Some("account")
+                            && timestamp(account.health.until.as_deref()) == reset
+                    })
+                    .and_then(|q| timestamp(q.started_at.as_deref()))
+                    .filter(applicable);
+                at = history_start
+                    .into_iter()
+                    .chain(hold_start)
+                    .min()
+                    .or_else(|| start.filter(|at| barrier.is_none() && *at <= observed))
+                    .unwrap_or(observed);
+            }
+            if observed <= now && reset.is_none_or(|r| observed < r) {
                 let bound = reset.unwrap_or(DateTime::<Utc>::MAX_UTC);
-                if let Some(existing) = observations.iter_mut().find(|o| o.at == observed) {
-                    if existing.used_pct != current.used_pct {
+                if let Some(existing) = observations.iter_mut().find(|o| o.at == at) {
+                    // Relocation can join 100% and over-limit polls at their
+                    // first exhausted history point. Both mean zero capacity;
+                    // retain the original sample, not the newer raw percentage.
+                    let same_exhaustion = at < observed
+                        && existing
+                            .used_pct
+                            .is_some_and(|u| u.is_finite() && u >= 100.)
+                        && current.used_pct.is_some_and(|u| u.is_finite() && u >= 100.);
+                    if existing.used_pct != current.used_pct && !same_exhaustion {
                         return Err(Error::DuplicateObservation);
                     }
-                    existing.valid_until =
-                        observed.checked_add_signed(Duration::seconds(FRESH_SECONDS));
+                    existing.valid_until = Some(bound);
                 } else {
                     observations.push(Observation {
-                        at: observed,
+                        at,
                         used_pct: current.used_pct,
-                        valid_until: observed.checked_add_signed(Duration::seconds(FRESH_SECONDS)),
+                        valid_until: Some(bound),
                     });
-                }
-                // Current capacity is not a historical sample. An old source
-                // value remains authoritative now, but cannot bridge an
-                // unobserved historical gap between its timestamp and now.
-                if !resets.iter().any(|at| observed < *at && *at <= now) {
-                    if let Some(existing) = observations.iter_mut().find(|o| o.at == now) {
-                        if existing.used_pct != current.used_pct {
-                            return Err(Error::DuplicateObservation);
-                        }
-                        existing.valid_until = Some(bound);
-                    } else {
-                        observations.push(Observation {
-                            at: now,
-                            used_pct: current.used_pct,
-                            valid_until: Some(bound),
-                        });
-                    }
                 }
             }
             // Past reset markers are actual boundaries. Only two adjacent
             // verified markers a full window apart establish a historical phase.
             resets.sort_unstable();
             resets.dedup();
-            let duration = Duration::seconds(kind.seconds().ok_or(Error::InvalidPhase)?);
             let mut phases: Vec<_> = resets
                 .windows(2)
                 .filter_map(|pair| {
@@ -466,7 +467,12 @@ fn snapshot_inputs(
                 })
                 .collect();
             if let Some(reset) = reset.filter(|_| observed <= now) {
-                resets.push(reset);
+                // One scheduled replenishment, only if this snapshot was received
+                // before its deadline. Already-stale metadata cannot resurrect
+                // quota on first display; no subsequent reset is synthesized.
+                if observed < reset && snapshot.data_at.is_some_and(|at| at <= now && at < reset) {
+                    resets.push(reset);
+                }
                 // This is ONE explicit current cycle, not repeated earlier or
                 // future cycles. A future-stamped observation cannot establish it.
                 if let Some(start) = reset.checked_sub_signed(duration)
@@ -507,6 +513,7 @@ struct Prepared<'a> {
     observations: Vec<&'a Observation>,
     phases: Vec<Phase>,
     resets: Vec<DateTime<Utc>>,
+    capacity_resets: Vec<DateTime<Utc>>,
 }
 #[derive(Clone, Copy)]
 enum Side {
@@ -557,27 +564,48 @@ fn prepare(window: Option<&WindowInput>) -> Result<Option<Prepared<'_>>, Error> 
     }) {
         return Err(Error::InvalidPhase);
     }
+    let mut capacity_resets = w.resets.clone();
+    capacity_resets.sort_unstable();
+    capacity_resets.dedup();
     Ok(Some(Prepared {
         observations,
         phases,
         resets,
+        capacity_resets,
     }))
+}
+
+// Actual samples win at equal timestamps, including an explicit unknown sample.
+// A phase boundary alone cannot manufacture capacity; only supplied reset facts can.
+fn capacity_source(
+    p: &Prepared<'_>,
+    t: DateTime<Utc>,
+    side: Side,
+) -> Option<(DateTime<Utc>, f64, DateTime<Utc>)> {
+    let end = p.observations.partition_point(|o| side.started(o.at, t));
+    let observation = end.checked_sub(1).and_then(|i| p.observations.get(i));
+    let end = p.capacity_resets.partition_point(|r| side.started(*r, t));
+    let reset = end.checked_sub(1).and_then(|i| p.capacity_resets.get(i));
+    if let Some(reset) = reset
+        && observation.is_none_or(|o| o.at < *reset)
+    {
+        return Some((*reset, 0., DateTime::<Utc>::MAX_UTC));
+    }
+    let o = observation?;
+    let used = o.used_pct.filter(|u| u.is_finite() && *u >= 0.)?;
+    let until = o.valid_until.filter(|e| *e > o.at)?;
+    Some((o.at, used, until))
 }
 
 fn remaining(p: &Prepared<'_>, t: DateTime<Utc>, now: DateTime<Utc>, side: Side) -> Option<f64> {
     if t > now {
         return None;
     }
-    let end = p.observations.partition_point(|o| side.started(o.at, t));
-    let o = *p.observations.get(end.checked_sub(1)?)?;
-    let used = o.used_pct.filter(|u| u.is_finite() && *u >= 0.)?;
-    let until = o.valid_until.filter(|e| *e > o.at)?;
+    let (at, used, until) = capacity_source(p, t, side)?;
     if !side.not_ended(t, until) {
         return None;
     }
-    // An observation exactly at a reset belongs to the NEW cycle. An older
-    // observation cannot be held across a reset even if its supplied bound errs.
-    let reset_index = p.resets.partition_point(|reset| *reset <= o.at);
+    let reset_index = p.resets.partition_point(|reset| *reset <= at);
     if p.resets
         .get(reset_index)
         .is_some_and(|reset| side.started(*reset, t))
@@ -612,12 +640,11 @@ fn next_change(inputs: &[Option<Prepared<'_>>], now: DateTime<Utc>) -> Option<Da
             // Only the latest currently contributing observation can expire. An old
             // superseded bound must not schedule a fictitious coverage change.
             let observation_end = if remaining(p, now, now, Side::Right).is_some() {
-                let end = p.observations.partition_point(|o| o.at <= now);
-                p.observations[end - 1]
-                    .valid_until
+                capacity_source(p, now, Side::Right)
+                    .map(|(_, _, until)| until)
                     .into_iter()
                     .chain(p.resets.iter().copied().find(|at| *at > now))
-                    .filter(|at| *at > now)
+                    .filter(|at| *at > now && *at != DateTime::<Utc>::MAX_UTC)
                     .min()
             } else {
                 None
@@ -630,7 +657,14 @@ fn next_change(inputs: &[Option<Prepared<'_>>], now: DateTime<Utc>) -> Option<Da
                 .flat_map(|phase| [phase.start, phase.reset])
                 .filter(|at| *at > now)
                 .min();
-            observation_end.into_iter().chain(phase_change).min()
+            // A known reset restores unknown capacity too, even without a pace
+            // phase. Its wake cannot depend on capacity being measured already.
+            let reset_change = p.capacity_resets.iter().copied().find(|at| *at > now);
+            observation_end
+                .into_iter()
+                .chain(phase_change)
+                .chain(reset_change)
+                .min()
         })
         .min()
 }
@@ -826,8 +860,9 @@ fn project_in_minute(
         .zip(current.pace.value)
         .map(|(remaining, pace)| {
             let difference = remaining - pace;
-            let tenths = (difference.abs() * 10.).round() as u64;
-            let direction = if tenths == 0 {
+            // Inclusive account-equivalent tolerance, independent of display
+            // rounding; absorb only arithmetic noise at the exact +/-0.1 edge.
+            let direction = if difference.abs() <= 0.1 + 1e-12 {
                 Direction::OnPace
             } else if difference > 0. {
                 Direction::Ahead
@@ -837,7 +872,11 @@ fn project_in_minute(
             Verdict {
                 difference,
                 direction,
-                tenths,
+                tenths: if direction == Direction::OnPace {
+                    0
+                } else {
+                    (difference.abs() * 10.).round() as u64
+                },
             }
         });
     Ok(Projection {
@@ -1091,14 +1130,14 @@ mod tests {
     }
 
     #[test]
-    fn reset_marker_without_phase_interrupts_actual_and_does_not_invent_pace() {
+    fn reset_marker_without_phase_restores_capacity_but_does_not_invent_pace() {
         let reset = now() - Duration::minutes(5);
         let mut a = account("a", "Plus", WindowKind::Weekly, 20., 84);
         let w = a.window.as_mut().unwrap();
         w.phases.clear();
         w.resets = vec![reset];
         let result = output(&[a]);
-        assert_eq!(result.current.remaining.value, None);
+        close(result.current.remaining.value.unwrap(), 1.);
         assert_eq!(result.current.pace.value, None);
         assert_eq!(result.verdict, None);
     }
@@ -1207,6 +1246,54 @@ mod tests {
             project(Provider::Codex, &[a], now()),
             Err(Error::InvalidPhase)
         );
+    }
+
+    #[test]
+    fn r165_unknown_capacity_without_phase_wakes_at_known_reset() {
+        let mut a = account("unknown", "Plus", WindowKind::Weekly, 20., 84);
+        let reset = now() + Duration::minutes(1);
+        let w = a.window.as_mut().unwrap();
+        w.observations[0].used_pct = None;
+        w.phases.clear();
+        w.resets = vec![reset];
+        let before = output(&[a.clone()]);
+        assert_eq!(before.current.remaining.value, None);
+        assert_eq!(before.current.pace.value, None);
+        assert_eq!(before.next_change, Some(reset));
+        assert!(
+            before
+                .knots
+                .iter()
+                .filter(|k| k.at > now())
+                .all(|k| k.right.remaining.value.is_none())
+        );
+        let after = project(Provider::Codex, &[a.clone()], reset).unwrap();
+        close(after.current.remaining.value.unwrap(), 1.);
+        assert_eq!(after.next_change, None);
+        // An actual same-time unknown sample overrides reset inference.
+        a.window.as_mut().unwrap().observations.push(observation(
+            reset,
+            None,
+            reset + Duration::hours(1),
+        ));
+        let after = project(Provider::Codex, &[a], reset).unwrap();
+        assert_eq!(after.current.remaining.value, None);
+    }
+
+    #[test]
+    fn r165_on_pace_includes_both_tenth_boundaries_but_not_outside() {
+        for (used, direction, tenths) in [
+            (40., Direction::OnPace, 0),
+            (60., Direction::OnPace, 0),
+            (39.9999, Direction::Ahead, 1),
+            (60.0001, Direction::Behind, 1),
+        ] {
+            let a = account("pace", "Plus", WindowKind::Weekly, used, 84);
+            let verdict = output(&[a]).verdict.unwrap();
+            assert_eq!(verdict.direction, direction, "used={used}");
+            assert_eq!(verdict.tenths, tenths, "used={used}");
+            close(verdict.difference, 0.5 - used / 100.);
+        }
     }
 }
 
@@ -1338,7 +1425,7 @@ mod snapshot_tests {
     }
 
     #[test]
-    fn snapshot_adapter_history_null_freshness_and_reset_cut_coverage() {
+    fn snapshot_adapter_history_null_and_reset_steps_preserve_coverage() {
         let now = clock().utc();
         let null = now - Duration::minutes(9);
         let reset = now - Duration::seconds(390);
@@ -1358,13 +1445,11 @@ mod snapshot_tests {
         assert_eq!(gap.right.remaining.value, None);
         let boundary = p.knots.iter().find(|k| k.at == reset).unwrap();
         close(boundary.left.remaining.value.unwrap(), 0.7);
-        assert_eq!(boundary.right.remaining.value, None);
-        let expired = p
-            .knots
-            .iter()
-            .find(|k| k.at == now - Duration::minutes(5))
-            .unwrap();
-        assert_eq!(expired.right.remaining.value, None);
+        close(boundary.right.remaining.value.unwrap(), 1.);
+        assert!(
+            p.knots.iter().all(|k| k.at != now - Duration::minutes(5)),
+            "rate freshness must not punch a capacity hole"
+        );
         close(p.current.remaining.value.unwrap(), 0.8);
         assert!(
             p.knots
@@ -1386,8 +1471,10 @@ mod snapshot_tests {
                 .knots
                 .iter()
                 .filter(|k| k.at < clock().utc())
-                .all(|k| k.left.remaining.value.is_none() && k.right.remaining.value.is_none()),
-            "a day-old snapshot cannot fill the unobserved preceding 19 hours"
+                .all(
+                    |k| k.left.remaining.value == Some(0.8) && k.right.remaining.value == Some(0.8)
+                ),
+            "a known unchanged capacity carries across the preceding 19 hours"
         );
         assert_eq!(
             projected
@@ -1398,7 +1485,7 @@ mod snapshot_tests {
                 .left
                 .remaining
                 .value,
-            None
+            Some(0.8)
         );
         let mut later = clock();
         later.now += Duration::hours(1);
@@ -1578,7 +1665,7 @@ mod snapshot_tests {
     }
 
     #[test]
-    fn snapshot_deadline_reset_known_to_unknown_without_snapshot_update() {
+    fn snapshot_deadline_known_reset_replenishes_once_without_snapshot_update() {
         let mut current = row("sample", "codex", "Plus", 20., 84);
         let deadline = clock().utc() + Duration::seconds(1);
         current["windows"][0]["reset_at"] = json!(deadline);
@@ -1592,42 +1679,42 @@ mod snapshot_tests {
         let mut at = clock();
         at.now += Duration::seconds(1);
         let after = project_snapshot(&data, &at);
-        assert_eq!(after[1].current.remaining.value, None);
+        close(after[1].current.remaining.value.unwrap(), 1.);
         assert_eq!(after[1].current.pace.value, None);
         assert_eq!(after[1].verdict, None);
         assert_eq!(after[1].next_change, None);
     }
 
     #[test]
-    fn snapshot_history_expiry_keeps_current_capacity_and_exact_deadline() {
+    fn snapshot_history_does_not_expire_at_rate_freshness_boundary() {
         let mut current = row("sample", "codex", "Plus", 20., 84);
         current["windows"][0]["observed_at"] = json!(clock().utc() - Duration::seconds(299));
         let data = snapshot(vec![current]);
-        let expiry = clock().utc() + Duration::seconds(1);
-        assert_eq!(codex(&data).next_change, Some(expiry));
-        assert_chart_deadline(&data, &clock(), expiry);
+        let deadline = clock().utc() + Duration::hours(84);
+        assert_eq!(codex(&data).next_change, Some(deadline));
+        assert_chart_deadline(&data, &clock(), deadline);
         let mut at = clock();
         at.now += Duration::seconds(2);
         let after = project_snapshot(&data, &at);
         close(after[1].current.remaining.value.unwrap(), 0.8);
-        let gap = after[1].knots.iter().find(|k| k.at == expiry).unwrap();
-        close(gap.left.remaining.value.unwrap(), 0.8);
-        assert_eq!(gap.right.remaining.value, None);
-        assert!(after[1].verdict.is_some());
-        assert_eq!(
-            after[1].next_change,
-            Some(clock().utc() + Duration::hours(84))
+        assert!(
+            after[1]
+                .knots
+                .iter()
+                .all(|k| k.at != clock().utc() + Duration::seconds(1))
         );
+        assert!(after[1].verdict.is_some());
+        assert_eq!(after[1].next_change, Some(deadline));
     }
 
     #[test]
-    fn current_snapshot_cannot_cross_a_verified_reset_without_a_new_observation() {
+    fn old_exhausted_snapshot_does_not_overwrite_a_reset_without_a_new_observation() {
         let mut current = row("sample", "codex", "Plus", 100., 84);
         let observed = clock().utc() - Duration::hours(2);
         current["windows"][0]["observed_at"] = json!(observed);
         let mut data = snapshot(vec![current]);
         history(&mut data, vec![], vec![clock().utc() - Duration::hours(1)]);
-        assert_eq!(codex(&data).current.remaining.value, None);
+        close(codex(&data).current.remaining.value.unwrap(), 1.);
         data.accounts.raw.accounts[0].windows[0].observed_at =
             Some((clock().utc() - Duration::hours(1)).to_rfc3339());
         close(codex(&data).current.remaining.value.unwrap(), 0.);
@@ -1655,7 +1742,7 @@ mod snapshot_tests {
             if elapsed == 0 {
                 close(result[1].current.remaining.value.unwrap(), 0.8);
             } else {
-                assert_eq!(result[1].current.remaining.value, None);
+                close(result[1].current.remaining.value.unwrap(), 1.);
                 assert_eq!(result[1].current.pace.value, None);
             }
         }
@@ -1681,5 +1768,258 @@ mod snapshot_tests {
                 .iter()
                 .all(|k| k.right.pace.value.is_none())
         );
+    }
+
+    #[test]
+    fn r165_fresh_exhausted_and_sparse_accounts_cover_the_full_history_range() {
+        let now = clock().utc();
+        // The fresh poll is not exhaustion onset; no history/cooling fact exists.
+        let exhausted = row("exhausted", "codex", "Team", 100., 84);
+        let mut sparse = row("sparse", "codex", "Plus", 40., 84);
+        sparse["windows"][0]["observed_at"] = json!(now - Duration::hours(2));
+        let mut data = snapshot(vec![exhausted, sparse]);
+        data.usage.accounts = vec![AccountHistory {
+            id: "sparse".into(),
+            windows: vec![HistoryWindow {
+                name: "7d".into(),
+                points: vec![
+                    (now - Duration::hours(22), Some(10.)),
+                    (now - Duration::hours(20), Some(20.)),
+                    (now - Duration::hours(2), Some(40.)),
+                ],
+                resets: vec![],
+                truncated: false,
+            }],
+            ..Default::default()
+        }];
+        let p = codex(&data);
+        assert_eq!(p.cohort, 2);
+        for knot in p.knots.iter().filter(|k| k.at <= now) {
+            for value in [knot.left.remaining, knot.right.remaining] {
+                assert_eq!((value.known, value.total), (2, 2));
+                assert!(value.value.is_some(), "full cohort missing at {}", knot.at);
+            }
+        }
+        close(p.knots[0].right.remaining.value.unwrap(), 0.8);
+        let change = p
+            .knots
+            .iter()
+            .find(|k| k.at == now - Duration::hours(2))
+            .unwrap();
+        close(change.left.remaining.value.unwrap(), 0.8);
+        close(change.right.remaining.value.unwrap(), 0.6);
+        close(p.current.remaining.value.unwrap(), 0.6);
+        assert_eq!(p.gap_spans.first().unwrap().from, p.from);
+        assert_eq!(p.gap_spans.last().unwrap().to, now);
+        assert!(
+            p.gap_spans
+                .windows(2)
+                .all(|pair| pair[0].to == pair[1].from)
+        );
+        assert!(
+            p.knots
+                .iter()
+                .filter(|k| k.at > now)
+                .all(|k| k.right.remaining.value.is_none())
+        );
+    }
+
+    #[test]
+    fn r165_exhaustion_uses_matching_hold_onset_and_ignores_other_scope_or_cycle() {
+        let now = clock().utc();
+        let onset = now - Duration::hours(3);
+        let reset = now + Duration::hours(84);
+        let mut current = row("sample", "codex", "Plus", 100., 84);
+        current["health"] =
+            json!({"kind":"cooling", "reason":"quota", "scope":"account", "until":reset});
+        current["quota_cooling"] = json!({"window":"7d", "reset_at":reset, "started_at":onset});
+        let p = codex(&snapshot(vec![current.clone()]));
+        let first = p.knots.iter().find(|k| k.at == onset).unwrap();
+        assert_eq!(first.left.remaining.value, None);
+        close(first.right.remaining.value.unwrap(), 0.);
+        for mutation in 0..4 {
+            let mut invalid = current.clone();
+            match mutation {
+                0 => invalid["quota_cooling"]["window"] = json!("5h"),
+                1 => invalid["quota_cooling"]["reset_at"] = json!(reset - Duration::days(7)),
+                2 => invalid["health"]["scope"] = json!("model:synthetic"),
+                _ => invalid["quota_cooling"]["started_at"] = json!(now - Duration::days(8)),
+            }
+            // Invalid hold onset is not used; exhaustion's unknown-onset rule
+            // falls back to the current window start, never that stale claim.
+            let p = codex(&snapshot(vec![invalid]));
+            close(p.knots[0].right.remaining.value.unwrap(), 0.);
+            assert!(p.knots.iter().all(|k| k.at != onset));
+        }
+    }
+
+    #[test]
+    fn r165_exhaustion_preserves_positive_null_and_first_exhausted_history() {
+        let now = clock().utc();
+        let barrier = now - Duration::hours(4);
+        let onset = now - Duration::hours(2);
+        for earlier in [Some(20.), None] {
+            let mut data = snapshot(vec![row("sample", "codex", "Plus", 100., 84)]);
+            history(
+                &mut data,
+                vec![(barrier, earlier), (onset, Some(100.))],
+                vec![],
+            );
+            let p = codex(&data);
+            let before = p.knots.iter().find(|k| k.at == barrier).unwrap();
+            assert_eq!(before.right.remaining.value, earlier.map(|u| 1. - u / 100.));
+            let first_zero = p.knots.iter().find(|k| k.at == onset).unwrap();
+            assert_eq!(
+                first_zero.left.remaining.value,
+                earlier.map(|u| 1. - u / 100.)
+            );
+            close(first_zero.right.remaining.value.unwrap(), 0.);
+            close(p.current.remaining.value.unwrap(), 0.);
+        }
+        // Without an exhausted history point, do not replace a known null gap
+        // with zero just because the latest poll is exhausted.
+        let mut data = snapshot(vec![row("sample", "codex", "Plus", 100., 84)]);
+        history(&mut data, vec![(barrier, None)], vec![]);
+        let p = codex(&data);
+        let poll = now - Duration::seconds(30);
+        let first_zero = p.knots.iter().find(|k| k.at == poll).unwrap();
+        assert_eq!(first_zero.left.remaining.value, None);
+        close(first_zero.right.remaining.value.unwrap(), 0.);
+    }
+
+    #[test]
+    fn r165_snapshot_last_change_holds_until_explicit_unknown_then_new_sample() {
+        let now = clock().utc();
+        let mut current = row("sample", "codex", "Plus", 40., 84);
+        current["windows"][0]["observed_at"] = json!(now - Duration::hours(1));
+        let mut data = snapshot(vec![current]);
+        let change = now - Duration::hours(8);
+        let unknown = now - Duration::hours(3);
+        history(
+            &mut data,
+            vec![(change, Some(40.)), (unknown, None)],
+            vec![],
+        );
+        let p = codex(&data);
+        let null = p.knots.iter().find(|k| k.at == unknown).unwrap();
+        close(null.left.remaining.value.unwrap(), 0.6);
+        assert_eq!(null.right.remaining.value, None);
+        assert!(
+            p.gap_spans
+                .iter()
+                .all(|span| span.to <= unknown || span.from >= now - Duration::hours(1))
+        );
+        close(p.current.remaining.value.unwrap(), 0.6);
+    }
+
+    #[test]
+    fn r165_scheduled_reset_cannot_resurrect_metadata_stale_at_first_receipt() {
+        let now = clock().utc();
+        let reset = now - Duration::hours(1);
+        let mut current = row("sample", "codex", "Plus", 100., 84);
+        current["windows"][0]["observed_at"] = json!(now - Duration::hours(2));
+        current["windows"][0]["reset_at"] = json!(reset);
+        let data = snapshot(vec![current]); // first receipt is AFTER this deadline
+        let p = codex(&data);
+        assert_eq!(p.current.remaining.value, None);
+        assert_eq!(p.next_change, None);
+        let boundary = p.knots.iter().find(|k| k.at == reset).unwrap();
+        close(boundary.left.remaining.value.unwrap(), 0.);
+        assert_eq!(boundary.right.remaining.value, None);
+    }
+
+    #[test]
+    fn r165_unknown_snapshot_without_phase_schedules_its_known_reset() {
+        let now = clock().utc();
+        let deadline = now + Duration::minutes(1);
+        let mut current = row("sample", "codex", "Plus", 20., 84);
+        current["windows"][0]["used_pct"] = Value::Null;
+        current["windows"][0]["reset_at"] = json!(deadline);
+        let mut data = snapshot(vec![current]);
+        history(&mut data, vec![], vec![now - Duration::days(1)]);
+        let before = codex(&data);
+        assert_eq!(before.current.remaining.value, None);
+        assert_eq!(before.current.pace.value, None);
+        assert_eq!(before.next_change, Some(deadline));
+        assert_chart_deadline(&data, &clock(), deadline);
+        let mut at = clock();
+        at.now += Duration::minutes(1);
+        let after = project_snapshot(&data, &at);
+        close(after[1].current.remaining.value.unwrap(), 1.);
+        assert_eq!(after[1].current.pace.value, None);
+        assert_eq!(after[1].next_change, None);
+    }
+
+    fn assert_equivalent_exhaustion_relocation(history_used: f64, current_used: f64) {
+        let now = clock().utc();
+        let barrier = now - Duration::hours(4);
+        let onset = now - Duration::hours(2);
+        for prior in [Some(20.), None] {
+            let mut data = snapshot(vec![
+                row("sample", "codex", "Plus", current_used, 84),
+                row("other-provider", "claude", "Max", 20., 84),
+            ]);
+            history(
+                &mut data,
+                vec![(barrier, prior), (onset, Some(history_used))],
+                vec![],
+            );
+            let inputs = snapshot_inputs(&data, now).unwrap();
+            let sample = inputs.iter().find(|a| a.id == "sample").unwrap();
+            let preserved = sample
+                .window
+                .as_ref()
+                .unwrap()
+                .observations
+                .iter()
+                .find(|o| o.at == onset)
+                .unwrap();
+            assert_eq!(preserved.used_pct, Some(history_used));
+            let p = codex(&data);
+            let before = p.knots.iter().find(|k| k.at == barrier).unwrap();
+            assert_eq!(before.right.remaining.value, prior.map(|u| 1. - u / 100.));
+            let first_zero = p.knots.iter().find(|k| k.at == onset).unwrap();
+            assert_eq!(
+                first_zero.left.remaining.value,
+                prior.map(|u| 1. - u / 100.)
+            );
+            close(first_zero.right.remaining.value.unwrap(), 0.);
+            close(p.current.remaining.value.unwrap(), 0.);
+            assert!(p.current.pace.value.is_some());
+            let panels = project_snapshot(&data, &clock());
+            let other = panels
+                .iter()
+                .find(|p| p.provider == Provider::Claude)
+                .unwrap();
+            close(other.current.remaining.value.unwrap(), 0.8);
+        }
+    }
+
+    #[test]
+    fn r165_exhausted_history_101_and_latest_100_are_compatible_zero_capacity() {
+        assert_equivalent_exhaustion_relocation(101., 100.);
+    }
+
+    #[test]
+    fn r165_exhausted_history_100_and_latest_101_are_compatible_zero_capacity() {
+        assert_equivalent_exhaustion_relocation(100., 101.);
+    }
+
+    #[test]
+    fn r165_same_time_conflicting_positive_or_null_samples_still_reject() {
+        let observed = clock().utc() - Duration::seconds(30);
+        for (historical, current) in [
+            (Some(20.), 30.),
+            (None, 20.),
+            (Some(20.), 100.),
+            (None, 100.),
+        ] {
+            let mut data = snapshot(vec![row("sample", "codex", "Plus", current, 84)]);
+            history(&mut data, vec![(observed, historical)], vec![]);
+            assert!(matches!(
+                snapshot_inputs(&data, clock().utc()),
+                Err(Error::DuplicateObservation)
+            ));
+        }
     }
 }

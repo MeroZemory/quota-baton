@@ -327,7 +327,7 @@ async fn r164_exhausted_snapshot_without_forecast_or_history_is_zero_until_reset
     for (at, expected) in [
         (now(), Some(0.)),
         (reset - Duration::seconds(1), Some(0.)),
-        (reset, None),
+        (reset, Some(1.)),
     ] {
         let data = captured.project(at.into()).unwrap();
         let clock = dashboard_model::Clock {
@@ -346,5 +346,74 @@ async fn r164_exhausted_snapshot_without_forecast_or_history_is_zero_until_reset
             codex.current.remaining.known,
             usize::from(expected.is_some())
         );
+    }
+}
+
+#[tokio::test]
+async fn r165_real_dto_exhausted_and_sparse_accounts_span_the_full_history() {
+    let mut wire = bundle();
+    wire["state"]["accounts"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|a| a["id"] == "sample-a" || a["id"] == "sample-b");
+    for account in wire["state"]["accounts"].as_array_mut().unwrap() {
+        account.as_object_mut().unwrap().remove("usage_forecast");
+        if account["id"] == "sample-a" {
+            account["windows"][0]["used_pct"] = json!(100.);
+            // A fresh poll's receipt time is not an exhaustion-onset time.
+            // With no earlier history/onset, the current window bounds zero.
+            account["windows"][0]["observed_at"] = json!(now() - Duration::seconds(60));
+        }
+    }
+    wire["usage_history"]["accounts"] = json!([{
+        "id":"sample-b", "windows":[{"name":"7d", "resets":[], "points":[
+            [now()-Duration::hours(20),20.],
+            [now()-Duration::hours(12),40.]
+        ]}]
+    }]);
+    wire["state"]["pools"] = json!({"codex":{"eligible":1}});
+    let captured = transport(&wire).await;
+    for lang in [UiLanguage::Ko, UiLanguage::En] {
+        i18n::with_language(lang, || {
+            let data = captured.project(now().into()).unwrap();
+            let clock = dashboard_model::Clock {
+                now: now().with_timezone(&FixedOffset::east_opt(32400).unwrap()),
+                day_start: now() - Duration::hours(12),
+                day_end: now() + Duration::hours(12),
+            };
+            let mut state = DashboardState::default();
+            state.tab = Tab::Usage;
+            let view = dashboard_model::project(&data, &mut state, &clock);
+            let p = &view.provider_usage[1];
+            assert_eq!((p.cohort, p.current.remaining.known), (2, 2));
+            let mut end = p.from;
+            for pair in p.knots.windows(2).filter(|pair| pair[0].at < p.now) {
+                assert_eq!(pair[0].at, end, "no hole before known span");
+                assert!(pair[0].right.remaining.value.is_some());
+                assert!(pair[1].left.remaining.value.is_some());
+                end = pair[1].at.min(p.now);
+            }
+            assert_eq!(end, p.now, "remaining spans now-19h through Now");
+            assert_eq!(p.knots.first().unwrap().at, p.from);
+            assert!((p.knots.first().unwrap().right.remaining.value.unwrap() - 0.8).abs() < 1e-9);
+            assert!((p.current.remaining.value.unwrap() - 0.6).abs() < 1e-9);
+            if let Some(out) = std::env::var_os("R165_RENDER_OUTPUT") {
+                std::fs::create_dir_all(&out).unwrap();
+                for dark in [false, true] {
+                    let options = Options {
+                        view: View::Usage,
+                        size: [1320, 1200],
+                        scale: 2,
+                        dark,
+                        now: clock.now,
+                    };
+                    let png = PathBuf::from(&out).join(format!(
+                        "full-history-{lang:?}-{}.png",
+                        if dark { "dark" } else { "light" }
+                    ));
+                    snapshot_render::save(&data, &options, &png).unwrap();
+                }
+            }
+        });
     }
 }
