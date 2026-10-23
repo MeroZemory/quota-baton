@@ -450,8 +450,29 @@ struct AccountIndex {
     groups: usize,
     recent: BTreeSet<(DateTime<Utc>, String)>,
 }
+/// Memory-only revoke fence for an exact adopted managed owner root.
+pub(crate) struct DeferredBindingFence {
+    root: String,
+    anchor: String,
+    account: String,
+    model: String,
+    revoked: Arc<crate::account_runtime::deferred_reset::Revocation>,
+}
+impl DeferredBindingFence {
+    pub(crate) fn live(&self) -> bool {
+        self.revoked.live()
+    }
+    pub(crate) fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.revoked.notified_raw()
+    }
+    fn matches(&self, data: &Data) -> bool {
+        launch::deferred_matches(data, &self.root, &self.anchor, &self.account, &self.model)
+            && BindingTable::accepted_in(data, Some(&self.root), &self.account)
+    }
+}
 #[derive(Clone, Default)]
 struct Data {
+    deferred_fences: Vec<std::sync::Weak<DeferredBindingFence>>,
     bindings: BTreeMap<String, Binding>,
     launches: BTreeMap<String, launch::Metadata>,
     launch_anchors: BTreeMap<String, launch::Anchor>,
@@ -521,6 +542,15 @@ impl Data {
     }
 
     fn changed(&mut self) {
+        let fences = std::mem::take(&mut self.deferred_fences);
+        for weak in fences {
+            if let Some(fence) = weak.upgrade() {
+                if !fence.matches(self) {
+                    fence.revoked.cancel();
+                }
+                self.deferred_fences.push(weak);
+            }
+        }
         self.commit_count_changes();
         self.dirty = true;
         self.revision = self.revision.wrapping_add(1);
@@ -2067,6 +2097,118 @@ impl BindingTable {
         })
         .map(|b| b.account.clone())
     }
+    #[cfg(test)]
+    pub(crate) fn fill_deferred_watch_slots_for_test(&self) {
+        let mut data = self.data.lock().unwrap();
+        let fence = data
+            .deferred_fences
+            .iter()
+            .find_map(|f| f.upgrade())
+            .unwrap();
+        data.deferred_fences
+            .resize_with(4096, || Arc::downgrade(&fence));
+        drop(data);
+        self.policies.fill_deferred_watch_slots_for_test();
+    }
+    /// Specialized deferred inspection: Data remains held through nonblocking
+    /// publication acquisition and the final leaf registration/consumption.
+    pub(crate) fn with_deferred_launch<T>(
+        &self,
+        request: HttpWaitRequest<'_>,
+        scope: &crate::launch_tokens::LaunchOwnerScope,
+        existing: Option<(
+            Arc<DeferredBindingFence>,
+            Arc<crate::routing::DeferredPolicyFence>,
+        )>,
+        inspect: impl FnOnce(
+            &WaitIntent<'_>,
+            Arc<DeferredBindingFence>,
+            Arc<crate::routing::DeferredPolicyFence>,
+        ) -> Option<T>,
+    ) -> Option<T> {
+        let _mutation = self.mutations.lock().ok()?;
+        let mut data = self.data.lock().ok()?;
+        if self.writes_stopped.load(Ordering::Acquire)
+            || !request.operation.can_reply()
+            || !scope.live()
+            || request.provider != Provider::Codex
+        {
+            return None;
+        }
+        let root = request.key?;
+        if !root
+            .strip_prefix("codex:")
+            .is_some_and(crate::launch_tokens::valid_native_thread)
+            || scope.root().is_some_and(|bound| bound != root)
+        {
+            return None;
+        }
+        let account = request.expected_source?;
+        let model = request.model?;
+        if !launch::deferred_matches(&data, root, scope.anchor(), account, model)
+            || !Self::accepted_in(&data, Some(root), account)
+            || self.retained_binding(&data, root, Utc::now())?.account != account
+        {
+            return None;
+        }
+        let policy_key = launch::policy_key(&data, Some(root))?.to_owned();
+        // Revalidation reuses the episode's pinned fences. It must not reserve
+        // another slot: a full owner table must still permit existing consumers.
+        let (binding, existing_policy) = if let Some((binding, policy)) = existing {
+            if !binding.live()
+                || binding.root != root
+                || binding.anchor != scope.anchor()
+                || binding.account != account
+                || binding.model != model
+                || !binding.matches(&data)
+            {
+                return None;
+            }
+            (binding, Some(policy))
+        } else {
+            data.deferred_fences.retain(|weak| weak.strong_count() != 0);
+            if data.deferred_fences.len() >= 4096 {
+                return None;
+            }
+            let binding = Arc::new(DeferredBindingFence {
+                root: root.to_owned(),
+                anchor: scope.anchor().to_owned(),
+                account: account.to_owned(),
+                model: model.to_owned(),
+                revoked: crate::account_runtime::deferred_reset::Revocation::new(),
+            });
+            data.deferred_fences.push(Arc::downgrade(&binding));
+            (binding, None)
+        };
+        self.policies
+            .try_with_quota_wait_condition(&policy_key, account, |plan| {
+                if plan.settings.mode == crate::routing::Mode::Strict
+                    || !request.operation.can_reply()
+                {
+                    return None;
+                }
+                let policy = if let Some(policy) = existing_policy {
+                    if !policy.matches_plan(&policy_key, account, plan) {
+                        return None;
+                    }
+                    policy
+                } else {
+                    self.policies
+                        .track_deferred_plan(&policy_key, account, plan)?
+                };
+                let intent = WaitIntent {
+                    provider: Provider::Codex,
+                    key: root,
+                    account,
+                    model: Some(model),
+                    policy_key: &policy_key,
+                    existing_placement: true,
+                    plan,
+                    operation: request.operation,
+                };
+                inspect(&intent, binding, policy)
+            })
+    }
     /// Inspect a current bound HTTP source without changing routing or C7.
     ///
     /// The runtime caller holds Store -> released -> probes -> volatile throughout
@@ -3345,6 +3487,13 @@ impl BindingTable {
             .chain(next.accounts.keys())
             .map(|id| (id.clone(), d.accounts.get(id).map_or(0, |a| a.count)))
             .collect();
+        next.deferred_fences = std::mem::take(&mut d.deferred_fences);
+        // Whole-container recovery cannot silently retain old owner authority.
+        for weak in &next.deferred_fences {
+            if let Some(fence) = weak.upgrade() {
+                fence.revoked.cancel();
+            }
+        }
         next.changed();
         *d = next;
         self.policies.finish_recovery();

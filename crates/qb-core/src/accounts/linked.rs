@@ -101,5 +101,12 @@ pub fn reload_and_store(store: &AccountStore, account: &Account) -> Result<Accou
     let candidate = candidate(account)?;
     let mut updated = account.clone();
     updated.token_meta = candidate.account.token_meta;
-    Ok(store.save(&updated, &candidate.tokens, Some(account.generation))?)
+    match store.save_credentials(&updated, &candidate.tokens, account.generation) {
+        // Linked-token recovery can legitimately clear LinkStale/NeedsRelogin or
+        // expire health. Preserve that native behavior as an ordinary FullSave.
+        Err(StoreError::CredentialHealthChange) => {
+            Ok(store.save(&updated, &candidate.tokens, Some(account.generation))?)
+        }
+        result => Ok(result?),
+    }
 }

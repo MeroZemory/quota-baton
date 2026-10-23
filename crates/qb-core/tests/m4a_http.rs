@@ -5656,3 +5656,232 @@ mod n5b_sse {
         );
     }
 }
+
+// N5d producer coverage: actual scoped HTTP + authenticated owner WebSocket.
+mod n5d_zero_retention_producer {
+    use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use qb_proto::native_reset::{Command, Event, Reply, Request, VERSION};
+    use tokio::time::timeout;
+    use tokio_tungstenite::{
+        connect_async,
+        tungstenite::{Message, client::IntoClientRequest},
+    };
+
+    const BOUND: Duration = Duration::from_secs(5);
+    const THREAD: &str = "12345678-1234-4abc-8def-123456789abc";
+    const UPLOAD: &str = r#"{ "model": "synthetic-model", "input": [] }"#;
+
+    #[tokio::test]
+    async fn n5d_zero_retention_physical_429_publishes_exact_scoped_waiting_episode() {
+        let h = timeout(
+            BOUND,
+            Harness::new_configured(
+                Provider::Codex,
+                1,
+                64,
+                1024,
+                false,
+                RoutingConfig::default(),
+                |config| {
+                    config.guard.retain_max_per_request_mib = 0;
+                    config.routing.mode = qb_core::routing::Mode::Recover;
+                    config.routing.reset_hold_secs = 1;
+                    config.routing.request_timeout_secs = 10;
+                    config.routing.move_guard.trip_seconds = 5;
+                },
+            ),
+        )
+        .await
+        .expect("synthetic producer fixture must start within bound");
+        let launch = timeout(BOUND, r11_http_issue(&h))
+            .await
+            .expect("actual issued launch must complete");
+        let owner_url = format!(
+            "{}/qb/native-owner",
+            launch.base_url.replacen("http://", "ws://", 1)
+        );
+        let mut owner_request = owner_url.into_client_request().unwrap();
+        owner_request
+            .headers_mut()
+            .insert("authorization", "Bearer synthetic-client".parse().unwrap());
+        let (mut owner, upgrade) = timeout(BOUND, connect_async(owner_request))
+            .await
+            .expect("owner must open before any scoped data ingress")
+            .unwrap();
+        assert_eq!(upgrade.status().as_u16(), 101);
+
+        // A real first request adopts the exact UUID. No direct binding/proof or
+        // deferred constructor is used, and the owner opened on this same pin.
+        let client = reqwest::Client::builder().timeout(BOUND).build().unwrap();
+        h.fake.state.push(ok());
+        let warm = client
+            .post(format!("{}/responses", launch.base_url))
+            .bearer_auth("synthetic-client")
+            .header("session-id", THREAD)
+            .body(UPLOAD)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(warm.status(), StatusCode::OK);
+        warm.bytes().await.unwrap();
+        let key = format!("codex:{THREAD}");
+        assert_eq!(
+            h.state.bindings.current(Some(&key)).as_deref(),
+            Some(launch.account.as_str())
+        );
+        let before = h.fake.state.requests().len();
+        assert_eq!(
+            h.fake
+                .state
+                .requests()
+                .iter()
+                .filter(|call| call.path_and_query == "/responses")
+                .count(),
+            1
+        );
+
+        let reset = chrono::DateTime::from_timestamp(Utc::now().timestamp() + 3600, 0).unwrap();
+        let mut limited = ScriptedResponse::json(StatusCode::TOO_MANY_REQUESTS, "");
+        for (name, value) in [
+            ("x-codex-primary-window-minutes", "300".to_owned()),
+            ("x-codex-primary-used-percent", "100".to_owned()),
+            ("x-codex-primary-reset-at", reset.timestamp().to_string()),
+            ("x-codex-secondary-window-minutes", "10080".to_owned()),
+            ("x-codex-secondary-used-percent", "10".to_owned()),
+            (
+                "x-codex-secondary-reset-at",
+                (reset + ChronoDuration::hours(47)).timestamp().to_string(),
+            ),
+            ("x-codex-active-limit", "5h".to_owned()),
+        ] {
+            limited.headers.insert(name, value.parse().unwrap());
+        }
+        // Empty complete body makes native Rate -> Quota reconciliation a no-op
+        // after header application; full raw headers supply the actual proof.
+        h.fake.state.push(limited);
+        let response = client
+            .post(format!("{}/responses", launch.base_url))
+            .bearer_auth("synthetic-client")
+            .header("session-id", THREAD)
+            .body(UPLOAD)
+            .send()
+            .await
+            .expect("zero-retention physical fallback must return without reset hold");
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            response.bytes().await.unwrap().is_empty(),
+            "physical limit bytes must remain verbatim"
+        );
+        let calls = h.fake.state.requests();
+        assert_eq!(
+            calls.len(),
+            before + 1,
+            "no replay or failover attempt is permitted"
+        );
+        let last = calls.last().unwrap();
+        assert_eq!(last.path_and_query, "/responses");
+        assert_eq!(last.body.as_ref(), UPLOAD.as_bytes());
+        assert_eq!(last.headers["authorization"], "Bearer synthetic-access-0");
+        assert_eq!(
+            h.state.bindings.current(Some(&key)).as_deref(),
+            Some(launch.account.as_str())
+        );
+
+        let observe = Request {
+            version: VERSION,
+            request_id: 1,
+            command: Command::Observe {
+                thread_id: THREAD.into(),
+            },
+        };
+        timeout(
+            BOUND,
+            owner.send(Message::Text(
+                serde_json::to_string(&observe).unwrap().into(),
+            )),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let message = timeout(BOUND, owner.next())
+            .await
+            .expect("zero-retention physical fallback must publish a Waiting episode")
+            .expect("owner closed before Waiting publication")
+            .expect("owner transport failed before Waiting publication");
+        let Message::Text(text) = message else {
+            panic!("expected correlated Waiting text reply")
+        };
+        let reply: Reply = serde_json::from_str(&text).unwrap();
+        assert!(reply.valid_shape());
+        assert_eq!(reply.version, VERSION);
+        assert_eq!(reply.request_id, Some(1));
+        let episode = match reply.event {
+            Event::Waiting {
+                episode,
+                reset_unix_ms,
+            } => {
+                assert_ne!(episode, 0);
+                assert_eq!(reset_unix_ms, reset.timestamp_millis());
+                episode
+            }
+            _ => panic!("zero-retention physical fallback must publish a Waiting episode"),
+        };
+        // Cancel only the actual server-issued episode, then close this owned
+        // socket. No reset-time Consume or native activation is claimed here.
+        let cancel = Request {
+            version: VERSION,
+            request_id: 2,
+            command: Command::Cancel { episode },
+        };
+        timeout(
+            BOUND,
+            owner.send(Message::Text(
+                serde_json::to_string(&cancel).unwrap().into(),
+            )),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let message = timeout(BOUND, owner.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let Message::Text(text) = message else {
+            panic!("expected correlated cancellation reply")
+        };
+        let reply: Reply = serde_json::from_str(&text).unwrap();
+        assert!(reply.valid_shape());
+        assert_eq!(reply.request_id, Some(2));
+        assert!(matches!(reply.event, Event::Cancelled { episode: actual } if actual == episode));
+        // The handler closes after terminal cancellation; this bounded read also
+        // proves this test does not rely on server teardown for owner cleanup.
+        timeout(BOUND, async {
+            if let Some(message) = owner.next().await {
+                match message {
+                    Ok(Message::Close(_)) | Err(_) => {}
+                    _ => panic!("unexpected frame after terminal episode cancellation"),
+                }
+            }
+        })
+        .await
+        .expect("terminal cancelled owner must close before teardown");
+        timeout(BOUND, async {
+            while h
+                .state
+                .inflight_requests
+                .load(std::sync::atomic::Ordering::Acquire)
+                != 0
+                || h.state.accounts.inflight_count(&launch.account) != 0
+                || h.state.bindings.pending_count(&launch.account) != 0
+                || h.state.budget.used() != 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("actual physical producer must release native request counters");
+        assert_eq!(h.fake.state.requests().len(), before + 1);
+    }
+}

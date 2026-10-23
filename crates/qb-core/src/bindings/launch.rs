@@ -244,6 +244,23 @@ pub(super) fn ownership_group<'a>(d: &'a Data, key: &'a str) -> &'a str {
         .map_or(key, |a| a.canonical_key.as_str())
 }
 
+/// Exact adopted issued-anchor/root/model view. No prefix-based child inference.
+pub(super) fn deferred_matches(
+    d: &Data,
+    root: &str,
+    anchor: &str,
+    account: &str,
+    model: &str,
+) -> bool {
+    d.groups.get(root).is_some_and(|g| g.account == account)
+        && d.launches
+            .get(root)
+            .is_some_and(|m| m.current_model.as_deref() == Some(model))
+        && d.launch_anchors
+            .get(anchor)
+            .is_some_and(|a| a.canonical_key == root)
+}
+
 pub(super) fn policy_key<'a>(d: &'a Data, key: Option<&'a str>) -> Option<&'a str> {
     key.map(|key| {
         d.launches

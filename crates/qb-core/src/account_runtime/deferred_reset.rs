@@ -1,0 +1,1187 @@
+//! Process-local launch-owned reset obligations, never expired proof tickets.
+use super::{AccountRuntime, wait_owner::ObservedHttp429};
+use crate::{
+    accounts::{Account, Health, HealthReason, Provider},
+    bindings::{BindingTable, DeferredBindingFence, HttpWaitRequest, WaitIntent},
+    issue_operation::IssueOperation,
+    launch_tokens::{LaunchOwnerScope, LaunchPin},
+    routing::{DeferredPolicyFence, Plan},
+};
+use chrono::{DateTime, Utc};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
+    },
+};
+use tokio::{sync::Notify, time::Instant};
+
+const CAPACITY: usize = 4096;
+const WAITING: u8 = 0;
+const SUSPENDED: u8 = 1;
+const EXPIRING: u8 = 2;
+const READY: u8 = 3;
+const CANCELLED: u8 = 4;
+const CONSUMED: u8 = 5;
+const RECOVER_CREDENTIAL: u8 = 1;
+const RECOVER_EXPIRY: u8 = 2;
+const BLOCK_REPORT: u8 = 4;
+
+/// Native typed fences can only revoke; they never construct report authority.
+pub(crate) struct Revocation {
+    live: AtomicBool,
+    changed: Notify,
+}
+impl Revocation {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            live: AtomicBool::new(true),
+            changed: Notify::new(),
+        })
+    }
+    pub(crate) fn live(&self) -> bool {
+        self.live.load(Ordering::Acquire)
+    }
+    pub(crate) fn cancel(&self) {
+        self.live.store(false, Ordering::Release);
+        self.changed.notify_waiters();
+    }
+    pub(crate) fn notified_raw(&self) -> tokio::sync::futures::Notified<'_> {
+        self.changed.notified()
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DeferredResetId(u64);
+impl DeferredResetId {
+    pub(crate) fn as_u64(self) -> u64 {
+        self.0
+    }
+    // A parsed lookup ID alone grants no authority; every API checks owner scope.
+    pub(crate) fn from_u64(id: u64) -> Self {
+        Self(id)
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeferredResetStatus {
+    Empty,
+    Waiting {
+        id: DeferredResetId,
+        reset_at: DateTime<Utc>,
+        wake: Instant,
+    },
+    Suspended {
+        id: DeferredResetId,
+        reset_at: DateTime<Utc>,
+        wake: Instant,
+    },
+    Cancelled,
+}
+/// A single final consumption, not credentials, account choice or send permission.
+pub(crate) struct DeferredResumePermit {
+    _private: (),
+}
+
+pub(super) struct PhysicalQualification {
+    pub(super) reset_at: DateTime<Utc>,
+    pub(super) started_at: DateTime<Utc>,
+    pub(super) scope: String,
+    pub(super) allow_credits: bool,
+    pub(super) quota_credit_releasable: bool,
+}
+struct Record {
+    id: DeferredResetId,
+    owner: LaunchOwnerScope,
+    account: String,
+    identity: crate::accounts::Identity,
+    source: crate::accounts::Source,
+    root: String,
+    model: String,
+    policy_key: String,
+    plan: Plan,
+    qualification: PhysicalQualification,
+    wake: Instant,
+    binding: Arc<DeferredBindingFence>,
+    policy: Arc<DeferredPolicyFence>,
+    phase: AtomicU8,
+    recovery: AtomicU8,
+    expiry_generation: AtomicU64,
+}
+impl Record {
+    fn live(&self) -> bool {
+        self.owner.live()
+            && self.binding.live()
+            && self.policy.live()
+            && self.phase.load(Ordering::Acquire) < CANCELLED
+    }
+    fn same_identity(&self, account: &Account) -> bool {
+        account.id == self.account
+            && account.provider == Provider::Codex
+            && account.identity == self.identity
+            && account.source == self.source
+            && account.allow_credits == self.qualification.allow_credits
+            && account.quota_credit_releasable == self.qualification.quota_credit_releasable
+    }
+    fn same_hold(&self, account: &Account) -> bool {
+        self.same_identity(account)
+            && matches!(&account.health, Health::Cooling { reason: HealthReason::Quota, until, scope }
+                if *until == self.qualification.reset_at && *scope == self.qualification.scope)
+            && account.quota_cooling.as_ref().is_some_and(|hold| {
+                hold.window == "5h"
+                    && hold.reset_at == self.qualification.reset_at
+                    && hold.started_at == self.qualification.started_at
+            })
+    }
+}
+struct State {
+    next: u64,
+    closed: bool,
+    records: BTreeMap<u64, Arc<Record>>,
+}
+pub(super) struct DeferredResets {
+    state: Mutex<State>,
+    changed: Notify,
+}
+impl DeferredResets {
+    pub(super) fn new() -> Self {
+        Self {
+            state: Mutex::new(State {
+                next: 0,
+                closed: false,
+                records: BTreeMap::new(),
+            }),
+            changed: Notify::new(),
+        }
+    }
+    fn register(
+        &self,
+        owner: &LaunchOwnerScope,
+        intent: &WaitIntent<'_>,
+        qualification: PhysicalQualification,
+        account: &Account,
+        binding: Arc<DeferredBindingFence>,
+        policy: Arc<DeferredPolicyFence>,
+    ) -> Option<DeferredResetId> {
+        // Complete bounded allocations before the final leaf publication/check.
+        let wall = Utc::now();
+        let mono = Instant::now();
+        let wake = mono.checked_add(
+            qualification
+                .reset_at
+                .signed_duration_since(wall)
+                .to_std()
+                .ok()?,
+        )?;
+        let model = intent.model()?.to_owned();
+        let mut state = self.state.lock().ok()?;
+        if state.closed {
+            return None;
+        }
+        let id = DeferredResetId(state.next.checked_add(1)?);
+        // Retire only unusable entries; live obligations are never evicted for room.
+        let dead: Vec<_> = state
+            .records
+            .iter()
+            .filter(|(_, r)| !r.live())
+            .map(|(id, _)| *id)
+            .collect();
+        let removed: Vec<_> = dead
+            .into_iter()
+            .filter_map(|id| state.records.remove(&id))
+            .collect();
+        if state.records.len() >= CAPACITY {
+            drop(state);
+            drop(removed);
+            return None;
+        }
+        let record = Arc::new(Record {
+            id,
+            owner: owner.clone(),
+            account: intent.account().to_owned(),
+            identity: account.identity.clone(),
+            source: account.source.clone(),
+            root: intent.key().to_owned(),
+            model,
+            policy_key: intent.policy_key().to_owned(),
+            plan: intent.plan().clone(),
+            qualification,
+            wake,
+            binding,
+            policy,
+            phase: AtomicU8::new(WAITING),
+            recovery: AtomicU8::new(0),
+            expiry_generation: AtomicU64::new(0),
+        });
+        if !intent.caller_current() || !record.live() || !owner.claim(intent.key()) {
+            drop(state);
+            drop(removed);
+            return None;
+        }
+        state.next = id.0;
+        state.records.insert(id.0, record);
+        drop(state);
+        drop(removed);
+        self.changed.notify_waiters();
+        Some(id)
+    }
+    fn record(&self, owner: &LaunchOwnerScope, id: DeferredResetId) -> Option<Arc<Record>> {
+        let state = self.state.lock().ok()?;
+        if state.closed {
+            return None;
+        }
+        let record = state.records.get(&id.0)?;
+        (record.owner.same_owner(owner) && record.live()).then(|| record.clone())
+    }
+    pub(super) fn requalify_account(
+        &self,
+        id: &str,
+        qualification: &PhysicalQualification,
+        model: Option<&str>,
+    ) {
+        let Ok(state) = self.state.lock() else {
+            return;
+        };
+        if state.closed {
+            return;
+        }
+        for record in state
+            .records
+            .values()
+            .filter(|r| r.account == id && r.live())
+        {
+            let same = record.qualification.reset_at == qualification.reset_at
+                && record.qualification.started_at == qualification.started_at
+                && record.qualification.scope == qualification.scope
+                && record.qualification.allow_credits == qualification.allow_credits
+                && record.qualification.quota_credit_releasable
+                    == qualification.quota_credit_releasable
+                && model.is_none_or(|reported| reported == record.model);
+            if !same {
+                record.phase.store(CANCELLED, Ordering::Release);
+            } else {
+                record.recovery.store(0, Ordering::Release);
+                let _ = record.phase.compare_exchange(
+                    SUSPENDED,
+                    WAITING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+            }
+        }
+        drop(state);
+        self.changed.notify_waiters();
+    }
+    pub(super) fn cancel_account(&self, id: &str) {
+        self.change_account(id, CANCELLED, false, 0);
+    }
+    pub(super) fn suspend_account(&self, id: &str) {
+        self.change_account(id, SUSPENDED, false, BLOCK_REPORT);
+    }
+    pub(super) fn credential_save(&self, id: &str) {
+        self.change_account(id, SUSPENDED, false, RECOVER_CREDENTIAL);
+    }
+    pub(super) fn expiry(&self, id: &str) {
+        self.change_account(id, SUSPENDED, true, RECOVER_EXPIRY);
+    }
+    fn change_account(&self, id: &str, phase: u8, keep_expiring: bool, recovery: u8) {
+        let Ok(state) = self.state.lock() else {
+            return;
+        };
+        for record in state.records.values().filter(|record| record.account == id) {
+            let old = record.phase.load(Ordering::Acquire);
+            if old < CANCELLED && !(keep_expiring && old == EXPIRING) {
+                record.recovery.fetch_or(recovery, Ordering::AcqRel);
+                record.phase.store(phase, Ordering::Release);
+            }
+        }
+        drop(state);
+        self.changed.notify_waiters();
+    }
+    pub(super) fn close(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.closed = true;
+            let records = std::mem::take(&mut state.records);
+            for record in records.values() {
+                if record.phase.load(Ordering::Acquire) < CANCELLED {
+                    record.phase.store(CANCELLED, Ordering::Release);
+                }
+            }
+            drop(state);
+            drop(records);
+        }
+        self.changed.notify_waiters();
+    }
+}
+impl AccountRuntime {
+    /// Called only at the physical far-429 fallback handoff, with its actual pin.
+    pub(crate) fn register_http_deferred_reset(
+        &self,
+        bindings: &BindingTable,
+        request: HttpWaitRequest<'_>,
+        observed: &ObservedHttp429,
+        pin: &LaunchPin,
+    ) -> Result<Option<(DeferredResetId, LaunchOwnerScope)>, ()> {
+        let Some(scope) = pin.deferred_owner_scope() else {
+            return Ok(None);
+        };
+        if !scope.matches_pin(pin) {
+            return Ok(None);
+        }
+        let _transaction = self.store.transaction().map_err(|_| ())?;
+        let released = self.released_quota.lock().map_err(|_| ())?;
+        let probes = self.probes.lock().map_err(|_| ())?;
+        let volatile = self.volatile.lock().map_err(|_| ())?;
+        let Some(id) = request.expected_source else {
+            return Ok(None);
+        };
+        if self.store.writes_stopped()
+            || probes.contains(id)
+            || volatile.contains_key(id)
+            || released.get(id).is_some_and(|release| release.pending)
+        {
+            return Ok(None);
+        }
+        let account = self.store.read_account_unlocked(id).map_err(|_| ())?;
+        if !self.deferred_credentials_current(&account) {
+            return Ok(None);
+        }
+        Ok(
+            bindings.with_deferred_launch(request, &scope, None, |intent, binding, policy| {
+                let qualification = self
+                    .wait_owner
+                    .qualify_deferred_physical_unlocked(observed, intent, &account)?;
+                self.wait_owner
+                    .deferred
+                    .register(&scope, intent, qualification, &account, binding, policy)
+                    .map(|id| (id, scope.clone()))
+            }),
+        )
+    }
+    fn deferred_credentials_current(&self, account: &Account) -> bool {
+        let now = Utc::now();
+        account.user_state == crate::accounts::UserState::Active
+            && !account.drain
+            && !account.auth_probe_pending
+            && account.auth_failures == 0
+            && !account.token_meta.refresh_uncertain
+            && account.payment_until.is_none_or(|until| until <= now)
+            && account
+                .token_meta
+                .expires_at
+                .is_none_or(|expiry| expiry > now)
+            && self
+                .store
+                .tokens_unlocked(account)
+                .is_ok_and(|tokens| !tokens.access_token.is_empty())
+    }
+    pub(crate) fn deferred_reset_status(
+        &self,
+        scope: &LaunchOwnerScope,
+        native_thread_uuid: &str,
+    ) -> DeferredResetStatus {
+        if !scope.live() {
+            return DeferredResetStatus::Cancelled;
+        }
+        let Ok(state) = self.wait_owner.deferred.state.lock() else {
+            return DeferredResetStatus::Cancelled;
+        };
+        if state.closed {
+            return DeferredResetStatus::Cancelled;
+        }
+        let Some(record) = state
+            .records
+            .values()
+            .find(|record| record.owner.same_owner(scope))
+        else {
+            return if scope.root().is_some() {
+                DeferredResetStatus::Cancelled
+            } else {
+                DeferredResetStatus::Empty
+            };
+        };
+        if !scope.matches_thread(native_thread_uuid) || !record.live() {
+            return DeferredResetStatus::Cancelled;
+        }
+        if record.phase.load(Ordering::Acquire) == SUSPENDED {
+            DeferredResetStatus::Suspended {
+                id: record.id,
+                reset_at: record.qualification.reset_at,
+                wake: record.wake,
+            }
+        } else {
+            DeferredResetStatus::Waiting {
+                id: record.id,
+                reset_at: record.qualification.reset_at,
+                wake: record.wake,
+            }
+        }
+    }
+    /// Enable all native cancellation notifications before inspecting status.
+    pub(crate) async fn deferred_reset_changed(&self, scope: &LaunchOwnerScope) {
+        let changed = self.wait_owner.deferred.changed.notified();
+        let owner = scope.notified();
+        tokio::pin!(changed, owner);
+        changed.as_mut().enable();
+        owner.as_mut().enable();
+        let record = self
+            .wait_owner
+            .deferred
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| {
+                state
+                    .records
+                    .values()
+                    .find(|r| r.owner.same_owner(scope))
+                    .cloned()
+            });
+        let Some(record) = record else {
+            if !scope.live()
+                || self
+                    .wait_owner
+                    .deferred
+                    .state
+                    .lock()
+                    .map_or(true, |state| state.closed)
+            {
+                return;
+            }
+            tokio::select! { _ = changed => {}, _ = owner => {} }
+            return;
+        };
+        let binding = record.binding.notified();
+        let policy = record.policy.notified();
+        tokio::pin!(binding, policy);
+        binding.as_mut().enable();
+        policy.as_mut().enable();
+        if !record.live() {
+            return;
+        }
+        tokio::select! { _ = changed => {}, _ = owner => {}, _ = binding => {}, _ = policy => {} }
+    }
+    pub(crate) fn cancel_deferred_reset(
+        &self,
+        scope: &LaunchOwnerScope,
+        id: DeferredResetId,
+    ) -> bool {
+        // Share the final consume leaf fence: cancellation cannot overwrite a
+        // consumed terminal phase or report success after consumption.
+        let Ok(state) = self.wait_owner.deferred.state.lock() else {
+            return false;
+        };
+        if state.closed {
+            return false;
+        }
+        let Some(record) = state.records.get(&id.0) else {
+            return false;
+        };
+        if !record.owner.same_owner(scope) || record.phase.load(Ordering::Acquire) >= CANCELLED {
+            return false;
+        }
+        record.phase.store(CANCELLED, Ordering::Release);
+        drop(state);
+        self.wait_owner.deferred.changed.notify_waiters();
+        true
+    }
+    /// Readiness hint before native final-get. May persist exact native expiry;
+    /// never consumes the episode or grants automatic activation authority.
+    pub(crate) fn inspect_deferred_reset(
+        &self,
+        bindings: &BindingTable,
+        scope: &LaunchOwnerScope,
+        id: DeferredResetId,
+        operation: &IssueOperation,
+    ) -> Result<bool, ()> {
+        self.check_deferred_reset(bindings, scope, id, operation, false)
+    }
+    /// Final parent authorize callback only. No original HTTP ticket is admitted.
+    pub(crate) fn consume_deferred_reset(
+        &self,
+        bindings: &BindingTable,
+        scope: &LaunchOwnerScope,
+        id: DeferredResetId,
+        operation: &IssueOperation,
+    ) -> Result<Option<DeferredResumePermit>, ()> {
+        self.check_deferred_reset(bindings, scope, id, operation, true)
+            .map(|granted| granted.then_some(DeferredResumePermit { _private: () }))
+    }
+    fn check_deferred_reset(
+        &self,
+        bindings: &BindingTable,
+        scope: &LaunchOwnerScope,
+        id: DeferredResetId,
+        operation: &IssueOperation,
+        consume: bool,
+    ) -> Result<bool, ()> {
+        let Some(record) = self.wait_owner.deferred.record(scope, id) else {
+            return Ok(false);
+        };
+        let _transaction = self.store.transaction().map_err(|_| ())?;
+        let released = self.released_quota.lock().map_err(|_| ())?;
+        let probes = self.probes.lock().map_err(|_| ())?;
+        let volatile = self.volatile.lock().map_err(|_| ())?;
+        let wall = Utc::now();
+        if !operation.can_reply()
+            || !record.live()
+            || Instant::now() < record.wake
+            || wall < record.qualification.reset_at
+            || self.store.writes_stopped()
+            || probes.contains(&record.account)
+            || volatile.contains_key(&record.account)
+            || released
+                .get(&record.account)
+                .is_some_and(|release| release.pending)
+        {
+            return Ok(false);
+        }
+        let mut account = self
+            .store
+            .read_account_unlocked(&record.account)
+            .map_err(|_| ())?;
+        if !record.same_identity(&account) || !self.deferred_credentials_current(&account) {
+            return Ok(false);
+        }
+        if record.phase.load(Ordering::Acquire) == SUSPENDED {
+            // Only credential-only saves and the native expiry boundary preserve
+            // the original hold's lineage. Store's restricted save compares all
+            // other metadata; generic writes cancel, reports independently block.
+            // Read the durable current record under Store, never infer success
+            // from the prehook or refresh result. Failed writes may leave usable
+            // old credentials; they convey no new proof or reset interval.
+            let recovery = record.recovery.load(Ordering::Acquire);
+            if recovery == 0 || recovery & BLOCK_REPORT != 0 {
+                return Ok(false);
+            }
+            let phase = if record.same_hold(&account) {
+                WAITING
+            } else if (recovery & RECOVER_EXPIRY != 0
+                || record.expiry_generation.load(Ordering::Acquire) != 0)
+                && matches!(account.health, Health::Ready)
+                && account.quota_cooling.is_none()
+            {
+                // An independent native expiry can win first. Its prehook plus
+                // durable Ready state certify this original hold only because
+                // every other metadata/report mutation cancelled or blocked it.
+                record
+                    .expiry_generation
+                    .store(account.generation, Ordering::Release);
+                READY
+            } else {
+                return Ok(false);
+            };
+            if record
+                .phase
+                .compare_exchange(SUSPENDED, phase, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Ok(false);
+            }
+            record.recovery.store(0, Ordering::Release);
+        }
+        match record.phase.load(Ordering::Acquire) {
+            WAITING => {
+                if !record.same_hold(&account)
+                    || record
+                        .phase
+                        .compare_exchange(WAITING, EXPIRING, Ordering::AcqRel, Ordering::Acquire)
+                        .is_err()
+                {
+                    return Ok(false);
+                }
+                // Exact hold checked above, under the same Store transaction.
+                // Native hook still revokes proof. Failed durability never grants.
+                account = match self.store.expire_health_unlocked(&record.account) {
+                    Ok(account) => account,
+                    Err(_) => {
+                        // A failed expiry grants nothing. Preserve only the
+                        // exact-hold retry lineage, checked again under Store.
+                        record.recovery.fetch_or(RECOVER_EXPIRY, Ordering::AcqRel);
+                        let _ = record.phase.compare_exchange(
+                            EXPIRING,
+                            SUSPENDED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        );
+                        self.wait_owner.deferred.changed.notify_waiters();
+                        return Err(());
+                    }
+                };
+                record
+                    .expiry_generation
+                    .store(account.generation, Ordering::Release);
+                if record
+                    .phase
+                    .compare_exchange(EXPIRING, READY, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    return Ok(false);
+                }
+            }
+            READY => {
+                if record.expiry_generation.load(Ordering::Acquire) != account.generation {
+                    return Ok(false);
+                }
+            }
+            _ => return Ok(false),
+        }
+        if !record.live()
+            || !matches!(account.health, Health::Ready)
+            || account.quota_cooling.is_some()
+            || !account.eligible_at(Some(&record.model), Utc::now())
+            || !self.deferred_credentials_current(&account)
+        {
+            record.phase.store(CANCELLED, Ordering::Release);
+            return Ok(false);
+        }
+        let request = HttpWaitRequest {
+            provider: Provider::Codex,
+            key: Some(&record.root),
+            model: Some(&record.model),
+            expected_source: Some(&record.account),
+            operation,
+        };
+        let result = bindings.with_deferred_launch(
+            request,
+            scope,
+            Some((record.binding.clone(), record.policy.clone())),
+            |intent, _, _| {
+                if intent.policy_key() != record.policy_key
+                    || !same_plan(&record.plan, intent.plan())
+                    || !record.live()
+                    || !operation.can_reply()
+                    || Utc::now() < record.qualification.reset_at
+                    || Instant::now() < record.wake
+                {
+                    return None;
+                }
+                let state = self.wait_owner.deferred.state.lock().ok()?;
+                if state.closed
+                    || !state
+                        .records
+                        .get(&id.0)
+                        .is_some_and(|r| Arc::ptr_eq(r, &record))
+                {
+                    return None;
+                }
+                let _owner_live = scope.live_guard()?;
+                if consume {
+                    operation.admit().ok()?;
+                    record
+                        .phase
+                        .compare_exchange(READY, CONSUMED, Ordering::AcqRel, Ordering::Acquire)
+                        .ok()?;
+                } else if record.phase.load(Ordering::Acquire) != READY {
+                    return None;
+                }
+                Some(())
+            },
+        );
+        if consume && result.is_some() {
+            self.wait_owner.deferred.changed.notify_waiters();
+        }
+        Ok(result.is_some())
+    }
+}
+pub(crate) fn same_plan(a: &Plan, b: &Plan) -> bool {
+    a.settings == b.settings
+        && a.anchor == b.anchor
+        && a.project == b.project
+        && a.source == b.source
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        account_runtime::HealthSignal,
+        accounts::{AccountStore, Tokens},
+        bindings::{Candidate, LaunchRequest},
+        config::RoutingConfig,
+        launch_tokens::{LaunchMetadata, LaunchOwnerLease, LaunchTokenRegistry},
+        observability::Observability,
+        routing::{On5hLimit, session_id},
+    };
+    use chrono::Duration;
+    use std::collections::BTreeSet;
+    const THREAD: &str = "11111111-2222-4333-8444-555555555555";
+    const ROOT: &str = "codex:11111111-2222-4333-8444-555555555555";
+    const ANCHOR: &str = "launch:synthetic-deferred";
+    const MODEL: &str = "synthetic-model";
+    struct Fixture {
+        runtime: Arc<AccountRuntime>,
+        table: Arc<BindingTable>,
+        pin: LaunchPin,
+        lease: LaunchOwnerLease,
+        id: String,
+        _home: tempfile::TempDir,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../.sandbox/r13-part-c/n5d-native/fixtures");
+            std::fs::create_dir_all(&base).unwrap();
+            let home = tempfile::tempdir_in(base).unwrap();
+            let store = Arc::new(AccountStore::acquire(home.path()).unwrap());
+            let account = store
+                .save(
+                    &crate::accounts::health::tests::fixture(),
+                    &Tokens {
+                        access_token: "synthetic-access".into(),
+                        refresh_token: "synthetic-refresh".into(),
+                        id_token: None,
+                    },
+                    None,
+                )
+                .unwrap();
+            let obs = Arc::new(Observability::new(home.path(), None).unwrap());
+            let runtime = AccountRuntime::new(store, obs, 0.0);
+            let table = BindingTable::new(home.path(), RoutingConfig::default()).unwrap();
+            let models = BTreeSet::from([MODEL.to_owned(), "synthetic-other".to_owned()]);
+            table
+                .place_launch(
+                    LaunchRequest {
+                        anchor_key: ANCHOR,
+                        resume_key: None,
+                        model: Some(MODEL),
+                        model_is_explicit: true,
+                        account_pref: Some(&account.id),
+                        allow_move_for_model: false,
+                    },
+                    &[Candidate {
+                        account: account.clone(),
+                        quota: None,
+                        inflight: 0,
+                    }],
+                    &BTreeMap::from([(account.id.clone(), models.clone())]),
+                    Utc::now(),
+                )
+                .unwrap();
+            table
+                .resolve_launch(Some(ANCHOR), Some(ROOT), Utc::now())
+                .unwrap();
+            let lease = table.begin_request(Some(ROOT), &account.id);
+            lease.dispatched();
+            drop(lease);
+            let registry = LaunchTokenRegistry::default();
+            let token = registry
+                .issue(LaunchMetadata {
+                    binding_anchor_key: ANCHOR.into(),
+                    advertised_models: models,
+                })
+                .unwrap();
+            let pin = registry.get_or_pin(token.expose_secret()).unwrap();
+            let lease = pin.open_deferred_owner().unwrap();
+            Self {
+                runtime,
+                table,
+                pin,
+                lease,
+                id: account.id,
+                _home: home,
+            }
+        }
+        fn request<'a>(&'a self, operation: &'a IssueOperation) -> HttpWaitRequest<'a> {
+            HttpWaitRequest {
+                provider: Provider::Codex,
+                key: Some(ROOT),
+                model: Some(MODEL),
+                expected_source: Some(&self.id),
+                operation,
+            }
+        }
+        async fn physical(&self, seconds: i64) -> (ObservedHttp429, DateTime<Utc>) {
+            let reset =
+                DateTime::from_timestamp((Utc::now() + Duration::seconds(seconds)).timestamp(), 0)
+                    .unwrap();
+            let mut headers = axum::http::HeaderMap::new();
+            for (name, value) in [
+                ("x-codex-primary-used-percent", "100".into()),
+                ("x-codex-primary-window-minutes", "300".into()),
+                ("x-codex-primary-reset-at", reset.timestamp().to_string()),
+                ("x-codex-secondary-used-percent", "20".into()),
+                ("x-codex-secondary-window-minutes", "10080".into()),
+                (
+                    "x-codex-secondary-reset-at",
+                    (reset + Duration::days(1)).timestamp().to_string(),
+                ),
+            ] {
+                headers.insert(name, value.parse().unwrap());
+            }
+            let origin = self.runtime.capture_http_origin(&self.id).await.unwrap();
+            let asof = self.table.begin_usage_observation_for(&self.id);
+            let (_, pending) = self
+                .runtime
+                .observe_http_429_headers_pending(
+                    &self.id,
+                    Provider::Codex,
+                    &headers,
+                    Some(MODEL),
+                    (&self.table, asof),
+                    Some(origin),
+                )
+                .await;
+            let body = serde_json::to_vec(&serde_json::json!({"error": {
+                "type": "usage_limit_reached", "resets_at": reset.timestamp()
+            }}))
+            .unwrap();
+            let body = AccountRuntime::qualify_http_429_body(Some(&body), Some(MODEL));
+            let observed = self
+                .runtime
+                .finish_http_429_report_observed(
+                    &self.id,
+                    pending,
+                    Some(reset),
+                    Some(HealthSignal::Cooling {
+                        reason: HealthReason::Quota,
+                        until: reset,
+                        scope: "account".into(),
+                    }),
+                    body,
+                )
+                .await
+                .unwrap()
+                .expect("actual complete physical header/body adapter must qualify");
+            (observed, reset)
+        }
+        fn register(&self, observed: &ObservedHttp429) -> (DeferredResetId, LaunchOwnerScope) {
+            let operation = IssueOperation::new(Instant::now() + std::time::Duration::from_secs(1));
+            let _caller = operation.caller_guard();
+            self.runtime
+                .register_http_deferred_reset(
+                    &self.table,
+                    self.request(&operation),
+                    observed,
+                    &self.pin,
+                )
+                .unwrap()
+                .expect("native existing managed physical fallback must register")
+        }
+        fn operation() -> IssueOperation {
+            IssueOperation::new(Instant::now() + std::time::Duration::from_secs(5))
+        }
+    }
+    #[tokio::test]
+    async fn n5d_physical_deferred_native_expiry_readiness_then_single_fresh_consume() {
+        let f = Fixture::new();
+        let (observed, reset) = f.physical(4).await;
+        let (id, scope) = f.register(&observed);
+        let status = f.runtime.deferred_reset_status(&scope, THREAD);
+        let DeferredResetStatus::Waiting { wake, reset_at, .. } = status else {
+            panic!("missing physical obligation");
+        };
+        assert_eq!(reset_at, reset);
+        assert!(
+            f.runtime
+                .consume_deferred_reset(&f.table, &scope, id, &Fixture::operation())
+                .unwrap()
+                .is_none()
+        );
+        let old_ticket = {
+            let _gate = f.runtime.store.transaction().unwrap();
+            let account = f.runtime.store.read_account_unlocked(&f.id).unwrap();
+            f.runtime
+                .wait_owner
+                .acquire_current_unlocked(&account, Some(MODEL), Utc::now())
+                .unwrap()
+        };
+        // Wait for the actual original native wall/mono reset, not a fabricated
+        // DTO or elapsed arbitrary sleep. Bound prevents a broken clock hanging.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(6),
+            tokio::time::sleep_until(wake),
+        )
+        .await
+        .unwrap();
+        assert!(Utc::now() >= reset);
+        // Synthetic live weak-slot pressure exercises both actual capacity
+        // checks without constructing thousands of unrelated native accounts.
+        // Existing readiness/consume must reuse their reserved owner fences.
+        f.table.fill_deferred_watch_slots_for_test();
+        assert!(
+            f.runtime
+                .inspect_deferred_reset(&f.table, &scope, id, &Fixture::operation())
+                .unwrap()
+        );
+        let after = f.runtime.store.load(&f.id).unwrap();
+        assert!(matches!(after.health, Health::Ready));
+        assert!(!f.runtime.wait_owner.ticket_current_unlocked(
+            &old_ticket,
+            &after,
+            Some(MODEL),
+            Utc::now()
+        ));
+        assert!(
+            f.runtime
+                .inspect_deferred_reset(&f.table, &scope, id, &Fixture::operation())
+                .unwrap()
+        );
+        let terminal = f.runtime.wait_owner.deferred.record(&scope, id).unwrap();
+        assert!(
+            f.runtime
+                .consume_deferred_reset(&f.table, &scope, id, &Fixture::operation())
+                .unwrap()
+                .is_some()
+        );
+        assert!(!f.runtime.cancel_deferred_reset(&scope, id));
+        assert_eq!(terminal.phase.load(Ordering::Acquire), CONSUMED);
+        assert!(
+            f.runtime
+                .consume_deferred_reset(&f.table, &scope, id, &Fixture::operation())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            after.generation,
+            f.runtime.store.load(&f.id).unwrap().generation,
+            "readiness/consume must not expire twice"
+        );
+        f.runtime.wait_owner.deferred.close();
+        assert_eq!(terminal.phase.load(Ordering::Acquire), CONSUMED);
+    }
+    #[tokio::test]
+    async fn n5d_physical_deferred_credential_recovery_and_independent_expiry_keep_original_reset()
+    {
+        // 0: refresh crosses reset; 1: independent expiry wins during refresh;
+        // 2: independent expiry alone. No new quota report is issued in any case.
+        for mode in 0..3 {
+            let f = Fixture::new();
+            let (observed, reset) = f.physical(4).await;
+            let (id, scope) = f.register(&observed);
+            let DeferredResetStatus::Waiting { wake, reset_at, .. } =
+                f.runtime.deferred_reset_status(&scope, THREAD)
+            else {
+                panic!("missing original episode");
+            };
+            assert_eq!(reset_at, reset);
+            let read = || {
+                let _gate = f.runtime.store.transaction().unwrap();
+                f.runtime.store.read_account_unlocked(&f.id).unwrap()
+            };
+            let tokens = Tokens {
+                access_token: "synthetic-access".into(),
+                refresh_token: "synthetic-refresh".into(),
+                id_token: None,
+            };
+            if mode != 2 {
+                let mut uncertain = read();
+                uncertain.token_meta.refresh_uncertain = true;
+                f.runtime
+                    .store
+                    .save_credentials(&uncertain, &tokens, uncertain.generation)
+                    .unwrap();
+            }
+            tokio::time::timeout(
+                std::time::Duration::from_secs(6),
+                tokio::time::sleep_until(wake),
+            )
+            .await
+            .unwrap();
+            assert!(Utc::now() >= reset);
+            if mode != 0 {
+                let expired = f.runtime.store.load(&f.id).unwrap();
+                assert!(matches!(expired.health, Health::Ready));
+                assert!(expired.quota_cooling.is_none());
+            }
+            if mode != 2 {
+                assert!(
+                    !f.runtime
+                        .inspect_deferred_reset(&f.table, &scope, id, &Fixture::operation())
+                        .unwrap(),
+                    "write-ahead uncertainty is not usable credentials"
+                );
+                let mut certain = read();
+                certain.token_meta.refresh_uncertain = false;
+                assert!(
+                    f.runtime
+                        .store
+                        .save_credentials(&certain, &tokens, certain.generation + 1)
+                        .is_err()
+                );
+                assert!(
+                    !f.runtime
+                        .inspect_deferred_reset(&f.table, &scope, id, &Fixture::operation())
+                        .unwrap(),
+                    "rejected save must not clear durable uncertainty"
+                );
+                f.runtime
+                    .store
+                    .save_credentials(&certain, &tokens, certain.generation)
+                    .unwrap();
+            }
+            assert!(
+                f.runtime
+                    .inspect_deferred_reset(&f.table, &scope, id, &Fixture::operation())
+                    .unwrap(),
+                "fresh exact native continuity must recover, mode={mode}"
+            );
+            let DeferredResetStatus::Waiting {
+                wake: after,
+                reset_at: after_reset,
+                ..
+            } = f.runtime.deferred_reset_status(&scope, THREAD)
+            else {
+                panic!("recovery lost original episode");
+            };
+            assert_eq!((after, after_reset), (wake, reset));
+            assert!(
+                f.runtime
+                    .consume_deferred_reset(&f.table, &scope, id, &Fixture::operation())
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                f.runtime
+                    .consume_deferred_reset(&f.table, &scope, id, &Fixture::operation())
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+    #[tokio::test]
+    async fn n5d_physical_deferred_scope_root_and_one_episode_are_exact() {
+        let f = Fixture::new();
+        let (observed, _) = f.physical(120).await;
+        let operation = Fixture::operation();
+        let mut request = f.request(&operation);
+        request.key = Some(ANCHOR);
+        assert!(
+            f.runtime
+                .register_http_deferred_reset(&f.table, request, &observed, &f.pin)
+                .unwrap()
+                .is_none()
+        );
+        let child = format!("{ROOT}:agent:synthetic");
+        let mut request = f.request(&operation);
+        request.key = Some(&child);
+        assert!(
+            f.runtime
+                .register_http_deferred_reset(&f.table, request, &observed, &f.pin)
+                .unwrap()
+                .is_none()
+        );
+        let (id, scope) = f.register(&observed);
+        assert!(
+            f.runtime
+                .register_http_deferred_reset(&f.table, f.request(&operation), &observed, &f.pin)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            f.runtime
+                .deferred_reset_status(&scope, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"),
+            DeferredResetStatus::Cancelled
+        );
+        let registry = LaunchTokenRegistry::default();
+        let token = registry
+            .issue(LaunchMetadata {
+                binding_anchor_key: ANCHOR.into(),
+                advertised_models: BTreeSet::new(),
+            })
+            .unwrap();
+        let pin = registry.get_or_pin(token.expose_secret()).unwrap();
+        let lease = pin.open_deferred_owner().unwrap();
+        assert!(!f.runtime.cancel_deferred_reset(&lease.scope(), id));
+        assert!(matches!(
+            f.runtime.deferred_reset_status(&scope, THREAD),
+            DeferredResetStatus::Waiting { .. }
+        ));
+        assert!(f.runtime.cancel_deferred_reset(&scope, id));
+        assert_eq!(
+            f.runtime.deferred_reset_status(&scope, THREAD),
+            DeferredResetStatus::Cancelled
+        );
+    }
+    #[tokio::test]
+    async fn n5d_physical_deferred_native_model_and_policy_away_back_cannot_resurrect() {
+        for policy in [false, true] {
+            let f = Fixture::new();
+            let (observed, _) = f.physical(120).await;
+            let (_id, scope) = f.register(&observed);
+            if policy {
+                f.table
+                    .set_routing_session_urgent(&session_id(ROOT), On5hLimit::Move)
+                    .unwrap();
+                f.table
+                    .set_routing_session_urgent(&session_id(ROOT), On5hLimit::Wait)
+                    .unwrap();
+            } else {
+                f.table
+                    .record_launch_model(ROOT, &f.id, "synthetic-other", Utc::now())
+                    .unwrap();
+                f.table
+                    .record_launch_model(ROOT, &f.id, MODEL, Utc::now())
+                    .unwrap();
+            }
+            assert_eq!(
+                f.runtime.deferred_reset_status(&scope, THREAD),
+                DeferredResetStatus::Cancelled
+            );
+        }
+    }
+    #[tokio::test]
+    async fn n5d_physical_deferred_owner_drop_settings_stop_and_unrelated_policy() {
+        let f = Fixture::new();
+        let unrelated = "codex:synthetic-unrelated";
+        let decision = f.table.choose(
+            Provider::Codex,
+            Some(unrelated),
+            None,
+            Some(MODEL),
+            &[Candidate {
+                account: f.runtime.store.load(&f.id).unwrap(),
+                quota: None,
+                inflight: 0,
+            }],
+            Some(&f.id),
+            0,
+        );
+        let crate::bindings::Decision::Selected { account, lease, .. } = decision else {
+            panic!("unrelated native placement required");
+        };
+        assert_eq!(account, f.id);
+        lease.dispatched();
+        drop(lease);
+        let (observed, _) = f.physical(120).await;
+        let (id, scope) = f.register(&observed);
+        f.table
+            .set_routing_session_urgent(&session_id(unrelated), On5hLimit::Move)
+            .unwrap();
+        assert!(matches!(
+            f.runtime.deferred_reset_status(&scope, THREAD),
+            DeferredResetStatus::Waiting { .. }
+        ));
+        f.runtime
+            .store
+            .update_metadata(&f.id, |account| {
+                account.user_state = crate::accounts::UserState::Paused
+            })
+            .unwrap();
+        assert_eq!(
+            f.runtime.deferred_reset_status(&scope, THREAD),
+            DeferredResetStatus::Cancelled
+        );
+        assert!(
+            f.runtime
+                .consume_deferred_reset(&f.table, &scope, id, &Fixture::operation())
+                .unwrap()
+                .is_none()
+        );
+        let f = Fixture::new();
+        let (observed, _) = f.physical(120).await;
+        let (_, scope) = f.register(&observed);
+        drop(f.lease);
+        assert_eq!(
+            f.runtime.deferred_reset_status(&scope, THREAD),
+            DeferredResetStatus::Cancelled
+        );
+        let f = Fixture::new();
+        let (observed, _) = f.physical(120).await;
+        let (_, scope) = f.register(&observed);
+        f.runtime.store.stop_writes();
+        assert_eq!(
+            f.runtime.deferred_reset_status(&scope, THREAD),
+            DeferredResetStatus::Cancelled
+        );
+    }
+}

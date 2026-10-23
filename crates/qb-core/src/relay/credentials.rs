@@ -1012,7 +1012,7 @@ impl TokenGates {
                     &after,
                 )
             } else {
-                write_store.save(&uncertain, &old_tokens, Some(uncertain.generation))
+                save_refresh_credentials(&write_store, &uncertain, &old_tokens)
             }
         })
         .await
@@ -1466,6 +1466,22 @@ impl Drop for AheadAccess {
         self.entries.lock().expect("ahead access").remove(&self.id);
     }
 }
+// Callers construct credential metadata from the current account. A native
+// NewerLinkedToken health transition is deliberately still a FullSave, with its
+// ordinary revocation semantics. No other restricted-save failure is retried here.
+fn save_refresh_credentials(
+    store: &AccountStore,
+    account: &Account,
+    tokens: &Tokens,
+) -> Result<Account, StoreError> {
+    match store.save_credentials(account, tokens, account.generation) {
+        Err(StoreError::CredentialHealthChange) => {
+            store.save(account, tokens, Some(account.generation))
+        }
+        result => result,
+    }
+}
+
 async fn restore_uncertainty(
     store: Arc<AccountStore>,
     account: &Account,
@@ -1477,7 +1493,7 @@ async fn restore_uncertainty(
     let _ = tokio::task::spawn_blocking(move || {
         let mut cleared = account;
         cleared.token_meta.refresh_uncertain = uncertain;
-        store.save(&cleared, &tokens, Some(cleared.generation))
+        save_refresh_credentials(&store, &cleared, &tokens)
     })
     .await;
 }
@@ -1586,7 +1602,7 @@ async fn persist_async(
                     &after,
                 )
             } else {
-                store.save(&current, &tokens, Some(current.generation))
+                save_refresh_credentials(&store, &current, &tokens)
             };
             match saved {
                 Ok(updated) => return Ok(Some((updated, tokens))),
