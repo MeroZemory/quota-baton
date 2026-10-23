@@ -679,7 +679,7 @@ mod tests {
     fn capped_candidate_moves_normal_sticky_binding_but_preserves_strict_anchor() {
         use crate::{
             accounts::Provider,
-            bindings::{BindingTable, Candidate, Decision},
+            bindings::{BindingTable, Candidate, Decision, DispatchAdmission, MoveObservations},
         };
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../.sandbox/ws-capacity-tests");
@@ -781,8 +781,32 @@ mod tests {
                 .filter(|candidate| !capped.contains(&candidate.account.id))
                 .cloned()
                 .collect();
-            let decision =
-                table.choose(Provider::Codex, Some(key), None, None, &available, None, 0);
+            // Model the end of the source grace at its explicit std-clock
+            // deadline, as the other capacity-owner unit fixtures do.
+            let mut wait =
+                OwnWait::start(&capacity, &a_id, Instant::now() + Duration::from_secs(10)).unwrap();
+            wait.waited = true;
+            let source = wait.spill_source_at(&capacity, wait.until).unwrap();
+            let target = capacity.reserve(&b_id).unwrap();
+            let proof = source.admit(&target).unwrap();
+            // Keep this exact capacity owner and destination reservation alive
+            // through admission; filtering alone is not capacity move authority.
+            let decision = table.choose_with_hold_at_admitted_proof(
+                Provider::Codex,
+                Some(key),
+                None,
+                None,
+                &available,
+                &candidates,
+                MoveObservations::untracked(),
+                None,
+                0,
+                false,
+                false,
+                chrono::Utc::now(),
+                None,
+                |_| Some(DispatchAdmission::capacity(proof)),
+            );
             if strict {
                 assert!(matches!(decision, Decision::None | Decision::Blocked));
                 assert_eq!(table.current(Some(key)).as_deref(), Some(a_id.as_str()));

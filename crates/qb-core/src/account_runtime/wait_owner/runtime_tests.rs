@@ -389,18 +389,38 @@ async fn n5a_runtime_wait_rejects_actual_binding_source_change() {
         .store
         .save(&other, &Fixture::tokens("synthetic-other-access"), None)
         .unwrap();
-    let selected = f.table.choose(
+    // Retain the actual bound source, including the reported quota state.
+    // A raw target label alone cannot authorize this synthetic source change.
+    let sources = [
+        Candidate {
+            account: f.account(),
+            quota: f.runtime.obs.quota_snapshot(&f.id),
+            inflight: 0,
+        },
+        Candidate {
+            account: other.clone(),
+            quota: None,
+            inflight: 0,
+        },
+    ];
+    let pins = crate::debug_pin::DebugPins::default();
+    pins.set(Provider::Codex, Some(KEY.to_owned()), other.id.clone());
+    let proof = pins.selection(Provider::Codex, Some(KEY)).unwrap();
+    let selected = f.table.choose_with_hold_at_admitted_proof(
         Provider::Codex,
         Some(KEY),
         None,
         None,
-        &[Candidate {
-            account: other.clone(),
-            quota: None,
-            inflight: 0,
-        }],
+        &sources[1..],
+        &sources,
+        crate::bindings::MoveObservations::untracked(),
         Some(&other.id),
         0,
+        false,
+        false,
+        Utc::now(),
+        None,
+        |_| Some(crate::bindings::DispatchAdmission::ordinary().with_pin(Some(proof))),
     );
     match selected {
         Decision::Selected { account, lease, .. } => {
