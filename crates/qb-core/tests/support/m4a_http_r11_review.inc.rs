@@ -206,10 +206,8 @@ mod r11_review {
     }
 
     #[tokio::test]
-    async fn r11_review_retained_ineligible_source_cannot_publish_resume() {
+    async fn r11_review_retained_ineligible_source_recovers_without_publishing_on_source() {
         let (h, source) = model_hold_fixture(false, "synthetic-model").await;
-        let before = h.state.bindings.export().unwrap();
-        let policies_before = h.state.bindings.policies.list();
         let calls_before = h.fake.state.requests().len();
         let (status, reply) = issue_http(
             &h,
@@ -217,22 +215,20 @@ mod r11_review {
                 "resume_id":"r11-review-model-hold"}),
         )
         .await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{reply}");
-        assert_eq!(reply["error"]["code"], "launch_unavailable");
-        let refused = h.state.bindings.export().unwrap();
-        for field in ["bindings", "launches"] {
-            assert_eq!(refused[field], before[field], "{field}");
-        }
-        assert_eq!(anchor_targets(&refused), anchor_targets(&before));
-        assert_eq!(h.state.bindings.policies.list(), policies_before);
+        assert_eq!(status, StatusCode::OK, "{reply}");
+        assert_ne!(reply["account"], source);
+        assert_eq!(reply["model"], "synthetic-model",
+            "implicit resume preserves the proved model, not the held default");
         assert_eq!(
             h.state
                 .bindings
                 .current(Some("codex:r11-review-model-hold")),
-            Some(source)
+            reply["account"].as_str().map(str::to_owned)
         );
         assert_eq!(h.fake.state.requests().len(), calls_before);
-        assert!(!h.ledger().iter().any(|row| row["reason"] == "forced"));
+        assert!(h.ledger().iter().any(|row| row["event"] == "binding_move"
+            && row["from"] == source && row["to"] == reply["account"]
+            && row["reason"] == "forced"));
     }
 
     #[tokio::test]
@@ -478,10 +474,7 @@ mod r11_review {
                     account.user_state = UserState::Paused
                 })
                 .unwrap();
-            h.fake.state.push(ScriptedResponse::json(
-                StatusCode::SERVICE_UNAVAILABLE,
-                r#"{}"#,
-            ));
+            // An unusable source is classified before any source catalog I/O.
             h.fake.state.push(ScriptedResponse::json(
                 StatusCode::OK,
                 r#"{"models":[{"slug":"synthetic-model"},{"slug":"menu-model"}]}"#,

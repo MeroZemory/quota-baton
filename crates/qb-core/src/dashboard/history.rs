@@ -291,7 +291,10 @@ impl ActivityLog {
             _ => input.notable,
         };
         if input.kind == ActivityKind::Move
-            && input.data.reason == Some(MoveReason::Forced)
+            && matches!(
+                input.data.reason,
+                Some(MoveReason::Forced | MoveReason::FiveHourFarMove)
+            )
             && let Some(session) = input.data.session.as_ref()
         {
             let candidate = self.events.iter_mut().rev().find(|e| {

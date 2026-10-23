@@ -263,9 +263,9 @@ async fn blocked_renewal(unrelated_first: bool) {
     })
     .await
     .expect("bounded native HTTP urgency fixture");
-    assert_eq!(status, 409, "urgency cannot override native Strict");
+    assert_eq!(status, 429, "urgency cannot override native Strict");
     let error: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(error["error"]["type"], "routing_policy_blocked");
+    assert_eq!(error["error"]["type"], "usage_limit_reached");
     assert!(Utc::now() < reset);
     timeout(PHASE, idle(&h, &source)).await.unwrap();
     assert_exact_attempts(&h, 1); // warm A only, no target A/B send or replay
@@ -330,9 +330,9 @@ async fn n5c_http_move_before_first_admission_refuses_without_wait_hint() {
     })
     .await
     .expect("bounded initial Move refusal and native cleanup");
-    assert_eq!(status, 409);
+    assert_eq!(status, 429);
     let error: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(error["error"]["type"], "routing_policy_blocked");
+    assert_eq!(error["error"]["type"], "usage_limit_reached");
     assert!(Utc::now() < reset);
     timeout(PHASE, idle(&h, &source)).await.unwrap();
     assert_exact_attempts(&h, 1);

@@ -44,7 +44,7 @@ async fn n10_four_bound_sessions_spill_only_one_to_a_fresh_reset_account() {
         })
         .collect();
     let mut landed = Vec::new();
-    let mut timed_out = 0;
+    let mut http_fallbacks = 0;
     for request in pending {
         let result = tokio::time::timeout(Duration::from_secs(4), request)
             .await
@@ -56,8 +56,8 @@ async fn n10_four_bound_sessions_spill_only_one_to_a_fresh_reset_account() {
                 landed.push(socket);
             }
             Err(Error::Http(response)) => {
-                assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
-                timed_out += 1;
+                assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+                http_fallbacks += 1;
             }
             Err(other) => panic!("unexpected synthetic upgrade result: {other}"),
         }
@@ -67,7 +67,7 @@ async fn n10_four_bound_sessions_spill_only_one_to_a_fresh_reset_account() {
         1,
         "one successful spill, not a vacuous all-refused cap"
     );
-    assert_eq!(timed_out, 3);
+    assert_eq!(http_fallbacks, 3);
     assert!(
         h.state.ws_capacity_waits_for_test() >= waits_before + 4,
         "each existing session must first wait on its source slot"

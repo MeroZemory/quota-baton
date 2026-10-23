@@ -201,7 +201,23 @@ async fn main() {
         } else {
             eprintln!("실패했습니다: {message}");
         }
+        keep_launch_error_visible();
         std::process::exit(1);
+    }
+}
+
+fn keep_launch_error_visible() {
+    use std::io::IsTerminal;
+    // Automated exec/pipe callers must retain their noninteractive exit path.
+    // A terminal launched for the interactive wrapper must not disappear before
+    // the user can read an issuance/model/resume failure.
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("launch-client"))
+        && std::io::stdin().is_terminal()
+        && std::io::stderr().is_terminal()
+    {
+        eprintln!("실행하지 못했습니다. 위 오류를 확인한 뒤 Enter 키를 누르면 닫습니다.");
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
     }
 }
 

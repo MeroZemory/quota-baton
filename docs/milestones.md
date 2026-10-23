@@ -105,7 +105,7 @@ Long waits and work that needs no build run as background lanes (W) with one com
 | N5c R13 E urgent policy (`on_5h_limit`, `--urgent`, CLI and dashboard toggle; 7d always moves) | S1 | none | `impl/r13-urgent` | policy tests, CLI tests, real-path capture |
 | N10 automatic outside-use detection and bounded WS capacity spill | S1; research in W | D30; no user settings | `impl/n10` after N5c | rising usage without qb traffic marks outside use; own traffic never marks; clean window clears; marked accounts reject running-session moves and are last-resort new placements; own-slot wait then D20-charged spill, at most one per reset target before fresh evidence; source-only access-program research |
 | N5d R13 E native-client resume after reset (Codex `/goal resume` only for a live goal; Claude continue) | S1 | none | `impl/r13-native-resume` | time-box close: passing unit/HTTP decision checks, running goal only and exactly once; full native acceptance deferred to N5d-native |
-| N5d-native full native reset continuation | S1 follow-up | supervisor resumes native acceptance scope | existing staged entry; no new harness in the current time-box | actual product-entry smoke and running-goal-only exactly-once evidence before ordinary activation; paused goals never resume |
+| N5d-native full native reset continuation | S1 next after R13.G | R13.G gate; supervisor re-prioritized native acceptance | existing staged entry | actual product-entry smoke and running-goal-only exactly-once evidence before ordinary activation; paused goals never resume |
 | N5i R13 C+E integration and defaults | S1 | N5a-c plus bounded N5d decision checks and N5m table | `impl/r13-native-resume` | focused gate, former WS timeout target once and first-click UIA once; native fallback remains disabled in ordinary builds; then S2 install |
 | N3 R9.5 move progress, interruption safety, readable preview | S1 | none | `impl/r9.5`, brief R9.5-move-progress.md | golden ko/en output, Ctrl+C tests per step, finish/rollback after a kill |
 | N4 R12.11 canary version timeout | S1 | none | `impl/r12.11` (proposal kept) | slow-version, timeout-to-cache and unparseable regressions |
@@ -115,7 +115,7 @@ Long waits and work that needs no build run as background lanes (W) with one com
 | N12 API-key pools (O14), see [below](#api-key-pools-n12) | S1 | owner decision O14 (pool order and spend consent); not ready until then | `impl/n12` | mixed-pool replay of the C6.4 incident; no paid request while an eligible subscription account exists (option 2); cap reached means unavailable, never overspent |
 | Held | R2 Part B (retire-cpa) | user decision | — | — |
 
-**Current S1 order** (importance; change it only when importance changes): N1, N2, N6, N5a, N5b, N5c, N10, N5d bounded close, N5i, N11 stale fixtures, N3, N4, N6t, N7 UI, N8, N6r (when its inputs exist).
+**Current S1 order** (remaining ready work, supervisor priority): R13.G six-stall repair, N5d-native, N6t, N7 UI, N8, N6r (when its inputs exist). Earlier N1–N6 minimum, N5a–c, N10, N5d bounded close, N5i, N11, N3 and N4 deliveries are preserved in the gate records.
 
 **Start now in W:** N5m and the N7 backtest.
 
@@ -234,6 +234,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-23 22:41 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | R13.UI 한 줄 배치 관문 통과·N5i 주 경로 설치 수용; 전체 native fallback은 후속 |
 | 2026-10-23 23:19 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | R9.5 진행·안전한 중단·명시적 복구 관문 완료; native 전체 수용·통합 예측은 후속 |
 | 2026-10-23 23:38 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | R9.6 미리보기 제목·단일 출력 집중 관문 완료; 보호·native 전체 수용·통합 예측 범위는 동일 |
+| 2026-10-24 04:37 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | R13.G 여섯 정지 원인 집중 관문·설치 인계; 전체 native fallback 미수용이므로 출시 수 유지 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -451,6 +452,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-24 02:13 | N6t 저장소·핀 근거 단위 | 소유자28·pin6·store20·실제 HTTP39/WS4·정적2 통과(helper1 제외) | 실제 자격증명/부재·generation·핀 owner/revision·변경 전 폐기 검증 | 기본/testkit strict lint0·제거 대조4 intended red·정확 복원; n6t-store-pin/completion.json. 전체 N6t·replay 미완료 |
 
 | 2026-10-24 02:55 | N6t 필수 owner MoveReason·단일 rebind | owner35·anchor6·runtime6·정적2/반례67 통과, 기본 core strict lint·fmt0 | 승인 전 근거·정확 permit·정책/배정/예산 보존 | 앵커 복구·Strict fence·D20·Rebalance 보완; semantic red4/정확복원·private compile red2/복원0. n6t-rebind/completion.json; 전체 관문·실제 replay 별도 |
+| 2026-10-24 04:37 | R13.G 한도·용량·launch·재개 | 코어11·R11 HTTP10·native-owner HTTP2·실제 WS4·콘솔1; 영향 범위 회귀·기본/testkit strict lint·build/read-only check0 | 여섯 사용자 정지 형태와 strict·모델 권한·기존 이동 보호 보존 | 코드89346c5; R13.G-evidence/delivery-fingerprint.json. 확대 실행 실패 원인과 focused 복구 보존, 전체 matrix·실제24h replay 주장 없음 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
@@ -458,7 +460,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 |---|---|---|---|
 | 이동 보호 구조 | runtime breaker 설치, typed rebind 미완료 | owner 증거가 있는 단일 변경점·정적 쓰기 차단 | N6t 진행 |
 | 제공자 통합 예측 | 잔여량·속도 차트 제공, pooled runway 미출시 | 24시간 backtest 후 통합 예측 | N7 backtest와 UI |
-| Native fallback·실제 replay | 주 경로 설치 수용, 전체 native 미수용·export 대기 | N5d-native 후속 수용 및 epoch별24시간 비교 | 일반 native fallback 비활성 유지; N6r 입력 도착 뒤 비교 |
+| Native fallback·실제 replay | R13.G 집중 관문 완료·설치 인계, 전체 native 미수용 | N5d-native 수용 및 epoch별24시간 비교 | 다음 N5d-native; 일반 native fallback은 수용 전 비활성 유지 |
 <!-- gaps:end -->
 
 R11 Windows process/crash focused verification uses `cargo test -p quota-baton --all-features --test r9_crash --no-fail-fast -- --test-threads=4`. It still runs cases concurrently and preserves every in-case race, kill checkpoint, 20-second command deadline and five-second reap deadline. Default high-concurrency deadline failures and diagnostic traces remain cited; the bounded run is not a claim that the default-load timing issue was fixed. No product timing or ownership workaround was added.

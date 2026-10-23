@@ -231,6 +231,7 @@ pub enum MoveReason {
     LaunchModel,
     ModelChoice,
     Forced,
+    FiveHourFarMove,
     ColdRebalance,
     ResetHoldTimeout,
     Overload,

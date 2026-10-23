@@ -491,6 +491,7 @@ impl Runtime {
             "launch_model" => MoveReason::LaunchModel,
             "model_choice" => MoveReason::ModelChoice,
             "forced" => MoveReason::Forced,
+            "five_hour_far_move" => MoveReason::FiveHourFarMove,
             "cold_rebalance" => MoveReason::ColdRebalance,
             "reset_hold_timeout" => MoveReason::ResetHoldTimeout,
             "overload" => MoveReason::Overload,

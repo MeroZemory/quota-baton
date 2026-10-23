@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::sync::{
     Arc, Mutex, MutexGuard, OnceLock, Weak,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicI64, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -114,6 +114,7 @@ struct Entry {
     last_activity: Instant,
     pins: usize,
     deferred_owner: Weak<DeferredOwner>,
+    binding_activity: Arc<AtomicI64>,
 }
 
 impl Entry {
@@ -210,6 +211,9 @@ impl LaunchTokenRegistry {
                     last_activity: now,
                     pins: 0,
                     deferred_owner: Weak::new(),
+                    binding_activity: Arc::new(AtomicI64::new(
+                        chrono::Utc::now().timestamp_millis(),
+                    )),
                 });
                 return Ok(token);
             }
@@ -223,6 +227,29 @@ impl LaunchTokenRegistry {
         self.0.lock().remove(&token_digest(token.expose_secret()));
     }
 
+    /// Attach only after authoritative placement, on the blocking issue worker.
+    /// Release the registry lock before binding registration. Pins thereafter
+    /// publish activity atomically without acquiring any binding locks.
+    pub(crate) fn bind_activity(
+        &self,
+        token: &LaunchToken,
+        table: &Arc<crate::bindings::BindingTable>,
+    ) {
+        let activity = self
+            .0
+            .lock()
+            .get(&token_digest(token.expose_secret()))
+            .map(|entry| {
+                (
+                    entry.metadata.binding_anchor_key.clone(),
+                    entry.binding_activity.clone(),
+                )
+            });
+        if let Some((anchor, stamp)) = activity {
+            table.bind_launch_activity(&anchor, &stamp);
+        }
+    }
+
     /// Atomically validate and pin. Each request obtains its own non-cloneable guard.
     /// Missing/expired failures are for the caller to apply only when a token is needed.
     pub fn get_or_pin(&self, token: &str) -> Result<LaunchPin, LaunchTokenError> {
@@ -234,6 +261,9 @@ impl LaunchTokenRegistry {
             .pins
             .checked_add(1)
             .ok_or(LaunchTokenError::PinCapacity)?;
+        entry
+            .binding_activity
+            .fetch_max(chrono::Utc::now().timestamp_millis(), Ordering::Release);
         Ok(LaunchPin {
             inner: Arc::clone(&self.0),
             digest,
@@ -436,6 +466,9 @@ impl Drop for LaunchPin {
         if let Some(entry) = entries.get_mut(&self.digest) {
             entry.pins -= 1;
             entry.last_activity = entry.last_activity.max((self.inner.clock)());
+            entry
+                .binding_activity
+                .fetch_max(chrono::Utc::now().timestamp_millis(), Ordering::Release);
         }
     }
 }

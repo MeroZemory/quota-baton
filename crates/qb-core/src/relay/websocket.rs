@@ -232,6 +232,7 @@ pub(super) async fn upgrade(state: Arc<RelayState>, request: Request) -> Respons
             std::time::Instant::now() + Duration::from_secs(state.ws_upgrade_hold_secs)
         });
     completion.precommit_deadline = Some(deadline);
+    completion.record.timeout_phase = Some("launch_resolution".into());
     let timeout = deadline.saturating_duration_since(std::time::Instant::now());
     let response = tokio::time::timeout(timeout, async {
         tokio::select! {
@@ -250,6 +251,9 @@ pub(super) async fn upgrade(state: Arc<RelayState>, request: Request) -> Respons
         )
     });
     completion.record.status = response.status().as_u16();
+    if response.status() != StatusCode::GATEWAY_TIMEOUT {
+        completion.record.timeout_phase = None;
+    }
     let local_rate_timeout = completion.record.outcome == "rate_wait_timeout";
     completion.finish(if local_rate_timeout {
         "rate_wait_timeout"
@@ -313,6 +317,7 @@ async fn upgrade_inner(
             if info.managed {
                 // The upgrade has no body model. Use the effective launch model;
                 // each response.create is admitted separately by the pump.
+                completion.record.timeout_phase = Some("source_model_admission".into());
                 match state.admit_data_model(&info, None, launch_deadline).await {
                     Ok(Some(model)) => {
                         session.model = Some(model.clone());
@@ -330,6 +335,7 @@ async fn upgrade_inner(
         Ok(None) => None,
         Err(error) => return http_data::error(completion, error),
     };
+    completion.record.timeout_phase = Some("project_admission".into());
     if state
         .prepare_project(
             &session,
@@ -376,6 +382,7 @@ async fn upgrade_inner(
         .unwrap_or(deadline);
     let mut quota_source: Option<String> = None;
     let mut own_wait: Option<capacity::OwnWait> = None;
+    let mut capacity_wait_deadline = None;
     let (upstream, upstream_headers, account, tokens, capacity_permit) = 'accounts: loop {
         if tried.len() == 4 {
             if let Some(id) = quota_source.take() {
@@ -392,6 +399,7 @@ async fn upgrade_inner(
         }
         // Recovery authority precedes any capacity queue. The source remains
         // only a hint; final selection and spill admission revalidate it.
+        completion.record.timeout_phase = Some("binding_authority".into());
         let binding_hint = {
             let table = state.bindings.clone();
             let key = session.key.clone();
@@ -433,7 +441,7 @@ async fn upgrade_inner(
         if own_wait.is_none()
             && let Some(source) = source.as_deref().filter(|source| !tried.contains(*source))
         {
-            own_wait = capacity::OwnWait::start(&state.ws_capacity, source, deadline);
+            own_wait = capacity::OwnWait::start(&state.ws_capacity, source, upgrade_deadline);
             if own_wait.is_none() {
                 // A release between the snapshot and start must not exclude the
                 // source after it already regained its own slot.
@@ -448,6 +456,7 @@ async fn upgrade_inner(
             && spill_source.is_none()
         {
             completion.end_attempt();
+            completion.record.timeout_phase = Some("source_capacity".into());
             wait.wait_once(&state.ws_capacity).await;
             continue;
         }
@@ -487,6 +496,7 @@ async fn upgrade_inner(
             )>,
         ));
         let admission_denied = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let own_wait_exhausted = spill_source.is_some();
         let admit = {
             let state = state.clone();
             // The blocking selector must not keep a cancelled upgrade alive.
@@ -565,6 +575,7 @@ async fn upgrade_inner(
             })
         };
         completion.policy_blocked = false;
+        completion.record.timeout_phase = Some("account_selection".into());
         let selected = state
             .select_launch_request_admitted(
                 Provider::Codex,
@@ -625,10 +636,25 @@ async fn upgrade_inner(
                         && capacity_candidate(&state, &session, &tried, &capped).await);
                 if capacity_blocked {
                     completion.end_attempt();
-                    if state.ws_capacity.wait_until(deadline).await {
+                    completion.record.timeout_phase = Some("destination_capacity".into());
+                    // An exhausted own-slot grace already permits the ordinary
+                    // guarded spill attempt above. If it cannot land, HTTP can
+                    // still serve this binding without a socket reservation.
+                    // Unbound/racing admissions get one short queue too; never
+                    // renew it on each selection or consume the connect budget.
+                    let wait_deadline = *capacity_wait_deadline.get_or_insert_with(|| {
+                        let now = std::time::Instant::now();
+                        if own_wait_exhausted {
+                            now
+                        } else {
+                            now + (upgrade_deadline.saturating_duration_since(now) / 2)
+                                .min(Duration::from_millis(250))
+                        }
+                    });
+                    if state.ws_capacity.wait_until(wait_deadline).await {
                         continue;
                     }
-                    return capacity_timeout();
+                    return capacity_http_fallback();
                 }
                 if completion.policy_blocked {
                     return state
@@ -655,6 +681,7 @@ async fn upgrade_inner(
             spill.commit();
         }
         tried.insert(account.id.clone());
+        completion.record.timeout_phase = Some("credential_gate".into());
         let (mut account, mut tokens) = match state
             .tokens
             .before_request(state.store.clone(), state.observability.clone(), account.id)
@@ -681,6 +708,7 @@ async fn upgrade_inner(
         let mut rate_retry_queued = false;
         loop {
             let admission_started = std::time::Instant::now();
+            completion.record.timeout_phase = Some("rate_admission".into());
             let admission = state
                 .accounts
                 .admit_until(&account.id, upgrade_deadline)
@@ -689,6 +717,7 @@ async fn upgrade_inner(
                 u64::try_from(admission_started.elapsed().as_millis()).unwrap_or(u64::MAX),
             );
             let mut forced = admission.forced() || std::time::Instant::now() >= upgrade_deadline;
+            completion.record.timeout_phase = Some("final_model_admission".into());
             if let Some(managed) = &managed
                 && let Err(error) = state
                     .guard_http_launch(managed, &account.id, launch_deadline)
@@ -696,6 +725,7 @@ async fn upgrade_inner(
             {
                 return http_data::error(completion, error);
             }
+            completion.record.timeout_phase = Some("dispatch_admission".into());
             if !state
                 .dispatch_data_allowed(
                     session.key.as_deref(),
@@ -749,6 +779,7 @@ async fn upgrade_inner(
             }
             let observation_asof = state.bindings.begin_usage_observation_for(&account.id);
             let sent_at = std::time::Instant::now();
+            completion.record.timeout_phase = Some("upstream_upgrade".into());
             let result = tokio::time::timeout(
                 Duration::from_secs(300),
                 state.client.get(&url).headers(forwarded).send(),
@@ -806,12 +837,14 @@ async fn upgrade_inner(
                     return network_failure();
                 }
                 if let Some(managed) = &managed {
+                    completion.record.timeout_phase = Some("final_model_admission".into());
                     if let Err(error) = state
                         .guard_http_launch(managed, &account.id, launch_deadline)
                         .await
                     {
                         return http_data::error(completion, error);
                     }
+                    completion.record.timeout_phase = Some("dispatch_admission".into());
                     if !state
                         .dispatch_data_allowed(
                             session.key.as_deref(),
@@ -1233,6 +1266,21 @@ fn handover_response() -> Response {
         .headers_mut()
         .insert("retry-after", HeaderValue::from_static("1"));
     response
+}
+
+fn capacity_http_fallback() -> Response {
+    // Codex 0.163/0.164 core/src/client.rs handles an upgrade HTTP 426
+    // as FallbackToHttp, immediately and for the rest of the session.
+    // 0.163: lines 1961-1964, 2295-2314:
+    // https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/core/src/client.rs#L1961
+    // 0.164: lines 1999-2002, 2327-2346:
+    // https://github.com/openai/codex/blob/rust-v0.164.0/codex-rs/core/src/client.rs#L1999
+    native_error(
+        StatusCode::UPGRADE_REQUIRED,
+        Provider::Codex,
+        "websocket_capacity",
+        "WebSocket capacity is unavailable; retry this request over HTTP.",
+    )
 }
 
 fn capacity_timeout() -> Response {

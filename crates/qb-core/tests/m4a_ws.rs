@@ -659,9 +659,9 @@ async fn r12_9_all_capped_upgrades_expire_without_redial_or_account_failure() {
     );
     let started = std::time::Instant::now();
     let (status, body) = h.error().await;
-    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
-    assert_eq!(body["error"]["type"], "request_timeout");
-    assert!(started.elapsed() >= Duration::from_millis(800));
+    assert_eq!(status, StatusCode::UPGRADE_REQUIRED);
+    assert_eq!(body["error"]["type"], "websocket_capacity");
+    assert!(started.elapsed() >= Duration::from_millis(100));
     assert!(started.elapsed() < Duration::from_secs(3));
     assert_eq!(
         h.fake.state.requests().len(),
@@ -794,9 +794,9 @@ async fn r12_9_losing_actual_upgrade_slot_race_preserves_binding_and_old_create(
         .unwrap()
         .unwrap_err()
     else {
-        panic!("capacity timeout expected")
+        panic!("capacity HTTP fallback expected")
     };
-    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
     assert_eq!(
         h.state
             .bindings
@@ -1024,25 +1024,20 @@ async fn r12_9_healthy_strict_anchor_waits_for_own_slot_despite_free_other_accou
     h.fake.state.keep_old_connections();
     let mut anchor = learn_one_socket_cap(&h, &h.ids[0], "synthetic-ws-session").await;
     routing_ws::strict(&h).await;
-    let (collected, resume) = h.state.pause_next_ws_selection();
+    let (waiting, resume) = h.state.pause_next_ws_own_wait();
     let request = h.request();
     let pending = tokio::spawn(async move { connect_async(request).await });
-    collected.await.unwrap();
-    let before = h.fake.state.requests().len();
-    resume.send(()).unwrap();
-    assert!(
-        tokio::time::timeout(Duration::from_millis(150), async {
-            while !pending.is_finished() {
-                tokio::task::yield_now().await;
-            }
-        })
+    tokio::time::timeout(Duration::from_secs(1), waiting)
         .await
-        .is_err(),
-        "strict capped anchor must wait"
-    );
+        .expect("strict upgrade must enter its own-slot grace")
+        .unwrap();
+    let before = h.fake.state.requests().len();
+    assert!(!pending.is_finished(), "strict capped anchor must wait");
     assert_eq!(h.fake.state.requests().len(), before);
     anchor.close(None).await.unwrap();
     drop(anchor);
+    capacity_count(&h, &h.ids[0], 0).await;
+    resume.send(()).unwrap();
     let (mut replacement, response) = tokio::time::timeout(Duration::from_secs(3), pending)
         .await
         .unwrap()
