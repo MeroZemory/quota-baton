@@ -2098,6 +2098,28 @@ impl BindingTable {
         })
         .map(|b| b.account.clone())
     }
+
+    /// Source identities to check in the store, including a durable anchor
+    /// whose live binding was pruned. This list itself grants no authority.
+    pub(crate) fn recovery_sources(
+        &self,
+        provider: Provider,
+        key: Option<&str>,
+    ) -> BTreeSet<String> {
+        let d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sources = BTreeSet::new();
+        if let Some(key) = key {
+            if let Some(anchor) = self.policies.plan(launch::policy_key(&d, Some(key))).anchor {
+                sources.insert(anchor);
+            }
+            if let Some(entry) = d.groups.get(group(key)) {
+                sources.insert(entry.account.clone());
+            }
+        } else if let Some(source) = d.sticky.get(provider.as_str()) {
+            sources.insert(source.clone());
+        }
+        sources
+    }
     #[cfg(test)]
     pub(crate) fn fill_deferred_watch_slots_for_test(&self) {
         let mut data = self.data.lock().unwrap();
@@ -2818,6 +2840,21 @@ impl BindingTable {
             return Decision::None;
         }
         if !admission.valid_for(admitted_from.as_deref(), &account) {
+            return Decision::None;
+        }
+        if !admission.valid_pin_for(provider, key, &account) {
+            return Decision::None;
+        }
+        if !admission.valid_store_for(
+            admitted_from.as_deref(),
+            admitted_from.as_deref().and_then(|id| {
+                move_evidence
+                    .iter()
+                    .find(|candidate| candidate.account.id == id)
+                    .map(|candidate| &candidate.account)
+            }),
+            &account,
+        ) {
             return Decision::None;
         }
         if !admission.valid_failure_for(

@@ -1,4 +1,6 @@
 use super::{Account, Health, Tokens, crypto, lease::Lease};
+mod selection;
+pub(crate) use selection::StoreUnavailableEvidence;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, OpenOptions},
@@ -63,6 +65,7 @@ pub struct AccountStore {
     gate: Mutex<()>,
     observer: Mutex<Option<AccountObserver>>,
     pre_mutation: Mutex<Option<PreMutationHook>>,
+    selection: Arc<selection::SelectionOwner>,
     lease: Mutex<Option<Lease>>,
     writes_stopped: AtomicBool,
 }
@@ -180,6 +183,7 @@ impl AccountStore {
             gate: Mutex::new(()),
             observer: Mutex::new(None),
             pre_mutation: Mutex::new(None),
+            selection: Arc::new(selection::SelectionOwner::default()),
             lease: Mutex::new(Some(lease)),
             writes_stopped: AtomicBool::new(false),
         };
@@ -246,6 +250,7 @@ impl AccountStore {
         if id.is_some_and(|id| self.path(id).is_err()) {
             return;
         }
+        self.selection.revoke(id);
         let hook = self
             .pre_mutation
             .lock()
@@ -417,6 +422,7 @@ impl AccountStore {
             }
             MetadataCause::UsageReport(report) => {
                 if self.path(id).is_ok() {
+                    self.selection.revoke(Some(id));
                     report.before_store_mutation(id);
                 }
             }
@@ -462,6 +468,35 @@ impl AccountStore {
     pub fn tokens(&self, account: &Account) -> Result<Tokens, StoreError> {
         let _guard = self.transaction()?;
         self.tokens_unlocked(account)
+    }
+
+    /// Same credential read as ordinary collection. A generation race is not
+    /// evidence of unusable credentials and cannot authorize relocation.
+    pub(crate) fn selection_credentials(
+        &self,
+        account: &Account,
+    ) -> (bool, Option<StoreUnavailableEvidence>) {
+        let Ok(_guard) = self.transaction() else {
+            return (false, None);
+        };
+        if self.writes_stopped() {
+            return (false, None);
+        }
+        match self.tokens_unlocked(account) {
+            Ok(tokens) if !tokens.access_token.is_empty() => (true, None),
+            Err(StoreError::GenerationConflict { .. }) => (false, None),
+            _ => (false, Some(self.selection.credential(account))),
+        }
+    }
+
+    /// A successful lookup of actual absence, never absence from a candidate
+    /// list. Mutation revokes the fact before a replacement can be written.
+    pub(crate) fn selection_absence(&self, id: &str) -> Option<StoreUnavailableEvidence> {
+        let _guard = self.transaction().ok()?;
+        if self.writes_stopped() {
+            return None;
+        }
+        matches!(self.read(id), Err(StoreError::NotFound)).then(|| self.selection.absent(id))
     }
 
     pub(crate) fn tokens_unlocked(&self, account: &Account) -> Result<Tokens, StoreError> {
@@ -1447,6 +1482,7 @@ mod tests {
             gate: Mutex::new(()),
             observer: Mutex::new(None),
             pre_mutation: Mutex::new(None),
+            selection: Arc::new(selection::SelectionOwner::default()),
             lease: Mutex::new(None),
             writes_stopped: AtomicBool::new(false),
         };
