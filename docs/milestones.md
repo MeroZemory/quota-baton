@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: N5d-native HTTP 집중 관문 종료·N6t 준비
-목표: 추가 사용자 입력 없는 native HTTP 재개·반복2회·pause 대조 검증 완료; 기본 WS·Claude 호환성은 관문 질문, 독립 N6t 진행
+현재 마일스톤: R14 N6t 관문 완료 · 다음 Codex WS 재개 생산 경로
+목표: 모든 이동의 소유자 근거·단일 변경점·정적 쓰기 차단 관문 통과; WS 전체 사용량 조회·실제 전송 근거 연결
 핵심 지표: 남은 출시 1/3 (R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측); 주 경로 설치 수용·native fallback 후속
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-24 07:14 KST (HTTP 집중 수용만; 일반 native 자동 재개 비활성)
+갱신: 2026-10-24 08:40 KST (N6t 관문 완료·병합 인계; 설치는 설계 세션)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -115,7 +115,7 @@ Long waits and work that needs no build run as background lanes (W) with one com
 | N12 API-key pools (O14), see [below](#api-key-pools-n12) | S1 | owner decision O14 (pool order and spend consent); not ready until then | `impl/n12` | mixed-pool replay of the C6.4 incident; no paid request while an eligible subscription account exists (option 2); cap reached means unavailable, never overspent |
 | Held | R2 Part B (retire-cpa) | user decision | — | — |
 
-**Current S1 order** (remaining ready work, supervisor priority): N5d-native (R13.G installed), N6t, N7 UI, N8, N6r (when its inputs exist). Earlier N1–N6 minimum, N5a–c, N10, N5d bounded close, N5i, N11, N3 and N4 deliveries are preserved in the gate records.
+**Current S1 order** (remaining ready work, supervisor priority): R13.G six-stall repair, N5d-native, N6t, N7 UI, N8, N6r (when its inputs exist). Earlier N1–N6 minimum, N5a–c, N10, N5d bounded close, N5i, N11, N3 and N4 deliveries are preserved in the gate records.
 
 **Start now in W:** N5m and the N7 backtest.
 
@@ -236,6 +236,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-23 23:38 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | R9.6 미리보기 제목·단일 출력 집중 관문 완료; 보호·native 전체 수용·통합 예측 범위는 동일 |
 | 2026-10-24 04:37 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | R13.G 여섯 정지 원인 집중 관문·설치 인계; 전체 native fallback 미수용이므로 출시 수 유지 |
 | 2026-10-24 07:14 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | native HTTP 무조회·반복2회·pause 집중 관문 통과, WS·Claude 전체 미수용·일반 활성화 없음 |
+| 2026-10-24 08:40 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | N6t 단일 근거형 이동 경로 관문 통과; 입력별 전체 검사·실패 집중 보완 지문 보존. 실제24시간 replay와 일반 native 활성화 별도 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -445,19 +446,29 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-23 22:41 | R13.UI 세션 밀도 복구 | 이전70→35 DIP·KO/EN 1024/1320·tray345·실제 HWND4개 | 기존 행 높이와 28 DIP 클릭/UIA 보존 | 기본/testkit strict tray lint·fmt·확인된 상태 변경·임시 홈 정리 통과 |
 | 2026-10-23 23:19 | R9.5 합성 실제 CLI·시작 안내 | 복구59·일반 CLI19·표시9·진행8 통과; 안내31–78 ms 상한 | 즉시 안내200 ms 미만·기존 이동 불변식 유지 | strict 기본/testkit CLI lint·제품 build·실제 read-only launch check0; stale native stub은 dev 소스 대조로 분리 |
 | 2026-10-23 23:38 | R9.6 제목·미리보기 | 표시·진행·헤더39·이동복구59·실제 CLI20 통과, timing1 제외 | 한영48칸·단일표 숨김·본문 보호 | 기본/testkit strict lint·제품 build·read-only launch check0; 폭 제한 제거 red101·정확 복원 green0 |
+| 2026-10-23 23:58 | N6t 봉인·쓰기 검사 단위 | bindings192·정적검사2(67 fixture) 통과·직접쓰기/영수증위조 컴파일 반례101→복원0 | 계정 필드 무단 변경 차단·스냅샷 보존 | lib·정적 검사 strict lint 통과; owner MoveReason·N6t 관문·실제24시간 replay 미완료 |
+| 2026-10-24 00:14 | N6t health 증거 단위 | bindings193·health15·정적2 통과; 증거검증 제거 red101·외부 생성 E0451·정확 복원 | 제외/WS 용량은 health 근거 아님; 모델 scope·만료·기존 drain 예외 보존 | cbedc86·strict core all-targets lint0; 전체 MoveReason·N6t 관문·실제 replay 미완료 |
+| 2026-10-24 00:40 | N6t WS 용량 증거 전달 단위 | 집중267통과(소유자5·bindings193·정적2·실제WS34·HTTP33), 검사 helper1제외 | 정확한 예약 활성·출발/목적지·owner 검증, 거부 시 정책/배정/예산 보존 | 기본/testkit strict core all-targets lint·의도한 red3개·정확 복원; n6t-capacity/completion.json. 전체 N6t 관문·실제 replay 미완료 |
+| 2026-10-24 01:04 | N6t C7 재분산 근거 단위 | bindings196(소유자3 포함)·정적2·실제 HTTP2·WS18 통과, helper1 제외 | 유휴·과부하 근거를 세션/출발/목적지/모델/시각에 고정 | 기본/testkit strict lint·의도한 red3·정확 복원; n6t-selection/completion.json. 전체 N6t·replay 미완료 |
+| 2026-10-24 01:42 | N6t 실패·재연결·모델 동의 근거 단위 | 소유자21·HTTP37·정적2 통과; WS143/1 뒤 해당403 3건·unkeyed2건 통과, 동의 compile-fail1 통과 | 실제 실패·세션/모델/기한·생존성·동의 revision 고정; 기본/testkit strict lint0 | 제거 대조3건 intended red·정확 복원; n6t-recovery-consent/completion.json. 전체 N6t·replay 미완료 |
+| 2026-10-24 02:13 | N6t 저장소·핀 근거 단위 | 소유자28·pin6·store20·실제 HTTP39/WS4·정적2 통과(helper1 제외) | 실제 자격증명/부재·generation·핀 owner/revision·변경 전 폐기 검증 | 기본/testkit strict lint0·제거 대조4 intended red·정확 복원; n6t-store-pin/completion.json. 전체 N6t·replay 미완료 |
+
+| 2026-10-24 02:55 | N6t 필수 owner MoveReason·단일 rebind | owner35·anchor6·runtime6·정적2/반례67 통과, 기본 core strict lint·fmt0 | 승인 전 근거·정확 permit·정책/배정/예산 보존 | 앵커 복구·Strict fence·D20·Rebalance 보완; semantic red4/정확복원·private compile red2/복원0. n6t-rebind/completion.json; 전체 관문·실제 replay 별도 |
 | 2026-10-24 04:37 | R13.G 한도·용량·launch·재개 | 코어11·R11 HTTP10·native-owner HTTP2·실제 WS4·콘솔1; 영향 범위 회귀·기본/testkit strict lint·build/read-only check0 | 여섯 사용자 정지 형태와 strict·모델 권한·기존 이동 보호 보존 | 코드89346c5; R13.G-evidence/delivery-fingerprint.json. 확대 실행 실패 원인과 focused 복구 보존, 전체 matrix·실제24h replay 주장 없음 |
 | 2026-10-24 05:16 | N5d-native 실제 원격 연결 보완 | native0.164 비root 거절→root TCP·bearer 확인, 제품 parent 진입·429·stopped 관측; 테스트102·testkit strict lint0 | 단일접속·인증·원래 argv 보존; 일반 활성화 없음 | R13-evidence/n5d-native-start; reset 후 progress는 아직 실패·core Observed0으로 다음 원인 확인 중 |
 | 2026-10-24 05:50 | N5d-native 대화 소유·한도 본문 보완 | CLI105·코어11·실제HTTP2 통과; testkit core/CLI strict lint0; 제목/구독/본문 제거 대조3건 정확 red→복원 | 실제 제품 Observed→Inspect→Consume→ACK 및 동일 UUID reset 후200 관측 | 44d437c·94c568f; 정상 종료 실패 보존, 일반 활성화·전체 native 수용 아님 |
 | 2026-10-24 06:29 | N5d-native 정상 종료·자동 쓰기 취소 | CLI116·기본/testkit strict lint·fmt·제품 build0; 정확 제거 대조3건101→복원61통과; 실제 재개1·pause1·각 종료0/loss없음 | 실제 제품 parent와 독립 Sol 검수로 EOF/Consume·늦은 dispatch·PeerClosed/Watchdog 경합 보완 | 2b9ba38·531c61b; eof-unit-fingerprint.json, physical164-33·paused164-3. HTTP fallback만, 전체 native 수용·일반 활성화 아님 |
 | 2026-10-24 07:14 | N5d-native 무조회·반복 HTTP 집중 관문 | CLI169·proto5·core13 통과; strict CLI/core lint·fmt·build0; 실제 무조회1·반복2·pause0재개·각 exit0 | 실제 제품 parent→native0.164→core→합성 HTTP, 원래 reset·동일 UUID 보존 | 757c1a3; stop-read-unit-1·rearm-lint-2 지문, unqueried164-2·paused164-4·repeated164-2. baseline 무조회 실패 및 반복 첫 시간봉투 실패 보존, WS·Claude·일반 활성화 별도 |
+| 2026-10-24 07:30 | N6t dev 결합 보완 집중 검증 | core1080·정적2/67반례·실제HTTP5/WS4·row6a1·native HTTP2 통과, strict core 기본/전체 lint·fmt0 | typed 권위 보존·5h 먼 한도 사유·현재/신규 모델 동의 구분 | a2eca02·06d1596; label hook 제거101→정확복원, 독립 Sol source PASS. dev 활동 연산4개만 manifest 추가(275 distinct), 전체 관문 다음 |
+| 2026-10-24 08:40 | N6t 최종 관문 | 기본3154통과/3실패→영향 HTTP118·정책75통과; 전체3550통과/1실패→런처 기본·전체각1통과; 코어1203통과 | owner 증거·정적67반례·실제 HTTP/WS·기본/전체 strict lint·읽기 전용 check | ed2cb87; n6t-close-fingerprint.json 입력별 재사용, 원본 실패 보존. 새 전체 green 합계로 주장하지 않음; N6r 별도 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
 | 빈칸 | 현재 값 | 필요한 값 | 다음 행동 |
 |---|---|---|---|
-| 이동 보호 구조 | runtime breaker 설치, typed rebind 미완료 | owner 증거가 있는 단일 변경점·정적 쓰기 차단 | N6t 진행 |
+| 이동 보호 구조 | runtime breaker 설치·typed rebind 관문 완료 | epoch별 실제24시간 차등 재생 | N6r export 검증 및 비교 |
 | 제공자 통합 예측 | 잔여량·속도 차트 제공, pooled runway 미출시 | 24시간 backtest 후 통합 예측 | N7 backtest와 UI |
-| Native fallback·실제 replay | native HTTP 무조회·반복2회·pause 통과, 기본 WS·Claude 미수용 | 호환성 결정·전체 수용 및 epoch별24시간 비교 | 관문 질문 전달·독립 N6t 진행; 일반 활성화 비활성 유지 |
+| Native fallback·실제 replay | native HTTP 무조회·반복2회·pause 통과, 기본 WS·Claude 미수용 | D26 amendment2 WS producer·안전한 활성화 및 epoch별24시간 비교 | WS producer·일반 활성화 비활성 유지 |
 <!-- gaps:end -->
 
 R11 Windows process/crash focused verification uses `cargo test -p quota-baton --all-features --test r9_crash --no-fail-fast -- --test-threads=4`. It still runs cases concurrently and preserves every in-case race, kill checkpoint, 20-second command deadline and five-second reap deadline. Default high-concurrency deadline failures and diagnostic traces remain cited; the bounded run is not a claim that the default-load timing issue was fixed. No product timing or ownership workaround was added.

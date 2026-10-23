@@ -571,7 +571,10 @@ async fn policy_edit_interrupts_reset_hold_instead_of_waiting_for_obsolete_deadl
     };
     let start = Instant::now();
     let (reply, ()) = tokio::join!(waiting, edit);
-    assert_eq!(reply.0, 409);
+    // Strict preserves its bound account's limit after interrupting the hold.
+    assert_eq!(reply.0, 429);
+    let body: Value = serde_json::from_slice(&reply.2).unwrap();
+    assert_eq!(body["error"]["type"], "usage_limit_reached");
     assert!(start.elapsed() < Duration::from_secs(3));
     assert_eq!(h.fake.state.requests().len(), 1);
 }

@@ -233,7 +233,7 @@ impl RelayState {
         // guard and through publication. A later adoption must reject this
         // choice before reserving capacity or publishing policy/bindings.
         let admit = Arc::new(move |account: &str| {
-            weak_owner.upgrade().is_some()
+            let allowed = weak_owner.upgrade().is_some()
                 && deadline.is_none_or(|at| Instant::now() < at)
                 && relay.upgrade().is_some_and(|relay| {
                     !relay.is_draining()
@@ -245,8 +245,14 @@ impl RelayState {
                                     && info.canonical_key == key
                                     && info.account == expected
                             })
-                })
-                && admit.as_ref().is_none_or(|admit| admit(account))
+                });
+            if !allowed {
+                return None;
+            }
+            admit.as_ref().map_or_else(
+                || Some(crate::bindings::DispatchAdmission::ordinary()),
+                |admit| admit(account),
+            )
         });
         let selected = self
             .select_request_configured(

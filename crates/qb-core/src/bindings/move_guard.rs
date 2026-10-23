@@ -160,6 +160,35 @@ pub(crate) struct Permit {
     destination_evidence: u64,
 }
 
+/// Minted only by a successful breaker commit. Neither selectors nor storage
+/// can invent this receipt from a reason string or a candidate identifier.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct CommittedMove {
+    key: String,
+    from: String,
+    to: String,
+}
+
+impl CommittedMove {
+    pub(super) fn source_for(&self, to: &str) -> Option<&str> {
+        (self.to == to).then_some(self.from.as_str())
+    }
+
+    pub(super) fn allows(&self, from: &str, to: &str) -> bool {
+        self.from == from && self.to == to
+    }
+
+    pub(super) fn for_group(&self, key: &str) -> bool {
+        self.key == key
+    }
+}
+
+impl Permit {
+    pub(super) fn applies_to(&self, key: &str, from: &str, to: &str, now: DateTime<Utc>) -> bool {
+        self.key == key && self.from == from && self.to == to && self.at == now
+    }
+}
+
 impl Breaker {
     fn prune(&mut self, now: DateTime<Utc>) -> DateTime<Utc> {
         let now = self.last_now.map_or(now, |prior| now.max(prior));
@@ -178,10 +207,65 @@ impl Breaker {
         now
     }
 
-    /// `fresh_unusable` and capacity fingerprints are supplied by the owning
-    /// runtime modules, not parsed from the proposed reason string.
+    /// Production callers must supply a judgement from the health owner.
+    /// A missing/filtered source or a reason string cannot mint this authority.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_observed(
+        &mut self,
+        limits: &Limits,
+        key: &str,
+        from: &str,
+        to: &str,
+        departure_evidence: u64,
+        destination_evidence: u64,
+        source_unusable: Option<&crate::accounts::health::UnusableEvidence>,
+        observations: Observations,
+        now: DateTime<Utc>,
+    ) -> Result<Permit, Denied> {
+        self.prepare_checked(
+            limits,
+            key,
+            from,
+            to,
+            departure_evidence,
+            destination_evidence,
+            source_unusable.is_some_and(|proof| proof.applies_to(from, now)),
+            observations,
+            now,
+        )
+    }
+
+    // Raw booleans exist only in breaker algorithm fixtures, never at the
+    // production binding boundary.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare(
+        &mut self,
+        limits: &Limits,
+        key: &str,
+        from: &str,
+        to: &str,
+        departure_evidence: u64,
+        destination_evidence: u64,
+        source_unusable: bool,
+        observations: Observations,
+        now: DateTime<Utc>,
+    ) -> Result<Permit, Denied> {
+        self.prepare_checked(
+            limits,
+            key,
+            from,
+            to,
+            departure_evidence,
+            destination_evidence,
+            source_unusable,
+            observations,
+            now,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_checked(
         &mut self,
         limits: &Limits,
         key: &str,
@@ -299,11 +383,20 @@ impl Breaker {
 
     /// Call only after policy/admission success, just before changing the group.
     /// The mutation gate excludes other commits/clear/rename in between.
-    pub(crate) fn commit(&mut self, permit: Permit, actual_to: &str) -> Result<(), Refusal> {
+    pub(super) fn commit(
+        &mut self,
+        permit: Permit,
+        actual_to: &str,
+    ) -> Result<CommittedMove, Refusal> {
         if permit.revision != self.revision || permit.to != actual_to || self.revision == u64::MAX {
             return Err(Refusal::StalePermit);
         }
         self.revision += 1;
+        let committed = CommittedMove {
+            key: permit.key.clone(),
+            from: permit.from.clone(),
+            to: permit.to.clone(),
+        };
         let already_counted = permit.shared_incident.as_ref().is_some_and(|key| {
             self.global
                 .iter()
@@ -326,7 +419,7 @@ impl Breaker {
                 to: permit.to,
                 destination_evidence: permit.destination_evidence,
             });
-        Ok(())
+        Ok(committed)
     }
 
     pub(crate) fn recent_moves(&self, now: DateTime<Utc>) -> Vec<super::MoveGuardPair> {
@@ -385,6 +478,58 @@ impl Breaker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn health_owner_proof_is_bound_to_source_and_selection_time() {
+        use crate::accounts::{Health, health::UnusableEvidence};
+        let mut b = Breaker::default();
+        move_at(&mut b, "session", "a", "b", false, 0).unwrap();
+        let now = now() + Duration::seconds(1);
+        let mut account = crate::accounts::health::tests::fixture();
+        account.id = "b".into();
+        account.health = Health::NeedsRelogin {
+            reason: "synthetic revoked".into(),
+            since: now,
+        };
+        let valid = UnusableEvidence::observe(&account, None, true, now).unwrap();
+        let stale =
+            UnusableEvidence::observe(&account, None, true, now - Duration::seconds(1)).unwrap();
+        account.id = "other-account".into();
+        let foreign = UnusableEvidence::observe(&account, None, true, now).unwrap();
+        let observations = Observations::same(Observation::before_collection());
+        for proof in [None, Some(&stale), Some(&foreign)] {
+            assert_eq!(
+                b.prepare_observed(
+                    &Limits::default(),
+                    "session",
+                    "b",
+                    "c",
+                    2,
+                    1,
+                    proof,
+                    observations,
+                    now,
+                )
+                .expect_err("health proof must match source and selection instant")
+                .reason,
+                Refusal::SessionTenMinutes,
+            );
+        }
+        let permit = b
+            .prepare_observed(
+                &Limits::default(),
+                "session",
+                "b",
+                "c",
+                2,
+                1,
+                Some(&valid),
+                observations,
+                now,
+            )
+            .unwrap();
+        b.commit(permit, "c").unwrap();
+    }
     fn now() -> DateTime<Utc> {
         DateTime::from_timestamp(2_000_000_000, 0).unwrap()
     }

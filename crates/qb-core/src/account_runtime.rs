@@ -2,6 +2,8 @@ pub(crate) mod deferred_reset;
 pub(crate) use deferred_reset::{DeferredResetId, DeferredResetStatus};
 mod outside_owner;
 mod outside_usage;
+mod selection;
+pub(crate) use selection::RuntimeUnavailableEvidence;
 mod wait_admission;
 mod wait_owner;
 mod wait_proof;
@@ -946,6 +948,7 @@ pub struct AccountRuntime {
     probes: Mutex<BTreeSet<String>>,
     released_quota: Arc<Mutex<BTreeMap<String, ReleasedQuota>>>,
     volatile: Mutex<BTreeMap<String, Health>>,
+    selection_owner: selection::SelectionOwner,
     inflight: Arc<Mutex<BTreeMap<String, usize>>>,
     poller: Mutex<Option<Weak<crate::quota::UsagePoller>>>,
     refresh_attention: Mutex<BTreeSet<String>>,
@@ -1090,7 +1093,9 @@ impl Drop for Probe {
     fn drop(&mut self) {
         if let Some(runtime) = self.runtime.upgrade()
             && let Ok(mut probes) = runtime.probes.lock()
+            && probes.contains(&self.id)
         {
+            runtime.selection_owner.invalidate();
             probes.remove(&self.id);
         }
     }
@@ -1148,6 +1153,7 @@ impl AccountRuntime {
             probes: Mutex::new(BTreeSet::new()),
             released_quota: Arc::new(Mutex::new(BTreeMap::new())),
             volatile: Mutex::new(BTreeMap::new()),
+            selection_owner: selection::SelectionOwner::default(),
             inflight: Arc::new(Mutex::new(BTreeMap::new())),
             poller: Mutex::new(None),
             refresh_attention: Mutex::new(BTreeSet::new()),
@@ -1734,7 +1740,9 @@ impl AccountRuntime {
                         }
                     )
                 }))
+            && health.contains_key(&account.id)
         {
+            self.selection_owner.invalidate();
             health.remove(&account.id);
         }
         let _=self.events.send(json!({"event":"account_changed","data":{"id":account.id,"health":account.health,"user_state":account.user_state}}));
@@ -1755,9 +1763,11 @@ impl AccountRuntime {
             return Ok(None);
         }
         let mut probes = self.probes.lock().map_err(|_| ProbeBusy)?;
-        if !probes.insert(account.id.clone()) {
+        if probes.contains(&account.id) {
             return Err(ProbeBusy);
         }
+        self.selection_owner.invalidate();
+        probes.insert(account.id.clone());
         Ok(Some(Probe {
             runtime: Arc::downgrade(self),
             id: account.id.clone(),
@@ -1804,6 +1814,7 @@ impl AccountRuntime {
             notices.remove(&account.id);
         }
         if let Ok(mut health) = self.volatile.lock() {
+            self.selection_owner.invalidate();
             health.insert(account.id.clone(), account.health.clone());
         }
         let _=self.events.send(json!({"event":"account_changed","data":{"id":account.id,"health":account.health,"user_state":account.user_state}}));

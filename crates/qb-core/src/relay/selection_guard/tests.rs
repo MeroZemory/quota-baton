@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 
 use crate::{
     accounts::{HealthReason, Provider, UserState},
-    bindings::{BindingTable, Decision},
+    bindings::{BindingTable, Decision, DispatchAdmission, MoveObservations},
     config::RoutingConfig,
 };
 use serde_json::json;
@@ -41,18 +41,26 @@ fn choose(
     now: DateTime<Utc>,
     admission: impl FnOnce(&str) -> bool,
 ) -> Decision {
-    table.choose_with_hold_at_admitted(
+    // Keep the real pin owner alive through selection and commit admission.
+    // The label selects a target; only its scoped evidence authorizes a move.
+    let pins = crate::debug_pin::DebugPins::default();
+    pins.set(Provider::Codex, Some(key.to_owned()), pin.to_owned());
+    let proof = pins.selection(Provider::Codex, Some(key)).unwrap();
+    table.choose_with_hold_at_admitted_proof(
         Provider::Codex,
         Some(key),
         None,
         None,
         candidates,
+        candidates,
+        MoveObservations::untracked(),
         Some(pin),
         100,
         false,
         false,
         now,
-        admission,
+        None,
+        |id| admission(id).then(|| DispatchAdmission::ordinary().with_pin(Some(proof))),
     )
 }
 

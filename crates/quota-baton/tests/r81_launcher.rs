@@ -509,13 +509,16 @@ process.exit(result.status ?? 1);
             "catalog must be released after the child exits"
         );
         assert_eq!(&native[6..], native_args(mode));
-        assert!(
-            !root.join("version-probed").exists(),
-            "ordinary launch probed version"
+        let expect_version_probe =
+            mode == "fresh-empty" && cfg!(all(feature = "testkit", debug_assertions));
+        assert_eq!(
+            root.join("version-probed").exists(),
+            expect_version_probe,
+            "{mode}: native capability version probe expectation"
         );
         assert!(!root.join("nonexistent-home").exists());
         println!(
-            "{mode}: generated launcher, post-start title, exact forwarded arguments, no version probe, exit 37, CODEX_HOME, label and 949/65001/restored949 verified"
+            "{mode}: generated launcher, post-start title, exact forwarded arguments, version probe={expect_version_probe}, exit 37, CODEX_HOME, label and 949/65001/restored949 verified"
         );
     }
 }

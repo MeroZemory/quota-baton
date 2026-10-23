@@ -23,11 +23,16 @@ use std::{
 
 const CAPACITY: usize = 20_000;
 const COUNT_CHANGE_CAPACITY: usize = CAPACITY * 2;
+mod admission;
+mod affinity;
+pub(crate) use admission::DispatchAdmission;
 mod capacity_spill;
 mod launch;
 pub(crate) use capacity_spill::CapacitySpillPermit;
 mod move_guard;
 pub(crate) mod quota_wait;
+mod rebind;
+mod selection;
 pub use launch::{
     LaunchEntitlements, LaunchError, LaunchInfo, LaunchPlacement, LaunchPolicyMove, LaunchRequest,
 };
@@ -405,22 +410,8 @@ impl PlacementState {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct Binding {
-    key: String,
-    account: String,
-    last_used: DateTime<Utc>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    accepted: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    first_seen_at: Option<DateTime<Utc>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    bound_since: Option<DateTime<Utc>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    client_kind: Option<crate::dashboard::ClientKind>,
-    #[serde(skip)]
-    observed_here: bool,
-}
+use affinity::Binding;
+
 #[derive(Serialize, Deserialize)]
 struct Snapshot {
     schema: u32,
@@ -638,6 +629,7 @@ impl BindingTable {
     }
 
     /// All calls occur under mutations, before external admission/dispatch.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn prepare_move(
         &self,
@@ -688,19 +680,26 @@ impl BindingTable {
         // Genuinely missing source evidence cannot grant the fresh-unusable
         // exception. A health poll timestamp is not proof.
         let usable = source.is_some_and(|c| self.move_source_usable(d, key, c, model, now));
-        let unusable = source.is_some() && !usable;
+        let unusable = source_account.as_ref().and_then(|account| {
+            crate::accounts::health::UnusableEvidence::observe(
+                account,
+                model,
+                Self::accepted_in(d, Some(key), &account.id),
+                now,
+            )
+        });
         let result = self
             .move_guard
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .prepare(
+            .prepare_observed(
                 &self.config.move_guard,
                 key,
                 from,
                 to,
                 semantic_evidence(source_account.as_ref()),
                 semantic_evidence(target_account.as_ref()),
-                unusable,
+                unusable.as_ref(),
                 observations,
                 now,
             );
@@ -745,33 +744,6 @@ impl BindingTable {
     ) -> bool {
         effective_account(candidate, d, &self.config, model, now).eligible_at(model, now)
             && (!candidate.account.drain || Self::accepted_in(d, Some(key), &candidate.account.id))
-    }
-    fn commit_move(
-        &self,
-        permit: Option<move_guard::Permit>,
-        to: &str,
-        provider: Provider,
-        key: &str,
-        model: Option<&str>,
-        now: DateTime<Utc>,
-    ) {
-        if let Some(permit) = permit {
-            // Internal invariant: neither clear nor rename can interleave under
-            // mutations. A stale permit never changes a binding.
-            self.move_guard
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .commit(permit, to)
-                .expect("move permit serialized by mutations");
-            if let Some(obs) = self.move_observability()
-                && let Err(error) = obs.committed_move(provider, key, to, model, now)
-            {
-                tracing::warn!(
-                    ?error,
-                    "move cost observation rejected; coverage incomplete"
-                );
-            }
-        }
     }
 }
 
@@ -2099,6 +2071,28 @@ impl BindingTable {
         })
         .map(|b| b.account.clone())
     }
+
+    /// Source identities to check in the store, including a durable anchor
+    /// whose live binding was pruned. This list itself grants no authority.
+    pub(crate) fn recovery_sources(
+        &self,
+        provider: Provider,
+        key: Option<&str>,
+    ) -> BTreeSet<String> {
+        let d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sources = BTreeSet::new();
+        if let Some(key) = key {
+            if let Some(anchor) = self.policies.plan(launch::policy_key(&d, Some(key))).anchor {
+                sources.insert(anchor);
+            }
+            if let Some(entry) = d.groups.get(group(key)) {
+                sources.insert(entry.account.clone());
+            }
+        } else if let Some(source) = d.sticky.get(provider.as_str()) {
+            sources.insert(source.clone());
+        }
+        sources
+    }
     #[cfg(test)]
     pub(crate) fn fill_deferred_watch_slots_for_test(&self) {
         let mut data = self.data.lock().unwrap();
@@ -2643,6 +2637,45 @@ impl BindingTable {
         coverage: Option<&BTreeSet<String>>,
         admit: impl FnOnce(&str) -> bool,
     ) -> Decision {
+        self.choose_with_hold_at_admitted_proof(
+            provider,
+            key,
+            parent,
+            model,
+            candidates,
+            move_evidence,
+            observations,
+            pinned,
+            request_bytes,
+            hold_allowed,
+            hold_timed_out,
+            now,
+            coverage,
+            |account| admit(account).then(DispatchAdmission::ordinary),
+        )
+    }
+
+    /// A capacity admission carries its owner's live reservation evidence.
+    /// Validate it against the actual source resolved under mutations, before
+    /// policy dispatch or any breaker charge/canonical account publication.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn choose_with_hold_at_admitted_proof(
+        self: &Arc<Self>,
+        provider: Provider,
+        key: Option<&str>,
+        parent: Option<&str>,
+        model: Option<&str>,
+        candidates: &[Candidate],
+        move_evidence: &[Candidate],
+        observations: MoveObservations,
+        pinned: Option<&str>,
+        request_bytes: u64,
+        hold_allowed: bool,
+        hold_timed_out: bool,
+        now: DateTime<Utc>,
+        coverage: Option<&BTreeSet<String>>,
+        admit: impl FnOnce(&str) -> Option<DispatchAdmission>,
+    ) -> Decision {
         let _mutation = self.mutations.lock().unwrap_or_else(|e| e.into_inner());
         let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
         for c in candidates {
@@ -2672,7 +2705,7 @@ impl BindingTable {
             coverage: Some(coverage),
             model_move: false,
         });
-        let (choice, mut reason) = self.select_ordered(
+        let (choice, selection) = self.select_ordered(
             &d,
             provider,
             key,
@@ -2684,6 +2717,7 @@ impl BindingTable {
             hold_allowed,
             preference.as_ref(),
         );
+        let mut reason = selection.code();
         let mut account = match choice {
             PreviewDecision::Hold { until } => return Decision::Hold { until },
             PreviewDecision::None => return Decision::None,
@@ -2730,12 +2764,9 @@ impl BindingTable {
             .map(|key| launch::ownership_group(&d, key))
             .map(str::to_owned)
             .unwrap_or_else(|| format!("unidentified:{}", provider.as_str()));
-        let guard_from = previous.as_deref().or_else(|| {
-            key.is_none()
-                .then(|| d.sticky.get(provider.as_str()))
-                .flatten()
-                .map(String::as_str)
-        });
+        let physical_source = self.rebind_source(&d, provider, key);
+        let guard_source = self.rebind_budget_source(&d, provider, key, &account);
+        let guard_from = guard_source.as_deref();
         // Retry exclusion removes a source from selectable candidates, not
         // from the full source evidence. Label before guard/policy publication.
         if reason == "forced"
@@ -2783,6 +2814,12 @@ impl BindingTable {
             Err(denied) => {
                 if let Some(old) =
                     guard_from.and_then(|id| candidates.iter().find(|c| c.account.id == id))
+                    && self
+                        .policies
+                        .plan(launch::policy_key(&d, key))
+                        .anchor
+                        .as_ref()
+                        .is_none_or(|anchor| physical_source.as_ref() == Some(anchor))
                     && self.move_source_usable(&d, &guard_key, old, model, now)
                 {
                     account = old.account.id.clone();
@@ -2796,48 +2833,83 @@ impl BindingTable {
             }
         };
         let policy_key = launch::policy_key(&d, key).map(str::to_owned);
+        let admitted_from = self
+            .policies
+            .plan(policy_key.as_deref())
+            .anchor
+            .or_else(|| physical_source.clone());
         drop(d);
-        if !admit(&account) {
+        let Some(admission) = admit(&account) else {
+            return Decision::None;
+        };
+        if !selection.valid_for(key, admitted_from.as_deref(), &account, model, now) {
             return Decision::None;
         }
-        if self
-            .policies
-            .dispatch(
+        if !admission.valid_for(admitted_from.as_deref(), &account) {
+            return Decision::None;
+        }
+        if !admission.valid_pin_for(provider, key, &account) {
+            return Decision::None;
+        }
+        if !admission.valid_store_for(
+            admitted_from.as_deref(),
+            admitted_from.as_deref().and_then(|id| {
+                move_evidence
+                    .iter()
+                    .find(|candidate| candidate.account.id == id)
+                    .map(|candidate| &candidate.account)
+            }),
+            &account,
+        ) {
+            return Decision::None;
+        }
+        if !admission.valid_failure_for(
+            key,
+            admitted_from.as_deref().and_then(|id| {
+                move_evidence
+                    .iter()
+                    .find(|c| c.account.id == id)
+                    .map(|c| &c.account)
+            }),
+            &account,
+            model,
+        ) {
+            return Decision::None;
+        }
+        let context = rebind::RebindContext {
+            provider,
+            key,
+            guard_key: &guard_key,
+            from: physical_source.as_deref(),
+            account: &account,
+            parent,
+            model,
+            candidates,
+            sources: move_evidence,
+            pinned,
+            request_bytes,
+            hold_timed_out,
+            now,
+            label: reason,
+        };
+        let authority = self.owner_move_reason(&context, &admission, Some(&selection), None);
+        let rebound = self.rebind(context, authority, permit, |reason| {
+            self.policies.dispatch(
                 policy_key.as_deref(),
                 &account,
                 previous.as_deref(),
                 reason,
                 now,
             )
-            .is_err()
-        {
-            tracing::warn!(
-                code = "routing_policy_blocked",
-                "Routing intent could not authorize dispatch"
-            );
-            return Decision::Blocked;
-        }
-        // The mutation gate remains held: a prepared move cannot go stale
-        // between policy publication and this charge.
-        self.commit_move(permit, &account, provider, &guard_key, model, now);
-        let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
-        // Placement plus capacity eviction is one visible count mutation.
-        d.defer_count_changes = true;
-        let moves = self.commit_binding(
-            &mut d,
-            provider,
-            key,
-            parent,
-            candidates,
-            pinned,
-            request_bytes,
-            hold_timed_out,
-            now,
-            &account,
-            reason,
-        );
-        let lease = self.reserve(&mut d, key, &account);
-        self.prune(&mut d, now);
+        });
+        let rebind::Rebound { mut data, moves } = match rebound {
+            Ok(rebound) => rebound,
+            Err(rebind::RebindError::Evidence) => return Decision::None,
+            Err(rebind::RebindError::Policy) => return Decision::Blocked,
+        };
+        let d = &mut *data;
+        let lease = self.reserve(d, key, &account);
+        self.prune(d, now);
         d.defer_count_changes = false;
         d.commit_count_changes();
         Decision::Selected {
@@ -2845,151 +2917,6 @@ impl BindingTable {
             lease,
             moves,
         }
-    }
-    // Shared commit: launch placement deliberately stops before reserve().
-    #[allow(clippy::too_many_arguments)]
-    fn commit_binding(
-        &self,
-        d: &mut Data,
-        provider: Provider,
-        key: Option<&str>,
-        parent: Option<&str>,
-        candidates: &[Candidate],
-        pinned: Option<&str>,
-        request_bytes: u64,
-        hold_timed_out: bool,
-        now: DateTime<Utc>,
-        account: &str,
-        reason: &str,
-    ) -> Vec<MoveEvent> {
-        d.count_change_clock = Some(now);
-        let mut moves = Vec::new();
-        if let Some(k) = key {
-            let g = group(k);
-            let accepted = Self::accepted_in(d, Some(k), account);
-            let selected_reason = reason;
-            let reason = if hold_timed_out {
-                "reset_hold_timeout"
-            } else {
-                reason
-            };
-            let previous = unindex_group(d, g);
-            let from = previous.as_ref().map(|entry| entry.account.to_owned());
-            let source_changed = from.as_deref() != Some(account);
-            let last_used = previous.as_ref().map_or(now, |entry| entry.last_used);
-            let mut keys = previous.map_or_else(BTreeSet::new, |entry| entry.keys);
-            keys.insert(k.into());
-            if let Some(p) = parent
-                && !d.bindings.contains_key(p)
-                && group(p) == g
-            {
-                keys.insert(p.into());
-            }
-            if from.as_deref() != Some(account) {
-                let candidate = candidates
-                    .iter()
-                    .find(|c| c.account.id == account)
-                    .expect("selection came from candidates");
-                let (evidence, placed_since_obs) = placement_evidence(candidate, d, now);
-                let capped = evidence == PlacementEvidence::Weak
-                    && placed_since_obs >= self.config.weak_evidence_new_sessions;
-                // C5 recovery is a placement; step-1 debug pins and step-2
-                // inheritance remain exempt even when the account changes.
-                let is_placement = selected_reason != "inherited" && pinned != Some(account);
-                if is_placement {
-                    let seq = self.begin_usage_observation();
-                    d.placements
-                        .entry(account.to_owned())
-                        .or_default()
-                        .placed(now, seq);
-                }
-                d.epochs.remove(g);
-                moves.push(MoveEvent {
-                    key: g.to_owned(),
-                    from: from.clone(),
-                    to: account.to_owned(),
-                    reason: if from.is_none() && selected_reason == "new" {
-                        "new"
-                    } else {
-                        reason
-                    }
-                    .into(),
-                    bytes: request_bytes,
-                    keys: keys.len(),
-                    debug_pin: pinned == Some(account),
-                    evidence,
-                    placement_charge_pct: if is_placement {
-                        self.config.placement_allowance_pct
-                    } else {
-                        0.0
-                    },
-                    capped,
-                    placed_since_obs,
-                    is_placement,
-                });
-                if from.is_some() {
-                    d.after_move.insert(g.into());
-                }
-            }
-            for k in &keys {
-                let previous = d.bindings.get(k).cloned();
-                if let Some(previous) = &previous {
-                    d.snapshot_weight = d
-                        .snapshot_weight
-                        .saturating_sub(binding_bound(&previous.key, &previous.account));
-                }
-                d.snapshot_weight = d.snapshot_weight.saturating_add(binding_bound(k, account));
-                d.bindings.insert(
-                    k.clone(),
-                    Binding {
-                        key: k.clone(),
-                        account: account.to_owned(),
-                        last_used,
-                        accepted: Some(accepted),
-                        first_seen_at: previous.as_ref().map_or(Some(now), |b| b.first_seen_at),
-                        bound_since: if from.as_deref() != Some(account) {
-                            Some(now)
-                        } else {
-                            previous.as_ref().and_then(|b| b.bound_since)
-                        },
-                        client_kind: previous.as_ref().and_then(|b| b.client_kind),
-                        observed_here: previous.as_ref().is_none_or(|b| b.observed_here),
-                    },
-                );
-            }
-            index_group(
-                d,
-                g.to_owned(),
-                Group {
-                    keys,
-                    account: account.to_owned(),
-                    last_used,
-                },
-            );
-            if k != g && !d.last_request_bytes.contains_key(g) {
-                d.unknown_cost.insert(g.to_owned());
-            }
-            if request_bytes > 0 && !d.unknown_cost.contains(g) {
-                let known = d.last_request_bytes.entry(g.to_owned()).or_default();
-                *known = (*known).max(request_bytes);
-            }
-            if !matches!(selected_reason, "mark_wait" | "guard_keep") {
-                d.overload_marks.remove(g);
-            }
-            d.changed();
-            // Publish every member and the group index before waking readers.
-            if source_changed {
-                self.policies.changed.notify_waiters();
-            }
-        } else if let Some(old) = d
-            .sticky
-            .insert(provider.as_str().into(), account.to_owned())
-            && old != account
-        {
-            d.accepted_unbound.remove(&old);
-            d.epochs.remove(&format!("unbound:{old}"));
-        }
-        moves
     }
     /// Read-only counterpart of prune for selection previews. Ordinary lookups
     /// visit one group; only outstanding capacity eviction walks the LRU prefix.
@@ -3038,7 +2965,7 @@ impl BindingTable {
         now: DateTime<Utc>,
         hold_allowed: bool,
     ) -> (PreviewDecision, &'static str) {
-        self.select_ordered(
+        let (choice, reason) = self.select_ordered(
             d,
             provider,
             key,
@@ -3049,440 +2976,8 @@ impl BindingTable {
             now,
             hold_allowed,
             None,
-        )
-    }
-    #[allow(clippy::too_many_arguments)]
-    fn select_ordered(
-        &self,
-        d: &Data,
-        provider: Provider,
-        key: Option<&str>,
-        parent: Option<&str>,
-        model: Option<&str>,
-        candidates: &[Candidate],
-        pinned: Option<&str>,
-        now: DateTime<Utc>,
-        hold_allowed: bool,
-        preference: Option<&launch::SelectionPreference<'_>>,
-    ) -> (PreviewDecision, &'static str) {
-        let policy_key = launch::policy_key(d, key);
-        let plan = self.policies.plan(policy_key);
-        let model_move = preference.is_some_and(|p| p.model_move);
-        let strict_anchor = plan.anchor.clone().or_else(|| {
-            key.and_then(|k| self.retained_binding(d, k, now))
-                .map(|b| b.account.clone())
-        });
-        let source = self.protected_source(d, key, plan.anchor.as_deref(), now);
-        let outside_unknown = d.outside_unknown
-            || d.outside_failure
-                .as_ref()
-                .is_some_and(|failed| failed.load(Ordering::Acquire));
-        let mut entries: Vec<_> = candidates
-            .iter()
-            .filter(|c| c.account.provider == provider)
-            .filter(|c| {
-                model_move
-                    || plan.settings.mode != crate::routing::Mode::Strict
-                    || strict_anchor
-                        .as_ref()
-                        .is_none_or(|anchor| anchor == &c.account.id)
-            })
-            .map(|c| {
-                let eligible = effective_account(c, d, &self.config, model, now)
-                    .eligible_at(model, now)
-                    && (!c.account.drain || Self::accepted_in(d, key, &c.account.id));
-                (c, eligible)
-            })
-            .collect();
-        if let Some(source) = source.as_deref() {
-            // Outside use never displaces an existing source. It only vetoes
-            // destinations, including forced moves and explicit preferences.
-            for (candidate, eligible) in &mut entries {
-                *eligible &= candidate.account.id == source
-                    || (!outside_unknown && !d.outside_used.contains(&candidate.account.id));
-            }
-        } else if entries.iter().any(|(candidate, eligible)| {
-            *eligible && !outside_unknown && !d.outside_used.contains(&candidate.account.id)
-        }) {
-            // Last resort is before C7 preference/gate partitions: a healthy
-            // unmarked account cannot be bypassed by a reset or plan ranking.
-            entries.retain(|(candidate, _)| !d.outside_used.contains(&candidate.account.id));
-        }
-        if let Some(id) = pinned
-            && entries
-                .iter()
-                .any(|(c, eligible)| c.account.id == id && *eligible)
-        {
-            return (PreviewDecision::Selected { account: id.into() }, "forced");
-        }
-        let mut bound = key
-            .filter(|_| !model_move)
-            .and_then(|k| self.retained_binding(d, k, now))
-            .cloned();
-        // A synchronously saved anchor wins over an older write-behind binding.
-        if let (Some(anchor), Some(key)) = (&plan.anchor, key.filter(|_| !model_move)) {
-            let b = bound.get_or_insert_with(|| Binding {
-                key: key.to_owned(),
-                account: anchor.clone(),
-                last_used: now,
-                accepted: None,
-                first_seen_at: None,
-                bound_since: None,
-                client_kind: None,
-                observed_here: false,
-            });
-            b.account = anchor.clone();
-        }
-        let bound_account = bound.as_ref().map(|b| b.account.clone());
-        let mut reason = "new";
-        if let Some(b) = bound {
-            reason = "forced";
-            if let Some((c, eligible)) = entries.iter().find(|(c, _)| c.account.id == b.account) {
-                if hold_allowed
-                    && c.account.user_state == UserState::Active
-                    && let Health::Cooling {
-                        reason: HealthReason::Quota,
-                        until,
-                        scope,
-                    } = &c.account.health
-                    && let Some(quota) = &c.account.quota_cooling
-                    && *until > now
-                    && (scope == "account"
-                        || scope
-                            .strip_prefix("model:")
-                            .is_some_and(|m| model == Some(m)))
-                {
-                    let reset = quota.reset_at;
-                    if reset > now
-                        && (reset - now).to_std().is_ok_and(|wait| {
-                            wait <= Duration::from_secs(plan.settings.reset_wait_secs)
-                        })
-                    {
-                        return (PreviewDecision::Hold { until: reset }, reason);
-                    }
-                    let skip_reason = if reset <= now {
-                        "reset_elapsed"
-                    } else if reset.signed_duration_since(now).to_std().is_err() {
-                        "reset_before_now"
-                    } else {
-                        "reset_beyond_hold_bound"
-                    };
-                    tracing::debug!(
-                        account = %b.account,
-                        reason = skip_reason,
-                        "reset hold skipped"
-                    );
-                }
-                if *eligible && plan.settings.mode != crate::routing::Mode::Rebalance {
-                    return (
-                        PreviewDecision::Selected {
-                            account: b.account.clone(),
-                        },
-                        if self.has_overload_mark(d, &b.key, now) {
-                            "mark_wait"
-                        } else {
-                            "forced"
-                        },
-                    );
-                }
-                if *eligible && d.active.contains_key(group(&b.key)) {
-                    return (
-                        PreviewDecision::Selected {
-                            account: b.account.clone(),
-                        },
-                        if self.has_overload_mark(d, &b.key, now) {
-                            "mark_wait"
-                        } else {
-                            "forced"
-                        },
-                    );
-                }
-                let marked = self.has_overload_mark(d, &b.key, now);
-                if marked && *eligible {
-                    let known_cost = !d.unknown_cost.contains(group(&b.key))
-                        && d.last_request_bytes
-                            .get(group(&b.key))
-                            .is_some_and(|n| *n > 0 && *n <= self.config.churn.max_move_bytes);
-                    let room_elsewhere = known_cost
-                        && entries.iter().any(|(candidate, eligible)| {
-                            candidate.account.id != b.account
-                                && *eligible
-                                && d.overload_marks
-                                    .get(group(&b.key))
-                                    .is_some_and(|mark| mark.from == b.account)
-                                && self.rebalance_target(
-                                    d,
-                                    &b.account,
-                                    candidate,
-                                    Some(group(&b.key)),
-                                    now,
-                                )
-                                && self.policies.discretionary_allowed(
-                                    policy_key.unwrap_or(&b.key),
-                                    Some(&candidate.account.id),
-                                    now,
-                                )
-                        });
-                    // Any discretionary veto waits on the existing mark. In
-                    // particular, fresh/uncapped targets must not erase a mark
-                    // while group, revisit, pool or cost guards are active.
-                    let guard_waiting = !known_cost
-                        || !self.policies.discretionary_allowed(
-                            policy_key.unwrap_or(&b.key),
-                            None,
-                            now,
-                        )
-                        || entries.iter().any(|(candidate, eligible)| {
-                            *eligible
-                                && candidate.account.id != b.account
-                                && self.rebalance_target_waiting(
-                                    d,
-                                    &b.account,
-                                    candidate,
-                                    Some(group(&b.key)),
-                                    now,
-                                )
-                                && (placement_capped(candidate, d, &self.config, now)
-                                    || !self.policies.discretionary_allowed(
-                                        policy_key.unwrap_or(&b.key),
-                                        Some(&candidate.account.id),
-                                        now,
-                                    ))
-                        });
-                    if !room_elsewhere
-                        && guard_waiting
-                        && self.active_sessions_in(d, &b.account, now)
-                            > self.spread_threshold_for(&b.account)
-                    {
-                        return (
-                            PreviewDecision::Selected {
-                                account: b.account.clone(),
-                            },
-                            "mark_wait",
-                        );
-                    }
-                    if !room_elsewhere
-                        || self.active_sessions_in(d, &b.account, now)
-                            <= self.spread_threshold_for(&b.account)
-                    {
-                        // choose_with_hold clears this mark when it reserves
-                        // the unchanged binding. Preview remains read-only.
-                        return (
-                            PreviewDecision::Selected {
-                                account: b.account.clone(),
-                            },
-                            "forced",
-                        );
-                    }
-                    // Use the ordinary C7 ordering below, restricted to real
-                    // eligible targets with room rather than candidate id order.
-                    reason = "overload";
-                }
-                if *eligible && !marked {
-                    let g = group(&b.key);
-                    let last = d.groups.get(g).map_or(b.last_used, |entry| entry.last_used);
-                    let at_capacity = self.active_sessions_in(d, &b.account, now)
-                        >= self.spread_threshold_for(&b.account);
-                    let cold =
-                        !protected(d, g) && idle(now, last) >= self.config.rebalance_idle_secs;
-                    if !cold
-                        || !self.policies.discretionary_allowed(
-                            policy_key.unwrap_or(&b.key),
-                            None,
-                            now,
-                        )
-                        || d.unknown_cost.contains(group(&b.key))
-                        || d.last_request_bytes.get(group(&b.key)).is_none_or(|bytes| {
-                            *bytes == 0 || *bytes > self.config.churn.max_move_bytes
-                        })
-                        || (!at_capacity
-                            && !c.account.drain
-                            && metrics_without_placement_charge(c, d, &self.config, now).gate)
-                    {
-                        return (
-                            PreviewDecision::Selected {
-                                account: b.account.clone(),
-                            },
-                            reason,
-                        );
-                    }
-                    reason = if marked { "overload" } else { "cold_rebalance" };
-                }
-            }
-        } else if let Some(p) = parent.and_then(|p| self.retained_binding(d, p, now)) {
-            if entries
-                .iter()
-                .any(|(c, eligible)| c.account.id == p.account && *eligible)
-            {
-                return (
-                    PreviewDecision::Selected {
-                        account: p.account.clone(),
-                    },
-                    "inherited",
-                );
-            }
-        } else if key.is_none()
-            && let Some(id) = d.sticky.get(provider.as_str())
-            && entries
-                .iter()
-                .any(|(c, eligible)| &c.account.id == id && *eligible)
-        {
-            return (
-                PreviewDecision::Selected {
-                    account: id.clone(),
-                },
-                reason,
-            );
-        }
-        let eligible: Vec<_> = entries
-            .into_iter()
-            .filter(|(c, eligible)| !c.account.drain && *eligible)
-            .map(|(c, _)| (c, metrics(c, d, &self.config, now)))
-            .collect();
-        let eligible: Vec<_> = eligible
-            .into_iter()
-            .filter(|(c, _)| {
-                if !matches!(reason, "overload" | "cold_rebalance") {
-                    return true;
-                }
-                bound_account.as_ref().is_some_and(|source| {
-                    source != &c.account.id
-                        && self.rebalance_target_base(d, source, c, key.map(group), now)
-                }) && key.is_some_and(|key| {
-                    self.policies.discretionary_allowed(
-                        policy_key.unwrap_or(key),
-                        Some(&c.account.id),
-                        now,
-                    )
-                })
-            })
-            .collect();
-        let has_gate = eligible.iter().any(|(_, m)| m.gate);
-        let pool: Vec<_> = eligible
-            .iter()
-            .filter(|(_, m)| !has_gate || m.gate)
-            .collect();
-        let has_room = pool.iter().any(|(c, _)| {
-            self.active_sessions_in(d, &c.account.id, now)
-                + self.reserved_in(d, &c.account.id, key.map(group), now)
-                < self.spread_threshold_for(&c.account.id)
-        });
-        let mut partition: Vec<_> = pool
-            .into_iter()
-            .filter(|(c, _)| {
-                !has_room
-                    || self.active_sessions_in(d, &c.account.id, now)
-                        + self.reserved_in(d, &c.account.id, key.map(group), now)
-                        < self.spread_threshold_for(&c.account.id)
-            })
-            .collect();
-        if reason == "overload" {
-            partition.retain(|(c, m)| {
-                m.gate
-                    && key
-                        .and_then(|key| d.overload_marks.get(group(key)))
-                        .is_some_and(|mark| {
-                            mark.from != c.account.id
-                                && self.rebalance_target_base(d, &mark.from, c, key.map(group), now)
-                                && key.is_some_and(|key| {
-                                    self.policies.discretionary_allowed(
-                                        policy_key.unwrap_or(key),
-                                        Some(&c.account.id),
-                                        now,
-                                    )
-                                })
-                        })
-            });
-        }
-        if reason == "cold_rebalance" {
-            partition.retain(|(c, _)| {
-                bound_account.as_ref().is_some_and(|source| {
-                    source != &c.account.id
-                        && self.rebalance_target_base(d, source, c, key.map(group), now)
-                }) && key.is_some_and(|key| {
-                    self.policies.discretionary_allowed(
-                        policy_key.unwrap_or(key),
-                        Some(&c.account.id),
-                        now,
-                    )
-                })
-            });
-        }
-        if matches!(reason, "overload" | "cold_rebalance") {
-            // A discretionary move cannot bypass a capped, non-pacing target
-            // by reviving a pacing alternative. Resolve room, pacing, then cap.
-            if partition
-                .iter()
-                .any(|(c, _)| !d.pacing.get(&c.account.id).copied().unwrap_or(false))
-            {
-                partition.retain(|(c, _)| !d.pacing.get(&c.account.id).copied().unwrap_or(false));
-            }
-            partition.retain(|(c, _)| !placement_capped(c, d, &self.config, now));
-        }
-        if partition.is_empty()
-            && matches!(reason, "cold_rebalance" | "overload")
-            && let Some(account) = bound_account
-        {
-            return (
-                PreviewDecision::Selected { account },
-                if reason == "overload" {
-                    "mark_wait"
-                } else {
-                    "forced"
-                },
-            );
-        }
-        let ratio = |c: &Candidate| {
-            (self.active_sessions_in(d, &c.account.id, now)
-                + self.reserved_in(d, &c.account.id, key.map(group), now)) as f64
-                / self.spread_threshold_for(&c.account.id) as f64
-        };
-        let min_ratio = partition
-            .iter()
-            .map(|(c, _)| ratio(c))
-            .min_by(f64::total_cmp);
-        if !has_room && let Some(minimum) = min_ratio {
-            partition.retain(|(c, _)| ratio(c) == minimum);
-        }
-        // Step 4: form the gate-passing set before any pacing/cap ordering.
-        // A lower-count or uncapped failing account must never displace it.
-        let mut gated: Vec<_> = partition
-            .iter()
-            .filter(|entry| entry.1.gate)
-            .map(|entry| (entry.0, &entry.1))
-            .collect();
-        let chosen = if !gated.is_empty() {
-            prefer_pacing_and_evidence(&mut gated, d, &self.config, now);
-            launch::prefer(&mut gated, preference);
-            // Approximate reset cohorts require one fixed anchor.
-            let anchor = gated
-                .iter()
-                .filter(|(_, m)| !m.unknown)
-                .filter_map(|(_, m)| m.weekly)
-                .min();
-            gated.sort_by(|(a, x), (b, y)| compare_gated(a, x, b, y, anchor));
-            gated.first().map(|(candidate, _)| *candidate)
-        } else {
-            // Step 5: only when this set has no passing gate, apply its own
-            // pacing/cap ordering and then choose the most headroom.
-            let mut fallback: Vec<_> = partition.iter().map(|entry| (entry.0, &entry.1)).collect();
-            prefer_pacing_and_evidence(&mut fallback, d, &self.config, now);
-            launch::prefer(&mut fallback, preference);
-            fallback
-                .iter()
-                .min_by(|(a, x), (b, y)| {
-                    x.usage
-                        .total_cmp(&y.usage)
-                        .then_with(|| a.account.id.cmp(&b.account.id))
-                })
-                .map(|(candidate, _)| *candidate)
-        };
-        (
-            chosen.map_or(PreviewDecision::None, |c| PreviewDecision::Selected {
-                account: c.account.id.clone(),
-            }),
-            reason,
-        )
+        );
+        (choice, reason.code())
     }
     pub fn export(&self) -> Result<Value> {
         let state = snapshot(&self.data.lock().unwrap_or_else(|e| e.into_inner()));
@@ -4947,6 +4442,19 @@ mod tests {
         let table = BindingTable::new(dir.path(), config).unwrap();
         (dir, table)
     }
+    // Explicit pin fixtures use the real owner, never a bare authority label.
+    pub(super) fn with_pin(
+        provider: Provider,
+        key: Option<&str>,
+        target: &str,
+        select: impl FnOnce(DispatchAdmission) -> Decision,
+    ) -> Decision {
+        let pins = crate::debug_pin::DebugPins::default();
+        pins.set(provider, key.map(str::to_owned), target.to_owned());
+        let proof = pins.selection(provider, key).unwrap();
+        select(DispatchAdmission::ordinary().with_pin(Some(proof)))
+    }
+
     fn choose(
         t: &Arc<BindingTable>,
         key: Option<&str>,
@@ -5093,18 +4601,24 @@ mod tests {
             let cs = [candidate("a", 10.0, 8, 1), candidate("b", 10.0, 30, 2)];
             let now = Utc::now();
             // Keep the actual ABA moves outside R14's unchanged-account return window.
-            let choose_raw = |id, at| match t.choose_with_hold_at(
-                Provider::Claude,
-                key,
-                None,
-                None,
-                &cs,
-                Some(id),
-                42,
-                true,
-                false,
-                at,
-            ) {
+            let choose_raw = |id, at| match with_pin(Provider::Claude, key, id, |admission| {
+                t.choose_with_hold_at_admitted_proof(
+                    Provider::Claude,
+                    key,
+                    None,
+                    None,
+                    &cs,
+                    &cs,
+                    MoveObservations::untracked(),
+                    Some(id),
+                    42,
+                    true,
+                    false,
+                    at,
+                    None,
+                    |_| Some(admission),
+                )
+            }) {
                 Decision::Selected { account, lease, .. } => {
                     assert_eq!(account, id);
                     lease
@@ -5175,16 +4689,7 @@ mod tests {
                 weight += next;
                 d.bindings.insert(
                     key.clone(),
-                    Binding {
-                        key,
-                        account: "a".into(),
-                        last_used: Utc::now(),
-                        accepted: None,
-                        first_seen_at: None,
-                        bound_since: None,
-                        client_kind: None,
-                        observed_here: false,
-                    },
+                    Binding::new(key, "a".into(), Utc::now(), None, None, None, None, false),
                 );
             }
             rebuild_indexes(&mut d);
@@ -5591,16 +5096,21 @@ mod tests {
         assert!(
             matches!(t.choose(Provider::Claude, Some("claude:s"), None, None, &[a.clone(), b.clone()], None, 1), Decision::Hold { until: u } if u == until)
         );
-        let result = t.choose_with_hold(
+        let result = t.choose_with_hold_at_admitted_proof(
             Provider::Claude,
             Some("claude:s"),
             None,
             None,
             std::slice::from_ref(&b),
+            &[a.clone(), b.clone()],
+            MoveObservations::untracked(),
             None,
             42,
             false,
             true,
+            Utc::now(),
+            None,
+            |_| Some(DispatchAdmission::ordinary()),
         );
         assert!(matches!(result, Decision::Selected { account, moves, .. }
             if account == "b" && moves[0].reason == "reset_hold_timeout"));
@@ -5658,16 +5168,7 @@ mod tests {
                 let key = format!("claude:other{i}");
                 d.bindings.insert(
                     key.clone(),
-                    Binding {
-                        key,
-                        account: "a".into(),
-                        accepted: None,
-                        last_used: Utc::now(),
-                        first_seen_at: None,
-                        bound_since: None,
-                        client_kind: None,
-                        observed_here: false,
-                    },
+                    Binding::new(key, "a".into(), Utc::now(), None, None, None, None, false),
                 );
             }
             rebuild_indexes(&mut d);
@@ -5727,10 +5228,11 @@ mod tests {
     #[test]
     fn handshake_preserves_after_move_for_first_response_create() {
         let (_dir, t) = table();
-        let a = candidate("a", 10.0, 8, 1);
+        let mut a = candidate("a", 10.0, 8, 1);
         let b = candidate("b", 5.0, 30, 2);
-        drop(choose(&t, Some("claude:s"), &[a]));
-        let (_, mut lease, _) = choose(&t, Some("claude:s"), &[b]);
+        drop(choose(&t, Some("claude:s"), &[a.clone()]));
+        a.account.user_state = UserState::Paused;
+        let (_, mut lease, _) = choose(&t, Some("claude:s"), &[a, b]);
         assert!(lease.after_move);
         lease.defer_after_move();
         drop(lease);
@@ -6164,16 +5666,7 @@ mod tests {
                 let key = format!("claude:oversized:agent:{i}");
                 d.bindings.insert(
                     key.clone(),
-                    Binding {
-                        key,
-                        account: "a".into(),
-                        accepted: None,
-                        last_used: now,
-                        first_seen_at: None,
-                        bound_since: None,
-                        client_kind: None,
-                        observed_here: false,
-                    },
+                    Binding::new(key, "a".into(), now, None, None, None, None, false),
                 );
             }
             rebuild_indexes(&mut d);
@@ -6661,14 +6154,28 @@ mod tests {
         } else {
             panic!("new group not selected");
         }
-        let result = t.choose(
+        let result = with_pin(
             Provider::Claude,
             Some("claude:s:agent:c"),
-            None,
-            None,
-            &[a, b],
-            Some("b"),
-            81,
+            "b",
+            |admission| {
+                t.choose_with_hold_at_admitted_proof(
+                    Provider::Claude,
+                    Some("claude:s:agent:c"),
+                    None,
+                    None,
+                    &[a.clone(), b.clone()],
+                    &[a, b],
+                    MoveObservations::untracked(),
+                    Some("b"),
+                    81,
+                    true,
+                    false,
+                    Utc::now(),
+                    None,
+                    |_| Some(admission),
+                )
+            },
         );
         if let Decision::Selected { lease, moves, .. } = result {
             assert!(lease.after_move);
@@ -6762,18 +6269,24 @@ mod tests {
 
     fn count_change_place(t: &Arc<BindingTable>, key: &str, id: &str, now: DateTime<Utc>) {
         let c = candidate(id, 10.0, 8, 1);
-        let decision = t.choose_with_hold_at(
-            Provider::Claude,
-            Some(key),
-            None,
-            None,
-            &[c],
-            Some(id),
-            0,
-            false,
-            false,
-            now,
-        );
+        let decision = with_pin(Provider::Claude, Some(key), id, |admission| {
+            t.choose_with_hold_at_admitted_proof(
+                Provider::Claude,
+                Some(key),
+                None,
+                None,
+                std::slice::from_ref(&c),
+                std::slice::from_ref(&c),
+                MoveObservations::untracked(),
+                Some(id),
+                0,
+                false,
+                false,
+                now,
+                None,
+                |_| Some(admission),
+            )
+        });
         let Decision::Selected { account, lease, .. } = decision else {
             panic!("{decision:?}");
         };
