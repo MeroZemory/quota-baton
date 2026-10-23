@@ -9,7 +9,7 @@ This file names the verification for each unit and each row. The row list and th
 목표: 확인된 긴급 토글·대기 표시 통합; 실제 5시간 한도 대기·전환 결함 수정과 HWND 검증
 핵심 지표: 남은 출시 1/3 (R14 보호 설치, R13 C+E 실행, R13 F 통합 예측); 이전 계열 2/2 종료
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-23 13:19 KST (G2 245879f·WS a6daf07 집중 통과; 정책 잠금 보완·실제 HWND 남음)
+갱신: 2026-10-23 13:33 KST (G2·실제 WS·정책 잠금 f2c964f 집중 통과; 정확 대조·최종 실제 HWND 관문 남음)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -388,8 +388,10 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-23 12:35 | N5c 확인된 긴급 UI·대기 표시 구현 단위 | core5·tray12·실제HTTP4, tray testkit strict lint·fmt·diff exit0 | 응답 지연·중복 억제·창 재개 상태·실제 대기 DTO | 코드d7c6243; n5c-ui-mailbox-repair/n5c-ui-lint-repair/n5c-ui-integration-repair 입력 기록. 실제 HWND와 G1/G2 수정은 미완료; N5c 관문 아님 |
 | 2026-10-23 12:46 | N5c 먼 5시간 한도 실제 응답 보존 수정 | HTTP5가족/20모드 사례·기존 HTTP/body5·strict core lint·fmt·diff 통과 | 일반 세션 실제429 유지, 긴급·주간·크레딧 대비 유지 | 코드965e489; 빈 필터 제외 후 lib 필터 수정. 조건 제거 exit101·정확 복원 exit0; G2·초기 poll·HWND·전체 N5c 전 |
 | 2026-10-23 12:56 | N5c 초기 full-poll 5시간 Wait·응답 경계 단위 | 초기 HTTP3가족/9사례·기존 Move1·G1물리2·경계2, strict core lint·fmt·diff 통과 | 한도 확인 뒤 zero target send·qb 작성429·정확 리셋, 원본 응답 fallback 보존 | 코드f9fe3e4·1445c41; 초기 기준 exact200/429 실패 뒤 수정 통과; G2·HWND·N5d·전체 N5c 전 |
-| 2026-10-23 13:07 | N5c 긴급 변경 뒤 원래 캐시 대기 보존 | core9·실제 HTTP1(2모드)·WS8, strict core testkit all-target lint·fmt·diff 통과 | 원래 리셋/마감 유지·조기 target send 없음·native retention | 코드245879f; n5c-cache-remainder-compile-repair 입력 fingerprint. 초기 테스트 import 오류 수정; G2 정확 제거3건 intended101·byte복원0 통과. 정책 publication 경합·실제 HWND·전체 N5c 별도 |
+| 2026-10-23 13:07 | N5c 긴급 변경 뒤 원래 캐시 대기 보존 | core9·실제 HTTP1(2모드)·WS8, strict core testkit all-target lint·fmt·diff 통과 | 원래 리셋/마감 유지·조기 target send 없음·native retention | 코드245879f; n5c-cache-remainder-compile-repair 입력 fingerprint. 초기 테스트 import 컴파일 오류 수정; 정책 publication 경합·정확 제거 대조·실제 HWND·전체 N5c는 별도 |
 | 2026-10-23 13:19 | N5c 실제 WS 긴급 변경·취소 단위 | 실제 upgraded WS2함수/3코호트·fmt·diff 통과 | 같은 소켓/계정 원래 리셋 후1회·Close 뒤 late send 없음 | 코드a6daf07; n5c-ws-urgency-unit 입력 fingerprint. 실제 admin정책/대시보드 대기 수명 포함; native HWND·정책 잠금 경합·전체 N5c 별도 |
+| 2026-10-23 13:33 | N5c G2·WS 조건 제거 대조 | G2 3건·실제 WS1건 intended exit101 및 정확 복원 exit0 | 컴파일/setup 실패 제외·각1테스트·소스 byte 동일 | n5c-g2-controls-g2-final-01 및 ws-final-01; 수정 시각 갱신·같은 테스트 복원 양성 확인 |
+| 2026-10-23 13:33 | N5c 정책 publication 경합 보완 단위 | outer4·실제 HTTP1/2모드·WS2/3코호트·strict core testkit all-target lint·fmt·diff 통과 | 실제 첫 결과/기존 대기 중 원래 wake·마감·drain 유지 | 코드f2c964f; n5c-publication-observer-repair 입력 fingerprint. 단위 진단 이벤트 범위 수정 뒤 기존 HTTP 순서 보존; 최종 gate/실제 HWND 전 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
