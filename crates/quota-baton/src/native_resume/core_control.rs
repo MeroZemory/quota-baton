@@ -111,6 +111,12 @@ impl Grant {
     }
 
     pub(crate) fn authorizes(self, episode: u64) -> bool {
+        self.is_current(episode)
+    }
+
+    /// Borrowed liveness check so the parent can retain this same opaque receipt
+    /// across its one physical write. Rechecking is not permission for a retry.
+    pub(crate) fn is_current(&self, episode: u64) -> bool {
         self.episode == episode
             && Instant::now() < self.deadline
             && self
@@ -394,9 +400,20 @@ impl CoreControl {
 
     /// Idle waiting has only the caller's absolute lifetime, not reset authority.
     pub(crate) async fn next_due(&mut self, deadline: Instant) -> Result<u64, Error> {
+        self.next_due_inner(Some(deadline)).await
+    }
+
+    /// No idle timer. The owner must retain/cancel this future; dropping it after
+    /// polling still closes the socket permanently, exactly like next_due.
+    pub(crate) async fn next_due_until_cancelled(&mut self) -> Result<u64, Error> {
+        self.next_due_inner(None).await
+    }
+
+    async fn next_due_inner(&mut self, deadline: Option<Instant>) -> Result<u64, Error> {
         let mut owned = self.socket.take().ok_or(Error::Closed)?;
-        if Instant::now() >= deadline || self.correlation.finished || !self.correlation.observed {
-            return Err(if Instant::now() >= deadline {
+        let elapsed = deadline.is_some_and(|deadline| Instant::now() >= deadline);
+        if elapsed || self.correlation.finished || !self.correlation.observed {
+            return Err(if elapsed {
                 Error::Timeout
             } else {
                 Error::Closed
@@ -407,7 +424,7 @@ impl CoreControl {
             return Ok(episode);
         }
         loop {
-            let reply = read_reply(&mut owned.socket, deadline).await?;
+            let reply = read_reply_idle(&mut owned.socket, deadline).await?;
             self.correlation.receive(reply)?;
             if let Some(episode) = self.correlation.due.take() {
                 self.socket = Some(owned);
@@ -526,19 +543,33 @@ async fn read_reply(
     socket: &mut WebSocketStream<TcpStream>,
     deadline: Instant,
 ) -> Result<Reply, Error> {
+    read_reply_idle(socket, Some(deadline)).await
+}
+
+async fn read_reply_idle(
+    socket: &mut WebSocketStream<TcpStream>,
+    deadline: Option<Instant>,
+) -> Result<Reply, Error> {
     loop {
-        let message = before(deadline, socket.next())
-            .await?
-            .ok_or(Error::Closed)?
-            .map_err(|_| Error::Transport)?;
+        let next = match deadline {
+            Some(deadline) => before(deadline, socket.next()).await?,
+            None => socket.next().await,
+        };
+        let message = next.ok_or(Error::Closed)?.map_err(|_| Error::Transport)?;
         match message {
             Message::Text(text) if text.len() <= MAX_MESSAGE_BYTES => {
                 return serde_json::from_str(&text).map_err(|_| Error::Protocol);
             }
             // Tungstenite queues the matching Pong; flushing does not admit work.
-            Message::Ping(_) => before(deadline, socket.flush())
+            Message::Ping(_) => {
+                let limit = Instant::now() + EXCHANGE_LIMIT;
+                before(
+                    deadline.map_or(limit, |deadline| deadline.min(limit)),
+                    socket.flush(),
+                )
                 .await?
-                .map_err(|_| Error::Transport)?,
+                .map_err(|_| Error::Transport)?;
+            }
             Message::Pong(_) => {}
             Message::Close(_) => return Err(Error::Closed),
             _ => return Err(Error::Protocol),

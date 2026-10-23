@@ -386,13 +386,82 @@ async fn grant_is_bound_to_episode_and_live_owned_socket() {
         let Ok(Consumption::Granted(grant)) = result else {
             panic!("expected grant")
         };
+        assert!(grant.is_current(EPISODE));
+        assert!(grant.is_current(EPISODE));
+        assert!(!grant.is_current(EPISODE + 1));
         if wrong_episode {
             assert!(!grant.authorizes(EPISODE + 1));
             client.close();
         } else {
             drop(client);
+            assert!(!grant.is_current(EPISODE));
             assert!(!grant.authorizes(EPISODE));
         }
+        no_more_requests(&mut server).await;
+    }
+}
+
+#[tokio::test]
+async fn cancellation_only_due_wait_receives_hint_or_closes_when_dropped() {
+    for cancelled in [false, true] {
+        let (mut client, mut server) = pair().await;
+        waiting(&mut client, &mut server).await;
+        let mut pending = Box::pin(client.next_due_until_cancelled());
+        assert!(futures_util::poll!(pending.as_mut()).is_pending());
+        if cancelled {
+            drop(pending);
+            assert!(client.is_closed());
+        } else {
+            reply(&mut server, None, Event::Due { episode: EPISODE }).await;
+            assert_eq!(
+                timeout(Duration::from_secs(2), pending)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                EPISODE
+            );
+            assert!(!client.is_closed());
+            client.close();
+        }
+        no_more_requests(&mut server).await;
+    }
+}
+
+#[tokio::test]
+async fn retained_grant_borrow_checks_explicit_close_and_original_deadline() {
+    for close in [true, false] {
+        let (mut client, mut server) = pair().await;
+        waiting(&mut client, &mut server).await;
+        let until = Instant::now() + Duration::from_millis(300);
+        let serve = async {
+            let req = request(&mut server).await;
+            assert!(matches!(req.command, Command::Consume { episode: EPISODE }));
+            reply(
+                &mut server,
+                Some(req.request_id),
+                Event::Granted { episode: EPISODE },
+            )
+            .await;
+        };
+        let (result, ()) = tokio::join!(client.consume(EPISODE, until), serve);
+        let Ok(Consumption::Granted(grant)) = result else {
+            panic!("expected exact grant")
+        };
+        assert!(grant.is_current(EPISODE));
+        // Retain the same noncloneable receipt until explicit invalidation.
+        if close {
+            client.close();
+        } else {
+            timeout(
+                Duration::from_secs(2),
+                tokio::time::sleep_until(grant.test_deadline()),
+            )
+            .await
+            .unwrap();
+        }
+        assert!(!grant.is_current(EPISODE));
+        assert!(!grant.authorizes(EPISODE));
+        client.close();
         no_more_requests(&mut server).await;
     }
 }
