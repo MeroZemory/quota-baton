@@ -16,6 +16,8 @@ use crate::{
 };
 
 pub(in crate::relay) struct Completion {
+    pub(super) failure_evidence: Option<super::outcome::RequestFailureEvidence>,
+    pub(super) failure_lifetime: Arc<std::sync::atomic::AtomicBool>,
     pub record: RequestRecord,
     pub dashboard_enabled: bool,
     pub dashboard_label: Option<crate::dashboard::labels::MemoryLabel>,
@@ -53,6 +55,8 @@ impl Completion {
         headers: &HeaderMap,
     ) -> Self {
         Self {
+            failure_evidence: None,
+            failure_lifetime: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             dashboard_enabled: true,
             dashboard_label: if provider == Provider::Codex {
                 crate::dashboard::labels::codex_workspace(headers)
@@ -337,6 +341,7 @@ impl Completion {
 
 impl Drop for Completion {
     fn drop(&mut self) {
+        self.failure_lifetime.store(false, Ordering::Release);
         if self.record.status == 0
             && self
                 .precommit_deadline

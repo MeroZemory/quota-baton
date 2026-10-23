@@ -45,17 +45,91 @@ pub struct LaunchInfo {
     pub advertised_models: BTreeSet<String>,
 }
 
-/// Called under BindingTable's mutation gate, without its data lock. A consent
-/// authorizer must atomically check this revision/from and durably change the
-/// Strict anchor, preserving policy and history. Ordinary dispatch is rechecked
-/// afterwards. A no-op authorizer cannot bypass Strict.
+/// Immutable evidence minted only by the launch owner after explicit consent,
+/// an explicit unsupported-or-model-unusable request, inactivity and destination
+/// admission checks.
+/// Strict authorization consumes its revision with a durable CAS; ordinary
+/// dispatch still rechecks authority afterwards. A reason string is not proof.
+///
+/// Evidence cannot be constructed or altered by a consumer:
+/// ```compile_fail
+/// use qb_core::bindings::LaunchPolicyMove;
+/// fn forge(mut evidence: LaunchPolicyMove) {
+///     evidence.account = "another-account".into();
+/// }
+/// ```
 #[derive(Clone, Debug)]
 pub struct LaunchPolicyMove {
-    pub key: String,
-    pub previous: String,
-    pub account: String,
-    pub expected_revision: u64,
-    pub at: DateTime<Utc>,
+    key: String,
+    previous: String,
+    account: String,
+    expected_revision: u64,
+    model: String,
+    at: DateTime<Utc>,
+}
+
+impl LaunchPolicyMove {
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+    pub fn previous(&self) -> &str {
+        &self.previous
+    }
+    pub fn account(&self) -> &str {
+        &self.account
+    }
+    pub fn expected_revision(&self) -> u64 {
+        self.expected_revision
+    }
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+    pub fn at(&self) -> DateTime<Utc> {
+        self.at
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn validate_context(
+        &self,
+        key: &str,
+        previous: Option<&str>,
+        account: &str,
+        revision: u64,
+        model: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> std::result::Result<(), LaunchError> {
+        if self.key != key
+            || previous != Some(self.previous())
+            || self.account != account
+            || self.previous == self.account
+            || self.expected_revision != revision
+            || model != Some(self.model())
+            || self.at != at
+        {
+            return Err(LaunchError::PolicyBlocked);
+        }
+        Ok(())
+    }
+
+    // Absent from production: routing tests need malformed/stale CAS inputs.
+    #[cfg(test)]
+    pub(crate) fn test_fixture(
+        key: &str,
+        previous: &str,
+        account: &str,
+        expected_revision: u64,
+        model: &str,
+        at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            key: key.into(),
+            previous: previous.into(),
+            account: account.into(),
+            expected_revision,
+            model: model.into(),
+            at,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -795,13 +869,6 @@ impl BindingTable {
             weight = weight.saturating_add(binding_bound(&key, &account));
         }
         room(weight)?;
-        let consent = LaunchPolicyMove {
-            key: policy_key.clone(),
-            previous: previous.clone().unwrap_or_default(),
-            account: account.clone(),
-            expected_revision: plan.revision,
-            at: now,
-        };
         let permit = self
             .prepare_move(
                 &d,
@@ -816,12 +883,64 @@ impl BindingTable {
             )
             .map_err(|_| LaunchError::MoveGuard)?;
         let existing = Self::accepted_in(&d, Some(&key), &account);
+        // Recheck the selected destination before it can become owner evidence.
+        if model_move
+            && !filtered.iter().any(|c| {
+                c.account.id == account
+                    && effective_account(c, &d, &self.config, model.as_deref(), now)
+                        .eligible_at(model.as_deref(), now)
+                    && (!c.account.drain || existing)
+            })
+        {
+            return Err(LaunchError::NoEligibleAccount);
+        }
         drop(d);
         if admit.is_some_and(|admit| !admit(&account, existing, model.as_deref())) {
             return Err(LaunchError::NoEligibleAccount);
         }
-        if model_move && plan.settings.mode == crate::routing::Mode::Strict {
-            authorize(&self.policies, &consent).map_err(|_| LaunchError::PolicyBlocked)?;
+        let consent = if model_move {
+            Some(LaunchPolicyMove {
+                key: policy_key.clone(),
+                previous: previous.clone().ok_or(LaunchError::PolicyBlocked)?,
+                account: account.clone(),
+                expected_revision: plan.revision,
+                model: model.clone().ok_or(LaunchError::PolicyBlocked)?,
+                at: now,
+            })
+        } else {
+            None
+        };
+        if let Some(consent) = &consent {
+            // Validate before the callback: Strict authorization itself advances
+            // the revision. Admission callbacks may have interposed a policy edit.
+            consent.validate_context(
+                &policy_key,
+                previous.as_deref(),
+                &account,
+                self.policies.plan(Some(&policy_key)).revision,
+                model.as_deref(),
+                now,
+            )?;
+            if plan.settings.mode == crate::routing::Mode::Strict {
+                authorize(&self.policies, consent).map_err(|_| LaunchError::PolicyBlocked)?;
+            }
+            let current = self.policies.plan(Some(&policy_key));
+            let expected_revision = if plan.settings.mode == crate::routing::Mode::Strict {
+                // Exactly one durable authorization, with no intervening edit.
+                if current.settings.mode != crate::routing::Mode::Strict
+                    || current.anchor.as_deref() != Some(account.as_str())
+                {
+                    return Err(LaunchError::PolicyBlocked);
+                }
+                plan.revision
+                    .checked_add(1)
+                    .ok_or(LaunchError::PolicyBlocked)?
+            } else {
+                plan.revision
+            };
+            if current.revision != expected_revision {
+                return Err(LaunchError::PolicyBlocked);
+            }
         }
         self.policies
             .dispatch_for_issue(
@@ -1591,6 +1710,325 @@ mod r11_active_adoption_tests {
                 .account,
             "a"
         );
+    }
+
+    #[test]
+    fn n6t_model_consent_actual_launch_binds_exact_context() {
+        // Both forms of explicit consent must reach the real Strict CAS.
+        for account_consent in [false, true] {
+            let (_home, table, cs, es) = fixture(Mode::Strict);
+            place(&table, &cs, &es);
+            table
+                .resolve_launch(Some(SOURCE), Some(REAL), Utc::now())
+                .unwrap();
+            let now = Utc::now();
+            let revision = table.routing_plan(Some(SOURCE)).revision;
+            let mut r = request("launch:n6t-consented");
+            r.resume_key = Some(REAL);
+            r.model = Some("m2");
+            r.account_pref = account_consent.then_some("b");
+            r.allow_move_for_model = !account_consent;
+            let mut called = false;
+            let placement = table
+                .place_launch_with_authorizer(r, &cs, &es, now, |store, proof| {
+                    called = true;
+                    assert_eq!(proof.key(), SOURCE);
+                    assert_eq!(proof.previous(), "a");
+                    assert_eq!(proof.account(), "b");
+                    assert_eq!(proof.model(), "m2");
+                    assert_eq!(proof.expected_revision(), revision);
+                    assert_eq!(proof.at(), now);
+                    assert!(
+                        proof
+                            .validate_context(SOURCE, Some("a"), "b", revision, Some("m2"), now)
+                            .is_ok()
+                    );
+                    // Change each transaction coordinate independently, including
+                    // absent source/model. No reason string participates in proof.
+                    for (key, from, to, rev, model, at) in [
+                        ("launch:other", Some("a"), "b", revision, Some("m2"), now),
+                        (SOURCE, Some("other"), "b", revision, Some("m2"), now),
+                        (SOURCE, None, "b", revision, Some("m2"), now),
+                        (SOURCE, Some("a"), "other", revision, Some("m2"), now),
+                        (SOURCE, Some("a"), "b", revision + 1, Some("m2"), now),
+                        (SOURCE, Some("a"), "b", revision, Some("m1"), now),
+                        (SOURCE, Some("a"), "b", revision, None, now),
+                        (
+                            SOURCE,
+                            Some("a"),
+                            "b",
+                            revision,
+                            Some("m2"),
+                            now + Delta::nanoseconds(1),
+                        ),
+                    ] {
+                        assert_eq!(
+                            proof.validate_context(key, from, to, rev, model, at),
+                            Err(LaunchError::PolicyBlocked)
+                        );
+                    }
+                    store.authorize_model_move(proof)
+                })
+                .unwrap();
+            assert!(called);
+            assert_eq!(placement.account, "b");
+            assert_eq!(placement.effective_model.as_deref(), Some("m2"));
+            assert_eq!(table.routing_plan(Some(SOURCE)).revision, revision + 1);
+            assert_eq!(table.current(Some(REAL)).as_deref(), Some("b"));
+        }
+    }
+
+    #[test]
+    fn n6t_non_model_or_unconsented_launches_never_expose_evidence() {
+        for case in [
+            "ordinary",
+            "implicit",
+            "supported",
+            "unconsented",
+            "busy",
+            "unknown",
+            "no_target",
+            "ineligible_target",
+            "implicit_health_failure",
+        ] {
+            let (_home, table, mut cs, mut es) = fixture(Mode::Strict);
+            // Initial placement is also an ordinary path, even with --account.
+            table
+                .place_launch_with_authorizer(request(SOURCE), &cs, &es, Utc::now(), |_, _| {
+                    panic!("initial placement cannot authorize MODEL")
+                })
+                .unwrap();
+            table
+                .resolve_launch(Some(SOURCE), Some(REAL), Utc::now())
+                .unwrap();
+            let mut r = request("launch:n6t-no-evidence");
+            r.resume_key = Some(REAL);
+            r.model = Some("m2");
+            r.account_pref = None;
+            r.allow_move_for_model = true;
+            let pin = (case == "busy").then(|| table.pin(Some(SOURCE)));
+            let expected = match case {
+                "ordinary" => {
+                    r.model = Some("m1");
+                    r.allow_move_for_model = false;
+                    None
+                }
+                "implicit" => {
+                    r.model_is_explicit = false;
+                    None
+                }
+                "supported" => {
+                    r.model = Some("m1");
+                    r.account_pref = Some("b");
+                    None
+                }
+                "unconsented" => {
+                    r.allow_move_for_model = false;
+                    Some(LaunchError::ConsentRequired)
+                }
+                "busy" => Some(LaunchError::Busy),
+                "unknown" => {
+                    es.remove("a");
+                    Some(LaunchError::EntitlementsUnknown)
+                }
+                "no_target" => {
+                    es.get_mut("b").unwrap().clear();
+                    Some(LaunchError::NoEligibleAccount)
+                }
+                "ineligible_target" => {
+                    cs[1].account.drain = true;
+                    Some(LaunchError::NoEligibleAccount)
+                }
+                "implicit_health_failure" => {
+                    r.model = Some("m1");
+                    r.model_is_explicit = false;
+                    cs[0].account.apply_health_signal(
+                        crate::accounts::HealthSignal::Revoked {
+                            reason: "synthetic".into(),
+                        },
+                        Utc::now(),
+                    );
+                    Some(LaunchError::PolicyBlocked)
+                }
+                _ => unreachable!(),
+            };
+            let result = table.place_launch_with_authorizer(r, &cs, &es, Utc::now(), |_, _| {
+                panic!("{case} cannot authorize MODEL")
+            });
+            match expected {
+                Some(error) => assert_eq!(result.unwrap_err(), error, "{case}"),
+                None => assert_eq!(result.unwrap().account, "a", "{case}"),
+            }
+            assert_eq!(table.current(Some(REAL)).as_deref(), Some("a"));
+            drop(pin);
+        }
+    }
+
+    #[test]
+    fn n6t_denied_admission_never_exposes_evidence() {
+        let (_home, table, cs, es) = fixture(Mode::Strict);
+        place(&table, &cs, &es);
+        table
+            .resolve_launch(Some(SOURCE), Some(REAL), Utc::now())
+            .unwrap();
+        let revision = table.routing_plan(Some(SOURCE)).revision;
+        let mut r = request("launch:n6t-admission-denied");
+        r.resume_key = Some(REAL);
+        r.model = Some("m2");
+        r.account_pref = Some("b");
+        assert_eq!(
+            table
+                .place_launch_for_issue_admitted(
+                    r,
+                    &cs,
+                    MoveObservations::untracked(),
+                    &es,
+                    Utc::now(),
+                    None,
+                    Some(&|_, _, _| false),
+                    |_, _| panic!("denied admission cannot authorize MODEL"),
+                )
+                .unwrap_err(),
+            LaunchError::NoEligibleAccount
+        );
+        assert_eq!(table.routing_plan(Some(SOURCE)).revision, revision);
+        assert_eq!(table.current(Some(REAL)).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn n6t_stale_admission_policy_rejects_before_authorizer() {
+        let (_home, table, cs, es) = fixture(Mode::Strict);
+        place(&table, &cs, &es);
+        table
+            .resolve_launch(Some(SOURCE), Some(REAL), Utc::now())
+            .unwrap();
+        let mut r = request("launch:n6t-stale");
+        r.resume_key = Some(REAL);
+        r.model = Some("m2");
+        r.account_pref = Some("b");
+        let admit = |_: &str, _: bool, _: Option<&str>| {
+            table
+                .policies
+                .put_project(
+                    None,
+                    Project {
+                        name: "interposed".into(),
+                        settings: Settings::default(),
+                    },
+                )
+                .unwrap();
+            true
+        };
+        assert_eq!(
+            table
+                .place_launch_for_issue_admitted(
+                    r,
+                    &cs,
+                    MoveObservations::untracked(),
+                    &es,
+                    Utc::now(),
+                    None,
+                    Some(&admit),
+                    |_, _| panic!("stale admission cannot authorize MODEL"),
+                )
+                .unwrap_err(),
+            LaunchError::PolicyBlocked
+        );
+        assert_eq!(table.current(Some(REAL)).as_deref(), Some("a"));
+        assert_eq!(
+            table.routing_plan(Some(SOURCE)).anchor.as_deref(),
+            Some("a")
+        );
+    }
+
+    #[test]
+    fn n6t_strict_authorizer_requires_exact_revision_bump() {
+        for interposed in [false, true] {
+            let (_home, table, cs, es) = fixture(Mode::Strict);
+            place(&table, &cs, &es);
+            table
+                .resolve_launch(Some(SOURCE), Some(REAL), Utc::now())
+                .unwrap();
+            let revision = table.routing_plan(Some(SOURCE)).revision;
+            let mut r = request("launch:n6t-authorizer");
+            r.resume_key = Some(REAL);
+            r.model = Some("m2");
+            r.account_pref = Some("b");
+            let result =
+                table.place_launch_with_authorizer(r, &cs, &es, Utc::now(), |store, proof| {
+                    if interposed {
+                        store.authorize_model_move(proof)?;
+                        store.put_project(
+                            None,
+                            Project {
+                                name: "after-cas".into(),
+                                settings: Settings::default(),
+                            },
+                        )?;
+                    }
+                    Ok(())
+                });
+            assert_eq!(result.unwrap_err(), LaunchError::PolicyBlocked);
+            assert_eq!(table.current(Some(REAL)).as_deref(), Some("a"));
+            let current = table.routing_plan(Some(SOURCE));
+            // A rejected binding publication must not roll back durable CAS.
+            assert_eq!(
+                current.anchor.as_deref(),
+                Some(if interposed { "b" } else { "a" })
+            );
+            assert_eq!(current.revision, revision + if interposed { 2 } else { 0 });
+        }
+    }
+
+    #[test]
+    fn n6t_model_cooled_source_requires_and_honors_explicit_consent() {
+        // A listed model can still be unavailable on the source. Preserve the
+        // original MODEL classification and Strict authorization for that case.
+        for consent in ["none", "account", "move_for_model"] {
+            let (_home, table, mut cs, es) = fixture(Mode::Strict);
+            place(&table, &cs, &es);
+            table
+                .resolve_launch(Some(SOURCE), Some(REAL), Utc::now())
+                .unwrap();
+            let now = Utc::now();
+            cs[0].account.apply_health_signal(
+                crate::accounts::HealthSignal::Cooling {
+                    reason: crate::accounts::HealthReason::Rate,
+                    until: now + Delta::minutes(5),
+                    scope: "model:m1".into(),
+                },
+                now,
+            );
+            assert!(es["a"].contains("m1"));
+            assert!(cs[0].account.eligible_at(None, now));
+            assert!(!cs[0].account.eligible_at(Some("m1"), now));
+            let revision = table.routing_plan(Some(SOURCE)).revision;
+            let mut r = request("launch:n6t-model-cooled");
+            r.resume_key = Some(REAL);
+            r.account_pref = (consent == "account").then_some("b");
+            r.allow_move_for_model = consent == "move_for_model";
+            let mut called = false;
+            let result = table.place_launch_with_authorizer(r, &cs, &es, now, |store, proof| {
+                called = true;
+                assert_eq!(proof.key(), SOURCE);
+                assert_eq!(proof.previous(), "a");
+                assert_eq!(proof.account(), "b");
+                assert_eq!(proof.model(), "m1");
+                assert_eq!(proof.expected_revision(), revision);
+                store.authorize_model_move(proof)
+            });
+            if consent == "none" {
+                assert_eq!(result.unwrap_err(), LaunchError::ConsentRequired);
+                assert!(!called);
+                assert_eq!(table.routing_plan(Some(SOURCE)).revision, revision);
+                assert_eq!(table.current(Some(REAL)).as_deref(), Some("a"));
+            } else {
+                assert_eq!(result.unwrap().account, "b");
+                assert!(called);
+                assert_eq!(table.routing_plan(Some(SOURCE)).revision, revision + 1);
+                assert_eq!(table.current(Some(REAL)).as_deref(), Some("b"));
+            }
+        }
     }
 
     fn counts(t: &BindingTable, key: &str, active: usize, pins: usize, pending: usize) {

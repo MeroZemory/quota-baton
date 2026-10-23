@@ -345,6 +345,12 @@ async fn upgrade_inner(
             "등록된 프로젝트와 루트 세션 연결을 확인해 주세요.",
         );
     }
+    // A reconnect upgrade has no body model. Retain the model from the actual
+    // failed precommit turn so model-scoped health and evidence stay scoped.
+    if session.model.is_none() {
+        let source = state.bindings.current(session.key.as_deref());
+        session.model = state.reconnect_model(session.key.as_deref(), source.as_deref());
+    }
     completion.session(&session);
     let ticket = state.observability.capture_request(&parts.headers, &[]);
     let query = parts
@@ -872,6 +878,13 @@ async fn upgrade_inner(
                 &error.raw,
                 session.model.as_deref(),
             );
+            let failure_evidence = decision.failed_attempt(
+                &account,
+                session.key.as_deref(),
+                session.model.as_deref(),
+                deadline,
+                &completion.failure_lifetime,
+            );
             decision.reconcile_quota(&credit_observation);
             if decision.kind == super::outcome::Kind::Quota {
                 state.accounts.invalidate_quota_rejection(&account.id).await;
@@ -1008,6 +1021,7 @@ async fn upgrade_inner(
                 return error.into_response();
             }
             if failover {
+                completion.failure_evidence = failure_evidence;
                 completion.failover(reason);
             }
             if error.complete
