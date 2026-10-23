@@ -342,10 +342,25 @@ struct DeferredOwner {
     digest: TokenDigest,
     anchor: String,
     root: OnceLock<String>,
-    claimed: AtomicBool,
+    reset_runtime: OnceLock<Weak<()>>,
+    episode: Mutex<OwnerEpisode>,
     live: AtomicBool,
     gate: Mutex<()>,
     changed: tokio::sync::Notify,
+}
+// Constant-size owner receipt survives reclamation of terminal reset records.
+// Only an explicit advance can reopen registration; the root is never cleared.
+enum OwnerEpisode {
+    Open {
+        previous: u64,
+        after: Option<chrono::DateTime<chrono::Utc>>,
+    },
+    Registered(u64),
+    Consumed {
+        id: u64,
+        at: chrono::DateTime<chrono::Utc>,
+        pending: Option<u64>,
+    },
 }
 impl LaunchOwnerLease {
     pub(crate) fn scope(&self) -> LaunchOwnerScope {
@@ -381,17 +396,133 @@ impl LaunchOwnerScope {
             && self.0.digest == pin.digest
             && Weak::ptr_eq(&self.0.registry, &Arc::downgrade(&pin.inner))
     }
-    pub(crate) fn claim(&self, root: &str) -> bool {
+    pub(crate) fn claim(
+        &self,
+        root: &str,
+        id: u64,
+        source_started_at: chrono::DateTime<chrono::Utc>,
+        runtime: &Arc<()>,
+    ) -> bool {
+        let Ok(mut episode) = self.0.episode.lock() else {
+            return false;
+        };
+        let (previous, after) = match *episode {
+            OwnerEpisode::Open { previous, after } => (previous, after),
+            OwnerEpisode::Consumed {
+                id,
+                at,
+                pending: None,
+            } => (id, Some(at)),
+            _ => return false,
+        };
         if !self.live()
+            || id <= previous
+            || after.is_some_and(|after| source_started_at <= after)
+            || self.root().is_some_and(|bound| bound != root)
             || self
                 .0
-                .claimed
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
+                .reset_runtime
+                .get()
+                .is_some_and(|bound| !Weak::ptr_eq(bound, &Arc::downgrade(runtime)))
         {
             return false;
         }
-        self.0.root.set(root.to_owned()).is_ok() && self.live()
+        if self.root().is_none() && self.0.root.set(root.to_owned()).is_err() {
+            return false;
+        }
+        if self.0.reset_runtime.get().is_none()
+            && self.0.reset_runtime.set(Arc::downgrade(runtime)).is_err()
+        {
+            return false;
+        }
+        if let OwnerEpisode::Consumed { pending, .. } = &mut *episode {
+            // One genuinely new qualified registration may arrive before its
+            // parent processes turn progress. It remains unusable until Advance.
+            *pending = Some(id);
+        } else {
+            *episode = OwnerEpisode::Registered(id);
+        }
+        self.live()
+    }
+    pub(crate) fn episode_id(&self) -> Result<Option<u64>, ()> {
+        Ok(match *self.0.episode.lock().map_err(|_| ())? {
+            OwnerEpisode::Open { .. } => None,
+            OwnerEpisode::Registered(id) | OwnerEpisode::Consumed { id, .. } => Some(id),
+        })
+    }
+    /// Called under the reset record and owner lifetime gates, only after the
+    /// final READY -> CONSUMED transition. No retained record is needed later.
+    pub(crate) fn consumed_episode(&self, id: u64) -> bool {
+        let Ok(mut episode) = self.0.episode.lock() else {
+            return false;
+        };
+        if !self.live() || !matches!(*episode, OwnerEpisode::Registered(actual) if actual == id) {
+            return false;
+        }
+        *episode = OwnerEpisode::Consumed {
+            id,
+            at: chrono::Utc::now(),
+            pending: None,
+        };
+        true
+    }
+    pub(crate) fn pending_episode(&self, id: u64, runtime: &Arc<()>) -> Result<Option<u64>, ()> {
+        let episode = self.0.episode.lock().map_err(|_| ())?;
+        if !self.live()
+            || !self
+                .0
+                .reset_runtime
+                .get()
+                .is_some_and(|bound| Weak::ptr_eq(bound, &Arc::downgrade(runtime)))
+        {
+            return Err(());
+        }
+        match *episode {
+            OwnerEpisode::Consumed {
+                id: actual,
+                pending,
+                ..
+            } if actual == id => Ok(pending),
+            _ => Err(()),
+        }
+    }
+    pub(crate) fn advance_episode(
+        &self,
+        id: u64,
+        runtime: &Arc<()>,
+        expected: Option<u64>,
+    ) -> bool {
+        let Ok(mut episode) = self.0.episode.lock() else {
+            return false;
+        };
+        let OwnerEpisode::Consumed {
+            id: actual,
+            at,
+            pending,
+        } = *episode
+        else {
+            return false;
+        };
+        if !self.live()
+            || actual != id
+            || pending != expected
+            || !self
+                .0
+                .reset_runtime
+                .get()
+                .is_some_and(|bound| Weak::ptr_eq(bound, &Arc::downgrade(runtime)))
+        {
+            return false;
+        }
+        *episode = if let Some(pending) = pending {
+            OwnerEpisode::Registered(pending)
+        } else {
+            OwnerEpisode::Open {
+                previous: id,
+                after: Some(at),
+            }
+        };
+        true
     }
     pub(crate) fn notified(&self) -> tokio::sync::futures::Notified<'_> {
         self.0.changed.notified()
@@ -444,7 +575,11 @@ impl LaunchPin {
             digest: self.digest,
             anchor: entry.metadata.binding_anchor_key.clone(),
             root: OnceLock::new(),
-            claimed: AtomicBool::new(false),
+            reset_runtime: OnceLock::new(),
+            episode: Mutex::new(OwnerEpisode::Open {
+                previous: 0,
+                after: None,
+            }),
             live: AtomicBool::new(true),
             gate: Mutex::new(()),
             changed: tokio::sync::Notify::new(),
@@ -520,6 +655,86 @@ mod tests {
             binding_anchor_key: "binding-anchor".into(),
             advertised_models: BTreeSet::from(["model-a".into()]),
         }
+    }
+
+    #[test]
+    fn deferred_owner_advance_preserves_root_pin_runtime_and_requires_new_source() {
+        let f = Fixture::new();
+        let token = f.issue();
+        let pin = f.registry.get_or_pin(token.expose_secret()).unwrap();
+        let lease = pin.open_deferred_owner().unwrap();
+        let scope = lease.scope();
+        let runtime = Arc::new(());
+        let foreign_runtime = Arc::new(());
+        let root = "codex:11111111-2222-4333-8444-555555555555";
+        let old_source = chrono::Utc::now();
+        assert!(!scope.advance_episode(7, &runtime, None));
+        assert!(!scope.claim(root, 0, old_source, &runtime));
+        assert!(scope.claim(root, 7, old_source, &runtime));
+        assert!(!scope.advance_episode(7, &runtime, None));
+        assert!(!scope.consumed_episode(8));
+        assert!(scope.consumed_episode(7));
+        // Consumption alone never makes another episode current.
+        assert!(!scope.claim(root, 8, old_source, &runtime));
+        assert!(!scope.advance_episode(8, &runtime, None));
+        assert!(!scope.advance_episode(7, &foreign_runtime, None));
+        assert!(scope.advance_episode(7, &runtime, None));
+        assert!(!scope.advance_episode(7, &runtime, None));
+        assert_eq!(scope.episode_id(), Ok(None));
+        assert_eq!(scope.root(), Some(root));
+        assert!(scope.matches_pin(&pin));
+        let other_token = f.issue();
+        let other_pin = f.registry.get_or_pin(other_token.expose_secret()).unwrap();
+        assert!(!scope.matches_pin(&other_pin));
+
+        let cutoff = match *scope.0.episode.lock().unwrap() {
+            OwnerEpisode::Open {
+                after: Some(at), ..
+            } => at,
+            _ => panic!("advance must open one fresh registration"),
+        };
+        let fresh = cutoff + chrono::Duration::nanoseconds(1);
+        assert!(!scope.claim(root, 8, old_source, &runtime));
+        assert!(!scope.claim(root, 8, cutoff, &runtime));
+        assert!(!scope.claim(root, 7, fresh, &runtime));
+        assert!(!scope.claim("codex:other-root", 8, fresh, &runtime));
+        assert!(!scope.claim(root, 8, fresh, &foreign_runtime));
+        assert!(scope.claim(root, 8, fresh, &runtime));
+        assert_eq!(scope.episode_id(), Ok(Some(8)));
+        assert!(!scope.consumed_episode(7));
+        assert!(!scope.advance_episode(7, &runtime, None));
+        assert!(scope.consumed_episode(8));
+        drop(lease);
+        assert!(!scope.advance_episode(8, &runtime, None));
+        assert!(!scope.claim(root, 9, fresh, &runtime));
+    }
+
+    #[test]
+    fn deferred_owner_has_only_one_pending_registration_until_exact_advance() {
+        let f = Fixture::new();
+        let token = f.issue();
+        let pin = f.registry.get_or_pin(token.expose_secret()).unwrap();
+        let lease = pin.open_deferred_owner().unwrap();
+        let scope = lease.scope();
+        let runtime = Arc::new(());
+        let root = "codex:11111111-2222-4333-8444-555555555555";
+        assert!(scope.claim(root, 1, chrono::Utc::now(), &runtime));
+        assert!(scope.consumed_episode(1));
+        let cutoff = match *scope.0.episode.lock().unwrap() {
+            OwnerEpisode::Consumed { at, .. } => at,
+            _ => panic!("missing exact consumed receipt"),
+        };
+        let fresh = cutoff + chrono::Duration::nanoseconds(1);
+        assert!(!scope.claim(root, 2, cutoff, &runtime));
+        assert!(scope.claim(root, 2, fresh, &runtime));
+        assert!(!scope.claim(root, 3, fresh, &runtime));
+        assert_eq!(scope.episode_id(), Ok(Some(1)));
+        assert!(!scope.consumed_episode(2));
+        assert!(!scope.advance_episode(1, &runtime, None));
+        assert!(!scope.advance_episode(1, &runtime, Some(3)));
+        assert!(scope.advance_episode(1, &runtime, Some(2)));
+        assert_eq!(scope.episode_id(), Ok(Some(2)));
+        assert!(!scope.advance_episode(1, &runtime, Some(2)));
     }
 
     #[test]

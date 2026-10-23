@@ -30,6 +30,11 @@ pub enum Command {
     Consume {
         episode: u64,
     },
+    /// Opens one future registration after this exact consumed episode. This
+    /// carries no reset evidence and grants no activation authority.
+    Advance {
+        episode: u64,
+    },
     Cancel {
         episode: u64,
     },
@@ -51,6 +56,7 @@ impl Request {
                 }
                 Command::Inspect { episode }
                 | Command::Consume { episode }
+                | Command::Advance { episode }
                 | Command::Cancel { episode } => *episode != 0,
             }
     }
@@ -69,12 +75,29 @@ pub struct Reply {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Event {
-    Waiting { episode: u64, reset_unix_ms: i64 },
-    Due { episode: u64 },
-    Ready { episode: u64 },
-    Granted { episode: u64 },
-    Cancelled { episode: u64 },
-    Refused { reason: Refusal },
+    Waiting {
+        episode: u64,
+        reset_unix_ms: i64,
+    },
+    Due {
+        episode: u64,
+    },
+    Ready {
+        episode: u64,
+    },
+    Granted {
+        episode: u64,
+    },
+    /// Correlates the consumed episode, never the future registration's ID.
+    Advanced {
+        episode: u64,
+    },
+    Cancelled {
+        episode: u64,
+    },
+    Refused {
+        reason: Refusal,
+    },
 }
 
 #[derive(Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -96,7 +119,7 @@ impl Reply {
                 episode,
                 reset_unix_ms,
             } => self.request_id.is_some() && *episode != 0 && *reset_unix_ms > 0,
-            Event::Ready { episode } | Event::Granted { episode } => {
+            Event::Ready { episode } | Event::Granted { episode } | Event::Advanced { episode } => {
                 self.request_id.is_some() && *episode != 0
             }
             Event::Due { episode } | Event::Cancelled { episode } => *episode != 0,
