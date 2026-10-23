@@ -4197,3 +4197,135 @@ async fn n5b_ws_deferred_rate_resend_keeps_controls_and_cancels_native_queue() {
     );
     assert_eq!(h.store.load(&account).unwrap().health, Health::Ready);
 }
+
+// Pending inspection is a pump future, not an inline incoming-frame await.
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn n5b_ws_initial_inspection_precheck_and_lease_keep_controls_live() {
+    for before_lease in [false, true] {
+        for eof in [false, true] {
+            let h = Harness::new(1).await;
+            let (mut client, account) = h.connect().await;
+            let raw = json!({"type":"response.create", "model":"synthetic-inspection", "input":[]})
+                .to_string();
+            let (arrived, release) = h.state.pause_ws_initial_inspection(
+                "codex:synthetic-ws-session",
+                raw.as_bytes(),
+                before_lease,
+            );
+            client.send(Message::text(raw)).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(3), arrived)
+                .await
+                .expect("initial inspection must reach its exact native await boundary")
+                .unwrap();
+            assert!(n5b_controls_data(&h).is_empty());
+            assert_eq!(h.state.accounts.inflight_count(&account), 0);
+            assert_eq!(h.state.bindings.pending_count(&account), 0);
+            let early_ping = bytes::Bytes::from_static(b"synthetic-inspection-before-deferred");
+            client
+                .send(Message::Ping(early_ping.clone()))
+                .await
+                .unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), receive(&mut client))
+                    .await
+                    .expect(
+                        "initial inspection controls must progress before eligibility/lease release"
+                    ),
+                Message::Pong(early_ping)
+            );
+            n5b_controls_deferred(&h, &mut client, Message::Binary(vec![0, 255, 42].into())).await;
+            client
+                .send(Message::Pong(bytes::Bytes::from_static(
+                    b"synthetic-inspection-pong",
+                )))
+                .await
+                .unwrap();
+            let ping = bytes::Bytes::from_static(b"synthetic-inspection-ping");
+            client.send(Message::Ping(ping.clone())).await.unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), receive(&mut client))
+                    .await
+                    .expect(
+                        "initial inspection controls must progress before eligibility/lease release"
+                    ),
+                Message::Pong(ping)
+            );
+            assert!(!release.is_closed());
+            if eof {
+                drop(client);
+            } else {
+                client.close(None).await.unwrap();
+                assert!(matches!(
+                    tokio::time::timeout(Duration::from_secs(1), client.next())
+                        .await
+                        .expect("inspection Close must precede native inspection release"),
+                    Some(Ok(Message::Close(_))) | None
+                ));
+            }
+            n5b_controls_released(&h, &account).await;
+            assert!(
+                release.is_closed(),
+                "cancellation must drop the inspection owner"
+            );
+            assert!(
+                release.send(()).is_err(),
+                "late inspection cannot revive cancelled create"
+            );
+            assert!(n5b_controls_data(&h).is_empty());
+            assert!(
+                !h.ledger()
+                    .iter()
+                    .any(|row| row["model"] == "synthetic-inspection"),
+                "pre-constructor cancellation must not invent a completion/attempt"
+            );
+            assert_eq!(h.fake.state.requests().len(), 1);
+            assert_eq!(
+                h.state
+                    .bindings
+                    .current(Some("codex:synthetic-ws-session"))
+                    .as_deref(),
+                Some(account.as_str())
+            );
+            assert_eq!(h.store.load(&account).unwrap().health, Health::Ready);
+        }
+    }
+}
+
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn n5b_ws_initial_inspection_release_sends_original_create_once() {
+    for before_lease in [false, true] {
+        let h = Harness::new(1).await;
+        let (mut client, account) = h.connect().await;
+        let raw = r#" { "type":"response.create", "model":"synthetic-inspection-positive", "input":[], "extra":42 } "#;
+        let (arrived, release) = h.state.pause_ws_initial_inspection(
+            "codex:synthetic-ws-session",
+            raw.as_bytes(),
+            before_lease,
+        );
+        client.send(Message::text(raw)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), arrived)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(n5b_controls_data(&h).is_empty());
+        let done = Message::text(r#"{"type":"response.completed"}"#);
+        h.fake.state.push_reply([done.clone()]);
+        release.send(()).unwrap();
+        assert_eq!(receive(&mut client).await, done);
+        assert_eq!(n5b_controls_data(&h), vec![Message::text(raw)]);
+        let row = r1_create_record(&h, "synthetic-inspection-positive").await;
+        assert_eq!(row["attempts"], 1);
+        assert_eq!(row["rate_retries"], 0);
+        assert_eq!(row["account"], account);
+        client.close(None).await.unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), client.next())
+                .await
+                .unwrap(),
+            Some(Ok(Message::Close(_))) | None
+        ));
+        n5b_controls_released(&h, &account).await;
+    }
+}
