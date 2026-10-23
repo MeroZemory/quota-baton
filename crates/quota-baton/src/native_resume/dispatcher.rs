@@ -54,6 +54,33 @@ impl<N: Write, U: Write> Dispatcher<N, U> {
         self.apply(action, authorize)
     }
 
+    /// Dedicated parent only: lets its ingress sequencer cover the COMPLETE
+    /// physical activation frame, delimiter and flush. A bounded async Consume
+    /// may run before acquiring that gate; the callback must then recheck its
+    /// ingress checkpoint under the gate and write directly through this sole
+    /// writer. Never enqueue automatic bytes for a later writer.
+    pub(crate) fn native_frame_committed(
+        &mut self,
+        frame: &[u8],
+        commit: impl FnOnce(&mut FrameWriter<N>, &[u8]) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let action = self.controller.native_frame(frame);
+        match action {
+            Ok(Action::ResumeNative(frame)) => match commit(&mut self.native, &frame) {
+                Ok(()) => Ok(()),
+                Err(Error::AuthorityDenied) => {
+                    self.controller.cancel_resume();
+                    Err(Error::AuthorityDenied)
+                }
+                Err(error) => {
+                    self.controller.disconnect();
+                    Err(error)
+                }
+            },
+            other => self.apply(other, || false),
+        }
+    }
+
     pub(crate) fn stopped_ticket(&mut self) -> Option<StoppedGoalTicket> {
         self.controller.stopped_ticket()
     }
@@ -93,7 +120,10 @@ impl<N: Write, U: Write> Dispatcher<N, U> {
             Action::ToNative(frame) => self.native.send(&frame),
             Action::ResumeNative(frame) => {
                 if !authorize() {
-                    self.controller.disconnect();
+                    // Revocation of automatic authority is not native/UI
+                    // transport loss. Keep the ordinary user-owned session
+                    // live, but never rearm this automatic attempt.
+                    self.controller.cancel_resume();
                     return Err(Error::AuthorityDenied);
                 }
                 self.native.send(&frame)
