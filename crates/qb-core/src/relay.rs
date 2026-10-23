@@ -68,6 +68,14 @@ pub struct HttpQuotaWaitEvent {
     pub source: String,
 }
 
+#[cfg(feature = "testkit")]
+#[derive(Clone, Debug)]
+pub struct WsQuotaWaitEvent {
+    pub stage: &'static str,
+    pub source: String,
+    pub deadline: tokio::time::Instant,
+}
+
 pub struct RelayState {
     pub accounts: Arc<crate::account_runtime::AccountRuntime>,
     pub quota: Arc<crate::quota::UsagePoller>,
@@ -101,6 +109,8 @@ pub struct RelayState {
     reconnect_exclusions: Mutex<BTreeMap<(String, String), Instant>>,
     #[cfg(feature = "testkit")]
     http_quota_wait_events: tokio::sync::broadcast::Sender<HttpQuotaWaitEvent>,
+    #[cfg(feature = "testkit")]
+    ws_quota_wait_events: tokio::sync::broadcast::Sender<WsQuotaWaitEvent>,
     draining: AtomicBool,
     drain_started: AtomicBool,
     drain_ready: AtomicBool,
@@ -419,6 +429,34 @@ impl RelayState {
         });
     }
 
+    #[cfg(feature = "testkit")]
+    pub fn subscribe_ws_quota_wait(&self) -> tokio::sync::broadcast::Receiver<WsQuotaWaitEvent> {
+        self.ws_quota_wait_events.subscribe()
+    }
+
+    /// Synthetic cache-loss setup; refuses to remove an active catalog refresh.
+    #[cfg(all(feature = "testkit", debug_assertions))]
+    pub fn clear_codex_catalog_for_test(
+        &self,
+        account: &str,
+    ) -> Result<bool, crate::catalog::CatalogError> {
+        self.catalogs.remove(account)
+    }
+
+    #[cfg(feature = "testkit")]
+    fn observe_ws_quota_wait(
+        &self,
+        stage: &'static str,
+        source: &str,
+        deadline: tokio::time::Instant,
+    ) {
+        let _ = self.ws_quota_wait_events.send(WsQuotaWaitEvent {
+            stage,
+            source: source.to_owned(),
+            deadline,
+        });
+    }
+
     fn http_wait_reset_source_current(&self, key: &str, source: &str, model: Option<&str>) -> bool {
         self.bindings
             .models_launch_snapshot(Some(key), None)
@@ -578,6 +616,8 @@ impl RelayState {
             reconnect_exclusions: Mutex::new(BTreeMap::new()),
             #[cfg(feature = "testkit")]
             http_quota_wait_events: tokio::sync::broadcast::channel(32).0,
+            #[cfg(feature = "testkit")]
+            ws_quota_wait_events: tokio::sync::broadcast::channel(32).0,
             draining: AtomicBool::new(false),
             drain_started: AtomicBool::new(false),
             drain_ready: AtomicBool::new(false),
