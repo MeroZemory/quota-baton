@@ -121,6 +121,17 @@ pub(super) async fn wait_http_quota(
             biased;
             _ = relay.wait_for_drain_start() => return stopped(source, envelope.is_some()),
             _ = tokio::time::sleep_until(deadline) => return stopped(source, envelope.is_some()),
+            _ = async {
+                match envelope {
+                    Some((wake, _)) => tokio::time::sleep_until(wake).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                if !caller_live(operation, deadline, relay.is_draining()) {
+                    return stopped(source, envelope.is_some());
+                }
+                return ended_envelope(source, envelope, Instant::now(), Utc::now());
+            },
             result = &mut task => result,
         };
         // Dropping a JoinHandle cannot stop running blocking work. It only
