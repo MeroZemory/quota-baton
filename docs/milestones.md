@@ -9,7 +9,7 @@ This file names the verification for each unit and each row. The row list and th
 목표: HTTP 대기 노드 검증 완료; WS/SSE 취소·keepalive 소유권 연결과 실제 전송 회귀
 핵심 지표: 남은 출시 1/3 (R14 보호 설치, R13 C+E 실행, R13 F 통합 예측); 이전 계열 2/2 종료
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-23 09:31 KST (N5a HTTP 관문 통과; WS/SSE 다음 노드 시작, C+E 통합·설치 전)
+갱신: 2026-10-23 09:39 KST (SSE 실제 취소·정확 제거 대조 통과; WS 대기 제어 연결 중, C+E 통합 전)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -377,6 +377,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-23 08:07 | N5a HTTP429 근거 완료 | N5a72·판정18·실제 TCP1, 총91통과; strict core/testkit all-target lint exit0 | 헤더 즉시 적용·본문 완료 후 최종 근거·새 보고 무효화 | ce351c2; 이전 코드 실제 조기 mint 대조 exit101·정확 복원 exit0. 실제 대기/재개 승인 아님 |
 | 2026-10-23 08:53 | N5a HTTP 대기 허가·초기화 재개 | 고정 입력129 N5a+3 helper+1 실제 drain=133통과, strict core/testkit lint·fmt exit0; 실제 재개/취소2 및 native renewal2 별도 통과 | 원래 wake/deadline·현재 모델/정책·취소 정리 | n5a-model-drain-gate/n5a-http-wait-actual 증거. 승인 hook 제거 exit101·정확 복원 exit0; 후속 policy/poll/전체 영향 회귀 전이며 전체 C+E 수용 아님 |
 | 2026-10-23 09:31 | N5a HTTP 최종 영향 관문 | library902(901+기대값 수리1)·HTTP바인딩59·WS123 통과, 기본/testkit strict core lint·fmt exit0 | HTTP 초기 진입·한도 밖 fallback·Codex/Claude 재개·poll 교체·취소·원래 타이머 | n5a-delivery-fingerprint.json에 입력별 명령/exit/합계. 실제 N5a9 포함; 타이머 제거 exit101·정확 복원 exit0; 전체 workspace/C+E/재생 수용 아님 |
+| 2026-10-23 09:39 | N5b 실제 SSE 취소 단위 | 실제 socket close1·strict target lint·fmt exit0; tx.closed 제거 exit101·정확 복원 exit0 | 비종료 stalled upstream·native 자원 정리 | 코드349909f; n5b-sse-unit/n5b-sse-cancel-red 증거. quota hold·WS·전체 N5b 수용 아님 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
