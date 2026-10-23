@@ -767,6 +767,8 @@ pub struct TrayAccount {
     #[serde(default)]
     pub allow_credits: bool,
     #[serde(default)]
+    pub outside_used: bool,
+    #[serde(default)]
     pub refresh_attention: bool,
     #[serde(default, deserialize_with = "decode_source")]
     pub source: String,
@@ -835,6 +837,47 @@ pub struct Inflight {
 pub struct Memory {
     #[serde(default)]
     pub private_bytes: u64,
+}
+
+#[cfg(test)]
+mod n10_outside_usage_transport_tests {
+    use super::*;
+
+    #[test]
+    fn n10_outside_used_survives_actual_dto_and_layout_input_with_legacy_default() {
+        for flag in [None, Some(false), Some(true)] {
+            let mut wire = serde_json::json!({"accounts":[{
+                "id":"synthetic-outside", "provider":"codex", "plan":"plus",
+                "user_state":"active", "health":{"kind":"ready"},
+                "credits_in_use":true, "allow_credits":true,
+                "source":{"kind":"cpa","mode":"adopted"}
+            }]});
+            if let Some(flag) = flag {
+                wire["accounts"][0]["outside_used"] = flag.into();
+            }
+            let snapshot: TraySnapshot = serde_json::from_value(wire).unwrap();
+            assert_eq!(snapshot.accounts[0].outside_used, flag.unwrap_or(false));
+            let read = TrayRead {
+                snapshot,
+                health: CoreHealth::Healthy(HealthResponse {
+                    ok: true,
+                    version: "synthetic".into(),
+                    pid: 1,
+                    started_at: "2026-10-23T00:00:00Z".into(),
+                }),
+            };
+            let now = "2026-10-23T00:00:00Z"
+                .parse::<chrono::DateTime<chrono::Utc>>()
+                .unwrap()
+                .into();
+            let rows = layout_rows(&read, now).unwrap();
+            let view = qb_tray::v2::project(rows[0].view_input.as_deref().unwrap(), now).unwrap();
+            let row = &view.sections[1].rows[0];
+            assert_eq!(row.raw.outside_used, flag.unwrap_or(false));
+            assert_eq!(row.state, qb_tray::v2::DisplayState::Credits);
+            assert!(row.raw.allow_credits && row.raw.source.owned_or_adopted());
+        }
+    }
 }
 
 #[cfg(test)]

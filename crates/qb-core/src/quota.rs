@@ -29,6 +29,11 @@ pub(crate) fn parse_snapshot_for_test(
     parse::snapshot(provider, body, now)
 }
 
+#[cfg(test)]
+pub(crate) fn is_complete_snapshot_for_test(provider: Provider, body: &[u8]) -> bool {
+    parse::is_complete_snapshot(provider, body)
+}
+
 const MAX_BODY: usize = 256 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -473,6 +478,7 @@ impl UsagePoller {
                 request = request.header("anthropic-beta", "oauth-2025-04-20");
             }
             let wait_origin = self.runtime.capture_poll_origin(id).await;
+            let outside_origin = self.runtime.capture_outside_poll_origin(id);
             let mut response = request.send().await.map_err(|_| PollError::Unavailable)?;
             let status = response.status();
             let mut body = Vec::new();
@@ -536,7 +542,7 @@ impl UsagePoller {
             }
             let account = self
                 .runtime
-                .apply_quota_snapshot_reported_origin(id, snapshot, &reported, None, wait_origin)
+                .apply_polled_quota_snapshot(id, snapshot, &reported, wait_origin, outside_origin)
                 .await
                 .map_err(|_| PollError::Unavailable)?;
             reservation.succeeded = true;

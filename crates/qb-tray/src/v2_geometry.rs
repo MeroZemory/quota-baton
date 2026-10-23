@@ -211,6 +211,7 @@ pub struct RowBox {
     pub more: Rect,
     pub name: Rect,
     pub plan: Option<Rect>,
+    pub outside_note: Option<Rect>,
     pub chip: Option<Rect>,
     pub usage: Option<Rect>,
     pub usage_lines: Vec<UsageLineBox>,
@@ -825,10 +826,13 @@ fn ordered<'a>(
 
 pub fn row_height(row: &v2::AccountRow, disabled_slot: bool) -> f32 {
     if disabled_slot {
-        return 44. + if row.reason.is_some() { 24. } else { 0. };
+        return 44.
+            + outside_note_height(row, &Presentation::default())
+            + if row.reason.is_some() { 24. } else { 0. };
     }
     let action = row.action.as_ref().map(|a| a.kind);
-    44. + forecast_height(row, &Presentation::default())
+    44. + outside_note_height(row, &Presentation::default())
+        + forecast_height(row, &Presentation::default())
         + row
             .usage
             .as_ref()
@@ -858,6 +862,11 @@ pub fn row_height(row: &v2::AccountRow, disabled_slot: bool) -> f32 {
             0.
         }
 }
+fn outside_note_height(row: &v2::AccountRow, p: &Presentation) -> f32 {
+    row.outside_note
+        .as_ref()
+        .map_or(0., |text| 6. + paragraph_height(p, text, 328.))
+}
 fn forecast_height(row: &v2::AccountRow, p: &Presentation) -> f32 {
     row.forecast_lines
         .first()
@@ -865,7 +874,8 @@ fn forecast_height(row: &v2::AccountRow, p: &Presentation) -> f32 {
 }
 fn row_box(row: &v2::AccountRow, disabled_slot: bool, y: f32, p: &Presentation) -> RowBox {
     let enabled = p.core_ok && !p.pending_ids.contains(&row.raw.id);
-    let height = row_height(row, disabled_slot)
+    let height = row_height(row, disabled_slot) + outside_note_height(row, p)
+        - outside_note_height(row, &Presentation::default())
         + if disabled_slot {
             0.
         } else {
@@ -923,6 +933,13 @@ fn row_box(row: &v2::AccountRow, disabled_slot: bool, y: f32, p: &Presentation) 
         )
     });
     let mut next = line1.bottom;
+    let outside_note = row.outside_note.as_ref().map(|text| {
+        next += 6.;
+        let height = paragraph_height(p, text, 328.);
+        let bounds = r(16., next, 344., next + height);
+        next += height;
+        bounds
+    });
     let mut usage = None;
     let mut usage_lines = Vec::new();
     let mut reset = None;
@@ -1061,7 +1078,7 @@ fn row_box(row: &v2::AccountRow, disabled_slot: bool, y: f32, p: &Presentation) 
         }
     }
     if disabled_slot && row.reason.is_some() {
-        reason = Some(r(16., line1.bottom + 8., 344., line1.bottom + 24.));
+        reason = Some(r(16., next + 8., 344., next + 24.));
     }
     RowBox {
         id: row.raw.id.clone(),
@@ -1073,6 +1090,7 @@ fn row_box(row: &v2::AccountRow, disabled_slot: bool, y: f32, p: &Presentation) 
         more,
         name,
         plan,
+        outside_note,
         chip,
         usage,
         usage_lines,
@@ -1769,6 +1787,7 @@ fn shift_row(row: &mut RowBox, dy: f32) {
     }
     for rect in [
         &mut row.plan,
+        &mut row.outside_note,
         &mut row.chip,
         &mut row.usage,
         &mut row.reset,

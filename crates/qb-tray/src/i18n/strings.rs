@@ -1,5 +1,6 @@
 //! Exact UI source copy only. Never translate user labels or identifiers.
 pub(super) const STRINGS: &[(&str, &str)] = &[
+    ("qb 밖에서도 사용 중", "also used outside qb"),
     ("5시간 대기 상태 확인 전", "5h wait status unavailable"),
     ("긴급", "Urgent"),
     ("지금 옮기기", "Move now"),

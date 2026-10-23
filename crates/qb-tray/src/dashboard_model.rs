@@ -539,6 +539,7 @@ pub struct AccountGroup {
     pub provider: String,
     pub name: String,
     pub plan: String,
+    pub outside_used: bool,
     pub chip: String,
     pub tone: v2::Tone,
     pub active: u64,
@@ -1300,7 +1301,10 @@ pub fn project(
             id: a.raw.id.clone(),
             provider: a.raw.provider.clone(),
             name: folder(&a.name),
-            plan: a.plan.clone().unwrap_or_else(unknown),
+            plan: v2::plan_label(&a.raw.provider, a.raw.plan.as_deref())
+                .map(str::to_owned)
+                .unwrap_or_else(unknown),
+            outside_used: a.raw.outside_used,
             chip: a.chip.as_ref().map(|c| c.text.clone()).unwrap_or_default(),
             tone: a.chip.as_ref().map_or(v2::Tone::Off, |c| c.tone),
             active: a.raw.active_sessions,

@@ -215,6 +215,16 @@ impl Renderer {
             .iter()
             .flat_map(|s| s.rows.iter().chain(&s.disabled_rows))
         {
+            if let Some(note) = &row.outside_note {
+                let mut s = style(12., false, 16.);
+                s.wrap = Wrap::KeepAll;
+                let lines = self
+                    .text
+                    .layout(note, bounds(r(0., 0., 328., 65536.)), s)?
+                    .metrics
+                    .total_lines;
+                p.subtitle_lines.insert(note.clone(), lines.max(1));
+            }
             if let Some(line) = row.forecast_lines.first() {
                 let mut s = style(12., row.forecast_warning, 16.);
                 s.wrap = Wrap::KeepAll;
@@ -882,6 +892,11 @@ impl Renderer {
                 p.secondary,
                 alpha,
             )?;
+        }
+        if let (Some(note), Some(rect)) = (&row.outside_note, b.outside_note) {
+            let mut s = style(12., false, 16.);
+            s.wrap = Wrap::KeepAll;
+            self.text(target, rect, note, s, p.secondary, alpha)?;
         }
         if let (Some(chip), Some(rect)) = (&row.chip, b.chip) {
             let (bg, fg) = p.chip(chip.tone);
@@ -1630,5 +1645,182 @@ mod r16_locale_measurement_tests {
             }
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod n10_outside_note_render_tests {
+    use super::*;
+    use windows::Win32::{
+        Graphics::{
+            Direct2D::{
+                Common::{D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_PIXEL_FORMAT},
+                D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_RENDER_TARGET_PROPERTIES,
+                D2D1CreateFactory, ID2D1Factory,
+            },
+            Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
+            Imaging::{
+                CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICImagingFactory,
+                WICBitmapCacheOnLoad,
+            },
+        },
+        System::Com::{
+            CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+            CoUninitialize,
+        },
+    };
+    struct Apartment;
+    impl Drop for Apartment {
+        fn drop(&mut self) {
+            unsafe { CoUninitialize() };
+        }
+    }
+
+    #[test]
+    fn n10_outside_note_paints_ko_en_without_consuming_identity_or_controls() -> Result<()> {
+        unsafe {
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
+        }
+        let _apartment = Apartment;
+        let renderer = Renderer::new(false)?;
+        let wic: IWICImagingFactory =
+            unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)? };
+        let factory: ID2D1Factory =
+            unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)? };
+        for language in [crate::i18n::UiLanguage::Ko, crate::i18n::UiLanguage::En] {
+            crate::i18n::with_language(language, || -> Result<()> {
+                for (user_state, health) in [
+                    ("active", serde_json::json!({"kind":"ready"})),
+                    (
+                        "active",
+                        serde_json::json!({"kind":"cooling", "scope":"account", "reason":"link_stale"}),
+                    ),
+                    ("disabled", serde_json::json!({"kind":"ready"})),
+                ] {
+                    let wire = serde_json::json!({"accounts":[{
+                        "id":"synthetic-note", "provider":"codex", "label":"Synthetic very long account identity to exercise ellipsis",
+                        "plan":"plus", "user_state":user_state, "health":health,
+                        "source":{"kind":"cpa","mode":"adopted"}, "outside_used":true,
+                        "allow_credits":true, "credits_in_use":true
+                    }]});
+                    let view = v2::project(&wire.to_string(), SystemTime::UNIX_EPOCH).unwrap();
+                    let row = view
+                        .sections
+                        .iter()
+                        .flat_map(|s| s.rows.iter().chain(&s.disabled_rows))
+                        .next()
+                        .unwrap();
+                    let mut presentation = g::Presentation::default();
+                    presentation.expanded.insert("codex".into(), true);
+                    renderer.measure(&view, &mut presentation)?;
+                    let scene = g::Scene::build(&view, presentation, 800.);
+                    let boxes = scene
+                        .sections
+                        .iter()
+                        .flat_map(|s| s.rows.iter().chain(&s.disabled_rows))
+                        .next()
+                        .unwrap();
+                    assert_eq!(g::WIDTH, 360.);
+                    assert!(
+                        boxes.name.right > boxes.name.left,
+                        "name must remain visible with all applicable controls"
+                    );
+                    assert!(boxes.more.left >= boxes.name.right);
+                    if let Some(chip) = boxes.chip {
+                        assert!(boxes.plan.unwrap().right <= chip.left);
+                    }
+                    if user_state == "disabled" {
+                        assert!(boxes.button.is_some());
+                    }
+                    let note = boxes.outside_note.unwrap();
+                    assert!(note.left >= 0. && note.right <= 360.);
+                    assert!(note.top >= boxes.line1.bottom && note.bottom <= boxes.rect.bottom);
+                    let mut text_style = style(12., false, 16.);
+                    text_style.wrap = Wrap::KeepAll;
+                    let metrics = renderer
+                        .text
+                        .layout(
+                            row.outside_note.as_deref().unwrap(),
+                            bounds(note),
+                            text_style,
+                        )?
+                        .metrics;
+                    assert!(!metrics.trimmed);
+                    assert!(metrics.required_height <= note.bottom - note.top + 0.1);
+                    let bitmap = unsafe {
+                        wic.CreateBitmap(
+                            360,
+                            800,
+                            &GUID_WICPixelFormat32bppPBGRA,
+                            WICBitmapCacheOnLoad,
+                        )?
+                    };
+                    let target = unsafe {
+                        factory.CreateWicBitmapRenderTarget(
+                            &bitmap,
+                            &D2D1_RENDER_TARGET_PROPERTIES {
+                                pixelFormat: D2D1_PIXEL_FORMAT {
+                                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                                },
+                                dpiX: 96.,
+                                dpiY: 96.,
+                                ..Default::default()
+                            },
+                        )?
+                    };
+                    let errors = BTreeSet::new();
+                    let options = RenderOptions {
+                        version: "synthetic",
+                        now: SystemTime::UNIX_EPOCH,
+                        hover: None,
+                        pressed: None,
+                        focus: None,
+                        core_note: None,
+                        last_success: None,
+                        errors: &errors,
+                        login: None,
+                        tooltip: None,
+                        draw_window_border: false,
+                    };
+                    let paint = |row: &v2::AccountRow| -> Result<Vec<u8>> {
+                        unsafe {
+                            target.BeginDraw();
+                            target.Clear(Some(&D2D1_COLOR_F {
+                                r: 1.,
+                                g: 1.,
+                                b: 1.,
+                                a: 1.,
+                            }));
+                        }
+                        renderer.row(&target, row, boxes, &options, 1.)?;
+                        unsafe {
+                            target.EndDraw(None, None)?;
+                        }
+                        let mut pixels = vec![0; 360 * 800 * 4];
+                        unsafe {
+                            bitmap.CopyPixels(std::ptr::null(), 360 * 4, &mut pixels)?;
+                        }
+                        Ok(pixels)
+                    };
+                    let marked = paint(row)?;
+                    let mut without_note = row.clone();
+                    without_note.outside_note = None;
+                    let baseline = paint(&without_note)?;
+                    let changed =
+                        (note.top.ceil() as usize..note.bottom.floor() as usize).any(|y| {
+                            let start = (y * 360 + note.left as usize) * 4;
+                            let end = (y * 360 + note.right as usize) * 4;
+                            marked[start..end] != baseline[start..end]
+                        });
+                    assert!(
+                        changed,
+                        "localized outside-use note must actually be drawn by the row renderer"
+                    );
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
     }
 }

@@ -1935,6 +1935,7 @@ fn tooltip_content(
                 row.credits.as_ref().map(|c| c.tooltip.clone()),
             ),
             (boxrow.plan, row.plan_tooltip.clone()),
+            (boxrow.outside_note, row.outside_note.clone()),
             (boxrow.forecast, Some(row.forecast_tooltip.clone())),
             (Some(boxrow.name), row.name_tooltip.clone()),
             (boxrow.usage, row.usage.as_ref().map(|u| u.tooltip.clone())),
@@ -2370,6 +2371,36 @@ fn publish_accessibility(hwnd: HWND, frame: &mut PaintedFrame) {
             selected: None,
             expanded: None,
         });
+    }
+    if frame.scene.popup.is_none() && frame.scene.dialog.is_none() && frame.scene.login.is_none() {
+        for boxrow in frame
+            .scene
+            .sections
+            .iter()
+            .flat_map(|s| s.rows.iter().chain(&s.disabled_rows))
+        {
+            if let Some(rect) = boxrow
+                .outside_note
+                .and_then(|r| qb_tray::v2_geometry::intersection(r, frame.scene.list))
+                && let Some(note) =
+                    row_view(&frame.view, &boxrow.id).and_then(|row| row.outside_note.as_ref())
+            {
+                elements.push(Element {
+                    parent: None,
+                    id: stable_id(format!("outside-used:{}", boxrow.id)),
+                    name: note.clone(),
+                    kind: Kind::Text,
+                    bounds: physical(rect, origin, scale),
+                    enabled: true,
+                    action: None,
+                    focusable: false,
+                    focused: false,
+                    value: None,
+                    selected: None,
+                    expanded: None,
+                });
+            }
+        }
     }
     let focus = INPUT.with(|i| i.borrow().focus.clone());
     for h in &frame.scene.targets {

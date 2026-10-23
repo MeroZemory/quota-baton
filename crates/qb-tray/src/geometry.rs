@@ -2296,6 +2296,7 @@ fn group_usage_height(g: &m::AccountGroup, available: f32) -> f32 {
 }
 fn group_header_height(b: &mut Builder<'_>, g: &m::AccountGroup, available: f32) -> f32 {
     group_usage_height(g, available)
+        + if g.outside_used { 20. } else { 0. }
         + g.forecast_lines
             .iter()
             .map(|line| {
@@ -2582,6 +2583,20 @@ fn group_header(b: &mut Builder<'_>, g: &m::AccountGroup, r: Rect, sticky: bool)
         }
     }
     let mut forecast_y = r.top + group_usage_height(g, width(r) + 2.) - 4.;
+    if g.outside_used {
+        let note = crate::i18n::static_text("qb 밖에서도 사용 중");
+        let bounds = rect(r.left + 32., forecast_y, (width(r) - 44.).max(1.), 16.);
+        b.text(bounds, note, 12., false, Color::Secondary, false);
+        b.semantic(
+            format!("{}:outside-used:{}", b.scope, g.id),
+            Some(format!("group:{}", g.id)),
+            Role::Text,
+            note.into(),
+            bounds,
+            None,
+        );
+        forecast_y += 20.;
+    }
     for (index, line) in g.forecast_lines.iter().enumerate() {
         let h = b.measured_height(line, (width(r) - 44.).max(1.), 12., g.forecast_warning);
         let bounds = rect(r.left + 32., forecast_y, (width(r) - 44.).max(1.), h);
@@ -3675,6 +3690,68 @@ mod r16_stable_key_tests {
             assert_eq!(detail_fact_key("Last activity"), "마지막 활동");
             assert_eq!(detail_fact_key("Rate-limit wait"), "속도 조절 대기");
         });
+    }
+}
+
+#[cfg(test)]
+mod n10_outside_usage_tests {
+    use super::*;
+
+    #[test]
+    fn n10_dashboard_outside_note_has_separate_paint_and_read_only_semantics() {
+        for language in [crate::i18n::UiLanguage::Ko, crate::i18n::UiLanguage::En] {
+            crate::i18n::with_language(language, || {
+                let clock = crate::dashboard_fixtures::clock();
+                let mut wire = serde_json::json!({"accounts":[{
+                    "id":"synthetic-outside", "provider":"codex", "label":"Synthetic",
+                    "plan":"plus", "user_state":"active", "health":{"kind":"ready"},
+                    "credits_in_use":true, "allow_credits":true, "source":{"kind":"oauth"}
+                }]});
+                let mut state = DashboardState {
+                    grouped: true,
+                    range: Range::All,
+                    ..Default::default()
+                };
+                let mut baseline = crate::dashboard_fixtures::snapshot();
+                baseline.accounts = v2::project(&wire.to_string(), clock.utc().into()).unwrap();
+                baseline.sessions.sessions.truncate(1);
+                baseline.sessions.sessions[0].account = "synthetic-outside".into();
+                baseline.sessions.sessions[0].provider = "codex".into();
+                let before = m::project(&baseline, &mut state, &clock);
+                wire["accounts"][0]["outside_used"] = true.into();
+                let mut marked = baseline.clone();
+                marked.accounts = v2::project(&wire.to_string(), clock.utc().into()).unwrap();
+                let after = m::project(&marked, &mut state, &clock);
+                let before_group = &before.groups[0];
+                let after_group = &after.groups[0];
+                assert!(!before_group.outside_used && after_group.outside_used);
+                assert_eq!(before_group.plan, after_group.plan);
+                assert_eq!(before_group.chip, after_group.chip);
+                assert_eq!(before_group.name, after_group.name);
+                assert_eq!(before_group.relogin_reason, after_group.relogin_reason);
+                let note = crate::i18n::static_text("qb 밖에서도 사용 중");
+                for size in [[1024., 640.], [1320., 900.]] {
+                    let plain = Scene::build(&before, &state, size, &Metrics::default());
+                    assert!(
+                        !plain.draw.iter().any(
+                            |d| matches!(d, Draw::Text { measure, .. } if measure.text == note)
+                        )
+                    );
+                    let scene = Scene::build(&after, &state, size, &Metrics::default());
+                    let node = scene.accessibility.iter().find(|n| n.name == note).unwrap();
+                    assert_eq!(node.role, Role::Text);
+                    assert!(node.target.is_none());
+                    assert!(
+                        scene
+                            .draw
+                            .iter()
+                            .any(|d| matches!(d, Draw::Text { rect, measure, .. }
+                        if measure.text == note && *rect == node.rect))
+                    );
+                    assert!(width(node.rect) > 200. && height(node.rect) == 16.);
+                }
+            });
+        }
     }
 }
 

@@ -5,6 +5,67 @@ use std::{
 };
 
 pub(in crate::relay) type Admission = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// One request's first-source grace, always inside its original upgrade limit.
+pub(super) struct OwnWait {
+    source: String,
+    until: Instant,
+    waited: bool,
+}
+
+/// A capacity-only hint. Binding admission must independently recheck the source.
+pub(super) struct SpillSource {
+    source: String,
+}
+
+fn own_wait_deadline(now: Instant, deadline: Instant) -> Option<Instant> {
+    let grace = (deadline.saturating_duration_since(now) / 2).min(Duration::from_millis(250));
+    (!grace.is_zero()).then(|| now + grace)
+}
+
+impl OwnWait {
+    pub(super) fn start(capacity: &Capacity, source: &str, deadline: Instant) -> Option<Self> {
+        let until = own_wait_deadline(Instant::now(), deadline)?;
+        capacity.is_capped(source).then(|| Self {
+            source: source.to_owned(),
+            until,
+            waited: false,
+        })
+    }
+
+    pub(super) fn source(&self) -> &str {
+        &self.source
+    }
+
+    pub(super) async fn wait_once(&mut self, capacity: &Capacity) {
+        self.waited = true;
+        #[cfg(feature = "testkit")]
+        capacity.before_own_wait().await;
+        capacity.wait_until(self.until).await;
+    }
+
+    pub(super) fn spill_source(&self, capacity: &Capacity) -> Option<SpillSource> {
+        self.spill_source_at(capacity, Instant::now())
+    }
+
+    fn spill_source_at(&self, capacity: &Capacity, now: Instant) -> Option<SpillSource> {
+        (self.waited && now >= self.until && capacity.is_capped(&self.source)).then(|| {
+            SpillSource {
+                source: self.source.clone(),
+            }
+        })
+    }
+}
+
+impl SpillSource {
+    pub(super) fn source(&self) -> &str {
+        &self.source
+    }
+
+    pub(super) fn still_capped(&self, capacity: &Capacity) -> bool {
+        capacity.is_capped(&self.source)
+    }
+}
 #[cfg(feature = "testkit")]
 type SelectionPause = (
     tokio::sync::oneshot::Sender<()>,
@@ -39,9 +100,32 @@ pub(in crate::relay) struct Capacity(
     #[cfg(feature = "testkit")] Mutex<Option<SelectionPause>>,
     #[cfg(feature = "testkit")] std::sync::atomic::AtomicUsize,
     #[cfg(feature = "testkit")] Mutex<Option<AdmissionPause>>,
+    #[cfg(feature = "testkit")] Mutex<Option<SelectionPause>>,
 );
 
 impl Capacity {
+    #[cfg(feature = "testkit")]
+    pub(in crate::relay) fn pause_own_wait(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered, observed) = tokio::sync::oneshot::channel();
+        let (resume, released) = tokio::sync::oneshot::channel();
+        *self.4.lock().unwrap_or_else(|e| e.into_inner()) = Some((entered, released));
+        (observed, resume)
+    }
+
+    #[cfg(feature = "testkit")]
+    async fn before_own_wait(&self) {
+        let hook = self.4.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some((entered, released)) = hook {
+            let _ = entered.send(());
+            let _ = released.await;
+        }
+    }
+
     #[cfg(feature = "testkit")]
     pub(in crate::relay) fn pause_admission(
         &self,
@@ -108,6 +192,14 @@ impl Capacity {
             .filter(|(_, state)| state.full())
             .map(|(id, _)| id.clone())
             .collect()
+    }
+
+    pub(super) fn is_capped(&self, account: &str) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(account)
+            .is_some_and(AccountCapacity::full)
     }
 
     pub(super) fn reserve(self: &Arc<Self>, account: &str) -> Option<Permit> {
@@ -185,6 +277,50 @@ impl Drop for Permit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn n10_own_wait_grace_is_inside_the_original_upgrade_envelope() {
+        let now = Instant::now();
+        assert_eq!(
+            own_wait_deadline(now, now + Duration::from_secs(10)),
+            Some(now + Duration::from_millis(250))
+        );
+        assert_eq!(
+            own_wait_deadline(now, now + Duration::from_millis(100)),
+            Some(now + Duration::from_millis(50))
+        );
+        assert_eq!(own_wait_deadline(now, now), None);
+        assert_eq!(own_wait_deadline(now, now - Duration::from_millis(1)), None);
+    }
+
+    #[test]
+    fn n10_spill_source_requires_wait_exhaustion_and_still_capped_source() {
+        let capacity = Arc::new(Capacity::default());
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(10);
+        assert!(OwnWait::start(&capacity, "a", deadline).is_none());
+        let live = capacity.reserve("a").unwrap();
+        let rejected = capacity.reserve("a").unwrap();
+        rejected.connection_limit();
+        drop(rejected);
+        let mut wait = OwnWait::start(&capacity, "a", deadline).unwrap();
+        let until = wait.until;
+        assert!(wait.spill_source_at(&capacity, until).is_none());
+        // Explicit historical wait observation; no real-time sleeps are needed
+        // to test both sides of the original grace's exact boundary.
+        wait.waited = true;
+        assert!(
+            wait.spill_source_at(&capacity, until - Duration::from_nanos(1))
+                .is_none()
+        );
+        let source = wait.spill_source_at(&capacity, until).unwrap();
+        assert_eq!(source.source(), "a");
+        assert!(source.still_capped(&capacity));
+        drop(live);
+        assert!(wait.spill_source_at(&capacity, until).is_none());
+        assert!(!source.still_capped(&capacity));
+        assert!(capacity.reserve("a").is_some());
+    }
 
     #[test]
     fn capped_candidate_moves_normal_sticky_binding_but_preserves_strict_anchor() {

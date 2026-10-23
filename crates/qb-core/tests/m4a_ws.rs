@@ -1,9 +1,16 @@
 use axum::http::{HeaderMap, StatusCode};
 #[cfg(feature = "testkit")]
+#[path = "support/n10_capacity_spill.rs"]
+mod n10_capacity_spill;
+#[cfg(feature = "testkit")]
 #[path = "support/n5b_ws_quota.rs"]
 mod n5b_ws_quota;
 #[path = "support/routing_ws.rs"]
 mod routing_ws;
+
+#[cfg(feature = "testkit")]
+#[path = "support/n10_slot_reuse.rs"]
+mod n10_slot_reuse;
 use chrono::{Duration as ChronoDuration, Utc};
 use futures_util::{SinkExt, StreamExt};
 use qb_core::{

@@ -678,6 +678,7 @@ impl RelayState {
         // The lease is held and account expiry/reconciliation precedes affinity restore.
         store.list()?;
         let bindings = crate::bindings::BindingTable::new(store.home(), config.routing.clone())?;
+        accounts.attach_outside_bindings(bindings.clone());
         observability.configure_move_notice(
             config
                 .routing
@@ -2515,6 +2516,7 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
         }
         completion.attempt(&account.id);
         let observation_asof = state.bindings.begin_usage_observation_for(&account.id);
+        state.accounts.note_own_usage_send(&account.id);
         let sent_at = Instant::now();
         let send = state
             .client
