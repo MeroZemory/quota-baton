@@ -1,5 +1,7 @@
 pub(super) mod capacity;
 mod pump;
+pub(super) mod ws_attempt;
+mod ws_write;
 
 use super::*;
 use tokio_tungstenite::{

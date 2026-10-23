@@ -8,7 +8,7 @@ mod wait_admission;
 mod wait_owner;
 mod wait_proof;
 
-pub(crate) use wait_owner::{PendingHttp429, WaitPolicySnapshot};
+pub(crate) use wait_owner::{ObservedUsagePoll, PendingHttp429, WaitPolicySnapshot};
 pub(crate) use wait_proof::ReportOrigin;
 
 use std::{
@@ -2496,7 +2496,13 @@ impl AccountRuntime {
             .await
             .ok();
         let (account, pending) = match applied {
-            Some((account, pending)) => (Some(account), pending),
+            Some((account, pending)) => (
+                Some(account),
+                pending.and_then(|receipt| match receipt {
+                    wait_owner::ReportReceipt::Http(pending) => Some(pending),
+                    wait_owner::ReportReceipt::Poll(_) => None,
+                }),
+            ),
             None => (None, None),
         };
         let quota_until = account.and_then(|account| match account.health {
@@ -2635,7 +2641,7 @@ impl AccountRuntime {
         model: Option<&str>,
         publication: (Option<ReportOrigin>, wait_owner::ReportPublication),
         outside: Option<outside_owner::PollApplication>,
-    ) -> Result<(Account, Option<PendingHttp429>), ()> {
+    ) -> Result<(Account, Option<wait_owner::ReportReceipt>), ()> {
         let (origin, publication) = publication;
         let reported = reported.clone();
         let store = self.store.clone();
@@ -2721,9 +2727,12 @@ impl AccountRuntime {
                         application.finish(candidate);
                         None
                     }
-                    wait_owner::ReportPublication::DeferredHttp429 => {
-                        application.seal_http(candidate, &account)
-                    }
+                    wait_owner::ReportPublication::ImmediatePollReceipt => application
+                        .finish_poll(candidate)
+                        .map(wait_owner::ReportReceipt::Poll),
+                    wait_owner::ReportPublication::DeferredHttp429 => application
+                        .seal_http(candidate, &account)
+                        .map(wait_owner::ReportReceipt::Http),
                 }
             } else {
                 None

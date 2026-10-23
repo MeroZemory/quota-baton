@@ -66,6 +66,12 @@ pub(crate) struct AcceptPermit {
     phase: Phase,
 }
 
+impl AcceptPermit {
+    pub(super) fn source(&self) -> ReportSource {
+        self.origin.source
+    }
+}
+
 /// Finite owner protocol, not evidence of successful native persistence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Phase {

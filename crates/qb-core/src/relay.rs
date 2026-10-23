@@ -18,6 +18,7 @@ pub(crate) use outcome::RequestFailureEvidence;
 pub(crate) use websocket::capacity::CapacityMoveEvidence;
 #[cfg(test)]
 pub(crate) use websocket::capacity::test_move_evidence;
+pub(crate) use websocket::ws_attempt::Candidate as WsQuotaCandidate;
 mod wire_metadata;
 
 use std::{
