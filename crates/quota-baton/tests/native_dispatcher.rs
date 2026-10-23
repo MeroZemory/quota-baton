@@ -87,6 +87,7 @@ fn final_response() -> Vec<u8> {
 fn actual_automatic_write_is_private_status_only_once_and_ack_is_suppressed() {
     let (mut d, n, u) = stopped();
     let ticket = d.stopped_ticket().unwrap();
+    assert_eq!(ticket.thread_id(), "a");
     d.begin_final_read(ticket).unwrap();
     let before_ui = u.0.lock().unwrap().bytes.len();
     d.native_frame_admitted(&final_response(), || true).unwrap();
