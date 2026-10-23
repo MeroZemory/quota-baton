@@ -2907,10 +2907,12 @@ async fn r1_ws_rate_wait_defers_one_charged_text_or_binary_and_preserves_bytes()
         let ballast_bytes = qb_core::guard::mib_bytes(Config::default().guard.inflight_budget_mib);
         let ballast = h.state.budget.reserve_message(ballast_bytes);
         let second = Message::Text("second unknown message, still in order".into());
-        client.send(second.clone()).await.unwrap();
+        // A second pending data frame now closes with 1008 so controls remain
+        // readable with one bounded slot. Send this later frame after that slot
+        // drains; the separate N5b overflow regression covers the close.
         // Memory protection blocks fresh reads, not an already charged slot.
         assert!(h.state.force_memory_sample_for_test(u64::MAX).guarded);
-        // The occupied slot must prevent an additional application read.
+        // The retained slot remains charged while native pacing is pending.
         tokio::time::sleep(Duration::from_millis(40)).await;
         assert_eq!(
             h.state.budget.used(),
@@ -2937,6 +2939,7 @@ async fn r1_ws_rate_wait_defers_one_charged_text_or_binary_and_preserves_bytes()
         assert!(h.state.force_memory_sample_for_test(u64::MAX).guarded);
         h.state.force_memory_sample_for_test(0);
         drop(ballast);
+        client.send(second.clone()).await.unwrap();
         assert_eq!(receive(&mut client).await, second);
         let messages: Vec<_> = h
             .fake
@@ -3949,4 +3952,248 @@ async fn r14_ws_failed_cold_rate_attempt_stays_unknown_after_resend_and_redial()
         r14_ws_wait_cost(&h, (100, 1, 1)).await;
         returned.close(None).await.unwrap();
     }
+}
+
+// N5b supporting control-read unit: no quota wait authority or new hold limits.
+#[cfg(feature = "testkit")]
+async fn n5b_controls_deferred(h: &Harness, client: &mut Client, extra: Message) {
+    let before = h.state.budget.used();
+    client.send(extra.clone()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while h.state.budget.used() != before + extra.len() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("one extra application frame must occupy the deferred reservation");
+}
+
+#[cfg(feature = "testkit")]
+async fn n5b_controls_released(h: &Harness, account: &str) {
+    tokio::time::timeout(Duration::from_secs(6), async {
+        loop {
+            let upstream_closed =
+                h.fake.state.events().iter().any(|event| {
+                    matches!(event, qb_testkit::websocket::ConnectionEvent::Closed(_))
+                });
+            if upstream_closed
+                && h.state
+                    .inflight_requests
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    == 0
+                && h.state.accounts.inflight_count(account) == 0
+                && h.state.accounts.pacing_snapshot(account).waiting == 0
+                && h.state.bindings.pending_count(account) == 0
+                && h.state.ws_reserved_for_test(account) == 0
+                && h.state.budget.used() == 0
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("control cancellation must close upstream and release native owners");
+}
+
+#[cfg(feature = "testkit")]
+fn n5b_controls_data(h: &Harness) -> Vec<Message> {
+    h.fake
+        .state
+        .messages()
+        .into_iter()
+        .filter(|message| matches!(message, Message::Text(_) | Message::Binary(_)))
+        .collect()
+}
+
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn n5b_ws_deferred_initial_keeps_ping_close_and_eof_responsive() {
+    for eof in [false, true] {
+        let h = Harness::new(1).await;
+        let (mut client, account) = h.connect().await;
+        let raw =
+            json!({"type":"response.create", "model":"synthetic-deferred-controls", "input":[]})
+                .to_string();
+        let (arrived, release) = h
+            .state
+            .pause_ws_ordinary_after_pacing("codex:synthetic-ws-session", raw.as_bytes());
+        client.send(Message::text(raw)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), arrived)
+            .await
+            .expect("actual initial admission must reach existing deterministic barrier")
+            .unwrap();
+        assert!(n5b_controls_data(&h).is_empty());
+        n5b_controls_deferred(
+            &h,
+            &mut client,
+            Message::Binary(vec![0, 255, 13, 10, 42].into()),
+        )
+        .await;
+        // Wire ordering proves Pong was consumed before this Ping is answered.
+        client
+            .send(Message::Pong(bytes::Bytes::from_static(
+                b"synthetic-deferred-pong",
+            )))
+            .await
+            .unwrap();
+        let ping = bytes::Bytes::from_static(b"synthetic-deferred-ping");
+        client.send(Message::Ping(ping.clone())).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), receive(&mut client))
+                .await
+                .expect("Ping after a deferred frame must not wait for admission"),
+            Message::Pong(ping),
+        );
+        assert!(
+            !release.is_closed(),
+            "Ping must not release/cancel the pending create"
+        );
+        if eof {
+            drop(client);
+        } else {
+            client.close(None).await.unwrap();
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(1), client.next())
+                    .await
+                    .expect("Close after deferred frame must precede admission release"),
+                Some(Ok(Message::Close(_))) | None
+            ));
+        }
+        n5b_controls_released(&h, &account).await;
+        assert!(
+            release.is_closed(),
+            "Close/EOF must drop the held admission future"
+        );
+        assert!(
+            release.send(()).is_err(),
+            "released barrier cannot revive a cancelled create"
+        );
+        assert!(
+            n5b_controls_data(&h).is_empty(),
+            "no initial or deferred send after close"
+        );
+        let row = r1_create_record(&h, "synthetic-deferred-controls").await;
+        assert_eq!(row["attempts"], 0);
+        assert_eq!(row["attempt_details"], json!([]));
+        assert_eq!(row["rate_retries"], 0);
+        assert_eq!(row["account"], account);
+        assert_eq!(h.fake.state.requests().len(), 1);
+        assert_eq!(
+            h.state
+                .bindings
+                .current(Some("codex:synthetic-ws-session"))
+                .as_deref(),
+            Some(account.as_str())
+        );
+        assert_eq!(h.store.load(&account).unwrap().health, Health::Ready);
+    }
+}
+
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn n5b_ws_second_deferred_data_closes_without_queue_growth() {
+    let h = Harness::new(1).await;
+    let (mut client, account) = h.connect().await;
+    let raw = json!({"type":"response.create", "model":"synthetic-deferred-overflow", "input":[]})
+        .to_string();
+    let (arrived, release) = h
+        .state
+        .pause_ws_ordinary_after_pacing("codex:synthetic-ws-session", raw.as_bytes());
+    client.send(Message::text(raw)).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), arrived)
+        .await
+        .unwrap()
+        .unwrap();
+    n5b_controls_deferred(&h, &mut client, Message::text("synthetic-first-deferred")).await;
+    client
+        .send(Message::Binary(vec![1, 2, 3].into()))
+        .await
+        .unwrap();
+    assert_close(
+        tokio::time::timeout(Duration::from_secs(1), receive(&mut client))
+            .await
+            .expect("second extra application frame must trigger bounded protocol close"),
+        1008,
+    );
+    let _ = client.flush().await;
+    n5b_controls_released(&h, &account).await;
+    assert!(release.is_closed());
+    assert!(release.send(()).is_err());
+    assert!(n5b_controls_data(&h).is_empty());
+    let row = r1_create_record(&h, "synthetic-deferred-overflow").await;
+    assert_eq!(row["attempts"], 0);
+    assert_eq!(row["rate_retries"], 0);
+}
+
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn n5b_ws_deferred_rate_resend_keeps_controls_and_cancels_native_queue() {
+    let h = Harness::new_configured(1, false, false, Some((60, 5)), None, None, |config| {
+        config.routing.ws_upgrade_hold_secs = 10;
+    })
+    .await;
+    h.fake.state.push_reply([Message::text(
+        r#"{"type":"error","status":429,"error":{"code":"rate_limit_exceeded"}}"#,
+    )]);
+    let (mut client, account) = h.connect().await;
+    // Continuation forbids same-account redial; no quota evidence is introduced.
+    client.send(Message::text(
+        r#"{"type":"response.create","model":"synthetic-deferred-rate","previous_response_id":"synthetic-prior","input":[]}"#,
+    )).await.unwrap();
+    r1_create_wait_for_initial_queue(&h, &account).await;
+    assert_eq!(
+        n5b_controls_data(&h).len(),
+        1,
+        "actual rate response followed first send"
+    );
+    // Extend only this synthetic account's native pacing backoff so scheduling
+    // cannot release a resend during the bounded control assertions. The turn's
+    // existing 60s rate budget is unchanged; this is not a new product default.
+    let backoff = h
+        .state
+        .accounts
+        .observe_429(&account, Some(Duration::from_secs(30)));
+    let held_until = backoff.rate_backoff_until.unwrap();
+    n5b_controls_deferred(&h, &mut client, Message::text("synthetic-rate-deferred")).await;
+    client
+        .send(Message::Pong(bytes::Bytes::from_static(
+            b"synthetic-rate-pong",
+        )))
+        .await
+        .unwrap();
+    let ping = bytes::Bytes::from_static(b"synthetic-rate-ping");
+    client.send(Message::Ping(ping.clone())).await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), receive(&mut client))
+            .await
+            .expect("rate resend Ping after deferred data must remain responsive"),
+        Message::Pong(ping),
+    );
+    client.close(None).await.unwrap();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), client.next())
+            .await
+            .expect("rate resend Close after deferred data must cancel native admission"),
+        Some(Ok(Message::Close(_))) | None
+    ));
+    n5b_controls_released(&h, &account).await;
+    assert!(
+        std::time::Instant::now() < held_until,
+        "cleanup must precede native backoff expiry"
+    );
+    let row = r1_create_record(&h, "synthetic-deferred-rate").await;
+    assert_eq!(row["attempts"], 1);
+    assert_eq!(row["rate_retries"], 0);
+    assert_eq!(
+        n5b_controls_data(&h).len(),
+        1,
+        "cancelled resend/deferred frame never sent"
+    );
+    assert_eq!(
+        h.fake.state.requests().len(),
+        1,
+        "no redial after continuation close"
+    );
+    assert_eq!(h.store.load(&account).unwrap().health, Health::Ready);
 }
