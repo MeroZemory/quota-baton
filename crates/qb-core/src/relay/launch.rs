@@ -2082,7 +2082,7 @@ impl RelayState {
         .await?
         .into_iter()
         .collect();
-        let (refreshed, _, observed) = self
+        let (refreshed, sources, observed, store_evidence, runtime_evidence) = self
             .candidates_with_evidence(
                 Provider::Codex,
                 resume_key.as_deref(),
@@ -2161,7 +2161,7 @@ impl RelayState {
                         // menu advertised yet; /models owns acceptance and metadata recording.
                         let pending = PendingIssue::new(registry, &anchor)?;
                         let placement = table
-                            .place_launch_for_issue_admitted(
+                            .place_launch_for_issue_evidence(
                                 crate::bindings::LaunchRequest {
                                     anchor_key: &anchor,
                                     resume_key: resume_key.as_deref(),
@@ -2171,7 +2171,10 @@ impl RelayState {
                                     allow_move_for_model: request.move_for_model,
                                 },
                                 &candidates,
+                                &sources,
                                 crate::bindings::MoveObservations::same(observed),
+                                store_evidence,
+                                runtime_evidence,
                                 &entitlements,
                                 chrono::Utc::now(),
                                 Some(&operation),

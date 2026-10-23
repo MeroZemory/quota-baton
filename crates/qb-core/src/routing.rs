@@ -1,5 +1,7 @@
 //! Durable local routing intent. Display labels and upstream payloads are never selectors.
+mod anchor_choice;
 pub mod forecast;
+pub(crate) use anchor_choice::{AnchorChoiceEvidence, AnchorRecoveryEvidence};
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -2129,9 +2131,9 @@ impl PolicyStore {
         consent: &crate::bindings::LaunchPolicyMove,
         operation: Option<&crate::issue_operation::IssueOperation>,
     ) -> Result<()> {
-        if consent.previous == consent.account
-            || crate::observability::safe_identifier(&consent.previous).is_none()
-            || crate::observability::safe_identifier(&consent.account).is_none()
+        if consent.previous() == consent.account()
+            || crate::observability::safe_identifier(consent.previous()).is_none()
+            || crate::observability::safe_identifier(consent.account()).is_none()
         {
             bail!("invalid explicit model move");
         }
@@ -2141,15 +2143,15 @@ impl PolicyStore {
             if self.persistence_failed.load(Ordering::Acquire) || self.strict_dispatch_blocked() {
                 bail!("routing policy recovery incomplete");
             }
-            if state.revision != consent.expected_revision {
+            if state.revision != consent.expected_revision() {
                 bail!("routing policy changed before explicit model move");
             }
-            let id = state.policy_id(&consent.key);
+            let id = state.policy_id(consent.key());
             let entry = state.sessions.get_mut(&id).ok_or_else(|| {
                 anyhow::anyhow!("explicit model move requires an anchored policy")
             })?;
             if entry.settings(&self.defaults).mode != Mode::Strict
-                || entry.anchor.as_deref() != Some(consent.previous.as_str())
+                || entry.anchor.as_deref() != Some(consent.previous())
             {
                 bail!("routing anchor changed before explicit model move");
             }
@@ -2163,12 +2165,12 @@ impl PolicyStore {
             }
             entry.movements.push(Movement {
                 id: Some(format!("{:032x}", rand::random::<u128>())),
-                from: consent.previous.clone(),
-                to: consent.account.clone(),
-                at: consent.at,
+                from: consent.previous().to_owned(),
+                to: consent.account().to_owned(),
+                at: consent.at(),
                 discretionary: false,
             });
-            entry.anchor = Some(consent.account.clone());
+            entry.anchor = Some(consent.account().to_owned());
             Ok(())
         })
     }
@@ -3423,13 +3425,14 @@ mod tests {
         account: &str,
     ) -> crate::bindings::LaunchPolicyMove {
         let plan = store.plan(Some(key));
-        crate::bindings::LaunchPolicyMove {
-            key: key.to_owned(),
-            previous: plan.anchor.unwrap(),
-            account: account.to_owned(),
-            expected_revision: plan.revision,
-            at: clock(),
-        }
+        crate::bindings::LaunchPolicyMove::test_fixture(
+            key,
+            plan.anchor.as_deref().unwrap(),
+            account,
+            plan.revision,
+            "m2",
+            clock(),
+        )
     }
 
     #[test]
@@ -3628,7 +3631,7 @@ mod tests {
             store.authorize_model_move(&consent).unwrap();
             assert_eq!(
                 store.plan(Some(key)).revision,
-                consent.expected_revision + 1
+                consent.expected_revision() + 1
             );
             assert!(!store.permits_dispatch(Some(key), "cx-a"));
             assert!(store.permits_dispatch(Some(key), "cx-b"));
@@ -3656,7 +3659,7 @@ mod tests {
             );
             let movement = after.movements.last().unwrap();
             assert_eq!((&*movement.from, &*movement.to), ("cx-a", "cx-b"));
-            assert_eq!(movement.at, consent.at);
+            assert_eq!(movement.at, consent.at());
             assert!(!movement.discretionary);
             assert_eq!(state.pool_moves["cx"].len(), 1);
             // If policy later permits rebalance, the explicit move still guards
@@ -3668,6 +3671,31 @@ mod tests {
             assert!(store.discretionary_allowed(key, Some("cx-fresh"), later));
             assert!(!store.discretionary_allowed(key, Some("cx-a"), later));
         }
+    }
+
+    #[test]
+    fn n6t_model_choice_reason_cannot_authorize_strict_move() {
+        let dir = home();
+        let store = PolicyStore::new(dir.path(), Settings::default()).unwrap();
+        let key = "codex:n6t-reason-is-not-proof";
+        store
+            .set_session(
+                &session_id(key),
+                Some(settings(Mode::Strict)),
+                None,
+                Some("cx-a"),
+            )
+            .unwrap();
+        let revision = store.plan(Some(key)).revision;
+        let before = fs::read(&store.path).unwrap();
+        assert!(
+            store
+                .dispatch(Some(key), "cx-b", Some("cx-a"), "model_choice", clock())
+                .is_err()
+        );
+        assert_eq!(store.plan(Some(key)).revision, revision);
+        assert_eq!(store.plan(Some(key)).anchor.as_deref(), Some("cx-a"));
+        assert_eq!(fs::read(&store.path).unwrap(), before);
     }
 
     #[test]
@@ -3695,12 +3723,18 @@ mod tests {
             .unwrap();
         let before = fs::read(&store.path).unwrap();
         assert!(store.authorize_model_move(&stale).is_err());
-        let mut wrong = r11_consent(&store, key, "cx-b");
-        wrong.previous = "cx-wrong".into();
+        let wrong = crate::bindings::LaunchPolicyMove::test_fixture(
+            key,
+            "cx-wrong",
+            "cx-b",
+            store.plan(Some(key)).revision,
+            "m2",
+            clock(),
+        );
         assert!(store.authorize_model_move(&wrong).is_err());
-        let mut noop = r11_consent(&store, key, "cx-a");
+        let noop = r11_consent(&store, key, "cx-a");
         assert!(store.authorize_model_move(&noop).is_err());
-        noop.account = "bad/account".into();
+        let noop = r11_consent(&store, key, "bad/account");
         assert!(store.authorize_model_move(&noop).is_err());
         assert_eq!(fs::read(&store.path).unwrap(), before);
         assert_eq!(store.plan(Some(key)).anchor.as_deref(), Some("cx-a"));
@@ -3782,7 +3816,7 @@ mod tests {
                 // Restoring the destination alone cannot bypass failed-persistence state.
                 fs::remove_dir(fence_path(&store.path)).unwrap();
                 assert!(store.authorize_model_move(&consent).is_err());
-                assert_eq!(store.plan(Some(key)).revision, consent.expected_revision);
+                assert_eq!(store.plan(Some(key)).revision, consent.expected_revision());
             }
         }
     }
@@ -3847,13 +3881,14 @@ mod tests {
         store
             .set_session(&session_id(key), Some(settings(Mode::Strict)), None, None)
             .unwrap();
-        let mut consent = crate::bindings::LaunchPolicyMove {
-            key: key.into(),
-            previous: "cx-a".into(),
-            account: "cx-b".into(),
-            expected_revision: store.plan(Some(key)).revision,
-            at: clock(),
-        };
+        let consent = crate::bindings::LaunchPolicyMove::test_fixture(
+            key,
+            "cx-a",
+            "cx-b",
+            store.plan(Some(key)).revision,
+            "m2",
+            clock(),
+        );
         assert!(store.authorize_model_move(&consent).is_err());
         store
             .set_session(
@@ -3863,7 +3898,7 @@ mod tests {
                 Some("cx-a"),
             )
             .unwrap();
-        consent.expected_revision = store.plan(Some(key)).revision;
+        let consent = r11_consent(&store, key, "cx-b");
         let before = fs::read(&store.path).unwrap();
         assert!(store.authorize_model_move(&consent).is_err());
         assert_eq!(fs::read(&store.path).unwrap(), before);
@@ -6254,13 +6289,14 @@ mod issue_operation_writer_tests {
         let key = "codex:operation-cancel";
         store.capture_strict_anchors([(key, "cx-a")]).unwrap();
         let plan = store.plan(Some(key));
-        let consent = crate::bindings::LaunchPolicyMove {
-            key: key.into(),
-            previous: "cx-a".into(),
-            account: "cx-b".into(),
-            expected_revision: plan.revision,
-            at: chrono::Utc::now(),
-        };
+        let consent = crate::bindings::LaunchPolicyMove::test_fixture(
+            key,
+            "cx-a",
+            "cx-b",
+            plan.revision,
+            "m2",
+            chrono::Utc::now(),
+        );
         let before = std::fs::read(&store.path).unwrap();
         let operation =
             IssueOperation::new(tokio::time::Instant::now() + std::time::Duration::from_secs(3600));

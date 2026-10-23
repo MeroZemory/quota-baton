@@ -14,6 +14,10 @@ mod response;
 mod selection_guard;
 mod upload;
 mod websocket;
+pub(crate) use outcome::RequestFailureEvidence;
+pub(crate) use websocket::capacity::CapacityMoveEvidence;
+#[cfg(test)]
+pub(crate) use websocket::capacity::test_move_evidence;
 mod wire_metadata;
 
 use std::{
@@ -167,7 +171,7 @@ pub struct RelayState {
     takeover_test_dependencies: Option<crate::accounts::takeover::Dependencies>,
     websocket: crate::config::WebsocketConfig,
     ws_capacity: Arc<websocket::capacity::Capacity>,
-    reconnect_exclusions: Mutex<BTreeMap<(String, String), Instant>>,
+    reconnect_exclusions: Mutex<BTreeMap<(String, String), outcome::ReconnectEvidence>>,
     #[cfg(feature = "testkit")]
     http_quota_wait_events: tokio::sync::broadcast::Sender<HttpQuotaWaitEvent>,
     #[cfg(feature = "testkit")]
@@ -816,19 +820,38 @@ impl RelayState {
         }
     }
 
-    pub(super) fn exclude_reconnect(&self, key: Option<&str>, account: &str) {
-        if let Some(key) = key
-            && let Ok(mut exclusions) = self.reconnect_exclusions.lock()
-        {
-            exclusions.retain(|_, expiry| *expiry > Instant::now());
+    fn exclude_reconnect(&self, evidence: outcome::ReconnectEvidence) {
+        if let Ok(mut exclusions) = self.reconnect_exclusions.lock() {
+            exclusions.retain(|_, proof| proof.active(Instant::now()));
             if exclusions.len() >= 4096 {
                 exclusions.pop_first();
             }
             exclusions.insert(
-                (key.to_owned(), account.to_owned()),
-                Instant::now() + Duration::from_secs(120),
+                (evidence.key().to_owned(), evidence.source().to_owned()),
+                evidence,
             );
         }
+    }
+
+    fn reconnect_failure(
+        &self,
+        key: Option<&str>,
+        account: Option<&str>,
+        model: Option<&str>,
+    ) -> Option<outcome::RequestFailureEvidence> {
+        let mut exclusions = self.reconnect_exclusions.lock().ok()?;
+        exclusions.retain(|_, proof| proof.active(Instant::now()));
+        let proof = exclusions.get(&(key?.to_owned(), account?.to_owned()))?;
+        proof.permits_model(model).then(|| proof.failure())
+    }
+
+    fn reconnect_model(&self, key: Option<&str>, account: Option<&str>) -> Option<String> {
+        let mut exclusions = self.reconnect_exclusions.lock().ok()?;
+        exclusions.retain(|_, proof| proof.active(Instant::now()));
+        exclusions
+            .get(&(key?.to_owned(), account?.to_owned()))?
+            .model()
+            .map(str::to_owned)
     }
 
     async fn candidates(
@@ -840,35 +863,38 @@ impl RelayState {
     ) -> Result<Vec<crate::bindings::Candidate>, ()> {
         self.candidates_with_evidence(provider, key, model, tried)
             .await
-            .map(|(candidates, _, _)| candidates)
+            .map(|(candidates, _, _, _, _)| candidates)
     }
 
     async fn candidates_with_evidence(
         &self,
         provider: Provider,
         key: Option<&str>,
-        _model: Option<&str>,
+        model: Option<&str>,
         tried: &BTreeSet<String>,
     ) -> Result<
         (
             Vec<crate::bindings::Candidate>,
             Vec<crate::bindings::Candidate>,
             crate::bindings::MoveObservation,
+            Vec<crate::accounts::StoreUnavailableEvidence>,
+            Vec<crate::account_runtime::RuntimeUnavailableEvidence>,
         ),
         (),
     > {
         let observed = crate::bindings::MoveObservation::before_collection();
+        let recovery_sources = self.bindings.recovery_sources(provider, key);
         let store = self.store.clone();
         let mut tried = tried.clone();
         if let Some(key) = key
             && let Ok(mut exclusions) = self.reconnect_exclusions.lock()
         {
-            exclusions.retain(|_, expiry| *expiry > Instant::now());
+            exclusions.retain(|_, proof| proof.active(Instant::now()));
             tried.extend(
                 exclusions
-                    .keys()
-                    .filter(|(session, _)| session == key)
-                    .map(|(_, id)| id.clone()),
+                    .iter()
+                    .filter(|((session, _), proof)| session == key && proof.permits_model(model))
+                    .map(|((_, id), _)| id.clone()),
             );
         }
         let read_store = store.clone();
@@ -900,6 +926,8 @@ impl RelayState {
         tokio::task::spawn_blocking(move || {
             let mut candidates = Vec::new();
             let mut evidence = Vec::new();
+            let mut store_evidence = Vec::new();
+            let mut runtime_evidence = Vec::new();
             use crate::observability::replay_recorder as tape;
             let recording = obs.replay();
             let collection = recording.as_ref().and_then(|r| r.next_id());
@@ -944,12 +972,13 @@ impl RelayState {
                 let retry_excluded = tried.contains(&account.id);
                 let runtime_excluded = !retry_excluded
                     && (runtime.probing(&account.id) || runtime.blocked_in_memory(&account.id));
+                if runtime_excluded {
+                    runtime_evidence.extend(runtime.selection_unavailable(&account.id));
+                }
                 let credential = if !retry_excluded && !runtime_excluded {
-                    Some(
-                        store
-                            .tokens(account)
-                            .is_ok_and(|t| !t.access_token.is_empty()),
-                    )
+                    let (readable, proof) = store.selection_credentials(account);
+                    store_evidence.extend(proof);
+                    Some(readable)
                 } else {
                     None
                 };
@@ -999,6 +1028,14 @@ impl RelayState {
                 // source evidence even when this account cannot be selected.
                 evidence.push(candidate);
             }
+            for source in recovery_sources {
+                if !evidence
+                    .iter()
+                    .any(|candidate| candidate.account.id == source)
+                {
+                    store_evidence.extend(store.selection_absence(&source));
+                }
+            }
             if let (Some(r), Some(collection)) = (&recording, collection) {
                 r.record(
                     tape::Owner::Collector,
@@ -1011,7 +1048,13 @@ impl RelayState {
                     },
                 );
             }
-            Ok((candidates, evidence, observed))
+            Ok((
+                candidates,
+                evidence,
+                observed,
+                store_evidence,
+                runtime_evidence,
+            ))
         })
         .await
         .map_err(|_| ())?
@@ -1286,7 +1329,13 @@ impl RelayState {
                 &self.bindings.policies.changed,
                 self.accounts.subscribe(),
             );
-            let (candidates, mut move_evidence, target_observed) = self
+            let (
+                candidates,
+                mut move_evidence,
+                target_observed,
+                mut store_evidence,
+                mut runtime_evidence,
+            ) = self
                 .candidates_with_evidence(provider, session.key.as_deref(), model, &excluded)
                 .await?;
             // Retain this conservative target bound through any launch refresh;
@@ -1298,10 +1347,18 @@ impl RelayState {
                     .await?;
                 // Catalog I/O can outlive a recovery or rejection of an excluded
                 // source. Refresh evidence without changing launch eligibility.
-                let (_, refreshed_evidence, observed) = self
+                let (
+                    _,
+                    refreshed_evidence,
+                    observed,
+                    refreshed_store_evidence,
+                    refreshed_runtime_evidence,
+                ) = self
                     .candidates_with_evidence(provider, session.key.as_deref(), model, &excluded)
                     .await?;
                 move_evidence = refreshed_evidence;
+                store_evidence = refreshed_store_evidence;
+                runtime_evidence = refreshed_runtime_evidence;
                 source_observed = observed;
                 selected
             } else {
@@ -1311,7 +1368,8 @@ impl RelayState {
             if admit.is_some() {
                 self.ws_capacity.before_selection().await;
             }
-            let pinned = self.pins.get(provider, session.key.as_deref());
+            let pin_evidence = self.pins.selection(provider, session.key.as_deref());
+            let pinned = pin_evidence.as_ref().map(|proof| proof.target().to_owned());
             let bytes = completion.selection_cost.unwrap_or(0);
             // Strict anchors/moves are durable before dispatch. Disk I/O must
             // not block a Tokio reactor thread while holding the table gate.
@@ -1328,9 +1386,15 @@ impl RelayState {
             let denied_choice = denied.clone();
             let admission_runtime = launch.map(|_| self.accounts.clone());
             let selection_operation = operation.clone();
+            // Refresh after every await/hold: an expired or recovered hint
+            // must not shadow a newer native health/selection decision.
+            let reconnect_source = self.bindings.current(session.key.as_deref());
+            let failure_evidence = completion.failure_evidence.clone().or_else(|| {
+                self.reconnect_failure(session.key.as_deref(), reconnect_source.as_deref(), model)
+            });
             let choice = tokio::task::spawn_blocking(move || {
                 let choose = |eligible: &dyn Fn(&str, bool) -> bool| {
-                    table.choose_with_hold_at_admitted_evidence(
+                    table.choose_with_hold_at_admitted_proof(
                         provider,
                         key.as_deref(),
                         parent.as_deref(),
@@ -1350,12 +1414,32 @@ impl RelayState {
                         |account| {
                             // BindingTable holds mutations through this
                             // admission and publication, including ordinary HTTP.
+                            let mut admission = None;
                             let allowed = selection_guard::admit(&selection_operation, || {
-                                eligible(account, table.existing_placement(key.as_deref(), account))
-                                    && admit.as_ref().is_none_or(|admit| admit(account))
+                                if !eligible(
+                                    account,
+                                    table.existing_placement(key.as_deref(), account),
+                                ) {
+                                    return false;
+                                }
+                                admission = admit.as_ref().map_or_else(
+                                    || Some(crate::bindings::DispatchAdmission::ordinary()),
+                                    |admit| admit(account),
+                                );
+                                admission.is_some()
                             });
                             denied_choice.store(!allowed, Ordering::Release);
-                            allowed
+                            if allowed {
+                                admission.map(|admission| {
+                                    admission
+                                        .with_failure(failure_evidence)
+                                        .with_pin(pin_evidence)
+                                        .with_store_evidence(store_evidence)
+                                        .with_runtime_evidence(runtime_evidence)
+                                })
+                            } else {
+                                None
+                            }
                         },
                     )
                 };
@@ -1439,6 +1523,9 @@ impl RelayState {
                     lease,
                     moves,
                 } => {
+                    // Selection has consumed the failed attempt's authority.
+                    // A later failure on the successor needs its own evidence.
+                    completion.failure_evidence = None;
                     if completion.reset_hold_timed_out
                         && held_account.as_deref() == Some(account.as_str())
                     {
@@ -2248,7 +2335,7 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
     completion.session(&session);
     completion.accounting_http_model(&parts.headers, &upload.prefix);
     let mut tried = BTreeSet::new();
-    let mut request_model = session.model.clone();
+    let request_model = session.model.clone();
     #[cfg(all(feature = "shape-capture", debug_assertions))]
     let shape_ticket = {
         let observability = state.observability.clone();
@@ -2691,6 +2778,15 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
             &held.prefix,
             request_model.as_deref(),
         );
+        let failure_evidence = decision.failed_attempt(
+            &account,
+            session.key.as_deref(),
+            request_model.as_deref(),
+            completion.precommit_deadline.unwrap_or_else(|| {
+                completion.start + Duration::from_secs(state.request_timeout_secs)
+            }),
+            &completion.failure_lifetime,
+        );
         decision.reconcile_quota(&credit_observation);
         completion.record.upstream_error_code = hold::error_code(&response_headers, &held.prefix);
         let mut observed_http_429 = None;
@@ -2731,9 +2827,9 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
                 state.accounts.invalidate_quota_rejection(&account.id).await;
             }
         }
-        if let Some(model) = decision.model.take().filter(|_| managed_http.is_none()) {
-            request_model = Some(model);
-        }
+        // Response-only model hints scope the health signal; they do not change
+        // the model of the request actually sent. Preserve that exact context
+        // for the sealed failed-attempt handoff and every same-body successor.
         if managed_http.is_some() && decision.kind == outcome::Kind::ModelPermission {
             // A failed or unchanged catalog refresh must not erase C6 row 6a's
             // observed model-specific denial. Keep its normal durable hold.
@@ -3179,6 +3275,7 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
             }
             break (status, response_headers, held);
         }
+        completion.failure_evidence = failure_evidence;
         completion.failover(decision.reason());
         let mut selection_tried = tried.clone();
         if let Some(source) = proof_reset_source {
@@ -3333,6 +3430,103 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
 #[cfg(test)]
 mod tests {
     #[tokio::test]
+    async fn n6t_selected_successor_retires_failure_before_independent_recovery() {
+        use super::*;
+        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.sandbox/n6t-successor");
+        std::fs::create_dir_all(&base).unwrap();
+        let root = tempfile::tempdir_in(base).unwrap();
+        let cpa = root.path().join("cpa");
+        std::fs::create_dir_all(&cpa).unwrap();
+        let mut activate = Vec::new();
+        for n in 0..3 {
+            let email = format!("sample-{n}@example.test");
+            std::fs::write(cpa.join(format!("{n}.json")), serde_json::to_vec(&serde_json::json!({
+                "type":"codex", "email":email, "account_id":format!("sample-{n}"),
+                "access_token":format!("synthetic-access-{n}"), "refresh_token":"synthetic-refresh",
+                "expired":"2099-01-01T00:00:00Z", "last_refresh":"2026-10-13T00:00:01Z"
+            })).unwrap()).unwrap();
+            activate.push(format!("codex:{email}"));
+        }
+        let store = Arc::new(AccountStore::acquire(&root.path().join("home")).unwrap());
+        crate::accounts::import::run(&store, &cpa, &activate, false).unwrap();
+        let obs = Arc::new(Observability::new(store.home(), None).unwrap());
+        let mut config = Config::default();
+        config.upstream.codex_base = "http://127.0.0.1:9".into();
+        config.upstream.anthropic_base = "http://127.0.0.1:9".into();
+        let state = RelayState::new(
+            store.clone(),
+            &config,
+            obs.clone(),
+            Arc::new(DebugPins::default()),
+        )
+        .unwrap();
+        let session = session::Session {
+            key: Some("codex:sample-recovery".into()),
+            parent: None,
+            model: None,
+        };
+        let mut completion = Completion::new(
+            obs,
+            &Method::GET,
+            "/v1/responses",
+            Provider::Codex,
+            &HeaderMap::new(),
+        );
+        completion.precommit_deadline = Some(Instant::now() + Duration::from_secs(30));
+        let mut tried = BTreeSet::new();
+        let source = state
+            .select_request(Provider::Codex, &session, &mut completion, None, &tried)
+            .await
+            .unwrap()
+            .unwrap();
+        completion.binding.take();
+        tried.insert(source.id.clone());
+        let decision = outcome::classify(
+            Provider::Codex,
+            StatusCode::UNAUTHORIZED,
+            &HeaderMap::new(),
+            b"{}",
+            None,
+        );
+        completion.failure_evidence = decision.failed_attempt(
+            &source,
+            session.key.as_deref(),
+            None,
+            completion.precommit_deadline.unwrap(),
+            &completion.failure_lifetime,
+        );
+        assert!(completion.failure_evidence.is_some());
+        let successor = state
+            .select_request(Provider::Codex, &session, &mut completion, None, &tried)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(successor.id, source.id);
+        assert!(
+            completion.failure_evidence.is_none(),
+            "selected successor must retire the previous source proof"
+        );
+        completion.binding.take();
+        store
+            .update_metadata(&successor.id, |account| {
+                account.health = Health::Cooling {
+                    reason: HealthReason::Payment,
+                    until: chrono::Utc::now() + chrono::Duration::hours(1),
+                    scope: "account".into(),
+                }
+            })
+            .unwrap();
+        tried.insert(successor.id.clone());
+        let next = state
+            .select_request(Provider::Codex, &session, &mut completion, None, &tried)
+            .await
+            .unwrap()
+            .expect("fresh successor health must allow independent recovery");
+        assert!(!tried.contains(&next.id));
+    }
+
+    #[tokio::test]
     async fn precommit_timeout_never_replaces_a_committed_response_during_cleanup() {
         let (commit, observed) = tokio::sync::watch::channel(false);
         let (release, wait) = tokio::sync::oneshot::channel();
@@ -3473,9 +3667,24 @@ mod tests {
                 .into_iter()
                 .filter(|a| a.id != source)
                 .collect();
-            state.exclude_reconnect(Some("codex:tray2-exclusions"), &others[0].id);
+            let failed = outcome::classify(
+                Provider::Codex,
+                StatusCode::UNAUTHORIZED,
+                &HeaderMap::new(),
+                b"{}",
+                None,
+            );
+            state.exclude_reconnect(
+                failed
+                    .reconnect_evidence(&others[0], Some("codex:tray2-exclusions"), None)
+                    .unwrap(),
+            );
             if exclude_all {
-                state.exclude_reconnect(Some("codex:tray2-exclusions"), &others[1].id);
+                state.exclude_reconnect(
+                    failed
+                        .reconnect_evidence(&others[1], Some("codex:tray2-exclusions"), None)
+                        .unwrap(),
+                );
             }
             let reset = chrono::Utc::now().timestamp() + 172800;
             fake.state.push(ScriptedResponse::json(

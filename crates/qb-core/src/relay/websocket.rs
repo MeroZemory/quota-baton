@@ -351,6 +351,12 @@ async fn upgrade_inner(
             "등록된 프로젝트와 루트 세션 연결을 확인해 주세요.",
         );
     }
+    // A reconnect upgrade has no body model. Retain the model from the actual
+    // failed precommit turn so model-scoped health and evidence stay scoped.
+    if session.model.is_none() {
+        let source = state.bindings.current(session.key.as_deref());
+        session.model = state.reconnect_model(session.key.as_deref(), source.as_deref());
+    }
     completion.session(&session);
     let ticket = state.observability.capture_request(&parts.headers, &[]);
     let query = parts
@@ -504,22 +510,20 @@ async fn upgrade_inner(
                 #[cfg(feature = "testkit")]
                 state.ws_capacity.before_admission();
                 if state.is_draining() || std::time::Instant::now() >= deadline {
-                    return false;
+                    return None;
                 }
-                let Some(reserved) = owner.upgrade() else {
-                    return false;
-                };
+                let reserved = owner.upgrade()?;
                 if let Some(source) = &preferred
                     && (account != source
                         || state.bindings.capacity_source(key.as_deref()).as_deref()
                             != Some(source.as_str()))
                 {
                     denied.store(true, Ordering::Release);
-                    return false;
+                    return None;
                 }
                 let Some(permit) = state.ws_capacity.reserve(account) else {
                     denied.store(true, Ordering::Release);
-                    return false;
+                    return None;
                 };
                 let current_source = state.bindings.capacity_source(key.as_deref());
                 if let Some(source) = current_source.as_deref()
@@ -533,37 +537,41 @@ async fn upgrade_inner(
                     // A cap/binding change after collection cannot manufacture
                     // an exhausted own-wait for the newly observed source.
                     denied.store(true, Ordering::Release);
-                    return false;
+                    return None;
                 }
                 // Capacity is reserved before the atomic spill fence, and both
                 // reservations roll back if publication/caller ownership fails.
-                let spill = if let Some(source) = &spill_source
+                let (spill, admission) = if let Some(source) = &spill_source
                     && account != source.source()
                 {
-                    if !source.still_capped(&state.ws_capacity) {
+                    let Some(proof) = source.admit(&permit) else {
                         denied.store(true, Ordering::Release);
-                        return false;
-                    }
-                    match state.bindings.admit_capacity_spill(
+                        return None;
+                    };
+                    let spill = match state.bindings.admit_capacity_spill(
                         key.as_deref(),
                         source.source(),
                         account,
                     ) {
-                        Ok(spill) => Some(spill),
+                        Ok(spill) => spill,
                         Err(()) => {
                             denied.store(true, Ordering::Release);
-                            return false;
+                            return None;
                         }
-                    }
+                    };
+                    (
+                        Some(spill),
+                        crate::bindings::DispatchAdmission::capacity(proof),
+                    )
                 } else {
-                    None
+                    (None, crate::bindings::DispatchAdmission::ordinary())
                 };
                 let mut reserved = reserved.lock().unwrap_or_else(|e| e.into_inner());
                 if state.is_draining() || std::time::Instant::now() >= deadline {
-                    return false;
+                    return None;
                 }
                 *reserved = Some((permit, spill));
-                true
+                Some(admission)
             })
         };
         completion.policy_blocked = false;
@@ -903,6 +911,13 @@ async fn upgrade_inner(
                 &error.raw,
                 session.model.as_deref(),
             );
+            let failure_evidence = decision.failed_attempt(
+                &account,
+                session.key.as_deref(),
+                session.model.as_deref(),
+                deadline,
+                &completion.failure_lifetime,
+            );
             decision.reconcile_quota(&credit_observation);
             if decision.kind == super::outcome::Kind::Quota {
                 state.accounts.invalidate_quota_rejection(&account.id).await;
@@ -1039,6 +1054,7 @@ async fn upgrade_inner(
                 return error.into_response();
             }
             if failover {
+                completion.failure_evidence = failure_evidence;
                 completion.failover(reason);
             }
             if error.complete

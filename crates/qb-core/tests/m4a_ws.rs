@@ -2295,6 +2295,36 @@ async fn c6_row_13a_unknown_model_403_multiple_reconnects_exclude_every_previous
 }
 
 #[tokio::test]
+async fn c6_row_13a_revoked_without_session_key_closes_1012_then_uses_alternate() {
+    let h = Harness::new_with_owned(2, true).await;
+    let raw = r#"{"type":"error","status":401,"error":{"code":"token_revoked"}}"#;
+    h.fake.state.push_reply([Message::Text(raw.into())]);
+    let mut request = h.request();
+    request.headers_mut().remove("session-id");
+    let (mut client, response) = connect_async(request).await.unwrap();
+    let account = response.headers()["x-quota-baton-account"]
+        .to_str()
+        .unwrap();
+    create(&mut client, "fixture-model").await;
+    assert_close(receive(&mut client).await, 1012);
+    assert!(matches!(
+        h.store.load(account).unwrap().health,
+        Health::NeedsRelogin { .. }
+    ));
+    let alternate = h.ids.iter().find(|id| id.as_str() != account).unwrap();
+    assert_eq!(h.store.load(alternate).unwrap().health, Health::Ready);
+    let mut request = h.request();
+    request.headers_mut().remove("session-id");
+    let (mut reconnect, response) = connect_async(request).await.unwrap();
+    assert_eq!(
+        response.headers()["x-quota-baton-account"],
+        alternate.as_str()
+    );
+    assert_eq!(h.fake.state.requests().len(), 2);
+    reconnect.close(None).await.unwrap();
+}
+
+#[tokio::test]
 async fn c6_row_13a_unknown_model_403_without_session_key_relays_without_1012() {
     let h = Harness::new(2).await;
     let raw = r#"{"type":"error","status":403,"error":{"type":"permission_error"}}"#;
