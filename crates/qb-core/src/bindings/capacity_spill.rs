@@ -144,16 +144,16 @@ mod tests {
             let key = format!("codex:spill-{index}");
             table.data.lock().unwrap().bindings.insert(
                 key.clone(),
-                Binding {
-                    key: key.clone(),
-                    account: "source".into(),
-                    last_used: Utc::now(),
-                    accepted: Some(true),
-                    first_seen_at: None,
-                    bound_since: None,
-                    client_kind: None,
-                    observed_here: true,
-                },
+                Binding::new(
+                    key.clone(),
+                    "source".into(),
+                    Utc::now(),
+                    Some(true),
+                    None,
+                    None,
+                    None,
+                    true,
+                ),
             );
             table.data.lock().unwrap().groups.insert(
                 key.clone(),
@@ -457,16 +457,16 @@ mod tests {
                 let mut d = table.data.lock().unwrap();
                 d.bindings.insert(
                     key.into(),
-                    Binding {
-                        key: key.into(),
-                        account: "target".into(),
-                        last_used: Utc::now(),
-                        accepted: Some(true),
-                        first_seen_at: None,
-                        bound_since: None,
-                        client_kind: None,
-                        observed_here: false,
-                    },
+                    Binding::new(
+                        key.into(),
+                        "target".into(),
+                        Utc::now(),
+                        Some(true),
+                        None,
+                        None,
+                        None,
+                        false,
+                    ),
                 );
                 d.groups.insert(
                     key.into(),

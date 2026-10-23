@@ -833,7 +833,7 @@ impl BindingTable {
                 operation,
             )
             .map_err(|_| LaunchError::PolicyBlocked)?;
-        self.commit_move(
+        let committed = self.commit_move(
             permit,
             &account,
             Provider::Codex,
@@ -842,7 +842,7 @@ impl BindingTable {
             now,
         );
         let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
-        let moves = self.commit_binding(
+        let moves = self.publish_binding(
             &mut d,
             Provider::Codex,
             Some(&key),
@@ -854,6 +854,7 @@ impl BindingTable {
             now,
             &account,
             reason,
+            committed.as_ref(),
         );
         let authority_changed = old_metadata.as_ref().is_none_or(|old| {
             old.current_model != metadata.current_model || old.policy_key != metadata.policy_key

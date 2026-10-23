@@ -160,6 +160,25 @@ pub(crate) struct Permit {
     destination_evidence: u64,
 }
 
+/// Minted only by a successful breaker commit. Neither selectors nor storage
+/// can invent this receipt from a reason string or a candidate identifier.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct CommittedMove {
+    key: String,
+    from: String,
+    to: String,
+}
+
+impl CommittedMove {
+    pub(super) fn allows(&self, from: &str, to: &str) -> bool {
+        self.from == from && self.to == to
+    }
+
+    pub(super) fn for_group(&self, key: &str) -> bool {
+        self.key == key
+    }
+}
+
 impl Breaker {
     fn prune(&mut self, now: DateTime<Utc>) -> DateTime<Utc> {
         let now = self.last_now.map_or(now, |prior| now.max(prior));
@@ -299,11 +318,20 @@ impl Breaker {
 
     /// Call only after policy/admission success, just before changing the group.
     /// The mutation gate excludes other commits/clear/rename in between.
-    pub(crate) fn commit(&mut self, permit: Permit, actual_to: &str) -> Result<(), Refusal> {
+    pub(super) fn commit(
+        &mut self,
+        permit: Permit,
+        actual_to: &str,
+    ) -> Result<CommittedMove, Refusal> {
         if permit.revision != self.revision || permit.to != actual_to || self.revision == u64::MAX {
             return Err(Refusal::StalePermit);
         }
         self.revision += 1;
+        let committed = CommittedMove {
+            key: permit.key.clone(),
+            from: permit.from.clone(),
+            to: permit.to.clone(),
+        };
         let already_counted = permit.shared_incident.as_ref().is_some_and(|key| {
             self.global
                 .iter()
@@ -326,7 +354,7 @@ impl Breaker {
                 to: permit.to,
                 destination_evidence: permit.destination_evidence,
             });
-        Ok(())
+        Ok(committed)
     }
 
     pub(crate) fn recent_moves(&self, now: DateTime<Utc>) -> Vec<super::MoveGuardPair> {
