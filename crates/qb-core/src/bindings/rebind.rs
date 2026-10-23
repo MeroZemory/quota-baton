@@ -56,6 +56,58 @@ impl MoveReason<'_> {
         }
     }
 
+    // Called only after valid(): diagnostic detail never supplies move authority.
+    fn diagnostic_label(
+        &self,
+        cx: &RebindContext<'_>,
+        table: &BindingTable,
+        d: &Data,
+    ) -> &'static str {
+        if let Self::AnchoredRecovery(proof, reason) = self {
+            let logical = RebindContext {
+                from: Some(proof.source()),
+                ..*cx
+            };
+            return reason.diagnostic_label(&logical, table, d);
+        }
+        let label = self.label();
+        if label != "forced" {
+            return label;
+        }
+        let Some(source) = cx
+            .sources
+            .iter()
+            .find(|c| Some(c.account.id.as_str()) == cx.from)
+        else {
+            return label;
+        };
+        let source = effective_account(source, d, &table.config, cx.model, cx.now);
+        let plan = table.policies.plan(launch::policy_key(d, cx.key));
+        if source.user_state == UserState::Active
+            && let Health::Cooling {
+                reason: HealthReason::Quota,
+                until,
+                scope,
+            } = &source.health
+            && *until > cx.now
+            && (scope == "account"
+                || scope
+                    .strip_prefix("model:")
+                    .is_some_and(|model| cx.model == Some(model)))
+            && let Some(quota) = &source.quota_cooling
+            && quota.window == "5h"
+            && quota
+                .reset_at
+                .signed_duration_since(cx.now)
+                .to_std()
+                .is_ok_and(|wait| wait > Duration::from_secs(plan.settings.reset_wait_secs))
+        {
+            "five_hour_far_move"
+        } else {
+            label
+        }
+    }
+
     fn valid(
         &self,
         cx: &RebindContext<'_>,
@@ -245,12 +297,12 @@ impl BindingTable {
         if !moving && permit.is_some() {
             return Err(RebindError::Evidence);
         }
-        drop(d);
         let label = if moving {
-            reason.as_ref().unwrap().label()
+            reason.as_ref().unwrap().diagnostic_label(&cx, self, &d)
         } else {
             cx.label
         };
+        drop(d);
         authorize(label).map_err(|_| RebindError::Policy)?;
         let committed = self.commit_move(
             permit,
@@ -606,10 +658,17 @@ mod tests {
                     "filtered healthy anchor cannot justify a logical move"
                 );
                 assert_eq!(table.export().unwrap(), before);
-                anchor.account.health = Health::NeedsRelogin {
-                    reason: "synthetic revoked".into(),
-                    since: Utc::now(),
+                let reset = Utc::now() + chrono::Duration::hours(2);
+                anchor.account.health = Health::Cooling {
+                    reason: HealthReason::Quota,
+                    until: reset,
+                    scope: "account".into(),
                 };
+                anchor.account.quota_cooling = Some(crate::accounts::QuotaCooling {
+                    window: "5h".into(),
+                    reset_at: reset,
+                    started_at: Utc::now(),
+                });
                 match choose(anchor) {
                     Decision::Selected { account, moves, .. } => {
                         assert_eq!(account, destination.account.id);
@@ -627,6 +686,7 @@ mod tests {
                             })
                         );
                         assert!(moves[0].is_placement);
+                        assert_eq!(moves[0].reason, "five_hour_far_move");
                     }
                     other => panic!(
                         "unusable logical anchor must recover despite stale live image: {other:?}"
@@ -953,75 +1013,104 @@ mod tests {
 
     #[test]
     fn n6t_move_label_is_derived_from_owner_reason_before_policy() {
-        let root = fixture_dir();
-        let table = BindingTable::new(root.path(), RoutingConfig::default()).unwrap();
-        let mut source = candidate("sample-source", 10., 24, 4);
-        let target = candidate("sample-target", 10., 24, 4);
-        let key = "claude:sample-label";
-        drop(table.choose(
-            Provider::Claude,
-            Some(key),
-            None,
-            None,
-            std::slice::from_ref(&source),
-            None,
-            0,
-        ));
-        let now = Utc::now();
-        source.account.user_state = UserState::Paused;
-        let sources = [source, target];
-        let _mutation = table.mutations.lock().unwrap();
-        let d = table.data.lock().unwrap();
-        let permit = table
-            .prepare_move_with_source(
-                &d,
-                key,
-                Some("sample-source"),
-                "sample-target",
-                Some(&sources[0]),
-                &sources,
-                MoveObservations::untracked(),
+        for (caller_label, reset_after_hold_secs) in [
+            ("cold_rebalance", None),
+            ("model_choice", None),
+            ("five_hour_far_move", None),
+            ("five_hour_far_move", Some(0)),
+            ("arbitrary", Some(1)),
+        ] {
+            let root = fixture_dir();
+            let table = BindingTable::new(root.path(), RoutingConfig::default()).unwrap();
+            let mut source = candidate("sample-source", 10., 24, 4);
+            let target = candidate("sample-target", 10., 24, 4);
+            let key = "claude:sample-label";
+            drop(table.choose(
+                Provider::Claude,
+                Some(key),
                 None,
-                "cold_rebalance",
-                now,
-            )
-            .unwrap();
-        drop(d);
-        let context = RebindContext {
-            provider: Provider::Claude,
-            key: Some(key),
-            guard_key: key,
-            from: Some("sample-source"),
-            account: "sample-target",
-            parent: None,
-            model: None,
-            candidates: &sources,
-            sources: &sources,
-            pinned: None,
-            request_bytes: 0,
-            hold_timed_out: false,
-            now,
-            label: "cold_rebalance",
-        };
-        let admission = DispatchAdmission::ordinary();
-        let authority = table.owner_move_reason(&context, &admission, None, None);
-        let rebound = table
-            .rebind(context, authority, permit, |label| {
-                assert_eq!(
-                    label, "forced",
-                    "owner reason, not caller label, must classify policy dispatch"
-                );
-                table.policies.dispatch(
-                    Some(key),
-                    "sample-target",
+                None,
+                std::slice::from_ref(&source),
+                None,
+                0,
+            ));
+            let now = Utc::now();
+            let expected = if let Some(extra) = reset_after_hold_secs {
+                let hold = table.routing_plan(Some(key)).settings.reset_wait_secs;
+                let reset = now + chrono::Duration::seconds(hold as i64 + extra);
+                source.account.health = Health::Cooling {
+                    reason: HealthReason::Quota,
+                    until: reset,
+                    scope: "account".into(),
+                };
+                source.account.quota_cooling = Some(crate::accounts::QuotaCooling {
+                    window: "5h".into(),
+                    reset_at: reset,
+                    started_at: now,
+                });
+                if extra > 0 {
+                    "five_hour_far_move"
+                } else {
+                    "forced"
+                }
+            } else {
+                source.account.user_state = UserState::Paused;
+                "forced"
+            };
+            let sources = [source, target];
+            let _mutation = table.mutations.lock().unwrap();
+            let d = table.data.lock().unwrap();
+            let permit = table
+                .prepare_move_with_source(
+                    &d,
+                    key,
                     Some("sample-source"),
-                    label,
+                    "sample-target",
+                    Some(&sources[0]),
+                    &sources,
+                    MoveObservations::untracked(),
+                    None,
+                    caller_label,
                     now,
                 )
-            })
-            .unwrap_or_else(|_| panic!("valid owner move refused"));
-        assert_eq!(rebound.moves[0].reason, "forced");
-        assert_eq!(rebound.data.groups[key].account, "sample-target");
+                .unwrap();
+            drop(d);
+            let context = RebindContext {
+                provider: Provider::Claude,
+                key: Some(key),
+                guard_key: key,
+                from: Some("sample-source"),
+                account: "sample-target",
+                parent: None,
+                model: None,
+                candidates: &sources,
+                sources: &sources,
+                pinned: None,
+                request_bytes: 0,
+                hold_timed_out: false,
+                now,
+                label: caller_label,
+            };
+            let admission = DispatchAdmission::ordinary();
+            let authority = table.owner_move_reason(&context, &admission, None, None);
+            let rebound = table
+                .rebind(context, authority, permit, |label| {
+                    assert_eq!(
+                        label, expected,
+                        "owner reason, not caller label, must classify policy dispatch"
+                    );
+                    table.policies.dispatch(
+                        Some(key),
+                        "sample-target",
+                        Some("sample-source"),
+                        label,
+                        now,
+                    )
+                })
+                .unwrap_or_else(|_| panic!("valid owner move refused"));
+            assert_eq!(rebound.moves[0].reason, expected);
+            assert_eq!(rebound.data.groups[key].account, "sample-target");
+        }
     }
 
     #[test]

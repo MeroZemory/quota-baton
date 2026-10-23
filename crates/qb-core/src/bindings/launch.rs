@@ -1854,6 +1854,38 @@ mod r11_active_adoption_tests {
     }
 
     #[test]
+    fn n6t_current_model_cooling_recovers_without_new_model_consent() {
+        for mode in [Mode::Rebalance, Mode::Strict] {
+            let (_home, table, mut cs, es) = fixture(mode);
+            place(&table, &cs, &es);
+            table
+                .resolve_launch(Some(SOURCE), Some(REAL), Utc::now())
+                .unwrap();
+            let now = Utc::now();
+            cs[0].account.apply_health_signal(
+                crate::accounts::HealthSignal::Cooling {
+                    reason: crate::accounts::HealthReason::Rate,
+                    until: now + Delta::minutes(5),
+                    scope: "model:m1".into(),
+                },
+                now,
+            );
+            let mut r = request("launch:n6t-current-model-cooling");
+            r.resume_key = Some(REAL);
+            let result = table.place_launch(r, &cs, &es, now);
+            if mode == Mode::Strict {
+                assert_eq!(result.unwrap_err(), LaunchError::PolicyBlocked);
+                assert_eq!(table.current(Some(REAL)).as_deref(), Some("a"));
+            } else {
+                let placed = result.unwrap();
+                assert_eq!(placed.account, "b");
+                assert_eq!(placed.moves[0].reason, "forced");
+                assert_eq!(table.current(Some(REAL)).as_deref(), Some("b"));
+            }
+        }
+    }
+
+    #[test]
     fn r13_g_forced_resume_still_respects_outside_use_destination_veto() {
         let (_home, t, mut cs, es) = fixture(Mode::Rebalance);
         place(&t, &cs, &es);
@@ -2323,11 +2355,12 @@ mod r11_active_adoption_tests {
     }
 
     #[test]
-    fn n6t_model_cooled_source_requires_and_honors_explicit_consent() {
-        // A listed model can still be unavailable on the source. Preserve the
-        // original MODEL classification and Strict authorization for that case.
+    fn n6t_healthy_source_new_model_cooled_requires_and_honors_explicit_consent() {
+        // R13.G allows recovery when the current model is unusable. Here the
+        // current m1 stays usable, but the explicitly requested m2 is cooled:
+        // D22 model-change consent and Strict authorization still apply.
         for consent in ["none", "account", "move_for_model"] {
-            let (_home, table, mut cs, es) = fixture(Mode::Strict);
+            let (_home, table, mut cs, mut es) = fixture(Mode::Strict);
             place(&table, &cs, &es);
             table
                 .resolve_launch(Some(SOURCE), Some(REAL), Utc::now())
@@ -2337,16 +2370,19 @@ mod r11_active_adoption_tests {
                 crate::accounts::HealthSignal::Cooling {
                     reason: crate::accounts::HealthReason::Rate,
                     until: now + Delta::minutes(5),
-                    scope: "model:m1".into(),
+                    scope: "model:m2".into(),
                 },
                 now,
             );
-            assert!(es["a"].contains("m1"));
+            es.get_mut("a").unwrap().insert("m2".into());
+            assert!(es["a"].contains("m2"));
+            assert!(cs[0].account.eligible_at(Some("m1"), now));
             assert!(cs[0].account.eligible_at(None, now));
-            assert!(!cs[0].account.eligible_at(Some("m1"), now));
+            assert!(!cs[0].account.eligible_at(Some("m2"), now));
             let revision = table.routing_plan(Some(SOURCE)).revision;
             let mut r = request("launch:n6t-model-cooled");
             r.resume_key = Some(REAL);
+            r.model = Some("m2");
             r.account_pref = (consent == "account").then_some("b");
             r.allow_move_for_model = consent == "move_for_model";
             let mut called = false;
@@ -2355,7 +2391,7 @@ mod r11_active_adoption_tests {
                 assert_eq!(proof.key(), SOURCE);
                 assert_eq!(proof.previous(), "a");
                 assert_eq!(proof.account(), "b");
-                assert_eq!(proof.model(), "m1");
+                assert_eq!(proof.model(), "m2");
                 assert_eq!(proof.expected_revision(), revision);
                 store.authorize_model_move(proof)
             });
