@@ -50,6 +50,7 @@ use super::{
 
 const EVENT_BUDGET: Duration = Duration::from_secs(5);
 const CHILD_POLL: Duration = Duration::from_millis(25);
+const TUI_EXIT_GRACE: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum JobStatus {
@@ -109,6 +110,81 @@ pub(crate) enum Error {
     Cleanup,
 }
 
+#[cfg(any(test, feature = "testkit"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TestLifecycle {
+    NativeReaderFinished,
+    DispatchWorkerFinished,
+    UiPublisherFinished,
+    ConsumeCallbackFinished,
+    FailureLatched(Error),
+}
+
+#[cfg(any(test, feature = "testkit"))]
+#[derive(Default)]
+struct TestGateState {
+    entered: Notify,
+    released: Mutex<bool>,
+    wake_thread: Condvar,
+    wake_async: Notify,
+}
+
+#[cfg(any(test, feature = "testkit"))]
+impl TestGateState {
+    fn release(&self) {
+        *self.released.lock().unwrap_or_else(|p| p.into_inner()) = true;
+        self.wake_thread.notify_all();
+        self.wake_async.notify_one();
+    }
+
+    fn wait_thread(&self) {
+        let mut released = self.released.lock().unwrap_or_else(|p| p.into_inner());
+        self.entered.notify_one();
+        while !*released {
+            released = self
+                .wake_thread
+                .wait(released)
+                .unwrap_or_else(|p| p.into_inner());
+        }
+    }
+
+    async fn wait_async(&self) {
+        self.entered.notify_one();
+        loop {
+            let wake = self.wake_async.notified();
+            tokio::pin!(wake);
+            wake.as_mut().enable();
+            if *self.released.lock().unwrap_or_else(|p| p.into_inner()) {
+                return;
+            }
+            wake.await;
+        }
+    }
+}
+
+/// One-shot scheduling hook only. Dropping the test handle releases its waiter.
+#[cfg(any(test, feature = "testkit"))]
+pub(crate) struct TestGate(Arc<TestGateState>);
+
+#[cfg(any(test, feature = "testkit"))]
+#[allow(dead_code)] // Testkit binary builds need not install or drive test gates.
+impl TestGate {
+    pub(crate) async fn entered(&self) {
+        self.0.entered.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.0.release();
+    }
+}
+
+#[cfg(any(test, feature = "testkit"))]
+impl Drop for TestGate {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 enum Operation {
     #[default]
@@ -127,6 +203,8 @@ struct AutoMailbox {
 #[derive(Default)]
 struct State {
     failure: Option<Error>,
+    cleanup_started: bool,
+    direct_write_uncertain: bool,
     operation: Operation,
     auto: AutoMailbox,
 }
@@ -141,9 +219,23 @@ struct Shared {
     dispatch_wake: Condvar,
     #[cfg(any(test, feature = "testkit"))]
     test_ingress: std::sync::OnceLock<tokio::sync::mpsc::Sender<Source>>,
+    #[cfg(any(test, feature = "testkit"))]
+    test_lifecycle: std::sync::OnceLock<tokio::sync::mpsc::Sender<TestLifecycle>>,
+    #[cfg(any(test, feature = "testkit"))]
+    test_consume_return: std::sync::OnceLock<Arc<TestGateState>>,
+    #[cfg(any(test, feature = "testkit"))]
+    test_before_cleanup: std::sync::OnceLock<Arc<TestGateState>>,
 }
 
 impl Shared {
+    #[cfg(any(test, feature = "testkit"))]
+    fn test_record(&self, event: TestLifecycle) {
+        if let Some(observer) = self.test_lifecycle.get() {
+            // Observation loss never blocks or changes dispatch/authority.
+            let _ = observer.try_send(event);
+        }
+    }
+
     fn state(&self) -> MutexGuard<'_, State> {
         match self.state.lock() {
             Ok(state) => state,
@@ -159,12 +251,26 @@ impl Shared {
     // No untrusted work or pipe/ingress calls run under these small state locks.
     fn fail(&self, error: Error) {
         let mut state = self.state();
-        if error == Error::WriteUncertain {
+        if error == Error::WriteUncertain && !state.cleanup_started {
+            state.direct_write_uncertain = true;
+        }
+        if error == Error::WriteUncertain
+            || (state.failure == Some(Error::Pump) && error != Error::Pump)
+        {
             state.failure = Some(error);
         }
         state.failure.get_or_insert(error);
         drop(state);
+        #[cfg(any(test, feature = "testkit"))]
+        self.test_record(TestLifecycle::FailureLatched(error));
         self.changed.notify_one();
+    }
+
+    fn begin_cleanup(&self) -> (Option<Error>, bool) {
+        let mut state = self.state();
+        // Serialize the cause boundary with fail(): job drain has not started.
+        state.cleanup_started = true;
+        (state.failure, state.direct_write_uncertain)
     }
 
     fn start_event(&self) -> Instant {
@@ -267,9 +373,13 @@ impl Shared {
         true
     }
 
-    fn supervision(&self) -> Result<(Option<Instant>, bool), Error> {
+    fn supervision(&self, peer_closed: bool) -> Result<(Option<Instant>, bool), Error> {
         let mut state = self.state();
-        if let Some(error) = state.failure {
+        // Explicit PeerClosed also drops the UI queue. Its publisher's Pump
+        // failure is secondary; no other failure receives an exit grace.
+        if let Some(error) = state.failure
+            && !(peer_closed && error == Error::Pump)
+        {
             return Err(error);
         }
         let deadline = match state.operation {
@@ -346,9 +456,43 @@ pub(crate) struct ManagedParent<J: Jobs> {
 }
 
 impl<J: Jobs> ManagedParent<J> {
+    #[cfg(any(test, feature = "testkit"))]
+    #[allow(dead_code)] // Optional test observer, unused by normal testkit entry.
+    pub(crate) fn test_lifecycle(&mut self) -> tokio::sync::mpsc::Receiver<TestLifecycle> {
+        let (sender, receiver) = tokio::sync::mpsc::channel(64);
+        assert!(
+            self.shared.test_lifecycle.set(sender).is_ok(),
+            "test lifecycle observer already installed"
+        );
+        receiver
+    }
+
+    #[cfg(any(test, feature = "testkit"))]
+    #[allow(dead_code)] // Optional deterministic test scheduling hook.
+    pub(crate) fn test_pause_consume_return(&mut self) -> TestGate {
+        let gate = Arc::new(TestGateState::default());
+        assert!(
+            self.shared.test_consume_return.set(gate.clone()).is_ok(),
+            "test Consume gate already installed"
+        );
+        TestGate(gate)
+    }
+
+    #[cfg(any(test, feature = "testkit"))]
+    #[allow(dead_code)] // Optional deterministic test scheduling hook.
+    pub(crate) fn test_pause_before_cleanup(&mut self) -> TestGate {
+        let gate = Arc::new(TestGateState::default());
+        assert!(
+            self.shared.test_before_cleanup.set(gate.clone()).is_ok(),
+            "test cleanup gate already installed"
+        );
+        TestGate(gate)
+    }
+
     /// Install one bounded, lossy publication observer. A received Source proves
     /// successful ingress admission, never dispatch completion or authority.
     #[cfg(any(test, feature = "testkit"))]
+    #[allow(dead_code)] // Testkit binary builds need not install this test-only observer.
     pub(crate) fn test_ingress(&mut self) -> tokio::sync::mpsc::Receiver<Source> {
         let (sender, receiver) = tokio::sync::mpsc::channel(super::ingress::QUEUE_FRAMES);
         assert!(
@@ -395,7 +539,7 @@ impl<J: Jobs> ManagedParent<J> {
         let native_publisher = publisher.clone();
         owner.spawn("qb-native-reader", move |shared| {
             let mut reader = BufReader::new(stdout);
-            reader_loop(
+            let result = reader_loop(
                 &shared,
                 &native_publisher,
                 || {
@@ -404,13 +548,16 @@ impl<J: Jobs> ManagedParent<J> {
                         .ok_or(Error::NativeEof)
                 },
                 Source::Native,
-            )
+            );
+            #[cfg(any(test, feature = "testkit"))]
+            shared.test_record(TestLifecycle::NativeReaderFinished);
+            result
         })?;
 
         let ui_publisher = publisher;
         owner.spawn("qb-ui-publisher", move |shared| {
             let mut receiver = ui.from_ui;
-            reader_loop(
+            let result = reader_loop(
                 &shared,
                 &ui_publisher,
                 || {
@@ -420,7 +567,10 @@ impl<J: Jobs> ManagedParent<J> {
                         .ok_or(Error::Pump)
                 },
                 Source::Ui,
-            )
+            );
+            #[cfg(any(test, feature = "testkit"))]
+            shared.test_record(TestLifecycle::UiPublisherFinished);
+            result
         })?;
 
         owner.spawn("qb-native-dispatch", move |shared| {
@@ -435,15 +585,21 @@ impl<J: Jobs> ManagedParent<J> {
         body: impl FnOnce(Arc<Shared>) -> Result<(), Error> + Send + 'static,
     ) -> Result<(), Error> {
         let shared = self.shared.clone();
+        #[cfg(any(test, feature = "testkit"))]
+        let dispatch_worker = name == "qb-native-dispatch";
         let worker = thread::Builder::new()
             .name(name.into())
-            .spawn(
-                move || match catch_unwind(AssertUnwindSafe(|| body(shared.clone()))) {
+            .spawn(move || {
+                match catch_unwind(AssertUnwindSafe(|| body(shared.clone()))) {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => shared.fail(error),
                     Err(_) => shared.fail(Error::Worker),
-                },
-            )
+                }
+                #[cfg(any(test, feature = "testkit"))]
+                if dispatch_worker {
+                    shared.test_record(TestLifecycle::DispatchWorkerFinished);
+                }
+            })
             .map_err(|_| Error::Setup)?;
         self.workers.push(worker);
         Ok(())
@@ -455,16 +611,38 @@ impl<J: Jobs> ManagedParent<J> {
         self.shared.enabled.store(true, Ordering::Release);
         self.shared.wake_dispatch();
         let result = self.supervise().await;
+        #[cfg(any(test, feature = "testkit"))]
+        if let Some(gate) = self.shared.test_before_cleanup.get() {
+            gate.wait_async().await;
+        }
+        let (failure_before_cleanup, direct_write_uncertain) = self.shared.begin_cleanup();
         let cleanup = self.cleanup();
+        if direct_write_uncertain {
+            return Err(Error::WriteUncertain);
+        }
         match result {
+            // A real ingress/worker failure can drop the UI receiver and make
+            // the pump finish first. Preserve that already-latched root cause,
+            // using the snapshot taken BEFORE job termination causes errors.
+            Err(Error::Pump) if failure_before_cleanup.is_some_and(|e| e != Error::Pump) => {
+                Err(failure_before_cleanup.unwrap_or(Error::Pump))
+            }
+            // Preserve the supervisor's fatal cause. Stopping jobs to handle a
+            // Pump/Watchdog failure can itself make a blocked write fail; that
+            // teardown consequence must not replace the original diagnosis.
             Err(error) => Err(error),
+            Ok(_) if self.shared.state().failure == Some(Error::WriteUncertain) => {
+                // A clean child exit cannot hide an unfinished physical write
+                // whose uncertainty becomes visible only after job drain.
+                Err(Error::WriteUncertain)
+            }
             Ok(status) => cleanup.map(|()| status),
         }
     }
 
     async fn supervise(&mut self) -> Result<JobStatus, Error> {
         loop {
-            let (deadline, auto_disabled) = self.shared.supervision()?;
+            let (deadline, auto_disabled) = self.shared.supervision(false)?;
             if auto_disabled {
                 self.drop_actor();
             }
@@ -481,7 +659,12 @@ impl<J: Jobs> ManagedParent<J> {
                         None => pending().await,
                     }
                 } => self.stop_auto(),
-                _ = self.pump.as_mut().ok_or(Error::Pump)? => return Err(Error::Pump),
+                result = self.pump.as_mut().ok_or(Error::Pump)? => {
+                    return match result {
+                        Err(socket_pump::Error::PeerClosed) => self.peer_closed_exit().await,
+                        _ => Err(Error::Pump),
+                    };
+                },
                 hint = async {
                     match self.due.as_mut() {
                         Some(due) => due.recv().await,
@@ -492,6 +675,33 @@ impl<J: Jobs> ManagedParent<J> {
                     None => self.stop_auto(),
                 },
                 () = tokio::time::sleep(CHILD_POLL) => {},
+            }
+        }
+    }
+
+    async fn peer_closed_exit(&mut self) -> Result<JobStatus, Error> {
+        // Stop new work without touching ingress: an in-flight physical writer
+        // may own its mutex. Never poll the completed pump again.
+        self.shared.stopped.store(true, Ordering::Release);
+        self.stop_auto();
+        self.shared.wake_dispatch();
+        let deadline = Instant::now() + TUI_EXIT_GRACE;
+        loop {
+            let (operation_deadline, _) = self.shared.supervision(true)?;
+            if Instant::now() >= deadline {
+                return Err(Error::Pump);
+            }
+            match self.jobs.try_wait().map_err(|_| Error::Job)? {
+                status @ (JobStatus::TuiExited(_) | JobStatus::BothExited { .. }) => {
+                    return Ok(status);
+                }
+                JobStatus::Running => {}
+                _ => return Err(Error::Pump),
+            }
+            tokio::select! {
+                () = self.shared.changed.notified() => {},
+                () = wait_deadline(operation_deadline) => {},
+                () = tokio::time::sleep_until((Instant::now() + CHILD_POLL).min(deadline)) => {},
             }
         }
     }
@@ -514,6 +724,7 @@ impl<J: Jobs> ManagedParent<J> {
         if self.cleaned {
             return Ok(());
         }
+        let _ = self.shared.begin_cleanup();
         self.shared.stopped.store(true, Ordering::Release);
         // No ingress locks before this drain. Both pipe ends can be blocked in
         // other threads; killing both jobs is their synchronous cancellation.
@@ -524,6 +735,17 @@ impl<J: Jobs> ManagedParent<J> {
         drop(self.actor.take());
         drop(self.pump.take());
         drop(self.due.take());
+        #[cfg(any(test, feature = "testkit"))]
+        for gate in [
+            self.shared.test_consume_return.get(),
+            self.shared.test_before_cleanup.get(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            // Cancellation cannot depend on a test task being polled during join.
+            gate.release();
+        }
         self.shared.wake_dispatch();
         for worker in self.workers.drain(..) {
             failed |= worker.join().is_err();
@@ -609,7 +831,12 @@ fn dispatch_loop<N: Write, U: Write>(
             }
             // ONLY the dedicated std thread, ONLY inside committed callback,
             // and NO ingress/mailbox mutex across this bounded exchange.
-            match runtime.block_on(core.consume(episode, deadline)) {
+            let consumed = runtime.block_on(core.consume(episode, deadline));
+            #[cfg(any(test, feature = "testkit"))]
+            if let Some(gate) = shared.test_consume_return.get() {
+                gate.wait_thread();
+            }
+            match consumed {
                 Ok(Consumption::Granted(receipt)) => {
                     let valid = receipt.is_current(episode);
                     grant = Some(receipt);
@@ -618,6 +845,10 @@ fn dispatch_loop<N: Write, U: Write>(
                 _ => false,
             }
         });
+        #[cfg(any(test, feature = "testkit"))]
+        if attempted {
+            shared.test_record(TestLifecycle::ConsumeCallbackFinished);
+        }
         // Preserve physical uncertainty ahead of any secondary timeout/latch.
         if result
             == Err(parent_dispatch::Error::Dispatch(
@@ -765,11 +996,26 @@ fn reader_loop(
         }
         Ok(())
     })();
+    // The pump owns the UI queue: its closure is reported to the supervisor,
+    // which stops dispatch and drops Consume before draining jobs. Closing shared
+    // ingress here would manufacture Revoked during that clean callback denial.
+    // A successful stopped reader of either source needs no extra ingress close.
+    // Frame/publication failures still close ingress and remain fatal.
+    let owned_shutdown = (source == Source::Ui && result == Err(Error::Pump))
+        || (result.is_ok() && shared.stopped.load(Ordering::Acquire));
+    if source == Source::Ui && result == Err(Error::Pump) {
+        // Close admission before reporting EOF, even if the supervisor has not
+        // yet observed the completed pump. AwaitCore/enter_physical both veto.
+        shared.stopped.store(true, Ordering::Release);
+        shared.disable_auto();
+    }
     // Notify BEFORE close, since close itself may wait for the physical writer's
     // ingress mutex. The independent supervisor can kill jobs to release it.
     if let Err(error) = result {
         shared.fail(error);
     }
-    publisher.close();
+    if !owned_shutdown {
+        publisher.close();
+    }
     result
 }
