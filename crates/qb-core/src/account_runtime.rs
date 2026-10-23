@@ -2847,8 +2847,8 @@ impl AccountRuntime {
         else {
             return None;
         };
-        let seconds = (*until - Utc::now()).num_seconds();
-        if seconds <= 0
+        let now = Utc::now();
+        if *until <= now
             || !(scope == "account"
                 || scope
                     .strip_prefix("model:")
@@ -2856,6 +2856,7 @@ impl AccountRuntime {
         {
             return None;
         }
+        let seconds = (*until - now).num_seconds().max(1);
         let mut response = if !websocket
             && let Some(cache) = self
                 .limits
