@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: R13 N5d native 초기화 재개 통합
-목표: 제품 런처 연결·종료 경합 단위 검증 완료; 실제 native TUI 수용 연결 중
+현재 마일스톤: R13 N5i HTTP·WS/SSE 대기 통합
+목표: N5d 통과한 판단·HTTP 검증 보존; N5i 기본 경계와 WS·첫 클릭 재확인
 핵심 지표: 남은 출시 1/3 (R14 보호 설치, R13 C+E 실행, R13 F 통합 예측); 이전 계열 2/2 종료
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-23 21:43 KST (N5d 관측 연결51+8 통과; 실제 native 하네스 fixture 보완 중)
+갱신: 2026-10-23 21:58 KST (N5d 시간 제한 종료; 전체 native 수용은 N5d-native 후속)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -104,8 +104,8 @@ Long waits and work that needs no build run as background lanes (W) with one com
 | N5b R13 E WS/SSE cancellation and keepalive during a hold | S1 | none | `impl/r13-ws-hold` | cancelled held WS/SSE releases its slot and binding; no orphaned upstream |
 | N5c R13 E urgent policy (`on_5h_limit`, `--urgent`, CLI and dashboard toggle; 7d always moves) | S1 | none | `impl/r13-urgent` | policy tests, CLI tests, real-path capture |
 | N10 automatic outside-use detection and bounded WS capacity spill | S1; research in W | D30; no user settings | `impl/n10` after N5c | rising usage without qb traffic marks outside use; own traffic never marks; clean window clears; marked accounts reject running-session moves and are last-resort new placements; own-slot wait then D20-charged spill, at most one per reset target before fresh evidence; source-only access-program research |
-| N5d R13 E native-client resume after reset (Codex `/goal resume` only for a live goal; Claude continue) | S1 | none | `impl/r13-native-resume` | synthetic native test, exactly-once resume |
-| N5i R13 C+E integration and defaults | S1 | N5a-d merged, N5m table | `impl/r13-ce` | full gate; then S2 install |
+| N5d R13 E native-client resume after reset (Codex `/goal resume` only for a live goal; Claude continue) | S1 | none | `impl/r13-native-resume` | time-box close: passing unit/HTTP decision checks, running goal only and exactly once; full native acceptance deferred to N5d-native |
+| N5i R13 C+E integration and defaults | S1 | N5a-c plus bounded N5d decision checks and N5m table | `impl/r13-native-resume` | focused gate, former WS timeout target once and first-click UIA once; native fallback remains disabled in ordinary builds; then S2 install |
 | N3 R9.5 move progress, interruption safety, readable preview | S1 | none | `impl/r9.5`, brief R9.5-move-progress.md | golden ko/en output, Ctrl+C tests per step, finish/rollback after a kill |
 | N4 R12.11 canary version timeout | S1 | none | `impl/r12.11` (proposal kept) | slow-version, timeout-to-cache and unparseable regressions |
 | N7 Part F pooled runway: calibration and 24 h backtest | W, then S1 | none for the backtest; the UI after N1 | backtest worker in `.sandbox/r13f-backtest/` | backtest error at 1 h and 3 h against a stated bound |
@@ -113,7 +113,7 @@ Long waits and work that needs no build run as background lanes (W) with one com
 | N9 README final and v0.2.0 release | S2 and design | N1 and N2 installed | design session | public export scan clean, release assets built from the export |
 | Held | R2 Part B (retire-cpa) | user decision | — | — |
 
-**Current S1 order** (importance; change it only when importance changes): N1, N2, N6, N5a, N5b, N5c, N10, N5d, N3, N4, N6t, N5i (when its inputs exist), N7 UI, N8, N6r (when its inputs exist).
+**Current S1 order** (importance; change it only when importance changes): N1, N2, N6, N5a, N5b, N5c, N10, N5d bounded close, N5i, N11 stale fixtures, N3, N4, N6t, N7 UI, N8, N6r (when its inputs exist).
 
 **Start now in W:** N5m and the N7 backtest.
 

@@ -69,7 +69,7 @@ The current plan, with lanes, owners and start commands, is the "Plan" section o
 | R12.1 | merged and INSTALLED (c6a304e, 10-21 23:14): image canary stage diagnostics and retry, user `-c` passthrough |
 | R12.9 | merged and INSTALLED (c899b6a, 10-22 01:02): outage follow-ups (credit hold fix kept, WS capacity spreading, release-hold, Q-owned CPA resume) |
 | R12.10 | merged (성능 조건·qb-tray scoped 관문 통과; `.sandbox/reports/R12.10.md`); 설치는 설계 세션 |
-| R13 | 진행 중: B+B2+D·A·A1 merged 및 설치 수용. C+E 긴급 등록 단위 f39e504·926793f 커밋, 전체 wait/move 실행 통합은 미출시. 현재: N5a HTTP·N5b WS/SSE 집중 관문 완료(N5b library909·WS139·HTTP115, 기본/testkit strict lint·fmt; c79b69c); N5c 긴급 정책 실행 집중 관문 완료; 다음 N10 자동 외부 사용·spill 보호 뒤 N5d native 재개; 측정·백테스트는 독립 lane; R12.11 제안은 우선순위에 따라 보존; brief `R13-burn-icon-hold.md` |
+| R13 | 진행 중: B+B2+D·A·A1 merged 및 설치 수용. C+E 긴급 등록 단위 f39e504·926793f 커밋, 전체 wait/move 실행 통합은 미출시. 현재: N5a HTTP·N5b WS/SSE 집중 관문 완료(N5b library909·WS139·HTTP115, 기본/testkit strict lint·fmt; c79b69c); N5c 긴급 정책 실행 집중 관문 완료; N10 설치 완료; N5d 시간 제한 종료·판단/HTTP 검증 보존, 전체 native 수용은 N5d-native 후속; N5i 집중 관문 진행; 측정·백테스트는 독립 lane; R12.11 제안은 우선순위에 따라 보존; brief `R13-burn-icon-hold.md` |
 | R14 | 진행 중: 1차 실행 보호 관문 완료·설치 보류. R14.1 사건 단위 예산·240초 만료만 우선 전달하며 수집기는 설치 조건에서 분리. 2차 근거형 rebind·정적 검사·실제24시간 재생은 별도 미완료 |
 | R14.1 | 설치 수용: dev249a14c (01:12 KST). guard21·R1419·HTTP12·WS123, strict lint 통과. takeover 연결 거절0/1,717·일반/이미지 exec·실제 dashboard 지표 확인 |
 | R12.11 | merged: df5bf72·집중58통과/1명시제외·strict CLI lint·real launch check·두 반례101→복원0. version15초·한 번 재시도·24시간 pass fallback, 잘못된 출력은 즉시 거절. 설치는 설계 세션 |
@@ -77,7 +77,7 @@ The current plan, with lanes, owners and start commands, is the "Plan" section o
 | R16.1 | 완료3737fe2·집중405·strict lint·D27 3HWND·KO PNG4개 동일: 영어 탭·표 제목·사용량 요약 폭 보완. 한국어 출력 보존, 1024×640·1320×900 scale2 실제 renderer 회귀·D27 경로 통과, self-merge 후 설계 세션 설치 |
 | R16.2 | 완료·설치 수용: dev ddf8d87, 04:34 KST; 실제 dashboard 확인·takeover 연결 거절0/1,959 |
 | N10 | merged·설치 수용(dev ef75624, 16:52; takeover 연결 거절0/1,278): D30 자동 외부 사용 감지(설정 없음)와 WS spill anti-herding. 외부 사용 표시는 현재·다음 window 동안 기존 세션 이동 대상에서 제외, 새 배정은 최후 수단. own-slot 대기 뒤 spill D20 charge/약한 근거 cap·새 사용량 관측 전 대상별1개. 4세션 reset 회귀·외부 상승/자체 트래픽/clean window 해제·Daybreak 소스 연구. N5c 바로 뒤·N5d 앞 |
-| N11 | 대기: dev tray 기존 실패6개는 모두 오래된 fixture로 소스·명세 대조 분류. forecast4개는 D24 compact face/tooltip 변경, logging2개는 offline render의 no-home/no-log와 충돌. 제품 회귀는 확인되지 않음. N5d 뒤 각 focused unit으로 복구; 분류 `.sandbox/research/N11-preexisting-tray-classification.md` |
+| N11 | 대기: dev tray 기존 실패6개는 모두 오래된 fixture로 소스·명세 대조 분류. forecast4개는 D24 compact face/tooltip 변경, logging2개는 offline render의 no-home/no-log와 충돌. 제품 회귀는 확인되지 않음. N5i 관문 뒤 각 focused unit으로 복구; 분류 `.sandbox/research/N11-preexisting-tray-classification.md` |
 | R9.5 | 대기(N3): 이동 진행·안전한 중단·재개·읽기 쉬운 확인. ready-node S1 순서에 따라 N5a-d 뒤 |
 | R16.3 | 완료·설치 수용(41cb129, 05:26 KST, takeover 거절0/1,889): 집중464·strict lint·KO/EN 실제10HWND·합성8PNG 통과. 제공자 주간/30일 계정분·권장선·음영·소진 사실 표시. 설치는 설계 세션 |
 | R16.4 | 완료·설치 수용: 32b52ea, 06:07 KST; 실제 coverage4/4·takeover 연결 거절0/1,923 |
