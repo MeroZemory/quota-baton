@@ -57,7 +57,7 @@ impl Plan {
         };
         let port = url
             .strip_prefix("ws://127.0.0.1:")
-            .and_then(|s| s.strip_suffix("/qb-native"))
+            .and_then(|s| s.strip_suffix('/'))
             .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
             .and_then(|s| s.parse::<u16>().ok())
             .filter(|p| *p != 0);

@@ -79,6 +79,7 @@ async fn authenticated_text_ping_and_close_roundtrip() {
         let endpoint = require(Endpoint::bind().await);
         assert!(endpoint.token().len() == 64);
         assert!(!endpoint.url().contains(endpoint.token()));
+        assert_eq!(require(endpoint.url().parse::<Uri>()).path(), "/");
         let request = request(&endpoint);
         let address = peer_address(&request);
         let server = async {
@@ -137,15 +138,15 @@ async fn rejected(mutator: impl FnOnce(&mut Request)) {
 #[tokio::test]
 async fn wrong_path_and_query_are_rejected_without_rearming() {
     rejected(|request| {
-        set_path(request, "/wrong");
+        set_path(request, "/qb-native");
     })
     .await;
     rejected(|request| {
-        set_path(request, "/qb-native?extra=1");
+        set_path(request, "/?extra=1");
     })
     .await;
     rejected(|request| {
-        set_path(request, "/qb-native?");
+        set_path(request, "/?");
     })
     .await;
 }
@@ -385,7 +386,7 @@ async fn header_limit_accepts_exactly_8192_and_rejects_8193() {
             };
             let prefix = format!(
                 concat!(
-                    "GET /qb-native HTTP/1.1\r\nHost: {}\r\nUpgrade: websocket\r\n",
+                    "GET / HTTP/1.1\r\nHost: {}\r\nUpgrade: websocket\r\n",
                     "Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n",
                     "Sec-WebSocket-Key: AAECAwQFBgcICQoLDA0ODw==\r\n",
                     "Authorization: Bearer {}\r\nX-Pad: ",

@@ -69,6 +69,8 @@ pub(crate) async fn run_codex(
     let codex_home = std::env::var_os("CODEX_HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
+    #[cfg(windows)]
+    crate::native_resume::diagnostic("parse");
     let mut plan = parse(args, &codex_home)?;
     if plan.passthrough {
         // Native informational commands need no qb home, config, key or core.
@@ -93,22 +95,30 @@ pub(crate) async fn run_codex(
     }
     // Strip QB flags before every existing R9 resume parser/admission/import.
     let id = crate::sessions::resume_uuid(&plan.native_args)?;
+    #[cfg(windows)]
+    crate::native_resume::diagnostic("preflight");
     crate::sessions_admission::preflight_launch(&plan.native_args, program)?;
     let progress = crate::sessions::prepare_resume(&home, id.as_deref(), None)?;
     crate::sessions::admission_check(&home, id.as_deref())?;
     crate::sessions::before_codex_resume(&plan.native_args)?;
     // Signal interception belongs to the move, never to the native child.
     drop(progress);
+    #[cfg(windows)]
+    crate::native_resume::diagnostic("admission");
     let (permit, native_args) =
         crate::sessions_admission::prepare_launch(&plan.native_args, program)?;
     plan.native_args = native_args;
     let outcome = async {
         crate::sessions::admission_check(&home, id.as_deref())?;
         let config = qb_core::config::Config::load(&home).map_err(|_| refusal(CORE))?;
+        #[cfg(windows)]
+        crate::native_resume::diagnostic("issue");
         let issued = issue_launch(&plan, &home, &config).await?;
         if issued.effective_model().is_none() {
             return Err(refusal(REPLY));
         }
+        #[cfg(windows)]
+        crate::native_resume::diagnostic("catalog");
         let FetchedCatalog { bytes, envelope } = issued.fetch_catalog().await?;
         // Envelope checking is transport validation only. Store exact wire bytes;
         // pinned-native schema acceptance remains a separate integration gate.

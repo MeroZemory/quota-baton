@@ -35,7 +35,9 @@ use zeroize::{Zeroize, Zeroizing};
 const MAX_BYTES: usize = 1024 * 1024;
 const HANDSHAKE_LIMIT: Duration = Duration::from_secs(5);
 const MAX_HEADER_BYTES: usize = 8 * 1024;
-const PATH: &str = "/qb-native";
+// Native --remote accepts only a root-path WebSocket URL. The single-use
+// listener and separate bearer capability provide admission, not a URL path.
+const PATH: &str = "/";
 
 /// Fixed diagnostics: underlying errors may contain secret handshake headers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -127,6 +129,10 @@ impl Endpoint {
         let (stream, _) = connection
             .map_err(|_| EndpointError::Timeout)?
             .map_err(|_| EndpointError::Accept)?;
+        #[cfg(all(feature = "testkit", debug_assertions))]
+        if std::env::var_os("QB_NATIVE_OBSERVATION_PATH").is_some() {
+            eprintln!("qb-native-stage:endpoint-tcp-connected");
+        }
         stream
             .set_nodelay(true)
             .map_err(|_| EndpointError::Accept)?;

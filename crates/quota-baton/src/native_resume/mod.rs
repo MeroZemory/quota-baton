@@ -24,6 +24,16 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LaunchError;
 
+/// Fixed harness stage labels only; no argv, endpoint or credential output.
+pub(crate) fn diagnostic(stage: &'static str) {
+    #[cfg(all(feature = "testkit", debug_assertions))]
+    if std::env::var_os("QB_NATIVE_OBSERVATION_PATH").is_some() {
+        eprintln!("qb-native-stage:{stage}");
+    }
+    #[cfg(not(all(feature = "testkit", debug_assertions)))]
+    let _ = stage;
+}
+
 /// The caller retains its original admission and catalog until this future and
 /// all its owned children/workers have finished. No replacement issuance occurs.
 pub(crate) async fn try_run(
@@ -38,6 +48,7 @@ pub(crate) async fn try_run(
     if !cfg!(all(feature = "testkit", debug_assertions)) {
         return Ok(None);
     }
+    diagnostic("plan");
     let remote = plan::from_issued_args(args);
     if matches!(remote, plan::Plan::ExistingPath) {
         return Ok(None);
@@ -50,7 +61,7 @@ pub(crate) async fn try_run(
     let version = crate::launcher_label::version_output(program)
         .ok()
         .and_then(|bytes| crate::launcher_label::parse_version_output(&bytes));
-    if version.as_deref() != Some("0.163.0") {
+    if !matches!(version.as_deref(), Some("0.163.0" | "0.164.0")) {
         return Ok(None);
     }
     // Explicit non-content harness observation only. No release-build reader,
@@ -64,6 +75,7 @@ pub(crate) async fn try_run(
     observation::emit(observation::Event::Entry);
     let outcome = async {
         let endpoint = endpoint::Endpoint::bind().await.map_err(|_| LaunchError)?;
+        diagnostic("endpoint-bound");
         const AUTH_ENV: &str = "QB_NATIVE_REMOTE_AUTH";
         let attached = remote
             .attach_remote(&endpoint.url(), AUTH_ENV)
@@ -84,6 +96,7 @@ pub(crate) async fn try_run(
         let control = core_control::CoreControl::connect(base, bearer)
             .await
             .map_err(|_| LaunchError)?;
+        diagnostic("control-connected");
         let jobs = crate::launcher_label::spawn_remote_pair(
             program,
             &attached.server_args,
@@ -93,6 +106,7 @@ pub(crate) async fn try_run(
             account_short,
         )
         .map_err(|_| LaunchError)?;
+        diagnostic("children-spawned");
         #[cfg(all(feature = "testkit", debug_assertions))]
         observation::emit(observation::Event::ChildrenSpawned);
         // jobs owns both trees already: accept failure/cancellation drops it before
@@ -100,7 +114,33 @@ pub(crate) async fn try_run(
         let socket = endpoint
             .accept(Instant::now() + Duration::from_secs(15))
             .await
-            .map_err(|_| LaunchError)?;
+            .map_err(|error| {
+                use crate::launcher_label::RemoteStatus;
+                diagnostic(match jobs.try_wait() {
+                    Ok(RemoteStatus::Running) => "children-running",
+                    Ok(RemoteStatus::TuiExited(code)) => {
+                        #[cfg(all(feature = "testkit", debug_assertions))]
+                        if std::env::var_os("QB_NATIVE_OBSERVATION_PATH").is_some() {
+                            eprintln!("qb-native-exit:tui:{code}");
+                        }
+                        let _ = code;
+                        "tui-exited"
+                    }
+                    Ok(RemoteStatus::ServerExited(_)) => "server-exited",
+                    Ok(RemoteStatus::BothExited { .. }) => "children-exited",
+                    Ok(RemoteStatus::Stopped) => "children-stopped",
+                    Err(_) => "children-status-error",
+                });
+                diagnostic(match error {
+                    endpoint::EndpointError::Entropy => "endpoint-entropy",
+                    endpoint::EndpointError::Bind => "endpoint-bind",
+                    endpoint::EndpointError::Accept => "endpoint-accept",
+                    endpoint::EndpointError::Handshake => "endpoint-handshake",
+                    endpoint::EndpointError::Timeout => "endpoint-timeout",
+                });
+                LaunchError
+            })?;
+        diagnostic("endpoint-accepted");
         #[cfg(all(feature = "testkit", debug_assertions))]
         observation::emit(observation::Event::EndpointAccepted);
         let owner = managed_parent::ManagedParent::new(jobs, namespace, control, socket)
