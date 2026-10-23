@@ -1,5 +1,9 @@
 //! Future child of m4a_ws; requires the staged WS receipt engine and pump adapter.
 //! All accounts/tokens and listeners are synthetic. No direct proof or Cooling mint.
+#[cfg(feature = "testkit")]
+#[path = "n5c_ws_urgency.rs"]
+mod n5c_ws_urgency;
+
 use super::*;
 use qb_core::{
     relay::WsQuotaWaitEvent,
