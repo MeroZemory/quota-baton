@@ -507,7 +507,9 @@ impl Fixture {
         .unwrap();
         fs::write(
             root.path().join("client.cmd"),
-            b"@echo off\r\nif \"%~1\"==\"--version\" (echo codex-cli 0.163.0& exit /b 0)\r\necho %*>\"%QB_PANEL2_SENTINEL%\"\r\nexit /b 0\r\n",
+            // This stub proves ordinary launch/admission, not native RPC.
+            // Keep the separate installed-version fixture at 0.163.0 above.
+            b"@echo off\r\nif \"%~1\"==\"--version\" (echo codex-cli 0.162.0& exit /b 0)\r\necho %*>\"%QB_PANEL2_SENTINEL%\"\r\nexit /b 0\r\n",
         )
         .unwrap();
         fs::write(
@@ -608,6 +610,15 @@ impl Fixture {
     }
 
     fn spawn(&self, args: &[OsString], checkpoint: Option<(&str, SocketAddr)>) -> Process {
+        self.spawn_at_home(args, checkpoint, &self.target)
+    }
+
+    fn spawn_at_home(
+        &self,
+        args: &[OsString],
+        checkpoint: Option<(&str, SocketAddr)>,
+        codex_home: &Path,
+    ) -> Process {
         let serial = self.next_log.fetch_add(1, Ordering::Relaxed);
         let stdout = self.root.path().join(format!("logs/{serial}.stdout.log"));
         let stderr = self.root.path().join(format!("logs/{serial}.stderr.log"));
@@ -643,7 +654,7 @@ impl Fixture {
             .env("HTTPS_PROXY", "")
             .env("ALL_PROXY", "")
             .env("QB_PANEL2_SENTINEL", self.root.path().join("launched.txt"))
-            .env("CODEX_HOME", &self.target)
+            .env("CODEX_HOME", codex_home)
             .env_remove("QB_R9_CHECKPOINT")
             .env_remove("QB_R9_CHECKPOINT_NOTIFY")
             .current_dir(self.root.path())
@@ -1242,6 +1253,179 @@ fn recover_import_after_kill(label: &str) {
             &fixture.contents,
         );
     }
+}
+
+fn r95_same_id_import_finishes_after_kill(label: &str) {
+    let fixture = Fixture::new();
+    let planned_after = unix_millis();
+    fixture.kill_at(&fixture.import_args(), label, || {
+        fixture.assert_boundary_state(label, false);
+    });
+    let planned_before = unix_millis();
+    assert_eq!(move_journal(&fixture.qb)["open"], true);
+    // All source names are gone at either boundary. The same command must
+    // recover its journal before trying to discover the requested source id.
+    assert!(fixture.segments.iter().all(|name| !name.exists()));
+    fixture.run(&fixture.import_args());
+    fixture.assert_owner(
+        true,
+        imported_goal(&fixture, (planned_after, planned_before)),
+        0,
+        &fixture.contents,
+    );
+    assert_eq!(fixture.core.counts(), (0, 0));
+    assert!(!fixture.root.path().join("launched.txt").exists());
+}
+
+#[test]
+fn r95_same_id_import_yes_finishes_after_names_gone_kill() {
+    r95_same_id_import_finishes_after_kill("stage:source_names_removed");
+}
+
+#[test]
+fn r95_same_id_import_yes_finishes_after_partial_publication_kill() {
+    r95_same_id_import_finishes_after_kill("stage:published");
+}
+
+#[test]
+fn r95_exact_resume_without_tty_requires_recovery_without_changing_evidence() {
+    for label in ["stage:source_names_removed", "stage:published"] {
+        let fixture = Fixture::new();
+        fixture.kill_at(&fixture.import_args(), label, || {
+            fixture.assert_boundary_state(label, false);
+        });
+        let before = fixture.protected_state();
+        let journal_path = fixture
+            .qb
+            .join(format!("journal/session-moves/{ROOT}.json"));
+        let journal = fs::read(&journal_path).unwrap();
+        let evidence = fixture.qb.join("journal/session-moves-evidence");
+        assert!(!evidence.exists());
+        let calls = fixture.core.counts();
+        let process = fixture.spawn(&fixture.launch_args(&["resume", ROOT]), None);
+        let stdout = process.stdout.clone();
+        let stderr = process.stderr.clone();
+        let diagnostic = process.failure();
+        assert!(
+            diagnostic.contains("이전 이동 복구를 터미널에서 finish/rollback으로 선택하세요"),
+            "expected the specific nonTTY recovery refusal: {diagnostic}"
+        );
+        assert!(diagnostic.contains("스크립트는 --yes를 사용하세요"));
+        for capture in [stdout, stderr] {
+            let bytes = fs::read(capture).unwrap();
+            assert!(!bytes.contains(&0x1b), "nonTTY output contains an escape");
+            assert!(!bytes.contains(&b'\r'), "nonTTY output rewrites a line");
+        }
+        assert!(fixture.protected_state() == before);
+        assert_eq!(fs::read(journal_path).unwrap(), journal);
+        assert_eq!(move_journal(&fixture.qb)["open"], true);
+        assert!(!evidence.exists());
+        assert_eq!(fixture.core.counts(), calls);
+        assert!(!fixture.root.path().join("launched.txt").exists());
+        assert_integrity(fixture.root.path());
+    }
+}
+
+#[test]
+fn r95_non_tty_progress_is_ordered_plaintext_and_heartbeats_while_parked() {
+    let fixture = Fixture::new();
+    let serial = fixture.next_log.load(Ordering::Relaxed);
+    let stderr = fixture
+        .root
+        .path()
+        .join(format!("logs/{serial}.stderr.log"));
+    let stdout = fixture
+        .root
+        .path()
+        .join(format!("logs/{serial}.stdout.log"));
+    fixture.kill_at(&fixture.import_args(), "stage:staged", || {
+        fixture.assert_boundary_state("stage:staged", false);
+        let initial = fs::read_to_string(&stderr).unwrap();
+        let first = initial.lines().next().expect("progress introduction");
+        assert!(first.starts_with("대화 11111111 를 qb로 가져올 준비를 합니다."));
+        assert!(first.contains("1~2분") && first.contains("창을 닫지 마세요"));
+        let mut previous = 0;
+        for phase in [
+            "홈 검색",
+            "대화 머리말 읽기",
+            "조상과 잠금 확인",
+            "미리보기 준비",
+        ] {
+            let position = initial
+                .find(phase)
+                .unwrap_or_else(|| panic!("missing phase {phase}: {initial}"));
+            assert!(position > previous, "out-of-order phase {phase}: {initial}");
+            previous = position;
+        }
+        // The worker reports after five seconds without a phase change. Poll
+        // the existing file capture with a deadline below the 30s testkit park.
+        let heartbeats = initial.matches("여전히 진행 중: 파일 연결").count();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let progress = fs::read_to_string(&stderr).unwrap();
+            if progress.matches("여전히 진행 중: 파일 연결").count() > heartbeats {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "missing parked heartbeat: {progress}"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+        for capture in [&stdout, &stderr] {
+            let bytes = fs::read(capture).unwrap();
+            assert!(!bytes.contains(&0x1b), "nonTTY output contains an escape");
+            assert!(!bytes.contains(&b'\r'), "nonTTY output rewrites a line");
+        }
+    });
+    // Keep the parked progress check subject to the normal privacy assertions.
+    assert_eq!(move_journal(&fixture.qb)["open"], true);
+    fixture.run(&fixture.recover_args());
+    fixture.assert_owner(false, original_goal(), 0, &fixture.contents);
+}
+
+#[test]
+fn r95_wrong_codex_home_refuses_before_recovery_mutation() {
+    let fixture = Fixture::new();
+    // Keep parsing valid so this reaches the launch-home preflight itself.
+    fs::copy(
+        fixture.target.join("config.toml"),
+        fixture.source.join("config.toml"),
+    )
+    .unwrap();
+    fixture.kill_at(&fixture.import_args(), "stage:source_names_removed", || {
+        fixture.assert_boundary_state("stage:source_names_removed", false);
+    });
+    let before = fixture.protected_state();
+    let journal_path = fixture
+        .qb
+        .join(format!("journal/session-moves/{ROOT}.json"));
+    let journal = fs::read(&journal_path).unwrap();
+    let calls = fixture.core.counts();
+    // Configure this child before spawning; never change process-global env or
+    // attempt to change CODEX_HOME after the recovery process has started.
+    let diagnostic = fixture
+        .spawn_at_home(
+            &fixture.launch_args(&["resume", ROOT]),
+            None,
+            &fixture.source,
+        )
+        .failure();
+    assert!(
+        diagnostic.contains("CODEX_HOME이 연결된 전용 홈과 다릅니다"),
+        "wrong refusal: {diagnostic}"
+    );
+    assert!(
+        !diagnostic.contains("finish/rollback"),
+        "recovery ran before home validation"
+    );
+    assert!(fixture.protected_state() == before);
+    assert_eq!(fs::read(journal_path).unwrap(), journal);
+    assert_eq!(move_journal(&fixture.qb)["open"], true);
+    assert!(!fixture.qb.join("journal/session-moves-evidence").exists());
+    assert_eq!(fixture.core.counts(), calls);
+    assert!(!fixture.root.path().join("launched.txt").exists());
+    assert_integrity(fixture.root.path());
 }
 
 fn recover_reverse_after_kill(label: &str, undo: bool) {

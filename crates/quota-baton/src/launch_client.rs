@@ -93,9 +93,12 @@ pub(crate) async fn run_codex(
     }
     // Strip QB flags before every existing R9 resume parser/admission/import.
     let id = crate::sessions::resume_uuid(&plan.native_args)?;
-    crate::sessions::admission_check(&home, id.as_deref())?;
     crate::sessions_admission::preflight_launch(&plan.native_args, program)?;
+    let progress = crate::sessions::prepare_resume(&home, id.as_deref(), None)?;
+    crate::sessions::admission_check(&home, id.as_deref())?;
     crate::sessions::before_codex_resume(&plan.native_args)?;
+    // Signal interception belongs to the move, never to the native child.
+    drop(progress);
     let (permit, native_args) =
         crate::sessions_admission::prepare_launch(&plan.native_args, program)?;
     plan.native_args = native_args;

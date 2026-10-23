@@ -190,6 +190,7 @@ pub(crate) struct ThreadPlan {
 }
 
 /// Status-only output; never format the goal row or its objective.
+#[cfg(test)]
 pub(crate) fn summaries(plan: &DbPlan) -> Vec<(String, String, String)> {
     plan.threads
         .iter()

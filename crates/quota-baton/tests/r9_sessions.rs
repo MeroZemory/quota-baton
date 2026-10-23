@@ -188,11 +188,18 @@ impl Fixture {
         }
         fs::write(qb.join("journal/wiring.json"),serde_json::to_vec(&serde_json::json!({"schema":3,"mode":"dedicated","install_completed":true,"home":target})).unwrap()).unwrap();
         let sentinel = root.path().join("launched.txt");
-        let stub = user.join("AppData/Roaming/npm/codex.cmd");
+        // Move compatibility uses the installed fixture. The launch stub has
+        // no app-server RPC implementation and must use the ordinary path.
+        fs::write(
+            user.join("AppData/Roaming/npm/codex.cmd"),
+            b"@echo off\r\necho codex-cli 0.163.0\r\n",
+        )
+        .unwrap();
+        let stub = root.path().join("client.cmd");
         fs::write(
             &stub,
             format!(
-                "@echo off\r\nif \"%~1\"==\"--version\" (echo codex-cli 0.163.0& exit /b 0)\r\necho %*>\"{}\"\r\nexit /b 0\r\n",
+                "@echo off\r\nif \"%~1\"==\"--version\" (echo codex-cli 0.162.0& exit /b 0)\r\necho %*>\"{}\"\r\nexit /b 0\r\n",
                 sentinel.display()
             ),
         )

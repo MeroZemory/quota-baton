@@ -102,6 +102,7 @@ fn command_import(store: &Store, from: &Path, keep_source: bool) -> Result<()> {
             move_source: !keep_source,
             yes: true,
             clean_stale: false,
+            verbose: false,
         },
     )
 }
@@ -800,6 +801,221 @@ fn interrupt_plan(f: &Fixture, m: Move, label: &'static str, nth: usize) -> Resu
 }
 fn interrupt(f: &Fixture, label: &'static str, nth: usize) -> Result<Witness> {
     interrupt_plan(f, f.plan()?, label, nth)
+}
+
+// Both `staged` calls matter: the first has a durable Prepared journal and a
+// new hardlink; the second has persisted Staged. Publication also precedes its
+// phase save, so use the actual hooks rather than constructing journal phases.
+const R95_MOVE_CHECKPOINTS: [(&str, usize); 11] = [
+    ("prepared", 1),
+    ("staged", 1),
+    ("staged", 2),
+    ("source_name_removed", 1),
+    ("source_names_removed", 1),
+    ("source_rows_removed", 1),
+    ("decided", 1),
+    ("published", 1),
+    ("target_rows", 1),
+    ("map_committed", 1),
+    ("committed", 1),
+];
+
+fn r95_cancel_at(f: &Fixture, label: &'static str, nth: usize) -> Result<Witness> {
+    use crate::sessions_progress as progress;
+
+    let plan = f.plan()?;
+    let witness = Witness::new(&plan)?;
+    let observed = witness.clone();
+    let store = f.hook_store();
+    let seen = Rc::new(Cell::new(0));
+    let count = seen.clone();
+    let scope = progress::test_scope();
+    let hook = HookGuard::install(move |current| {
+        assert!(
+            count.get() < nth,
+            "move advanced beyond cancelled {label}/{nth}"
+        );
+        observed.check(
+            &load(&store, ROOT)?.context("cancel checkpoint journal")?,
+            current,
+        )?;
+        if current == label {
+            count.set(count.get() + 1);
+            if count.get() == nth {
+                // Exercise repeated requests through the same thread-local API
+                // as a signal, without returning a synthetic hook error.
+                progress::test_request_cancel();
+                progress::test_request_cancel();
+            }
+        }
+        Ok(())
+    });
+    let error = run_plan(&f.store, plan).expect_err("cancel must stop at the named boundary");
+    drop(hook);
+    let interrupted = error
+        .downcast_ref::<progress::Interrupted>()
+        .with_context(|| format!("expected progress interruption at {label}/{nth}: {error:#}"))?;
+    assert!(interrupted.changed, "durable move was reported unchanged");
+    assert_eq!(seen.get(), nth, "unreached cancellation {label}/{nth}");
+    // Recovery must be a fresh operation, not inherit the sticky cancellation.
+    drop(scope);
+    witness.check(&load(&f.store, ROOT)?.context("cancelled move")?, label)?;
+    Ok(witness)
+}
+
+#[test]
+fn r95_precommit_cancel_preserves_the_full_tree() -> Result<()> {
+    use crate::sessions_progress as progress;
+
+    let f = Fixture::new()?;
+    let plan = f.plan()?;
+    let before = tree(f.root.path(), true)?;
+    let scope = progress::test_scope();
+    progress::test_request_cancel();
+    progress::test_request_cancel();
+    let error = run_plan(&f.store, plan).expect_err("precommit cancellation must refuse the move");
+    assert!(
+        !error
+            .downcast_ref::<progress::Interrupted>()
+            .context("typed precommit interruption")?
+            .changed
+    );
+    drop(scope);
+    assert_eq!(tree(f.root.path(), true)?, before);
+    assert!(load(&f.store, ROOT)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn r95_repeated_cancel_at_every_move_checkpoint_can_explicitly_finish() -> Result<()> {
+    for (label, nth) in R95_MOVE_CHECKPOINTS {
+        let f = Fixture::new()?;
+        let witness = r95_cancel_at(&f, label, nth)?;
+        let observed = witness.clone();
+        let store = f.hook_store();
+        let hook = HookGuard::install(move |current| {
+            observed.check(
+                &load(&store, ROOT)?.context("finishing cancelled move")?,
+                current,
+            )
+        });
+        recover_impl(&f.store, ROOT, false, Some(true))
+            .with_context(|| format!("finish after cancellation at {label}/{nth}"))?;
+        drop(hook);
+        assert_target(&f, &witness)?;
+        let finished = tree(f.root.path(), true)?;
+        recover_impl(&f.store, ROOT, false, Some(true))?;
+        assert_eq!(tree(f.root.path(), true)?, finished);
+    }
+    Ok(())
+}
+
+#[test]
+fn r95_repeated_cancel_before_decided_can_independently_restore_exact_source() -> Result<()> {
+    for (label, nth) in R95_MOVE_CHECKPOINTS.into_iter().take(6) {
+        let f = Fixture::new()?;
+        let original = rows(&f.source)?;
+        let index = fs::read(f.source.join("session_index.jsonl"))?;
+        let witness = r95_cancel_at(&f, label, nth)?;
+        let observed = witness.clone();
+        let store = f.hook_store();
+        let hook = HookGuard::install(move |current| {
+            observed.check(
+                &load(&store, ROOT)?.context("rolling back cancelled move")?,
+                current,
+            )
+        });
+        recover_impl(&f.store, ROOT, false, Some(false))?;
+        drop(hook);
+        assert_source(&f, &witness, &original)?;
+        assert_eq!(fs::read(f.source.join("session_index.jsonl"))?, index);
+        witness.check(
+            &load(&f.store, ROOT)?.context("rolled back move")?,
+            "rollback_complete",
+        )?;
+        let restored = tree(f.root.path(), true)?;
+        recover_impl(&f.store, ROOT, false, Some(false))?;
+        assert_eq!(tree(f.root.path(), true)?, restored);
+    }
+    Ok(())
+}
+
+#[test]
+fn r95_repeated_cancel_after_decided_refuses_rollback_without_changes() -> Result<()> {
+    // Complete journals are already closed and recovery is a no-op. Only the
+    // four open postdecision boundaries must reject an explicit rollback.
+    for (label, nth) in R95_MOVE_CHECKPOINTS.into_iter().skip(6).take(4) {
+        let f = Fixture::new()?;
+        let witness = r95_cancel_at(&f, label, nth)?;
+        let before = tree(f.root.path(), true)?;
+        for _ in 0..2 {
+            recover_impl(&f.store, ROOT, false, Some(false))
+                .expect_err("a durable publication decision cannot be rolled back");
+            assert_eq!(tree(f.root.path(), true)?, before);
+            let durable = load(&f.store, ROOT)?.context("refused rollback journal")?;
+            assert!(open(&durable) && durable.phase >= Phase::Decided);
+            witness.check(&durable, label)?;
+        }
+        recover_impl(&f.store, ROOT, false, Some(true))?;
+        assert_target(&f, &witness)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn r95_forward_recovery_provider_change_refuses_before_source_unlink() -> Result<()> {
+    for (label, nth) in R95_MOVE_CHECKPOINTS.into_iter().take(3) {
+        let f = Fixture::new()?;
+        let witness = r95_cancel_at(&f, label, nth)?;
+        fs::write(f.store.target.join("config.toml"), "model_provider='qb'\n")?;
+        let before = tree(f.root.path(), false)?;
+        for _ in 0..2 {
+            recover_impl(&f.store, ROOT, false, Some(true))
+                .expect_err("finish must revalidate the destination provider before unlinking");
+            assert_eq!(tree(f.root.path(), false)?, before);
+            let durable = load(&f.store, ROOT)?.context("provider conflict journal")?;
+            assert!(open(&durable) && durable.phase < Phase::Decided);
+            witness.check(&durable, label)?;
+            for file in &witness.files {
+                assert!(file.names.iter().all(|name| name.exists()));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn r95_forward_recovery_rowless_alternate_target_rollout_refuses_before_source_unlink() -> Result<()>
+{
+    for (label, nth) in R95_MOVE_CHECKPOINTS.into_iter().take(3) {
+        let f = Fixture::new()?;
+        let witness = r95_cancel_at(&f, label, nth)?;
+        let alternate = rollout(&f.store.target, ROOT, SECOND, None, None)?;
+        no_rows(&f.store.target)?;
+        assert!(
+            witness
+                .files
+                .iter()
+                .all(|file| file.target.as_ref() != Some(&alternate))
+        );
+        let before = tree(f.root.path(), false)?;
+        for _ in 0..2 {
+            recover_impl(&f.store, ROOT, false, Some(true))
+                .expect_err("a rowless target rollout with the same logical id must block finish");
+            assert_eq!(tree(f.root.path(), false)?, before);
+            let durable = load(&f.store, ROOT)?.context("rowless target conflict journal")?;
+            assert!(open(&durable) && durable.phase < Phase::Decided);
+            // Witness::check requires an empty public target before Decided;
+            // here the deliberately injected conflicting rollout is public.
+            for file in &witness.files {
+                for name in &file.names {
+                    assert_eq!(guard::identity(name)?, file.identity);
+                    assert_eq!(fs::read(name)?, file.body);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, PartialEq, Eq)]
