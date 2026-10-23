@@ -27,6 +27,8 @@ pub(crate) const MAX_PENDING: usize = 64;
 /// Payloads omit the stdio delimiter. Normal forwarded payloads are byte-identical.
 pub(crate) enum Action {
     ToNative(Vec<u8>),
+    /// Automatic activation must pass a fresh parent authority check at write time.
+    ResumeNative(Vec<u8>),
     ToUi(Vec<u8>),
     Suppress,
 }
@@ -266,7 +268,7 @@ impl Controller {
                 // or acknowledgement is unknown, never permission to send again.
                 self.delivery = Delivery::UnknownNoRetry;
                 self.dispatched_goal = self.active.clone();
-                return Ok(self.inject(
+                return Ok(self.inject_resume(
                     2,
                     "thread/goal/set",
                     json!({
@@ -446,6 +448,11 @@ impl Controller {
         // Value serialization is infallible; no untrusted parser errors escape.
         let value = json!({ "id": format!("{}{serial}", self.namespace), "method": method, "params": params });
         Action::ToNative(value.to_string().into_bytes())
+    }
+
+    fn inject_resume(&self, serial: u8, method: &str, params: Value) -> Action {
+        let value = json!({ "id": format!("{}{serial}", self.namespace), "method": method, "params": params });
+        Action::ResumeNative(value.to_string().into_bytes())
     }
 
     fn require_connected(&self) -> Result<(), Error> {

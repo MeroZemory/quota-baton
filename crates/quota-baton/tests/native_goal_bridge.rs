@@ -97,7 +97,7 @@ fn ready(c: &mut Controller) -> StoppedGoalTicket {
 
 fn command(action: Action) -> Value {
     match action {
-        Action::ToNative(raw) => serde_json::from_slice(&raw).unwrap(),
+        Action::ToNative(raw) | Action::ResumeNative(raw) => serde_json::from_slice(&raw).unwrap(),
         _ => panic!("expected injected native request"),
     }
 }
