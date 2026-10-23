@@ -17,11 +17,12 @@ One week on the author's machine (Oct 16 to Oct 22, 2026):
 
 ## What sets it apart
 
-1. **Sessions keep their account.** Usage thresholds only decide where a *new* session goes. A running session changes account only when its account is out of quota, logged out or paused, so its prompt cache is not thrown away to chase a slightly emptier account.
+1. **Sessions keep their account.** Usage thresholds only decide where a *new* session goes. A running session changes account only when its account is out of weekly quota, logged out or paused (or at a 5-hour limit, if you marked it urgent), so its prompt cache is not thrown away to chase a slightly emptier account.
 2. **It knows how much is left, and when it will run out.** Usage comes from response headers and from each provider's usage endpoint. Every account shows one line such as `5h 47m left · runs out 11:27 (weekly)`, and each provider gets a summary line and a weekly chart against an even-pace line.
 3. **It does not touch what your client sends.** Request and response bodies from the real Claude Code and Codex CLI are relayed byte for byte; only the headers that carry credentials and routing are replaced. There is no client impersonation, no injected tools and no forced flags.
 4. **It stays small.** quota-baton never stores conversations. It keeps one copy of each request body only until the response starts, so memory does not grow with conversation length or with the number of idle connections.
-5. **It installs next to your setup, not over it.** `wire` adds `codex-qb` and `claude-qb`; plain `codex` and `claude` keep working exactly as before, as a fallback if the proxy is down.
+5. **It does not burn an account to dodge a short limit.** At a 5-hour limit a session waits on its own account for the reset instead of re-sending its whole context to another account. Mark a session urgent and it moves instead. Accounts you also use outside quota-baton are detected from their usage and left alone.
+6. **It installs next to your setup, not over it.** `wire` adds `codex-qb` and `claude-qb`; plain `codex` and `claude` keep working exactly as before, as a fallback if the proxy is down.
 
 ## Problems it fixes
 
@@ -42,7 +43,7 @@ Before writing quota-baton, the author ran two popular multi-account proxies on 
 
 ## How it works
 
-`claude-qb` and `codex-qb` point Claude Code and Codex CLI at the core on 127.0.0.1. The core reads each account's 5-hour and weekly usage and gives every new session the account with the most room. An account that has just taken a session gets no other new session until fresh usage data arrives, so a burst of launches does not pile onto one account. From then on the session keeps that account. When the account runs out, gets logged out or is paused, the next request of that session goes to another account.
+`claude-qb` and `codex-qb` point Claude Code and Codex CLI at the core on 127.0.0.1. The core reads each account's 5-hour and weekly usage and gives every new session the account with the most room. An account that has just taken a session gets no other new session until fresh usage data arrives, so a burst of launches does not pile onto one account. From then on the session keeps that account. When the account runs out of weekly quota, gets logged out or is paused, the next request of that session goes to another account. At a 5-hour limit the session waits for the reset on the same account, unless it is marked urgent.
 
 This is what that looked like for four Codex accounts over two days. As each Plus account reached its weekly limit, new work went to the next one:
 
@@ -143,6 +144,8 @@ The tray flyout shows the same accounts in a smaller view, with pause, credits a
 | `codex-qb resume <id>` | Bring a Codex conversation from another home into quota-baton |
 | `codex-qb --account <id>` | Prefer one account for this launch |
 | `codex-qb --images` | New session with the image tool |
+| `codex-qb --urgent`, `claude-qb --urgent` | Start a session that moves to another account at a 5-hour limit instead of waiting |
+| `quota-baton sessions urgent <id> on\|off` | Change that for a running session (also a toggle in the dashboard) |
 
 For a two-letter shortcut such as `codex-ab` (= `codex-qb --account <id>`), set `short = "ab"` under that account in `config.toml` and run `wire` again.
 
@@ -156,6 +159,7 @@ Settings live in `%LOCALAPPDATA%\quota-baton\config.toml`; set `QB_HOME` to use 
 - **Two providers.** Claude subscriptions (Claude Code) and ChatGPT subscriptions (Codex CLI).
 - **A move costs one uncached turn.** Prompt caches belong to an account and cannot follow a session. Codex also drops hidden reasoning from the old account.
 - **Korean by default.** The tray and dashboard switch to English with `[ui] language = "en"` in `config.toml`. Most CLI messages are still Korean.
+- **Waiting has a limit.** A session waits only while its client keeps the request open; after that it shows the provider's limit message and you resume it yourself. Automatic resume after long waits is not finished yet.
 - **Forecasts are estimates** from recent usage, not figures from the provider.
 - **Your accounts, your terms.** Use it only with accounts you own, and check each provider's terms for your plan.
 
