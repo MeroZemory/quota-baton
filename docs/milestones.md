@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: R12.11 canary 버전 지연 보완 완료
-목표: 이미지 canary 지연 집중 관문 완료·설치 인계; N5d 동일 native 재개 통합 계속
+현재 마일스톤: R13 N5d native 초기화 재개 통합
+목표: 실제 TUI 능력·명령 소유권 기반 검증 완료; 코어 초기화 권한과 실행기 연결 계속
 핵심 지표: 남은 출시 1/3 (R14 보호 설치, R13 C+E 실행, R13 F 통합 예측); 이전 계열 2/2 종료
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-23 17:20 KST (R12.11 집중 관문 완료; N10 설치 수용·N11 fixture6개 분류)
+갱신: 2026-10-23 18:35 KST (N5d 실제 TUI3사례·소유권/파이프 단위 검증; 제품 재개 미출시)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -410,12 +410,13 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-23 14:24 | N5c 집중 영향·실제 창 관문 | core957·HTTP74·tray12·CLI23 통과; WS140/1timeout 뒤 동일 exact1 통과; strict lint·실제 ko/en4HWND·launch check0 | 권한·원래 리셋/캐시 대기·기한 유지·취소 정리 | 코드744190e와 docs-only dev merge 입력; 비반복 토글 실제 down/up·임시 진단 정확 복원. WS 원실패/UIA enqueue 원인 미확정은 보고서 보존; 전체 C+E/replay 별도 |
 | 2026-10-23 16:48 | N10 자동 외부 사용·WS spill 관문 | 집중45·실제 한영4HWND·default/all-features lint·단독 core·제품 build 통과 | 전체 default2799/6/17; all-features 수치는 fingerprint·기존6실패 원인 대조·복구54 재실행 | e43a37b·7e37088; N10-evidence/delivery-fingerprint.json 입력별 기록. 최초 timeout 원인 미확정·실제24시간 replay 별도 |
 | 2026-10-23 17:20 | R12.11 느린 버전·캐시 집중 관문 | CLI58통과/1명시제외·strict lint·fmt·build·real check0 | 두 실제 hook control101→복원0·입력 동일 | df5bf72; R12.11-evidence/fingerprint.json. 24시간 wall-clock receipt·metadata fingerprint는 바이너리 attestation 아님 |
+| 2026-10-23 18:35 | N5d 실제 TUI·단일 writer 준비 | 실제 TUI3/3·dispatch 제거 대조1/복원1, Rust27·launcher14통과·strict CLI lint·fmt0 | core-qualified reset와 실제 managed launcher 통합 | cf611ae; n5d-native-tui 및 n5d-rust-primitives 증거. 두 Rust 경합 대조 예상실패/정확복원; unregistered primitive·test-only pipe이며 전체 N5d 수용 아님 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 동작 |
 |---|---|---|---|
-| R13 C+E native 재개 | N5a-c 관문·동일 native 합성 재개 능력 확인 | 실행 소유자에 정확히1회 재개·통합 설치 | N5d owner bridge·취소/중복 수용 후 N5i |
+| R13 C+E native 재개 | N5a-c 관문·실제 TUI3사례·명령/파이프 기반 검증 | 실행 소유자에 정확히1회 재개·통합 설치 | 코어 초기화 권한·owned transport·Claude 지속 재개 수용 후 N5i |
 | 실제24시간 라우팅 재생 | 기록기 설치·다중 epoch 입력 규칙 확정 | 각 epoch 초기 상태와 손실을 반영한 재생 | N6t owner와 N6r 실제 export 검증 |
 | 제공자 통합 예측 | 표시·잔여량 차트 설치; backtest 준비 | 실제24시간 backtest와 pooled 검증 | N7 검증 후 UI 통합 |
 <!-- gaps:end -->

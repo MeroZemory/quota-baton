@@ -575,8 +575,66 @@ mod contained {
         process: OwnedHandle,
     }
 
+    /// Staged transport seam; activate only with the parent's serialized bridge.
+    /// Keep `child` alive while moving the pipe ends to their owners. Dropping it
+    /// kills/reaps the whole job even if either parent pipe remains open. Dropping
+    /// `stdin` sends EOF; stderr is inherited separately, never JSON stdout.
+    #[cfg(test)]
+    pub(super) struct StdioChild {
+        pub(super) child: Child,
+        pub(super) stdin: File,
+        pub(super) stdout: File,
+    }
+
     impl Child {
         pub(super) fn spawn(command: &Command, output: Option<&File>) -> io::Result<Self> {
+            let null_input;
+            let input = if output.is_some() {
+                null_input = File::open("NUL")?;
+                HANDLE(null_input.as_raw_handle())
+            } else {
+                unsafe { GetStdHandle(STD_INPUT_HANDLE) }.unwrap_or_default()
+            };
+            let stdout = match output {
+                Some(file) => HANDLE(file.as_raw_handle()),
+                None => unsafe { GetStdHandle(STD_OUTPUT_HANDLE) }.unwrap_or_default(),
+            };
+            let stderr = match output {
+                Some(file) => HANDLE(file.as_raw_handle()),
+                None => unsafe { GetStdHandle(STD_ERROR_HANDLE) }.unwrap_or_default(),
+            };
+            Self::spawn_with_handles(command, input, stdout, stderr, output.is_some())
+        }
+
+        /// No production entry point until transport/authority integration owns
+        /// the pipe lifecycle. No default launcher or capture behavior changes.
+        #[cfg(test)]
+        pub(super) fn spawn_stdio(command: &Command) -> io::Result<StdioChild> {
+            let (child_input, stdin) = pipe()?;
+            let (stdout, child_output) = pipe()?;
+            let child = Self::spawn_with_handles(
+                command,
+                HANDLE(child_input.as_raw_handle()),
+                HANDLE(child_output.as_raw_handle()),
+                unsafe { GetStdHandle(STD_ERROR_HANDLE) }.unwrap_or_default(),
+                true,
+            )?;
+            // Both original child ends close here. Only explicit duplicates in
+            // HANDLE_LIST were inheritable; every parent end stays non-inheritable.
+            Ok(StdioChild {
+                child,
+                stdin,
+                stdout,
+            })
+        }
+
+        fn spawn_with_handles(
+            command: &Command,
+            input: HANDLE,
+            stdout: HANDLE,
+            stderr: HANDLE,
+            hide: bool,
+        ) -> io::Result<Self> {
             let environment = environment_block(command)?;
             let (program, mut line) = command_line(command)?;
             let job = owned(unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) })?;
@@ -593,21 +651,9 @@ mod contained {
             {
                 return Err(io::Error::last_os_error());
             }
-            let null_input;
-            let input = inherited(if output.is_some() {
-                null_input = File::open("NUL")?;
-                HANDLE(null_input.as_raw_handle())
-            } else {
-                unsafe { GetStdHandle(STD_INPUT_HANDLE) }.unwrap_or_default()
-            })?;
-            let stdout = inherited(match output {
-                Some(file) => HANDLE(file.as_raw_handle()),
-                None => unsafe { GetStdHandle(STD_OUTPUT_HANDLE) }.unwrap_or_default(),
-            })?;
-            let stderr = inherited(match output {
-                Some(file) => HANDLE(file.as_raw_handle()),
-                None => unsafe { GetStdHandle(STD_ERROR_HANDLE) }.unwrap_or_default(),
-            })?;
+            let input = inherited(input)?;
+            let stdout = inherited(stdout)?;
+            let stderr = inherited(stderr)?;
             let handles = [
                 HANDLE(input.as_raw_handle()),
                 HANDLE(stdout.as_raw_handle()),
@@ -628,7 +674,7 @@ mod contained {
                 .transpose()?;
             let mut information = PROCESS_INFORMATION::default();
             let mut flags = CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT;
-            if output.is_some() {
+            if hide {
                 flags |= CREATE_NO_WINDOW;
             }
             if environment.is_some() {
@@ -765,13 +811,19 @@ mod contained {
         capture_with_timeout(command, super::VERSION_TIMEOUT)
     }
 
-    fn capture_with_timeout(command: &Command, timeout: Duration) -> io::Result<Vec<u8>> {
+    fn pipe() -> io::Result<(File, File)> {
         let (mut read, mut write) = (std::ptr::null_mut(), std::ptr::null_mut());
+        // A null SECURITY_ATTRIBUTES creates non-inheritable original ends.
         if unsafe { CreatePipe(&mut read, &mut write, std::ptr::null(), 0) } == 0 {
             return Err(io::Error::last_os_error());
         }
         let read = File::from(owned(read)?);
         let write = File::from(owned(write)?);
+        Ok((read, write))
+    }
+
+    fn capture_with_timeout(command: &Command, timeout: Duration) -> io::Result<Vec<u8>> {
+        let (read, write) = pipe()?;
         let mut child = Child::spawn(command, Some(&write))
             .inspect_err(|_error| {
                 #[cfg(all(feature = "testkit", debug_assertions))]
@@ -932,9 +984,25 @@ mod contained {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::io::Write;
+        use windows::Win32::Foundation::{
+            ERROR_BROKEN_PIPE, GetHandleInformation, HANDLE_FLAG_INHERIT,
+        };
         use windows::Win32::System::Threading::{
             OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess,
         };
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn PeekNamedPipe(
+                pipe: *mut c_void,
+                buffer: *mut c_void,
+                size: u32,
+                read: *mut u32,
+                available: *mut u32,
+                left: *mut u32,
+            ) -> i32;
+        }
 
         #[repr(C)]
         #[derive(Default)]
@@ -942,6 +1010,167 @@ mod contained {
             assigned: u32,
             count: u32,
             ids: [usize; 8],
+        }
+
+        /// Single reader: consume only bytes already reported available, so no
+        /// blocking read or detached reader thread can outlive a failed test.
+        /// Both byte count and elapsed time are bounded, including EOF checks.
+        fn stdio_read(pipe: &mut File, count: Option<usize>) -> io::Result<Vec<u8>> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut output = Vec::new();
+            loop {
+                if count == Some(output.len()) {
+                    return Ok(output);
+                }
+                if Instant::now() >= deadline {
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+                let mut available = 0;
+                if unsafe {
+                    PeekNamedPipe(
+                        pipe.as_raw_handle(),
+                        std::ptr::null_mut(),
+                        0,
+                        std::ptr::null_mut(),
+                        &mut available,
+                        std::ptr::null_mut(),
+                    )
+                } == 0
+                {
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() == Some(ERROR_BROKEN_PIPE.0 as i32) {
+                        return if count.is_none() {
+                            Ok(output)
+                        } else {
+                            Err(io::ErrorKind::UnexpectedEof.into())
+                        };
+                    }
+                    return Err(error);
+                }
+                if available == 0 {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                let limit = count.unwrap_or(4096).min(4096);
+                if output.len() >= limit {
+                    return Err(io::ErrorKind::InvalidData.into());
+                }
+                let size = (available as usize).min(limit - output.len());
+                let start = output.len();
+                output.resize(start + size, 0);
+                pipe.read_exact(&mut output[start..])?;
+            }
+        }
+
+        #[test]
+        fn owned_stdio_bidirectional_bytes_stdin_eof_and_separate_stderr() {
+            let powershell = Path::new(&std::env::var_os("SystemRoot").unwrap())
+                .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+            let mut command = Command::new(powershell);
+            command.args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$i=[Console]::OpenStandardInput(); $o=[Console]::OpenStandardOutput(); \
+                 [Console]::Error.WriteLine('owned-stdio-separate-stderr'); \
+                 $b=New-Object byte[] 257; \
+                 while(($n=$i.Read($b,0,$b.Length)) -gt 0){$o.Write($b,0,$n);$o.Flush()}; \
+                 $o.WriteByte(126); $o.Flush()",
+            ]);
+            let StdioChild {
+                mut child,
+                mut stdin,
+                mut stdout,
+            } = Child::spawn_stdio(&command).unwrap();
+            for handle in [
+                stdin.as_raw_handle(),
+                stdout.as_raw_handle(),
+                child.job.as_raw_handle(),
+                child.process.as_raw_handle(),
+            ] {
+                let mut flags = 0;
+                unsafe { GetHandleInformation(HANDLE(handle), &mut flags) }.unwrap();
+                assert_eq!(flags & HANDLE_FLAG_INHERIT.0, 0);
+            }
+            // Smaller than the empty anonymous pipe's buffer; the fixture never
+            // needs a blocking bulk write or a competing stdin writer.
+            let payload = b"{\"x\":1}\n\0\xff\r\n";
+            stdin.write_all(payload).unwrap();
+            stdin.flush().unwrap();
+            let echoed = stdio_read(&mut stdout, Some(payload.len()));
+            drop(stdin); // The child must see EOF and exit without a kill.
+            let status = child.wait(Some(Duration::from_secs(5)));
+            drop(child); // Cleanup also precedes assertions on a failed wait.
+            let tail = stdio_read(&mut stdout, None);
+            assert_eq!(echoed.unwrap(), payload);
+            assert_eq!(status.unwrap(), 0);
+            assert_eq!(tail.unwrap(), b"~", "stderr must not enter JSON stdout");
+        }
+
+        #[test]
+        fn owned_stdio_drop_reaps_child_and_descendant_with_pipes_open() {
+            let scratch =
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/owned-stdio-tests");
+            std::fs::create_dir_all(&scratch).unwrap();
+            let root = tempfile::tempdir_in(scratch).unwrap();
+            std::fs::write(root.path().join("descendant.cmd"),
+                b"@echo off\r\npowershell.exe -NoLogo -NoProfile -NonInteractive -Command \"[Console]::Write('descendant-ready'); Start-Sleep -Seconds 30\"\r\n").unwrap();
+            let script = root.path().join("parent.cmd");
+            std::fs::write(&script,
+                b"@echo off\r\nstart \"\" /b \"%SystemRoot%\\System32\\cmd.exe\" /d /c \"\"%~dp0descendant.cmd\"\"\r\npowershell.exe -NoLogo -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 30\"\r\n").unwrap();
+            let StdioChild {
+                child,
+                stdin,
+                mut stdout,
+            } = Child::spawn_stdio(&Command::new(&script)).unwrap();
+            let ready = stdio_read(&mut stdout, Some(b"descendant-ready".len()));
+            // Readiness comes from the descendant that still owns stdout. Retain
+            // only processes enumerated in THIS job, never an image-name/PID hunt.
+            let mut observed = Vec::new();
+            if ready.is_ok() {
+                let mut ids = ProcessIds::default();
+                assert_ne!(
+                    unsafe {
+                        QueryInformationJobObject(
+                            child.job.as_raw_handle(),
+                            3,
+                            (&mut ids as *mut ProcessIds).cast(),
+                            size_of::<ProcessIds>() as u32,
+                            std::ptr::null_mut(),
+                        )
+                    },
+                    0
+                );
+                assert!(ids.count >= 2 && ids.count as usize <= ids.ids.len());
+                for &id in &ids.ids[..ids.count as usize] {
+                    let handle = unsafe {
+                        OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, false, id as u32)
+                    }
+                    .unwrap();
+                    observed.push(owned(handle.0).unwrap());
+                }
+            }
+            drop(child); // Both parent pipe ends deliberately remain OPEN.
+            let eof = stdio_read(&mut stdout, None);
+            let mut all_exited = true;
+            for handle in observed {
+                let exited = unsafe { WaitForSingleObject(HANDLE(handle.as_raw_handle()), 5000) }
+                    == WAIT_OBJECT_0;
+                if !exited {
+                    all_exited = false;
+                    // Failure cleanup uses only this retained synthetic handle.
+                    unsafe { TerminateProcess(HANDLE(handle.as_raw_handle()), 1) }.unwrap();
+                    assert_eq!(
+                        unsafe { WaitForSingleObject(HANDLE(handle.as_raw_handle()), 5000) },
+                        WAIT_OBJECT_0
+                    );
+                }
+            }
+            drop(stdin);
+            assert_eq!(ready.unwrap(), b"descendant-ready");
+            assert!(eof.unwrap().is_empty(), "descendant kept stdout alive");
+            assert!(all_exited, "owned process survived stdio child drop");
         }
 
         #[test]
