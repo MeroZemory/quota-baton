@@ -1,3 +1,5 @@
+pub(crate) mod deferred_reset;
+pub(crate) use deferred_reset::{DeferredResetId, DeferredResetStatus};
 mod outside_owner;
 mod outside_usage;
 mod wait_admission;

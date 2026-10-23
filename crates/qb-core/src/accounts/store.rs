@@ -43,6 +43,8 @@ pub enum StoreError {
     IdentityCollision,
     #[error("account token metadata is older than stored metadata")]
     OlderToken,
+    #[error("credential save requires an ordinary native health transition")]
+    CredentialHealthChange,
     #[error("account store synchronization failed")]
     Synchronization,
 }
@@ -89,6 +91,13 @@ pub(crate) enum BeforeAccountMutation<'a> {
     },
     FullSave {
         id: &'a str,
+    },
+    /// A restricted save ATTEMPT, not a continuity certificate or success event.
+    /// Current proof invalidation is identical to FullSave, before any read.
+    CredentialSave {
+        id: &'a str,
+        expected_generation: u64,
+        refresh_uncertain: bool,
     },
     Retire {
         id: &'a str,
@@ -230,6 +239,7 @@ impl AccountStore {
             | BeforeAccountMutation::HealthExpiry { id }
             | BeforeAccountMutation::Settings { id }
             | BeforeAccountMutation::FullSave { id }
+            | BeforeAccountMutation::CredentialSave { id, .. }
             | BeforeAccountMutation::Retire { id } => Some(id),
             BeforeAccountMutation::Stop => None,
         };
@@ -306,6 +316,19 @@ impl AccountStore {
     // Caller holds transaction(); adoption validates before any expiry mutation.
     pub(crate) fn read_account_unlocked(&self, id: &str) -> Result<Account, StoreError> {
         Ok(self.read(id)?.account)
+    }
+
+    /// Caller holds transaction() through exact captured-hold validation, this
+    /// native expiry, and fresh eligibility checks. This never acquires the gate.
+    /// Unlike ordinary load, stopped writes cannot return an unexpired account
+    /// as a successful expiry inspection. No result here grants resume authority.
+    pub(crate) fn expire_health_unlocked(&self, id: &str) -> Result<Account, StoreError> {
+        if self.writes_stopped() {
+            return Err(StoreError::LeaseUnavailable);
+        }
+        // Reuse the native id-only HealthExpiry hook, generation fence, durable
+        // metadata write and post-observer. Any failed persistence returns Err.
+        self.load_unlocked(id)
     }
 
     fn load_unlocked(&self, id: &str) -> Result<Account, StoreError> {
@@ -459,6 +482,26 @@ impl AccountStore {
     ) -> Result<Account, StoreError> {
         let _guard = self.transaction()?;
         self.save_unlocked(account, tokens, expected)
+    }
+
+    /// Replace existing credentials under an exact generation fence. No identity,
+    /// source, settings or health edits are accepted, except the existing explicit
+    /// StoreError -> Ready recovery used after a successfully persisted rotation.
+    /// A prehook is an attempt notification only, including on rejection/failure.
+    pub fn save_credentials(
+        &self,
+        account: &Account,
+        tokens: &Tokens,
+        expected_generation: u64,
+    ) -> Result<Account, StoreError> {
+        let _guard = self.transaction()?;
+        self.save_record_with_credentials_unlocked(
+            account,
+            tokens,
+            Some(expected_generation),
+            None,
+            Some(expected_generation),
+        )
     }
 
     pub(crate) fn save_unlocked(
@@ -657,7 +700,27 @@ impl AccountStore {
         expected: Option<u64>,
         receipt_change: Option<(Option<&super::takeover::Receipt>, &super::takeover::Receipt)>,
     ) -> Result<Account, StoreError> {
-        self.before_mutation(BeforeAccountMutation::FullSave { id: &account.id });
+        self.save_record_with_credentials_unlocked(account, tokens, expected, receipt_change, None)
+    }
+
+    fn save_record_with_credentials_unlocked(
+        &self,
+        account: &Account,
+        tokens: &Tokens,
+        expected: Option<u64>,
+        receipt_change: Option<(Option<&super::takeover::Receipt>, &super::takeover::Receipt)>,
+        credential_generation: Option<u64>,
+    ) -> Result<Account, StoreError> {
+        match credential_generation {
+            Some(expected_generation) => {
+                self.before_mutation(BeforeAccountMutation::CredentialSave {
+                    id: &account.id,
+                    expected_generation,
+                    refresh_uncertain: account.token_meta.refresh_uncertain,
+                })
+            }
+            None => self.before_mutation(BeforeAccountMutation::FullSave { id: &account.id }),
+        }
         Self::validate(account)?;
         let old = match self.read(&account.id) {
             Ok(record) => Some(record),
@@ -696,6 +759,13 @@ impl AccountStore {
             return Err(StoreError::OlderToken);
         }
         if expected.is_some_and(|n| n != account.generation) {
+            return Err(StoreError::InvalidData);
+        }
+        if credential_generation.is_some()
+            && !old
+                .as_ref()
+                .is_some_and(|old| Self::credential_metadata_matches(&old.account, account))
+        {
             return Err(StoreError::InvalidData);
         }
         let previous_receipt = old.as_ref().and_then(|r| r.takeover_receipt.as_ref());
@@ -747,6 +817,16 @@ impl AccountStore {
             .unwrap_or(0)
             .checked_add(1)
             .ok_or(StoreError::InvalidData)?;
+        // NewerLinkedToken can itself normalize health (including auth/payment
+        // expiry). Such a save must use the ordinary FullSave path, not acquire
+        // a credential-only classification by hiding the normalized post-state.
+        if credential_generation.is_some()
+            && !old
+                .as_ref()
+                .is_some_and(|old| Self::credential_metadata_matches(&old.account, &updated))
+        {
+            return Err(StoreError::CredentialHealthChange);
+        }
         let record = Record {
             account: updated.clone(),
             secret_dpapi_b64: crypto::encrypt(tokens)?,
@@ -761,6 +841,27 @@ impl AccountStore {
                 .unwrap_or(&Health::Ready),
         );
         Ok(updated)
+    }
+
+    fn credential_metadata_matches(before: &Account, after: &Account) -> bool {
+        let mut permitted = before.clone();
+        permitted.token_meta = after.token_meta.clone();
+        // CAS validation checks the requested generation; persistence advances it.
+        permitted.generation = after.generation;
+        if matches!(
+            before.health,
+            Health::Cooling {
+                reason: super::HealthReason::StoreError,
+                ..
+            }
+        ) && after.health == Health::Ready
+            && !after.token_meta.refresh_uncertain
+            && after.token_meta.newer_than(&before.token_meta)
+        {
+            permitted.health = Health::Ready;
+        }
+        // Compare the complete metadata: newly added settings default to denied.
+        permitted == *after
     }
 
     fn check_generation(expected: Option<u64>, actual: Option<u64>) -> Result<(), StoreError> {
@@ -1361,6 +1462,62 @@ mod tests {
     }
 
     #[test]
+    fn n5d_credential_attempt_revokes_before_failed_read_and_represents_writeahead() {
+        let (_root, store, events) = n5a_hook_store();
+        let account = super::super::health::tests::fixture();
+        let tokens = Tokens {
+            access_token: "synthetic-credential-access".into(),
+            refresh_token: "synthetic-credential-refresh".into(),
+            id_token: None,
+        };
+        // The missing record must not skip the typed pre-mutation notification.
+        for uncertain in [false, true] {
+            let mut candidate = account.clone();
+            candidate.token_meta.refresh_uncertain = uncertain;
+            assert!(matches!(
+                store.save_credentials(&candidate, &tokens, candidate.generation),
+                Err(StoreError::GenerationConflict { actual: None, .. })
+            ));
+        }
+        assert!(matches!(
+            store.save(&account, &tokens, Some(account.generation)),
+            Err(StoreError::GenerationConflict { actual: None, .. })
+        ));
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 3);
+        assert!(events[0].starts_with("CredentialSave"));
+        assert!(events[0].contains("refresh_uncertain: false"));
+        assert!(events[1].starts_with("CredentialSave"));
+        assert!(events[1].contains("refresh_uncertain: true"));
+        assert!(events[1].contains(&format!("expected_generation: {}", account.generation)));
+        assert!(events[2].starts_with("FullSave"));
+    }
+
+    #[test]
+    fn n5d_credential_projection_does_not_allow_auth_or_payment_recovery() {
+        let before = super::super::health::tests::fixture();
+        let now = Utc::now();
+        for reason in [
+            HealthReason::Auth,
+            HealthReason::Payment,
+            HealthReason::Quota,
+        ] {
+            let mut held = before.clone();
+            held.health = Health::Cooling {
+                reason,
+                until: now + Duration::hours(1),
+                scope: "account".into(),
+            };
+            let mut candidate = held.clone();
+            candidate.token_meta.last_refresh_at = Some(now);
+            candidate.health = Health::Ready;
+            assert!(!AccountStore::credential_metadata_matches(
+                &held, &candidate
+            ));
+        }
+    }
+
+    #[test]
     fn n5a_prehook_precedes_missing_metadata_and_keeps_native_error() {
         let (_root, store, events) = n5a_hook_store();
         store.set_observer(Arc::new(|_, _| panic!("failed write must not notify")));
@@ -1497,6 +1654,67 @@ mod tests {
         assert_eq!(events[1], "Stop");
         assert!(events[2].starts_with("Metadata"));
         assert_eq!(store.read(&account.id).unwrap().account, account);
+    }
+
+    #[test]
+    fn n5d_caller_held_expiry_persists_before_return_and_keeps_native_load_semantics() {
+        let (_root, store, events) = n5a_hook_store();
+        let mut account = super::super::health::tests::fixture();
+        account.health = Health::Cooling {
+            reason: HealthReason::Quota,
+            until: Utc::now() - Duration::seconds(1),
+            scope: "account".into(),
+        };
+        n5a_seed_metadata(&store, &account);
+        let output = events.clone();
+        store.set_observer(Arc::new(move |current, _| {
+            let mut events = output.lock().unwrap();
+            assert!(events.last().unwrap().starts_with("HealthExpiry"));
+            assert_eq!(current.health, Health::Ready);
+            events.push("PostObserver".into());
+        }));
+        {
+            let _gate = store.transaction().unwrap();
+            let expired = store.expire_health_unlocked(&account.id).unwrap();
+            assert_eq!(expired.health, Health::Ready);
+            assert_eq!(expired.generation, account.generation + 1);
+            assert_eq!(store.read(&account.id).unwrap().account, expired);
+            assert_eq!(events.lock().unwrap().len(), 2);
+            // No expiry transition is synthesized on a subsequent inspection.
+            assert_eq!(store.expire_health_unlocked(&account.id).unwrap(), expired);
+            assert_eq!(events.lock().unwrap().len(), 2);
+        }
+        store.stop_writes();
+        let current = store.load(&account.id).unwrap();
+        let _gate = store.transaction().unwrap();
+        assert!(matches!(
+            store.expire_health_unlocked(&account.id),
+            Err(StoreError::LeaseUnavailable)
+        ));
+        assert_eq!(store.read(&account.id).unwrap().account, current);
+    }
+
+    #[test]
+    fn n5d_caller_held_expiry_failure_returns_no_account_after_revocation() {
+        let (_root, store, events) = n5a_hook_store();
+        let mut account = super::super::health::tests::fixture();
+        account.generation = u64::MAX;
+        account.health = Health::Cooling {
+            reason: HealthReason::Quota,
+            until: Utc::now() - Duration::seconds(1),
+            scope: "account".into(),
+        };
+        n5a_seed_metadata(&store, &account);
+        store.set_observer(Arc::new(|_, _| panic!("failed expiry must not publish")));
+        let _gate = store.transaction().unwrap();
+        assert!(matches!(
+            store.expire_health_unlocked(&account.id),
+            Err(StoreError::InvalidData)
+        ));
+        assert_eq!(store.read(&account.id).unwrap().account, account);
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].starts_with("HealthExpiry"));
     }
 
     #[test]

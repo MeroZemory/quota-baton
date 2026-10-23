@@ -6,6 +6,7 @@ mod images;
 mod launch;
 mod ledger;
 mod models;
+mod native_reset;
 pub(crate) mod notices;
 mod outcome;
 mod quota_wait;
@@ -1972,7 +1973,10 @@ async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Re
                 "/v1/responses" | "/v1/responses/compact" | "/v1/alpha/search"
             )
             || request.method() == Method::GET
-                && matches!(request.uri().path(), "/v1/models" | "/v1/responses")
+                && matches!(
+                    request.uri().path(),
+                    "/v1/models" | "/v1/responses" | "/v1/qb/native-owner"
+                )
                 && !request.headers().contains_key("anthropic-version"))
     {
         return native_error(
@@ -1989,6 +1993,9 @@ async fn relay(State(state): State<Arc<RelayState>>, mut request: Request) -> Re
             .insert(launch::LaunchIngress { pin: pin.clone() });
         pin
     });
+    if request.method() == Method::GET && request.uri().path() == "/v1/qb/native-owner" {
+        return native_reset::upgrade(state, request, launch_pin).await;
+    }
     let image_edit = images::matches(request.method(), request.uri().path())
         .then(|| request.uri().path().ends_with("/edits"));
     let provider = if request.uri().path().starts_with("/v1/messages") {
@@ -2904,14 +2911,6 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
             None
         };
         // M4b는 select만 교체한다. 보관본 없는 요청과 commit 이후에는 재전송하지 않는다.
-        if !decision.failover() || retained.is_none() || permission_denials >= 2 {
-            break (status, response_headers, held);
-        }
-        if let Some(copy) = retained.as_ref()
-            && copy.complete().await.is_none()
-        {
-            break (status, response_headers, held);
-        }
         // D26 physical-response fallback only: a genuinely accepted 5h-only
         // report plus a current bound effective Wait whose reset cannot fit.
         // A mere optional-wait refusal never supplies this provenance.
@@ -2931,30 +2930,78 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
             let model = request_model.clone();
             let source = account.id.clone();
             let work_operation = operation.clone();
+            let pin = parts
+                .extensions
+                .get::<launch::LaunchIngress>()
+                .and_then(|ingress| ingress.pin.clone());
             let task = tokio::task::spawn_blocking(move || {
-                accounts.observed_http_far_wait(
-                    &bindings,
-                    crate::bindings::HttpWaitRequest {
-                        provider,
-                        key: Some(&key),
-                        model: model.as_deref(),
-                        expected_source: Some(&source),
-                        operation: &work_operation,
-                    },
-                    &observed,
-                )
+                let preserve = accounts
+                    .observed_http_far_wait(
+                        &bindings,
+                        crate::bindings::HttpWaitRequest {
+                            provider,
+                            key: Some(&key),
+                            model: model.as_deref(),
+                            expected_source: Some(&source),
+                            operation: &work_operation,
+                        },
+                        &observed,
+                    )
+                    .unwrap_or(false);
+                let publication = if preserve {
+                    pin.as_deref().and_then(|pin| {
+                        accounts
+                            .register_http_deferred_reset(
+                                &bindings,
+                                crate::bindings::HttpWaitRequest {
+                                    provider,
+                                    key: Some(&key),
+                                    model: model.as_deref(),
+                                    expected_source: Some(&source),
+                                    operation: &work_operation,
+                                },
+                                &observed,
+                                pin,
+                            )
+                            .ok()
+                            .flatten()
+                            .map(|(id, scope)| {
+                                native_reset::PendingPublication::new(accounts.clone(), scope, id)
+                            })
+                    })
+                } else {
+                    None
+                };
+                (preserve, publication)
             });
-            let preserve = tokio::select! {
+            let (preserve, publication) = tokio::select! {
                 biased;
-                _ = state.wait_for_drain_start() => false,
-                _ = tokio::time::sleep_until(operation.deadline()) => false,
-                result = task => matches!(result, Ok(Ok(true))),
+                _ = state.wait_for_drain_start() => (false, None),
+                _ = tokio::time::sleep_until(operation.deadline()) => (false, None),
+                result = task => result.unwrap_or((false, None)),
             };
             // Caller Drop cancels detached inspection on route cancellation.
             // Native downstream delivery still owns the untouched held response.
-            if state.is_draining() || (preserve && operation.can_reply()) {
+            if preserve && operation.can_reply() && !state.is_draining() {
+                if let Some(publication) = publication {
+                    publication.keep();
+                }
                 break (status, response_headers, held);
             }
+            // The armed publication cancels on deadline, drain, caller loss or
+            // a dropped blocking result; expiry never leaves an armed obligation.
+            drop(publication);
+            if state.is_draining() {
+                break (status, response_headers, held);
+            }
+        }
+        if !decision.failover() || retained.is_none() || permission_denials >= 2 {
+            break (status, response_headers, held);
+        }
+        if let Some(copy) = retained.as_ref()
+            && copy.complete().await.is_none()
+        {
+            break (status, response_headers, held);
         }
         let mut proof_reset_source = None;
         #[cfg(feature = "testkit")]

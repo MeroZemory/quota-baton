@@ -296,6 +296,27 @@ pub struct Plan {
     pub source: &'static str,
     pub revision: u64,
 }
+/// Fixed native policy projection; only publication can revoke this fence.
+pub(crate) struct DeferredPolicyFence {
+    key: String,
+    account: String,
+    plan: Plan,
+    revoked: Arc<crate::account_runtime::deferred_reset::Revocation>,
+}
+impl DeferredPolicyFence {
+    pub(crate) fn live(&self) -> bool {
+        self.revoked.live()
+    }
+    pub(crate) fn matches_plan(&self, key: &str, account: &str, plan: &Plan) -> bool {
+        self.live()
+            && self.key == key
+            && self.account == account
+            && crate::account_runtime::deferred_reset::same_plan(&self.plan, plan)
+    }
+    pub(crate) fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.revoked.notified_raw()
+    }
+}
 pub struct PolicyStore {
     path: PathBuf,
     defaults: Settings,
@@ -315,6 +336,7 @@ pub struct PolicyStore {
     durable_generation: Mutex<Option<(u64, String)>>,
     warnings: Mutex<WarningState>,
     pub(crate) changed: tokio::sync::Notify,
+    deferred_fences: Mutex<Vec<std::sync::Weak<DeferredPolicyFence>>>,
 }
 
 #[cfg(test)]
@@ -1104,6 +1126,7 @@ impl PolicyStore {
                 sink: None,
             }),
             changed: tokio::sync::Notify::new(),
+            deferred_fences: Mutex::new(Vec::new()),
         })
     }
     pub fn with_limits(mut self, limits: ChurnLimits) -> Result<Self> {
@@ -1286,6 +1309,7 @@ impl PolicyStore {
                         next.revision = state.revision;
                         *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(next);
                     }
+                    self.refresh_deferred_fences();
                 }
                 self.warn("routing_policy_write_failed");
                 self.changed.notify_waiters();
@@ -1313,6 +1337,7 @@ impl PolicyStore {
                     .unwrap_or_else(|e| e.into_inner()) = intent;
             }
             *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(next);
+            self.refresh_deferred_fences();
         }
         self.changed.notify_waiters();
         Ok(result)
@@ -1325,6 +1350,7 @@ impl PolicyStore {
         {
             let _publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
             *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(next);
+            self.refresh_deferred_fences();
         }
         if newly_frozen {
             self.changed.notify_waiters();
@@ -1413,6 +1439,7 @@ impl PolicyStore {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = intent;
             *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(next);
+            self.refresh_deferred_fences();
         }
         self.changed.notify_waiters();
         if recovered.blocked {
@@ -1420,11 +1447,64 @@ impl PolicyStore {
         }
         Ok(())
     }
+    #[cfg(test)]
+    pub(crate) fn fill_deferred_watch_slots_for_test(&self) {
+        let mut fences = self.deferred_fences.lock().unwrap();
+        let fence = fences.iter().find_map(|f| f.upgrade()).unwrap();
+        fences.resize_with(4096, || Arc::downgrade(&fence));
+    }
+    // Caller holds publication access; no publication lock is reacquired.
+    pub(crate) fn track_deferred_plan(
+        &self,
+        key: &str,
+        account: &str,
+        plan: &Plan,
+    ) -> Option<Arc<DeferredPolicyFence>> {
+        if self.persistence_failed.load(Ordering::Acquire)
+            || self.lifecycle_recovery.load(Ordering::Acquire)
+        {
+            return None;
+        }
+        let mut fences = self.deferred_fences.lock().ok()?;
+        fences.retain(|fence| fence.strong_count() != 0);
+        if fences.len() >= 4096 {
+            return None;
+        }
+        let fence = Arc::new(DeferredPolicyFence {
+            key: key.to_owned(),
+            account: account.to_owned(),
+            plan: plan.clone(),
+            revoked: crate::account_runtime::deferred_reset::Revocation::new(),
+        });
+        fences.push(Arc::downgrade(&fence));
+        Some(fence)
+    }
+    // Called only inside actual native publication fences, after state changes.
+    fn refresh_deferred_fences(&self) {
+        let Ok(mut fences) = self.deferred_fences.lock() else {
+            return;
+        };
+        fences.retain(|weak| {
+            let Some(fence) = weak.upgrade() else {
+                return false;
+            };
+            let plan = self.plan_published(Some(&fence.key));
+            if self.persistence_failed.load(Ordering::Acquire)
+                || self.lifecycle_recovery.load(Ordering::Acquire)
+                || !self.permits_dispatch_published(Some(&fence.key), &fence.account)
+                || !crate::account_runtime::deferred_reset::same_plan(&fence.plan, &plan)
+            {
+                fence.revoked.cancel();
+            }
+            true
+        });
+    }
     /// Import recovery blocks strict dispatch until validation and anchor capture finish.
     /// Unrelated non-strict sessions continue serving.
     pub(crate) fn begin_recovery(&self) {
         let _publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
         self.lifecycle_recovery.store(true, Ordering::Release);
+        self.refresh_deferred_fences();
         self.changed.notify_waiters();
     }
     pub(crate) fn finish_recovery(&self) {
@@ -2199,6 +2279,7 @@ impl PolicyStore {
                 {
                     let _publication = self.publication.write().unwrap_or_else(|e| e.into_inner());
                     *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(next);
+                    self.refresh_deferred_fences();
                 }
                 self.warn("routing_forced_history_overflow");
                 self.changed.notify_waiters();

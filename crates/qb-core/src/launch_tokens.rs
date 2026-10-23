@@ -3,7 +3,10 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{
+    Arc, Mutex, MutexGuard, OnceLock, Weak,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -110,11 +113,17 @@ struct Entry {
     metadata: LaunchMetadata,
     last_activity: Instant,
     pins: usize,
+    deferred_owner: Weak<DeferredOwner>,
 }
 
 impl Entry {
     fn expired(&self, now: Instant) -> bool {
-        self.pins == 0 && now.saturating_duration_since(self.last_activity) >= IDLE_TIMEOUT
+        self.pins == 0
+            && self
+                .deferred_owner
+                .upgrade()
+                .is_none_or(|owner| !owner.live.load(Ordering::Acquire))
+            && now.saturating_duration_since(self.last_activity) >= IDLE_TIMEOUT
     }
 }
 
@@ -200,6 +209,7 @@ impl LaunchTokenRegistry {
                     metadata,
                     last_activity: now,
                     pins: 0,
+                    deferred_owner: Weak::new(),
                 });
                 return Ok(token);
             }
@@ -290,7 +300,130 @@ impl fmt::Debug for LaunchPin {
     }
 }
 
+/// A control connection's process-local lifetime, independent of request pins.
+/// Only a real issued pin can create this owner; it grants no account authority.
+pub(crate) struct LaunchOwnerLease {
+    scope: LaunchOwnerScope,
+}
+#[derive(Clone)]
+pub(crate) struct LaunchOwnerScope(Arc<DeferredOwner>);
+struct DeferredOwner {
+    registry: Weak<Inner>,
+    digest: TokenDigest,
+    anchor: String,
+    root: OnceLock<String>,
+    claimed: AtomicBool,
+    live: AtomicBool,
+    gate: Mutex<()>,
+    changed: tokio::sync::Notify,
+}
+impl LaunchOwnerLease {
+    pub(crate) fn scope(&self) -> LaunchOwnerScope {
+        self.scope.clone()
+    }
+}
+impl Drop for LaunchOwnerLease {
+    fn drop(&mut self) {
+        let _gate = self.scope.0.gate.lock().unwrap_or_else(|e| e.into_inner());
+        self.scope.0.live.store(false, Ordering::Release);
+        self.scope.0.changed.notify_waiters();
+    }
+}
+impl LaunchOwnerScope {
+    pub(crate) fn live_guard(&self) -> Option<MutexGuard<'_, ()>> {
+        let guard = self.0.gate.lock().ok()?;
+        self.live().then_some(guard)
+    }
+    pub(crate) fn live(&self) -> bool {
+        self.0.live.load(Ordering::Acquire)
+    }
+    pub(crate) fn same_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+    pub(crate) fn anchor(&self) -> &str {
+        &self.0.anchor
+    }
+    pub(crate) fn root(&self) -> Option<&str> {
+        self.0.root.get().map(String::as_str)
+    }
+    pub(crate) fn matches_pin(&self, pin: &LaunchPin) -> bool {
+        self.live()
+            && self.0.digest == pin.digest
+            && Weak::ptr_eq(&self.0.registry, &Arc::downgrade(&pin.inner))
+    }
+    pub(crate) fn claim(&self, root: &str) -> bool {
+        if !self.live()
+            || self
+                .0
+                .claimed
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return false;
+        }
+        self.0.root.set(root.to_owned()).is_ok() && self.live()
+    }
+    pub(crate) fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.0.changed.notified()
+    }
+    pub(crate) fn matches_thread(&self, thread: &str) -> bool {
+        self.live()
+            && valid_native_thread(thread)
+            && self.root().and_then(|root| root.strip_prefix("codex:")) == Some(thread)
+    }
+}
+pub(crate) fn valid_native_thread(thread: &str) -> bool {
+    thread.len() == 36
+        && thread.bytes().enumerate().all(|(i, b)| {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                b == b'-'
+            } else {
+                b.is_ascii_hexdigit()
+            }
+        })
+}
+
 impl LaunchPin {
+    pub(crate) fn deferred_owner_scope(&self) -> Option<LaunchOwnerScope> {
+        let owner = self
+            .inner
+            .lock()
+            .get(&self.digest)?
+            .deferred_owner
+            .upgrade()?;
+        owner
+            .live
+            .load(Ordering::Acquire)
+            .then_some(LaunchOwnerScope(owner))
+    }
+    /// Open before data ingress. Registration later binds the observed C8 UUID.
+    pub(crate) fn open_deferred_owner(&self) -> Result<LaunchOwnerLease, LaunchTokenError> {
+        let mut entries = self.inner.lock();
+        let entry = entries
+            .get_mut(&self.digest)
+            .ok_or(LaunchTokenError::Missing)?;
+        if entry
+            .deferred_owner
+            .upgrade()
+            .is_some_and(|owner| owner.live.load(Ordering::Acquire))
+        {
+            return Err(LaunchTokenError::Capacity);
+        }
+        let owner = Arc::new(DeferredOwner {
+            registry: Arc::downgrade(&self.inner),
+            digest: self.digest,
+            anchor: entry.metadata.binding_anchor_key.clone(),
+            root: OnceLock::new(),
+            claimed: AtomicBool::new(false),
+            live: AtomicBool::new(true),
+            gate: Mutex::new(()),
+            changed: tokio::sync::Notify::new(),
+        });
+        entry.deferred_owner = Arc::downgrade(&owner);
+        Ok(LaunchOwnerLease {
+            scope: LaunchOwnerScope(owner),
+        })
+    }
     /// A fresh snapshot, including catalog updates made after pin acquisition.
     pub fn metadata(&self) -> LaunchMetadata {
         self.inner.lock()[&self.digest].metadata.clone()

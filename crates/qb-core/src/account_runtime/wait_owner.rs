@@ -328,6 +328,7 @@ fn wait_wake(
 
 pub(super) struct WaitOwner {
     proofs: WaitProofs<ShortQuotaProof>,
+    pub(super) deferred: super::deferred_reset::DeferredResets,
     changed: Notify,
 }
 
@@ -335,6 +336,7 @@ impl WaitOwner {
     pub(super) fn new() -> Self {
         Self {
             proofs: WaitProofs::new(CAPACITY),
+            deferred: super::deferred_reset::DeferredResets::new(),
             changed: Notify::new(),
         }
     }
@@ -422,6 +424,23 @@ impl WaitOwner {
         // Recheck the exact physical report after classification/clock work.
         self.proofs.admit(&observed.native).ok()?;
         Some(())
+    }
+
+    pub(super) fn qualify_deferred_physical_unlocked(
+        &self,
+        observed: &ObservedHttp429,
+        intent: &crate::bindings::WaitIntent<'_>,
+        account: &Account,
+    ) -> Option<super::deferred_reset::PhysicalQualification> {
+        self.observed_http_far_wait_unlocked(observed, intent, account)?;
+        let proof = self.proofs.admit(&observed.native).ok()?;
+        Some(super::deferred_reset::PhysicalQualification {
+            reset_at: proof.reset_at,
+            started_at: proof.started_at,
+            scope: proof.scope.clone(),
+            allow_credits: proof.allow_credits,
+            quota_credit_releasable: proof.quota_credit_releasable,
+        })
     }
 
     /// A full current proof can classify a qb-authored initial response without
@@ -658,6 +677,7 @@ impl WaitOwner {
     }
 
     fn retire(&self, id: &str) {
+        self.deferred.cancel_account(id);
         let _ = self.proofs.retire(id);
         self.changed.notify_waiters();
     }
@@ -668,9 +688,28 @@ impl WaitOwner {
         result.ok()
     }
 
-    fn mint(&self, permit: AcceptPermit, proof: ShortQuotaProof) {
-        let _ = self.proofs.mint(permit, proof);
+    fn mint(&self, id: &str, permit: AcceptPermit, proof: ShortQuotaProof) {
+        if self.proofs.mint(permit, proof).is_ok() {
+            self.requalify_deferred(id);
+        }
         self.changed.notify_waiters();
+    }
+    fn requalify_deferred(&self, id: &str) {
+        if let Ok((_, proof)) = self.proofs.acquire(id)
+            && proof.valid_at(Utc::now())
+        {
+            self.deferred.requalify_account(
+                id,
+                &super::deferred_reset::PhysicalQualification {
+                    reset_at: proof.reset_at,
+                    started_at: proof.started_at,
+                    scope: proof.scope.clone(),
+                    allow_credits: proof.allow_credits,
+                    quota_credit_releasable: proof.quota_credit_releasable,
+                },
+                proof.model.as_deref(),
+            );
+        }
     }
 
     /// Caller holds the store transaction. The hook owns neither Store nor Runtime.
@@ -687,19 +726,35 @@ impl WaitOwner {
                     owner.retire(id);
                 }
                 BeforeAccountMutation::Metadata { id, .. }
-                | BeforeAccountMutation::HealthExpiry { id }
                 | BeforeAccountMutation::Settings { id }
-                | BeforeAccountMutation::FullSave { id } => owner.invalidate(id),
+                | BeforeAccountMutation::FullSave { id } => {
+                    owner.deferred.cancel_account(id);
+                    owner.invalidate(id);
+                }
+                BeforeAccountMutation::HealthExpiry { id } => {
+                    owner.deferred.expiry(id);
+                    owner.cut_proof(id);
+                }
+                BeforeAccountMutation::CredentialSave { id, .. } => {
+                    // Attempt only: cut short proof; recovery reads durable state.
+                    owner.deferred.credential_save(id);
+                    owner.cut_proof(id);
+                }
             }
         }));
     }
 
     pub(super) fn close(&self) {
+        self.deferred.close();
         let _ = self.proofs.close();
         self.changed.notify_waiters();
     }
 
     fn invalidate(&self, id: &str) {
+        self.deferred.cancel_account(id);
+        self.cut_proof(id);
+    }
+    fn cut_proof(&self, id: &str) {
         let _ = self.proofs.invalidate(id);
         self.changed.notify_waiters();
     }
@@ -787,6 +842,7 @@ impl ReportMutation for ReportApplication {
             owner.invalidate(&self.id);
             return;
         }
+        owner.deferred.suspend_account(id);
         self.permit = permit.and_then(|permit| owner.rotate(permit));
         if self.permit.is_none() {
             owner.invalidate(id);
@@ -804,7 +860,7 @@ impl ReportApplication {
         if let Some(owner) = self.owner.upgrade()
             && let Some(permit) = self.permit.take()
         {
-            owner.mint(permit, proof);
+            owner.mint(&self.id, permit, proof);
         }
     }
 
@@ -821,6 +877,7 @@ impl ReportApplication {
         let minted = owner.proofs.mint(permit, proof);
         owner.changed.notify_waiters();
         minted.ok()?;
+        owner.requalify_deferred(&self.id);
         let (native, _) = owner.proofs.acquire(&self.id).ok()?;
         Some(ObservedHttp429 { native })
     }
