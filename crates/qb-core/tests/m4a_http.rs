@@ -1670,6 +1670,48 @@ async fn c6_row_6a_model_plan_denial_scopes_then_allows_other_model() {
     assert!(!a.eligible(Some("fixture-pro")));
 }
 #[tokio::test]
+async fn n6t_http_response_model_hint_preserves_actual_keyed_attempt_and_body() {
+    let h = Harness::new(Provider::Codex, 2, 384, 1024).await;
+    let session = "synthetic-response-model-context";
+    h.fake.state.push(ScriptedResponse::json(
+        StatusCode::BAD_REQUEST,
+        r#"{"error":{"message":"The 'fixture-pro' model is not supported when using Codex with a ChatGPT account"}}"#,
+    ));
+    h.fake.state.push(ok());
+    let response = h.send_with_session(Provider::Codex, session).await;
+    assert_eq!(response.status(), 200);
+    let successor = response.headers()["x-quota-baton-account"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    response.bytes().await.unwrap();
+    let requests = h.fake.state.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests.iter().all(|request| request.body == "{}"));
+    assert_ne!(
+        requests[0].headers["authorization"],
+        requests[1].headers["authorization"]
+    );
+    let source = h
+        .store
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|account| {
+            requests[0].headers["authorization"]
+                == format!("Bearer {}", h.store.tokens(account).unwrap().access_token)
+        })
+        .unwrap();
+    assert_ne!(source.id, successor);
+    assert!(source.eligible(Some("fixture-other")));
+    assert!(!source.eligible(Some("fixture-pro")));
+    assert_eq!(
+        h.state.bindings.current(Some(&format!("codex:{session}"))),
+        Some(successor)
+    );
+}
+
+#[tokio::test]
 async fn c6_row_7_payment_fails_over_and_relays_last_when_none() {
     let h = Harness::new(Provider::Codex, 2, 384, 1024).await;
     for _ in 0..2 {

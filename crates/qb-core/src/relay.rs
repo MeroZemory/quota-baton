@@ -2335,7 +2335,7 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
     completion.session(&session);
     completion.accounting_http_model(&parts.headers, &upload.prefix);
     let mut tried = BTreeSet::new();
-    let mut request_model = session.model.clone();
+    let request_model = session.model.clone();
     #[cfg(all(feature = "shape-capture", debug_assertions))]
     let shape_ticket = {
         let observability = state.observability.clone();
@@ -2827,9 +2827,9 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
                 state.accounts.invalidate_quota_rejection(&account.id).await;
             }
         }
-        if let Some(model) = decision.model.take().filter(|_| managed_http.is_none()) {
-            request_model = Some(model);
-        }
+        // Response-only model hints scope the health signal; they do not change
+        // the model of the request actually sent. Preserve that exact context
+        // for the sealed failed-attempt handoff and every same-body successor.
         if managed_http.is_some() && decision.kind == outcome::Kind::ModelPermission {
             // A failed or unchanged catalog refresh must not erase C6 row 6a's
             // observed model-specific denial. Keep its normal durable hold.
