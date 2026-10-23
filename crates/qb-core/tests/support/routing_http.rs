@@ -296,7 +296,7 @@ async fn drain_during_new_placement_wait_cannot_create_a_phantom_warm_binding() 
 
 #[tokio::test]
 async fn total_precommit_deadline_cancels_hold_without_sending_or_changing_account() {
-    let h = Harness::with_limits(Provider::Codex, 60, 1, 60).await;
+    let h = Harness::with_limits(Provider::Codex, 60, 2, 60).await;
     let first = h
         .turn("/v1/responses", &[("session-id", "total-deadline")], RAW)
         .await;

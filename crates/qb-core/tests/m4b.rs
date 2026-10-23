@@ -139,6 +139,12 @@ impl Harness {
         let mut config = Config::default();
         config.routing.reset_hold_secs = reset_hold_secs;
         config.routing.request_timeout_secs = request_timeout_secs;
+        // Synthetic short deadlines must still satisfy the production trip bound.
+        config.routing.move_guard.trip_seconds = config
+            .routing
+            .move_guard
+            .trip_seconds
+            .min(request_timeout_secs.saturating_sub(1));
         config.routing.rate_hold_secs = rate_hold_secs;
         config.server.data_port = 0;
         config.server.admin_port = 0;
