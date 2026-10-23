@@ -6,10 +6,10 @@ This file names the verification for each unit and each row. The row list and th
 
 <!-- status:begin -->
 현재 마일스톤: R13 N5d native 초기화 재개 통합
-목표: native 단일 재개 권한 통합 검증 완료; 제품 런처·실제 TUI 연결 중
+목표: 제품 런처 연결·종료 경합 단위 검증 완료; 실제 native TUI 수용 연결 중
 핵심 지표: 남은 출시 1/3 (R14 보호 설치, R13 C+E 실행, R13 F 통합 예측); 이전 계열 2/2 종료
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-23 20:43 KST (N5d 단일 권한 통합37·정확 반례 통과; 제품 재개 미출시)
+갱신: 2026-10-23 21:34 KST (N5d 제품 연결·managed46/observer8·정확 반례3 통과; 실제 TUI 수용 전)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -415,6 +415,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-23 20:09 | N5d 초기 full-proof 대기 등록·소유 실행기 구성 | owner3·실제 HTTP2·actor16·부모9 통과; strict core/CLI lint·fmt0 | 추가 data send 없이 정확 Waiting; 초기 hook 제거101→정확복원0 | 7c94f3a·017afb0·ace4e36·3c28a3e; initial-unit-inputs.json. managed transport 실제 연결·WS producer·Claude 재개 수용은 별도 |
 | 2026-10-23 20:23 | N5d owned 실행기 취소·파이프 수명 | managed7·strict CLI testkit all-target lint·fmt0 | 실제 synthetic 두 프로세스·막힌 쓰기·EOF·worker 정리 | 762d81b; n5d-managed-owner/unit-inputs.json. 단일 스레드 runtime·외부180초 제한; 자동 권한 연결/생산 등록은 미포함 |
 | 2026-10-23 20:43 | N5d 단일 core 권한·native 재개 통합 | managed37·actor18/client21·parent12/dispatcher10 통과; 기본/testkit CLI strict·fmt0 | premature core-close 정확 red101→바이트복원0; 권한 상실 시 ordinary 보존 | a46e25a·04721aa·288dd5c; episode-unit/unit-inputs.json. 제품 등록·실제 native/core 실행·반복 episode·WS producer·Claude 재개는 미수용 |
+| 2026-10-23 21:34 | N5d 제품 런처·정상 종료/직접 쓰기 오류 경계 | managed46·observer8·launch-client25·기본/testkit CLI strict·fmt 통과 | 종료·직접 쓰기·원인 보존 제거3건101→정확복원0 | eb2601b·b2a6c38·0bddc36; production-entry-unit-inputs.json. 두 초기 대조는 감도 미입증으로 보존; 실제 core/native TUI·반복 episode·WS producer·Claude 재개 수용은 별도 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
