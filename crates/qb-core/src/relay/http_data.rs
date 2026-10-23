@@ -66,6 +66,64 @@ impl RelayState {
         Ok(Some(ManagedHttp { info, model }))
     }
 
+    /// Initial HTTP only. Does not enter or modify the shared G2 wait helper.
+    /// The request's original data deadline is passed unchanged into inspection.
+    pub(super) async fn initial_http_far_wait(
+        &self,
+        provider: Provider,
+        session: &session::Session,
+        model: Option<&str>,
+        deadline: tokio::time::Instant,
+    ) -> Option<Response> {
+        let key = session.key.as_deref()?;
+        if key.is_empty()
+            || key.len() > 1024
+            || model.is_some_and(|value| value.len() > 256)
+            || self.is_draining()
+            || self.pins.get(provider, Some(key)).is_some()
+        {
+            return None;
+        }
+        let operation = crate::issue_operation::IssueOperation::new(deadline);
+        let _caller = operation.caller_guard();
+        let work_operation = operation.clone();
+        let accounts = self.accounts.clone();
+        let bindings = self.bindings.clone();
+        let work_key = key.to_owned();
+        let model = model.map(str::to_owned);
+        let task = tokio::task::spawn_blocking(move || {
+            accounts.current_http_initial_far_wait(
+                &bindings,
+                crate::bindings::HttpWaitRequest {
+                    provider,
+                    key: Some(&work_key),
+                    model: model.as_deref(),
+                    expected_source: None,
+                    operation: &work_operation,
+                },
+            )
+        });
+        let fallback = tokio::select! {
+            biased;
+            _ = self.wait_for_drain_start() => return None,
+            _ = tokio::time::sleep_until(deadline) => return None,
+            result = task => result.ok()?.ok()??,
+        };
+        if self.is_draining()
+            || !operation.can_reply()
+            || self.pins.get(provider, Some(key)).is_some()
+        {
+            return None;
+        }
+        // Reject a cut/replaced proof or changed policy while native work was
+        // returning. Response facts were assembled under all native gates.
+        let response = fallback.into_response(&self.bindings.policies)?;
+        if self.is_draining() || !operation.can_reply() {
+            return None;
+        }
+        Some(response)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn select_http_request(
         self: &Arc<Self>,
