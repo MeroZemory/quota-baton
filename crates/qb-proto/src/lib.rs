@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+pub mod native_reset;
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub ok: bool,
