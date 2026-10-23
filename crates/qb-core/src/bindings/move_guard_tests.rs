@@ -354,7 +354,7 @@ fn r14_observed_limit_is_fresh_unusable_evidence_not_guard_keep() {
 
 #[test]
 fn r14_excluded_source_needs_fresh_unusable_evidence() {
-    for state in ["unknown", "ready", "payment", "quota"] {
+    for state in ["unknown", "ready", "ready_changed", "payment", "quota"] {
         let root = fixture_dir();
         let table = BindingTable::new(root.path(), RoutingConfig::default()).unwrap();
         let now = Utc::now();
@@ -367,6 +367,13 @@ fn r14_excluded_source_needs_fresh_unusable_evidence() {
         selected(pick(&table, key, &cs, &cs[0].account.id, now, |_| true));
         selected(pick(&table, key, &cs, &cs[1].account.id, now, |_| true));
         match state {
+            "ready_changed" => {
+                // A changed fingerprint without actual unusability cannot
+                // authorize another move, even with a fresh source collection.
+                let before = semantic_evidence(Some(&cs[1].account));
+                cs[1].account.allow_credits = !cs[1].account.allow_credits;
+                assert_ne!(semantic_evidence(Some(&cs[1].account)), before);
+            }
             "payment" => {
                 cs[1].account.apply_health_signal(
                     HealthSignal::Cooling {

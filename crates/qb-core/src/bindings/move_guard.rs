@@ -197,10 +197,65 @@ impl Breaker {
         now
     }
 
-    /// `fresh_unusable` and capacity fingerprints are supplied by the owning
-    /// runtime modules, not parsed from the proposed reason string.
+    /// Production callers must supply a judgement from the health owner.
+    /// A missing/filtered source or a reason string cannot mint this authority.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_observed(
+        &mut self,
+        limits: &Limits,
+        key: &str,
+        from: &str,
+        to: &str,
+        departure_evidence: u64,
+        destination_evidence: u64,
+        source_unusable: Option<&crate::accounts::health::UnusableEvidence>,
+        observations: Observations,
+        now: DateTime<Utc>,
+    ) -> Result<Permit, Denied> {
+        self.prepare_checked(
+            limits,
+            key,
+            from,
+            to,
+            departure_evidence,
+            destination_evidence,
+            source_unusable.is_some_and(|proof| proof.applies_to(from, now)),
+            observations,
+            now,
+        )
+    }
+
+    // Raw booleans exist only in breaker algorithm fixtures, never at the
+    // production binding boundary.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare(
+        &mut self,
+        limits: &Limits,
+        key: &str,
+        from: &str,
+        to: &str,
+        departure_evidence: u64,
+        destination_evidence: u64,
+        source_unusable: bool,
+        observations: Observations,
+        now: DateTime<Utc>,
+    ) -> Result<Permit, Denied> {
+        self.prepare_checked(
+            limits,
+            key,
+            from,
+            to,
+            departure_evidence,
+            destination_evidence,
+            source_unusable,
+            observations,
+            now,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_checked(
         &mut self,
         limits: &Limits,
         key: &str,
@@ -413,6 +468,58 @@ impl Breaker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn health_owner_proof_is_bound_to_source_and_selection_time() {
+        use crate::accounts::{Health, health::UnusableEvidence};
+        let mut b = Breaker::default();
+        move_at(&mut b, "session", "a", "b", false, 0).unwrap();
+        let now = now() + Duration::seconds(1);
+        let mut account = crate::accounts::health::tests::fixture();
+        account.id = "b".into();
+        account.health = Health::NeedsRelogin {
+            reason: "synthetic revoked".into(),
+            since: now,
+        };
+        let valid = UnusableEvidence::observe(&account, None, true, now).unwrap();
+        let stale =
+            UnusableEvidence::observe(&account, None, true, now - Duration::seconds(1)).unwrap();
+        account.id = "other-account".into();
+        let foreign = UnusableEvidence::observe(&account, None, true, now).unwrap();
+        let observations = Observations::same(Observation::before_collection());
+        for proof in [None, Some(&stale), Some(&foreign)] {
+            assert_eq!(
+                b.prepare_observed(
+                    &Limits::default(),
+                    "session",
+                    "b",
+                    "c",
+                    2,
+                    1,
+                    proof,
+                    observations,
+                    now,
+                )
+                .expect_err("health proof must match source and selection instant")
+                .reason,
+                Refusal::SessionTenMinutes,
+            );
+        }
+        let permit = b
+            .prepare_observed(
+                &Limits::default(),
+                "session",
+                "b",
+                "c",
+                2,
+                1,
+                Some(&valid),
+                observations,
+                now,
+            )
+            .unwrap();
+        b.commit(permit, "c").unwrap();
+    }
     fn now() -> DateTime<Utc> {
         DateTime::from_timestamp(2_000_000_000, 0).unwrap()
     }
