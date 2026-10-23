@@ -60,6 +60,9 @@ pub struct Account {
     pub active_sessions: u64,
     pub bound_sessions: u64,
     pub allow_credits: bool,
+    /// Read-only core status, independent of health and credential ownership.
+    #[serde(default)]
+    pub outside_used: bool,
     pub drain: bool,
     pub probe_pending: bool,
     pub refresh_attention: bool,
@@ -258,6 +261,7 @@ pub struct AccountRow {
     pub raw: Account,
     pub name: String,
     pub plan: Option<String>,
+    pub outside_note: Option<String>,
     pub plan_tooltip: Option<String>,
     pub name_tooltip: Option<String>,
     pub state: DisplayState,
@@ -839,6 +843,9 @@ fn project_row(a: &Account, name: String, now: DateTime<Utc>) -> AccountRow {
         name_tooltip: nonempty(a.email.as_deref()).map(clean),
         name,
         plan,
+        outside_note: a
+            .outside_used
+            .then(|| crate::i18n::static_text("qb 밖에서도 사용 중").to_owned()),
         state,
         group,
         chip,
@@ -1293,6 +1300,7 @@ fn finish_row(row: &mut AccountRow, summary: &Summary, serving: Option<&str>, no
     row.accessible_name = [
         Some(row.name.clone()),
         row.plan.clone(),
+        row.outside_note.clone(),
         row.chip.as_ref().map(|c| c.text.clone()),
         usage_accessibility,
         row.forecast_lines.first().cloned(),
@@ -2491,6 +2499,105 @@ mod tests {
                 .count()
                 <= 127
         );
+    }
+}
+
+#[cfg(test)]
+mod n10_outside_usage_tests {
+    use super::*;
+
+    #[test]
+    fn n10_outside_note_is_localized_and_preserves_health_credits_source_and_actions() {
+        for language in [crate::i18n::UiLanguage::Ko, crate::i18n::UiLanguage::En] {
+            crate::i18n::with_language(language, || {
+                let note = crate::i18n::static_text("qb 밖에서도 사용 중");
+                assert_eq!(
+                    note,
+                    if language == crate::i18n::UiLanguage::En {
+                        "also used outside qb"
+                    } else {
+                        "qb 밖에서도 사용 중"
+                    }
+                );
+                for (user_state, health, credits) in [
+                    ("active", "ready", false),
+                    ("active", "ready", true),
+                    ("active", "needs_relogin", false),
+                    ("paused", "ready", false),
+                    ("disabled", "ready", false),
+                ] {
+                    let mut wire = serde_json::json!({"accounts":[{
+                        "id":"synthetic-outside", "provider":"codex", "label":"Synthetic account with a deliberately very long identity name",
+                        "plan":"plus", "user_state":user_state, "health":{"kind":health},
+                        "credits_in_use":credits, "allow_credits":credits,
+                        "source":{"kind":"cpa","mode":"adopted"}
+                    }]});
+                    let now = timestamp("2026-10-23T00:00:00Z").unwrap().into();
+                    let original = project(&wire.to_string(), now).unwrap();
+                    wire["accounts"][0]["outside_used"] = true.into();
+                    let marked = project(&wire.to_string(), now).unwrap();
+                    let find = |view: &View| {
+                        view.sections
+                            .iter()
+                            .flat_map(|s| s.rows.iter().chain(&s.disabled_rows))
+                            .find(|r| r.raw.id == "synthetic-outside")
+                            .unwrap()
+                            .clone()
+                    };
+                    let before = find(&original);
+                    let after = find(&marked);
+                    assert!(!before.raw.outside_used && after.raw.outside_used);
+                    assert_eq!(before.name, after.name);
+                    assert_eq!(before.state, after.state);
+                    assert_eq!(before.reason, after.reason);
+                    assert_eq!(
+                        before.chip.as_ref().map(|c| &c.text),
+                        after.chip.as_ref().map(|c| &c.text)
+                    );
+                    assert_eq!(
+                        before.action.as_ref().map(|a| a.kind),
+                        after.action.as_ref().map(|a| a.kind)
+                    );
+                    assert_eq!(before.menu.identity_line, after.menu.identity_line);
+                    assert_eq!(before.plan_tooltip, after.plan_tooltip);
+                    assert_eq!(
+                        before.credits.as_ref().map(|c| &c.text),
+                        after.credits.as_ref().map(|c| &c.text)
+                    );
+                    assert_eq!(before.plan, after.plan);
+                    assert!(before.outside_note.is_none());
+                    assert_eq!(after.outside_note.as_deref(), Some(note));
+                    assert!(after.accessible_name.contains(note));
+                    let mut presentation = crate::v2_geometry::Presentation::default();
+                    presentation.expanded.insert("codex".into(), true);
+                    let scene = crate::v2_geometry::Scene::build(&marked, presentation, 800.);
+                    let row_box = scene
+                        .sections
+                        .iter()
+                        .flat_map(|s| s.rows.iter().chain(&s.disabled_rows))
+                        .find(|r| r.id == "synthetic-outside")
+                        .unwrap();
+                    assert!(
+                        row_box.name.right > row_box.name.left,
+                        "identity must retain nonzero width"
+                    );
+                    assert_eq!(row_box.rect.right - row_box.rect.left, 360.);
+                    assert!(row_box.more.left >= row_box.name.right);
+                    if let Some(chip) = row_box.chip {
+                        assert!(row_box.plan.unwrap().right <= chip.left);
+                    }
+                    let secondary = row_box.outside_note.unwrap();
+                    assert!(secondary.top >= row_box.line1.bottom);
+                    assert!(secondary.bottom <= row_box.rect.bottom);
+                    assert!(row_box.usage.is_none_or(|r| r.top >= secondary.bottom));
+                    assert!(row_box.reason.is_none_or(|r| r.top >= secondary.bottom));
+                    assert!(
+                        secondary.left >= row_box.rect.left
+                            && secondary.right <= row_box.rect.right
+                    );
+                }
+            });
+        }
     }
 }
 

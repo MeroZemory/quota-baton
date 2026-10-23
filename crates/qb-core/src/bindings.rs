@@ -23,7 +23,9 @@ use std::{
 
 const CAPACITY: usize = 20_000;
 const COUNT_CHANGE_CAPACITY: usize = CAPACITY * 2;
+mod capacity_spill;
 mod launch;
+pub(crate) use capacity_spill::CapacitySpillPermit;
 mod move_guard;
 pub(crate) mod quota_wait;
 pub use launch::{
@@ -469,6 +471,10 @@ struct Data {
     overload_marks: BTreeMap<String, OverloadMark>,
     successes: BTreeMap<String, DateTime<Utc>>,
     placements: BTreeMap<String, PlacementState>,
+    capacity_spills: BTreeMap<String, u64>,
+    outside_used: BTreeSet<String>,
+    outside_unknown: bool,
+    outside_failure: Option<Arc<AtomicBool>>,
     last_request_bytes: BTreeMap<String, u64>,
     unknown_cost: BTreeSet<String>,
     mark_history: BTreeMap<String, Vec<DateTime<Utc>>>,
@@ -2891,7 +2897,12 @@ impl BindingTable {
             key.and_then(|k| self.retained_binding(d, k, now))
                 .map(|b| b.account.clone())
         });
-        let entries: Vec<_> = candidates
+        let source = self.protected_source(d, key, plan.anchor.as_deref(), now);
+        let outside_unknown = d.outside_unknown
+            || d.outside_failure
+                .as_ref()
+                .is_some_and(|failed| failed.load(Ordering::Acquire));
+        let mut entries: Vec<_> = candidates
             .iter()
             .filter(|c| c.account.provider == provider)
             .filter(|c| {
@@ -2908,6 +2919,20 @@ impl BindingTable {
                 (c, eligible)
             })
             .collect();
+        if let Some(source) = source.as_deref() {
+            // Outside use never displaces an existing source. It only vetoes
+            // destinations, including forced moves and explicit preferences.
+            for (candidate, eligible) in &mut entries {
+                *eligible &= candidate.account.id == source
+                    || (!outside_unknown && !d.outside_used.contains(&candidate.account.id));
+            }
+        } else if entries.iter().any(|(candidate, eligible)| {
+            *eligible && !outside_unknown && !d.outside_used.contains(&candidate.account.id)
+        }) {
+            // Last resort is before C7 preference/gate partitions: a healthy
+            // unmarked account cannot be bypassed by a reset or plan ranking.
+            entries.retain(|(candidate, _)| !d.outside_used.contains(&candidate.account.id));
+        }
         if let Some(id) = pinned
             && entries
                 .iter()
@@ -5986,6 +6011,64 @@ mod tests {
             "eviction must preserve group atomicity"
         );
     }
+    #[test]
+    fn n10_outside_use_is_last_resort_before_reset_preference() {
+        let (_dir, table) = table();
+        let outside = candidate("outside", 1.0, 1, 1);
+        let ordinary = candidate("ordinary", 85.0, 40, 5);
+        table.set_outside_use("outside", true);
+        let (selected, lease, _) = choose(&table, Some("claude:new"), &[outside.clone(), ordinary]);
+        assert_eq!(
+            selected, "ordinary",
+            "a reset preference cannot override outside-use protection"
+        );
+        drop(lease);
+        let (selected, lease, _) = choose(&table, Some("claude:last-resort"), &[outside]);
+        assert_eq!(
+            selected, "outside",
+            "native last resort must still serve a new session"
+        );
+        drop(lease);
+    }
+
+    #[test]
+    fn n10_outside_use_reuses_source_but_never_receives_an_existing_group() {
+        let (_dir, table) = table();
+        let source = candidate("source", 10.0, 40, 5);
+        let outside = candidate("outside", 1.0, 1, 1);
+        let (_, lease, _) = choose(&table, Some("claude:source"), std::slice::from_ref(&source));
+        drop(lease);
+        let (_, lease, _) = choose(
+            &table,
+            Some("claude:outside"),
+            std::slice::from_ref(&outside),
+        );
+        drop(lease);
+        table.set_outside_use("outside", true);
+        let (selected, lease, _) =
+            choose(&table, Some("claude:outside"), &[source, outside.clone()]);
+        assert_eq!(
+            selected, "outside",
+            "an existing outside-used source keeps serving"
+        );
+        drop(lease);
+        assert!(
+            matches!(
+                table.choose(
+                    Provider::Claude,
+                    Some("claude:source"),
+                    None,
+                    None,
+                    std::slice::from_ref(&outside),
+                    None,
+                    42
+                ),
+                Decision::None
+            ),
+            "even forced recovery cannot transfer a running group onto outside-used capacity"
+        );
+    }
+
     fn observe_at(c: &mut Candidate, time: DateTime<Utc>) {
         for w in c.quota.as_mut().unwrap()["windows"].as_array_mut().unwrap() {
             w["observed_at"] = json!(time);

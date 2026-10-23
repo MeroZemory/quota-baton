@@ -450,23 +450,83 @@ fn request_model(headers: &HeaderMap, bytes: &[u8]) -> Option<String> {
 }
 
 async fn current_account(
-    state: &RelayState,
+    state: &Arc<RelayState>,
     id: String,
-) -> Result<Option<(Account, crate::accounts::Tokens)>, ()> {
+    bound: Option<String>,
+) -> Result<Option<(Account, crate::accounts::Tokens, bool)>, ()> {
+    let state = state.clone();
     let store = state.store.clone();
     tokio::task::spawn_blocking(move || {
         let _gate = store.transaction().map_err(|_| ())?;
-        let account = store.read_account_unlocked(&id).map_err(|_| ())?;
-        if !eligible(&account) {
-            return Ok(None);
-        }
-        // Metadata and the current token generation come from one transaction.
-        // An intervening refresh is observed, never requested by image traffic.
-        let tokens = store.tokens_unlocked(&account).map_err(|_| ())?;
-        Ok((!tokens.access_token.is_empty()).then_some((account, tokens)))
+        current_account_unlocked(&store, &state.images, &id, bound.as_deref(), &|id| {
+            state.accounts.outside_protected(id)
+        })
     })
     .await
     .map_err(|_| ())?
+}
+
+// The marker query is an in-memory read. It must not reenter Store's transaction.
+fn current_account_unlocked(
+    store: &AccountStore,
+    images: &Mutex<ImageState>,
+    id: &str,
+    bound: Option<&str>,
+    outside_protected: &impl Fn(&str) -> bool,
+) -> Result<Option<(Account, crate::accounts::Tokens, bool)>, ()> {
+    let account = store.read_account_unlocked(id).map_err(|_| ())?;
+    if !eligible(&account) {
+        return Ok(None);
+    }
+    let mut outside_last_resort = false;
+    if outside_protected(id) && bound != Some(id) {
+        if bound.is_some() || current_unmarked_account_unlocked(store, images, outside_protected)? {
+            return Ok(None);
+        }
+        outside_last_resort = true;
+    }
+    // Metadata and the current token generation come from one transaction.
+    // An intervening refresh is observed, never requested by image traffic.
+    let tokens = store.tokens_unlocked(&account).map_err(|_| ())?;
+    Ok((!tokens.access_token.is_empty()).then_some((account, tokens, outside_last_resort)))
+}
+
+// The caller holds Store's transaction. Soft image preferences do not make an
+// otherwise usable unmarked account unavailable for D30's last-resort rule.
+fn current_unmarked_account_unlocked(
+    store: &AccountStore,
+    images: &Mutex<ImageState>,
+    outside_protected: &impl Fn(&str) -> bool,
+) -> Result<bool, ()> {
+    for snapshot in AccountStore::list_metadata(store.home()).map_err(|_| ())? {
+        if outside_protected(&snapshot.id) {
+            continue;
+        }
+        let Ok(account) = store.read_account_unlocked(&snapshot.id) else {
+            continue;
+        };
+        if !eligible(&account) {
+            continue;
+        }
+        let Ok(tokens) = store.tokens_unlocked(&account) else {
+            continue;
+        };
+        if tokens.access_token.is_empty() {
+            continue;
+        }
+        let credential = credential_key(&tokens);
+        let available = {
+            let health = images.lock().unwrap_or_else(|e| e.into_inner());
+            health.accounts.get(&account.id).is_none_or(|image| {
+                !(image.incapable && image.credential == credential)
+                    && image.exhausted.is_none_or(|at| at <= chrono::Utc::now())
+            })
+        };
+        if available && !outside_protected(&account.id) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub(super) async fn relay(state: Arc<RelayState>, request: Request) -> Response {
@@ -678,6 +738,17 @@ pub(super) async fn relay(state: Arc<RelayState>, request: Request) -> Response 
             true
         });
     }
+    // Outside-use protection is stronger than image affinity/preferences. An
+    // existing image session may keep its source, but never move onto another
+    // outside-used account. New sessions use one only as a genuine last resort.
+    let has_unmarked = candidates
+        .iter()
+        .any(|(account, _)| !state.accounts.outside_protected(&account.id));
+    candidates.retain(|(account, _)| {
+        !state.accounts.outside_protected(&account.id)
+            || bound.as_deref() == Some(account.id.as_str())
+            || (bound.is_none() && !has_unmarked)
+    });
     if candidates.is_empty() {
         let reason = if earliest.is_some() {
             "quota_exhausted"
@@ -704,10 +775,17 @@ pub(super) async fn relay(state: Arc<RelayState>, request: Request) -> Response 
     for (index, (snapshot, _)) in candidates.into_iter().enumerate() {
         // No await occurs between this transaction result and request dispatch.
         // Reload settings, health and tokens after every prior quota response.
-        let (account, tokens) = match current_account(&state, snapshot.id).await {
-            Ok(Some(current)) => current,
-            Ok(None) | Err(()) => continue,
-        };
+        let (account, tokens, outside_last_resort) =
+            match current_account(&state, snapshot.id, bound.clone()).await {
+                Ok(Some(current)) => current,
+                Ok(None) | Err(()) => continue,
+            };
+        if state.accounts.outside_protected(&account.id)
+            && (bound.as_ref().is_some_and(|source| source != &account.id)
+                || (bound.is_none() && !outside_last_resort))
+        {
+            continue;
+        }
         {
             let mut health = state.images.lock().unwrap_or_else(|e| e.into_inner());
             let h = health.observe(&account.id, account.generation, credential_key(&tokens));
@@ -740,6 +818,7 @@ pub(super) async fn relay(state: Arc<RelayState>, request: Request) -> Response 
             url.push('?');
             url.push_str(query);
         }
+        state.accounts.note_own_usage_send(&account.id);
         let upstream = match state
             .client
             .post(url)
@@ -1011,6 +1090,164 @@ fn retry_after(headers: &mut HeaderMap, at: chrono::DateTime<chrono::Utc>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ImageAdmissionFixture {
+        _root: tempfile::TempDir,
+        store: AccountStore,
+        ids: Vec<String>,
+        images: Mutex<ImageState>,
+    }
+
+    impl ImageAdmissionFixture {
+        fn new() -> Self {
+            let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../.sandbox/n10-image-admission");
+            std::fs::create_dir_all(&base).unwrap();
+            let root = tempfile::tempdir_in(base).unwrap();
+            let imports = root.path().join("imports");
+            std::fs::create_dir_all(&imports).unwrap();
+            let mut selectors = Vec::new();
+            for index in 0..2 {
+                let email = format!("synthetic-image-{index}@example.invalid");
+                std::fs::write(
+                    imports.join(format!("{index}.json")),
+                    serde_json::to_vec(&serde_json::json!({
+                        "type": "codex", "email": email,
+                        "account_id": format!("synthetic-image-{index}"),
+                        "access_token": format!("synthetic-image-access-{index}"),
+                        "refresh_token": "synthetic-image-refresh",
+                        "id_token": "synthetic-image-id",
+                        "expired": "2099-01-01T00:00:00Z",
+                        "last_refresh": "2026-01-01T00:00:00Z"
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+                selectors.push(format!("codex:{email}"));
+            }
+            let store = AccountStore::acquire(&root.path().join("home")).unwrap();
+            crate::accounts::import::run(&store, &imports, &selectors, false).unwrap();
+            let ids: Vec<_> = store.list().unwrap().into_iter().map(|a| a.id).collect();
+            for id in &ids {
+                store
+                    .update_metadata(id, |a| a.plan = Some("plus".into()))
+                    .unwrap();
+            }
+            Self {
+                _root: root,
+                store,
+                ids,
+                images: Mutex::new(ImageState::default()),
+            }
+        }
+
+        fn admit(
+            &self,
+            selected: usize,
+            bound: Option<&str>,
+            protected: &[&str],
+        ) -> Option<(Account, crate::accounts::Tokens, bool)> {
+            let _gate = self.store.transaction().unwrap();
+            current_account_unlocked(
+                &self.store,
+                &self.images,
+                &self.ids[selected],
+                bound,
+                &|id| protected.contains(&id),
+            )
+            .unwrap()
+        }
+    }
+
+    #[test]
+    fn n10_image_final_admission_rechecks_new_mark_and_current_metadata() {
+        let fixture = ImageAdmissionFixture::new();
+        // Candidate collection saw two usable, unmarked accounts. A mark that
+        // arrives afterward must be checked at the actual Store admission seam.
+        assert!(fixture.admit(0, None, &[]).is_some());
+        let marked = [fixture.ids[0].as_str()];
+        assert!(fixture.admit(0, None, &marked).is_none());
+        assert_eq!(
+            fixture.admit(1, None, &marked).unwrap().0.id,
+            fixture.ids[1]
+        );
+        fixture
+            .store
+            .update_metadata(&fixture.ids[1], |a| a.plan = Some("pro".into()))
+            .unwrap();
+        assert!(
+            fixture.admit(0, None, &marked).is_none(),
+            "a soft Pro last-resort preference does not remove a native alternative"
+        );
+        // A stale eligible candidate is not an alternative after a native drain.
+        fixture
+            .store
+            .update_metadata(&fixture.ids[1], |a| a.drain = true)
+            .unwrap();
+        let (account, _, last_resort) = fixture.admit(0, None, &marked).unwrap();
+        assert_eq!(account.id, fixture.ids[0]);
+        assert!(last_resort);
+        fixture
+            .store
+            .update_metadata(&fixture.ids[1], |a| a.drain = false)
+            .unwrap();
+        assert!(fixture.admit(0, None, &marked).is_none());
+    }
+
+    #[test]
+    fn n10_image_last_resort_checks_current_credentials_and_image_health() {
+        let fixture = ImageAdmissionFixture::new();
+        let marked = [fixture.ids[0].as_str()];
+        let mut alternative = fixture.store.load(&fixture.ids[1]).unwrap();
+        let mut tokens = fixture.store.tokens(&alternative).unwrap();
+        fixture.images.lock().unwrap().failure(
+            &alternative.id,
+            alternative.generation,
+            credential_key(&tokens),
+            true,
+            None,
+        );
+        assert!(fixture.admit(0, None, &marked).unwrap().2);
+        // A new credential makes the old image auth rejection inapplicable.
+        tokens.access_token = "synthetic-image-replacement".into();
+        alternative.token_meta.last_refresh_at =
+            Some(alternative.token_meta.last_refresh_at.unwrap() + chrono::Duration::seconds(1));
+        let generation = alternative.generation;
+        alternative = fixture
+            .store
+            .save(&alternative, &tokens, Some(generation))
+            .unwrap();
+        assert!(fixture.admit(0, None, &marked).is_none());
+        // Image quota remains independent of the new credential's auth status.
+        fixture.images.lock().unwrap().failure(
+            &alternative.id,
+            alternative.generation,
+            credential_key(&tokens),
+            false,
+            Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+        );
+        assert!(fixture.admit(0, None, &marked).unwrap().2);
+    }
+
+    #[test]
+    fn n10_image_outside_protection_preserves_exact_bound_source() {
+        let fixture = ImageAdmissionFixture::new();
+        let marked = [fixture.ids[0].as_str()];
+        assert!(fixture.admit(0, Some(&fixture.ids[1]), &marked).is_none());
+        let (account, _, last_resort) = fixture.admit(0, Some(&fixture.ids[0]), &marked).unwrap();
+        assert_eq!(account.id, fixture.ids[0]);
+        assert!(!last_resort);
+        fixture
+            .store
+            .update_metadata(&fixture.ids[1], |a| a.drain = true)
+            .unwrap();
+        assert!(
+            fixture.admit(0, Some(&fixture.ids[1]), &marked).is_none(),
+            "having no alternative cannot override an existing source's destination veto"
+        );
+        let all_protected = [fixture.ids[0].as_str(), fixture.ids[1].as_str()];
+        assert!(fixture.admit(0, None, &all_protected).unwrap().2);
+    }
 
     #[test]
     fn fragmented_edit_admission_has_logarithmic_records_and_returns_all_budget() {

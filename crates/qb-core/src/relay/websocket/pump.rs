@@ -369,6 +369,9 @@ impl RateBudget {
     }
 
     fn note_usage_send(&self, context: &Context) {
+        if let Some(runtime) = &context.runtime {
+            runtime.note_own_usage_send(&context.account);
+        }
         if let Some(relay) = &context.relay {
             let asof = relay.bindings.begin_usage_observation_for(&context.account);
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1653,6 +1656,12 @@ where
             );
         }
         if matches!(message, Message::Text(_) | Message::Binary(_)) {
+            // Opaque/observer data can also consume usage. Control frames do
+            // not taint outside-use attribution, but every possible data send
+            // must be fenced even when it is not a typed response.create.
+            if let Some(runtime) = &context.runtime {
+                runtime.note_own_usage_send(&context.account);
+            }
             rate.initial_dispatch();
             rate.record_forced_send(context.runtime.as_ref(), &context.account);
         }

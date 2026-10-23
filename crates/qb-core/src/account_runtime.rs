@@ -1,3 +1,5 @@
+mod outside_owner;
+mod outside_usage;
 mod wait_admission;
 mod wait_owner;
 mod wait_proof;
@@ -885,6 +887,7 @@ pub struct QuotaObservation {
 
 pub struct AccountRuntime {
     pub store: Arc<AccountStore>,
+    outside_owner: Arc<outside_owner::OutsideOwner>,
     wait_owner: Arc<wait_owner::WaitOwner>,
     obs: Arc<Observability>,
     events: broadcast::Sender<Value>,
@@ -892,7 +895,7 @@ pub struct AccountRuntime {
     probes: Mutex<BTreeSet<String>>,
     released_quota: Arc<Mutex<BTreeMap<String, ReleasedQuota>>>,
     volatile: Mutex<BTreeMap<String, Health>>,
-    inflight: Mutex<BTreeMap<String, usize>>,
+    inflight: Arc<Mutex<BTreeMap<String, usize>>>,
     poller: Mutex<Option<Weak<crate::quota::UsagePoller>>>,
     refresh_attention: Mutex<BTreeSet<String>>,
     pacing: Mutex<BTreeMap<String, PacingState>>,
@@ -1085,6 +1088,7 @@ impl AccountRuntime {
         }));
         }
         Arc::new(Self {
+            outside_owner: Arc::new(outside_owner::OutsideOwner::new(store.home())),
             store,
             wait_owner,
             obs,
@@ -1093,7 +1097,7 @@ impl AccountRuntime {
             probes: Mutex::new(BTreeSet::new()),
             released_quota: Arc::new(Mutex::new(BTreeMap::new())),
             volatile: Mutex::new(BTreeMap::new()),
-            inflight: Mutex::new(BTreeMap::new()),
+            inflight: Arc::new(Mutex::new(BTreeMap::new())),
             poller: Mutex::new(None),
             refresh_attention: Mutex::new(BTreeSet::new()),
             pacing: Mutex::new(BTreeMap::new()),
@@ -2241,7 +2245,7 @@ impl AccountRuntime {
                 && !takeover_fenced.contains(&a.id) && !self.blocked_in_memory(&a.id);
             let health = if pending { json!({"kind":"cooling","reason":"auth","until":Utc::now(),"scope":"account","probe_pending":true}) } else { json!(health) };
             let usage_forecast = visible_usage_forecast(self.obs.dashboard().usage_forecast(&a.id, now, None), &quota, credits_in_use);
-            json!({"pool_eligible":a.user_state == UserState::Active && !pending && !takeover_fenced.contains(&a.id) && health["kind"] == "ready","takeover_pending":takeover_fenced.contains(&a.id),"quota_cooling":a.quota_cooling,"quota_credit_releasable":quota_credit_releasable,"observed_at":quota["observed_at"],"quota_notice":quota_notice,"credits_in_use":credits_in_use,"usage_forecast":usage_forecast,"has_alternative":has_alternative,"id":a.id,"generation":a.generation,"last_refresh_at":a.token_meta.last_refresh_at,"provider":a.provider,"label":a.label,"email":a.email,"plan":quota["plan"].as_str().map(str::to_owned).or(a.plan.clone()),"user_state":a.user_state,"source":a.source,"health":health,"probe_pending":pending,"pacing":{"backoff_until":backoff_until,"step":pacing.rate_step,"release_interval_ms":pacing.rate_release_interval.as_millis() as u64,"waiting":pacing.waiting},"windows":quota["windows"].as_array().cloned().unwrap_or_default(),"credits":quota["credits"],"last_used_at":null,"bound_sessions":0,"token_expires_at":a.token_meta.expires_at,"drain":a.drain,"allow_credits":a.allow_credits,"refresh_attention":takeover_fenced.contains(&a.id) || self.refresh_attention.lock().map(|f|f.contains(&a.id)).unwrap_or(false)})
+            json!({"outside_used":self.outside_used(&a.id),"pool_eligible":a.user_state == UserState::Active && !pending && !takeover_fenced.contains(&a.id) && health["kind"] == "ready","takeover_pending":takeover_fenced.contains(&a.id),"quota_cooling":a.quota_cooling,"quota_credit_releasable":quota_credit_releasable,"observed_at":quota["observed_at"],"quota_notice":quota_notice,"credits_in_use":credits_in_use,"usage_forecast":usage_forecast,"has_alternative":has_alternative,"id":a.id,"generation":a.generation,"last_refresh_at":a.token_meta.last_refresh_at,"provider":a.provider,"label":a.label,"email":a.email,"plan":quota["plan"].as_str().map(str::to_owned).or(a.plan.clone()),"user_state":a.user_state,"source":a.source,"health":health,"probe_pending":pending,"pacing":{"backoff_until":backoff_until,"step":pacing.rate_step,"release_interval_ms":pacing.rate_release_interval.as_millis() as u64,"waiting":pacing.waiting},"windows":quota["windows"].as_array().cloned().unwrap_or_default(),"credits":quota["credits"],"last_used_at":null,"bound_sessions":0,"token_expires_at":a.token_meta.expires_at,"drain":a.drain,"allow_credits":a.allow_credits,"refresh_attention":takeover_fenced.contains(&a.id) || self.refresh_attention.lock().map(|f|f.contains(&a.id)).unwrap_or(false)})
         }).collect())
     }
 
@@ -2425,6 +2429,7 @@ impl AccountRuntime {
                 &reported,
                 model,
                 (origin, publication),
+                None,
             )
             .await
             .ok();
@@ -2554,6 +2559,7 @@ impl AccountRuntime {
             reported,
             model,
             (origin, wait_owner::ReportPublication::Immediate),
+            None,
         )
         .await
         .map(|(account, _)| account)
@@ -2566,6 +2572,7 @@ impl AccountRuntime {
         reported: &Value,
         model: Option<&str>,
         publication: (Option<ReportOrigin>, wait_owner::ReportPublication),
+        outside: Option<outside_owner::PollApplication>,
     ) -> Result<(Account, Option<PendingHttp429>), ()> {
         let (origin, publication) = publication;
         let reported = reported.clone();
@@ -2576,6 +2583,8 @@ impl AccountRuntime {
         let account_id = id.to_owned();
         let model = model.map(str::to_owned);
         let released_quota = self.released_quota.clone();
+        let outside_owner = self.outside_owner.clone();
+        let outside_inflight = self.inflight.clone();
         let (account, snapshot, pending) = tokio::task::spawn_blocking(move || -> Result<_, ()> {
             let _guard = store.transaction().map_err(|_| ())?;
             // Consume the pre-send ordinal before classification, even for a
@@ -2665,6 +2674,24 @@ impl AccountRuntime {
                 &snapshot,
                 model.as_deref(),
             );
+            let publish_outside = ran && !store.writes_stopped() && outside.is_some();
+            if publish_outside
+                && let Some(outside_owner::PollApplication {
+                    origin: Some(origin),
+                }) = outside
+            {
+                let active = outside_inflight
+                    .lock()
+                    .map(|counts| counts.get(&account_id).copied().unwrap_or(0) > 0)
+                    .unwrap_or(true);
+                outside_owner.observe(&account_id, &reported, origin, active);
+            }
+            // Native selection can take the inverse Store/bindings order.
+            // Finish persistence, release Store, then publish under mutations.
+            drop(_guard);
+            if publish_outside {
+                outside_owner.publish();
+            }
             Ok((account, snapshot, pending))
         })
         .await

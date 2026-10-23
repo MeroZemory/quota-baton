@@ -79,6 +79,16 @@ impl RelayState {
         self.ws_capacity.waits_for_test()
     }
 
+    #[cfg(feature = "testkit")]
+    pub fn pause_next_ws_own_wait(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.ws_capacity.pause_own_wait()
+    }
+
     pub fn ws_reserved_for_test(&self, account: &str) -> usize {
         self.ws_capacity.reserved_for_test(account)
     }
@@ -359,6 +369,7 @@ async fn upgrade_inner(
         .checked_sub(Duration::from_millis(100))
         .unwrap_or(deadline);
     let mut quota_source: Option<String> = None;
+    let mut own_wait: Option<capacity::OwnWait> = None;
     let (upstream, upstream_headers, account, tokens, capacity_permit) = 'accounts: loop {
         if tried.len() == 4 {
             if let Some(id) = quota_source.take() {
@@ -373,18 +384,102 @@ async fn upgrade_inner(
                 }
             };
         }
-        // Preserve ordinary sticky selection while there is room. Capacity is
-        // a WS-only exclusion: normal routing may move to another eligible
-        // account; strict anchors stay anchored and wait for their slot.
-        let capped = state.ws_capacity.capped();
+        // Recovery authority precedes any capacity queue. The source remains
+        // only a hint; final selection and spill admission revalidate it.
+        let binding_hint = {
+            let table = state.bindings.clone();
+            let key = session.key.clone();
+            tokio::task::spawn_blocking(move || {
+                let policy = table.routing_plan(key.as_deref());
+                if policy.settings.mode == crate::routing::Mode::Strict
+                    && (table.policies.strict_dispatch_blocked()
+                        || policy
+                            .anchor
+                            .as_deref()
+                            .is_some_and(|anchor| !table.permits_dispatch(key.as_deref(), anchor)))
+                {
+                    return Err(());
+                }
+                Ok(table.capacity_source(key.as_deref()))
+            })
+        };
+        let source = match tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(launch_deadline) => return capacity_timeout(),
+            _ = state.wait_for_drain_start() => return handover_response(),
+            result = binding_hint => result,
+        } {
+            Ok(Ok(source)) => source,
+            Ok(Err(())) => {
+                completion.policy_blocked = true;
+                return state
+                    .unavailable(completion, Provider::Codex, true, None)
+                    .await;
+            }
+            Err(_) => return network_failure(),
+        };
+        let mut capped = state.ws_capacity.capped();
+        if own_wait.as_ref().is_some_and(|wait| {
+            source.as_deref() != Some(wait.source()) || tried.contains(wait.source())
+        }) {
+            own_wait = None;
+        }
+        if own_wait.is_none()
+            && let Some(source) = source.as_deref().filter(|source| !tried.contains(*source))
+        {
+            own_wait = capacity::OwnWait::start(&state.ws_capacity, source, deadline);
+            if own_wait.is_none() {
+                // A release between the snapshot and start must not exclude the
+                // source after it already regained its own slot.
+                capped.remove(source);
+            }
+        }
+        let spill_source = own_wait
+            .as_ref()
+            .and_then(|wait| wait.spill_source(&state.ws_capacity));
+        if let Some(wait) = own_wait.as_mut()
+            && capped.contains(wait.source())
+            && spill_source.is_none()
+        {
+            completion.end_attempt();
+            wait.wait_once(&state.ws_capacity).await;
+            continue;
+        }
+        // A slot returned during the grace gets one source-only native choice,
+        // including in Rebalance. This changes eligibility, never authority.
+        let preferred_source = own_wait
+            .as_ref()
+            .filter(|wait| !capped.contains(wait.source()))
+            .map(|wait| wait.source().to_owned());
         // A local cap is not evidence that a managed launch's account failed.
         // Keep its healthy binding and let the reservation refusal wait below.
-        let excluded = if managed.is_some() {
+        let mut excluded = if managed.is_some() {
             tried.clone()
         } else {
             tried.union(&capped).cloned().collect()
         };
-        let reserved = Arc::new(std::sync::Mutex::new(None));
+        if let Some(source) = &preferred_source {
+            let candidates = match tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(launch_deadline) => return capacity_timeout(),
+                _ = state.wait_for_drain_start() => return handover_response(),
+                result = state.candidates(
+                    Provider::Codex, session.key.as_deref(), session.model.as_deref(), &tried,
+                ) => result,
+            } {
+                Ok(candidates) => candidates,
+                Err(_) => return network_failure(),
+            };
+            excluded.extend(candidates.into_iter().filter_map(|candidate| {
+                (candidate.account.id != *source).then_some(candidate.account.id)
+            }));
+        }
+        let reserved = Arc::new(std::sync::Mutex::new(
+            None::<(
+                capacity::Permit,
+                Option<crate::bindings::CapacitySpillPermit>,
+            )>,
+        ));
         let admission_denied = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let admit = {
             let state = state.clone();
@@ -392,6 +487,9 @@ async fn upgrade_inner(
             // Only this live future owns the strong reservation container.
             let owner = Arc::downgrade(&reserved);
             let denied = admission_denied.clone();
+            let key = session.key.clone();
+            let preferred = preferred_source.clone();
+            let failed = tried.clone();
             Arc::new(move |account: &str| {
                 #[cfg(feature = "testkit")]
                 state.ws_capacity.before_admission();
@@ -401,11 +499,61 @@ async fn upgrade_inner(
                 let Some(reserved) = owner.upgrade() else {
                     return false;
                 };
-                let permit = state.ws_capacity.reserve(account);
-                denied.store(permit.is_none(), Ordering::Release);
-                let allowed = permit.is_some();
-                *reserved.lock().unwrap_or_else(|e| e.into_inner()) = permit;
-                allowed
+                if let Some(source) = &preferred
+                    && (account != source
+                        || state.bindings.capacity_source(key.as_deref()).as_deref()
+                            != Some(source.as_str()))
+                {
+                    denied.store(true, Ordering::Release);
+                    return false;
+                }
+                let Some(permit) = state.ws_capacity.reserve(account) else {
+                    denied.store(true, Ordering::Release);
+                    return false;
+                };
+                let current_source = state.bindings.capacity_source(key.as_deref());
+                if let Some(source) = current_source.as_deref()
+                    && source != account
+                    && !failed.contains(source)
+                    && state.ws_capacity.is_capped(source)
+                    && spill_source
+                        .as_ref()
+                        .is_none_or(|proof| proof.source() != source)
+                {
+                    // A cap/binding change after collection cannot manufacture
+                    // an exhausted own-wait for the newly observed source.
+                    denied.store(true, Ordering::Release);
+                    return false;
+                }
+                // Capacity is reserved before the atomic spill fence, and both
+                // reservations roll back if publication/caller ownership fails.
+                let spill = if let Some(source) = &spill_source
+                    && account != source.source()
+                {
+                    if !source.still_capped(&state.ws_capacity) {
+                        denied.store(true, Ordering::Release);
+                        return false;
+                    }
+                    match state.bindings.admit_capacity_spill(
+                        key.as_deref(),
+                        source.source(),
+                        account,
+                    ) {
+                        Ok(spill) => Some(spill),
+                        Err(()) => {
+                            denied.store(true, Ordering::Release);
+                            return false;
+                        }
+                    }
+                } else {
+                    None
+                };
+                let mut reserved = reserved.lock().unwrap_or_else(|e| e.into_inner());
+                if state.is_draining() || std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                *reserved = Some((permit, spill));
+                true
             })
         };
         completion.policy_blocked = false;
@@ -450,6 +598,16 @@ async fn upgrade_inner(
                         .unavailable(completion, Provider::Codex, true, None)
                         .await;
                 }
+                if preferred_source.is_some()
+                    && !admission_denied.load(Ordering::Acquire)
+                    && !completion.policy_blocked
+                {
+                    // The returned slot did not make its source natively
+                    // eligible. Recollect through the ordinary policy path.
+                    own_wait = None;
+                    completion.end_attempt();
+                    continue;
+                }
                 // Preview the actual routing decision with only capacity
                 // exclusions removed. In particular, unrelated full accounts
                 // cannot mask an unavailable strict anchor or drain policy.
@@ -480,11 +638,14 @@ async fn upgrade_inner(
             }
             Err(_) => return network_failure(),
         };
-        let capacity_permit = reserved
+        let (capacity_permit, spill_permit) = reserved
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
             .expect("selected WS account has an admitted slot");
+        if let Some(spill) = spill_permit {
+            spill.commit();
+        }
         tried.insert(account.id.clone());
         let (mut account, mut tokens) = match state
             .tokens
