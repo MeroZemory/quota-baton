@@ -371,6 +371,22 @@ impl UsagePoller {
         self.poll_reason(id, None).await
     }
     async fn poll_reason(&self, id: &str, placement: Option<u64>) -> Result<Account, PollError> {
+        self.poll_reason_observed(id, placement, false)
+            .await
+            .map(|(account, _)| account)
+    }
+    pub(crate) async fn poll_ws_quota(
+        &self,
+        id: &str,
+    ) -> Result<(Account, Option<crate::account_runtime::ObservedUsagePoll>), PollError> {
+        self.poll_reason_observed(id, None, true).await
+    }
+    async fn poll_reason_observed(
+        &self,
+        id: &str,
+        placement: Option<u64>,
+        capture_receipt: bool,
+    ) -> Result<(Account, Option<crate::account_runtime::ObservedUsagePoll>), PollError> {
         let account = self.load(id).await?;
         if account.user_state == UserState::Disabled
             || (matches!(account.health, Health::NeedsRelogin { .. })
@@ -540,13 +556,34 @@ impl UsagePoller {
                     .await
                     .map_err(|_| PollError::Unavailable)?;
             }
-            let account = self
-                .runtime
-                .apply_polled_quota_snapshot(id, snapshot, &reported, wait_origin, outside_origin)
-                .await
-                .map_err(|_| PollError::Unavailable)?;
+            let (account, receipt) =
+                if capture_receipt && account.provider == Provider::Codex && replace_windows {
+                    self.runtime
+                        .apply_polled_quota_snapshot_observed(
+                            id,
+                            snapshot,
+                            &reported,
+                            wait_origin,
+                            outside_origin,
+                        )
+                        .await
+                        .map_err(|_| PollError::Unavailable)?
+                } else {
+                    let account = self
+                        .runtime
+                        .apply_polled_quota_snapshot(
+                            id,
+                            snapshot,
+                            &reported,
+                            wait_origin,
+                            outside_origin,
+                        )
+                        .await
+                        .map_err(|_| PollError::Unavailable)?;
+                    (account, None)
+                };
             reservation.succeeded = true;
-            return Ok(account);
+            return Ok((account, receipt));
         }
         Err(PollError::Unavailable)
     }
@@ -1240,6 +1277,9 @@ mod tests {
             clock.placement_polled_through.is_none(),
             "refused placement poll spends no placement trigger"
         );
+    }
+    mod ws_poll_receipt_tests {
+        include!("quota/ws_poll_receipt_tests.rs");
     }
     include!("quota/profile_tests.rs");
 }

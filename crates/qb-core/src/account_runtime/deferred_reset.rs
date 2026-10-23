@@ -370,6 +370,60 @@ impl AccountRuntime {
             }),
         )
     }
+    /// Actual WS producer: original full C9 receipt plus one physically sent
+    /// create on the same account/root/model. Transport witness is consumed
+    /// inside the existing Store, runtime, binding and policy gates.
+    pub(crate) fn register_ws_deferred_reset(
+        &self,
+        bindings: &BindingTable,
+        request: HttpWaitRequest<'_>,
+        observed: &super::wait_owner::ObservedUsagePoll,
+        pin: &LaunchPin,
+        candidate: crate::relay::WsQuotaCandidate,
+    ) -> Result<Option<(DeferredResetId, LaunchOwnerScope)>, ()> {
+        let Some(scope) = pin.deferred_owner_scope() else {
+            return Ok(None);
+        };
+        if !scope.matches_pin(pin) {
+            return Ok(None);
+        }
+        let _transaction = self.store.transaction().map_err(|_| ())?;
+        let released = self.released_quota.lock().map_err(|_| ())?;
+        let probes = self.probes.lock().map_err(|_| ())?;
+        let volatile = self.volatile.lock().map_err(|_| ())?;
+        let Some(id) = request.expected_source else {
+            return Ok(None);
+        };
+        if self.store.writes_stopped()
+            || probes.contains(id)
+            || volatile.contains_key(id)
+            || released.get(id).is_some_and(|release| release.pending)
+        {
+            return Ok(None);
+        }
+        let account = self.store.read_account_unlocked(id).map_err(|_| ())?;
+        if !self.deferred_credentials_current(&account) {
+            return Ok(None);
+        }
+        let key = request.key;
+        let model = request.model;
+        Ok(
+            bindings.with_deferred_launch(request, &scope, None, |intent, binding, policy| {
+                candidate
+                    .with_current(id, key, model, || {
+                        let qualification = self
+                            .wait_owner
+                            .qualify_deferred_ws_poll_unlocked(observed, intent, &account)?;
+                        self.wait_owner
+                            .deferred
+                            .register(&scope, intent, qualification, &account, binding, policy)
+                            .map(|id| (id, scope.clone()))
+                    })
+                    .flatten()
+            }),
+        )
+    }
+
     /// Initial producer facade: preserves the opaque fallback's exact original
     /// proof and owner before fresh registration gates; never reacquires a proof.
     pub(crate) fn register_initial_deferred_reset(

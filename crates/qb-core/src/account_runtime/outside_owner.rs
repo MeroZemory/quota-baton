@@ -418,6 +418,47 @@ impl super::AccountRuntime {
         self.outside_owner.capture(id, active)
     }
 
+    /// Called only for a complete Codex poll response by the C9 producer.
+    /// Raw native classification and exact mint/acquire remain under Store.
+    pub(crate) async fn apply_polled_quota_snapshot_observed(
+        &self,
+        id: &str,
+        snapshot: Value,
+        reported: &Value,
+        wait_origin: Option<super::ReportOrigin>,
+        outside_origin: Option<PollOrigin>,
+    ) -> Result<
+        (
+            crate::accounts::Account,
+            Option<super::wait_owner::ObservedUsagePoll>,
+        ),
+        (),
+    > {
+        self.apply_quota_snapshot_reported_inner(
+            id,
+            snapshot,
+            reported,
+            None,
+            (
+                wait_origin,
+                super::wait_owner::ReportPublication::ImmediatePollReceipt,
+            ),
+            Some(PollApplication {
+                origin: outside_origin,
+            }),
+        )
+        .await
+        .map(|(account, receipt)| {
+            (
+                account,
+                receipt.and_then(|receipt| match receipt {
+                    super::wait_owner::ReportReceipt::Poll(receipt) => Some(receipt),
+                    super::wait_owner::ReportReceipt::Http(_) => None,
+                }),
+            )
+        })
+    }
+
     /// Poll-only raw report. The existing wait provenance/model stays intact.
     pub(crate) async fn apply_polled_quota_snapshot(
         &self,

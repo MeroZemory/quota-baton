@@ -36,6 +36,17 @@ pub(crate) struct ObservedHttp429 {
     native: WaitTicket,
 }
 
+/// Only the exact accepted UsagePoll application can construct this receipt.
+/// It is not dispatch, native command or deferred registration authority.
+pub(crate) struct ObservedUsagePoll {
+    native: WaitTicket,
+}
+
+pub(super) enum ReportReceipt {
+    Http(PendingHttp429),
+    Poll(ObservedUsagePoll),
+}
+
 struct KnownQuotaBody {
     reset_at: DateTime<Utc>,
     model: Option<String>,
@@ -171,6 +182,7 @@ impl ShortQuotaProof {
 
 pub(super) enum ReportPublication {
     Immediate,
+    ImmediatePollReceipt,
     DeferredHttp429,
 }
 
@@ -406,16 +418,25 @@ impl WaitOwner {
         intent: &crate::bindings::WaitIntent<'_>,
         account: &Account,
     ) -> Option<()> {
+        self.observed_far_wait_unlocked(&observed.native, intent, account)
+    }
+
+    fn observed_far_wait_unlocked(
+        &self,
+        ticket: &WaitTicket,
+        intent: &crate::bindings::WaitIntent<'_>,
+        account: &Account,
+    ) -> Option<()> {
         if account.id != intent.account()
             || account.provider != intent.provider()
-            || observed.native.account_id() != account.id
+            || ticket.account_id() != account.id
             || !intent.existing_placement()
             || intent.plan().settings.mode == crate::routing::Mode::Strict
             || intent.plan().settings.on_5h_limit != crate::routing::On5hLimit::Wait
         {
             return None;
         }
-        let proof = self.proofs.admit(&observed.native).ok()?;
+        let proof = self.proofs.admit(ticket).ok()?;
         let wall = Utc::now();
         let mono = tokio::time::Instant::now();
         if !proof.applies_to(intent.model()) || !proof.matches_current(account, wall) {
@@ -429,7 +450,7 @@ impl WaitOwner {
             return None;
         }
         // Recheck the exact physical report after classification/clock work.
-        self.proofs.admit(&observed.native).ok()?;
+        self.proofs.admit(ticket).ok()?;
         Some(())
     }
 
@@ -440,6 +461,23 @@ impl WaitOwner {
         account: &Account,
     ) -> Option<super::deferred_reset::PhysicalQualification> {
         self.observed_http_far_wait_unlocked(observed, intent, account)?;
+        let proof = self.proofs.admit(&observed.native).ok()?;
+        Some(super::deferred_reset::PhysicalQualification {
+            reset_at: proof.reset_at,
+            started_at: proof.started_at,
+            scope: proof.scope.clone(),
+            allow_credits: proof.allow_credits,
+            quota_credit_releasable: proof.quota_credit_releasable,
+        })
+    }
+
+    pub(super) fn qualify_deferred_ws_poll_unlocked(
+        &self,
+        observed: &ObservedUsagePoll,
+        intent: &crate::bindings::WaitIntent<'_>,
+        account: &Account,
+    ) -> Option<super::deferred_reset::PhysicalQualification> {
+        self.observed_far_wait_unlocked(&observed.native, intent, account)?;
         let proof = self.proofs.admit(&observed.native).ok()?;
         Some(super::deferred_reset::PhysicalQualification {
             reset_at: proof.reset_at,
@@ -913,7 +951,7 @@ impl ReportApplication {
     // Store remains held from this response's native final classification through
     // mint/acquire. Every competing report publisher also requires Store. A cut
     // can only decline the token; later reports cannot substitute their evidence.
-    fn finish_http(mut self, candidate: Option<ShortQuotaProof>) -> Option<ObservedHttp429> {
+    fn finish_ticket(mut self, candidate: Option<ShortQuotaProof>) -> Option<WaitTicket> {
         let proof = candidate?;
         if !proof.valid_at(Utc::now()) {
             return None;
@@ -925,7 +963,23 @@ impl ReportApplication {
         minted.ok()?;
         owner.requalify_deferred(&self.id);
         let (native, _) = owner.proofs.acquire(&self.id).ok()?;
-        Some(ObservedHttp429 { native })
+        Some(native)
+    }
+
+    fn finish_http(self, candidate: Option<ShortQuotaProof>) -> Option<ObservedHttp429> {
+        self.finish_ticket(candidate)
+            .map(|native| ObservedHttp429 { native })
+    }
+
+    pub(super) fn finish_poll(
+        self,
+        candidate: Option<ShortQuotaProof>,
+    ) -> Option<ObservedUsagePoll> {
+        if self.permit.as_ref()?.source() != ReportSource::UsagePoll {
+            return None;
+        }
+        self.finish_ticket(candidate)
+            .map(|native| ObservedUsagePoll { native })
     }
 
     pub(super) fn seal_http(
