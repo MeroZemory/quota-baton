@@ -2,6 +2,9 @@
 use crate::{sessions_db as db, sessions_discovery as discovery, sessions_guard as guard};
 
 pub(crate) fn friendly_error(error: &anyhow::Error) -> Option<String> {
+    if let Some(message) = crate::sessions_progress::friendly_error(error) {
+        return Some(message);
+    }
     if let Some(provider) = error.downcast_ref::<crate::sessions_db::UnsupportedProvider>() {
         return Some(provider.to_string());
     }
@@ -53,7 +56,12 @@ pub(crate) fn friendly_error(error: &anyhow::Error) -> Option<String> {
         "압축된 rollout 또는 .zst 형제가 있습니다. sessions unimport 후 다시 가져오세요",
         "가져온 대화의 메타데이터가 없습니다",
         "오래된 기록을 다른 대화가 사용합니다. --clean-stale 없이 다시 시도하세요",
-        "확인 입력이 일치하지 않아 취소했습니다.",
+        "취소했습니다. 아무것도 바뀌지 않았습니다.",
+        "Cancelled. Nothing was changed.",
+        "이동 중단 처리를 준비하지 못했습니다",
+        "이전 이동 복구를 터미널에서 finish/rollback으로 선택하세요. 스크립트는 --yes를 사용하세요.",
+        "게시가 확정된 이동은 되돌릴 수 없습니다. finish로 먼저 복구하세요.",
+        "이전 이동을 되돌렸습니다. 원본 홈에서 대화를 다시 열어 주세요.",
         "표준 입력과 출력이 모두 터미널이어야 합니다. 수동 명령을 실행해 주세요.",
         "확인 안내를 출력하지 못했습니다.",
         "확인 입력을 읽지 못해 취소했습니다.",
@@ -96,6 +104,11 @@ use std::{
 // D21 panel chose move; sharing remains an explicit user choice.
 const DEFAULT_KEEP_SOURCE: bool = false;
 
+fn progress_english(home: &Path) -> bool {
+    qb_core::config::Config::load(home)
+        .is_ok_and(|config| config.ui.language == qb_core::config::UiLanguage::En)
+}
+
 #[derive(Subcommand)]
 pub(crate) enum SessionsCommand {
     #[command(about = "실행 중인 코어에서 루트 세션의 5시간 제한 긴급 전환을 설정합니다")]
@@ -127,6 +140,8 @@ pub(crate) enum SessionsCommand {
         yes: bool,
         #[arg(long, conflicts_with = "list")]
         clean_stale: bool,
+        #[arg(long)]
+        verbose: bool,
     },
     #[command(about = "가져온 대화의 연결만 되돌립니다")]
     Unimport {
@@ -866,44 +881,85 @@ fn update_index(target: &Path, entries: &[String], remove: bool) -> Result<()> {
     Ok(())
 }
 
-fn preview(id: &str, files: &[discovery::Rollout], target: &Path) -> Result<()> {
-    let bytes: u64 = files.iter().map(|file| file.bytes).sum();
-    crate::print_stdout(format_args!("기록 크기: {bytes}바이트"))?;
-    crate::print_stdout(format_args!(
-        "대화 {id}: 기록 {}개를 연결합니다",
-        files.len()
-    ))?;
-    for item in files {
-        crate::print_stdout(format_args!(
-            "{} → {}",
-            item.path.display(),
-            target.join("sessions").join(&item.relative).display()
-        ))?;
-        if item.thread != id {
-            crate::print_stdout(format_args!(
-                "원본에 남는 조상 기록: {}",
-                item.path.display()
-            ))?;
+fn preview(
+    id: &str,
+    files: &[discovery::Rollout],
+    target: &Path,
+    database: &db::DbPlan,
+) -> Result<()> {
+    use crate::sessions_presentation::{
+        self as presentation, FileLink, Language, Preview, Verbose,
+    };
+    crate::sessions_progress::phase(crate::sessions_progress::Phase::Preview, None)?;
+    let thread = database.threads.iter().find(|t| t.id == id);
+    let text = |row: Option<&db::RowSnapshot>, key: &str| -> Option<String> {
+        match row?.values.get(key)? {
+            db::DbValue::Text(bytes) => String::from_utf8(bytes.clone()).ok(),
+            _ => None,
         }
-    }
-    crate::print_stdout(format_args!(
-        "move는 원본 이름과 대화 항목을 제거합니다. 다른 대화에 필요한 기록의 이동은 거절합니다."
-    ))?;
-    crate::print_stdout(format_args!("돌려보내기: quota-baton sessions return {id}"))?;
-    crate::print_stdout(format_args!("계속하기: codex-qb resume {id}"))?;
+    };
+    let title = thread
+        .and_then(|t| text(t.thread.as_ref(), "title"))
+        .or_else(|| {
+            thread
+                .and_then(|t| t.latest_index_entry.as_ref())
+                .and_then(|entry| entry["thread_name"].as_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_default();
+    let before = thread.and_then(|t| t.source_goal_status.as_deref());
+    let after = thread.and_then(|t| text(t.goal.as_ref(), "status"));
+    let names = files
+        .iter()
+        .map(|file| {
+            (
+                file.path.to_string_lossy().into_owned(),
+                target
+                    .join("sessions")
+                    .join(&file.relative)
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let links = names
+        .iter()
+        .map(|(source, target)| FileLink { source, target })
+        .collect::<Vec<_>>();
+    let ancestors = files
+        .iter()
+        .filter(|f| f.thread != id)
+        .map(|f| f.thread.as_str())
+        .collect::<Vec<_>>();
+    let profile = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let source = database.source_home.to_string_lossy();
+    let target = target.to_string_lossy();
+    let body = presentation::format_body(
+        if crate::sessions_progress::english() {
+            Language::En
+        } else {
+            Language::Ko
+        },
+        &Preview {
+            id,
+            title: &title,
+            bytes: files.iter().map(|f| f.bytes).sum(),
+            source_home: &source,
+            target_home: &target,
+            profile_home: &profile,
+            goal_before: before,
+            goal_after: after.as_deref(),
+            verbose: crate::sessions_progress::verbose().then_some(Verbose {
+                files: &links,
+                ancestors: &ancestors,
+            }),
+        },
+    );
+    crate::print_stdout(format_args!("{body}"))?;
     Ok(())
-}
-
-fn goal_status(value: &str) -> &'static str {
-    match value {
-        "active" => "진행 중",
-        "usage_limited" => "사용량 한도 대기",
-        "paused" => "일시정지",
-        "blocked" => "외부 조건 대기",
-        "budget_limited" => "예산 소진",
-        "complete" => "완료",
-        _ => "알 수 없음",
-    }
 }
 
 fn verify_links(entry: &Import, growth: bool) -> Result<()> {
@@ -1039,6 +1095,7 @@ fn preview_imports(
         ) {
             Ok(_) => included.push(id.clone()),
             Err(error) if bulk => {
+                crate::sessions_progress::check()?;
                 let class = import_refusal_class(&error);
                 refused[class] += 1;
                 crate::print_stdout(format_args!(
@@ -1057,6 +1114,18 @@ pub(crate) fn run(home: &Path, command: SessionsCommand) -> Result<()> {
         !matches!(&command, SessionsCommand::Urgent { .. }),
         "긴급 정책은 실행 중인 코어에 요청해야 합니다"
     );
+    let id = match &command {
+        SessionsCommand::Import { id, .. } => id.first().map(String::as_str).unwrap_or("all"),
+        SessionsCommand::Return { id, .. }
+        | SessionsCommand::Recover { id, .. }
+        | SessionsCommand::Unimport { id, .. } => id,
+        SessionsCommand::Urgent { .. } => unreachable!(),
+    };
+    let _progress = if matches!(&command, SessionsCommand::Import { .. }) {
+        crate::sessions_progress::Operation::begin(id, progress_english(home))?
+    } else {
+        crate::sessions_progress::Operation::begin_existing(id, progress_english(home))?
+    };
     run_with_store(Store::open(home)?, command)
 }
 
@@ -1076,7 +1145,7 @@ fn run_with_store(mut store: Store, command: SessionsCommand) -> Result<()> {
         SessionsCommand::Urgent { .. } => bail!("긴급 정책은 실행 중인 코어에 요청해야 합니다"),
         SessionsCommand::Import {
             from,
-            id,
+            mut id,
             all,
             list,
             apply,
@@ -1084,7 +1153,9 @@ fn run_with_store(mut store: Store, command: SessionsCommand) -> Result<()> {
             move_source,
             yes,
             clean_stale,
+            verbose,
         } => {
+            crate::sessions_progress::set_verbose(verbose);
             ensure!(
                 !id.is_empty() || all || list,
                 "대화 ID, --all 또는 --list를 지정하세요"
@@ -1095,6 +1166,23 @@ fn run_with_store(mut store: Store, command: SessionsCommand) -> Result<()> {
                 None
             };
             let mut keep_source = !move_source && (keep_source || DEFAULT_KEEP_SOURCE);
+            crate::sessions_progress::phase(crate::sessions_progress::Phase::Searching, None)?;
+            // Resolve an interrupted exact-id move before scanning its now
+            // partially removed source home. Recovery still owns all fences.
+            if apply {
+                let mut remaining = Vec::new();
+                for requested in &id {
+                    match staged::offer_recovery(&store, requested, yes)? {
+                        Some(false) => return Ok(()),
+                        Some(true) => {}
+                        None => remaining.push(requested.clone()),
+                    }
+                }
+                if !id.is_empty() && remaining.is_empty() {
+                    return Ok(());
+                }
+                id = remaining;
+            }
             let catalog = discovery::catalog(&from)?;
             if list {
                 let providers = db::threads(&catalog.home)?
@@ -1164,7 +1252,7 @@ fn run_with_store(mut store: Store, command: SessionsCommand) -> Result<()> {
                     ImportOptions {
                         apply,
                         skip_existing: all,
-                        announce: true,
+                        announce: !apply,
                         keep_source,
                         clean_stale,
                     },
@@ -1172,6 +1260,7 @@ fn run_with_store(mut store: Store, command: SessionsCommand) -> Result<()> {
                     Ok(true) => imported += 1,
                     Ok(false) => skipped += 1,
                     Err(error) if bulk => {
+                        crate::sessions_progress::check()?;
                         let class = import_refusal_class(&error);
                         match class {
                             0 => live += 1,
@@ -1345,13 +1434,16 @@ fn import_one_using(
     check_destination_inventory(&catalog.home, &store.target, &files)?;
     let stale = stale_plan(store, catalog, id)?;
     if announce {
-        preview(id, &files, &store.target)?;
         for copy in &stale {
             let bytes: u64 = copy.names.iter().map(|n| n.bytes).sum();
             crate::print_stdout(format_args!(
-                "다른 홈의 같은 기록: {} · {}개 · {bytes}바이트 · {}",
-                copy.home.display(),
+                "다른 홈의 같은 기록: {} · {}개 · {} · {}",
+                crate::sessions_presentation::readable_path(
+                    &copy.home.to_string_lossy(),
+                    &std::env::var("USERPROFILE").unwrap_or_default()
+                ),
                 copy.names.len(),
+                crate::sessions_presentation::size(bytes),
                 if clean_stale || !keep_source {
                     "정리 후 journal에서 복구 가능"
                 } else {
@@ -1397,13 +1489,7 @@ fn import_one_using(
         }
     }
     if announce {
-        for (thread, from, to) in db::summaries(&database) {
-            crate::print_stdout(format_args!(
-                "목표 {thread}: {} → {}",
-                goal_status(&from),
-                goal_status(&to)
-            ))?;
-        }
+        preview(id, &files, &store.target, &database)?;
     }
     if !apply {
         return Ok(true);
@@ -1466,6 +1552,8 @@ fn import_one_using(
             )?)
         },
     };
+    let _commit = crate::sessions_progress::commit()?;
+    crate::sessions_progress::phase(crate::sessions_progress::Phase::Linking, None)?;
     journal.imports.insert(id.into(), record.clone());
     store.save(&journal)?;
     checkpoint(store, id, "prepared")?;
@@ -1479,6 +1567,7 @@ fn import_one_using(
         }
     }
     checkpoint(store, id, "linked")?;
+    crate::sessions_progress::phase(crate::sessions_progress::Phase::Records, None)?;
     db::apply(&database)?;
     checkpoint(store, id, "target_rows")?;
     update_index(&store.target, &record.index, false)?;
@@ -1538,6 +1627,9 @@ fn import_one_using(
     journal.imports.get_mut(id).unwrap().complete = true;
     store.save(&journal)?;
     checkpoint(store, id, "committed")?;
+    // Legacy sharing keeps its transaction as one safe step. Cancellation may
+    // stop here only after the durable journal reports the share complete.
+    crate::sessions_progress::boundary()?;
     if announce && keep_source {
         crate::print_stdout(format_args!(
             "주의: 두 홈의 대화 기록은 같은 파일입니다. 양쪽에서 동시에 실행하면 기록이 손상될 수 있습니다."
@@ -1949,8 +2041,29 @@ fn resume_in_target(store: &Store, id: &str, previous_owner: Option<&Path>) -> R
     Ok(false)
 }
 
+/// Resolve only the requested journal before the ordinary admission veto.
+/// The returned scope must end before starting a native child.
+pub(crate) fn prepare_resume(
+    home: &Path,
+    id: Option<&str>,
+    target: Option<&Path>,
+) -> Result<Option<crate::sessions_progress::Operation>> {
+    let Some(id) = id else {
+        return Ok(None);
+    };
+    let progress = crate::sessions_progress::Operation::begin(id, progress_english(home))?;
+    ensure!(discovery::valid_id(id), "대화 ID는 UUID여야 합니다");
+    let store = Store::open_selected(home, target)?;
+    ensure!(
+        staged::offer_recovery(&store, id, false)? != Some(false),
+        "이전 이동을 되돌렸습니다. 원본 홈에서 대화를 다시 열어 주세요."
+    );
+    Ok(Some(progress))
+}
+
 pub(crate) fn before_codex_resume_at(args: &[OsString], target: Option<&Path>) -> Result<()> {
     let requested = resume_uuid(args)?;
+    let _progress = prepare_resume(&qb_core::home()?, requested.as_deref(), target)?;
     admission_check(&qb_core::home()?, requested.as_deref())?;
     let Some(id) = requested else {
         return Ok(());
@@ -1973,6 +2086,7 @@ pub(crate) fn before_codex_resume_at(args: &[OsString], target: Option<&Path>) -
         candidates.push(owner);
     }
     for home in candidates {
+        crate::sessions_progress::check()?;
         if fs::canonicalize(&home).ok().as_ref() == Some(&store.target) {
             continue;
         }
@@ -1982,6 +2096,7 @@ pub(crate) fn before_codex_resume_at(args: &[OsString], target: Option<&Path>) -
             matches.push(catalog);
         }
     }
+    crate::sessions_progress::check()?;
     ensure!(
         !matches.is_empty(),
         "기존 홈에서 대화를 찾지 못했습니다. sessions import --from으로 원본을 지정하세요"
@@ -2052,6 +2167,7 @@ pub(crate) fn before_codex_resume_at(args: &[OsString], target: Option<&Path>) -
         "기존 대화를 qb로 {action} ({} → qb)",
         matches[0].home.display()
     ))?;
+    crate::sessions_progress::phase(crate::sessions_progress::Phase::Starting, None)?;
     Ok(())
 }
 

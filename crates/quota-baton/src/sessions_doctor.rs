@@ -318,6 +318,8 @@ fn analyze(q: &Path, homes: &[Home], operations: &[Operation]) -> Vec<Diagnostic
     }
     out.sort();
     out.dedup();
+    // Open journals explain why the following names/rows may be incomplete.
+    out.sort_by_key(|item| item.code != "미완료_이동");
     out
 }
 

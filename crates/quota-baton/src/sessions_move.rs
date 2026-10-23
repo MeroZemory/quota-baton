@@ -194,6 +194,7 @@ fn hash(p: &Path) -> Result<String> {
     let mut h = Sha256::new();
     let mut b = [0; 65536];
     loop {
+        crate::sessions_progress::check()?;
         let n = f.read(&mut b)?;
         if n == 0 {
             break;
@@ -333,6 +334,7 @@ fn make_plan(
     returning: bool,
     origin: &Path,
 ) -> Result<Move> {
+    crate::sessions_progress::phase(crate::sessions_progress::Phase::Checking, None)?;
     ensure!(discovery::valid_id(id), "대화 ID는 UUID여야 합니다");
     let source = fs::canonicalize(source)?;
     let target = fs::canonicalize(target)?;
@@ -576,6 +578,7 @@ fn step(store: &Store, m: &Move, label: &str) -> Result<()> {
         }
         Ok(())
     })?;
+    crate::sessions_progress::boundary()?;
     checkpoint(store, &m.id, &format!("stage:{label}"))
 }
 fn rollback(store: &Store, m: &mut Move) -> Result<()> {
@@ -667,10 +670,13 @@ fn execute(store: &Store, m: &mut Move) -> Result<()> {
     }
 
     if m.phase == Phase::Prepared {
+        crate::sessions_progress::phase(crate::sessions_progress::Phase::Linking, None)?;
         for f in &m.files {
             let _parent =
                 guard::prepare_parent(&store.staging_home()?, f.stage.parent().context(CONFLICT)?)?;
-            fs::hard_link(&f.sources[0], &f.stage)?;
+            if !f.stage.exists() {
+                fs::hard_link(&f.sources[0], &f.stage)?;
+            }
             same(f, &f.stage)?;
             step(store, m, "staged")?;
         }
@@ -725,6 +731,7 @@ fn execute(store: &Store, m: &mut Move) -> Result<()> {
         step(store, m, "source_names_removed")?;
     }
     if m.phase == Phase::NamesGone {
+        crate::sessions_progress::phase(crate::sessions_progress::Phase::Records, None)?;
         for home in &m.homes {
             if home != &m.target && found_descendants(m, home)? {
                 rollback(store, m)?;
@@ -779,6 +786,7 @@ fn execute(store: &Store, m: &mut Move) -> Result<()> {
         save(store, m)?;
     }
     if m.phase == Phase::Published {
+        crate::sessions_progress::phase(crate::sessions_progress::Phase::Records, None)?;
         db::apply(&m.database)?;
         db::verify(&m.database)?;
         m.phase = Phase::Rows;
@@ -808,6 +816,7 @@ fn execute(store: &Store, m: &mut Move) -> Result<()> {
     Ok(())
 }
 fn run_plan(store: &Store, mut m: Move) -> Result<()> {
+    crate::sessions_progress::check()?;
     let _admission = admission::exclusive(&m.homes, &m.id)?;
     let _store = store.lock()?;
     ensure!(
@@ -827,6 +836,9 @@ fn run_plan(store: &Store, mut m: Move) -> Result<()> {
             descendants(home, &m.id)?;
         }
     }
+    // Archiving a previous journal is already a write. Admit cancellation
+    // before it, then defer until the new journal has a durable boundary.
+    let _commit = crate::sessions_progress::commit()?;
     if let Some(previous) = load(store, &m.id)? {
         ensure!(
             !open(&previous),
@@ -880,14 +892,12 @@ pub(super) fn import(
         &catalog.home,
     )?;
     if o.announce {
-        super::preview(id, &super::migration_files(catalog, id)?, &store.target)?;
-        for (thread, from, to) in db::summaries(&m.database) {
-            crate::print_stdout(format_args!(
-                "목표 {thread}: {} → {}",
-                super::goal_status(&from),
-                super::goal_status(&to)
-            ))?;
-        }
+        super::preview(
+            id,
+            &super::migration_files(catalog, id)?,
+            &store.target,
+            &m.database,
+        )?;
     }
     if o.apply {
         #[cfg(not(test))]
@@ -1038,16 +1048,29 @@ fn abort_legitimate_source_append(store: &Store, m: &mut Move) -> Result<bool> {
     Ok(true)
 }
 pub(super) fn recover(store: &Store, id: &str) -> Result<()> {
-    recover_impl(store, id, false)
+    recover_impl(store, id, false, None)
 }
 pub(super) fn recover_resolve(store: &Store, id: &str) -> Result<()> {
-    recover_impl(store, id, true)
+    recover_impl(store, id, true, None)
 }
-fn recover_impl(store: &Store, id: &str, resolve_map: bool) -> Result<()> {
+/// None means no open journal; false means the user rolled back and stops here.
+pub(super) fn offer_recovery(store: &Store, id: &str, yes: bool) -> Result<Option<bool>> {
+    let Some(m) = load(store, id)?.filter(open) else {
+        return Ok(None);
+    };
+    let finish = confirm::recovery(yes, m.phase < Phase::Decided)?;
+    recover_impl(store, id, false, Some(finish))?;
+    Ok(Some(finish))
+}
+fn recover_impl(store: &Store, id: &str, resolve_map: bool, choice: Option<bool>) -> Result<()> {
     let mut m = load(store, id)?.context("복구할 이동 기록이 없습니다")?;
     if !open(&m) {
         return Ok(());
     }
+    ensure!(
+        choice != Some(false) || m.phase < Phase::Decided,
+        "게시가 확정된 이동은 되돌릴 수 없습니다. finish로 먼저 복구하세요."
+    );
     let _admission = admission::exclusive(&m.homes, &m.id)?;
     let _store = store.lock()?;
     let names = m
@@ -1063,12 +1086,27 @@ fn recover_impl(store: &Store, id: &str, resolve_map: bool) -> Result<()> {
         .cloned()
         .collect::<Vec<_>>();
     let _guards = guard::reserve_decoded_exclusive(&m.homes, std::slice::from_ref(&m.id), &names)?;
+    let _commit = crate::sessions_progress::commit()?;
     let result = (|| {
         if verify_files(&m).is_err() {
             if abort_legitimate_source_append(store, &mut m)? {
                 return Ok(());
             }
             bail!("{CONFLICT}");
+        }
+        if choice == Some(true) && m.phase < Phase::Decided {
+            // Finishing an interrupted plan is a new forward admission. The
+            // destination may have changed since the original preview.
+            db::verify_destination_provider(&m.database)?;
+            let destination = discovery::catalog(&m.target)?;
+            destination.ensure_readable_for(&BTreeSet::from([m.id.clone()]))?;
+            ensure!(
+                !destination.threads.contains_key(&m.id)
+                    && !destination
+                        .all()
+                        .any(|item| { m.files.iter().any(|f| f.physical == item.physical) }),
+                "{CONFLICT}"
+            );
         }
         if resolve_map {
             ensure!(
@@ -1081,7 +1119,7 @@ fn recover_impl(store: &Store, id: &str, resolve_map: bool) -> Result<()> {
             m.map = mapping::replan_resolution(&m.map)?;
             save(store, &m)?;
         }
-        if m.phase < Phase::Decided {
+        if m.phase < Phase::Decided && choice != Some(true) {
             rollback(store, &mut m)
         } else {
             execute(store, &mut m)

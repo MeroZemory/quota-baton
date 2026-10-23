@@ -327,6 +327,10 @@ fn read_meta(
     physical: String,
 ) -> Result<Rollout> {
     let opened = crate::sessions_guard::open_header(directory, path)?;
+    crate::sessions_progress::phase(
+        crate::sessions_progress::Phase::Header,
+        Some(opened.file().metadata()?.len()),
+    )?;
     let compressed = path.extension().is_some_and(|s| s == "zst");
     if compressed && let Some(mut rollout) = cached_compressed(path, &opened)? {
         rollout.relative = relative;
@@ -430,6 +434,7 @@ fn read_meta(
 }
 
 pub(crate) fn catalog(home: &Path) -> Result<Catalog> {
+    crate::sessions_progress::check()?;
     ensure!(ordinary(home)?.is_dir(), "원본 홈이 폴더가 아닙니다");
     let home = fs::canonicalize(home)?;
     if let Some(snapshot) = READ_ONLY_CACHE.with(|slot| {
@@ -440,6 +445,7 @@ pub(crate) fn catalog(home: &Path) -> Result<Catalog> {
         return Ok((*snapshot).clone());
     }
     let result = scan_catalog(home)?;
+    crate::sessions_progress::check()?;
     READ_ONLY_CACHE.with(|slot| -> Result<()> {
         let mut state = slot.borrow_mut();
         if let Some(cache) = state.as_mut() {
@@ -492,10 +498,13 @@ fn read_jobs(jobs: &[HeaderJob]) -> Result<Vec<Result<Rollout>>> {
     std::thread::scope(|scope| {
         let mut handles = Vec::new();
         for chunk in jobs.chunks(jobs.len().div_ceil(4)) {
+            let progress = crate::sessions_progress::reader_context();
             handles.push(
                 std::thread::Builder::new()
                     .name("qb-session-header".into())
-                    .spawn_scoped(scope, move || chunk.iter().map(read).collect::<Vec<_>>())?,
+                    .spawn_scoped(scope, move || {
+                        progress.run(|| chunk.iter().map(read).collect::<Vec<_>>())
+                    })?,
             );
         }
         let mut results = Vec::with_capacity(jobs.len());
@@ -532,6 +541,7 @@ fn scan_catalog(home: PathBuf) -> Result<Catalog> {
             ordinary(&dir)?;
             let directory = crate::sessions_guard::header_directory(&home, &dir)?;
             for entry in fs::read_dir(&dir)? {
+                crate::sessions_progress::check()?;
                 let entry = entry?;
                 let path = entry.path();
                 let kind = ordinary(&path)?;
