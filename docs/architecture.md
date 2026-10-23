@@ -756,6 +756,7 @@ Each milestone is independently verifiable and sized for an implementer working 
     2. Add API keys as a separate pool used only when every subscription account is unavailable (subscription first).
     3. Add a per-credential `priority`, with placement and failover as the previous proxy does; the owner picks the values.
   - **Whichever is chosen:** pools never mix unless enabled, bindings stay on an eligible credential, a binding to an unavailable one is re-placed, and native error classes are kept (C6.4).
+  - **Plan once decided:** node N12 in [milestones](milestones.md#api-key-pools-n12) (separate pools, spend caps with consent, no quiet moves to a paid key).
 - **O12.** `POST /v1/memories/trace_summarize` is used by Codex's `memories` feature, which is off by default (`core/src/client.rs:179`, `features/src/lib.rs:1231-1235`). It returns 404 (unsupported) until the user asks for it.
 
 

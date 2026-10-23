@@ -37,8 +37,7 @@ Before writing quota-baton, the author ran two popular multi-account proxies on 
 | One 404 put a model on a 12-hour cooldown. | A 404 never changes an account's state. |
 | Rotation happened only after a 429, and paid credits were spent without asking. | Usage drives the choice of account before any limit is hit. Paid credits are off until you turn them on per account. |
 | The proxy answered rate-limited requests with an instant 429, and clients gave up; dozens of sessions sat stopped for hours. | A rate-limited request waits up to 60 seconds and is then sent once; the provider's own answer is passed through. quota-baton never makes up a 429. |
-| Subscription logins and pay-per-token API keys shared one pool, and large sessions quietly moved to a paid key. | Supports subscription logins only. API keys cannot be added. |
-| Request bodies from the real clients were rewritten through one translation path. | Bodies pass through unchanged. |
+| Exhausted logins stayed bound to their sessions for up to an hour, and Claude Code showed "Credit balance too low" although no credit had run out. | A session's account is checked again on every request; if it can no longer serve, the session is placed on another account before the request is sent. The client sees the provider's own error, never a relabelled one. |
 | One self-updating process carried all traffic, with a chain of launcher scripts and no status outside a web page. | A separate core and tray. The core upgrades in place (`serve --takeover`); status is in the tray, a native dashboard and the CLI. |
 
 ## How it works
@@ -156,7 +155,7 @@ Settings live in `%LOCALAPPDATA%\quota-baton\config.toml`; set `QB_HOME` to use 
 ## Limits
 
 - **Windows only.** The core is portable Rust, but the tray, credential storage and launchers are Windows-specific.
-- **Two providers.** Claude subscriptions (Claude Code) and ChatGPT subscriptions (Codex CLI).
+- **Two providers, subscriptions only.** Claude subscriptions (Claude Code) and ChatGPT subscriptions (Codex CLI). Pay-per-token API keys are not supported yet; they are planned as a separate pool that never mixes with subscription accounts ([plan](docs/milestones.md#api-key-pools-n12)).
 - **A move costs one uncached turn.** Prompt caches belong to an account and cannot follow a session. Codex also drops hidden reasoning from the old account.
 - **Korean by default.** The tray and dashboard switch to English with `[ui] language = "en"` in `config.toml`. Most CLI messages are still Korean.
 - **Waiting has a limit.** A session waits only while its client keeps the request open; after that it shows the provider's limit message and you resume it yourself. Automatic resume after long waits is not finished yet.
