@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: N5d-native HTTP 집중 관문 종료·N6t 준비
-목표: 추가 사용자 입력 없는 native HTTP 재개·반복2회·pause 대조 검증 완료; 기본 WS·Claude 호환성은 관문 질문, 독립 N6t 진행
+현재 마일스톤: R14 N6t 단일 근거형 이동 경로 최종 관문
+목표: dev 결합·모델 동의 fixture·한도 전환 사유 보완 집중 검증 완료; 고정 입력의 최종 전체 관문
 핵심 지표: 남은 출시 1/3 (R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측); 주 경로 설치 수용·native fallback 후속
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-24 07:14 KST (HTTP 집중 수용만; 일반 native 자동 재개 비활성)
+갱신: 2026-10-24 07:30 KST (N6t 집중 보완 통과·전체 관문 재개; 미병합·미설치)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -458,6 +458,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-24 05:50 | N5d-native 대화 소유·한도 본문 보완 | CLI105·코어11·실제HTTP2 통과; testkit core/CLI strict lint0; 제목/구독/본문 제거 대조3건 정확 red→복원 | 실제 제품 Observed→Inspect→Consume→ACK 및 동일 UUID reset 후200 관측 | 44d437c·94c568f; 정상 종료 실패 보존, 일반 활성화·전체 native 수용 아님 |
 | 2026-10-24 06:29 | N5d-native 정상 종료·자동 쓰기 취소 | CLI116·기본/testkit strict lint·fmt·제품 build0; 정확 제거 대조3건101→복원61통과; 실제 재개1·pause1·각 종료0/loss없음 | 실제 제품 parent와 독립 Sol 검수로 EOF/Consume·늦은 dispatch·PeerClosed/Watchdog 경합 보완 | 2b9ba38·531c61b; eof-unit-fingerprint.json, physical164-33·paused164-3. HTTP fallback만, 전체 native 수용·일반 활성화 아님 |
 | 2026-10-24 07:14 | N5d-native 무조회·반복 HTTP 집중 관문 | CLI169·proto5·core13 통과; strict CLI/core lint·fmt·build0; 실제 무조회1·반복2·pause0재개·각 exit0 | 실제 제품 parent→native0.164→core→합성 HTTP, 원래 reset·동일 UUID 보존 | 757c1a3; stop-read-unit-1·rearm-lint-2 지문, unqueried164-2·paused164-4·repeated164-2. baseline 무조회 실패 및 반복 첫 시간봉투 실패 보존, WS·Claude·일반 활성화 별도 |
+| 2026-10-24 07:30 | N6t dev 결합 보완 집중 검증 | core1080·정적2/67반례·실제HTTP5/WS4·row6a1·native HTTP2 통과, strict core 기본/전체 lint·fmt0 | typed 권위 보존·5h 먼 한도 사유·현재/신규 모델 동의 구분 | a2eca02·06d1596; label hook 제거101→정확복원, 독립 Sol source PASS. dev 활동 연산4개만 manifest 추가(275 distinct), 전체 관문 다음 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
@@ -465,7 +466,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 |---|---|---|---|
 | 이동 보호 구조 | runtime breaker 설치, typed rebind 미완료 | owner 증거가 있는 단일 변경점·정적 쓰기 차단 | N6t 진행 |
 | 제공자 통합 예측 | 잔여량·속도 차트 제공, pooled runway 미출시 | 24시간 backtest 후 통합 예측 | N7 backtest와 UI |
-| Native fallback·실제 replay | native HTTP 무조회·반복2회·pause 통과, 기본 WS·Claude 미수용 | 호환성 결정·전체 수용 및 epoch별24시간 비교 | 관문 질문 전달·독립 N6t 진행; 일반 활성화 비활성 유지 |
+| Native fallback·실제 replay | native HTTP 무조회·반복2회·pause 통과, 기본 WS·Claude 미수용 | D26 amendment2 WS producer·안전한 활성화 및 epoch별24시간 비교 | N6t 뒤 WS producer·일반 활성화 비활성 유지 |
 <!-- gaps:end -->
 
 R11 Windows process/crash focused verification uses `cargo test -p quota-baton --all-features --test r9_crash --no-fail-fast -- --test-threads=4`. It still runs cases concurrently and preserves every in-case race, kill checkpoint, 20-second command deadline and five-second reap deadline. Default high-concurrency deadline failures and diagnostic traces remain cited; the bounded run is not a claim that the default-load timing issue was fixed. No product timing or ownership workaround was added.
