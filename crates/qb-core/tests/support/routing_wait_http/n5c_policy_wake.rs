@@ -230,6 +230,30 @@ async fn blocked_renewal(unrelated_first: bool) {
         assert_eq!(current.settings.mode, Mode::Strict);
         assert_eq!(current.settings.reset_wait_secs, 60);
         assert_eq!(current.anchor, initial.anchor);
+        // Urgency revokes the optional proof, but preserves the original
+        // native cache hold. This fixture checks prompt policy wake and Strict
+        // authority, not expiry: explicitly remove the native hold for cleanup
+        // only AFTER proving the wake happened while Store was still held.
+        timeout(
+            PHASE,
+            h.admin(
+                reqwest::Method::POST,
+                "/admin/v1/routing",
+                Some(json!({
+                    "kind":"session",
+                    "id":qb_core::routing::session_id(&key),
+                    "settings":{"mode":"strict", "reset_wait_secs":0}
+                })),
+            ),
+        )
+        .await
+        .expect("explicit native hold cancellation must not need Store");
+        held.assert_held();
+        let cleanup = h.state.bindings.policies.plan(Some(&key));
+        assert_eq!(cleanup.settings.mode, Mode::Strict);
+        assert_eq!(cleanup.settings.on_5h_limit, On5hLimit::Move);
+        assert_eq!(cleanup.settings.reset_wait_secs, 0);
+        assert_eq!(cleanup.anchor, initial.anchor);
         // Native selection is allowed to need Store. Do not await the HTTP
         // response until the real lease and its abandoned inspection can end.
         held.finish();
