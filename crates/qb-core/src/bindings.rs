@@ -673,19 +673,26 @@ impl BindingTable {
         // Genuinely missing source evidence cannot grant the fresh-unusable
         // exception. A health poll timestamp is not proof.
         let usable = source.is_some_and(|c| self.move_source_usable(d, key, c, model, now));
-        let unusable = source.is_some() && !usable;
+        let unusable = source_account.as_ref().and_then(|account| {
+            crate::accounts::health::UnusableEvidence::observe(
+                account,
+                model,
+                Self::accepted_in(d, Some(key), &account.id),
+                now,
+            )
+        });
         let result = self
             .move_guard
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .prepare(
+            .prepare_observed(
                 &self.config.move_guard,
                 key,
                 from,
                 to,
                 semantic_evidence(source_account.as_ref()),
                 semantic_evidence(target_account.as_ref()),
-                unusable,
+                unusable.as_ref(),
                 observations,
                 now,
             );

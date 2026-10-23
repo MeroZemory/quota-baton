@@ -2,6 +2,34 @@
 use super::{Account, Health, HealthReason, Provider, QuotaCooling, UserState};
 use chrono::{DateTime, Duration, Utc};
 
+/// A health-owner judgement about this account at this exact selection instant.
+/// Missing credentials, retry exclusion and WS capacity are not health facts.
+pub(crate) struct UnusableEvidence {
+    account: String,
+    at: DateTime<Utc>,
+}
+
+impl UnusableEvidence {
+    /// `accepted` is the binding owner's existing-session drain exemption.
+    /// Evaluate the normalized account, including model-scoped cooling, rather
+    /// than a filtered candidate list or a proposed move reason.
+    pub(crate) fn observe(
+        account: &Account,
+        model: Option<&str>,
+        accepted: bool,
+        now: DateTime<Utc>,
+    ) -> Option<Self> {
+        (!account.eligible_at(model, now) || (account.drain && !accepted)).then(|| Self {
+            account: account.id.clone(),
+            at: now,
+        })
+    }
+
+    pub(crate) fn applies_to(&self, account: &str, now: DateTime<Utc>) -> bool {
+        self.account == account && self.at == now
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum HealthSignal {
     TerminalRefresh {
@@ -510,6 +538,50 @@ fn timestamp(value: &serde_json::Value) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn unusable_evidence_requires_account_health_not_candidate_exclusion() {
+        let mut account = fixture();
+        let now = Utc::now();
+        assert!(UnusableEvidence::observe(&account, None, false, now).is_none());
+        account.health = Health::NeedsRelogin {
+            reason: "synthetic revoked".into(),
+            since: now,
+        };
+        let proof = UnusableEvidence::observe(&account, None, false, now).unwrap();
+        assert!(proof.applies_to(&account.id, now));
+        assert!(!proof.applies_to("other-account", now));
+        assert!(!proof.applies_to(&account.id, now + Duration::nanoseconds(1)));
+    }
+
+    #[test]
+    fn unusable_evidence_preserves_model_expiry_and_existing_drain_exemption() {
+        let mut account = fixture();
+        let now = Utc::now();
+        account.health = Health::Cooling {
+            reason: HealthReason::Rate,
+            until: now + Duration::minutes(1),
+            scope: "model:sample-model".into(),
+        };
+        assert!(UnusableEvidence::observe(&account, Some("sample-model"), true, now).is_some());
+        assert!(UnusableEvidence::observe(&account, Some("other-model"), true, now).is_none());
+        assert!(UnusableEvidence::observe(&account, None, true, now).is_none());
+        assert!(
+            UnusableEvidence::observe(
+                &account,
+                Some("sample-model"),
+                true,
+                now + Duration::minutes(1),
+            )
+            .is_none()
+        );
+        account.health = Health::Ready;
+        account.drain = true;
+        assert!(UnusableEvidence::observe(&account, None, false, now).is_some());
+        assert!(UnusableEvidence::observe(&account, None, true, now).is_none());
+        account.payment_until = Some(now + Duration::minutes(1));
+        assert!(UnusableEvidence::observe(&account, None, true, now).is_some());
+    }
 
     pub(crate) fn fixture() -> Account {
         let identity = super::super::Identity::Codex {
