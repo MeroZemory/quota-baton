@@ -369,22 +369,28 @@ mod tests {
         let mut target = super::super::tests::candidate("target", 0.0, 24, 5);
         target.account.provider = Provider::Codex;
         let mut reserved = None;
-        let decision = table.choose_with_hold_at_admitted(
+        let (_capacity_lifetime, proof) = crate::relay::test_move_evidence("source", "target");
+        let decision = table.choose_with_hold_at_admitted_proof(
             Provider::Codex,
             Some("codex:spill-0"),
             None,
             None,
-            &[target],
+            std::slice::from_ref(&target),
+            std::slice::from_ref(&target),
+            MoveObservations::untracked(),
             None,
             42,
             false,
             false,
             Utc::now(),
+            None,
             |account| {
                 reserved = table
                     .admit_capacity_spill(Some("codex:spill-0"), "source", account)
                     .ok();
-                reserved.is_some()
+                reserved
+                    .as_ref()
+                    .map(|_| DispatchAdmission::capacity(proof))
             },
         );
         assert!(matches!(decision, Decision::Selected { .. }));

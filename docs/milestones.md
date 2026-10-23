@@ -6,10 +6,10 @@ This file names the verification for each unit and each row. The row list and th
 
 <!-- status:begin -->
 현재 마일스톤: R14 N6t 근거형 계정 이동 보호
-목표: 저장소·자격증명·핀 근거 전달 검증; 모든 이동의 owner MoveReason·단일 rebind 연결
+목표: 모든 이동의 owner MoveReason·단일 rebind 집중 검증 완료; 전체 N6t 관문 실행
 핵심 지표: 남은 출시 1/3 (R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측); 주 경로 설치 수용·native fallback 후속
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-24 02:12 KST (저장소·핀 집중 검증·제거 반례 통과; 전체 N6t 관문 전)
+갱신: 2026-10-24 02:55 KST (단일 rebind·정책 앵커·D20 집중 검증 통과; 전체 N6t 관문 전)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -450,6 +450,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-24 01:42 | N6t 실패·재연결·모델 동의 근거 단위 | 소유자21·HTTP37·정적2 통과; WS143/1 뒤 해당403 3건·unkeyed2건 통과, 동의 compile-fail1 통과 | 실제 실패·세션/모델/기한·생존성·동의 revision 고정; 기본/testkit strict lint0 | 제거 대조3건 intended red·정확 복원; n6t-recovery-consent/completion.json. 전체 N6t·replay 미완료 |
 | 2026-10-24 02:13 | N6t 저장소·핀 근거 단위 | 소유자28·pin6·store20·실제 HTTP39/WS4·정적2 통과(helper1 제외) | 실제 자격증명/부재·generation·핀 owner/revision·변경 전 폐기 검증 | 기본/testkit strict lint0·제거 대조4 intended red·정확 복원; n6t-store-pin/completion.json. 전체 N6t·replay 미완료 |
 
+| 2026-10-24 02:55 | N6t 필수 owner MoveReason·단일 rebind | owner35·anchor6·runtime6·정적2/반례67 통과, 기본 core strict lint·fmt0 | 승인 전 근거·정확 permit·정책/배정/예산 보존 | 앵커 복구·Strict fence·D20·Rebalance 보완; semantic red4/정확복원·private compile red2/복원0. n6t-rebind/completion.json; 전체 관문·실제 replay 별도 |
 <!-- support:end -->
 
 <!-- gaps:begin -->

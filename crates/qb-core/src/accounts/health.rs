@@ -6,6 +6,7 @@ use chrono::{DateTime, Duration, Utc};
 /// Missing credentials, retry exclusion and WS capacity are not health facts.
 pub(crate) struct UnusableEvidence {
     account: String,
+    model: Option<String>,
     at: DateTime<Utc>,
 }
 
@@ -21,8 +22,18 @@ impl UnusableEvidence {
     ) -> Option<Self> {
         (!account.eligible_at(model, now) || (account.drain && !accepted)).then(|| Self {
             account: account.id.clone(),
+            model: model.map(str::to_owned),
             at: now,
         })
+    }
+
+    pub(crate) fn applies_to_context(
+        &self,
+        account: &str,
+        model: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> bool {
+        self.applies_to(account, now) && self.model.as_deref() == model
     }
 
     pub(crate) fn applies_to(&self, account: &str, now: DateTime<Utc>) -> bool {

@@ -789,17 +789,28 @@ fn round2_debug_pin_is_exempt_but_new_and_unmatched_pin_recovery_take_charge() {
     assert!(new.is_placement);
     assert_eq!(new.placement_charge_pct, 2.);
     let before_pin = t.usage_sequence.load(Ordering::Relaxed);
-    let pinned_choice = |key: &str, cs: &[Candidate], at| match t.choose_with_hold_at(
+    let pinned_choice = |key: &str, cs: &[Candidate], at| match super::tests::with_pin(
         Provider::Claude,
         Some(key),
-        None,
-        None,
-        cs,
-        Some("cl-b"),
-        100,
-        true,
-        false,
-        at,
+        "cl-b",
+        |admission| {
+            t.choose_with_hold_at_admitted_proof(
+                Provider::Claude,
+                Some(key),
+                None,
+                None,
+                cs,
+                cs,
+                MoveObservations::untracked(),
+                Some("cl-b"),
+                100,
+                true,
+                false,
+                at,
+                None,
+                |_| Some(admission),
+            )
+        },
     ) {
         Decision::Selected {
             account,

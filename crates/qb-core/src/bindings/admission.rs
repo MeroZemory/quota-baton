@@ -6,6 +6,7 @@ pub(crate) struct DispatchAdmission {
     failure: Option<crate::relay::RequestFailureEvidence>,
     pin: Option<crate::debug_pin::DebugPinEvidence>,
     store: Vec<crate::accounts::StoreUnavailableEvidence>,
+    runtime: Vec<crate::account_runtime::RuntimeUnavailableEvidence>,
 }
 
 impl DispatchAdmission {
@@ -15,6 +16,7 @@ impl DispatchAdmission {
             failure: None,
             pin: None,
             store: Vec::new(),
+            runtime: Vec::new(),
         }
     }
 
@@ -24,6 +26,7 @@ impl DispatchAdmission {
             failure: None,
             pin: None,
             store: Vec::new(),
+            runtime: Vec::new(),
         }
     }
 
@@ -46,6 +49,49 @@ impl DispatchAdmission {
     ) -> Self {
         self.store = store;
         self
+    }
+
+    pub(crate) fn with_runtime_evidence(
+        mut self,
+        runtime: Vec<crate::account_runtime::RuntimeUnavailableEvidence>,
+    ) -> Self {
+        self.runtime = runtime;
+        self
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn move_reason<'a>(
+        &'a self,
+        provider: crate::accounts::Provider,
+        key: Option<&str>,
+        from: &str,
+        source: Option<&crate::accounts::Account>,
+        to: &str,
+        model: Option<&str>,
+    ) -> Option<super::rebind::MoveReason<'a>> {
+        use super::rebind::MoveReason;
+        if let Some(proof) = self
+            .pin
+            .as_ref()
+            .filter(|p| p.applies_to(provider, key, to))
+        {
+            return Some(MoveReason::UserPin(proof));
+        }
+        if let Some(proof) = self.capacity.as_ref().filter(|p| p.applies_to(from, to)) {
+            return Some(MoveReason::Capacity(proof));
+        }
+        if let Some(proof) = self.failure.as_ref().filter(|p| {
+            source.is_some_and(|source| p.applies_to(key, source, model, std::time::Instant::now()))
+        }) {
+            return Some(MoveReason::Rejected(proof));
+        }
+        if let Some(proof) = self.runtime.iter().find(|p| p.applies_to(from)) {
+            return Some(MoveReason::RuntimeUnavailable(proof));
+        }
+        self.store
+            .iter()
+            .find(|p| p.applies_to(from, source))
+            .map(MoveReason::StoreUnavailable)
     }
 
     pub(super) fn valid_store_for(

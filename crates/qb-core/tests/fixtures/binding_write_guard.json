@@ -94,12 +94,6 @@
     {
       "path": "crates/qb-core/src/bindings.rs",
       "function": "BindingTable::choose_with_hold_at_admitted_proof",
-      "expression": "assignment: d .Alone defer_count_changes =Alone true",
-      "count": 1
-    },
-    {
-      "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::choose_with_hold_at_admitted_proof",
       "expression": "method: d .Alone last_request_bytes .Alone entry Parenthesis( group Parenthesis( key ) .Alone to_owned Parenthesis( ) )",
       "count": 1
     },
@@ -124,20 +118,20 @@
     {
       "path": "crates/qb-core/src/bindings.rs",
       "function": "BindingTable::choose_with_hold_at_admitted_proof",
-      "expression": "method: self .Alone commit_move Parenthesis( permit ,Alone &Alone account ,Alone provider ,Alone &Alone guard_key ,Alone model ,Alone now )",
+      "expression": "method: self .Alone rebind Parenthesis( context ,Alone authority ,Alone permit ,Alone |Alone reason |Alone Brace( self .Alone policies .Alone dispatch Parenthesis( policy_key .Alone as_deref Parenthesis( ) ,Alone &Alone account ,Alone previous .Alone as_deref Parenthesis( ) ,Alone reason ,Alone now ,Alone ) ) )",
       "count": 1
     },
     {
       "path": "crates/qb-core/src/bindings.rs",
       "function": "BindingTable::choose_with_hold_at_admitted_proof",
-      "expression": "method: self .Alone publish_binding Parenthesis( &Alone mut d ,Alone provider ,Alone key ,Alone parent ,Alone candidates ,Alone pinned ,Alone request_bytes ,Alone hold_timed_out ,Alone now ,Alone &Alone account ,Alone reason ,Alone committed .Alone as_ref Parenthesis( ) ,Alone )",
+      "expression": "mutable-escape: &Alone mut *Alone data",
       "count": 1
     },
     {
       "path": "crates/qb-core/src/bindings.rs",
       "function": "BindingTable::choose_with_hold_at_admitted_proof",
       "expression": "mutable-escape: &Alone mut d",
-      "count": 4
+      "count": 1
     },
     {
       "path": "crates/qb-core/src/bindings.rs",
@@ -465,138 +459,6 @@
     },
     {
       "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::publish_binding",
-      "expression": "assignment: *Alone known =Alone Parenthesis( *Alone known ) .Alone max Parenthesis( request_bytes )",
-      "count": 1
-    },
-    {
-      "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::publish_binding",
-      "expression": "assignment: d .Alone count_change_clock =Alone Some Parenthesis( now )",
-      "count": 1
-    },
-    {
-      "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::publish_binding",
-      "expression": "assignment: d .Alone snapshot_weight =Alone d .Alone snapshot_weight .Alone saturating_add Parenthesis( binding_bound Parenthesis( k ,Alone account ) )",
-      "count": 1
-    },
-    {
-      "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::publish_binding",
-      "expression": "assignment: d .Alone snapshot_weight =Alone d .Alone snapshot_weight .Alone saturating_sub Parenthesis( binding_bound Parenthesis( &Alone previous .Alone key ,Alone &Alone previous .Alone account ) )",
-      "count": 1
-    },
-    {
-      "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::publish_binding",
-      "expression": "call: Binding :Joint :Alone new Parenthesis( k .Alone clone Parenthesis( ) ,Alone account .Alone to_owned Parenthesis( ) ,Alone last_used ,Alone None ,Alone None ,Alone None ,Alone None ,Alone false ,Alone )",
-      "count": 1
-    },
-    {
-      "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::publish_binding",
-      "expression": "call: index_group Parenthesis( d ,Alone g .Alone to_owned Parenthesis( ) ,Alone Group Brace( keys ,Alone account :Alone account .Alone to_owned Parenthesis( ) ,Alone last_used ,Alone ) ,Alone )",
-      "count": 1
-    },
-    {
-      "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::publish_binding",
-      "expression": "call: unindex_group Parenthesis( d ,Alone g )",
-      "count": 1
-    },
-    {
-      "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::publish_binding",
-      "expression": "construction: Group Brace( keys ,Alone account :Alone account .Alone to_owned Parenthesis( ) ,Alone last_used ,Alone )",
-      "count": 1
-    },
-    {
-      "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::publish_binding",
-      "expression": "method: binding .Alone rebind Parenthesis( account ,Alone committed .Alone expect Parenthesis( \"existing binding requires authority\" ) ,Alone )",
-      "count": 1
-    },
-    {
-      "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::publish_binding",
-      "expression": "method: d .Alone accepted_unbound .Alone remove Parenthesis( &Alone old )",
-      "count": 1
-    },
-    {
-      "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::publish_binding",
-      "expression": "method: d .Alone after_move .Alone insert Parenthesis( g .Alone into Parenthesis( ) )",
-      "count": 1
-    },
-    {
-      "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::publish_binding",
-      "expression": "method: d .Alone bindings .Alone insert Parenthesis( k .Alone clone Parenthesis( ) ,Alone next )",
-      "count": 1
-    },
-    {
-      "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::publish_binding",
-      "expression": "method: d .Alone epochs .Alone remove Parenthesis( &Alone format !Alone Parenthesis( \"unbound:{old}\" ) )",
-      "count": 1
-    },
-    {
-      "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::publish_binding",
-      "expression": "method: d .Alone epochs .Alone remove Parenthesis( g )",
-      "count": 1
-    },
-    {
-      "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::publish_binding",
-      "expression": "method: d .Alone last_request_bytes .Alone entry Parenthesis( g .Alone to_owned Parenthesis( ) )",
-      "count": 1
-    },
-    {
-      "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::publish_binding",
-      "expression": "method: d .Alone last_request_bytes .Alone entry Parenthesis( g .Alone to_owned Parenthesis( ) ) .Alone or_default Parenthesis( )",
-      "count": 1
-    },
-    {
-      "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::publish_binding",
-      "expression": "method: d .Alone overload_marks .Alone remove Parenthesis( g )",
-      "count": 1
-    },
-    {
-      "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::publish_binding",
-      "expression": "method: d .Alone placements .Alone entry Parenthesis( account .Alone to_owned Parenthesis( ) )",
-      "count": 1
-    },
-    {
-      "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::publish_binding",
-      "expression": "method: d .Alone placements .Alone entry Parenthesis( account .Alone to_owned Parenthesis( ) ) .Alone or_default Parenthesis( )",
-      "count": 1
-    },
-    {
-      "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::publish_binding",
-      "expression": "method: d .Alone sticky .Alone insert Parenthesis( provider .Alone as_str Parenthesis( ) .Alone into Parenthesis( ) ,Alone account .Alone to_owned Parenthesis( ) )",
-      "count": 1
-    },
-    {
-      "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::publish_binding",
-      "expression": "method: d .Alone unknown_cost .Alone insert Parenthesis( g .Alone to_owned Parenthesis( ) )",
-      "count": 1
-    },
-    {
-      "path": "crates/qb-core/src/bindings.rs",
-      "function": "BindingTable::publish_binding",
-      "expression": "opaque-macro: assert !Alone Parenthesis( authority .Alone for_group Parenthesis( launch :Joint :Alone ownership_group Parenthesis( d ,Alone g ) ) &Joint &Alone authority .Alone allows Parenthesis( &Alone previous .Alone account ,Alone account ) ,Alone \"rebind receipt belongs to another source/group\" )",
-      "count": 1
-    },
-    {
-      "path": "crates/qb-core/src/bindings.rs",
       "function": "BindingTable::rename_move_state",
       "expression": "assignment: *Alone guard =Alone proposed",
       "count": 1
@@ -707,24 +569,6 @@
       "path": "crates/qb-core/src/bindings.rs",
       "function": "BindingTable::routing_view",
       "expression": "opaque-macro: serde_json :Joint :Alone json !Alone Parenthesis( Brace( \"id\" :Alone crate :Joint :Alone routing :Joint :Alone session_id Parenthesis( key ) ,Alone \"account\" :Alone g .Alone account ,Alone \"policy\" :Alone self .Alone policies .Alone plan Parenthesis( launch :Joint :Alone policy_key Parenthesis( &Alone d ,Alone Some Parenthesis( key ) ) ) ) )",
-      "count": 1
-    },
-    {
-      "path": "crates/qb-core/src/bindings/selection.rs",
-      "function": "BindingTable::select_ranked",
-      "expression": "assignment: b .Alone account =Alone anchor .Alone clone Parenthesis( )",
-      "count": 1
-    },
-    {
-      "path": "crates/qb-core/src/bindings/selection.rs",
-      "function": "BindingTable::select_ranked",
-      "expression": "compound-assignment: *Alone eligible &Joint =Alone candidate .Alone account .Alone id =Joint =Alone source |Joint |Alone Parenthesis( !Alone outside_unknown &Joint &Alone !Alone d .Alone outside_used .Alone contains Parenthesis( &Alone candidate .Alone account .Alone id ) )",
-      "count": 1
-    },
-    {
-      "path": "crates/qb-core/src/bindings/selection.rs",
-      "function": "BindingTable::select_ranked",
-      "expression": "opaque-macro: tracing :Joint :Alone debug !Alone Parenthesis( account =Alone %Alone b .Alone account ,Alone reason =Alone skip_reason ,Alone \"reset hold skipped\" )",
       "count": 1
     },
     {
@@ -1106,6 +950,12 @@
       "count": 1
     },
     {
+      "path": "crates/qb-core/src/bindings/admission.rs",
+      "function": "DispatchAdmission::move_reason",
+      "expression": "sensitive-import: use super :Joint :Alone rebind :Joint :Alone MoveReason ;Alone",
+      "count": 1
+    },
+    {
       "path": "crates/qb-core/src/bindings/affinity.rs",
       "function": "Binding::new",
       "expression": "construction: Identity Brace( account )",
@@ -1197,45 +1047,45 @@
     },
     {
       "path": "crates/qb-core/src/bindings/launch.rs",
-      "function": "BindingTable::place_launch_for_issue_admitted",
+      "function": "BindingTable::place_launch_for_issue_evidence",
+      "expression": "assignment: d .Alone defer_count_changes =Alone false",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/launch.rs",
+      "function": "BindingTable::place_launch_for_issue_evidence",
       "expression": "method: d .Alone launch_anchors .Alone insert Parenthesis( request .Alone anchor_key .Alone to_owned Parenthesis( ) ,Alone anchor )",
       "count": 1
     },
     {
       "path": "crates/qb-core/src/bindings/launch.rs",
-      "function": "BindingTable::place_launch_for_issue_admitted",
+      "function": "BindingTable::place_launch_for_issue_evidence",
       "expression": "method: d .Alone launches .Alone insert Parenthesis( key .Alone clone Parenthesis( ) ,Alone metadata )",
       "count": 1
     },
     {
       "path": "crates/qb-core/src/bindings/launch.rs",
-      "function": "BindingTable::place_launch_for_issue_admitted",
+      "function": "BindingTable::place_launch_for_issue_evidence",
       "expression": "method: d .Alone placements .Alone entry Parenthesis( candidate .Alone account .Alone id .Alone clone Parenthesis( ) )",
       "count": 1
     },
     {
       "path": "crates/qb-core/src/bindings/launch.rs",
-      "function": "BindingTable::place_launch_for_issue_admitted",
+      "function": "BindingTable::place_launch_for_issue_evidence",
       "expression": "method: d .Alone placements .Alone entry Parenthesis( candidate .Alone account .Alone id .Alone clone Parenthesis( ) ) .Alone or_default Parenthesis( )",
       "count": 1
     },
     {
       "path": "crates/qb-core/src/bindings/launch.rs",
-      "function": "BindingTable::place_launch_for_issue_admitted",
-      "expression": "method: self .Alone commit_move Parenthesis( permit ,Alone &Alone account ,Alone Provider :Joint :Alone Codex ,Alone &Alone key ,Alone model .Alone as_deref Parenthesis( ) ,Alone now ,Alone )",
+      "function": "BindingTable::place_launch_for_issue_evidence",
+      "expression": "method: self .Alone rebind Parenthesis( context ,Alone authority ,Alone permit ,Alone |Alone reason |Alone Brace( if let Some Parenthesis( consent ) =Alone &Alone consent Brace( consent .Alone validate_context Parenthesis( &Alone policy_key ,Alone previous .Alone as_deref Parenthesis( ) ,Alone &Alone account ,Alone self .Alone policies .Alone plan Parenthesis( Some Parenthesis( &Alone policy_key ) ) .Alone revision ,Alone model .Alone as_deref Parenthesis( ) ,Alone now ,Alone ) ?Alone ;Alone if plan .Alone settings .Alone mode =Joint =Alone crate :Joint :Alone routing :Joint :Alone Mode :Joint :Alone Strict Brace( authorize Parenthesis( &Alone self .Alone policies ,Alone consent ) .Alone map_err Parenthesis( |Alone _ |Alone LaunchError :Joint :Alone PolicyBlocked ) ?Alone ;Alone ) let current =Alone self .Alone policies .Alone plan Parenthesis( Some Parenthesis( &Alone policy_key ) ) ;Alone let expected_revision =Alone if plan .Alone settings .Alone mode =Joint =Alone crate :Joint :Alone routing :Joint :Alone Mode :Joint :Alone Strict Brace( if current .Alone settings .Alone mode !Joint =Alone crate :Joint :Alone routing :Joint :Alone Mode :Joint :Alone Strict |Joint |Alone current .Alone anchor .Alone as_deref Parenthesis( ) !Joint =Alone Some Parenthesis( account .Alone as_str Parenthesis( ) ) Brace( bail !Alone Parenthesis( \"launch authorization changed\" ) ;Alone ) plan .Alone revision .Alone checked_add Parenthesis( 1 ) .Alone ok_or_else Parenthesis( |Alone |Alone anyhow :Joint :Alone anyhow !Alone Parenthesis( \"launch revision overflow\" ) ) ?Alone ) else Brace( plan .Alone revision ) ;Alone if current .Alone revision !Joint =Alone expected_revision Brace( bail !Alone Parenthesis( \"launch authorization changed\" ) ;Alone ) ) self .Alone policies .Alone dispatch_for_issue Parenthesis( Some Parenthesis( &Alone policy_key ) ,Alone &Alone account ,Alone previous .Alone as_deref Parenthesis( ) ,Alone reason ,Alone now ,Alone operation ,Alone ) .Alone map_err Parenthesis( |Alone _ |Alone LaunchError :Joint :Alone PolicyBlocked ) ?Alone ;Alone Ok Parenthesis( Parenthesis( ) ) ) )",
       "count": 1
     },
     {
       "path": "crates/qb-core/src/bindings/launch.rs",
-      "function": "BindingTable::place_launch_for_issue_admitted",
-      "expression": "method: self .Alone publish_binding Parenthesis( &Alone mut d ,Alone Provider :Joint :Alone Codex ,Alone Some Parenthesis( &Alone key ) ,Alone None ,Alone candidates ,Alone None ,Alone 0 ,Alone false ,Alone now ,Alone &Alone account ,Alone reason ,Alone committed .Alone as_ref Parenthesis( ) ,Alone )",
-      "count": 1
-    },
-    {
-      "path": "crates/qb-core/src/bindings/launch.rs",
-      "function": "BindingTable::place_launch_for_issue_admitted",
+      "function": "BindingTable::place_launch_for_issue_evidence",
       "expression": "mutable-escape: &Alone mut d",
-      "count": 4
+      "count": 3
     },
     {
       "path": "crates/qb-core/src/bindings/launch.rs",
@@ -1601,6 +1451,180 @@
       "path": "crates/qb-core/src/bindings/quota_wait.rs",
       "function": "<module>",
       "expression": "sensitive-import: use serde_json :Joint :Alone Value ;Alone",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/rebind.rs",
+      "function": "BindingTable::publish_binding",
+      "expression": "assignment: *Alone known =Alone Parenthesis( *Alone known ) .Alone max Parenthesis( request_bytes )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/rebind.rs",
+      "function": "BindingTable::publish_binding",
+      "expression": "assignment: d .Alone count_change_clock =Alone Some Parenthesis( now )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/rebind.rs",
+      "function": "BindingTable::publish_binding",
+      "expression": "assignment: d .Alone snapshot_weight =Alone d .Alone snapshot_weight .Alone saturating_add Parenthesis( binding_bound Parenthesis( k ,Alone account ) )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/rebind.rs",
+      "function": "BindingTable::publish_binding",
+      "expression": "assignment: d .Alone snapshot_weight =Alone d .Alone snapshot_weight .Alone saturating_sub Parenthesis( binding_bound Parenthesis( &Alone previous .Alone key ,Alone &Alone previous .Alone account ) )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/rebind.rs",
+      "function": "BindingTable::publish_binding",
+      "expression": "call: Binding :Joint :Alone new Parenthesis( k .Alone clone Parenthesis( ) ,Alone account .Alone to_owned Parenthesis( ) ,Alone last_used ,Alone None ,Alone None ,Alone None ,Alone None ,Alone false ,Alone )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/rebind.rs",
+      "function": "BindingTable::publish_binding",
+      "expression": "call: index_group Parenthesis( d ,Alone g .Alone to_owned Parenthesis( ) ,Alone Group Brace( keys ,Alone account :Alone account .Alone to_owned Parenthesis( ) ,Alone last_used ,Alone ) ,Alone )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/rebind.rs",
+      "function": "BindingTable::publish_binding",
+      "expression": "call: unindex_group Parenthesis( d ,Alone g )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/rebind.rs",
+      "function": "BindingTable::publish_binding",
+      "expression": "construction: Group Brace( keys ,Alone account :Alone account .Alone to_owned Parenthesis( ) ,Alone last_used ,Alone )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/rebind.rs",
+      "function": "BindingTable::publish_binding",
+      "expression": "method: binding .Alone rebind Parenthesis( account ,Alone committed .Alone expect Parenthesis( \"existing binding requires authority\" ) ,Alone )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/rebind.rs",
+      "function": "BindingTable::publish_binding",
+      "expression": "method: d .Alone accepted_unbound .Alone remove Parenthesis( &Alone old )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/rebind.rs",
+      "function": "BindingTable::publish_binding",
+      "expression": "method: d .Alone after_move .Alone insert Parenthesis( g .Alone into Parenthesis( ) )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/rebind.rs",
+      "function": "BindingTable::publish_binding",
+      "expression": "method: d .Alone bindings .Alone insert Parenthesis( k .Alone clone Parenthesis( ) ,Alone next )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/rebind.rs",
+      "function": "BindingTable::publish_binding",
+      "expression": "method: d .Alone epochs .Alone remove Parenthesis( &Alone format !Alone Parenthesis( \"unbound:{old}\" ) )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/rebind.rs",
+      "function": "BindingTable::publish_binding",
+      "expression": "method: d .Alone epochs .Alone remove Parenthesis( g )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/rebind.rs",
+      "function": "BindingTable::publish_binding",
+      "expression": "method: d .Alone last_request_bytes .Alone entry Parenthesis( g .Alone to_owned Parenthesis( ) )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/rebind.rs",
+      "function": "BindingTable::publish_binding",
+      "expression": "method: d .Alone last_request_bytes .Alone entry Parenthesis( g .Alone to_owned Parenthesis( ) ) .Alone or_default Parenthesis( )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/rebind.rs",
+      "function": "BindingTable::publish_binding",
+      "expression": "method: d .Alone overload_marks .Alone remove Parenthesis( g )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/rebind.rs",
+      "function": "BindingTable::publish_binding",
+      "expression": "method: d .Alone placements .Alone entry Parenthesis( account .Alone to_owned Parenthesis( ) )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/rebind.rs",
+      "function": "BindingTable::publish_binding",
+      "expression": "method: d .Alone placements .Alone entry Parenthesis( account .Alone to_owned Parenthesis( ) ) .Alone or_default Parenthesis( )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/rebind.rs",
+      "function": "BindingTable::publish_binding",
+      "expression": "method: d .Alone sticky .Alone insert Parenthesis( provider .Alone as_str Parenthesis( ) .Alone into Parenthesis( ) ,Alone account .Alone to_owned Parenthesis( ) )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/rebind.rs",
+      "function": "BindingTable::publish_binding",
+      "expression": "method: d .Alone unknown_cost .Alone insert Parenthesis( g .Alone to_owned Parenthesis( ) )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/rebind.rs",
+      "function": "BindingTable::publish_binding",
+      "expression": "opaque-macro: assert !Alone Parenthesis( authority .Alone for_group Parenthesis( launch :Joint :Alone ownership_group Parenthesis( d ,Alone g ) ) &Joint &Alone authority .Alone allows Parenthesis( &Alone previous .Alone account ,Alone account ) ,Alone \"rebind receipt belongs to another source/group\" )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/rebind.rs",
+      "function": "BindingTable::rebind",
+      "expression": "assignment: d .Alone defer_count_changes =Alone true",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/rebind.rs",
+      "function": "BindingTable::rebind",
+      "expression": "method: self .Alone commit_move Parenthesis( permit ,Alone cx .Alone account ,Alone cx .Alone provider ,Alone cx .Alone guard_key ,Alone cx .Alone model ,Alone cx .Alone now ,Alone )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/rebind.rs",
+      "function": "BindingTable::rebind",
+      "expression": "method: self .Alone publish_binding Parenthesis( &Alone mut d ,Alone cx .Alone provider ,Alone cx .Alone key ,Alone cx .Alone parent ,Alone cx .Alone candidates ,Alone cx .Alone pinned ,Alone cx .Alone request_bytes ,Alone cx .Alone hold_timed_out ,Alone cx .Alone now ,Alone cx .Alone account ,Alone label ,Alone committed .Alone as_ref Parenthesis( ) ,Alone )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/rebind.rs",
+      "function": "BindingTable::rebind",
+      "expression": "mutable-escape: &Alone mut d",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/selection.rs",
+      "function": "BindingTable::select_ranked",
+      "expression": "assignment: b .Alone account =Alone anchor .Alone clone Parenthesis( )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/selection.rs",
+      "function": "BindingTable::select_ranked",
+      "expression": "compound-assignment: *Alone eligible &Joint =Alone candidate .Alone account .Alone id =Joint =Alone source |Joint |Alone Parenthesis( !Alone outside_unknown &Joint &Alone !Alone d .Alone outside_used .Alone contains Parenthesis( &Alone candidate .Alone account .Alone id ) )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/selection.rs",
+      "function": "BindingTable::select_ranked",
+      "expression": "opaque-macro: tracing :Joint :Alone debug !Alone Parenthesis( account =Alone %Alone b .Alone account ,Alone reason =Alone skip_reason ,Alone \"reset hold skipped\" )",
       "count": 1
     }
   ],

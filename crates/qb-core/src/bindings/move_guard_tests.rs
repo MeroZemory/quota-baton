@@ -1,5 +1,6 @@
 use super::tests::{candidate, fixture_dir};
 use super::*;
+use crate::debug_pin::DebugPins;
 use std::sync::atomic::AtomicUsize;
 
 fn pick(
@@ -10,8 +11,12 @@ fn pick(
     now: DateTime<Utc>,
     admit: impl FnOnce(&str) -> bool,
 ) -> Decision {
+    let pins = DebugPins::default();
+    pins.set(Provider::Claude, Some(key.into()), pin.into());
+    let proof = pins.selection(Provider::Claude, Some(key)).unwrap();
     // This direct fixture models a current observation at each call.
-    table.choose_with_hold_at_admitted_evidence(
+    // Pin authority is separate from source health and observation freshness.
+    table.choose_with_hold_at_admitted_proof(
         Provider::Claude,
         Some(key),
         None,
@@ -25,7 +30,7 @@ fn pick(
         false,
         now,
         None,
-        admit,
+        |id| admit(id).then(|| DispatchAdmission::ordinary().with_pin(Some(proof))),
     )
 }
 fn selected(decision: Decision) -> String {
@@ -44,7 +49,14 @@ fn pick_snapshot(
     now: DateTime<Utc>,
     calls: &AtomicUsize,
 ) -> Decision {
-    table.choose_with_hold_at_admitted_evidence(
+    let pins = DebugPins::default();
+    pins.set(
+        Provider::Claude,
+        Some(key.into()),
+        candidates[0].account.id.clone(),
+    );
+    let proof = pins.selection(Provider::Claude, Some(key)).unwrap();
+    table.choose_with_hold_at_admitted_proof(
         Provider::Claude,
         Some(key),
         None,
@@ -60,7 +72,7 @@ fn pick_snapshot(
         None,
         |_| {
             calls.fetch_add(1, Ordering::SeqCst);
-            true
+            Some(DispatchAdmission::ordinary().with_pin(Some(proof)))
         },
     )
 }
@@ -392,7 +404,10 @@ fn r14_excluded_source_needs_fresh_unusable_evidence() {
         let evidence = if state == "unknown" { &[][..] } else { &cs[..] };
         assert_eq!(semantic_evidence(None), 0);
         let calls = AtomicUsize::new(0);
-        let choice = table.choose_with_hold_at_admitted_evidence(
+        let pins = DebugPins::default();
+        pins.set(Provider::Claude, Some(key.into()), cs[2].account.id.clone());
+        let proof = pins.selection(Provider::Claude, Some(key)).unwrap();
+        let choice = table.choose_with_hold_at_admitted_proof(
             Provider::Claude,
             Some(key),
             None,
@@ -409,7 +424,7 @@ fn r14_excluded_source_needs_fresh_unusable_evidence() {
             |id| {
                 assert_eq!(id, cs[2].account.id);
                 calls.fetch_add(1, Ordering::SeqCst);
-                true
+                Some(DispatchAdmission::ordinary().with_pin(Some(proof)))
             },
         );
         if matches!(state, "payment" | "quota") {

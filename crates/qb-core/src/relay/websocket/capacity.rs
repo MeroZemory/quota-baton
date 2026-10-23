@@ -330,6 +330,23 @@ impl Drop for Permit {
     }
 }
 
+/// Synthetic owner fixture; retains real occupied and reserved slots.
+#[cfg(test)]
+pub(crate) fn test_move_evidence(from: &str, to: &str) -> (impl Sized, CapacityMoveEvidence) {
+    let capacity = Arc::new(Capacity::default());
+    let live = capacity.reserve(from).unwrap();
+    let rejected = capacity.reserve(from).unwrap();
+    rejected.connection_limit();
+    drop(rejected);
+    let mut wait =
+        OwnWait::start(&capacity, from, Instant::now() + Duration::from_secs(10)).unwrap();
+    wait.waited = true;
+    let source = wait.spill_source_at(&capacity, wait.until).unwrap();
+    let target = capacity.reserve(to).unwrap();
+    let proof = source.admit(&target).unwrap();
+    ((capacity, live, target), proof)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

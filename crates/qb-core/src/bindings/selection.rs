@@ -26,6 +26,7 @@ impl SelectionCode {
 /// Only this selection owner can construct a cold/overload judgement. It is
 /// consumed in the same mutations transaction that evaluated all C7 guards.
 pub(super) struct RebalanceEvidence {
+    kind: SelectionCode,
     key: String,
     from: String,
     to: String,
@@ -33,6 +34,9 @@ pub(super) struct RebalanceEvidence {
     at: DateTime<Utc>,
 }
 impl RebalanceEvidence {
+    pub(super) fn label(&self) -> &'static str {
+        self.kind.code()
+    }
     pub(super) fn applies_to(
         &self,
         key: Option<&str>,
@@ -54,6 +58,9 @@ pub(super) struct SelectionReason {
     evidence: Option<RebalanceEvidence>,
 }
 impl SelectionReason {
+    pub(super) fn evidence(&self) -> Option<&RebalanceEvidence> {
+        self.evidence.as_ref()
+    }
     pub(super) fn code(&self) -> &'static str {
         self.code.code()
     }
@@ -126,6 +133,7 @@ impl BindingTable {
                         })
                         .filter(|from| from != account)
                         .map(|from| RebalanceEvidence {
+                            kind: code,
                             key: group(key).to_owned(),
                             from,
                             to: account.clone(),
