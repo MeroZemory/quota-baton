@@ -259,12 +259,13 @@ impl WaitPolicySnapshot {
         &self.plan
     }
 
-    pub(crate) fn unchanged(&self, policies: &crate::routing::PolicyStore) -> bool {
-        policies
-            .with_wait_plan(&self.key, &self.account, |current| {
-                same_wait_plan(&self.plan, current).then_some(())
-            })
-            .is_some()
+    /// None is contention/poison, never unchanged policy or handoff permission.
+    pub(crate) fn try_unchanged(&self, policies: &crate::routing::PolicyStore) -> Option<bool> {
+        policies.try_native_cache_plan(&self.key, &self.account, |current| {
+            current.settings.reset_wait_secs != 0
+                && current.settings.on_5h_limit == crate::routing::On5hLimit::Wait
+                && same_wait_plan(&self.plan, current)
+        })
     }
 }
 

@@ -210,10 +210,12 @@ async fn wait_optional_quota(
         }
         // Reject-only policy view: no Store/runtime/binding gates or new proof.
         // Global revision alone is not a change to this admitted wait.
-        if policy_snapshot
-            .as_ref()
-            .is_some_and(|snapshot| !snapshot.unchanged(&relay.bindings.policies))
-        {
+        let policy_current =
+            match wait_policy_unchanged(relay, policy_snapshot.as_ref(), &inputs, envelope).await {
+                Ok(current) => current,
+                Err(ended) => return ended,
+            };
+        if !policy_current {
             return policy_stopped(source, envelope.is_some(), native_cache.take());
         }
         let accounts = relay.accounts.clone();
@@ -285,9 +287,16 @@ async fn wait_optional_quota(
                 if let Some(ended) = ended_envelope(source, envelope, Instant::now(), Utc::now()) {
                     return Some(ended);
                 }
-                if policy_snapshot.as_ref().is_some_and(|snapshot| {
-                    !snapshot.unchanged(&relay.bindings.policies)
-                }) {
+                let policy_current = match wait_policy_unchanged(
+                    relay,
+                    policy_snapshot.as_ref(),
+                    &inputs,
+                    envelope,
+                ).await {
+                    Ok(current) => current,
+                    Err(ended) => return ended,
+                };
+                if !policy_current {
                     #[cfg(feature = "testkit")]
                     if matches!(transport, WaitTransport::Http) {
                         relay.observe_http_quota_wait_inspection("policy_revoked", source);
@@ -353,10 +362,24 @@ async fn wait_optional_quota(
         }
         // Publication may have been consumed before the first snapshot was
         // available. Recheck the receipt's policy before retaining or sleeping.
-        if policy_snapshot
-            .as_ref()
-            .is_some_and(|snapshot| !snapshot.unchanged(&relay.bindings.policies))
+        // First delivery uses the actual receipt's immutable bounds for timers
+        // only. No cache interval, display guard or handoff exists until below.
+        #[cfg(all(test, feature = "testkit"))]
+        if first && matches!(transport, WaitTransport::Http) {
+            relay.observe_http_quota_wait_inspection("result_policy_check", source);
+        }
+        let policy_current = match wait_policy_unchanged(
+            relay,
+            policy_snapshot.as_ref(),
+            &inputs,
+            Some(fixed),
+        )
+        .await
         {
+            Ok(current) => current,
+            Err(ended) => return ended,
+        };
+        if !policy_current {
             #[cfg(feature = "testkit")]
             if matches!(transport, WaitTransport::Http) {
                 relay.observe_http_quota_wait_inspection("result_policy_revoked", source);
@@ -416,6 +439,55 @@ async fn wait_optional_quota(
         }
         // Notification -> rearm -> native renewal. A missing/partial/changed
         // proof exits; no new admission or interval after the first receipt.
+    }
+}
+
+// Publication contention is neither unchanged policy nor an urgency handoff.
+// Keep the existing receipt/task, if any, and the ORIGINAL timer envelope while
+// waiting for a definite try-only comparison. No Store work or admission here.
+async fn wait_policy_unchanged(
+    relay: &RelayState,
+    snapshot: Option<&crate::account_runtime::WaitPolicySnapshot>,
+    inputs: &Inputs,
+    envelope: Option<(Instant, DateTime<Utc>)>,
+) -> Result<bool, Option<WaitHint>> {
+    let Some(snapshot) = snapshot else {
+        return Ok(true);
+    };
+    loop {
+        let changed = relay.bindings.policies.changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        if !caller_live(
+            &inputs.operation,
+            inputs.operation.deadline(),
+            relay.is_draining(),
+        ) {
+            return Err(stopped(&inputs.source, envelope.is_some()));
+        }
+        if let Some(ended) = ended_envelope(&inputs.source, envelope, Instant::now(), Utc::now()) {
+            return Err(Some(ended));
+        }
+        if let Some(current) = snapshot.try_unchanged(&relay.bindings.policies) {
+            return Ok(current);
+        }
+        tokio::select! {
+            biased;
+            _ = relay.wait_for_drain_start() => {
+                return Err(stopped(&inputs.source, envelope.is_some()));
+            },
+            _ = tokio::time::sleep_until(inputs.operation.deadline()) => {
+                return Err(stopped(&inputs.source, envelope.is_some()));
+            },
+            _ = async {
+                match envelope {
+                    Some((wake, _)) => tokio::time::sleep_until(wake).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {},
+            _ = &mut changed => {},
+            _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {},
+        }
     }
 }
 
@@ -1115,5 +1187,326 @@ mod tests {
         .unwrap();
         assert_eq!(proof_reset.end, WaitEnd::Reset);
         assert!(proof_reset.native_cache.is_none());
+    }
+}
+
+#[cfg(all(test, feature = "testkit"))]
+mod publication_tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::time::Duration;
+
+    struct PublicationHolder {
+        release: Option<std::sync::mpsc::SyncSender<()>>,
+        worker: Option<std::thread::JoinHandle<()>>,
+        released: Arc<AtomicBool>,
+    }
+
+    impl PublicationHolder {
+        fn start(table: Arc<crate::bindings::BindingTable>) -> Self {
+            let (entered, locked) = std::sync::mpsc::sync_channel(1);
+            let (release, resume) = std::sync::mpsc::sync_channel(1);
+            let released = Arc::new(AtomicBool::new(false));
+            let flag = released.clone();
+            let worker = std::thread::spawn(move || {
+                table
+                    .policies
+                    .hold_wait_publication_for_test(entered, resume, &flag);
+            });
+            let holder = Self {
+                release: Some(release),
+                worker: Some(worker),
+                released,
+            };
+            locked.recv_timeout(Duration::from_secs(5)).unwrap();
+            holder
+        }
+
+        fn assert_held(&self) {
+            assert!(
+                !self.released.load(Ordering::Acquire),
+                "outer policy wait must not block Tokio on publication"
+            );
+        }
+    }
+
+    impl Drop for PublicationHolder {
+        fn drop(&mut self) {
+            if let Some(release) = self.release.take() {
+                let _ = release.try_send(());
+            }
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    async fn proven_relay() -> (tempfile::TempDir, RelayState, Inputs, CallerGuard) {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.sandbox/r13-part-c/publication-unit-runs");
+        std::fs::create_dir_all(&root).unwrap();
+        let home = tempfile::tempdir_in(root).unwrap();
+        let store = Arc::new(crate::accounts::AccountStore::acquire(home.path()).unwrap());
+        let identity = crate::accounts::Identity::Codex {
+            account_id: "synthetic-publication-account".into(),
+            email: "publication@example.invalid".into(),
+            user_id: None,
+        };
+        let account = crate::accounts::Account {
+            schema: 1,
+            id: identity.id(),
+            provider: Provider::Codex,
+            label: "Synthetic publication account".into(),
+            email: "publication@example.invalid".into(),
+            plan: Some("plus".into()),
+            identity,
+            source: crate::accounts::Source::Oauth,
+            user_state: crate::accounts::UserState::Active,
+            health: crate::accounts::Health::Ready,
+            auth_failures: 0,
+            payment_failures: 0,
+            payment_until: None,
+            auth_probe_pending: false,
+            quota_cooling: None,
+            quota_credit_releasable: false,
+            drain: false,
+            allow_credits: false,
+            generation: 0,
+            token_meta: crate::accounts::TokenMeta::default(),
+        };
+        store
+            .save(
+                &account,
+                &crate::accounts::Tokens {
+                    access_token: "synthetic-publication-access".into(),
+                    refresh_token: "synthetic-publication-refresh".into(),
+                    id_token: None,
+                },
+                None,
+            )
+            .unwrap();
+        let obs = Arc::new(crate::observability::Observability::new(home.path(), None).unwrap());
+        let mut config = crate::config::Config::default();
+        config.upstream.codex_base = "http://127.0.0.1:9".into();
+        config.upstream.anthropic_base = "http://127.0.0.1:9".into();
+        let relay = RelayState::new(
+            store,
+            &config,
+            obs,
+            Arc::new(crate::debug_pin::DebugPins::default()),
+        )
+        .unwrap();
+        let key = "codex:synthetic-publication-wait";
+        relay
+            .bindings
+            .import(serde_json::json!({
+                "schema": 1,
+                "bindings": [{"key": key, "account": account.id, "last_used": Utc::now()}],
+            }))
+            .unwrap();
+        // Real origin + real native reducer, not a constructed receipt/interval.
+        let origin = relay
+            .accounts
+            .capture_http_origin(&account.id)
+            .await
+            .unwrap();
+        let at = Utc::now();
+        let raw = serde_json::json!({"observed_at": at, "windows": [
+            {"name":"5h", "used_pct":100.0, "observed_at":at,
+                "reset_at":at + chrono::Duration::seconds(45)},
+            {"name":"7d", "used_pct":20.0, "observed_at":at,
+                "reset_at":at + chrono::Duration::days(1)}
+        ]});
+        relay
+            .accounts
+            .apply_quota_snapshot_reported_origin(
+                &account.id,
+                raw.clone(),
+                &raw,
+                None,
+                Some(origin),
+            )
+            .await
+            .unwrap();
+        let operation = IssueOperation::new(Instant::now() + Duration::from_secs(120));
+        let caller = operation.caller_guard();
+        let inputs = Inputs {
+            provider: Provider::Codex,
+            key: key.into(),
+            model: None,
+            source: account.id,
+            operation,
+        };
+        (home, relay, inputs, caller)
+    }
+
+    enum Exit {
+        FirstReceiptWake,
+        Wake,
+        Deadline,
+        Drain,
+    }
+
+    async fn outer_publication_busy(exit: Exit) {
+        let (_home, relay, inputs, caller) = proven_relay().await;
+        let mut gate = relay.hold_next_http_quota_wait_result(&inputs.key, &inputs.source);
+        let mut events = relay.subscribe_http_quota_wait();
+        let mut inspections = relay.subscribe_http_quota_wait_inspections();
+        let mut waiting = Box::pin(wait_http_quota(
+            &relay,
+            inputs.provider,
+            &inputs.key,
+            None,
+            &inputs.source,
+            &inputs.operation,
+            &caller,
+        ));
+        // Capture the actual first native receipt's immutable timer bounds.
+        let bounds = tokio::select! {
+            biased;
+            _ = &mut waiting => panic!("outer wait ended before genuine receipt delivery"),
+            bounds = gate.entered() => bounds.unwrap(),
+        };
+        assert_eq!(bounds.source, inputs.source);
+        assert_eq!(bounds.deadline, inputs.operation.deadline());
+        assert!(bounds.wake < bounds.deadline);
+        assert!(bounds.reset_at > Utc::now());
+        if matches!(&exit, Exit::FirstReceiptWake) {
+            // Hold publication AFTER native inspection released its guards but
+            // BEFORE delivery. Drive the real post-result policy comparison.
+            let holder = PublicationHolder::start(relay.bindings.clone());
+            gate.release();
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut waiting => panic!("first receipt ended before result policy comparison"),
+                    event = inspections.recv() => {
+                        let event = event.unwrap();
+                        assert_eq!(event.source, inputs.source);
+                        if event.stage == "result_policy_check" {
+                            break;
+                        }
+                    },
+                }
+            }
+            holder.assert_held();
+            assert!(
+                events.try_recv().is_err(),
+                "uncompared first receipt must not publish admission"
+            );
+            tokio::time::advance(bounds.wake.saturating_duration_since(Instant::now())).await;
+            let std::task::Poll::Ready(Some(end)) = futures_util::poll!(&mut waiting) else {
+                panic!("first receipt policy contention must retain its original wake");
+            };
+            assert_eq!(end.end, WaitEnd::WallResetPending);
+            assert_eq!(end.source, inputs.source);
+            assert!(end.native_cache.is_none());
+            assert!(!end.reset_reached());
+            assert!(
+                events.try_recv().is_err(),
+                "timer-only receipt must not publish admission"
+            );
+            holder.assert_held();
+            drop(holder);
+            return;
+        }
+        gate.release();
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut waiting => panic!("outer wait ended before actual admission"),
+                event = events.recv() => {
+                    let event = event.unwrap();
+                    assert_eq!(event.source, inputs.source);
+                    if event.stage == "admitted" {
+                        break;
+                    }
+                },
+            }
+        }
+        while inspections.try_recv().is_ok() {}
+        let holder = PublicationHolder::start(relay.bindings.clone());
+        // Native account event wakes the real outer engine; no direct callback
+        // or helper invocation substitutes for its pre-inspection policy check.
+        relay.accounts.set_refresh_attention(&inputs.source, true);
+        let first = futures_util::poll!(&mut waiting);
+        // A read()-instead-of-try_read() mutant blocks this very poll. The safety
+        // holder eventually releases it; this marker then rejects that fallback.
+        holder.assert_held();
+        assert!(
+            first.is_pending(),
+            "busy publication must not terminate or hand off the wait"
+        );
+        assert!(
+            inspections.try_recv().is_err(),
+            "busy comparison must not start another inspection"
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "busy comparison must not readmit optional waiting"
+        );
+        match exit {
+            Exit::FirstReceiptWake => unreachable!("first receipt handled before admission"),
+            Exit::Wake => {
+                tokio::time::advance(bounds.wake.saturating_duration_since(Instant::now())).await;
+                let end = waiting.await.unwrap();
+                // Paused Tokio advances only monotonic time; original wall reset
+                // remains future. Never extend wake or fabricate a reset hint.
+                assert_eq!(end.end, WaitEnd::WallResetPending);
+                assert_eq!(end.source, inputs.source);
+                assert!(end.native_cache.is_none());
+                assert!(!end.reset_reached());
+                holder.assert_held();
+            }
+            Exit::Deadline => {
+                tokio::time::advance(bounds.deadline.saturating_duration_since(Instant::now()))
+                    .await;
+                let end = waiting.await.unwrap();
+                assert_eq!(end.end, WaitEnd::Revoked);
+                assert!(end.native_cache.is_none());
+                holder.assert_held();
+                assert!(inputs.operation.check().is_err());
+            }
+            Exit::Drain => {
+                let mut drain = Box::pin(relay.begin_drain());
+                let first = futures_util::poll!(&mut drain);
+                assert!(
+                    first.is_pending(),
+                    "real drain must wait for held publication"
+                );
+                assert!(relay.is_draining());
+                let end = waiting.await.unwrap();
+                assert_eq!(end.end, WaitEnd::Revoked);
+                assert!(end.native_cache.is_none());
+                holder.assert_held();
+                drop(holder);
+                drain.await.unwrap();
+                return;
+            }
+        }
+        drop(holder);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn n5c_outer_first_receipt_publication_busy_preserves_original_wake() {
+        outer_publication_busy(Exit::FirstReceiptWake).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn n5c_outer_publication_busy_preserves_original_wake() {
+        outer_publication_busy(Exit::Wake).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn n5c_outer_publication_busy_preserves_original_deadline() {
+        outer_publication_busy(Exit::Deadline).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn n5c_outer_publication_busy_services_real_drain() {
+        outer_publication_busy(Exit::Drain).await;
     }
 }
