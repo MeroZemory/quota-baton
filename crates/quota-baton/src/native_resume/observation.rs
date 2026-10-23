@@ -87,12 +87,76 @@ pub(crate) enum Event {
     EndpointAccepted,
     ParentEntered,
     Cleanup,
-    StoppedThread { thread_id: ThreadId },
-    Observed { episode: u64 },
-    Inspected { episode: u64, ready: bool },
-    Consumed { episode: u64, granted: bool },
+    StoppedThread {
+        thread_id: ThreadId,
+    },
+    NativeThreadStarted {
+        thread_id: ThreadId,
+    },
+    NativeTurnCompleted {
+        thread_id: ThreadId,
+        successful: bool,
+    },
+    Observed {
+        episode: u64,
+    },
+    ObservationRejected {
+        reason: qb_proto::native_reset::Refusal,
+    },
+    ObservationFailed,
+    Inspected {
+        episode: u64,
+        ready: bool,
+    },
+    Consumed {
+        episode: u64,
+        granted: bool,
+    },
     ActivationWritten,
     ActivationAcknowledged,
+}
+
+/// Classify only the non-content fields of actual native notifications. This
+/// bound is local so path-included observer tests need no framing module.
+/// Invalid/unknown input is not capture loss and has no authority effect.
+pub(crate) fn classify_native_notification(frame: &[u8]) -> Option<Event> {
+    if frame.len() > 1024 * 1024 {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(frame).ok()?;
+    let notification = value.as_object()?;
+    // Native app-server omits jsonrpc; accept its optional standard spelling,
+    // but never classify a request/response (including an explicit null id).
+    if notification.contains_key("id")
+        || notification
+            .get("jsonrpc")
+            .is_some_and(|version| version.as_str() != Some("2.0"))
+    {
+        return None;
+    }
+    let params = notification.get("params")?.as_object()?;
+    match notification.get("method")?.as_str()? {
+        "thread/started" => {
+            let id = params.get("thread")?.as_object()?.get("id")?.as_str()?;
+            Some(Event::NativeThreadStarted {
+                thread_id: ThreadId::parse(id).ok()?,
+            })
+        }
+        "turn/completed" => {
+            let id = params.get("threadId")?.as_str()?;
+            let status = params.get("turn")?.as_object()?.get("status")?.as_str()?;
+            let successful = match status {
+                "completed" => true,
+                "failed" | "interrupted" => false,
+                _ => return None,
+            };
+            Some(Event::NativeTurnCompleted {
+                thread_id: ThreadId::parse(id).ok()?,
+                successful,
+            })
+        }
+        _ => None,
+    }
 }
 
 struct Stats {

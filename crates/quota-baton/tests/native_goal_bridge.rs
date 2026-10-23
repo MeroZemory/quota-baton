@@ -123,6 +123,119 @@ fn final_read(c: &mut Controller, ticket: StoppedGoalTicket) -> Value {
 }
 
 #[test]
+fn ephemeral_title_start_does_not_replace_correlated_foreground_selection() {
+    let mut c = controller();
+    ui(&mut c, json!(1), "thread/start", json!({}));
+    ui(&mut c, json!(10), "thread/start", json!({"ephemeral":true}));
+    response(&mut c, json!(1), json!({"thread":{"id":"thread-a"}}));
+    response(&mut c, json!(10), json!({"thread":{"id":"title-thread"}}));
+    ui(
+        &mut c,
+        json!(2),
+        "thread/goal/set",
+        json!({"threadId":"thread-a",
+        "objective":"user objective", "origin":"user", "status":"active"}),
+    );
+    response(&mut c, json!(2), json!({"goal":snapshot("active")}));
+    quota(&mut c);
+    read_goal(&mut c, snapshot("usageLimited"));
+    assert_eq!(c.stopped_ticket().unwrap().thread_id(), "thread-a");
+}
+
+#[test]
+fn ephemeral_start_after_sealing_still_revokes_resume_authority() {
+    let mut c = controller();
+    let ticket = ready(&mut c);
+    ui(&mut c, json!(10), "thread/start", json!({"ephemeral":true}));
+    response(&mut c, json!(10), json!({"thread":{"id":"title-thread"}}));
+    assert_eq!(c.delivery(), Delivery::Cancelled);
+    assert!(c.begin_final_read(ticket).is_err());
+}
+
+#[test]
+fn temporary_unsubscribe_preserves_foreground_but_pending_cleanup_blocks_sealing() {
+    let mut c = controller();
+    user_active(&mut c);
+    ui(&mut c, json!(10), "thread/start", json!({"ephemeral":true}));
+    response(&mut c, json!(10), json!({"thread":{"id":"title-thread"}}));
+    quota(&mut c);
+    ui(
+        &mut c,
+        json!(11),
+        "thread/unsubscribe",
+        json!({"threadId":"title-thread"}),
+    );
+    read_goal(&mut c, snapshot("usageLimited"));
+    assert!(
+        c.stopped_ticket().is_none(),
+        "pending cleanup blocks sealing"
+    );
+    response(&mut c, json!(11), json!({"status":"unsubscribed"}));
+    assert!(c.stopped_ticket().is_none(), "cleanup cannot mint a ticket");
+    read_goal(&mut c, snapshot("usageLimited"));
+    assert_eq!(c.stopped_ticket().unwrap().thread_id(), "thread-a");
+}
+
+#[test]
+fn current_or_unknown_unsubscribe_and_other_thread_archive_still_clear_owner() {
+    for (method, params) in [
+        ("thread/unsubscribe", json!({"threadId":"thread-a"})),
+        ("thread/unsubscribe", json!({})),
+        ("thread/unsubscribe", json!({"threadId":null})),
+        ("thread/unsubscribe", json!({"threadId":7})),
+        ("thread/unsubscribe", json!({"threadId":""})),
+        ("thread/archive", json!({"threadId":"other-thread"})),
+    ] {
+        let mut c = controller();
+        user_active(&mut c);
+        quota(&mut c);
+        ui(&mut c, json!(10), method, params);
+        response(&mut c, json!(10), json!({}));
+        quota(&mut c);
+        read_goal(&mut c, snapshot("usageLimited"));
+        assert!(
+            c.stopped_ticket().is_none(),
+            "{method} must clear ownership"
+        );
+    }
+}
+
+#[test]
+fn unrelated_unsubscribe_after_sealing_revokes_before_and_during_final_read() {
+    for checking in [false, true] {
+        let mut c = controller();
+        let ticket = ready(&mut c);
+        let private_id = if checking {
+            final_read(&mut c, ticket)
+        } else {
+            ui(
+                &mut c,
+                json!(10),
+                "thread/unsubscribe",
+                json!({"threadId":"title-thread"}),
+            );
+            response(&mut c, json!(10), json!({"status":"unsubscribed"}));
+            assert_eq!(c.delivery(), Delivery::Cancelled);
+            assert!(c.begin_final_read(ticket).is_err());
+            continue;
+        };
+        ui(
+            &mut c,
+            json!(10),
+            "thread/unsubscribe",
+            json!({"threadId":"title-thread"}),
+        );
+        response(&mut c, json!(10), json!({"status":"unsubscribed"}));
+        assert!(matches!(
+            response(&mut c, private_id, json!({"goal":snapshot("usageLimited")})),
+            Action::Suppress
+        ));
+        assert_eq!(c.delivery(), Delivery::Cancelled);
+        assert!(c.stopped_ticket().is_none());
+    }
+}
+
+#[test]
 fn observed_user_goal_stopped_snapshot_final_read_and_status_only_active() {
     let mut c = controller();
     let ticket = ready(&mut c);

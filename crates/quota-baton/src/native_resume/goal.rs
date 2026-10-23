@@ -216,9 +216,23 @@ impl Controller {
         // `pending`. After sealing EVERY UI frame vetoes the episode. Responses
         // can be user approval/denial and therefore always revoke as well.
         let method = value["method"].as_str();
+        // Native title generation starts a separate ephemeral thread. It is
+        // not a foreground selection; pending RPCs still prevent sealing and
+        // every UI frame after sealing still revokes automatic authority.
+        let auxiliary_start =
+            method == Some("thread/start") && value["params"]["ephemeral"] == true;
+        // Temporary title threads unsubscribe independently of the foreground.
+        // Unknown/current targets remain conservative. Archive is not exempt:
+        // it can remove descendants as well as the explicitly named thread.
+        let unrelated_unsubscribe = method == Some("thread/unsubscribe")
+            && self.current.as_deref().is_some_and(|current| {
+                value["params"]["threadId"]
+                    .as_str()
+                    .is_some_and(|target| !target.is_empty() && target != current)
+            });
         if self.sealed
             || method.is_none_or(|method| {
-                owner_edit(method)
+                owner_edit(method) && !auxiliary_start && !unrelated_unsubscribe
                     || method.starts_with("turn/")
                     || method.starts_with("thread/goal/") && method != "thread/goal/get"
             })
@@ -227,7 +241,7 @@ impl Controller {
         }
         if let Some(method) = method {
             // Responses veto authority but never create pending UI requests.
-            if owner_edit(method) {
+            if owner_edit(method) && !auxiliary_start && !unrelated_unsubscribe {
                 self.current = None;
                 self.forget_goal();
             } else if method.starts_with("thread/goal/") && method != "thread/goal/get" {
@@ -377,7 +391,8 @@ impl Controller {
         if matches!(
             pending.method.as_str(),
             "thread/start" | "thread/resume" | "thread/fork"
-        ) {
+        ) && !(pending.method == "thread/start" && pending.params["ephemeral"] == true)
+        {
             let id = result["thread"]["id"]
                 .as_str()
                 .filter(|s| !s.is_empty())

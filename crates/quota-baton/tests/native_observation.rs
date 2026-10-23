@@ -2,6 +2,7 @@
 #![cfg(all(feature = "testkit", debug_assertions))]
 
 #[path = "../src/native_resume/observation.rs"]
+#[allow(dead_code)] // Native notification projection is tested in its own target.
 mod observation;
 
 use std::{fs, path::Path};
