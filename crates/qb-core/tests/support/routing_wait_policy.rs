@@ -70,11 +70,13 @@ async fn n5a_http_effective_policy_zero_revokes_admitted_wait_before_reset() {
             .await
             .expect("effective zero-wait policy must stop admitted wait promptly")
             .expect("physical request result sender disappeared");
-        // Live Strict forbids a new account; the ordinary native chooser returns
-        // a typed policy rejection, not the original upstream empty 429.
-        assert_eq!(status, 409);
-        let body: Value = serde_json::from_slice(&body).expect("typed native policy error JSON");
-        assert_eq!(body["error"]["type"], "routing_policy_blocked");
+        // R13.G: live Strict forbids a new account and returns the genuine
+        // bound-account limit. The policy edit must still interrupt promptly.
+        assert_eq!(status, 429);
+        assert!(
+            body.is_empty(),
+            "preserve the original empty upstream 429 body"
+        );
         assert!(Utc::now() < reset, "reply must not wait for original reset");
         timeout(PHASE, idle(&h, &source))
             .await
