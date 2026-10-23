@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: N10 자동 외부 사용 감지·WS spill 보호
-목표: N10 집중45검사·수정 제거 대조·실제 한영4창 통과; 전체 관문 검증
+현재 마일스톤: R13 N5d 리셋 후 native 재개
+목표: N10 자동 외부 사용·WS spill 관문 완료; N5d 실행 소유자 연결·정확히 한 번 재개 구현
 핵심 지표: 남은 출시 1/3 (R14 보호 설치, R13 C+E 실행, R13 F 통합 예측); 이전 계열 2/2 종료
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-23 15:50 KST (N10 구현 e43a37b; 실제4창 확인·전체 관문 실행 중, 미설치)
+갱신: 2026-10-23 16:48 KST (N10 관문 완료·설치 인계; N5d 합성 native 재개 능력 확인, 제품 통합 전)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -211,6 +211,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-23 09:31 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | N5a HTTP 집중 관문 통과; C+E 전체 통합·설치 전이므로 출시 수 유지 |
 | 2026-10-23 11:33 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | N5b 집중 관문 통과; N5c-d·N5i 및 C+E 설치 전이므로 출시 수 유지 |
 | 2026-10-23 14:24 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | N5c 집중 관문·실제 한/영 클릭4HWND 완료; N10·N5d·통합·설치 전이므로 출시 수 유지 |
+| 2026-10-23 16:48 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | N10 집중45·실제 한영4창·두 workspace strict lint·전체 행렬 검증 완료. 기존6실패 재현; 추가 합성 버전 timeout은 변경 없는 복구54 직렬 재실행 통과. 미설치 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -405,14 +406,15 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-23 13:56 | N5c 정책 경합 대조·Strict fixture 정리 | publication2 intended101/정확 복원0, HTTP3·fmt 통과 | 기존 즉시 정책 취소/Strict60/추가 전송 없음 검증 뒤에만 명시적 hold0 정리 | n5c-g2-controls-publication-final-01; 최초 final m4b72통과/2timeout 기록, 8초 client와 원래20초 cache hold 충돌. 제품 변경 없음; 최종 영향/실제 HWND 전 |
 | 2026-10-23 14:09 | N5c HTTP 전체·WS timeout 진단 | HTTP74 통과; WS140통과/1timeout, 실패 테스트 동일2초 제한 집중 재실행1통과 | 시간 제한·전송/계정/리셋 assertions 유지; panic에 expected stage만 추가 | n5c-final-repair 및 n5c-final-ws-repair/1.log; 첫 WS 실패 원인은 미확정. 나머지 영향·실제 HWND 관문 전 |
 | 2026-10-23 14:24 | N5c 집중 영향·실제 창 관문 | core957·HTTP74·tray12·CLI23 통과; WS140/1timeout 뒤 동일 exact1 통과; strict lint·실제 ko/en4HWND·launch check0 | 권한·원래 리셋/캐시 대기·기한 유지·취소 정리 | 코드744190e와 docs-only dev merge 입력; 비반복 토글 실제 down/up·임시 진단 정확 복원. WS 원실패/UIA enqueue 원인 미확정은 보고서 보존; 전체 C+E/replay 별도 |
+| 2026-10-23 16:48 | N10 자동 외부 사용·WS spill 관문 | 집중45·실제 한영4HWND·default/all-features lint·단독 core·제품 build 통과 | 전체 default2799/6/17; all-features 수치는 fingerprint·기존6실패 원인 대조·복구54 재실행 | e43a37b·7e37088; N10-evidence/delivery-fingerprint.json 입력별 기록. 최초 timeout 원인 미확정·실제24시간 replay 별도 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 동작 |
 |---|---|---|---|
-| 외부 직접 사용·WS spill 보호 | N10 구현·집중45검사·실제 한영4창 확인; 전체 관문 진행 중 | 외부 사용 자동 보호·fresh 관측 전 대상별 최대1spill | N10 구현과 실제4세션 회귀 |
-| R13 C+E 실행 | N5a-c 집중 관문 완료·native 재개 미완료 | 리셋 뒤 자동 재개 정확히1회·통합 설치 | N10 뒤 N5d·N5i |
-| 제공자 통합 예측 | 현재 잔여량·개별 예측 제공, pooled 미출시 | 실제24시간 backtest 후 보수적 pooled runway | 독립 N7 backtest lane·UI 통합 |
+| R13 C+E native 재개 | N5a-c 관문·동일 native 합성 재개 능력 확인 | 실행 소유자에 정확히1회 재개·통합 설치 | N5d owner bridge·취소/중복 수용 후 N5i |
+| 실제24시간 라우팅 재생 | 기록기 설치·다중 epoch 입력 규칙 확정 | 각 epoch 초기 상태와 손실을 반영한 재생 | N6t owner와 N6r 실제 export 검증 |
+| 제공자 통합 예측 | 표시·잔여량 차트 설치; backtest 준비 | 실제24시간 backtest와 pooled 검증 | N7 검증 후 UI 통합 |
 <!-- gaps:end -->
 
 R11 Windows process/crash focused verification uses `cargo test -p quota-baton --all-features --test r9_crash --no-fail-fast -- --test-threads=4`. It still runs cases concurrently and preserves every in-case race, kill checkpoint, 20-second command deadline and five-second reap deadline. Default high-concurrency deadline failures and diagnostic traces remain cited; the bounded run is not a claim that the default-load timing issue was fixed. No product timing or ownership workaround was added.

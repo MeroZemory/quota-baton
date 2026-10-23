@@ -76,7 +76,7 @@ The current plan, with lanes, owners and start commands, is the "Plan" section o
 | R16 | 완료: 코드19b8d22, 영문 UI·snapshot·PNG·Claude 프로젝트명. 집중438통과·strict lint·실제 core/AdminClient/tray 3HWND·최종 CLI20 PNG 통과. 설치 수용 dev006449a·02:26 KST·takeover 거절0/1,811. brief `R16-readme-assets.md` |
 | R16.1 | 완료3737fe2·집중405·strict lint·D27 3HWND·KO PNG4개 동일: 영어 탭·표 제목·사용량 요약 폭 보완. 한국어 출력 보존, 1024×640·1320×900 scale2 실제 renderer 회귀·D27 경로 통과, self-merge 후 설계 세션 설치 |
 | R16.2 | 완료·설치 수용: dev ddf8d87, 04:34 KST; 실제 dashboard 확인·takeover 연결 거절0/1,959 |
-| N10 | 진행 중: D30 자동 외부 사용 감지(설정 없음)와 WS spill anti-herding. 외부 사용 표시는 현재·다음 window 동안 기존 세션 이동 대상에서 제외, 새 배정은 최후 수단. own-slot 대기 뒤 spill D20 charge/약한 근거 cap·새 사용량 관측 전 대상별1개. 4세션 reset 회귀·외부 상승/자체 트래픽/clean window 해제·Daybreak 소스 연구. N5c 바로 뒤·N5d 앞 |
+| N10 | 관문 완료·병합 인계(e43a37b·7e37088, 실제 한영4창·전체 행렬 검증; 기존6실패 재현·복구54 집중 재실행 통과): D30 자동 외부 사용 감지(설정 없음)와 WS spill anti-herding. 외부 사용 표시는 현재·다음 window 동안 기존 세션 이동 대상에서 제외, 새 배정은 최후 수단. own-slot 대기 뒤 spill D20 charge/약한 근거 cap·새 사용량 관측 전 대상별1개. 4세션 reset 회귀·외부 상승/자체 트래픽/clean window 해제·Daybreak 소스 연구. N5c 바로 뒤·N5d 앞 |
 | R9.5 | 대기(N3): 이동 진행·안전한 중단·재개·읽기 쉬운 확인. ready-node S1 순서에 따라 N5a-d 뒤 |
 | R16.3 | 완료·설치 수용(41cb129, 05:26 KST, takeover 거절0/1,889): 집중464·strict lint·KO/EN 실제10HWND·합성8PNG 통과. 제공자 주간/30일 계정분·권장선·음영·소진 사실 표시. 설치는 설계 세션 |
 | R16.4 | 완료·설치 수용: 32b52ea, 06:07 KST; 실제 coverage4/4·takeover 연결 거절0/1,923 |
