@@ -9,7 +9,7 @@ This file names the verification for each unit and each row. The row list and th
 목표: 제품 런처 연결·종료 경합 단위 검증 완료; 실제 native TUI 수용 연결 중
 핵심 지표: 남은 출시 1/3 (R14 보호 설치, R13 C+E 실행, R13 F 통합 예측); 이전 계열 2/2 종료
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-23 21:34 KST (N5d 제품 연결·managed46/observer8·정확 반례3 통과; 실제 TUI 수용 전)
+갱신: 2026-10-23 21:43 KST (N5d 관측 연결51+8 통과; 실제 native 하네스 fixture 보완 중)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -416,6 +416,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-23 20:23 | N5d owned 실행기 취소·파이프 수명 | managed7·strict CLI testkit all-target lint·fmt0 | 실제 synthetic 두 프로세스·막힌 쓰기·EOF·worker 정리 | 762d81b; n5d-managed-owner/unit-inputs.json. 단일 스레드 runtime·외부180초 제한; 자동 권한 연결/생산 등록은 미포함 |
 | 2026-10-23 20:43 | N5d 단일 core 권한·native 재개 통합 | managed37·actor18/client21·parent12/dispatcher10 통과; 기본/testkit CLI strict·fmt0 | premature core-close 정확 red101→바이트복원0; 권한 상실 시 ordinary 보존 | a46e25a·04721aa·288dd5c; episode-unit/unit-inputs.json. 제품 등록·실제 native/core 실행·반복 episode·WS producer·Claude 재개는 미수용 |
 | 2026-10-23 21:34 | N5d 제품 런처·정상 종료/직접 쓰기 오류 경계 | managed46·observer8·launch-client25·기본/testkit CLI strict·fmt 통과 | 종료·직접 쓰기·원인 보존 제거3건101→정확복원0 | eb2601b·b2a6c38·0bddc36; production-entry-unit-inputs.json. 두 초기 대조는 감도 미입증으로 보존; 실제 core/native TUI·반복 episode·WS producer·Claude 재개 수용은 별도 |
+| 2026-10-23 21:43 | N5d 실제 실행 관측 연결 | managed51·observer8·기본/testkit strict lint·fmt·시험 제품 build 통과 | Capture finish와 실제 entry/control/write/ACK/cleanup 인과 관측 | c7b3e7c; observation-registration-inputs.json. 첫 native 하네스는 코어 시작 전용 fixture 키 형식 오류로 실패·완전 정리; 실제 native 재개 수용 전 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
