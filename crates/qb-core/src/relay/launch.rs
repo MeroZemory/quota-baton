@@ -75,6 +75,9 @@ pub struct LaunchRequest {
     pub resume_id: Option<String>,
     #[serde(default)]
     pub move_for_model: bool,
+    /// Authenticated launcher intent only; plain issuance preserves policy.
+    #[serde(default)]
+    pub urgent: bool,
 }
 
 /// URLs contain a routing handle. Deliberately no Debug or Display.
@@ -749,6 +752,7 @@ mod tests {
             account_pref: None,
             resume_id: None,
             move_for_model: false,
+            urgent: false,
         }
     }
     fn issued_handle(reply: &LaunchReply) -> &str {
@@ -837,6 +841,127 @@ mod tests {
             Err(LaunchError::Invalid)
         ));
         assert!(f.upstream.state.requests().is_empty());
+    }
+
+    #[test]
+    fn n5c_launch_urgent_wire_is_optional_bool_and_rejects_unknown_authority() {
+        let plain: LaunchRequest = serde_json::from_value(json!({"model":"common"})).unwrap();
+        assert!(!plain.urgent);
+        let urgent: LaunchRequest =
+            serde_json::from_value(json!({"model":"common","urgent":true})).unwrap();
+        assert!(urgent.urgent);
+        for value in [
+            json!(null),
+            json!("move"),
+            json!(1),
+            json!({"session_id":"synthetic"}),
+        ] {
+            assert!(
+                serde_json::from_value::<LaunchRequest>(json!({"model":"common","urgent":value}))
+                    .is_err()
+            );
+        }
+        assert!(
+            serde_json::from_value::<LaunchRequest>(json!({
+                "model":"common", "urgent":true, "policy_id":"synthetic-display-label",
+            }))
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn n5c_urgent_launch_prepublication_and_plain_resume_preserve_overlay() {
+        let f = Fixture::new().await;
+        warm_issue_catalog(&f, &f.id, &["common"]).await;
+        let first = f
+            .relay
+            .issue_launch(
+                LaunchRequest {
+                    urgent: true,
+                    ..issue_request(Some("common"))
+                },
+                10200,
+            )
+            .await
+            .unwrap();
+        let pin = f
+            .relay
+            .launch_tokens
+            .get_or_pin(issued_handle(&first))
+            .unwrap();
+        let anchor = pin.metadata().binding_anchor_key;
+        assert_eq!(
+            f.relay
+                .bindings
+                .routing_plan(Some(&anchor))
+                .settings
+                .on_5h_limit,
+            crate::routing::On5hLimit::Move
+        );
+        let id = "12345678-1234-4234-8234-123456789abc";
+        let key = format!("codex:{id}");
+        f.relay
+            .bindings
+            .resolve_launch(Some(&anchor), Some(&key), chrono::Utc::now())
+            .unwrap();
+        for expected in [
+            crate::routing::On5hLimit::Move,
+            crate::routing::On5hLimit::Wait,
+        ] {
+            f.relay
+                .bindings
+                .set_routing_session_urgent(&crate::routing::session_id(&key), expected)
+                .unwrap();
+            let resumed = f
+                .relay
+                .issue_launch(
+                    LaunchRequest {
+                        resume_id: Some(id.into()),
+                        ..issue_request(Some("common"))
+                    },
+                    10200,
+                )
+                .await
+                .unwrap();
+            assert_eq!(resumed.account, first.account);
+            assert_eq!(
+                f.relay
+                    .bindings
+                    .routing_plan(Some(&key))
+                    .settings
+                    .on_5h_limit,
+                expected
+            );
+        }
+        f.relay
+            .bindings
+            .set_routing_session(
+                &crate::routing::session_id(&key),
+                Some(crate::routing::Settings {
+                    mode: crate::routing::Mode::Strict,
+                    reset_wait_secs: 17,
+                    on_5h_limit: crate::routing::On5hLimit::Wait,
+                }),
+                None,
+                false,
+            )
+            .unwrap();
+        f.relay
+            .issue_launch(
+                LaunchRequest {
+                    urgent: true,
+                    resume_id: Some(id.into()),
+                    ..issue_request(Some("common"))
+                },
+                10200,
+            )
+            .await
+            .unwrap();
+        let plan = f.relay.bindings.routing_plan(Some(&key));
+        assert_eq!(plan.settings.mode, crate::routing::Mode::Strict);
+        assert_eq!(plan.settings.reset_wait_secs, 17);
+        assert_eq!(plan.settings.on_5h_limit, crate::routing::On5hLimit::Move);
+        assert_eq!(plan.anchor.as_deref(), Some(first.account.as_str()));
     }
 
     #[tokio::test]
@@ -989,6 +1114,7 @@ mod tests {
                 Some(crate::routing::Settings {
                     mode: crate::routing::Mode::Strict,
                     reset_wait_secs: 7,
+                    on_5h_limit: crate::routing::On5hLimit::Wait,
                 }),
                 None,
                 Some(&f.id),
@@ -1132,6 +1258,7 @@ mod tests {
                 Some(crate::routing::Settings {
                     mode: crate::routing::Mode::Strict,
                     reset_wait_secs: 7,
+                    on_5h_limit: crate::routing::On5hLimit::Wait,
                 }),
                 None,
                 Some(&f.id),
@@ -1747,6 +1874,14 @@ impl RelayState {
                                 },
                             )
                             .map_err(issue_binding_error)?;
+                        if request.urgent {
+                            table
+                                .set_routing_session_urgent(
+                                    &crate::routing::session_id(&placement.canonical_key),
+                                    crate::routing::On5hLimit::Move,
+                                )
+                                .map_err(|_| LaunchError::Store)?;
+                        }
                         for event in &placement.moves {
                             if event.is_placement {
                                 obs.record_placement(event);

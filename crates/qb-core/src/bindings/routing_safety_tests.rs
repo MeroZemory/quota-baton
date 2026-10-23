@@ -1598,6 +1598,7 @@ fn round2_any_discretionary_guard_veto_keeps_mark_on_healthy_source() {
                             crate::routing::Mode::Recover
                         },
                         reset_wait_secs: 60,
+                        on_5h_limit: crate::routing::On5hLimit::Wait,
                     }),
                     None,
                     Some("cl-a"),

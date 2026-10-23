@@ -1164,6 +1164,29 @@ fn decode_scoped(value: Value, strict: bool) -> Result<Data> {
     }
     Ok(d)
 }
+// Constructible only by the binding owner while its mutation gate is held.
+// This is first-association evidence, never dispatch or movement authority.
+pub(crate) struct ManagedFirstProject<'a> {
+    key: &'a str,
+    account: &'a str,
+    _gate: std::marker::PhantomData<&'a ()>,
+}
+impl<'a> ManagedFirstProject<'a> {
+    fn new(key: &'a str, account: &'a str, _gate: &'a std::sync::MutexGuard<'_, ()>) -> Self {
+        Self {
+            key,
+            account,
+            _gate: std::marker::PhantomData,
+        }
+    }
+    pub(crate) fn key(&self) -> &str {
+        self.key
+    }
+    pub(crate) fn account(&self) -> &str {
+        self.account
+    }
+}
+
 impl BindingTable {
     fn accepted_in(d: &Data, key: Option<&str>, id: &str) -> bool {
         if key.is_none() {
@@ -1189,7 +1212,15 @@ impl BindingTable {
         let d = self.data.lock().unwrap_or_else(|e| e.into_inner());
         let anchor = d.groups.get(group(key)).map(|g| g.account.clone());
         let policy_key = launch::policy_key(&d, Some(key)).unwrap().to_owned();
+        let managed_first =
+            d.launches.contains_key(group(key)) && launch::idle_placement(&d, group(key));
         drop(d);
+        if managed_first && let Some(account) = anchor.as_deref() {
+            return self.policies.associate_managed_first_project(
+                ManagedFirstProject::new(&policy_key, account, &_mutation),
+                project,
+            );
+        }
         self.policies
             .associate_with_anchor(&policy_key, project, anchor.as_deref())
     }
@@ -1203,6 +1234,15 @@ impl BindingTable {
         &self,
         id: &str,
         settings: Option<crate::routing::Settings>,
+        project: Option<&str>,
+        inherit: bool,
+    ) -> Result<()> {
+        self.set_routing_session_patch(id, settings.map(Into::into), project, inherit)
+    }
+    pub fn set_routing_session_patch(
+        &self,
+        id: &str,
+        settings: Option<crate::routing::SettingsEdit>,
         project: Option<&str>,
         inherit: bool,
     ) -> Result<()> {
@@ -1222,13 +1262,62 @@ impl BindingTable {
         let policy_id = binding
             .as_ref()
             .map(|(key, _)| crate::routing::session_id(key));
-        self.policies.edit_session_for_key(
+        self.policies.edit_session_patch_for_key(
             policy_id.as_deref().unwrap_or(id),
             settings,
             project,
             binding.as_ref().map(|(_, a)| a.as_str()),
             inherit,
             binding.as_ref().map(|(k, _)| k.as_str()),
+        )
+    }
+    /// Authenticated launch intent for an exact native Claude session identity.
+    /// This creates no observed binding and grants no dispatch authority.
+    pub fn register_claude_urgent(&self, session_id: &str) -> Result<()> {
+        if session_id.len() != 36
+            || !session_id.bytes().enumerate().all(|(i, byte)| {
+                if matches!(i, 8 | 13 | 18 | 23) {
+                    byte == b'-'
+                } else {
+                    byte.is_ascii_hexdigit()
+                }
+            })
+        {
+            anyhow::bail!("invalid native Claude launch identity");
+        }
+        let _mutation = self.mutations.lock().unwrap_or_else(|e| e.into_inner());
+        let key = format!("claude:{session_id}");
+        self.policies.set_session_urgent_for_key(
+            &crate::routing::session_id(&key),
+            crate::routing::On5hLimit::Move,
+            Some(&key),
+        )
+    }
+    pub fn set_routing_session_urgent(
+        &self,
+        id: &str,
+        on_5h_limit: crate::routing::On5hLimit,
+    ) -> Result<()> {
+        let _mutation = self.mutations.lock().unwrap_or_else(|e| e.into_inner());
+        let d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        let binding = d
+            .groups
+            .iter()
+            .find(|(key, _)| crate::routing::session_id(key) == id)
+            .map(|(key, g)| {
+                (
+                    launch::policy_key(&d, Some(key)).unwrap().to_owned(),
+                    g.account.clone(),
+                )
+            });
+        drop(d);
+        let policy_id = binding
+            .as_ref()
+            .map(|(key, _)| crate::routing::session_id(key));
+        self.policies.set_session_urgent_for_key(
+            policy_id.as_deref().unwrap_or(id),
+            on_5h_limit,
+            binding.as_ref().map(|(key, _)| key.as_str()),
         )
     }
     pub fn new(home: &Path, config: RoutingConfig) -> Result<Arc<Self>> {
@@ -1240,6 +1329,7 @@ impl BindingTable {
             crate::routing::Settings {
                 mode: config.mode,
                 reset_wait_secs: config.reset_hold_secs,
+                on_5h_limit: crate::routing::On5hLimit::Wait,
             },
         )?
         .with_limits(config.churn.clone())?;
@@ -3687,6 +3777,250 @@ mod tests {
         assert!(!n5a_authority_ready(repeated.as_mut()));
     }
 
+    const N5C_FIRST: &str = "launch:synthetic-first-project";
+    const N5C_REAL: &str = "codex:synthetic-first-project";
+
+    #[test]
+    fn n5c_claude_launch_intent_preserves_exact_native_identity_without_binding() {
+        let (_home, table) = table();
+        for invalid in [
+            "label",
+            "12345678123442348234123456789abc",
+            "claude:12345678-1234-4234-8234-123456789abc",
+        ] {
+            assert!(table.register_claude_urgent(invalid).is_err());
+        }
+        let native = "12345678-1234-4234-8234-123456789ABC";
+        table.register_claude_urgent(native).unwrap();
+        let key = format!("claude:{native}");
+        let plan = table.routing_plan(Some(&key));
+        assert_eq!(plan.settings.on_5h_limit, crate::routing::On5hLimit::Move);
+        assert!(plan.anchor.is_none());
+        assert!(table.current(Some(&key)).is_none());
+        assert_eq!(
+            table
+                .routing_plan(Some(&key.to_lowercase()))
+                .settings
+                .on_5h_limit,
+            crate::routing::On5hLimit::Wait
+        );
+        let d = table.data.lock().unwrap();
+        assert!(d.groups.is_empty());
+        assert!(d.bindings.is_empty());
+    }
+
+    fn n5c_managed_first_fixture() -> (tempfile::TempDir, Arc<BindingTable>, String) {
+        let (home, table) = table();
+        table
+            .policies
+            .set_session_urgent_for_key(
+                &crate::routing::session_id(N5C_FIRST),
+                crate::routing::On5hLimit::Move,
+                Some(N5C_FIRST),
+            )
+            .unwrap();
+        let mut c = candidate("cx-first", 0.0, 168, 5);
+        c.account.provider = Provider::Codex;
+        c.account.identity = Identity::Codex {
+            user_id: None,
+            account_id: "synthetic-first".into(),
+            email: "synthetic@example.invalid".into(),
+        };
+        let placed = table
+            .place_launch(
+                LaunchRequest {
+                    anchor_key: N5C_FIRST,
+                    resume_key: None,
+                    model: Some("synthetic-model"),
+                    model_is_explicit: true,
+                    account_pref: Some("cx-first"),
+                    allow_move_for_model: false,
+                },
+                &[c],
+                &BTreeMap::from([(
+                    "cx-first".into(),
+                    BTreeSet::from(["synthetic-model".into()]),
+                )]),
+                Utc::now(),
+            )
+            .unwrap();
+        assert_eq!(placed.account, "cx-first");
+        assert_eq!(placed.moves.len(), 1);
+        let initial = &placed.moves[0];
+        assert_eq!(initial.key, N5C_FIRST);
+        assert!(initial.from.is_none());
+        assert_eq!(initial.to, "cx-first");
+        assert!(initial.is_placement);
+        let before = table.routing_plan(Some(N5C_FIRST));
+        assert_eq!(before.anchor.as_deref(), Some("cx-first"));
+        let adopted = table
+            .resolve_launch(Some(N5C_FIRST), Some(N5C_REAL), Utc::now())
+            .unwrap();
+        assert_eq!(adopted.canonical_key, N5C_REAL);
+        assert_eq!(table.data.lock().unwrap().launches.len(), 1);
+        let project = table
+            .policies
+            .put_project(
+                None,
+                crate::routing::Project {
+                    name: "synthetic first project".into(),
+                    settings: crate::routing::Settings {
+                        mode: crate::routing::Mode::Strict,
+                        reset_wait_secs: 23,
+                        on_5h_limit: crate::routing::On5hLimit::Wait,
+                    },
+                },
+            )
+            .unwrap();
+        (home, table, project)
+    }
+
+    #[test]
+    fn n5c_managed_idle_overlay_associates_once_preserving_native_anchor_and_identity() {
+        let (home, table, project) = n5c_managed_first_fixture();
+        // Generic anchored overlay is still rejected; only the owner path differs.
+        assert!(
+            table
+                .policies
+                .associate_with_anchor(N5C_FIRST, &project, Some("cx-first"))
+                .is_err()
+        );
+        table.associate_project(N5C_REAL, &project).unwrap();
+        table.associate_project(N5C_REAL, &project).unwrap();
+        let plan = table.routing_plan(Some(N5C_REAL));
+        assert_eq!(plan.project.as_deref(), Some(project.as_str()));
+        assert_eq!(plan.anchor.as_deref(), Some("cx-first"));
+        assert_eq!(plan.settings.mode, crate::routing::Mode::Strict);
+        assert_eq!(plan.settings.reset_wait_secs, 23);
+        assert_eq!(plan.settings.on_5h_limit, crate::routing::On5hLimit::Move);
+        assert!(table.permits_dispatch(Some(N5C_REAL), "cx-first"));
+        assert!(!table.permits_dispatch(Some(N5C_REAL), "cx-other"));
+        assert_eq!(
+            table
+                .launch_info(N5C_REAL, Utc::now())
+                .unwrap()
+                .current_model
+                .as_deref(),
+            Some("synthetic-model")
+        );
+        {
+            let d = table.data.lock().unwrap();
+            assert_eq!(launch::policy_key(&d, Some(N5C_REAL)), Some(N5C_FIRST));
+            assert!(launch::idle_placement(&d, N5C_REAL));
+        }
+        let other = table
+            .policies
+            .put_project(
+                None,
+                crate::routing::Project {
+                    name: "synthetic other project".into(),
+                    settings: crate::routing::Settings::default(),
+                },
+            )
+            .unwrap();
+        let before = table.policies.list();
+        assert!(table.associate_project(N5C_REAL, &other).is_err());
+        assert_eq!(table.policies.list(), before);
+        drop(table);
+        let restarted =
+            crate::routing::PolicyStore::new(home.path(), crate::routing::Settings::default())
+                .unwrap();
+        let persisted = restarted.plan(Some(N5C_FIRST));
+        assert_eq!(persisted.project.as_deref(), Some(project.as_str()));
+        assert_eq!(persisted.anchor.as_deref(), Some("cx-first"));
+        assert_eq!(persisted.settings, plan.settings);
+    }
+
+    #[test]
+    fn n5c_managed_first_project_refuses_after_native_reservation_even_without_dispatch() {
+        let (_home, table, project) = n5c_managed_first_fixture();
+        let lease = table.begin_request(Some(N5C_REAL), "cx-first");
+        drop(lease);
+        assert!(!launch::idle_placement(
+            &table.data.lock().unwrap(),
+            N5C_REAL
+        ));
+        let before = table.policies.list();
+        assert!(table.associate_project(N5C_REAL, &project).is_err());
+        assert_eq!(table.policies.list(), before);
+        assert_eq!(table.current(Some(N5C_REAL)).as_deref(), Some("cx-first"));
+    }
+
+    #[test]
+    fn n5c_managed_first_project_writer_rechecks_interposed_policy_and_account() {
+        for account in ["cx-first", "cx-other"] {
+            let (_home, table, project) = n5c_managed_first_fixture();
+            let mutation = table.mutations.lock().unwrap();
+            let d = table.data.lock().unwrap();
+            assert!(launch::idle_placement(&d, N5C_REAL));
+            let key = launch::policy_key(&d, Some(N5C_REAL)).unwrap().to_owned();
+            let selected = d.groups[N5C_REAL].account.clone();
+            let evidence = ManagedFirstProject::new(&key, &selected, &mutation);
+            drop(d);
+            // Independent policy owners may publish while the binding gate is
+            // held. Interpose an actual setter after proof construction; no
+            // timing/FIFO assumption or synthetic accepted-bit manipulation.
+            table
+                .policies
+                .set_session(
+                    &crate::routing::session_id(&key),
+                    Some(crate::routing::Settings {
+                        mode: crate::routing::Mode::Recover,
+                        reset_wait_secs: 31,
+                        on_5h_limit: crate::routing::On5hLimit::Move,
+                    }),
+                    None,
+                    Some(account),
+                )
+                .unwrap();
+            if account != selected {
+                table
+                    .policies
+                    .dispatch(Some(&key), account, Some(&selected), "forced", Utc::now())
+                    .unwrap();
+            }
+            let before = table.policies.list();
+            assert!(
+                table
+                    .policies
+                    .associate_managed_first_project(evidence, &project)
+                    .is_err()
+            );
+            assert_eq!(table.policies.list(), before);
+        }
+    }
+
+    #[test]
+    fn n5c_managed_same_project_still_checks_owner_account_and_retired_writer() {
+        let (_home, table, project) = n5c_managed_first_fixture();
+        table.associate_project(N5C_REAL, &project).unwrap();
+        table
+            .policies
+            .set_session(
+                &crate::routing::session_id(N5C_FIRST),
+                Some(crate::routing::Settings::default()),
+                Some(&project),
+                Some("cx-other"),
+            )
+            .unwrap();
+        table
+            .policies
+            .dispatch(
+                Some(N5C_FIRST),
+                "cx-other",
+                Some("cx-first"),
+                "forced",
+                Utc::now(),
+            )
+            .unwrap();
+        let before = table.policies.list();
+        assert!(table.associate_project(N5C_REAL, &project).is_err());
+        assert_eq!(table.policies.list(), before);
+        let (_retired_home, table, project) = n5c_managed_first_fixture();
+        table.freeze().unwrap();
+        assert!(table.associate_project(N5C_REAL, &project).is_err());
+    }
+
     fn n5a_wait_fixture() -> (tempfile::TempDir, Arc<BindingTable>) {
         let root = fixture_dir();
         let table = BindingTable::new(root.path(), RoutingConfig::default()).unwrap();
@@ -3837,6 +4171,7 @@ mod tests {
                 Some(crate::routing::Settings {
                     mode: crate::routing::Mode::Strict,
                     reset_wait_secs: 60,
+                    on_5h_limit: crate::routing::On5hLimit::Wait,
                 }),
                 None,
                 false,
@@ -3857,6 +4192,7 @@ mod tests {
                 Some(crate::routing::Settings {
                     mode: crate::routing::Mode::Strict,
                     reset_wait_secs: 0,
+                    on_5h_limit: crate::routing::On5hLimit::Wait,
                 }),
                 None,
                 false,
@@ -4040,6 +4376,7 @@ mod tests {
                 Some(crate::routing::Settings {
                     mode: crate::routing::Mode::Rebalance,
                     reset_wait_secs: wait_secs,
+                    on_5h_limit: crate::routing::On5hLimit::Wait,
                 }),
                 None,
                 None,
@@ -4222,6 +4559,7 @@ mod tests {
             crate::routing::Settings {
                 mode: crate::routing::Mode::Rebalance,
                 reset_wait_secs: 60,
+                on_5h_limit: crate::routing::On5hLimit::Wait,
             },
         )
         .unwrap();
@@ -4231,6 +4569,7 @@ mod tests {
                 Some(crate::routing::Settings {
                     mode: crate::routing::Mode::Strict,
                     reset_wait_secs: 0,
+                    on_5h_limit: crate::routing::On5hLimit::Wait,
                 }),
                 None,
                 None,
@@ -4554,6 +4893,7 @@ mod tests {
                     Some(crate::routing::Settings {
                         mode: crate::routing::Mode::Strict,
                         reset_wait_secs: 0,
+                        on_5h_limit: crate::routing::On5hLimit::Wait,
                     }),
                     None,
                     false,
@@ -4765,6 +5105,7 @@ mod tests {
                     Some(crate::routing::Settings {
                         mode: crate::routing::Mode::Strict,
                         reset_wait_secs: 0,
+                        on_5h_limit: crate::routing::On5hLimit::Wait,
                     }),
                     None,
                     None,
@@ -4822,6 +5163,7 @@ mod tests {
                 Some(crate::routing::Settings {
                     mode: crate::routing::Mode::Strict,
                     reset_wait_secs: 0,
+                    on_5h_limit: crate::routing::On5hLimit::Wait,
                 }),
                 None,
                 None,

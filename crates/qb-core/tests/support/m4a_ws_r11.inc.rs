@@ -183,6 +183,7 @@ mod r11_actual {
                         account_pref: account.map(str::to_owned),
                         resume_id: None,
                         move_for_model: false,
+                        urgent: false,
                     },
                     self.h.servers.data_addr.port(),
                 )
@@ -440,6 +441,7 @@ mod r11_actual {
                         account_pref: None,
                         resume_id: Some("r11-real-header".into()),
                         move_for_model: false,
+                        urgent: false,
                     },
                     t.h.servers.data_addr.port(),
                 )
@@ -899,6 +901,7 @@ mod r11_actual {
                             account_pref: Some(account.clone()),
                             resume_id: Some(key.into()),
                             move_for_model: false,
+                            urgent: false,
                         },
                         t.h.servers.data_addr.port(),
                     )
@@ -1048,6 +1051,7 @@ mod r11_actual {
                             account_pref: Some(account.clone()),
                             resume_id: None,
                             move_for_model: false,
+                            urgent: false,
                         },
                         t.h.servers.data_addr.port(),
                     )
@@ -1287,6 +1291,7 @@ mod r11_actual {
                     account_pref: Some(account.into()),
                     resume_id: Some(key.into()),
                     move_for_model: false,
+                    urgent: false,
                 },
                 t.h.servers.data_addr.port(),
             ),
@@ -1650,6 +1655,7 @@ mod r11_actual {
                         Some(Settings {
                             mode: Mode::Strict,
                             reset_wait_secs: 60,
+                            on_5h_limit: qb_core::routing::On5hLimit::Wait,
                         }),
                         None,
                         false,

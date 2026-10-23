@@ -869,6 +869,7 @@ async fn r12_9_healthy_unanchored_strict_first_placement_waits_then_dispatches()
                 Some(qb_core::routing::Settings {
                     mode: qb_core::routing::Mode::Strict,
                     reset_wait_secs: 0,
+                    on_5h_limit: qb_core::routing::On5hLimit::Wait,
                 }),
                 None,
                 false,

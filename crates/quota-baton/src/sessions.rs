@@ -98,6 +98,12 @@ const DEFAULT_KEEP_SOURCE: bool = false;
 
 #[derive(Subcommand)]
 pub(crate) enum SessionsCommand {
+    #[command(about = "실행 중인 코어에서 루트 세션의 5시간 제한 긴급 전환을 설정합니다")]
+    Urgent {
+        id: String,
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
     #[command(
         about = "기존 대화를 qb로 가져옵니다",
         override_usage = "quota-baton sessions import --from <HOME> [<UUID> | --all | --list] [--apply]"
@@ -1047,6 +1053,10 @@ fn preview_imports(
 }
 
 pub(crate) fn run(home: &Path, command: SessionsCommand) -> Result<()> {
+    ensure!(
+        !matches!(&command, SessionsCommand::Urgent { .. }),
+        "긴급 정책은 실행 중인 코어에 요청해야 합니다"
+    );
     run_with_store(Store::open(home)?, command)
 }
 
@@ -1063,6 +1073,7 @@ fn run_with_store(mut store: Store, command: SessionsCommand) -> Result<()> {
         store = store.for_session(id)?;
     }
     match command {
+        SessionsCommand::Urgent { .. } => bail!("긴급 정책은 실행 중인 코어에 요청해야 합니다"),
         SessionsCommand::Import {
             from,
             id,
@@ -2115,4 +2126,34 @@ pub(crate) fn admission_check(home: &Path, requested: Option<&str>) -> Result<()
         resume_entry(&legacy, id)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod n5c_urgent_args_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Args {
+        #[command(subcommand)]
+        command: SessionsCommand,
+    }
+
+    #[test]
+    fn n5c_sessions_urgent_accepts_only_explicit_on_or_off() {
+        for state in ["on", "off"] {
+            let args = Args::try_parse_from(["qb", "urgent", "synthetic", state]).unwrap();
+            assert!(
+                matches!(args.command, SessionsCommand::Urgent { id, state: value }
+                if id == "synthetic" && value == state)
+            );
+        }
+        for args in [
+            vec!["qb", "urgent", "synthetic"],
+            vec!["qb", "urgent", "synthetic", "move"],
+            vec!["qb", "urgent", "synthetic", "true"],
+        ] {
+            assert!(Args::try_parse_from(args).is_err());
+        }
+    }
 }

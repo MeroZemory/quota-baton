@@ -202,7 +202,32 @@ pub(crate) struct AdmittedQuotaWait {
     deadline: tokio::time::Instant,
 }
 
+/// Read-only effective policy at admission; no ticket or quota/dispatch authority.
+/// Used only to stop optional waiting while a native inspection is blocked.
+pub(crate) struct WaitPolicySnapshot {
+    key: String,
+    account: String,
+    plan: crate::routing::Plan,
+}
+
+impl WaitPolicySnapshot {
+    pub(crate) fn unchanged(&self, policies: &crate::routing::PolicyStore) -> bool {
+        policies
+            .with_wait_plan(&self.key, &self.account, |current| {
+                same_wait_plan(&self.plan, current).then_some(())
+            })
+            .is_some()
+    }
+}
+
 impl AdmittedQuotaWait {
+    pub(crate) fn policy_snapshot(&self) -> WaitPolicySnapshot {
+        WaitPolicySnapshot {
+            key: self.policy_key.clone(),
+            account: self.account.clone(),
+            plan: self.plan.clone(),
+        }
+    }
     pub(crate) fn account(&self) -> &str {
         &self.account
     }

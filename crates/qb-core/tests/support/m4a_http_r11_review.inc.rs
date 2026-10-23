@@ -83,6 +83,7 @@ mod r11_review {
                     Some(qb_core::routing::Settings {
                         mode: qb_core::routing::Mode::Strict,
                         reset_wait_secs: 0,
+                        on_5h_limit: qb_core::routing::On5hLimit::Wait,
                     }),
                     None,
                     Some(&info.account),
@@ -352,6 +353,7 @@ mod r11_review {
                         account_pref: None,
                         resume_id: None,
                         move_for_model: false,
+                        urgent: false,
                     },
                     h.servers.data_addr.port(),
                 )
@@ -408,6 +410,7 @@ mod r11_review {
                             account_pref: Some(pref),
                             resume_id: None,
                             move_for_model: false,
+                            urgent: false,
                         },
                         port,
                     )
@@ -463,6 +466,7 @@ mod r11_review {
                         Some(qb_core::routing::Settings {
                             mode: qb_core::routing::Mode::Strict,
                             reset_wait_secs: 0,
+                            on_5h_limit: qb_core::routing::On5hLimit::Wait,
                         }),
                         None,
                         Some(&persisted.account),

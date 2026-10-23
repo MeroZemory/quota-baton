@@ -448,13 +448,19 @@ async fn run() -> anyhow::Result<()> {
             // errors, after the existing contained runner's tree cleanup.
             std::process::exit(status?);
         }
-        let status = launcher_label::run(*client, command, settings.as_deref(), args);
+        let status = launch_client::run_claude(command, settings.as_deref(), args).await;
         std::process::exit(status?);
     }
     let home = qb_core::home()?;
     match cli.command {
         Command::Debug { command } => debug_snapshot::run(&home, command).await?,
         Command::Doctor => sessions::doctor(&home)?,
+        Command::Sessions {
+            command: sessions::SessionsCommand::Urgent { id, state },
+        } => {
+            let config = qb_core::config::Config::load(&home)?;
+            routing_cli::urgent(id, state == "on", &home, &config).await?;
+        }
         Command::Sessions { command } => sessions::run(&home, command)?,
         Command::LaunchClient { .. } => {
             unreachable!("launcher handled before core home resolution")

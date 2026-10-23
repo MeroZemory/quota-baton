@@ -12,6 +12,7 @@ clap.workspace = true
 chrono.workspace = true
 qb-core.workspace = true
 qb-proto.workspace = true
+rand.workspace = true
 qb-tray = { path = "../qb-tray" }
 reqwest.workspace = true
 rusqlite = { version = "=0.33.0", features = ["bundled"] }

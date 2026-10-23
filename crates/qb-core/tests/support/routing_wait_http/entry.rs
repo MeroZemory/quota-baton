@@ -255,3 +255,6 @@ async fn n5a_http_full_poll_reset_beyond_hold_declines_initial_wait_and_normally
     assert_eq!(usage.state.requests().len(), 1);
     assert_eq!(h.fake.state.requests().len(), 2);
 }
+
+#[path = "n5c_policy_wake.rs"]
+mod n5c_policy_wake;

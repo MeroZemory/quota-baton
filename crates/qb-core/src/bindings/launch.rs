@@ -1568,6 +1568,7 @@ mod r11_active_adoption_tests {
         Settings {
             mode: Mode::Strict,
             reset_wait_secs: 0,
+            on_5h_limit: crate::routing::On5hLimit::Wait,
         }
     }
 
