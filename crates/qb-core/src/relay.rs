@@ -2247,7 +2247,13 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
     let allow_initial_fallback = true;
     if allow_initial_fallback
         && let Some(response) = state
-            .initial_http_far_wait(provider, &session, request_model.as_deref(), data_deadline)
+            .initial_http_far_wait(
+                provider,
+                &session,
+                request_model.as_deref(),
+                data_deadline,
+                parts.extensions.get::<launch::LaunchIngress>(),
+            )
             .await
     {
         completion.outcome(response.status().as_u16(), "quota_wait_fallback");
