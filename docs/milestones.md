@@ -9,7 +9,7 @@ This file names the verification for each unit and each row. The row list and th
 목표: HTTP 대기 노드 검증 완료; WS/SSE 취소·keepalive 소유권 연결과 실제 전송 회귀
 핵심 지표: 남은 출시 1/3 (R14 보호 설치, R13 C+E 실행, R13 F 통합 예측); 이전 계열 2/2 종료
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-23 09:58 KST (SSE·WS 제어 취소 단위 통과; 근거 기반 WS 대기 연결 중, C+E 통합 전)
+갱신: 2026-10-23 10:14 KST (WS 비동기 초기 검사·기한 단위 통과; 실제 poll 근거 대기 연결 중, C+E 통합 전)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -380,6 +380,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-23 09:39 | N5b 실제 SSE 취소 단위 | 실제 socket close1·strict target lint·fmt exit0; tx.closed 제거 exit101·정확 복원 exit0 | 비종료 stalled upstream·native 자원 정리 | 코드349909f; n5b-sse-unit/n5b-sse-cancel-red 증거. quota hold·WS·전체 N5b 수용 아님 |
 | 2026-10-23 09:58 | N5b WS 대기 제어 단위 | 실제3·기존 바이트1·영향WS126 통과, strict default/testkit core lint·fmt exit0 | deferred 뒤 Ping/Close/EOF·추가 데이터 제한·자원 반환 | 코드dd640ad; exact predicate 제거 예상 실패·정확 복원 통과. quota proof wait·전체 N5b 수용 아님 |
 | 2026-10-23 09:58 | N5m Codex HTTP 5시간 합성 실측 | 명시6시간 idle 설정·실제18,000초, 1attempt/0retry·exit0 | postheaders/pre-first-event tolerance만 측정 | zero control 포함2건, Job/home 정리·독립 증거 검수; 기본 timeout·캐시TTL·제품5시간 hold 주장 아님 |
+| 2026-10-23 10:14 | N5b 비동기 초기 검사 단위 | private3·실제5·기존 바이트1, strict core/testkit all-target lint·fmt exit0 | pre-eligibility/pre-lease Ping·Close/EOF·원래 모델 기한 | 코드b13118a; inline-await·기한 재계산 대조 예상 실패/정확 복원 통과. quota wait·전체 N5b 수용 아님 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
