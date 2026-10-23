@@ -19,7 +19,7 @@ pub(crate) struct Preview<'a> {
     pub(crate) source_home: &'a str,
     pub(crate) target_home: &'a str,
     pub(crate) profile_home: &'a str,
-    /// Raw goal states are localized; unknown values remain readable verbatim.
+    /// Raw goal states are localized; unrecognized values use a fixed label.
     pub(crate) goal_before: Option<&'a str>,
     pub(crate) goal_after: Option<&'a str>,
     pub(crate) verbose: Option<Verbose<'a>>,
@@ -58,7 +58,10 @@ pub(crate) fn format_body(language: Language, preview: &Preview<'_>) -> String {
     let mut out = String::new();
     match language {
         Language::Ko => {
-            let _ = writeln!(out, "대화 {id}를 qb로 가져옵니다  ({title} · 기록 {size})\n");
+            let _ = writeln!(
+                out,
+                "대화 {id}를 qb로 가져옵니다  ({title} · 기록 {size})\n"
+            );
             let _ = writeln!(out, "  어디서   {source}    기본 Codex 홈");
             let _ = writeln!(out, "  어디로   {target}    codex-qb 홈");
             let _ = writeln!(out, "  목표     {goal}\n");
@@ -66,7 +69,10 @@ pub(crate) fn format_body(language: Language, preview: &Preview<'_>) -> String {
             out.push_str("  share   원본 홈에도 남겨 둡니다. 두 곳에서 동시에 열지 마세요.\n");
         }
         Language::En => {
-            let _ = writeln!(out, "Bring conversation {id} into qb  ({title} · history {size})\n");
+            let _ = writeln!(
+                out,
+                "Bring conversation {id} into qb  ({title} · history {size})\n"
+            );
             let _ = writeln!(out, "  From    {source}    default Codex home");
             let _ = writeln!(out, "  To      {target}    codex-qb home");
             let _ = writeln!(out, "  Goal    {goal}\n");
@@ -99,7 +105,10 @@ pub(crate) fn format_body(language: Language, preview: &Preview<'_>) -> String {
     let id = plain(preview.id);
     match language {
         Language::Ko => {
-            let _ = writeln!(out, "\n  나중에 되돌리기: quota-baton sessions return {id}\n");
+            let _ = writeln!(
+                out,
+                "\n  나중에 되돌리기: quota-baton sessions return {id}\n"
+            );
         }
         Language::En => {
             let _ = writeln!(out, "\n  Return later: quota-baton sessions return {id}\n");
@@ -121,11 +130,14 @@ fn goal_text(language: Language, before: Option<&str>, after: Option<&str>) -> S
         };
         format!("{after_text} ({unchanged})")
     } else {
-        format!("{} → {after_text}", goal_state(language, before.unwrap_or(absent)))
+        format!(
+            "{} → {after_text}",
+            goal_state(language, before.unwrap_or(absent))
+        )
     }
 }
 
-fn goal_state(language: Language, state: &str) -> String {
+pub(super) fn goal_state(language: Language, state: &str) -> String {
     plain(match (language, state) {
         (Language::Ko, "active") => "진행 중",
         (Language::Ko, "usage_limited") => "사용량 한도 대기",
@@ -136,7 +148,10 @@ fn goal_state(language: Language, state: &str) -> String {
         (Language::En, "usage_limited") => "waiting for usage limit reset",
         (Language::En, "blocked") => "waiting for external conditions",
         (Language::En, "budget_limited") => "budget exhausted",
-        _ => state,
+        (Language::En, "active" | "paused" | "complete" | "none")
+        | (Language::Ko, "없음" | "진행 중" | "일시정지" | "완료") => state,
+        (Language::En, _) => "unknown",
+        (Language::Ko, _) => "알 수 없음",
     })
 }
 
@@ -223,7 +238,7 @@ move 또는 share를 입력하세요 (취소: Enter) > "#;
 
   From    ~\.codex    default Codex home
   To      ~\.codex-acct\qb    codex-qb home
-  Goal    waiting → active
+  Goal    waiting for external conditions → active
 
   move    Move into qb and remove from the source home. It can no longer be opened there.  (recommended)
   share   Keep it in the source home too. Do not open it in both places at once.
@@ -242,7 +257,7 @@ Enter move or share (cancel: Enter) > "#;
         // A compressed history supplies its on-disk byte count, never decoded
         // contents or a rollout filename to the ordinary preview.
         let mut input = preview();
-        input.goal_before = Some("waiting");
+        input.goal_before = Some("blocked");
         input.goal_after = Some("active");
         assert_eq!(format_preview(Language::En, &input), EN);
     }
@@ -250,12 +265,16 @@ Enter move or share (cancel: Enter) > "#;
     #[test]
     fn body_excludes_only_the_final_prompt() {
         for (language, golden, prompt) in [
-            (Language::Ko, KO, "move 또는 share를 입력하세요 (취소: Enter) > "),
+            (
+                Language::Ko,
+                KO,
+                "move 또는 share를 입력하세요 (취소: Enter) > ",
+            ),
             (Language::En, EN, "Enter move or share (cancel: Enter) > "),
         ] {
             let mut input = preview();
             if language == Language::En {
-                input.goal_before = Some("waiting");
+                input.goal_before = Some("blocked");
                 input.goal_after = Some("active");
             }
             let body = format_body(language, &input);
@@ -269,32 +288,52 @@ Enter move or share (cancel: Enter) > "#;
     fn raw_goal_states_are_localized() {
         for (raw, ko, en) in [
             ("active", "진행 중", "active"),
-            ("usage_limited", "사용량 한도 대기", "waiting for usage limit reset"),
+            (
+                "usage_limited",
+                "사용량 한도 대기",
+                "waiting for usage limit reset",
+            ),
             ("paused", "일시정지", "paused"),
-            ("blocked", "외부 조건 대기", "waiting for external conditions"),
+            (
+                "blocked",
+                "외부 조건 대기",
+                "waiting for external conditions",
+            ),
             ("budget_limited", "예산 소진", "budget exhausted"),
             ("complete", "완료", "complete"),
-            ("future_state", "future_state", "future_state"),
+            ("future_state", "알 수 없음", "unknown"),
         ] {
             assert_eq!(goal_state(Language::Ko, raw), ko);
             assert_eq!(goal_state(Language::En, raw), en);
         }
-        assert_eq!(goal_text(Language::Ko, Some("active"), Some("paused")), "진행 중 → 일시정지");
-        assert_eq!(goal_text(Language::En, Some("blocked"), Some("blocked")), "waiting for external conditions (unchanged)");
+        assert_eq!(
+            goal_text(Language::Ko, Some("active"), Some("paused")),
+            "진행 중 → 일시정지"
+        );
+        assert_eq!(
+            goal_text(Language::En, Some("blocked"), Some("blocked")),
+            "waiting for external conditions (unchanged)"
+        );
     }
 
     #[test]
     fn golden_verbose_files_and_ancestors() {
-        let files = [FileLink {
-            source: r"\\?\C:\Users\Sample\.codex\sessions\rollout-sample.jsonl.zst",
-            target: r"\\?\C:\Users\Sample\.codex-acct\qb\sessions\rollout-sample.jsonl.zst",
-        }, FileLink {
-            source: r"C:\Users\Sample\.codex\sessions\rollout-parent.jsonl",
-            target: r"C:\Users\Sample\.codex-acct\qb\sessions\rollout-parent.jsonl",
-        }];
+        let files = [
+            FileLink {
+                source: r"\\?\C:\Users\Sample\.codex\sessions\rollout-sample.jsonl.zst",
+                target: r"\\?\C:\Users\Sample\.codex-acct\qb\sessions\rollout-sample.jsonl.zst",
+            },
+            FileLink {
+                source: r"C:\Users\Sample\.codex\sessions\rollout-parent.jsonl",
+                target: r"C:\Users\Sample\.codex-acct\qb\sessions\rollout-parent.jsonl",
+            },
+        ];
         let ancestors = ["abcdef01-2345-6789-abcd-ef0123456789"];
         let mut input = preview();
-        input.verbose = Some(Verbose { files: &files, ancestors: &ancestors });
+        input.verbose = Some(Verbose {
+            files: &files,
+            ancestors: &ancestors,
+        });
         let expected = KO.replace(
             "\n  나중에 되돌리기:",
             r#"
@@ -336,20 +375,41 @@ Enter move or share (cancel: Enter) > "#;
 
     #[test]
     fn profile_replacement_requires_a_path_boundary() {
-        assert_eq!(readable_path(r"C:\Users\Sample2\.codex", r"C:\Users\Sample"), r"C:\Users\Sample2\.codex");
-        assert_eq!(readable_path(r"\\?\C:\USERS\SAMPLE\.codex", r"C:\Users\Sample\"), r"~\.codex");
+        assert_eq!(
+            readable_path(r"C:\Users\Sample2\.codex", r"C:\Users\Sample"),
+            r"C:\Users\Sample2\.codex"
+        );
+        assert_eq!(
+            readable_path(r"\\?\C:\USERS\SAMPLE\.codex", r"C:\Users\Sample\"),
+            r"~\.codex"
+        );
         assert_eq!(readable_path(r"C:\Users\Sample", r"C:\Users\Sample"), "~");
-        assert_eq!(readable_path(r"\\?\UNC\server\share\home", r"\\server\share"), r"~\home");
-        assert_eq!(readable_path("/home/sample/.codex", "/home/sample"), "~/.codex");
-        assert_eq!(readable_path("/home/예시/.codex", "/home/sample"), "/home/예시/.codex");
+        assert_eq!(
+            readable_path(r"\\?\UNC\server\share\home", r"\\server\share"),
+            r"~\home"
+        );
+        assert_eq!(
+            readable_path("/home/sample/.codex", "/home/sample"),
+            "~/.codex"
+        );
+        assert_eq!(
+            readable_path("/home/예시/.codex", "/home/sample"),
+            "/home/예시/.codex"
+        );
         assert_eq!(readable_path("/home/sample", ""), "/home/sample");
     }
 
     #[test]
     fn missing_and_unchanged_goals_and_unicode_ids() {
         assert_eq!(goal_text(Language::En, None, None), "none (unchanged)");
-        assert_eq!(goal_text(Language::Ko, None, Some("진행 중")), "없음 → 진행 중");
-        assert_eq!(goal_text(Language::En, Some("active"), Some("active")), "active (unchanged)");
+        assert_eq!(
+            goal_text(Language::Ko, None, Some("진행 중")),
+            "없음 → 진행 중"
+        );
+        assert_eq!(
+            goal_text(Language::En, Some("active"), Some("active")),
+            "active (unchanged)"
+        );
         assert_eq!(short_id("가나다라마바사아자"), "가나다라마바사아");
     }
 }

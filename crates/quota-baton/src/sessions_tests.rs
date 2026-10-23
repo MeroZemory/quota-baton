@@ -26,8 +26,9 @@ fn r9_cli_diagnostics_allow_only_fixed_messages_not_attached_content() {
         ))
         .is_none()
     );
-    assert_eq!(goal_status("active"), "진행 중");
-    assert_eq!(goal_status("SYNTHETIC-PRIVATE"), "알 수 없음");
+    use crate::sessions_presentation::{Language, goal_state};
+    assert_eq!(goal_state(Language::Ko, "active"), "진행 중");
+    assert_eq!(goal_state(Language::Ko, "SYNTHETIC-PRIVATE"), "알 수 없음");
 }
 
 #[test]
