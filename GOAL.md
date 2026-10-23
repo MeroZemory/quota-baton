@@ -78,7 +78,7 @@ The current plan, with lanes, owners and start commands, is the "Plan" section o
 | R16.2 | 완료·설치 수용: dev ddf8d87, 04:34 KST; 실제 dashboard 확인·takeover 연결 거절0/1,959 |
 | N10 | merged·설치 수용(dev ef75624, 16:52; takeover 연결 거절0/1,278): D30 자동 외부 사용 감지(설정 없음)와 WS spill anti-herding. 외부 사용 표시는 현재·다음 window 동안 기존 세션 이동 대상에서 제외, 새 배정은 최후 수단. own-slot 대기 뒤 spill D20 charge/약한 근거 cap·새 사용량 관측 전 대상별1개. 4세션 reset 회귀·외부 상승/자체 트래픽/clean window 해제·Daybreak 소스 연구. N5c 바로 뒤·N5d 앞 |
 | N5d-native | 후속 수용 미완료: 감독 시간 제한에 따라 실제 제품 런처→native TUI 전체 검증·반복 episode·WS quota producer·Claude continue를 분리. 통과한 판단/HTTP 검사는 보존, 일반 빌드의 새 native 자동 재개는 비활성. N5i 설치 관문을 막지 않음; 사용자 pause 세션 재개 금지 |
-| N11 | 대기: dev tray 기존 실패6개는 모두 오래된 fixture로 소스·명세 대조 분류. forecast4개는 D24 compact face/tooltip 변경, logging2개는 offline render의 no-home/no-log와 충돌. 제품 회귀는 확인되지 않음. N5i 관문 뒤 각 focused unit으로 복구; 분류 `.sandbox/research/N11-preexisting-tray-classification.md` |
+| N11 | 완료: dev 기존 tray6실패는 모두 오래된 fixture. 제품 변경 없이 compact summary/tooltip·측정 geometry·normal startup logging fixture 복구. 대상·인접36검사·strict tray lint·fmt 통과; 보고서 `.sandbox/reports/N11.md` |
 | R9.5 | 대기(N3): 이동 진행·안전한 중단·재개·읽기 쉬운 확인. ready-node S1 순서에 따라 N5a-d 뒤 |
 | R16.3 | 완료·설치 수용(41cb129, 05:26 KST, takeover 거절0/1,889): 집중464·strict lint·KO/EN 실제10HWND·합성8PNG 통과. 제공자 주간/30일 계정분·권장선·음영·소진 사실 표시. 설치는 설계 세션 |
 | R16.4 | 완료·설치 수용: 32b52ea, 06:07 KST; 실제 coverage4/4·takeover 연결 거절0/1,923 |

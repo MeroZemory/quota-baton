@@ -6,10 +6,10 @@ This file names the verification for each unit and each row. The row list and th
 
 <!-- status:begin -->
 현재 마일스톤: R13 N5i HTTP·WS/SSE 대기 통합
-목표: N5i 집중 관문 통과; N11 오래된 fixture6개 마무리·설치 인계
+목표: N5i 집중 관문·N11 fixture6개 복구 완료; 설치 인계
 핵심 지표: 남은 출시 1/3 (R14 보호 설치, R13 C+E 실행, R13 F 통합 예측); 이전 계열 2/2 종료
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-23 22:02 KST (N5i 집중324·WS 재확인1·실제 첫 클릭1 통과; N5d-native 후속)
+갱신: 2026-10-23 22:04 KST (N5i324·실제 첫 클릭1·N11 36통과; native 전체 수용은 후속)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -216,6 +216,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-23 16:52 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | N10 설치 수용·takeover 연결 거절0/1,278; 출시 분모 밖 보호 보완 |
 | 2026-10-23 17:20 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | R12.11 집중 관문 완료·self-merge 인계; C+E 전체·통합 예측 미출시 |
 | 2026-10-23 22:02 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | N5i 주 경로 집중 관문 통과·설치 인계 전; 전체 native 자동 재개는 N5d-native 후속 |
+| 2026-10-23 22:04 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | N11 기존6실패 복구·focused gate36통과; 새 기능 설치 수 변화 없음 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -420,12 +421,13 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-23 21:34 | N5d 제품 런처·정상 종료/직접 쓰기 오류 경계 | managed46·observer8·launch-client25·기본/testkit CLI strict·fmt 통과 | 종료·직접 쓰기·원인 보존 제거3건101→정확복원0 | eb2601b·b2a6c38·0bddc36; production-entry-unit-inputs.json. 두 초기 대조는 감도 미입증으로 보존; 실제 core/native TUI·반복 episode·WS producer·Claude 재개 수용은 별도 |
 | 2026-10-23 21:43 | N5d 실제 실행 관측 연결 | managed51·observer8·기본/testkit strict lint·fmt·시험 제품 build 통과 | Capture finish와 실제 entry/control/write/ACK/cleanup 인과 관측 | c7b3e7c; observation-registration-inputs.json. 첫 native 하네스는 코어 시작 전용 fixture 키 형식 오류로 실패·완전 정리; 실제 native 재개 수용 전 |
 | 2026-10-23 22:02 | N5i 주 경로 통합·기본 경계 | 집중 테스트 실행324통과, 기본/testkit strict core·CLI·fmt0, 실제 HWND 첫 클릭1통과 | 이전 WS timeout target1회·기존 제한 유지·원래 reset/취소 보존 | 572892a·da9a538; n5i-focused 및 n5i-main-path 입력별 지문. 전체 native 수용·실제24시간 replay·설치 별도 |
+| 2026-10-23 22:04 | N11 오래된 tray fixture6개 복구 | 세 대상35·offline isolation1통과, strict tray lint·fmt0 | HTTP DTO·상세 tooltip·측정 geometry·로그 비노출 보존 | 제품 코드 변경 없음; N11-evidence/gate/completion.json |
 <!-- support:end -->
 
 <!-- gaps:begin -->
 | 빈칸 | 현재 값 | 필요한 값 | 다음 행동 |
 |---|---|---|---|
-| C+E 설치 | N5i 주 경로 focused gate 통과, native fallback 비활성 | 설계 세션 설치·실제 주 경로 수용 | N5i 인계; N11 오래된 fixture6개 정리 |
+| C+E 설치 | N5i 주 경로 focused gate 통과, native fallback 비활성 | 설계 세션 설치·실제 주 경로 수용 | N5i 인계; N11 fixture6개 정리 완료 |
 | 제공자 통합 예측 | 잔여량·속도 차트 제공, pooled runway 미출시 | 24시간 backtest 후 통합 예측 | N7 backtest와 UI |
 | Native fallback·구조 검증 | 판단/HTTP 통과, 전체 native 미수용·replay export 대기 | N5d-native 실제 수용 및 epoch별24시간 재생 | 별도 후속; 주 경로 설치를 막지 않음 |
 <!-- gaps:end -->
