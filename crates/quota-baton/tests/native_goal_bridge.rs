@@ -635,3 +635,19 @@ fn ticket_is_bound_to_its_parent_namespace() {
     let _other_ticket = ready(&mut other);
     assert_eq!(error(other.begin_final_read(ticket)), Error::TicketInvalid);
 }
+
+#[test]
+fn lost_core_authority_cancels_automatic_work_but_preserves_ordinary_native_io() {
+    let mut c = controller();
+    let ticket = ready(&mut c);
+    c.cancel_resume();
+    assert_eq!(c.delivery(), Delivery::Cancelled);
+    assert!(c.stopped_ticket().is_none());
+    assert_eq!(error(c.begin_final_read(ticket)), Error::AttemptConsumed);
+    ui(&mut c, json!(90), "account/read", json!({}));
+    match response(&mut c, json!(90), json!({"synthetic":true})) {
+        Action::ToUi(_) => {}
+        _ => panic!("normal response must still reach live TUI"),
+    }
+    assert!(c.stopped_ticket().is_none());
+}

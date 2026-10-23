@@ -232,3 +232,51 @@ fn authority_callback_runs_only_for_activation_and_before_its_first_byte() {
     })
     .unwrap();
 }
+
+#[test]
+fn control_close_during_final_read_keeps_tui_live_without_auto_activation() {
+    let (mut d, n, u) = stopped();
+    let ticket = d.stopped_ticket().unwrap();
+    d.begin_final_read(ticket).unwrap();
+    let native_before = n.0.lock().unwrap().bytes.clone();
+    d.cancel_resume();
+    d.native_frame_admitted(&final_response(), || {
+        panic!("cancelled control cannot consume")
+    })
+    .unwrap();
+    assert_eq!(d.delivery(), Delivery::Cancelled);
+    assert_eq!(n.0.lock().unwrap().bytes, native_before);
+    let frame = br#"{"id":90,"method":"account/read","params":{}}"#;
+    d.ui_frame(frame).unwrap();
+    assert!(
+        n.0.lock()
+            .unwrap()
+            .bytes
+            .ends_with(&[frame.as_slice(), b"\n"].concat())
+    );
+    let response = br#"{"id":90,"result":{"synthetic":true}}"#;
+    d.native_frame(response).unwrap();
+    assert!(
+        u.0.lock()
+            .unwrap()
+            .bytes
+            .ends_with(&[response.as_slice(), b"\n"].concat())
+    );
+    assert!(d.stopped_ticket().is_none());
+}
+
+#[test]
+fn control_close_after_write_does_not_retry_or_erase_unknown_delivery() {
+    let (mut d, n, _) = stopped();
+    let ticket = d.stopped_ticket().unwrap();
+    d.begin_final_read(ticket).unwrap();
+    d.native_frame_admitted(&final_response(), || true).unwrap();
+    assert_eq!(d.delivery(), Delivery::UnknownNoRetry);
+    let before = n.0.lock().unwrap().bytes.clone();
+    d.cancel_resume();
+    assert_eq!(d.delivery(), Delivery::UnknownNoRetry);
+    d.native_frame_admitted(&final_response(), || panic!("no retry"))
+        .unwrap();
+    assert_eq!(n.0.lock().unwrap().bytes, before);
+    assert!(d.stopped_ticket().is_none());
+}

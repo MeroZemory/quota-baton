@@ -150,6 +150,19 @@ impl Controller {
         self.delivery
     }
 
+    /// Loss/revocation of the separate core authority disables automatic work
+    /// without taking away the user's still-live ordinary native transport.
+    /// An activation already handed to the writer remains unknown; never retry.
+    pub(crate) fn cancel_resume(&mut self) {
+        self.ticket_taken = true;
+        self.stopped = None;
+        self.active = None;
+        self.quota_observed = false;
+        if matches!(self.delivery, Delivery::NotSent | Delivery::Checking) {
+            self.delivery = Delivery::Cancelled;
+        }
+    }
+
     pub(crate) fn disconnect(&mut self) {
         self.connected = false;
         self.stopped = None;
