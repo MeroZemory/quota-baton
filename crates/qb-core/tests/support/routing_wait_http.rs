@@ -9,6 +9,9 @@ use tokio::{
     time::{Instant as TokioInstant, timeout},
 };
 
+#[path = "routing_wait_claude.rs"]
+mod routing_wait_claude;
+
 const PHASE: Duration = Duration::from_secs(3);
 const UPLOAD: &str = r#"{ "model": "synthetic-model-http-wait", "input": "conversation-marker", "encrypted_content": "verbatim" }"#;
 const FINAL: &str = r#"{"n5a_http_wait":"retry"}"#;
@@ -316,3 +319,12 @@ mod routing_wait_drain;
 
 #[path = "routing_wait_policy.rs"]
 mod routing_wait_policy;
+
+#[path = "routing_wait_http/poll_renewal.rs"]
+mod poll_renewal;
+
+#[path = "routing_wait_blocked_inspection.rs"]
+mod routing_wait_blocked_inspection;
+
+#[path = "routing_wait_http/entry.rs"]
+mod entry;

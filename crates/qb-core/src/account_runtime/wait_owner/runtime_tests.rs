@@ -734,3 +734,5 @@ async fn n5a_runtime_wait_real_store_barrier_orders_failed_release_before_admiss
 }
 
 mod renewal_tests;
+
+mod full_save_tests;
