@@ -1023,6 +1023,18 @@
     },
     {
       "path": "crates/qb-core/src/bindings/launch.rs",
+      "function": "BindingTable::bind_launch_activity",
+      "expression": "method: d .Alone launch_activity .Alone insert Parenthesis( anchor .Alone to_owned Parenthesis( ) ,Alone Activity Brace( stamp :Alone Arc :Joint :Alone downgrade Parenthesis( stamp ) ,Alone writer :Alone Arc :Joint :Alone downgrade Parenthesis( self ) ,Alone ) ,Alone )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/launch.rs",
+      "function": "BindingTable::bind_launch_activity",
+      "expression": "method: d .Alone launch_activity .Alone retain Parenthesis( |Alone key ,Alone activity |Alone anchors .Alone contains Parenthesis( key ) &Joint &Alone activity .Alone stamp .Alone strong_count Parenthesis( ) >Alone 0 )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/launch.rs",
       "function": "BindingTable::launch_info",
       "expression": "mutable-escape: &Alone mut d",
       "count": 2
@@ -1342,7 +1354,19 @@
     {
       "path": "crates/qb-core/src/bindings/launch.rs",
       "function": "prune",
+      "expression": "method: d .Alone launch_activity .Alone retain Parenthesis( |Alone anchor ,Alone activity |Alone Brace( let Some Parenthesis( writer ) =Alone activity .Alone writer .Alone upgrade Parenthesis( ) else Brace( return false ;Alone ) ;Alone if writer .Alone writes_stopped .Alone load Parenthesis( Ordering :Joint :Alone Acquire ) Brace( return false ;Alone ) let Parenthesis( Some Parenthesis( row ) ,Alone Some Parenthesis( stamp ) ) =Alone Parenthesis( anchors .Alone get_mut Parenthesis( anchor ) ,Alone activity .Alone stamp .Alone upgrade Parenthesis( ) ) else Brace( return false ;Alone ) ;Alone if let Some Parenthesis( at ) =Alone DateTime :Joint :Alone <Alone Utc >Alone :Joint :Alone from_timestamp_millis Parenthesis( stamp .Alone load Parenthesis( Ordering :Joint :Alone Acquire ) ) &Joint &Alone at >Alone row .Alone last_used Brace( row .Alone last_used =Alone at ;Alone activity_changed =Alone true ;Alone ) true ) )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/launch.rs",
+      "function": "prune",
       "expression": "method: d .Alone launch_anchors .Alone retain Parenthesis( |Alone _ ,Alone a |Alone Brace( idle Parenthesis( now ,Alone a .Alone last_used ) <Alone IDLE_SECS |Joint |Alone d .Alone active .Alone contains_key Parenthesis( &Alone a .Alone canonical_key ) |Joint |Alone d .Alone pins .Alone contains_key Parenthesis( &Alone a .Alone canonical_key ) ) )",
+      "count": 1
+    },
+    {
+      "path": "crates/qb-core/src/bindings/launch.rs",
+      "function": "prune",
+      "expression": "mutable-escape: &Alone mut d .Alone launch_anchors",
       "count": 1
     },
     {
