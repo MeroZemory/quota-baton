@@ -31,6 +31,7 @@ mod launch;
 pub(crate) use capacity_spill::CapacitySpillPermit;
 mod move_guard;
 pub(crate) mod quota_wait;
+mod rebind;
 mod selection;
 pub use launch::{
     LaunchEntitlements, LaunchError, LaunchInfo, LaunchPlacement, LaunchPolicyMove, LaunchRequest,
@@ -626,6 +627,7 @@ impl BindingTable {
     }
 
     /// All calls occur under mutations, before external admission/dispatch.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn prepare_move(
         &self,
@@ -740,37 +742,6 @@ impl BindingTable {
     ) -> bool {
         effective_account(candidate, d, &self.config, model, now).eligible_at(model, now)
             && (!candidate.account.drain || Self::accepted_in(d, Some(key), &candidate.account.id))
-    }
-    fn commit_move(
-        &self,
-        permit: Option<move_guard::Permit>,
-        to: &str,
-        provider: Provider,
-        key: &str,
-        model: Option<&str>,
-        now: DateTime<Utc>,
-    ) -> Option<move_guard::CommittedMove> {
-        if let Some(permit) = permit {
-            // Internal invariant: neither clear nor rename can interleave under
-            // mutations. A stale permit never changes a binding.
-            let committed = self
-                .move_guard
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .commit(permit, to)
-                .expect("move permit serialized by mutations");
-            if let Some(obs) = self.move_observability()
-                && let Err(error) = obs.committed_move(provider, key, to, model, now)
-            {
-                tracing::warn!(
-                    ?error,
-                    "move cost observation rejected; coverage incomplete"
-                );
-            }
-            Some(committed)
-        } else {
-            None
-        }
     }
 }
 
@@ -2791,12 +2762,9 @@ impl BindingTable {
             .map(|key| launch::ownership_group(&d, key))
             .map(str::to_owned)
             .unwrap_or_else(|| format!("unidentified:{}", provider.as_str()));
-        let guard_from = previous.as_deref().or_else(|| {
-            key.is_none()
-                .then(|| d.sticky.get(provider.as_str()))
-                .flatten()
-                .map(String::as_str)
-        });
+        let physical_source = self.rebind_source(&d, provider, key);
+        let guard_source = self.rebind_budget_source(&d, provider, key, &account);
+        let guard_from = guard_source.as_deref();
         let permit = match self.prepare_move_with_source(
             &d,
             &guard_key,
@@ -2813,6 +2781,12 @@ impl BindingTable {
             Err(denied) => {
                 if let Some(old) =
                     guard_from.and_then(|id| candidates.iter().find(|c| c.account.id == id))
+                    && self
+                        .policies
+                        .plan(launch::policy_key(&d, key))
+                        .anchor
+                        .as_ref()
+                        .is_none_or(|anchor| physical_source.as_ref() == Some(anchor))
                     && self.move_source_usable(&d, &guard_key, old, model, now)
                 {
                     account = old.account.id.clone();
@@ -2826,12 +2800,11 @@ impl BindingTable {
             }
         };
         let policy_key = launch::policy_key(&d, key).map(str::to_owned);
-        // Match the WS owner's saved-anchor/retained-source authority even
-        // when write-behind has not yet materialized a live binding row.
-        let admission_anchor = self.policies.plan(policy_key.as_deref()).anchor;
         let admitted_from = self
-            .protected_source(&d, key, admission_anchor.as_deref(), now)
-            .or_else(|| guard_from.map(str::to_owned));
+            .policies
+            .plan(policy_key.as_deref())
+            .anchor
+            .or_else(|| physical_source.clone());
         drop(d);
         let Some(admission) = admit(&account) else {
             return Decision::None;
@@ -2870,45 +2843,40 @@ impl BindingTable {
         ) {
             return Decision::None;
         }
-        if self
-            .policies
-            .dispatch(
+        let context = rebind::RebindContext {
+            provider,
+            key,
+            guard_key: &guard_key,
+            from: physical_source.as_deref(),
+            account: &account,
+            parent,
+            model,
+            candidates,
+            sources: move_evidence,
+            pinned,
+            request_bytes,
+            hold_timed_out,
+            now,
+            label: reason,
+        };
+        let authority = self.owner_move_reason(&context, &admission, Some(&selection), None);
+        let rebound = self.rebind(context, authority, permit, |reason| {
+            self.policies.dispatch(
                 policy_key.as_deref(),
                 &account,
                 previous.as_deref(),
                 reason,
                 now,
             )
-            .is_err()
-        {
-            tracing::warn!(
-                code = "routing_policy_blocked",
-                "Routing intent could not authorize dispatch"
-            );
-            return Decision::Blocked;
-        }
-        // The mutation gate remains held: a prepared move cannot go stale
-        // between policy publication and this charge.
-        let committed = self.commit_move(permit, &account, provider, &guard_key, model, now);
-        let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
-        // Placement plus capacity eviction is one visible count mutation.
-        d.defer_count_changes = true;
-        let moves = self.publish_binding(
-            &mut d,
-            provider,
-            key,
-            parent,
-            candidates,
-            pinned,
-            request_bytes,
-            hold_timed_out,
-            now,
-            &account,
-            reason,
-            committed.as_ref(),
-        );
-        let lease = self.reserve(&mut d, key, &account);
-        self.prune(&mut d, now);
+        });
+        let rebind::Rebound { mut data, moves } = match rebound {
+            Ok(rebound) => rebound,
+            Err(rebind::RebindError::Evidence) => return Decision::None,
+            Err(rebind::RebindError::Policy) => return Decision::Blocked,
+        };
+        let d = &mut *data;
+        let lease = self.reserve(d, key, &account);
+        self.prune(d, now);
         d.defer_count_changes = false;
         d.commit_count_changes();
         Decision::Selected {
@@ -2916,223 +2884,6 @@ impl BindingTable {
             lease,
             moves,
         }
-    }
-    #[cfg(test)]
-    #[allow(clippy::too_many_arguments)]
-    fn commit_binding(
-        &self,
-        d: &mut Data,
-        provider: Provider,
-        key: Option<&str>,
-        parent: Option<&str>,
-        candidates: &[Candidate],
-        pinned: Option<&str>,
-        request_bytes: u64,
-        hold_timed_out: bool,
-        now: DateTime<Utc>,
-        account: &str,
-        reason: &str,
-    ) -> Vec<MoveEvent> {
-        let guard_key = key.map(group).unwrap_or("unidentified:test");
-        let from = key
-            .and_then(|k| d.groups.get(group(k)))
-            .map(|g| g.account.as_str());
-        let permit = self
-            .prepare_move(
-                d,
-                guard_key,
-                from,
-                account,
-                candidates,
-                MoveObservations::untracked(),
-                None,
-                reason,
-                now,
-            )
-            .expect("fixture move admitted");
-        let committed = self.commit_move(permit, account, provider, guard_key, None, now);
-        self.publish_binding(
-            d,
-            provider,
-            key,
-            parent,
-            candidates,
-            pinned,
-            request_bytes,
-            hold_timed_out,
-            now,
-            account,
-            reason,
-            committed.as_ref(),
-        )
-    }
-    // Shared commit: launch placement deliberately stops before reserve().
-    #[allow(clippy::too_many_arguments)]
-    fn publish_binding(
-        &self,
-        d: &mut Data,
-        provider: Provider,
-        key: Option<&str>,
-        parent: Option<&str>,
-        candidates: &[Candidate],
-        pinned: Option<&str>,
-        request_bytes: u64,
-        hold_timed_out: bool,
-        now: DateTime<Utc>,
-        account: &str,
-        reason: &str,
-        committed: Option<&move_guard::CommittedMove>,
-    ) -> Vec<MoveEvent> {
-        d.count_change_clock = Some(now);
-        let mut moves = Vec::new();
-        if let Some(k) = key {
-            let g = group(k);
-            let accepted = Self::accepted_in(d, Some(k), account);
-            let selected_reason = reason;
-            let reason = if hold_timed_out {
-                "reset_hold_timeout"
-            } else {
-                reason
-            };
-            if let Some(previous) = d.groups.get(g).filter(|entry| entry.account != account) {
-                let authority = committed.expect("canonical rebind requires committed authority");
-                assert!(
-                    authority.for_group(launch::ownership_group(d, g))
-                        && authority.allows(&previous.account, account),
-                    "rebind receipt belongs to another source/group"
-                );
-            }
-            let previous = unindex_group(d, g);
-            let from = previous.as_ref().map(|entry| entry.account.to_owned());
-            let source_changed = from.as_deref() != Some(account);
-            let last_used = previous.as_ref().map_or(now, |entry| entry.last_used);
-            let mut keys = previous.map_or_else(BTreeSet::new, |entry| entry.keys);
-            keys.insert(k.into());
-            if let Some(p) = parent
-                && !d.bindings.contains_key(p)
-                && group(p) == g
-            {
-                keys.insert(p.into());
-            }
-            if from.as_deref() != Some(account) {
-                let candidate = candidates
-                    .iter()
-                    .find(|c| c.account.id == account)
-                    .expect("selection came from candidates");
-                let (evidence, placed_since_obs) = placement_evidence(candidate, d, now);
-                let capped = evidence == PlacementEvidence::Weak
-                    && placed_since_obs >= self.config.weak_evidence_new_sessions;
-                // C5 recovery is a placement; step-1 debug pins and step-2
-                // inheritance remain exempt even when the account changes.
-                let is_placement = selected_reason != "inherited" && pinned != Some(account);
-                if is_placement {
-                    let seq = self.begin_usage_observation();
-                    d.placements
-                        .entry(account.to_owned())
-                        .or_default()
-                        .placed(now, seq);
-                }
-                d.epochs.remove(g);
-                moves.push(MoveEvent {
-                    key: g.to_owned(),
-                    from: from.clone(),
-                    to: account.to_owned(),
-                    reason: if from.is_none() && selected_reason == "new" {
-                        "new"
-                    } else {
-                        reason
-                    }
-                    .into(),
-                    bytes: request_bytes,
-                    keys: keys.len(),
-                    debug_pin: pinned == Some(account),
-                    evidence,
-                    placement_charge_pct: if is_placement {
-                        self.config.placement_allowance_pct
-                    } else {
-                        0.0
-                    },
-                    capped,
-                    placed_since_obs,
-                    is_placement,
-                });
-                if from.is_some() {
-                    d.after_move.insert(g.into());
-                }
-            }
-            for k in &keys {
-                let previous = d.bindings.get(k).cloned();
-                if let Some(previous) = &previous {
-                    d.snapshot_weight = d
-                        .snapshot_weight
-                        .saturating_sub(binding_bound(&previous.key, &previous.account));
-                }
-                d.snapshot_weight = d.snapshot_weight.saturating_add(binding_bound(k, account));
-                let mut next = if let Some(mut binding) = previous.clone() {
-                    if binding.account != account {
-                        binding.rebind(
-                            account,
-                            committed.expect("existing binding requires authority"),
-                        );
-                    }
-                    binding
-                } else {
-                    Binding::new(
-                        k.clone(),
-                        account.to_owned(),
-                        last_used,
-                        None,
-                        None,
-                        None,
-                        None,
-                        false,
-                    )
-                };
-                next.last_used = last_used;
-                next.accepted = Some(accepted);
-                next.first_seen_at = previous.as_ref().map_or(Some(now), |b| b.first_seen_at);
-                next.bound_since = if from.as_deref() != Some(account) {
-                    Some(now)
-                } else {
-                    previous.as_ref().and_then(|b| b.bound_since)
-                };
-                next.client_kind = previous.as_ref().and_then(|b| b.client_kind);
-                next.observed_here = previous.as_ref().is_none_or(|b| b.observed_here);
-                d.bindings.insert(k.clone(), next);
-            }
-            index_group(
-                d,
-                g.to_owned(),
-                Group {
-                    keys,
-                    account: account.to_owned(),
-                    last_used,
-                },
-            );
-            if k != g && !d.last_request_bytes.contains_key(g) {
-                d.unknown_cost.insert(g.to_owned());
-            }
-            if request_bytes > 0 && !d.unknown_cost.contains(g) {
-                let known = d.last_request_bytes.entry(g.to_owned()).or_default();
-                *known = (*known).max(request_bytes);
-            }
-            if !matches!(selected_reason, "mark_wait" | "guard_keep") {
-                d.overload_marks.remove(g);
-            }
-            d.changed();
-            // Publish every member and the group index before waking readers.
-            if source_changed {
-                self.policies.changed.notify_waiters();
-            }
-        } else if let Some(old) = d
-            .sticky
-            .insert(provider.as_str().into(), account.to_owned())
-            && old != account
-        {
-            d.accepted_unbound.remove(&old);
-            d.epochs.remove(&format!("unbound:{old}"));
-        }
-        moves
     }
     /// Read-only counterpart of prune for selection previews. Ordinary lookups
     /// visit one group; only outstanding capacity eviction walks the LRU prefix.
@@ -4658,6 +4409,19 @@ mod tests {
         let table = BindingTable::new(dir.path(), config).unwrap();
         (dir, table)
     }
+    // Explicit pin fixtures use the real owner, never a bare authority label.
+    pub(super) fn with_pin(
+        provider: Provider,
+        key: Option<&str>,
+        target: &str,
+        select: impl FnOnce(DispatchAdmission) -> Decision,
+    ) -> Decision {
+        let pins = crate::debug_pin::DebugPins::default();
+        pins.set(provider, key.map(str::to_owned), target.to_owned());
+        let proof = pins.selection(provider, key).unwrap();
+        select(DispatchAdmission::ordinary().with_pin(Some(proof)))
+    }
+
     fn choose(
         t: &Arc<BindingTable>,
         key: Option<&str>,
@@ -4804,18 +4568,24 @@ mod tests {
             let cs = [candidate("a", 10.0, 8, 1), candidate("b", 10.0, 30, 2)];
             let now = Utc::now();
             // Keep the actual ABA moves outside R14's unchanged-account return window.
-            let choose_raw = |id, at| match t.choose_with_hold_at(
-                Provider::Claude,
-                key,
-                None,
-                None,
-                &cs,
-                Some(id),
-                42,
-                true,
-                false,
-                at,
-            ) {
+            let choose_raw = |id, at| match with_pin(Provider::Claude, key, id, |admission| {
+                t.choose_with_hold_at_admitted_proof(
+                    Provider::Claude,
+                    key,
+                    None,
+                    None,
+                    &cs,
+                    &cs,
+                    MoveObservations::untracked(),
+                    Some(id),
+                    42,
+                    true,
+                    false,
+                    at,
+                    None,
+                    |_| Some(admission),
+                )
+            }) {
                 Decision::Selected { account, lease, .. } => {
                     assert_eq!(account, id);
                     lease
@@ -5293,16 +5063,21 @@ mod tests {
         assert!(
             matches!(t.choose(Provider::Claude, Some("claude:s"), None, None, &[a.clone(), b.clone()], None, 1), Decision::Hold { until: u } if u == until)
         );
-        let result = t.choose_with_hold(
+        let result = t.choose_with_hold_at_admitted_proof(
             Provider::Claude,
             Some("claude:s"),
             None,
             None,
             std::slice::from_ref(&b),
+            &[a.clone(), b.clone()],
+            MoveObservations::untracked(),
             None,
             42,
             false,
             true,
+            Utc::now(),
+            None,
+            |_| Some(DispatchAdmission::ordinary()),
         );
         assert!(matches!(result, Decision::Selected { account, moves, .. }
             if account == "b" && moves[0].reason == "reset_hold_timeout"));
@@ -5420,10 +5195,11 @@ mod tests {
     #[test]
     fn handshake_preserves_after_move_for_first_response_create() {
         let (_dir, t) = table();
-        let a = candidate("a", 10.0, 8, 1);
+        let mut a = candidate("a", 10.0, 8, 1);
         let b = candidate("b", 5.0, 30, 2);
-        drop(choose(&t, Some("claude:s"), &[a]));
-        let (_, mut lease, _) = choose(&t, Some("claude:s"), &[b]);
+        drop(choose(&t, Some("claude:s"), &[a.clone()]));
+        a.account.user_state = UserState::Paused;
+        let (_, mut lease, _) = choose(&t, Some("claude:s"), &[a, b]);
         assert!(lease.after_move);
         lease.defer_after_move();
         drop(lease);
@@ -6345,14 +6121,28 @@ mod tests {
         } else {
             panic!("new group not selected");
         }
-        let result = t.choose(
+        let result = with_pin(
             Provider::Claude,
             Some("claude:s:agent:c"),
-            None,
-            None,
-            &[a, b],
-            Some("b"),
-            81,
+            "b",
+            |admission| {
+                t.choose_with_hold_at_admitted_proof(
+                    Provider::Claude,
+                    Some("claude:s:agent:c"),
+                    None,
+                    None,
+                    &[a.clone(), b.clone()],
+                    &[a, b],
+                    MoveObservations::untracked(),
+                    Some("b"),
+                    81,
+                    true,
+                    false,
+                    Utc::now(),
+                    None,
+                    |_| Some(admission),
+                )
+            },
         );
         if let Decision::Selected { lease, moves, .. } = result {
             assert!(lease.after_move);
@@ -6446,18 +6236,24 @@ mod tests {
 
     fn count_change_place(t: &Arc<BindingTable>, key: &str, id: &str, now: DateTime<Utc>) {
         let c = candidate(id, 10.0, 8, 1);
-        let decision = t.choose_with_hold_at(
-            Provider::Claude,
-            Some(key),
-            None,
-            None,
-            &[c],
-            Some(id),
-            0,
-            false,
-            false,
-            now,
-        );
+        let decision = with_pin(Provider::Claude, Some(key), id, |admission| {
+            t.choose_with_hold_at_admitted_proof(
+                Provider::Claude,
+                Some(key),
+                None,
+                None,
+                std::slice::from_ref(&c),
+                std::slice::from_ref(&c),
+                MoveObservations::untracked(),
+                Some(id),
+                0,
+                false,
+                false,
+                now,
+                None,
+                |_| Some(admission),
+            )
+        });
         let Decision::Selected { account, lease, .. } = decision else {
             panic!("{decision:?}");
         };

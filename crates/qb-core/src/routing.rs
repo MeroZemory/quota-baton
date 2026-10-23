@@ -1,5 +1,7 @@
 //! Durable local routing intent. Display labels and upstream payloads are never selectors.
+mod anchor_choice;
 pub mod forecast;
+pub(crate) use anchor_choice::{AnchorChoiceEvidence, AnchorRecoveryEvidence};
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

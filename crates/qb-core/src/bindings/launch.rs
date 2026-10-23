@@ -650,6 +650,36 @@ impl BindingTable {
         admit: Option<&LaunchAdmission<'_>>,
         authorize: impl FnOnce(&crate::routing::PolicyStore, &LaunchPolicyMove) -> Result<()>,
     ) -> std::result::Result<LaunchPlacement, LaunchError> {
+        self.place_launch_for_issue_evidence(
+            request,
+            candidates,
+            candidates,
+            observations,
+            Vec::new(),
+            Vec::new(),
+            entitlements,
+            now,
+            operation,
+            admit,
+            authorize,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn place_launch_for_issue_evidence(
+        &self,
+        request: LaunchRequest<'_>,
+        candidates: &[Candidate],
+        sources: &[Candidate],
+        observations: MoveObservations,
+        store_evidence: Vec<crate::accounts::StoreUnavailableEvidence>,
+        runtime_evidence: Vec<crate::account_runtime::RuntimeUnavailableEvidence>,
+        entitlements: &LaunchEntitlements,
+        now: DateTime<Utc>,
+        operation: Option<&crate::issue_operation::IssueOperation>,
+        admit: Option<&LaunchAdmission<'_>>,
+        authorize: impl FnOnce(&crate::routing::PolicyStore, &LaunchPolicyMove) -> Result<()>,
+    ) -> std::result::Result<LaunchPlacement, LaunchError> {
         if !is_anchor(request.anchor_key)
             || request.resume_key.is_some_and(|k| !real_key(k))
             || request.model.is_some_and(|m| !valid_model(m))
@@ -869,12 +899,17 @@ impl BindingTable {
             weight = weight.saturating_add(binding_bound(&key, &account));
         }
         room(weight)?;
+        let move_source = self.rebind_source(&d, Provider::Codex, Some(&key));
+        let budget_source = self.rebind_budget_source(&d, Provider::Codex, Some(&key), &account);
         let permit = self
-            .prepare_move(
+            .prepare_move_with_source(
                 &d,
                 &key,
-                previous.as_deref(),
+                budget_source.as_deref(),
                 &account,
+                budget_source
+                    .as_deref()
+                    .and_then(|id| sources.iter().find(|c| c.account.id == id)),
                 candidates,
                 observations,
                 model.as_deref(),
@@ -910,71 +945,75 @@ impl BindingTable {
         } else {
             None
         };
-        if let Some(consent) = &consent {
-            // Validate before the callback: Strict authorization itself advances
-            // the revision. Admission callbacks may have interposed a policy edit.
-            consent.validate_context(
-                &policy_key,
-                previous.as_deref(),
-                &account,
-                self.policies.plan(Some(&policy_key)).revision,
-                model.as_deref(),
-                now,
-            )?;
-            if plan.settings.mode == crate::routing::Mode::Strict {
-                authorize(&self.policies, consent).map_err(|_| LaunchError::PolicyBlocked)?;
-            }
-            let current = self.policies.plan(Some(&policy_key));
-            let expected_revision = if plan.settings.mode == crate::routing::Mode::Strict {
-                // Exactly one durable authorization, with no intervening edit.
-                if current.settings.mode != crate::routing::Mode::Strict
-                    || current.anchor.as_deref() != Some(account.as_str())
-                {
-                    return Err(LaunchError::PolicyBlocked);
-                }
-                plan.revision
-                    .checked_add(1)
-                    .ok_or(LaunchError::PolicyBlocked)?
-            } else {
-                plan.revision
-            };
-            if current.revision != expected_revision {
-                return Err(LaunchError::PolicyBlocked);
-            }
-        }
-        self.policies
-            .dispatch_for_issue(
-                Some(&policy_key),
-                &account,
-                previous.as_deref(),
-                reason,
-                now,
-                operation,
-            )
-            .map_err(|_| LaunchError::PolicyBlocked)?;
-        let committed = self.commit_move(
-            permit,
-            &account,
-            Provider::Codex,
-            &key,
-            model.as_deref(),
-            now,
-        );
-        let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
-        let moves = self.publish_binding(
-            &mut d,
-            Provider::Codex,
-            Some(&key),
-            None,
+        let admission = DispatchAdmission::ordinary()
+            .with_store_evidence(store_evidence)
+            .with_runtime_evidence(runtime_evidence);
+        let context = rebind::RebindContext {
+            provider: Provider::Codex,
+            key: Some(&key),
+            guard_key: &key,
+            from: move_source.as_deref(),
+            account: &account,
+            parent: None,
+            model: model.as_deref(),
             candidates,
-            None,
-            0,
-            false,
+            sources,
+            pinned: None,
+            request_bytes: 0,
+            hold_timed_out: false,
             now,
-            &account,
-            reason,
-            committed.as_ref(),
-        );
+            label: reason,
+        };
+        let authority = self.owner_move_reason(&context, &admission, None, consent.as_ref());
+        let rebound = self
+            .rebind(context, authority, permit, |reason| {
+                if let Some(consent) = &consent {
+                    // Validate before the callback: Strict authorization itself advances
+                    // the revision. Admission callbacks may have interposed a policy edit.
+                    consent.validate_context(
+                        &policy_key,
+                        previous.as_deref(),
+                        &account,
+                        self.policies.plan(Some(&policy_key)).revision,
+                        model.as_deref(),
+                        now,
+                    )?;
+                    if plan.settings.mode == crate::routing::Mode::Strict {
+                        authorize(&self.policies, consent)
+                            .map_err(|_| LaunchError::PolicyBlocked)?;
+                    }
+                    let current = self.policies.plan(Some(&policy_key));
+                    let expected_revision = if plan.settings.mode == crate::routing::Mode::Strict {
+                        // Exactly one durable authorization, with no intervening edit.
+                        if current.settings.mode != crate::routing::Mode::Strict
+                            || current.anchor.as_deref() != Some(account.as_str())
+                        {
+                            bail!("launch authorization changed");
+                        }
+                        plan.revision
+                            .checked_add(1)
+                            .ok_or_else(|| anyhow::anyhow!("launch revision overflow"))?
+                    } else {
+                        plan.revision
+                    };
+                    if current.revision != expected_revision {
+                        bail!("launch authorization changed");
+                    }
+                }
+                self.policies
+                    .dispatch_for_issue(
+                        Some(&policy_key),
+                        &account,
+                        previous.as_deref(),
+                        reason,
+                        now,
+                        operation,
+                    )
+                    .map_err(|_| LaunchError::PolicyBlocked)?;
+                Ok(())
+            })
+            .map_err(|_| LaunchError::PolicyBlocked)?;
+        let rebind::Rebound { data: mut d, moves } = rebound;
         let authority_changed = old_metadata.as_ref().is_none_or(|old| {
             old.current_model != metadata.current_model || old.policy_key != metadata.policy_key
         }) || d
@@ -986,6 +1025,8 @@ impl BindingTable {
             .insert(request.anchor_key.to_owned(), anchor);
         reweight(&mut d);
         d.changed();
+        d.defer_count_changes = false;
+        d.commit_count_changes();
         if authority_changed {
             self.policies.changed.notify_waiters();
         }

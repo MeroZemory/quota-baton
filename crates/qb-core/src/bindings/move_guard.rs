@@ -170,12 +170,22 @@ pub(super) struct CommittedMove {
 }
 
 impl CommittedMove {
+    pub(super) fn source_for(&self, to: &str) -> Option<&str> {
+        (self.to == to).then_some(self.from.as_str())
+    }
+
     pub(super) fn allows(&self, from: &str, to: &str) -> bool {
         self.from == from && self.to == to
     }
 
     pub(super) fn for_group(&self, key: &str) -> bool {
         self.key == key
+    }
+}
+
+impl Permit {
+    pub(super) fn applies_to(&self, key: &str, from: &str, to: &str, now: DateTime<Utc>) -> bool {
+        self.key == key && self.from == from && self.to == to && self.at == now
     }
 }
 

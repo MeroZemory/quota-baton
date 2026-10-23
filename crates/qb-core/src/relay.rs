@@ -16,6 +16,8 @@ mod upload;
 mod websocket;
 pub(crate) use outcome::RequestFailureEvidence;
 pub(crate) use websocket::capacity::CapacityMoveEvidence;
+#[cfg(test)]
+pub(crate) use websocket::capacity::test_move_evidence;
 mod wire_metadata;
 
 use std::{
@@ -858,7 +860,7 @@ impl RelayState {
     ) -> Result<Vec<crate::bindings::Candidate>, ()> {
         self.candidates_with_evidence(provider, key, model, tried)
             .await
-            .map(|(candidates, _, _, _)| candidates)
+            .map(|(candidates, _, _, _, _)| candidates)
     }
 
     async fn candidates_with_evidence(
@@ -873,6 +875,7 @@ impl RelayState {
             Vec<crate::bindings::Candidate>,
             crate::bindings::MoveObservation,
             Vec<crate::accounts::StoreUnavailableEvidence>,
+            Vec<crate::account_runtime::RuntimeUnavailableEvidence>,
         ),
         (),
     > {
@@ -921,6 +924,7 @@ impl RelayState {
             let mut candidates = Vec::new();
             let mut evidence = Vec::new();
             let mut store_evidence = Vec::new();
+            let mut runtime_evidence = Vec::new();
             use crate::observability::replay_recorder as tape;
             let recording = obs.replay();
             let collection = recording.as_ref().and_then(|r| r.next_id());
@@ -965,6 +969,9 @@ impl RelayState {
                 let retry_excluded = tried.contains(&account.id);
                 let runtime_excluded = !retry_excluded
                     && (runtime.probing(&account.id) || runtime.blocked_in_memory(&account.id));
+                if runtime_excluded {
+                    runtime_evidence.extend(runtime.selection_unavailable(&account.id));
+                }
                 let credential = if !retry_excluded && !runtime_excluded {
                     let (readable, proof) = store.selection_credentials(account);
                     store_evidence.extend(proof);
@@ -1038,7 +1045,13 @@ impl RelayState {
                     },
                 );
             }
-            Ok((candidates, evidence, observed, store_evidence))
+            Ok((
+                candidates,
+                evidence,
+                observed,
+                store_evidence,
+                runtime_evidence,
+            ))
         })
         .await
         .map_err(|_| ())?
@@ -1312,7 +1325,13 @@ impl RelayState {
                 &self.bindings.policies.changed,
                 self.accounts.subscribe(),
             );
-            let (candidates, mut move_evidence, target_observed, mut store_evidence) = self
+            let (
+                candidates,
+                mut move_evidence,
+                target_observed,
+                mut store_evidence,
+                mut runtime_evidence,
+            ) = self
                 .candidates_with_evidence(provider, session.key.as_deref(), model, &excluded)
                 .await?;
             // Retain this conservative target bound through any launch refresh;
@@ -1324,11 +1343,18 @@ impl RelayState {
                     .await?;
                 // Catalog I/O can outlive a recovery or rejection of an excluded
                 // source. Refresh evidence without changing launch eligibility.
-                let (_, refreshed_evidence, observed, refreshed_store_evidence) = self
+                let (
+                    _,
+                    refreshed_evidence,
+                    observed,
+                    refreshed_store_evidence,
+                    refreshed_runtime_evidence,
+                ) = self
                     .candidates_with_evidence(provider, session.key.as_deref(), model, &excluded)
                     .await?;
                 move_evidence = refreshed_evidence;
                 store_evidence = refreshed_store_evidence;
+                runtime_evidence = refreshed_runtime_evidence;
                 source_observed = observed;
                 selected
             } else {
@@ -1405,6 +1431,7 @@ impl RelayState {
                                         .with_failure(failure_evidence)
                                         .with_pin(pin_evidence)
                                         .with_store_evidence(store_evidence)
+                                        .with_runtime_evidence(runtime_evidence)
                                 })
                             } else {
                                 None
