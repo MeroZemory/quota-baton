@@ -23,6 +23,7 @@ use std::{
 
 const CAPACITY: usize = 20_000;
 const COUNT_CHANGE_CAPACITY: usize = CAPACITY * 2;
+mod affinity;
 mod capacity_spill;
 mod launch;
 pub(crate) use capacity_spill::CapacitySpillPermit;
@@ -405,22 +406,8 @@ impl PlacementState {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct Binding {
-    key: String,
-    account: String,
-    last_used: DateTime<Utc>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    accepted: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    first_seen_at: Option<DateTime<Utc>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    bound_since: Option<DateTime<Utc>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    client_kind: Option<crate::dashboard::ClientKind>,
-    #[serde(skip)]
-    observed_here: bool,
-}
+use affinity::Binding;
+
 #[derive(Serialize, Deserialize)]
 struct Snapshot {
     schema: u32,
@@ -752,11 +739,12 @@ impl BindingTable {
         key: &str,
         model: Option<&str>,
         now: DateTime<Utc>,
-    ) {
+    ) -> Option<move_guard::CommittedMove> {
         if let Some(permit) = permit {
             // Internal invariant: neither clear nor rename can interleave under
             // mutations. A stale permit never changes a binding.
-            self.move_guard
+            let committed = self
+                .move_guard
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .commit(permit, to)
@@ -769,6 +757,9 @@ impl BindingTable {
                     "move cost observation rejected; coverage incomplete"
                 );
             }
+            Some(committed)
+        } else {
+            None
         }
     }
 }
@@ -2786,11 +2777,11 @@ impl BindingTable {
         }
         // The mutation gate remains held: a prepared move cannot go stale
         // between policy publication and this charge.
-        self.commit_move(permit, &account, provider, &guard_key, model, now);
+        let committed = self.commit_move(permit, &account, provider, &guard_key, model, now);
         let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
         // Placement plus capacity eviction is one visible count mutation.
         d.defer_count_changes = true;
-        let moves = self.commit_binding(
+        let moves = self.publish_binding(
             &mut d,
             provider,
             key,
@@ -2802,6 +2793,7 @@ impl BindingTable {
             now,
             &account,
             reason,
+            committed.as_ref(),
         );
         let lease = self.reserve(&mut d, key, &account);
         self.prune(&mut d, now);
@@ -2813,7 +2805,7 @@ impl BindingTable {
             moves,
         }
     }
-    // Shared commit: launch placement deliberately stops before reserve().
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn commit_binding(
         &self,
@@ -2829,6 +2821,56 @@ impl BindingTable {
         account: &str,
         reason: &str,
     ) -> Vec<MoveEvent> {
+        let guard_key = key.map(group).unwrap_or("unidentified:test");
+        let from = key
+            .and_then(|k| d.groups.get(group(k)))
+            .map(|g| g.account.as_str());
+        let permit = self
+            .prepare_move(
+                d,
+                guard_key,
+                from,
+                account,
+                candidates,
+                MoveObservations::untracked(),
+                None,
+                reason,
+                now,
+            )
+            .expect("fixture move admitted");
+        let committed = self.commit_move(permit, account, provider, guard_key, None, now);
+        self.publish_binding(
+            d,
+            provider,
+            key,
+            parent,
+            candidates,
+            pinned,
+            request_bytes,
+            hold_timed_out,
+            now,
+            account,
+            reason,
+            committed.as_ref(),
+        )
+    }
+    // Shared commit: launch placement deliberately stops before reserve().
+    #[allow(clippy::too_many_arguments)]
+    fn publish_binding(
+        &self,
+        d: &mut Data,
+        provider: Provider,
+        key: Option<&str>,
+        parent: Option<&str>,
+        candidates: &[Candidate],
+        pinned: Option<&str>,
+        request_bytes: u64,
+        hold_timed_out: bool,
+        now: DateTime<Utc>,
+        account: &str,
+        reason: &str,
+        committed: Option<&move_guard::CommittedMove>,
+    ) -> Vec<MoveEvent> {
         d.count_change_clock = Some(now);
         let mut moves = Vec::new();
         if let Some(k) = key {
@@ -2840,6 +2882,14 @@ impl BindingTable {
             } else {
                 reason
             };
+            if let Some(previous) = d.groups.get(g).filter(|entry| entry.account != account) {
+                let authority = committed.expect("canonical rebind requires committed authority");
+                assert!(
+                    authority.for_group(launch::ownership_group(d, g))
+                        && authority.allows(&previous.account, account),
+                    "rebind receipt belongs to another source/group"
+                );
+            }
             let previous = unindex_group(d, g);
             let from = previous.as_ref().map(|entry| entry.account.to_owned());
             let source_changed = from.as_deref() != Some(account);
@@ -2906,23 +2956,37 @@ impl BindingTable {
                         .saturating_sub(binding_bound(&previous.key, &previous.account));
                 }
                 d.snapshot_weight = d.snapshot_weight.saturating_add(binding_bound(k, account));
-                d.bindings.insert(
-                    k.clone(),
-                    Binding {
-                        key: k.clone(),
-                        account: account.to_owned(),
+                let mut next = if let Some(mut binding) = previous.clone() {
+                    if binding.account != account {
+                        binding.rebind(
+                            account,
+                            committed.expect("existing binding requires authority"),
+                        );
+                    }
+                    binding
+                } else {
+                    Binding::new(
+                        k.clone(),
+                        account.to_owned(),
                         last_used,
-                        accepted: Some(accepted),
-                        first_seen_at: previous.as_ref().map_or(Some(now), |b| b.first_seen_at),
-                        bound_since: if from.as_deref() != Some(account) {
-                            Some(now)
-                        } else {
-                            previous.as_ref().and_then(|b| b.bound_since)
-                        },
-                        client_kind: previous.as_ref().and_then(|b| b.client_kind),
-                        observed_here: previous.as_ref().is_none_or(|b| b.observed_here),
-                    },
-                );
+                        None,
+                        None,
+                        None,
+                        None,
+                        false,
+                    )
+                };
+                next.last_used = last_used;
+                next.accepted = Some(accepted);
+                next.first_seen_at = previous.as_ref().map_or(Some(now), |b| b.first_seen_at);
+                next.bound_since = if from.as_deref() != Some(account) {
+                    Some(now)
+                } else {
+                    previous.as_ref().and_then(|b| b.bound_since)
+                };
+                next.client_kind = previous.as_ref().and_then(|b| b.client_kind);
+                next.observed_here = previous.as_ref().is_none_or(|b| b.observed_here);
+                d.bindings.insert(k.clone(), next);
             }
             index_group(
                 d,
@@ -3082,21 +3146,24 @@ impl BindingTable {
         {
             return (PreviewDecision::Selected { account: id.into() }, "forced");
         }
+        struct SelectionBinding {
+            key: String,
+            account: String,
+            last_used: DateTime<Utc>,
+        }
         let mut bound = key
             .filter(|_| !model_move)
             .and_then(|k| self.retained_binding(d, k, now))
-            .cloned();
-        // A synchronously saved anchor wins over an older write-behind binding.
+            .map(|b| SelectionBinding {
+                key: b.key.clone(),
+                account: b.account.clone(),
+                last_used: b.last_used,
+            });
         if let (Some(anchor), Some(key)) = (&plan.anchor, key.filter(|_| !model_move)) {
-            let b = bound.get_or_insert_with(|| Binding {
+            let b = bound.get_or_insert_with(|| SelectionBinding {
                 key: key.to_owned(),
                 account: anchor.clone(),
                 last_used: now,
-                accepted: None,
-                first_seen_at: None,
-                bound_since: None,
-                client_kind: None,
-                observed_here: false,
             });
             b.account = anchor.clone();
         }
@@ -5142,16 +5209,7 @@ mod tests {
                 weight += next;
                 d.bindings.insert(
                     key.clone(),
-                    Binding {
-                        key,
-                        account: "a".into(),
-                        last_used: Utc::now(),
-                        accepted: None,
-                        first_seen_at: None,
-                        bound_since: None,
-                        client_kind: None,
-                        observed_here: false,
-                    },
+                    Binding::new(key, "a".into(), Utc::now(), None, None, None, None, false),
                 );
             }
             rebuild_indexes(&mut d);
@@ -5625,16 +5683,7 @@ mod tests {
                 let key = format!("claude:other{i}");
                 d.bindings.insert(
                     key.clone(),
-                    Binding {
-                        key,
-                        account: "a".into(),
-                        accepted: None,
-                        last_used: Utc::now(),
-                        first_seen_at: None,
-                        bound_since: None,
-                        client_kind: None,
-                        observed_here: false,
-                    },
+                    Binding::new(key, "a".into(), Utc::now(), None, None, None, None, false),
                 );
             }
             rebuild_indexes(&mut d);
@@ -6131,16 +6180,7 @@ mod tests {
                 let key = format!("claude:oversized:agent:{i}");
                 d.bindings.insert(
                     key.clone(),
-                    Binding {
-                        key,
-                        account: "a".into(),
-                        accepted: None,
-                        last_used: now,
-                        first_seen_at: None,
-                        bound_since: None,
-                        client_kind: None,
-                        observed_here: false,
-                    },
+                    Binding::new(key, "a".into(), now, None, None, None, None, false),
                 );
             }
             rebuild_indexes(&mut d);

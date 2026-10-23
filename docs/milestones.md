@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: R9.6 대화 이동 미리보기 제목
-목표: 한영 제목 폭·실제 합성 CLI·집중 관문 완료; 설치 인계 후 N6t 진행
+현재 마일스톤: R14 N6t 근거형 계정 이동 보호
+목표: 계정 필드 봉인·정적 쓰기 검사 단위 통과; owner 증거형 MoveReason과 단일 이동 경로 연결
 핵심 지표: 남은 출시 1/3 (R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측); 주 경로 설치 수용·native fallback 후속
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-23 23:38 KST (제목·단일 미리보기 집중 관문 통과)
+갱신: 2026-10-23 23:58 KST (봉인·정적 검사 단위 통과; 전체 N6t 관문 전)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -443,6 +443,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-23 22:41 | R13.UI 세션 밀도 복구 | 이전70→35 DIP·KO/EN 1024/1320·tray345·실제 HWND4개 | 기존 행 높이와 28 DIP 클릭/UIA 보존 | 기본/testkit strict tray lint·fmt·확인된 상태 변경·임시 홈 정리 통과 |
 | 2026-10-23 23:19 | R9.5 합성 실제 CLI·시작 안내 | 복구59·일반 CLI19·표시9·진행8 통과; 안내31–78 ms 상한 | 즉시 안내200 ms 미만·기존 이동 불변식 유지 | strict 기본/testkit CLI lint·제품 build·실제 read-only launch check0; stale native stub은 dev 소스 대조로 분리 |
 | 2026-10-23 23:38 | R9.6 제목·미리보기 | 표시·진행·헤더39·이동복구59·실제 CLI20 통과, timing1 제외 | 한영48칸·단일표 숨김·본문 보호 | 기본/testkit strict lint·제품 build·read-only launch check0; 폭 제한 제거 red101·정확 복원 green0 |
+| 2026-10-23 23:58 | N6t 봉인·쓰기 검사 단위 | bindings192·정적검사2(67 fixture) 통과·직접쓰기/영수증위조 컴파일 반례101→복원0 | 계정 필드 무단 변경 차단·스냅샷 보존 | lib·정적 검사 strict lint 통과; owner MoveReason·N6t 관문·실제24시간 replay 미완료 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
