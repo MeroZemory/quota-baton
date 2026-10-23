@@ -112,6 +112,7 @@ Long waits and work that needs no build run as background lanes (W) with one com
 | N7 Part F pooled runway: calibration and 24 h backtest | W, then S1 | none for the backtest; the UI after N1 | backtest worker in `.sandbox/r13f-backtest/` | backtest error at 1 h and 3 h against a stated bound |
 | N8 R15 compiled admin contract | S1 | none | `impl/r15`, brief R15-contract.md | contract round trips, static guard, property tests |
 | N9 README final and v0.2.0 release | S2 and design | N1 and N2 installed | design session | public export scan clean, release assets built from the export |
+| N12 API-key pools (O14), see [below](#api-key-pools-n12) | S1 | owner decision O14 (pool order and spend consent); not ready until then | `impl/n12` | mixed-pool replay of the C6.4 incident; no paid request while an eligible subscription account exists (option 2); cap reached means unavailable, never overspent |
 | Held | R2 Part B (retire-cpa) | user decision | — | — |
 
 **Current S1 order** (importance; change it only when importance changes): N1, N2, N6, N5a, N5b, N5c, N10, N5d bounded close, N5i, N11 stale fixtures, N3, N4, N6t, N7 UI, N8, N6r (when its inputs exist).
@@ -119,6 +120,19 @@ Long waits and work that needs no build run as background lanes (W) with one com
 **Start now in W:** N5m and the N7 backtest.
 
 **No polling.** Nobody polls a running job or a pane in a loop. Every wait has the next ready node from this table.
+
+### API-key pools (N12)
+
+TODO, waiting for the owner decision O14 ([architecture](architecture.md)). Today quota-baton accepts subscription logins only. When pay-per-token API keys are added, the previous proxy's mixed-pool failures (contract C6.4: stale affinity to exhausted credentials, a misleading credit error, sessions quietly moved to a paid key) must not come back. The plan:
+
+1. **Separate pools.** Each provider gets a subscription pool and an API-key pool. A request never mixes them unless a config option enables it, and the order between pools is the O14 choice. The recommended order is subscription first: a key is used only when no subscription account can serve (O14 option 2), so perishable subscription quota is spent before money (D11).
+2. **Money needs consent.** A key is added off and is turned on by the owner. Each key has a spend cap per day and per month, counted from the response `usage` in the ledger. At the cap the key is unavailable, so it is never overspent.
+3. **No quiet moves to a paid key.** A move onto a key is a move under D20 (breaker, cache cost) and is recorded as an event with the reason. Under D26, a non-urgent session at a 5-hour limit still waits; it does not move to a key.
+4. **Native errors and per-key billing.** C6.4 items 2-6 apply unchanged: bindings are checked on every request, billing errors stay billing errors, and credit is never aggregated across keys.
+5. **Guarded spending.** The D29 token-burn guard counts paid keys and can trip on them; the dashboard shows each key's spend against its cap.
+6. **Tests before merge.** A replay of the C6.4 incident, a property test that no request reaches a key while an eligible subscription account exists (option 2), and cap tests.
+
+Anthropic-compatible third-party providers (D8) are a separate later item; they share items 2-6 but are chosen by model prefix, not by pool order.
 
 ## Fingerprint and reuse (dependency-aware)
 
