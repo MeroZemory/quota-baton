@@ -1714,7 +1714,16 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
         if no_sessions { 0. } else { 32. },
     );
     b.fill(header, Color::Footer, 0.);
-    let columns = columns(width(card) - 50., !s.grouped);
+    let control_width = v
+        .flat
+        .iter()
+        .map(|row| {
+            session_control_layout(b, row, 0., &v.clock)
+                .last()
+                .map_or(0., |(_, r, _)| r.right)
+        })
+        .fold(0., f32::max);
+    let columns = session_columns(width(card) - 50., !s.grouped, control_width);
     let mut cx = card.left + 25.;
     if !no_sessions {
         for (key, label, cw) in &columns {
@@ -2290,6 +2299,35 @@ pub fn columns(available: f32, flat: bool) -> Vec<(SortKey, &'static str, f32)> 
     }
     cols
 }
+// Reserve the Notes cell for real actions before dropping optional data columns.
+// The legacy column policy is unchanged when no session supports urgency.
+fn session_columns(available: f32, flat: bool, controls: f32) -> Vec<(SortKey, &'static str, f32)> {
+    if controls == 0. {
+        return columns(available, flat);
+    }
+    let mut cols = columns(available, flat);
+    cols.retain(|c| c.0 != SortKey::Memo);
+    let needed = controls + 8.;
+    for key in [
+        SortKey::Start,
+        SortKey::Model,
+        SortKey::LastActivity,
+        SortKey::Requests,
+    ] {
+        if cols.iter().map(|c| c.2).sum::<f32>() + needed <= available {
+            break;
+        }
+        cols.retain(|c| c.0 != key);
+    }
+    let used = cols.iter().map(|c| c.2).sum::<f32>();
+    cols.push((
+        SortKey::Memo,
+        crate::i18n::static_text("메모"),
+        (available - used).max(needed),
+    ));
+    cols
+}
+
 fn group_usage_height(g: &m::AccountGroup, available: f32) -> f32 {
     let slots = ((available - 40. + 24.) / 320.).floor().max(1.) as usize;
     60. + g.windows.len().max(1).div_ceil(slots).saturating_sub(1) as f32 * 24.
@@ -2645,7 +2683,7 @@ enum SessionControl {
 fn session_control_layout(
     b: &mut Builder<'_>,
     row: &m::SessionRow,
-    available: f32,
+    _available: f32,
     clock: &m::Clock,
 ) -> Vec<(SessionControl, Rect, String)> {
     if row.routing.is_none() && row.quota_wait.is_none() {
@@ -2686,10 +2724,7 @@ fn session_control_layout(
             crate::i18n::static_text("긴급 설정 저장 실패").into(),
         ));
     }
-    let available = (available - 24.).max(1.);
-    let mut x = 12.;
-    let mut y = 35.;
-    let mut line_height: f32 = 0.;
+    let mut x = 0.;
     let mut result = vec![];
     for (kind, label) in parts {
         let (size, padding) = match kind {
@@ -2697,30 +2732,27 @@ fn session_control_layout(
             SessionControl::Move => (13., 16.),
             _ => (12., 0.),
         };
-        let w = (b.measured_width(&label, size, false) + padding).min(available);
-        let h = (b.measured_height(&label, (w - padding).max(1.), size, false) + 10.).max(28.);
-        if x > 12. && x + w > available + 12. {
-            x = 12.;
-            y += line_height + 4.;
-            line_height = 0.;
-        }
-        result.push((kind, rect(x, y, w, h), label));
-        x += w + 10.;
-        line_height = line_height.max(h);
+        let measured = b.measured_width(&label, size, false) + padding;
+        let w = match kind {
+            SessionControl::Waiting => measured.min(80.),
+            SessionControl::Feedback => measured.min(48.),
+            _ => measured,
+        };
+        result.push((kind, rect(x, 3.5, w, 28.), label));
+        x += w + 8.;
     }
     result
 }
 fn session_height(
-    b: &mut Builder<'_>,
-    row: &m::SessionRow,
-    available: f32,
-    clock: &m::Clock,
+    _b: &mut Builder<'_>,
+    _row: &m::SessionRow,
+    _available: f32,
+    _clock: &m::Clock,
 ) -> f32 {
-    session_control_layout(b, row, available, clock)
-        .iter()
-        .map(|(_, r, _)| r.bottom + 5.)
-        .fold(35., f32::max)
+    // Pre-N5c row rhythm, including pending, waiting and disabled controls.
+    35.
 }
+
 fn session_controls(b: &mut Builder<'_>, row: &m::SessionRow, row_rect: Rect, clock: &m::Clock) {
     for (kind, local, label) in session_control_layout(b, row, width(row_rect), clock) {
         let r = rect(
@@ -2780,7 +2812,7 @@ fn session_controls(b: &mut Builder<'_>, row: &m::SessionRow, row_rect: Rect, cl
                 );
                 b.text(
                     rect(r.left, r.top + 5., width(r), height(r) - 6.),
-                    label,
+                    label.clone(),
                     12.,
                     false,
                     if row.urgency_failed && matches!(kind, SessionControl::Feedback) {
@@ -2788,8 +2820,9 @@ fn session_controls(b: &mut Builder<'_>, row: &m::SessionRow, row_rect: Rect, cl
                     } else {
                         Color::Secondary
                     },
-                    true,
+                    false,
                 );
+                b.tooltip(r, label.clone());
                 if matches!(kind, SessionControl::Feedback) && row.urgency_failed {
                     b.tooltip(
                         r,
@@ -3036,6 +3069,31 @@ fn session(
                     );
                 }
             }
+            SortKey::Memo if row.routing.is_some() || row.quota_wait.is_some() => {
+                let cell = rect(cr.left, r.top, *cw, 35.);
+                if !row.memo.is_empty() {
+                    // Specific action explanations take precedence over the cell.
+                    b.tooltip(cell, row.memo.clone());
+                }
+                session_controls(b, row, cell, clock);
+                let used = session_control_layout(b, row, *cw, clock)
+                    .last()
+                    .map_or(0., |(_, r, _)| r.right + 8.);
+                if *cw - used >= 40. {
+                    b.text(
+                        rect(cr.left + used, cr.top, *cw - used, 20.),
+                        row.memo.clone(),
+                        12.,
+                        false,
+                        if row.memo.contains(crate::i18n::static_text("크레딧")) {
+                            Color::Warn
+                        } else {
+                            Color::Text
+                        },
+                        false,
+                    );
+                }
+            }
             _ => {
                 let text = match key {
                     SortKey::Model => &row.model,
@@ -3062,7 +3120,6 @@ fn session(
         }
         x += *cw;
     }
-    session_controls(b, row, r, clock);
 }
 fn recent(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card: Rect) {
     b.card(card);
@@ -3847,6 +3904,95 @@ mod n5c_session_control_tests {
                         }]
                     );
                     assert!(state.selected.is_none());
+                }
+            });
+        }
+    }
+    #[test]
+    fn r13_ui_urgency_keeps_pre_n5c_35_dip_rows_and_inline_targets() {
+        for lang in [crate::i18n::UiLanguage::Ko, crate::i18n::UiLanguage::En] {
+            crate::i18n::with_language(lang, || {
+                for size in [[1024., 640.], [1320., 900.]] {
+                    for grouped in [false, true] {
+                        for waiting in [false, true] {
+                            let (mut snapshot, mut state, clock, id) = fixture("recover");
+                            state.grouped = grouped;
+                            if !waiting {
+                                snapshot.sessions.sessions[0].quota_wait = None;
+                            }
+                            for pending in [false, true] {
+                                if pending {
+                                    state.apply_urgency_update(
+                                        crate::state::UrgencyUpdate::Pending { id: "a".repeat(64) },
+                                    );
+                                }
+                                let view = m::project(&snapshot, &mut state, &clock);
+                                let scene = Scene::build(&view, &state, size, &Metrics::default());
+                                let row = scene.session_rows.iter().find(|r| r.id == id).unwrap();
+                                assert_eq!(
+                                    height(row.rect),
+                                    35.,
+                                    "pre-N5c row height: {lang:?} {size:?}"
+                                );
+                                let mut controls = Vec::new();
+                                for target in [
+                                    Target::SessionUrgency(id.clone()),
+                                    Target::SessionMoveNow(id.clone()),
+                                ] {
+                                    if !waiting && matches!(target, Target::SessionMoveNow(_)) {
+                                        continue;
+                                    }
+                                    let node = scene
+                                        .accessibility
+                                        .iter()
+                                        .find(|n| n.target.as_ref() == Some(&target))
+                                        .unwrap();
+                                    assert!(
+                                        node.rect.left >= row.rect.left
+                                            && node.rect.right <= row.rect.right,
+                                        "inline control outside row: {:?} {:?}",
+                                        node.rect,
+                                        row.rect
+                                    );
+                                    assert!(
+                                        node.rect.top >= row.rect.top
+                                            && node.rect.bottom <= row.rect.bottom
+                                    );
+                                    assert_eq!(
+                                        height(node.rect),
+                                        28.,
+                                        "same full hit target height"
+                                    );
+                                    let hit =
+                                        scene.targets.iter().find(|h| h.target == target).unwrap();
+                                    assert_eq!(hit.rect, node.rect);
+                                    controls.push(node.rect);
+                                }
+                                assert!(controls.windows(2).all(|w| w[0].right <= w[1].left));
+                                for draw in &scene.draw {
+                                    if let Draw::Text { rect, measure, .. } = draw
+                                        && rect.top >= row.rect.top
+                                        && rect.bottom <= row.rect.bottom
+                                        && ![
+                                            crate::i18n::static_text("긴급"),
+                                            crate::i18n::static_text("지금 옮기기"),
+                                            "\u{e73e}",
+                                        ]
+                                        .contains(&measure.text.as_str())
+                                    {
+                                        assert!(
+                                            controls
+                                                .iter()
+                                                .all(|c| rect.right <= c.left
+                                                    || rect.left >= c.right),
+                                            "text overlaps action: {}",
+                                            measure.text
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             });
         }
