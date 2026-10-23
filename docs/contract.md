@@ -498,6 +498,25 @@ Associating a project preserves an explicit root override unless `inherit: true`
 
 `routing.request_timeout_secs` (default 300 s) bounds the whole HTTP pre-commit path, including preparation, selection and holds, refresh, dial and retries. If it expires before response headers, return a provider-shaped HTTP 504. It never cuts off an already committed stream. The WebSocket upgrade has its own overall `ws_upgrade_hold_secs` envelope (default 10 s), including refresh and dial, below Codex's 15 s connect timeout (C6.3).
 
+### C7.3 Accounts also used outside qb (D30)
+
+This protection needs no setting. When observed usage rises beyond the noise
+band without attributable qb traffic, the account is marked as also used
+outside qb for the rest of that window and the next. A full observed clean
+window is required to clear it; a timer or a missing usage report is not enough.
+Existing sessions may keep using their source account. Running sessions never
+move onto a marked account, and new sessions use it only as a last resort.
+Saved routing anchors remain source authority when a binding image is absent
+or stale. An unavailable detector state is conservative placement protection,
+not positive outside-use attribution or an authentication failure.
+
+A session at its account's learned WebSocket capacity first waits for its own
+slot within the original upgrade deadline. A spill pays the ordinary D20
+placement charge and weak-evidence cap. Only one spilled session may land on
+each destination until fresh post-spill usage evidence arrives for its tracked
+windows. Cached values, reset timestamps and incomplete coverage do not reopen
+that spill allowance. A freshly reset destination still has weak evidence.
+
 ## C8. Session keys and the allowed body peek
 
 ### Claude
