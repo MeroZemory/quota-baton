@@ -254,11 +254,11 @@ fn attachment_consumes_plan_and_only_adds_nonsecret_remote_options_to_tui() {
     let args = issued(&["--strict-config", "--", "resume"]);
     let (_, expected_server) = owned(&args);
     let attached = from_issued_args(&args)
-        .attach_remote("ws://127.0.0.1:43210/qb-native", "QB_REMOTE_SYNTHETIC")
+        .attach_remote("ws://127.0.0.1:43210/", "QB_REMOTE_SYNTHETIC")
         .unwrap();
     let mut expected_tui = argv(&[
         "--remote",
-        "ws://127.0.0.1:43210/qb-native",
+        "ws://127.0.0.1:43210/",
         "--remote-auth-token-env",
         "QB_REMOTE_SYNTHETIC",
     ]);
@@ -277,15 +277,16 @@ fn attach_error(result: Result<plan::AttachedRemoteTui, AttachError>) -> AttachE
 #[test]
 fn attachment_rejects_secret_urls_external_endpoints_and_invalid_env_names() {
     for url in [
-        "ws://localhost:1234/qb-native",
-        "wss://127.0.0.1:1234/qb-native",
-        "ws://127.0.0.1:0/qb-native",
-        "ws://127.0.0.1:65536/qb-native",
-        "ws://user:secret@127.0.0.1:1234/qb-native",
+        "ws://localhost:1234/",
+        "wss://127.0.0.1:1234/",
+        "ws://127.0.0.1:0/",
+        "ws://127.0.0.1:65536/",
+        "ws://user:secret@127.0.0.1:1234/",
         "ws://127.0.0.1:1234/secret",
-        "ws://127.0.0.1:1234/qb-native?token=secret",
-        "ws://127.0.0.1:1234/qb-native#secret",
-        "ws://127.0.0.1:1234/qb-native\n",
+        "ws://127.0.0.1:1234/qb-native",
+        "ws://127.0.0.1:1234/?token=secret",
+        "ws://127.0.0.1:1234/#secret",
+        "ws://127.0.0.1:1234/\n",
     ] {
         assert_eq!(
             attach_error(from_issued_args(&issued(&[])).attach_remote(url, "QB_REMOTE")),
@@ -301,14 +302,12 @@ fn attachment_rejects_secret_urls_external_endpoints_and_invalid_env_names() {
         "한글",
     ] {
         assert_eq!(
-            attach_error(
-                from_issued_args(&issued(&[])).attach_remote("ws://127.0.0.1:1/qb-native", name)
-            ),
+            attach_error(from_issued_args(&issued(&[])).attach_remote("ws://127.0.0.1:1/", name)),
             AttachError::InvalidEnvironmentName
         );
     }
     assert_eq!(
-        attach_error(Plan::ExistingPath.attach_remote("ws://127.0.0.1:1/qb-native", "QB_REMOTE")),
+        attach_error(Plan::ExistingPath.attach_remote("ws://127.0.0.1:1/", "QB_REMOTE")),
         AttachError::ExistingPath
     );
 }
