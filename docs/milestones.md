@@ -6,10 +6,10 @@ This file names the verification for each unit and each row. The row list and th
 
 <!-- status:begin -->
 현재 마일스톤: R14 N6t 근거형 계정 이동 보호
-목표: 계정 봉인·정적 검사와 health 소유 증거 연결 통과; 나머지 MoveReason·단일 이동 경로 연결
+목표: 봉인·정적 검사와 health·WS 용량 증거 전달 통과; 나머지 MoveReason·단일 이동 경로 연결
 핵심 지표: 남은 출시 1/3 (R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측); 주 경로 설치 수용·native fallback 후속
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-24 00:14 KST (health 증거 단위 통과; 전체 N6t 관문 전)
+갱신: 2026-10-24 00:40 KST (WS 용량 증거 전달 단위 통과; 전체 N6t 관문 전)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -445,6 +445,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-23 23:38 | R9.6 제목·미리보기 | 표시·진행·헤더39·이동복구59·실제 CLI20 통과, timing1 제외 | 한영48칸·단일표 숨김·본문 보호 | 기본/testkit strict lint·제품 build·read-only launch check0; 폭 제한 제거 red101·정확 복원 green0 |
 | 2026-10-23 23:58 | N6t 봉인·쓰기 검사 단위 | bindings192·정적검사2(67 fixture) 통과·직접쓰기/영수증위조 컴파일 반례101→복원0 | 계정 필드 무단 변경 차단·스냅샷 보존 | lib·정적 검사 strict lint 통과; owner MoveReason·N6t 관문·실제24시간 replay 미완료 |
 | 2026-10-24 00:14 | N6t health 증거 단위 | bindings193·health15·정적2 통과; 증거검증 제거 red101·외부 생성 E0451·정확 복원 | 제외/WS 용량은 health 근거 아님; 모델 scope·만료·기존 drain 예외 보존 | cbedc86·strict core all-targets lint0; 전체 MoveReason·N6t 관문·실제 replay 미완료 |
+| 2026-10-24 00:40 | N6t WS 용량 증거 전달 단위 | 집중267통과(소유자5·bindings193·정적2·실제WS34·HTTP33), 검사 helper1제외 | 정확한 예약 활성·출발/목적지·owner 검증, 거부 시 정책/배정/예산 보존 | 기본/testkit strict core all-targets lint·의도한 red3개·정확 복원; n6t-capacity/completion.json. 전체 N6t 관문·실제 replay 미완료 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
