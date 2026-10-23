@@ -58,7 +58,8 @@ impl Sink<Message> for PhysicalSink {
         }
         match message {
             Message::Frame(frame) => trace.final_frames.push(frame.header().is_final),
-            _ => panic!("drive must send physical frames"),
+            Message::Text(_) | Message::Binary(_) => trace.final_frames.push(true),
+            Message::Ping(_) | Message::Pong(_) | Message::Close(_) => {}
         }
         Ok(())
     }
@@ -296,4 +297,49 @@ fn sink_error_cannot_be_overridden_by_finish_true() {
     assert_burned(&leg);
     write.finish(true);
     assert!(leg.quota_candidate().is_none());
+}
+
+#[test]
+fn count_complete_non_final_tail_never_qualifies() {
+    let (leg, mut write, trace) = setup(Script::default(), 3);
+    for index in 0..3 {
+        let message = if index == 2 {
+            Message::Frame(Frame::message(
+                vec![b'x'],
+                OpCode::Data(Data::Continue),
+                false,
+            ))
+        } else {
+            frame(index, 3)
+        };
+        let mut send = Box::pin(write.send(message));
+        assert!(matches!(poll_once(send.as_mut()), Poll::Ready(Ok(()))));
+    }
+    assert_eq!(trace.lock().unwrap().final_frames, [false, false, false]);
+    write.finish(true);
+    assert!(
+        leg.quota_candidate().is_none(),
+        "three flushed non-final frames must not authorize a completed create"
+    );
+    assert_burned(&leg);
+}
+
+#[test]
+fn invalid_fragment_progression_never_qualifies() {
+    let invalid = [
+        vec![frame(0, 1), frame(1, 2)],
+        vec![frame(0, 2), frame(0, 1)],
+        vec![frame(1, 2), frame(1, 2)],
+        vec![Message::Ping(vec![b'x'].into())],
+        vec![Message::Text("{}".into()), Message::Text("{}".into())],
+    ];
+    for messages in invalid {
+        let (leg, mut write, _) = setup(Script::default(), messages.len());
+        for message in messages {
+            let mut send = Box::pin(write.send(message));
+            assert!(matches!(poll_once(send.as_mut()), Poll::Ready(Ok(()))));
+        }
+        write.finish(true);
+        assert_burned(&leg);
+    }
 }

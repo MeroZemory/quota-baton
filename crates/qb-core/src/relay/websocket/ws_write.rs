@@ -9,7 +9,10 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{
+    Message,
+    protocol::frame::coding::{Data, OpCode},
+};
 
 pub(super) struct ForwardWrite<S> {
     inner: S,
@@ -66,6 +69,28 @@ impl<S> ForwardWrite<S> {
         (self.inner, self.sent)
     }
 
+    fn valid_fragment(&self, message: &Message) -> bool {
+        let Some(index) = self.accepted_fragments.checked_add(1) else {
+            return false;
+        };
+        if index > self.expected_fragments {
+            return false;
+        }
+        match message {
+            Message::Text(_) | Message::Binary(_) => index == 1 && self.expected_fragments == 1,
+            Message::Frame(frame) => {
+                let header = frame.header();
+                header.is_final == (index == self.expected_fragments)
+                    && if index == 1 {
+                        matches!(header.opcode, OpCode::Data(Data::Text | Data::Binary))
+                    } else {
+                        header.opcode == OpCode::Data(Data::Continue)
+                    }
+            }
+            _ => false,
+        }
+    }
+
     fn fail(&mut self) {
         self.failed = true;
         // Burn immediately, even if a caller retains the adapter after error.
@@ -91,6 +116,11 @@ impl<S: Sink<Message> + Unpin> Sink<Message> for ForwardWrite<S> {
                 self.sent = Some(sent);
                 self.ticket = Some(ticket);
             }
+        }
+        // Item count alone cannot prove a complete WS message. An invalid
+        // sequence still forwards normally, but can never authorize a wait.
+        if !self.valid_fragment(&message) {
+            self.fail();
         }
         // Even failed start_send taints: transport may have accepted partial data.
         let result = Pin::new(&mut self.inner).start_send(message);
