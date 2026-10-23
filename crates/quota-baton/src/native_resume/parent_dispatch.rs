@@ -54,13 +54,23 @@ impl<N: Write, U: Write> Parent<N, U> {
 
     /// Caller has separately completed fresh nonconsuming core inspection.
     pub(crate) fn begin_final_read(&mut self, ticket: StoppedGoalTicket) -> Result<(), Error> {
-        self.ingress.checkpoint().map_err(Error::Ingress)?;
+        match self.ingress.checkpoint() {
+            Ok(_) => {}
+            Err(ingress::Error::Pending) => {
+                // Input arriving during Inspect consumes this auto candidate,
+                // but remains queued for ordinary dispatch. No native read or
+                // activation may jump ahead of it.
+                self.dispatcher.cancel_resume();
+                return Err(Error::Dispatch(dispatcher::Error::AuthorityDenied));
+            }
+            Err(error) => return Err(Error::Ingress(error)),
+        }
         let mut unwind = UnwindClose(Some(self.close.clone()));
         let result = self
             .dispatcher
             .begin_final_read(ticket)
             .map_err(Error::Dispatch);
-        if result.is_ok() {
+        if result.is_ok() || result == Err(Error::Dispatch(dispatcher::Error::AuthorityDenied)) {
             unwind.0 = None;
         }
         result
