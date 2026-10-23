@@ -127,6 +127,7 @@ struct FakeState {
     flushes: usize,
     native_read_waiting: bool,
     native_eof: bool,
+    last_observed_status: Option<JobStatus>,
 }
 
 struct Proof {
@@ -136,6 +137,7 @@ struct Proof {
     written: Notify,
     flushing: Notify,
     native_read_waiting: Notify,
+    status_observed: Notify,
 }
 
 impl Proof {
@@ -156,12 +158,14 @@ impl Proof {
                 flushes: 0,
                 native_read_waiting: false,
                 native_eof: false,
+                last_observed_status: None,
             }),
             changed: Condvar::new(),
             entered: Notify::new(),
             written: Notify::new(),
             flushing: Notify::new(),
             native_read_waiting: Notify::new(),
+            status_observed: Notify::new(),
         })
     }
 
@@ -170,6 +174,18 @@ impl Proof {
         state.native.extend(bytes);
         state.native.push_back(b'\n');
         self.changed.notify_all();
+    }
+
+    async fn observed_status(&self, expected: JobStatus) {
+        loop {
+            let observed = self.status_observed.notified();
+            tokio::pin!(observed);
+            observed.as_mut().enable();
+            if self.state.lock().unwrap().last_observed_status == Some(expected) {
+                return;
+            }
+            observed.await;
+        }
     }
 
     async fn line_written(&self) {
@@ -286,7 +302,11 @@ impl Jobs for FakeJobs {
         self.pipes.take().ok_or(io::ErrorKind::NotConnected.into())
     }
     fn try_wait(&self) -> io::Result<JobStatus> {
-        Ok(self.proof.state.lock().unwrap().status)
+        let mut state = self.proof.state.lock().unwrap();
+        let status = state.status;
+        state.last_observed_status = Some(status);
+        self.proof.status_observed.notify_one();
+        Ok(status)
     }
     fn stop_jobs(&mut self) -> io::Result<()> {
         let mut state = self.proof.state.lock().unwrap();
@@ -1084,6 +1104,355 @@ async fn managed_episode_delayed_consume_blocked_write_keeps_original_candidate_
             0,
             "blocked activation delivered no frame"
         );
+        closed(&mut core).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn managed_boundary_eof_requires_actual_clean_tui_exit() {
+    for status in [
+        JobStatus::Running,
+        JobStatus::TuiExited(1),
+        JobStatus::ServerExited(0),
+        JobStatus::ServerExited(1),
+        JobStatus::BothExited { tui: 0, server: 1 },
+        JobStatus::BothExited { tui: 1, server: 0 },
+        JobStatus::Stopped,
+        JobStatus::TuiExited(0),
+        JobStatus::BothExited { tui: 0, server: 0 },
+    ] {
+        bounded(async {
+            let (socket, mut ui, control, mut core) = peers().await;
+            let proof = Proof::new(false);
+            let mut owner = require(ManagedParent::new(
+                FakeJobs::new(proof.clone()),
+                PREFIX.into(),
+                control,
+                socket,
+            ));
+            let mut events = owner.test_lifecycle();
+            let peer = async {
+                ordinary_still_live(&mut ui, &proof, 84).await;
+                {
+                    let mut state = proof.state.lock().unwrap();
+                    assert!(state.native.is_empty());
+                    state.native_eof = true;
+                    proof.changed.notify_all();
+                }
+                while events.recv().await.expect("EOF grace observation")
+                    != managed_parent::TestLifecycle::NativeEofGrace
+                {}
+                // Observe Running after EOF, before any real exit is supplied.
+                // Trial 28's TUI-only zero must not require a server exit first.
+                proof.state.lock().unwrap().last_observed_status = None;
+                proof.observed_status(JobStatus::Running).await;
+                if status == (JobStatus::BothExited { tui: 0, server: 0 }) {
+                    {
+                        let mut state = proof.state.lock().unwrap();
+                        assert!(!state.stopped);
+                        assert_eq!(state.stops, 0);
+                        state.status = JobStatus::ServerExited(0);
+                        state.last_observed_status = None;
+                    }
+                    proof.observed_status(JobStatus::ServerExited(0)).await;
+                }
+                let mut state = proof.state.lock().unwrap();
+                assert!(!state.stopped);
+                assert_eq!(state.stops, 0);
+                state.status = status;
+            };
+            let (result, ()) = tokio::join!(owner.run(), peer);
+            assert_eq!(
+                result,
+                if matches!(
+                    status,
+                    JobStatus::TuiExited(0) | JobStatus::BothExited { tui: 0, server: 0 }
+                ) {
+                    Ok(status)
+                } else {
+                    Err(Error::NativeEof)
+                }
+            );
+            proof.cleaned(false);
+            closed(&mut core).await;
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn managed_boundary_eof_freezes_granted_consume_before_supervisor_grace() {
+    bounded(async {
+        let (socket, mut ui, control, mut core) = peers().await;
+        let proof = Proof::new(false);
+        let mut owner = require(ManagedParent::new(
+            FakeJobs::new(proof.clone()),
+            PREFIX.into(),
+            control,
+            socket,
+        ));
+        let mut events = owner.test_lifecycle();
+        let consume_gate = owner.test_pause_consume_return();
+        let mut run = Box::pin(owner.run());
+        tokio::select! {
+            result = &mut run => { let _ = result; panic!("owner exited before granted Consume"); }
+            () = async {
+                stopped_dialogue(&mut ui, &proof).await;
+                waiting(&mut core).await;
+                ready(&mut core, &proof).await;
+                final_native_reply(&proof);
+                let consume = core_request(&mut core).await;
+                assert!(matches!(consume.command, Command::Consume { episode: EPISODE }));
+                core_reply(
+                    &mut core,
+                    Some(consume.request_id),
+                    Event::Granted { episode: EPISODE },
+                ).await;
+                consume_gate.entered().await;
+            } => {}
+        }
+        // Keep run UNPOLLED: the reader must freeze admission independently of
+        // native_eof_exit, while a genuinely granted callback is ready to resume.
+        {
+            let mut state = proof.state.lock().unwrap();
+            state.native_eof = true;
+            proof.changed.notify_all();
+        }
+        loop {
+            let event = events
+                .recv()
+                .await
+                .expect("reader EOF before supervisor grace");
+            assert_ne!(event, managed_parent::TestLifecycle::NativeEofGrace);
+            if event == managed_parent::TestLifecycle::FailureLatched(Error::NativeEof) {
+                break;
+            }
+        }
+        consume_gate.release();
+        loop {
+            let event = events.recv().await.expect("completed Consume veto");
+            assert_ne!(event, managed_parent::TestLifecycle::NativeEofGrace);
+            if event == managed_parent::TestLifecycle::ConsumeCallbackFinished {
+                break;
+            }
+        }
+        assert_eq!(proof.automatic_count(), 0);
+        proof.live();
+        // An independent TUI zero arrives after EOF, before any job termination.
+        proof.state.lock().unwrap().status = JobStatus::TuiExited(0);
+        assert_eq!(run.await, Ok(JobStatus::TuiExited(0)));
+        assert_eq!(proof.automatic_count(), 0);
+        proof.cleaned(false);
+        closed(&mut core).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn managed_computed_dispatch_failure_survives_cleanup_and_concurrent_eof() {
+    for status in [
+        JobStatus::TuiExited(0),
+        JobStatus::BothExited { tui: 0, server: 0 },
+        JobStatus::Running,
+    ] {
+        bounded(async {
+            let (socket, _ui, control, mut core) = peers().await;
+            let proof = Proof::new(false);
+            let mut owner = require(ManagedParent::new(
+                FakeJobs::new(proof.clone()),
+                PREFIX.into(),
+                control,
+                socket,
+            ));
+            let mut ingress = owner.test_ingress();
+            let mut events = owner.test_lifecycle();
+            let dispatch_gate = owner.test_pause_dispatch_failure();
+            let cleanup_gate = owner.test_pause_before_cleanup();
+            // Valid framing/JSON passes the real reader; the dispatcher's RPC
+            // decoder must reject the numeric method. Dispatch starts in run.
+            proof.native(br#"{"method":123}"#);
+            assert_eq!(ingress.recv().await, Some(ingress::Source::Native));
+            loop {
+                let reading = proof.native_read_waiting.notified();
+                tokio::pin!(reading);
+                reading.as_mut().enable();
+                if proof.state.lock().unwrap().native_read_waiting {
+                    break;
+                }
+                reading.await;
+            }
+            proof.state.lock().unwrap().status = status;
+            let mut run = Box::pin(owner.run());
+            tokio::select! {
+                result = &mut run => { let _ = result; panic!("owner bypassed cleanup gate"); }
+                () = cleanup_gate.entered() => {}
+            }
+            // For zero exits the supervisor has selected Ok before cleanup;
+            // Running instead selects the pump closed by the failed dispatcher.
+            dispatch_gate.entered().await;
+            proof.live();
+            {
+                let mut state = proof.state.lock().unwrap();
+                state.native_eof = true;
+                proof.changed.notify_all();
+            }
+            loop {
+                let event = events
+                    .recv()
+                    .await
+                    .expect("EOF while dispatch result is held");
+                assert_ne!(
+                    event,
+                    managed_parent::TestLifecycle::FailureLatched(Error::Dispatch)
+                );
+                if event == managed_parent::TestLifecycle::FailureLatched(Error::NativeEof) {
+                    break;
+                }
+            }
+            proof.live();
+            cleanup_gate.release();
+            // ONLY cleanup releases dispatch_gate, after the cause snapshot.
+            // The wrapper records its computed failure during the ensuing join.
+            assert_eq!(run.await, Err(Error::Dispatch));
+            let mut dispatch_latched = false;
+            while let Ok(event) = events.try_recv() {
+                dispatch_latched |=
+                    event == managed_parent::TestLifecycle::FailureLatched(Error::Dispatch);
+            }
+            assert!(dispatch_latched);
+            proof.cleaned(false);
+            closed(&mut core).await;
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn managed_native_eof_and_actual_peer_close_accept_clean_tui_but_binary_stays_fatal() {
+    for clean_close in [true, false] {
+        bounded(async {
+            let (socket, mut ui, control, mut core) = peers().await;
+            let proof = Proof::new(false);
+            let mut owner = require(ManagedParent::new(
+                FakeJobs::new(proof.clone()),
+                PREFIX.into(),
+                control,
+                socket,
+            ));
+            let mut events = owner.test_lifecycle();
+            let gate = owner.test_pause_before_cleanup();
+            let peer = async {
+                ordinary_still_live(&mut ui, &proof, 86).await;
+                {
+                    let mut state = proof.state.lock().unwrap();
+                    assert!(!state.stopped);
+                    state.native_eof = true;
+                    proof.changed.notify_all();
+                }
+                while events.recv().await.expect("native EOF grace")
+                    != managed_parent::TestLifecycle::NativeEofGrace
+                {}
+                require(
+                    ui.send(if clean_close {
+                        Message::Close(None)
+                    } else {
+                        Message::Binary(vec![0_u8].into())
+                    })
+                    .await,
+                );
+                while events.recv().await.expect("UI publisher completion")
+                    != managed_parent::TestLifecycle::UiPublisherFinished
+                {}
+                // The real socket outcome and reader EOF precede the independent
+                // TUI zero; cleanup cannot manufacture that exit observation.
+                assert!(!proof.state.lock().unwrap().stopped);
+                proof.state.lock().unwrap().status = JobStatus::TuiExited(0);
+                gate.entered().await;
+                gate.release();
+            };
+            let (result, ()) = tokio::join!(owner.run(), peer);
+            if clean_close {
+                assert_eq!(result, Ok(JobStatus::TuiExited(0)));
+            } else {
+                assert!(matches!(result, Err(Error::Pump | Error::NativeEof)));
+            }
+            proof.cleaned(false);
+            closed(&mut core).await;
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn managed_truncated_native_eof_remains_read_failure_with_both_zero_exits() {
+    bounded(async {
+        let (socket, mut ui, control, mut core) = peers().await;
+        let proof = Proof::new(false);
+        let mut owner = require(ManagedParent::new(
+            FakeJobs::new(proof.clone()),
+            PREFIX.into(),
+            control,
+            socket,
+        ));
+        let mut events = owner.test_lifecycle();
+        let gate = owner.test_pause_before_cleanup();
+        let peer = async {
+            ordinary_still_live(&mut ui, &proof, 85).await;
+            {
+                let mut state = proof.state.lock().unwrap();
+                state.native.extend(b"{\"id\":99}"); // Complete JSON, missing LF.
+                state.native_eof = true;
+                proof.changed.notify_all();
+            }
+            gate.entered().await;
+            assert!(!proof.state.lock().unwrap().stopped);
+            proof.state.lock().unwrap().status = JobStatus::BothExited { tui: 0, server: 0 };
+            gate.release();
+        };
+        let (result, ()) = tokio::join!(owner.run(), peer);
+        assert_eq!(result, Err(Error::NativeRead));
+        while let Ok(event) = events.try_recv() {
+            assert_ne!(event, managed_parent::TestLifecycle::NativeEofGrace);
+        }
+        proof.cleaned(false);
+        closed(&mut core).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn managed_boundary_eof_with_both_zero_exits_preserves_pending_write_uncertainty() {
+    bounded(async {
+        let (socket, mut ui, control, mut core) = peers().await;
+        let proof = Proof::new(true);
+        let mut owner = require(ManagedParent::new(
+            FakeJobs::new(proof.clone()),
+            PREFIX.into(),
+            control,
+            socket,
+        ));
+        let mut events = owner.test_lifecycle();
+        let peer = async {
+            require(ui.send(text(REQUEST)).await);
+            proof.entered.notified().await;
+            {
+                let mut state = proof.state.lock().unwrap();
+                assert!(state.writing && state.block);
+                state.native_eof = true;
+                proof.changed.notify_all();
+            }
+            while events.recv().await.expect("EOF grace observation")
+                != managed_parent::TestLifecycle::NativeEofGrace
+            {}
+            let mut state = proof.state.lock().unwrap();
+            assert!(!state.stopped);
+            state.status = JobStatus::BothExited { tui: 0, server: 0 };
+        };
+        let (result, ()) = tokio::join!(owner.run(), peer);
+        assert_eq!(result, Err(Error::WriteUncertain));
+        assert!(proof.state.lock().unwrap().input.is_empty());
+        proof.cleaned(true);
         closed(&mut core).await;
     })
     .await;

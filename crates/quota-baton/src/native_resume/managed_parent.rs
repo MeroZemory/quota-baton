@@ -33,6 +33,7 @@ use std::{
     time::Duration,
 };
 
+use futures_util::FutureExt;
 use tokio::{runtime::Handle, sync::Notify, time::Instant};
 use tokio_tungstenite::WebSocketStream;
 
@@ -62,6 +63,15 @@ pub(crate) enum JobStatus {
     ServerExited(i32),
     BothExited { tui: i32, server: i32 },
     Stopped,
+}
+
+impl JobStatus {
+    fn clean_tui_exit(self) -> bool {
+        matches!(
+            self,
+            Self::TuiExited(0) | Self::BothExited { tui: 0, server: 0 }
+        )
+    }
 }
 
 /// Resource seam, never permission. stop_jobs MUST drain both jobs and unblock
@@ -121,6 +131,7 @@ pub(crate) enum TestLifecycle {
     UiPublisherFinished,
     ConsumeCallbackFinished,
     FailureLatched(Error),
+    NativeEofGrace,
 }
 
 #[cfg(any(test, feature = "testkit"))]
@@ -206,6 +217,9 @@ struct AutoMailbox {
 #[derive(Default)]
 struct State {
     failure: Option<Error>,
+    native_eof_seen: bool,
+    non_eof_failure: Option<Error>,
+    dispatch_failure: Option<Error>,
     cleanup_started: bool,
     direct_write_uncertain: bool,
     operation: Operation,
@@ -215,6 +229,7 @@ struct State {
 #[derive(Default)]
 struct Shared {
     state: Mutex<State>,
+    cleanup_wake: Condvar,
     changed: Notify,
     stopped: AtomicBool,
     enabled: AtomicBool,
@@ -228,6 +243,8 @@ struct Shared {
     test_consume_return: std::sync::OnceLock<Arc<TestGateState>>,
     #[cfg(any(test, feature = "testkit"))]
     test_before_cleanup: std::sync::OnceLock<Arc<TestGateState>>,
+    #[cfg(any(test, feature = "testkit"))]
+    test_dispatch_failure: std::sync::OnceLock<Arc<TestGateState>>,
 }
 
 impl Shared {
@@ -253,7 +270,30 @@ impl Shared {
 
     // No untrusted work or pipe/ingress calls run under these small state locks.
     fn fail(&self, error: Error) {
+        self.record_failure(error, false);
+    }
+
+    fn dispatch_failed(&self, error: Error) {
+        self.record_failure(error, true);
+    }
+
+    fn record_failure(&self, error: Error, dispatch: bool) {
         let mut state = self.state();
+        if dispatch {
+            // Retain the worker's own result through join, even if its wrapper
+            // is descheduled between computing the result and recording it.
+            state.dispatch_failure = Some(error);
+        }
+        if error == Error::NativeEof {
+            // Serialize EOF admission loss with AwaitCore/enter_physical, before
+            // publishing failure or waiting for the local supervisor to run.
+            self.stopped.store(true, Ordering::Release);
+            state.auto.disabled = true;
+            state.native_eof_seen = true;
+        } else if error == Error::WriteUncertain || state.non_eof_failure.is_none() {
+            // EOF is provisional only when it is the sole observed failure.
+            state.non_eof_failure = Some(error);
+        }
         if error == Error::WriteUncertain && !state.cleanup_started {
             state.direct_write_uncertain = true;
         }
@@ -267,13 +307,36 @@ impl Shared {
         #[cfg(any(test, feature = "testkit"))]
         self.test_record(TestLifecycle::FailureLatched(error));
         self.changed.notify_one();
+        if error == Error::NativeEof {
+            self.wake_dispatch();
+        }
     }
 
-    fn begin_cleanup(&self) -> (Option<Error>, bool) {
+    fn begin_cleanup(&self) -> (Option<Error>, bool, Option<Error>) {
         let mut state = self.state();
         // Serialize the cause boundary with fail(): job drain has not started.
         state.cleanup_started = true;
-        (state.failure, state.direct_write_uncertain)
+        self.cleanup_wake.notify_all();
+        (
+            state.failure,
+            state.direct_write_uncertain,
+            state
+                .native_eof_seen
+                .then_some(state.non_eof_failure)
+                .flatten(),
+        )
+    }
+
+    fn retain_eof_dispatch(&self) {
+        let mut state = self.state();
+        // Admission is frozen, but dropping the dispatcher's queues before the
+        // supervisor handles EOF would manufacture a competing pump failure.
+        while state.native_eof_seen && !state.cleanup_started {
+            state = self
+                .cleanup_wake
+                .wait(state)
+                .unwrap_or_else(|p| p.into_inner());
+        }
     }
 
     fn start_event(&self) -> Instant {
@@ -288,7 +351,17 @@ impl Shared {
         // A clean IPC timeout is auto denial, never a physical watchdog failure.
         // Physical expiry cannot be erased by a late completion instead.
         if matches!(state.operation, Operation::Physical(d) if Instant::now() >= d) {
-            state.failure.get_or_insert(Error::Watchdog);
+            // A provisional close must never mask a completed over-budget
+            // physical write. Keep genuine failures, including uncertainty.
+            if state
+                .failure
+                .is_none_or(|e| matches!(e, Error::Pump | Error::NativeEof))
+            {
+                state.failure = Some(Error::Watchdog);
+            }
+            if state.non_eof_failure.is_none_or(|e| e == Error::Pump) {
+                state.non_eof_failure = Some(Error::Watchdog);
+            }
         }
         state.operation = Operation::Idle;
         drop(state);
@@ -376,11 +449,29 @@ impl Shared {
         true
     }
 
-    fn supervision(&self, peer_closed: bool) -> Result<(Option<Instant>, bool), Error> {
+    fn supervision(
+        &self,
+        allowed_failure: Option<Error>,
+    ) -> Result<(Option<Instant>, bool), Error> {
+        self.supervision_with_peer_close(allowed_failure, false)
+    }
+
+    fn supervision_with_peer_close(
+        &self,
+        allowed_failure: Option<Error>,
+        peer_closed: bool,
+    ) -> Result<(Option<Instant>, bool), Error> {
         let mut state = self.state();
         // Explicit PeerClosed also drops the UI queue. Its publisher's Pump
-        // failure is secondary; no other failure receives an exit grace.
+        // failure is secondary. Boundary EOF has a separate, stricter grace.
+        if allowed_failure == Some(Error::NativeEof)
+            && let Some(error) = state.non_eof_failure
+            && !(peer_closed && error == Error::Pump)
+        {
+            return Err(error);
+        }
         if let Some(error) = state.failure
+            && Some(error) != allowed_failure
             && !(peer_closed && error == Error::Pump)
         {
             return Err(error);
@@ -453,6 +544,7 @@ pub(crate) struct ManagedParent<J: Jobs> {
     shared: Arc<Shared>,
     actor: Option<Actor>,
     pump: Option<Pump>,
+    peer_closed: bool,
     due: Option<tokio::sync::mpsc::Receiver<control_actor::DueHint>>,
     workers: Vec<JoinHandle<()>>,
     cleaned: bool,
@@ -492,6 +584,17 @@ impl<J: Jobs> ManagedParent<J> {
         TestGate(gate)
     }
 
+    #[cfg(any(test, feature = "testkit"))]
+    #[allow(dead_code)] // Optional deterministic terminal-result scheduling hook.
+    pub(crate) fn test_pause_dispatch_failure(&mut self) -> TestGate {
+        let gate = Arc::new(TestGateState::default());
+        assert!(
+            self.shared.test_dispatch_failure.set(gate.clone()).is_ok(),
+            "test dispatch failure gate already installed"
+        );
+        TestGate(gate)
+    }
+
     /// Install one bounded, lossy publication observer. A received Source proves
     /// successful ingress admission, never dispatch completion or authority.
     #[cfg(any(test, feature = "testkit"))]
@@ -516,6 +619,7 @@ impl<J: Jobs> ManagedParent<J> {
             shared: Arc::new(Shared::default()),
             actor: None,
             pump: None,
+            peer_closed: false,
             due: None,
             workers: Vec::with_capacity(3),
             cleaned: false,
@@ -593,15 +697,22 @@ impl<J: Jobs> ManagedParent<J> {
         body: impl FnOnce(Arc<Shared>) -> Result<(), Error> + Send + 'static,
     ) -> Result<(), Error> {
         let shared = self.shared.clone();
-        #[cfg(any(test, feature = "testkit"))]
         let dispatch_worker = name == "qb-native-dispatch";
         let worker = thread::Builder::new()
             .name(name.into())
             .spawn(move || {
-                match catch_unwind(AssertUnwindSafe(|| body(shared.clone()))) {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => shared.fail(error),
-                    Err(_) => shared.fail(Error::Worker),
+                let result = catch_unwind(AssertUnwindSafe(|| body(shared.clone())))
+                    .unwrap_or(Err(Error::Worker));
+                if let Err(error) = result {
+                    if dispatch_worker {
+                        #[cfg(any(test, feature = "testkit"))]
+                        if let Some(gate) = shared.test_dispatch_failure.get() {
+                            gate.wait_thread();
+                        }
+                        shared.dispatch_failed(error);
+                    } else {
+                        shared.fail(error);
+                    }
                 }
                 #[cfg(any(test, feature = "testkit"))]
                 if dispatch_worker {
@@ -623,22 +734,60 @@ impl<J: Jobs> ManagedParent<J> {
         if let Some(gate) = self.shared.test_before_cleanup.get() {
             gate.wait_async().await;
         }
-        let (failure_before_cleanup, direct_write_uncertain) = self.shared.begin_cleanup();
+        #[cfg(all(feature = "testkit", debug_assertions))]
+        if std::env::var_os("QB_NATIVE_OBSERVATION_PATH").is_some()
+            && let Ok(status) = self.jobs.try_wait()
+        {
+            eprintln!("qb-native-child:{status:?}");
+        }
+        let (failure_before_cleanup, direct_write_uncertain, eof_other_failure) =
+            self.shared.begin_cleanup();
+        #[cfg(all(feature = "testkit", debug_assertions))]
+        if std::env::var_os("QB_NATIVE_OBSERVATION_PATH").is_some() {
+            eprintln!(
+                "qb-native-outcome:{result:?}:{failure_before_cleanup:?}:{eof_other_failure:?}"
+            );
+        }
         let cleanup = self.cleanup();
         if direct_write_uncertain {
             return Err(Error::WriteUncertain);
         }
+        // Only the dispatch worker's result survives the cleanup boundary.
+        // Cleanup reader/pump errors cannot revoke its ingress (reader_loop).
+        // A write failed by job termination stays secondary to a fatal cause.
+        let dispatch_failure = self.shared.state().dispatch_failure;
+        let root_failure = failure_before_cleanup
+            .filter(|error| !matches!(error, Error::Pump | Error::NativeEof))
+            .or(dispatch_failure.filter(|error| *error != Error::WriteUncertain))
+            .or(failure_before_cleanup);
         match result {
             // A real ingress/worker failure can drop the UI receiver and make
             // the pump finish first. Preserve that already-latched root cause,
             // using the snapshot taken BEFORE job termination causes errors.
-            Err(Error::Pump) if failure_before_cleanup.is_some_and(|e| e != Error::Pump) => {
-                Err(failure_before_cleanup.unwrap_or(Error::Pump))
+            Err(Error::Pump) if root_failure.is_some_and(|e| e != Error::Pump) => {
+                Err(root_failure.unwrap_or(Error::Pump))
             }
             // Preserve the supervisor's fatal cause. Stopping jobs to handle a
             // Pump/Watchdog failure can itself make a blocked write fail; that
             // teardown consequence must not replace the original diagnosis.
             Err(error) => Err(error),
+            Ok(_) if root_failure.is_some_and(|e| !matches!(e, Error::Pump | Error::NativeEof)) => {
+                Err(root_failure.unwrap_or(Error::Worker))
+            }
+            Ok(status)
+                if eof_other_failure.is_some_and(|error| {
+                    error != Error::Pump || !self.peer_closed || !status.clean_tui_exit()
+                }) =>
+            {
+                Err(eof_other_failure.unwrap_or(Error::NativeEof))
+            }
+            Ok(status)
+                if failure_before_cleanup == Some(Error::NativeEof) && !status.clean_tui_exit() =>
+            {
+                // EOF can latch after the supervisor selects a child status.
+                // Only an actual TUI zero, with no known server failure, is clean.
+                Err(Error::NativeEof)
+            }
             Ok(_) if self.shared.state().failure == Some(Error::WriteUncertain) => {
                 // A clean child exit cannot hide an unfinished physical write
                 // whose uncertainty becomes visible only after job drain.
@@ -650,7 +799,12 @@ impl<J: Jobs> ManagedParent<J> {
 
     async fn supervise(&mut self) -> Result<JobStatus, Error> {
         loop {
-            let (deadline, auto_disabled) = self.shared.supervision(false)?;
+            let (deadline, auto_disabled) = match self.shared.supervision(None) {
+                Err(Error::NativeEof) => {
+                    return self.native_eof_exit(Instant::now() + TUI_EXIT_GRACE).await;
+                }
+                result => result?,
+            };
             if auto_disabled {
                 self.drop_actor();
             }
@@ -668,6 +822,14 @@ impl<J: Jobs> ManagedParent<J> {
                     }
                 } => self.stop_auto(),
                 result = self.pump.as_mut().ok_or(Error::Pump)? => {
+                    // Never poll this completed future again during EOF grace.
+                    self.pump.take();
+                    #[cfg(all(feature = "testkit", debug_assertions))]
+                    if std::env::var_os("QB_NATIVE_OBSERVATION_PATH").is_some()
+                        && let Err(error) = result
+                    {
+                        eprintln!("qb-native-pump:{error}");
+                    }
                     return match result {
                         Err(socket_pump::Error::PeerClosed) => self.peer_closed_exit().await,
                         _ => Err(Error::Pump),
@@ -688,6 +850,7 @@ impl<J: Jobs> ManagedParent<J> {
     }
 
     async fn peer_closed_exit(&mut self) -> Result<JobStatus, Error> {
+        self.peer_closed = true;
         // Stop new work without touching ingress: an in-flight physical writer
         // may own its mutex. Never poll the completed pump again.
         self.shared.stopped.store(true, Ordering::Release);
@@ -695,7 +858,10 @@ impl<J: Jobs> ManagedParent<J> {
         self.shared.wake_dispatch();
         let deadline = Instant::now() + TUI_EXIT_GRACE;
         loop {
-            let (operation_deadline, _) = self.shared.supervision(true)?;
+            let (operation_deadline, _) = match self.shared.supervision(Some(Error::Pump)) {
+                Err(Error::NativeEof) => return self.native_eof_exit(deadline).await,
+                result => result?,
+            };
             if Instant::now() >= deadline {
                 return Err(Error::Pump);
             }
@@ -705,6 +871,60 @@ impl<J: Jobs> ManagedParent<J> {
                 }
                 JobStatus::Running => {}
                 _ => return Err(Error::Pump),
+            }
+            tokio::select! {
+                () = self.shared.changed.notified() => {},
+                () = wait_deadline(operation_deadline) => {},
+                () = tokio::time::sleep_until((Instant::now() + CHILD_POLL).min(deadline)) => {},
+            }
+        }
+    }
+
+    async fn native_eof_exit(&mut self, deadline: Instant) -> Result<JobStatus, Error> {
+        // Only read_frame's EOF BETWEEN complete frames reaches this path.
+        // Freeze admission, but never terminate jobs to manufacture exit proof.
+        self.shared.stopped.store(true, Ordering::Release);
+        self.stop_auto();
+        self.shared.wake_dispatch();
+        #[cfg(any(test, feature = "testkit"))]
+        self.shared.test_record(TestLifecycle::NativeEofGrace);
+        #[cfg(all(feature = "testkit", debug_assertions))]
+        let mut last_status = None;
+        loop {
+            // UI reader closure alone does not prove a clean socket close.
+            // Poll the actual pump once before permitting that provisional
+            // Pump report; invalid/binary/transport failures remain fatal.
+            if let Some(pump) = self.pump.as_mut()
+                && let Some(result) = pump.as_mut().now_or_never()
+            {
+                self.pump.take();
+                match result {
+                    Err(socket_pump::Error::PeerClosed) => self.peer_closed = true,
+                    _ => return Err(Error::Pump),
+                }
+            }
+            let (operation_deadline, _) = self
+                .shared
+                .supervision_with_peer_close(Some(Error::NativeEof), self.peer_closed)?;
+            if Instant::now() >= deadline {
+                return Err(Error::NativeEof);
+            }
+            let status = self.jobs.try_wait().map_err(|_| Error::Job)?;
+            #[cfg(all(feature = "testkit", debug_assertions))]
+            if last_status != Some(status) {
+                // JobStatus contains only fixed variants and numeric exit codes.
+                if std::env::var_os("QB_NATIVE_OBSERVATION_PATH").is_some() {
+                    eprintln!("qb-native-child:{status:?}");
+                }
+                last_status = Some(status);
+            }
+            match status {
+                // Native 0.164 trial 28 reported TuiExited(0) before cleanup:
+                // the parent still owns the app-server and must stop it after
+                // that independent TUI exit. BOTH zero is sufficient, not required.
+                status if status.clean_tui_exit() => return Ok(status),
+                JobStatus::Running | JobStatus::ServerExited(0) => {}
+                _ => return Err(Error::NativeEof),
             }
             tokio::select! {
                 () = self.shared.changed.notified() => {},
@@ -747,6 +967,7 @@ impl<J: Jobs> ManagedParent<J> {
         for gate in [
             self.shared.test_consume_return.get(),
             self.shared.test_before_cleanup.get(),
+            self.shared.test_dispatch_failure.get(),
         ]
         .into_iter()
         .flatten()
@@ -1015,6 +1236,7 @@ fn dispatch_loop<N: Write, U: Write>(
             shared.wait_dispatch();
         }
     }
+    shared.retain_eof_dispatch();
     Ok(())
 }
 
@@ -1055,8 +1277,11 @@ fn reader_loop(
     // which stops dispatch and drops Consume before draining jobs. Closing shared
     // ingress here would manufacture Revoked during that clean callback denial.
     // A successful stopped reader of either source needs no extra ingress close.
+    // Boundary native EOF is adjudicated against an actual clean TUI exit. Do
+    // not manufacture ingress failure before that bounded status check.
     // Frame/publication failures still close ingress and remain fatal.
-    let owned_shutdown = (source == Source::Ui && result == Err(Error::Pump))
+    let owned_shutdown = (source == Source::Native && result == Err(Error::NativeEof))
+        || (source == Source::Ui && result == Err(Error::Pump))
         || (result.is_ok() && shared.stopped.load(Ordering::Acquire));
     if source == Source::Ui && result == Err(Error::Pump) {
         // Close admission before reporting EOF, even if the supervisor has not
@@ -1069,8 +1294,97 @@ fn reader_loop(
     if let Err(error) = result {
         shared.fail(error);
     }
-    if !owned_shutdown {
+    // Once job drain starts, pipe/read failures are cancellation consequences.
+    // Do not turn them into an apparently genuine late dispatch Ingress error.
+    // A reader that may still close ingress has already recorded its root cause
+    // under the same state lock used by begin_cleanup.
+    let cleanup_started = shared.state().cleanup_started;
+    if !owned_shutdown && !cleanup_started {
         publisher.close();
     }
     result
+}
+
+#[cfg(test)]
+mod eof_tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_reader_failures_do_not_revoke_dispatch_ingress() {
+        for (source, error) in [
+            (Source::Native, Error::NativeRead),
+            (Source::Ui, Error::Pump),
+        ] {
+            let shared = Shared::default();
+            let (ingress, publisher) = super::super::ingress::channel();
+            let _ = shared.begin_cleanup();
+            assert_eq!(
+                reader_loop(&shared, &publisher, || Err(error), source),
+                Err(error)
+            );
+            assert_eq!(ingress.backlog(), Ok(0));
+        }
+    }
+
+    #[test]
+    fn boundary_eof_grace_preserves_every_other_latched_failure() {
+        for error in [
+            Error::Pump,
+            Error::Ingress,
+            Error::Dispatch,
+            Error::Worker,
+            Error::NativeRead,
+            Error::WriteUncertain,
+            Error::Watchdog,
+        ] {
+            for eof_first in [false, true] {
+                let shared = Shared::default();
+                for failure in if eof_first {
+                    [Error::NativeEof, error]
+                } else {
+                    [error, Error::NativeEof]
+                } {
+                    shared.fail(failure);
+                }
+                assert_eq!(shared.supervision(Some(Error::NativeEof)), Err(error));
+            }
+        }
+    }
+
+    #[test]
+    fn boundary_eof_cannot_erase_expired_physical_deadline() {
+        let shared = Shared::default();
+        shared.fail(Error::NativeEof);
+        shared.state().operation = Operation::Physical(Instant::now());
+        assert_eq!(
+            shared.supervision(Some(Error::NativeEof)),
+            Err(Error::Watchdog)
+        );
+        shared.end_event();
+        assert_eq!(
+            shared.supervision(Some(Error::NativeEof)),
+            Err(Error::Watchdog)
+        );
+    }
+
+    #[test]
+    fn confirmed_peer_close_cannot_erase_completed_physical_deadline() {
+        for eof_first in [true, false] {
+            let shared = Shared::default();
+            for error in if eof_first {
+                [Error::NativeEof, Error::Pump]
+            } else {
+                [Error::Pump, Error::NativeEof]
+            } {
+                shared.fail(error);
+            }
+            shared.state().operation = Operation::Physical(Instant::now());
+            shared.end_event();
+            assert_eq!(
+                shared.supervision_with_peer_close(Some(Error::NativeEof), true),
+                Err(Error::Watchdog)
+            );
+            assert_eq!(shared.begin_cleanup().2, Some(Error::Watchdog));
+        }
+    }
 }
