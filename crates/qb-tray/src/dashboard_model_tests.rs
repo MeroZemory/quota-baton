@@ -1564,3 +1564,25 @@ fn r11_model_choice_wire_reasons_preserve_initial_timeline_and_explicit_move_wor
         assert!(event_row(&first, &data.accounts, &c).is_none());
     }
 }
+
+// Existing presentation fixtures supply only selection. Route through the same
+// production projection with an explicit state; urgency tests provide real DTOs.
+fn session_row(
+    s: &Session,
+    accounts: &v2::View,
+    clock: &Clock,
+    selected: Option<&str>,
+) -> SessionRow {
+    let state = DashboardState {
+        selected: selected.map(str::to_owned),
+        ..Default::default()
+    };
+    super::session_row(s, accounts, clock, &state)
+}
+fn detail_view(d: &SessionDetail, accounts: &v2::View, clock: &Clock, expired: bool) -> DetailView {
+    let state = DashboardState {
+        selected: Some(d.session.id.clone()),
+        ..Default::default()
+    };
+    super::detail_view(d, accounts, clock, expired, &state)
+}

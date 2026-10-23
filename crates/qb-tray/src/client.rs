@@ -1,4 +1,4 @@
-//! Client for the local core admin API. Dashboard methods are read-only.
+//! Client for the local core admin API. Requests run on the async worker, never the UI thread.
 //!
 //! This module deliberately has no dependency on the Win32 shell.  The tray
 //! shell can poll [`AdminClient`] and render the returned snapshot later.
@@ -81,6 +81,46 @@ impl AdminClient {
             "sessions",
         )
         .await
+    }
+
+    /// Set the desired policy once. The acknowledgement does not assert movement.
+    pub async fn set_session_urgent(&self, id: &str, urgent: bool) -> Result<(), ClientError> {
+        if id.len() != 64
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(ClientError::AccountAction(
+                "긴급 설정 대상이 올바르지 않습니다",
+            ));
+        }
+        let body = serde_json::json!({"kind":"urgent", "id":id,
+            "on_5h_limit": if urgent { "move" } else { "wait" }});
+        let mut response = Self::check_response(
+            self.request(reqwest::Method::POST, "/admin/v1/routing")
+                .json(&body)
+                .send()
+                .await
+                .map_err(ClientError::Transport)?,
+        )
+        .await?;
+        const LIMIT: usize = 4096;
+        let invalid = || ClientError::AccountAction("긴급 설정 응답을 확인할 수 없습니다");
+        if response.content_length().is_some_and(|n| n > LIMIT as u64) {
+            return Err(invalid());
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(ClientError::Transport)? {
+            if chunk.len() > LIMIT.saturating_sub(bytes.len()) {
+                return Err(invalid());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+        if ack.get("updated").and_then(serde_json::Value::as_bool) != Some(true) {
+            return Err(invalid());
+        }
+        Ok(())
     }
 
     pub async fn dashboard_session(
@@ -1485,5 +1525,122 @@ mod r7_dashboard_client_tests {
         assert!(error.to_string().contains("요청과 다릅니다"));
         assert!(!error.to_string().contains("12345678"));
         task.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod n5c_urgency_client_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn exchange(reply: String, urgent: bool) -> Result<(), ClientError> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut raw = vec![];
+            let mut byte = [0];
+            while !raw.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).await.unwrap();
+                raw.push(byte[0]);
+                assert!(raw.len() < 8192);
+            }
+            let headers = String::from_utf8(raw).unwrap();
+            assert!(headers.starts_with("POST /admin/v1/routing HTTP/1.1\r\n"));
+            assert!(
+                headers
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer synthetic-n5c-token\r\n")
+            );
+            assert!(
+                headers
+                    .to_ascii_lowercase()
+                    .contains(&format!("host: 127.0.0.1:{port}\r\n"))
+            );
+            let n: usize = headers
+                .lines()
+                .find_map(|line| {
+                    let (k, v) = line.split_once(':')?;
+                    k.eq_ignore_ascii_case("content-length")
+                        .then(|| v.trim().parse().unwrap())
+                })
+                .unwrap();
+            assert!(n < 1024);
+            let mut body = vec![0; n];
+            socket.read_exact(&mut body).await.unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                serde_json::json!({"kind":"urgent","id":"a".repeat(64),"on_5h_limit":if urgent {"move"} else {"wait"}})
+            );
+            socket.write_all(reply.as_bytes()).await.unwrap();
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            AdminClient::new(port, "synthetic-n5c-token")
+                .unwrap()
+                .set_session_urgent(&"a".repeat(64), urgent),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        result
+    }
+    fn reply(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+    #[tokio::test]
+    async fn n5c_urgency_client_posts_exact_desired_state_and_checks_acknowledgement() {
+        for urgent in [false, true] {
+            assert!(exchange(reply(r#"{"updated":true}"#), urgent).await.is_ok());
+        }
+        for body in [
+            r#"{"updated":false}"#,
+            r#"{}"#,
+            r#"{"updated":"true"}"#,
+            "not JSON",
+        ] {
+            assert!(matches!(
+                exchange(reply(body), true).await,
+                Err(ClientError::AccountAction(_))
+            ));
+        }
+    }
+    #[tokio::test]
+    async fn n5c_urgency_client_rejects_display_ids_before_io_and_bounds_chunked_ack() {
+        let destination = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        destination.set_nonblocking(true).unwrap();
+        let client = AdminClient::new(
+            destination.local_addr().unwrap().port(),
+            "synthetic-n5c-token",
+        )
+        .unwrap();
+        for id in [
+            "a".repeat(12),
+            "A".repeat(64),
+            "g".repeat(64),
+            "a".repeat(65),
+            String::new(),
+        ] {
+            assert!(matches!(
+                client.set_session_urgent(&id, true).await,
+                Err(ClientError::AccountAction(_))
+            ));
+        }
+        assert_eq!(
+            destination.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        let body = format!(r#"{{"updated":true,"extra":"{}"}}"#, "x".repeat(4096));
+        let chunked = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+            body.len(),
+            body
+        );
+        assert!(matches!(
+            exchange(chunked, true).await,
+            Err(ClientError::AccountAction(_))
+        ));
     }
 }

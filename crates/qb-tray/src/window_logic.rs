@@ -171,6 +171,8 @@ pub fn startup_commands(
     state: &mut qb_tray::state::DashboardState,
 ) -> Vec<qb_tray::state::Command> {
     use qb_tray::state::{Command, Tab};
+    // Pending/failed mutations belong to the closed HWND, never preferences.
+    state.urgency_update = None;
     let mut commands = vec![
         Command::Sessions(state.range),
         Command::Activity(state.event_days),
@@ -448,4 +450,25 @@ mod r1210_tests {
         assert!(!wheel_scroll(&mut state, &scene, [50., 50.], 96.));
         assert_eq!(state.table_offset, 200.);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn n5c_reopen_restores_query_preferences_without_pending_mutation() {
+    use qb_tray::state::{Command, DashboardState, Tab, UrgencyUpdate};
+    let mut saved = DashboardState::default();
+    saved.tab = Tab::Usage;
+    saved.urgency_update = Some(UrgencyUpdate::Pending { id: "a".repeat(64) });
+    let commands = startup_commands(&mut saved);
+    assert!(
+        saved.urgency_update.is_none(),
+        "reopened owner must not inherit a dead mutation"
+    );
+    assert_eq!(saved.tab, Tab::Usage);
+    assert!(commands.iter().any(|c| matches!(c, Command::Usage)));
+    assert!(
+        !commands
+            .iter()
+            .any(|c| matches!(c, Command::SetSessionUrgent { .. }))
+    );
 }

@@ -1,5 +1,44 @@
 //! Exact UI source copy only. Never translate user labels or identifiers.
 pub(super) const STRINGS: &[(&str, &str)] = &[
+    ("5시간 대기 상태 확인 전", "5h wait status unavailable"),
+    ("긴급", "Urgent"),
+    ("지금 옮기기", "Move now"),
+    ("초기화 {0}까지 대기", "Waiting until reset {0}"),
+    ("긴급 설정 확인 전", "Urgency unavailable"),
+    ("긴급 설정 저장 중", "Saving urgency"),
+    ("긴급 설정 저장 실패", "Urgency update failed"),
+    (
+        "새로고침 또는 다른 긴급 설정 처리를 기다려 주세요",
+        "Wait for refresh or the current urgency update",
+    ),
+    (
+        "5시간 한도에서 다른 계정을 찾습니다. 고정·캐시·이동 제한은 그대로 적용됩니다",
+        "Look for another account at the 5h limit. Pin, cache and move limits still apply",
+    ),
+    (
+        "계정 고정 정책에서는 지금 옮길 수 없습니다",
+        "Move now is unavailable under Strict pinning",
+    ),
+    (
+        "이미 긴급으로 설정되어 있습니다. 실제 이동에는 기존 제한이 적용됩니다",
+        "Already urgent. Existing limits still govern actual movement",
+    ),
+    (
+        "세션을 긴급으로 설정합니다. 실제 계정 이동을 보장하지 않습니다",
+        "Mark this session urgent. An account move is not guaranteed",
+    ),
+    (
+        "긴급 설정을 저장하지 못했습니다. 새로고침한 뒤 다시 시도하세요",
+        "Could not save urgency. Refresh before trying again",
+    ),
+    (
+        "긴급 설정 대상이 올바르지 않습니다",
+        "Invalid session urgency target",
+    ),
+    (
+        "긴급 설정 응답을 확인할 수 없습니다",
+        "Could not verify the urgency update",
+    ),
     (
         "\n같은 알림 {0}번 더 · {1}",
         "\n{0} more identical alerts · {1}",

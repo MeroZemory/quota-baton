@@ -145,6 +145,35 @@ pub struct Move {
     pub reason: String,
     pub next_turn_cache: Option<String>,
 }
+/// Optional server-issued routing capability. Unknown values never imply Wait.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SessionRouting {
+    pub action_id: String,
+    pub on_5h_limit: String,
+    pub mode: String,
+}
+impl SessionRouting {
+    pub(crate) fn usable(&self) -> bool {
+        valid_routing_action_id(&self.action_id)
+            && matches!(self.on_5h_limit.as_str(), "wait" | "move")
+            && matches!(self.mode.as_str(), "strict" | "recover" | "rebalance")
+    }
+    pub fn urgent(&self) -> bool {
+        self.on_5h_limit == "move"
+    }
+}
+pub(crate) fn valid_routing_action_id(id: &str) -> bool {
+    id.len() == 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+/// Genuine engine admission visibility, independent of rate pacing/account health.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct QuotaWait {
+    pub reset_at: DateTime<Utc>,
+    pub waiting: u32,
+}
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Session {
@@ -160,6 +189,9 @@ pub struct Session {
     pub inflight: Inflight,
     pub inflight_known: bool,
     pub pacing_wait: Option<PacingWait>,
+    pub routing: Option<SessionRouting>,
+    pub quota_wait: Option<QuotaWait>,
+    pub quota_wait_known: bool,
     pub model: Option<String>,
     pub subagents_today: Option<u64>,
     pub requests_today: Option<u64>,
@@ -191,6 +223,9 @@ impl Default for Session {
             // Legacy/mock snapshots predate this loss-of-evidence flag.
             inflight_known: true,
             pacing_wait: None,
+            routing: None,
+            quota_wait: None,
+            quota_wait_known: false,
             model: None,
             subagents_today: None,
             requests_today: None,
@@ -491,6 +526,12 @@ pub struct SessionRow {
     pub first_seen: Option<DateTime<Utc>>,
     pub request_count: Option<u64>,
     pub selected: bool,
+    pub routing: Option<SessionRouting>,
+    pub quota_wait: Option<QuotaWait>,
+    pub quota_wait_known: bool,
+    pub urgency_enabled: bool,
+    pub urgency_pending: bool,
+    pub urgency_failed: bool,
 }
 #[derive(Clone, Debug)]
 pub struct AccountGroup {
@@ -972,7 +1013,7 @@ fn session_row(
     s: &Session,
     accounts: &v2::View,
     clock: &Clock,
-    selected: Option<&str>,
+    state: &DashboardState,
 ) -> SessionRow {
     let account = account_rows(accounts)
         .into_iter()
@@ -1092,7 +1133,17 @@ fn session_row(
         last_used: s.last_used_at,
         first_seen: s.first_seen_at,
         request_count: s.requests_today.filter(|_| s.counters_complete),
-        selected: selected == Some(&s.id),
+        selected: state.selected.as_deref() == Some(&s.id),
+        routing: s.routing.as_ref().filter(|r| r.usable()).cloned(),
+        quota_wait: s.quota_wait.as_ref().filter(|w| w.waiting > 0).cloned(),
+        quota_wait_known: s.quota_wait_known,
+        urgency_enabled: state.session_urgency_enabled(&s.id),
+        urgency_pending: s.routing.as_ref().is_some_and(|r| {
+            matches!(&state.urgency_update, Some(UrgencyUpdate::Pending { id }) if id == &r.action_id)
+        }),
+        urgency_failed: s.routing.as_ref().is_some_and(|r| {
+            matches!(&state.urgency_update, Some(UrgencyUpdate::Finished { id, failed: true }) if id == &r.action_id)
+        }),
     }
 }
 fn compare_rows(
@@ -1129,6 +1180,7 @@ pub fn project(
     state: &mut DashboardState,
     clock: &Clock,
 ) -> DashboardView {
+    state.refresh_session_actions(&snapshot.sessions.sessions, snapshot.connection.core_ok);
     let all: Vec<_> = snapshot
         .sessions
         .sessions
@@ -1164,7 +1216,7 @@ pub fn project(
             if needle.is_empty() {
                 return true;
             }
-            let row = session_row(s, &snapshot.accounts, clock, state.selected.as_deref());
+            let row = session_row(s, &snapshot.accounts, clock, state);
             [
                 row.label,
                 row.short_id,
@@ -1180,7 +1232,7 @@ pub fn project(
         .collect();
     let mut flat: Vec<_> = matching
         .iter()
-        .map(|s| session_row(s, &snapshot.accounts, clock, state.selected.as_deref()))
+        .map(|s| session_row(s, &snapshot.accounts, clock, state))
         .collect();
     flat.sort_by(|a, b| compare_rows(a, b, state.sort, state.descending));
     state.table_freeze.apply(&mut flat, |r| r.id.clone());
@@ -1199,7 +1251,7 @@ pub fn project(
         let mut rows: Vec<_> = matching
             .iter()
             .filter(|s| s.account == a.raw.id)
-            .map(|s| session_row(s, &snapshot.accounts, clock, state.selected.as_deref()))
+            .map(|s| session_row(s, &snapshot.accounts, clock, state))
             .collect();
         rows.sort_by(|a, b| compare_rows(a, b, SortKey::LastActivity, true));
         state
@@ -1358,7 +1410,7 @@ pub fn project(
         .detail
         .as_ref()
         .filter(|d| state.selected.as_deref() == Some(&d.session.id))
-        .map(|d| detail_view(d, &snapshot.accounts, clock, state.detail_expired))
+        .map(|d| detail_view(d, &snapshot.accounts, clock, state.detail_expired, state))
         .or_else(|| {
             state
                 .selected
@@ -2029,9 +2081,15 @@ pub fn outcome(r: &RequestSummary, accounts: &v2::View) -> String {
         _ => unknown(),
     }
 }
-fn detail_view(d: &SessionDetail, accounts: &v2::View, clock: &Clock, expired: bool) -> DetailView {
+fn detail_view(
+    d: &SessionDetail,
+    accounts: &v2::View,
+    clock: &Clock,
+    expired: bool,
+    state: &DashboardState,
+) -> DetailView {
     let s = &d.session;
-    let row = session_row(s, accounts, clock, Some(&s.id));
+    let row = session_row(s, accounts, clock, state);
     let account = account_rows(accounts)
         .into_iter()
         .find(|a| a.raw.id == s.account);
@@ -2619,5 +2677,83 @@ mod r16_localization_tests {
             serde_json::from_slice(&serde_json::to_vec(&history).unwrap()).unwrap();
         assert_eq!(restored.accounts[0].windows[0].points[0].1, None);
         assert!(restored.truncated);
+    }
+}
+
+#[cfg(test)]
+mod n5c_routing_dto_tests {
+    use super::*;
+    #[test]
+    fn n5c_session_routing_wait_roundtrip_preserves_wire_identity_and_missing_authority() {
+        let raw = serde_json::json!({"id":"111111111111","routing":{"action_id":"a".repeat(64),"on_5h_limit":"wait","mode":"recover"},
+            "quota_wait":{"reset_at":"2026-10-23T12:00:00Z","waiting":2},"quota_wait_known":true});
+        let row: Session = serde_json::from_value(raw.clone()).unwrap();
+        let out = serde_json::to_value(&row).unwrap();
+        assert_eq!(out["routing"], raw["routing"]);
+        assert_eq!(out["quota_wait"], raw["quota_wait"]);
+        assert!(out["quota_wait_known"].as_bool().unwrap());
+        assert!(row.routing.as_ref().unwrap().usable());
+        let legacy: Session =
+            serde_json::from_value(serde_json::json!({"id":"111111111111"})).unwrap();
+        assert!(legacy.routing.is_none());
+        assert!(legacy.quota_wait.is_none());
+        assert!(
+            !legacy.quota_wait_known,
+            "missing visibility is unknown, never zero waiting"
+        );
+        let mut unknown = raw;
+        unknown["routing"]["on_5h_limit"] = "future".into();
+        let unknown: Session = serde_json::from_value(unknown).unwrap();
+        assert!(
+            !unknown.routing.unwrap().usable(),
+            "future policy is not implicit Wait"
+        );
+    }
+    #[test]
+    fn n5c_projection_keeps_rate_wait_distinct_and_failure_does_not_change_confirmed_urgency() {
+        let mut snapshot = crate::dashboard_fixtures::snapshot();
+        snapshot.sessions.sessions.truncate(1);
+        let row = &mut snapshot.sessions.sessions[0];
+        row.routing = Some(SessionRouting {
+            action_id: "a".repeat(64),
+            on_5h_limit: "wait".into(),
+            mode: "recover".into(),
+        });
+        row.quota_wait = None;
+        row.quota_wait_known = true;
+        row.pacing_wait = Some(serde_json::from_value(serde_json::json!({
+            "waiting":1,"since":crate::dashboard_fixtures::clock().utc()-chrono::Duration::seconds(42)
+        })).unwrap());
+        let id = row.id.clone();
+        let mut state = DashboardState::default();
+        let clock = crate::dashboard_fixtures::clock();
+        project(&snapshot, &mut state, &clock);
+        assert!(
+            state
+                .activate(&crate::geometry::Target::SessionMoveNow(id.clone()))
+                .is_empty()
+        );
+        state.activate(&crate::geometry::Target::SessionUrgency(id));
+        state.apply_urgency_update(UrgencyUpdate::Finished {
+            id: "a".repeat(64),
+            failed: true,
+        });
+        let view = project(&snapshot, &mut state, &clock);
+        let row = &view.flat[0];
+        assert!(row.urgency_failed);
+        assert!(!row.urgency_pending);
+        assert!(row.urgency_enabled);
+        assert!(row.quota_wait.is_none());
+        assert!(
+            row.memo
+                .contains(&crate::i18n::format("속도 조절 대기 {0}초", &["42".into()]))
+        );
+        assert!(!row.routing.as_ref().unwrap().urgent());
+        snapshot.sessions.sessions[0].routing = None;
+        snapshot.sessions.sessions[0].quota_wait_known = false;
+        let view = project(&snapshot, &mut state, &clock);
+        assert!(!view.flat[0].urgency_enabled);
+        assert!(view.flat[0].routing.is_none());
+        assert!(!view.flat[0].quota_wait_known);
     }
 }

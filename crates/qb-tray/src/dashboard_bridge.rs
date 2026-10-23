@@ -46,6 +46,7 @@ pub(super) struct Inbox {
     pub geometry: Option<Option<Geometry>>,
     pub theme: Option<bool>,
     pub clock: Option<model::Clock>,
+    pub urgency: Option<qb_tray::state::UrgencyUpdate>,
     snapshot_revision: Option<u64>,
 }
 #[derive(Clone)]
@@ -82,6 +83,12 @@ impl UiPort {
     }
     pub fn owner(&self) -> u64 {
         self.shared.owner()
+    }
+    #[cfg(test)]
+    pub(crate) fn test_urgency(&self) -> Option<qb_tray::state::UrgencyUpdate> {
+        self.shared
+            .drain(self.owner(), |inbox| inbox.urgency.take())
+            .flatten()
     }
     fn update(&self, change: impl FnOnce(&mut Inbox)) -> bool {
         #[cfg(test)]
@@ -129,6 +136,9 @@ impl UiPort {
     pub fn theme(&self, dark: bool) -> bool {
         self.update(move |i| i.theme = Some(dark))
     }
+    pub fn urgency(&self, update: qb_tray::state::UrgencyUpdate) -> bool {
+        self.update(move |i| i.urgency = Some(update))
+    }
     pub fn clock(&self, clock: model::Clock) -> bool {
         self.update(move |i| i.clock = Some(clock))
     }
@@ -141,6 +151,7 @@ impl UiPort {
                     && inbox.geometry.is_none()
                     && inbox.theme.is_none()
                     && inbox.clock.is_none()
+                    && inbox.urgency.is_none()
                 {
                     return None;
                 }
