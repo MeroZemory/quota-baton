@@ -44,6 +44,34 @@ fn completed(status: Value) -> Value {
 }
 
 #[test]
+fn goal_notifications_export_only_known_state_and_canonical_thread() {
+    for (status, expected) in [
+        ("active", "active"),
+        ("paused", "paused"),
+        ("usageLimited", "usage_limited"),
+    ] {
+        assert_eq!(
+            project(json!({"method":"thread/goal/updated","params":{
+            "threadId":UUID,"goal":{"status":status,"objective":"private-goal",
+                "tokens":99,"extra":"private-value"}}})),
+            Some(json!({"event":"native_goal_updated","thread_id":UUID,"state":expected}))
+        );
+    }
+    for status in [json!("unknown"), json!(true), Value::Null, json!({})] {
+        assert!(
+            project(json!({"method":"thread/goal/updated","params":{
+            "threadId":UUID,"goal":{"status":status}}}))
+            .is_none()
+        );
+    }
+    assert!(
+        project(json!({"method":"thread/goal/updated","params":{
+        "threadId":"private-invalid-id","goal":{"status":"paused"}}}))
+        .is_none()
+    );
+}
+
+#[test]
 fn native_thread_started_serializes_only_fixed_event_and_canonical_uuid() {
     for id in [UUID, "0123456789abcdef0123456789abcdef"] {
         let value = json!({"method":"thread/started", "params":{"thread":{
