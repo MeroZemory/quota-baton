@@ -6,6 +6,7 @@ fn requests_round_trip_without_accepting_goal_text_or_caller_authority() {
     for command in [
         json!({"type":"observe", "thread_id":"synthetic-thread"}),
         json!({"type":"consume", "episode":7}),
+        json!({"type":"inspect", "episode":7}),
         json!({"type":"cancel", "episode":7}),
     ] {
         let wire = json!({"version":VERSION,"request_id":1,"command":command});
@@ -65,6 +66,7 @@ fn hints_and_other_request_or_episode_grants_never_admit_activation() {
     for event in [
         json!({"type":"waiting", "episode":7,"reset_unix_ms":123}),
         json!({"type":"due", "episode":7}),
+        json!({"type":"ready", "episode":7}),
         json!({"type":"cancelled", "episode":7}),
         json!({"type":"refused", "reason":"not_due"}),
     ] {
