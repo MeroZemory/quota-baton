@@ -13,7 +13,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const SCHEME: &str = "d23-image-discovery-1";
@@ -142,13 +142,22 @@ fn check_inner(program: &Path, qb_home: &Path) -> Result<()> {
 }
 
 fn check_inner_impl(program: &Path, qb_home: &Path) -> Result<()> {
-    let version_output =
-        crate::launcher_label::version_output(program).context(ProbeStage::Version)?;
-    let version = version(&version_output).context(ProbeStage::Version)?;
     let qb_home = fs::canonicalize(qb_home)?;
     let base = qb_home.join("state/image-canary");
     // Pins the no-reparse ancestors for cache publication and scratch lifetime.
     let _guard = crate::sessions_guard::prepare_parent(&qb_home, &base)?;
+    let version = match version_gate(
+        program,
+        &qb_home,
+        &base,
+        || crate::launcher_label::version_output(program),
+        SystemTime::now,
+    )
+    .context(ProbeStage::Version)?
+    {
+        VersionGate::Known(version) => version,
+        VersionGate::TimeoutCache => return Ok(()),
+    };
     let cache = base.join(cache_name(&version));
     crate::sessions_guard::safe_path(&qb_home, &cache)?;
     if cached_pass(&cache, &version) {
@@ -165,6 +174,233 @@ fn check_inner_impl(program: &Path, qb_home: &Path) -> Result<()> {
     publish_pass(&qb_home, &cache, &version).context(ProbeStage::CachePublication)
 }
 
+const VERSION_RECEIPT: &str = "last-version-read.json";
+const VERSION_LOCK: &str = "last-version-read.lock";
+const VERSION_LOCK_WAIT: Duration = Duration::from_secs(35);
+const VERSION_MAX_AGE_NS: u64 = 24 * 60 * 60 * 1_000_000_000;
+
+#[derive(Debug, PartialEq, Eq)]
+enum VersionGate {
+    Known(String),
+    TimeoutCache,
+}
+
+fn version_attempts(mut attempt: impl FnMut() -> std::io::Result<Vec<u8>>) -> Result<VersionGate> {
+    use crate::launcher_label::{VersionFailure, version_failure};
+    let mut first_timeout = false;
+    for index in 0..2 {
+        match attempt() {
+            // Parse failures are terminal, even when a valid legacy pass exists.
+            Ok(output) => return version(&output).map(VersionGate::Known),
+            Err(error) => {
+                let failure = version_failure(&error);
+                if index == 1 {
+                    if first_timeout && failure == VersionFailure::Timeout {
+                        return Ok(VersionGate::TimeoutCache);
+                    }
+                    return Err(error.into());
+                }
+                if !matches!(failure, VersionFailure::Spawn | VersionFailure::Timeout) {
+                    return Err(error.into());
+                }
+                first_timeout = failure == VersionFailure::Timeout;
+            }
+        }
+    }
+    unreachable!()
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionReceipt {
+    schema: u8,
+    version: String,
+    read_utc_ns: u64,
+    fingerprint: Option<String>,
+}
+impl VersionReceipt {
+    fn valid(&self) -> bool {
+        self.schema == 1
+            && version(self.version.as_bytes()).is_ok_and(|v| v == self.version)
+            && self.fingerprint.as_ref().is_none_or(|hash| {
+                hash.len() == 64
+                    && hash
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+    }
+}
+
+fn utc_ns(now: SystemTime) -> Result<u64> {
+    Ok(u64::try_from(now.duration_since(UNIX_EPOCH)?.as_nanos())?)
+}
+
+// Metadata identity, not code attestation: the fallback still uses a last-known
+// version. The hash avoids persisting an executable pathname in the receipt.
+fn program_fingerprint(program: &Path) -> Option<String> {
+    let program = fs::canonicalize(program).ok()?;
+    let metadata = fs::metadata(&program).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let modified = metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    let path = program.as_os_str().as_encoded_bytes();
+    let mut digest = Sha256::new();
+    digest.update(b"qb-version-program-metadata-v1");
+    digest.update(u64::try_from(path.len()).ok()?.to_be_bytes());
+    digest.update(path);
+    digest.update(metadata.len().to_be_bytes());
+    digest.update(modified.to_be_bytes());
+    Some(format!("{:x}", digest.finalize()))
+}
+
+fn wait_version_lock(
+    file: &File,
+    bound: Duration,
+    mut contended: impl FnMut(),
+) -> std::io::Result<()> {
+    let began = Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if began.elapsed() >= bound {
+                    return Err(std::io::ErrorKind::TimedOut.into());
+                }
+                contended();
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+        }
+    }
+}
+
+// One receipt + one lock per managed home, not a directory scan or growing index.
+// All cooperating readers hold this lock through the two bounded version attempts.
+struct VersionMemo {
+    _lock: File,
+    path: PathBuf,
+    prior: Option<VersionReceipt>,
+}
+impl VersionMemo {
+    fn begin(root: &Path, base: &Path) -> Result<Self> {
+        let lock = base.join(VERSION_LOCK);
+        crate::sessions_guard::safe_path(root, &lock)?;
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock)?;
+        ensure!(lock.metadata()?.is_file(), "version lock type");
+        // Two 15s probes plus 5s cleanup/publication headroom. Never wait
+        // indefinitely for a hung peer; no lock is retained during tool probing.
+        wait_version_lock(&lock, VERSION_LOCK_WAIT, || {})?;
+        let path = base.join(VERSION_RECEIPT);
+        crate::sessions_guard::safe_path(root, &path)?;
+        let prior = match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                ensure!(metadata.is_file(), "version receipt type");
+                let read = || -> Result<VersionReceipt> {
+                    let mut bytes = Vec::new();
+                    File::open(&path)?.take(1025).read_to_end(&mut bytes)?;
+                    ensure!(bytes.len() <= 1024, "version receipt limit");
+                    let receipt: VersionReceipt = serde_json::from_slice(&bytes)?;
+                    ensure!(receipt.valid(), "version receipt format");
+                    Ok(receipt)
+                };
+                let prior = read().ok();
+                // Invalidate BEFORE reading a potentially newer version. A failed
+                // new receipt write/crash cannot leave the old pass eligible.
+                // Unlink instead of truncating a possibly hardlinked old record.
+                fs::remove_file(&path)?;
+                prior
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        Ok(Self {
+            _lock: lock,
+            path,
+            prior,
+        })
+    }
+    fn publish(&self, receipt: &VersionReceipt) -> Result<()> {
+        ensure!(receipt.valid(), "version receipt format");
+        let bytes = serde_json::to_vec(receipt)?;
+        ensure!(bytes.len() <= 1024, "version receipt limit");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&self.path)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        Ok(())
+    }
+    fn restore(&self) -> Result<()> {
+        if let Some(prior) = &self.prior {
+            self.publish(prior)?;
+        }
+        Ok(())
+    }
+}
+
+fn version_gate(
+    program: &Path,
+    root: &Path,
+    base: &Path,
+    attempt: impl FnMut() -> std::io::Result<Vec<u8>>,
+    now: impl Fn() -> SystemTime,
+) -> Result<VersionGate> {
+    let memo = VersionMemo::begin(root, base)?;
+    let before = program_fingerprint(program);
+    let result = version_attempts(attempt);
+    // This samples the actual read completion, not cache-use time for a retained
+    // version. Failed parses never publish a new version or advance its age.
+    let read_at = now();
+    let after = program_fingerprint(program);
+    match result {
+        Ok(VersionGate::Known(version)) => {
+            memo.publish(&VersionReceipt {
+                schema: 1,
+                version: version.clone(),
+                read_utc_ns: utc_ns(read_at)?,
+                fingerprint: if before == after { after } else { None },
+            })?;
+            Ok(VersionGate::Known(version))
+        }
+        Ok(VersionGate::TimeoutCache) => {
+            memo.restore()?; // Retain original timestamp; a cache hit never renews it.
+            let prior = memo.prior.as_ref().context("version receipt missing")?;
+            let age = utc_ns(read_at)?
+                .checked_sub(prior.read_utc_ns)
+                .context("version receipt future")?;
+            ensure!(age <= VERSION_MAX_AGE_NS, "version receipt expired");
+            ensure!(
+                before.is_some() && before == after && prior.fingerprint == after,
+                "version receipt program changed"
+            );
+            let cache = base.join(cache_name(&prior.version));
+            crate::sessions_guard::safe_path(root, &cache)?;
+            ensure!(
+                cached_pass(&cache, &prior.version),
+                "version cached pass missing"
+            );
+            diagnostic("version-timeout-cache", true);
+            Ok(VersionGate::TimeoutCache)
+        }
+        Err(error) => {
+            memo.restore()?;
+            Err(error)
+        }
+    }
+}
+
 fn diagnostic(stage: &'static str, failed: bool) {
     // Fixed stage names only: never native output, request bodies or error chains.
     if failed {
@@ -173,18 +409,7 @@ fn diagnostic(stage: &'static str, failed: bool) {
 }
 
 fn version(output: &[u8]) -> Result<String> {
-    ensure!(output.len() <= 512, "version limit");
-    let value = std::str::from_utf8(output)?.trim();
-    let number = value.strip_prefix("codex-cli ").unwrap_or(value);
-    ensure!(
-        !number.is_empty()
-            && number.bytes().next().is_some_and(|b| b.is_ascii_digit())
-            && number
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b".-+_".contains(&b)),
-        "version format"
-    );
-    Ok(number.to_owned())
+    crate::launcher_label::parse_version_output(output).context("version format")
 }
 
 fn cache_name(version: &str) -> String {
@@ -764,6 +989,289 @@ fn code_declaration(description: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn version_fixture() -> Result<(tempfile::TempDir, PathBuf)> {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r1211-fixtures");
+        fs::create_dir_all(&base)?;
+        let home = tempfile::tempdir_in(fs::canonicalize(base)?)?;
+        let program = home.path().join("synthetic-codex.exe");
+        fs::write(&program, b"synthetic fixture, never executed")?;
+        Ok((home, program))
+    }
+    fn gate(
+        home: &Path,
+        program: &Path,
+        now: SystemTime,
+        attempt: impl FnMut() -> std::io::Result<Vec<u8>>,
+    ) -> Result<VersionGate> {
+        let base = home.join("state/image-canary");
+        let _guard = crate::sessions_guard::prepare_parent(home, &base)?;
+        version_gate(program, home, &base, attempt, || now)
+    }
+    fn version_time() -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+    }
+    fn timeout() -> std::io::Error {
+        crate::launcher_label::VersionFailure::Timeout.wrap(std::io::ErrorKind::TimedOut.into())
+    }
+    fn seed_version(home: &Path, program: &Path, now: SystemTime) -> Result<PathBuf> {
+        assert_eq!(
+            gate(home, program, now, || Ok(b"codex-cli 0.163.0".to_vec()))?,
+            VersionGate::Known("0.163.0".into())
+        );
+        let pass = home.join("state/image-canary").join(cache_name("0.163.0"));
+        publish_pass(home, &pass, "0.163.0")?;
+        Ok(pass)
+    }
+    #[test]
+    fn r1211_version_lock_waits_for_a_peer_but_has_a_finite_bound() -> Result<()> {
+        let (home, _) = version_fixture()?;
+        let path = home.path().join("manual-version.lock");
+        let held = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        held.lock()?;
+        let peer = OpenOptions::new().read(true).write(true).open(&path)?;
+        assert_eq!(
+            wait_version_lock(&peer, Duration::ZERO, || unreachable!())
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        let (entered, seen) = std::sync::mpsc::sync_channel(1);
+        let (release, released) = std::sync::mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let mut notified = false;
+            wait_version_lock(&peer, VERSION_LOCK_WAIT, || {
+                if !notified {
+                    notified = true;
+                    entered.send(()).unwrap();
+                    released.recv_timeout(Duration::from_secs(5)).unwrap();
+                }
+            })
+            .unwrap();
+        });
+        seen.recv_timeout(Duration::from_secs(5))?;
+        drop(held);
+        release.send(())?;
+        worker.join().unwrap();
+        assert_eq!(VERSION_LOCK_WAIT, Duration::from_secs(35));
+        Ok(())
+    }
+
+    #[test]
+    fn r1211_two_wait_timeouts_use_valid_last_version_without_refreshing_age() -> Result<()> {
+        let (home, program) = version_fixture()?;
+        let at = version_time();
+        seed_version(home.path(), &program, at)?;
+        let receipt = home.path().join("state/image-canary").join(VERSION_RECEIPT);
+        let original = fs::read(&receipt)?;
+        let mut calls = 0;
+        assert_eq!(
+            gate(home.path(), &program, at + Duration::from_secs(60), || {
+                calls += 1;
+                Err(timeout())
+            })?,
+            VersionGate::TimeoutCache
+        );
+        assert_eq!(calls, 2);
+        assert_eq!(fs::read(receipt)?, original);
+        Ok(())
+    }
+    #[test]
+    fn r1211_version_cache_age_exact_24h_and_clock_rollback() -> Result<()> {
+        // Windows SystemTime is represented in 100 ns ticks; a 1 ns change
+        // can round back to the same instant and cannot test either edge.
+        const CLOCK_TICK_NS: u64 = 100;
+        for (elapsed, accepted) in [
+            (
+                Duration::from_nanos(VERSION_MAX_AGE_NS - CLOCK_TICK_NS),
+                true,
+            ),
+            (Duration::from_nanos(VERSION_MAX_AGE_NS), true),
+            (
+                Duration::from_nanos(VERSION_MAX_AGE_NS + CLOCK_TICK_NS),
+                false,
+            ),
+        ] {
+            let (home, program) = version_fixture()?;
+            let at = version_time();
+            assert_eq!(
+                utc_ns(at + elapsed)? - utc_ns(at)?,
+                elapsed.as_nanos() as u64
+            );
+            seed_version(home.path(), &program, at)?;
+            assert_eq!(
+                gate(home.path(), &program, at + elapsed, || Err(timeout())).is_ok(),
+                accepted
+            );
+            assert!(
+                gate(
+                    home.path(),
+                    &program,
+                    at - Duration::from_nanos(CLOCK_TICK_NS),
+                    || Err(timeout())
+                )
+                .is_err()
+            );
+        }
+        Ok(())
+    }
+    #[test]
+    fn r1211_missing_failed_wrong_version_and_changed_program_cache_reject() -> Result<()> {
+        for case in 0..6 {
+            let (home, program) = version_fixture()?;
+            let at = version_time();
+            let pass = seed_version(home.path(), &program, at)?;
+            match case {
+                0 => fs::remove_file(home.path().join("state/image-canary").join(VERSION_RECEIPT))?,
+                1 => fs::remove_file(&pass)?,
+                2 => fs::write(&pass, br#"{"version":"0.163.0","pass":false}"#)?,
+                3 => fs::write(&pass, br#"{"version":"0.164.0","pass":true}"#)?,
+                4 => fs::write(&program, b"different synthetic file length, never executed")?,
+                _ => fs::write(
+                    home.path().join("state/image-canary").join(VERSION_RECEIPT),
+                    b"malformed",
+                )?,
+            }
+            let mut calls = 0;
+            assert!(
+                gate(home.path(), &program, at, || {
+                    calls += 1;
+                    Err(timeout())
+                })
+                .is_err()
+            );
+            assert_eq!(calls, 2);
+        }
+        Ok(())
+    }
+    #[test]
+    fn r1211_unparseable_version_is_never_retried_or_retained() -> Result<()> {
+        let (home, program) = version_fixture()?;
+        let at = version_time();
+        let pass = seed_version(home.path(), &program, at)?;
+        let receipt = home.path().join("state/image-canary").join(VERSION_RECEIPT);
+        let original = fs::read(&receipt)?;
+        for output in [
+            b"invalid".to_vec(),
+            b"codex-cli 0.164.0\nextra".to_vec(),
+            vec![b'1'; 513],
+            vec![255],
+        ] {
+            let mut calls = 0;
+            assert!(
+                gate(home.path(), &program, at + Duration::from_secs(1), || {
+                    calls += 1;
+                    Ok(output.clone())
+                })
+                .is_err()
+            );
+            assert_eq!(calls, 1);
+            assert_eq!(fs::read(&receipt)?, original);
+            assert!(cached_pass(&pass, "0.163.0"));
+        }
+        Ok(())
+    }
+    #[test]
+    fn r1211_spawn_retry_and_mixed_errors_never_grant_timeout_fallback() -> Result<()> {
+        use crate::launcher_label::VersionFailure;
+        for failures in [
+            [VersionFailure::Spawn, VersionFailure::Timeout],
+            [VersionFailure::Timeout, VersionFailure::Spawn],
+            [VersionFailure::Spawn, VersionFailure::Spawn],
+        ] {
+            let (home, program) = version_fixture()?;
+            let at = version_time();
+            seed_version(home.path(), &program, at)?;
+            let mut index = 0;
+            assert!(
+                gate(home.path(), &program, at, || {
+                    let failure = failures[index];
+                    index += 1;
+                    Err(failure.wrap(std::io::ErrorKind::TimedOut.into()))
+                })
+                .is_err()
+            );
+            assert_eq!(index, 2);
+        }
+        for failure in [VersionFailure::Spawn, VersionFailure::Timeout] {
+            let mut calls = 0;
+            assert_eq!(
+                version_attempts(|| {
+                    calls += 1;
+                    if calls == 1 {
+                        Err(failure.wrap(std::io::ErrorKind::Other.into()))
+                    } else {
+                        Ok(b"0.164.0".to_vec())
+                    }
+                })?,
+                VersionGate::Known("0.164.0".into())
+            );
+            assert_eq!(calls, 2);
+        }
+        Ok(())
+    }
+    #[test]
+    fn r1211_nonspawn_io_and_nonzero_class_are_terminal_even_if_timed_out_kind() {
+        for kind in [
+            std::io::ErrorKind::Other,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::InvalidData,
+        ] {
+            let mut calls = 0;
+            assert!(
+                version_attempts(|| {
+                    calls += 1;
+                    Err(kind.into())
+                })
+                .is_err()
+            );
+            assert_eq!(calls, 1);
+        }
+    }
+    #[test]
+    fn r1211_latest_parsed_version_without_pass_cannot_fall_back_to_older_pass() -> Result<()> {
+        let (home, program) = version_fixture()?;
+        let at = version_time();
+        let pass = seed_version(home.path(), &program, at)?;
+        assert_eq!(
+            gate(home.path(), &program, at + Duration::from_secs(1), || Ok(
+                b"0.164.0".to_vec()
+            ))?,
+            VersionGate::Known("0.164.0".into())
+        );
+        assert!(cached_pass(&pass, "0.163.0"));
+        assert!(
+            gate(home.path(), &program, at + Duration::from_secs(2), || Err(
+                timeout()
+            ))
+            .is_err()
+        );
+        Ok(())
+    }
+    #[test]
+    fn r1211_legacy_operator_pass_keeps_exact_format_with_fresh_version_receipt() -> Result<()> {
+        let (home, program) = version_fixture()?;
+        let base = home.path().join("state/image-canary");
+        fs::create_dir_all(&base)?;
+        let pass = base.join(cache_name("0.163.0"));
+        let original = b"{\"version\":\"0.163.0\",\"pass\":true}\n";
+        fs::write(&pass, original)?;
+        // Legacy pass alone cannot establish when a version was actually read.
+        assert!(gate(home.path(), &program, version_time(), || Err(timeout())).is_err());
+        assert_eq!(
+            gate(home.path(), &program, version_time(), || Ok(
+                b"0.163.0".to_vec()
+            ))?,
+            VersionGate::Known("0.163.0".into())
+        );
+        assert!(cached_pass(&pass, "0.163.0"));
+        assert_eq!(fs::read(pass)?, original);
+        Ok(())
+    }
+
     #[test]
     fn retries_native_wait_and_server_timeout_once_then_succeeds() -> Result<()> {
         for stage in [ProbeStage::NativeWait, ProbeStage::ServerTimeout] {
@@ -925,10 +1433,16 @@ mod tests {
             .join("state/image-canary")
             .join(cache_name("0.163.0"));
         assert!(cached_pass(&cache, "0.163.0"));
+        let base = cache.parent().unwrap();
+        let receipt: VersionReceipt =
+            serde_json::from_slice(&fs::read(base.join(VERSION_RECEIPT))?)?;
+        assert!(receipt.valid());
+        assert_eq!(receipt.version, "0.163.0");
+        assert!(base.join(VERSION_LOCK).is_file());
         assert_eq!(
-            fs::read_dir(cache.parent().unwrap())?.count(),
-            1,
-            "scratch and publication anchors must be removed"
+            fs::read_dir(base)?.count(),
+            3,
+            "only legacy pass, version receipt and version lock remain"
         );
         Ok(())
     }

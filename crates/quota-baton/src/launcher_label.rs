@@ -167,8 +167,67 @@ fn run_with_environment_and_account(
     Ok(status?.code().unwrap_or(1))
 }
 
+#[cfg(windows)]
+const VERSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Only errors tagged at the actual spawn/wait boundaries are retryable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VersionFailure {
+    Spawn,
+    Timeout,
+    Other,
+}
+#[derive(Debug)]
+struct VersionIoError {
+    failure: VersionFailure,
+    source: std::io::Error,
+}
+impl std::fmt::Display for VersionIoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("version-probe")
+    }
+}
+impl std::error::Error for VersionIoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+#[cfg(any(windows, test))]
+impl VersionFailure {
+    pub(crate) fn wrap(self, source: std::io::Error) -> std::io::Error {
+        std::io::Error::new(
+            source.kind(),
+            VersionIoError {
+                failure: self,
+                source,
+            },
+        )
+    }
+}
+pub(crate) fn version_failure(error: &std::io::Error) -> VersionFailure {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<VersionIoError>())
+        .map_or(VersionFailure::Other, |inner| inner.failure)
+}
+
+pub(crate) fn parse_version_output(output: &[u8]) -> Option<String> {
+    if output.len() > 512 {
+        return None;
+    }
+    let value = std::str::from_utf8(output).ok()?.trim();
+    let number = value.strip_prefix("codex-cli ").unwrap_or(value);
+    (!number.is_empty()
+        && number.bytes().next().is_some_and(|b| b.is_ascii_digit())
+        && number
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".-+_".contains(&b)))
+    .then(|| number.to_owned())
+}
+
 /// The version probe uses the same npm/node resolution and batch quoting as a
-/// launch, but has bounded output and a five-second process-tree lifetime.
+/// launch, but has bounded output and a fifteen-second process-tree lifetime.
+/// Retry policy belongs to the canary version gate, not this single attempt.
 pub(crate) fn version_output(program: &Path) -> std::io::Result<Vec<u8>> {
     #[cfg(windows)]
     {
@@ -703,27 +762,39 @@ mod contained {
     }
 
     pub(super) fn capture(command: &Command) -> io::Result<Vec<u8>> {
+        capture_with_timeout(command, super::VERSION_TIMEOUT)
+    }
+
+    fn capture_with_timeout(command: &Command, timeout: Duration) -> io::Result<Vec<u8>> {
         let (mut read, mut write) = (std::ptr::null_mut(), std::ptr::null_mut());
         if unsafe { CreatePipe(&mut read, &mut write, std::ptr::null(), 0) } == 0 {
             return Err(io::Error::last_os_error());
         }
         let read = File::from(owned(read)?);
         let write = File::from(owned(write)?);
-        let mut child = Child::spawn(command, Some(&write)).inspect_err(|_error| {
-            #[cfg(all(feature = "testkit", debug_assertions))]
-            eprintln!(
-                "qb-version-probe stage=spawn kind={:?} os={:?}",
-                _error.kind(),
-                _error.raw_os_error()
-            );
-        })?;
+        let mut child = Child::spawn(command, Some(&write))
+            .inspect_err(|_error| {
+                #[cfg(all(feature = "testkit", debug_assertions))]
+                eprintln!(
+                    "qb-version-probe stage=spawn kind={:?} os={:?}",
+                    _error.kind(),
+                    _error.raw_os_error()
+                );
+            })
+            .map_err(|error| super::VersionFailure::Spawn.wrap(error))?;
         drop(write);
         let reader = std::thread::spawn(move || {
             let mut bytes = Vec::new();
             read.take(4097).read_to_end(&mut bytes)?;
             Ok::<_, io::Error>(bytes)
         });
-        let status = child.wait(Some(Duration::from_secs(5)));
+        let status = child.wait(Some(timeout)).map_err(|error| {
+            if error.kind() == io::ErrorKind::TimedOut {
+                super::VersionFailure::Timeout.wrap(error)
+            } else {
+                error
+            }
+        });
         drop(child); // Closes every inherited pipe writer, even on timeout.
         let output = reader
             .join()
@@ -742,7 +813,15 @@ mod contained {
             ),
             _ => {}
         }
-        if status? != 0 || output.len() > 4096 {
+        // Invalid bounded output is terminal even if the process also timed
+        // out. Cleanup and reader join above still precede every result.
+        if output.len() > 512 {
+            return Err(io::Error::other("Codex 버전을 확인하지 못했습니다"));
+        }
+        if status.is_err() && !output.is_empty() && super::parse_version_output(&output).is_none() {
+            return Err(io::Error::other("Codex 버전을 확인하지 못했습니다"));
+        }
+        if status? != 0 {
             return Err(io::Error::other("Codex 버전을 확인하지 못했습니다"));
         }
         Ok(output)
@@ -863,6 +942,88 @@ mod contained {
             assigned: u32,
             count: u32,
             ids: [usize; 8],
+        }
+
+        #[test]
+        fn r1211_oversized_output_then_hang_is_terminal_after_cleanup() {
+            let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r1211-fixtures");
+            std::fs::create_dir_all(&base).unwrap();
+            let root = tempfile::tempdir_in(base).unwrap();
+            for (case, output) in ["x".repeat(513), "not-a-version".to_owned()]
+                .iter()
+                .enumerate()
+            {
+                let script = root.path().join(format!("invalid-version-{case}.cmd"));
+                let text = format!("@echo off\r\necho {output}\r\n:hold\r\ngoto hold\r\n");
+                std::fs::write(&script, text).unwrap();
+                let error = capture_with_timeout(&Command::new(script), Duration::from_secs(1))
+                    .unwrap_err();
+                assert_eq!(
+                    super::super::version_failure(&error),
+                    super::super::VersionFailure::Other
+                );
+            }
+            // capture returned only after job active-count reached zero and the
+            // bounded reader joined; an oversized timed-out attempt cannot fall back.
+        }
+
+        #[test]
+        fn r1211_actual_wait_timeout_is_tagged_and_owned_descendant_has_exited() {
+            let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r1211-fixtures");
+            std::fs::create_dir_all(&base).unwrap();
+            let root = tempfile::tempdir_in(base).unwrap();
+            let ready = root.path().join("owned-pid.ready");
+            let temporary = root.path().join("owned-pid.tmp");
+            let quote = |p: &Path| p.to_string_lossy().replace('\'', "''");
+            let script = root.path().join("timeout-version.cmd");
+            std::fs::write(&script, format!(
+                "@echo off\r\npowershell.exe -NoLogo -NoProfile -NonInteractive -Command \"[IO.File]::WriteAllText('{}',$PID.ToString()); [IO.File]::Move('{}','{}'); Start-Sleep -Seconds 30\"\r\n",
+                quote(&temporary), quote(&temporary), quote(&ready),
+            )).unwrap();
+            let worker = std::thread::spawn(move || {
+                capture_with_timeout(&Command::new(script), Duration::from_secs(5))
+            });
+            // Retain a handle to the known synthetic descendant while alive;
+            // do not infer cleanup from a possibly recycled numeric PID later.
+            let began = Instant::now();
+            let process = loop {
+                if let Ok(text) = std::fs::read_to_string(&ready) {
+                    let id: u32 = text.parse().unwrap();
+                    let handle =
+                        unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, false, id) }
+                            .unwrap_or_else(|error| {
+                                panic!("synthetic descendant handle id={id}: {error}")
+                            });
+                    break Some(owned(handle.0).unwrap());
+                }
+                if began.elapsed() >= Duration::from_secs(4) {
+                    break None;
+                }
+                std::thread::yield_now();
+            };
+            let error = worker.join().unwrap().unwrap_err();
+            assert_eq!(
+                super::super::version_failure(&error),
+                super::super::VersionFailure::Timeout
+            );
+            let process =
+                process.expect("synthetic descendant did not publish its PID before deadline");
+            // Job active-count zero means termination has begun; a retained
+            // process handle may become signaled just after that accounting cut.
+            let exited = unsafe { WaitForSingleObject(HANDLE(process.as_raw_handle()), 5000) }
+                == WAIT_OBJECT_0;
+            if !exited {
+                // Failure cleanup is restricted to the retained synthetic handle.
+                unsafe { TerminateProcess(HANDLE(process.as_raw_handle()), 1) }.unwrap();
+                assert_eq!(
+                    unsafe { WaitForSingleObject(HANDLE(process.as_raw_handle()), 5000) },
+                    WAIT_OBJECT_0
+                );
+            }
+            assert!(
+                exited,
+                "capture returned before its owned descendant exited"
+            );
         }
 
         #[test]
@@ -1217,4 +1378,41 @@ fn r12_contained_environment_sets_and_removes_only_child_variables() {
     );
     command.env_remove("QB_SYNTHETIC_IMAGE_KEY");
     assert_eq!(contained::capture(&command).unwrap(), b"absent\r\n");
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn r1211_slow_fake_version_survives_old_five_second_limit() {
+    let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r1211-fixtures");
+    std::fs::create_dir_all(&base).unwrap();
+    let root = tempfile::tempdir_in(base).unwrap();
+    let script = root.path().join("slow-version.cmd");
+    std::fs::write(&script, b"@echo off\r\npowershell.exe -NoLogo -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 6\"\r\necho codex-cli 0.163.0\r\nexit /b 0\r\n").unwrap();
+    let began = std::time::Instant::now();
+    assert_eq!(version_output(&script).unwrap(), b"codex-cli 0.163.0\r\n");
+    assert!(began.elapsed() >= std::time::Duration::from_secs(6));
+    assert_eq!(VERSION_TIMEOUT, std::time::Duration::from_secs(15));
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn r1211_native_fake_nonzero_is_terminal_and_missing_spawn_is_distinct() {
+    let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r1211-fixtures");
+    std::fs::create_dir_all(&base).unwrap();
+    let root = tempfile::tempdir_in(base).unwrap();
+    let script = root.path().join("nonzero-version.cmd");
+    std::fs::write(
+        &script,
+        b"@echo off\r\necho codex-cli 0.163.0\r\nexit /b 7\r\n",
+    )
+    .unwrap();
+    assert_eq!(
+        version_failure(&version_output(&script).unwrap_err()),
+        VersionFailure::Other
+    );
+    let missing = root.path().join("missing-version.exe");
+    assert_eq!(
+        version_failure(&version_output(&missing).unwrap_err()),
+        VersionFailure::Spawn
+    );
 }
