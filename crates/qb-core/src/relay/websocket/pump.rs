@@ -705,16 +705,31 @@ async fn apply_error(
     Ok(decision)
 }
 
-async fn reconnect_available(context: &Context, model: Option<&str>) -> Result<bool, ()> {
+async fn reconnect_available(
+    context: &Context,
+    model: Option<&str>,
+    decision: &crate::relay::outcome::Decision,
+) -> Result<bool, ()> {
     let Some(relay) = &context.relay else {
         return Ok(false);
     };
     let key = context.session.key.as_deref();
-    // Without a stable key, a model-scoped or unchanged account could be
-    // reselected immediately. Relay its frame instead of spending a retry.
-    if key.is_none() && relay.accounts.eligible(&context.account, None).await {
-        return Ok(false);
+    // An account-wide failure already prevents an unkeyed reconnect from
+    // selecting this source. It needs no keyed handoff, but an unchanged or
+    // model-only failure must still be relayed without a speculative retry.
+    if key.is_none() {
+        if relay.accounts.eligible(&context.account, None).await {
+            return Ok(false);
+        }
+        let tried = std::collections::BTreeSet::from([context.account.clone()]);
+        return Ok(relay.select(Codex, None, model, &tried).await?.is_some());
     }
+    let Some((failed_account, _)) = &context.credentials else {
+        return Ok(false);
+    };
+    let Some(evidence) = decision.reconnect_evidence(failed_account, key, model) else {
+        return Ok(false);
+    };
     let tried = std::collections::BTreeSet::from([context.account.clone()]);
     let deadline = context.launch_deadline();
     if let Some(info) = context.managed_launch(deadline).await.map_err(|_| ())? {
@@ -746,13 +761,13 @@ async fn reconnect_available(context: &Context, model: Option<&str>) -> Result<b
         ) {
             return Ok(false);
         }
-        relay.exclude_reconnect(key, &context.account);
+        relay.exclude_reconnect(evidence);
         return Ok(true);
     }
-    if relay.select(Codex, key, None, &tried).await?.is_none() {
+    if relay.select(Codex, key, model, &tried).await?.is_none() {
         return Ok(false);
     }
-    relay.exclude_reconnect(key, &context.account);
+    relay.exclude_reconnect(evidence);
     Ok(true)
 }
 
@@ -2538,7 +2553,7 @@ async fn run_with_read_timeout(
                                 if current.len() == 1 && request.and_then(|id| current.get(&id)).is_some_and(|active| !active.committed)
                                     && decision.as_ref().is_some_and(|decision| decision.failover() && decision.kind != crate::relay::outcome::Kind::Rate)
                                     && !(managed_socket && decision.as_ref().is_some_and(|decision| decision.kind == crate::relay::outcome::Kind::ModelPermission))
-                                    && reconnect_available(&context, active_model.as_deref()).await.unwrap_or(false) {
+                                    && reconnect_available(&context, active_model.as_deref(), decision.as_ref().expect("qualified failure")).await.unwrap_or(false) {
                                     if let Some(mut active) = request.and_then(|id| current.remove(&id)) {
                                         active.upstream(Some(event));
                                         active

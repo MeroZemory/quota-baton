@@ -2820,6 +2820,19 @@ impl BindingTable {
         if !admission.valid_for(admitted_from.as_deref(), &account) {
             return Decision::None;
         }
+        if !admission.valid_failure_for(
+            key,
+            admitted_from.as_deref().and_then(|id| {
+                move_evidence
+                    .iter()
+                    .find(|c| c.account.id == id)
+                    .map(|c| &c.account)
+            }),
+            &account,
+            model,
+        ) {
+            return Decision::None;
+        }
         if self
             .policies
             .dispatch(

@@ -14,6 +14,7 @@ mod response;
 mod selection_guard;
 mod upload;
 mod websocket;
+pub(crate) use outcome::RequestFailureEvidence;
 pub(crate) use websocket::capacity::CapacityMoveEvidence;
 mod wire_metadata;
 
@@ -168,7 +169,7 @@ pub struct RelayState {
     takeover_test_dependencies: Option<crate::accounts::takeover::Dependencies>,
     websocket: crate::config::WebsocketConfig,
     ws_capacity: Arc<websocket::capacity::Capacity>,
-    reconnect_exclusions: Mutex<BTreeMap<(String, String), Instant>>,
+    reconnect_exclusions: Mutex<BTreeMap<(String, String), outcome::ReconnectEvidence>>,
     #[cfg(feature = "testkit")]
     http_quota_wait_events: tokio::sync::broadcast::Sender<HttpQuotaWaitEvent>,
     #[cfg(feature = "testkit")]
@@ -814,19 +815,38 @@ impl RelayState {
         }
     }
 
-    pub(super) fn exclude_reconnect(&self, key: Option<&str>, account: &str) {
-        if let Some(key) = key
-            && let Ok(mut exclusions) = self.reconnect_exclusions.lock()
-        {
-            exclusions.retain(|_, expiry| *expiry > Instant::now());
+    fn exclude_reconnect(&self, evidence: outcome::ReconnectEvidence) {
+        if let Ok(mut exclusions) = self.reconnect_exclusions.lock() {
+            exclusions.retain(|_, proof| proof.active(Instant::now()));
             if exclusions.len() >= 4096 {
                 exclusions.pop_first();
             }
             exclusions.insert(
-                (key.to_owned(), account.to_owned()),
-                Instant::now() + Duration::from_secs(120),
+                (evidence.key().to_owned(), evidence.source().to_owned()),
+                evidence,
             );
         }
+    }
+
+    fn reconnect_failure(
+        &self,
+        key: Option<&str>,
+        account: Option<&str>,
+        model: Option<&str>,
+    ) -> Option<outcome::RequestFailureEvidence> {
+        let mut exclusions = self.reconnect_exclusions.lock().ok()?;
+        exclusions.retain(|_, proof| proof.active(Instant::now()));
+        let proof = exclusions.get(&(key?.to_owned(), account?.to_owned()))?;
+        proof.permits_model(model).then(|| proof.failure())
+    }
+
+    fn reconnect_model(&self, key: Option<&str>, account: Option<&str>) -> Option<String> {
+        let mut exclusions = self.reconnect_exclusions.lock().ok()?;
+        exclusions.retain(|_, proof| proof.active(Instant::now()));
+        exclusions
+            .get(&(key?.to_owned(), account?.to_owned()))?
+            .model()
+            .map(str::to_owned)
     }
 
     async fn candidates(
@@ -845,7 +865,7 @@ impl RelayState {
         &self,
         provider: Provider,
         key: Option<&str>,
-        _model: Option<&str>,
+        model: Option<&str>,
         tried: &BTreeSet<String>,
     ) -> Result<
         (
@@ -861,12 +881,12 @@ impl RelayState {
         if let Some(key) = key
             && let Ok(mut exclusions) = self.reconnect_exclusions.lock()
         {
-            exclusions.retain(|_, expiry| *expiry > Instant::now());
+            exclusions.retain(|_, proof| proof.active(Instant::now()));
             tried.extend(
                 exclusions
-                    .keys()
-                    .filter(|(session, _)| session == key)
-                    .map(|(_, id)| id.clone()),
+                    .iter()
+                    .filter(|((session, _), proof)| session == key && proof.permits_model(model))
+                    .map(|((_, id), _)| id.clone()),
             );
         }
         let read_store = store.clone();
@@ -1325,6 +1345,12 @@ impl RelayState {
             let denied_choice = denied.clone();
             let admission_runtime = launch.map(|_| self.accounts.clone());
             let selection_operation = operation.clone();
+            // Refresh after every await/hold: an expired or recovered hint
+            // must not shadow a newer native health/selection decision.
+            let reconnect_source = self.bindings.current(session.key.as_deref());
+            let failure_evidence = completion.failure_evidence.clone().or_else(|| {
+                self.reconnect_failure(session.key.as_deref(), reconnect_source.as_deref(), model)
+            });
             let choice = tokio::task::spawn_blocking(move || {
                 let choose = |eligible: &dyn Fn(&str, bool) -> bool| {
                     table.choose_with_hold_at_admitted_proof(
@@ -1362,7 +1388,11 @@ impl RelayState {
                                 admission.is_some()
                             });
                             denied_choice.store(!allowed, Ordering::Release);
-                            if allowed { admission } else { None }
+                            if allowed {
+                                admission.map(|admission| admission.with_failure(failure_evidence))
+                            } else {
+                                None
+                            }
                         },
                     )
                 };
@@ -1429,6 +1459,9 @@ impl RelayState {
                     lease,
                     moves,
                 } => {
+                    // Selection has consumed the failed attempt's authority.
+                    // A later failure on the successor needs its own evidence.
+                    completion.failure_evidence = None;
                     if completion.reset_hold_timed_out
                         && held_account.as_deref() == Some(account.as_str())
                     {
@@ -2681,6 +2714,15 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
             &held.prefix,
             request_model.as_deref(),
         );
+        let failure_evidence = decision.failed_attempt(
+            &account,
+            session.key.as_deref(),
+            request_model.as_deref(),
+            completion.precommit_deadline.unwrap_or_else(|| {
+                completion.start + Duration::from_secs(state.request_timeout_secs)
+            }),
+            &completion.failure_lifetime,
+        );
         decision.reconcile_quota(&credit_observation);
         completion.record.upstream_error_code = hold::error_code(&response_headers, &held.prefix);
         let mut observed_http_429 = None;
@@ -3164,6 +3206,7 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
             }
             break (status, response_headers, held);
         }
+        completion.failure_evidence = failure_evidence;
         completion.failover(decision.reason());
         let mut selection_tried = tried.clone();
         if let Some(source) = proof_reset_source {
@@ -3318,6 +3361,103 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
 #[cfg(test)]
 mod tests {
     #[tokio::test]
+    async fn n6t_selected_successor_retires_failure_before_independent_recovery() {
+        use super::*;
+        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.sandbox/n6t-successor");
+        std::fs::create_dir_all(&base).unwrap();
+        let root = tempfile::tempdir_in(base).unwrap();
+        let cpa = root.path().join("cpa");
+        std::fs::create_dir_all(&cpa).unwrap();
+        let mut activate = Vec::new();
+        for n in 0..3 {
+            let email = format!("sample-{n}@example.test");
+            std::fs::write(cpa.join(format!("{n}.json")), serde_json::to_vec(&serde_json::json!({
+                "type":"codex", "email":email, "account_id":format!("sample-{n}"),
+                "access_token":format!("synthetic-access-{n}"), "refresh_token":"synthetic-refresh",
+                "expired":"2099-01-01T00:00:00Z", "last_refresh":"2026-10-13T00:00:01Z"
+            })).unwrap()).unwrap();
+            activate.push(format!("codex:{email}"));
+        }
+        let store = Arc::new(AccountStore::acquire(&root.path().join("home")).unwrap());
+        crate::accounts::import::run(&store, &cpa, &activate, false).unwrap();
+        let obs = Arc::new(Observability::new(store.home(), None).unwrap());
+        let mut config = Config::default();
+        config.upstream.codex_base = "http://127.0.0.1:9".into();
+        config.upstream.anthropic_base = "http://127.0.0.1:9".into();
+        let state = RelayState::new(
+            store.clone(),
+            &config,
+            obs.clone(),
+            Arc::new(DebugPins::default()),
+        )
+        .unwrap();
+        let session = session::Session {
+            key: Some("codex:sample-recovery".into()),
+            parent: None,
+            model: None,
+        };
+        let mut completion = Completion::new(
+            obs,
+            &Method::GET,
+            "/v1/responses",
+            Provider::Codex,
+            &HeaderMap::new(),
+        );
+        completion.precommit_deadline = Some(Instant::now() + Duration::from_secs(30));
+        let mut tried = BTreeSet::new();
+        let source = state
+            .select_request(Provider::Codex, &session, &mut completion, None, &tried)
+            .await
+            .unwrap()
+            .unwrap();
+        completion.binding.take();
+        tried.insert(source.id.clone());
+        let decision = outcome::classify(
+            Provider::Codex,
+            StatusCode::UNAUTHORIZED,
+            &HeaderMap::new(),
+            b"{}",
+            None,
+        );
+        completion.failure_evidence = decision.failed_attempt(
+            &source,
+            session.key.as_deref(),
+            None,
+            completion.precommit_deadline.unwrap(),
+            &completion.failure_lifetime,
+        );
+        assert!(completion.failure_evidence.is_some());
+        let successor = state
+            .select_request(Provider::Codex, &session, &mut completion, None, &tried)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(successor.id, source.id);
+        assert!(
+            completion.failure_evidence.is_none(),
+            "selected successor must retire the previous source proof"
+        );
+        completion.binding.take();
+        store
+            .update_metadata(&successor.id, |account| {
+                account.health = Health::Cooling {
+                    reason: HealthReason::Payment,
+                    until: chrono::Utc::now() + chrono::Duration::hours(1),
+                    scope: "account".into(),
+                }
+            })
+            .unwrap();
+        tried.insert(successor.id.clone());
+        let next = state
+            .select_request(Provider::Codex, &session, &mut completion, None, &tried)
+            .await
+            .unwrap()
+            .expect("fresh successor health must allow independent recovery");
+        assert!(!tried.contains(&next.id));
+    }
+
+    #[tokio::test]
     async fn precommit_timeout_never_replaces_a_committed_response_during_cleanup() {
         let (commit, observed) = tokio::sync::watch::channel(false);
         let (release, wait) = tokio::sync::oneshot::channel();
@@ -3458,9 +3598,24 @@ mod tests {
                 .into_iter()
                 .filter(|a| a.id != source)
                 .collect();
-            state.exclude_reconnect(Some("codex:tray2-exclusions"), &others[0].id);
+            let failed = outcome::classify(
+                Provider::Codex,
+                StatusCode::UNAUTHORIZED,
+                &HeaderMap::new(),
+                b"{}",
+                None,
+            );
+            state.exclude_reconnect(
+                failed
+                    .reconnect_evidence(&others[0], Some("codex:tray2-exclusions"), None)
+                    .unwrap(),
+            );
             if exclude_all {
-                state.exclude_reconnect(Some("codex:tray2-exclusions"), &others[1].id);
+                state.exclude_reconnect(
+                    failed
+                        .reconnect_evidence(&others[1], Some("codex:tray2-exclusions"), None)
+                        .unwrap(),
+                );
             }
             let reset = chrono::Utc::now().timestamp() + 172800;
             fake.state.push(ScriptedResponse::json(
