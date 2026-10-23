@@ -1589,9 +1589,15 @@ async fn run_with_read_timeout(
             break;
         }
         // During a rate wait, retain at most one extra, budgeted client message.
-        // Stop client reads once occupied; drain it through the normal path.
+        // Keep reading controls with that slot occupied; another application
+        // frame closes the connection instead of growing a queue.
         // split 잠금은 poll 사이에 해제되어
         // 큰 쓰기가 진행되는 동안 같은 소켓의 읽기와 자동 pong을 poll할 수 있다.
+        let pending_client_admission = pending_launch_create.is_some()
+            || pending_initial.is_some()
+            || to_upstream.is_some()
+            || pending_rate_redial.is_some()
+            || rate_redial.is_some();
         tokio::select! {
             _ = async { drain_signal.as_mut().unwrap().await }, if drain_signal.is_some() && !draining && ending.is_none() => {
                 draining = true;
@@ -1888,13 +1894,17 @@ async fn run_with_read_timeout(
                 // Memory protection pauses client reads but leaves existing streams alive.
             }
             incoming = async {
-                if let Some((message, reservation)) = deferred_client.take() {
+                // A retained application frame must not conceal later control
+                // frames. Drain that slot only after pending admission/write ends.
+                if pending_client_admission {
+                    (client_read.next().await, None)
+                } else if let Some((message, reservation)) = deferred_client.take() {
                     (Some(Ok(message)), Some(reservation))
                 } else {
                     (client_read.next().await, None)
                 }
             }, if ending.is_none() && pending_launch_error.is_none() && (
-                (deferred_client.is_none() && (pending_launch_create.is_some() || pending_initial.is_some() || pending_rate_redial.is_some() || rate_redial.is_some() || (managed_socket && to_upstream.is_some())))
+                pending_client_admission
                 || ((deferred_client.is_some() || (client_admitted && !context.memory_guard.is_guarded()))
                     && to_upstream.is_none() && pending_launch_create.is_none() && pending_initial.is_none() && rate_redial.is_none() && pending_rate_redial.is_none() && !terminal_pending)
             ) => {
@@ -1911,9 +1921,15 @@ async fn run_with_read_timeout(
                         }
                         None | Some(Err(_)) => ending = Some((None, "client_eof")),
                         Some(Ok(message)) => {
-                            let reservation = context.budget.reserve_message(message.len());
-                            deferred_client = Some((message, reservation));
-                            continue;
+                            if deferred_client.is_some() {
+                                // Exactly one extra application frame is retained.
+                                // Do not overwrite its reservation or grow a queue.
+                                ending = Some((Some(CloseFrame { code: 1008.into(), reason: "".into() }), "pending_client_overflow"));
+                            } else {
+                                let reservation = context.budget.reserve_message(message.len());
+                                deferred_client = Some((message, reservation));
+                                continue;
+                            }
                         }
                     }
                     to_upstream = None;
