@@ -9,7 +9,7 @@ This file names the verification for each unit and each row. The row list and th
 목표: 확인된 긴급 토글·대기 표시 통합; 실제 5시간 한도 대기·전환 결함 수정과 HWND 검증
 핵심 지표: 남은 출시 1/3 (R14 보호 설치, R13 C+E 실행, R13 F 통합 예측); 이전 계열 2/2 종료
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-23 13:56 KST (정책 잠금 정확 대조2 통과; Strict fixture 정리3 통과·최종 영향/실제 HWND 관문 진행)
+갱신: 2026-10-23 14:09 KST (HTTP74 통과; WS140통과/1timeout 뒤 동일 조건 집중1 통과, 잔여 검사·실제 HWND 진행)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -393,6 +393,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-23 13:33 | N5c G2·WS 조건 제거 대조 | G2 3건·실제 WS1건 intended exit101 및 정확 복원 exit0 | 컴파일/setup 실패 제외·각1테스트·소스 byte 동일 | n5c-g2-controls-g2-final-01 및 ws-final-01; 수정 시각 갱신·같은 테스트 복원 양성 확인 |
 | 2026-10-23 13:33 | N5c 정책 publication 경합 보완 단위 | outer4·실제 HTTP1/2모드·WS2/3코호트·strict core testkit all-target lint·fmt·diff 통과 | 실제 첫 결과/기존 대기 중 원래 wake·마감·drain 유지 | 코드f2c964f; n5c-publication-observer-repair 입력 fingerprint. 단위 진단 이벤트 범위 수정 뒤 기존 HTTP 순서 보존; 최종 gate/실제 HWND 전 |
 | 2026-10-23 13:56 | N5c 정책 경합 대조·Strict fixture 정리 | publication2 intended101/정확 복원0, HTTP3·fmt 통과 | 기존 즉시 정책 취소/Strict60/추가 전송 없음 검증 뒤에만 명시적 hold0 정리 | n5c-g2-controls-publication-final-01; 최초 final m4b72통과/2timeout 기록, 8초 client와 원래20초 cache hold 충돌. 제품 변경 없음; 최종 영향/실제 HWND 전 |
+| 2026-10-23 14:09 | N5c HTTP 전체·WS timeout 진단 | HTTP74 통과; WS140통과/1timeout, 실패 테스트 동일2초 제한 집중 재실행1통과 | 시간 제한·전송/계정/리셋 assertions 유지; panic에 expected stage만 추가 | n5c-final-repair 및 n5c-final-ws-repair/1.log; 첫 WS 실패 원인은 미확정. 나머지 영향·실제 HWND 관문 전 |
 <!-- support:end -->
 
 <!-- gaps:begin -->

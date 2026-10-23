@@ -95,7 +95,9 @@ async fn stage(
 ) -> WsQuotaWaitEvent {
     let event = timeout(PHASE, events.recv())
         .await
-        .expect("unsent WS create must enter genuine quota wait / reset reselect")
+        .unwrap_or_else(|_| {
+            panic!("unsent WS create must enter genuine quota wait / reset reselect: {expected}")
+        })
         .expect("WS wait observer closed or lagged");
     assert_eq!(event.stage, expected, "wrong native WS quota wait stage");
     assert_eq!(event.source, source, "wrong native WS quota wait source");
