@@ -8,6 +8,12 @@ const MODEL_BYTES: usize = 256;
 const MODEL_COUNT: usize = 2048;
 const MODELS_BYTES: usize = 64 * 1024;
 
+#[derive(Clone)]
+pub(super) struct Activity {
+    stamp: std::sync::Weak<std::sync::atomic::AtomicI64>,
+    writer: std::sync::Weak<BindingTable>,
+}
+
 /// Only known catalogs are present. Absence is not evidence of no entitlement.
 pub type LaunchEntitlements = BTreeMap<String, BTreeSet<String>>;
 
@@ -454,6 +460,32 @@ fn discard_group(d: &mut Data, key: &str) {
     d.changed();
 }
 pub(super) fn prune(d: &mut Data, now: DateTime<Utc>) {
+    // A validated pin publishes even while a writer owns mutations/data. Read
+    // that activity BEFORE expiry so contention cannot discard the renewal.
+    let mut activity_changed = false;
+    let anchors = &mut d.launch_anchors;
+    d.launch_activity.retain(|anchor, activity| {
+        let Some(writer) = activity.writer.upgrade() else {
+            return false;
+        };
+        if writer.writes_stopped.load(Ordering::Acquire) {
+            return false;
+        }
+        let (Some(row), Some(stamp)) = (anchors.get_mut(anchor), activity.stamp.upgrade()) else {
+            return false;
+        };
+        if let Some(at) = DateTime::<Utc>::from_timestamp_millis(stamp.load(Ordering::Acquire))
+            && at > row.last_used
+        {
+            row.last_used = at;
+            activity_changed = true;
+        }
+        true
+    });
+    if activity_changed {
+        rebuild_retention(d);
+        d.changed();
+    }
     let before = d.launch_anchors.len();
     d.launch_anchors.retain(|_, a| {
         idle(now, a.last_used) < IDLE_SECS
@@ -510,6 +542,41 @@ fn room(weight: usize) -> std::result::Result<(), LaunchError> {
 }
 
 impl BindingTable {
+    /// Issue-worker-only registration of a bounded, process-local activity stamp.
+    /// A stamp can retain existing identity, never create or authorize one.
+    pub(crate) fn bind_launch_activity(
+        self: &Arc<Self>,
+        anchor: &str,
+        stamp: &Arc<std::sync::atomic::AtomicI64>,
+    ) {
+        let _mutation = self.mutations.lock().unwrap_or_else(|e| e.into_inner());
+        if self.writes_stopped.load(Ordering::Acquire) {
+            return;
+        }
+        let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(key) = d
+            .launch_anchors
+            .get(anchor)
+            .map(|a| a.canonical_key.clone())
+            && d.groups.contains_key(&key)
+            && d.launches.contains_key(&key)
+        {
+            let anchors: BTreeSet<_> = d.launch_anchors.keys().cloned().collect();
+            d.launch_activity
+                .retain(|key, activity| anchors.contains(key) && activity.stamp.strong_count() > 0);
+            if d.launch_activity.len() < crate::launch_tokens::CAPACITY
+                || d.launch_activity.contains_key(anchor)
+            {
+                d.launch_activity.insert(
+                    anchor.to_owned(),
+                    Activity {
+                        stamp: Arc::downgrade(stamp),
+                        writer: Arc::downgrade(self),
+                    },
+                );
+            }
+        }
+    }
     /// Read-only native cache-hold condition. This cannot admit an operation,
     /// acquire quota proof or authorize dispatch. None means contention/poison;
     /// Some(false) means a definite native refusal. All acquisitions are try-only.
@@ -759,13 +826,16 @@ impl BindingTable {
             .as_deref()
             .and_then(|id| candidates.iter().find(|c| c.account.id == id));
         let usable = current.is_some_and(|c| {
-            effective_account(c, &d, &self.config, None, now).eligible_at(None, now)
+            effective_account(c, &d, &self.config, old_model.as_deref(), now)
+                .eligible_at(old_model.as_deref(), now)
                 && (!c.account.drain || Self::accepted_in(&d, Some(&key), &c.account.id))
         });
         let mut model_move = false;
         if let (Some(id), Some(model)) = (
             previous.as_deref(),
-            request.model.filter(|_| request.model_is_explicit),
+            request
+                .model
+                .filter(|_| request.model_is_explicit && usable),
         ) {
             let supported = entitlements
                 .get(id)
@@ -1741,6 +1811,237 @@ mod r11_active_adoption_tests {
             model_is_explicit: true,
             account_pref: Some("a"),
             allow_move_for_model: false,
+        }
+    }
+
+    #[test]
+    fn r13_g_unusable_resume_explicit_model_recovers_without_model_move_consent() {
+        for mode in [Mode::Rebalance, Mode::Strict] {
+            let (_home, t, mut cs, mut es) = fixture(mode);
+            place(&t, &cs, &es);
+            t.resolve_launch(Some(SOURCE), Some(REAL), Utc::now())
+                .unwrap();
+            let now = Utc::now();
+            cs[0].account.health = Health::Cooling {
+                reason: crate::accounts::HealthReason::Quota,
+                until: now + chrono::Duration::hours(4),
+                scope: "account".into(),
+            };
+            // Recovery cannot depend on refreshing the unusable source menu.
+            es.remove("a");
+            let resumed = LaunchRequest {
+                anchor_key: "launch:r13-g-forced-resume",
+                resume_key: Some(REAL),
+                model: Some("m2"),
+                model_is_explicit: true,
+                account_pref: None,
+                allow_move_for_model: false,
+            };
+            let placed = t.place_launch(resumed, &cs, &es, now);
+            if mode == Mode::Strict {
+                assert!(matches!(placed, Err(LaunchError::PolicyBlocked)));
+                assert_eq!(t.launch_info(REAL, now).unwrap().account, "a");
+            } else {
+                let placed = placed.unwrap();
+                assert_eq!(placed.account, "b");
+                assert_eq!(placed.effective_model.as_deref(), Some("m2"));
+                assert_eq!(placed.moves.len(), 1);
+                assert_eq!(placed.moves[0].reason, "forced");
+                assert!(placed.moves[0].is_placement);
+                assert_eq!(t.launch_info(SOURCE, now).unwrap().account, "b");
+            }
+        }
+    }
+
+    #[test]
+    fn r13_g_forced_resume_still_respects_outside_use_destination_veto() {
+        let (_home, t, mut cs, es) = fixture(Mode::Rebalance);
+        place(&t, &cs, &es);
+        t.resolve_launch(Some(SOURCE), Some(REAL), Utc::now())
+            .unwrap();
+        // D30 protects an existing dispatched session; an unstarted launch
+        // placement may still use an outside-used account as a last resort.
+        let lease = t.begin_request(Some(REAL), "a");
+        lease.receipt().dispatched();
+        drop(lease);
+        assert_eq!(t.capacity_source(Some(REAL)).as_deref(), Some("a"));
+        cs[0].account.health = Health::Cooling {
+            reason: crate::accounts::HealthReason::Quota,
+            until: Utc::now() + chrono::Duration::hours(4),
+            scope: "account".into(),
+        };
+        t.set_outside_use("b", true);
+        let resumed = LaunchRequest {
+            anchor_key: "launch:r13-g-outside-resume",
+            resume_key: Some(REAL),
+            model: Some("m2"),
+            model_is_explicit: true,
+            account_pref: None,
+            allow_move_for_model: false,
+        };
+        assert!(t.place_launch(resumed, &cs, &es, Utc::now()).is_err());
+        assert_eq!(t.launch_info(REAL, Utc::now()).unwrap().account, "a");
+    }
+
+    #[test]
+    fn r13_g_valid_launch_pin_renews_binding_before_prune_and_on_completion() {
+        for completion in [false, true] {
+            let (_home, t, cs, es) = fixture(Mode::Rebalance);
+            place(&t, &cs, &es);
+            t.resolve_launch(Some(SOURCE), Some(REAL), Utc::now())
+                .unwrap();
+            let registry = crate::launch_tokens::LaunchTokenRegistry::default();
+            let token = registry
+                .issue(crate::launch_tokens::LaunchMetadata {
+                    binding_anchor_key: SOURCE.into(),
+                    advertised_models: BTreeSet::new(),
+                })
+                .unwrap();
+            registry.bind_activity(&token, &t);
+            let pin = completion.then(|| registry.get_or_pin(token.expose_secret()).unwrap());
+            {
+                // Model the binding's start clock aging before the token's
+                // completion clock, without manufacturing a new binding.
+                let mut d = t.data.lock().unwrap();
+                d.launch_anchors.get_mut(SOURCE).unwrap().last_used =
+                    Utc::now() - chrono::Duration::days(2);
+                rebuild_retention(&mut d);
+                // Cross the real native capacity bound with synthetic indexed
+                // groups, then exercise the production pruning path below.
+                let template = d.bindings[REAL].clone();
+                let group_template = d.groups[REAL].clone();
+                for index in 0..CAPACITY {
+                    let key = format!("codex:r13-g-capacity-{index}");
+                    let mut binding = template.clone();
+                    binding.key = key.clone();
+                    d.snapshot_weight += binding_bound(&binding.key, &binding.account);
+                    d.bindings.insert(key.clone(), binding);
+                    let mut entry = group_template.clone();
+                    entry.keys = BTreeSet::from([key.clone()]);
+                    index_group(&mut d, key, entry);
+                }
+            }
+            if completion {
+                drop(pin);
+            } else {
+                drop(registry.get_or_pin(token.expose_secret()).unwrap());
+            }
+            {
+                let mut d = t.data.lock().unwrap();
+                assert!(d.bindings.len() > CAPACITY);
+                t.prune(&mut d, Utc::now());
+                assert!(d.bindings.len() <= CAPACITY);
+            }
+            let current = t
+                .resolve_launch(Some(SOURCE), Some(REAL), Utc::now())
+                .unwrap();
+            assert_eq!(current.account, "a");
+            assert_eq!(current.current_model.as_deref(), Some("m1"));
+        }
+    }
+
+    #[test]
+    fn r13_g_pin_renewal_is_nonblocking_and_cannot_revive_missing_or_retired_authority() {
+        let (_home, t, cs, es) = fixture(Mode::Rebalance);
+        place(&t, &cs, &es);
+        let registry = crate::launch_tokens::LaunchTokenRegistry::default();
+        let token = registry
+            .issue(crate::launch_tokens::LaunchMetadata {
+                binding_anchor_key: SOURCE.into(),
+                advertised_models: BTreeSet::new(),
+            })
+            .unwrap();
+        registry.bind_activity(&token, &t);
+        let gate = t.mutations.lock().unwrap();
+        // A blocking callback would deadlock this same-thread ownership test.
+        drop(registry.get_or_pin(token.expose_secret()).unwrap());
+        drop(gate);
+        let before = resolution_state(&t);
+        t.bind_launch_activity(
+            "launch:not-issued",
+            &Arc::new(std::sync::atomic::AtomicI64::new(
+                Utc::now().timestamp_millis(),
+            )),
+        );
+        assert_eq!(resolution_state(&t), before);
+        t.writes_stopped.store(true, Ordering::Release);
+        drop(registry.get_or_pin(token.expose_secret()).unwrap());
+        {
+            let mut d = t.data.lock().unwrap();
+            t.prune(&mut d, Utc::now());
+            assert!(
+                d.launch_activity.is_empty(),
+                "retired writer must not consume activity"
+            );
+        }
+        assert_eq!(resolution_state(&t), before);
+        t.writes_stopped.store(false, Ordering::Release);
+        {
+            let mut d = t.data.lock().unwrap();
+            discard_group(&mut d, SOURCE);
+        }
+        drop(registry.get_or_pin(token.expose_secret()).unwrap());
+        assert!(matches!(
+            t.resolve_launch(Some(SOURCE), None, Utc::now()),
+            Err(LaunchError::UnknownLaunch)
+        ));
+        assert!(matches!(
+            registry.get_or_pin(&"x".repeat(43)),
+            Err(crate::launch_tokens::LaunchTokenError::Missing)
+        ));
+    }
+
+    #[test]
+    fn r13_g_activity_published_during_binding_contention_survives_next_prune() {
+        for completion in [false, true] {
+            let (_home, t, cs, es) = fixture(Mode::Rebalance);
+            place(&t, &cs, &es);
+            t.resolve_launch(Some(SOURCE), Some(REAL), Utc::now())
+                .unwrap();
+            let registry = crate::launch_tokens::LaunchTokenRegistry::default();
+            let token = registry
+                .issue(crate::launch_tokens::LaunchMetadata {
+                    binding_anchor_key: SOURCE.into(),
+                    advertised_models: BTreeSet::new(),
+                })
+                .unwrap();
+            registry.bind_activity(&token, &t);
+            let pin = completion.then(|| registry.get_or_pin(token.expose_secret()).unwrap());
+            // Deterministically own BOTH locks before activity is published.
+            // The writer then immediately prunes with those same locks held.
+            let gate = t.mutations.lock().unwrap();
+            let mut d = t.data.lock().unwrap();
+            let old = Utc::now() - chrono::Duration::days(2);
+            d.launch_anchors.get_mut(SOURCE).unwrap().last_used = old;
+            rebuild_retention(&mut d);
+            d.launch_activity[SOURCE]
+                .stamp
+                .upgrade()
+                .unwrap()
+                .store(old.timestamp_millis(), Ordering::Release);
+            let acquired = if completion {
+                drop(pin);
+                None
+            } else {
+                Some(registry.get_or_pin(token.expose_secret()).unwrap())
+            };
+            t.prune(&mut d, Utc::now());
+            assert!(
+                d.launch_anchors.contains_key(SOURCE),
+                "contended pin activity must precede expiry"
+            );
+            assert_eq!(info(&d, SOURCE).unwrap().canonical_key, REAL);
+            assert_eq!(info(&d, SOURCE).unwrap().account, "a");
+            drop(d);
+            drop(gate);
+            drop(acquired);
+            assert_eq!(
+                t.resolve_launch(Some(SOURCE), Some(REAL), Utc::now())
+                    .unwrap()
+                    .current_model
+                    .as_deref(),
+                Some("m1")
+            );
         }
     }
 

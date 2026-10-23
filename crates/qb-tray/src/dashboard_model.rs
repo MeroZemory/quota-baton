@@ -1509,7 +1509,7 @@ pub fn reason(word: &str) -> &str {
         "auth" => crate::i18n::static_text("인증 확인 대기"),
         "store_error" => crate::i18n::static_text("저장 오류"),
         "overload" => crate::i18n::static_text("몰린 세션 나눔"),
-        "forced" => crate::i18n::static_text("쓸 수 없는 계정에서 전환"),
+        "forced" | "five_hour_far_move" => crate::i18n::static_text("쓸 수 없는 계정에서 전환"),
         "cold_rebalance" => crate::i18n::static_text("오래 쉬어 다시 배치"),
         "reset_hold_timeout" => crate::i18n::static_text("초기화를 기다렸지만 풀리지 않음"),
         "new" => crate::i18n::static_text("처음 배정"),

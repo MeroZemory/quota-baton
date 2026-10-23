@@ -1,5 +1,6 @@
 // Included once by m4a_ws.rs. The support directory avoids another Cargo target.
 mod r11_actual {
+    include!("r13_g_ws.inc.rs");
     use super::*;
     use axum::response::IntoResponse;
     use std::{collections::BTreeMap, sync::Mutex};
@@ -93,6 +94,15 @@ mod r11_actual {
         }
 
         async fn new_configured(count: usize, usage_base: Option<&str>, request_secs: u64) -> Self {
+            Self::new_with_upgrade_deadline(count, usage_base, request_secs, 2).await
+        }
+
+        async fn new_with_upgrade_deadline(
+            count: usize,
+            usage_base: Option<&str>,
+            request_secs: u64,
+            upgrade_secs: u64,
+        ) -> Self {
             let mut h =
                 Harness::new_with_options(count, false, false, Some((2, 3)), Some((5, 2))).await;
             // Reuse the synthetic homes, account import, WS recorder and serial
@@ -146,7 +156,8 @@ mod r11_actual {
                 config.routing.reset_hold_secs = 60;
             }
             config.routing.move_guard.trip_seconds = 4;
-            config.routing.ws_upgrade_hold_secs = 2;
+            // Callers keep the same validated WS bound as production (<15s).
+            config.routing.ws_upgrade_hold_secs = upgrade_secs;
             config.routing.rate_hold_secs = 2;
             config.routing.rate_hold_max_retries = 3;
             h.state = Arc::new(
