@@ -47,6 +47,11 @@ pub(super) enum Handoff {
     Account(String),
     Add,
 }
+struct PendingUrgency {
+    owner: u64,
+    id: String,
+    urgent: bool,
+}
 struct PendingGeometry {
     owner: u64,
     sequence: u64,
@@ -69,6 +74,8 @@ struct Control {
     geometry_revision: u64,
     saved_geometry: (u64, u64),
     handoff: Option<(u64, Handoff)>,
+    urgency_pending: Option<PendingUrgency>,
+    urgency_inflight: Option<u64>,
 }
 impl Default for Control {
     fn default() -> Self {
@@ -88,6 +95,8 @@ impl Default for Control {
             geometry_revision: 0,
             saved_geometry: (0, 0),
             handoff: None,
+            urgency_pending: None,
+            urgency_inflight: None,
         }
     }
 }
@@ -272,6 +281,54 @@ impl Coordinator {
         }
         ok
     }
+    // A mutation is consumed once, independently of polling intent/requeue.
+    // This method runs only on the existing asynchronous worker.
+    async fn update_urgency(&self) {
+        let admitted = {
+            let mut c = self.control.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(action) = c.urgency_pending.take() else {
+                return;
+            };
+            if self.stop.load(Ordering::Acquire) || c.urgency_inflight.is_some() {
+                return;
+            }
+            let Some(port) = c
+                .port
+                .as_ref()
+                .filter(|p| p.owner() == action.owner)
+                .cloned()
+            else {
+                return;
+            };
+            c.urgency_inflight = Some(action.owner);
+            (action, port)
+        };
+        let (action, port) = admitted;
+        port.urgency(qb_tray::state::UrgencyUpdate::Pending {
+            id: action.id.clone(),
+        });
+        let failed = match self.client() {
+            Ok(client) => client
+                .set_session_urgent(&action.id, action.urgent)
+                .await
+                .is_err(),
+            Err(_) => true,
+        };
+        {
+            let mut c = self.control.lock().unwrap_or_else(|e| e.into_inner());
+            c.urgency_inflight = None;
+            if c.port.as_ref().is_some_and(|p| p.owner() == action.owner) {
+                // An ambiguous response is never retried. Read authoritative
+                // state after either outcome, without changing query intent.
+                c.dirty |= SESSIONS | DETAIL;
+                self.changed.notify_one();
+            }
+        }
+        port.urgency(qb_tray::state::UrgencyUpdate::Finished {
+            id: action.id,
+            failed,
+        });
+    }
     pub(super) async fn run(self: Arc<Self>) {
         let mut cached: Option<Arc<model::DashboardSnapshot>> = None;
         let mut cached_owner = None;
@@ -301,6 +358,7 @@ impl Coordinator {
             if stopping {
                 break;
             }
+            self.update_urgency().await;
             let Some(mut work) = self.work() else {
                 cached = None;
                 cached_owner = None;
@@ -510,6 +568,7 @@ impl Bridge for Coordinator {
         }
         let mut c = self.control.lock().unwrap_or_else(|e| e.into_inner());
         let mut handoff = false;
+        let mut urgency_rejected = None;
         match event {
             Event::Opened { port } => {
                 c.intent = c.intent.saturating_add(1);
@@ -525,7 +584,31 @@ impl Bridge for Coordinator {
                 c.detail = None;
                 c.dirty = 0;
                 c.handoff = None;
+                c.urgency_pending = None;
                 self.open.store(false, Ordering::Release);
+            }
+            Event::Command {
+                owner,
+                command: Command::SetSessionUrgent { id, urgent },
+            } if c.port.as_ref().is_some_and(|p| p.owner() == owner) => {
+                if c.urgency_inflight.is_none()
+                    && c.urgency_pending.is_none()
+                    && id.len() == 64
+                    && id
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                {
+                    c.urgency_pending = Some(PendingUrgency { owner, id, urgent });
+                } else if c.urgency_inflight != Some(owner)
+                    && c.urgency_pending
+                        .as_ref()
+                        .is_none_or(|pending| pending.owner != owner)
+                    && let Some(port) = c.port.as_ref()
+                {
+                    // Another owner's POST cannot strand the reopened state.
+                    // Duplicates of this owner's current action stay pending.
+                    urgency_rejected = Some((port.clone(), id));
+                }
             }
             Event::Command { owner, command }
                 if c.port.as_ref().is_some_and(|p| p.owner() == owner) =>
@@ -557,6 +640,7 @@ impl Bridge for Coordinator {
                         c.handoff = Some((owner, Handoff::Add));
                         handoff = true;
                     }
+                    Command::SetSessionUrgent { .. } => unreachable!("handled before query work"),
                     Command::FocusSearch | Command::FocusEventSearch => {}
                 }
             }
@@ -586,6 +670,9 @@ impl Bridge for Coordinator {
             _ => return,
         }
         drop(c);
+        if let Some((port, id)) = urgency_rejected {
+            port.urgency(qb_tray::state::UrgencyUpdate::Finished { id, failed: true });
+        }
         self.changed.notify_one();
         if let Some(worker) = super::WORKER.get() {
             worker.refresh_interest();

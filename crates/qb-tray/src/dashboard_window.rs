@@ -788,6 +788,10 @@ fn apply_mail(hwnd: HWND) {
             h.clock_at = Instant::now();
             h.clock_reconcile = false;
         }
+        if let Some(update) = mail.urgency.take() {
+            h.state.apply_urgency_update(update);
+            changed = true;
+        }
         if let Some((ticket, detail)) = mail.detail.take() {
             h.state.publish_detail(&ticket, detail);
             changed = true;
@@ -2061,6 +2065,7 @@ fn teardown(hwnd: HWND) {
         h.renderer.clear_target_resources();
         h.target = None;
         let mut preferences = h.state.clone();
+        preferences.urgency_update = None;
         preferences.search.clear();
         preferences.event_search.clear();
         preferences.select(None);

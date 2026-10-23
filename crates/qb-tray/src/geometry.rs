@@ -21,6 +21,8 @@ pub enum Target {
     Sort(SortKey),
     Group(String),
     Session(String),
+    SessionUrgency(String),
+    SessionMoveNow(String),
     CloseDetail,
     DetailSurface,
     EventFilter(EventFilter),
@@ -1898,13 +1900,20 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
                 total += if g.rows.is_empty() {
                     32.
                 } else {
-                    g.rows.len() as f32 * 35.
+                    g.rows
+                        .iter()
+                        .map(|row| session_height(b, row, width(viewport) - 24., &v.clock))
+                        .sum()
                 };
             }
         }
         total + 12.
     } else {
-        v.flat.len() as f32 * 35. + 8.
+        v.flat
+            .iter()
+            .map(|row| session_height(b, row, width(viewport) - 22., &v.clock))
+            .sum::<f32>()
+            + 8.
     };
     let (old, offset) = b.begin_region(ScrollRegion::Table, viewport, content, s.table_offset);
     let mut ry = viewport.top - offset;
@@ -2063,7 +2072,11 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
                     } else if group.rows.is_empty() {
                         32.
                     } else {
-                        group.rows.len() as f32 * 35.
+                        group
+                            .rows
+                            .iter()
+                            .map(|row| session_height(b, row, width(viewport) - 24., &v.clock))
+                            .sum()
                     };
                     let box_rect = rect(
                         viewport.left + 11.,
@@ -2154,23 +2167,26 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
                             );
                         } else {
                             for (index, row) in group.rows.iter().enumerate() {
+                                let row_height =
+                                    session_height(b, row, width(box_rect) - 2., &v.clock);
                                 session(
                                     b,
                                     row,
-                                    rect(box_rect.left + 1., ry, width(box_rect) - 2., 35.),
+                                    rect(box_rect.left + 1., ry, width(box_rect) - 2., row_height),
                                     &columns,
                                     Some(format!("group:{}", group.id)),
+                                    &v.clock,
                                 );
                                 if index + 1 < group.rows.len() {
                                     b.line(
-                                        [box_rect.left + 1., ry + 34.5],
-                                        [box_rect.right - 1., ry + 34.5],
+                                        [box_rect.left + 1., ry + row_height - 0.5],
+                                        [box_rect.right - 1., ry + row_height - 0.5],
                                         Color::Border,
                                         1.,
                                         None,
                                     );
                                 }
-                                ry += 35.;
+                                ry += row_height;
                             }
                         }
                     }
@@ -2197,14 +2213,16 @@ fn sessions(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card:
                 }
             } else {
                 for row in &v.flat {
+                    let row_height = session_height(b, row, width(viewport) - 22., &v.clock);
                     session(
                         b,
                         row,
-                        rect(viewport.left + 11., ry, width(viewport) - 22., 35.),
+                        rect(viewport.left + 11., ry, width(viewport) - 22., row_height),
                         &columns,
                         None,
+                        &v.clock,
                     );
-                    ry += 35.;
+                    ry += row_height;
                 }
             }
         }
@@ -2601,20 +2619,275 @@ fn bar_color(p: u8) -> Color {
         Color::BarCritical
     }
 }
+// One measured layout is used for scroll extents, paint, pointer and UIA bounds.
+#[derive(Clone, Copy)]
+enum SessionControl {
+    Urgency,
+    Waiting,
+    Move,
+    Feedback,
+}
+fn session_control_layout(
+    b: &mut Builder<'_>,
+    row: &m::SessionRow,
+    available: f32,
+    clock: &m::Clock,
+) -> Vec<(SessionControl, Rect, String)> {
+    if row.routing.is_none() && row.quota_wait.is_none() {
+        return vec![];
+    }
+    let mut parts = vec![(
+        SessionControl::Urgency,
+        crate::i18n::static_text(if row.routing.is_some() {
+            "긴급"
+        } else {
+            "긴급 설정 확인 전"
+        })
+        .to_string(),
+    )];
+    if !row.quota_wait_known {
+        parts.push((
+            SessionControl::Waiting,
+            crate::i18n::static_text("5시간 대기 상태 확인 전").into(),
+        ));
+    } else if let Some(wait) = &row.quota_wait {
+        parts.push((
+            SessionControl::Waiting,
+            crate::i18n::format("초기화 {0}까지 대기", &[clock.time(Some(wait.reset_at))]),
+        ));
+        parts.push((
+            SessionControl::Move,
+            crate::i18n::static_text("지금 옮기기").into(),
+        ));
+    }
+    if row.urgency_pending {
+        parts.push((
+            SessionControl::Feedback,
+            crate::i18n::static_text("긴급 설정 저장 중").into(),
+        ));
+    } else if row.urgency_failed {
+        parts.push((
+            SessionControl::Feedback,
+            crate::i18n::static_text("긴급 설정 저장 실패").into(),
+        ));
+    }
+    let available = (available - 24.).max(1.);
+    let mut x = 12.;
+    let mut y = 35.;
+    let mut line_height: f32 = 0.;
+    let mut result = vec![];
+    for (kind, label) in parts {
+        let (size, padding) = match kind {
+            SessionControl::Urgency => (13., 36.),
+            SessionControl::Move => (13., 16.),
+            _ => (12., 0.),
+        };
+        let w = (b.measured_width(&label, size, false) + padding).min(available);
+        let h = (b.measured_height(&label, (w - padding).max(1.), size, false) + 10.).max(28.);
+        if x > 12. && x + w > available + 12. {
+            x = 12.;
+            y += line_height + 4.;
+            line_height = 0.;
+        }
+        result.push((kind, rect(x, y, w, h), label));
+        x += w + 10.;
+        line_height = line_height.max(h);
+    }
+    result
+}
+fn session_height(
+    b: &mut Builder<'_>,
+    row: &m::SessionRow,
+    available: f32,
+    clock: &m::Clock,
+) -> f32 {
+    session_control_layout(b, row, available, clock)
+        .iter()
+        .map(|(_, r, _)| r.bottom + 5.)
+        .fold(35., f32::max)
+}
+fn session_controls(b: &mut Builder<'_>, row: &m::SessionRow, row_rect: Rect, clock: &m::Clock) {
+    for (kind, local, label) in session_control_layout(b, row, width(row_rect), clock) {
+        let r = rect(
+            row_rect.left + local.left,
+            row_rect.top + local.top,
+            width(local),
+            height(local),
+        );
+        let (target, role, selected, enabled, reason) = match kind {
+            SessionControl::Urgency => (
+                Some(Target::SessionUrgency(row.id.clone())),
+                Role::Checkbox,
+                row.routing.as_ref().is_some_and(m::SessionRouting::urgent),
+                row.urgency_enabled,
+                if row.routing.is_none() {
+                    "긴급 설정 확인 전"
+                } else if row.urgency_pending {
+                    "긴급 설정 저장 중"
+                } else if !row.urgency_enabled {
+                    "새로고침 또는 다른 긴급 설정 처리를 기다려 주세요"
+                } else {
+                    "5시간 한도에서 다른 계정을 찾습니다. 고정·캐시·이동 제한은 그대로 적용됩니다"
+                },
+            ),
+            SessionControl::Move => {
+                let strict = row.routing.as_ref().is_some_and(|r| r.mode == "strict");
+                let urgent = row.routing.as_ref().is_some_and(m::SessionRouting::urgent);
+                (
+                    Some(Target::SessionMoveNow(row.id.clone())),
+                    Role::Button,
+                    false,
+                    row.urgency_enabled && !strict && !urgent,
+                    if strict {
+                        "계정 고정 정책에서는 지금 옮길 수 없습니다"
+                    } else if urgent {
+                        "이미 긴급으로 설정되어 있습니다. 실제 이동에는 기존 제한이 적용됩니다"
+                    } else if !row.urgency_enabled {
+                        "새로고침 또는 다른 긴급 설정 처리를 기다려 주세요"
+                    } else {
+                        "세션을 긴급으로 설정합니다. 실제 계정 이동을 보장하지 않습니다"
+                    },
+                )
+            }
+            SessionControl::Waiting | SessionControl::Feedback => {
+                let key = if matches!(kind, SessionControl::Waiting) {
+                    "waiting"
+                } else {
+                    "urgency-feedback"
+                };
+                b.semantic(
+                    format!("session:{}:{key}", row.id),
+                    Some(format!("session:{}", row.id)),
+                    Role::Text,
+                    label.clone(),
+                    r,
+                    None,
+                );
+                b.text(
+                    rect(r.left, r.top + 5., width(r), height(r) - 6.),
+                    label,
+                    12.,
+                    false,
+                    if row.urgency_failed && matches!(kind, SessionControl::Feedback) {
+                        Color::Bad
+                    } else {
+                        Color::Secondary
+                    },
+                    true,
+                );
+                if matches!(kind, SessionControl::Feedback) && row.urgency_failed {
+                    b.tooltip(
+                        r,
+                        crate::i18n::static_text(
+                            "긴급 설정을 저장하지 못했습니다. 새로고침한 뒤 다시 시도하세요",
+                        )
+                        .into(),
+                    );
+                }
+                continue;
+            }
+        };
+        let enabled = enabled && b.enabled;
+        let tip = crate::i18n::static_text(reason).to_string();
+        if let (Some(hit), Some(target)) = (intersection(r, b.clip), target) {
+            let idx = b.semantic(
+                format!("session:{}:{target:?}", row.id),
+                Some(format!("session:{}", row.id)),
+                role,
+                label.clone(),
+                hit,
+                Some(target.clone()),
+            );
+            b.scene.accessibility[idx].selected = selected;
+            b.scene.accessibility[idx].enabled = enabled;
+            if role == Role::Checkbox {
+                b.scene.accessibility[idx].value = Some(
+                    crate::i18n::static_text(if row.routing.is_none() {
+                        "확인 전"
+                    } else if selected {
+                        "켜짐"
+                    } else {
+                        "꺼짐"
+                    })
+                    .into(),
+                );
+            }
+            b.scene.targets.push(HitTarget {
+                rect: hit,
+                target,
+                enabled,
+                tooltip: Some(tip.clone()),
+            });
+        }
+        b.tooltip(r, tip);
+        if !enabled {
+            b.scene.draw.push(Draw::Alpha(0.5));
+        }
+        b.fill(r, Color::Surface, 4.);
+        b.stroke(r, Color::Border, 1., 4.);
+        let padding = if role == Role::Checkbox {
+            let check = rect(r.left + 6., r.top + 7., 14., 14.);
+            if selected {
+                b.fill(check, Color::Accent, 2.);
+                b.text_face(
+                    check,
+                    "\u{e73e}",
+                    12.,
+                    false,
+                    Color::OnAccent,
+                    false,
+                    Face::Icon,
+                    TextAlign::Center,
+                );
+            } else {
+                b.stroke(check, Color::Secondary, 1., 2.);
+                if row.routing.is_none() {
+                    b.line(
+                        [check.left + 3., check.top + 7.],
+                        [check.right - 3., check.top + 7.],
+                        Color::Secondary,
+                        1.,
+                        None,
+                    );
+                }
+            }
+            28.
+        } else {
+            8.
+        };
+        b.text(
+            rect(
+                r.left + padding,
+                r.top + 5.,
+                (width(r) - padding - 8.).max(1.),
+                height(r) - 6.,
+            ),
+            label,
+            13.,
+            false,
+            Color::Text,
+            true,
+        );
+        if !enabled {
+            b.scene.draw.push(Draw::Alpha(1.));
+        }
+    }
+}
 fn session(
     b: &mut Builder<'_>,
     row: &m::SessionRow,
     r: Rect,
     columns: &[(SortKey, &str, f32)],
     parent: Option<String>,
+    clock: &m::Clock,
 ) {
     b.scene.session_rows.push(SessionGeometry {
         id: row.id.clone(),
         rect: r,
     });
-    b.tooltip(rect(r.left + 12., r.top, 16., height(r)), row.dot.clone());
+    b.tooltip(rect(r.left + 12., r.top, 16., 35.), row.dot.clone());
     b.tooltip(
-        rect(r.left + 28., r.top, 268., height(r)),
+        rect(r.left + 28., r.top, 268., 35.),
         row.label_source.clone(),
     );
     let key = format!("session:{}", row.id);
@@ -2774,6 +3047,7 @@ fn session(
         }
         x += *cw;
     }
+    session_controls(b, row, r, clock);
 }
 fn recent(b: &mut Builder<'_>, v: &m::DashboardView, s: &DashboardState, card: Rect) {
     b.card(card);
@@ -3401,5 +3675,156 @@ mod r16_stable_key_tests {
             assert_eq!(detail_fact_key("Last activity"), "마지막 활동");
             assert_eq!(detail_fact_key("Rate-limit wait"), "속도 조절 대기");
         });
+    }
+}
+
+#[cfg(test)]
+mod n5c_session_control_tests {
+    use super::*;
+    fn fixture(mode: &str) -> (m::DashboardSnapshot, DashboardState, m::Clock, String) {
+        let mut snapshot = crate::dashboard_fixtures::snapshot();
+        snapshot.sessions.sessions.truncate(1);
+        let row = &mut snapshot.sessions.sessions[0];
+        row.routing = Some(m::SessionRouting {
+            action_id: "a".repeat(64),
+            on_5h_limit: "wait".into(),
+            mode: mode.into(),
+        });
+        row.quota_wait = Some(m::QuotaWait {
+            reset_at: crate::dashboard_fixtures::clock().utc() + chrono::Duration::minutes(5),
+            waiting: 1,
+        });
+        row.quota_wait_known = true;
+        let id = row.id.clone();
+        (
+            snapshot,
+            DashboardState {
+                grouped: false,
+                range: Range::All,
+                ..Default::default()
+            },
+            crate::dashboard_fixtures::clock(),
+            id,
+        )
+    }
+    #[test]
+    fn n5c_session_actions_share_whole_painted_hit_and_uia_rects_in_both_languages() {
+        for lang in [crate::i18n::UiLanguage::Ko, crate::i18n::UiLanguage::En] {
+            crate::i18n::with_language(lang, || {
+                for size in [[1024., 640.], [1320., 900.]] {
+                    let (snapshot, mut state, clock, id) = fixture("recover");
+                    let view = m::project(&snapshot, &mut state, &clock);
+                    let scene = Scene::build(&view, &state, size, &Metrics::default());
+                    for (target, role, label) in [
+                        (
+                            Target::SessionUrgency(id.clone()),
+                            Role::Checkbox,
+                            crate::i18n::static_text("긴급"),
+                        ),
+                        (
+                            Target::SessionMoveNow(id.clone()),
+                            Role::Button,
+                            crate::i18n::static_text("지금 옮기기"),
+                        ),
+                    ] {
+                        let hit = scene
+                            .targets
+                            .iter()
+                            .find(|h| h.target == target)
+                            .expect("visible action target");
+                        let node = scene
+                            .accessibility
+                            .iter()
+                            .find(|n| n.target.as_ref() == Some(&target))
+                            .unwrap();
+                        assert!(hit.enabled && node.enabled);
+                        assert_eq!(hit.rect, node.rect);
+                        assert_eq!(node.role, role);
+                        assert_eq!(node.name, label);
+                        assert!(width(hit.rect) > 16. && height(hit.rect) >= 28.);
+                        assert!(
+                            scene
+                                .draw
+                                .iter()
+                                .any(|d| matches!(d,Draw::Stroke{rect,..} if *rect==hit.rect)),
+                            "painted border and hit/UIA use the same whole box"
+                        );
+                        for [x, y] in [
+                            [hit.rect.left + 1., hit.rect.top + 1.],
+                            [hit.rect.right - 1., hit.rect.bottom - 1.],
+                        ] {
+                            assert_eq!(
+                                scene.hit_test(x, y),
+                                Some(&target),
+                                "row selection must not swallow action edges"
+                            );
+                        }
+                        assert!(scene.focus_order().contains(&&target));
+                    }
+                    let command = state.activate(&Target::SessionMoveNow(id));
+                    assert_eq!(
+                        command,
+                        vec![Command::SetSessionUrgent {
+                            id: "a".repeat(64),
+                            urgent: true
+                        }]
+                    );
+                    assert!(state.selected.is_none());
+                }
+            });
+        }
+    }
+    #[test]
+    fn n5c_strict_and_pending_controls_block_row_fallthrough_and_expose_safe_tooltips() {
+        let (snapshot, mut state, clock, id) = fixture("strict");
+        let view = m::project(&snapshot, &mut state, &clock);
+        let scene = Scene::build(&view, &state, [1024., 640.], &Metrics::default());
+        let move_target = Target::SessionMoveNow(id.clone());
+        let hit = scene
+            .targets
+            .iter()
+            .find(|h| h.target == move_target)
+            .unwrap();
+        assert!(!hit.enabled);
+        assert!(
+            scene
+                .hit_test(hit.rect.left + 1., hit.rect.top + 1.)
+                .is_none()
+        );
+        assert_eq!(
+            scene.tooltip_at(hit.rect.left + 1., hit.rect.top + 1.),
+            Some(crate::i18n::static_text(
+                "계정 고정 정책에서는 지금 옮길 수 없습니다"
+            ))
+        );
+        assert!(state.activate(&move_target).is_empty());
+        assert_eq!(
+            state.activate(&Target::SessionUrgency(id.clone())),
+            vec![Command::SetSessionUrgent {
+                id: "a".repeat(64),
+                urgent: true
+            }]
+        );
+        let view = m::project(&snapshot, &mut state, &clock);
+        let scene = Scene::build(&view, &state, [1024., 640.], &Metrics::default());
+        assert!(
+            scene
+                .targets
+                .iter()
+                .filter(|h| matches!(
+                    h.target,
+                    Target::SessionUrgency(_) | Target::SessionMoveNow(_)
+                ))
+                .all(|h| !h.enabled)
+        );
+        let check = scene
+            .accessibility
+            .iter()
+            .find(|n| n.target == Some(Target::SessionUrgency(id.clone())))
+            .unwrap();
+        assert!(
+            !check.selected,
+            "pending does not optimistically check the preference"
+        );
     }
 }

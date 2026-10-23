@@ -21,6 +21,10 @@ struct State {
     credits: BTreeMap<AccountId, bool>,
     incomplete: BTreeSet<SessionId>,
     membership_generation: u64,
+    routing_revision: Option<u64>,
+    quota_waits: BTreeMap<u64, QuotaWaitEntry>,
+    quota_wait_next: u64,
+    quota_wait_complete: bool,
 }
 #[derive(Clone, PartialEq, Eq)]
 struct AccountFacts {
@@ -48,6 +52,30 @@ pub struct Runtime {
 pub(crate) struct Archive {
     pub activity: Option<ActivityLog>,
     pub usage: Option<UsageHistory>,
+}
+const QUOTA_WAIT_CAP: usize = 4096;
+struct QuotaWaitEntry {
+    session: SessionId,
+    account: AccountId,
+    reset_at: DateTime<Utc>,
+    deadline: Instant,
+}
+/// Visibility lifetime only: never owns a receipt, caller guard or binding lease.
+pub(crate) struct QuotaWaitGuard {
+    runtime: Weak<Runtime>,
+    id: u64,
+}
+impl Drop for QuotaWaitGuard {
+    fn drop(&mut self) {
+        let Some(runtime) = self.runtime.upgrade() else {
+            return;
+        };
+        if let Some(mut state) = runtime.writable()
+            && let Some(wait) = state.quota_waits.remove(&self.id)
+        {
+            state.model.notify_changed(&wait.session);
+        }
+    }
 }
 pub struct RequestGuard {
     runtime: Arc<Runtime>,
@@ -162,6 +190,10 @@ impl Runtime {
                 credits: BTreeMap::new(),
                 incomplete: BTreeSet::new(),
                 membership_generation: 0,
+                routing_revision: None,
+                quota_waits: BTreeMap::new(),
+                quota_wait_next: 0,
+                quota_wait_complete: true,
             }),
             bindings: Mutex::new(Weak::new()),
             events: Mutex::new(None),
@@ -835,23 +867,146 @@ impl Runtime {
             });
         }
     }
+    /// Called only after the native wait engine has admitted its fixed envelope.
+    pub(crate) fn quota_wait(
+        self: &Arc<Self>,
+        key: &str,
+        source: &str,
+        reset_at: DateTime<Utc>,
+        deadline: tokio::time::Instant,
+    ) -> Option<QuotaWaitGuard> {
+        if key.is_empty() || source.is_empty() {
+            return None;
+        }
+        let now = Utc::now();
+        if reset_at <= now || deadline <= tokio::time::Instant::now() {
+            return None;
+        }
+        let row = self.table()?.dashboard_quota_wait_row(key, source)?;
+        let session = row.id.clone();
+        let account = row.account.clone();
+        let mut state = self.writable()?;
+        Self::prune_quota_waits(&mut state, now, Instant::now());
+        let Some(id) = state.quota_wait_next.checked_add(1) else {
+            state.quota_wait_complete = false;
+            state.model.resync = true;
+            return None;
+        };
+        if state.quota_waits.len() >= QUOTA_WAIT_CAP {
+            state.quota_wait_complete = false;
+            state.model.resync = true;
+            return None;
+        }
+        if state.model.upsert_binding(row, now).is_err() {
+            state.quota_wait_complete = false;
+            state.model.resync = true;
+            return None;
+        }
+        state.membership_generation = state.membership_generation.saturating_add(1);
+        state.quota_wait_next = id;
+        state.quota_waits.insert(
+            id,
+            QuotaWaitEntry {
+                session: session.clone(),
+                account,
+                reset_at,
+                deadline: deadline.into_std(),
+            },
+        );
+        state.model.notify_changed(&session);
+        Some(QuotaWaitGuard {
+            runtime: Arc::downgrade(self),
+            id,
+        })
+    }
+    fn prune_quota_waits(state: &mut State, now: DateTime<Utc>, mono: Instant) {
+        let expired: Vec<_> = state
+            .quota_waits
+            .iter()
+            .filter(|(_, w)| w.reset_at <= now || w.deadline <= mono)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in expired {
+            if let Some(wait) = state.quota_waits.remove(&id) {
+                state.model.notify_changed(&wait.session);
+            }
+        }
+    }
+    fn enrich_sessions(&self, rows: &mut [SessionSummary]) {
+        // Binding/policy reads finish before taking dashboard state. There is
+        // no dashboard -> Data nested lock and no policy-thread callback.
+        let routing = self
+            .table()
+            .map(|table| table.dashboard_routing_snapshot())
+            .unwrap_or_default();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let live = !self.frozen.load(Ordering::Acquire);
+        if live {
+            Self::prune_quota_waits(&mut state, Utc::now(), Instant::now());
+        }
+        // Identity adoption/movement during a wait must not turn an unmatched
+        // live token into a fabricated zero on the new canonical row.
+        let complete = live
+            && state.quota_wait_complete
+            && state.quota_waits.values().all(|wait| {
+                routing
+                    .get(&wait.session)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|(account, _)| account == &wait.account)
+            });
+        let mut totals: BTreeMap<(SessionId, AccountId), QuotaWaitView> = BTreeMap::new();
+        if complete {
+            for wait in state.quota_waits.values() {
+                let key = (wait.session.clone(), wait.account.clone());
+                totals
+                    .entry(key)
+                    .and_modify(|view| {
+                        view.waiting += 1; // Bounded by QUOTA_WAIT_CAP.
+                        view.reset_at = view.reset_at.min(wait.reset_at);
+                    })
+                    .or_insert(QuotaWaitView {
+                        waiting: 1,
+                        reset_at: wait.reset_at,
+                    });
+            }
+        }
+        for row in rows {
+            row.routing = routing
+                .get(&row.id)
+                .and_then(Option::as_ref)
+                .filter(|(account, _)| account == &row.account)
+                .map(|(_, routing)| routing.clone());
+            row.quota_wait_known = complete && row.routing.is_some();
+            row.quota_wait = if row.quota_wait_known {
+                totals.get(&(row.id.clone(), row.account.clone())).cloned()
+            } else {
+                None
+            };
+        }
+    }
     pub fn sessions(&self, range: SessionRange) -> SessionsView {
         self.sync();
         self.queue_lookups();
-        self.state
+        let mut view = self
+            .state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .model
-            .sessions(range, Utc::now())
+            .sessions(range, Utc::now());
+        self.enrich_sessions(&mut view.sessions);
+        view
     }
     pub fn detail(&self, id: &SessionId) -> Option<SessionDetail> {
         self.sync();
         self.queue_lookups();
-        self.state
+        let mut detail = self
+            .state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .model
-            .detail(id, Utc::now())
+            .detail(id, Utc::now())?;
+        self.enrich_sessions(std::slice::from_mut(&mut detail.session));
+        Some(detail)
     }
     pub fn activity_page(
         &self,
@@ -888,10 +1043,19 @@ impl Runtime {
             *last = Instant::now();
         }
         self.sync();
+        // Policy publication can be independent of binding membership. GETs
+        // enrich synchronously; the existing tick asks streaming clients to
+        // refetch without adding a callback/lock edge on policy writers.
+        let revision = self.table().map(|table| table.policies.plan(None).revision);
         let changes = {
             let Some(mut state) = self.writable() else {
                 return;
             };
+            if state.routing_revision != revision {
+                state.routing_revision = revision;
+                state.model.resync = true;
+            }
+            Self::prune_quota_waits(&mut state, Utc::now(), Instant::now());
             state.activity.prune(Utc::now());
             state.usage.advance(Utc::now());
             state.model.take_changes(self.millis())
@@ -963,6 +1127,165 @@ pub fn request_outcome(outcome: &str) -> RequestOutcome {
 
 #[cfg(test)]
 mod tests {
+    fn n5c_ui_fixture() -> (tempfile::TempDir, Arc<BindingTable>, Arc<Runtime>) {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.sandbox/r13-part-c/n5c-ui-fixtures");
+        std::fs::create_dir_all(&root).unwrap();
+        let home = tempfile::tempdir_in(root).unwrap();
+        let config = crate::config::Config::default();
+        let table = BindingTable::new(home.path(), config.routing.clone()).unwrap();
+        table
+            .import(serde_json::json!({"schema":1,"bindings":[{
+                "key":"codex:synthetic-ui-root", "account":"cx-abc123", "last_used":Utc::now()
+            }]}))
+            .unwrap();
+        let runtime = Runtime::new();
+        runtime.attach(&table, &config);
+        (home, table, runtime)
+    }
+
+    #[test]
+    fn n5c_ui_actual_routing_projection_refreshes_without_ledger_or_binding_change() {
+        let (_home, table, runtime) = n5c_ui_fixture();
+        let key = "codex:synthetic-ui-root";
+        let id = SessionId::from_key(key);
+        let before = runtime.detail(&id).unwrap();
+        let authority = before.session.routing.unwrap();
+        assert_eq!(authority.action_id, crate::routing::session_id(key));
+        assert_eq!(authority.action_id.len(), 64);
+        assert_eq!(id.as_str().len(), 12);
+        assert_eq!(authority.on_5h_limit, crate::routing::On5hLimit::Wait);
+        table
+            .set_routing_session_urgent(&authority.action_id, crate::routing::On5hLimit::Move)
+            .unwrap();
+        let after = runtime.detail(&id).unwrap();
+        assert_eq!(
+            after.session.routing.unwrap().on_5h_limit,
+            crate::routing::On5hLimit::Move
+        );
+        assert_eq!(after.session.account.as_str(), "cx-abc123");
+        assert_eq!(after.session.id, id);
+        assert!(after.session.quota_wait_known);
+        assert!(after.session.quota_wait.is_none());
+        assert!(after.session.pacing_wait.is_none());
+        let wire = serde_json::to_string(&runtime.sessions(SessionRange::All)).unwrap();
+        assert!(
+            !wire.contains(key),
+            "projection must not expose raw session key"
+        );
+    }
+
+    #[test]
+    fn n5c_ui_wait_guard_counts_distinct_lifetimes_and_keeps_fixed_resets() {
+        let (_home, _table, runtime) = n5c_ui_fixture();
+        let key = "codex:synthetic-ui-root";
+        let id = SessionId::from_key(key);
+        let reset = Utc::now() + chrono::Duration::minutes(2);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        assert!(
+            runtime
+                .quota_wait(key, "cx-def456", reset, deadline)
+                .is_none()
+        );
+        let first = runtime
+            .quota_wait(key, "cx-abc123", reset, deadline)
+            .unwrap();
+        let second = runtime
+            .quota_wait(
+                key,
+                "cx-abc123",
+                reset + chrono::Duration::seconds(10),
+                deadline,
+            )
+            .unwrap();
+        let view = runtime.detail(&id).unwrap().session;
+        assert_eq!(
+            view.quota_wait.unwrap(),
+            QuotaWaitView {
+                waiting: 2,
+                reset_at: reset
+            }
+        );
+        assert!(view.pacing_wait.is_none());
+        drop(first);
+        assert_eq!(
+            runtime.detail(&id).unwrap().session.quota_wait.unwrap(),
+            QuotaWaitView {
+                waiting: 1,
+                reset_at: reset + chrono::Duration::seconds(10)
+            }
+        );
+        drop(second);
+        assert!(runtime.detail(&id).unwrap().session.quota_wait.is_none());
+        assert!(runtime.state.lock().unwrap().quota_waits.is_empty());
+    }
+
+    #[test]
+    fn n5c_ui_wait_guard_expiry_never_resurrects_and_ids_fail_closed() {
+        let (_home, _table, runtime) = n5c_ui_fixture();
+        let key = "codex:synthetic-ui-root";
+        let reset = Utc::now() + chrono::Duration::minutes(2);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let guard = runtime
+            .quota_wait(key, "cx-abc123", reset, deadline)
+            .unwrap();
+        {
+            let mut state = runtime.state.lock().unwrap();
+            Runtime::prune_quota_waits(&mut state, reset, Instant::now());
+            assert!(state.quota_waits.is_empty());
+            state.quota_wait_next = u64::MAX;
+        }
+        assert!(
+            runtime
+                .quota_wait(key, "cx-abc123", reset, deadline)
+                .is_none()
+        );
+        drop(guard);
+        let view = runtime.detail(&SessionId::from_key(key)).unwrap().session;
+        assert!(!view.quota_wait_known);
+        assert!(view.quota_wait.is_none());
+        assert!(runtime.state.lock().unwrap().quota_waits.is_empty());
+    }
+
+    #[test]
+    fn n5c_ui_wait_capacity_marks_unknown_sticky_instead_of_partial_zero() {
+        let (_home, _table, runtime) = n5c_ui_fixture();
+        let key = "codex:synthetic-ui-root";
+        let id = SessionId::from_key(key);
+        let reset = Utc::now() + chrono::Duration::minutes(2);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        {
+            let mut state = runtime.state.lock().unwrap();
+            // Pure bounded-owner capacity fixture, not quota proof authority.
+            for n in 1..=QUOTA_WAIT_CAP as u64 {
+                state.quota_waits.insert(
+                    n,
+                    QuotaWaitEntry {
+                        session: id.clone(),
+                        account: "cx-abc123".to_owned().try_into().unwrap(),
+                        reset_at: reset,
+                        deadline: deadline.into_std(),
+                    },
+                );
+            }
+            state.quota_wait_next = QUOTA_WAIT_CAP as u64;
+        }
+        assert!(
+            runtime
+                .quota_wait(key, "cx-abc123", reset, deadline)
+                .is_none()
+        );
+        let view = runtime.detail(&id).unwrap().session;
+        assert!(!view.quota_wait_known);
+        assert!(view.quota_wait.is_none());
+        assert_eq!(
+            runtime.state.lock().unwrap().quota_waits.len(),
+            QUOTA_WAIT_CAP
+        );
+        runtime.state.lock().unwrap().quota_waits.clear();
+        assert!(!runtime.detail(&id).unwrap().session.quota_wait_known);
+    }
+
     #[test]
     fn r13_forecast_runtime_rejects_future_and_restarts_cold() {
         let runtime = super::Runtime::new();

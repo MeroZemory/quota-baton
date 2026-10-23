@@ -1,6 +1,6 @@
 //! Pure dashboard preferences and navigation. No native calls or I/O.
 use crate::{
-    dashboard_model::{EventRow, SessionDetail},
+    dashboard_model::{EventRow, Session, SessionDetail, SessionRouting, valid_routing_action_id},
     geometry::Target,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -146,6 +146,18 @@ pub enum Command {
     OpenTrayAdd,
     FocusSearch,
     FocusEventSearch,
+    SetSessionUrgent { id: String, urgent: bool },
+}
+/// One serial mutation lane; acknowledgements do not assert that an account moved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UrgencyUpdate {
+    Pending { id: String },
+    Finished { id: String, failed: bool },
+}
+#[derive(Clone, Debug)]
+pub(crate) struct SessionAction {
+    routing: SessionRouting,
+    waiting: bool,
 }
 #[derive(Clone, Debug, Default)]
 pub struct Freeze {
@@ -203,6 +215,8 @@ pub struct DashboardState {
     pub group_orders: BTreeMap<String, Freeze>,
     pub group_headers: Freeze,
     pub(crate) generation: u64,
+    pub urgency_update: Option<UrgencyUpdate>,
+    pub(crate) session_actions: BTreeMap<String, SessionAction>,
 }
 impl Default for DashboardState {
     fn default() -> Self {
@@ -232,10 +246,89 @@ impl Default for DashboardState {
             group_orders: Default::default(),
             group_headers: Default::default(),
             generation: 0,
+            urgency_update: None,
+            session_actions: BTreeMap::new(),
         }
     }
 }
 impl DashboardState {
+    pub fn apply_urgency_update(&mut self, update: UrgencyUpdate) {
+        let id = match &update {
+            UrgencyUpdate::Pending { id } | UrgencyUpdate::Finished { id, .. } => id,
+        };
+        if !valid_routing_action_id(id) {
+            return;
+        }
+        match &update {
+            UrgencyUpdate::Pending { .. } => {
+                if matches!(&self.urgency_update, Some(UrgencyUpdate::Pending { id: current }) if current != id)
+                {
+                    return;
+                }
+                self.urgency_update = Some(update);
+            }
+            UrgencyUpdate::Finished { failed, .. } => {
+                if !matches!(&self.urgency_update, Some(UrgencyUpdate::Pending { id: current }) if current == id)
+                {
+                    return;
+                }
+                self.urgency_update = if *failed { Some(update) } else { None };
+            }
+        }
+    }
+    pub(crate) fn refresh_session_actions(&mut self, sessions: &[Session], available: bool) {
+        self.session_actions.clear();
+        // Bounded like the policy store. Duplicated display IDs are ambiguous.
+        if !available || sessions.len() > 20_000 {
+            return;
+        }
+        let mut seen = BTreeSet::new();
+        for session in sessions {
+            if !seen.insert(session.id.as_str()) {
+                self.session_actions.remove(&session.id);
+                continue;
+            }
+            if session.id.len() != 12
+                || !session
+                    .id
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                continue;
+            }
+            if let Some(routing) = session.routing.as_ref().filter(|r| r.usable()) {
+                self.session_actions.insert(
+                    session.id.clone(),
+                    SessionAction {
+                        routing: routing.clone(),
+                        waiting: session.quota_wait_known
+                            && session.quota_wait.as_ref().is_some_and(|w| w.waiting > 0),
+                    },
+                );
+            }
+        }
+    }
+    pub(crate) fn session_urgency_enabled(&self, row_id: &str) -> bool {
+        !matches!(self.urgency_update, Some(UrgencyUpdate::Pending { .. }))
+            && self.session_actions.contains_key(row_id)
+    }
+    fn session_urgent_command(&mut self, row_id: &str, move_now: bool) -> Vec<Command> {
+        if !self.session_urgency_enabled(row_id) {
+            return vec![];
+        }
+        let Some(action) = self.session_actions.get(row_id) else {
+            return vec![];
+        };
+        if move_now
+            && (!action.waiting || action.routing.mode == "strict" || action.routing.urgent())
+        {
+            return vec![];
+        }
+        let urgent = move_now || !action.routing.urgent();
+        let id = action.routing.action_id.clone();
+        self.urgency_update = Some(UrgencyUpdate::Pending { id: id.clone() });
+        vec![Command::SetSessionUrgent { id, urgent }]
+    }
     pub fn select(&mut self, id: Option<String>) -> Option<DetailTicket> {
         self.generation = self
             .generation
@@ -344,6 +437,8 @@ impl DashboardState {
                 }
                 vec![]
             }
+            Target::SessionUrgency(id) => self.session_urgent_command(id, false),
+            Target::SessionMoveNow(id) => self.session_urgent_command(id, true),
             Target::Session(id) => {
                 let selected = if self.selected.as_deref() == Some(id) {
                     None
@@ -465,6 +560,204 @@ mod tests {
         assert_eq!(
             s.activate(&Target::Today),
             vec![Command::Sessions(Range::Today)]
+        );
+    }
+}
+
+#[cfg(test)]
+mod n5c_urgency_tests {
+    use super::*;
+    use crate::dashboard_model::{QuotaWait, SessionsResponse};
+    fn session(row: &str, action: &str, mode: &str, urgent: bool, waiting: bool) -> Session {
+        serde_json::from_value(serde_json::json!({
+            "id":row, "provider":"codex", "routing":{
+                "action_id":action,"mode":mode,"on_5h_limit":if urgent {"move"} else {"wait"}},
+            "quota_wait_known":true,
+            "quota_wait":if waiting {serde_json::json!({"reset_at":"2026-10-23T12:00:00Z","waiting":1})} else {serde_json::Value::Null}
+        })).unwrap()
+    }
+    #[test]
+    fn n5c_urgency_uses_exact_current_action_and_explicit_desired_state_once() {
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        let mut rows = vec![
+            session("111111111111", &a, "recover", false, true),
+            session("222222222222", &b, "rebalance", false, true),
+        ];
+        let mut state = DashboardState::default();
+        state.select(Some("222222222222".into()));
+        state.refresh_session_actions(&rows, true);
+        assert_eq!(
+            state.activate(&Target::SessionUrgency(rows[0].id.clone())),
+            vec![Command::SetSessionUrgent {
+                id: a.clone(),
+                urgent: true
+            }]
+        );
+        assert_eq!(state.selected.as_deref(), Some("222222222222"));
+        assert!(
+            state
+                .activate(&Target::SessionMoveNow(rows[1].id.clone()))
+                .is_empty()
+        );
+        assert!(
+            state
+                .activate(&Target::SessionUrgency(rows[0].id.clone()))
+                .is_empty()
+        );
+        state.apply_urgency_update(UrgencyUpdate::Finished {
+            id: b,
+            failed: false,
+        });
+        assert!(
+            !state.session_urgency_enabled(&rows[0].id),
+            "unrelated completion must not unlock the lane"
+        );
+        state.apply_urgency_update(UrgencyUpdate::Finished {
+            id: a.clone(),
+            failed: false,
+        });
+        assert!(
+            !rows[0].routing.as_ref().unwrap().urgent(),
+            "acknowledgement never rewrites DTO policy"
+        );
+        rows[0].routing.as_mut().unwrap().on_5h_limit = "move".into();
+        state.refresh_session_actions(&rows, true);
+        assert_eq!(
+            state.activate(&Target::SessionUrgency(rows[0].id.clone())),
+            vec![Command::SetSessionUrgent {
+                id: a,
+                urgent: false
+            }]
+        );
+    }
+    #[test]
+    fn n5c_urgency_legacy_unknown_offline_and_removed_rows_have_no_authority() {
+        let valid = session("111111111111", &"a".repeat(64), "recover", false, true);
+        for routing in [
+            None,
+            Some(SessionRouting {
+                action_id: valid.id.clone(),
+                on_5h_limit: "wait".into(),
+                mode: "recover".into(),
+            }),
+            Some(SessionRouting {
+                action_id: "A".repeat(64),
+                on_5h_limit: "wait".into(),
+                mode: "recover".into(),
+            }),
+            Some(SessionRouting {
+                action_id: "a".repeat(64),
+                on_5h_limit: "future".into(),
+                mode: "recover".into(),
+            }),
+            Some(SessionRouting {
+                action_id: "a".repeat(64),
+                on_5h_limit: "wait".into(),
+                mode: "future".into(),
+            }),
+        ] {
+            let mut row = valid.clone();
+            row.routing = routing;
+            let mut state = DashboardState::default();
+            state.refresh_session_actions(&[row.clone()], true);
+            assert!(
+                state
+                    .activate(&Target::SessionUrgency(row.id.clone()))
+                    .is_empty()
+            );
+            assert!(state.activate(&Target::SessionMoveNow(row.id)).is_empty());
+        }
+        let mut state = DashboardState::default();
+        state.refresh_session_actions(std::slice::from_ref(&valid), true);
+        assert!(state.session_urgency_enabled(&valid.id));
+        assert!(
+            state
+                .activate(&Target::SessionUrgency("a".repeat(64)))
+                .is_empty(),
+            "action ID is not a display-row lookup"
+        );
+        state.refresh_session_actions(std::slice::from_ref(&valid), false);
+        assert!(
+            state
+                .activate(&Target::SessionUrgency(valid.id.clone()))
+                .is_empty()
+        );
+        state.refresh_session_actions(&[], true);
+        assert!(
+            state
+                .activate(&Target::SessionUrgency(valid.id.clone()))
+                .is_empty()
+        );
+        state.refresh_session_actions(&[valid.clone(), valid.clone()], true);
+        assert!(
+            state.activate(&Target::SessionUrgency(valid.id)).is_empty(),
+            "duplicate display ID cannot choose authority"
+        );
+        let legacy: SessionsResponse =
+            serde_json::from_value(serde_json::json!({"sessions":[{"id":"111111111111"}]}))
+                .unwrap();
+        assert!(legacy.sessions[0].routing.is_none());
+    }
+    #[test]
+    fn n5c_move_now_requires_real_wait_and_respects_strict_while_toggle_remains_available() {
+        let id = "a".repeat(64);
+        let mut row = session("111111111111", &id, "strict", false, true);
+        let mut state = DashboardState::default();
+        state.refresh_session_actions(std::slice::from_ref(&row), true);
+        assert!(
+            state
+                .activate(&Target::SessionMoveNow(row.id.clone()))
+                .is_empty()
+        );
+        assert_eq!(
+            state.activate(&Target::SessionUrgency(row.id.clone())),
+            vec![Command::SetSessionUrgent {
+                id: id.clone(),
+                urgent: true
+            }]
+        );
+        state.apply_urgency_update(UrgencyUpdate::Finished {
+            id: id.clone(),
+            failed: true,
+        });
+        assert!(matches!(
+            state.urgency_update,
+            Some(UrgencyUpdate::Finished { failed: true, .. })
+        ));
+        assert_eq!(row.routing.as_ref().unwrap().on_5h_limit, "wait");
+        row.routing.as_mut().unwrap().mode = "recover".into();
+        row.quota_wait = None;
+        state.refresh_session_actions(std::slice::from_ref(&row), true);
+        assert!(
+            state
+                .activate(&Target::SessionMoveNow(row.id.clone()))
+                .is_empty()
+        );
+        row.quota_wait = Some(QuotaWait {
+            reset_at: "2026-10-23T12:00:00Z".parse().unwrap(),
+            waiting: 0,
+        });
+        state.refresh_session_actions(std::slice::from_ref(&row), true);
+        assert!(
+            state
+                .activate(&Target::SessionMoveNow(row.id.clone()))
+                .is_empty()
+        );
+        row.quota_wait.as_mut().unwrap().waiting = 1;
+        row.quota_wait_known = false;
+        state.refresh_session_actions(std::slice::from_ref(&row), true);
+        assert!(
+            state
+                .activate(&Target::SessionMoveNow(row.id.clone()))
+                .is_empty(),
+            "unknown coverage cannot authorize the waiting-only action"
+        );
+        row.quota_wait_known = true;
+        state.refresh_session_actions(std::slice::from_ref(&row), true);
+        assert_eq!(
+            state.activate(&Target::SessionMoveNow(row.id.clone())),
+            vec![Command::SetSessionUrgent { id, urgent: true }]
         );
     }
 }

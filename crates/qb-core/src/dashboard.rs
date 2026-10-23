@@ -391,6 +391,19 @@ pub struct RateWaitToday {
     pub count: u64,
     pub total_ms: u64,
 }
+/// Native binding-row authority, distinct from the short dashboard identity.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct SessionRouting {
+    pub action_id: String,
+    pub on_5h_limit: crate::routing::On5hLimit,
+    pub mode: crate::routing::Mode,
+}
+/// Actual live admitted quota waits; rate pacing is a separate observation.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct QuotaWaitView {
+    pub waiting: u32,
+    pub reset_at: DateTime<Utc>,
+}
 #[derive(Serialize)]
 pub struct SessionSummary {
     pub id: SessionId,
@@ -405,6 +418,9 @@ pub struct SessionSummary {
     pub inflight: InflightView,
     pub inflight_known: bool,
     pub pacing_wait: Option<PacingWait>,
+    pub routing: Option<SessionRouting>,
+    pub quota_wait: Option<QuotaWaitView>,
+    pub quota_wait_known: bool,
     pub model: Option<String>,
     pub subagents_today: usize,
     pub requests_today: u64,
@@ -954,6 +970,10 @@ impl Dashboard {
                 waiting: waits.len(),
                 since: *since,
             }),
+            // Runtime enriches only from current native binding/owner state.
+            routing: None,
+            quota_wait: None,
+            quota_wait_known: false,
             model: s.model.clone(),
             subagents_today: if current_day { s.subagents.len() } else { 0 },
             requests_today: if current_day { s.day.requests } else { 0 },

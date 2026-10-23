@@ -135,6 +135,8 @@ async fn wait_quota(
     let mut policy_snapshot: Option<crate::account_runtime::WaitPolicySnapshot> = None;
     // Once set, this envelope is immutable even after replacement proof tickets.
     let mut envelope: Option<(Instant, DateTime<Utc>)> = None;
+    // One display-only lifetime for this admitted envelope, never per renewal.
+    let mut _quota_wait_visibility = None;
 
     loop {
         // Arm BOTH authority notifications before EVERY native inspection. An
@@ -304,6 +306,12 @@ async fn wait_quota(
                 relay.observe_http_quota_wait_inspection("result_policy_revoked", source);
             }
             return stopped(source, envelope.is_some());
+        }
+        if first {
+            _quota_wait_visibility =
+                relay
+                    .dashboard()
+                    .quota_wait(key, source, current.reset_at(), deadline);
         }
         receipt = Some(current);
         #[cfg(feature = "testkit")]

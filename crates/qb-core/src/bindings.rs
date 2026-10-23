@@ -1187,6 +1187,14 @@ impl<'a> ManagedFirstProject<'a> {
     }
 }
 
+type DashboardRoutingSnapshot = BTreeMap<
+    crate::dashboard::SessionId,
+    Option<(
+        crate::dashboard::AccountId,
+        crate::dashboard::SessionRouting,
+    )>,
+>;
+
 impl BindingTable {
     fn accepted_in(d: &Data, key: Option<&str>, id: &str) -> bool {
         if key.is_none() {
@@ -1476,6 +1484,51 @@ impl BindingTable {
             client_kind: metadata.and_then(|b| b.client_kind),
             restored: metadata.is_none_or(|b| !b.observed_here),
         })
+    }
+    /// Projection only. Never derive mutation authority from dashboard12.
+    pub(crate) fn dashboard_routing_snapshot(&self) -> DashboardRoutingSnapshot {
+        let d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rows = BTreeMap::new();
+        for (key, group) in &d.groups {
+            let Ok(account) = crate::dashboard::AccountId::try_from(group.account.clone()) else {
+                continue;
+            };
+            let plan = self.policies.plan(launch::policy_key(&d, Some(key)));
+            let row = (
+                account,
+                crate::dashboard::SessionRouting {
+                    action_id: crate::routing::session_id(key),
+                    on_5h_limit: plan.settings.on_5h_limit,
+                    mode: plan.settings.mode,
+                },
+            );
+            // A short-display collision must not choose an arbitrary root.
+            rows.entry(crate::dashboard::SessionId::from_key(key))
+                .and_modify(|slot| *slot = None)
+                .or_insert(Some(row));
+        }
+        rows
+    }
+    /// Resolve aliases/anchors read-only for an already-admitted wait's view.
+    /// This observes identity; it does not validate a proof or reserve a lease.
+    pub(crate) fn dashboard_quota_wait_row(
+        &self,
+        key: &str,
+        source: &str,
+    ) -> Option<crate::dashboard::BindingGroup> {
+        let d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        let requested = group(key);
+        let canonical = if d.groups.contains_key(requested) {
+            requested
+        } else {
+            d.launch_aliases
+                .get(requested)
+                .map_or_else(|| launch::ownership_group(&d, requested), String::as_str)
+        };
+        if d.groups.get(canonical)?.account != source {
+            return None;
+        }
+        self.dashboard_row(&d, canonical, Utc::now())
     }
     pub(crate) fn dashboard_snapshot(
         &self,
@@ -4019,6 +4072,73 @@ mod tests {
         let (_retired_home, table, project) = n5c_managed_first_fixture();
         table.freeze().unwrap();
         assert!(table.associate_project(N5C_REAL, &project).is_err());
+    }
+
+    #[test]
+    fn n5c_ui_managed_projection_uses_observed_root_handle_and_original_policy() {
+        let (_home, table) = table();
+        table
+            .policies
+            .set_session_urgent_for_key(
+                &crate::routing::session_id(N5C_FIRST),
+                crate::routing::On5hLimit::Move,
+                Some(N5C_FIRST),
+            )
+            .unwrap();
+        let mut c = candidate("cx-abc123", 0.0, 168, 5);
+        c.account.provider = Provider::Codex;
+        c.account.identity = Identity::Codex {
+            user_id: None,
+            account_id: "synthetic-ui-account".into(),
+            email: "synthetic@example.invalid".into(),
+        };
+        let placed = table
+            .place_launch(
+                LaunchRequest {
+                    anchor_key: N5C_FIRST,
+                    resume_key: None,
+                    model: Some("synthetic-model"),
+                    model_is_explicit: true,
+                    account_pref: Some("cx-abc123"),
+                    allow_move_for_model: false,
+                },
+                &[c],
+                &BTreeMap::from([(
+                    "cx-abc123".into(),
+                    BTreeSet::from(["synthetic-model".into()]),
+                )]),
+                Utc::now(),
+            )
+            .unwrap();
+        assert_eq!(placed.account, "cx-abc123");
+        let adopted = table
+            .resolve_launch(Some(N5C_FIRST), Some(N5C_REAL), Utc::now())
+            .unwrap();
+        assert_eq!(adopted.canonical_key, N5C_REAL);
+        let rows = table.dashboard_routing_snapshot();
+        let (account, routing) = rows[&crate::dashboard::SessionId::from_key(N5C_REAL)]
+            .as_ref()
+            .unwrap();
+        assert_eq!(account.as_str(), "cx-abc123");
+        assert_eq!(routing.action_id, crate::routing::session_id(N5C_REAL));
+        assert_ne!(routing.action_id, crate::routing::session_id(N5C_FIRST));
+        assert_eq!(routing.on_5h_limit, crate::routing::On5hLimit::Move);
+        table
+            .set_routing_session_urgent(&routing.action_id, crate::routing::On5hLimit::Wait)
+            .unwrap();
+        assert_eq!(
+            table.policies.plan(Some(N5C_FIRST)).settings.on_5h_limit,
+            crate::routing::On5hLimit::Wait
+        );
+        let row = table
+            .dashboard_quota_wait_row(N5C_FIRST, "cx-abc123")
+            .unwrap();
+        assert_eq!(row.id, crate::dashboard::SessionId::from_key(N5C_REAL));
+        assert!(
+            table
+                .dashboard_quota_wait_row(N5C_FIRST, "cx-def456")
+                .is_none()
+        );
     }
 
     fn n5a_wait_fixture() -> (tempfile::TempDir, Arc<BindingTable>) {

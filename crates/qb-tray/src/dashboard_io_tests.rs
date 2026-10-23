@@ -264,3 +264,6 @@ async fn dashboard_actor_retries_failed_usage_without_new_quota_event_at_throttl
     coordinator.stop();
     task.await.unwrap();
 }
+
+#[path = "dashboard_io_urgency_tests.rs"]
+mod urgency_tests;
