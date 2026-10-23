@@ -68,6 +68,17 @@ impl Harness {
         dead: bool,
         routing: RoutingConfig,
     ) -> Self {
+        Self::new_configured(provider, n, budget, memory, dead, routing, |_| {}).await
+    }
+    async fn new_configured(
+        provider: Provider,
+        n: usize,
+        budget: u64,
+        memory: u64,
+        dead: bool,
+        routing: RoutingConfig,
+        configure: impl FnOnce(&mut Config),
+    ) -> Self {
         let serial = SERIAL.lock().await;
         let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/m4a-http");
         fs::create_dir_all(&base).unwrap();
@@ -114,6 +125,7 @@ impl Harness {
             config.upstream.codex_base = format!("http://{}", listener.local_addr().unwrap());
             drop(listener);
         }
+        configure(&mut config);
         let obs = Arc::new(Observability::new(&home, None).unwrap());
         let state = Arc::new(
             RelayState::new(
@@ -5334,3 +5346,304 @@ async fn r11_http_entry_adoption_after_selection_snapshot_rejects_stale_publicat
 }
 
 include!("support/m4a_http_r11_review.inc.rs");
+
+mod n5b_sse {
+    use super::*;
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Method, Request},
+        response::Response,
+    };
+    use futures_util::Stream;
+    use hyper::{body::Incoming, server::conn::http1, service::service_fn};
+    use hyper_util::rt::TokioIo;
+    use std::{
+        convert::Infallible,
+        io,
+        net::Shutdown,
+        pin::Pin,
+        sync::{Mutex, atomic::Ordering},
+        task::{Context, Poll},
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt, BufReader},
+        net::{TcpListener, TcpStream},
+        sync::oneshot,
+        task::JoinHandle,
+        time::timeout,
+    };
+
+    const PHASE: Duration = Duration::from_secs(3);
+    const UPLOAD: &str = r#"{"input":[],"stream":true}"#;
+    const FIRST: &[u8] = b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"synthetic-sse\",\"status\":\"in_progress\"}}\n\n";
+
+    // This stream has no terminal event, EOF, timer, or producer that can finish it.
+    // Its Drop signal is owned by the actual upstream HTTP response body.
+    struct StalledBody {
+        first: Option<Bytes>,
+        stalled: Option<oneshot::Sender<()>>,
+        dropped: Option<oneshot::Sender<()>>,
+    }
+
+    impl Stream for StalledBody {
+        type Item = Result<Bytes, io::Error>;
+
+        fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            if let Some(bytes) = self.first.take() {
+                return Poll::Ready(Some(Ok(bytes)));
+            }
+            if let Some(stalled) = self.stalled.take() {
+                let _ = stalled.send(());
+            }
+            Poll::Pending
+        }
+    }
+
+    impl Drop for StalledBody {
+        fn drop(&mut self) {
+            if let Some(dropped) = self.dropped.take() {
+                let _ = dropped.send(());
+            }
+        }
+    }
+
+    struct Signals {
+        request: oneshot::Receiver<(Method, String, Bytes)>,
+        stalled: oneshot::Receiver<()>,
+        dropped: oneshot::Receiver<()>,
+        closed: oneshot::Receiver<()>,
+    }
+
+    struct StalledUpstream {
+        url: String,
+        task: JoinHandle<()>,
+    }
+
+    impl StalledUpstream {
+        async fn start() -> (Self, Signals) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            assert!(address.ip().is_loopback());
+            let (request_tx, request) = oneshot::channel();
+            let (stalled_tx, stalled) = oneshot::channel();
+            let (dropped_tx, dropped) = oneshot::channel();
+            let (closed_tx, closed) = oneshot::channel();
+            let exchange = Arc::new(Mutex::new(Some((
+                request_tx,
+                StalledBody {
+                    first: Some(Bytes::from_static(FIRST)),
+                    stalled: Some(stalled_tx),
+                    dropped: Some(dropped_tx),
+                },
+            ))));
+            let task = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let service = service_fn(move |request: Request<Incoming>| {
+                    let (seen, stream) = exchange
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("the SSE fixture accepts exactly one upstream request");
+                    async move {
+                        let (parts, body) = request.into_parts();
+                        let body = to_bytes(Body::new(body), 4096).await.unwrap();
+                        let _ = seen.send((parts.method, parts.uri.path().to_owned(), body));
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header("content-type", "text/event-stream")
+                                .header("connection", "close")
+                                .body(Body::from_stream(stream))
+                                .unwrap(),
+                        )
+                    }
+                });
+                // Await the real connection directly: aborting this task is not
+                // used to satisfy either closure signal or any assertion.
+                let _ = http1::Builder::new()
+                    .serve_connection(TokioIo::new(socket), service)
+                    .await;
+                let _ = closed_tx.send(());
+            });
+            (
+                Self {
+                    url: format!("http://{address}"),
+                    task,
+                },
+                Signals {
+                    request,
+                    stalled,
+                    dropped,
+                    closed,
+                },
+            )
+        }
+    }
+
+    impl Drop for StalledUpstream {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn line(reader: &mut BufReader<TcpStream>, limit: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for _ in 0..limit {
+            bytes.push(
+                reader
+                    .read_u8()
+                    .await
+                    .expect("incomplete HTTP fixture line"),
+            );
+            if bytes.ends_with(b"\r\n") {
+                return bytes;
+            }
+        }
+        panic!("HTTP fixture line exceeded its bound");
+    }
+
+    async fn first_event(reader: &mut BufReader<TcpStream>) {
+        let mut headers = Vec::new();
+        loop {
+            let next = line(reader, 2048).await;
+            headers.extend_from_slice(&next);
+            assert!(
+                headers.len() <= 16 * 1024,
+                "HTTP headers exceeded fixture bound"
+            );
+            if next == b"\r\n" {
+                break;
+            }
+        }
+        let headers = String::from_utf8(headers).unwrap();
+        assert!(headers.starts_with("HTTP/1.1 200 "), "{headers}");
+        let headers = headers.to_ascii_lowercase();
+        assert!(headers.contains("\r\ncontent-type: text/event-stream\r\n"));
+        assert!(headers.contains("\r\ntransfer-encoding: chunked\r\n"));
+        let mut body = Vec::new();
+        while body.len() < FIRST.len() {
+            let size = String::from_utf8(line(reader, 64).await).unwrap();
+            let size = usize::from_str_radix(size.trim_end().split(';').next().unwrap(), 16)
+                .expect("invalid HTTP chunk length");
+            assert!(size > 0 && size <= FIRST.len() - body.len());
+            let start = body.len();
+            body.resize(start + size, 0);
+            reader.read_exact(&mut body[start..]).await.unwrap();
+            let mut delimiter = [0; 2];
+            reader.read_exact(&mut delimiter).await.unwrap();
+            assert_eq!(delimiter, *b"\r\n");
+        }
+        assert_eq!(body.as_slice(), FIRST, "SSE body bytes changed");
+    }
+
+    #[tokio::test]
+    async fn n5b_sse_stalled_body_os_close_drops_upstream_and_releases_native_owners() {
+        let (mut upstream, signals) = StalledUpstream::start().await;
+        let h = Harness::new_configured(
+            Provider::Codex,
+            1,
+            64,
+            1024,
+            false,
+            RoutingConfig::default(),
+            |config| config.upstream.codex_base = upstream.url.clone(),
+        )
+        .await;
+        let account = h.ids().into_iter().next().unwrap();
+        assert_eq!(h.state.budget.used(), 0);
+        assert_eq!(h.state.inflight_requests.load(Ordering::Acquire), 0);
+        assert_eq!(h.state.accounts.inflight_count(&account), 0);
+        assert_eq!(h.state.bindings.pending_count(&account), 0);
+        assert!(h.servers.data_addr.ip().is_loopback());
+        let mut socket = timeout(PHASE, TcpStream::connect(h.servers.data_addr))
+            .await
+            .unwrap()
+            .unwrap();
+        let request = format!(
+            "POST /v1/responses HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer synthetic-client\r\nContent-Type: application/json\r\nsession-id: synthetic-n5b-sse-close\r\nContent-Length: {}\r\n\r\n{UPLOAD}",
+            h.servers.data_addr,
+            UPLOAD.len()
+        );
+        timeout(PHASE, socket.write_all(request.as_bytes()))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut reader = BufReader::new(socket);
+        timeout(PHASE, first_event(&mut reader))
+            .await
+            .expect("actual HTTP client must receive the complete nonterminal SSE event");
+        let (method, path, body) = timeout(PHASE, signals.request).await.unwrap().unwrap();
+        assert_eq!(method, Method::POST);
+        assert_eq!(path, "/responses");
+        assert_eq!(
+            body.as_ref(),
+            UPLOAD.as_bytes(),
+            "request body bytes changed"
+        );
+        timeout(PHASE, signals.stalled)
+            .await
+            .expect("upstream body must be polled into its indefinite stall")
+            .unwrap();
+        assert_eq!(h.state.inflight_requests.load(Ordering::Acquire), 1);
+        assert_eq!(h.state.accounts.inflight_count(&account), 1);
+        assert!(
+            h.ledger()
+                .iter()
+                .all(|row| row["route"] != "POST /v1/responses"),
+            "nonterminal SSE bytes must not finish the native request"
+        );
+
+        // Close the actual OS socket. Keep both servers and the account runtime
+        // alive; neither a response Drop shortcut nor server teardown closes it.
+        let socket = reader.into_inner().into_std().unwrap();
+        socket.shutdown(Shutdown::Both).unwrap();
+        drop(socket);
+        timeout(PHASE, signals.dropped)
+            .await
+            .expect("SSE client close must drop upstream before teardown")
+            .expect("upstream body Drop signal abandoned");
+        timeout(PHASE, signals.closed)
+            .await
+            .expect("SSE client close must close the real upstream connection")
+            .unwrap();
+        timeout(PHASE, &mut upstream.task).await.unwrap().unwrap();
+        timeout(PHASE, async {
+            loop {
+                if h.state.inflight_requests.load(Ordering::Acquire) == 0
+                    && h.state.accounts.inflight_count(&account) == 0
+                    && h.state.bindings.pending_count(&account) == 0
+                    && h.state.budget.used() == 0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("SSE client close must release native owners before teardown");
+        assert_eq!(h.state.budget.used(), 0);
+        assert_eq!(h.state.inflight_requests.load(Ordering::Acquire), 0);
+        assert_eq!(h.state.accounts.inflight_count(&account), 0);
+        assert_eq!(h.state.bindings.pending_count(&account), 0);
+        let rows = h.ledger();
+        let requests = rows
+            .iter()
+            .filter(|row| row["route"] == "POST /v1/responses")
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 1);
+        let row = requests[0];
+        assert_eq!(row["transport"], "http");
+        assert_eq!(row["account"], account);
+        assert_eq!(row["status"], 200);
+        assert_eq!(row["upstream_status"], 200);
+        assert_eq!(row["attempts"], 1);
+        assert_eq!(row["outcome"], "client_drop");
+        assert_eq!(row["bytes_in"], UPLOAD.len() as u64);
+        assert_eq!(row["bytes_out"], FIRST.len() as u64);
+        assert!(h.fake.state.requests().is_empty());
+        assert!(
+            !h.servers.data_task.is_finished(),
+            "relay ended before assertions"
+        );
+    }
+}
