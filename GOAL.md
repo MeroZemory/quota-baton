@@ -81,6 +81,7 @@ The current plan, with lanes, owners and start commands, is the "Plan" section o
 | R13.UI | 완료: 세션 행35 DIP·메모 열 앞 긴급 토글. 한영 1024/1320 geometry·tray345·strict lint·실제 core/AdminClient/tray4HWND 관문 통과. 보고서 `.sandbox/reports/R13.UI.md`; 설치는 설계 세션 |
 | N11 | 완료: dev 기존 tray6실패는 모두 오래된 fixture. 제품 변경 없이 compact summary/tooltip·측정 geometry·normal startup logging fixture 복구. 대상·인접36검사·strict tray lint·fmt 통과; 보고서 `.sandbox/reports/N11.md` |
 | R9.5 | 완료(N3): 즉시 안내·5초 heartbeat·단계별 안전 취소·명시적 복구·한영 읽기 쉬운 확인. 합성 실제 CLI 집중 관문·read-only launch check 통과, 설치 인계. 보고서 `.sandbox/reports/R9.5.md` |
+| R9.6 | 완료: DB·index·첫 사용자 줄 제목 순서, 48칸·한영 출력·단일 집계표 숨김. 집중 관문 통과; 보고서 `.sandbox/reports/R9.6.md` |
 | R16.3 | 완료·설치 수용(41cb129, 05:26 KST, takeover 거절0/1,889): 집중464·strict lint·KO/EN 실제10HWND·합성8PNG 통과. 제공자 주간/30일 계정분·권장선·음영·소진 사실 표시. 설치는 설계 세션 |
 | R16.4 | 완료·설치 수용: 32b52ea, 06:07 KST; 실제 coverage4/4·takeover 연결 거절0/1,923 |
 | R16.5 | 완료: 7cab418 잔여량 이력 유지·소진0·리셋100·한영 결과 문구. 집중466·strict lint·실제 core/AdminClient/tray10HWND·export2PNG 확인. 19353ac 설치 수용(06:58)·takeover 거절0/1,920; 다음 N5a |

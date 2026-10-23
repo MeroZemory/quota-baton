@@ -5,11 +5,11 @@ This file names the verification for each unit and each row. The row list and th
 ## Status (single source for every report head)
 
 <!-- status:begin -->
-현재 마일스톤: R9.5 대화 이동 진행·안전한 중단·복구
-목표: 합성 실제 CLI·한영 확인·집중 관문 완료; 설치 인계 후 typed rebind 진행
+현재 마일스톤: R9.6 대화 이동 미리보기 제목
+목표: 한영 제목 폭·실제 합성 CLI·집중 관문 완료; 설치 인계 후 N6t 진행
 핵심 지표: 남은 출시 1/3 (R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측); 주 경로 설치 수용·native fallback 후속
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-23 23:19 KST (진행·복구 집중 관문·read-only launch check 통과)
+갱신: 2026-10-23 23:38 KST (제목·단일 미리보기 집중 관문 통과)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -233,6 +233,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-23 22:04 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | N11 기존6실패 복구·focused gate36통과; 새 기능 설치 수 변화 없음 |
 | 2026-10-23 22:41 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | R13.UI 한 줄 배치 관문 통과·N5i 주 경로 설치 수용; 전체 native fallback은 후속 |
 | 2026-10-23 23:19 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | R9.5 진행·안전한 중단·명시적 복구 관문 완료; native 전체 수용·통합 예측은 후속 |
+| 2026-10-23 23:38 | 남은 출시 (분모 3: R14 보호 설치, R13 C+E 대기·이동·재개 실행, R13 F 제공자 통합 예측) | 1/3 | R9.6 미리보기 제목·단일 출력 집중 관문 완료; 보호·native 전체 수용·통합 예측 범위는 동일 |
 <!-- metric:end -->
 
 <!-- support:begin -->
@@ -441,6 +442,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-23 22:11 | N5i 주 경로 설치 | dev27499b8·연결 거절0/1,026; 양쪽 urgent 런처·CLI on/off 통과 | 설계 세션 실제 설치 확인 | native 자동 재개 전체 수용은 N5d-native 후속 |
 | 2026-10-23 22:41 | R13.UI 세션 밀도 복구 | 이전70→35 DIP·KO/EN 1024/1320·tray345·실제 HWND4개 | 기존 행 높이와 28 DIP 클릭/UIA 보존 | 기본/testkit strict tray lint·fmt·확인된 상태 변경·임시 홈 정리 통과 |
 | 2026-10-23 23:19 | R9.5 합성 실제 CLI·시작 안내 | 복구59·일반 CLI19·표시9·진행8 통과; 안내31–78 ms 상한 | 즉시 안내200 ms 미만·기존 이동 불변식 유지 | strict 기본/testkit CLI lint·제품 build·실제 read-only launch check0; stale native stub은 dev 소스 대조로 분리 |
+| 2026-10-23 23:38 | R9.6 제목·미리보기 | 표시·진행·헤더39·이동복구59·실제 CLI20 통과, timing1 제외 | 한영48칸·단일표 숨김·본문 보호 | 기본/testkit strict lint·제품 build·read-only launch check0; 폭 제한 제거 red101·정확 복원 green0 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
