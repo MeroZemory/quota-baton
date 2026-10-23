@@ -490,3 +490,64 @@ async fn n5c_http_nonurgent_far_5h_preserves_actual_429_without_spending_b() {
 async fn n5c_http_urgent_far_5h_normally_moves_b_with_verbatim_upload() {
     far_five_hour("move").await;
 }
+
+#[tokio::test]
+async fn n5c_http_nonurgent_zero_hold_and_original_deadline_preserve_actual_429() {
+    for (name, hold, remaining) in [("zero", 0, 3600), ("deadline", 60, 45)] {
+        let session = format!("synthetic-n5c-fallback-bound-{name}");
+        let (h, a, b, usage) = behavior_fixture(&session, "recover", "wait").await;
+        h.admin(
+            reqwest::Method::POST,
+            "/admin/v1/routing",
+            Some(json!({"kind":"session", "id":qb_core::routing::session_id(&format!("codex:{session}")),
+                "settings":{"mode":"recover","reset_wait_secs":hold}})),
+        ).await;
+        let reset = (Utc::now() + ChronoDuration::seconds(remaining)).timestamp();
+        let mut rejection = far_limit();
+        rejection.headers.insert(
+            "x-codex-primary-reset-at",
+            reset.to_string().parse().unwrap(),
+        );
+        h.fake.state.push(rejection);
+        h.fake
+            .state
+            .push(ScriptedResponse::json(StatusCode::OK, FINAL));
+        let response = timeout(
+            PHASE,
+            h.client
+                .post(format!("http://{}/v1/responses", h.servers.data_addr))
+                .bearer_auth("synthetic-client")
+                .header("content-type", "application/json")
+                .header("session-id", &session)
+                .timeout(Duration::from_secs(30))
+                .body(UPLOAD)
+                .send(),
+        )
+        .await
+        .expect("far Wait must return the observed rejection without starting another hold")
+        .unwrap();
+        assert_eq!(
+            response.status().as_u16(),
+            429,
+            "zero hold or original deadline must retain the actual rejection, not move B"
+        );
+        assert_eq!(
+            response.headers()["x-codex-primary-reset-at"]
+                .to_str()
+                .unwrap(),
+            reset.to_string()
+        );
+        assert!(response.bytes().await.unwrap().is_empty());
+        assert_source(&h, 1, &a);
+        assert_exact_attempts(&h, 2);
+        assert_eq!(
+            h.state
+                .bindings
+                .current(Some(&format!("codex:{session}")))
+                .as_deref(),
+            Some(a.as_str())
+        );
+        clean(&h, &a, &b).await;
+        assert!(usage.state.requests().is_empty());
+    }
+}
