@@ -1384,3 +1384,137 @@ async fn r1_ws_completion_outlives_context_and_snapshots_both_wait_drop_orders()
         }
     }
 }
+
+fn n5b_inspection_context(pair: &Pair) -> Context {
+    Context {
+        runtime: None,
+        relay: pair.relay.clone(),
+        drain_signal: None,
+        credentials: None,
+        budget: pair.budget.clone(),
+        memory_guard: pair.memory_guard.clone(),
+        observability: pair.obs.clone(),
+        account: "fake-account".into(),
+        session: Session::default(),
+        headers: HeaderMap::new(),
+        upstream_url: String::new(),
+        idle_close: Duration::from_secs(60),
+        close_after_response: false,
+        capture_ticket: None,
+        connection: "synthetic-inspection".into(),
+    }
+}
+
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn n5b_create_revalidation_keeps_expired_original_deadline() {
+    let pair = pair_with_tracking(
+        Duration::from_secs(60),
+        false,
+        PARSE_LIMIT,
+        UPSTREAM_READ_TIMEOUT,
+        true,
+    )
+    .await;
+    let context = Arc::new(n5b_inspection_context(&pair));
+    let relay = context.relay.as_ref().unwrap();
+    let (arrived, release) = pause_create_dispatch(relay);
+    // The managed revalidation entry must honor the supplied original bound,
+    // even with an unreleased native test gate and a fresh Context clock.
+    let original = Instant::now() - Duration::from_millis(1);
+    let result = tokio::time::timeout(Duration::from_millis(250), async {
+        let (arrived, result) = tokio::join!(
+            arrived,
+            admit_create(context.clone(), Some("synthetic-model".into()), original)
+        );
+        arrived.unwrap();
+        result
+    })
+    .await
+    .expect("managed create revalidation must not renew an expired create deadline");
+    assert!(matches!(result, Err(DataLaunchError::Unavailable)));
+    assert!(release.is_closed());
+    assert_eq!(pair.budget.used(), 0);
+    assert_eq!(relay.bindings.pending_count("fake-account"), 0);
+}
+
+#[tokio::test]
+async fn n5b_initial_admission_preserves_forced_expiry_classification() {
+    let pair = pair(Duration::from_secs(60), false, PARSE_LIMIT).await;
+    let context = Arc::new(n5b_inspection_context(&pair));
+    for forced in [false, true] {
+        let rate = Arc::new(RateBudget::with_limits(Duration::from_secs(30), 3));
+        rate.state.lock().unwrap().forced = forced;
+        rate.commit(); // Native admit returns false; eligible(None runtime) remains true.
+        let pending = PendingInitial {
+            request: 0,
+            message: Message::text("synthetic"),
+            reservation: pair.budget.reserve_message(9),
+            rate,
+            deadline: Instant::now(),
+        };
+        assert_eq!(
+            admit_initial(context.clone(), &pending, None, false).await,
+            InitialAdmission::Rejected { expired: forced }
+        );
+        drop(pending);
+    }
+    // A ready native admission retains the same rate deadline and send counters.
+    let rate = Arc::new(RateBudget::with_limits(Duration::from_secs(30), 3));
+    let deadline = rate.deadline;
+    let pending = PendingInitial {
+        request: 1,
+        message: Message::text("synthetic"),
+        reservation: pair.budget.reserve_message(9),
+        rate: rate.clone(),
+        deadline: Instant::now(),
+    };
+    assert_eq!(
+        admit_initial(context, &pending, Some("synthetic-model".into()), false).await,
+        InitialAdmission::Ready
+    );
+    assert_eq!(rate.deadline, deadline);
+    assert!(!rate.initial_sent());
+    assert_eq!(rate.state.lock().unwrap().retries, 0);
+    drop(pending);
+    assert_eq!(pair.budget.used(), 0);
+}
+
+#[tokio::test]
+async fn n5b_initial_admission_forced_but_ineligible_does_not_report_rate_expiry() {
+    let pair = pair_with_tracking(
+        Duration::from_secs(60),
+        false,
+        PARSE_LIMIT,
+        UPSTREAM_READ_TIMEOUT,
+        true,
+    )
+    .await;
+    let mut context = n5b_inspection_context(&pair);
+    context.runtime = Some(pair.relay.as_ref().unwrap().accounts.clone());
+    // The pair intentionally has a binding but no native account in its store.
+    assert!(
+        !context
+            .runtime
+            .as_ref()
+            .unwrap()
+            .eligible("fake-account", None)
+            .await
+    );
+    let rate = Arc::new(RateBudget::with_limits(Duration::ZERO, 3));
+    rate.state.lock().unwrap().forced = true;
+    rate.commit();
+    let pending = PendingInitial {
+        request: 0,
+        message: Message::text("synthetic"),
+        reservation: pair.budget.reserve_message(9),
+        rate,
+        deadline: Instant::now(),
+    };
+    assert_eq!(
+        admit_initial(Arc::new(context), &pending, None, false).await,
+        InitialAdmission::Rejected { expired: false }
+    );
+    drop(pending);
+    assert_eq!(pair.budget.used(), 0);
+}

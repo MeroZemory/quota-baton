@@ -894,6 +894,117 @@ struct PendingInitial {
     message: Message,
     reservation: Reservation,
     rate: Arc<RateBudget>,
+    deadline: Instant,
+}
+
+struct PendingInspection {
+    message: Message,
+    reservation: Reservation,
+    session: Session,
+    model: Option<String>,
+    managed: bool,
+    deadline: Instant,
+}
+
+#[derive(Debug)]
+enum InspectFailure {
+    Ineligible,
+    ReservationUnavailable,
+}
+type InitialInspection = BoxFuture<'static, Result<CurrentCompletion, InspectFailure>>;
+
+#[derive(Debug, PartialEq, Eq)]
+enum InitialAdmission {
+    Ready,
+    Rejected { expired: bool },
+}
+
+fn inspect_initial(context: Arc<Context>, pending: &PendingInspection) -> InitialInspection {
+    let session = Session {
+        key: pending.session.key.clone(),
+        parent: pending.session.parent.clone(),
+        model: pending.session.model.clone(),
+    };
+    let model = pending.model.clone();
+    let managed = pending.managed;
+    #[cfg(feature = "testkit")]
+    let message = pending.message.clone();
+    #[cfg(feature = "testkit")]
+    let deadline = pending.deadline;
+    Box::pin(async move {
+        #[cfg(feature = "testkit")]
+        if !wait_dispatch_until(
+            &context,
+            &message,
+            OrdinaryDispatchStage::BeforeEligibility,
+            deadline,
+        )
+        .await
+        {
+            return Err(InspectFailure::Ineligible);
+        }
+        if let Some(runtime) = &context.runtime
+            && !runtime.eligible(&context.account, model.as_deref()).await
+        {
+            return Err(InspectFailure::Ineligible);
+        }
+        #[cfg(feature = "testkit")]
+        if !wait_dispatch_until(
+            &context,
+            &message,
+            OrdinaryDispatchStage::BeforeLease,
+            deadline,
+        )
+        .await
+        {
+            return Err(InspectFailure::ReservationUnavailable);
+        }
+        let active = if managed {
+            CurrentCompletion::new_for_session(&context, &session).await
+        } else {
+            CurrentCompletion::new(&context).await
+        };
+        active.ok_or(InspectFailure::ReservationUnavailable)
+    })
+}
+
+fn admit_initial(
+    context: Arc<Context>,
+    pending: &PendingInitial,
+    model: Option<String>,
+    managed: bool,
+) -> BoxFuture<'static, InitialAdmission> {
+    let rate = pending.rate.clone();
+    #[cfg(feature = "testkit")]
+    let message = pending.message.clone();
+    Box::pin(async move {
+        let paced = rate.admit(context.runtime.as_ref(), &context.account).await;
+        let eligible = paced
+            && match &context.runtime {
+                Some(runtime) if !managed && model.is_none() => {
+                    runtime.eligible_unknown_model(&context.account).await
+                }
+                Some(runtime) => runtime.eligible(&context.account, model.as_deref()).await,
+                None => true,
+            };
+        #[cfg(feature = "testkit")]
+        let eligible = eligible
+            && (managed
+                || wait_ordinary_dispatch(&context, &message, OrdinaryDispatchStage::AfterPacing)
+                    .await);
+        if eligible {
+            return InitialAdmission::Ready;
+        }
+        // Keep the native false-result recheck in this independently polled future.
+        let forced = rate.state.lock().unwrap_or_else(|e| e.into_inner()).forced;
+        let eligible_now = match &context.runtime {
+            Some(runtime) => runtime.eligible(&context.account, model.as_deref()).await,
+            None => true,
+        };
+        InitialAdmission::Rejected {
+            expired: forced && eligible_now,
+        }
+    })
 }
 
 type LaunchPreparation = BoxFuture<'static, Result<(Session, String), DataLaunchError>>;
@@ -908,6 +1019,8 @@ const PROMOTED_BEFORE_WRITE: &str = "launch_promoted_before_write";
 enum OrdinaryDispatchStage {
     AfterPacing,
     BeforeWrite,
+    BeforeEligibility,
+    BeforeLease,
 }
 
 #[cfg(feature = "testkit")]
@@ -925,6 +1038,28 @@ static ORDINARY_DISPATCH_GATES: Mutex<Vec<OrdinaryDispatchGate>> = Mutex::new(Ve
 
 #[cfg(feature = "testkit")]
 impl crate::relay::RelayState {
+    /// Test-only pause immediately before initial eligibility or lease inspection.
+    pub fn pause_ws_initial_inspection(
+        self: &Arc<Self>,
+        session: &str,
+        payload: &[u8],
+        before_lease: bool,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        pause_ordinary_dispatch(
+            self,
+            session,
+            payload,
+            if before_lease {
+                OrdinaryDispatchStage::BeforeLease
+            } else {
+                OrdinaryDispatchStage::BeforeEligibility
+            },
+        )
+    }
+
     /// Pause the specified ordinary frame after pacing, before observing promotion.
     pub fn pause_ws_ordinary_after_pacing(
         self: &Arc<Self>,
@@ -991,6 +1126,16 @@ async fn wait_ordinary_dispatch(
     message: &Message,
     stage: OrdinaryDispatchStage,
 ) -> bool {
+    wait_dispatch_until(context, message, stage, context.launch_deadline()).await
+}
+
+#[cfg(feature = "testkit")]
+async fn wait_dispatch_until(
+    context: &Context,
+    message: &Message,
+    stage: OrdinaryDispatchStage,
+    deadline: Instant,
+) -> bool {
     let Some(relay) = &context.relay else {
         return true;
     };
@@ -1019,7 +1164,7 @@ async fn wait_ordinary_dispatch(
         tokio::select! {
             biased;
             _ = relay.wait_for_drain_start() => return false,
-            result = tokio::time::timeout_at(context.launch_deadline(), gate.release) => {
+            result = tokio::time::timeout_at(deadline, gate.release) => {
                 return result.is_ok_and(|result| result.is_ok());
             }
         }
@@ -1062,8 +1207,11 @@ pub(super) fn pause_create_dispatch(
     (observed, release)
 }
 
-fn admit_create(context: Arc<Context>, model: Option<String>) -> CreateAdmission {
-    let deadline = context.launch_deadline();
+fn admit_create(
+    context: Arc<Context>,
+    model: Option<String>,
+    deadline: Instant,
+) -> CreateAdmission {
     Box::pin(async move {
         #[cfg(feature = "testkit")]
         if let Some(relay) = &context.relay {
@@ -1459,11 +1607,13 @@ async fn run_with_read_timeout(
     let mut pending_rate_redial: Option<PendingRateResend> = None;
     let mut rate_redial: Option<RateRedial> = None;
     let mut deferred_client: Option<(Message, Reservation)> = None;
-    let mut pending_launch_create: Option<(Message, Reservation)> = None;
+    let mut pending_launch_create: Option<(Message, Reservation, Instant)> = None;
     let mut launch_preparation: Option<LaunchPreparation> = None;
     let mut pending_launch_error: Option<Message> = None;
     let mut pending_initial: Option<PendingInitial> = None;
-    let mut initial_admission: Option<BoxFuture<'static, bool>> = None;
+    let mut initial_admission: Option<BoxFuture<'static, InitialAdmission>> = None;
+    let mut pending_inspection: Option<PendingInspection> = None;
+    let mut initial_inspection: Option<InitialInspection> = None;
     let mut create_admission: Option<CreateAdmission> = None;
     let mut initial_write_admission: Option<BoxFuture<'static, Result<(), &'static str>>> = None;
     let mut initial_ready = false;
@@ -1537,6 +1687,10 @@ async fn run_with_read_timeout(
             launch_preparation = None;
             deferred_client = None;
         }
+        if draining && pending_inspection.take().is_some() {
+            initial_inspection = None;
+            deferred_client = None;
+        }
         if draining && let Some(pending) = pending_initial.take() {
             initial_admission = None;
             create_admission = None;
@@ -1558,6 +1712,8 @@ async fn run_with_read_timeout(
         if ending.is_some() {
             launch_preparation = None;
             pending_launch_create = None;
+            pending_inspection = None;
+            initial_inspection = None;
             initial_admission = None;
             create_admission = None;
             initial_write_admission = None;
@@ -1593,7 +1749,9 @@ async fn run_with_read_timeout(
         // frame closes the connection instead of growing a queue.
         // split 잠금은 poll 사이에 해제되어
         // 큰 쓰기가 진행되는 동안 같은 소켓의 읽기와 자동 pong을 poll할 수 있다.
+        let pending_inspection_active = pending_inspection.is_some();
         let pending_client_admission = pending_launch_create.is_some()
+            || pending_inspection_active
             || pending_initial.is_some()
             || to_upstream.is_some()
             || pending_rate_redial.is_some()
@@ -1604,7 +1762,7 @@ async fn run_with_read_timeout(
             }
             result = async { launch_preparation.as_mut().unwrap().await }, if launch_preparation.is_some() && ending.is_none() => {
                 launch_preparation = None;
-                let (message, reservation) = pending_launch_create.take().expect("launch preparation owns payload");
+                let (message, reservation, deadline) = pending_launch_create.take().expect("launch preparation owns payload");
                 draining |= context.relay.as_ref().is_some_and(|relay| relay.is_draining());
                 if draining { continue; }
                 let (session, accepted_model) = match result {
@@ -1618,43 +1776,48 @@ async fn run_with_read_timeout(
                         continue;
                     }
                 };
-                model = Some(accepted_model);
-                if let Some(runtime) = &context.runtime && !runtime.eligible(&context.account, model.as_deref()).await {
-                    ending = Some((Some(CloseFrame { code: 1000.into(), reason: "".into() }), "account_ineligible"));
-                    end_deadline = Instant::now() + CLOSE_TIMEOUT;
-                    continue;
-                }
-                let Some(mut active) = CurrentCompletion::new_for_session(&context, &session).await else {
-                    pending_launch_error = Some(launch_error(DataLaunchError::Changed));
-                    ending = Some((Some(CloseFrame {code:1001.into(),reason:"".into()}),"routing_unavailable"));
-                    end_deadline = Instant::now() + CLOSE_TIMEOUT;
-                    continue;
+                let pending = PendingInspection { message, reservation, session, model: Some(accepted_model), managed: true, deadline };
+                initial_inspection = Some(inspect_initial(context.clone(), &pending));
+                pending_inspection = Some(pending);
+            }
+            result = async { initial_inspection.as_mut().unwrap().await }, if initial_inspection.is_some() && ending.is_none() => {
+                initial_inspection = None;
+                let pending = pending_inspection.take().expect("inspection owns payload");
+                draining |= context.relay.as_ref().is_some_and(|relay| relay.is_draining());
+                if draining { continue; }
+                let mut active = match result {
+                    Ok(active) => active,
+                    Err(InspectFailure::Ineligible) => {
+                        ending = Some((Some(CloseFrame { code:1000.into(), reason:"".into() }), "account_ineligible"));
+                        end_deadline = Instant::now() + CLOSE_TIMEOUT;
+                        continue;
+                    }
+                    Err(InspectFailure::ReservationUnavailable) => {
+                        if pending.managed { pending_launch_error = Some(launch_error(DataLaunchError::Changed)); }
+                        ending = Some((Some(CloseFrame { code:1001.into(), reason:"".into() }), "routing_unavailable"));
+                        end_deadline = Instant::now() + CLOSE_TIMEOUT;
+                        continue;
+                    }
                 };
+                model = pending.model.clone();
                 active.model = model.clone();
                 active.completion.record.model = model.clone();
                 active.completion.dashboard_model(model.as_deref());
-                active.last_create = Some((message.clone(), reservation.clone()));
-                active.completion.input_bytes.fetch_add(message.len() as u64, Ordering::Relaxed);
+                active.last_create = Some((pending.message.clone(), pending.reservation.clone()));
+                active.completion.input_bytes.fetch_add(pending.message.len() as u64, Ordering::Relaxed);
                 if let Some(relay) = &context.relay {
-                    if has_previous_response_id(&message) { relay.bindings.unknown_request_cost(session.key.as_deref()); }
-                    else { relay.bindings.request_bytes(session.key.as_deref(), message.len() as u64); }
+                    if has_previous_response_id(&pending.message) { relay.bindings.unknown_request_cost(pending.session.key.as_deref()); }
+                    else { relay.bindings.request_bytes(pending.session.key.as_deref(), pending.message.len() as u64); }
                 }
                 let rate = active.rate.clone();
                 let request = next_request;
                 next_request += 1;
                 current.insert(request, active);
-                pending_initial = Some(PendingInitial { request, message, reservation, rate: rate.clone() });
-                let context = context.clone();
-                let model = model.clone();
-                initial_admission = Some(Box::pin(async move {
-                    if !rate.admit(context.runtime.as_ref(), &context.account).await { return false; }
-                    match &context.runtime {
-                        Some(runtime) => runtime.eligible(&context.account, model.as_deref()).await,
-                        None => true,
-                    }
-                }));
+                let initial = PendingInitial { request, message: pending.message, reservation: pending.reservation, rate, deadline: pending.deadline };
+                initial_admission = Some(admit_initial(context.clone(), &initial, model.clone(), pending.managed));
+                pending_initial = Some(initial);
             }
-            eligible = async { initial_admission.as_mut().unwrap().await }, if initial_admission.is_some() && to_upstream.is_none() && ending.is_none() => {
+            admission = async { initial_admission.as_mut().unwrap().await }, if initial_admission.is_some() && to_upstream.is_none() && ending.is_none() => {
                 initial_admission = None;
                 let pending = pending_initial.take().expect("initial admission owns payload");
                 draining |= context.relay.as_ref().is_some_and(|relay| relay.is_draining());
@@ -1664,13 +1827,7 @@ async fn run_with_read_timeout(
                     pending_initial = Some(pending);
                     continue;
                 }
-                if !eligible {
-                    let forced = pending.rate.state.lock().unwrap_or_else(|e| e.into_inner()).forced;
-                    let eligible_now = match &context.runtime {
-                        Some(runtime) => runtime.eligible(&context.account, model.as_deref()).await,
-                        None => true,
-                    };
-                    let expired = forced && eligible_now;
+                if let InitialAdmission::Rejected { expired } = admission {
                     let reason = if expired { "rate_wait_timeout" } else { "account_ineligible" };
                     if let Some(active) = current.get_mut(&pending.request) {
                         active.completion.record.outcome = reason.into();
@@ -1694,7 +1851,7 @@ async fn run_with_read_timeout(
                             continue;
                         }
                     };
-                    create_admission = Some(admit_create(context.clone(), requested));
+                    create_admission = Some(admit_create(context.clone(), requested, pending.deadline));
                 } else {
                     initial_ready = true;
                 }
@@ -1763,7 +1920,7 @@ async fn run_with_read_timeout(
                             ending = Some((Some(CloseFrame { code: 1001.into(), reason: "".into() }), "takeover_drain"));
                             end_deadline = Instant::now() + CLOSE_TIMEOUT;
                         }
-                        if current.is_empty() && ending.is_none() && let Some(runtime) = &context.runtime
+                        if current.is_empty() && !pending_inspection_active && ending.is_none() && let Some(runtime) = &context.runtime
                             && !runtime.eligible(&context.account, model.as_deref()).await {
                             ending = Some((Some(CloseFrame { code: 1000.into(), reason: "".into() }), "account_ineligible"));
                             end_deadline = Instant::now() + CLOSE_TIMEOUT;
@@ -1906,10 +2063,10 @@ async fn run_with_read_timeout(
             }, if ending.is_none() && pending_launch_error.is_none() && (
                 pending_client_admission
                 || ((deferred_client.is_some() || (client_admitted && !context.memory_guard.is_guarded()))
-                    && to_upstream.is_none() && pending_launch_create.is_none() && pending_initial.is_none() && rate_redial.is_none() && pending_rate_redial.is_none() && !terminal_pending)
+                    && to_upstream.is_none() && pending_launch_create.is_none() && !pending_inspection_active && pending_initial.is_none() && rate_redial.is_none() && pending_rate_redial.is_none() && !terminal_pending)
             ) => {
                 let (message, reservation) = incoming;
-                if pending_launch_create.is_some() || pending_initial.is_some() || to_upstream.is_some() || pending_rate_redial.is_some() || rate_redial.is_some() {
+                if pending_client_admission {
                     match message {
                         Some(Ok(Message::Ping(_))) => {
                             if to_client.is_none() { to_client = Some(flush(client_sink.take().unwrap())); }
@@ -1935,6 +2092,8 @@ async fn run_with_read_timeout(
                     to_upstream = None;
                     launch_preparation = None;
                     pending_launch_create = None;
+                    pending_inspection = None;
+                    initial_inspection = None;
                     initial_admission = None;
                     create_admission = None;
                     initial_write_admission = None;
@@ -1950,7 +2109,7 @@ async fn run_with_read_timeout(
                     Some(Ok(message)) => {
                         let bytes = message.len();
                         let reservation = reservation.unwrap_or_else(|| context.budget.reserve_message(bytes));
-                        let mut request = current.keys().next().copied();
+                        let request = current.keys().next().copied();
                         // Upgrade-time classification cannot outlive authoritative promotion.
                         // Keep the original message/reservation and use normal managed preparation.
                         if !managed_socket && matches!(&message, Message::Text(_) | Message::Binary(_)) {
@@ -1972,33 +2131,21 @@ async fn run_with_read_timeout(
                                 let context = context.clone();
                                 let deadline = context.launch_deadline();
                                 launch_preparation = Some(Box::pin(async move { context.prepare_launch_create(requested.as_deref(), deadline).await }));
-                                pending_launch_create = Some((message, reservation));
+                                pending_launch_create = Some((message, reservation, deadline));
                                 continue;
                             }
                         }
                         if let Message::Text(text) = &message && response_create(text.as_str()) {
                             draining |= context.relay.as_ref().is_some_and(|relay| relay.is_draining());
                             if draining { continue; }
-                            model = super::super::wire_metadata::Metadata::parse(text.as_bytes()).and_then(|meta| meta.model());
-                            if let Some(runtime) = &context.runtime && !runtime.eligible(&context.account, model.as_deref()).await {
-                                ending = Some((Some(CloseFrame { code: 1000.into(), reason: "".into() }), "account_ineligible"));
-                                end_deadline = Instant::now() + CLOSE_TIMEOUT;
-                                continue;
-                            }
-                            let Some(mut active) = CurrentCompletion::new(&context).await else {
-                                ending=Some((Some(CloseFrame {code:1001.into(),reason:"".into()}),"routing_unavailable"));
-                                end_deadline=Instant::now()+CLOSE_TIMEOUT;
-                                continue;
+                            let pending = PendingInspection {
+                                model: super::super::wire_metadata::Metadata::parse(text.as_bytes()).and_then(|meta| meta.model()),
+                                session: Session { key: context.session.key.clone(), parent: context.session.parent.clone(), model: context.session.model.clone() },
+                                managed: false, deadline: context.launch_deadline(), message, reservation,
                             };
-                            active.model = model.clone();
-                            active.completion.record.model = model.clone();
-                            active.completion.dashboard_model(model.as_deref());
-                            request = Some(next_request);
-                            current.insert(next_request, active);
-                            if let Some(active) = current.get_mut(&next_request) {
-                                active.last_create = Some((message.clone(), reservation.clone()));
-                            }
-                            next_request += 1;
+                            initial_inspection = Some(inspect_initial(context.clone(), &pending));
+                            pending_inspection = Some(pending);
+                            continue;
                         }
                         // 라이브러리가 예약한 로컬 pong을 반대쪽 전달 완료와 독립적으로 flush한다.
                         if matches!(&message, Message::Ping(_)) && to_client.is_none() {
@@ -2014,34 +2161,9 @@ async fn run_with_read_timeout(
                             ending = Some((frame.clone(), "client_close"));
                             end_deadline = Instant::now() + CLOSE_TIMEOUT;
                         }
-                        let initial_rate = if let Message::Text(text) = &message {
-                            response_create(text.as_str()).then(|| request.and_then(|id| current.get(&id)).map(|active| active.rate.clone())).flatten()
-                        } else { None };
-                        // Transfer the deferred slot's reservation into the
-                        // write. Re-admitting its already charged bytes could
-                        // deadlock when the slot itself fills the budget.
-                        if let Some(rate) = initial_rate {
-                            let request = request.expect("response.create has completion");
-                            pending_initial = Some(PendingInitial { request, message, reservation, rate: rate.clone() });
-                            let context = context.clone();
-                            let model = model.clone();
-                            #[cfg(feature = "testkit")]
-                            let wait_message = pending_initial.as_ref().unwrap().message.clone();
-                            initial_admission = Some(Box::pin(async move {
-                                if !rate.admit(context.runtime.as_ref(), &context.account).await { return false; }
-                                let eligible = match &context.runtime {
-                                    Some(runtime) => if model.is_some() { runtime.eligible(&context.account, model.as_deref()).await } else { runtime.eligible_unknown_model(&context.account).await },
-                                    None => true,
-                                };
-                                #[cfg(feature = "testkit")]
-                                if eligible && !wait_ordinary_dispatch(&context, &wait_message, OrdinaryDispatchStage::AfterPacing).await { return false; }
-                                eligible
-                            }));
-                        } else {
-                            let fallback_model = if let Message::Text(text) = &message { super::super::wire_metadata::Metadata::parse(text.as_bytes()).and_then(|meta| meta.model()) } else { None };
-                            to_upstream = Some(guarded_upstream_write(context.clone(), upstream_sink.take().unwrap(), message, reservation,
-                                Delivered { bytes, request, terminal: None, completed: false }, fallback_model, managed_socket));
-                        }
+                        let fallback_model = if let Message::Text(text) = &message { super::super::wire_metadata::Metadata::parse(text.as_bytes()).and_then(|meta| meta.model()) } else { None };
+                        to_upstream = Some(guarded_upstream_write(context.clone(), upstream_sink.take().unwrap(), message, reservation,
+                            Delivered { bytes, request, terminal: None, completed: false }, fallback_model, managed_socket));
                     }
                     _ => { ending = Some((None, "client_eof")); end_deadline = Instant::now() + CLOSE_TIMEOUT; }
                 }
@@ -2279,7 +2401,7 @@ async fn run_with_read_timeout(
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => true,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => false,
                 };
-                if relevant && current.is_empty() && !terminal_pending && let Some(runtime) = &context.runtime
+                if relevant && current.is_empty() && !pending_inspection_active && !terminal_pending && let Some(runtime) = &context.runtime
                     && !runtime.eligible(&context.account, model.as_deref()).await {
                     ending = Some((Some(CloseFrame { code: 1000.into(), reason: "".into() }), "account_ineligible"));
                     end_deadline = Instant::now() + CLOSE_TIMEOUT;
@@ -2308,6 +2430,8 @@ async fn run_with_read_timeout(
     drop(to_upstream);
     drop(launch_preparation);
     drop(pending_launch_create);
+    drop(initial_inspection);
+    drop(pending_inspection);
     drop(initial_admission);
     drop(create_admission);
     drop(initial_write_admission);
