@@ -23,6 +23,10 @@ pub enum Command {
     Observe {
         thread_id: String,
     },
+    /// Nonconsuming readiness before the final native goal read.
+    Inspect {
+        episode: u64,
+    },
     Consume {
         episode: u64,
     },
@@ -45,7 +49,9 @@ impl Request {
                             .bytes()
                             .all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b))
                 }
-                Command::Consume { episode } | Command::Cancel { episode } => *episode != 0,
+                Command::Inspect { episode }
+                | Command::Consume { episode }
+                | Command::Cancel { episode } => *episode != 0,
             }
     }
 }
@@ -65,6 +71,7 @@ pub struct Reply {
 pub enum Event {
     Waiting { episode: u64, reset_unix_ms: i64 },
     Due { episode: u64 },
+    Ready { episode: u64 },
     Granted { episode: u64 },
     Cancelled { episode: u64 },
     Refused { reason: Refusal },
@@ -89,7 +96,9 @@ impl Reply {
                 episode,
                 reset_unix_ms,
             } => self.request_id.is_some() && *episode != 0 && *reset_unix_ms > 0,
-            Event::Granted { episode } => self.request_id.is_some() && *episode != 0,
+            Event::Ready { episode } | Event::Granted { episode } => {
+                self.request_id.is_some() && *episode != 0
+            }
             Event::Due { episode } | Event::Cancelled { episode } => *episode != 0,
             Event::Refused { .. } => self.request_id.is_some(),
         }
