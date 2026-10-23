@@ -5674,6 +5674,15 @@ mod n5d_zero_retention_producer {
 
     #[tokio::test]
     async fn n5d_zero_retention_physical_429_publishes_exact_scoped_waiting_episode() {
+        physical_429_publishes_exact_scoped_waiting_episode(false).await;
+    }
+
+    #[tokio::test]
+    async fn n5d_native_plan_metadata_physical_429_publishes_exact_scoped_waiting_episode() {
+        physical_429_publishes_exact_scoped_waiting_episode(true).await;
+    }
+
+    async fn physical_429_publishes_exact_scoped_waiting_episode(with_plan_metadata: bool) {
         let h = timeout(
             BOUND,
             Harness::new_configured(
@@ -5742,7 +5751,15 @@ mod n5d_zero_retention_producer {
         );
 
         let reset = chrono::DateTime::from_timestamp(Utc::now().timestamp() + 3600, 0).unwrap();
-        let mut limited = ScriptedResponse::json(StatusCode::TOO_MANY_REQUESTS, "");
+        let body = if with_plan_metadata {
+            serde_json::json!({"error":{"type":"usage_limit_reached",
+                "message":"Synthetic quota fixture", "plan_type":"pro",
+                "resets_at":reset.timestamp()}})
+            .to_string()
+        } else {
+            String::new()
+        };
+        let mut limited = ScriptedResponse::json(StatusCode::TOO_MANY_REQUESTS, body.clone());
         for (name, value) in [
             ("x-codex-primary-window-minutes", "300".to_owned()),
             ("x-codex-primary-used-percent", "100".to_owned()),
@@ -5757,8 +5774,8 @@ mod n5d_zero_retention_producer {
         ] {
             limited.headers.insert(name, value.parse().unwrap());
         }
-        // Empty complete body makes native Rate -> Quota reconciliation a no-op
-        // after header application; full raw headers supply the actual proof.
+        // Exercise both header-only proof and the real native metadata shape.
+        // The body can compose with full raw headers; it never supplies origin.
         h.fake.state.push(limited);
         let response = client
             .post(format!("{}/responses", launch.base_url))
@@ -5769,8 +5786,9 @@ mod n5d_zero_retention_producer {
             .await
             .expect("zero-retention physical fallback must return without reset hold");
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert!(
-            response.bytes().await.unwrap().is_empty(),
+        assert_eq!(
+            response.bytes().await.unwrap().as_ref(),
+            body.as_bytes(),
             "physical limit bytes must remain verbatim"
         );
         let calls = h.fake.state.requests();

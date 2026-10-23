@@ -56,6 +56,9 @@ struct QuotaBodyError {
     code: Option<String>,
     #[serde(rename = "message")]
     _message: Option<String>,
+    // Descriptive metadata only; never quota scope or proof authority.
+    #[serde(rename = "plan_type")]
+    _plan_type: Option<String>,
     resets_at: i64,
 }
 
@@ -1543,13 +1546,17 @@ mod tests {
 
     impl Composition {
         fn new() -> Self {
+            Self::with_weekly_usage(20.)
+        }
+
+        fn with_weekly_usage(weekly_used_pct: f64) -> Self {
             let header_at = DateTime::from_timestamp(2_000_000_000, 0).unwrap();
             let observed = header_at - Duration::seconds(10);
             let reset = header_at + Duration::minutes(10);
             let initial = crate::accounts::health::tests::fixture();
             let raw = json!({"observed_at":observed,"windows":[
                 {"name":"5h","used_pct":100.,"observed_at":observed,"reset_at":reset},
-                {"name":"7d","used_pct":20.,"observed_at":observed,"reset_at":reset+Duration::days(1)},
+                {"name":"7d","used_pct":weekly_used_pct,"observed_at":observed,"reset_at":reset+Duration::days(1)},
             ]});
             let mut before = initial.clone();
             before.apply_health_signal(
@@ -1574,6 +1581,62 @@ mod tests {
                 at: header_at + Duration::seconds(2),
             }
         }
+    }
+
+    #[test]
+    fn n5a_body_compose_native_plan_type_metadata_preserves_known_quota_witness() {
+        let c = Composition::with_weekly_usage(10.);
+        let reset = c.header.reset_at;
+        let mut value = json!({"error": {
+            "type":"usage_limit_reached",
+            "message":"Synthetic quota fixture",
+            "plan_type":"pro",
+            "resets_at":reset.timestamp(),
+        }});
+        let bytes = serde_json::to_vec(&value).unwrap();
+        let body = AccountRuntime::qualify_http_429_body(Some(&bytes), None);
+        assert!(body.qualified);
+        let known = body
+            .known
+            .expect("native plan metadata must retain the witness");
+        assert_eq!(known.reset_at, reset);
+        assert!(known.model.is_none());
+
+        value["error"].as_object_mut().unwrap().remove("plan_type");
+        let baseline = serde_json::to_vec(&value).unwrap();
+        let baseline = AccountRuntime::qualify_http_429_body(Some(&baseline), None);
+        assert!(baseline.qualified && baseline.known.is_some());
+
+        let mut after = c.before.clone();
+        after.apply_health_signal(c.signal.clone(), c.at);
+        let proof = c
+            .header
+            .compose_codex_body(&c.before, &after, &c.signal, &known, Some(reset), c.at)
+            .expect("matching full 5h and non-full weekly evidence must compose");
+        assert!(proof.matches_current(&after, c.at));
+        assert!(!proof.quota_credit_releasable);
+    }
+
+    #[test]
+    fn n5a_body_compose_plan_type_rejects_invalid_types_and_duplicates() {
+        for plan_type in [json!(true), json!(123), json!([]), json!({})] {
+            let bytes = serde_json::to_vec(&json!({"error": {
+                "type":"usage_limit_reached",
+                "message":"Synthetic quota fixture",
+                "plan_type":plan_type,
+                "resets_at":2_000_000_600_i64,
+            }}))
+            .unwrap();
+            let body = AccountRuntime::qualify_http_429_body(Some(&bytes), None);
+            assert!(body.qualified);
+            assert!(
+                body.known.is_none(),
+                "invalid metadata must not supply a witness"
+            );
+        }
+        let duplicate = br#"{"error":{"type":"usage_limit_reached","plan_type":"pro","plan_type":"pro","resets_at":2000000600}}"#;
+        let body = AccountRuntime::qualify_http_429_body(Some(duplicate), None);
+        assert!(body.qualified && body.known.is_none());
     }
 
     #[test]
