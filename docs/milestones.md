@@ -6,10 +6,10 @@ This file names the verification for each unit and each row. The row list and th
 
 <!-- status:begin -->
 현재 마일스톤: R13 N5c 긴급 정책 실행
-목표: 긴급 정책 저장·실행 옵션·HTTP 경합 단위 완료; 대시보드 토글과 실제 이동 검증 연결
+목표: 확인된 긴급 토글·대기 표시 통합; 실제 5시간 한도 대기·전환 결함 수정과 HWND 검증
 핵심 지표: 남은 출시 1/3 (R14 보호 설치, R13 C+E 실행, R13 F 통합 예측); 이전 계열 2/2 종료
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-23 12:02 KST (N5c 코어10·CLI23·실제HTTP4·strict lint 단위 통과; UI·실제 이동·전체 C+E 전)
+갱신: 2026-10-23 12:35 KST (UI 코드 d7c6243; core5·tray12·실제HTTP4 및 tray strict lint 통과; G1/G2·실제 HWND 검증 중)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -384,6 +384,7 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-23 10:14 | N5b 비동기 초기 검사 단위 | private3·실제5·기존 바이트1, strict core/testkit all-target lint·fmt exit0 | pre-eligibility/pre-lease Ping·Close/EOF·원래 모델 기한 | 코드b13118a; inline-await·기한 재계산 대조 예상 실패/정확 복원 통과. quota wait·전체 N5b 수용 아님 |
 | 2026-10-23 11:33 | N5b WS/SSE 최종 영향 관문 | library909·실제WS139·HTTP115 통과, 기본/testkit strict core all-target lint·fmt·diff exit0 | 원래 create·같은 소켓/계정·실제 poll 리셋·취소·관리형 모델 최종 거절 | 코드c79b69c; n5b-delivery-gate 입력별 fingerprint. shared hook·조기 리셋·admitted timer 대조 exit101/정확 복원 exit0; N5c-d·전체 C+E·실제 replay는 별도 |
 | 2026-10-23 12:02 | N5c 긴급 정책 저장·실행·경합 집중 단위 | 코어10·CLI23·실제HTTP4, core/CLI strict lint·fmt·diff exit0 | UI 통합 전 저장·권한·첫 허가 경합 확인 | 코드4461075; n5c-launch-owner-unit 입력 fingerprint; 첫 결과 비교문 제거 exit101·정확 복원 exit0. 전체 N5c·C+E 관문 아님 |
+| 2026-10-23 12:35 | N5c 확인된 긴급 UI·대기 표시 구현 단위 | core5·tray12·실제HTTP4, tray testkit strict lint·fmt·diff exit0 | 응답 지연·중복 억제·창 재개 상태·실제 대기 DTO | 코드d7c6243; n5c-ui-mailbox-repair/n5c-ui-lint-repair/n5c-ui-integration-repair 입력 기록. 실제 HWND와 G1/G2 수정은 미완료; N5c 관문 아님 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
