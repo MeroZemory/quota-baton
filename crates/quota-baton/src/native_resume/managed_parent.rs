@@ -1,4 +1,4 @@
-//! Unregistered run owner for ONE native ticket and ONE core reset episode.
+//! Owned run owner for ONE native ticket and ONE core reset episode.
 //!
 //! The caller keeps admission/catalog alive until this owner has returned or
 //! finished Drop. Own the authenticated endpoint and both jobs before entering
@@ -35,6 +35,9 @@ use std::{
 
 use tokio::{runtime::Handle, sync::Notify, time::Instant};
 use tokio_tungstenite::WebSocketStream;
+
+#[cfg(all(feature = "testkit", debug_assertions))]
+use super::observation::{self, Event, ThreadId};
 
 use super::{
     control_actor,
@@ -751,7 +754,13 @@ impl<J: Jobs> ManagedParent<J> {
             failed |= worker.join().is_err();
         }
         self.cleaned = true;
-        if failed { Err(Error::Cleanup) } else { Ok(()) }
+        if failed {
+            Err(Error::Cleanup)
+        } else {
+            #[cfg(all(feature = "testkit", debug_assertions))]
+            observation::emit(Event::Cleanup);
+            Ok(())
+        }
     }
 }
 
@@ -805,6 +814,8 @@ fn dispatch_loop<N: Write, U: Write>(
 ) -> Result<(), Error> {
     let mut core = Some(core);
     let mut phase = AutoPhase::Learning;
+    #[cfg(all(feature = "testkit", debug_assertions))]
+    let mut acknowledged_emitted = false;
     while !shared.stopped.load(Ordering::Acquire) {
         if !shared.enabled.load(Ordering::Acquire) {
             shared.wait_dispatch();
@@ -821,6 +832,8 @@ fn dispatch_loop<N: Write, U: Write>(
         };
         let mut grant: Option<Grant> = None;
         let mut attempted = false;
+        #[cfg(all(feature = "testkit", debug_assertions))]
+        let delivery_before = parent.delivery();
         let result = parent.process_next(|| {
             attempted = true;
             let (Some(episode), Some(core)) = (episode, core.as_ref()) else {
@@ -832,6 +845,11 @@ fn dispatch_loop<N: Write, U: Write>(
             // ONLY the dedicated std thread, ONLY inside committed callback,
             // and NO ingress/mailbox mutex across this bounded exchange.
             let consumed = runtime.block_on(core.consume(episode, deadline));
+            #[cfg(all(feature = "testkit", debug_assertions))]
+            observation::emit(Event::Consumed {
+                episode,
+                granted: matches!(consumed, Ok(Consumption::Granted(_))),
+            });
             #[cfg(any(test, feature = "testkit"))]
             if let Some(gate) = shared.test_consume_return.get() {
                 gate.wait_thread();
@@ -845,6 +863,19 @@ fn dispatch_loop<N: Write, U: Write>(
                 _ => false,
             }
         });
+        #[cfg(all(feature = "testkit", debug_assertions))]
+        if result == Ok(true) && attempted && grant.is_some() {
+            observation::emit(Event::ActivationWritten);
+        }
+        #[cfg(all(feature = "testkit", debug_assertions))]
+        if !acknowledged_emitted
+            && result.is_ok()
+            && delivery_before != Delivery::Acknowledged
+            && parent.delivery() == Delivery::Acknowledged
+        {
+            acknowledged_emitted = true;
+            observation::emit(Event::ActivationAcknowledged);
+        }
         #[cfg(any(test, feature = "testkit"))]
         if attempted {
             shared.test_record(TestLifecycle::ConsumeCallbackFinished);
@@ -883,6 +914,10 @@ fn dispatch_loop<N: Write, U: Write>(
         if matches!(phase, AutoPhase::Learning)
             && let Some(ticket) = parent.stopped_ticket()
         {
+            #[cfg(all(feature = "testkit", debug_assertions))]
+            if let Ok(thread_id) = ThreadId::parse(ticket.thread_id()) {
+                observation::emit(Event::StoppedThread { thread_id });
+            }
             // Taking this ticket permanently leaves Learning, on EVERY result.
             phase = AutoPhase::Terminal;
             let deadline = Instant::now() + EVENT_BUDGET;
@@ -901,6 +936,8 @@ fn dispatch_loop<N: Write, U: Write>(
                 Ok(Observation::Waiting { episode, .. }) | Ok(Observation::Due { episode })
                     if shared.bind_episode(episode) =>
                 {
+                    #[cfg(all(feature = "testkit", debug_assertions))]
+                    observation::emit(Event::Observed { episode });
                     if immediate {
                         shared.publish_due(episode);
                     }
@@ -933,6 +970,11 @@ fn dispatch_loop<N: Write, U: Write>(
                     }
                 };
                 shared.end_event();
+                #[cfg(all(feature = "testkit", debug_assertions))]
+                observation::emit(Event::Inspected {
+                    episode,
+                    ready: matches!(inspected, Ok(Inspection::Ready)),
+                });
                 if matches!(inspected, Ok(Inspection::Ready)) && shared.enter_physical(deadline) {
                     let result = parent.begin_final_read(ticket);
                     if result

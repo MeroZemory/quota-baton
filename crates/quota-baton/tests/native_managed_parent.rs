@@ -20,6 +20,9 @@ mod ingress;
 mod launcher_label;
 #[path = "../src/native_resume/managed_parent.rs"]
 mod managed_parent;
+#[cfg(all(feature = "testkit", debug_assertions))]
+#[path = "../src/native_resume/observation.rs"]
+mod observation;
 #[path = "../src/native_resume/parent_dispatch.rs"]
 mod parent_dispatch;
 #[path = "../src/native_resume/socket_pump.rs"]
