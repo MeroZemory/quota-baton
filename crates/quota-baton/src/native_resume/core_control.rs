@@ -1,4 +1,4 @@
-//! Unregistered, single-socket, single-episode core client. Not native activation.
+//! Single-socket, explicitly advanced episode core client. Not native activation.
 //!
 //! Requests have one absolute deadline, capped at five seconds. Waiting for an
 //! unsolicited Due uses the parent's deadline (which may include a long reset),
@@ -204,6 +204,7 @@ enum Kind {
     Inspect(u64),
     Consume(u64),
     Cancel(u64),
+    Advance(u64),
 }
 
 struct Pending {
@@ -219,6 +220,8 @@ struct Correlation {
     pending: Option<Pending>,
     due: Option<u64>,
     finished: bool,
+    granted: Option<u64>,
+    retired_episode: u64,
 }
 
 impl Correlation {
@@ -230,11 +233,15 @@ impl Correlation {
             pending: None,
             due: None,
             finished: false,
+            granted: None,
+            retired_episode: 0,
         }
     }
 
     fn begin(&mut self, command: Command) -> Result<Request, Error> {
-        if self.finished || self.pending.is_some() {
+        let advancing = matches!(&command, Command::Advance { episode }
+            if self.finished && self.granted == Some(*episode));
+        if (self.finished && !advancing) || self.pending.is_some() {
             return Err(Error::Closed);
         }
         let kind = match &command {
@@ -246,6 +253,7 @@ impl Correlation {
                 Kind::Consume(*episode)
             }
             Command::Cancel { episode } if self.episode == Some(*episode) => Kind::Cancel(*episode),
+            Command::Advance { episode } if advancing => Kind::Advance(*episode),
             _ => return Err(Error::Protocol),
         };
         let id = self
@@ -263,13 +271,17 @@ impl Correlation {
         self.last_id = id;
         self.observed = true;
         // Consume/Cancel are spent before the first send, including failed sends.
-        self.finished = matches!(kind, Kind::Consume(_) | Kind::Cancel(_));
+        self.finished = matches!(kind, Kind::Consume(_) | Kind::Cancel(_) | Kind::Advance(_));
+        if matches!(kind, Kind::Advance(_)) {
+            self.granted = None;
+        }
         self.pending = Some(Pending { id, kind });
         Ok(request)
     }
 
     fn bind_episode(&mut self, episode: u64) -> Result<(), Error> {
-        if self.episode.is_some_and(|current| current != episode) {
+        if episode <= self.retired_episode || self.episode.is_some_and(|current| current != episode)
+        {
             return Err(Error::Protocol);
         }
         self.episode = Some(episode);
@@ -289,6 +301,12 @@ impl Correlation {
             return Err(Error::Protocol);
         }
         if reply.request_id.is_none() {
+            if matches!(&reply.event, Event::Due { episode } | Event::Cancelled { episode }
+                if *episode <= self.retired_episode)
+            {
+                // Already-retired hints cannot bind or wake the new episode.
+                return Ok(None);
+            }
             match reply.event {
                 Event::Due { episode } => {
                     if !self.observed || self.finished && self.pending.is_none() {
@@ -316,7 +334,17 @@ impl Correlation {
             (Kind::Inspect(expected), Event::Ready { episode })
             | (Kind::Cancel(expected), Event::Cancelled { episode })
                 if expected == *episode => {}
-            (Kind::Consume(episode), Event::Granted { .. }) if reply.grants(id, episode) => {}
+            (Kind::Consume(episode), Event::Granted { .. }) if reply.grants(id, episode) => {
+                self.granted = Some(episode);
+                self.due = None;
+            }
+            (Kind::Advance(expected), Event::Advanced { episode }) if expected == *episode => {
+                self.retired_episode = expected;
+                self.episode = None;
+                self.due = None;
+                self.observed = false;
+                self.finished = false;
+            }
             (_, Event::Refused { .. }) => {}
             _ => return Err(Error::Protocol),
         }
@@ -484,6 +512,37 @@ impl CoreControl {
                 Ok(Consumption::Refused(reason))
             }
             _ => unreachable!("correlation validates consume event"),
+        }
+    }
+
+    /// Opens only a future registration slot. It never returns a Grant or Due.
+    /// The managed parent must first prove committed ACK and native progress.
+    pub(crate) async fn advance_episode(
+        &mut self,
+        episode: u64,
+        deadline: Instant,
+    ) -> Result<(), Error> {
+        // Retire prior receipts before any new wire exchange, even if the
+        // exchange fails. The same socket gets a fresh receipt lifetime.
+        self.live.store(false, Ordering::Release);
+        self.live = Arc::new(AtomicBool::new(true));
+        if let Some(socket) = self.socket.as_mut() {
+            socket.live = self.live.clone();
+        } else {
+            self.live.store(false, Ordering::Release);
+            return Err(Error::Closed);
+        }
+        match self
+            .exchange(Command::Advance { episode }, deadline)
+            .await?
+            .event
+        {
+            Event::Advanced { .. } => Ok(()),
+            Event::Refused { .. } => {
+                self.close();
+                Err(Error::Cancelled)
+            }
+            _ => unreachable!("correlation validates advance event"),
         }
     }
 
@@ -677,5 +736,101 @@ mod tests {
             live: Arc::downgrade(&live),
         };
         assert!(!grant.authorizes(7));
+    }
+    fn granted_correlation() -> Correlation {
+        let mut state = Correlation::new();
+        state
+            .begin(Command::Observe {
+                thread_id: "thread-a".into(),
+            })
+            .unwrap();
+        state
+            .receive(Reply {
+                version: VERSION,
+                request_id: Some(1),
+                event: Event::Due { episode: 7 },
+            })
+            .unwrap();
+        state.begin(Command::Consume { episode: 7 }).unwrap();
+        state
+            .receive(Reply {
+                version: VERSION,
+                request_id: Some(2),
+                event: Event::Granted { episode: 7 },
+            })
+            .unwrap();
+        state
+    }
+
+    #[test]
+    fn advance_requires_exact_consumed_receipt_and_a_correlated_reply() {
+        assert!(
+            Correlation::new()
+                .begin(Command::Advance { episode: 7 })
+                .is_err()
+        );
+        assert!(
+            granted_correlation()
+                .begin(Command::Advance { episode: 8 })
+                .is_err()
+        );
+        for (request_id, episode) in [(2, 7), (3, 8)] {
+            let mut state = granted_correlation();
+            assert_eq!(
+                state
+                    .begin(Command::Advance { episode: 7 })
+                    .unwrap()
+                    .request_id,
+                3
+            );
+            assert!(
+                state
+                    .receive(Reply {
+                        version: VERSION,
+                        request_id: Some(request_id),
+                        event: Event::Advanced { episode }
+                    })
+                    .is_err()
+            );
+        }
+        let mut state = granted_correlation();
+        state.begin(Command::Advance { episode: 7 }).unwrap();
+        state
+            .receive(Reply {
+                version: VERSION,
+                request_id: Some(3),
+                event: Event::Advanced { episode: 7 },
+            })
+            .unwrap();
+        assert!(state.begin(Command::Advance { episode: 7 }).is_err());
+        assert!(
+            state
+                .receive(Reply {
+                    version: VERSION,
+                    request_id: None,
+                    event: Event::Due { episode: 7 }
+                })
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(state.episode, None);
+        assert_eq!(
+            state
+                .begin(Command::Observe {
+                    thread_id: "thread-a".into()
+                })
+                .unwrap()
+                .request_id,
+            4
+        );
+        assert!(
+            state
+                .receive(Reply {
+                    version: VERSION,
+                    request_id: Some(4),
+                    event: Event::Due { episode: 7 }
+                })
+                .is_err()
+        );
     }
 }

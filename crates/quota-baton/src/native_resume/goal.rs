@@ -11,18 +11,22 @@
 //!
 //! One controller represents ONE authoritative stopped-goal/reset episode. It can
 //! issue one ticket and attempt one final read and one active command. Even rejected
-//! or revoked tickets are never recreated from duplicate receipts. To support a
-//! later episode the parent must authenticate distinct real progress followed by a
-//! new stop and supply a fresh namespace/controller. Never replace a controller just
-//! because a notification/read repeats. Repeated daily reset support is not wired.
+//! or revoked tickets are never recreated from duplicate receipts. Only a matching
+//! automatic ACK and a fresh, successfully completed foreground turn can mint the
+//! single-use NextEpisodeProof. After separate core Advance, the serialized parent
+//! may consume it to install a fresh controller/namespace for a future distinct
+//! stop. Notifications and observation.rs never supply core authority.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde_json::{Value, json};
 
 pub(crate) const MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_PENDING: usize = 64;
+pub(crate) const MAX_RETIRED_NAMESPACES: usize = 64;
+pub(crate) const MAX_SEEN_TURNS: usize = 1024;
+pub(crate) const MAX_TURN_ID_BYTES: usize = 256;
 
 /// Payloads omit the stdio delimiter. Normal forwarded payloads are byte-identical.
 pub(crate) enum Action {
@@ -47,6 +51,8 @@ pub(crate) enum Error {
     TicketInvalid,
     AttemptConsumed,
     GenerationExhausted,
+    ProofInvalid,
+    RetiredNamespaceBound,
 }
 
 impl fmt::Display for Error {
@@ -63,6 +69,8 @@ impl fmt::Display for Error {
             Self::TicketInvalid => "native_goal_ticket_invalid",
             Self::AttemptConsumed => "native_goal_attempt_consumed",
             Self::GenerationExhausted => "native_goal_generation_exhausted",
+            Self::ProofInvalid => "native_goal_proof_invalid",
+            Self::RetiredNamespaceBound => "native_goal_retired_namespace_bound",
         })
     }
 }
@@ -96,6 +104,18 @@ impl StoppedGoalTicket {
     }
 }
 
+/// Opaque, nonClone, single-use evidence from this controller's ACK and actual
+/// serialized turn progress. Neither an observer event nor core reset authority.
+pub(crate) struct NextEpisodeProof {
+    namespace: String,
+    generation: u64,
+}
+
+struct Progress {
+    turn_id: String,
+    completed: bool,
+}
+
 struct Pending {
     method: String,
     params: Value,
@@ -111,6 +131,12 @@ pub(crate) struct Controller {
     current: Option<String>,
     active: Option<Value>,
     dispatched_goal: Option<Value>,
+    dispatched_generation: Option<u64>,
+    progress: Option<Progress>,
+    proof_taken: bool,
+    automatic_vetoed: bool,
+    seen_turns: BTreeSet<String>,
+    retired_namespaces: Vec<String>,
     quota_observed: bool,
     stopped: Option<Value>,
     sealed: bool,
@@ -137,6 +163,12 @@ impl Controller {
             current: None,
             active: None,
             dispatched_goal: None,
+            dispatched_generation: None,
+            progress: None,
+            proof_taken: false,
+            automatic_vetoed: false,
+            seen_turns: BTreeSet::new(),
+            retired_namespaces: Vec::new(),
             quota_observed: false,
             stopped: None,
             sealed: false,
@@ -154,6 +186,8 @@ impl Controller {
     /// without taking away the user's still-live ordinary native transport.
     /// An activation already handed to the writer remains unknown; never retry.
     pub(crate) fn cancel_resume(&mut self) {
+        self.automatic_vetoed = true;
+        self.progress = None;
         self.ticket_taken = true;
         self.stopped = None;
         self.active = None;
@@ -164,6 +198,8 @@ impl Controller {
     }
 
     pub(crate) fn disconnect(&mut self) {
+        self.automatic_vetoed = true;
+        self.progress = None;
         self.connected = false;
         self.stopped = None;
         self.active = None;
@@ -176,6 +212,10 @@ impl Controller {
     }
 
     fn revoke(&mut self) -> Result<(), Error> {
+        if self.sealed {
+            self.automatic_vetoed = true;
+            self.progress = None;
+        }
         self.generation = self
             .generation
             .checked_add(1)
@@ -205,12 +245,13 @@ impl Controller {
     fn receive_ui(&mut self, raw: &[u8]) -> Result<Action, Error> {
         self.require_connected()?;
         let value = decode(raw)?;
-        if value["id"]
-            .as_str()
-            .is_some_and(|s| s.starts_with(&self.namespace))
-        {
+        if value["id"].as_str().is_some_and(|s| {
+            s.starts_with(&self.namespace)
+                || self.retired_namespaces.iter().any(|ns| s.starts_with(ns))
+        }) {
             return Err(Error::NamespaceCollision);
         }
+        self.remember_turn_fields(&value["params"]);
         // While learning ownership, unrelated pipelined reads must not erase a
         // correlated selection/user-goal reply. They still block sealing via
         // `pending`. After sealing EVERY UI frame vetoes the episode. Responses
@@ -282,6 +323,21 @@ impl Controller {
     fn receive_native(&mut self, raw: &[u8]) -> Result<Action, Error> {
         self.require_connected()?;
         let value = decode(raw)?;
+        if let Some((id, retired)) = value["id"].as_str().and_then(|id| {
+            self.retired_namespaces
+                .iter()
+                .find(|ns| id.starts_with(ns.as_str()))
+                .map(|ns| (id, ns))
+        }) {
+            // Only the two RPCs actually owned by a retired controller can have
+            // late replies. Unknown suffixes and native requests are collisions.
+            if value.get("method").is_some()
+                || !matches!(id.strip_prefix(retired.as_str()), Some("1" | "2"))
+            {
+                return Err(Error::NamespaceCollision);
+            }
+            return Ok(Action::Suppress);
+        }
         if let Some(id) = value["id"]
             .as_str()
             .filter(|id| id.starts_with(&self.namespace))
@@ -304,6 +360,8 @@ impl Controller {
                 // or acknowledgement is unknown, never permission to send again.
                 self.delivery = Delivery::UnknownNoRetry;
                 self.dispatched_goal = self.active.clone();
+                self.dispatched_generation = Some(self.generation);
+                self.quota_observed = false;
                 return Ok(self.inject_resume(
                     2,
                     "thread/goal/set",
@@ -315,17 +373,35 @@ impl Controller {
             if id == format!("{}2", self.namespace) && self.delivery == Delivery::UnknownNoRetry {
                 if value.get("error").is_some() {
                     self.delivery = Delivery::Rejected;
+                    self.automatic_vetoed = true;
+                    self.progress = None;
                 } else if self.dispatched_goal.as_ref().is_some_and(|active| {
                     same_identity(active, &value["result"]["goal"])
                         && value["result"]["goal"]["status"] == "active"
                 }) {
                     self.delivery = Delivery::Acknowledged;
+                } else {
+                    // A mismatching/malformed ACK cannot be repaired by replay.
+                    self.delivery = Delivery::Rejected;
+                    self.automatic_vetoed = true;
+                    self.progress = None;
                 }
             }
             return Ok(Action::Suppress);
         }
 
         if value.get("method").is_none() {
+            self.remember_turn_fields(&value["result"]);
+            if let Some(turns) = value["result"]["thread"]["turns"].as_array() {
+                for turn in turns {
+                    self.remember_turn(turn["id"].as_str());
+                }
+            }
+            if let Some(turns) = value["result"]["turns"].as_array() {
+                for turn in turns {
+                    self.remember_turn(turn["id"].as_str());
+                }
+            }
             let key = id_key(&value["id"])?;
             if let Some(pending) = self.pending.remove(&key)
                 && value.get("error").is_none()
@@ -336,6 +412,7 @@ impl Controller {
         } else {
             let method = value["method"].as_str().ok_or(Error::InvalidFrame)?;
             let params = &value["params"];
+            self.observe_turn(&value)?;
             if self
                 .current
                 .as_deref()
@@ -343,7 +420,21 @@ impl Controller {
             {
                 if method == "thread/goal/updated" {
                     let goal = &params["goal"];
-                    if self.active.as_ref().is_some_and(|a| same_identity(a, goal))
+                    if goal["status"] == "active"
+                        && self.resume_live()
+                        && self
+                            .dispatched_goal
+                            .as_ref()
+                            .is_some_and(|a| same_identity(a, goal))
+                    {
+                        // Native's genuine automatic echo can precede its ACK.
+                        // It preserves identity but cannot acknowledge the RPC.
+                    } else if self.dispatched_goal.is_some() && goal["status"] == "usageLimited" {
+                        // Another stop before explicit rearm is not current live
+                        // progress and cannot be laundered into a fresh episode.
+                        self.revoke()?;
+                        self.forget_goal();
+                    } else if self.active.as_ref().is_some_and(|a| same_identity(a, goal))
                         && goal["status"] == "usageLimited"
                     {
                         if self.stopped.as_ref().is_some_and(|s| s != goal) {
@@ -378,13 +469,172 @@ impl Controller {
                     if method != "thread/goal/cleared" {
                         self.current = None;
                     }
-                } else if method == "turn/started" && (self.quota_observed || self.sealed) {
-                    self.revoke()?;
-                    self.quota_observed = false;
                 }
             }
         }
         Ok(Action::ToUi(raw.to_vec()))
+    }
+
+    // Remember native history and unrelated turn IDs too: a preexisting or
+    // foreign ID cannot become a fresh automatic turn in a later episode. Bounds
+    // disable automatic work without breaking ordinary native/UI forwarding.
+    fn remember_turn(&mut self, id: Option<&str>) -> bool {
+        let Some(id) = id else { return false };
+        if id.is_empty() || id.len() > MAX_TURN_ID_BYTES {
+            self.cancel_resume();
+            return false;
+        }
+        if self.seen_turns.contains(id) {
+            return false;
+        }
+        if self.seen_turns.len() >= MAX_SEEN_TURNS {
+            self.cancel_resume();
+            return false;
+        }
+        self.seen_turns.insert(id.to_owned())
+    }
+
+    fn remember_turn_fields(&mut self, fields: &Value) {
+        self.remember_turn(fields["turn"]["id"].as_str());
+        self.remember_turn(fields["turnId"].as_str());
+    }
+
+    fn resume_live(&self) -> bool {
+        self.connected
+            && !self.automatic_vetoed
+            && matches!(
+                self.delivery,
+                Delivery::UnknownNoRetry | Delivery::Acknowledged
+            )
+            && self.dispatched_generation == Some(self.generation)
+            && self.pending.is_empty()
+            && self.active.as_ref().is_some_and(|active| {
+                active["status"] == "active"
+                    && active["threadId"].as_str() == self.current.as_deref()
+                    && self
+                        .dispatched_goal
+                        .as_ref()
+                        .is_some_and(|original| same_identity(active, original))
+            })
+    }
+
+    fn observe_turn(&mut self, value: &Value) -> Result<(), Error> {
+        let method = value["method"].as_str();
+        let params = &value["params"];
+        let id = params["turn"]["id"].as_str();
+        let fresh = self.remember_turn(id);
+        self.remember_turn(params["turnId"].as_str());
+        let foreground = self
+            .current
+            .as_deref()
+            .is_some_and(|thread| params["threadId"].as_str() == Some(thread));
+        let notification =
+            value.get("id").is_none() && value.get("jsonrpc").is_none_or(|v| v == "2.0");
+        if method == Some("turn/started") && foreground {
+            if self.resume_live()
+                && notification
+                && fresh
+                && params["turn"]["status"] == "inProgress"
+                && params["turn"]["error"].is_null()
+                && self.progress.is_none()
+            {
+                self.progress = Some(Progress {
+                    turn_id: id.expect("fresh validated turn id").to_owned(),
+                    completed: false,
+                });
+            } else if self.quota_observed || self.sealed {
+                self.revoke()?;
+                self.quota_observed = false;
+            }
+        } else if method == Some("turn/completed")
+            && self
+                .progress
+                .as_ref()
+                .is_some_and(|p| Some(p.turn_id.as_str()) == id && !p.completed)
+        {
+            if foreground
+                && notification
+                && self.resume_live()
+                && params["turn"]["status"] == "completed"
+                && params["turn"]["error"].is_null()
+            {
+                if let Some(progress) = &mut self.progress {
+                    progress.completed = true;
+                }
+            } else {
+                self.revoke()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Ok(None) is pending/already taken; a terminal veto is explicit so the
+    /// parent can promptly close core control without closing ordinary stdio.
+    pub(crate) fn take_next_episode_proof(&mut self) -> Result<Option<NextEpisodeProof>, Error> {
+        if self.retired_namespaces.len() >= MAX_RETIRED_NAMESPACES {
+            self.cancel_resume();
+            return Err(Error::RetiredNamespaceBound);
+        }
+        if !self.connected
+            || self.automatic_vetoed
+            || matches!(self.delivery, Delivery::Cancelled | Delivery::Rejected)
+        {
+            return Err(Error::ProofInvalid);
+        }
+        if self.proof_taken || !self.proof_ready() {
+            return Ok(None);
+        }
+        self.proof_taken = true;
+        Ok(Some(NextEpisodeProof {
+            namespace: self.namespace.clone(),
+            generation: self.generation,
+        }))
+    }
+
+    fn proof_ready(&self) -> bool {
+        self.resume_live()
+            && self.delivery == Delivery::Acknowledged
+            && self.progress.as_ref().is_some_and(|p| p.completed)
+    }
+
+    /// Explicit proof consumption only; the parent must first obtain separate
+    /// core Advance and atomically exclude pending ingress around this call.
+    /// Never recycle a controller, ticket, namespace or private response receipt.
+    pub(crate) fn rearm(
+        &mut self,
+        proof: NextEpisodeProof,
+        namespace: String,
+    ) -> Result<(), Error> {
+        let result = self.rearm_checked(proof, namespace);
+        if result.is_err() {
+            self.cancel_resume();
+        }
+        result
+    }
+
+    fn rearm_checked(&mut self, proof: NextEpisodeProof, namespace: String) -> Result<(), Error> {
+        if !self.proof_taken
+            || !self.proof_ready()
+            || proof.namespace != self.namespace
+            || proof.generation != self.generation
+        {
+            return Err(Error::ProofInvalid);
+        }
+        if namespace == self.namespace || self.retired_namespaces.contains(&namespace) {
+            return Err(Error::NamespaceCollision);
+        }
+        if self.retired_namespaces.len() >= MAX_RETIRED_NAMESPACES {
+            return Err(Error::RetiredNamespaceBound);
+        }
+        let mut next = Self::new(namespace)?;
+        next.current = self.current.take();
+        next.active = self.active.take();
+        next.seen_turns = std::mem::take(&mut self.seen_turns);
+        next.retired_namespaces = std::mem::take(&mut self.retired_namespaces);
+        next.retired_namespaces
+            .push(std::mem::take(&mut self.namespace));
+        *self = next;
+        Ok(())
     }
 
     fn observe_response(&mut self, pending: Pending, result: &Value) -> Result<(), Error> {
@@ -477,6 +727,7 @@ impl Controller {
 
     fn eligible(&self) -> bool {
         self.connected
+            && !self.automatic_vetoed
             && self.current.is_some()
             && self.stopped.is_some()
             && self.quota_observed

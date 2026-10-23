@@ -81,6 +81,11 @@ enum Command {
         deadline: Instant,
         reply: oneshot::Sender<Result<Consumption, Error>>,
     },
+    Advance {
+        episode: u64,
+        deadline: Instant,
+        reply: oneshot::Sender<Result<(), Error>>,
+    },
     #[allow(dead_code)] // Explicit protocol close is exercised by isolated clients.
     Close {
         reply: oneshot::Sender<Result<(), Error>>,
@@ -100,6 +105,9 @@ impl Command {
                 let _ = reply.send(Err(error));
             }
             Self::Close { reply } => {
+                let _ = reply.send(Err(error));
+            }
+            Self::Advance { reply, .. } => {
                 let _ = reply.send(Err(error));
             }
         }
@@ -257,6 +265,19 @@ impl Parent {
         .await
     }
 
+    pub(crate) async fn advance_episode(
+        &self,
+        episode: u64,
+        deadline: Instant,
+    ) -> Result<(), Error> {
+        self.request(deadline, |deadline, reply| Command::Advance {
+            episode,
+            deadline,
+            reply,
+        })
+        .await
+    }
+
     #[allow(dead_code)] // Run ownership normally cancels via Parent Drop.
     pub(crate) async fn close(&self, deadline: Instant) -> Result<(), Error> {
         self.request(deadline, |_, reply| Command::Close { reply })
@@ -368,7 +389,11 @@ async fn run_inner(
     lifetime: Option<Instant>,
 ) -> Result<(), Error> {
     let mut owned = OwnedControl(control);
-    let result = episode(&mut owned.0, &mut io, lifetime).await;
+    let result = loop {
+        if let Err(error) = episode(&mut owned.0, &mut io, lifetime).await {
+            break Err(error);
+        }
+    };
     // Close before returning or dropping queued replies, including graceful Close.
     owned.0.close();
     io.commands.close();
@@ -510,13 +535,41 @@ async fn episode(
     if !granted {
         return Err(Error::Refused);
     }
-    // Grant stays bound to live control while the parent executes its callback.
-    // No second command except Close is valid, even if the grant receiver is lost.
-    let last = match command(io, Some(deadline)).await {
-        Ok(command) => Interrupted::Command(Some(command)),
-        Err(error) => error,
+    // The receipt retains its original five-second physical deadline. The
+    // owner may then wait for real native ACK/progress without extending it.
+    // Only an explicit Advance can open a later, separately qualified episode.
+    let next = match command(io, lifetime).await {
+        Ok(command) => command,
+        Err(error) => return Err(terminate(control, error)),
     };
-    Err(terminate(control, last))
+    let Command::Advance {
+        episode: previous,
+        deadline,
+        mut reply,
+    } = next
+    else {
+        return Err(terminate(control, Interrupted::Command(Some(next))));
+    };
+    if previous != episode {
+        reply.send(Err(Error::Phase)).ok();
+        return Err(Error::Phase);
+    }
+    let deadline = bounded_deadline(deadline, lifetime);
+    match exchange(
+        control.advance_episode(previous, deadline),
+        &mut reply,
+        io,
+        deadline,
+    )
+    .await
+    {
+        Ok(()) => reply.send(Ok(())).map_err(|_| Error::ReplyLost),
+        Err(error) => {
+            let error = terminate(control, error);
+            reply.send(Err(error)).ok();
+            Err(error)
+        }
+    }
 }
 
 #[cfg(test)]

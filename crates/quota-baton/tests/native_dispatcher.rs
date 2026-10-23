@@ -1,8 +1,10 @@
 //! Coupled ownership and physical writer ordering; no reset authority fixture.
+#[allow(dead_code)] // This isolated target exercises a subset of the production adapter.
 #[path = "../src/native_resume/dispatcher.rs"]
 mod dispatcher;
 #[path = "../src/native_resume/framing.rs"]
 mod framing;
+#[allow(dead_code)] // This isolated target exercises a subset of the production adapter.
 #[path = "../src/native_resume/goal.rs"]
 mod goal;
 

@@ -6,7 +6,7 @@ use std::io::Write;
 
 use super::{
     framing::FrameWriter,
-    goal::{Action, Controller, Delivery, StoppedGoalTicket},
+    goal::{Action, Controller, Delivery, NextEpisodeProof, StoppedGoalTicket},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -87,6 +87,24 @@ impl<N: Write, U: Write> Dispatcher<N, U> {
 
     pub(crate) fn stopped_ticket(&mut self) -> Option<StoppedGoalTicket> {
         self.controller.stopped_ticket()
+    }
+
+    pub(crate) fn take_next_episode_proof(&mut self) -> Result<Option<NextEpisodeProof>, Error> {
+        self.controller
+            .take_next_episode_proof()
+            .map_err(|_| Error::AuthorityDenied)
+    }
+
+    /// Replace only native ownership state; retain the existing physical writers.
+    /// A failed rearm consumes/vetoes automatic work, not ordinary user transport.
+    pub(crate) fn rearm(
+        &mut self,
+        proof: NextEpisodeProof,
+        namespace: String,
+    ) -> Result<(), Error> {
+        self.controller
+            .rearm(proof, namespace)
+            .map_err(|_| Error::AuthorityDenied)
     }
 
     /// Parent must revalidate its distinct core authority immediately before

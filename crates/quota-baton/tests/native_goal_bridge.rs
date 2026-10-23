@@ -1,5 +1,6 @@
 //! Standalone coverage for staged, unregistered native ownership code. No native
 //! process, credentials, transport, provider policy or core authorization fixture.
+#[allow(dead_code)] // This isolated target exercises a subset of the production adapter.
 #[path = "../src/native_resume/goal.rs"]
 mod goal;
 

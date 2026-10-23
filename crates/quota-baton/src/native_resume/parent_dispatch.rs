@@ -7,7 +7,7 @@ use std::io::Write;
 
 use super::{
     dispatcher::{self, Dispatcher},
-    goal::{Delivery, StoppedGoalTicket},
+    goal::{Delivery, NextEpisodeProof, StoppedGoalTicket},
     ingress::{self, CommitError, Publisher, Source},
 };
 
@@ -50,6 +50,63 @@ impl<N: Write, U: Write> Parent<N, U> {
 
     pub(crate) fn stopped_ticket(&mut self) -> Option<StoppedGoalTicket> {
         self.dispatcher.stopped_ticket()
+    }
+
+    /// Pending progress is Ok(None); an automatic veto is AuthorityDenied. The
+    /// proof is single-use and never substitutes for the caller's core Advance.
+    pub(crate) fn take_next_episode_proof(&mut self) -> Result<Option<NextEpisodeProof>, Error> {
+        if let Err(error) = self.ingress.backlog() {
+            self.dispatcher.disconnect();
+            return Err(Error::Ingress(error));
+        }
+        self.dispatcher
+            .take_next_episode_proof()
+            .map_err(Error::Dispatch)
+    }
+
+    /// Call after bounded core Advance. Recheck empty ingress AFTER that exchange
+    /// and hold its gate during the state swap, retaining readers and both writers.
+    /// Pending input consumes the proof and vetoes automatic work; it stays queued
+    /// for ordinary dispatch. A controller/namespace is never reused on failure.
+    pub(crate) fn rearm(
+        &mut self,
+        proof: NextEpisodeProof,
+        namespace: String,
+    ) -> Result<(), Error> {
+        let checkpoint = match self.ingress.checkpoint() {
+            Ok(checkpoint) => checkpoint,
+            Err(ingress::Error::Pending) => {
+                self.dispatcher.cancel_resume();
+                return Err(Error::Dispatch(dispatcher::Error::AuthorityDenied));
+            }
+            Err(error) => {
+                self.dispatcher.disconnect();
+                return Err(Error::Ingress(error));
+            }
+        };
+        let mut unwind = UnwindClose(Some(self.close.clone()));
+        let dispatcher = &mut self.dispatcher;
+        // with_current treats closure errors as uncertain physical writes. Keep
+        // a clean rearm veto inside Ok so ordinary input remains live.
+        let result = self.ingress.with_current(checkpoint, || {
+            Ok::<_, std::convert::Infallible>(dispatcher.rearm(proof, namespace))
+        });
+        match result {
+            Ok(result) => {
+                unwind.0 = None;
+                result.map_err(Error::Dispatch)
+            }
+            Err(CommitError::Ingress(ingress::Error::Pending | ingress::Error::Stale)) => {
+                self.dispatcher.cancel_resume();
+                unwind.0 = None;
+                Err(Error::Dispatch(dispatcher::Error::AuthorityDenied))
+            }
+            Err(CommitError::Ingress(error)) => {
+                self.dispatcher.disconnect();
+                Err(Error::Ingress(error))
+            }
+            Err(CommitError::Write(never)) => match never {},
+        }
     }
 
     /// Caller has separately completed fresh nonconsuming core inspection.

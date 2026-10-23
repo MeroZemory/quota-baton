@@ -1,12 +1,15 @@
 //! Composed local ordering only: authorization callbacks are synthetic, not core permits.
+#[allow(dead_code)] // This isolated target exercises a subset of the production adapter.
 #[path = "../src/native_resume/dispatcher.rs"]
 mod dispatcher;
 #[path = "../src/native_resume/framing.rs"]
 mod framing;
+#[allow(dead_code)] // This isolated target exercises a subset of the production adapter.
 #[path = "../src/native_resume/goal.rs"]
 mod goal;
 #[path = "../src/native_resume/ingress.rs"]
 mod ingress;
+#[allow(dead_code)] // This isolated target exercises a subset of the production adapter.
 #[path = "../src/native_resume/parent_dispatch.rs"]
 mod parent_dispatch;
 

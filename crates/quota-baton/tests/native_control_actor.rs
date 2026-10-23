@@ -541,3 +541,106 @@ async fn cancellation_only_due_idle_parent_or_actor_drop_closes_without_consume(
         }
     }
 }
+
+#[tokio::test]
+async fn explicit_advance_retires_old_receipt_and_accepts_only_a_new_episode() {
+    let (control, mut server) = pair().await;
+    let (mut parent, io) = channels();
+    let mut hints = parent.take_due().unwrap();
+    let work = async {
+        let mut prior = None;
+        for episode in [EPISODE, EPISODE + 1] {
+            require(parent.observe("thread-a", deadline()).await);
+            assert_eq!(
+                require(timeout(BUDGET, hints.recv()).await)
+                    .unwrap()
+                    .episode(),
+                episode
+            );
+            assert!(matches!(
+                parent.inspect(episode, deadline()).await,
+                Ok(Inspection::Ready)
+            ));
+            let Consumption::Granted(grant) = require(parent.consume(episode, deadline()).await)
+            else {
+                panic!("grant")
+            };
+            assert!(grant.is_current(episode));
+            if episode == EPISODE {
+                require(parent.advance_episode(episode, deadline()).await);
+                assert!(!grant.is_current(episode));
+                prior = Some(grant);
+            } else {
+                assert!(!prior.as_ref().unwrap().is_current(EPISODE));
+                require(parent.close(deadline()).await);
+                assert!(!grant.is_current(episode));
+            }
+        }
+    };
+    let peer = async {
+        for episode in [EPISODE, EPISODE + 1] {
+            let observe = request(&mut server).await;
+            assert!(matches!(observe.command, Command::Observe { .. }));
+            reply(
+                &mut server,
+                Some(observe.request_id),
+                Event::Due { episode },
+            )
+            .await;
+            let inspect = request(&mut server).await;
+            assert!(
+                matches!(inspect.command, Command::Inspect { episode: found } if found == episode)
+            );
+            reply(
+                &mut server,
+                Some(inspect.request_id),
+                Event::Ready { episode },
+            )
+            .await;
+            let consume = request(&mut server).await;
+            assert!(
+                matches!(consume.command, Command::Consume { episode: found } if found == episode)
+            );
+            reply(
+                &mut server,
+                Some(consume.request_id),
+                Event::Granted { episode },
+            )
+            .await;
+            if episode == EPISODE {
+                let advance = request(&mut server).await;
+                assert!(matches!(
+                    advance.command,
+                    Command::Advance { episode: EPISODE }
+                ));
+                reply(
+                    &mut server,
+                    Some(advance.request_id),
+                    Event::Advanced { episode },
+                )
+                .await;
+                // A queued old hint must not wake or bind the new Observe.
+                reply(&mut server, None, Event::Due { episode }).await;
+            }
+        }
+        closed(&mut server).await;
+    };
+    let (result, (), ()) =
+        bounded(async { tokio::join!(run_until_cancelled(control, io), work, peer) }).await;
+    require(result);
+}
+
+#[tokio::test]
+async fn advance_before_a_grant_is_local_terminal_denial() {
+    let (control, mut server) = pair().await;
+    let (parent, io) = channels();
+    let work = async {
+        assert!(parent.advance_episode(EPISODE, deadline()).await.is_err());
+    };
+    let peer = async {
+        closed(&mut server).await;
+    };
+    let (result, (), ()) =
+        bounded(async { tokio::join!(run_until_cancelled(control, io), work, peer) }).await;
+    assert!(result.is_err());
+}
