@@ -163,9 +163,10 @@ async fn origin_and_protocol_negotiation_are_rejected() {
     })
     .await;
     rejected(|request| {
-        request
-            .headers_mut()
-            .insert(SEC_WEBSOCKET_EXTENSIONS, require("permessage-deflate".parse()));
+        request.headers_mut().insert(
+            SEC_WEBSOCKET_EXTENSIONS,
+            require("permessage-deflate".parse()),
+        );
     })
     .await;
     rejected(|request| {
@@ -228,16 +229,24 @@ async fn fragmented_text_is_reassembled() {
         let client = async {
             let stream = require(TcpStream::connect(address).await);
             let (mut socket, _) = require(client_async(request, stream).await);
-            require(socket.send(Message::Frame(Frame::message(
-                b"synthetic ".to_vec(),
-                OpCode::Data(Data::Text),
-                false,
-            ))).await);
-            require(socket.send(Message::Frame(Frame::message(
-                b"fragment".to_vec(),
-                OpCode::Data(Data::Continue),
-                true,
-            ))).await);
+            require(
+                socket
+                    .send(Message::Frame(Frame::message(
+                        b"synthetic ".to_vec(),
+                        OpCode::Data(Data::Text),
+                        false,
+                    )))
+                    .await,
+            );
+            require(
+                socket
+                    .send(Message::Frame(Frame::message(
+                        b"fragment".to_vec(),
+                        OpCode::Data(Data::Continue),
+                        true,
+                    )))
+                    .await,
+            );
         };
         let server = async {
             let mut socket = require(endpoint.accept(deadline()).await);
@@ -258,24 +267,35 @@ async fn rejects_large_message(fragmented: bool) {
             let stream = require(TcpStream::connect(address).await);
             let (mut socket, _) = require(client_async(request, stream).await);
             if fragmented {
-                require(socket.send(Message::Frame(Frame::message(
-                    vec![b'a'; LIMIT / 2 + 1],
-                    OpCode::Data(Data::Text),
-                    false,
-                ))).await);
+                require(
+                    socket
+                        .send(Message::Frame(Frame::message(
+                            vec![b'a'; LIMIT / 2 + 1],
+                            OpCode::Data(Data::Text),
+                            false,
+                        )))
+                        .await,
+                );
                 // Server may close immediately on the aggregate-size error.
-                let _ = socket.send(Message::Frame(Frame::message(
-                    vec![b'a'; LIMIT / 2 + 1],
-                    OpCode::Data(Data::Continue),
-                    true,
-                ))).await;
+                let _ = socket
+                    .send(Message::Frame(Frame::message(
+                        vec![b'a'; LIMIT / 2 + 1],
+                        OpCode::Data(Data::Continue),
+                        true,
+                    )))
+                    .await;
             } else {
-                let _ = socket.send(Message::Binary(vec![0; LIMIT + 1].into())).await;
+                let _ = socket
+                    .send(Message::Binary(vec![0; LIMIT + 1].into()))
+                    .await;
             }
         };
         let server = async {
             let mut socket = require(endpoint.accept(deadline()).await);
-            assert!(matches!(socket.next().await, Some(Err(WsError::Capacity(_)))));
+            assert!(matches!(
+                socket.next().await,
+                Some(Err(WsError::Capacity(_)))
+            ));
         };
         tokio::join!(server, client);
     })
@@ -293,7 +313,9 @@ async fn no_peer_deadline_and_pending_accept_cancellation_release_listener() {
     bounded(async {
         let endpoint = require(Endpoint::bind().await);
         let address = peer_address(&request(&endpoint));
-        let result = endpoint.accept(Instant::now() + Duration::from_millis(30)).await;
+        let result = endpoint
+            .accept(Instant::now() + Duration::from_millis(30))
+            .await;
         assert!(matches!(result, Err(EndpointError::Timeout)));
         drop(require(TcpListener::bind(address).await));
 
@@ -368,7 +390,8 @@ async fn header_limit_accepts_exactly_8192_and_rejects_8193() {
                     "Sec-WebSocket-Key: AAECAwQFBgcICQoLDA0ODw==\r\n",
                     "Authorization: Bearer {}\r\nX-Pad: ",
                 ),
-                host, endpoint.token(),
+                host,
+                endpoint.token(),
             );
             let padding = size - prefix.len() - 4;
             let wire = format!("{prefix}{}\r\n\r\n", "a".repeat(padding));
