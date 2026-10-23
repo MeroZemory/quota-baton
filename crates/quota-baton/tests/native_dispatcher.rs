@@ -181,10 +181,8 @@ fn final_read_is_not_authority_and_default_frame_path_cannot_activate() {
         Err(Error::AuthorityDenied)
     );
     assert_eq!(n.0.lock().unwrap().bytes, before);
-    assert_eq!(
-        d.native_frame_admitted(&final_response(), || true),
-        Err(Error::Protocol)
-    );
+    d.native_frame_admitted(&final_response(), || panic!("denial cannot retry"))
+        .unwrap();
     assert_eq!(n.0.lock().unwrap().bytes, before);
 }
 
@@ -205,9 +203,15 @@ fn revocation_during_final_read_is_checked_before_any_activation_byte() {
     assert_eq!(checks, 1);
     assert_eq!(n.0.lock().unwrap().bytes, before);
     assert!(d.stopped_ticket().is_none());
-    assert_eq!(
-        d.native_frame_admitted(&final_response(), || panic!("no second admission")),
-        Err(Error::Protocol)
+    d.native_frame_admitted(&final_response(), || panic!("no second admission"))
+        .unwrap();
+    let user = br#"{"id":91,"method":"account/read","params":{}}"#;
+    d.ui_frame(user).unwrap();
+    assert!(
+        n.0.lock()
+            .unwrap()
+            .bytes
+            .ends_with(&[user.as_slice(), b"\n"].concat())
     );
 }
 
@@ -278,5 +282,54 @@ fn control_close_after_write_does_not_retry_or_erase_unknown_delivery() {
     d.native_frame_admitted(&final_response(), || panic!("no retry"))
         .unwrap();
     assert_eq!(n.0.lock().unwrap().bytes, before);
+    assert!(d.stopped_ticket().is_none());
+}
+
+#[test]
+fn parent_commit_covers_whole_frame_and_never_runs_for_ordinary_or_duplicate_input() {
+    let (mut d, n, _) = stopped();
+    let ticket = d.stopped_ticket().unwrap();
+    d.begin_final_read(ticket).unwrap();
+    let before = n.0.lock().unwrap().bytes.len();
+    d.native_frame_committed(&final_response(), |writer, frame| {
+        assert_eq!(n.0.lock().unwrap().bytes.len(), before);
+        writer.send(frame).map_err(|_| Error::WriteUncertain)?;
+        let written = n.0.lock().unwrap();
+        assert!(written.bytes.len() > before);
+        assert_eq!(written.bytes.last(), Some(&b'\n'));
+        Ok(())
+    })
+    .unwrap();
+    let after = n.0.lock().unwrap().bytes.clone();
+    d.native_frame_committed(&final_response(), |_, _| panic!("duplicate commit"))
+        .unwrap();
+    assert_eq!(n.0.lock().unwrap().bytes, after);
+    d.native_frame_committed(br#"{"method":"server/notice","params":{}}"#, |_, _| {
+        panic!("ordinary input cannot commit")
+    })
+    .unwrap();
+}
+
+#[test]
+fn parent_commit_veto_preserves_ordinary_tui_and_never_rearms_activation() {
+    let (mut d, n, _) = stopped();
+    let ticket = d.stopped_ticket().unwrap();
+    d.begin_final_read(ticket).unwrap();
+    let before = n.0.lock().unwrap().bytes.clone();
+    assert_eq!(
+        d.native_frame_committed(&final_response(), |_, _| Err(Error::AuthorityDenied)),
+        Err(Error::AuthorityDenied)
+    );
+    assert_eq!(n.0.lock().unwrap().bytes, before);
+    d.native_frame_committed(&final_response(), |_, _| panic!("veto is terminal"))
+        .unwrap();
+    let user = br#"{"id":92,"method":"account/read","params":{}}"#;
+    d.ui_frame(user).unwrap();
+    assert!(
+        n.0.lock()
+            .unwrap()
+            .bytes
+            .ends_with(&[user.as_slice(), b"\n"].concat())
+    );
     assert!(d.stopped_ticket().is_none());
 }
