@@ -912,3 +912,18 @@ Minutes are dropped once the remainder is a day or more. The provider summary us
   - The chart shades the gap between the actual line and the pace line.
   - A one-line verdict sits beside it, e.g. "0.6 accounts ahead of pace" or "running 0.4 accounts behind", using the D24 amendment 5 wording style.
 - **5-hour windows.** They are not aggregated: they reset too often for a pace line to inform a decision. They stay on the account cards.
+
+## D30. qb protects accounts that are also used outside it, automatically — Accepted (user direction, 2026-10-23)
+
+**Incident.** acct-alpha (Codex Plus) reset its 5-hour window at 12:19 KST. Between 12:19 and 12:42, qb spilled 4 Codex sessions onto it from acct-d, whose concurrent WebSocket cap was full, and the window went from 0% to 100% in 24 minutes. The user's own session on acct-alpha's direct home (another project's main session) was then blocked until 17:19.
+
+**User direction.** No per-account reservation: "유저는 이런걸 신경안쓰면좋겠는데. 예약없어야하지 않을까요". The protection must need no setting.
+
+**Decision.**
+1. **Spill anti-herding.** A session over its account's learned WebSocket cap first waits for a slot on its own account, within the upgrade deadline. A spill to another account takes the D20 placement charge and the weak-evidence cap. After a spill, at most one spilled session may land on a given account until fresh usage evidence for that account arrives. A freshly reset account counts as weak evidence.
+2. **Automatic outside-use detection.** qb knows which requests it sent to each account. When an account's usage rises with no qb traffic on it (beyond a noise band), qb marks the account "also used elsewhere" for the rest of that window and the next.
+   - qb never moves running sessions onto such an account.
+   - It places new sessions there only when no other account can serve.
+   - The dashboard notes "also used outside qb" next to the account.
+   - The mark clears after a full window with no outside rise.
+3. There is no setting and no user action. The user's direct homes (codex-mz, codex-ib and the others) keep working, and qb gives way to them.
