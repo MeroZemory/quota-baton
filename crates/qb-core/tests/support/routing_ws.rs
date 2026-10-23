@@ -613,7 +613,10 @@ async fn upgrade_skips_reset_beyond_remaining_budget_without_overriding_strict()
             })
             .unwrap();
         if mode == qb_core::routing::Mode::Strict {
-            assert_eq!(h.error().await.0, StatusCode::CONFLICT);
+            let (status, body) = h.error().await;
+            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(body["error"]["type"], "usage_limit_reached");
+            assert_eq!(body["error"]["resets_at"], until.timestamp());
             assert_eq!(h.fake.state.requests().len(), 1);
         } else {
             let (mut next, b) = h.connect().await;
@@ -665,7 +668,10 @@ async fn pending_quota_reconnect_skips_reset_outside_upgrade_budget_in_each_mode
             "actual quota frame must create the pending ticket before reconnect"
         );
         if mode == qb_core::routing::Mode::Strict {
-            assert_eq!(h.error().await.0, StatusCode::CONFLICT);
+            let (status, body) = h.error().await;
+            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(body["error"]["type"], "usage_limit_reached");
+            assert!(body["error"]["resets_at"].as_i64().unwrap() > Utc::now().timestamp());
             assert_eq!(h.fake.state.requests().len(), 1);
         } else {
             let (mut next, b) = h.connect().await;
