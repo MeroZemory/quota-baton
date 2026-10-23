@@ -12,6 +12,7 @@ use super::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Error {
     Protocol,
+    AuthorityDenied,
     WriteUncertain,
 }
 
@@ -32,12 +33,25 @@ impl<N: Write, U: Write> Dispatcher<N, U> {
 
     pub(crate) fn ui_frame(&mut self, frame: &[u8]) -> Result<(), Error> {
         let action = self.controller.ui_frame(frame);
-        self.apply(action)
+        self.apply(action, || false)
     }
 
     pub(crate) fn native_frame(&mut self, frame: &[u8]) -> Result<(), Error> {
         let action = self.controller.native_frame(frame);
-        self.apply(action)
+        self.apply(action, || false)
+    }
+
+    /// Called only by the serialized parent. The callback consumes/revalidates
+    /// core authority immediately before the automatic write, not before the
+    /// asynchronous final-read exchange. It is never used for ordinary frames.
+    /// Denial closes this episode without any native activation bytes or retry.
+    pub(crate) fn native_frame_admitted(
+        &mut self,
+        frame: &[u8],
+        authorize: impl FnOnce() -> bool,
+    ) -> Result<(), Error> {
+        let action = self.controller.native_frame(frame);
+        self.apply(action, authorize)
     }
 
     pub(crate) fn stopped_ticket(&mut self) -> Option<StoppedGoalTicket> {
@@ -48,7 +62,7 @@ impl<N: Write, U: Write> Dispatcher<N, U> {
     /// this call. A native ownership ticket alone never permits automatic work.
     pub(crate) fn begin_final_read(&mut self, ticket: StoppedGoalTicket) -> Result<(), Error> {
         let action = self.controller.begin_final_read(ticket);
-        self.apply(action)
+        self.apply(action, || false)
     }
 
     pub(crate) fn delivery(&self) -> Delivery {
@@ -60,13 +74,24 @@ impl<N: Write, U: Write> Dispatcher<N, U> {
         self.controller.disconnect();
     }
 
-    fn apply(&mut self, action: Result<Action, super::goal::Error>) -> Result<(), Error> {
+    fn apply(
+        &mut self,
+        action: Result<Action, super::goal::Error>,
+        authorize: impl FnOnce() -> bool,
+    ) -> Result<(), Error> {
         let action = action.map_err(|_| {
             self.controller.disconnect();
             Error::Protocol
         })?;
         let result = match action {
             Action::ToNative(frame) => self.native.send(&frame),
+            Action::ResumeNative(frame) => {
+                if !authorize() {
+                    self.controller.disconnect();
+                    return Err(Error::AuthorityDenied);
+                }
+                self.native.send(&frame)
+            }
             Action::ToUi(frame) => self.ui.send(&frame),
             Action::Suppress => Ok(()),
         };

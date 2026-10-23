@@ -89,7 +89,7 @@ fn actual_automatic_write_is_private_status_only_once_and_ack_is_suppressed() {
     let ticket = d.stopped_ticket().unwrap();
     d.begin_final_read(ticket).unwrap();
     let before_ui = u.0.lock().unwrap().bytes.len();
-    d.native_frame(&final_response()).unwrap();
+    d.native_frame_admitted(&final_response(), || true).unwrap();
     native(
         &mut d,
         json!({"id":format!("{PREFIX}2"),"result":{"goal":goal("active")}}),
@@ -124,7 +124,7 @@ fn partial_automatic_write_disconnects_and_cannot_emit_a_second_byte() {
         out.fail_after = Some(out.bytes.len() + 5);
     }
     assert_eq!(
-        d.native_frame(&final_response()),
+        d.native_frame_admitted(&final_response(), || true),
         Err(Error::WriteUncertain)
     );
     assert_eq!(d.delivery(), Delivery::UnknownNoRetry);
@@ -167,4 +167,67 @@ fn ui_transport_loss_and_reader_truncation_cancel_before_resume() {
     let calls = n.0.lock().unwrap().calls;
     assert_eq!(d.native_frame(&final_response()), Err(Error::Protocol));
     assert_eq!(n.0.lock().unwrap().calls, calls);
+}
+
+#[test]
+fn final_read_is_not_authority_and_default_frame_path_cannot_activate() {
+    let (mut d, n, _) = stopped();
+    let ticket = d.stopped_ticket().unwrap();
+    d.begin_final_read(ticket).unwrap();
+    let before = n.0.lock().unwrap().bytes.clone();
+    assert_eq!(
+        d.native_frame(&final_response()),
+        Err(Error::AuthorityDenied)
+    );
+    assert_eq!(n.0.lock().unwrap().bytes, before);
+    assert_eq!(
+        d.native_frame_admitted(&final_response(), || true),
+        Err(Error::Protocol)
+    );
+    assert_eq!(n.0.lock().unwrap().bytes, before);
+}
+
+#[test]
+fn revocation_during_final_read_is_checked_before_any_activation_byte() {
+    let (mut d, n, _) = stopped();
+    let ticket = d.stopped_ticket().unwrap();
+    d.begin_final_read(ticket).unwrap();
+    let before = n.0.lock().unwrap().bytes.clone();
+    let mut checks = 0;
+    assert_eq!(
+        d.native_frame_admitted(&final_response(), || {
+            checks += 1;
+            false
+        }),
+        Err(Error::AuthorityDenied)
+    );
+    assert_eq!(checks, 1);
+    assert_eq!(n.0.lock().unwrap().bytes, before);
+    assert!(d.stopped_ticket().is_none());
+    assert_eq!(
+        d.native_frame_admitted(&final_response(), || panic!("no second admission")),
+        Err(Error::Protocol)
+    );
+}
+
+#[test]
+fn authority_callback_runs_only_for_activation_and_before_its_first_byte() {
+    let (mut d, n, _) = stopped();
+    let ticket = d.stopped_ticket().unwrap();
+    d.begin_final_read(ticket).unwrap();
+    d.native_frame_admitted(br#"{"method":"server/notice","params":{}}"#, || {
+        panic!("ordinary frame is not authority")
+    })
+    .unwrap();
+    let before = n.0.lock().unwrap().bytes.len();
+    d.native_frame_admitted(&final_response(), || {
+        assert_eq!(n.0.lock().unwrap().bytes.len(), before);
+        true
+    })
+    .unwrap();
+    assert!(n.0.lock().unwrap().bytes.len() > before);
+    d.native_frame_admitted(&final_response(), || {
+        panic!("duplicate cannot consume authority")
+    })
+    .unwrap();
 }
