@@ -1864,3 +1864,42 @@ async fn managed_native_eof_before_cleanup_preserves_root_over_selected_pump_fai
     })
     .await;
 }
+
+#[tokio::test]
+async fn managed_ack_and_completed_native_progress_open_only_a_future_core_slot() {
+    bounded(async {
+        let (socket, mut ui, control, mut core) = peers().await;
+        let proof = Proof::new(false);
+        let owner = require(ManagedParent::new(FakeJobs::new(proof.clone()), PREFIX.into(), control, socket));
+        let mut run = Box::pin(owner.run());
+        tokio::select! {
+            result = &mut run => { let _ = result; panic!("run exited during repeated episode"); }
+            () = async {
+                stopped_dialogue(&mut ui, &proof).await;
+                waiting(&mut core).await;
+                ready(&mut core, &proof).await;
+                final_native_reply(&proof);
+                let consume = core_request(&mut core).await;
+                assert!(matches!(consume.command, Command::Consume { episode: EPISODE }));
+                core_reply(&mut core, Some(consume.request_id), Event::Granted { episode: EPISODE }).await;
+                proof.wait_native_frame(&json!(format!("{PREFIX}2"))).await;
+                proof.native(json!({"id":format!("{PREFIX}2"),"result":{"goal":native_goal("active")}}).to_string().as_bytes());
+                for status in ["inProgress", "completed"] {
+                    let notification = json!({"method":if status=="completed" {"turn/completed"} else {"turn/started"},"params":{"threadId":THREAD,"turn":{"id":"fresh-native-turn","status":status,"error":null}}});
+                    proof.native(notification.to_string().as_bytes());
+                    assert_eq!(ui_value(&mut ui).await, notification);
+                }
+                let advance = core_request(&mut core).await;
+                assert!(matches!(advance.command, Command::Advance { episode: EPISODE }));
+                core_reply(&mut core, Some(advance.request_id), Event::Advanced { episode: EPISODE }).await;
+                // Advance carries no new reset or activation permission. The
+                // owner remains idle until a distinct native stop and qualified
+                // core registration; no second Observe/Consume is manufactured.
+                assert!(timeout(Duration::from_millis(40),core.next()).await.is_err());
+                assert_eq!(proof.automatic_count(),1);
+            } => {}
+        }
+        drop(run);
+        proof.cleaned(false);
+    }).await;
+}

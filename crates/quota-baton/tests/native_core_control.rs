@@ -1,5 +1,6 @@
 //! Synthetic TCP/WebSocket peers only. No native child, core authority fixture,
 //! credentials, profiles or provider traffic. Production module is unregistered.
+#[allow(dead_code)] // This isolated target exercises a subset of the production adapter.
 #[path = "../src/native_resume/core_control.rs"]
 mod core_control;
 

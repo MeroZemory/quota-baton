@@ -34,6 +34,7 @@ use std::{
 };
 
 use futures_util::FutureExt;
+use rand::TryRngCore;
 use tokio::{runtime::Handle, sync::Notify, time::Instant};
 use tokio_tungstenite::WebSocketStream;
 
@@ -212,6 +213,7 @@ struct AutoMailbox {
     disabled: bool,
     episode: Option<u64>,
     due: Option<u64>,
+    retired_episode: u64,
 }
 
 #[derive(Default)]
@@ -407,6 +409,7 @@ impl Shared {
         let mut state = self.state();
         let auto = &mut state.auto;
         if episode == 0
+            || episode <= auto.retired_episode
             || auto.episode.is_some_and(|id| id != episode)
             || auto.due.is_some_and(|id| id != episode)
         {
@@ -425,6 +428,9 @@ impl Shared {
     fn publish_due(&self, episode: u64) {
         let mut state = self.state();
         let auto = &mut state.auto;
+        if episode != 0 && episode <= auto.retired_episode {
+            return;
+        }
         if episode == 0
             || auto.episode.is_some_and(|id| id != episode)
             || auto.due.is_some_and(|id| id != episode)
@@ -446,6 +452,22 @@ impl Shared {
             return false;
         }
         state.auto.due.take();
+        true
+    }
+
+    fn advance_episode(&self, previous: u64) -> bool {
+        let mut state = self.state();
+        if state.failure.is_some()
+            || state.auto.disabled
+            || self.stopped.load(Ordering::Acquire)
+            || state.auto.episode != Some(previous)
+            || previous <= state.auto.retired_episode
+        {
+            return false;
+        }
+        state.auto.retired_episode = previous;
+        state.auto.episode = None;
+        state.auto.due = None;
         true
     }
 
@@ -1005,6 +1027,9 @@ enum AutoPhase {
     FinalRead {
         episode: u64,
     },
+    AwaitProgress {
+        episode: u64,
+    },
     Terminal,
 }
 
@@ -1121,7 +1146,11 @@ fn dispatch_loop<N: Write, U: Write>(
             == Err(parent_dispatch::Error::Dispatch(
                 dispatcher::Error::AuthorityDenied,
             ));
-        if attempted
+        if attempted && result.is_ok() {
+            phase = AutoPhase::AwaitProgress {
+                episode: episode.ok_or(Error::Worker)?,
+            };
+        } else if attempted
             || denied
             || (matches!(phase, AutoPhase::FinalRead { .. })
                 && parent.delivery() == Delivery::Cancelled)
@@ -1135,6 +1164,47 @@ fn dispatch_loop<N: Write, U: Write>(
         };
         if shared.auto_disabled() && core.is_some() {
             terminal_auto(&mut parent, &mut core, &mut phase, shared);
+        }
+
+        if let AutoPhase::AwaitProgress { episode } = phase {
+            match parent.take_next_episode_proof() {
+                Ok(Some(proof)) => {
+                    let mut nonce = [0_u8; 16];
+                    if rand::rngs::OsRng.try_fill_bytes(&mut nonce).is_err() {
+                        terminal_auto(&mut parent, &mut core, &mut phase, shared);
+                        continue;
+                    }
+                    let namespace = format!(
+                        "qb-goal-{}:",
+                        nonce
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect::<String>()
+                    );
+                    let deadline = Instant::now() + EVENT_BUDGET;
+                    let advanced = match core.as_ref() {
+                        Some(core) if shared.await_core(deadline) => runtime
+                            .block_on(core.advance_episode(episode, deadline))
+                            .is_ok(),
+                        _ => false,
+                    };
+                    shared.end_event();
+                    if advanced
+                        && shared.advance_episode(episode)
+                        && parent.rearm(proof, namespace).is_ok()
+                    {
+                        phase = AutoPhase::Learning;
+                        #[cfg(all(feature = "testkit", debug_assertions))]
+                        {
+                            acknowledged_emitted = false;
+                        }
+                    } else {
+                        terminal_auto(&mut parent, &mut core, &mut phase, shared);
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => terminal_auto(&mut parent, &mut core, &mut phase, shared),
+            }
         }
 
         if matches!(phase, AutoPhase::Learning)
@@ -1385,6 +1455,38 @@ mod eof_tests {
                 Err(Error::Watchdog)
             );
             assert_eq!(shared.begin_cleanup().2, Some(Error::Watchdog));
+        }
+    }
+    #[test]
+    fn advancing_mailbox_retires_old_due_without_reusing_authority() {
+        let shared = Shared::default();
+        assert!(!shared.advance_episode(7));
+        assert!(shared.bind_episode(7));
+        shared.publish_due(7);
+        assert!(shared.take_due(7));
+        assert!(shared.advance_episode(7));
+        assert!(!shared.advance_episode(7));
+        shared.publish_due(7);
+        assert!(!shared.take_due(7));
+        assert!(!shared.auto_disabled());
+        assert!(shared.bind_episode(8));
+        shared.publish_due(7);
+        assert!(!shared.take_due(8));
+        shared.publish_due(8);
+        assert!(shared.take_due(8));
+    }
+
+    #[test]
+    fn mailbox_never_advances_after_failure_or_auto_veto() {
+        for fail in [true, false] {
+            let shared = Shared::default();
+            assert!(shared.bind_episode(7));
+            if fail {
+                shared.fail(Error::NativeEof);
+            } else {
+                shared.disable_auto();
+            }
+            assert!(!shared.advance_episode(7));
         }
     }
 }
