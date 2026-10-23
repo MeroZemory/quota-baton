@@ -586,6 +586,112 @@ mod contained {
         pub(super) stdout: File,
     }
 
+    /// Staged ownership only, with no default activation or goal/core authority.
+    /// The parent must own this pair and its endpoint before releasing admission,
+    /// retain its lease/catalog through cleanup, and poll for either child's exit.
+    /// On any exit/error/cancellation, stop both jobs BEFORE joining pipe workers;
+    /// release admission only after both jobs are empty AND those workers joined.
+    /// No background supervisor or duplicated pipe owner is created here.
+    #[cfg(test)]
+    pub(super) struct RemotePair {
+        server: Option<Child>,
+        tui: Option<Child>,
+        stdio: Option<(File, File)>,
+    }
+
+    #[cfg(test)]
+    #[derive(Debug, Eq, PartialEq)]
+    pub(super) enum RemotePairStatus {
+        Running,
+        TuiExited(i32),
+        ServerExited(i32),
+        // A snapshot cannot determine exit ordering when both are already done.
+        BothExited { tui: i32, server: i32 },
+        Stopped,
+    }
+
+    #[cfg(test)]
+    impl RemotePair {
+        pub(super) fn spawn(server: &Command, tui: &Command) -> io::Result<Self> {
+            Self::spawn_inner(server, tui, |_| Ok(()))
+        }
+
+        // Observe the guarded first job before the second spawn in tests.
+        // Both actual spawn calls stay here and share the same error cleanup.
+        fn spawn_inner(
+            server: &Command,
+            tui: &Command,
+            before_tui: impl FnOnce(&mut Self) -> io::Result<()>,
+        ) -> io::Result<Self> {
+            let StdioChild {
+                child,
+                stdin,
+                stdout,
+            } = Child::spawn_stdio(server)?;
+            let mut pair = Self {
+                server: Some(child),
+                tui: None,
+                stdio: Some((stdin, stdout)),
+            };
+            before_tui(&mut pair)?;
+            // Default Child spawn inherits the terminal; only the server hides.
+            pair.tui = Some(Child::spawn(tui, None)?);
+            Ok(pair)
+        }
+
+        /// Transfer the server's sole parent stdin/stdout ends exactly once.
+        pub(super) fn take_stdio(&mut self) -> io::Result<(File, File)> {
+            self.stdio.take().ok_or(io::ErrorKind::NotConnected.into())
+        }
+
+        /// Read-only status snapshot. An exit revokes the parent's run; the parent
+        /// must stop both jobs before worker joins, never continue on one child.
+        pub(super) fn try_wait(&self) -> io::Result<RemotePairStatus> {
+            match (&self.tui, &self.server) {
+                (Some(tui), Some(server)) => match (tui.try_wait()?, server.try_wait()?) {
+                    (None, None) => Ok(RemotePairStatus::Running),
+                    (Some(code), None) => Ok(RemotePairStatus::TuiExited(code)),
+                    (None, Some(code)) => Ok(RemotePairStatus::ServerExited(code)),
+                    (Some(tui), Some(server)) => {
+                        Ok(RemotePairStatus::BothExited { tui, server })
+                    }
+                },
+                (None, None) => Ok(RemotePairStatus::Stopped),
+                _ => Err(io::ErrorKind::NotConnected.into()),
+            }
+        }
+
+        /// Signal BOTH jobs before draining; external pipe ends may remain open.
+        /// Returns only after Child::drop retries termination and drains both
+        /// jobs to zero. A cleanup error never skips the other child's cleanup.
+        pub(super) fn stop_jobs(&mut self) -> io::Result<()> {
+            let mut error = None;
+            for child in [&self.tui, &self.server].into_iter().flatten() {
+                if unsafe { TerminateJobObject(child.job.as_raw_handle(), 1) } == 0
+                    && error.is_none()
+                {
+                    error = Some(io::Error::last_os_error());
+                }
+            }
+            for slot in [&mut self.tui, &mut self.server] {
+                if let Some(child) = slot.take() {
+                    drop(child); // Existing fail-closed drain to job active == 0.
+                }
+            }
+            match error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        }
+    }
+
+    #[cfg(test)]
+    impl Drop for RemotePair {
+        fn drop(&mut self) {
+            let _ = self.stop_jobs();
+        }
+    }
+
     impl Child {
         pub(super) fn spawn(command: &Command, output: Option<&File>) -> io::Result<Self> {
             let null_input;
@@ -706,6 +812,20 @@ mod contained {
                 return Err(io::Error::last_os_error());
             }
             Ok(child)
+        }
+
+        #[cfg(test)]
+        pub(super) fn try_wait(&self) -> io::Result<Option<i32>> {
+            match unsafe { WaitForSingleObject(HANDLE(self.process.as_raw_handle()), 0) } {
+                WAIT_OBJECT_0 => {
+                    let mut code = 1;
+                    unsafe { GetExitCodeProcess(HANDLE(self.process.as_raw_handle()), &mut code) }
+                        .map_err(os_error)?;
+                    Ok(Some(code as i32))
+                }
+                WAIT_TIMEOUT => Ok(None),
+                _ => Err(io::Error::last_os_error()),
+            }
         }
 
         pub(super) fn wait(&mut self, timeout: Option<Duration>) -> io::Result<i32> {
@@ -1060,6 +1180,226 @@ mod contained {
                 output.resize(start + size, 0);
                 pipe.read_exact(&mut output[start..])?;
             }
+        }
+
+        fn pair_commands() -> (tempfile::TempDir, Command, Command) {
+            let scratch =
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/remote-pair-tests");
+            std::fs::create_dir_all(&scratch).unwrap();
+            let root = tempfile::tempdir_in(scratch).unwrap();
+            std::fs::write(
+                root.path().join("descendant.cmd"),
+                concat!(
+                    "@echo off\r\n",
+                    "\"%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" ",
+                    "-NoLogo -NoProfile -NonInteractive -Command ",
+                    "\"[Console]::Write('pair-descendant-ready'); Start-Sleep -Seconds 30\"\r\n",
+                ),
+            )
+            .unwrap();
+            let script = root.path().join("server.cmd");
+            std::fs::write(
+                &script,
+                concat!(
+                    "@echo off\r\n",
+                    "start \"\" /b \"%SystemRoot%\\System32\\cmd.exe\" /d /c ",
+                    "\"\"%~dp0descendant.cmd\"\"\r\n",
+                    "\"%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" ",
+                    "-NoLogo -NoProfile -NonInteractive -Command ",
+                    "\"Start-Sleep -Seconds 30\"\r\n",
+                ),
+            )
+            .unwrap();
+            let tui = pair_powershell("Start-Sleep -Seconds 30");
+            (root, Command::new(script), tui)
+        }
+
+        fn pair_powershell(script: &str) -> Command {
+            let powershell = Path::new(&std::env::var_os("SystemRoot").unwrap())
+                .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+            let mut command = Command::new(powershell);
+            command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script]);
+            command
+        }
+
+        // Handles are retained from THIS job's membership only. No public raw
+        // handle API, process-name search, adopted process, or numeric-PID kill.
+        fn pair_observe_job(child: &Child, minimum: u32) -> (OwnedHandle, Vec<OwnedHandle>) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let ids = loop {
+                let mut ids = ProcessIds::default();
+                assert_ne!(
+                    unsafe {
+                        QueryInformationJobObject(
+                            child.job.as_raw_handle(),
+                            3,
+                            (&mut ids as *mut ProcessIds).cast(),
+                            size_of::<ProcessIds>() as u32,
+                            std::ptr::null_mut(),
+                        )
+                    },
+                    0
+                );
+                if ids.count >= minimum {
+                    break ids;
+                }
+                assert!(Instant::now() < deadline, "synthetic pair job not ready");
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            assert!(ids.count as usize <= ids.ids.len());
+            let processes = ids.ids[..ids.count as usize]
+                .iter()
+                .map(|&id| {
+                    let handle = unsafe {
+                        OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, false, id as u32)
+                    }
+                    .unwrap();
+                    owned(handle.0).unwrap()
+                })
+                .collect();
+            (child.job.try_clone().unwrap(), processes)
+        }
+
+        fn pair_assert_stopped(observed: (OwnedHandle, Vec<OwnedHandle>)) {
+            let (job, processes) = observed;
+            let mut accounting = Accounting::default();
+            assert_ne!(
+                unsafe {
+                    QueryInformationJobObject(
+                        job.as_raw_handle(),
+                        1,
+                        (&mut accounting as *mut Accounting).cast(),
+                        size_of::<Accounting>() as u32,
+                        std::ptr::null_mut(),
+                    )
+                },
+                0
+            );
+            assert_eq!(accounting.active, 0);
+            for process in processes {
+                // Job accounting can reach zero before process handles signal.
+                let exited = unsafe { WaitForSingleObject(HANDLE(process.as_raw_handle()), 5000) }
+                    == WAIT_OBJECT_0;
+                if !exited {
+                    unsafe { TerminateProcess(HANDLE(process.as_raw_handle()), 1) }.unwrap();
+                    assert_eq!(
+                        unsafe { WaitForSingleObject(HANDLE(process.as_raw_handle()), 5000) },
+                        WAIT_OBJECT_0
+                    );
+                }
+                assert!(exited, "owned pair process survived cleanup");
+            }
+        }
+
+        fn pair_wait_exit(pair: &RemotePair) -> RemotePairStatus {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let status = pair.try_wait().unwrap();
+                if status != RemotePairStatus::Running {
+                    return status;
+                }
+                assert!(Instant::now() < deadline, "synthetic pair exit not observed");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        #[test]
+        fn remote_pair_second_spawn_failure_reaps_first_job_with_pipes_open() {
+            let (root, server, _) = pair_commands();
+            let missing = Command::new(root.path().join("missing-tui.exe"));
+            let mut observed = None;
+            let mut pipes = None;
+            let result = RemotePair::spawn_inner(&server, &missing, |pair| {
+                let (stdin, mut stdout) = pair.take_stdio()?;
+                let ready = stdio_read(&mut stdout, Some(b"pair-descendant-ready".len()))?;
+                assert_eq!(ready, b"pair-descendant-ready");
+                observed = Some(pair_observe_job(pair.server.as_ref().unwrap(), 2));
+                pipes = Some((stdin, stdout));
+                Ok(())
+            });
+            assert!(result.is_err(), "second actual spawn must fail");
+            pair_assert_stopped(observed.unwrap());
+            let (stdin, mut stdout) = pipes.unwrap();
+            assert!(stdio_read(&mut stdout, None).unwrap().is_empty());
+            drop(stdin); // EOF was proved while this parent end stayed open.
+        }
+
+        #[test]
+        fn remote_pair_early_tui_exit_drop_reaps_server_and_descendants() {
+            let (root, server, _) = pair_commands();
+            let release = root.path().join("release-tui");
+            let quoted = release.to_string_lossy().replace('\'', "''");
+            let tui = pair_powershell(&format!(
+                "while(!(Test-Path -LiteralPath '{quoted}')){{Start-Sleep -Milliseconds 20}}; exit 17"
+            ));
+            let mut pair = RemotePair::spawn(&server, &tui).unwrap();
+            let (stdin, mut stdout) = pair.take_stdio().unwrap();
+            assert!(pair.take_stdio().is_err(), "pipe transfer must be single-use");
+            assert_eq!(
+                stdio_read(&mut stdout, Some(b"pair-descendant-ready".len())).unwrap(),
+                b"pair-descendant-ready"
+            );
+            let server_job = pair_observe_job(pair.server.as_ref().unwrap(), 2);
+            let tui_job = pair_observe_job(pair.tui.as_ref().unwrap(), 1);
+            assert_eq!(pair.try_wait().unwrap(), RemotePairStatus::Running);
+            std::fs::write(&release, b"synthetic release").unwrap();
+            assert_eq!(pair_wait_exit(&pair), RemotePairStatus::TuiExited(17));
+            drop(pair); // Parent observes the terminal status, then tears down.
+            pair_assert_stopped(server_job);
+            pair_assert_stopped(tui_job);
+            assert!(stdio_read(&mut stdout, None).unwrap().is_empty());
+            drop(stdin);
+        }
+
+        #[test]
+        fn remote_pair_server_first_exit_stops_tui_before_pipe_join() {
+            let (_root, server, tui) = pair_commands();
+            let mut pair = RemotePair::spawn(&server, &tui).unwrap();
+            let (stdin, mut stdout) = pair.take_stdio().unwrap();
+            assert_eq!(
+                stdio_read(&mut stdout, Some(b"pair-descendant-ready".len())).unwrap(),
+                b"pair-descendant-ready"
+            );
+            let server_job = pair_observe_job(pair.server.as_ref().unwrap(), 2);
+            let tui_job = pair_observe_job(pair.tui.as_ref().unwrap(), 1);
+            // Inject failure only into the owned synthetic server's exact job.
+            assert_ne!(
+                unsafe { TerminateJobObject(pair.server.as_ref().unwrap().job.as_raw_handle(), 23) },
+                0
+            );
+            assert_eq!(pair_wait_exit(&pair), RemotePairStatus::ServerExited(23));
+            pair.stop_jobs().unwrap();
+            pair_assert_stopped(server_job);
+            pair_assert_stopped(tui_job);
+            assert_eq!(pair.try_wait().unwrap(), RemotePairStatus::Stopped);
+            pair.stop_jobs().unwrap(); // Idempotent, with no process to rearm.
+            // This is the worker-join boundary: both jobs are already zero while
+            // the transferred parent pipes deliberately remain open.
+            assert!(stdio_read(&mut stdout, None).unwrap().is_empty());
+            drop(pair);
+            drop(stdin);
+        }
+
+        #[test]
+        fn remote_pair_error_return_drops_both_running_jobs_with_pipes_open() {
+            let (_root, server, tui) = pair_commands();
+            let mut pair = RemotePair::spawn(&server, &tui).unwrap();
+            let (stdin, mut stdout) = pair.take_stdio().unwrap();
+            assert_eq!(
+                stdio_read(&mut stdout, Some(b"pair-descendant-ready".len())).unwrap(),
+                b"pair-descendant-ready"
+            );
+            let server_job = pair_observe_job(pair.server.as_ref().unwrap(), 2);
+            let tui_job = pair_observe_job(pair.tui.as_ref().unwrap(), 1);
+            assert_eq!(pair.try_wait().unwrap(), RemotePairStatus::Running);
+            fn parent_error(_pair: RemotePair) -> io::Result<()> {
+                Err(io::ErrorKind::Other.into())
+            }
+            assert!(parent_error(pair).is_err());
+            pair_assert_stopped(server_job);
+            pair_assert_stopped(tui_job);
+            assert!(stdio_read(&mut stdout, None).unwrap().is_empty());
+            drop(stdin);
         }
 
         #[test]
