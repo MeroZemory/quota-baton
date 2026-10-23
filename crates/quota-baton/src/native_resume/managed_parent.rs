@@ -546,9 +546,14 @@ impl<J: Jobs> ManagedParent<J> {
                 &shared,
                 &native_publisher,
                 || {
-                    framing::read_frame(&mut reader)
+                    let frame = framing::read_frame(&mut reader)
                         .map_err(|_| Error::NativeRead)?
-                        .ok_or(Error::NativeEof)
+                        .ok_or(Error::NativeEof)?;
+                    #[cfg(all(feature = "testkit", debug_assertions))]
+                    if let Some(event) = observation::classify_native_notification(&frame) {
+                        observation::emit(event);
+                    }
+                    Ok(frame)
                 },
                 Source::Native,
             );
@@ -931,6 +936,14 @@ fn dispatch_loop<N: Write, U: Write>(
                 }
             };
             shared.end_event();
+            #[cfg(all(feature = "testkit", debug_assertions))]
+            match &observed {
+                Ok(Observation::Refused(reason)) => {
+                    observation::emit(Event::ObservationRejected { reason: *reason });
+                }
+                Err(_) => observation::emit(Event::ObservationFailed),
+                _ => {}
+            }
             let immediate = matches!(observed, Ok(Observation::Due { .. }));
             match observed {
                 Ok(Observation::Waiting { episode, .. }) | Ok(Observation::Due { episode })
