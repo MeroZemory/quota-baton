@@ -211,7 +211,7 @@ impl Operation {
             )
         } else {
             format!(
-                "대화 {short} 를 qb로 가져올 준비를 합니다. 큰 대화는 1~2분 걸릴 수 있습니다. 창을 닫지 마세요."
+                "대화 {short}를 qb로 가져올 준비를 합니다. 큰 대화는 1~2분 걸릴 수 있습니다. 창을 닫지 마세요."
             )
         };
         // Flush before starting a worker, registering signals, or any scan.

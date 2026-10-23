@@ -25,6 +25,7 @@ windows = { workspace = true, features = ["Wdk_Foundation", "Wdk_Storage_FileSys
 zstd.workspace = true
 zeroize.workspace = true
 futures-util.workspace = true
+unicode-width = "=0.2.2"
 tokio-tungstenite.workspace = true
 
 [build-dependencies]

@@ -238,7 +238,7 @@ impl Fixture {
             meta["payload"]["forked_from_id"] = parent.into();
             meta["payload"]["history_base"] = serde_json::json!({"thread_id":parent,"end_ordinal_exclusive":5,"end_byte_offset":100});
         }
-        fs::write(&path, format!("{meta}\n{}\n", serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":PRIVATE_BODY}}))).unwrap();
+        fs::write(&path, format!("{meta}\n{}\n", serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":format!("sample conversation\n{PRIVATE_BODY}")}}))).unwrap();
         if !recent {
             fs::OpenOptions::new()
                 .write(true)
@@ -394,6 +394,45 @@ fn assert_success(output: &Output) {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn r96_single_preview_bounds_title_omits_batch_table_and_verbose_keeps_first_line() {
+    use unicode_width::UnicodeWidthStr;
+    let f = Fixture::new();
+    f.add(A, false, "openai");
+    let title = format!("{}\nsecond prompt line", "회의 abc ".repeat(400));
+    let db = Connection::open(f.source.join("state_5.sqlite")).unwrap();
+    db.execute(
+        "ALTER TABLE threads ADD COLUMN title TEXT NOT NULL DEFAULT ''",
+        [],
+    )
+    .unwrap();
+    db.execute("UPDATE threads SET title=?1 WHERE id=?2", [&title, A])
+        .unwrap();
+    drop(db);
+    let out = f.import(A, false);
+    assert_success(&out);
+    let output = String::from_utf8_lossy(&out.stdout);
+    let label = output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("제목"))
+        .unwrap()
+        .trim();
+    assert!(label.width() <= 48);
+    assert!(label.ends_with('…'));
+    assert!(!output.contains("second prompt line"));
+    assert!(!output.contains("결과 |"));
+    assert!(!output.contains("개수 |"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("11111111 를"));
+    let verbose = f.import_options(A, false, &["--verbose"]);
+    assert_success(&verbose);
+    let output = String::from_utf8_lossy(&verbose.stdout);
+    assert!(output.contains(title.lines().next().unwrap().trim()));
+    assert!(!output.contains("second prompt line"));
+    assert!(output.contains("결과 |"));
+    assert!(!f.target.join("state_5.sqlite").exists());
 }
 
 #[test]
@@ -777,7 +816,7 @@ fn r9_yes_keep_source_shares_without_a_prompt() {
     let out = f.import_options(A, true, &["--keep-source"]);
     assert_success(&out);
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.contains("결과 | 공유 |"));
+    assert!(!text.contains("결과 |"));
     assert!(!text.contains("입력하세요"));
     assert!(!f.sentinel.exists());
     let target = f.target.join("sessions").join(source.file_name().unwrap());
@@ -1093,7 +1132,7 @@ fn r9_explicit_move_succeeds_and_conflicts_with_keep_source_without_journal() {
 
     let moved = f.import_options(A, true, &["--move"]);
     assert_success(&moved);
-    assert!(String::from_utf8_lossy(&moved.stdout).contains("결과 | 이동 |"));
+    assert!(!String::from_utf8_lossy(&moved.stdout).contains("결과 |"));
     assert!(!source.exists());
     assert_eq!(fs::read(&target).unwrap(), original);
     assert!(thread_path(&f.source, A).is_none());

@@ -898,15 +898,19 @@ fn preview(
             _ => None,
         }
     };
-    let title = thread
-        .and_then(|t| text(t.thread.as_ref(), "title"))
-        .or_else(|| {
-            thread
-                .and_then(|t| t.latest_index_entry.as_ref())
-                .and_then(|entry| entry["thread_name"].as_str())
-                .map(str::to_owned)
-        })
-        .unwrap_or_default();
+    let db_title = thread.and_then(|t| text(t.thread.as_ref(), "title"));
+    let index_name = thread
+        .and_then(|t| t.latest_index_entry.as_ref())
+        .and_then(|entry| entry["thread_name"].as_str());
+    let title = crate::sessions_preview_title::resolve(
+        db_title.as_deref(),
+        index_name,
+        files
+            .iter()
+            .rev()
+            .find(|file| file.thread == id)
+            .map(|file| file.path.as_path()),
+    );
     let before = thread.and_then(|t| t.source_goal_status.as_deref());
     let after = thread.and_then(|t| text(t.goal.as_ref(), "status"));
     let names = files
@@ -1225,6 +1229,7 @@ fn run_with_store(mut store: Store, command: SessionsCommand) -> Result<()> {
                 std::cmp::Reverse(catalog.chain(id).map(|c| c.len()).unwrap_or(0))
             });
             let bulk = all || ids.len() > 1;
+            let show_summary = ids.len() > 1 || verbose;
             let mut preflight_refused = [0; 3];
             if apply {
                 crate::print_stdout(format_args!("가져오기 계획 · 대화 {}개", ids.len()))?;
@@ -1273,19 +1278,21 @@ fn run_with_store(mut store: Store, command: SessionsCommand) -> Result<()> {
                     Err(error) => return Err(error),
                 }
             }
-            crate::print_stdout(format_args!(
-                "결과 | {} | 이미 가져옴 | 실행 중 건너뜀 | 분기 건너뜀 | 실패",
-                if !apply {
-                    "처리 예정"
-                } else if keep_source {
-                    "공유"
-                } else {
-                    "이동"
-                }
-            ))?;
-            crate::print_stdout(format_args!(
-                "개수 | {imported} | {skipped} | {live} | {diverged} | {failed}"
-            ))?;
+            if show_summary {
+                crate::print_stdout(format_args!(
+                    "결과 | {} | 이미 가져옴 | 실행 중 건너뜀 | 분기 건너뜀 | 실패",
+                    if !apply {
+                        "처리 예정"
+                    } else if keep_source {
+                        "공유"
+                    } else {
+                        "이동"
+                    }
+                ))?;
+                crate::print_stdout(format_args!(
+                    "개수 | {imported} | {skipped} | {live} | {diverged} | {failed}"
+                ))?;
+            }
             Ok(())
         }
         SessionsCommand::Unimport {

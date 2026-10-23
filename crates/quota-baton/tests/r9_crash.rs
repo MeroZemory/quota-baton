@@ -1342,7 +1342,7 @@ fn r95_non_tty_progress_is_ordered_plaintext_and_heartbeats_while_parked() {
         fixture.assert_boundary_state("stage:staged", false);
         let initial = fs::read_to_string(&stderr).unwrap();
         let first = initial.lines().next().expect("progress introduction");
-        assert!(first.starts_with("대화 11111111 를 qb로 가져올 준비를 합니다."));
+        assert!(first.starts_with("대화 11111111를 qb로 가져올 준비를 합니다."));
         assert!(first.contains("1~2분") && first.contains("창을 닫지 마세요"));
         let mut previous = 0;
         for phase in [
