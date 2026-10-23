@@ -1510,12 +1510,26 @@ impl PolicyStore {
         account: &str,
         inspect: impl FnOnce(&Plan) -> Option<T>,
     ) -> Option<T> {
+        self.with_quota_wait_condition(key, account, false, inspect)
+    }
+
+    /// Data-only projection. `fallback` permits a zero budget for retaining an
+    /// already observed provider response; it never relaxes wait admission.
+    pub(crate) fn with_quota_wait_condition<T>(
+        &self,
+        key: &str,
+        account: &str,
+        fallback: bool,
+        inspect: impl FnOnce(&Plan) -> Option<T>,
+    ) -> Option<T> {
         let _publication = self.publication.read().ok()?;
         if !self.permits_dispatch_published(Some(key), account) {
             return None;
         }
         let plan = self.plan_published(Some(key));
-        if plan.settings.reset_wait_secs == 0 || plan.settings.on_5h_limit != On5hLimit::Wait {
+        if (!fallback && plan.settings.reset_wait_secs == 0)
+            || plan.settings.on_5h_limit != On5hLimit::Wait
+        {
             return None;
         }
         inspect(&plan)

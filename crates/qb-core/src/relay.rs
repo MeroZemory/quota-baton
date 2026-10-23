@@ -2635,9 +2635,10 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
         );
         decision.reconcile_quota(&credit_observation);
         completion.record.upstream_error_code = hold::error_code(&response_headers, &held.prefix);
+        let mut observed_http_429 = None;
         if decision.kind == outcome::Kind::Quota {
             if status == StatusCode::TOO_MANY_REQUESTS {
-                // The bounded side copy only supplies optional wait authority.
+                // The bounded side copy supplies optional wait/fallback evidence.
                 // Native classification and downstream bytes remain unchanged.
                 let decoded_body = (held.complete && held.terminal.is_none())
                     .then(|| hold::decoded_side(&response_headers, &held.prefix))
@@ -2646,9 +2647,9 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
                     decoded_body.as_deref(),
                     request_model.as_deref(),
                 );
-                if state
+                match state
                     .accounts
-                    .finish_http_429_report_with_body(
+                    .finish_http_429_report_observed(
                         &account.id,
                         pending_http_429,
                         decision.quota_reset,
@@ -2656,15 +2657,17 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
                         body,
                     )
                     .await
-                    .is_err()
                 {
-                    return failure(
-                        &mut completion,
-                        StatusCode::BAD_GATEWAY,
-                        provider,
-                        "store_error",
-                        "Could not persist account health",
-                    );
+                    Ok(observed) => observed_http_429 = observed,
+                    Err(()) => {
+                        return failure(
+                            &mut completion,
+                            StatusCode::BAD_GATEWAY,
+                            provider,
+                            "store_error",
+                            "Could not persist account health",
+                        );
+                    }
                 }
             } else {
                 state.accounts.invalidate_quota_rejection(&account.id).await;
@@ -2884,6 +2887,50 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
             && copy.complete().await.is_none()
         {
             break (status, response_headers, held);
+        }
+        // D26 physical-response fallback only: a genuinely accepted 5h-only
+        // report plus a current bound effective Wait whose reset cannot fit.
+        // A mere optional-wait refusal never supplies this provenance.
+        if !forced_send
+            && decision.kind == outcome::Kind::Quota
+            && let Some(observed) = observed_http_429.take()
+            && let Some(key) = session.key.as_deref()
+            && let Some(deadline) = completion.precommit_deadline
+        {
+            let operation = crate::issue_operation::IssueOperation::new(
+                tokio::time::Instant::from_std(deadline),
+            );
+            let _caller = operation.caller_guard();
+            let accounts = state.accounts.clone();
+            let bindings = state.bindings.clone();
+            let key = key.to_owned();
+            let model = request_model.clone();
+            let source = account.id.clone();
+            let work_operation = operation.clone();
+            let task = tokio::task::spawn_blocking(move || {
+                accounts.observed_http_far_wait(
+                    &bindings,
+                    crate::bindings::HttpWaitRequest {
+                        provider,
+                        key: Some(&key),
+                        model: model.as_deref(),
+                        expected_source: Some(&source),
+                        operation: &work_operation,
+                    },
+                    &observed,
+                )
+            });
+            let preserve = tokio::select! {
+                biased;
+                _ = state.wait_for_drain_start() => false,
+                _ = tokio::time::sleep_until(operation.deadline()) => false,
+                result = task => matches!(result, Ok(Ok(true))),
+            };
+            // Caller Drop cancels detached inspection on route cancellation.
+            // Native downstream delivery still owns the untouched held response.
+            if state.is_draining() || (preserve && operation.can_reply()) {
+                break (status, response_headers, held);
+            }
         }
         let mut proof_reset_source = None;
         if decision.kind == outcome::Kind::Quota {

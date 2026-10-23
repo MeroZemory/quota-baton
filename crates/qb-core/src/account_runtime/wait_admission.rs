@@ -1,6 +1,6 @@
 //! Revocable HTTP wait inspection under the native runtime authority gates.
 use super::AccountRuntime;
-use super::wait_owner::{AdmittedQuotaWait, WaitOwner};
+use super::wait_owner::{AdmittedQuotaWait, ObservedHttp429, WaitOwner};
 use crate::accounts::Account;
 use crate::bindings::{BindingTable, HttpWaitRequest, WaitIntent};
 use chrono::Utc;
@@ -42,6 +42,20 @@ impl AccountRuntime {
         })
     }
 
+    /// No admission, renewal, rotation or native mutation. The exact physical
+    /// report must still be current under all existing runtime/binding gates.
+    pub(crate) fn observed_http_far_wait(
+        &self,
+        bindings: &BindingTable,
+        request: HttpWaitRequest<'_>,
+        observed: &ObservedHttp429,
+    ) -> Result<bool, ()> {
+        self.with_current_http_condition(bindings, request, true, |owner, intent, account| {
+            owner.observed_http_far_wait_unlocked(observed, intent, account)
+        })
+        .map(|result| result.is_some())
+    }
+
     pub(crate) fn http_quota_wait_changed(&self) -> tokio::sync::futures::Notified<'_> {
         self.wait_owner.notified()
     }
@@ -52,11 +66,21 @@ impl AccountRuntime {
         request: HttpWaitRequest<'_>,
         inspect: impl FnOnce(&WaitOwner, &WaitIntent<'_>, &Account) -> Option<T>,
     ) -> Result<Option<T>, ()> {
+        self.with_current_http_condition(bindings, request, false, inspect)
+    }
+
+    fn with_current_http_condition<T>(
+        &self,
+        bindings: &BindingTable,
+        request: HttpWaitRequest<'_>,
+        fallback: bool,
+        inspect: impl FnOnce(&WaitOwner, &WaitIntent<'_>, &Account) -> Option<T>,
+    ) -> Result<Option<T>, ()> {
         let _transaction = self.store.transaction().map_err(|_| ())?;
         let released = self.released_quota.lock().map_err(|_| ())?;
         let probes = self.probes.lock().map_err(|_| ())?;
         let volatile = self.volatile.lock().map_err(|_| ())?;
-        Ok(bindings.try_current_quota_wait(request, |intent| {
+        let inspect = |intent: &WaitIntent<'_>| {
             let id = intent.account();
             if self.store.writes_stopped()
                 || probes.contains(id)
@@ -82,6 +106,11 @@ impl AccountRuntime {
             // Sample expiry after blocking credentials work. The owner then
             // checks current quota/proof/model, clocks, caller and ticket last.
             inspect(&self.wait_owner, intent, &account)
-        }))
+        };
+        Ok(if fallback {
+            bindings.try_current_quota_fallback(request, inspect)
+        } else {
+            bindings.try_current_quota_wait(request, inspect)
+        })
     }
 }

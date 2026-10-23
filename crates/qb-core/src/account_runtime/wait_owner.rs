@@ -30,6 +30,12 @@ pub(crate) struct QualifiedHttp429Body {
     known: Option<KnownQuotaBody>,
 }
 
+/// Exact published proof from this physical response, not wait/send authority.
+/// No constructor outside the native final-report adapter; no body is retained.
+pub(crate) struct ObservedHttp429 {
+    native: WaitTicket,
+}
+
 struct KnownQuotaBody {
     reset_at: DateTime<Utc>,
     model: Option<String>,
@@ -337,6 +343,42 @@ impl WaitOwner {
         proof.reset_at == ticket.reset_at
             && proof.applies_to(model)
             && proof.matches_current(account, now)
+    }
+
+    /// Read-only fallback condition for an already observed physical 429.
+    /// The caller holds the same native gates as wait inspection. This grants
+    /// neither a receipt nor dispatch; it can only retain the original response.
+    pub(super) fn observed_http_far_wait_unlocked(
+        &self,
+        observed: &ObservedHttp429,
+        intent: &crate::bindings::WaitIntent<'_>,
+        account: &Account,
+    ) -> Option<()> {
+        if account.id != intent.account()
+            || account.provider != intent.provider()
+            || observed.native.account_id() != account.id
+            || !intent.existing_placement()
+            || intent.plan().settings.mode == crate::routing::Mode::Strict
+            || intent.plan().settings.on_5h_limit != crate::routing::On5hLimit::Wait
+        {
+            return None;
+        }
+        let proof = self.proofs.admit(&observed.native).ok()?;
+        let wall = Utc::now();
+        let mono = tokio::time::Instant::now();
+        if !proof.applies_to(intent.model()) || !proof.matches_current(account, wall) {
+            return None;
+        }
+        let remaining = proof.reset_at.signed_duration_since(wall).to_std().ok()?;
+        let beyond_hold =
+            remaining > std::time::Duration::from_secs(intent.plan().settings.reset_wait_secs);
+        let beyond_deadline = mono.checked_add(remaining)? >= intent.deadline();
+        if remaining.is_zero() || !(beyond_hold || beyond_deadline) || !intent.caller_current() {
+            return None;
+        }
+        // Recheck the exact physical report after classification/clock work.
+        self.proofs.admit(&observed.native).ok()?;
+        Some(())
     }
 
     /// Current metadata/credentials and runtime eligibility were checked by the
@@ -671,6 +713,23 @@ impl ReportApplication {
         }
     }
 
+    // Store remains held from this response's native final classification through
+    // mint/acquire. Every competing report publisher also requires Store. A cut
+    // can only decline the token; later reports cannot substitute their evidence.
+    fn finish_http(mut self, candidate: Option<ShortQuotaProof>) -> Option<ObservedHttp429> {
+        let proof = candidate?;
+        if !proof.valid_at(Utc::now()) {
+            return None;
+        }
+        let owner = self.owner.upgrade()?;
+        let permit = self.permit.take()?;
+        let minted = owner.proofs.mint(permit, proof);
+        owner.changed.notify_waiters();
+        minted.ok()?;
+        let (native, _) = owner.proofs.acquire(&self.id).ok()?;
+        Some(ObservedHttp429 { native })
+    }
+
     pub(super) fn seal_http(
         mut self,
         candidate: Option<ShortQuotaProof>,
@@ -837,6 +896,7 @@ impl AccountRuntime {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn finish_http_429_report_with_body(
         &self,
         id: &str,
@@ -845,6 +905,19 @@ impl AccountRuntime {
         signal: Option<HealthSignal>,
         body: QualifiedHttp429Body,
     ) -> Result<(), ()> {
+        self.finish_http_429_report_observed(id, pending, known_reset, signal, body)
+            .await
+            .map(|_| ())
+    }
+
+    pub(crate) async fn finish_http_429_report_observed(
+        &self,
+        id: &str,
+        pending: Option<PendingHttp429>,
+        known_reset: Option<DateTime<Utc>>,
+        signal: Option<HealthSignal>,
+        body: QualifiedHttp429Body,
+    ) -> Result<Option<ObservedHttp429>, ()> {
         let store = self.store.clone();
         let owner = self.wait_owner.clone();
         let id = id.to_owned();
@@ -856,7 +929,7 @@ impl AccountRuntime {
                     owner.close();
                     // Old no-signal handling only invalidated optional proof;
                     // it did not expose Store-gate failure as a native 502.
-                    return if has_signal { Err(()) } else { Ok(()) };
+                    return if has_signal { Err(()) } else { Ok(None) };
                 }
             };
             if store.writes_stopped() {
@@ -872,6 +945,7 @@ impl AccountRuntime {
                 Some((application, proof)) => (Some(application), Some(proof)),
                 None => (None, None),
             };
+            let mut observed = None;
             match signal {
                 Some(signal) => {
                     // Same native transition/cause as transition(), without a
@@ -947,7 +1021,7 @@ impl AccountRuntime {
                         && !store.writes_stopped()
                         && let Some(application) = application
                     {
-                        application.finish(classified);
+                        observed = application.finish_http(classified);
                     }
                 }
                 None => {
@@ -961,7 +1035,7 @@ impl AccountRuntime {
                             })
                         });
                         if !store.writes_stopped() && current_matches {
-                            application.finish(candidate);
+                            observed = application.finish_http(candidate);
                         } else {
                             // Missing/malformed/stale metadata declines only
                             // proof. No native signal means no new data error.
@@ -970,14 +1044,14 @@ impl AccountRuntime {
                     }
                 }
             }
-            Ok::<_, ()>(())
+            Ok::<_, ()>(observed)
         })
         .await;
         match result {
             Ok(result) => result,
             Err(_) => {
                 self.wait_owner.close();
-                if has_signal { Err(()) } else { Ok(()) }
+                if has_signal { Err(()) } else { Ok(None) }
             }
         }
     }

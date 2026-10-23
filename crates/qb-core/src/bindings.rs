@@ -2072,6 +2072,25 @@ impl BindingTable {
         request: HttpWaitRequest<'_>,
         inspect: impl FnOnce(&WaitIntent<'_>) -> Option<T>,
     ) -> Option<T> {
+        self.try_current_quota_condition(request, false, inspect)
+    }
+
+    /// Read-only fallback projection includes zero hold budgets. All current
+    /// identity/model/native policy and final prune/publication checks are shared.
+    pub(crate) fn try_current_quota_fallback<T>(
+        &self,
+        request: HttpWaitRequest<'_>,
+        inspect: impl FnOnce(&WaitIntent<'_>) -> Option<T>,
+    ) -> Option<T> {
+        self.try_current_quota_condition(request, true, inspect)
+    }
+
+    fn try_current_quota_condition<T>(
+        &self,
+        request: HttpWaitRequest<'_>,
+        fallback: bool,
+        inspect: impl FnOnce(&WaitIntent<'_>) -> Option<T>,
+    ) -> Option<T> {
         // An uncalled closure and rejected result are dropped after our gates.
         let mut inspect = Some(inspect);
         // Keep a rejected T outside publication, mutations and final Data scopes.
@@ -2136,9 +2155,11 @@ impl BindingTable {
                     .recv_timeout(Duration::from_secs(5))
                     .expect("wait publication gate timed out");
             }
-            let inspected = self
-                .policies
-                .with_wait_plan(&policy_key, &source.account, |plan| {
+            let inspected = self.policies.with_quota_wait_condition(
+                &policy_key,
+                &source.account,
+                fallback,
+                |plan| {
                     if !request.operation.can_reply() {
                         return None;
                     }
@@ -2184,7 +2205,8 @@ impl BindingTable {
                         return None;
                     }
                     Some(())
-                });
+                },
+            );
             inspected.is_some()
                 && !self.writes_stopped.load(Ordering::Acquire)
                 && request.operation.can_reply()
