@@ -122,6 +122,8 @@ struct FakeState {
     fail_after: Option<usize>,
     block_flush: bool,
     flushes: usize,
+    native_read_waiting: bool,
+    native_eof: bool,
 }
 
 struct Proof {
@@ -130,6 +132,7 @@ struct Proof {
     entered: Notify,
     written: Notify,
     flushing: Notify,
+    native_read_waiting: Notify,
 }
 
 impl Proof {
@@ -148,11 +151,14 @@ impl Proof {
                 fail_after: None,
                 block_flush: false,
                 flushes: 0,
+                native_read_waiting: false,
+                native_eof: false,
             }),
             changed: Condvar::new(),
             entered: Notify::new(),
             written: Notify::new(),
             flushing: Notify::new(),
+            native_read_waiting: Notify::new(),
         })
     }
 
@@ -231,9 +237,12 @@ impl Write for FakeInput {
 impl Read for FakeOutput {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         let mut state = self.0.state.lock().unwrap();
-        while state.native.is_empty() && !state.stopped {
+        while state.native.is_empty() && !state.native_eof && !state.stopped {
+            state.native_read_waiting = true;
+            self.0.native_read_waiting.notify_one();
             state = self.0.changed.wait(state).unwrap();
         }
+        state.native_read_waiting = false;
         let len = bytes.len().min(state.native.len());
         for byte in &mut bytes[..len] {
             *byte = state.native.pop_front().unwrap();
@@ -1072,6 +1081,413 @@ async fn managed_episode_delayed_consume_blocked_write_keeps_original_candidate_
             0,
             "blocked activation delivered no frame"
         );
+        closed(&mut core).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn managed_peer_closed_then_delayed_actual_tui_exit_reports_zero() {
+    bounded(async {
+        let (socket, mut ui, control, mut core) = peers().await;
+        let proof = Proof::new(false);
+        let owner = require(ManagedParent::new(
+            FakeJobs::new(proof.clone()),
+            PREFIX.into(),
+            control,
+            socket,
+        ));
+        let peer = async {
+            // Confirm an operational ordinary transport before the genuine
+            // synthetic TUI socket closes. No job exit is published yet.
+            ordinary_still_live(&mut ui, &proof, 80).await;
+            require(ui.send(Message::Close(None)).await);
+            closed(&mut ui).await;
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            {
+                let mut state = proof.state.lock().unwrap();
+                assert_eq!(state.status, JobStatus::Running);
+                assert!(
+                    !state.stopped,
+                    "peer_close_must_allow_actual_tui_exit_status_to_arrive"
+                );
+                state.status = JobStatus::TuiExited(0);
+            }
+        };
+        let (result, ()) = tokio::join!(owner.run(), peer);
+        assert_eq!(
+            result,
+            Ok(JobStatus::TuiExited(0)),
+            "peer_close_followed_by_actual_tui_exit_preserves_zero_status"
+        );
+        proof.cleaned(false);
+        closed(&mut core).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn managed_peer_closed_without_actual_job_exit_remains_pump_failure() {
+    bounded(async {
+        let (socket, mut ui, control, mut core) = peers().await;
+        let proof = Proof::new(false);
+        let owner = require(ManagedParent::new(
+            FakeJobs::new(proof.clone()),
+            PREFIX.into(),
+            control,
+            socket,
+        ));
+        let peer = async {
+            ordinary_still_live(&mut ui, &proof, 81).await;
+            require(ui.send(Message::Close(None)).await);
+        };
+        let (result, ()) = tokio::join!(owner.run(), peer);
+        assert_eq!(
+            result,
+            Err(Error::Pump),
+            "peer_close_is_not_a_fabricated_job_exit"
+        );
+        assert_eq!(proof.state.lock().unwrap().status, JobStatus::Running);
+        proof.cleaned(false);
+        closed(&mut core).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn managed_invalid_binary_without_actual_job_exit_remains_pump_failure() {
+    bounded(async {
+        let (socket, mut ui, control, mut core) = peers().await;
+        let proof = Proof::new(false);
+        let owner = require(ManagedParent::new(
+            FakeJobs::new(proof.clone()),
+            PREFIX.into(),
+            control,
+            socket,
+        ));
+        let peer = async {
+            ordinary_still_live(&mut ui, &proof, 82).await;
+            require(ui.send(Message::Binary(vec![0_u8].into())).await);
+        };
+        let (result, ()) = tokio::join!(owner.run(), peer);
+        assert_eq!(
+            result,
+            Err(Error::Pump),
+            "invalid_binary_is_not_a_successful_tui_exit"
+        );
+        assert_eq!(proof.state.lock().unwrap().status, JobStatus::Running);
+        proof.cleaned(false);
+        closed(&mut core).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn managed_successful_tui_exit_with_pending_write_reports_uncertainty() {
+    bounded(async {
+        let (socket, mut ui, control, mut core) = peers().await;
+        let proof = Proof::new(true);
+        let owner = require(ManagedParent::new(
+            FakeJobs::new(proof.clone()),
+            PREFIX.into(),
+            control,
+            socket,
+        ));
+        let peer = async {
+            require(ui.send(text(REQUEST)).await);
+            proof.entered.notified().await;
+            {
+                let mut state = proof.state.lock().unwrap();
+                assert!(
+                    state.writing && state.block,
+                    "native_write_pending_before_successful_exit"
+                );
+                assert!(!state.stopped);
+                assert_eq!(state.status, JobStatus::Running);
+                // No pump failure or watchdog has initiated cleanup. The
+                // successful job status itself makes the supervisor stop jobs.
+                state.status = JobStatus::TuiExited(0);
+            }
+        };
+        let (result, ()) = tokio::join!(owner.run(), peer);
+        assert_eq!(
+            result,
+            Err(Error::WriteUncertain),
+            "successful_child_exit_must_not_hide_cleanup_write_uncertainty"
+        );
+        proof.cleaned(true);
+        assert_eq!(proof.state.lock().unwrap().status, JobStatus::TuiExited(0));
+        assert!(
+            proof.state.lock().unwrap().input.is_empty(),
+            "blocked_native_write_was_not_retried"
+        );
+        closed(&mut core).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn managed_peer_close_during_consume_publisher_shutdown_preserves_delayed_tui_exit() {
+    bounded(async {
+        let (socket, mut ui, control, mut core) = peers().await;
+        let proof = Proof::new(false);
+        let mut owner = require(ManagedParent::new(
+            FakeJobs::new(proof.clone()),
+            PREFIX.into(),
+            control,
+            socket,
+        ));
+        let mut events = owner.test_lifecycle();
+        let gate = owner.test_pause_consume_return();
+        let peer = async {
+            stopped_dialogue(&mut ui, &proof).await;
+            waiting(&mut core).await;
+            ready(&mut core, &proof).await;
+            final_native_reply(&proof);
+            let consume = core_request(&mut core).await;
+            assert!(matches!(
+                consume.command,
+                Command::Consume { episode: EPISODE }
+            ));
+            // Prove native stdout is waiting before peer closure. Its next
+            // valid frame must return through the normal stopped-reader path.
+            loop {
+                let reading = proof.native_read_waiting.notified();
+                tokio::pin!(reading);
+                reading.as_mut().enable();
+                if proof.state.lock().unwrap().native_read_waiting {
+                    break;
+                }
+                reading.await;
+            }
+            // Do not grant Consume: actual peer closure cancels the exchange.
+            require(ui.send(Message::Close(None)).await);
+            gate.entered().await;
+            loop {
+                match events.recv().await {
+                    Some(managed_parent::TestLifecycle::UiPublisherFinished) => break,
+                    Some(_) => {}
+                    None => panic!("missing_ui_publisher_shutdown_observation"),
+                }
+            }
+            proof.live();
+            assert_eq!(proof.automatic_count(), 0);
+            proof.native(READY);
+            loop {
+                match events.recv().await {
+                    Some(managed_parent::TestLifecycle::NativeReaderFinished) => break,
+                    Some(_) => {}
+                    None => panic!("missing_stopped_native_reader_completion_observation"),
+                }
+            }
+            // Both reader exit paths have completed while the real Consume
+            // callback is still paused. Neither may manufacture ingress loss.
+            gate.release();
+            loop {
+                match events.recv().await {
+                    Some(managed_parent::TestLifecycle::DispatchWorkerFinished) => break,
+                    Some(_) => {}
+                    None => panic!("missing_post_latch_dispatch_worker_completion_observation"),
+                }
+            }
+            // Actual status arrives only after publisher shutdown AND the worker
+            // wrapper has latched its final result. Callback completion alone
+            // precedes that latch and could hide a real Revoked/Ingress error
+            // behind a successful child status.
+            let mut state = proof.state.lock().unwrap();
+            assert!(
+                !state.stopped,
+                "peer_close_during_consume_preserves_actual_exit_zero"
+            );
+            assert_eq!(state.status, JobStatus::Running);
+            state.status = JobStatus::TuiExited(0);
+        };
+        let (result, ()) = tokio::join!(owner.run(), peer);
+        assert_eq!(
+            result,
+            Ok(JobStatus::TuiExited(0)),
+            "peer_close_during_consume_preserves_actual_exit_zero"
+        );
+        assert_eq!(
+            proof.automatic_count(),
+            0,
+            "peer_close_during_consume_sends_no_activation"
+        );
+        proof.cleaned(false);
+        closed(&mut core).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn managed_direct_write_failure_before_cleanup_overrides_selected_pump_error() {
+    bounded(async {
+        let (socket, mut ui, control, mut core) = peers().await;
+        let proof = Proof::new(true);
+        let mut owner = require(ManagedParent::new(
+            FakeJobs::new(proof.clone()),
+            PREFIX.into(),
+            control,
+            socket,
+        ));
+        let mut events = owner.test_lifecycle();
+        let gate = owner.test_pause_before_cleanup();
+        let peer = async {
+            require(ui.send(text(REQUEST)).await);
+            proof.entered.notified().await;
+            assert!(proof.state.lock().unwrap().writing);
+            require(ui.send(Message::Binary(vec![0_u8].into())).await);
+            // The supervisor has selected the real pump failure; cleanup has
+            // not begun. Fail the writer independently of stop_jobs().
+            gate.entered().await;
+            {
+                let mut state = proof.state.lock().unwrap();
+                assert!(!state.stopped, "direct_write_failure_precedes_job_cleanup");
+                assert!(state.writing);
+                state.fail_after = Some(state.input.len());
+                state.block = false;
+                proof.changed.notify_all();
+            }
+            loop {
+                match events.recv().await {
+                    Some(managed_parent::TestLifecycle::FailureLatched(Error::WriteUncertain)) => {
+                        break;
+                    }
+                    Some(_) => {}
+                    None => panic!("missing_precleanup_uncertainty_latch_observation"),
+                }
+            }
+            assert!(!proof.state.lock().unwrap().stopped);
+            gate.release();
+        };
+        let (result, ()) = tokio::join!(owner.run(), peer);
+        assert_eq!(
+            result,
+            Err(Error::WriteUncertain),
+            "direct_precleanup_uncertainty_outranks_selected_pump_failure"
+        );
+        proof.cleaned(false);
+        assert!(proof.state.lock().unwrap().input.is_empty());
+        closed(&mut core).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn managed_genuine_ingress_overflow_during_consume_remains_fatal() {
+    bounded(async {
+        let (socket, mut ui, control, mut core) = peers().await;
+        let proof = Proof::new(false);
+        let mut owner = require(ManagedParent::new(
+            FakeJobs::new(proof.clone()),
+            PREFIX.into(),
+            control,
+            socket,
+        ));
+        let mut events = owner.test_lifecycle();
+        let mut admitted = owner.test_ingress();
+        let peer = async {
+            stopped_dialogue(&mut ui, &proof).await;
+            waiting(&mut core).await;
+            ready(&mut core, &proof).await;
+            final_native_reply(&proof);
+            let consume = core_request(&mut core).await;
+            assert!(matches!(
+                consume.command,
+                Command::Consume { episode: EPISODE }
+            ));
+            while admitted.try_recv().is_ok() {}
+            // Consume is actually pending, so no dispatcher can drain these
+            // eight admitted frames. The ninth real UI frame overflows ingress.
+            for id in 100..108 {
+                let request = json!({"id":id,"method":"account/read","params":{}});
+                require(ui.send(text(request.to_string().as_bytes())).await);
+                assert_eq!(admitted.recv().await, Some(ingress::Source::Ui));
+            }
+            require(
+                ui.send(text(br#"{"id":108,"method":"account/read","params":{}}"#))
+                    .await,
+            );
+            loop {
+                match events.recv().await {
+                    Some(managed_parent::TestLifecycle::FailureLatched(Error::Ingress)) => break,
+                    Some(_) => {}
+                    None => panic!("missing_genuine_ingress_failure_observation"),
+                }
+            }
+        };
+        let (result, ()) = tokio::join!(owner.run(), peer);
+        assert_eq!(
+            result,
+            Err(Error::Ingress),
+            "genuine_ingress_overflow_is_not_clean_peer_shutdown"
+        );
+        assert_eq!(proof.automatic_count(), 0);
+        proof.cleaned(false);
+        closed(&mut core).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn managed_native_eof_before_cleanup_preserves_root_over_selected_pump_failure() {
+    bounded(async {
+        let (socket, mut ui, control, mut core) = peers().await;
+        let proof = Proof::new(false);
+        let mut owner = require(ManagedParent::new(
+            FakeJobs::new(proof.clone()),
+            PREFIX.into(),
+            control,
+            socket,
+        ));
+        let mut events = owner.test_lifecycle();
+        let gate = owner.test_pause_before_cleanup();
+        let peer = async {
+            ordinary_still_live(&mut ui, &proof, 83).await;
+            // The next native read must already be in flight when the pump
+            // stops admission. No job termination creates this EOF.
+            loop {
+                let reading = proof.native_read_waiting.notified();
+                tokio::pin!(reading);
+                reading.as_mut().enable();
+                if proof.state.lock().unwrap().native_read_waiting {
+                    break;
+                }
+                reading.await;
+            }
+            require(ui.send(Message::Binary(vec![0_u8].into())).await);
+            gate.entered().await;
+            {
+                let mut state = proof.state.lock().unwrap();
+                assert!(!state.stopped, "native_eof_precedes_cleanup");
+                assert_eq!(state.status, JobStatus::Running);
+                assert!(state.native_read_waiting);
+                assert!(state.native.is_empty());
+                // Close the synthetic native stdout independently. The actual
+                // reader returns zero, read_frame returns None, and the native
+                // reader reports NativeEof through the ordinary failure path.
+                state.native_eof = true;
+                proof.changed.notify_all();
+            }
+            loop {
+                match events.recv().await {
+                    Some(managed_parent::TestLifecycle::FailureLatched(Error::NativeEof)) => break,
+                    Some(_) => {}
+                    None => panic!("missing_native_eof_before_cleanup_latch"),
+                }
+            }
+            assert!(!proof.state.lock().unwrap().stopped);
+            gate.release();
+        };
+        let (result, ()) = tokio::join!(owner.run(), peer);
+        assert_eq!(
+            result,
+            Err(Error::NativeEof),
+            "native_eof_latched_before_cleanup_outranks_selected_pump_failure"
+        );
+        assert_eq!(proof.state.lock().unwrap().status, JobStatus::Running);
+        assert_eq!(proof.automatic_count(), 0);
+        proof.cleaned(false);
         closed(&mut core).await;
     })
     .await;
