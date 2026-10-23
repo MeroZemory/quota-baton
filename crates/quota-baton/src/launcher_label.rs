@@ -89,6 +89,149 @@ pub(crate) fn run_with_account(
     run_with_environment_and_account(Client::Codex, program, None, args, &[], account_short)
 }
 
+/// Prepared commands contain the TUI-only bearer and deliberately have no Debug
+/// or Clone. This API remains uncalled until the managed parent is activated.
+#[cfg(windows)]
+#[allow(dead_code)]
+pub(crate) struct PreparedRemotePair {
+    server: std::process::Command,
+    tui: std::process::Command,
+    title: ConsoleTitle,
+    repair_title: bool,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum RemoteStatus {
+    Running,
+    TuiExited(i32),
+    ServerExited(i32),
+    BothExited { tui: i32, server: i32 },
+    Stopped,
+}
+
+/// Owns both jobs and the optional title worker, never their transferred pipes.
+/// Parent must retain endpoint/admission/catalog, stop jobs BEFORE pipe-worker
+/// joins, then join every external worker before releasing admission/catalog.
+#[cfg(windows)]
+#[allow(dead_code)]
+pub(crate) struct RemoteRun {
+    pair: contained::RemotePair,
+    repair: Option<(std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>)>,
+}
+
+#[cfg(windows)]
+#[allow(dead_code)]
+impl PreparedRemotePair {
+    pub(crate) fn new(
+        program: &Path,
+        server_args: &[std::ffi::OsString],
+        tui_args: &[std::ffi::OsString],
+        env_name: &str,
+        secret: &std::ffi::OsStr,
+        account_short: Option<&str>,
+    ) -> std::io::Result<Self> {
+        use std::os::windows::ffi::OsStrExt;
+        let valid_name = !env_name.is_empty()
+            && env_name.len() <= 128
+            && env_name.bytes().enumerate().all(|(i, byte)| {
+                byte == b'_' || byte.is_ascii_alphabetic() || (i > 0 && byte.is_ascii_digit())
+            });
+        if !program.is_absolute()
+            || !valid_name
+            || secret.is_empty()
+            || secret.encode_wide().count() > 4096
+            || secret.encode_wide().any(|unit| unit == 0)
+        {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
+        let mut server = client_command(Client::Codex, program);
+        server.args(server_args).env_remove(env_name);
+        let mut tui = client_command(Client::Codex, program);
+        tui.args(tui_args).env(env_name, secret);
+        let repair_title = tui.get_program() == program.as_os_str()
+            && program
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
+                });
+        Ok(Self {
+            server,
+            tui,
+            title: ConsoleTitle::new(program, account_short)?,
+            repair_title,
+        })
+    }
+
+    pub(crate) fn spawn(self) -> std::io::Result<RemoteRun> {
+        let pair = contained::RemotePair::spawn(&self.server, &self.tui)
+            .map_err(|error| std::io::Error::from(error.kind()))?;
+        let repair = self.repair_title.then(|| self.title.watch());
+        // Commands (including their environment copies) are not retained by run.
+        Ok(RemoteRun { pair, repair })
+    }
+}
+
+#[cfg(windows)]
+#[allow(dead_code)]
+pub(crate) fn spawn_remote_pair(
+    program: &Path,
+    server_args: &[std::ffi::OsString],
+    tui_args: &[std::ffi::OsString],
+    env_name: &str,
+    secret: &std::ffi::OsStr,
+    account_short: Option<&str>,
+) -> std::io::Result<RemoteRun> {
+    PreparedRemotePair::new(
+        program,
+        server_args,
+        tui_args,
+        env_name,
+        secret,
+        account_short,
+    )?
+    .spawn()
+}
+
+#[cfg(windows)]
+#[allow(dead_code)]
+impl RemoteRun {
+    pub(crate) fn take_stdio(&mut self) -> std::io::Result<(std::fs::File, std::fs::File)> {
+        self.pair.take_stdio()
+    }
+
+    pub(crate) fn try_wait(&self) -> std::io::Result<RemoteStatus> {
+        use contained::RemotePairStatus as Status;
+        self.pair.try_wait().map(|status| match status {
+            Status::Running => RemoteStatus::Running,
+            Status::TuiExited(code) => RemoteStatus::TuiExited(code),
+            Status::ServerExited(code) => RemoteStatus::ServerExited(code),
+            Status::BothExited { tui, server } => RemoteStatus::BothExited { tui, server },
+            Status::Stopped => RemoteStatus::Stopped,
+        })
+    }
+
+    pub(crate) fn stop_jobs(&mut self) -> std::io::Result<()> {
+        let status = self.pair.stop_jobs();
+        if let Some((stop, worker)) = self.repair.take() {
+            let _ = stop.send(());
+            if worker.join().is_err() && status.is_ok() {
+                return Err(std::io::ErrorKind::Other.into());
+            }
+        }
+        status
+    }
+}
+
+#[cfg(windows)]
+impl Drop for RemoteRun {
+    fn drop(&mut self) {
+        let _ = self.stop_jobs();
+    }
+}
+
 fn run_with_environment_and_account(
     client: Client,
     program: &Path,
@@ -579,7 +722,6 @@ mod contained {
     /// Keep `child` alive while moving the pipe ends to their owners. Dropping it
     /// kills/reaps the whole job even if either parent pipe remains open. Dropping
     /// `stdin` sends EOF; stderr is inherited separately, never JSON stdout.
-    #[cfg(test)]
     pub(super) struct StdioChild {
         pub(super) child: Child,
         pub(super) stdin: File,
@@ -592,14 +734,12 @@ mod contained {
     /// On any exit/error/cancellation, stop both jobs BEFORE joining pipe workers;
     /// release admission only after both jobs are empty AND those workers joined.
     /// No background supervisor or duplicated pipe owner is created here.
-    #[cfg(test)]
     pub(super) struct RemotePair {
         server: Option<Child>,
         tui: Option<Child>,
         stdio: Option<(File, File)>,
     }
 
-    #[cfg(test)]
     #[derive(Debug, Eq, PartialEq)]
     pub(super) enum RemotePairStatus {
         Running,
@@ -610,7 +750,6 @@ mod contained {
         Stopped,
     }
 
-    #[cfg(test)]
     impl RemotePair {
         pub(super) fn spawn(server: &Command, tui: &Command) -> io::Result<Self> {
             Self::spawn_inner(server, tui, |_| Ok(()))
@@ -652,9 +791,7 @@ mod contained {
                     (None, None) => Ok(RemotePairStatus::Running),
                     (Some(code), None) => Ok(RemotePairStatus::TuiExited(code)),
                     (None, Some(code)) => Ok(RemotePairStatus::ServerExited(code)),
-                    (Some(tui), Some(server)) => {
-                        Ok(RemotePairStatus::BothExited { tui, server })
-                    }
+                    (Some(tui), Some(server)) => Ok(RemotePairStatus::BothExited { tui, server }),
                 },
                 (None, None) => Ok(RemotePairStatus::Stopped),
                 _ => Err(io::ErrorKind::NotConnected.into()),
@@ -685,7 +822,6 @@ mod contained {
         }
     }
 
-    #[cfg(test)]
     impl Drop for RemotePair {
         fn drop(&mut self) {
             let _ = self.stop_jobs();
@@ -712,9 +848,8 @@ mod contained {
             Self::spawn_with_handles(command, input, stdout, stderr, output.is_some())
         }
 
-        /// No production entry point until transport/authority integration owns
-        /// the pipe lifecycle. No default launcher or capture behavior changes.
-        #[cfg(test)]
+        /// RemoteRun owns the job; its managed parent must own the pipe lifecycle.
+        /// No default launcher or capture behavior changes.
         pub(super) fn spawn_stdio(command: &Command) -> io::Result<StdioChild> {
             let (child_input, stdin) = pipe()?;
             let (stdout, child_output) = pipe()?;
@@ -814,7 +949,6 @@ mod contained {
             Ok(child)
         }
 
-        #[cfg(test)]
         pub(super) fn try_wait(&self) -> io::Result<Option<i32>> {
             match unsafe { WaitForSingleObject(HANDLE(self.process.as_raw_handle()), 0) } {
                 WAIT_OBJECT_0 => {
@@ -1218,7 +1352,13 @@ mod contained {
             let powershell = Path::new(&std::env::var_os("SystemRoot").unwrap())
                 .join("System32/WindowsPowerShell/v1.0/powershell.exe");
             let mut command = Command::new(powershell);
-            command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script]);
+            command.args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ]);
             command
         }
 
@@ -1298,9 +1438,94 @@ mod contained {
                 if status != RemotePairStatus::Running {
                     return status;
                 }
-                assert!(Instant::now() < deadline, "synthetic pair exit not observed");
+                assert!(
+                    Instant::now() < deadline,
+                    "synthetic pair exit not observed"
+                );
                 std::thread::sleep(Duration::from_millis(5));
             }
+        }
+
+        #[test]
+        fn remote_api_isolates_tui_environment_and_drop_drains_both_jobs() {
+            use super::super::{PreparedRemotePair, RemoteStatus};
+            let scratch =
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/remote-api-tests");
+            std::fs::create_dir_all(&scratch).unwrap();
+            let root = tempfile::tempdir_in(scratch).unwrap();
+            let ready = root.path().join("tui-ready");
+            let program = Path::new(&std::env::var_os("SystemRoot").unwrap())
+                .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+            let env_name = "QB_SYNTHETIC_REMOTE_CAPABILITY";
+            let secret = OsStr::new("synthetic-remote-capability");
+            let args = |script: &str| -> Vec<OsString> {
+                [
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    script,
+                ]
+                .into_iter()
+                .map(OsString::from)
+                .collect()
+            };
+            let server_args = args(
+                "if(Test-Path Env:QB_SYNTHETIC_REMOTE_CAPABILITY){exit 41}; \
+                 [Console]::Write('server-env-absent'); Start-Sleep -Seconds 30",
+            );
+            let tui_args = args(&format!(
+                "if(!(Test-Path Env:QB_SYNTHETIC_REMOTE_CAPABILITY)){{exit 42}}; \
+                 [IO.File]::WriteAllText('{}','tui-env-present'); Start-Sleep -Seconds 30",
+                ready.to_string_lossy().replace('\'', "''"),
+            ));
+            let prepared =
+                PreparedRemotePair::new(&program, &server_args, &tui_args, env_name, secret, None)
+                    .unwrap();
+            // Explicit removal overrides even a colliding inherited variable;
+            // the fixture never mutates this test runner's global environment.
+            assert!(
+                prepared
+                    .server
+                    .get_envs()
+                    .any(|(name, value)| { name == OsStr::new(env_name) && value.is_none() })
+            );
+            assert!(
+                prepared
+                    .tui
+                    .get_envs()
+                    .any(|(name, value)| { name == OsStr::new(env_name) && value == Some(secret) })
+            );
+            for command in [&prepared.server, &prepared.tui] {
+                assert!(!command.get_args().any(|arg| {
+                    arg.to_string_lossy()
+                        .contains(secret.to_string_lossy().as_ref())
+                }));
+            }
+            let mut run = prepared.spawn().unwrap();
+            let (stdin, mut stdout) = run.take_stdio().unwrap();
+            assert!(run.take_stdio().is_err());
+            assert_eq!(
+                stdio_read(&mut stdout, Some(b"server-env-absent".len())).unwrap(),
+                b"server-env-absent"
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !ready.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "synthetic TUI did not become ready"
+                );
+                assert_eq!(run.try_wait().unwrap(), RemoteStatus::Running);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(std::fs::read(&ready).unwrap(), b"tui-env-present");
+            let server_job = pair_observe_job(run.pair.server.as_ref().unwrap(), 1);
+            let tui_job = pair_observe_job(run.pair.tui.as_ref().unwrap(), 1);
+            drop(run);
+            pair_assert_stopped(server_job);
+            pair_assert_stopped(tui_job);
+            assert!(stdio_read(&mut stdout, None).unwrap().is_empty());
+            drop(stdin);
         }
 
         #[test]
@@ -1334,7 +1559,10 @@ mod contained {
             ));
             let mut pair = RemotePair::spawn(&server, &tui).unwrap();
             let (stdin, mut stdout) = pair.take_stdio().unwrap();
-            assert!(pair.take_stdio().is_err(), "pipe transfer must be single-use");
+            assert!(
+                pair.take_stdio().is_err(),
+                "pipe transfer must be single-use"
+            );
             assert_eq!(
                 stdio_read(&mut stdout, Some(b"pair-descendant-ready".len())).unwrap(),
                 b"pair-descendant-ready"
@@ -1364,7 +1592,9 @@ mod contained {
             let tui_job = pair_observe_job(pair.tui.as_ref().unwrap(), 1);
             // Inject failure only into the owned synthetic server's exact job.
             assert_ne!(
-                unsafe { TerminateJobObject(pair.server.as_ref().unwrap().job.as_raw_handle(), 23) },
+                unsafe {
+                    TerminateJobObject(pair.server.as_ref().unwrap().job.as_raw_handle(), 23)
+                },
                 0
             );
             assert_eq!(pair_wait_exit(&pair), RemotePairStatus::ServerExited(23));
