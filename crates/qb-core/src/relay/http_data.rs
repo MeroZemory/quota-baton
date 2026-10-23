@@ -76,6 +76,9 @@ impl RelayState {
         deadline: tokio::time::Instant,
         ingress: Option<&LaunchIngress>,
     ) -> Option<Response> {
+        // A far limit may stop the native turn only while its actual resume
+        // owner is connected. Ordinary launchers cannot resume that turn yet.
+        let resume_owner = ingress?.pin.as_ref()?.deferred_owner_scope()?;
         let key = session.key.as_deref()?;
         if key.is_empty()
             || key.len() > 1024
@@ -137,6 +140,7 @@ impl RelayState {
         let fallback = fallback?;
         if self.is_draining()
             || !operation.can_reply()
+            || !resume_owner.live()
             || self.pins.get(provider, Some(key)).is_some()
         {
             return None;

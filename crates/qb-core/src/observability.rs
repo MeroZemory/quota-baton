@@ -89,6 +89,8 @@ pub struct RequestRecord {
     #[serde(default)]
     pub relayed_rate_429s: u32,
     pub outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_phase: Option<String>,
     #[serde(default)]
     pub retained_copy: bool,
     #[serde(default)]
@@ -2095,6 +2097,7 @@ mod tests {
             rate_retries: 0,
             relayed_rate_429s: 0,
             outcome: "ok".into(),
+            timeout_phase: None,
             retained_copy: true,
             upstream_error_code: None,
             attempt_details: Vec::new(),

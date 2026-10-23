@@ -659,9 +659,9 @@ async fn r12_9_all_capped_upgrades_expire_without_redial_or_account_failure() {
     );
     let started = std::time::Instant::now();
     let (status, body) = h.error().await;
-    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
-    assert_eq!(body["error"]["type"], "request_timeout");
-    assert!(started.elapsed() >= Duration::from_millis(800));
+    assert_eq!(status, StatusCode::UPGRADE_REQUIRED);
+    assert_eq!(body["error"]["type"], "websocket_capacity");
+    assert!(started.elapsed() >= Duration::from_millis(100));
     assert!(started.elapsed() < Duration::from_secs(3));
     assert_eq!(
         h.fake.state.requests().len(),
@@ -794,9 +794,9 @@ async fn r12_9_losing_actual_upgrade_slot_race_preserves_binding_and_old_create(
         .unwrap()
         .unwrap_err()
     else {
-        panic!("capacity timeout expected")
+        panic!("capacity HTTP fallback expected")
     };
-    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
     assert_eq!(
         h.state
             .bindings

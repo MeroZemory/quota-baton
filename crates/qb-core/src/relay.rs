@@ -609,6 +609,9 @@ impl RelayState {
             return response;
         }
         if completion.policy_blocked {
+            if let Some(response) = completion.strict_quota_response.take() {
+                return response;
+            }
             return native_error(
                 StatusCode::CONFLICT,
                 provider,
@@ -1180,6 +1183,7 @@ impl RelayState {
         admit: Option<websocket::capacity::Admission>,
         launch: Option<&http_data::ManagedHttp>,
     ) -> Result<Option<Account>, ()> {
+        completion.strict_quota_response = None;
         if session.key.is_none()
             && self.bindings.routing_plan(None).settings.mode == crate::routing::Mode::Strict
         {
@@ -1411,6 +1415,23 @@ impl RelayState {
                         == crate::routing::Mode::Strict =>
                 {
                     completion.policy_blocked = true;
+                    let plan = self.bindings.routing_plan(session.key.as_deref());
+                    if !self.bindings.policies.strict_dispatch_blocked()
+                        && let Some(anchor) = plan.anchor.as_deref()
+                        && self
+                            .bindings
+                            .permits_dispatch(session.key.as_deref(), anchor)
+                    {
+                        completion.strict_quota_response = self
+                            .accounts
+                            .strict_quota_response(
+                                anchor,
+                                provider,
+                                completion.record.transport == "ws",
+                                model,
+                            )
+                            .await;
+                    }
                     return Ok(None);
                 }
                 crate::bindings::Decision::Selected {
@@ -2922,6 +2943,11 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
         // A mere optional-wait refusal never supplies this provenance.
         if !forced_send
             && decision.kind == outcome::Kind::Quota
+            && let Some(resume_owner) = parts
+                .extensions
+                .get::<launch::LaunchIngress>()
+                .and_then(|ingress| ingress.pin.as_ref())
+                .and_then(|pin| pin.deferred_owner_scope())
             && let Some(observed) = observed_http_429.take()
             && let Some(key) = session.key.as_deref()
             && let Some(deadline) = completion.precommit_deadline
@@ -2988,7 +3014,7 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
             };
             // Caller Drop cancels detached inspection on route cancellation.
             // Native downstream delivery still owns the untouched held response.
-            if preserve && operation.can_reply() && !state.is_draining() {
+            if preserve && operation.can_reply() && resume_owner.live() && !state.is_draining() {
                 if let Some(publication) = publication {
                     publication.keep();
                 }

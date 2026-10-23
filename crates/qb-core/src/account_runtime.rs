@@ -312,6 +312,55 @@ mod release_probe_tests {
     }
 
     #[tokio::test]
+    async fn r13_g_strict_anchor_limit_never_uses_unrelated_or_nonquota_state() {
+        let f = PollFixture::new();
+        let reset = Utc::now() + Duration::hours(4);
+        for (reason, scope, paused, expected) in [
+            (HealthReason::Quota, "account", false, true),
+            (HealthReason::Quota, "model:m", false, true),
+            (HealthReason::Quota, "model:other", false, false),
+            (HealthReason::Quota, "account", true, false),
+            (HealthReason::Auth, "account", false, false),
+            (HealthReason::Payment, "account", false, false),
+        ] {
+            f.runtime
+                .store
+                .update_metadata(&f.id, |account| {
+                    account.user_state = if paused {
+                        UserState::Paused
+                    } else {
+                        UserState::Active
+                    };
+                    account.health = Health::Cooling {
+                        reason,
+                        until: reset,
+                        scope: scope.into(),
+                    };
+                })
+                .unwrap();
+            let response = f
+                .runtime
+                .strict_quota_response(&f.id, Provider::Codex, true, Some("m"))
+                .await;
+            assert_eq!(response.is_some(), expected);
+            if let Some(response) = response {
+                assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+                let body = axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap();
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(body["error"]["resets_at"], reset.timestamp());
+            }
+        }
+        assert!(
+            f.runtime
+                .strict_quota_response("missing-synthetic-anchor", Provider::Codex, true, Some("m"))
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn outage_release_poll_status_only_keeps_fresh_status_without_old_numbers() {
         for (status, rejected) in [("rejected", true), ("allowed", false)] {
             let f = PollFixture::new();
@@ -2746,6 +2795,92 @@ impl AccountRuntime {
             poller.before_unavailable(provider).await;
         }
         self.unavailable_known(provider, websocket, model).await
+    }
+
+    /// Only the authorized strict anchor can supply this limit response.
+    /// Other unavailable states remain policy refusals, never pool evidence.
+    pub(crate) async fn strict_quota_response(
+        &self,
+        id: &str,
+        provider: Provider,
+        websocket: bool,
+        model: Option<&str>,
+    ) -> Option<Response> {
+        let store = self.store.clone();
+        let id = id.to_owned();
+        let mut account = tokio::task::spawn_blocking(move || store.load(&id))
+            .await
+            .ok()?
+            .ok()?;
+        if !matches!(
+            account.health,
+            Health::Ready
+                | Health::Cooling {
+                    reason: HealthReason::Quota,
+                    ..
+                }
+        ) {
+            return None;
+        }
+        if let Some(health) = self
+            .volatile
+            .lock()
+            .ok()
+            .and_then(|v| v.get(&account.id).cloned())
+            && let Health::Cooling { until, scope, .. } = &health
+            && *until > Utc::now()
+            && (scope == "account"
+                || scope
+                    .strip_prefix("model:")
+                    .is_some_and(|m| model == Some(m)))
+        {
+            account.health = health;
+        }
+        if account.provider != provider || account.user_state != UserState::Active {
+            return None;
+        }
+        let Health::Cooling {
+            reason: HealthReason::Quota,
+            until,
+            scope,
+        } = &account.health
+        else {
+            return None;
+        };
+        let seconds = (*until - Utc::now()).num_seconds();
+        if seconds <= 0
+            || !(scope == "account"
+                || scope
+                    .strip_prefix("model:")
+                    .is_some_and(|m| model == Some(m)))
+        {
+            return None;
+        }
+        let mut response = if !websocket
+            && let Some(cache) = self
+                .limits
+                .lock()
+                .ok()
+                .and_then(|m| m.get(&account.id).cloned())
+                .filter(|c| c.status == StatusCode::TOO_MANY_REQUESTS)
+        {
+            let mut response = Response::new(Body::from(cache.body));
+            *response.status_mut() = cache.status;
+            *response.headers_mut() = cache.headers;
+            response
+        } else {
+            let error = if provider == Provider::Codex {
+                json!({"error":{"type":"usage_limit_reached","message":"quota-baton: bound account is cooling","resets_at":until.timestamp(),"resets_in_seconds":seconds}})
+            } else {
+                json!({"type":"error","error":{"type":"rate_limit_error","message":"quota-baton: bound account is cooling"}})
+            };
+            (StatusCode::TOO_MANY_REQUESTS, Json(error)).into_response()
+        };
+        response.headers_mut().insert(
+            "retry-after",
+            HeaderValue::from_str(&seconds.to_string()).ok()?,
+        );
+        Some(response)
     }
 
     pub(crate) async fn unavailable_known(

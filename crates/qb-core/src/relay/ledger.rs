@@ -32,6 +32,7 @@ pub(in crate::relay) struct Completion {
     pub binding: Option<crate::bindings::BindingLease>,
     pub reset_hold_used: bool,
     pub policy_blocked: bool,
+    pub strict_quota_response: Option<axum::response::Response>,
     pub usage_prepolled: bool,
     pub reset_hold_timed_out: bool,
     observability: Arc<Observability>,
@@ -71,6 +72,7 @@ impl Completion {
             burst_client: crate::burst::client_identity(headers),
             reset_hold_used: false,
             policy_blocked: false,
+            strict_quota_response: None,
             usage_prepolled: false,
             reset_hold_timed_out: false,
             input_bytes: Arc::new(AtomicU64::new(0)),
@@ -110,6 +112,7 @@ impl Completion {
                 rate_retries: 0,
                 relayed_rate_429s: 0,
                 outcome: "client_drop".into(),
+                timeout_phase: None,
                 retained_copy: false,
                 upstream_error_code: None,
                 attempt_details: Vec::new(),
@@ -344,6 +347,9 @@ impl Drop for Completion {
         {
             self.record.status = 504;
             self.record.outcome = "request_timeout".into();
+        }
+        if self.record.status != 504 {
+            self.record.timeout_phase = None;
         }
         self.accounting_finish(
             matches!(self.record.outcome.as_str(), "ok" | "rate_hold_ok")
@@ -854,5 +860,53 @@ mod admission_tests {
         );
         completion.binding.as_ref().unwrap().dispatched();
         assert!(table.existing_placement(Some(key), &id));
+    }
+}
+
+#[cfg(test)]
+mod timeout_phase_tests {
+    use super::*;
+
+    #[test]
+    fn r13_g_completion_drop_keeps_phase_only_for_a_real_timeout() {
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r13-g-ledger");
+        std::fs::create_dir_all(&root).unwrap();
+        let home = tempfile::tempdir_in(root).unwrap();
+        let obs = Arc::new(Observability::new(home.path(), None).unwrap());
+        for expired in [false, true] {
+            let mut completion = Completion::new(
+                obs.clone(),
+                &Method::GET,
+                "/v1/responses",
+                Provider::Codex,
+                &HeaderMap::new(),
+            );
+            completion.record.transport = "ws".into();
+            completion.record.timeout_phase = Some("source_model_admission".into());
+            completion.precommit_deadline = Some(if expired {
+                Instant::now() - std::time::Duration::from_secs(1)
+            } else {
+                Instant::now() + std::time::Duration::from_secs(30)
+            });
+            drop(completion);
+        }
+        obs.flush().unwrap();
+        let rows: Vec<serde_json::Value> = std::fs::read_dir(home.path().join("ledger"))
+            .unwrap()
+            .flat_map(|entry| {
+                std::fs::read_to_string(entry.unwrap().path())
+                    .unwrap()
+                    .lines()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .map(|line| serde_json::from_str(&line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["outcome"], "client_drop");
+        assert!(rows[0].get("timeout_phase").is_none());
+        assert_eq!(rows[1]["status"], 504);
+        assert_eq!(rows[1]["timeout_phase"], "source_model_admission");
     }
 }
