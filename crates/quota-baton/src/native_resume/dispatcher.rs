@@ -69,6 +69,12 @@ impl<N: Write, U: Write> Dispatcher<N, U> {
         self.controller.delivery()
     }
 
+    /// A closed core control channel cancels automatic work, not ordinary TUI
+    /// input/output. Actual native/UI transport loss still uses disconnect().
+    pub(crate) fn cancel_resume(&mut self) {
+        self.controller.cancel_resume();
+    }
+
     /// Reader EOF/error and either child exit must invoke this before teardown.
     pub(crate) fn disconnect(&mut self) {
         self.controller.disconnect();
