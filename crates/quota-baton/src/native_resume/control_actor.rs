@@ -81,6 +81,7 @@ enum Command {
         deadline: Instant,
         reply: oneshot::Sender<Result<Consumption, Error>>,
     },
+    #[allow(dead_code)] // Explicit protocol close is exercised by isolated clients.
     Close {
         reply: oneshot::Sender<Result<(), Error>>,
     },
@@ -256,6 +257,7 @@ impl Parent {
         .await
     }
 
+    #[allow(dead_code)] // Run ownership normally cancels via Parent Drop.
     pub(crate) async fn close(&self, deadline: Instant) -> Result<(), Error> {
         self.request(deadline, |_, reply| Command::Close { reply })
             .await
@@ -348,6 +350,8 @@ fn emit_due(io: &ActorIo, episode: u64) -> Result<(), Error> {
 }
 
 /// Parent supplies the episode lifetime; elapsed lifetime is always terminal.
+#[cfg(test)]
+#[allow(dead_code)] // Finite-lifetime adapter for isolated actor tests.
 pub(crate) async fn run(control: CoreControl, io: ActorIo, lifetime: Instant) -> Result<(), Error> {
     run_inner(control, io, Some(lifetime)).await
 }

@@ -24,6 +24,8 @@ tokio.workspace = true
 windows = { workspace = true, features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_System_IO"] }
 zstd.workspace = true
 zeroize.workspace = true
+futures-util.workspace = true
+tokio-tungstenite.workspace = true
 
 [build-dependencies]
 cc = "=1.8.0"
@@ -32,11 +34,9 @@ cc = "=1.8.0"
 async-stream.workspace = true
 axum.workspace = true
 bytes.workspace = true
-futures-util.workspace = true
 qb-core = { workspace = true, features = ["testkit"] }
 tempfile.workspace = true
 qb-testkit.workspace = true
-tokio-tungstenite.workspace = true
 
 [features]
 default = []

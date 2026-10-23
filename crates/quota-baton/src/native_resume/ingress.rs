@@ -42,7 +42,7 @@ pub(crate) enum Error {
 
 /// Write errors remain typed for the parent; no payload/error formatting here.
 pub(crate) enum CommitError<E> {
-    Ingress(Error),
+    Ingress(#[allow(dead_code)] Error),
     Write(E),
 }
 
