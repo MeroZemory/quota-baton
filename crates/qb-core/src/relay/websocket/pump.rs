@@ -982,7 +982,9 @@ async fn eligible_unsent_create(
     if hint.source != context.account
         || !matches!(
             hint.end,
-            crate::relay::quota_wait::WaitEnd::Reset | crate::relay::quota_wait::WaitEnd::Revoked
+            crate::relay::quota_wait::WaitEnd::Reset
+                | crate::relay::quota_wait::WaitEnd::NativeCacheReset
+                | crate::relay::quota_wait::WaitEnd::Revoked
         )
     {
         return false;
@@ -995,7 +997,7 @@ async fn eligible_unsent_create(
         create.quota_revalidated.store(true, Ordering::Release);
     }
     #[cfg(feature = "testkit")]
-    if eligible {
+    if eligible && hint.end != crate::relay::quota_wait::WaitEnd::NativeCacheReset {
         relay.observe_ws_quota_wait("reselect", &context.account, create.operation.deadline());
     }
     eligible

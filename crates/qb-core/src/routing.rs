@@ -1557,11 +1557,47 @@ impl PolicyStore {
         inspect(&plan)
     }
 
+    /// Nonblocking native policy view, not wait or dispatch authority. None means
+    /// contention/poison; Some(false) means a definite native refusal. The callback
+    /// is read-only and must not reacquire policy or binding locks.
+    pub(crate) fn try_native_cache_plan(
+        &self,
+        key: &str,
+        account: &str,
+        inspect: impl FnOnce(&Plan) -> bool,
+    ) -> Option<bool> {
+        let _publication = self.publication.try_read().ok()?;
+        let state = self.state.try_lock().ok()?;
+        let witness = self.recovery_intent.try_lock().ok()?;
+        if state.frozen {
+            return Some(false);
+        }
+        let current = state.policy_id(key);
+        let guarded = witness.policy_id(key);
+        let id = if self.recovery_blocked.load(Ordering::Acquire)
+            && witness.sessions.contains_key(&guarded)
+        {
+            guarded
+        } else {
+            current
+        };
+        let plan = self.resolve_with_witness(&state, &witness, &id);
+        Some(
+            (plan.settings.mode != Mode::Strict
+                || (!self.strict_dispatch_blocked() && plan.anchor.as_deref() == Some(account)))
+                && inspect(&plan),
+        )
+    }
+
     fn resolve(&self, state: &State, id: &str) -> Plan {
         let witness = self
             .recovery_intent
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        self.resolve_with_witness(state, &witness, id)
+    }
+    // Shared by blocking native reads and the nonblocking cache-only view.
+    fn resolve_with_witness(&self, state: &State, witness: &State, id: &str) -> Plan {
         let session = if self.recovery_blocked.load(Ordering::Acquire) {
             witness.sessions.get(id).or_else(|| state.sessions.get(id))
         } else {
@@ -2313,6 +2349,70 @@ impl PolicyStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn n5c_native_cache_plan_is_try_only_and_matches_native_strict_permissions() {
+        let root = home();
+        let store = PolicyStore::new(root.path(), Settings::default()).unwrap();
+        let key = "codex:synthetic-cache-policy";
+        let actual = store.plan(Some(key));
+        assert_eq!(
+            store.try_native_cache_plan(key, "synthetic-source", |plan| {
+                assert_eq!(plan.settings, actual.settings);
+                assert_eq!(plan.anchor, actual.anchor);
+                assert_eq!(plan.project, actual.project);
+                assert_eq!(plan.revision, actual.revision);
+                assert_eq!(plan.source, actual.source);
+                assert!(store.publication.try_write().is_err());
+                true
+            }),
+            Some(true)
+        );
+        {
+            let _held = store.publication.write().unwrap();
+            assert_eq!(
+                store.try_native_cache_plan(key, "synthetic-source", |_| true),
+                None
+            );
+        }
+        {
+            let _held = store.state.lock().unwrap();
+            assert_eq!(
+                store.try_native_cache_plan(key, "synthetic-source", |_| true),
+                None
+            );
+        }
+        {
+            let _held = store.recovery_intent.lock().unwrap();
+            assert_eq!(
+                store.try_native_cache_plan(key, "synthetic-source", |_| true),
+                None
+            );
+        }
+        store
+            .set_session(
+                &session_id(key),
+                Some(settings(Mode::Strict)),
+                None,
+                Some("synthetic-source"),
+            )
+            .unwrap();
+        assert!(store.permits_dispatch(Some(key), "synthetic-source"));
+        assert_eq!(
+            store.try_native_cache_plan(key, "synthetic-source", |_| true),
+            Some(true)
+        );
+        assert!(!store.permits_dispatch(Some(key), "synthetic-other"));
+        assert_eq!(
+            store.try_native_cache_plan(key, "synthetic-other", |_| true),
+            Some(false)
+        );
+        store.freeze();
+        assert_eq!(
+            store.try_native_cache_plan(key, "synthetic-source", |_| true),
+            Some(false)
+        );
+    }
+
     fn home() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
     }

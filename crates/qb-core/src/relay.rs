@@ -1201,6 +1201,8 @@ impl RelayState {
         // On its next request, resolve C7 before publishing any context.
         let prior = self.bindings.current(session.key.as_deref());
         let mut proof_reset_source = None;
+        #[cfg(feature = "testkit")]
+        let mut optional_reset = false;
         if completion.record.transport == "http"
             && !completion.reset_hold_used
             && self.pins.get(provider, session.key.as_deref()).is_none()
@@ -1213,13 +1215,17 @@ impl RelayState {
             .await
             {
                 completion.reset_hold_used = true;
-                completion.reset_hold_timed_out = waited.end != quota_wait::WaitEnd::Reset;
+                completion.reset_hold_timed_out = !waited.reset_reached();
                 if self.is_draining() || waited.end == quota_wait::WaitEnd::WallResetPending {
                     return Ok(None);
                 }
-                if waited.end == quota_wait::WaitEnd::Reset
+                if waited.reset_reached()
                     && self.http_wait_reset_source_current(key, &waited.source, model)
                 {
+                    #[cfg(feature = "testkit")]
+                    {
+                        optional_reset = waited.end == quota_wait::WaitEnd::Reset;
+                    }
                     proof_reset_source = Some(waited.source);
                 }
             }
@@ -1262,7 +1268,9 @@ impl RelayState {
             // local retry exclusion; current native gates still own dispatch.
             excluded.remove(&source);
             #[cfg(feature = "testkit")]
-            self.observe_http_quota_wait("reselect", &source);
+            if optional_reset {
+                self.observe_http_quota_wait("reselect", &source);
+            }
         }
         let mut held_account = None;
         loop {
@@ -2947,6 +2955,8 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
             }
         }
         let mut proof_reset_source = None;
+        #[cfg(feature = "testkit")]
+        let mut optional_reset = false;
         if decision.kind == outcome::Kind::Quota {
             if let Some(ticket) = &quota_pending {
                 state.accounts.take_pending_quota(ticket);
@@ -2979,11 +2989,11 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
             }
             if let Some(waited) = proof_wait {
                 completion.reset_hold_used = true;
-                completion.reset_hold_timed_out = waited.end != quota_wait::WaitEnd::Reset;
+                completion.reset_hold_timed_out = !waited.reset_reached();
                 if waited.end == quota_wait::WaitEnd::WallResetPending {
                     break (status, response_headers, held);
                 }
-                if waited.end == quota_wait::WaitEnd::Reset
+                if waited.reset_reached()
                     && session.key.as_deref().is_some_and(|key| {
                         state.http_wait_reset_source_current(
                             key,
@@ -2992,6 +3002,10 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
                         )
                     })
                 {
+                    #[cfg(feature = "testkit")]
+                    {
+                        optional_reset = waited.end == quota_wait::WaitEnd::Reset;
+                    }
                     proof_reset_source = Some(waited.source);
                 }
             } else {
@@ -3089,7 +3103,9 @@ async fn relay_inner(state: Arc<RelayState>, mut request: Request) -> Response {
         if let Some(source) = proof_reset_source {
             selection_tried.remove(&source);
             #[cfg(feature = "testkit")]
-            state.observe_http_quota_wait("reselect", &source);
+            if optional_reset {
+                state.observe_http_quota_wait("reselect", &source);
+            }
         }
         let next = state
             .select_http_request(

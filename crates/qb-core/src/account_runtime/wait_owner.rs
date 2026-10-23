@@ -254,6 +254,11 @@ pub(crate) struct WaitPolicySnapshot {
 }
 
 impl WaitPolicySnapshot {
+    /// Immutable admission policy data, never a ticket or dispatch permission.
+    pub(crate) fn plan(&self) -> &crate::routing::Plan {
+        &self.plan
+    }
+
     pub(crate) fn unchanged(&self, policies: &crate::routing::PolicyStore) -> bool {
         policies
             .with_wait_plan(&self.key, &self.account, |current| {
