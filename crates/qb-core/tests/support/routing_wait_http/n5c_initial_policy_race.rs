@@ -73,11 +73,11 @@ async fn n5c_http_move_consumed_before_first_snapshot_rejects_delayed_native_res
             .await
             .expect("bounded actual HTTP first-result policy race");
     assert_eq!(
-        status, 409,
+        status, 429,
         "Revoked cannot override native Strict or force B"
     );
     let error: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(error["error"]["type"], "routing_policy_blocked");
+    assert_eq!(error["error"]["type"], "usage_limit_reached");
     assert!(
         Utc::now() < reset,
         "old reset must not become another retained wait"

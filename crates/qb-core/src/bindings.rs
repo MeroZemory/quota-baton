@@ -476,6 +476,8 @@ struct Data {
     bindings: BTreeMap<String, Binding>,
     launches: BTreeMap<String, launch::Metadata>,
     launch_anchors: BTreeMap<String, launch::Anchor>,
+    // Process-local activity only; never serialized or used as dispatch authority.
+    launch_activity: BTreeMap<String, launch::Activity>,
     launch_aliases: BTreeMap<String, String>,
     launch_retention: BTreeMap<String, DateTime<Utc>>,
     launch_weight: usize,
@@ -2734,6 +2736,37 @@ impl BindingTable {
                 .flatten()
                 .map(String::as_str)
         });
+        // Retry exclusion removes a source from selectable candidates, not
+        // from the full source evidence. Label before guard/policy publication.
+        if reason == "forced"
+            && guard_from.is_some_and(|id| id != account)
+            && let Some(source) =
+                guard_from.and_then(|id| move_evidence.iter().find(|c| c.account.id == id))
+        {
+            let source = effective_account(source, &d, &self.config, model, now);
+            let plan = self.policies.plan(launch::policy_key(&d, key));
+            if source.user_state == UserState::Active
+                && let Health::Cooling {
+                    reason: HealthReason::Quota,
+                    until,
+                    scope,
+                } = &source.health
+                && *until > now
+                && (scope == "account"
+                    || scope
+                        .strip_prefix("model:")
+                        .is_some_and(|m| model == Some(m)))
+                && let Some(quota) = &source.quota_cooling
+                && quota.window == "5h"
+                && quota
+                    .reset_at
+                    .signed_duration_since(now)
+                    .to_std()
+                    .is_ok_and(|wait| wait > Duration::from_secs(plan.settings.reset_wait_secs))
+            {
+                reason = "five_hour_far_move";
+            }
+        }
         let permit = match self.prepare_move_with_source(
             &d,
             &guard_key,

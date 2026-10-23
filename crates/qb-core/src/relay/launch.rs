@@ -772,6 +772,138 @@ mod tests {
         );
         f.relay.launch_catalog(id, true, false).await.unwrap();
     }
+
+    async fn model_admission_fixture(cooling: bool) -> (Fixture, crate::bindings::LaunchInfo) {
+        let f = Fixture::new().await;
+        warm_issue_catalog(&f, &f.id, &["common"]).await;
+        let reply = f
+            .relay
+            .issue_launch(issue_request(Some("common")), 10200)
+            .await
+            .unwrap();
+        let pin = f
+            .relay
+            .launch_tokens
+            .get_or_pin(issued_handle(&reply))
+            .unwrap();
+        let info = f
+            .relay
+            .bindings
+            .launch_info(&pin.metadata().binding_anchor_key, chrono::Utc::now())
+            .unwrap();
+        assert!(info.managed);
+        assert_eq!(info.current_model.as_deref(), Some("common"));
+        if cooling {
+            let now = chrono::Utc::now();
+            let reset = now + chrono::Duration::hours(4);
+            f.relay
+                .store
+                .update_metadata(&f.id, |account| {
+                    account.health = crate::accounts::Health::Cooling {
+                        reason: crate::accounts::HealthReason::Quota,
+                        until: reset,
+                        scope: "account".into(),
+                    };
+                    account.quota_cooling = Some(crate::accounts::QuotaCooling {
+                        window: "5h".into(),
+                        reset_at: reset,
+                        started_at: now,
+                    });
+                })
+                .unwrap();
+        }
+        (f, info)
+    }
+
+    #[tokio::test]
+    async fn r13_g_current_model_recovery_precedes_stalled_source_catalog() {
+        for requested in [None, Some("common")] {
+            let (f, info) = model_admission_fixture(true).await;
+            let refresh = CatalogRefreshOwner::new(
+                f.relay
+                    .catalogs
+                    .begin_refresh(&f.id, RefreshMode::Force)
+                    .unwrap()
+                    .unwrap(),
+                &f.relay.catalog_changed,
+            );
+            let requests = f.upstream.state.requests().len();
+            let admitted = tokio::time::timeout(
+                Duration::from_secs(2),
+                f.relay.admit_data_model(
+                    &info,
+                    requested,
+                    tokio::time::Instant::now() + Duration::from_secs(10),
+                ),
+            )
+            .await
+            .expect("current-model recovery must not await the stalled source catalog");
+            assert_eq!(admitted.unwrap().as_deref(), Some("common"));
+            assert!(f.relay.catalogs.view(&f.id).unwrap().refreshing);
+            assert_eq!(f.upstream.state.requests().len(), requests);
+            assert_eq!(
+                f.relay
+                    .bindings
+                    .current(Some(&info.canonical_key))
+                    .as_deref(),
+                Some(f.id.as_str())
+            );
+            assert!(
+                !f.relay
+                    .dispatch_data_allowed(Some(&info.canonical_key), &f.id, Some("common"))
+                    .await
+            );
+            drop(refresh);
+        }
+    }
+
+    #[tokio::test]
+    async fn r13_g_new_model_and_usable_source_still_require_catalog_admission() {
+        for cooling in [false, true] {
+            let (f, info) = model_admission_fixture(cooling).await;
+            let requested = if cooling { "special" } else { "common" };
+            let supported = if cooling { "common" } else { "special" };
+            let refresh = CatalogRefreshOwner::new(
+                f.relay
+                    .catalogs
+                    .begin_refresh(&f.id, RefreshMode::Force)
+                    .unwrap()
+                    .unwrap(),
+                &f.relay.catalog_changed,
+            );
+            let admission = f.relay.admit_data_model(
+                &info,
+                Some(requested),
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            );
+            tokio::pin!(admission);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut admission)
+                    .await
+                    .is_err(),
+                "new models and usable sources must await their catalog"
+            );
+            // Both the singleflight result and the forced unsupported-model
+            // re-observation refuse this pick.
+            let catalog = json!({"models":[{"slug":supported}]});
+            f.reply(StatusCode::OK, catalog.clone());
+            refresh.finish(Ok(catalog)).unwrap();
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(2), &mut admission)
+                    .await
+                    .unwrap(),
+                Err(DataLaunchError::UnsupportedModel)
+            ));
+            let current = f
+                .relay
+                .bindings
+                .launch_info(&info.canonical_key, chrono::Utc::now())
+                .unwrap();
+            assert_eq!(current.account, f.id);
+            assert_eq!(current.current_model.as_deref(), Some("common"));
+        }
+    }
+
     async fn second_issue_account(f: &Fixture) -> String {
         let mut second = credential(0);
         second["email"] = json!("second@example.invalid");
@@ -1073,6 +1205,152 @@ mod tests {
                 .canonical_key,
             "codex:resume-test"
         );
+    }
+
+    #[tokio::test]
+    async fn r13_g_resume_refreshes_cached_destination_menu_without_source_catalog_or_flags() {
+        for move_for_model in [false, true] {
+            let f = Fixture::new().await;
+            let second = second_issue_account(&f).await;
+            warm_issue_catalog(&f, &f.id, &["common"]).await;
+            warm_issue_catalog(&f, &second, &["common"]).await;
+            let first = f
+                .relay
+                .issue_launch(
+                    LaunchRequest {
+                        account_pref: Some(f.id.clone()),
+                        ..issue_request(Some("common"))
+                    },
+                    10200,
+                )
+                .await
+                .unwrap();
+            let pin = f
+                .relay
+                .launch_tokens
+                .get_or_pin(issued_handle(&first))
+                .unwrap();
+            f.relay
+                .bindings
+                .resolve_launch(
+                    Some(&pin.metadata().binding_anchor_key),
+                    Some("codex:r13-g-model-resume"),
+                    chrono::Utc::now(),
+                )
+                .unwrap();
+            let now = chrono::Utc::now();
+            f.relay
+                .store
+                .update_metadata(&f.id, |account| {
+                    account.health = crate::accounts::Health::Cooling {
+                        reason: crate::accounts::HealthReason::Quota,
+                        until: now + chrono::Duration::hours(4),
+                        scope: "account".into(),
+                    };
+                })
+                .unwrap();
+            f.relay.catalogs.remove(&f.id).unwrap();
+            let before = f.upstream.state.requests().len();
+            // The ready destination now serves the explicit model, although
+            // its previously cached menu did not list it.
+            f.reply(
+                StatusCode::OK,
+                json!({"models":[{"slug":"common"},{"slug":"special"}]}),
+            );
+            let resumed = f
+                .relay
+                .issue_launch(
+                    LaunchRequest {
+                        resume_id: Some("r13-g-model-resume".into()),
+                        model_is_explicit: true,
+                        move_for_model,
+                        ..issue_request(Some("special"))
+                    },
+                    10200,
+                )
+                .await
+                .unwrap();
+            assert_eq!(resumed.account, second);
+            assert_eq!(resumed.model.as_deref(), Some("special"));
+            let calls = f.upstream.state.requests();
+            assert_eq!(
+                calls.len(),
+                before + 1,
+                "only destination menu is refreshed"
+            );
+            let destination = f.relay.store.load(&second).unwrap();
+            let tokens = f.relay.store.tokens(&destination).unwrap();
+            assert_eq!(
+                calls[before].headers["authorization"],
+                format!("Bearer {}", tokens.access_token)
+            );
+            assert!(calls[before].path_and_query.starts_with("/models"));
+        }
+    }
+
+    #[tokio::test]
+    async fn r13_g_model_scoped_current_limit_recovers_explicit_and_implicit_resume() {
+        for explicit in [true, false] {
+            let f = Fixture::new().await;
+            let second = second_issue_account(&f).await;
+            warm_issue_catalog(&f, &f.id, &["common"]).await;
+            warm_issue_catalog(&f, &second, &["common"]).await;
+            let first = f
+                .relay
+                .issue_launch(
+                    LaunchRequest {
+                        account_pref: Some(f.id.clone()),
+                        ..issue_request(Some("common"))
+                    },
+                    10200,
+                )
+                .await
+                .unwrap();
+            let pin = f
+                .relay
+                .launch_tokens
+                .get_or_pin(issued_handle(&first))
+                .unwrap();
+            f.relay
+                .bindings
+                .resolve_launch(
+                    Some(&pin.metadata().binding_anchor_key),
+                    Some("codex:r13-g-scoped-resume"),
+                    chrono::Utc::now(),
+                )
+                .unwrap();
+            f.relay
+                .store
+                .update_metadata(&f.id, |account| {
+                    account.health = crate::accounts::Health::Cooling {
+                        reason: crate::accounts::HealthReason::Quota,
+                        until: chrono::Utc::now() + chrono::Duration::hours(4),
+                        scope: "model:common".into(),
+                    };
+                })
+                .unwrap();
+            f.relay.catalogs.remove(&f.id).unwrap();
+            let before = f.upstream.state.requests().len();
+            let resumed = f
+                .relay
+                .issue_launch(
+                    LaunchRequest {
+                        resume_id: Some("r13-g-scoped-resume".into()),
+                        model_is_explicit: explicit,
+                        ..issue_request(explicit.then_some("common"))
+                    },
+                    10200,
+                )
+                .await
+                .unwrap();
+            assert_eq!(resumed.account, second);
+            assert_eq!(resumed.model.as_deref(), Some("common"));
+            assert_eq!(
+                f.upstream.state.requests().len(),
+                before,
+                "a current-model limit cannot fetch the unusable source catalog"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1755,20 +2033,47 @@ impl RelayState {
             .filter(|c| c.account.eligible(None))
             .map(|c| c.account.id.clone())
             .collect();
-        if let Some(info) = &prior {
+        let bound_usable = prior.as_ref().is_some_and(|info| {
+            candidates.iter().any(|candidate| {
+                candidate.account.id == info.account
+                    && candidate.account.eligible(info.current_model.as_deref())
+            })
+        });
+        if let Some(info) = prior.as_ref().filter(|_| !bound_usable) {
+            ids.remove(&info.account);
+        }
+        if let Some(info) = prior.as_ref().filter(|_| bound_usable) {
             ids.insert(info.account.clone());
         }
         // One shared budget includes every queued catalog, not eight seconds
         // per wave. Fail the whole issuance before placement on exhaustion.
         let deadline = operation.deadline();
+        let explicit_model = request
+            .model
+            .as_deref()
+            .filter(|_| request.model_is_explicit);
         let entitlements: crate::bindings::LaunchEntitlements = collect_issue_catalogs(
             ids,
-            prior.as_ref().map(|info| info.account.as_str()),
+            prior
+                .as_ref()
+                .filter(|_| bound_usable)
+                .map(|info| info.account.as_str()),
             deadline,
             |id, existing| async move {
-                self.launch_catalog(&id, false, existing)
+                let mut catalog = self
+                    .launch_catalog(&id, false, existing)
                     .await
-                    .map(|catalog| catalog.supported().clone())
+                    .map_err(|_| ())?;
+                // A cached menu predating a new model is not a current denial.
+                // Refresh only a missing explicit pick, inside the SAME issue
+                // budget; this never bypasses destination admission or D30.
+                if explicit_model.is_some_and(|model| !catalog.supported().contains(model)) {
+                    catalog = self
+                        .launch_catalog(&id, true, existing)
+                        .await
+                        .map_err(|_| ())?;
+                }
+                Ok(catalog.supported().clone())
             },
         )
         .await?
@@ -1904,6 +2209,7 @@ impl RelayState {
                             "http://127.0.0.1:{data_port}/l/{}/v1",
                             pending.token.expose_secret()
                         );
+                        pending.registry.bind_activity(&pending.token, &table);
                         let reply = LaunchReply {
                             catalog_url: format!("{base_url}/models"),
                             base_url,
@@ -2253,19 +2559,35 @@ impl RelayState {
             .filter(|model| crate::catalog::valid_model_id(model))
             .map(str::to_owned)
             .ok_or(DataLaunchError::Invalid)?;
-        let observed =
-            tokio::time::timeout_at(deadline, self.launch_catalog(&info.account, false, true))
+        // Resolve recovery before catalog I/O: an unusable source's refresh
+        // can consume the entire WS upgrade deadline before selection runs.
+        // Only its proved current model gets this exception; destination
+        // entitlement and final dispatch checks remain mandatory.
+        let recovering_current = info.current_model.as_deref() == Some(model.as_str())
+            && !self
+                .dispatch_data_allowed(Some(&info.canonical_key), &info.account, Some(&model))
                 .await;
-        let mut catalog = match observed {
-            Ok(Ok(catalog)) => Some(catalog),
-            _ if info.current_model.as_deref() == Some(model.as_str())
-                && !self
-                    .dispatch_data_allowed(Some(&info.canonical_key), &info.account, Some(&model))
-                    .await =>
-            {
-                None
+        let mut catalog = if recovering_current {
+            None
+        } else {
+            let observed =
+                tokio::time::timeout_at(deadline, self.launch_catalog(&info.account, false, true))
+                    .await;
+            match observed {
+                Ok(Ok(catalog)) => Some(catalog),
+                _ if info.current_model.as_deref() == Some(model.as_str())
+                    && !self
+                        .dispatch_data_allowed(
+                            Some(&info.canonical_key),
+                            &info.account,
+                            Some(&model),
+                        )
+                        .await =>
+                {
+                    None
+                }
+                _ => return Err(DataLaunchError::Unavailable),
             }
-            _ => return Err(DataLaunchError::Unavailable),
         };
         // A proved current model can recover from an unusable source after
         // restart. Destination entitlement and policy gates still run before

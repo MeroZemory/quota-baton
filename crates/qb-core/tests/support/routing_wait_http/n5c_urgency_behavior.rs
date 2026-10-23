@@ -1,4 +1,5 @@
 //! Child of entry::n5c_policy_wake; genuine HTTP/poll/admin paths only.
+use super::n5c_initial_far::native_owner::{self, NativeOwner};
 use super::*;
 
 async fn behavior_fixture(
@@ -65,17 +66,10 @@ async fn target(h: &Harness, session: &str) -> (u16, String, Vec<u8>) {
         .await
         .unwrap();
     let status = response.status().as_u16();
-    if status == 429 {
-        let reset = response
-            .headers()
-            .get("x-codex-primary-reset-at")
-            .expect("fallback must preserve the actual provider reset header")
-            .to_str()
-            .unwrap()
-            .parse::<i64>()
-            .unwrap();
-        assert!(reset > Utc::now().timestamp() + 120);
-    }
+    let reset_header = response
+        .headers()
+        .get("x-codex-primary-reset-at")
+        .map(|value| value.to_str().unwrap().parse::<i64>().unwrap());
     let account = response
         .headers()
         .get("x-quota-baton-account")
@@ -87,6 +81,19 @@ async fn target(h: &Harness, session: &str) -> (u16, String, Vec<u8>) {
         .unwrap()
         .unwrap()
         .to_vec();
+    if status == 429 {
+        // A physical rejection retains its header, including an empty body.
+        // A poll-only strict limit has no physical response to replay and uses
+        // the exact anchor's reset in the provider-shaped JSON instead.
+        let reset = reset_header
+            .or_else(|| {
+                serde_json::from_slice::<Value>(&body)
+                    .ok()
+                    .and_then(|value| value["error"]["resets_at"].as_i64())
+            })
+            .expect("limit response must preserve an observed reset");
+        assert!(reset > Utc::now().timestamp() + 120);
+    }
     (status, account, body)
 }
 
@@ -169,7 +176,7 @@ fn far_limit() -> ScriptedResponse {
     let (_, mut response) = reset_response();
     response.headers.insert(
         "x-codex-primary-reset-at",
-        (Utc::now() + ChronoDuration::hours(1))
+        (Utc::now() + ChronoDuration::hours(4))
             .timestamp()
             .to_string()
             .parse()
@@ -335,9 +342,10 @@ async fn n5c_http_long_weekly_limit_moves_for_either_urgency_except_strict() {
             .await;
             assert_no_more_events(&mut events);
             if mode == "strict" {
-                assert_eq!(status, 409);
+                assert_eq!(status, 429);
                 let error: Value = serde_json::from_slice(&body).unwrap();
-                assert_eq!(error["error"]["type"], "routing_policy_blocked");
+                assert_eq!(error["error"]["type"], "usage_limit_reached");
+                assert_eq!(error["error"]["resets_at"], reset.timestamp());
                 assert_exact_attempts(&h, 1);
             } else {
                 assert_eq!(
@@ -526,24 +534,24 @@ async fn n5c_http_midwait_move_preserves_original_cache_hold_then_real_429_norma
     }
 }
 
-// D26 fallback acceptance: preserve the actual provider 429; never manufacture
-// one from a usage poll. Current N5a over-bound behavior instead selects B.
+// D26 amendment 1: no connected launch owner means ordinary far Wait moves.
+// Strict still preserves the genuine provider rejection; urgent is unchanged.
 async fn far_five_hour(urgent: &str) {
-    for mode in ["recover", "rebalance"] {
+    for mode in ["recover", "rebalance", "strict"] {
         let session = format!("synthetic-n5c-far-{urgent}-{mode}");
         let (h, a, b, usage) = behavior_fixture(&session, mode, urgent).await;
         h.fake.state.push(far_limit());
         h.fake
             .state
-            .push(ScriptedResponse::json(StatusCode::OK, FINAL)); // catch wrong failover
-        let (status, _account, body) = timeout(Duration::from_secs(12), target(&h, &session))
+            .push(ScriptedResponse::json(StatusCode::OK, FINAL));
+        let (status, account, body) = timeout(Duration::from_secs(12), target(&h, &session))
             .await
-            .expect("nonurgent fallback must return the actual limit within original budget");
+            .expect("far limit must receive a decision within original budget");
         assert_source(&h, 1, &a);
-        if urgent == "wait" {
+        if mode == "strict" {
             assert_eq!(
                 status, 429,
-                "nonurgent beyond-bound 5h must preserve provider limit instead of moving B"
+                "Strict must preserve the genuine provider rejection without moving B"
             );
             assert!(
                 body.is_empty(),
@@ -559,10 +567,17 @@ async fn far_five_hour(urgent: &str) {
             );
         } else {
             assert_eq!(status, 200);
+            assert_eq!(account, b);
             assert_eq!(body.as_slice(), FINAL.as_bytes());
             assert_eq!(h.fake.state.requests().len(), 3);
             assert_source(&h, 2, &b);
             assert_one_move(&h, &a, &b);
+            if urgent == "wait" {
+                assert!(h.ledger().iter().any(|row| row["event"] == "binding_move"
+                    && row["from"] == a
+                    && row["to"] == b
+                    && row["reason"] == "five_hour_far_move"));
+            }
             assert_eq!(
                 h.state
                     .bindings
@@ -577,7 +592,7 @@ async fn far_five_hour(urgent: &str) {
 }
 
 #[tokio::test]
-async fn n5c_http_nonurgent_far_5h_preserves_actual_429_without_spending_b() {
+async fn n5c_http_nonurgent_far_5h_moves_b_but_strict_preserves_actual_429() {
     far_five_hour("wait").await;
 }
 
@@ -587,16 +602,26 @@ async fn n5c_http_urgent_far_5h_normally_moves_b_with_verbatim_upload() {
 }
 
 #[tokio::test]
-async fn n5c_http_nonurgent_zero_hold_and_original_deadline_preserve_actual_429() {
-    for (name, hold, remaining) in [("zero", 0, 3600), ("deadline", 60, 45)] {
-        let session = format!("synthetic-n5c-fallback-bound-{name}");
-        let (h, a, b, usage) = behavior_fixture(&session, "recover", "wait").await;
+async fn n5c_http_connected_native_owner_far_zero_hold_and_deadline_preserve_actual_429() {
+    // Keep the old D26 observed-429 coverage behind actual runtime authority,
+    // including a four-hour reset with an eligible, unused alternate account.
+    for (mode, hold, remaining) in [
+        ("recover", 60, 14400),
+        ("rebalance", 60, 14400),
+        ("recover", 0, 14400),
+        ("rebalance", 0, 14400),
+        ("recover", 60, 45),
+        ("rebalance", 60, 45),
+    ] {
+        let session = "45678901-4567-4def-8abc-45678901abcd".to_owned();
+        let (h, a, b, usage) = behavior_fixture(&session, mode, "wait").await;
         h.admin(
             reqwest::Method::POST,
             "/admin/v1/routing",
             Some(json!({"kind":"session", "id":qb_core::routing::session_id(&format!("codex:{session}")),
-                "settings":{"mode":"recover","reset_wait_secs":hold}})),
+                "settings":{"mode":mode,"reset_wait_secs":hold}})),
         ).await;
+        let owner = NativeOwner::connect(&h, &session, &a).await;
         let reset = (Utc::now() + ChronoDuration::seconds(remaining)).timestamp();
         let mut rejection = far_limit();
         rejection.headers.insert(
@@ -607,24 +632,11 @@ async fn n5c_http_nonurgent_zero_hold_and_original_deadline_preserve_actual_429(
         h.fake
             .state
             .push(ScriptedResponse::json(StatusCode::OK, FINAL));
-        let response = timeout(
-            PHASE,
-            h.client
-                .post(format!("http://{}/v1/responses", h.servers.data_addr))
-                .bearer_auth("synthetic-client")
-                .header("content-type", "application/json")
-                .header("session-id", &session)
-                .timeout(Duration::from_secs(30))
-                .body(UPLOAD)
-                .send(),
-        )
-        .await
-        .expect("far Wait must return the observed rejection without starting another hold")
-        .unwrap();
+        let response = owner.request(&h, &session).await;
         assert_eq!(
             response.status().as_u16(),
             429,
-            "zero hold or original deadline must retain the actual rejection, not move B"
+            "connected native owner must retain D26 observed rejection without moving B"
         );
         assert_eq!(
             response.headers()["x-codex-primary-reset-at"]
@@ -633,8 +645,7 @@ async fn n5c_http_nonurgent_zero_hold_and_original_deadline_preserve_actual_429(
             reset.to_string()
         );
         assert!(response.bytes().await.unwrap().is_empty());
-        assert_source(&h, 1, &a);
-        assert_exact_attempts(&h, 2);
+        native_owner::assert_same_source_attempts(&h, 2);
         assert_eq!(
             h.state
                 .bindings
@@ -644,5 +655,11 @@ async fn n5c_http_nonurgent_zero_hold_and_original_deadline_preserve_actual_429(
         );
         clean(&h, &a, &b).await;
         assert!(usage.state.requests().is_empty());
+        owner
+            .finish(
+                &session,
+                chrono::DateTime::from_timestamp(reset, 0).unwrap(),
+            )
+            .await;
     }
 }
