@@ -83,3 +83,14 @@ The available 6.1978-day move inventory is not a complete decision tape. It does
 Recommendation: implement a bounded, opt-in metadata recorder with explicit owner DTOs, pseudonymous identities, initial-state reconciliation and loss manifests. The design session enables it after reviewing the schema and operator controls, and supplies the sanitized export. The main never reads the live profile. The proposed input contract is in `.sandbox/r14-prep/replay-capture-inputs.md` in the implementation worktree.
 
 At the gate, please confirm whether an existing complete sanitized tape is available. Otherwise, please settle the installation/capture step needed before the final structural/replay acceptance. The requested runtime-first delivery can ship independently; owner separation, proof producers and synthetic/static checks continue while capture is arranged. No waiver of the 24-hour gate or acceptance of a move-only replay is requested.
+
+## R13 N5d: native continuation boundaries (collect for the gate)
+
+Codex integration continues independently; these are not reasons to stop it. The physical and initial full-proof HTTP producers have actual scoped owner tests. Their final publication does not authorize a native command by itself.
+
+Two remaining compatibility questions need a gate decision if further evidence does not close them:
+
+- Existing interactive Claude TUI: the pinned public TypeScript/Python interfaces reviewed so far do not establish a non-user command that resumes the same owned, quota-stopped TUI. A new user prompt, guessed keystroke or process restart would change the acceptance boundary. Recommendation: preserve the no-activation behavior for this unsupported path, label it explicitly, and decide whether a separately specified owned-client mechanism is acceptable. Evidence: `R13-evidence/n5d-core-owner/claude-primary-continuation.md` in the main repository report directory. This is a bounded evidence limit, not a claim of impossibility.
+- Received Codex WS quota errors: supported client source has wrapped errors with quota headers, but the inspected real-source fixtures do not prove a complete five-hour/long-window report plus unambiguous physical attempt identity. Separate unlabelled rate-limit and rejection frames cannot acquire that identity through timing, adjacency or a merged snapshot. Recommendation: decline registration from those incomplete frames; decide whether to obtain a sanitized complete wire fixture or specify an independently qualified full-poll producer for that path. Source research: implementation `.sandbox/r13-part-c/n5d-native/ws-producer-shape-review.md`. A cloned report origin is single-use and cannot mint successive stream reports.
+
+These questions will be sent once with the milestone gate batch. No unsupported continuation, alternate transport or weaker proof is being enabled while the managed Codex parent is integrated.

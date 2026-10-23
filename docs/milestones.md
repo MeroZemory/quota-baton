@@ -6,10 +6,10 @@ This file names the verification for each unit and each row. The row list and th
 
 <!-- status:begin -->
 현재 마일스톤: R13 N5d native 초기화 재개 통합
-목표: 실제 TUI 능력·명령 소유권 기반 검증 완료; 코어 초기화 권한과 실행기 연결 계속
+목표: 실제 429·초기 full-proof 대기 등록 검증 완료; owned 실행기 전체 연결 계속
 핵심 지표: 남은 출시 1/3 (R14 보호 설치, R13 C+E 실행, R13 F 통합 예측); 이전 계열 2/2 종료
 사용자 대기: R2 Part B(retire-cpa) 실행 여부 결정 — 남은 CPA 연결 계정을 qb가 직접 갱신하도록 넘기고 CPA를 멈출지. 선택: 지금 / 보류. 추천: 보류(CPA 연결 Claude 계정이 아직 CPA 갱신에 의존). 풀리는 것: R2 Part B 구현과 설치.
-갱신: 2026-10-23 18:35 KST (N5d 실제 TUI3사례·소유권/파이프 단위 검증; 제품 재개 미출시)
+갱신: 2026-10-23 20:09 KST (N5d 초기 대기 등록·소유 실행기 구성 단위 검증; 제품 재개 미출시)
 <!-- status:end -->
 
 The Codex main updates this block at each unit and gate close; the design session edits it when priority or approval changes. `.sandbox/scripts/status_head.py` copies it verbatim into the head of `.sandbox/reports/RESUME.md` and the current row's report. The Codex main runs that script at every unit close; nobody hand-edits a report head.
@@ -411,12 +411,14 @@ Report standard 2026-10-22 (`C:/_projects/research/methods/reporting/devlog-and-
 | 2026-10-23 16:48 | N10 자동 외부 사용·WS spill 관문 | 집중45·실제 한영4HWND·default/all-features lint·단독 core·제품 build 통과 | 전체 default2799/6/17; all-features 수치는 fingerprint·기존6실패 원인 대조·복구54 재실행 | e43a37b·7e37088; N10-evidence/delivery-fingerprint.json 입력별 기록. 최초 timeout 원인 미확정·실제24시간 replay 별도 |
 | 2026-10-23 17:20 | R12.11 느린 버전·캐시 집중 관문 | CLI58통과/1명시제외·strict lint·fmt·build·real check0 | 두 실제 hook control101→복원0·입력 동일 | df5bf72; R12.11-evidence/fingerprint.json. 24시간 wall-clock receipt·metadata fingerprint는 바이너리 attestation 아님 |
 | 2026-10-23 18:35 | N5d 실제 TUI·단일 writer 준비 | 실제 TUI3/3·dispatch 제거 대조1/복원1, Rust27·launcher14통과·strict CLI lint·fmt0 | core-qualified reset와 실제 managed launcher 통합 | cf611ae; n5d-native-tui 및 n5d-rust-primitives 증거. 두 Rust 경합 대조 예상실패/정확복원; unregistered primitive·test-only pipe이며 전체 N5d 수용 아님 |
+| 2026-10-23 19:47 | N5d 실제 코어 재개 권한·입력 경합 | 실제 제어10·권한9·보관0 HTTP1·자격6·기존 refresh77·제어 client19·입력/dispatch23 통과; strict core lint0 | HTTP 응답 권한과 owned 실행기 전체 연결 | 318b31e·720da8f·36d4735; n5d-core-owner 입력과 두 제거 대조101→정확복원0. staged client/parent·poll/WS producer 미완료, 전체 N5d 수용 아님 |
+| 2026-10-23 20:09 | N5d 초기 full-proof 대기 등록·소유 실행기 구성 | owner3·실제 HTTP2·actor16·부모9 통과; strict core/CLI lint·fmt0 | 추가 data send 없이 정확 Waiting; 초기 hook 제거101→정확복원0 | 7c94f3a·017afb0·ace4e36·3c28a3e; initial-unit-inputs.json. managed transport 실제 연결·WS producer·Claude 재개 수용은 별도 |
 <!-- support:end -->
 
 <!-- gaps:begin -->
 | 남은 차이 | 지금 | 넘어야 할 값 | 다음 동작 |
 |---|---|---|---|
-| R13 C+E native 재개 | N5a-c 관문·실제 TUI3사례·명령/파이프 기반 검증 | 실행 소유자에 정확히1회 재개·통합 설치 | 코어 초기화 권한·owned transport·Claude 지속 재개 수용 후 N5i |
+| R13 C+E native 재개 | N5a-c 관문·실제 TUI3사례·물리/초기 HTTP 대기 권한 검증 | 실행 소유자에 정확히1회 재개·통합 설치 | 코어 초기화 권한·owned transport·Claude 지속 재개 수용 후 N5i |
 | 실제24시간 라우팅 재생 | 기록기 설치·다중 epoch 입력 규칙 확정 | 각 epoch 초기 상태와 손실을 반영한 재생 | N6t owner와 N6r 실제 export 검증 |
 | 제공자 통합 예측 | 표시·잔여량 차트 설치; backtest 준비 | 실제24시간 backtest와 pooled 검증 | N7 검증 후 UI 통합 |
 <!-- gaps:end -->
