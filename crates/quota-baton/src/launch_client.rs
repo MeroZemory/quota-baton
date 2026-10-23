@@ -111,27 +111,42 @@ pub(crate) async fn run_codex(
         // pinned-native schema acceptance remains a separate integration gate.
         drop(envelope);
         let snapshot = crate::catalog_snapshot::CatalogSnapshot::create(&home, &bytes)?;
-        run_issued(program, &issued, &config, snapshot)
+        run_issued(program, &issued, &config, snapshot).await
     }
     .await;
     drop(permit);
     outcome
 }
 
-fn run_issued(
+async fn run_issued(
     program: &Path,
     issued: &IssuedLaunch,
     config: &qb_core::config::Config,
     snapshot: crate::catalog_snapshot::CatalogSnapshot,
 ) -> Result<i32> {
-    let status = issued.native_args(snapshot.path()).and_then(|args| {
+    let status = async {
+        let args = issued.native_args(snapshot.path())?;
+        #[cfg(windows)]
+        if let Some(status) = crate::native_resume::try_run(
+            program,
+            &args,
+            &issued.base_url,
+            &issued.client_key,
+            account_short(config, issued.account()),
+        )
+        .await
+        .map_err(|_| refusal(NATIVE))?
+        {
+            return Ok(status);
+        }
         crate::launcher_label::run_with_account(
             program,
             &args,
             account_short(config, issued.account()),
         )
         .map_err(|_| refusal(NATIVE))
-    });
+    }
+    .await;
     // The runner returns after the contained process TREE has finished, even
     // on errors. Explicit release also covers argument construction failure.
     drop(snapshot);
@@ -836,8 +851,8 @@ mod tests {
     }
 
     #[cfg(windows)]
-    #[test]
-    fn snapshot_is_released_on_argument_and_runner_errors() {
+    #[tokio::test]
+    async fn snapshot_is_released_on_argument_and_runner_errors() {
         let base =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.sandbox/r11-catalog-snapshot-tests");
         std::fs::create_dir_all(&base).unwrap();
@@ -868,6 +883,7 @@ mod tests {
                 &qb_core::config::Config::default(),
                 snapshot,
             )
+            .await
             .unwrap_err();
             assert_eq!(error.to_string(), expected);
             assert!(!path.exists());

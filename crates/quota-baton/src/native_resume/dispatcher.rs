@@ -36,6 +36,8 @@ impl<N: Write, U: Write> Dispatcher<N, U> {
         self.apply(action, || false)
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)] // Isolated controller adapters; production uses committed.
     pub(crate) fn native_frame(&mut self, frame: &[u8]) -> Result<(), Error> {
         let action = self.controller.native_frame(frame);
         self.apply(action, || false)
@@ -45,6 +47,8 @@ impl<N: Write, U: Write> Dispatcher<N, U> {
     /// core authority immediately before the automatic write, not before the
     /// asynchronous final-read exchange. It is never used for ordinary frames.
     /// Denial closes this episode without any native activation bytes or retry.
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn native_frame_admitted(
         &mut self,
         frame: &[u8],

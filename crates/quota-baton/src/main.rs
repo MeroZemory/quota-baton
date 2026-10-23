@@ -15,6 +15,8 @@ mod image_launch;
 mod launch_client;
 mod launcher_label;
 mod launcher_script;
+#[cfg(windows)]
+mod native_resume;
 mod resume_selection;
 mod routing_cli;
 mod sessions;

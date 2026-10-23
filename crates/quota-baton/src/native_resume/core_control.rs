@@ -80,25 +80,32 @@ impl std::error::Error for Error {}
 
 /// Hints are deliberately not convertible to Grant. No thread or URL is Debug.
 pub(crate) enum Observation {
-    Waiting { episode: u64, reset_unix_ms: i64 },
-    Due { episode: u64 },
-    Refused(Refusal),
+    Waiting {
+        episode: u64,
+        #[allow(dead_code)] // Preserve the original reported reset for observers.
+        reset_unix_ms: i64,
+    },
+    Due {
+        episode: u64,
+    },
+    Refused(#[allow(dead_code)] Refusal),
 }
 
 pub(crate) enum Inspection {
     Ready,
-    Refused(Refusal),
+    Refused(#[allow(dead_code)] Refusal),
 }
 
 pub(crate) enum Consumption {
     Granted(Grant),
-    Refused(Refusal),
+    Refused(#[allow(dead_code)] Refusal),
 }
 
 /// Opaque, noncloneable, nonserializable, deadline-bound receipt for ONE callback.
 /// Dropping/poisoning the client invalidates it. A peer close not yet polled is
 /// not observable without a reader; the parent still owns event/write ordering.
 pub(crate) struct Grant {
+    #[allow(dead_code)] // Exact correlation is retained even without an observer.
     request_id: u64,
     episode: u64,
     deadline: Instant,
@@ -106,10 +113,13 @@ pub(crate) struct Grant {
 }
 
 impl Grant {
+    #[allow(dead_code)] // Read-only correlation for typed observation/tests.
     pub(crate) fn request_id(&self) -> u64 {
         self.request_id
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)] // Consuming compatibility adapter; runtime retains Grant.
     pub(crate) fn authorizes(self, episode: u64) -> bool {
         self.is_current(episode)
     }
@@ -126,6 +136,7 @@ impl Grant {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn test_deadline(&self) -> Instant {
         self.deadline
     }
@@ -476,6 +487,8 @@ impl CoreControl {
         }
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)] // Runtime closes the single owned episode on cancellation.
     pub(crate) async fn cancel(&mut self, episode: u64, deadline: Instant) -> Result<(), Error> {
         let result = self.exchange(Command::Cancel { episode }, deadline).await;
         self.close();
@@ -493,6 +506,8 @@ impl CoreControl {
         self.correlation.finished = true;
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn is_closed(&self) -> bool {
         self.socket.is_none() || !self.live.load(Ordering::Acquire)
     }

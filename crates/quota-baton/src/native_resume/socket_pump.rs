@@ -98,6 +98,8 @@ pub(crate) struct ParentIo {
 pub(crate) struct UiSender(mpsc::Sender<Frame>);
 
 impl UiSender {
+    #[cfg(test)]
+    #[allow(dead_code)] // Runtime sole writer uses bounded synchronous admission.
     pub(crate) async fn send(&self, frame: Frame) -> Result<(), Error> {
         timeout(IO_DEADLINE, self.0.send(frame))
             .await
@@ -207,6 +209,7 @@ where
 /// Synthetic WS streams and short deadlines for deterministic blocked-sink tests;
 /// production only accepts EndpointIo and uses its fixed transport bounds.
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) async fn run_test_socket<S>(
     socket: WebSocketStream<S>,
     io: SocketIo,

@@ -84,11 +84,14 @@ impl<N: Write, U: Write> Parent<N, U> {
         self.dispatcher.cancel_resume();
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)] // Production lifetime is the owned parent, not a caller handle.
     pub(crate) fn disconnect(&mut self) {
         self.ingress_close();
         self.dispatcher.disconnect();
     }
 
+    #[cfg(test)]
     fn ingress_close(&mut self) {
         self.close.close();
     }
