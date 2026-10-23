@@ -102,6 +102,7 @@ fn command_import(store: &Store, from: &Path, keep_source: bool) -> Result<()> {
             move_source: !keep_source,
             yes: true,
             clean_stale: false,
+            verbose: false,
         },
     )
 }
