@@ -2052,6 +2052,7 @@ impl RelayState {
             .model
             .as_deref()
             .filter(|_| request.model_is_explicit);
+        let refresh_missing_catalog = prior.is_some() && !bound_usable;
         let entitlements: crate::bindings::LaunchEntitlements = collect_issue_catalogs(
             ids,
             prior
@@ -2067,7 +2068,9 @@ impl RelayState {
                 // A cached menu predating a new model is not a current denial.
                 // Refresh only a missing explicit pick, inside the SAME issue
                 // budget; this never bypasses destination admission or D30.
-                if explicit_model.is_some_and(|model| !catalog.supported().contains(model)) {
+                if refresh_missing_catalog
+                    && explicit_model.is_some_and(|model| !catalog.supported().contains(model))
+                {
                     catalog = self
                         .launch_catalog(&id, true, existing)
                         .await
